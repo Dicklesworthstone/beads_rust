@@ -1009,6 +1009,13 @@ fn restore_moved_components(
     for component in components.iter().rev() {
         let source = backup_component_path(source_dir, destination_base, &component.suffix)?;
         let destination = family_component_path(destination_base, &component.suffix);
+        let source_metadata = secure_file_metadata(&source)?.ok_or_else(|| {
+            BeadsError::internal(format!(
+                "retained schema-migration component disappeared before restoration: {}",
+                source.display()
+            ))
+        })?;
+        verify_component_bytes(&source, &source_metadata, component)?;
         rename_path_no_replace(&source, &destination)?;
         let restored_metadata = secure_file_metadata(&destination)?.ok_or_else(|| {
             BeadsError::internal(format!(
@@ -1119,9 +1126,7 @@ fn rollback_installed_main_to_original<F>(
 where
     F: FnMut(&Path) -> Result<()>,
 {
-    if write_authority.database_target_authority_state()?
-        != DatabaseTargetAuthorityState::Held
-    {
+    if write_authority.database_target_authority_state()? != DatabaseTargetAuthorityState::Held {
         return Err(BeadsError::SyncConflict {
             message: "refusing schema-migration rollback because the live database is no longer the authority-held replacement"
                 .to_string(),
@@ -1215,11 +1220,7 @@ where
                     write_authority.restore_retained_database_inode_after_authorized_replace()
                 })
                 .and_then(|()| write_authority.verify_database_authority())
-                .and_then(|()| {
-                    db_path
-                        .parent()
-                        .map_or(Ok(()), &mut sync)
-                });
+                .and_then(|()| db_path.parent().map_or(Ok(()), &mut sync));
             return Err(CompactedInstallFailure::after_rollback(error, rollback));
         }
         if let Err(error) = rename_path_no_replace(candidate_path, displaced_main) {
@@ -1228,11 +1229,7 @@ where
                     write_authority.restore_retained_database_inode_after_authorized_replace()
                 })
                 .and_then(|()| write_authority.verify_database_authority())
-                .and_then(|()| {
-                    db_path
-                        .parent()
-                        .map_or(Ok(()), &mut sync)
-                });
+                .and_then(|()| db_path.parent().map_or(Ok(()), &mut sync));
             return Err(CompactedInstallFailure::after_rollback(error, rollback));
         }
     }
@@ -1248,11 +1245,7 @@ where
         if let Err(error) = rename_path_no_replace(candidate_path, db_path) {
             let rollback = rename_path_no_replace(displaced_main, db_path)
                 .and_then(|()| write_authority.verify_database_authority())
-                .and_then(|()| {
-                    db_path
-                        .parent()
-                        .map_or(Ok(()), &mut sync)
-                });
+                .and_then(|()| db_path.parent().map_or(Ok(()), &mut sync));
             return Err(CompactedInstallFailure::after_rollback(error, rollback));
         }
         if let Err(error) = write_authority.adopt_locked_database_replacement(replacement_lock) {
@@ -1262,11 +1255,7 @@ where
                     write_authority.restore_retained_database_inode_after_authorized_replace()
                 })
                 .and_then(|()| write_authority.verify_database_authority())
-                .and_then(|()| {
-                    db_path
-                        .parent()
-                        .map_or(Ok(()), &mut sync)
-                });
+                .and_then(|()| db_path.parent().map_or(Ok(()), &mut sync));
             return Err(CompactedInstallFailure::after_rollback(error, rollback));
         }
     }
@@ -1367,9 +1356,7 @@ fn rollback_compacted_install(
     failed_dir: &Path,
     write_authority: &Arc<DatabaseFamilyWriteLock>,
 ) -> Result<()> {
-    if write_authority.database_target_authority_state()?
-        != DatabaseTargetAuthorityState::Held
-    {
+    if write_authority.database_target_authority_state()? != DatabaseTargetAuthorityState::Held {
         return Err(BeadsError::SyncConflict {
             message: "refusing to roll back a compacted database that is no longer the authority-held live generation"
                 .to_string(),
@@ -2865,6 +2852,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    ))]
     fn failed_post_adoption_verification_restores_database_and_authority() {
         let (_temp, migration) = reviewed_v14_migration_context();
         let raw_before = raw_family_witness(&migration.db_path).expect("original raw witness");
@@ -2917,6 +2910,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    ))]
     fn post_install_directory_sync_failure_restores_original_main_and_authority() {
         let (_temp, migration) = reviewed_v14_migration_context();
         let raw_before = raw_family_witness(&migration.db_path).expect("original raw witness");
@@ -2986,6 +2985,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    ))]
     fn repeated_directory_sync_failure_is_reported_as_uncertain() {
         let (_temp, migration) = reviewed_v14_migration_context();
         let candidate_path = migration.beads_dir.join("uncertain-sync-candidate.db");

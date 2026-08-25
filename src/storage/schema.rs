@@ -17,8 +17,7 @@ const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
 // caused rustc to interpret hundreds of thousands of loop iterations on every
 // schema rebuild, overwhelming the compile-time savings of the runtime fast
 // path itself.
-const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str =
-    "v4-comment-safe-core-aux-columns-fks-index-collations-checks-autoincrement-cookie-fenced";
+const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str = "v5-version-fenced-lexical-core-aux-columns-fks-index-collations-checks-autoincrement-cookie-fenced";
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 const GATE_RESULT_HISTORY_MIGRATION_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS gate_result_history (
@@ -1888,6 +1887,23 @@ enum SqlEvidenceToken {
     Symbol(char),
 }
 
+const fn sql_delimited_token_end(bytes: &[u8], start: usize, delimiter: u8) -> usize {
+    let mut index = start + 1;
+    while index < bytes.len() {
+        if bytes[index] != delimiter {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        if index < bytes.len() && bytes[index] == delimiter {
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    index
+}
+
 fn sql_evidence_tokens(sql: &str) -> Vec<SqlEvidenceToken> {
     let bytes = sql.as_bytes();
     let mut tokens = Vec::new();
@@ -1915,44 +1931,17 @@ fn sql_evidence_tokens(sql: &str) -> Vec<SqlEvidenceToken> {
             continue;
         }
         if byte == b'\'' {
-            let start = index;
-            index += 1;
-            while index < bytes.len() {
-                if bytes[index] == b'\'' {
-                    if index + 1 < bytes.len() && bytes[index + 1] == b'\'' {
-                        index += 2;
-                    } else {
-                        index += 1;
-                        break;
-                    }
-                } else {
-                    index += 1;
-                }
-            }
-            tokens.push(SqlEvidenceToken::StringLiteral(
-                sql[start..index].to_string(),
-            ));
+            let end = sql_delimited_token_end(bytes, index, byte);
+            tokens.push(SqlEvidenceToken::StringLiteral(sql[index..end].to_string()));
+            index = end;
             continue;
         }
         if byte == b'"' || byte == b'`' {
-            let start = index;
-            let delimiter = byte;
-            index += 1;
-            while index < bytes.len() {
-                if bytes[index] == delimiter {
-                    if index + 1 < bytes.len() && bytes[index + 1] == delimiter {
-                        index += 2;
-                    } else {
-                        index += 1;
-                        break;
-                    }
-                } else {
-                    index += 1;
-                }
-            }
+            let end = sql_delimited_token_end(bytes, index, byte);
             tokens.push(SqlEvidenceToken::QuotedIdentifier(
-                sql[start..index].to_string(),
+                sql[index..end].to_string(),
             ));
+            index = end;
             continue;
         }
         if byte == b'[' {
@@ -2219,11 +2208,16 @@ fn blocked_cache_table_canonical(conn: &Connection) -> bool {
         && !has_legacy_blocked_by_json
 }
 
-fn current_schema_version_declared(conn: &Connection) -> bool {
+fn runtime_user_version(conn: &Connection) -> Result<i64> {
     conn.query_row("PRAGMA user_version")
-        .ok()
-        .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
-        .is_some_and(|version| version == i64::from(CURRENT_SCHEMA_VERSION))
+        .map_err(BeadsError::from)?
+        .get(0)
+        .and_then(SqliteValue::as_integer)
+        .ok_or_else(|| BeadsError::internal("PRAGMA user_version returned no integer value"))
+}
+
+fn current_schema_version_declared(conn: &Connection) -> bool {
+    runtime_user_version(conn).is_ok_and(|version| version == i64::from(CURRENT_SCHEMA_VERSION))
 }
 
 /// Expected column order for the issues table (id + ISSUE_COLUMNS names).
@@ -2900,19 +2894,27 @@ pub(crate) fn runtime_schema_cookie(conn: &Connection) -> Result<i64> {
 /// commit after this fence, in which case the older recorded cookie safely
 /// fails to match on the next fast open.
 pub(crate) fn attest_runtime_schema_cookie(conn: &Connection) -> Result<i64> {
-    let before = runtime_schema_cookie(conn)?;
+    let cookie_before = runtime_schema_cookie(conn)?;
+    let version_before = runtime_user_version(conn)?;
+    if version_before != i64::from(CURRENT_SCHEMA_VERSION) {
+        return Err(BeadsError::Config(format!(
+            "runtime schema version {version_before} is not the supported version {CURRENT_SCHEMA_VERSION}"
+        )));
+    }
     if !runtime_schema_compatible(conn) {
         return Err(BeadsError::Config(
             "runtime schema remains incompatible after repair".to_string(),
         ));
     }
-    let after = runtime_schema_cookie(conn)?;
-    if before != after {
+    let version_after = runtime_user_version(conn)?;
+    let cookie_after = runtime_schema_cookie(conn)?;
+    if cookie_before != cookie_after || version_before != version_after {
         return Err(BeadsError::Config(format!(
-            "runtime schema changed while compatibility was being attested ({before} -> {after})"
+            "runtime schema changed while compatibility was being attested \
+             (cookie {cookie_before} -> {cookie_after}, version {version_before} -> {version_after})"
         )));
     }
-    Ok(after)
+    Ok(cookie_after)
 }
 
 fn runtime_schema_witness_value(cookie: i64) -> String {
@@ -2931,6 +2933,12 @@ pub(crate) fn runtime_schema_witness_matches(conn: &Connection) -> bool {
     let Ok(cookie_before) = runtime_schema_cookie(conn) else {
         return false;
     };
+    let Ok(version_before) = runtime_user_version(conn) else {
+        return false;
+    };
+    if version_before != i64::from(CURRENT_SCHEMA_VERSION) {
+        return false;
+    }
     let expected = runtime_schema_witness_value(cookie_before);
     let witness_matches = conn
         .query_row_with_params(
@@ -2941,6 +2949,7 @@ pub(crate) fn runtime_schema_witness_matches(conn: &Connection) -> bool {
         .and_then(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_owned))
         .is_some_and(|value| value == expected);
     witness_matches
+        && runtime_user_version(conn).is_ok_and(|version_after| version_after == version_before)
         && runtime_schema_cookie(conn).is_ok_and(|cookie_after| cookie_after == cookie_before)
 }
 
@@ -6201,7 +6210,7 @@ mod tests {
         apply_schema(&conn).expect("schema");
         let cookie = attest_runtime_schema_cookie(&conn).expect("attest current schema");
         let prior_witness = format!(
-            "schema-{CURRENT_SCHEMA_VERSION}.contract-v3-exact-core-aux-columns-fks-index-shapes-checks-autoincrement-cookie-fenced.cookie-{cookie}"
+            "schema-{CURRENT_SCHEMA_VERSION}.contract-v4-comment-safe-core-aux-columns-fks-index-collations-checks-autoincrement-cookie-fenced.cookie-{cookie}"
         );
         conn.execute_with_params(
             "INSERT INTO metadata (key, value) VALUES (?, ?)",
@@ -6216,6 +6225,54 @@ mod tests {
             !runtime_schema_witness_matches(&conn),
             "a witness minted under the weaker contract must force full re-attestation"
         );
+    }
+
+    #[test]
+    fn test_runtime_schema_witness_rejects_same_cookie_user_version_changes() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("user_version_runtime_schema_witness.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+        let attested_cookie =
+            attest_runtime_schema_cookie(&conn).expect("attest initial runtime schema");
+        record_runtime_schema_witness(&conn, attested_cookie).expect("record witness");
+        assert!(runtime_schema_witness_matches(&conn));
+
+        let downgrade = CURRENT_SCHEMA_VERSION
+            .checked_sub(1)
+            .expect("current schema has a prior version");
+        let future = CURRENT_SCHEMA_VERSION
+            .checked_add(1)
+            .expect("current schema has a future version");
+        for (label, changed_version) in [("downgrade", downgrade), ("future", future)] {
+            conn.execute(&format!("PRAGMA user_version = {changed_version}"))
+                .unwrap_or_else(|error| panic!("stamp {label} version: {error}"));
+            assert_eq!(
+                runtime_schema_cookie(&conn).expect("read unchanged schema cookie"),
+                attested_cookie,
+                "a user_version-only {label} must exercise the same-cookie witness seam"
+            );
+            assert!(
+                !runtime_schema_witness_matches(&conn),
+                "a current witness must not trust a same-cookie {label} version stamp"
+            );
+            assert!(
+                attest_runtime_schema_cookie(&conn).is_err(),
+                "attestation must reject a same-cookie {label} version stamp"
+            );
+
+            conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+                .unwrap_or_else(|error| panic!("restore current version after {label}: {error}"));
+            assert_eq!(
+                runtime_schema_cookie(&conn).expect("read restored schema cookie"),
+                attested_cookie,
+                "restoring user_version must not conceal a schema-cookie mutation"
+            );
+            assert!(
+                runtime_schema_witness_matches(&conn),
+                "the unchanged schema and restored version should match the recorded witness"
+            );
+        }
     }
 
     #[test]
