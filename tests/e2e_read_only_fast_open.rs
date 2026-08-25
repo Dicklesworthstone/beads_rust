@@ -9,8 +9,11 @@ mod common;
 use beads_rust::franken_sync::Connection;
 use common::cli::{BrRun, BrWorkspace, parse_created_id, run_br, run_br_with_env};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
@@ -315,60 +318,54 @@ fn strings<const N: usize>(values: [&str; N]) -> Vec<String> {
 
 #[derive(Debug, PartialEq, Eq)]
 struct RegularFileEvidence {
-    bytes: Vec<u8>,
+    size_bytes: usize,
+    sha256: String,
     readonly: bool,
-    platform_mode: Option<u32>,
-}
-
-#[cfg(unix)]
-fn platform_mode(metadata: &fs::Metadata) -> Option<u32> {
-    use std::os::unix::fs::PermissionsExt;
-    Some(metadata.permissions().mode())
-}
-
-#[cfg(not(unix))]
-const fn platform_mode(_metadata: &fs::Metadata) -> Option<u32> {
-    None
+    #[cfg(unix)]
+    unix_mode: u32,
 }
 
 fn regular_file_evidence(root: &Path) -> BTreeMap<String, RegularFileEvidence> {
-    WalkDir::new(root)
-        .sort_by_file_name()
-        .into_iter()
-        .filter_map(|entry| {
-            let entry = entry.unwrap_or_else(|error| {
-                panic!("walk {} for fast-open evidence: {error}", root.display())
-            });
-            entry.file_type().is_file().then(|| {
-                let relative = entry
-                    .path()
-                    .strip_prefix(root)
-                    .expect("walked path stays below evidence root")
-                    .to_string_lossy()
-                    .into_owned();
-                let bytes = fs::read(entry.path()).unwrap_or_else(|error| {
-                    panic!(
-                        "read {} for fast-open evidence: {error}",
-                        entry.path().display()
-                    )
-                });
-                let metadata = entry.metadata().unwrap_or_else(|error| {
-                    panic!(
-                        "stat {} for fast-open evidence: {error}",
-                        entry.path().display()
-                    )
-                });
-                (
-                    relative,
-                    RegularFileEvidence {
-                        bytes,
-                        readonly: metadata.permissions().readonly(),
-                        platform_mode: platform_mode(&metadata),
-                    },
-                )
-            })
-        })
-        .collect()
+    let mut evidence = BTreeMap::new();
+    for entry in WalkDir::new(root).sort_by_file_name() {
+        let entry = entry.unwrap_or_else(|error| {
+            panic!("walk {} for fast-open evidence: {error}", root.display())
+        });
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let relative = entry
+            .path()
+            .strip_prefix(root)
+            .expect("walked path stays below evidence root")
+            .to_string_lossy()
+            .into_owned();
+        let bytes = fs::read(entry.path()).unwrap_or_else(|error| {
+            panic!(
+                "read {} for fast-open evidence: {error}",
+                entry.path().display()
+            )
+        });
+        let metadata = entry.metadata().unwrap_or_else(|error| {
+            panic!(
+                "stat {} for fast-open evidence: {error}",
+                entry.path().display()
+            )
+        });
+        let prior = evidence.insert(
+            relative,
+            RegularFileEvidence {
+                size_bytes: bytes.len(),
+                sha256: format!("{:x}", Sha256::digest(&bytes)),
+                readonly: metadata.permissions().readonly(),
+                #[cfg(unix)]
+                unix_mode: metadata.permissions().mode(),
+            },
+        );
+        assert!(prior.is_none(), "walk returned a duplicate evidence path");
+    }
+    evidence
 }
 
 fn run_command(workspace: &BrWorkspace, command: &MatrixCommand, disable_fast_open: bool) -> BrRun {

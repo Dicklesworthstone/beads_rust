@@ -2364,8 +2364,8 @@ impl SqliteStorage {
         // the explicit, receipt-bound alternative for operator-driven
         // migrations of supported version pairs.
         let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
-        let effective_schema_version =
-            connection_user_version(&conn).or_else(|| database_header_user_version(path));
+        let header_schema_version = checked_database_header_user_version(path)?;
+        let effective_schema_version = connection_user_version(&conn).or(header_schema_version);
         if let Some(version) = effective_schema_version
             && version > current_schema_version
         {
@@ -2446,7 +2446,7 @@ impl SqliteStorage {
         // the true, current value that the raw header bytes do not yet reflect
         // (issue #373). A real database always carries the header magic even
         // when its user_version lives only in the WAL.
-        if database_header_user_version(path).is_none() {
+        if checked_database_header_user_version(path)?.is_none() {
             return Ok(None);
         }
 
@@ -2464,9 +2464,8 @@ impl SqliteStorage {
         // (WAL-aware) and fall back to the header peek. Reviewed reconciliation
         // is intentionally exact-version only: a future schema may add columns,
         // triggers, or invariants that this binary cannot witness safely.
-        if connection_user_version(&conn).or_else(|| database_header_user_version(path))
-            != Some(current_schema_version)
-        {
+        let header_version = checked_database_header_user_version(path)?;
+        if connection_user_version(&conn).or(header_version) != Some(current_schema_version) {
             conn.close().map_err(BeadsError::Database)?;
             return Ok(None);
         }
@@ -2503,7 +2502,7 @@ impl SqliteStorage {
         lock_timeout_ms: Option<u64>,
     ) -> Result<Option<Self>> {
         let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
-        if database_header_user_version(path).is_none() {
+        if checked_database_header_user_version(path)?.is_none() {
             return Ok(None);
         }
 
@@ -2522,8 +2521,8 @@ impl SqliteStorage {
         if let Some(timeout_ms) = lock_timeout_ms {
             conn.execute(&format!("PRAGMA busy_timeout={timeout_ms}"))?;
         }
-        if connection_user_version(&conn).or_else(|| database_header_user_version(path))
-            != Some(current_schema_version)
+        let header_version = checked_database_header_user_version(path)?;
+        if connection_user_version(&conn).or(header_version) != Some(current_schema_version)
             || !runtime_schema_compatible(&conn)
         {
             return Ok(None);
@@ -16232,7 +16231,7 @@ fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
 
 fn preflight_effective_schema_before_writable_open(db_path: &Path) -> Result<()> {
     let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
-    let Some(header_version) = database_header_user_version(db_path) else {
+    let Some(header_version) = checked_database_header_user_version(db_path)? else {
         return Ok(());
     };
     if header_version > current_schema_version {
@@ -16262,7 +16261,7 @@ fn preflight_effective_schema_before_writable_open(db_path: &Path) -> Result<()>
 /// the engine, and the over-permissive namespace sidecar prevents that open.
 fn verify_namespace_healing_schema_precondition(db_path: &Path) -> Result<()> {
     let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
-    let header_version = database_header_user_version(db_path).ok_or_else(|| {
+    let header_version = checked_database_header_user_version(db_path)?.ok_or_else(|| {
         BeadsError::SyncConflict {
             message: "Refusing fsqlite namespace sidecar repair because the database header does not prove a readable schema version"
                 .to_string(),
@@ -16530,14 +16529,14 @@ fn connection_user_version(conn: &Connection) -> Option<u32> {
 }
 
 fn effective_database_user_version(path: &Path) -> Result<Option<u32>> {
-    if database_header_user_version(path).is_none() {
+    if checked_database_header_user_version(path)?.is_none() {
         return Ok(None);
     }
     let conn = open_with_flags(
         path.to_string_lossy().as_ref(),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
-    let version = connection_user_version(&conn).or_else(|| database_header_user_version(path));
+    let version = connection_user_version(&conn).or(checked_database_header_user_version(path)?);
     conn.close().map_err(BeadsError::Database)?;
     Ok(version)
 }
@@ -20180,6 +20179,55 @@ mod tests {
             );
         }
         snapshot
+    }
+
+    fn synthetic_wal_header(salts: (u32, u32)) -> (Vec<u8>, (u32, u32)) {
+        const PAGE_SIZE: u32 = 512;
+
+        let mut header = [0_u8; 32];
+        header[..4].copy_from_slice(&0x377f_0682_u32.to_be_bytes());
+        header[4..8].copy_from_slice(&3_007_000_u32.to_be_bytes());
+        header[8..12].copy_from_slice(&PAGE_SIZE.to_be_bytes());
+        header[16..20].copy_from_slice(&salts.0.to_be_bytes());
+        header[20..24].copy_from_slice(&salts.1.to_be_bytes());
+        let checksum = wal_checksum(&header[..24], 0, 0, false);
+        header[24..28].copy_from_slice(&checksum.0.to_be_bytes());
+        header[28..32].copy_from_slice(&checksum.1.to_be_bytes());
+        (header.to_vec(), checksum)
+    }
+
+    fn append_synthetic_wal_frame(
+        wal: &mut Vec<u8>,
+        running_checksum: &mut (u32, u32),
+        page_number: u32,
+        database_size: u32,
+        salts: (u32, u32),
+        page_one_user_version: Option<u32>,
+    ) {
+        const PAGE_SIZE: usize = 512;
+
+        let mut frame = vec![0_u8; 24 + PAGE_SIZE];
+        frame[..4].copy_from_slice(&page_number.to_be_bytes());
+        frame[4..8].copy_from_slice(&database_size.to_be_bytes());
+        frame[8..12].copy_from_slice(&salts.0.to_be_bytes());
+        frame[12..16].copy_from_slice(&salts.1.to_be_bytes());
+        if let Some(user_version) = page_one_user_version {
+            assert_eq!(page_number, 1, "only page one carries user_version");
+            frame[24..40].copy_from_slice(b"SQLite format 3\0");
+            frame[40..42].copy_from_slice(&512_u16.to_be_bytes());
+            frame[84..88].copy_from_slice(&user_version.to_be_bytes());
+        }
+        let after_header = wal_checksum(
+            &frame[..8],
+            running_checksum.0,
+            running_checksum.1,
+            false,
+        );
+        let checksum = wal_checksum(&frame[24..], after_header.0, after_header.1, false);
+        frame[16..20].copy_from_slice(&checksum.0.to_be_bytes());
+        frame[20..24].copy_from_slice(&checksum.1.to_be_bytes());
+        *running_checksum = checksum;
+        wal.extend_from_slice(&frame);
     }
 
     /// GitHub #403: the lock-free fast path must not chmod a namespace
@@ -29242,6 +29290,33 @@ mod tests {
         assert_eq!(
             database_header_user_version(&db_path),
             Some(u32::try_from(CURRENT_SCHEMA_VERSION).unwrap())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_schema_preflight_refuses_symlinked_database_without_mutating_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("header_target.db");
+        let alias = temp.path().join("header_alias.db");
+        let storage = SqliteStorage::open(&target).unwrap();
+        drop(storage);
+        symlink(&target, &alias).unwrap();
+        let family_before = directory_bytes_and_modes(temp.path());
+
+        let error = SqliteStorage::open_with_timeout(&alias, Some(50))
+            .expect_err("schema preflight must never follow a database symlink");
+
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "unexpected database symlink refusal: {error}"
+        );
+        assert_eq!(
+            directory_bytes_and_modes(temp.path()),
+            family_before,
+            "database symlink refusal must leave the target family byte and mode neutral"
         );
     }
 

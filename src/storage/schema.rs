@@ -1445,40 +1445,33 @@ const BLOCKED_CACHE_RUNTIME_INDEXES: &[ExpectedRuntimeIndex] = &[runtime_index(
 
 // Exact partial-index predicates. Unquoted SQL syntax is case-insensitive, but
 // string-literal bytes are data and must compare exactly.
-const SEMANTIC_PARTIAL_INDEX_PREDICATES: &[(&str, &str)] =
-    &[
-        ("idx_issues_assignee", "assignee IS NOT NULL"),
-        ("idx_issues_external_ref_unique", "external_ref IS NOT NULL"),
-        ("idx_issues_ephemeral", "ephemeral = 1"),
-        ("idx_issues_pinned", "pinned = 1"),
-        ("idx_issues_tombstone", "status = 'tombstone'"),
-        ("idx_issues_due_at", "due_at IS NOT NULL"),
-        ("idx_issues_defer_until", "defer_until IS NOT NULL"),
-        (
-            "idx_issues_ready",
-            "status = 'open' AND ephemeral = 0 AND pinned = 0 AND is_template = 0",
-        ),
-        (
-            "idx_issues_list_active_order",
-            "status NOT IN ('closed', 'tombstone') AND (is_template = 0 OR is_template IS NULL)",
-        ),
-        ("idx_dependencies_thread", "thread_id != ''"),
-        (
-            "idx_dependencies_blocking",
-            "(type = 'blocks' OR type = 'parent-child' OR type = 'conditional-blocks' OR type = 'waits-for')",
-        ),
-        ("idx_events_actor", "actor != ''"),
-        ("idx_close_metadata_bypassed", "bypassed_policy = 1"),
-        ("idx_capacity_occupancy_actor", "actor IS NOT NULL"),
-        (
-            "idx_capacity_occupancy_harness",
-            "harness IS NOT NULL",
-        ),
-        (
-            "idx_capacity_occupancy_session",
-            "session IS NOT NULL",
-        ),
-    ];
+const EXPECTED_RUNTIME_PARTIAL_INDEX_PREDICATES: &[(&str, &str)] = &[
+    ("idx_issues_assignee", "assignee IS NOT NULL"),
+    ("idx_issues_external_ref_unique", "external_ref IS NOT NULL"),
+    ("idx_issues_ephemeral", "ephemeral = 1"),
+    ("idx_issues_pinned", "pinned = 1"),
+    ("idx_issues_tombstone", "status = 'tombstone'"),
+    ("idx_issues_due_at", "due_at IS NOT NULL"),
+    ("idx_issues_defer_until", "defer_until IS NOT NULL"),
+    (
+        "idx_issues_ready",
+        "status = 'open' AND ephemeral = 0 AND pinned = 0 AND is_template = 0",
+    ),
+    (
+        "idx_issues_list_active_order",
+        "status NOT IN ('closed', 'tombstone') AND (is_template = 0 OR is_template IS NULL)",
+    ),
+    ("idx_dependencies_thread", "thread_id != ''"),
+    (
+        "idx_dependencies_blocking",
+        "(type = 'blocks' OR type = 'parent-child' OR type = 'conditional-blocks' OR type = 'waits-for')",
+    ),
+    ("idx_events_actor", "actor != ''"),
+    ("idx_close_metadata_bypassed", "bypassed_policy = 1"),
+    ("idx_capacity_occupancy_actor", "actor IS NOT NULL"),
+    ("idx_capacity_occupancy_harness", "harness IS NOT NULL"),
+    ("idx_capacity_occupancy_session", "session IS NOT NULL"),
+];
 
 // Complete runtime column manifests for auxiliary tables. `Some(definition)`
 // marks a column SQLite can add without inventing audit data or installing an
@@ -1932,7 +1925,8 @@ fn auxiliary_runtime_indexes_canonical(
         }
 
         runtime_index_key_shape_canonical(conn, expected.name, expected.columns)
-            && semantic_partial_index_predicate_canonical(conn, expected.name)
+            && (!expected.partial
+                || semantic_partial_index_predicate_canonical(conn, expected.name))
     });
 
     expected_indexes_match
@@ -1946,11 +1940,11 @@ fn auxiliary_runtime_indexes_canonical(
                 // Every explicit index must be in the exact table manifest.
                 // Even a non-UNIQUE expression or partial index is maintained
                 // on writes and can reject otherwise-valid canonical data.
-                Some(origin) if origin.eq_ignore_ascii_case("c") => indexes
-                    .iter()
-                    .any(|expected| expected.name == name),
-                // An automatic UNIQUE constraint (origin `u`) or an unknown
-                // origin changes which otherwise-valid rows can be written.
+                Some(origin) if origin.eq_ignore_ascii_case("c") => {
+                    indexes.iter().any(|expected| expected.name == name)
+                }
+                // An automatic UNIQUE constraint (origin `u`) or any unknown
+                // origin is outside the explicit manifest.
                 _ => false,
             }
         })
@@ -2188,23 +2182,17 @@ fn table_declaration_clauses_canonical(conn: &Connection, table: &str) -> bool {
     // None of those policies are surfaced completely by table_xinfo or
     // foreign_key_list, so reject any explicit override lexically while still
     // ignoring comments, string literals, and quoted identifiers.
-    [
-        "COLLATE",
-        "ON CONFLICT",
-        "MATCH",
-        "DEFERRABLE",
-        "INITIALLY",
-    ]
+    ["COLLATE", "ON CONFLICT", "MATCH", "DEFERRABLE", "INITIALLY"]
         .iter()
         .all(|clause| !sql_contains_token_sequence(sql, clause))
 }
 
 fn semantic_partial_index_predicate_canonical(conn: &Connection, index: &str) -> bool {
-    let Some((_, predicate)) = SEMANTIC_PARTIAL_INDEX_PREDICATES
+    let Some((_, predicate)) = EXPECTED_RUNTIME_PARTIAL_INDEX_PREDICATES
         .iter()
         .find(|(expected_index, _)| *expected_index == index)
     else {
-        return true;
+        return false;
     };
     let escaped_index = index.replace('\'', "''");
     let Ok(row) = conn.query_row(&format!(
@@ -3882,23 +3870,23 @@ fn attest_gate_result_history_indexes(conn: &Connection) -> Result<()> {
     }
 
     for row in &index_rows {
-        let unique = row
-            .get(2)
-            .and_then(SqliteValue::as_integer)
-            .ok_or_else(|| schema_migration_shape_error("index has no uniqueness flag"))?;
-        if unique == 0 {
-            continue;
-        }
+        let name = row
+            .get(1)
+            .and_then(SqliteValue::as_text)
+            .ok_or_else(|| schema_migration_shape_error("index has no text name"))?;
         let origin = row.get(3).and_then(SqliteValue::as_text);
         if origin.is_some_and(|value| value.eq_ignore_ascii_case("pk")) {
             continue;
         }
-        let name = row
-            .get(1)
-            .and_then(SqliteValue::as_text)
-            .unwrap_or("<unnamed>");
+        if origin.is_some_and(|value| value.eq_ignore_ascii_case("c"))
+            && GATE_RESULT_HISTORY_INDEXES
+                .iter()
+                .any(|(expected, _)| *expected == name)
+        {
+            continue;
+        }
         return Err(schema_migration_shape_error(format!(
-            "unexpected UNIQUE index {name} changes gate-result-history write semantics"
+            "unexpected index {name} is outside the gate-result-history manifest"
         )));
     }
     Ok(())
@@ -6059,7 +6047,9 @@ mod tests {
         let error = rebuild_issues_table(&conn)
             .expect_err("rebuild must fail closed on a staging-name collision");
         assert!(
-            error.to_string().contains("staging table issues_rebuild_tmp already exists"),
+            error
+                .to_string()
+                .contains("staging table issues_rebuild_tmp already exists"),
             "collision refusal should be explicit: {error}"
         );
         let sentinel = conn
@@ -6091,7 +6081,9 @@ mod tests {
         let error = rebuild_kv_table_without_unique(&conn, "config")
             .expect_err("KV rebuild must fail closed on a staging-name collision");
         assert!(
-            error.to_string().contains("staging table config_rebuild_tmp already exists"),
+            error
+                .to_string()
+                .contains("staging table config_rebuild_tmp already exists"),
             "collision refusal should be explicit: {error}"
         );
         let sentinel = conn
@@ -6984,6 +6976,70 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_schema_contract_preserves_partial_index_literal_case() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("upper-case-tombstone-index.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+
+        execute_batch(
+            &conn,
+            r"
+            DROP INDEX idx_issues_tombstone;
+            CREATE INDEX idx_issues_tombstone
+                ON issues(status) WHERE status = 'TOMBSTONE';
+            ",
+        )
+        .expect("plant same-shape index with different literal bytes");
+
+        assert!(
+            runtime_index_key_shape_canonical(&conn, "idx_issues_tombstone", &["status"]),
+            "the key shape must exercise the hidden predicate seam"
+        );
+        assert!(
+            !semantic_partial_index_predicate_canonical(&conn, "idx_issues_tombstone"),
+            "SQL keywords are case-insensitive, but predicate string literals are not"
+        );
+        assert!(!runtime_schema_compatible(&conn));
+        assert!(attest_runtime_schema_cookie(&conn).is_err());
+    }
+
+    #[test]
+    fn test_runtime_schema_contract_rejects_unexpected_expression_index() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("unexpected-expression-index.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+
+        conn.execute(
+            "INSERT INTO issues (id, title, description)
+             VALUES ('json-control', 'Control', 'not-json')",
+        )
+        .expect("canonical schema accepts an opaque non-JSON description");
+        conn.execute("DELETE FROM issues WHERE id = 'json-control'")
+            .expect("clear control row before creating expression index");
+        conn.execute(
+            "CREATE INDEX rogue_description_json
+             ON issues(json_extract(description, '$.x'))",
+        )
+        .expect("plant unexpected expression index on empty table");
+        assert!(
+            conn.execute(
+                "INSERT INTO issues (id, title, description)
+                 VALUES ('json-rejected', 'Rejected', 'not-json')"
+            )
+            .is_err(),
+            "maintaining the rogue expression index must reject canonical opaque text"
+        );
+
+        assert!(
+            !runtime_schema_compatible(&conn),
+            "every explicit index must be present in the exact manifest"
+        );
+        assert!(attest_runtime_schema_cookie(&conn).is_err());
+    }
+
+    #[test]
     fn test_runtime_schema_contract_rejects_unexpected_unique_index() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("unexpected_unique_index.db");
@@ -7047,6 +7103,34 @@ mod tests {
             attest_gate_result_history_schema(&conn).is_err(),
             "gate-history attestation must reject unexpected UNIQUE indexes"
         );
+        assert!(!runtime_schema_compatible(&conn));
+        assert!(attest_runtime_schema_cookie(&conn).is_err());
+    }
+
+    #[test]
+    fn test_gate_history_contract_rejects_unexpected_expression_index() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("unexpected-gate-expression-index.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+        conn.execute("INSERT INTO issues (id, title) VALUES ('gate-expr-owner', 'Owner')")
+            .expect("seed gate owner");
+        conn.execute(
+            "CREATE INDEX rogue_gate_note_json
+             ON gate_result_history(json_extract(note, '$.result'))",
+        )
+        .expect("plant unexpected gate-history expression index");
+        assert!(
+            conn.execute(
+                "INSERT INTO gate_result_history
+                 (issue_id, from_status, to_status, status_revision, gate, provider, note)
+                 VALUES ('gate-expr-owner', 'open', 'closed', 1, 'tests', 'ci', 'not-json')"
+            )
+            .is_err(),
+            "maintaining the rogue index must reject canonical opaque note text"
+        );
+
+        assert!(attest_gate_result_history_schema(&conn).is_err());
         assert!(!runtime_schema_compatible(&conn));
         assert!(attest_runtime_schema_cookie(&conn).is_err());
     }
@@ -7217,7 +7301,7 @@ mod tests {
         apply_schema(&conn).expect("schema");
         let cookie = attest_runtime_schema_cookie(&conn).expect("attest current schema");
         let prior_witness = format!(
-            "schema-{CURRENT_SCHEMA_VERSION}.contract-v12-version-fenced-lexical-core-aux-columns-fks-match-immediate-index-and-primary-key-directions-implicit-binary-collations-case-exact-literal-defaults-default-conflicts-exact-checks-autoincrement-rowid-nonstrict-no-hidden-columns-no-triggers-cookie-fenced.cookie-{cookie}"
+            "schema-{CURRENT_SCHEMA_VERSION}.contract-v13-exact-ddl-version-domain-cookie-fenced.cookie-{cookie}"
         );
         conn.execute_with_params(
             "INSERT INTO metadata (key, value) VALUES (?, ?)",
