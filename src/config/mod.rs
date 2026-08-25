@@ -10637,7 +10637,10 @@ routing:
 
         let err =
             move_database_family_to_recovery(&db_path, &beads_dir, stamp).expect_err("should fail");
-        assert!(matches!(err, BeadsError::Io(_)));
+        assert!(
+            matches!(err, BeadsError::SyncConflict { .. }),
+            "a pre-existing recovery target must be classified as a no-replace conflict: {err}"
+        );
 
         assert!(db_path.is_file(), "db should be restored after rollback");
         assert!(wal_path.is_file(), "wal should remain after rollback");
@@ -10650,6 +10653,38 @@ routing:
         assert!(
             conflicting_wal_backup.is_dir(),
             "the pre-existing conflicting path should be untouched"
+        );
+    }
+
+    #[test]
+    fn recovery_move_rollback_never_replaces_a_late_foreign_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let original = temp.path().join("beads.db");
+        let renamed = temp.path().join("beads.db.fixed-stamp.bak");
+        fs::write(&original, b"foreign-generation").expect("plant late foreign path");
+        fs::write(&renamed, b"retained-original").expect("plant retained recovery artifact");
+
+        let error = rollback_renamed_paths(
+            &[(original.clone(), renamed.clone())],
+            "test database-family backup",
+        )
+        .expect_err("rollback must refuse to replace a path that appeared late");
+
+        assert!(
+            error
+                .to_string()
+                .contains("without replacing an existing path"),
+            "unexpected rollback error: {error}"
+        );
+        assert_eq!(
+            fs::read(&original).expect("read foreign path"),
+            b"foreign-generation",
+            "rollback must preserve the late foreign generation"
+        );
+        assert_eq!(
+            fs::read(&renamed).expect("read retained recovery artifact"),
+            b"retained-original",
+            "failed no-replace rollback must retain the original recovery artifact"
         );
     }
 
