@@ -870,7 +870,6 @@ impl DatabaseFamilyWriteLock {
             database_lock,
             &self.canonical_database_path,
             "retained database recovery authority",
-            &database_path_descriptor(&self.canonical_database_path),
             true,
         )?;
         if database_authority.identity == Some(retained_identity)
@@ -966,14 +965,16 @@ impl DatabaseFamilyWriteLock {
     /// Drop locks for displaced database inodes only after recovery has
     /// irreversibly accepted the replacement.
     pub(crate) fn finalize_database_replacement(&self) -> Result<()> {
-        self.verify_database_authority()?;
-        self.database_authority
+        self.verify_common_authority()?;
+        let mut database_authority = self
+            .database_authority
             .lock()
             .map_err(|_| BeadsError::SyncConflict {
                 message: "Database inode authority state was poisoned".to_string(),
-            })?
-            .retired_locks
-            .clear();
+            })?;
+        maybe_replace_database_before_finalize_locked_verify(&self.canonical_database_path)?;
+        self.verify_database_inode_authority_locked(&database_authority)?;
+        database_authority.retired_locks.clear();
         Ok(())
     }
 
@@ -996,17 +997,17 @@ impl DatabaseFamilyWriteLock {
         finalize_older_replacements: bool,
     ) -> Result<()> {
         self.verify_common_authority()?;
-        let target_identity = authority_path_identity(
-            &self.canonical_database_path,
-            "restored database write authority",
-            &database_path_descriptor(&self.canonical_database_path),
-        )?;
         let mut database_authority =
             self.database_authority
                 .lock()
                 .map_err(|_| BeadsError::SyncConflict {
                     message: "Database inode authority state was poisoned".to_string(),
                 })?;
+        let target_identity = authority_path_identity(
+            &self.canonical_database_path,
+            "restored database write authority",
+            &database_path_descriptor(&self.canonical_database_path),
+        )?;
 
         if database_authority.identity == Some(target_identity) {
             let current_lock =
@@ -1045,13 +1046,13 @@ impl DatabaseFamilyWriteLock {
         let retained_index = retained_index.ok_or_else(|| BeadsError::SyncConflict {
             message: "Restored database inode was not retained under lock".to_string(),
         })?;
-        let restored_lock = database_authority.retired_locks.swap_remove(retained_index);
         verify_locked_file_identity(
-            &restored_lock,
+            &database_authority.retired_locks[retained_index],
             &self.canonical_database_path,
             "restored database write authority",
             true,
         )?;
+        let restored_lock = database_authority.retired_locks.swap_remove(retained_index);
         if let Some(displaced_lock) = database_authority.lock.replace(restored_lock) {
             database_authority.retired_locks.push(displaced_lock);
         }
@@ -1126,6 +1127,12 @@ impl DatabaseFamilyWriteLock {
     /// database family to a legitimately missing state.
     pub(crate) fn clear_database_inode_after_authorized_remove(&self) -> Result<()> {
         self.verify_common_authority()?;
+        let mut database_authority =
+            self.database_authority
+                .lock()
+                .map_err(|_| BeadsError::SyncConflict {
+                    message: "Database inode authority state was poisoned".to_string(),
+                })?;
         match fs::symlink_metadata(&self.canonical_database_path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Ok(_) => {
@@ -1140,12 +1147,6 @@ impl DatabaseFamilyWriteLock {
                 )));
             }
         }
-        let mut database_authority =
-            self.database_authority
-                .lock()
-                .map_err(|_| BeadsError::SyncConflict {
-                    message: "Database inode authority state was poisoned".to_string(),
-                })?;
         database_authority.lock = None;
         database_authority.identity = None;
         database_authority.retired_locks.clear();
@@ -1161,37 +1162,7 @@ impl DatabaseFamilyWriteLock {
                 .map_err(|_| BeadsError::SyncConflict {
                     message: "Database inode authority state was poisoned".to_string(),
                 })?;
-        if let Some(database_lock) = database_authority.lock.as_ref() {
-            let current_identity = verify_locked_file_identity(
-                database_lock,
-                &self.canonical_database_path,
-                "database write authority",
-                true,
-            )?;
-            if database_authority.identity != Some(current_identity) {
-                return Err(BeadsError::SyncConflict {
-                    message: "Database inode changed while its write authority was held"
-                        .to_string(),
-                });
-            }
-        } else {
-            match fs::symlink_metadata(&self.canonical_database_path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Ok(_) => {
-                    return Err(BeadsError::SyncConflict {
-                        message: "Database appeared before its inode authority was bound"
-                            .to_string(),
-                    });
-                }
-                Err(error) => {
-                    return Err(BeadsError::Config(format!(
-                        "Could not verify missing database authority {}: {error}",
-                        database_path_descriptor(&self.canonical_database_path)
-                    )));
-                }
-            }
-        }
-        Ok(())
+        self.verify_database_inode_authority_locked(&database_authority)
     }
 }
 
@@ -16512,6 +16483,58 @@ mod tests {
         )
         .expect("hard-link alias authority is available after the original authority drops");
         drop(alias_authority);
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    ))]
+    #[test]
+    fn database_replacement_finalization_reverifies_before_retiring_locks() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let database_path = beads_dir.join("beads.db");
+        let original_retained_path = beads_dir.join("original-retained.db");
+        fs::write(&database_path, b"original database generation").unwrap();
+        let authority = blocking_database_family_write_lock_with_timeout(
+            &beads_dir,
+            &database_path,
+            Some(1_000),
+        )
+        .unwrap();
+        authority.bind_database_inode_for_mutation().unwrap();
+        install_database_candidate_no_replace(&database_path, &original_retained_path).unwrap();
+        authority
+            .install_empty_database_replacement_and_bind()
+            .unwrap();
+        assert_eq!(
+            authority.database_authority.lock().unwrap().retired_locks.len(),
+            1,
+            "the displaced original must remain locked before finalization"
+        );
+
+        DatabaseFamilyWriteLock::arm_database_replacement_before_finalize_locked_verify_for_test();
+        let error = authority
+            .finalize_database_replacement()
+            .expect_err("a canonical-path swap at finalization must fail closed");
+
+        assert!(
+            error.to_string().contains("database write authority"),
+            "unexpected finalization identity error: {error}"
+        );
+        assert_eq!(
+            authority.database_authority.lock().unwrap().retired_locks.len(),
+            1,
+            "failed finalization must not release the displaced inode lock"
+        );
+        assert_eq!(
+            fs::read(&database_path).unwrap(),
+            b"foreign database generation installed by finalize hook",
+            "the hook must causally replace the canonical generation"
+        );
     }
 
     #[test]
