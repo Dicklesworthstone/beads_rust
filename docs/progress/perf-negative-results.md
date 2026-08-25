@@ -547,3 +547,15 @@ Entries preserve failed experiments as reusable evidence. A retry is justified o
 - **Retry-condition predicate:** Do not reintroduce a correlated per-row label aggregate from query-count intuition alone. Retry only after a new engine/query-plan change and require the same matched-host, balanced-order, byte-parity gate to clear both median and p95 by at least `10%`, with the unaffected text control within `5%`.
 - **Bead id (if applicable):** `beads_rust-7kw0`
 - **Commit (if attempted):** runtime repair `79fb0e1f`; rejected projection cleanup `7cf131ba`.
+
+### 2026-08-24 — Runtime-witness contract upgrade on lock-free reads — blocker
+
+- **Hypothesis:** Bumping the persisted runtime-schema witness contract would keep lock-free fast reads cheap for databases whose otherwise-valid witness was written by the preceding contract.
+- **Workload(s) probed:** Fresh-eyes static control-flow review of the current `fast_open_runtime_schema_is_compatible` path and the ordinary writable-open witness writer. No timing run was credited because the local one-minute load remained above the mandatory threshold of `10`.
+- **Measurement summary:** An old-contract witness no longer matches, so each lock-free read performs the full runtime-schema attestation until an ordinary writable open records the current witness. The read-only path cannot refresh the witness without violating its observational-only contract. The size and duration of this upgrade-only cost remain unmeasured on the exact current tree.
+- **Outcome:** blocker; retain the safety behavior and withhold an exact-current fast-open performance or release claim until the upgraded-database shape is measured.
+- **Scratch worktree:** not applicable; current shared-tree static review
+- **Profile evidence:** none yet; exact-current upgraded-fixture profile is pending the `1m < 10` execution gate.
+- **Retry-condition predicate:** On a quiet host, compare an old-contract upgraded fixture before and after one ordinary writable open, with byte/semantic output parity and the normal read-command matrix. Do not make the lock-free path persist a witness merely to improve this result.
+- **Bead id (if applicable):** `beads_rust-7kw0`
+- **Commit (if attempted):** no runtime edit; ledger-only finding after the runtime-contract-token bump.
