@@ -959,7 +959,11 @@ fn open_sqlite_storage_with_recovery_strategy(
         authority.verify_database_authority()?;
     }
 
-    quarantine_truncated_wal_sidecar(&paths.db_path, beads_dir);
+    if let Some(authority) = write_authority {
+        authority.verify_database_authority()?;
+        quarantine_truncated_wal_sidecar(&paths.db_path, beads_dir);
+        authority.verify_database_authority()?;
+    }
 
     let prepare_fresh_storage = || -> Result<(SqliteStorage, RecoveryBackupSet)> {
         let authority = write_authority.ok_or_else(|| BeadsError::SyncConflict {

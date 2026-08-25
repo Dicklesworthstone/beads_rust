@@ -2346,7 +2346,7 @@ impl SqliteStorage {
         // a raw header alone cannot rule out a future user_version in WAL.
         // Authority-aware startup/recovery callers use
         // `open_with_timeout_under_write_authority` below.
-        refuse_known_future_schema_header(path)?;
+        preflight_effective_schema_before_writable_open(path)?;
         let conn = Connection::open(path.to_string_lossy().into_owned())?;
 
         // Set busy_timeout. Default is 0 (#243) — frankensqlite's busy
@@ -15792,6 +15792,7 @@ fn namespace_sidecar_mode_repair_required(db_path: &Path) -> Result<bool> {
     {
         use std::os::unix::fs::PermissionsExt;
 
+        let mut repair_required = false;
         for suffix in crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES {
             let sidecar = database_sidecar_path(db_path, suffix);
             let metadata = match std::fs::symlink_metadata(&sidecar) {
@@ -15809,15 +15810,17 @@ fn namespace_sidecar_mode_repair_required(db_path: &Path) -> Result<bool> {
             }
             let mode = metadata.permissions().mode();
             if mode & 0o077 != 0 {
-                return Ok(true);
+                repair_required = true;
             }
         }
+        return Ok(repair_required);
     }
     #[cfg(not(unix))]
     {
         let _ = db_path;
     }
-    Ok(false)
+    #[cfg(not(unix))]
+    return Ok(false);
 }
 
 fn database_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
@@ -15833,12 +15836,208 @@ fn future_schema_error(version: u32, current_schema_version: u32) -> BeadsError 
     ))
 }
 
-fn refuse_known_future_schema_header(db_path: &Path) -> Result<()> {
-    let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
-    if let Some(version) = database_header_user_version(db_path)
-        && version > current_schema_version
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalFrameState {
+    AbsentOrEmpty,
+    HeaderOnly,
+    FramesPresent,
+}
+
+fn wal_checksum(bytes: &[u8], big_endian_words: bool) -> (u32, u32) {
+    let mut s1 = 0_u32;
+    let mut s2 = 0_u32;
+    for chunk in bytes.chunks_exact(8) {
+        let first: [u8; 4] = chunk[..4].try_into().unwrap_or([0; 4]);
+        let second: [u8; 4] = chunk[4..].try_into().unwrap_or([0; 4]);
+        let x0 = if big_endian_words {
+            u32::from_be_bytes(first)
+        } else {
+            u32::from_le_bytes(first)
+        };
+        let x1 = if big_endian_words {
+            u32::from_be_bytes(second)
+        } else {
+            u32::from_le_bytes(second)
+        };
+        s1 = s1.wrapping_add(x0).wrapping_add(s2);
+        s2 = s2.wrapping_add(x1).wrapping_add(s1);
+    }
+    (s1, s2)
+}
+
+/// Classify a SQLite WAL without following a replacement symlink or trusting
+/// length alone. Header-only WALs are accepted only after magic, format,
+/// page-size, checksum, handle identity, and frame alignment validation.
+fn sqlite_wal_frame_state(db_path: &Path) -> Result<WalFrameState> {
+    let wal_path = database_sidecar_path(db_path, "-wal");
+    let initial_metadata = match std::fs::symlink_metadata(&wal_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WalFrameState::AbsentOrEmpty);
+        }
+        Err(error) => return Err(BeadsError::Io(error)),
+    };
+    if initial_metadata.file_type().is_symlink() || !initial_metadata.is_file() {
+        return Err(BeadsError::SyncConflict {
+            message: "Refusing schema preflight because the WAL path is not a regular file"
+                .to_string(),
+        });
+    }
+    if initial_metadata.len() == 0 {
+        return Ok(WalFrameState::AbsentOrEmpty);
+    }
+    if initial_metadata.len() < 32 {
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "Refusing schema preflight because the {}-byte WAL header is truncated",
+                initial_metadata.len()
+            ),
+        });
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
     {
-        return Err(future_schema_error(version, current_schema_version));
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut wal_file = options.open(&wal_path).map_err(|error| {
+        BeadsError::SyncConflict {
+            message: format!(
+                "WAL changed before its no-follow schema-preflight handle could be opened: {error}"
+            ),
+        }
+    })?;
+    let handle_metadata = wal_file.metadata()?;
+    let path_metadata = std::fs::symlink_metadata(&wal_path)?;
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.is_file()
+        || handle_metadata.len() != initial_metadata.len()
+        || path_metadata.len() != initial_metadata.len()
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "WAL changed identity or length during schema preflight".to_string(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let initial_identity = (initial_metadata.dev(), initial_metadata.ino());
+        if (handle_metadata.dev(), handle_metadata.ino()) != initial_identity
+            || (path_metadata.dev(), path_metadata.ino()) != initial_identity
+        {
+            return Err(BeadsError::SyncConflict {
+                message: "WAL changed identity during schema preflight".to_string(),
+            });
+        }
+    }
+
+    let mut header = [0_u8; 32];
+    wal_file.read_exact(&mut header)?;
+    let magic = u32::from_be_bytes(header[..4].try_into().unwrap_or([0; 4]));
+    if !matches!(magic, 0x377f_0682 | 0x377f_0683) {
+        return Err(BeadsError::SyncConflict {
+            message: format!("Refusing schema preflight because WAL magic {magic:#010x} is invalid"),
+        });
+    }
+    let format_version = u32::from_be_bytes(header[4..8].try_into().unwrap_or([0; 4]));
+    if format_version != 3_007_000 {
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "Refusing schema preflight because WAL format version {format_version} is unsupported"
+            ),
+        });
+    }
+    let page_size = u32::from_be_bytes(header[8..12].try_into().unwrap_or([0; 4]));
+    if !(512..=65_536).contains(&page_size) || !page_size.is_power_of_two() {
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "Refusing schema preflight because WAL page size {page_size} is invalid"
+            ),
+        });
+    }
+    let expected_checksum = wal_checksum(&header[..24], magic == 0x377f_0683);
+    let stored_checksum = (
+        u32::from_be_bytes(header[24..28].try_into().unwrap_or([0; 4])),
+        u32::from_be_bytes(header[28..32].try_into().unwrap_or([0; 4])),
+    );
+    if stored_checksum != expected_checksum {
+        return Err(BeadsError::SyncConflict {
+            message: "Refusing schema preflight because the WAL header checksum is invalid"
+                .to_string(),
+        });
+    }
+
+    let frame_size = u64::from(page_size) + 24;
+    let frame_bytes = initial_metadata.len() - 32;
+    if !frame_bytes.is_multiple_of(frame_size) {
+        return Err(BeadsError::SyncConflict {
+            message: "Refusing schema preflight because the WAL ends in a partial frame"
+                .to_string(),
+        });
+    }
+    let final_handle_metadata = wal_file.metadata()?;
+    let final_path_metadata = std::fs::symlink_metadata(&wal_path)?;
+    if final_handle_metadata.len() != initial_metadata.len()
+        || final_path_metadata.len() != initial_metadata.len()
+        || final_path_metadata.file_type().is_symlink()
+        || !final_path_metadata.is_file()
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "WAL changed while its schema preflight was being verified".to_string(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let initial_identity = (initial_metadata.dev(), initial_metadata.ino());
+        if (final_handle_metadata.dev(), final_handle_metadata.ino()) != initial_identity
+            || (final_path_metadata.dev(), final_path_metadata.ino()) != initial_identity
+        {
+            return Err(BeadsError::SyncConflict {
+                message: "WAL changed identity while its schema preflight was being verified"
+                    .to_string(),
+            });
+        }
+    }
+
+    if frame_bytes == 0 {
+        Ok(WalFrameState::HeaderOnly)
+    } else {
+        Ok(WalFrameState::FramesPresent)
+    }
+}
+
+fn preflight_effective_schema_before_writable_open(db_path: &Path) -> Result<()> {
+    let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
+    let Some(header_version) = database_header_user_version(db_path) else {
+        return Ok(());
+    };
+    if header_version > current_schema_version {
+        return Err(future_schema_error(
+            header_version,
+            current_schema_version,
+        ));
+    }
+    if sqlite_wal_frame_state(db_path)? == WalFrameState::FramesPresent {
+        let conn = open_with_flags(
+            db_path.to_string_lossy().as_ref(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let effective_version = connection_user_version(&conn);
+        conn.close().map_err(BeadsError::Database)?;
+        let effective_version = effective_version.ok_or_else(|| BeadsError::SyncConflict {
+            message:
+                "Refusing writable database open because the WAL-aware schema version is unreadable"
+                    .to_string(),
+        })?;
+        if effective_version > current_schema_version {
+            return Err(future_schema_error(
+                effective_version,
+                current_schema_version,
+            ));
+        }
     }
     Ok(())
 }
@@ -15864,27 +16063,11 @@ fn verify_namespace_healing_schema_precondition(db_path: &Path) -> Result<()> {
         ));
     }
 
-    let wal_path = database_sidecar_path(db_path, "-wal");
-    let wal_metadata = match std::fs::symlink_metadata(&wal_path) {
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(BeadsError::Io(error)),
-    };
-    if let Some(metadata) = wal_metadata {
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(BeadsError::SyncConflict {
-                message: "Refusing fsqlite namespace sidecar repair because the WAL path is not a regular file"
-                    .to_string(),
-            });
-        }
-        if !matches!(metadata.len(), 0 | 32) {
-            return Err(BeadsError::SyncConflict {
-                message: format!(
-                    "Refusing fsqlite namespace sidecar repair because a {}-byte WAL makes the effective schema version uncertain",
-                    metadata.len()
-                ),
-            });
-        }
+    if sqlite_wal_frame_state(db_path)? == WalFrameState::FramesPresent {
+        return Err(BeadsError::SyncConflict {
+            message: "Refusing fsqlite namespace sidecar repair because WAL frames make the effective schema version uncertain"
+                .to_string(),
+        });
     }
     Ok(())
 }

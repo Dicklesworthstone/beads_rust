@@ -63,12 +63,16 @@ migrated workspaces on every platform.
   import queries, and the linear witness survives transaction retries
   ([c87e1b43](https://github.com/Dicklesworthstone/beads_rust/commit/c87e1b43),
   [2676ba7a](https://github.com/Dicklesworthstone/beads_rust/commit/2676ba7a)).
-- Measured performance wins retained from the profile-first campaign:
-  fused relation-count queries, SQL-side label projection for structured
-  `ready` output (GitHub #309), fast-open synchronized default reads, and
-  short-circuited empty external epic joins
-  ([70928a3f](https://github.com/Dicklesworthstone/beads_rust/commit/70928a3f),
-  [0064a5dd](https://github.com/Dicklesworthstone/beads_rust/commit/0064a5dd)).
+- The profile-first campaign retained fast-open synchronized default reads
+  and the short-circuited empty external-epic join. Relation-count fusion was
+  explicitly reverted after it missed the retention gates
+  ([70928a3f](https://github.com/Dicklesworthstone/beads_rust/commit/70928a3f)).
+  v0.4.1 also shipped SQL-side label projection for structured `ready` output
+  (GitHub #309,
+  [0064a5dd](https://github.com/Dicklesworthstone/beads_rust/commit/0064a5dd));
+  the current tree has since replaced that correlated projection with faster
+  post-truncation batched hydration, as recorded in the performance
+  negative-results ledger.
 
 ## v0.4.0 -- 2026-08-22 (Release)
 
