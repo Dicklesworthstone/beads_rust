@@ -756,6 +756,7 @@ pub(crate) fn execute_batch(conn: &Connection, sql: &str) -> Result<()> {
 /// Returns an error if the SQL execution fails or pragmas cannot be set.
 pub fn apply_schema(conn: &Connection) -> Result<()> {
     refuse_future_schema_version(conn, "schema application")?;
+    refuse_persistent_triggers(conn, "schema application")?;
 
     // Detect a truly fresh (empty) database before any DDL runs.
     // On a fresh DB, SCHEMA_SQL creates everything at the current version,
@@ -864,12 +865,27 @@ fn refuse_future_schema_version(conn: &Connection, operation: &str) -> Result<()
     Ok(())
 }
 
+fn refuse_persistent_triggers(conn: &Connection, operation: &str) -> Result<()> {
+    let rows = conn.query("SELECT name FROM sqlite_master WHERE type = 'trigger' LIMIT 1")?;
+    let Some(trigger) = rows
+        .first()
+        .and_then(|row| row.get(0).and_then(SqliteValue::as_text))
+    else {
+        return Ok(());
+    };
+    Err(BeadsError::Config(format!(
+        "{operation} refused: persistent trigger {trigger:?} is outside the canonical schema contract"
+    )))
+}
+
 fn validate_reviewed_schema_migration(
     conn: &Connection,
     from: u32,
     target_version: u32,
     marked_at: &str,
 ) -> Result<()> {
+    refuse_persistent_triggers(conn, "reviewed schema migration")?;
+
     let supported_target = current_schema_version_u32()?;
     if target_version != supported_target {
         return Err(BeadsError::internal(format!(
@@ -984,10 +1000,11 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
 /// ([`REVIEWED_MIGRATION_SOURCE_VERSIONS`] → `CURRENT_SCHEMA_VERSION`) run
 /// genuinely atomically in one
 /// `BEGIN IMMEDIATE` transaction and cannot stamp an arbitrary target after
-/// running newer migrations. Every other version pair falls back to the
-/// general migration engine so legacy databases (pre-v13) keep an upgrade
-/// path; there the chokepoint's pre-migrate snapshot remains the
-/// full-rollback safety net, exactly as before.
+/// running newer migrations. Older, pre-reviewed source versions fall back to
+/// the general migration engine so legacy databases (pre-v13) keep an upgrade
+/// path; future source versions are refused before any write. On the legacy
+/// path, the chokepoint's pre-migrate snapshot remains the full-rollback safety
+/// net, exactly as before.
 ///
 /// # Errors
 ///
@@ -1010,6 +1027,7 @@ pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) 
             "schema migrate refused — source schema {from} is newer than supported version {supported_target}"
         )));
     }
+    refuse_persistent_triggers(conn, "schema migration")?;
     if REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         let marked_at = Utc::now().to_rfc3339();
         validate_reviewed_schema_migration(conn, from, target_version, &marked_at)?;
@@ -1078,6 +1096,7 @@ pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) 
 
 pub(crate) fn apply_runtime_compatible_schema(conn: &Connection) -> Result<()> {
     refuse_future_schema_version(conn, "runtime schema repair")?;
+    refuse_persistent_triggers(conn, "runtime schema repair")?;
 
     // The table layouts are already safe to operate on, so we can skip the
     // heavier pre-schema rebuilds and just restore any missing canonical DDL.
@@ -2098,6 +2117,37 @@ fn expected_check_expression(sql: &str) -> Option<Vec<SqlEvidenceToken>> {
     (close_parenthesis + 1 == tokens.len()).then_some(expression)
 }
 
+fn table_check_constraints_canonical(
+    conn: &Connection,
+    table: &str,
+    expected_checks: &[&str],
+) -> bool {
+    let escaped_table = table.replace('\'', "''");
+    let Ok(row) = conn.query_row(&format!(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '{escaped_table}'"
+    )) else {
+        return false;
+    };
+    let Some(sql) = row.get(0).and_then(SqliteValue::as_text) else {
+        return false;
+    };
+    let Some(actual) = table_check_expressions(sql) else {
+        return false;
+    };
+    let Some(expected) = expected_checks
+        .iter()
+        .map(|required| expected_check_expression(required))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+
+    actual.len() == expected.len()
+        && expected
+            .iter()
+            .all(|required| actual.contains(required))
+}
+
 fn compact_sql_fragment(sql: &str) -> String {
     sql_without_comments(sql)
         .chars()
@@ -2136,6 +2186,7 @@ fn auxiliary_runtime_table_canonical(
     auxiliary_runtime_columns_canonical(conn, table, columns)
         && auxiliary_runtime_issue_foreign_key_canonical(conn, table)
         && auxiliary_runtime_indexes_canonical(conn, table, indexes)
+        && table_check_constraints_canonical(conn, table, &[])
 }
 
 fn capacity_exemptions_schema_canonical(conn: &Connection) -> bool {
@@ -2293,33 +2344,22 @@ fn core_runtime_table_canonical(
     core_runtime_columns_canonical(conn, table, columns, order_sensitive)
         && core_runtime_foreign_keys_canonical(conn, table, issue_reference_columns)
         && auxiliary_runtime_indexes_canonical(conn, table, indexes)
+        && (table == "issues" || table_check_constraints_canonical(conn, table, &[]))
         && autoincrement_primary_key
             .is_none_or(|column| table_declares_autoincrement_primary_key(conn, table, column))
         && (!forbid_unique_indexes || table_has_no_unique_indexes(conn, table))
 }
 
 fn issues_required_checks_canonical(conn: &Connection) -> bool {
-    let Ok(row) =
-        conn.query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'issues'")
-    else {
-        return false;
-    };
-    let Some(sql) = row.get(0).and_then(SqliteValue::as_text) else {
-        return false;
-    };
-    let expected = [
-        "CHECK(length(title) <= 500)",
-        "CHECK(priority >= 0 AND priority <= 4)",
-        ISSUES_CLOSED_AT_CHECK,
-    ]
-    .iter()
-    .map(|required| expected_check_expression(required))
-    .collect::<Option<Vec<_>>>();
-    let actual = table_check_expressions(sql);
-
-    matches!((actual, expected), (Some(actual), Some(expected))
-        if actual.len() == expected.len()
-            && expected.iter().all(|required| actual.contains(required)))
+    table_check_constraints_canonical(
+        conn,
+        "issues",
+        &[
+            "CHECK(length(title) <= 500)",
+            "CHECK(priority >= 0 AND priority <= 4)",
+            ISSUES_CLOSED_AT_CHECK,
+        ],
+    )
 }
 
 fn blocked_cache_table_canonical(conn: &Connection) -> bool {
@@ -3793,6 +3833,11 @@ fn attest_gate_result_history_schema(conn: &Connection) -> Result<()> {
     attest_gate_result_history_columns(conn)?;
     attest_gate_result_history_foreign_key(conn)?;
     attest_gate_result_history_indexes(conn)?;
+    if !table_check_constraints_canonical(conn, "gate_result_history", &[]) {
+        return Err(schema_migration_shape_error(
+            "gate_result_history has an unexpected CHECK constraint",
+        ));
+    }
     if !table_declares_autoincrement_primary_key(conn, "gate_result_history", "id") {
         return Err(schema_migration_shape_error(
             "gate_result_history.id is not declared INTEGER PRIMARY KEY AUTOINCREMENT",
@@ -6256,6 +6301,109 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_schema_contract_rejects_hidden_generated_columns() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("generated-label-column.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+
+        execute_batch(
+            &conn,
+            r"
+            DROP INDEX idx_labels_label;
+            DROP INDEX idx_labels_issue;
+            DROP TABLE labels;
+            CREATE TABLE labels (
+                issue_id TEXT NOT NULL,
+                label TEXT NOT NULL,
+                normalized_label TEXT GENERATED ALWAYS AS (lower(label)) VIRTUAL,
+                PRIMARY KEY (issue_id, label),
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            CREATE INDEX idx_labels_label ON labels(label);
+            CREATE INDEX idx_labels_issue ON labels(issue_id);
+            ",
+        )
+        .expect("plant a generated column hidden from table_info");
+
+        assert_eq!(
+            conn.query("PRAGMA table_info('labels')")
+                .expect("read legacy column view")
+                .len(),
+            LABELS_RUNTIME_COLUMNS.len(),
+            "table_info must exercise the old false-green seam"
+        );
+        assert!(
+            conn.query("PRAGMA table_xinfo('labels')")
+                .expect("read complete column view")
+                .iter()
+                .any(|row| {
+                    row.get(1).and_then(SqliteValue::as_text) == Some("normalized_label")
+                        && row
+                            .get(6)
+                            .and_then(SqliteValue::as_integer)
+                            .is_some_and(|hidden| hidden != 0)
+                }),
+            "table_xinfo must expose the planted generated column"
+        );
+        assert!(
+            !runtime_schema_compatible(&conn),
+            "hidden generated columns are not part of the canonical write contract"
+        );
+        assert!(attest_runtime_schema_cookie(&conn).is_err());
+    }
+
+    #[test]
+    fn test_runtime_schema_contract_rejects_write_restricting_triggers() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("write-restricting-trigger.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+
+        conn.execute(
+            "CREATE TRIGGER reject_issue_insert
+             BEFORE INSERT ON issues
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected issue rejection');
+             END",
+        )
+        .expect("plant write-restricting trigger");
+        assert!(
+            conn.execute("INSERT INTO issues (id, title) VALUES ('rejected', 'Rejected')")
+                .is_err(),
+            "the planted trigger must reject a canonically valid write"
+        );
+        assert!(
+            core_runtime_table_canonical(
+                &conn,
+                "issues",
+                ISSUES_RUNTIME_COLUMNS,
+                &[],
+                ISSUES_RUNTIME_INDEXES,
+                true,
+                None,
+                false,
+            ),
+            "the trigger must leave the old per-table manifest unchanged"
+        );
+        assert!(!runtime_has_no_persistent_triggers(&conn));
+        assert!(!runtime_schema_compatible(&conn));
+        assert!(attest_runtime_schema_cookie(&conn).is_err());
+        let cookie_before = runtime_schema_cookie(&conn).expect("read trigger schema cookie");
+        let repair_error =
+            apply_schema(&conn).expect_err("schema repair must not execute through a trigger");
+        assert!(
+            repair_error.to_string().contains("persistent trigger"),
+            "trigger refusal should be explicit: {repair_error}"
+        );
+        assert_eq!(
+            runtime_schema_cookie(&conn).expect("read refused trigger cookie"),
+            cookie_before,
+            "trigger refusal must occur before repair DDL"
+        );
+    }
+
+    #[test]
     fn test_runtime_schema_contract_rejects_weakened_external_ref_unique_predicate() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("weakened_external_ref_index.db");
@@ -6592,7 +6740,7 @@ mod tests {
         apply_schema(&conn).expect("schema");
         let cookie = attest_runtime_schema_cookie(&conn).expect("attest current schema");
         let prior_witness = format!(
-            "schema-{CURRENT_SCHEMA_VERSION}.contract-v6-version-fenced-lexical-core-aux-columns-fks-index-directions-collations-checks-autoincrement-cookie-fenced.cookie-{cookie}"
+            "schema-{CURRENT_SCHEMA_VERSION}.contract-v7-version-fenced-lexical-core-aux-columns-fks-index-directions-collations-exact-checks-autoincrement-cookie-fenced.cookie-{cookie}"
         );
         conn.execute_with_params(
             "INSERT INTO metadata (key, value) VALUES (?, ?)",

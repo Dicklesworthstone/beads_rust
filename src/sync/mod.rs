@@ -1768,6 +1768,18 @@ fn verify_locked_file_identity(
         lock_path.display().to_string()
     };
     let opened = authority_file_identity(file, lock_path, role, &lock_path_display)?;
+    #[cfg(windows)]
+    let current_guard = path::open_regular_authority_source(lock_path)?.ok_or_else(|| {
+        BeadsError::Config(format!(
+            "Locked {role} path disappeared at {lock_path_display}"
+        ))
+    })?;
+    #[cfg(windows)]
+    let current = (
+        current_guard.identity().device_id(),
+        current_guard.identity().inode(),
+    );
+    #[cfg(not(windows))]
     let current = authority_path_identity(lock_path, role, &lock_path_display)?;
     if opened != current {
         return Err(BeadsError::Config(format!(
@@ -1775,6 +1787,9 @@ fn verify_locked_file_identity(
             lock_path_display
         )));
     }
+    // On Windows, `current_guard` deliberately remains live through the
+    // comparison above. Its handle denies delete sharing, closing the
+    // path-open-to-compare replacement gap.
     Ok(opened)
 }
 

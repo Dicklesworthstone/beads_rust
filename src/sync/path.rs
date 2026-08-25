@@ -1886,18 +1886,26 @@ pub(crate) fn pin_jsonl_target(path: &Path) -> Result<PinnedJsonlName> {
 }
 
 /// Opens one Windows authority path through a retained no-follow parent
-/// capability and returns its exact volume/file-index identity.
+/// capability and retains the delete-denying leaf handle.
 ///
 /// Unlike [`pin_jsonl_target`], this probe shares writes because database and
 /// lock-sidecar handles remain writable while their authority is verified. It
-/// still denies delete sharing during both identity opens, so the named leaf
-/// cannot be replaced while its handle identity is compared.
+/// still denies delete sharing, so the named leaf cannot be replaced until the
+/// caller has compared its identity and drops the returned guard.
 #[cfg(windows)]
-pub(super) fn open_regular_authority_identity(path: &Path) -> Result<Option<JsonlFileIdentity>> {
+pub(super) fn open_regular_authority_source(path: &Path) -> Result<Option<OpenedJsonlSource>> {
     let pinned = pin_windows_name_without_leaf_open(path)?;
     let opened = pinned.open_optional_regular_for_authority_identity()?;
     pinned.parent.verify_route()?;
-    Ok(opened.map(|source| source.identity()))
+    Ok(opened)
+}
+
+/// Convenience identity-only probe for callers that do not compare against a
+/// second retained handle. Exact authority comparisons must keep the source
+/// returned by [`open_regular_authority_source`] alive through the comparison.
+#[cfg(windows)]
+pub(super) fn open_regular_authority_identity(path: &Path) -> Result<Option<JsonlFileIdentity>> {
+    Ok(open_regular_authority_source(path)?.map(|source| source.identity()))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -3944,6 +3952,35 @@ mod tests {
 
         drop(writer);
         pin_jsonl_target(&target).expect("JSONL pin should succeed after the writer closes");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_authority_identity_guard_denies_replacement_until_comparison_finishes() {
+        let temp = TempDir::new().expect("create Windows temp directory");
+        let parent = temp.path().join("parent");
+        let target = parent.join("database-authority.lock");
+        let displaced = parent.join("database-authority.displaced");
+        std::fs::create_dir(&parent).expect("create Windows authority parent");
+        std::fs::write(&target, b"authority generation").expect("write authority file");
+
+        let guard = open_regular_authority_source(&target)
+            .expect("open Windows authority identity guard")
+            .expect("authority target exists");
+        assert_ne!(guard.identity().file_index(), 0);
+        let rename_error = std::fs::rename(&target, &displaced)
+            .expect_err("the retained comparison guard must deny path replacement");
+        assert!(
+            matches!(
+                rename_error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Other
+            ),
+            "unexpected Windows sharing-violation error: {rename_error}"
+        );
+
+        drop(guard);
+        std::fs::rename(&target, &displaced)
+            .expect("replacement may proceed only after the comparison guard drops");
     }
 
     #[cfg(windows)]
