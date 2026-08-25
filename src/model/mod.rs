@@ -802,11 +802,7 @@ impl Issue {
                 .then_with(|| left.body.cmp(&right.body))
                 .then_with(|| left.id.cmp(&right.id))
         });
-        if self_comments != other_comments {
-            return false;
-        }
-
-        true
+        self_comments == other_comments
     }
 
     /// Check if this issue is a tombstone that has exceeded its TTL.

@@ -1249,10 +1249,7 @@ fn conditional_matches(conditional: &ConditionalGate, labels: &[String], priorit
     {
         return false;
     }
-    if !conditional.priority.is_empty() && !conditional.priority.contains(&priority) {
-        return false;
-    }
-    true
+    conditional.priority.is_empty() || conditional.priority.contains(&priority)
 }
 
 /// Evaluate the configured gates for a `from -> to` transition against the
