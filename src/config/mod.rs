@@ -2906,17 +2906,11 @@ pub(crate) fn compact_database_via_vacuum_into_in_place(
         lock_timeout,
         &write_authority,
         |path, timeout| {
-            SqliteStorage::open_with_timeout_under_write_authority(
-                path,
-                timeout,
-                &write_authority,
-            )
+            SqliteStorage::open_with_timeout_under_write_authority(path, timeout, &write_authority)
         },
         || Ok(()),
         || Ok(()),
-        |from, to| {
-            crate::util::sync_rename_parent_directories(from, to).map_err(BeadsError::Io)
-        },
+        |from, to| crate::util::sync_rename_parent_directories(from, to).map_err(BeadsError::Io),
     )
 }
 
@@ -2932,17 +2926,11 @@ fn compact_database_via_vacuum_into_in_place_under_write_authority(
         lock_timeout,
         write_authority,
         |path, timeout| {
-            SqliteStorage::open_with_timeout_under_write_authority(
-                path,
-                timeout,
-                write_authority,
-            )
+            SqliteStorage::open_with_timeout_under_write_authority(path, timeout, write_authority)
         },
         || Ok(()),
         || Ok(()),
-        |from, to| {
-            crate::util::sync_rename_parent_directories(from, to).map_err(BeadsError::Io)
-        },
+        |from, to| crate::util::sync_rename_parent_directories(from, to).map_err(BeadsError::Io),
     )
 }
 
@@ -3036,21 +3024,14 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
         std::process::id(),
         Utc::now().format("%Y%m%d_%H%M%S_%f")
     );
-    let retained_family = match move_database_family_to_recovery(
-        db_path,
-        recovery_parent,
-        &compaction_stamp,
-    ) {
-        Ok(backup_set) => backup_set,
-        Err(stage_error) => {
-            remove_locked_compaction_candidate(
-                write_authority,
-                &replacement_lock,
-                &temp_path,
-            );
-            return Err(stage_error);
-        }
-    };
+    let retained_family =
+        match move_database_family_to_recovery(db_path, recovery_parent, &compaction_stamp) {
+            Ok(backup_set) => backup_set,
+            Err(stage_error) => {
+                remove_locked_compaction_candidate(write_authority, &replacement_lock, &temp_path);
+                return Err(stage_error);
+            }
+        };
     let staged_database = retained_family
         .files
         .iter()
@@ -3059,9 +3040,7 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
         .ok_or_else(|| BeadsError::SyncConflict {
             message: "Compaction could not stage the retained database generation".to_string(),
         })
-        .and_then(|staged| {
-            write_authority.verify_staged_database_recovery_authority(staged)
-        })
+        .and_then(|staged| write_authority.verify_staged_database_recovery_authority(staged))
         .and_then(|()| verify_recovery_backup_set(&retained_family));
     if let Err(authority_error) = staged_verification {
         let rollback_result = rollback_renamed_paths_no_replace(
@@ -3137,10 +3116,9 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
     match post_install_result {
         Ok(reopened) => Ok(reopened),
         Err(install_error) => {
-            if let Err(rollback_error) = rollback_compacted_database_install(
-                &retained_family,
-                write_authority,
-            ) {
+            if let Err(rollback_error) =
+                rollback_compacted_database_install(&retained_family, write_authority)
+            {
                 return Err(BeadsError::WithContext {
                     context: format!(
                         "Compacted database installation failed ({install_error}); restoring the retained pre-compaction family also failed"
@@ -3158,8 +3136,8 @@ fn remove_locked_compaction_candidate(
     replacement_lock: &fs::File,
     temp_path: &Path,
 ) {
-    if let Err(error) = write_authority
-        .verify_locked_database_replacement_candidate(temp_path, replacement_lock)
+    if let Err(error) =
+        write_authority.verify_locked_database_replacement_candidate(temp_path, replacement_lock)
     {
         tracing::warn!(
             error = %error,
@@ -4432,12 +4410,12 @@ impl OpenStorageResult {
                 &write_authority,
             )
             .map_err(|reopen_err| BeadsError::WithContext {
-                    context: format!(
-                        "Restored the original database family at '{}' but failed to reopen it",
-                        self.paths.db_path.display()
-                    ),
-                    source: Box::new(reopen_err),
-                })?;
+                context: format!(
+                    "Restored the original database family at '{}' but failed to reopen it",
+                    self.paths.db_path.display()
+                ),
+                source: Box::new(reopen_err),
+            })?;
             write_authority.verify_database_authority()?;
             restored_storage.attach_write_authority(Arc::clone(&write_authority));
             self.storage = restored_storage;
@@ -9034,7 +9012,9 @@ routing:
             "unexpected authority error: {error}"
         );
         assert_eq!(
-            fs::metadata(&db_path).expect("inspect preserved foreign").ino(),
+            fs::metadata(&db_path)
+                .expect("inspect preserved foreign")
+                .ino(),
             foreign_inode,
             "the foreign generation must return to the canonical path"
         );
@@ -9879,7 +9859,9 @@ routing:
                     .find(|path| {
                         path.file_name()
                             .and_then(|name| name.to_str())
-                            .is_some_and(|name| name.starts_with("beads.db.") && name.ends_with(".bak"))
+                            .is_some_and(|name| {
+                                name.starts_with("beads.db.") && name.ends_with(".bak")
+                            })
                     })
                     .expect("find staged main database");
                 fs::rename(&staged_database, &retained_original)
