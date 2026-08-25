@@ -258,6 +258,12 @@ fn prepare_current_wal_without_shm(fixture: &FixtureWorkspace) {
     let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
     let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
     let historical_wal = fs::read(&wal_path).expect("read historical WAL-only fixture");
+    let import_recovery = fixture.beads_dir.join(".br_recovery");
+    match fs::symlink_metadata(&import_recovery) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => panic!("checked-in WAL-only fixture must not own recovery artifacts"),
+        Err(error) => panic!("inspect checked-in WAL-only recovery path: {error}"),
+    }
 
     prepare_current_database(fixture, "wal_without_shm_current_schema_import");
     let archived_historical_wal = fixture
@@ -322,6 +328,50 @@ fn prepare_current_wal_without_shm(fixture: &FixtureWorkspace) {
             "fixture should not manufacture an archived SHM"
         );
     }
+
+    // Import compaction retains the database generation it replaced under
+    // `.br_recovery`. Those forensic backups describe fixture construction,
+    // not the healthy WAL-only topology under test. Preserve the whole tree
+    // outside doctor's active recovery path, including an empty directory.
+    let import_recovery_entries = match fs::symlink_metadata(&import_recovery) {
+        Ok(metadata) => {
+            assert!(
+                metadata.is_dir(),
+                "current import recovery artifact must be a directory"
+            );
+            Some(sorted_directory_entry_names(
+                &import_recovery,
+                "read current import recovery artifacts",
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("inspect current import recovery artifacts: {error}"),
+    };
+    preserve_generated_artifact(fixture, &import_recovery);
+    let archived_recovery = fixture
+        .beads_dir
+        .join(".fixture_current_import_artifacts")
+        .join(".br_recovery");
+    match fs::symlink_metadata(&import_recovery) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => panic!("fixture import recovery artifacts should not remain active"),
+        Err(error) => panic!("verify archived import recovery path: {error}"),
+    }
+    if let Some(import_recovery_entries) = import_recovery_entries {
+        assert_eq!(
+            sorted_directory_entry_names(
+                &archived_recovery,
+                "read preserved current import recovery artifacts",
+            ),
+            import_recovery_entries,
+            "preserved import recovery tree should retain its exact top-level inventory"
+        );
+    } else {
+        assert!(
+            !archived_recovery.exists(),
+            "fixture should not manufacture an archived recovery directory"
+        );
+    }
     assert_eq!(
         fs::read(wal_path).expect("reread current WAL-without-SHM fixture"),
         current_wal,
@@ -378,6 +428,19 @@ fn preserve_generated_artifact(fixture: &FixtureWorkspace, path: &Path) {
         .file_name()
         .expect("generated fixture artifact should have a file name");
     fs::rename(path, archive.join(file_name)).expect("preserve current-import artifact");
+}
+
+fn sorted_directory_entry_names(path: &Path, context: &str) -> Vec<std::ffi::OsString> {
+    let mut names = fs::read_dir(path)
+        .unwrap_or_else(|error| panic!("{context}: {error}"))
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|error| panic!("{context}: {error}"))
+                .file_name()
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names
 }
 
 fn mark_database_needs_flush(db_path: &Path) {
