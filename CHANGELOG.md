@@ -15,7 +15,76 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
-## v0.5.1 -- 2026-08-25 (Release)
+## v0.5.2 -- 2026-08-25 (Release)
+
+Cross-platform correctness release driven by a full GitHub-issue triage pass.
+Windows sync and schema migration are structurally repaired, stale engine
+sidecars self-heal on write, `--rename-prefix` finally does what its name says,
+and search stops hiding the fact that it hid something.
+
+### Windows: JSONL export and sync repaired (#413)
+
+- Every JSONL authority comparison (pinned route vs canonical sidecar
+  authority, sibling-parent checks, `.beads` containment) now resolves both
+  operands through one shared comparable-path convention — verbatim
+  (`\\?\C:\...`) and 8.3-alias aware on Windows, byte-equal fast path
+  elsewhere — instead of comparing lexical spellings against
+  `fs::canonicalize` output byte-for-byte
+  ([470d86a6](https://github.com/Dicklesworthstone/beads_rust/commit/470d86a6)).
+  Reparse-route rejection still runs before any comparison-time resolution.
+- Conditional JSONL publication is now implemented on Windows
+  (rename-under-verified-authority) instead of being a hard platform error;
+  downgraded publications surface through the existing
+  `publication_atomicity` receipt field.
+
+### Windows: reviewed schema migration repaired (#443, #446)
+
+- The migration candidate's durability barrier synced through a read-only
+  handle; Windows `FlushFileBuffers` requires write access, so every
+  `migrate-schema apply` failed with os error 5 before installation began.
+  The sync now uses a writable handle
+  ([d8993ffb](https://github.com/Dicklesworthstone/beads_rust/commit/d8993ffb)).
+- Every rename in the retention/install/rollback pipeline retries briefly on
+  Windows sharing violations (AV/indexer handles) and names the stage and
+  both paths on exhaustion; `failed.json` receipts now record `failed_stage`.
+
+### Storage: stale WAL-certificate sidecars self-heal on write (#441)
+
+- A write that fails because `-wal-cert` carries an unsupported record
+  version (typically after an engine-generation upgrade) now quarantines
+  `-wal-cert`/`-wal-cert-head` into verified `.br_recovery` backups, reopens,
+  and retries once — the WAL itself is never touched, and the recovery path
+  has no dependence on the JSONL merge anchor.
+
+### Sync: `--rename-prefix` preserves ids and emits a mapping (#442)
+
+- Prefix renames now replace only the prefix segment
+  (`oldp-cargo-license-spdx-ay8` → `newp-cargo-license-spdx-ay8`); a doubled
+  prefix collapses exactly once; regeneration happens only on collision and
+  is flagged. Sync output gains a `prefix_renames` old→new receipt (omitted
+  when empty), and the old id continues to be stashed in `external_ref`.
+
+### Search: hidden-closed indication (#445)
+
+- `br search` still excludes closed issues by default, but text output now
+  prints `note: N closed match(es) hidden; rerun with --all to include them`
+  and JSON/TOON gain `hidden_closed_count` when (and only when) matches were
+  hidden; the legacy bare-array shape is preserved otherwise.
+
+### Test and release infrastructure
+
+- `install.sh` routes glibc hosts older than the gnu artifact floor to the
+  statically linked musl artifact, closing the loader-failure gap on
+  Debian 12 / Ubuntu 22.04 / RHEL 9 / AL2023 (#444).
+- The linked-worktree vcs-status e2e test is hermetic against host git
+  config, and effective-config probes honor caller `GIT_CONFIG_SYSTEM` /
+  `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_NOSYSTEM` read-location overrides (#437).
+- GitHub Action pin `taiki-e/install-action` bumped to v2.86.5 (verified
+  upstream); `similar` 3.2.0 and `vergen-gix` 10.0.2 lockfile bumps.
+
+---
+
+## v0.5.1 -- 2026-08-25 (Tag)
 
 Safety-focused storage and recovery release, with a retained profile-driven
 speedup for structured `ready` output. The user-facing changes are deliberately
