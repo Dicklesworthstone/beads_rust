@@ -64,6 +64,25 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+fn maybe_replace_database_before_finalize_locked_verify(path: &Path) -> Result<()> {
+    let replace = REPLACE_DATABASE_BEFORE_FINALIZE_LOCKED_VERIFY
+        .with(|configured| configured.replace(false));
+    if !replace {
+        return Ok(());
+    }
+    let mut retained = path.as_os_str().to_os_string();
+    retained.push(".test-retained-before-finalize-verify");
+    fs::rename(path, PathBuf::from(retained))?;
+    fs::write(path, b"foreign database generation installed by finalize hook")?;
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn maybe_replace_database_before_finalize_locked_verify(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 /// Exact source state used by stale-overwrite guards.
 ///
 /// `Missing` is intentionally distinct from a present zero-byte file.
@@ -497,6 +516,11 @@ fn update_sync_path_digest(hasher: &mut Sha256, path: &Path) {
 }
 
 impl DatabaseFamilyWriteLock {
+    #[cfg(test)]
+    fn arm_database_replacement_before_finalize_locked_verify_for_test() {
+        REPLACE_DATABASE_BEFORE_FINALIZE_LOCKED_VERIFY.with(|configured| configured.set(true));
+    }
+
     #[must_use]
     pub fn authority_path_sha256(&self) -> &str {
         &self.authority_path_sha256
@@ -532,6 +556,43 @@ impl DatabaseFamilyWriteLock {
                 message: "Canonical database path changed while its write authority was held"
                     .to_string(),
             });
+        }
+        Ok(())
+    }
+
+    fn verify_database_inode_authority_locked(
+        &self,
+        database_authority: &DatabaseInodeAuthority,
+    ) -> Result<()> {
+        if let Some(database_lock) = database_authority.lock.as_ref() {
+            let current_identity = verify_locked_file_identity(
+                database_lock,
+                &self.canonical_database_path,
+                "database write authority",
+                true,
+            )?;
+            if database_authority.identity != Some(current_identity) {
+                return Err(BeadsError::SyncConflict {
+                    message: "Database inode changed while its write authority was held"
+                        .to_string(),
+                });
+            }
+        } else {
+            match fs::symlink_metadata(&self.canonical_database_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(BeadsError::SyncConflict {
+                        message: "Database appeared before its inode authority was bound"
+                            .to_string(),
+                    });
+                }
+                Err(error) => {
+                    return Err(BeadsError::Config(format!(
+                        "Could not verify missing database authority {}: {error}",
+                        database_path_descriptor(&self.canonical_database_path)
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -776,6 +837,12 @@ impl DatabaseFamilyWriteLock {
     /// original inode for the currently visible database generation.
     pub(crate) fn database_target_authority_state(&self) -> Result<DatabaseTargetAuthorityState> {
         self.verify_common_authority()?;
+        let database_authority =
+            self.database_authority
+                .lock()
+                .map_err(|_| BeadsError::SyncConflict {
+                    message: "Database inode authority state was poisoned".to_string(),
+                })?;
         let target_metadata = match fs::symlink_metadata(&self.canonical_database_path) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                 return Ok(DatabaseTargetAuthorityState::Foreign);
@@ -796,13 +863,6 @@ impl DatabaseFamilyWriteLock {
         let Some(target_identity) = target_metadata else {
             return Ok(DatabaseTargetAuthorityState::Missing);
         };
-
-        let database_authority =
-            self.database_authority
-                .lock()
-                .map_err(|_| BeadsError::SyncConflict {
-                    message: "Database inode authority state was poisoned".to_string(),
-                })?;
         let Some(database_lock) = database_authority.lock.as_ref() else {
             return Ok(DatabaseTargetAuthorityState::Foreign);
         };
