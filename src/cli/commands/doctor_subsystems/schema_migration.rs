@@ -1638,6 +1638,14 @@ where
                 write_authority,
             ));
         }
+        if let Err(error) =
+            write_authority.verify_staged_database_recovery_authority(candidate_path)
+        {
+            let rollback = exchange_database_paths(candidate_path, db_path)
+                .and_then(|()| write_authority.verify_database_authority())
+                .and_then(|()| db_path.parent().map_or(Ok(()), &mut sync));
+            return Err(CompactedInstallFailure::after_rollback(error, rollback));
+        }
         if let Err(error) = write_authority.adopt_locked_database_replacement(replacement_lock) {
             let rollback = exchange_database_paths(candidate_path, db_path)
                 .and_then(|()| {
@@ -1665,6 +1673,14 @@ where
                 error,
                 write_authority,
             ));
+        }
+        if let Err(error) =
+            write_authority.verify_staged_database_recovery_authority(displaced_main)
+        {
+            let rollback = rename_path_no_replace(displaced_main, db_path)
+                .and_then(|()| write_authority.verify_database_authority())
+                .and_then(|()| db_path.parent().map_or(Ok(()), &mut sync));
+            return Err(CompactedInstallFailure::after_rollback(error, rollback));
         }
         if let Err(error) = rename_path_no_replace(candidate_path, db_path) {
             let rollback = rename_path_no_replace(displaced_main, db_path)
