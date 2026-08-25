@@ -905,6 +905,14 @@ complete by default), `search` results are **capped at 50 by default**
 (`--limit <N>`, `0`=unlimited) — a broad text query can match a large fraction
 of the corpus, so a bounded, relevance-ordered result set is the default.
 
+**Closed issues are excluded by default** (tombstones always). When that
+exclusion hides matches, text output ends with a trailing note
+(`note: N closed match(es) hidden; rerun with --all to include them`), and
+JSON/TOON output becomes a wrapper object with a `hidden_closed_count` field
+alongside `issues` — the legacy bare-array shape is preserved when nothing was
+hidden. Pass `--all` (or a terminal `--status` such as `closed`) to include
+closed issues.
+
 **Examples:**
 ```bash
 # Search in all fields
@@ -1401,7 +1409,7 @@ br sync [OPTIONS]
 | `--manifest` | Write manifest file with export summary |
 | `--error-policy <POLICY>` | Export error handling: strict, best-effort, partial, required-core |
 | `--orphans <MODE>` | Orphan handling: strict, resurrect, skip, allow |
-| `--rename-prefix` | During import, rewrite mismatched issue IDs into the configured default prefix |
+| `--rename-prefix` | During import, rewrite mismatched issue-ID prefixes into the configured default prefix, preserving the id remainder |
 | `--rebuild` | During import, rebuild SQLite from JSONL and remove DB entries absent from JSONL |
 | `--dry-run` | With `--reconcile`, preview the plan without any mutation |
 | `--apply` | Apply a conflict-free `--reconcile-additive` plan transactionally |
@@ -1432,6 +1440,14 @@ br sync [OPTIONS]
 - `--rebuild` is rejected with every non-import mode, including `--flush-only`, `--merge`, `--status`, and `--witness`.
 - Recovery artifacts are preserved under `.beads/.br_recovery/` when br has to move aside a damaged SQLite family before rebuilding.
 - If open-time recovery rebuilt the database before a semantic import flag such as `--rename-prefix` could apply, br prints a rerun command that includes the needed flags.
+
+**Prefix rename semantics (`--rename-prefix`):**
+- Only the prefix segment is replaced; the id remainder (descriptive slug and hash) is preserved: `oldp-cargo-license-spdx-ay8` becomes `newp-cargo-license-spdx-ay8`.
+- A doubled prefix collapses exactly once, never recursively: `oldp-oldp-central-build-inputs-3un` becomes `newp-central-build-inputs-3un`.
+- If the preserved id would collide with an existing id (or the old id has no separable prefix), that issue falls back to a freshly generated id and the receipt marks it with `fallback` (`regenerated-on-collision` or `regenerated-unparseable-id`).
+- Each renamed issue's old id is stashed in its `external_ref` when that field was empty.
+- The import output reports every rewrite as a `prefix_renames` list of `{old_id, new_id, fallback?}` entries (text and `--json`/`--robot`); use it to fix up external references. The field is omitted from JSON when no rename happened.
+- Without `--force`, the import short-circuits (skipping the rename) when the JSONL content hash is unchanged since the last import; and a following `br sync --flush-only` needs `--force` to write the renamed ids back to the JSONL.
 
 **Additive reconciliation semantics:**
 - `br sync --reconcile-additive --robot` is the default dry-run. It opens the current database read-only, compares exact issue IDs, and emits a hash-bound `br.sync.additive-reconciliation.v2` receipt plus a `plan_sha256` review token.
@@ -1557,7 +1573,10 @@ output descriptor.
 Prompts, optional locks, hooks, fsmonitor, untracked-cache writes, paging, lazy
 object fetches, and inherited Git redirections are disabled, and pathspecs are
 literal. Fixed-key config probes intentionally observe effective
-system/global/common/worktree settings; any configured content transform makes
+system/global/common/worktree settings and honor the caller's
+`GIT_CONFIG_SYSTEM`/`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_NOSYSTEM` read-location
+overrides, so they see the same configuration files the caller's own `git`
+would read; any configured content transform makes
 the comparison unavailable without exposing its path. The command also
 inspects repository-local attributes before comparing raw worktree bytes and
 never executes clean/process filters or text conversions. Its sequential

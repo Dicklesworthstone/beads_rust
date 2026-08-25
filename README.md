@@ -948,6 +948,15 @@ br config get id.prefix
 br sync --import-only --rename-prefix
 ```
 
+`--rename-prefix` replaces only the prefix segment and keeps the rest of each
+id intact (`oldp-cargo-license-spdx-ay8` -> `newp-cargo-license-spdx-ay8`;
+a doubled prefix collapses once: `oldp-oldp-x-3un` -> `newp-x-3un`). The
+sync output includes a `prefix_renames` old-id -> new-id mapping so you can
+fix up external references, and each old id is stashed in the issue's
+`external_ref` when empty. Note: without `--force` the import is skipped when
+the JSONL hash is unchanged since the last import, and a following
+`br sync --flush-only` needs `--force` to write the renamed ids back out.
+
 If you want to preserve imported IDs exactly as-is, omit `--rename-prefix`.
 
 ### Error: "Stale database"

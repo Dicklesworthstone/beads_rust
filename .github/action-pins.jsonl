@@ -1,6 +1,6 @@
 {"workflow":".github/workflows/audit.yml","action":"actions/checkout","sha":"3d3c42e5aac5ba805825da76410c181273ba90b1","tag":"v7.0.1","source":"verified upstream tag refs/tags/v7.0.1"}
 {"workflow":".github/workflows/audit.yml","action":"dtolnay/rust-toolchain","sha":"6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772","tag":"default-branch-head-2026-08-05","source":"verified upstream commit snapshot dated 2026-08-05; compare master...6c977a6 identical"}
-{"workflow":".github/workflows/audit.yml","action":"taiki-e/install-action","sha":"288e746965032cfcc232e09af2daf5f23c14d780","tag":"v2.86.1","source":"verified upstream tag refs/tags/v2.86.1"}
+{"workflow":".github/workflows/audit.yml","action":"taiki-e/install-action","sha":"ba47c86ac325773530516bb756137ac718732518","tag":"v2.86.5","source":"verified upstream tag refs/tags/v2.86.5"}
 {"workflow":".github/workflows/ci.yml","action":"actions/cache/restore","sha":"55cc8345863c7cc4c66a329aec7e433d2d1c52a9","tag":"v6.1.0","source":"verified upstream tag refs/tags/v6.1.0"}
 {"workflow":".github/workflows/ci.yml","action":"actions/cache/save","sha":"55cc8345863c7cc4c66a329aec7e433d2d1c52a9","tag":"v6.1.0","source":"verified upstream tag refs/tags/v6.1.0"}
 {"workflow":".github/workflows/ci.yml","action":"actions/checkout","sha":"3d3c42e5aac5ba805825da76410c181273ba90b1","tag":"v7.0.1","source":"verified upstream tag refs/tags/v7.0.1"}
@@ -9,7 +9,7 @@
 {"workflow":".github/workflows/ci.yml","action":"codecov/codecov-action","sha":"fb8b3582c8e4def4969c97caa2f19720cb33a72f","tag":"v7.0.0","source":"verified upstream tag refs/tags/v7.0.0"}
 {"workflow":".github/workflows/ci.yml","action":"dtolnay/rust-toolchain","sha":"6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772","tag":"default-branch-head-2026-08-05","source":"verified upstream commit snapshot dated 2026-08-05; compare master...6c977a6 identical"}
 {"workflow":".github/workflows/ci.yml","action":"Swatinem/rust-cache","sha":"f0d9c3887740aee45f6153b24b3a6b815192ec16","tag":"master-head-2026-08-17","source":"verified upstream default-branch commit snapshot dated 2026-08-17; 51 commits after tag v2.9.1"}
-{"workflow":".github/workflows/ci.yml","action":"taiki-e/install-action","sha":"288e746965032cfcc232e09af2daf5f23c14d780","tag":"v2.86.1","source":"verified upstream tag refs/tags/v2.86.1"}
+{"workflow":".github/workflows/ci.yml","action":"taiki-e/install-action","sha":"ba47c86ac325773530516bb756137ac718732518","tag":"v2.86.5","source":"verified upstream tag refs/tags/v2.86.5"}
 {"workflow":".github/workflows/conformance.yml","action":"actions/checkout","sha":"3d3c42e5aac5ba805825da76410c181273ba90b1","tag":"v7.0.1","source":"verified upstream tag refs/tags/v7.0.1"}
 {"workflow":".github/workflows/conformance.yml","action":"actions/setup-go","sha":"b7ad1dad31e06c5925ef5d2fc7ad053ef454303e","tag":"v7.0.0","source":"verified upstream tag refs/tags/v7.0.0"}
 {"workflow":".github/workflows/conformance.yml","action":"actions/upload-artifact","sha":"043fb46d1a93c77aae656e7c1c64a875d1fc6a0a","tag":"v7.0.1","source":"current workflow ref; inline tag comment"}

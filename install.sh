@@ -137,7 +137,15 @@ SKIP_SKILLS=0
 INSTALL_MIGRATION_SKILL=0
 MAX_RETRIES=3
 DOWNLOAD_TIMEOUT=120
-INSTALLER_VERSION="2.0.0"
+INSTALLER_VERSION="2.1.0"
+# Minimum glibc the published linux gnu artifacts require (#444). The gnu
+# builds inherit the release builder's glibc, so hosts below this floor fail
+# in the loader before main with "version `GLIBC_x.y' not found". Keep this
+# in sync with the release pipeline's measured floor
+# (objdump -T br | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1).
+# Hosts below the floor are routed to the statically linked musl artifact,
+# which has zero GLIBC_* references and runs on any distribution.
+GNU_ARTIFACT_GLIBC_FLOOR="${GNU_ARTIFACT_GLIBC_FLOOR:-2.39}"
 
 # Colors for fallback output
 RED='\033[0;31m'
@@ -626,6 +634,49 @@ detect_platform() {
         # rather than fabricating an artifact name that does not exist.
         if [ "$libc" = "musl" ] && [ "$arch" != "amd64" ] && [ "$arch" != "arm64" ]; then
             libc=""
+        fi
+
+        # glibc hosts older than the gnu artifact's floor cannot start the
+        # gnu binary at all (loader failure before main, #444). The question
+        # that matters is not "which libc" but "which glibc version", so
+        # prefer the static musl artifact whenever the host floor is too low.
+        # Probe order: getconf (canonical), then ldd's banner. An unreadable
+        # version keeps the gnu artifact — glibc hosts virtually always
+        # answer one of the two probes, and guessing musl on a false negative
+        # would be a silent behavior change for healthy hosts.
+        if [ -z "$libc" ] && { [ "$arch" = "amd64" ] || [ "$arch" = "arm64" ]; }; then
+            local host_glibc=""
+            if command -v getconf >/dev/null 2>&1; then
+                host_glibc=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}' || true)
+            fi
+            if [ -z "$host_glibc" ] && command -v ldd >/dev/null 2>&1; then
+                # Capture first, then match: musl's ldd exits non-zero and a
+                # pipeline here would trip `set -o pipefail` (same trap as
+                # the musl sniff above).
+                ldd_banner=$(ldd --version 2>&1 | head -n 1 || true)
+                case "$ldd_banner" in
+                    *[0-9].[0-9]*) host_glibc=$(printf '%s\n' "$ldd_banner" | grep -oE '[0-9]+\.[0-9]+' | tail -1 || true) ;;
+                esac
+            fi
+            # Defensive default in case the function is exercised standalone
+            # (the e2e harness extracts/sources functions in isolation).
+            local gnu_floor="${GNU_ARTIFACT_GLIBC_FLOOR:-2.39}"
+            case "$host_glibc" in
+                [0-9]*.[0-9]*)
+                    local host_major="${host_glibc%%.*}"
+                    local host_minor="${host_glibc#*.}"
+                    host_minor="${host_minor%%.*}"
+                    local floor_major="${gnu_floor%%.*}"
+                    local floor_minor="${gnu_floor#*.}"
+                    floor_minor="${floor_minor%%.*}"
+                    if [ "$host_major" -lt "$floor_major" ] || {
+                        [ "$host_major" -eq "$floor_major" ] && [ "$host_minor" -lt "$floor_minor" ]
+                    }; then
+                        log_warn "Host glibc ${host_glibc} is below the gnu artifact floor ${gnu_floor}; selecting the statically linked musl build"
+                        libc="musl"
+                    fi
+                    ;;
+            esac
         fi
     fi
 
