@@ -140,14 +140,16 @@ Pre-built binaries are available from GitHub Releases:
 
 ```bash
 # Example for Linux x86_64
-VERSION=v0.1.23
-curl -L "https://github.com/Dicklesworthstone/beads_rust/releases/download/${VERSION}/br-${VERSION}-linux_amd64.tar.gz" -o br.tar.gz
+TAG=v0.5.0
+VERSION="${TAG#v}"
+curl -L "https://github.com/Dicklesworthstone/beads_rust/releases/download/${TAG}/br-${VERSION}-linux_amd64.tar.gz" -o br.tar.gz
 tar -xzf br.tar.gz br
 sudo install -m 0755 br /usr/local/bin/br
 
 # Example for macOS ARM64
-VERSION=v0.1.23
-curl -L "https://github.com/Dicklesworthstone/beads_rust/releases/download/${VERSION}/br-${VERSION}-darwin_arm64.tar.gz" -o br.tar.gz
+TAG=v0.5.0
+VERSION="${TAG#v}"
+curl -L "https://github.com/Dicklesworthstone/beads_rust/releases/download/${TAG}/br-${VERSION}-darwin_arm64.tar.gz" -o br.tar.gz
 tar -xzf br.tar.gz br
 sudo install -m 0755 br /usr/local/bin/br
 ```
