@@ -226,6 +226,12 @@ fn test_pkgbuild_syntax() {
 #[test]
 fn test_cargo_metadata() {
     let cargo_toml = fs::read_to_string("Cargo.toml").expect("Failed to read Cargo.toml");
+    let manifest: toml::Value =
+        toml::from_str(&cargo_toml).expect("Cargo.toml must be valid TOML");
+    let package = manifest
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .expect("Cargo.toml must have a package table");
 
     // Required fields for crates.io
     assert!(cargo_toml.contains("name = "), "Cargo.toml must have name");
@@ -237,9 +243,14 @@ fn test_cargo_metadata() {
         cargo_toml.contains("description = "),
         "Cargo.toml must have description for crates.io"
     );
+    assert_eq!(
+        package.get("license-file").and_then(toml::Value::as_str),
+        Some("LICENSE"),
+        "Cargo.toml must publish the repository's nonstandard license text"
+    );
     assert!(
-        cargo_toml.contains("license = "),
-        "Cargo.toml must have license for crates.io"
+        package.get("license").is_none(),
+        "Cargo.toml must not mislabel the rider-bearing license as a standard SPDX license"
     );
     assert!(
         cargo_toml.contains("repository = "),
