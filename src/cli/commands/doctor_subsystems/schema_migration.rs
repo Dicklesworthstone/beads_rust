@@ -950,9 +950,18 @@ fn install_compacted_candidate(
     {
         exchange_database_paths(candidate_path, db_path)?;
         if let Err(error) = write_authority.adopt_locked_database_replacement(replacement_lock) {
-            let rollback = exchange_database_paths(candidate_path, db_path);
-            return match rollback {
-                Ok(()) => Err(error),
+            let exchange_rollback = exchange_database_paths(candidate_path, db_path);
+            return match exchange_rollback {
+                Ok(()) => match write_authority
+                    .restore_retained_database_inode_after_authorized_replace()
+                {
+                    Ok(()) => Err(error),
+                    Err(authority_error) => Err(BeadsError::internal(format!(
+                        "database replacement authority adoption failed ({error}); atomic \
+                         exchange rollback succeeded, but retained authority restoration failed \
+                         ({authority_error})"
+                    ))),
+                },
                 Err(rollback_error) => Err(BeadsError::internal(format!(
                     "database replacement authority adoption failed ({error}); atomic exchange \
                      rollback also failed ({rollback_error})"
@@ -990,7 +999,16 @@ fn install_compacted_candidate(
             let candidate_restore = fs::rename(db_path, candidate_path).map_err(BeadsError::Io);
             let original_restore = fs::rename(displaced_main, db_path).map_err(BeadsError::Io);
             return match (candidate_restore, original_restore) {
-                (Ok(()), Ok(())) => Err(error),
+                (Ok(()), Ok(())) => match write_authority
+                    .restore_retained_database_inode_after_authorized_replace()
+                {
+                    Ok(()) => Err(error),
+                    Err(authority_error) => Err(BeadsError::internal(format!(
+                        "database replacement authority adoption failed ({error}); filesystem \
+                         rollback succeeded, but retained authority restoration failed \
+                         ({authority_error})"
+                    ))),
+                },
                 (candidate_result, original_result) => Err(BeadsError::internal(format!(
                     "database replacement authority adoption failed ({error}); candidate \
                      rollback={candidate_result:?}, original rollback={original_result:?}"
@@ -2501,6 +2519,58 @@ mod tests {
             !migration_runs_root(&migration.beads_dir).exists(),
             "a stale token must be refused before allocating recovery artifacts"
         );
+    }
+
+    #[test]
+    fn failed_post_adoption_verification_restores_database_and_authority() {
+        let (_temp, migration) = reviewed_v14_migration_context();
+        let raw_before = raw_family_witness(&migration.db_path).expect("original raw witness");
+        let candidate_path = migration.beads_dir.join("candidate.db");
+        let locked_stale_path = migration.beads_dir.join("locked-stale-candidate.db");
+        let displaced_main = migration.beads_dir.join("displaced-original.db");
+        fs::write(&candidate_path, b"candidate generation").expect("write candidate");
+        fs::write(&locked_stale_path, b"stale locked generation")
+            .expect("write stale locked generation");
+
+        // Model a candidate-path replacement after the candidate inode was
+        // locked but before installation. Adoption records the stale locked
+        // inode, then its post-adoption verification rejects the different
+        // inode that was actually installed.
+        let replacement_lock = migration
+            .write_authority
+            .lock_database_replacement_candidate(&locked_stale_path)
+            .expect("lock stale candidate inode");
+        let error = install_compacted_candidate(
+            &candidate_path,
+            &migration.db_path,
+            &displaced_main,
+            replacement_lock,
+            &migration.write_authority,
+        )
+        .expect_err("post-adoption identity mismatch must fail");
+
+        assert!(
+            error.to_string().contains("authority"),
+            "failure should identify replacement authority: {error}"
+        );
+        assert_eq!(
+            raw_family_witness(&migration.db_path).expect("restored raw witness"),
+            raw_before,
+            "the original database family must be restored exactly"
+        );
+        assert_eq!(
+            fs::read(&candidate_path).expect("restored candidate"),
+            b"candidate generation",
+            "the rejected candidate must return to its staging path"
+        );
+        assert!(
+            !displaced_main.exists(),
+            "failure before original retention must not fabricate a displaced database"
+        );
+        migration
+            .write_authority
+            .verify_database_authority()
+            .expect("restored original inode authority");
     }
 
     #[test]
