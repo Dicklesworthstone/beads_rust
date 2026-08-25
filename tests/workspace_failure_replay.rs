@@ -34,8 +34,12 @@ fn fixture_workspace(name: &str) -> FixtureWorkspace {
     };
 
     match name {
+        "corrupt_db_text" => prepare_current_corrupt_db_text(&fixture),
         "db_jsonl_disagreement" => prepare_current_db_jsonl_disagreement(&fixture),
         "duplicate_config_rows" => prepare_current_duplicate_config_rows(&fixture),
+        "interrupted_rebuild_leftovers" => {
+            prepare_current_interrupted_rebuild_leftovers(&fixture);
+        }
         "journal_sidecar_leftover" => prepare_current_journal_sidecar_leftover(&fixture),
         "jsonl_conflict_markers" => prepare_current_jsonl_conflict_markers(&fixture),
         "metadata_custom_paths" => prepare_current_metadata_custom_paths(&fixture),
@@ -49,6 +53,83 @@ fn fixture_workspace(name: &str) -> FixtureWorkspace {
     }
 
     fixture
+}
+
+fn prepare_current_corrupt_db_text(fixture: &FixtureWorkspace) {
+    preserve_unowned_malformed_primary_wal(fixture);
+}
+
+fn prepare_current_interrupted_rebuild_leftovers(fixture: &FixtureWorkspace) {
+    let db_path = current_database_path(fixture);
+    let backup_path = fixture.beads_dir.join("beads.db.bad_20260312T000000Z");
+    let marker_path = fixture
+        .beads_dir
+        .join(".br_recovery")
+        .join("beads.db.20260312T000000Z.rebuild-failed");
+    let db_bytes = fs::read(&db_path).expect("read interrupted-rebuild live database");
+    let backup_bytes = fs::read(&backup_path).expect("read interrupted-rebuild backup");
+    let marker_bytes = fs::read(&marker_path).expect("read interrupted-rebuild marker");
+
+    preserve_unowned_malformed_primary_wal(fixture);
+
+    assert_eq!(
+        fs::read(db_path).expect("reread interrupted-rebuild live database"),
+        db_bytes,
+        "WAL normalization must not change the malformed live database"
+    );
+    assert_eq!(
+        fs::read(backup_path).expect("reread interrupted-rebuild backup"),
+        backup_bytes,
+        "WAL normalization must not change the preserved backup"
+    );
+    assert_eq!(
+        fs::read(marker_path).expect("reread interrupted-rebuild marker"),
+        marker_bytes,
+        "WAL normalization must not change the rebuild-failure marker"
+    );
+}
+
+fn preserve_unowned_malformed_primary_wal(fixture: &FixtureWorkspace) {
+    let db_path = current_database_path(fixture);
+    let db_bytes = fs::read(&db_path).expect("read malformed-primary fixture database");
+    assert!(
+        !db_bytes.starts_with(b"SQLite format 3\0"),
+        "malformed-primary fixture should retain a non-SQLite live database"
+    );
+
+    let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+    let wal_bytes = fs::read(&wal_path)
+        .expect("malformed-primary fixture should retain its historical WAL artifact");
+    assert!(
+        !wal_bytes.is_empty(),
+        "malformed-primary fixture WAL artifact must be nonempty"
+    );
+
+    // These fixtures intentionally present a plain-text primary database with
+    // valid JSONL available for recovery. Their historical captures also
+    // retained a committed legacy-schema WAL, which creates a different,
+    // deliberately fail-closed boundary: br must not discard committed frames
+    // when the main header cannot establish their authority. Keep that source
+    // artifact byte-for-byte in each isolated replay, but move it out of the
+    // active database family so the cases exercise the malformed-primary and
+    // recovery-debris contracts described by their fixture manifests.
+    preserve_generated_artifact(fixture, &wal_path);
+
+    let archived_wal = fixture
+        .beads_dir
+        .join(".fixture_current_import_artifacts")
+        .join("beads.db-wal");
+    assert!(!wal_path.exists(), "fixture WAL should not remain active");
+    assert_eq!(
+        fs::read(archived_wal).expect("read preserved malformed-primary fixture WAL"),
+        wal_bytes,
+        "preserved fixture WAL should retain its exact bytes"
+    );
+    assert_eq!(
+        fs::read(db_path).expect("reread malformed-primary fixture database"),
+        db_bytes,
+        "preserving the unrelated WAL must not change the malformed primary"
+    );
 }
 
 fn prepare_current_db_jsonl_disagreement(fixture: &FixtureWorkspace) {

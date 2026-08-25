@@ -15,7 +15,7 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
-## v0.5.0 -- 2026-08-25
+## v0.5.1 -- 2026-08-25 (Release)
 
 Safety-focused storage and recovery release, with a retained profile-driven
 speedup for structured `ready` output. The user-facing changes are deliberately
@@ -104,13 +104,16 @@ replacement, crash, and schema-drift races.
   `2x` median-and-tail target was not achieved.
 - A database carrying the previous runtime-witness contract performs the full
   schema attestation on lock-free reads until an ordinary writable open records
-  the current witness. On the final runtime bytes, a balanced 100-sample
-  `release-perf` profile measured the prior-contract path at `90.605341 ms`
-  median / `101.779796 ms` p95 and the current-witness fast path at
-  `51.977261 ms` / `67.686561 ms`, reductions of `42.633337%` / `33.497056%`.
-  The conservative current-witness control with fast-open disabled measured
-  `84.227769 ms` / `116.585020 ms`; output was identical and all database
-  witnesses and integrity checks remained valid. The read-only path
+  the current witness. On the pre-release v0.5.0 runtime logic carried
+  unchanged into v0.5.1, a balanced 100-sample `release-perf` profile measured
+  the prior-contract path at `90.605341 ms` median / `101.779796 ms` p95 and
+  the current-witness fast path at `51.977261 ms` / `67.686561 ms`, reductions
+  of `42.633337%` / `33.497056%`. The conservative current-witness control with
+  fast-open disabled measured `84.227769 ms` / `116.585020 ms`; output was
+  identical and all database witnesses and integrity checks remained valid.
+  The v0.5.1 binary differs in release metadata, and its release tree includes
+  the corrected replay harness, so those figures are deliberately not
+  described as byte-identical v0.5.1 profiling. The read-only path
   intentionally does not persist a witness.
 
 ### Packaging and regression coverage
@@ -119,8 +122,8 @@ replacement, crash, and schema-drift races.
   upstream fix for [RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258.html)
   and its follow-up stream/error-budget hardening
   ([10bcadca](https://github.com/Dicklesworthstone/beads_rust/commit/10bcadca)).
-- Cargo and Nix source metadata move to 0.5.0; checksummed Homebrew, AUR, and
-  Scoop metadata remains pinned to the last public assets until the v0.5.0
+- Cargo and Nix source metadata move to 0.5.1; checksummed Homebrew, AUR, and
+  Scoop metadata remains pinned to the last public assets until the v0.5.1
   release is published and its real hashes can be recorded. Cargo now points
   at the repository's rider-bearing `LICENSE` via `license-file` instead of
   incorrectly declaring the package as plain SPDX MIT
@@ -131,7 +134,7 @@ replacement, crash, and schema-drift races.
   the recoverable DSR key `RWTQoKUb...` (ID `36B847D11BA5A0D0`), and refuses
   release creation unless every exact archive, checksum, and `.minisig`
   triplet is present and nonempty. Raw v0.4.1 sidecars already used this key;
-  v0.5.0 unifies DSR and GitHub Actions on it and corrects the documentation
+  v0.5.1 unifies DSR and GitHub Actions on it and corrects the documentation
   drift. `RWS7nGFf...` remains v0.4.0 history, while the older CI-era
   `RWSp4vEO...` key is unrecoverable
   ([ada0b658](https://github.com/Dicklesworthstone/beads_rust/commit/ada0b658),
@@ -140,7 +143,7 @@ replacement, crash, and schema-drift races.
 - Package-manager metadata no longer represents the custom rider as plain MIT:
   Homebrew uses `:cannot_represent`, AUR uses
   `LicenseRef-MIT-OpenAI-Anthropic-Rider`, Nix uses `licenses.unfree`, and Scoop
-  links the repository license. The v0.5.0 archives let the post-publication
+  links the repository license. The v0.5.1 archives let the post-publication
   Homebrew and AUR revisions install the actual rider-bearing file, Nix installs
   it from source, and Scoop receives it inside the release zip. The staged
   Homebrew/AUR definitions remain installable against v0.4.1, whose archives
@@ -154,6 +157,18 @@ replacement, crash, and schema-drift races.
   current-vs-retired key boundary, and missing-secret/missing-sidecar failures.
   Performance figures above remain revision-scoped; this changelog does not
   promote earlier gate runs into exact-current release certification.
+
+## v0.5.0 -- 2026-08-25 (Tag)
+
+Unpublished stabilization tag. After an earlier topology failure stopped the
+release gate before this target ran, the canonical reliability replay exposed
+a fixture whose plain-text primary database was accidentally paired with a
+committed legacy-schema WAL. Runtime correctly refused to discard those
+ambiguous committed frames; the replay setup now preserves that historical WAL
+outside the active database family so the case tests its documented
+malformed-primary recovery contract. No v0.5.0 GitHub Release, crates.io
+package, or platform assets were published. v0.5.1 supersedes this tag without
+moving or rewriting it.
 
 ## v0.4.1 -- 2026-08-24 (Release)
 

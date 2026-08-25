@@ -398,7 +398,7 @@ The resource surface is `beads://project/info`, `beads://issues/{id}`,
 
 ```bash
 br --version
-# br 0.5.0
+# br 0.5.1
 ```
 
 ### Verify Release Signatures
@@ -417,7 +417,7 @@ script verifies automatically.
 > **Key history:** v0.4.0 used the one-release key
 > `RWS7nGFfBYC+MWeZLEaowkjNi77w5FEOk49fEhX2jZ6gpd9uQ4vzVIrF` (key ID
 > `31BE80055F619CBB`). v0.4.1 moved to the recoverable DSR key shown above,
-> but its release documentation did not record that rotation. From v0.5.0,
+> but its release documentation did not record that rotation. From v0.5.1,
 > the same current key is installed in both DSR and GitHub Actions and is
 > verified before upload. Releases before v0.4.0 either shipped no
 > `.minisig` or used an unrecoverable CI-era key; treat those signatures as

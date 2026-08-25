@@ -40,7 +40,7 @@ class Br < Formula
 
   def install
     bin.install "br"
-    # v0.4.1 predates bundled licenses; v0.5.0 and later archives include it.
+    # v0.4.1 predates bundled licenses; v0.5.1 and later archives include it.
     doc.install "LICENSE" if File.exist?("LICENSE")
   end
 
