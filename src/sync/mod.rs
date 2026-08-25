@@ -1710,6 +1710,18 @@ fn verify_locked_file_identity(
         lock_path.display().to_string()
     };
     let opened = authority_file_identity(file, lock_path, role, &lock_path_display)?;
+    #[cfg(windows)]
+    let current_guard = path::open_regular_authority_source(lock_path)?.ok_or_else(|| {
+        BeadsError::Config(format!(
+            "Locked {role} path disappeared at {lock_path_display}"
+        ))
+    })?;
+    #[cfg(windows)]
+    let current = {
+        let identity = current_guard.identity();
+        (identity.device_id(), identity.inode())
+    };
+    #[cfg(not(windows))]
     let current = authority_path_identity(lock_path, role, &lock_path_display)?;
     if opened != current {
         return Err(BeadsError::Config(format!(

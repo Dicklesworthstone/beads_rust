@@ -2671,7 +2671,7 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
     for row in &index_rows {
         if let Some(name) = row.get(0).and_then(SqliteValue::as_text) {
             conn.execute(&format!(
-                "DROP INDEX IF EXISTS {}",
+                "DROP INDEX IF EXISTS main.{}",
                 quote_sql_identifier(name)
             ))?;
         }

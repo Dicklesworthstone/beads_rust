@@ -16237,16 +16237,22 @@ fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
 
 fn preflight_effective_schema_before_writable_open(db_path: &Path) -> Result<()> {
     let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
-    let Some(header_version) = checked_database_header_user_version(db_path)? else {
-        return Ok(());
-    };
-    if header_version > current_schema_version {
-        return Err(future_schema_error(
-            header_version,
-            current_schema_version,
-        ));
+    let header_version = checked_database_header_user_version(db_path)?;
+    if let Some(header_version) = header_version
+        && header_version > current_schema_version
+    {
+        return Err(future_schema_error(header_version, current_schema_version));
     }
     let wal_preflight = sqlite_wal_schema_preflight(db_path)?;
+    let Some(header_version) = header_version else {
+        if wal_preflight.has_committed_frames {
+            return Err(BeadsError::SyncConflict {
+                message: "Refusing writable database open because committed WAL frames exist without a stable readable main-database header"
+                    .to_string(),
+            });
+        }
+        return Ok(());
+    };
     let effective_version = wal_preflight
         .committed_user_version
         .unwrap_or(header_version);
@@ -29639,6 +29645,59 @@ mod tests {
             bytes_before,
             "malformed commit refusal must not rewrite the WAL"
         );
+    }
+
+    #[test]
+    fn test_committed_wal_without_readable_main_header_is_refused_byte_neutral() {
+        let current = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap();
+        let future = current.checked_add(1).unwrap();
+        let salts = (0x89AB_CDEF, 0x0123_4567);
+
+        for (main_kind, main_bytes) in [
+            ("missing", None),
+            ("short", Some(vec![0_u8; 20])),
+            ("invalid", Some(vec![0_u8; 100])),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let db_path = temp.path().join(format!("{main_kind}_main.db"));
+            if let Some(bytes) = &main_bytes {
+                fs::write(&db_path, bytes).unwrap();
+            }
+            let wal_path = database_sidecar_path(&db_path, "-wal");
+            let (mut wal, mut running_checksum) = synthetic_wal_header(salts);
+            append_synthetic_wal_frame(
+                &mut wal,
+                &mut running_checksum,
+                1,
+                1,
+                salts,
+                Some(future),
+            );
+            fs::write(&wal_path, &wal).unwrap();
+            let observed_main_before = fs::read(&db_path).ok();
+            let wal_before = fs::read(&wal_path).unwrap();
+
+            let error = SqliteStorage::open_with_timeout(&db_path, Some(50)).expect_err(
+                "a committed WAL cannot authorize creation or repair without a readable main header",
+            );
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("committed WAL frames exist without a stable readable"),
+                "unexpected {main_kind} main-header refusal: {error}"
+            );
+            assert_eq!(
+                fs::read(&db_path).ok(),
+                observed_main_before,
+                "{main_kind} main database changed before WAL uncertainty was refused"
+            );
+            assert_eq!(
+                fs::read(&wal_path).unwrap(),
+                wal_before,
+                "{main_kind} main-header refusal rewrote the WAL"
+            );
+        }
     }
 
     #[cfg(unix)]
