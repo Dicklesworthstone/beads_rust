@@ -77,6 +77,7 @@ fn release_workflow_exposes_expected_fragment_steps() -> Result<(), String> {
         "Create archive (zip)",
         "Sign release archive with Ed25519",
         "Generate changelog",
+        "Install digest-verified Syft",
         "Generate SBOMs (CycloneDX and SPDX)",
     ] {
         release_step_script(step_name)?;
@@ -266,23 +267,33 @@ fn release_workflow_uses_the_pinned_toolchain_and_lockfile() -> Result<(), Strin
 }
 
 #[test]
-fn release_sbom_generation_uses_pinned_syft_without_remote_script_execution() -> Result<(), String>
-{
+fn release_sbom_generation_uses_digest_pinned_syft_without_remote_script_execution(
+) -> Result<(), String> {
     let workflow = read_to_string(Path::new(RELEASE_WORKFLOW))?;
+    let install_script = release_step_script("Install digest-verified Syft")?;
     let script = release_step_script("Generate SBOMs (CycloneDX and SPDX)")?;
 
     require_contains(
-        &workflow,
-        "uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610",
+        &install_script,
+        "https://github.com/anchore/syft/releases/download/v${syft_version}/${syft_archive}",
     )?;
-    require_contains(&workflow, "syft-version: v1.42.3")?;
-    require_contains(&script, r#""${{ steps.syft.outputs.cmd }}" dir:."#)?;
+    require_contains(&install_script, "syft_version=\"1.42.3\"")?;
+    require_contains(
+        &install_script,
+        "syft_sha256=\"0d6be741479eddd2c8644a288990c04f3df0d609bbc1599a005532a9dff63509\"",
+    )?;
+    require_contains(&install_script, "sha256sum -c -")?;
+    require_contains(&install_script, "--proto '=https' --tlsv1.2")?;
+    require_contains(&install_script, "tar -xzf \"$syft_archive_path\"")?;
+    require_contains(&install_script, "test -x \"$RUNNER_TEMP/syft\"")?;
+    require_contains(&script, r#""$SYFT_BIN" dir:."#)?;
     require_contains(
         &script,
         "-o cyclonedx-json=artifacts/sbom.cdx.json",
     )?;
     require_contains(&script, "-o spdx-json=artifacts/sbom.spdx.json")?;
     require_not_contains(&workflow, "raw.githubusercontent.com/anchore/syft")?;
+    require_not_contains(&workflow, "anchore/sbom-action")?;
     require_not_contains(&script, "curl")
 }
 

@@ -627,17 +627,28 @@ jobs:
           echo "=== Generated release notes ==="
           cat RELEASE_NOTES.md
 
-      - name: Install pinned Syft
-        id: syft
-        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
-        with:
-          syft-version: v1.42.3
+      - name: Install digest-verified Syft
+        run: |
+          set -euo pipefail
+          readonly syft_version="1.42.3"
+          readonly syft_archive="syft_${syft_version}_linux_amd64.tar.gz"
+          readonly syft_sha256="0d6be741479eddd2c8644a288990c04f3df0d609bbc1599a005532a9dff63509"
+          readonly syft_url="https://github.com/anchore/syft/releases/download/v${syft_version}/${syft_archive}"
+          readonly syft_archive_path="${RUNNER_TEMP:?}/${syft_archive}"
+          curl --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors \
+            --output "$syft_archive_path" "$syft_url"
+          printf '%s  %s\n' "$syft_sha256" "$syft_archive_path" | sha256sum -c -
+          tar -xzf "$syft_archive_path" -C "$RUNNER_TEMP" syft
+          test -x "$RUNNER_TEMP/syft"
+          "$RUNNER_TEMP/syft" version
+          echo "SYFT_BIN=$RUNNER_TEMP/syft" >> "$GITHUB_ENV"
 
       - name: Generate SBOMs (CycloneDX and SPDX)
         env:
           SYFT_CHECK_FOR_APP_UPDATE: 'false'
         run: |
-          "${{ steps.syft.outputs.cmd }}" dir:. \
+          "$SYFT_BIN" dir:. \
             -o cyclonedx-json=artifacts/sbom.cdx.json \
             -o spdx-json=artifacts/sbom.spdx.json
 
