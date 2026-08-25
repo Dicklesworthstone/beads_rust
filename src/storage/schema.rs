@@ -2063,8 +2063,7 @@ fn table_check_expressions(sql: &str) -> Option<Vec<Vec<SqlEvidenceToken>>> {
                 Some(SqlEvidenceToken::Unquoted(keyword)) if keyword == "check"
             )
         {
-            let (expression, close_parenthesis) =
-                parenthesized_sql_tokens(&tokens, index + 1)?;
+            let (expression, close_parenthesis) = parenthesized_sql_tokens(&tokens, index + 1)?;
             checks.push(expression);
             index = close_parenthesis + 1;
             continue;
@@ -4654,13 +4653,7 @@ mod tests {
         // while the stamp-integrity refusals below are fully retained.
         let current = current_schema_version_u32().expect("current version");
         let future = current.checked_add(1).expect("future version");
-        for (from, target) in [
-            (13, 14),
-            (14, 14),
-            (15, 15),
-            (13, 16),
-            (future, current),
-        ] {
+        for (from, target) in [(13, 14), (14, 14), (15, 15), (13, 16), (future, current)] {
             let temp = TempDir::new().expect("tempdir");
             let db_path = temp.path().join(format!("refuse-{from}-{target}.db"));
             let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
@@ -6570,7 +6563,7 @@ mod tests {
         apply_schema(&conn).expect("schema");
         let cookie = attest_runtime_schema_cookie(&conn).expect("attest current schema");
         let prior_witness = format!(
-            "schema-{CURRENT_SCHEMA_VERSION}.contract-v5-version-fenced-lexical-core-aux-columns-fks-index-collations-checks-autoincrement-cookie-fenced.cookie-{cookie}"
+            "schema-{CURRENT_SCHEMA_VERSION}.contract-v6-version-fenced-lexical-core-aux-columns-fks-index-directions-collations-checks-autoincrement-cookie-fenced.cookie-{cookie}"
         );
         conn.execute_with_params(
             "INSERT INTO metadata (key, value) VALUES (?, ?)",

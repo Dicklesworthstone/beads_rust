@@ -58,6 +58,12 @@ const DEFAULT_JSONL_EXPORT_PARALLELISM: usize = 64;
 const IMPORT_EXPORT_HASH_BATCH_SIZE: usize = 512;
 const MAX_JSONL_TEMP_PATH_ATTEMPTS: u32 = 64;
 
+#[cfg(test)]
+thread_local! {
+    static REPLACE_DATABASE_BEFORE_FINALIZE_LOCKED_VERIFY: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 /// Exact source state used by stale-overwrite guards.
 ///
 /// `Missing` is intentionally distinct from a present zero-byte file.
