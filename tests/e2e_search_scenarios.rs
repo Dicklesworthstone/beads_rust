@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_issues_array, extract_json_payload, run_br};
 use serde_json::Value;
 
 fn parse_created_id(stdout: &str) -> String {
@@ -283,8 +283,9 @@ fn search_with_status_filter() {
     );
     assert!(search.status.success(), "search failed: {}", search.stderr);
 
-    let payload = extract_json_payload(&search.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    // "bug" also matches the closed issue, so the payload carries the
+    // hidden-closed wrapper (#445).
+    let json = extract_issues_array(&search.stdout);
 
     for issue in &json {
         assert_eq!(
@@ -370,8 +371,9 @@ fn search_include_closed() {
     );
     assert!(search_no_closed.status.success());
 
-    let payload_no_closed = extract_json_payload(&search_no_closed.stdout);
-    let json_no_closed: Vec<Value> = serde_json::from_str(&payload_no_closed).expect("parse");
+    // "login" also matches the closed issue, so this payload carries the
+    // hidden-closed wrapper (#445).
+    let json_no_closed = extract_issues_array(&search_no_closed.stdout);
 
     // With --all to include closed issues
     let search_with_closed = run_br(
@@ -385,13 +387,154 @@ fn search_include_closed() {
         search_with_closed.stderr
     );
 
-    let payload_with_closed = extract_json_payload(&search_with_closed.stdout);
-    let json_with_closed: Vec<Value> = serde_json::from_str(&payload_with_closed).expect("parse");
+    let json_with_closed = extract_issues_array(&search_with_closed.stdout);
 
     // Should find more results with --include-closed
     assert!(
         json_with_closed.len() >= json_no_closed.len(),
         "Including closed should find at least as many results"
+    );
+}
+
+// =============================================================================
+// HIDDEN CLOSED MATCH REPORTING (#445)
+// =============================================================================
+
+#[test]
+fn search_text_notes_hidden_closed_matches() {
+    let (workspace, _ids) = setup_search_workspace();
+
+    // "login" matches two open issues plus the closed "Fixed login timeout bug".
+    let search = run_br(&workspace, ["search", "login"], "search_hidden_text");
+    assert!(search.status.success(), "search failed: {}", search.stderr);
+
+    assert!(
+        search.stdout.contains("1 closed match(es) hidden") && search.stdout.contains("--all"),
+        "text output should note the hidden closed match: {}",
+        search.stdout
+    );
+}
+
+#[test]
+fn search_text_notes_hidden_closed_matches_with_empty_results() {
+    let (workspace, _ids) = setup_search_workspace();
+
+    // "timeout" appears only in the closed issue, so the visible result set
+    // is empty — exactly when the narrowed corpus is most misleading.
+    let search = run_br(&workspace, ["search", "timeout"], "search_hidden_empty");
+    assert!(search.status.success(), "search failed: {}", search.stderr);
+
+    assert!(
+        search.stdout.contains("1 closed match(es) hidden") && search.stdout.contains("--all"),
+        "empty text output should still note the hidden closed match: {}",
+        search.stdout
+    );
+}
+
+#[test]
+fn search_json_reports_hidden_closed_count() {
+    let (workspace, _ids) = setup_search_workspace();
+
+    let search = run_br(
+        &workspace,
+        ["search", "login", "--json"],
+        "search_hidden_json",
+    );
+    assert!(search.status.success(), "search failed: {}", search.stderr);
+
+    let payload = extract_json_payload(&search.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse json");
+
+    assert_eq!(
+        json["hidden_closed_count"], 1,
+        "wrapper should report one hidden closed match: {json}"
+    );
+    assert!(
+        json["issues"].is_array(),
+        "wrapper should carry the result rows under 'issues': {json}"
+    );
+}
+
+#[test]
+fn search_toon_reports_hidden_closed_count() {
+    let (workspace, _ids) = setup_search_workspace();
+
+    let search = run_br(
+        &workspace,
+        ["search", "login", "--format", "toon"],
+        "search_hidden_toon",
+    );
+    assert!(search.status.success(), "search failed: {}", search.stderr);
+
+    assert!(
+        search.stdout.contains("hidden_closed_count"),
+        "TOON output should follow the JSON wrapper shape: {}",
+        search.stdout
+    );
+}
+
+#[test]
+fn search_hidden_closed_count_absent_without_closed_matches() {
+    let (workspace, _ids) = setup_search_workspace();
+
+    // No closed issue mentions "database": legacy shapes must be preserved.
+    let json_search = run_br(
+        &workspace,
+        ["search", "database", "--json"],
+        "search_no_hidden_json",
+    );
+    assert!(json_search.status.success());
+    let payload = extract_json_payload(&json_search.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse json");
+    assert!(
+        json.is_array(),
+        "JSON should stay a bare array when nothing was hidden: {json}"
+    );
+
+    let text_search = run_br(&workspace, ["search", "database"], "search_no_hidden_text");
+    assert!(text_search.status.success());
+    assert!(
+        !text_search.stdout.contains("hidden"),
+        "text output should not mention hidden matches: {}",
+        text_search.stdout
+    );
+}
+
+#[test]
+fn search_hidden_closed_count_absent_with_all_flag() {
+    let (workspace, _ids) = setup_search_workspace();
+
+    let search = run_br(
+        &workspace,
+        ["search", "login", "--all", "--json"],
+        "search_all_no_hidden",
+    );
+    assert!(search.status.success(), "search failed: {}", search.stderr);
+
+    let payload = extract_json_payload(&search.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse json");
+    assert!(
+        json.is_array(),
+        "--all includes closed issues, so the legacy array shape stays: {json}"
+    );
+}
+
+#[test]
+fn search_hidden_closed_count_absent_with_status_closed() {
+    let (workspace, _ids) = setup_search_workspace();
+
+    let search = run_br(
+        &workspace,
+        ["search", "login", "--status", "closed", "--json"],
+        "search_status_closed_no_hidden",
+    );
+    assert!(search.status.success(), "search failed: {}", search.stderr);
+
+    let payload = extract_json_payload(&search.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse json");
+    assert!(
+        json.is_array(),
+        "--status closed already includes closed issues, so the legacy array shape stays: {json}"
     );
 }
 
@@ -581,8 +724,9 @@ fn search_combined_multiple_filters() {
     );
     assert!(search.status.success(), "search failed: {}", search.stderr);
 
-    let payload = extract_json_payload(&search.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    // "bug" also matches the closed bug, so the payload carries the
+    // hidden-closed wrapper (#445).
+    let json = extract_issues_array(&search.stdout);
 
     for issue in &json {
         assert_eq!(issue["status"], "open");

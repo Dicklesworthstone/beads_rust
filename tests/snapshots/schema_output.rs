@@ -482,7 +482,10 @@ fn live_command_cases(fixture: &LiveCommandFixture) -> Vec<LiveCommandCase<'_>> 
         },
         LiveCommandCase {
             name: "search",
-            args: vec!["search", "contract fixture", "--json"],
+            // `--all` keeps the declared legacy array shape: without it, the
+            // closed fixture would trigger the hidden-closed wrapper object
+            // (#445), which the shape metadata documents in its notes.
+            args: vec!["search", "contract fixture", "--all", "--json"],
             require_extracted_items: true,
         },
         LiveCommandCase {

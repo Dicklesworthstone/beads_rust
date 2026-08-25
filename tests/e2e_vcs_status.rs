@@ -30,6 +30,12 @@ fn git(root: &Path, args: &[&str]) -> std::process::Output {
         .current_dir(root)
         .env("HOME", root)
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        // Repository setup must not inherit host-level global git
+        // configuration (outer GIT_CONFIG_GLOBAL or XDG_CONFIG_HOME), which
+        // could otherwise register content filters or line-ending transforms
+        // that change what these fixtures check out.
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env_remove("XDG_CONFIG_HOME")
         .output()
         .expect("run git")
 }
@@ -72,6 +78,8 @@ fn git_with_stdin_ok(root: &Path, args: &[&str], input: &str) {
         .current_dir(root)
         .env("HOME", root)
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env_remove("XDG_CONFIG_HOME")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -572,13 +580,39 @@ fn e2e_vcs_status_honors_linked_worktree_effective_config() {
         &workspace.root,
         &["worktree", "add", "-b", "linked-config", linked_text],
     );
+    // Give the linked worktree its own local store. Since #429, workspace
+    // discovery resolves a linked worktree whose `.beads` holds only tracked
+    // artifacts to the PRIMARY checkout's `.beads`; the probes would then run
+    // in the primary worktree, where the `--worktree` git configuration this
+    // test exercises never applies (and the global `core.autocrlf = true`
+    // below would surface as `git_content_transform_required` instead).
+    for artifact in ["beads.db", "metadata.json"] {
+        let source = workspace.root.join(".beads").join(artifact);
+        if source.is_file() {
+            std::fs::copy(&source, linked.join(".beads").join(artifact))
+                .expect("copy primary workspace store into linked worktree");
+        }
+    }
     let linked_home = workspace.root.join("linked-global-home");
     std::fs::create_dir(&linked_home).expect("linked-worktree global config HOME");
+    let linked_global = linked_home.join(".gitconfig");
     std::fs::write(
-        linked_home.join(".gitconfig"),
+        &linked_global,
         "[core]\n\tautocrlf = true\n\tfilemode = true\n",
     )
     .expect("linked-worktree global config");
+    // Pin every git configuration scope br's effective-config probes can
+    // observe. `HOME` alone is not hermetic: without these overrides the
+    // probes still read the host's /etc/gitconfig (or the git prefix's
+    // system config) and any `$XDG_CONFIG_HOME/git/config`, so host-level
+    // entries such as registered git-lfs filters or `core.autocrlf` leak
+    // into the assertions. `hardened_git_command` propagates exactly these
+    // read-location keys to its effective-config probes.
+    let hermetic_env = [
+        ("HOME", linked_home.as_os_str()),
+        ("GIT_CONFIG_NOSYSTEM", std::ffi::OsStr::new("1")),
+        ("GIT_CONFIG_GLOBAL", linked_global.as_os_str()),
+    ];
 
     git_ok(&linked, &["config", "--worktree", "core.filemode", "false"]);
     git_ok(&linked, &["config", "--worktree", "core.autocrlf", "false"]);
@@ -592,7 +626,7 @@ fn e2e_vcs_status_honors_linked_worktree_effective_config() {
     let filemode = run_br_smoke_at_root_with_env(
         &linked,
         ["vcs-status", "--json"],
-        [("HOME", linked_home.as_os_str())],
+        hermetic_env,
         "linked_worktree_filemode",
     );
     assert!(filemode.status.success(), "{}", filemode.stderr);
@@ -613,7 +647,7 @@ fn e2e_vcs_status_honors_linked_worktree_effective_config() {
     let attributes = run_br_smoke_at_root_with_env(
         &linked,
         ["vcs-status", "--json"],
-        [("HOME", linked_home.as_os_str())],
+        hermetic_env,
         "linked_worktree_attributes",
     );
     assert!(attributes.status.success(), "{}", attributes.stderr);
@@ -636,7 +670,7 @@ fn e2e_vcs_status_honors_linked_worktree_effective_config() {
     let autocrlf = run_br_smoke_at_root_with_env(
         &linked,
         ["vcs-status", "--json"],
-        [("HOME", linked_home.as_os_str())],
+        hermetic_env,
         "linked_worktree_autocrlf",
     );
     assert!(autocrlf.status.success(), "{}", autocrlf.stderr);

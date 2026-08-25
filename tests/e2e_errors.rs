@@ -691,6 +691,188 @@ fn e2e_sync_rename_prefix_applies_after_missing_db_recovery_without_force() {
 }
 
 #[test]
+fn e2e_sync_rename_prefix_preserves_id_remainder_and_reports_mapping() {
+    // Issue #442: `--rename-prefix` used to regenerate ids from scratch,
+    // dropping descriptive slugs (`oldp-cargo-license-spdx-ay8` became
+    // `newp-ay8`). It must instead replace only the prefix segment, collapse
+    // a doubled prefix exactly once, fall back to generation only on
+    // collision, and report every rewrite as a `prefix_renames` mapping.
+    let _log =
+        common::test_log("e2e_sync_rename_prefix_preserves_id_remainder_and_reports_mapping");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let set_prefix = run_br(
+        &workspace,
+        ["config", "set", "issue_prefix=target"],
+        "config_set_issue_prefix",
+    );
+    assert!(
+        set_prefix.status.success(),
+        "config set failed: {}",
+        set_prefix.stderr
+    );
+
+    let make = |title: &str, label: &str| {
+        let create = run_br(&workspace, ["create", title], label);
+        assert!(create.status.success(), "create failed: {}", create.stderr);
+        parse_created_id(&create.stdout)
+    };
+    let id_slugged = make("Slugged issue", "create_slugged");
+    let id_doubled = make("Doubled issue", "create_doubled");
+    let id_occupant = make("Collision occupant", "create_occupant");
+    let id_challenger = make("Collision challenger", "create_challenger");
+    let remainder = |id: &str| {
+        id.split_once('-')
+            .map(|(_, rest)| rest.to_string())
+            .expect("created ids should carry a prefix")
+    };
+    let (rem_slugged, rem_doubled, rem_occupant) = (
+        remainder(&id_slugged),
+        remainder(&id_doubled),
+        remainder(&id_occupant),
+    );
+
+    let dep = run_br(
+        &workspace,
+        ["dep", "add", &id_slugged, &id_doubled],
+        "dep_add",
+    );
+    assert!(dep.status.success(), "dep add failed: {}", dep.stderr);
+    let comment = run_br(
+        &workspace,
+        ["comments", "add", &id_slugged, "note before rename"],
+        "comments_add",
+    );
+    assert!(
+        comment.status.success(),
+        "comments add failed: {}",
+        comment.stderr
+    );
+
+    let flush = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
+    assert!(
+        flush.status.success(),
+        "sync flush failed: {}",
+        flush.stderr
+    );
+
+    // Rewrite the exported ids into a foreign prefix: a plain mismatch, a
+    // doubled prefix, and a challenger whose preserved id would collide with
+    // the occupant that keeps its matching `target-` id.
+    let issues_path = workspace.root.join(".beads").join("issues.jsonl");
+    let jsonl = fs::read_to_string(&issues_path).expect("read issues jsonl");
+    let old_slugged = format!("legacy-{rem_slugged}");
+    let old_doubled = format!("legacy-legacy-{rem_doubled}");
+    let old_challenger = format!("legacy-{rem_occupant}");
+    let rewritten = jsonl
+        .replace(&id_slugged, &old_slugged)
+        .replace(&id_doubled, &old_doubled)
+        .replace(&id_challenger, &old_challenger);
+    fs::write(&issues_path, rewritten).expect("rewrite jsonl");
+
+    let alt_db = workspace.root.join(".beads").join("rename-receipt-alt.db");
+    let result = run_br(
+        &workspace,
+        [
+            "--db",
+            alt_db.to_str().expect("alt db path"),
+            "sync",
+            "--import-only",
+            "--rename-prefix",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "sync_rename_prefix_receipt",
+    );
+    assert!(
+        result.status.success(),
+        "rename-prefix import should succeed: {}",
+        result.stderr
+    );
+
+    let payload = extract_json_payload(&result.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse import json");
+    assert_eq!(json["created"].as_u64(), Some(4));
+    let renames = json["prefix_renames"]
+        .as_array()
+        .expect("import JSON should carry the prefix_renames receipt");
+    assert_eq!(renames.len(), 3, "receipt: {renames:?}");
+    let entry = |old_id: &str| {
+        renames
+            .iter()
+            .find(|entry| entry["old_id"].as_str() == Some(old_id))
+            .unwrap_or_else(|| panic!("missing receipt entry for {old_id}: {renames:?}"))
+    };
+
+    let slugged_entry = entry(&old_slugged);
+    assert_eq!(
+        slugged_entry["new_id"].as_str(),
+        Some(id_slugged.as_str()),
+        "prefix rename must preserve the id remainder"
+    );
+    assert!(
+        slugged_entry.get("fallback").is_none(),
+        "preserved rename must not carry a fallback marker: {slugged_entry}"
+    );
+
+    let doubled_entry = entry(&old_doubled);
+    assert_eq!(
+        doubled_entry["new_id"].as_str(),
+        Some(id_doubled.as_str()),
+        "doubled prefix must collapse exactly once"
+    );
+    assert!(doubled_entry.get("fallback").is_none());
+
+    let challenger_entry = entry(&old_challenger);
+    let challenger_new = challenger_entry["new_id"]
+        .as_str()
+        .expect("challenger new_id");
+    assert_ne!(
+        challenger_new, id_occupant,
+        "collision must not silently re-mint over the occupant"
+    );
+    assert!(challenger_new.starts_with("target-"));
+    assert_eq!(
+        challenger_entry["fallback"].as_str(),
+        Some("regenerated-on-collision")
+    );
+
+    // The renamed rows landed under the preserved ids, references rewritten
+    // and old ids stashed in external_ref.
+    let alt_storage = SqliteStorage::open(&alt_db).expect("open alt db");
+    let imported_ids = alt_storage.get_all_ids().expect("all ids");
+    assert_eq!(imported_ids.len(), 4, "imported ids: {imported_ids:?}");
+    for expected in [&id_slugged, &id_doubled, &id_occupant] {
+        assert!(
+            imported_ids.contains(expected),
+            "missing {expected} in {imported_ids:?}"
+        );
+    }
+    let slugged_issue = alt_storage
+        .get_issue(&id_slugged)
+        .expect("get renamed issue")
+        .expect("renamed issue present");
+    assert_eq!(
+        slugged_issue.external_ref.as_deref(),
+        Some(old_slugged.as_str()),
+        "old id must be stashed in external_ref"
+    );
+    let deps = alt_storage
+        .get_dependencies(&id_slugged)
+        .expect("dependencies");
+    assert!(
+        deps.contains(&id_doubled),
+        "dependency reference must follow the rename: {deps:?}"
+    );
+    let comments = alt_storage.get_comments(&id_slugged).expect("comments");
+    assert_eq!(comments.len(), 1, "comment must follow the rename");
+    assert_eq!(comments[0].issue_id, id_slugged);
+}
+
+#[test]
 fn e2e_auto_flush_skips_silently_overwriting_conflict_markered_jsonl() {
     // Regression: post-command auto-flush used to unconditionally call
     // `export_to_jsonl_with_policy`, which overwrote any existing JSONL —

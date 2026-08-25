@@ -2553,6 +2553,7 @@ commands:
     items_at: .
     item_schema: IssueWithCounts
     error_envelope_on_stderr: false
+    notes: "Bare array when no closed matches were hidden. When the default closed-issue exclusion hid matches, the shape becomes a wrapper object `{\"issues\": [...], \"hidden_closed_count\": N}` (iterate with `.issues[]`); pass `--all` (or a terminal `--status`) to include closed issues instead."
   show:
     shape: array
     jq_filter: ".[0]"
