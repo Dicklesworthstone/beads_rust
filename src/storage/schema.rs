@@ -18,7 +18,7 @@ const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
 // schema rebuild, overwhelming the compile-time savings of the runtime fast
 // path itself.
 const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str =
-    "v2-exact-columns-fks-indexes-history-autoincrement-cookie-fenced";
+    "v3-exact-core-aux-columns-fks-index-shapes-checks-autoincrement-cookie-fenced";
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 const GATE_RESULT_HISTORY_MIGRATION_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS gate_result_history (
@@ -206,45 +206,6 @@ const GATE_RESULT_HISTORY_INDEXES: &[(&str, &[&str])] = &[
             "id",
         ],
     ),
-];
-
-const REQUIRED_RUNTIME_INDEXES: &[&str] = &[
-    "idx_blocked_cache_blocked_at",
-    "idx_comments_created_at",
-    "idx_comments_issue",
-    "idx_config_key",
-    "idx_dependencies_blocking",
-    "idx_dependencies_depends_on",
-    "idx_dependencies_depends_on_type",
-    "idx_dependencies_issue",
-    "idx_dependencies_thread",
-    "idx_dependencies_type",
-    "idx_dirty_issues_marked_at",
-    "idx_events_actor",
-    "idx_events_created_at",
-    "idx_events_issue",
-    "idx_events_type",
-    "idx_gate_result_history_issue",
-    "idx_gate_result_history_scope",
-    "idx_issues_assignee",
-    "idx_issues_content_hash",
-    "idx_issues_created_at",
-    "idx_issues_defer_until",
-    "idx_issues_due_at",
-    "idx_issues_ephemeral",
-    "idx_issues_external_ref_unique",
-    "idx_issues_issue_type",
-    "idx_issues_list_active_order",
-    "idx_issues_pinned",
-    "idx_issues_priority",
-    "idx_issues_ready",
-    "idx_issues_status",
-    "idx_issues_status_priority_created",
-    "idx_issues_tombstone",
-    "idx_issues_updated_at",
-    "idx_labels_issue",
-    "idx_labels_label",
-    "idx_metadata_key",
 ];
 
 /// Effects produced by one explicit reviewed schema migration.
@@ -1253,21 +1214,9 @@ const ISSUES_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
     schema_column("assignee", "TEXT", false, None, 0),
     schema_column("owner", "TEXT", false, Some("''"), 0),
     schema_column("estimated_minutes", "INTEGER", false, None, 0),
-    schema_column(
-        "created_at",
-        "DATETIME",
-        true,
-        Some("CURRENT_TIMESTAMP"),
-        0,
-    ),
+    schema_column("created_at", "DATETIME", true, Some("CURRENT_TIMESTAMP"), 0),
     schema_column("created_by", "TEXT", false, Some("''"), 0),
-    schema_column(
-        "updated_at",
-        "DATETIME",
-        true,
-        Some("CURRENT_TIMESTAMP"),
-        0,
-    ),
+    schema_column("updated_at", "DATETIME", true, Some("CURRENT_TIMESTAMP"), 0),
     schema_column("closed_at", "DATETIME", false, None, 0),
     schema_column("close_reason", "TEXT", false, Some("''"), 0),
     schema_column("closed_by_session", "TEXT", false, Some("''"), 0),
@@ -1296,13 +1245,7 @@ const DEPENDENCIES_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
     schema_column("issue_id", "TEXT", true, None, 1),
     schema_column("depends_on_id", "TEXT", true, None, 2),
     schema_column("type", "TEXT", true, Some("'blocks'"), 0),
-    schema_column(
-        "created_at",
-        "DATETIME",
-        true,
-        Some("CURRENT_TIMESTAMP"),
-        0,
-    ),
+    schema_column("created_at", "DATETIME", true, Some("CURRENT_TIMESTAMP"), 0),
     schema_column("created_by", "TEXT", true, Some("''"), 0),
     schema_column("metadata", "TEXT", false, Some("'{}'"), 0),
     schema_column("thread_id", "TEXT", false, Some("''"), 0),
@@ -1318,13 +1261,7 @@ const COMMENTS_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
     schema_column("issue_id", "TEXT", true, None, 0),
     schema_column("author", "TEXT", true, None, 0),
     schema_column("text", "TEXT", true, None, 0),
-    schema_column(
-        "created_at",
-        "DATETIME",
-        true,
-        Some("CURRENT_TIMESTAMP"),
-        0,
-    ),
+    schema_column("created_at", "DATETIME", true, Some("CURRENT_TIMESTAMP"), 0),
 ];
 
 const EVENTS_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
@@ -1335,13 +1272,7 @@ const EVENTS_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
     schema_column("old_value", "TEXT", false, None, 0),
     schema_column("new_value", "TEXT", false, None, 0),
     schema_column("comment", "TEXT", false, None, 0),
-    schema_column(
-        "created_at",
-        "DATETIME",
-        true,
-        Some("CURRENT_TIMESTAMP"),
-        0,
-    ),
+    schema_column("created_at", "DATETIME", true, Some("CURRENT_TIMESTAMP"), 0),
     schema_column("agent_name", "TEXT", false, None, 0),
     schema_column("harness", "TEXT", false, None, 0),
     schema_column("model", "TEXT", false, None, 0),
@@ -1354,13 +1285,7 @@ const CONFIG_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
 const METADATA_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = CONFIG_RUNTIME_COLUMNS;
 const DIRTY_ISSUES_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
     schema_column("issue_id", "TEXT", false, None, 1),
-    schema_column(
-        "marked_at",
-        "DATETIME",
-        true,
-        Some("CURRENT_TIMESTAMP"),
-        0,
-    ),
+    schema_column("marked_at", "DATETIME", true, Some("CURRENT_TIMESTAMP"), 0),
 ];
 const EXPORT_HASHES_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
     schema_column("issue_id", "TEXT", false, None, 1),
@@ -1376,13 +1301,7 @@ const EXPORT_HASHES_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
 const BLOCKED_CACHE_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
     schema_column("issue_id", "TEXT", false, None, 1),
     schema_column("blocked_by", "TEXT", true, None, 0),
-    schema_column(
-        "blocked_at",
-        "DATETIME",
-        true,
-        Some("CURRENT_TIMESTAMP"),
-        0,
-    ),
+    schema_column("blocked_at", "DATETIME", true, Some("CURRENT_TIMESTAMP"), 0),
 ];
 const CHILD_COUNTERS_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
     schema_column("parent_id", "TEXT", false, None, 1),
@@ -1396,12 +1315,7 @@ const ISSUES_RUNTIME_INDEXES: &[ExpectedRuntimeIndex] = &[
     runtime_index("idx_issues_assignee", &["assignee"], false, true),
     runtime_index("idx_issues_created_at", &["created_at"], false, false),
     runtime_index("idx_issues_updated_at", &["updated_at"], false, false),
-    runtime_index(
-        "idx_issues_content_hash",
-        &["content_hash"],
-        false,
-        false,
-    ),
+    runtime_index("idx_issues_content_hash", &["content_hash"], false, false),
     runtime_index(
         "idx_issues_external_ref_unique",
         &["external_ref"],
@@ -1462,12 +1376,7 @@ const LABELS_RUNTIME_INDEXES: &[ExpectedRuntimeIndex] = &[
 ];
 const COMMENTS_RUNTIME_INDEXES: &[ExpectedRuntimeIndex] = &[
     runtime_index("idx_comments_issue", &["issue_id"], false, false),
-    runtime_index(
-        "idx_comments_created_at",
-        &["created_at"],
-        false,
-        false,
-    ),
+    runtime_index("idx_comments_created_at", &["created_at"], false, false),
 ];
 const EVENTS_RUNTIME_INDEXES: &[ExpectedRuntimeIndex] = &[
     runtime_index("idx_events_issue", &["issue_id"], false, false),
@@ -1491,6 +1400,14 @@ const BLOCKED_CACHE_RUNTIME_INDEXES: &[ExpectedRuntimeIndex] = &[runtime_index(
     false,
     false,
 )];
+
+// Most partial-index predicates affect only planner eligibility: SQLite will
+// not use a partial index for a query that does not imply the predicate. The
+// external-reference index is different because its UNIQUE bit is part of the
+// data model. A weaker predicate can silently admit duplicate non-NULL
+// external references, so its WHERE clause is part of the runtime contract.
+const SEMANTIC_PARTIAL_INDEX_PREDICATES: &[(&str, &str)] =
+    &[("idx_issues_external_ref_unique", "external_ref IS NOT NULL")];
 
 // Complete runtime column manifests for auxiliary tables. `Some(definition)`
 // marks a column SQLite can add without inventing audit data or installing an
@@ -1797,15 +1714,15 @@ fn auxiliary_runtime_indexes_canonical(
         return false;
     };
 
-    indexes.iter().all(|expected| {
+    let expected_indexes_match = indexes.iter().all(|expected| {
         let Some(index_row) = index_rows
             .iter()
             .find(|row| row.get(1).and_then(SqliteValue::as_text) == Some(expected.name))
         else {
             return false;
         };
-        let uniqueness_matches = index_row.get(2).and_then(SqliteValue::as_integer)
-            == Some(i64::from(expected.unique));
+        let uniqueness_matches =
+            index_row.get(2).and_then(SqliteValue::as_integer) == Some(i64::from(expected.unique));
         let explicitly_created = index_row
             .get(3)
             .and_then(SqliteValue::as_text)
@@ -1829,7 +1746,63 @@ fn auxiliary_runtime_indexes_canonical(
                         && row.get(2).and_then(SqliteValue::as_text) == Some(*expected_name)
                 },
             )
-    })
+            && semantic_partial_index_predicate_canonical(conn, expected.name)
+    });
+
+    expected_indexes_match
+        && index_rows.iter().all(|row| {
+            let unique = row
+                .get(2)
+                .and_then(SqliteValue::as_integer)
+                .is_some_and(|value| value != 0);
+            if !unique {
+                return true;
+            }
+
+            let Some(name) = row.get(1).and_then(SqliteValue::as_text) else {
+                return false;
+            };
+            match row.get(3).and_then(SqliteValue::as_text) {
+                // A canonical PRIMARY KEY may have an automatic backing index.
+                Some(origin) if origin.eq_ignore_ascii_case("pk") => true,
+                // Explicit unique indexes are accepted only when their exact
+                // name and UNIQUE shape are in this table's manifest.
+                Some(origin) if origin.eq_ignore_ascii_case("c") => indexes
+                    .iter()
+                    .any(|expected| expected.name == name && expected.unique),
+                // An automatic UNIQUE constraint (origin `u`) or an unknown
+                // origin changes which otherwise-valid rows can be written.
+                _ => false,
+            }
+        })
+}
+
+fn compact_sql_fragment(sql: &str) -> String {
+    sql.chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn semantic_partial_index_predicate_canonical(conn: &Connection, index: &str) -> bool {
+    let Some((_, predicate)) = SEMANTIC_PARTIAL_INDEX_PREDICATES
+        .iter()
+        .find(|(expected_index, _)| *expected_index == index)
+    else {
+        return true;
+    };
+    let escaped_index = index.replace('\'', "''");
+    let Ok(row) = conn.query_row(&format!(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = '{escaped_index}'"
+    )) else {
+        return false;
+    };
+    let Some(sql) = row.get(0).and_then(SqliteValue::as_text) else {
+        return false;
+    };
+    let normalized = compact_sql_fragment(sql);
+    let expected_suffix = format!("where{}", compact_sql_fragment(predicate));
+    normalized.trim_end_matches(';').ends_with(&expected_suffix)
 }
 
 fn auxiliary_runtime_table_canonical(
@@ -1852,12 +1825,8 @@ fn core_runtime_default_matches(
     sql_default_matches(actual, expected)
         || matches!(
             (table, column, actual, expected),
-            (
-                "comments",
-                "author" | "text",
-                Some("''"),
-                None
-            ) | ("events", "event_type", Some("''"), None)
+            ("comments", "author" | "text", Some("''"), None)
+                | ("events", "event_type", Some("''"), None)
         )
 }
 
@@ -1876,32 +1845,34 @@ fn core_runtime_columns_canonical(
     }
 
     columns.iter().enumerate().all(|(position, expected)| {
-        let matches = |row: &Vec<SqliteValue>| {
-            let name = row.get(1).and_then(SqliteValue::as_text);
-            let data_type = row.get(2).and_then(SqliteValue::as_text);
-            let not_null = row
-                .get(3)
-                .and_then(SqliteValue::as_integer)
-                .is_some_and(|value| value != 0);
-            let default_value = row.get(4).and_then(SqliteValue::as_text);
-            let primary_key_position = row.get(5).and_then(SqliteValue::as_integer);
-            name == Some(expected.name)
-                && data_type.is_some_and(|value| value.eq_ignore_ascii_case(expected.data_type))
-                && not_null == expected.not_null
-                && core_runtime_default_matches(
-                    table,
-                    expected.name,
-                    default_value,
-                    expected.default_value,
-                )
-                && primary_key_position == Some(expected.primary_key_position)
-        };
         if order_sensitive {
-            rows.get(position).is_some_and(matches)
+            rows.get(position)
+                .is_some_and(|row| core_runtime_column_matches(table, row, expected))
         } else {
-            rows.iter().any(matches)
+            rows.iter()
+                .any(|row| core_runtime_column_matches(table, row, expected))
         }
     })
+}
+
+fn core_runtime_column_matches(
+    table: &str,
+    row: &[SqliteValue],
+    expected: &ExpectedSchemaColumn,
+) -> bool {
+    let name = row.get(1).and_then(SqliteValue::as_text);
+    let data_type = row.get(2).and_then(SqliteValue::as_text);
+    let not_null = row
+        .get(3)
+        .and_then(SqliteValue::as_integer)
+        .is_some_and(|value| value != 0);
+    let default_value = row.get(4).and_then(SqliteValue::as_text);
+    let primary_key_position = row.get(5).and_then(SqliteValue::as_integer);
+    name == Some(expected.name)
+        && data_type.is_some_and(|value| value.eq_ignore_ascii_case(expected.data_type))
+        && not_null == expected.not_null
+        && core_runtime_default_matches(table, expected.name, default_value, expected.default_value)
+        && primary_key_position == Some(expected.primary_key_position)
 }
 
 fn core_runtime_foreign_keys_canonical(
@@ -1919,8 +1890,7 @@ fn core_runtime_foreign_keys_canonical(
             .zip(issue_reference_columns)
             .enumerate()
             .all(|(sequence, (row, from))| {
-                row.get(1).and_then(SqliteValue::as_integer)
-                    == i64::try_from(sequence).ok()
+                row.get(1).and_then(SqliteValue::as_integer) == i64::try_from(sequence).ok()
                     && row.get(2).and_then(SqliteValue::as_text) == Some("issues")
                     && row.get(3).and_then(SqliteValue::as_text) == Some(*from)
                     && row.get(4).and_then(SqliteValue::as_text) == Some("id")
@@ -1964,31 +1934,22 @@ fn core_runtime_table_canonical(
 }
 
 fn issues_required_checks_canonical(conn: &Connection) -> bool {
-    let Ok(row) = conn.query_row(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'issues'",
-    ) else {
+    let Ok(row) =
+        conn.query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'issues'")
+    else {
         return false;
     };
     let Some(sql) = row.get(0).and_then(SqliteValue::as_text) else {
         return false;
     };
-    let normalized = sql
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
-    normalized.contains("check(length(title) <= 500)")
-        && normalized.contains("check(priority >= 0 and priority <= 4)")
-        && normalized.contains("status = 'closed' and closed_at is not null")
-        && normalized.contains("status = 'tombstone'")
-        && normalized.contains("status not in ('closed', 'tombstone') and closed_at is null")
-}
-
-fn table_has_columns(conn: &Connection, table: &str, required_columns: &[&str]) -> bool {
-    table_exists(conn, table)
-        && required_columns
-            .iter()
-            .all(|column| column_exists(conn, table, column))
+    let normalized = compact_sql_fragment(sql);
+    [
+        "CHECK(length(title) <= 500)",
+        "CHECK(priority >= 0 AND priority <= 4)",
+        ISSUES_CLOSED_AT_CHECK,
+    ]
+    .iter()
+    .all(|required| normalized.contains(&compact_sql_fragment(required)))
 }
 
 fn blocked_cache_table_canonical(conn: &Connection) -> bool {
@@ -2038,24 +1999,6 @@ fn current_schema_version_declared(conn: &Connection) -> bool {
         .ok()
         .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
         .is_some_and(|version| version == i64::from(CURRENT_SCHEMA_VERSION))
-}
-
-fn core_runtime_tables_exist(conn: &Connection) -> bool {
-    [
-        "issues",
-        "dependencies",
-        "labels",
-        "comments",
-        "events",
-        "config",
-        "metadata",
-        "dirty_issues",
-        "export_hashes",
-        "blocked_issues_cache",
-        "child_counters",
-    ]
-    .iter()
-    .all(|table| table_exists(conn, table))
 }
 
 /// Expected column order for the issues table (id + ISSUE_COLUMNS names).
@@ -5723,6 +5666,124 @@ mod tests {
             "unexpected repair error: {error}"
         );
         assert!(attest_runtime_schema_cookie(&conn).is_err());
+    }
+
+    #[test]
+    fn test_runtime_schema_contract_rejects_core_table_without_pk_or_cascade() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("noncanonical_labels.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+
+        execute_batch(
+            &conn,
+            r"
+            DROP INDEX IF EXISTS idx_labels_label;
+            DROP INDEX IF EXISTS idx_labels_issue;
+            DROP TABLE labels;
+            CREATE TABLE labels (
+                issue_id TEXT NOT NULL,
+                label TEXT NOT NULL
+            );
+            CREATE INDEX idx_labels_label ON labels(label);
+            CREATE INDEX idx_labels_issue ON labels(issue_id);
+            ",
+        )
+        .expect("plant exact core names and indexes without PK or cascade");
+
+        assert!(current_schema_version_declared(&conn));
+        assert!(
+            !runtime_schema_compatible(&conn),
+            "core column and index names must not hide missing PK/cascade semantics"
+        );
+        assert!(
+            attest_runtime_schema_cookie(&conn).is_err(),
+            "a malformed core table must never mint a durable witness"
+        );
+    }
+
+    #[test]
+    fn test_runtime_schema_contract_rejects_weakened_external_ref_unique_predicate() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("weakened_external_ref_index.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+
+        execute_batch(
+            &conn,
+            r"
+            DROP INDEX idx_issues_external_ref_unique;
+            CREATE UNIQUE INDEX idx_issues_external_ref_unique
+                ON issues(external_ref) WHERE 0;
+            INSERT INTO issues (id, title, external_ref)
+                VALUES ('external-ref-a', 'External ref A', 'shared-ref');
+            INSERT INTO issues (id, title, external_ref)
+                VALUES ('external-ref-b', 'External ref B', 'shared-ref');
+            ",
+        )
+        .expect("the weakened predicate must actually admit duplicate non-NULL references");
+
+        assert!(
+            !runtime_schema_compatible(&conn),
+            "the semantic UNIQUE predicate is part of the runtime contract"
+        );
+        assert!(attest_runtime_schema_cookie(&conn).is_err());
+    }
+
+    #[test]
+    fn test_runtime_schema_contract_rejects_unexpected_unique_index() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("unexpected_unique_index.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+
+        execute_batch(
+            &conn,
+            r"
+            INSERT INTO issues (id, title) VALUES ('label-owner-a', 'Label owner A');
+            INSERT INTO issues (id, title) VALUES ('label-owner-b', 'Label owner B');
+            CREATE UNIQUE INDEX rogue_unique_label ON labels(label);
+            INSERT INTO labels (issue_id, label) VALUES ('label-owner-a', 'shared');
+            ",
+        )
+        .expect("plant an unexpected write-restricting index");
+        let duplicate_label =
+            conn.execute("INSERT INTO labels (issue_id, label) VALUES ('label-owner-b', 'shared')");
+        assert!(
+            duplicate_label.is_err(),
+            "the planted index must materially reject otherwise-valid label sharing"
+        );
+
+        assert!(
+            !runtime_schema_compatible(&conn),
+            "unexpected UNIQUE indexes must not pass the runtime contract"
+        );
+        assert!(attest_runtime_schema_cookie(&conn).is_err());
+    }
+
+    #[test]
+    fn test_runtime_schema_witness_rejects_prior_contract_token() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("prior_runtime_schema_witness.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+        let cookie = attest_runtime_schema_cookie(&conn).expect("attest current schema");
+        let prior_witness = format!(
+            "schema-{CURRENT_SCHEMA_VERSION}.contract-v2-exact-columns-fks-indexes-history-autoincrement-cookie-fenced.cookie-{cookie}"
+        );
+        conn.execute_with_params(
+            "INSERT INTO metadata (key, value) VALUES (?, ?)",
+            &[
+                SqliteValue::from(RUNTIME_SCHEMA_WITNESS_KEY),
+                SqliteValue::from(prior_witness),
+            ],
+        )
+        .expect("plant prior-contract witness at the current cookie");
+
+        assert!(
+            !runtime_schema_witness_matches(&conn),
+            "a witness minted under the weaker contract must force full re-attestation"
+        );
     }
 
     #[test]

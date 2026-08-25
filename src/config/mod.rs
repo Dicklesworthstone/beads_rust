@@ -2041,7 +2041,7 @@ fn expected_recovery_artifact_fingerprint(
     }
 }
 
-fn verify_recovery_backup_set(backup_set: &RecoveryBackupSet) -> Result<()> {
+fn verify_recovery_backup_manifest(backup_set: &RecoveryBackupSet) -> Result<()> {
     if backup_set.files.len() != backup_set.verified_files.len() {
         return Err(BeadsError::SyncConflict {
             message: format!(
@@ -2050,10 +2050,8 @@ fn verify_recovery_backup_set(backup_set: &RecoveryBackupSet) -> Result<()> {
             ),
         });
     }
-    for ((original, backup), verification) in backup_set
-        .files
-        .iter()
-        .zip(&backup_set.verified_files)
+    for ((original, backup), verification) in
+        backup_set.files.iter().zip(&backup_set.verified_files)
     {
         if verification.original != original.display().to_string()
             || verification.backup != backup.display().to_string()
@@ -2065,6 +2063,13 @@ fn verify_recovery_backup_set(backup_set: &RecoveryBackupSet) -> Result<()> {
                 ),
             });
         }
+    }
+    Ok(())
+}
+
+fn verify_recovery_backup_set(backup_set: &RecoveryBackupSet) -> Result<()> {
+    verify_recovery_backup_manifest(backup_set)?;
+    for ((_, backup), verification) in backup_set.files.iter().zip(&backup_set.verified_files) {
         verify_recovery_backup_artifact(
             backup,
             &expected_recovery_artifact_fingerprint(verification),
@@ -2077,6 +2082,189 @@ fn verify_recovery_backup_set(backup_set: &RecoveryBackupSet) -> Result<()> {
 enum MissingRenameSourcePolicy {
     Skip,
     Error,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn rename_recovery_path_no_replace(from: &Path, to: &Path) -> Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+    match renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(()),
+        Err(error) if error == rustix::io::Errno::EXIST => Err(BeadsError::SyncConflict {
+            message: format!(
+                "Refusing to replace recovery namespace target '{}' while moving '{}'",
+                to.display(),
+                from.display()
+            ),
+        }),
+        Err(error) => Err(BeadsError::Io(std::io::Error::from(error))),
+    }
+}
+
+#[cfg(windows)]
+fn rename_recovery_path_no_replace(from: &Path, to: &Path) -> Result<()> {
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(error) => match fs::symlink_metadata(to) {
+            Ok(_) => Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Refusing to replace recovery namespace target '{}' while moving '{}'",
+                    to.display(),
+                    from.display()
+                ),
+            }),
+            Err(inspect_error) if inspect_error.kind() == std::io::ErrorKind::NotFound => {
+                Err(BeadsError::Io(error))
+            }
+            Err(inspect_error) => Err(BeadsError::WithContext {
+                context: format!(
+                    "Failed to inspect recovery namespace target '{}' after rename failed",
+                    to.display()
+                ),
+                source: Box::new(inspect_error),
+            }),
+        },
+    }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    windows
+)))]
+fn rename_recovery_path_no_replace(_from: &Path, _to: &Path) -> Result<()> {
+    Err(BeadsError::Config(
+        "This platform does not provide the atomic no-replace primitive required for database recovery restore"
+            .to_string(),
+    ))
+}
+
+fn rollback_renamed_paths_no_replace(
+    renamed_paths: &[RecoveryBackupPath],
+    operation: &str,
+) -> Result<()> {
+    let mut first_sync_error = None;
+    for (original, renamed) in renamed_paths.iter().rev() {
+        rename_recovery_path_no_replace(renamed, original).map_err(|error| {
+            BeadsError::WithContext {
+                context: format!(
+                    "Failed to roll back {operation}: restore '{}' from '{}' without replacing an existing path",
+                    original.display(),
+                    renamed.display()
+                ),
+                source: Box::new(error),
+            }
+        })?;
+        if let Err(error) = crate::util::sync_rename_parent_directories(renamed, original)
+            && first_sync_error.is_none()
+        {
+            first_sync_error = Some(BeadsError::WithContext {
+                context: format!(
+                    "Rolled back {operation}, but failed to make the restored namespace durable"
+                ),
+                source: Box::new(error),
+            });
+        }
+    }
+
+    first_sync_error.map_or(Ok(()), Err)
+}
+
+fn rename_existing_paths_no_replace<I>(
+    paths: I,
+    operation: &str,
+    missing_source_policy: MissingRenameSourcePolicy,
+) -> Result<Vec<RecoveryBackupPath>>
+where
+    I: IntoIterator<Item = (PathBuf, PathBuf)>,
+{
+    let mut renamed_paths = Vec::new();
+
+    for (original, renamed) in paths {
+        match fs::symlink_metadata(&original) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if matches!(missing_source_policy, MissingRenameSourcePolicy::Skip) {
+                    continue;
+                }
+                let rename_error = BeadsError::WithContext {
+                    context: format!("Failed to {operation}"),
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("expected '{}' to exist", original.display()),
+                    )),
+                };
+                if let Err(rollback_error) =
+                    rollback_renamed_paths_no_replace(&renamed_paths, operation)
+                {
+                    return Err(BeadsError::WithContext {
+                        context: format!(
+                            "Failed to {operation} ({rename_error}); rollback also failed"
+                        ),
+                        source: Box::new(rollback_error),
+                    });
+                }
+                return Err(rename_error);
+            }
+            Err(error) => {
+                let rename_error = BeadsError::WithContext {
+                    context: format!(
+                        "Failed to inspect '{}' before attempting to {operation}",
+                        original.display()
+                    ),
+                    source: Box::new(error),
+                };
+                if let Err(rollback_error) =
+                    rollback_renamed_paths_no_replace(&renamed_paths, operation)
+                {
+                    return Err(BeadsError::WithContext {
+                        context: format!(
+                            "Failed to {operation} ({rename_error}); rollback also failed"
+                        ),
+                        source: Box::new(rollback_error),
+                    });
+                }
+                return Err(rename_error);
+            }
+        }
+
+        if let Err(rename_error) = rename_recovery_path_no_replace(&original, &renamed) {
+            if let Err(rollback_error) =
+                rollback_renamed_paths_no_replace(&renamed_paths, operation)
+            {
+                return Err(BeadsError::WithContext {
+                    context: format!(
+                        "Failed to {operation} ({rename_error}); rollback also failed"
+                    ),
+                    source: Box::new(rollback_error),
+                });
+            }
+            return Err(rename_error);
+        }
+
+        renamed_paths.push((original.clone(), renamed.clone()));
+        if let Err(sync_error) = crate::util::sync_rename_parent_directories(&original, &renamed) {
+            if let Err(rollback_error) =
+                rollback_renamed_paths_no_replace(&renamed_paths, operation)
+            {
+                return Err(BeadsError::WithContext {
+                    context: format!(
+                        "Completed a namespace rename while attempting to {operation}, but parent-directory sync failed ({sync_error}); rollback also failed"
+                    ),
+                    source: Box::new(rollback_error),
+                });
+            }
+            return Err(BeadsError::WithContext {
+                context: format!(
+                    "Completed and rolled back a namespace rename while attempting to {operation}, but parent-directory sync failed"
+                ),
+                source: Box::new(sync_error),
+            });
+        }
+    }
+
+    Ok(renamed_paths)
 }
 
 fn rename_existing_paths<I>(
