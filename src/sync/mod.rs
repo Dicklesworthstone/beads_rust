@@ -631,6 +631,7 @@ impl DatabaseFamilyWriteLock {
     /// The replacement is locked before it becomes visible at the canonical
     /// database path. A hard-link alias therefore cannot acquire a competing
     /// inode authority in the interval between creation and binding.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn install_empty_database_replacement_and_bind(
         &self,
     ) -> Result<FreshDatabaseReplacementWitness> {

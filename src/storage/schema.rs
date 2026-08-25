@@ -2465,6 +2465,7 @@ fn run_pre_schema_migrations(conn: &Connection) -> Result<bool> {
     Ok(issues_rebuilt)
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
     let version_ok = current_schema_version_declared(conn);
     let issues_ok = core_runtime_table_canonical(

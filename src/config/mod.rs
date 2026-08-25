@@ -1900,12 +1900,15 @@ fn recovery_restore_failure(
 fn rollback_renamed_paths(renamed_paths: &[RecoveryBackupPath], operation: &str) -> Result<()> {
     let mut first_sync_error = None;
     for (original, renamed) in renamed_paths.iter().rev() {
-        fs::rename(renamed, original).with_context(|| {
-            format!(
-                "Failed to roll back {operation}: restore '{}' from '{}'",
-                original.display(),
-                renamed.display()
-            )
+        rename_recovery_path_no_replace(renamed, original).map_err(|error| {
+            BeadsError::WithContext {
+                context: format!(
+                    "Failed to roll back {operation}: restore '{}' from '{}' without replacing an existing path",
+                    original.display(),
+                    renamed.display()
+                ),
+                source: Box::new(error),
+            }
         })?;
         if let Err(error) = crate::util::sync_rename_parent_directories(renamed, original)
             && first_sync_error.is_none()
@@ -2267,101 +2270,6 @@ where
     Ok(renamed_paths)
 }
 
-fn rename_existing_paths<I>(
-    paths: I,
-    operation: &str,
-    missing_source_policy: MissingRenameSourcePolicy,
-) -> Result<Vec<RecoveryBackupPath>>
-where
-    I: IntoIterator<Item = (PathBuf, PathBuf)>,
-{
-    let mut renamed_paths = Vec::new();
-
-    for (original, renamed) in paths {
-        match fs::symlink_metadata(&original) {
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                if matches!(missing_source_policy, MissingRenameSourcePolicy::Skip) {
-                    continue;
-                }
-
-                let rename_err = BeadsError::WithContext {
-                    context: format!("Failed to {operation}"),
-                    source: Box::new(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("expected '{}' to exist", original.display()),
-                    )),
-                };
-                if let Err(rollback_err) = rollback_renamed_paths(&renamed_paths, operation) {
-                    return Err(BeadsError::WithContext {
-                        context: format!(
-                            "Failed to {operation} ({rename_err}); rollback also failed"
-                        ),
-                        source: Box::new(rollback_err),
-                    });
-                }
-
-                return Err(rename_err);
-            }
-            Err(err) => {
-                let rename_err = BeadsError::WithContext {
-                    context: format!(
-                        "Failed to inspect '{}' before attempting to {operation}",
-                        original.display()
-                    ),
-                    source: Box::new(err),
-                };
-                if let Err(rollback_err) = rollback_renamed_paths(&renamed_paths, operation) {
-                    return Err(BeadsError::WithContext {
-                        context: format!(
-                            "Failed to {operation} ({rename_err}); rollback also failed"
-                        ),
-                        source: Box::new(rollback_err),
-                    });
-                }
-
-                return Err(rename_err);
-            }
-        }
-
-        if let Err(rename_err) = fs::rename(&original, &renamed) {
-            if let Err(rollback_err) = rollback_renamed_paths(&renamed_paths, operation) {
-                warn!(
-                    operation,
-                    rollback_error = %rollback_err,
-                    "Failed to roll back partially completed file rename batch"
-                );
-                return Err(BeadsError::WithContext {
-                    context: format!("Failed to {operation} ({rename_err}); rollback also failed"),
-                    source: Box::new(rollback_err),
-                });
-            }
-
-            return Err(rename_err.into());
-        }
-
-        renamed_paths.push((original.clone(), renamed.clone()));
-        if let Err(sync_err) = crate::util::sync_rename_parent_directories(&original, &renamed) {
-            if let Err(rollback_err) = rollback_renamed_paths(&renamed_paths, operation) {
-                return Err(BeadsError::WithContext {
-                    context: format!(
-                        "Completed a namespace rename while attempting to {operation}, but parent-directory sync failed ({sync_err}); rollback also failed"
-                    ),
-                    source: Box::new(rollback_err),
-                });
-            }
-            return Err(BeadsError::WithContext {
-                context: format!(
-                    "Completed and rolled back a namespace rename while attempting to {operation}, but parent-directory sync failed"
-                ),
-                source: Box::new(sync_err),
-            });
-        }
-    }
-
-    Ok(renamed_paths)
-}
-
 #[allow(clippy::too_many_lines)]
 fn rename_existing_paths_with_backup_verification<I>(
     paths: I,
@@ -2421,7 +2329,7 @@ where
             }
         };
 
-        if let Err(rename_err) = fs::rename(&original, &renamed) {
+        if let Err(rename_err) = rename_recovery_path_no_replace(&original, &renamed) {
             if let Err(rollback_err) = rollback_renamed_paths(&renamed_paths, operation) {
                 warn!(
                     operation,
@@ -2434,7 +2342,7 @@ where
                 });
             }
 
-            return Err(rename_err.into());
+            return Err(rename_err);
         }
 
         renamed_paths.push((original.clone(), renamed.clone()));
@@ -3121,18 +3029,17 @@ where
             ));
         }
     };
-    if !backup_set.had_original_database {
-        if let Err(sidecar_err) = write_authority
+    if !backup_set.had_original_database
+        && let Err(sidecar_err) = write_authority
             .verify_fresh_database_replacement_witness(&fresh_witness)
             .and_then(|()| move_orphaned_database_sidecars_to_recovery(&mut backup_set))
-        {
-            return Err(finish_failed_database_recovery(
-                &backup_set,
-                write_authority,
-                sidecar_err,
-                RecoveryFailurePhase::Install,
-            ));
-        }
+    {
+        return Err(finish_failed_database_recovery(
+            &backup_set,
+            write_authority,
+            sidecar_err,
+            RecoveryFailurePhase::Install,
+        ));
     }
 
     match rebuild(fresh_witness) {
@@ -3202,18 +3109,7 @@ fn rollback_database_family_after_recovery_failure(
     use crate::sync::DatabaseTargetAuthorityState;
 
     let target_state = write_authority.database_target_authority_state()?;
-    let live_sidecar_exists = database_family_paths(&backup_set.db_path)
-        .into_iter()
-        .skip(1)
-        .try_fold(false, |found, path| match fs::symlink_metadata(path) {
-            Ok(_) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(found),
-            Err(error) => Err(BeadsError::WithContext {
-                context: "Failed to inspect the live database family before recovery rollback"
-                    .to_string(),
-                source: Box::new(error),
-            }),
-        })?;
+    let live_sidecar_exists = database_family_has_live_sidecars(&backup_set.db_path)?;
     let preserve_live_target = target_state == DatabaseTargetAuthorityState::Foreign
         || (target_state == DatabaseTargetAuthorityState::Missing && live_sidecar_exists)
         || (phase == RecoveryFailurePhase::Install
@@ -3229,7 +3125,24 @@ fn rollback_database_family_after_recovery_failure(
         return Ok(RecoveryRollbackDisposition::PreservedLiveTarget);
     }
 
-    restore_database_family_after_failed_rebuild(backup_set)?;
+    restore_database_family_after_failed_rebuild_before_live_staging(backup_set, || {
+        let late_target_state = write_authority.database_target_authority_state()?;
+        let late_sidecar_exists = database_family_has_live_sidecars(&backup_set.db_path)?;
+        let late_target_must_be_preserved = late_target_state
+            == DatabaseTargetAuthorityState::Foreign
+            || (late_target_state == DatabaseTargetAuthorityState::Missing && late_sidecar_exists)
+            || (phase == RecoveryFailurePhase::Install
+                && late_target_state == DatabaseTargetAuthorityState::Held
+                && late_sidecar_exists);
+        if late_target_state != target_state || late_target_must_be_preserved {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Refusing recovery rollback because the live database family changed while its backups were being claimed (expected {target_state:?}, found {late_target_state:?}); it was left untouched"
+                ),
+            });
+        }
+        Ok(())
+    })?;
     if backup_set.had_original_database {
         write_authority.restore_retained_database_inode_after_authorized_replace()?;
     } else {
@@ -3237,6 +3150,23 @@ fn rollback_database_family_after_recovery_failure(
     }
     write_authority.verify_database_authority()?;
     Ok(RecoveryRollbackDisposition::Restored)
+}
+
+fn database_family_has_live_sidecars(db_path: &Path) -> Result<bool> {
+    database_family_paths(db_path)
+        .into_iter()
+        .skip(1)
+        .try_fold(false, |found, path| match fs::symlink_metadata(&path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(found),
+            Err(error) => Err(BeadsError::WithContext {
+                context: format!(
+                    "Failed to inspect live database-family sidecar '{}' during recovery rollback",
+                    path.display()
+                ),
+                source: Box::new(error),
+            }),
+        })
 }
 
 fn prepare_database_family_backup_for_recovery(
@@ -3465,6 +3395,7 @@ fn database_family_has_live_paths(db_path: &Path) -> Result<bool> {
         })
 }
 
+#[allow(clippy::too_many_lines)]
 fn restore_database_family_after_failed_rebuild_with_hooks<B, R>(
     backup_set: &RecoveryBackupSet,
     before_live_staging: B,
@@ -4510,7 +4441,7 @@ fn open_sqlite_storage_for_startup(
                 },
                 None,
             )),
-            Ok(Some(_)) | Ok(None) => open_sqlite_storage_with_recovery_after_fast_open_miss(
+            Ok(Some(_) | None) => open_sqlite_storage_with_recovery_after_fast_open_miss(
                 beads_dir,
                 paths,
                 lock_timeout,
