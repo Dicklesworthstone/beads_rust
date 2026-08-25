@@ -16253,12 +16253,12 @@ fn preflight_effective_schema_before_writable_open(db_path: &Path) -> Result<()>
     Ok(())
 }
 
-/// Prove that chmod cannot precede a known or WAL-uncertain future schema.
+/// Prove that chmod cannot precede an effective future schema.
 ///
-/// A 32-byte SQLite WAL contains only its header; it has no frames and cannot
-/// override page 1's user_version. Any larger or malformed WAL is left
-/// untouched because the effective version cannot be proven without opening
-/// the engine, and the over-permissive namespace sidecar prevents that open.
+/// The main-header and WAL witnesses are read through stable no-follow
+/// handles. WAL page one is resolved with SQLite's recovery scan rules, so a
+/// valid committed version overrides the main header while reused, partial, or
+/// uncommitted tail bytes do not authorize or block a repair.
 fn verify_namespace_healing_schema_precondition(db_path: &Path) -> Result<()> {
     let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
     let header_version = checked_database_header_user_version(db_path)?.ok_or_else(|| {
@@ -29497,6 +29497,141 @@ mod tests {
             directory_bytes_and_modes(temp.path()),
             family_before,
             "invalid header-only WAL refusal must be byte and mode neutral"
+        );
+    }
+
+    #[test]
+    fn test_wal_preflight_stops_at_reused_or_partial_crash_tail() {
+        let salts = (0x1020_3040, 0x5060_7080);
+        for tail_kind in ["reused", "partial"] {
+            let temp = TempDir::new().unwrap();
+            let db_path = temp.path().join(format!("{tail_kind}_wal_tail.db"));
+            let wal_path = database_sidecar_path(&db_path, "-wal");
+            let (mut wal, mut running_checksum) = synthetic_wal_header(salts);
+            append_synthetic_wal_frame(
+                &mut wal,
+                &mut running_checksum,
+                1,
+                1,
+                salts,
+                Some(73),
+            );
+            if tail_kind == "reused" {
+                append_synthetic_wal_frame(
+                    &mut wal,
+                    &mut running_checksum,
+                    2,
+                    2,
+                    (salts.0 ^ 1, salts.1),
+                    None,
+                );
+            } else {
+                wal.extend_from_slice(&[0xA5; 37]);
+            }
+            fs::write(&wal_path, &wal).unwrap();
+            let bytes_before = fs::read(&wal_path).unwrap();
+
+            let preflight = sqlite_wal_schema_preflight(&db_path).unwrap();
+
+            assert_eq!(
+                preflight.committed_user_version,
+                Some(73),
+                "{tail_kind} bytes after the last valid commit must not override page one"
+            );
+            assert_eq!(
+                fs::read(&wal_path).unwrap(),
+                bytes_before,
+                "{tail_kind} tail recovery must be byte neutral"
+            );
+        }
+    }
+
+    #[test]
+    fn test_wal_preflight_ignores_valid_uncommitted_page_one_tail() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("uncommitted_page_one_tail.db");
+        let wal_path = database_sidecar_path(&db_path, "-wal");
+        let salts = (0x1122_3344, 0x5566_7788);
+        let (mut wal, mut running_checksum) = synthetic_wal_header(salts);
+        append_synthetic_wal_frame(
+            &mut wal,
+            &mut running_checksum,
+            1,
+            1,
+            salts,
+            Some(81),
+        );
+        append_synthetic_wal_frame(
+            &mut wal,
+            &mut running_checksum,
+            1,
+            0,
+            salts,
+            Some(9_999),
+        );
+        fs::write(&wal_path, &wal).unwrap();
+        let bytes_before = fs::read(&wal_path).unwrap();
+
+        let preflight = sqlite_wal_schema_preflight(&db_path).unwrap();
+
+        assert_eq!(
+            preflight.committed_user_version,
+            Some(81),
+            "a checksum-valid page-one frame after the last commit is not effective"
+        );
+        assert_eq!(fs::read(&wal_path).unwrap(), bytes_before);
+
+        let no_commit_path = temp.path().join("only_uncommitted_page_one.db");
+        let no_commit_wal_path = database_sidecar_path(&no_commit_path, "-wal");
+        let (mut no_commit_wal, mut no_commit_checksum) = synthetic_wal_header(salts);
+        append_synthetic_wal_frame(
+            &mut no_commit_wal,
+            &mut no_commit_checksum,
+            1,
+            0,
+            salts,
+            Some(9_999),
+        );
+        fs::write(&no_commit_wal_path, &no_commit_wal).unwrap();
+        assert_eq!(
+            sqlite_wal_schema_preflight(&no_commit_path)
+                .unwrap()
+                .committed_user_version,
+            None,
+            "without any valid commit the database header remains authoritative"
+        );
+    }
+
+    #[test]
+    fn test_wal_preflight_rejects_checksum_valid_impossible_commit_size() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("impossible_commit_size.db");
+        let wal_path = database_sidecar_path(&db_path, "-wal");
+        let salts = (0x1357_9BDF, 0x2468_ACE0);
+        let (mut wal, mut running_checksum) = synthetic_wal_header(salts);
+        append_synthetic_wal_frame(
+            &mut wal,
+            &mut running_checksum,
+            2,
+            1,
+            salts,
+            None,
+        );
+        fs::write(&wal_path, &wal).unwrap();
+        let bytes_before = fs::read(&wal_path).unwrap();
+
+        let error = sqlite_wal_schema_preflight(&db_path)
+            .expect_err("a commit cannot shrink below the page carried by its commit frame");
+
+        assert!(
+            error.to_string().contains("database size 1")
+                && error.to_string().contains("page number 2"),
+            "unexpected malformed commit refusal: {error}"
+        );
+        assert_eq!(
+            fs::read(&wal_path).unwrap(),
+            bytes_before,
+            "malformed commit refusal must not rewrite the WAL"
         );
     }
 
