@@ -1721,18 +1721,16 @@ fn runtime_index_key_shape_canonical(
         })
         .collect::<Vec<_>>();
     key_rows.len() == expected_columns.len()
-        && key_rows
-            .iter()
-            .zip(expected_columns)
-            .enumerate()
-            .all(|(position, (row, expected_name))| {
+        && key_rows.iter().zip(expected_columns).enumerate().all(
+            |(position, (row, expected_name))| {
                 row.get(0).and_then(SqliteValue::as_integer) == i64::try_from(position).ok()
                     && row.get(2).and_then(SqliteValue::as_text) == Some(*expected_name)
                     && row
                         .get(4)
                         .and_then(SqliteValue::as_text)
                         .is_some_and(|collation| collation.eq_ignore_ascii_case("BINARY"))
-            })
+            },
+        )
 }
 
 fn auxiliary_runtime_indexes_canonical(
@@ -1910,9 +1908,7 @@ fn sql_evidence_tokens(sql: &str) -> Vec<SqlEvidenceToken> {
         }
         if byte == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'*' {
             index += 2;
-            while index + 1 < bytes.len()
-                && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
-            {
+            while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
                 index += 1;
             }
             index = (index + 2).min(bytes.len());
@@ -4289,13 +4285,32 @@ mod tests {
             "INTEGER PRIMARY KEY AUTOINCREMENT",
             "INTEGER PRIMARY KEY /* id INTEGER PRIMARY KEY AUTOINCREMENT */",
         );
+        let string_spoofed_autoincrement = GATE_RESULT_HISTORY_MIGRATION_SQL.replace(
+            "INTEGER PRIMARY KEY AUTOINCREMENT",
+            "INTEGER PRIMARY KEY CHECK('id INTEGER PRIMARY KEY AUTOINCREMENT' IS NOT NULL)",
+        );
+        let quoted_identifier_spoofed_autoincrement = GATE_RESULT_HISTORY_MIGRATION_SQL
+            .replace("INTEGER PRIMARY KEY AUTOINCREMENT", "INTEGER PRIMARY KEY")
+            .replace(
+                "        FOREIGN KEY (issue_id)",
+                "        CONSTRAINT \"id INTEGER PRIMARY KEY AUTOINCREMENT\" CHECK (1),\n\
+                 FOREIGN KEY (issue_id)",
+            );
 
         for (label, schema_sql) in [
             ("column_type", malformed_type),
             ("foreign_key", malformed_foreign_key),
             ("index_order", malformed_index),
             ("autoincrement", malformed_autoincrement),
-            ("comment_spoofed_autoincrement", comment_spoofed_autoincrement),
+            (
+                "comment_spoofed_autoincrement",
+                comment_spoofed_autoincrement,
+            ),
+            ("string_spoofed_autoincrement", string_spoofed_autoincrement),
+            (
+                "quoted_identifier_spoofed_autoincrement",
+                quoted_identifier_spoofed_autoincrement,
+            ),
         ] {
             let (_temp, conn) = reviewed_v14_with_gate_history_schema(&schema_sql);
             let error = run_migrations_atomic(
@@ -5994,10 +6009,7 @@ mod tests {
             "NOCASE must materially reject references the canonical BINARY index permits"
         );
         assert!(
-            semantic_partial_index_predicate_canonical(
-                &conn,
-                "idx_issues_external_ref_unique"
-            ),
+            semantic_partial_index_predicate_canonical(&conn, "idx_issues_external_ref_unique"),
             "the fixture must retain the canonical partial-index predicate"
         );
         assert!(
@@ -6099,10 +6111,13 @@ mod tests {
             (status = 'closed' AND closed_at IS NOT NULL) OR
             (status = 'tombstone') OR
             (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL)
-        )",
+            )",
             &format!("        CHECK (1) /* {ISSUES_CLOSED_AT_CHECK} */"),
         );
-        assert_ne!(schema, SCHEMA_SQL, "the fixture must weaken the issue checks");
+        assert_ne!(
+            schema, SCHEMA_SQL,
+            "the fixture must weaken the issue checks"
+        );
         execute_batch(&conn, &schema).expect("install comment-spoofed schema");
         conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
             .expect("stamp current version without applying canonical checks");
@@ -6145,6 +6160,37 @@ mod tests {
         );
         assert!(!runtime_schema_compatible(&conn));
         assert!(attest_runtime_schema_cookie(&conn).is_err());
+    }
+
+    #[test]
+    fn test_sql_evidence_requires_unquoted_schema_tokens() {
+        let title_check = "CHECK(length(title) <= 500)";
+        assert!(sql_contains_token_sequence(
+            "title TEXT CHECK(length(title) <= 500)",
+            title_check,
+        ));
+        assert!(!sql_contains_token_sequence(
+            r#"CONSTRAINT "CHECK(length(title) <= 500)" CHECK (1)"#,
+            title_check,
+        ));
+        assert!(!sql_contains_token_sequence(
+            "CHECK('CHECK(length(title) <= 500)' IS NOT NULL)",
+            title_check,
+        ));
+
+        let autoincrement = "id INTEGER PRIMARY KEY AUTOINCREMENT";
+        assert!(sql_contains_token_sequence(
+            "id INTEGER PRIMARY KEY AUTOINCREMENT",
+            autoincrement,
+        ));
+        assert!(!sql_contains_token_sequence(
+            r#"id INTEGER PRIMARY KEY, CONSTRAINT "id INTEGER PRIMARY KEY AUTOINCREMENT" CHECK (1)"#,
+            autoincrement,
+        ));
+        assert!(!sql_contains_token_sequence(
+            "id INTEGER PRIMARY KEY CHECK('id INTEGER PRIMARY KEY AUTOINCREMENT' IS NOT NULL)",
+            autoincrement,
+        ));
     }
 
     #[test]

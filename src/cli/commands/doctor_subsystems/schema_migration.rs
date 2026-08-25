@@ -756,13 +756,25 @@ fn run_post_migration_maintenance(
     ensure_new_directory(&displaced_dir)?;
     move_present_sidecars_new(db_path, &displaced_dir, &source_raw)?;
     let displaced_main = backup_component_path(&displaced_dir, db_path, "")?;
-    if let Err(error) = install_compacted_candidate(
+    if let Err(failure) = install_compacted_candidate(
         &candidate_path,
         db_path,
         &displaced_main,
         replacement_lock,
         write_authority,
     ) {
+        let CompactedInstallFailure { disposition, error } = failure;
+        if disposition == CompactedInstallFailureDisposition::LiveStateUncertain {
+            return Err(BeadsError::WithContext {
+                context: format!(
+                    "compacted database installation stopped with an uncertain live-main \
+                     disposition; retained the original sidecars at {} instead of mixing \
+                     database generations",
+                    displaced_dir.display()
+                ),
+                source: Box::new(error),
+            });
+        }
         let rollback = restore_present_sidecars(db_path, &displaced_dir, &source_raw);
         return match rollback {
             Ok(()) => Err(error),
@@ -772,35 +784,44 @@ fn run_post_migration_maintenance(
             ))),
         };
     }
-    verify_backup_family(db_path, &displaced_dir, &source_raw)?;
-
-    let installed_logical = logical_witness(db_path);
-    let installed_is_exact = installed_logical
-        .as_ref()
-        .is_ok_and(|witness| witness == &candidate_logical);
-    if !installed_is_exact {
-        let failed_dir = run_dir.join("maintenance-failed-new-family");
-        ensure_new_directory(&failed_dir)?;
-        if let Ok(installed_raw) = raw_family_witness(db_path) {
-            move_present_sidecars_new(db_path, &failed_dir, &installed_raw)?;
+    let post_install_result = (|| {
+        verify_backup_family(db_path, &displaced_dir, &source_raw)?;
+        let installed_logical = logical_witness(db_path)?;
+        if installed_logical != candidate_logical {
+            return Err(BeadsError::internal(format!(
+                "installed compacted database did not match its attested candidate \
+                 (installed integrity={:?}, candidate integrity={:?})",
+                installed_logical.integrity_check, candidate_logical.integrity_check
+            )));
         }
-        rollback_compacted_install(db_path, &displaced_main, &failed_dir, write_authority)?;
-        restore_present_sidecars(db_path, &displaced_dir, &source_raw)?;
-        return Err(BeadsError::internal(format!(
-            "installed compacted database failed its fresh logical attestation ({:?}); the \
-             original database family was restored and the rejected compacted family is retained \
-             at {}",
-            installed_logical
-                .as_ref()
-                .map(|witness| witness.integrity_check.as_str())
-                .unwrap_or("logical witness unavailable"),
-            failed_dir.display()
-        )));
+        // Every child directory has already synced its own entries. This final
+        // parent barrier must still precede replacement finalization so a
+        // failure remains rollback-capable under the retained original lock.
+        sync_directory(run_dir)
+    })();
+    if let Err(error) = post_install_result {
+        return Err(rollback_after_compacted_install_failure(
+            db_path,
+            &displaced_main,
+            &displaced_dir,
+            &source_raw,
+            run_dir,
+            write_authority,
+            error,
+        ));
     }
 
-    write_authority.finalize_database_replacement()?;
-    write_authority.verify_database_authority()?;
-    sync_directory(run_dir)?;
+    if let Err(error) = write_authority.finalize_database_replacement() {
+        return Err(rollback_after_compacted_install_failure(
+            db_path,
+            &displaced_main,
+            &displaced_dir,
+            &source_raw,
+            run_dir,
+            write_authority,
+            error,
+        ));
+    }
     effects.post_migration_maintenance_completed = true;
     Ok(effects)
 }
@@ -903,14 +924,32 @@ fn move_present_sidecars_new(
     let mut moved = Vec::with_capacity(present_sidecars.len());
     for component in present_sidecars {
         let source = family_component_path(source_base, &component.suffix);
-        let destination = backup_component_path(destination_dir, source_base, &component.suffix)?;
-        let metadata = secure_file_metadata(&source)?.ok_or_else(|| {
-            BeadsError::internal(format!(
-                "schema-migration sidecar disappeared before retention: {}",
-                source.display()
-            ))
-        })?;
-        verify_component_bytes(&source, &metadata, component)?;
+        let prepared_move = (|| {
+            let destination =
+                backup_component_path(destination_dir, source_base, &component.suffix)?;
+            let metadata = secure_file_metadata(&source)?.ok_or_else(|| {
+                BeadsError::internal(format!(
+                    "schema-migration sidecar disappeared before retention: {}",
+                    source.display()
+                ))
+            })?;
+            verify_component_bytes(&source, &metadata, component)?;
+            Ok(destination)
+        })();
+        let destination = match prepared_move {
+            Ok(destination) => destination,
+            Err(error) => {
+                let rollback = restore_moved_components(source_base, destination_dir, &moved);
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(BeadsError::internal(format!(
+                        "could not prepare schema-migration sidecar move for {} ({error}); \
+                         rollback of prior moves also failed ({rollback_error})",
+                        source.display()
+                    ))),
+                };
+            }
+        };
         if let Err(error) = rename_path_no_replace(&source, &destination) {
             let rollback = restore_moved_components(source_base, destination_dir, &moved);
             return match rollback {
@@ -923,13 +962,16 @@ fn move_present_sidecars_new(
             };
         }
         moved.push((*component).clone());
-        let moved_metadata = secure_file_metadata(&destination)?.ok_or_else(|| {
-            BeadsError::internal(format!(
-                "schema-migration sidecar disappeared after retention: {}",
-                destination.display()
-            ))
-        })?;
-        if let Err(error) = verify_component_bytes(&destination, &moved_metadata, component) {
+        let moved_verification = (|| {
+            let moved_metadata = secure_file_metadata(&destination)?.ok_or_else(|| {
+                BeadsError::internal(format!(
+                    "schema-migration sidecar disappeared after retention: {}",
+                    destination.display()
+                ))
+            })?;
+            verify_component_bytes(&destination, &moved_metadata, component)
+        })();
+        if let Err(error) = moved_verification {
             let rollback = restore_moved_components(source_base, destination_dir, &moved);
             return match rollback {
                 Ok(()) => Err(error),
@@ -1063,12 +1105,12 @@ impl CompactedInstallFailure {
 
 impl std::fmt::Display for CompactedInstallFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.error.fmt(formatter)
+        std::fmt::Display::fmt(&self.error, formatter)
     }
 }
 
 fn rollback_installed_main_to_original<F>(
-    candidate_path: &Path,
+    _candidate_path: &Path,
     db_path: &Path,
     displaced_main: &Path,
     write_authority: &Arc<DatabaseFamilyWriteLock>,
@@ -1094,7 +1136,7 @@ where
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
     {
-        rename_path_no_replace(db_path, candidate_path)?;
+        rename_path_no_replace(db_path, _candidate_path)?;
         rename_path_no_replace(displaced_main, db_path)?;
         write_authority.restore_retained_database_inode_after_authorized_replace()?;
     }
@@ -1126,6 +1168,9 @@ fn install_compacted_candidate(
     )
 }
 
+// The branch structure is the installation state machine: each fallible point
+// must preserve whether the original generation is proven restored.
+#[allow(clippy::too_many_lines)]
 fn install_compacted_candidate_with_sync<F>(
     candidate_path: &Path,
     db_path: &Path,
@@ -1137,7 +1182,16 @@ fn install_compacted_candidate_with_sync<F>(
 where
     F: FnMut(&Path) -> Result<()>,
 {
-    if secure_file_metadata(displaced_main)?.is_some() {
+    let displaced_metadata = match secure_file_metadata(displaced_main) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Err(CompactedInstallFailure::from_original_state(
+                error,
+                write_authority,
+            ));
+        }
+    };
+    if displaced_metadata.is_some() {
         return Err(CompactedInstallFailure::from_original_state(
             BeadsError::internal(format!(
                 "refusing to overwrite retained pre-compaction database {}",
@@ -1149,89 +1203,162 @@ where
 
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     {
-        exchange_database_paths(candidate_path, db_path)?;
-        if let Err(error) = write_authority.adopt_locked_database_replacement(replacement_lock) {
-            let exchange_rollback = exchange_database_paths(candidate_path, db_path);
-            return match exchange_rollback {
-                Ok(()) => match write_authority
-                    .restore_retained_database_inode_after_authorized_replace()
-                {
-                    Ok(()) => Err(error),
-                    Err(authority_error) => Err(BeadsError::internal(format!(
-                        "database replacement authority adoption failed ({error}); atomic \
-                         exchange rollback succeeded, but retained authority restoration failed \
-                         ({authority_error})"
-                    ))),
-                },
-                Err(rollback_error) => Err(BeadsError::internal(format!(
-                    "database replacement authority adoption failed ({error}); atomic exchange \
-                     rollback also failed ({rollback_error})"
-                ))),
-            };
+        if let Err(error) = exchange_database_paths(candidate_path, db_path) {
+            return Err(CompactedInstallFailure::from_original_state(
+                error,
+                write_authority,
+            ));
         }
-        if let Err(error) = fs::rename(candidate_path, displaced_main) {
-            let exchange_rollback = exchange_database_paths(db_path, candidate_path);
-            return match exchange_rollback {
-                Ok(()) => match write_authority
-                    .restore_retained_database_inode_after_authorized_replace()
-                {
-                    Ok(()) => Err(BeadsError::Io(error)),
-                    Err(authority_error) => Err(BeadsError::internal(format!(
-                        "could not retain exchanged pre-compaction database ({error}); exchange \
-                         rollback succeeded, but authority rollback failed ({authority_error})"
-                    ))),
-                },
-                Err(exchange_error) => Err(BeadsError::internal(format!(
-                    "could not retain exchanged pre-compaction database ({error}); exchange \
-                     rollback also failed ({exchange_error}); replacement authority remains \
-                     bound to the still-installed database"
-                ))),
-            };
+        if let Err(error) = write_authority.adopt_locked_database_replacement(replacement_lock) {
+            let rollback = exchange_database_paths(candidate_path, db_path)
+                .and_then(|()| {
+                    write_authority.restore_retained_database_inode_after_authorized_replace()
+                })
+                .and_then(|()| write_authority.verify_database_authority())
+                .and_then(|()| {
+                    db_path
+                        .parent()
+                        .map_or(Ok(()), &mut sync)
+                });
+            return Err(CompactedInstallFailure::after_rollback(error, rollback));
+        }
+        if let Err(error) = rename_path_no_replace(candidate_path, displaced_main) {
+            let rollback = exchange_database_paths(db_path, candidate_path)
+                .and_then(|()| {
+                    write_authority.restore_retained_database_inode_after_authorized_replace()
+                })
+                .and_then(|()| write_authority.verify_database_authority())
+                .and_then(|()| {
+                    db_path
+                        .parent()
+                        .map_or(Ok(()), &mut sync)
+                });
+            return Err(CompactedInstallFailure::after_rollback(error, rollback));
         }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
     {
-        fs::rename(db_path, displaced_main).map_err(BeadsError::Io)?;
-        if let Err(error) = fs::rename(candidate_path, db_path) {
-            let rollback = fs::rename(displaced_main, db_path).map_err(BeadsError::Io);
-            return match rollback {
-                Ok(()) => Err(BeadsError::Io(error)),
-                Err(rollback_error) => Err(BeadsError::internal(format!(
-                    "could not install compacted database ({error}); restoring the retained \
-                     original also failed ({rollback_error})"
-                ))),
-            };
+        if let Err(error) = rename_path_no_replace(db_path, displaced_main) {
+            return Err(CompactedInstallFailure::from_original_state(
+                error,
+                write_authority,
+            ));
+        }
+        if let Err(error) = rename_path_no_replace(candidate_path, db_path) {
+            let rollback = rename_path_no_replace(displaced_main, db_path)
+                .and_then(|()| write_authority.verify_database_authority())
+                .and_then(|()| {
+                    db_path
+                        .parent()
+                        .map_or(Ok(()), &mut sync)
+                });
+            return Err(CompactedInstallFailure::after_rollback(error, rollback));
         }
         if let Err(error) = write_authority.adopt_locked_database_replacement(replacement_lock) {
-            let candidate_restore = fs::rename(db_path, candidate_path).map_err(BeadsError::Io);
-            let original_restore = fs::rename(displaced_main, db_path).map_err(BeadsError::Io);
-            return match (candidate_restore, original_restore) {
-                (Ok(()), Ok(())) => match write_authority
-                    .restore_retained_database_inode_after_authorized_replace()
-                {
-                    Ok(()) => Err(error),
-                    Err(authority_error) => Err(BeadsError::internal(format!(
-                        "database replacement authority adoption failed ({error}); filesystem \
-                         rollback succeeded, but retained authority restoration failed \
-                         ({authority_error})"
-                    ))),
-                },
-                (candidate_result, original_result) => Err(BeadsError::internal(format!(
-                    "database replacement authority adoption failed ({error}); candidate \
-                     rollback={candidate_result:?}, original rollback={original_result:?}"
-                ))),
-            };
+            let rollback = rename_path_no_replace(db_path, candidate_path)
+                .and_then(|()| rename_path_no_replace(displaced_main, db_path))
+                .and_then(|()| {
+                    write_authority.restore_retained_database_inode_after_authorized_replace()
+                })
+                .and_then(|()| write_authority.verify_database_authority())
+                .and_then(|()| {
+                    db_path
+                        .parent()
+                        .map_or(Ok(()), &mut sync)
+                });
+            return Err(CompactedInstallFailure::after_rollback(error, rollback));
         }
     }
 
-    if let Some(parent) = db_path.parent() {
-        sync_directory(parent)?;
-    }
-    if let Some(parent) = displaced_main.parent() {
-        sync_directory(parent)?;
+    let durability_result = db_path
+        .parent()
+        .map_or(Ok(()), &mut sync)
+        .and_then(|()| displaced_main.parent().map_or(Ok(()), &mut sync));
+    if let Err(error) = durability_result {
+        let rollback = rollback_installed_main_to_original(
+            candidate_path,
+            db_path,
+            displaced_main,
+            write_authority,
+            &mut sync,
+        );
+        return Err(CompactedInstallFailure::after_rollback(error, rollback));
     }
     Ok(())
+}
+
+fn rollback_after_compacted_install_failure(
+    db_path: &Path,
+    displaced_main: &Path,
+    displaced_dir: &Path,
+    source_raw: &RawFamilyWitness,
+    run_dir: &Path,
+    write_authority: &Arc<DatabaseFamilyWriteLock>,
+    operation_error: BeadsError,
+) -> BeadsError {
+    let target_state = match write_authority.database_target_authority_state() {
+        Ok(state) => state,
+        Err(authority_error) => {
+            return BeadsError::WithContext {
+                context: format!(
+                    "schema-migration post-installation validation failed, and the live database \
+                     authority could not be classified ({authority_error}); retained the original \
+                     family at {} and did not mix generations",
+                    displaced_dir.display()
+                ),
+                source: Box::new(operation_error),
+            };
+        }
+    };
+    if target_state != DatabaseTargetAuthorityState::Held {
+        return BeadsError::WithContext {
+            context: format!(
+                "schema-migration post-installation validation failed while the live database \
+                 had authority state {target_state:?}; retained the original family at {} and \
+                 left the live generation untouched",
+                displaced_dir.display()
+            ),
+            source: Box::new(operation_error),
+        };
+    }
+
+    let failed_dir = run_dir.join("maintenance-failed-new-family");
+    let rollback_result = (|| {
+        ensure_new_directory(&failed_dir)?;
+        let installed_raw = raw_family_witness(db_path)?;
+        move_present_sidecars_new(db_path, &failed_dir, &installed_raw)?;
+        rollback_compacted_install(db_path, displaced_main, &failed_dir, write_authority)?;
+        restore_present_sidecars(db_path, displaced_dir, source_raw)?;
+        write_authority.verify_database_authority()?;
+        let restored_raw = raw_family_witness(db_path)?;
+        if restored_raw != *source_raw {
+            return Err(BeadsError::internal(
+                "schema-migration rollback did not reproduce the attested original database family",
+            ));
+        }
+        Ok(())
+    })();
+
+    match rollback_result {
+        Ok(()) => BeadsError::WithContext {
+            context: format!(
+                "schema-migration post-installation validation failed; restored the original \
+                 database family and retained the rejected replacement at {}",
+                failed_dir.display()
+            ),
+            source: Box::new(operation_error),
+        },
+        Err(rollback_error) => BeadsError::WithContext {
+            context: format!(
+                "schema-migration post-installation validation failed and rollback could not \
+                 prove the original family restored ({rollback_error}); recovery artifacts remain \
+                 under {}",
+                run_dir.display()
+            ),
+            source: Box::new(operation_error),
+        },
+    }
 }
 
 fn rollback_compacted_install(
@@ -1240,6 +1367,14 @@ fn rollback_compacted_install(
     failed_dir: &Path,
     write_authority: &Arc<DatabaseFamilyWriteLock>,
 ) -> Result<()> {
+    if write_authority.database_target_authority_state()?
+        != DatabaseTargetAuthorityState::Held
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "refusing to roll back a compacted database that is no longer the authority-held live generation"
+                .to_string(),
+        });
+    }
     ensure_directory(failed_dir)?;
     let failed_main = backup_component_path(failed_dir, db_path, "")?;
     if secure_file_metadata(&failed_main)?.is_some() {
@@ -1253,13 +1388,13 @@ fn rollback_compacted_install(
     {
         exchange_database_paths(db_path, displaced_main)?;
         write_authority.restore_retained_database_inode_after_authorized_replace()?;
-        fs::rename(displaced_main, &failed_main).map_err(BeadsError::Io)?;
+        rename_path_no_replace(displaced_main, &failed_main)?;
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
     {
-        fs::rename(db_path, &failed_main).map_err(BeadsError::Io)?;
-        fs::rename(displaced_main, db_path).map_err(BeadsError::Io)?;
+        rename_path_no_replace(db_path, &failed_main)?;
+        rename_path_no_replace(displaced_main, db_path)?;
         write_authority.restore_retained_database_inode_after_authorized_replace()?;
     }
 
@@ -2779,6 +2914,113 @@ mod tests {
             .write_authority
             .verify_database_authority()
             .expect("restored original inode authority");
+    }
+
+    #[test]
+    fn post_install_directory_sync_failure_restores_original_main_and_authority() {
+        let (_temp, migration) = reviewed_v14_migration_context();
+        let raw_before = raw_family_witness(&migration.db_path).expect("original raw witness");
+        let candidate_path = migration.beads_dir.join("sync-failure-candidate.db");
+        let displaced_dir = migration.beads_dir.join("sync-failure-displaced");
+        fs::create_dir(&displaced_dir).expect("create displaced directory");
+        let displaced_main = displaced_dir.join("beads.db");
+        fs::write(&candidate_path, b"candidate generation").expect("write candidate");
+        let replacement_lock = migration
+            .write_authority
+            .lock_database_replacement_candidate(&candidate_path)
+            .expect("lock candidate inode");
+        let sync_calls = std::cell::Cell::new(0_u32);
+
+        let failure = install_compacted_candidate_with_sync(
+            &candidate_path,
+            &migration.db_path,
+            &displaced_main,
+            replacement_lock,
+            &migration.write_authority,
+            |_| {
+                let call = sync_calls.get();
+                sync_calls.set(call + 1);
+                if call == 0 {
+                    Err(BeadsError::Io(std::io::Error::other(
+                        "forced post-install directory sync failure",
+                    )))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("post-install sync failure must fail the installation");
+
+        assert_eq!(
+            failure.disposition,
+            CompactedInstallFailureDisposition::OriginalRestored,
+            "a successful compensating exchange and sync must prove restoration"
+        );
+        assert!(
+            failure
+                .to_string()
+                .contains("forced post-install directory sync failure"),
+            "the causal durability failure must remain visible: {failure}"
+        );
+        assert_eq!(
+            raw_family_witness(&migration.db_path).expect("restored raw witness"),
+            raw_before,
+            "the original main and sidecars must remain byte-exact"
+        );
+        migration
+            .write_authority
+            .verify_database_authority()
+            .expect("restored original inode authority");
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        assert_eq!(
+            fs::read(&displaced_main).expect("retained rejected candidate"),
+            b"candidate generation",
+            "the rejected replacement must be retained without overwriting another path"
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        assert_eq!(
+            fs::read(&candidate_path).expect("restored rejected candidate"),
+            b"candidate generation",
+            "the rejected replacement must return to its no-replace staging path"
+        );
+    }
+
+    #[test]
+    fn repeated_directory_sync_failure_is_reported_as_uncertain() {
+        let (_temp, migration) = reviewed_v14_migration_context();
+        let candidate_path = migration.beads_dir.join("uncertain-sync-candidate.db");
+        let displaced_dir = migration.beads_dir.join("uncertain-sync-displaced");
+        fs::create_dir(&displaced_dir).expect("create displaced directory");
+        let displaced_main = displaced_dir.join("beads.db");
+        fs::write(&candidate_path, b"candidate generation").expect("write candidate");
+        let replacement_lock = migration
+            .write_authority
+            .lock_database_replacement_candidate(&candidate_path)
+            .expect("lock candidate inode");
+
+        let failure = install_compacted_candidate_with_sync(
+            &candidate_path,
+            &migration.db_path,
+            &displaced_main,
+            replacement_lock,
+            &migration.write_authority,
+            |_| {
+                Err(BeadsError::Io(std::io::Error::other(
+                    "forced persistent directory sync failure",
+                )))
+            },
+        )
+        .expect_err("an unproved rollback must fail closed");
+
+        assert_eq!(
+            failure.disposition,
+            CompactedInstallFailureDisposition::LiveStateUncertain,
+            "the caller must not restore original sidecars without a durable rollback proof"
+        );
+        assert!(
+            failure.to_string().contains("could not prove"),
+            "uncertain disposition must explain the missing proof: {failure}"
+        );
     }
 
     #[test]
