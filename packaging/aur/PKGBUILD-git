@@ -10,7 +10,7 @@ pkgrel=1
 pkgdesc="Agent-first issue tracker (SQLite + JSONL) - git version"
 arch=('x86_64' 'aarch64')
 url="https://github.com/Dicklesworthstone/beads_rust"
-license=('MIT')
+license=('LicenseRef-MIT-OpenAI-Anthropic-Rider')
 provides=('br')
 conflicts=('br' 'br-bin')
 makedepends=('rust' 'cargo' 'git')
@@ -39,5 +39,5 @@ check() {
 package() {
     cd "${pkgname}"
     install -Dm755 "target/release/br" "${pkgdir}/usr/bin/br"
-    install -Dm644 "LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE" 2>/dev/null || true
+    install -Dm644 "LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 }

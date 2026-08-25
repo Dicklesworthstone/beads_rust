@@ -403,22 +403,25 @@ br --version
 
 ### Verify Release Signatures
 
-Release archives from v0.4.0 onward ship a `.minisig` sidecar signed with
-the `br` release key (minisign key ID `31BE80055F619CBB`):
+Release archives from v0.4.1 onward ship a `.minisig` sidecar signed with
+the current `br` release key (minisign key ID `36B847D11BA5A0D0`):
 
 ```bash
 minisign -Vm br-<version>-<platform>.tar.gz \
-  -P 'RWS7nGFfBYC+MWeZLEaowkjNi77w5FEOk49fEhX2jZ6gpd9uQ4vzVIrF'
+  -P 'RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB'
 ```
 
 Every asset also has a mandatory `.sha256` sidecar, which the install
 script verifies automatically.
 
-> **Key history:** releases before v0.4.0 either shipped no `.minisig` or
-> were signed during a CI-secret era whose key (documented at the time as
-> `RWSp4vEO…`) is no longer recoverable; signatures from that era should be
-> considered unverifiable (see GitHub #411). The key above is the sole
-> current trust anchor.
+> **Key history:** v0.4.0 used the one-release key
+> `RWS7nGFfBYC+MWeZLEaowkjNi77w5FEOk49fEhX2jZ6gpd9uQ4vzVIrF` (key ID
+> `31BE80055F619CBB`). v0.4.1 moved to the recoverable DSR key shown above,
+> but its release documentation did not record that rotation. From v0.5.0,
+> the same current key is installed in both DSR and GitHub Actions and is
+> verified before upload. Releases before v0.4.0 either shipped no
+> `.minisig` or used an unrecoverable CI-era key; treat those signatures as
+> unverifiable (see GitHub #411).
 
 ---
 

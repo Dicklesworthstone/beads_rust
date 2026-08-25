@@ -13,7 +13,7 @@
 class Br < Formula
   desc "Agent-first issue tracker (SQLite + JSONL)"
   homepage "https://github.com/Dicklesworthstone/beads_rust"
-  license "MIT"
+  license :cannot_represent
   version "0.2.10"
 
   on_macos do
@@ -40,6 +40,7 @@ class Br < Formula
 
   def install
     bin.install "br"
+    doc.install "LICENSE"
   end
 
   test do

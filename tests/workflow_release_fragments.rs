@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 const RELEASE_WORKFLOW: &str = ".github/workflows/release.yml";
 const README: &str = "README.md";
 const CURRENT_MINISIGN_PUBLIC_KEY: &str =
+    "RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB";
+const PREVIOUS_MINISIGN_PUBLIC_KEY: &str =
     "RWS7nGFfBYC+MWeZLEaowkjNi77w5FEOk49fEhX2jZ6gpd9uQ4vzVIrF";
 const RETIRED_MINISIGN_PUBLIC_KEY: &str =
     "RWSp4vEOdKsY8e95W9/4eLrSJ2B2GHv4U+CKMBXqRX3JhPrPn8J0DWBG";
@@ -148,6 +150,7 @@ fn release_signatures_use_the_documented_current_trust_anchor() -> Result<(), St
     require_contains(&readme, CURRENT_MINISIGN_PUBLIC_KEY)?;
     let public_key_env = format!("MINISIGN_PUBLIC_KEY: '{CURRENT_MINISIGN_PUBLIC_KEY}'");
     require_contains(&workflow, &public_key_env)?;
+    require_not_contains(&workflow, PREVIOUS_MINISIGN_PUBLIC_KEY)?;
     require_not_contains(&workflow, RETIRED_MINISIGN_PUBLIC_KEY)?;
     require_contains(
         &changelog_script,

@@ -75,6 +75,7 @@
           cp ${./Cargo.toml} $out/beads_rust/Cargo.toml
           cp ${./Cargo.lock} $out/beads_rust/Cargo.lock
           cp ${./build.rs} $out/beads_rust/build.rs
+          cp ${./LICENSE} $out/beads_rust/LICENSE
           cp -r ${./src} $out/beads_rust/src
 
           # Optional directories
@@ -126,10 +127,14 @@
 
           doCheck = false;  # Tests run separately in checks
 
+          postInstall = ''
+            install -Dm644 LICENSE "$out/share/licenses/beads_rust/LICENSE"
+          '';
+
           meta = with pkgs.lib; {
             description = "Agent-first issue tracker (SQLite + JSONL)";
             homepage = "https://github.com/Dicklesworthstone/beads_rust";
-            license = licenses.mit;
+            license = licenses.unfree;
             mainProgram = "br";
             platforms = platforms.unix;
           };
