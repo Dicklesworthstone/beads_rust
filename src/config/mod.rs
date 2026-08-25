@@ -2106,7 +2106,7 @@ fn rename_recovery_path_no_replace(from: &Path, to: &Path) -> Result<()> {
 
 #[cfg(windows)]
 fn rename_recovery_path_no_replace(from: &Path, to: &Path) -> Result<()> {
-    match fs::rename(from, to) {
+    match crate::sync::rename_recovery_path_no_replace_windows(from, to) {
         Ok(()) => Ok(()),
         Err(error) => match fs::symlink_metadata(to) {
             Ok(_) => Err(BeadsError::SyncConflict {

@@ -18,7 +18,7 @@ const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
 // schema rebuild, overwhelming the compile-time savings of the runtime fast
 // path itself.
 const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str =
-    "v3-exact-core-aux-columns-fks-index-shapes-checks-autoincrement-cookie-fenced";
+    "v4-comment-safe-core-aux-columns-fks-index-collations-checks-autoincrement-cookie-fenced";
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 const GATE_RESULT_HISTORY_MIGRATION_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS gate_result_history (
@@ -1693,15 +1693,48 @@ fn table_declares_autoincrement_primary_key(conn: &Connection, table: &str, colu
     let Some(sql) = row.get(0).and_then(SqliteValue::as_text) else {
         return false;
     };
-    let normalized = sql
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
-    normalized.contains(&format!(
-        "{} integer primary key autoincrement",
-        column.to_ascii_lowercase()
-    ))
+    let normalized = compact_sql_fragment(sql);
+    let expected = compact_sql_fragment(&format!("{column} INTEGER PRIMARY KEY AUTOINCREMENT"));
+    normalized.contains(&expected)
+}
+
+fn runtime_index_key_shape_canonical(
+    conn: &Connection,
+    index: &str,
+    expected_columns: &[&str],
+) -> bool {
+    let escaped_index = index.replace('\'', "''");
+    let Ok(rows) = conn.query(&format!("PRAGMA index_xinfo('{escaped_index}')")) else {
+        return false;
+    };
+    if rows
+        .iter()
+        .any(|row| row.get(5).and_then(SqliteValue::as_integer).is_none())
+    {
+        return false;
+    }
+
+    let key_rows = rows
+        .iter()
+        .filter(|row| {
+            row.get(5)
+                .and_then(SqliteValue::as_integer)
+                .is_some_and(|value| value != 0)
+        })
+        .collect::<Vec<_>>();
+    key_rows.len() == expected_columns.len()
+        && key_rows
+            .iter()
+            .zip(expected_columns)
+            .enumerate()
+            .all(|(position, (row, expected_name))| {
+                row.get(0).and_then(SqliteValue::as_integer) == i64::try_from(position).ok()
+                    && row.get(2).and_then(SqliteValue::as_text) == Some(*expected_name)
+                    && row
+                        .get(4)
+                        .and_then(SqliteValue::as_text)
+                        .is_some_and(|collation| collation.eq_ignore_ascii_case("BINARY"))
+            })
 }
 
 fn auxiliary_runtime_indexes_canonical(
@@ -1735,17 +1768,7 @@ fn auxiliary_runtime_indexes_canonical(
             return false;
         }
 
-        let escaped_index = expected.name.replace('\'', "''");
-        let Ok(column_rows) = conn.query(&format!("PRAGMA index_info('{escaped_index}')")) else {
-            return false;
-        };
-        column_rows.len() == expected.columns.len()
-            && column_rows.iter().zip(expected.columns).enumerate().all(
-                |(position, (row, expected_name))| {
-                    row.get(0).and_then(SqliteValue::as_integer) == i64::try_from(position).ok()
-                        && row.get(2).and_then(SqliteValue::as_text) == Some(*expected_name)
-                },
-            )
+        runtime_index_key_shape_canonical(conn, expected.name, expected.columns)
             && semantic_partial_index_predicate_canonical(conn, expected.name)
     });
 
@@ -1777,8 +1800,93 @@ fn auxiliary_runtime_indexes_canonical(
         })
 }
 
+fn sql_without_comments(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut output = String::with_capacity(sql.len());
+    let mut copy_start = 0;
+    let mut index = 0;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_line_comment {
+            if byte == b'\n' {
+                in_line_comment = false;
+                copy_start = index;
+            }
+            index += 1;
+            continue;
+        }
+        if in_block_comment {
+            if byte == b'*' && index + 1 < bytes.len() && bytes[index + 1] == b'/' {
+                in_block_comment = false;
+                index += 2;
+                copy_start = index;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if in_single_quote {
+            if byte == b'\'' {
+                if index + 1 < bytes.len() && bytes[index + 1] == b'\'' {
+                    index += 2;
+                } else {
+                    in_single_quote = false;
+                    index += 1;
+                }
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if in_double_quote {
+            if byte == b'"' {
+                if index + 1 < bytes.len() && bytes[index + 1] == b'"' {
+                    index += 2;
+                } else {
+                    in_double_quote = false;
+                    index += 1;
+                }
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+
+        if byte == b'\'' {
+            in_single_quote = true;
+            index += 1;
+        } else if byte == b'"' {
+            in_double_quote = true;
+            index += 1;
+        } else if byte == b'-' && index + 1 < bytes.len() && bytes[index + 1] == b'-' {
+            output.push_str(&sql[copy_start..index]);
+            output.push(' ');
+            in_line_comment = true;
+            index += 2;
+        } else if byte == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'*' {
+            output.push_str(&sql[copy_start..index]);
+            output.push(' ');
+            in_block_comment = true;
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+
+    if !in_line_comment && !in_block_comment {
+        output.push_str(&sql[copy_start..]);
+    }
+    output
+}
+
 fn compact_sql_fragment(sql: &str) -> String {
-    sql.chars()
+    sql_without_comments(sql)
+        .chars()
         .filter(|character| !character.is_ascii_whitespace())
         .flat_map(char::to_lowercase)
         .collect()
@@ -3361,30 +3469,32 @@ fn attest_gate_result_history_indexes(conn: &Connection) -> Result<()> {
             )));
         }
 
-        let escaped_index = index_name.replace('\'', "''");
-        let columns = conn.query(&format!("PRAGMA index_info('{escaped_index}')"))?;
-        if columns.len() != expected_columns.len() {
+        if !runtime_index_key_shape_canonical(conn, index_name, expected_columns) {
             return Err(schema_migration_shape_error(format!(
-                "index {index_name} has {} columns, expected {}",
-                columns.len(),
-                expected_columns.len()
+                "index {index_name} key columns or collations are not canonical"
             )));
         }
-        for (position, (row, expected_name)) in columns.iter().zip(*expected_columns).enumerate() {
-            let sequence = row.get(0).and_then(SqliteValue::as_integer);
-            let name = row.get(2).and_then(SqliteValue::as_text);
-            let expected_sequence = i64::try_from(position).map_err(|_| {
-                schema_migration_shape_error(format!(
-                    "index {index_name} position does not fit i64"
-                ))
-            })?;
-            if sequence != Some(expected_sequence) || name != Some(*expected_name) {
-                return Err(schema_migration_shape_error(format!(
-                    "index {index_name} column {position} is not canonical \
-                     (seq={sequence:?}, name={name:?}, expected={expected_name:?})"
-                )));
-            }
+    }
+
+    for row in &index_rows {
+        let unique = row
+            .get(2)
+            .and_then(SqliteValue::as_integer)
+            .ok_or_else(|| schema_migration_shape_error("index has no uniqueness flag"))?;
+        if unique == 0 {
+            continue;
         }
+        let origin = row.get(3).and_then(SqliteValue::as_text);
+        if origin.is_some_and(|value| value.eq_ignore_ascii_case("pk")) {
+            continue;
+        }
+        let name = row
+            .get(1)
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("<unnamed>");
+        return Err(schema_migration_shape_error(format!(
+            "unexpected UNIQUE index {name} changes gate-result-history write semantics"
+        )));
     }
     Ok(())
 }

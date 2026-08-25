@@ -296,6 +296,20 @@ fn install_database_candidate_no_replace(candidate: &Path, target: &Path) -> Res
     }
 }
 
+/// Atomically rename a recovery artifact on Windows only when the destination
+/// name is still absent.
+///
+/// `std::fs::rename` replaces an existing destination on current Windows
+/// implementations, so recovery code must use the same native no-replace
+/// primitive as fresh-database installation.
+#[cfg(windows)]
+pub(crate) fn rename_recovery_path_no_replace_windows(
+    from: &Path,
+    to: &Path,
+) -> std::io::Result<()> {
+    db_inode_lock::rename_database_candidate_no_replace(from, to)
+}
+
 #[cfg(not(any(
     target_os = "linux",
     target_os = "android",
@@ -802,6 +816,48 @@ impl DatabaseFamilyWriteLock {
         } else {
             Ok(DatabaseTargetAuthorityState::Foreign)
         }
+    }
+
+    /// Verify that a database staged out of the canonical namespace is still
+    /// the exact inode retained by this database-family authority.
+    pub(crate) fn verify_staged_database_recovery_authority(
+        &self,
+        staged_database_path: &Path,
+    ) -> Result<()> {
+        self.verify_common_authority()?;
+        let staged_identity = authority_path_identity(
+            staged_database_path,
+            "staged database recovery target",
+            &database_path_descriptor(staged_database_path),
+        )?;
+        let database_authority =
+            self.database_authority
+                .lock()
+                .map_err(|_| BeadsError::SyncConflict {
+                    message: "Database inode authority state was poisoned".to_string(),
+                })?;
+        let database_lock =
+            database_authority
+                .lock
+                .as_ref()
+                .ok_or_else(|| BeadsError::SyncConflict {
+                    message: "Staged database has no retained inode authority".to_string(),
+                })?;
+        let retained_identity = authority_file_identity(
+            database_lock,
+            staged_database_path,
+            "retained database recovery authority",
+            &database_path_descriptor(staged_database_path),
+        )?;
+        if database_authority.identity != Some(retained_identity)
+            || staged_identity != retained_identity
+        {
+            return Err(BeadsError::SyncConflict {
+                message: "Database generation changed after the final recovery authority check; refusing to install the original backup"
+                    .to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Verify that a fresh-replacement witness still names this authority and
