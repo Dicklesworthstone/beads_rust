@@ -15861,9 +15861,18 @@ enum WalFrameState {
     FramesPresent,
 }
 
-fn wal_checksum(bytes: &[u8], big_endian_words: bool) -> (u32, u32) {
-    let mut s1 = 0_u32;
-    let mut s2 = 0_u32;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalSchemaPreflight {
+    frame_state: WalFrameState,
+    committed_user_version: Option<u32>,
+}
+
+fn wal_checksum(
+    bytes: &[u8],
+    mut s1: u32,
+    mut s2: u32,
+    big_endian_words: bool,
+) -> (u32, u32) {
     for chunk in bytes.chunks_exact(8) {
         let first: [u8; 4] = chunk[..4].try_into().unwrap_or([0; 4]);
         let second: [u8; 4] = chunk[4..].try_into().unwrap_or([0; 4]);
@@ -15883,15 +15892,19 @@ fn wal_checksum(bytes: &[u8], big_endian_words: bool) -> (u32, u32) {
     (s1, s2)
 }
 
-/// Classify a SQLite WAL without following a replacement symlink or trusting
-/// length alone. Header-only WALs are accepted only after magic, format,
-/// page-size, checksum, handle identity, and frame alignment validation.
-fn sqlite_wal_frame_state(db_path: &Path) -> Result<WalFrameState> {
+/// Parse the effective schema stamp from a SQLite WAL without opening any
+/// engine surface. Header-only WALs are accepted only after magic, format,
+/// page-size, checksum, handle identity, and frame alignment validation; WAL
+/// frames are salt/checksum validated through the last commit boundary.
+fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
     let wal_path = database_sidecar_path(db_path, "-wal");
     let initial_metadata = match std::fs::symlink_metadata(&wal_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(WalFrameState::AbsentOrEmpty);
+            return Ok(WalSchemaPreflight {
+                frame_state: WalFrameState::AbsentOrEmpty,
+                committed_user_version: None,
+            });
         }
         Err(error) => return Err(BeadsError::Io(error)),
     };
@@ -15949,7 +15962,10 @@ fn sqlite_wal_frame_state(db_path: &Path) -> Result<WalFrameState> {
     }
 
     if initial_metadata.len() == 0 {
-        return Ok(WalFrameState::AbsentOrEmpty);
+        return Ok(WalSchemaPreflight {
+            frame_state: WalFrameState::AbsentOrEmpty,
+            committed_user_version: None,
+        });
     }
 
     let mut header = [0_u8; 32];
@@ -15976,7 +15992,7 @@ fn sqlite_wal_frame_state(db_path: &Path) -> Result<WalFrameState> {
             ),
         });
     }
-    let expected_checksum = wal_checksum(&header[..24], magic == 0x377f_0683);
+    let expected_checksum = wal_checksum(&header[..24], 0, 0, magic == 0x377f_0683);
     let stored_checksum = (
         u32::from_be_bytes(header[24..28].try_into().unwrap_or([0; 4])),
         u32::from_be_bytes(header[28..32].try_into().unwrap_or([0; 4])),
@@ -15996,6 +16012,138 @@ fn sqlite_wal_frame_state(db_path: &Path) -> Result<WalFrameState> {
                 .to_string(),
         });
     }
+    if frame_bytes == 0 {
+        let final_handle_metadata = wal_file.metadata()?;
+        let final_path_metadata = std::fs::symlink_metadata(&wal_path)?;
+        if final_handle_metadata.len() != initial_metadata.len()
+            || final_path_metadata.len() != initial_metadata.len()
+            || final_path_metadata.file_type().is_symlink()
+            || !final_path_metadata.is_file()
+        {
+            return Err(BeadsError::SyncConflict {
+                message: "WAL changed while its schema preflight was being verified".to_string(),
+            });
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let initial_identity = (initial_metadata.dev(), initial_metadata.ino());
+            if (final_handle_metadata.dev(), final_handle_metadata.ino()) != initial_identity
+                || (final_path_metadata.dev(), final_path_metadata.ino()) != initial_identity
+            {
+                return Err(BeadsError::SyncConflict {
+                    message: "WAL changed identity while its schema preflight was being verified"
+                        .to_string(),
+                });
+            }
+        }
+        return Ok(WalSchemaPreflight {
+            frame_state: WalFrameState::HeaderOnly,
+            committed_user_version: None,
+        });
+    }
+
+    let page_size_usize = usize::try_from(page_size).map_err(|_| BeadsError::SyncConflict {
+        message: "WAL page size does not fit this platform".to_string(),
+    })?;
+    let frame_size_usize = page_size_usize + 24;
+    let frame_count = frame_bytes / frame_size;
+    let header_salts = (
+        u32::from_be_bytes(header[16..20].try_into().unwrap_or([0; 4])),
+        u32::from_be_bytes(header[20..24].try_into().unwrap_or([0; 4])),
+    );
+    let big_endian_words = magic == 0x377f_0683;
+    let mut running_checksum = expected_checksum;
+    let mut pending_page_one_version = None;
+    let mut committed_page_one_version = None;
+    let mut saw_commit = false;
+    let mut frame = vec![0_u8; frame_size_usize];
+    for frame_index in 0..frame_count {
+        wal_file.read_exact(&mut frame)?;
+        let page_number = u32::from_be_bytes(frame[..4].try_into().unwrap_or([0; 4]));
+        if page_number == 0 {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Refusing schema preflight because WAL frame {frame_index} has page number zero"
+                ),
+            });
+        }
+        let database_size = u32::from_be_bytes(frame[4..8].try_into().unwrap_or([0; 4]));
+        let frame_salts = (
+            u32::from_be_bytes(frame[8..12].try_into().unwrap_or([0; 4])),
+            u32::from_be_bytes(frame[12..16].try_into().unwrap_or([0; 4])),
+        );
+        if frame_salts != header_salts {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Refusing schema preflight because WAL frame {frame_index} has stale salts"
+                ),
+            });
+        }
+        let checksum_after_header = wal_checksum(
+            &frame[..8],
+            running_checksum.0,
+            running_checksum.1,
+            big_endian_words,
+        );
+        let expected_frame_checksum = wal_checksum(
+            &frame[24..],
+            checksum_after_header.0,
+            checksum_after_header.1,
+            big_endian_words,
+        );
+        let stored_frame_checksum = (
+            u32::from_be_bytes(frame[16..20].try_into().unwrap_or([0; 4])),
+            u32::from_be_bytes(frame[20..24].try_into().unwrap_or([0; 4])),
+        );
+        if stored_frame_checksum != expected_frame_checksum {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Refusing schema preflight because WAL frame {frame_index} has an invalid checksum"
+                ),
+            });
+        }
+        running_checksum = expected_frame_checksum;
+
+        if page_number == 1 {
+            let page = &frame[24..];
+            if &page[..16] != b"SQLite format 3\0" {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Refusing schema preflight because WAL page-one frame {frame_index} has an invalid database header"
+                    ),
+                });
+            }
+            let encoded_page_size = u16::from_be_bytes(page[16..18].try_into().unwrap_or([0; 2]));
+            let page_one_size = if encoded_page_size == 1 {
+                65_536
+            } else {
+                u32::from(encoded_page_size)
+            };
+            if page_one_size != page_size {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Refusing schema preflight because WAL page-one frame {frame_index} disagrees with the WAL page size"
+                    ),
+                });
+            }
+            pending_page_one_version = Some(u32::from_be_bytes(
+                page[60..64].try_into().unwrap_or([0; 4]),
+            ));
+        }
+        if database_size != 0 {
+            saw_commit = true;
+            committed_page_one_version = pending_page_one_version;
+        }
+    }
+    if !saw_commit {
+        return Err(BeadsError::SyncConflict {
+            message:
+                "Refusing writable database open because WAL frames have no stable commit boundary"
+                    .to_string(),
+        });
+    }
+
     let final_handle_metadata = wal_file.metadata()?;
     let final_path_metadata = std::fs::symlink_metadata(&wal_path)?;
     if final_handle_metadata.len() != initial_metadata.len()
@@ -16021,11 +16169,14 @@ fn sqlite_wal_frame_state(db_path: &Path) -> Result<WalFrameState> {
         }
     }
 
-    if frame_bytes == 0 {
-        Ok(WalFrameState::HeaderOnly)
-    } else {
-        Ok(WalFrameState::FramesPresent)
-    }
+    Ok(WalSchemaPreflight {
+        frame_state: WalFrameState::FramesPresent,
+        committed_user_version: committed_page_one_version,
+    })
+}
+
+fn sqlite_wal_frame_state(db_path: &Path) -> Result<WalFrameState> {
+    Ok(sqlite_wal_schema_preflight(db_path)?.frame_state)
 }
 
 fn preflight_effective_schema_before_writable_open(db_path: &Path) -> Result<()> {
@@ -16039,24 +16190,15 @@ fn preflight_effective_schema_before_writable_open(db_path: &Path) -> Result<()>
             current_schema_version,
         ));
     }
-    if sqlite_wal_frame_state(db_path)? == WalFrameState::FramesPresent {
-        let conn = open_with_flags(
-            db_path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
-        let effective_version = connection_user_version(&conn);
-        conn.close().map_err(BeadsError::Database)?;
-        let effective_version = effective_version.ok_or_else(|| BeadsError::SyncConflict {
-            message:
-                "Refusing writable database open because the WAL-aware schema version is unreadable"
-                    .to_string(),
-        })?;
-        if effective_version > current_schema_version {
-            return Err(future_schema_error(
-                effective_version,
-                current_schema_version,
-            ));
-        }
+    let wal_preflight = sqlite_wal_schema_preflight(db_path)?;
+    let effective_version = wal_preflight
+        .committed_user_version
+        .unwrap_or(header_version);
+    if effective_version > current_schema_version {
+        return Err(future_schema_error(
+            effective_version,
+            current_schema_version,
+        ));
     }
     Ok(())
 }
@@ -18796,12 +18938,18 @@ impl SqliteStorage {
         if !is_sqlite {
             return Ok(PendingSyncMergeInspection::Absent);
         }
-        // This is the writable fast-open fallback's first engine open. The
-        // caller has already bound the exact database inode, so any required
-        // namespace-sidecar repair belongs here rather than in the preceding
-        // lock-free read-only probe.
-        heal_namespace_sidecar_modes_under_authority(path, authority)?;
-        authority.verify_database_authority()?;
+        // Pending-saga classification must precede every database-family
+        // mutation, including chmod. If fsqlite's namespace sidecars need a
+        // repair before they can be opened, the pending state is unknowable;
+        // fail closed and leave the entire family untouched. Once an exact
+        // Absent verdict is available, the ordinary authority-gated opener may
+        // perform the separately reviewed repair.
+        if namespace_sidecar_mode_repair_required(path)? {
+            return Err(BeadsError::SyncConflict {
+                message: "Pending sync-merge state is unknown because fsqlite namespace sidecar repair would require mutation before the pending-saga verdict"
+                    .to_string(),
+            });
+        }
         let Some(mut storage) = Self::open_current_read_only(path)? else {
             let found = effective_database_user_version(path)?;
             return match found {
@@ -19574,6 +19722,70 @@ mod tests {
             "rejected same-ID payload substitution must perform zero writes"
         );
         assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_inspection_refuses_sidecar_repair_without_mutating_valid_receipt_family() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("pending_receipt_permissive_sidecar.db");
+        {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            let now = Utc.with_ymd_and_hms(2026, 7, 27, 7, 0, 0).unwrap();
+            let issue = make_issue(
+                "bd-pending-sidecar",
+                "Pending sidecar inspection",
+                Status::Open,
+                2,
+                None,
+                now,
+                None,
+            );
+            let kept = vec![issue];
+            let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+            storage
+                .apply_sync_merge_atomically(&kept, &[], &[], &intent)
+                .expect("write a valid pending receipt");
+            assert!(matches!(
+                storage.inspect_pending_sync_merge().unwrap(),
+                PendingSyncMergeInspection::Valid(_)
+            ));
+            storage.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+
+        let sidecars = existing_namespace_sidecars(&db_path);
+        assert!(!sidecars.is_empty(), "namespace sidecar fixture");
+        for sidecar in &sidecars {
+            fs::set_permissions(sidecar, fs::Permissions::from_mode(0o664)).unwrap();
+        }
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                temp.path(),
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+        let family_before = directory_bytes_and_modes(temp.path());
+
+        let error = SqliteStorage::inspect_pending_sync_merge_under_authority(
+            &db_path,
+            &authority,
+        )
+        .expect_err("pending inspection must not chmod before its verdict");
+        assert!(
+            error
+                .to_string()
+                .contains("repair would require mutation before the pending-saga verdict"),
+            "unexpected pending-sidecar inspection error: {error}"
+        );
+        assert_eq!(
+            directory_bytes_and_modes(temp.path()),
+            family_before,
+            "pending inspection changed database-family bytes or modes before returning"
+        );
     }
 
     #[test]
@@ -26844,6 +27056,13 @@ mod tests {
             Some(4242),
             "header peek unexpectedly reflected the WAL-resident user_version; \
              the WAL-miss scenario cannot be proven"
+        );
+        let wal_preflight = sqlite_wal_schema_preflight(&db_path).unwrap();
+        assert_eq!(wal_preflight.frame_state, WalFrameState::FramesPresent);
+        assert_eq!(
+            wal_preflight.committed_user_version,
+            Some(4242),
+            "the byte-neutral WAL parser must recover page one's committed user_version"
         );
     }
 

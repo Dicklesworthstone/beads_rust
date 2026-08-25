@@ -1250,7 +1250,10 @@ const fn command_must_refuse_during_pending_merge(cmd: &Commands) -> bool {
     match cmd {
         Commands::Init { .. } => true,
         Commands::Sync(args) => {
-            args.flush_only || args.import_only || (args.reconcile_additive && args.apply)
+            args.flush_only
+                || args.import_only
+                || (args.reconcile && !args.dry_run)
+                || (args.reconcile_additive && args.apply)
         }
         Commands::Doctor(args) => {
             ((!args.robot_triage && (args.repair || args.repair_indexes)) && !args.dry_run)
@@ -1266,6 +1269,7 @@ const fn command_must_refuse_during_pending_merge(cmd: &Commands) -> bool {
         Commands::Gate { command } => {
             matches!(command, beads_rust::cli::GateCommands::Report(_))
         }
+        Commands::Capacity { command } => is_mutating_capacity_command(command),
         Commands::Query { command } => matches!(
             command,
             beads_rust::cli::QueryCommands::Save(_) | beads_rust::cli::QueryCommands::Delete(_)
@@ -1293,6 +1297,17 @@ const fn command_must_refuse_during_pending_merge(cmd: &Commands) -> bool {
         #[cfg(feature = "mcp")]
         Commands::Serve(_) => true,
         _ => false,
+    }
+}
+
+/// Keep capacity mutation classification exhaustive so a future subcommand
+/// cannot silently bypass the pending-merge refusal gate.
+const fn is_mutating_capacity_command(command: &beads_rust::cli::CapacityCommands) -> bool {
+    match command {
+        beads_rust::cli::CapacityCommands::Exempt(_)
+        | beads_rust::cli::CapacityCommands::Renew(_)
+        | beads_rust::cli::CapacityCommands::Revoke(_) => true,
+        beads_rust::cli::CapacityCommands::Exemptions(_) => false,
     }
 }
 
@@ -1684,7 +1699,11 @@ const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
 /// ordinary startup path.
 const fn supports_auto_import_read_only_probe(cmd: &Commands) -> bool {
     match cmd {
-        Commands::Sync(args) => args.status,
+        // Sync never participates in startup auto-import. Both status and the
+        // reconcile planner are observational, so their default invocations
+        // can use the same current-schema lock-free open without requiring
+        // redundant explicit auto-sync opt-outs.
+        Commands::Sync(args) => args.status || (args.reconcile && args.dry_run),
         Commands::List(_)
         | Commands::Show(_)
         | Commands::Search(_)
@@ -2612,6 +2631,15 @@ mod tests {
         let sync_status = Cli::parse_from(["br", "sync", "--status"]);
         assert!(build_cli_overrides(&sync_status).read_only_fast_open);
 
+        let sync_reconcile_dry_run = Cli::parse_from(["br", "sync", "--reconcile", "--dry-run"]);
+        assert!(
+            build_cli_overrides(&sync_reconcile_dry_run).read_only_fast_open,
+            "the reconcile planner is observational and must not wait behind the writer lock"
+        );
+
+        let sync_reconcile_apply = Cli::parse_from(["br", "sync", "--reconcile"]);
+        assert!(!build_cli_overrides(&sync_reconcile_apply).read_only_fast_open);
+
         let sync_flush = Cli::parse_from(["br", "sync", "--flush-only"]);
         assert!(!build_cli_overrides(&sync_flush).read_only_fast_open);
 
@@ -3439,6 +3467,7 @@ mod tests {
         let mutations = vec![
             Cli::parse_from(["br", "sync", "--flush-only"]).command,
             Cli::parse_from(["br", "sync", "--import-only"]).command,
+            Cli::parse_from(["br", "sync", "--reconcile"]).command,
             Cli::parse_from(["br", "sync", "--reconcile-additive", "--apply"]).command,
         ];
         for command in &mutations {
@@ -3475,6 +3504,41 @@ mod tests {
                 "pass",
             ])
             .command,
+            Cli::parse_from([
+                "br",
+                "capacity",
+                "exempt",
+                "bd-one",
+                "--status",
+                "blocked",
+                "--provider",
+                "operator",
+                "--reason",
+                "pending merge guard fixture",
+            ])
+            .command,
+            Cli::parse_from([
+                "br",
+                "capacity",
+                "renew",
+                "bd-one",
+                "--status",
+                "blocked",
+                "--provider",
+                "operator",
+            ])
+            .command,
+            Cli::parse_from([
+                "br",
+                "capacity",
+                "revoke",
+                "bd-one",
+                "--status",
+                "blocked",
+                "--provider",
+                "operator",
+            ])
+            .command,
             Cli::parse_from(["br", "query", "save", "mine"]).command,
             Cli::parse_from(["br", "config", "set", "sync.auto_flush=true"]).command,
             Cli::parse_from(["br", "config", "edit"]).command,
@@ -3505,8 +3569,10 @@ mod tests {
             Cli::parse_from(["br", "show", "bd-one"]).command,
             Cli::parse_from(["br", "sync", "--status"]).command,
             Cli::parse_from(["br", "sync", "--witness"]).command,
+            Cli::parse_from(["br", "sync", "--reconcile", "--dry-run"]).command,
             Cli::parse_from(["br", "sync", "--reconcile-additive"]).command,
             Cli::parse_from(["br", "gate", "list", "bd-one"]).command,
+            Cli::parse_from(["br", "capacity", "exemptions", "bd-one"]).command,
             Cli::parse_from(["br", "query", "list"]).command,
             Cli::parse_from(["br", "config", "list"]).command,
             Cli::parse_from(["br", "history", "list"]).command,

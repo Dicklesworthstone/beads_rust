@@ -205,6 +205,10 @@ fn status_and_report_commands() -> Vec<MatrixCommand> {
         exact_command("lint_json", strings(["lint", "--json"])),
         exact_command("sync_status_json", strings(["sync", "--status", "--json"])),
         exact_command(
+            "sync_reconcile_dry_run_json",
+            strings(["sync", "--reconcile", "--dry-run", "--json"]),
+        ),
+        exact_command(
             "stats_no_activity_json",
             strings(["stats", "--no-activity", "--json"]),
         ),

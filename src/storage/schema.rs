@@ -17,7 +17,7 @@ const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
 // caused rustc to interpret hundreds of thousands of loop iterations on every
 // schema rebuild, overwhelming the compile-time savings of the runtime fast
 // path itself.
-const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str = "v8-version-fenced-lexical-core-aux-columns-fks-index-directions-collations-exact-checks-autoincrement-no-hidden-columns-no-triggers-cookie-fenced";
+const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str = "v11-version-fenced-lexical-core-aux-columns-fks-match-immediate-index-and-primary-key-directions-implicit-binary-collations-default-conflicts-exact-checks-autoincrement-rowid-nonstrict-no-hidden-columns-no-triggers-cookie-fenced";
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 const GATE_RESULT_HISTORY_MIGRATION_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS gate_result_history (
@@ -1729,6 +1729,10 @@ fn auxiliary_runtime_issue_foreign_key_canonical(conn: &Connection, table: &str)
             .get(6)
             .and_then(SqliteValue::as_text)
             .is_some_and(|value| value.eq_ignore_ascii_case("CASCADE"))
+        && row
+            .get(7)
+            .and_then(SqliteValue::as_text)
+            .is_some_and(|value| value.eq_ignore_ascii_case("NONE"))
 }
 
 fn table_declares_autoincrement_primary_key(conn: &Connection, table: &str, column: &str) -> bool {
@@ -1780,6 +1784,95 @@ fn runtime_index_key_shape_canonical(
                         .is_some_and(|collation| collation.eq_ignore_ascii_case("BINARY"))
             },
         )
+}
+
+fn runtime_primary_key_shape_canonical(
+    conn: &Connection,
+    table: &str,
+    columns: &[ExpectedSchemaColumn],
+) -> bool {
+    let mut primary_key = columns
+        .iter()
+        .filter(|column| column.primary_key_position > 0)
+        .collect::<Vec<_>>();
+    primary_key.sort_by_key(|column| column.primary_key_position);
+
+    let escaped_table = table.replace('\'', "''");
+    let Ok(index_rows) = conn.query(&format!("PRAGMA index_list('{escaped_table}')")) else {
+        return false;
+    };
+    let primary_key_indexes = index_rows
+        .iter()
+        .filter(|row| {
+            row.get(3)
+                .and_then(SqliteValue::as_text)
+                .is_some_and(|origin| origin.eq_ignore_ascii_case("pk"))
+        })
+        .collect::<Vec<_>>();
+
+    if primary_key.is_empty() {
+        return primary_key_indexes.is_empty();
+    }
+
+    // An exact `INTEGER PRIMARY KEY` aliases the rowid and therefore has no
+    // backing index to inspect. Its declaration is separately attested for
+    // AUTOINCREMENT on the runtime tables that require it.
+    if primary_key.len() == 1
+        && primary_key[0].data_type.eq_ignore_ascii_case("INTEGER")
+        && primary_key_indexes.is_empty()
+    {
+        return true;
+    }
+
+    let [index_row] = primary_key_indexes.as_slice() else {
+        return false;
+    };
+    if index_row.get(2).and_then(SqliteValue::as_integer) != Some(1)
+        || index_row.get(4).and_then(SqliteValue::as_integer) != Some(0)
+    {
+        return false;
+    }
+    let Some(index_name) = index_row.get(1).and_then(SqliteValue::as_text) else {
+        return false;
+    };
+    let expected_columns = primary_key
+        .iter()
+        .map(|column| column.name)
+        .collect::<Vec<_>>();
+    runtime_index_key_shape_canonical(conn, index_name, &expected_columns)
+}
+
+fn auxiliary_runtime_primary_key_shape_canonical(
+    conn: &Connection,
+    table: &str,
+    columns: &[AuxiliaryRuntimeColumn],
+) -> bool {
+    let expected = columns
+        .iter()
+        .map(|column| column.expected)
+        .collect::<Vec<_>>();
+    runtime_primary_key_shape_canonical(conn, table, &expected)
+}
+
+fn runtime_table_options_canonical(conn: &Connection, table: &str) -> bool {
+    conn.query("PRAGMA table_list").is_ok_and(|rows| {
+        let matching = rows
+            .iter()
+            .filter(|row| {
+                row.get(0).and_then(SqliteValue::as_text) == Some("main")
+                    && row.get(1).and_then(SqliteValue::as_text) == Some(table)
+                    && row
+                        .get(2)
+                        .and_then(SqliteValue::as_text)
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("table"))
+            })
+            .collect::<Vec<_>>();
+        let [row] = matching.as_slice() else {
+            return false;
+        };
+        row.get(4).and_then(SqliteValue::as_integer) == Some(0)
+            && row.get(5).and_then(SqliteValue::as_integer) == Some(0)
+    })
 }
 
 fn auxiliary_runtime_indexes_canonical(
@@ -2148,6 +2241,27 @@ fn table_check_constraints_canonical(
             .all(|required| actual.contains(required))
 }
 
+fn table_declaration_clauses_canonical(conn: &Connection, table: &str) -> bool {
+    let escaped_table = table.replace('\'', "''");
+    let Ok(row) = conn.query_row(&format!(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '{escaped_table}'"
+    )) else {
+        return false;
+    };
+    let Some(sql) = row.get(0).and_then(SqliteValue::as_text) else {
+        return false;
+    };
+
+    // Canonical SCHEMA_SQL uses SQLite's implicit BINARY collation, default
+    // ABORT conflict policies, and immediate non-deferrable foreign keys.
+    // None of those policies are surfaced completely by table_xinfo or
+    // foreign_key_list, so reject any explicit override lexically while still
+    // ignoring comments, string literals, and quoted identifiers.
+    ["COLLATE", "ON CONFLICT", "DEFERRABLE", "INITIALLY"]
+        .iter()
+        .all(|clause| !sql_contains_token_sequence(sql, clause))
+}
+
 fn compact_sql_fragment(sql: &str) -> String {
     sql_without_comments(sql)
         .chars()
@@ -2186,7 +2300,10 @@ fn auxiliary_runtime_table_canonical(
     auxiliary_runtime_columns_canonical(conn, table, columns)
         && auxiliary_runtime_issue_foreign_key_canonical(conn, table)
         && auxiliary_runtime_indexes_canonical(conn, table, indexes)
+        && auxiliary_runtime_primary_key_shape_canonical(conn, table, columns)
+        && runtime_table_options_canonical(conn, table)
         && table_check_constraints_canonical(conn, table, &[])
+        && table_declaration_clauses_canonical(conn, table)
 }
 
 fn capacity_exemptions_schema_canonical(conn: &Connection) -> bool {
@@ -2318,6 +2435,10 @@ fn core_runtime_foreign_keys_canonical(
                         .get(6)
                         .and_then(SqliteValue::as_text)
                         .is_some_and(|value| value.eq_ignore_ascii_case("CASCADE"))
+                    && row
+                        .get(7)
+                        .and_then(SqliteValue::as_text)
+                        .is_some_and(|value| value.eq_ignore_ascii_case("NONE"))
             })
 }
 
@@ -2344,7 +2465,10 @@ fn core_runtime_table_canonical(
     core_runtime_columns_canonical(conn, table, columns, order_sensitive)
         && core_runtime_foreign_keys_canonical(conn, table, issue_reference_columns)
         && auxiliary_runtime_indexes_canonical(conn, table, indexes)
+        && runtime_primary_key_shape_canonical(conn, table, columns)
+        && runtime_table_options_canonical(conn, table)
         && (table == "issues" || table_check_constraints_canonical(conn, table, &[]))
+        && table_declaration_clauses_canonical(conn, table)
         && autoincrement_primary_key
             .is_none_or(|column| table_declares_autoincrement_primary_key(conn, table, column))
         && (!forbid_unique_indexes || table_has_no_unique_indexes(conn, table))
@@ -3833,6 +3957,17 @@ fn attest_gate_result_history_schema(conn: &Connection) -> Result<()> {
     attest_gate_result_history_columns(conn)?;
     attest_gate_result_history_foreign_key(conn)?;
     attest_gate_result_history_indexes(conn)?;
+    if !runtime_primary_key_shape_canonical(conn, "gate_result_history", GATE_RESULT_HISTORY_COLUMNS)
+    {
+        return Err(schema_migration_shape_error(
+            "gate_result_history primary-key direction or collation is not canonical",
+        ));
+    }
+    if !runtime_table_options_canonical(conn, "gate_result_history") {
+        return Err(schema_migration_shape_error(
+            "gate_result_history must be a non-STRICT rowid table",
+        ));
+    }
     if !table_check_constraints_canonical(conn, "gate_result_history", &[]) {
         return Err(schema_migration_shape_error(
             "gate_result_history has an unexpected CHECK constraint",
@@ -6354,6 +6489,148 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_schema_contract_rejects_extra_core_table_check() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("extra-label-check.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+
+        execute_batch(
+            &conn,
+            r"
+            DROP INDEX idx_labels_label;
+            DROP INDEX idx_labels_issue;
+            DROP TABLE labels;
+            CREATE TABLE labels (
+                issue_id TEXT NOT NULL,
+                label TEXT NOT NULL CHECK(length(label) >= 1),
+                PRIMARY KEY (issue_id, label),
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            CREATE INDEX idx_labels_label ON labels(label);
+            CREATE INDEX idx_labels_issue ON labels(issue_id);
+            INSERT INTO issues (id, title) VALUES ('label-check-owner', 'Owner');
+            ",
+        )
+        .expect("plant a write-restricting CHECK outside issues");
+        assert!(
+            conn.execute(
+                "INSERT INTO labels (issue_id, label) VALUES ('label-check-owner', '')"
+            )
+            .is_err(),
+            "the extra CHECK must reject a label accepted by the canonical schema"
+        );
+        assert!(
+            !core_runtime_table_canonical(
+                &conn,
+                "labels",
+                LABELS_RUNTIME_COLUMNS,
+                &["issue_id"],
+                LABELS_RUNTIME_INDEXES,
+                false,
+                None,
+                false,
+            ),
+            "a hidden write restriction must not pass the core-table contract"
+        );
+        assert!(!runtime_schema_compatible(&conn));
+        assert!(attest_runtime_schema_cookie(&conn).is_err());
+    }
+
+    #[test]
+    fn test_runtime_schema_contract_rejects_nonbinary_primary_key_collation() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("nonbinary-issue-primary-key.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let schema = SCHEMA_SQL.replacen(
+            "id TEXT PRIMARY KEY,",
+            "id TEXT PRIMARY KEY COLLATE NOCASE,",
+            1,
+        );
+        assert_ne!(schema, SCHEMA_SQL, "the fixture must alter the issue PK");
+        execute_batch(&conn, &schema).expect("install non-BINARY issue primary key");
+        conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+            .expect("stamp current version");
+
+        conn.execute("INSERT INTO issues (id, title) VALUES ('Case-ID', 'Upper')")
+            .expect("seed mixed-case id");
+        assert!(
+            conn.execute("INSERT INTO issues (id, title) VALUES ('case-id', 'Lower')")
+                .is_err(),
+            "NOCASE primary key must reject IDs that the canonical BINARY key permits"
+        );
+        assert!(issues_required_checks_canonical(&conn));
+        assert!(
+            !runtime_primary_key_shape_canonical(&conn, "issues", ISSUES_RUNTIME_COLUMNS),
+            "primary-key collation is part of its uniqueness semantics"
+        );
+        assert!(!runtime_schema_compatible(&conn));
+        assert!(attest_runtime_schema_cookie(&conn).is_err());
+    }
+
+    #[test]
+    fn test_runtime_schema_contract_rejects_without_rowid_tables() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("without-rowid-dependencies.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+
+        execute_batch(
+            &conn,
+            r"
+            DROP INDEX idx_dependencies_issue;
+            DROP INDEX idx_dependencies_depends_on;
+            DROP INDEX idx_dependencies_type;
+            DROP INDEX idx_dependencies_depends_on_type;
+            DROP INDEX idx_dependencies_thread;
+            DROP INDEX idx_dependencies_blocking;
+            DROP TABLE dependencies;
+            CREATE TABLE dependencies (
+                issue_id TEXT NOT NULL,
+                depends_on_id TEXT NOT NULL,
+                type TEXT NOT NULL DEFAULT 'blocks',
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                created_by TEXT NOT NULL DEFAULT '',
+                metadata TEXT DEFAULT '{}',
+                thread_id TEXT DEFAULT '',
+                PRIMARY KEY (issue_id, depends_on_id),
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            ) WITHOUT ROWID;
+            CREATE INDEX idx_dependencies_issue ON dependencies(issue_id);
+            CREATE INDEX idx_dependencies_depends_on ON dependencies(depends_on_id);
+            CREATE INDEX idx_dependencies_type ON dependencies(type);
+            CREATE INDEX idx_dependencies_depends_on_type
+                ON dependencies(depends_on_id, type);
+            CREATE INDEX idx_dependencies_thread
+                ON dependencies(thread_id) WHERE thread_id != '';
+            CREATE INDEX idx_dependencies_blocking
+                ON dependencies(depends_on_id, issue_id)
+                WHERE (type = 'blocks' OR type = 'parent-child'
+                    OR type = 'conditional-blocks' OR type = 'waits-for');
+            INSERT INTO issues (id, title) VALUES ('rowid-child', 'Child');
+            INSERT INTO dependencies (issue_id, depends_on_id)
+                VALUES ('rowid-child', 'external-parent');
+            ",
+        )
+        .expect("plant exact-shape WITHOUT ROWID dependencies");
+
+        assert!(
+            conn.query(
+                "SELECT depends_on_id FROM dependencies
+                 WHERE issue_id = 'rowid-child' ORDER BY rowid"
+            )
+            .is_err(),
+            "WITHOUT ROWID must break a dependency read shape used by live storage"
+        );
+        assert!(
+            !runtime_table_options_canonical(&conn, "dependencies"),
+            "canonical dependencies is an ordinary rowid table"
+        );
+        assert!(!runtime_schema_compatible(&conn));
+        assert!(attest_runtime_schema_cookie(&conn).is_err());
+    }
+
+    #[test]
     fn test_runtime_schema_contract_rejects_write_restricting_triggers() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("write-restricting-trigger.db");
@@ -6740,7 +7017,7 @@ mod tests {
         apply_schema(&conn).expect("schema");
         let cookie = attest_runtime_schema_cookie(&conn).expect("attest current schema");
         let prior_witness = format!(
-            "schema-{CURRENT_SCHEMA_VERSION}.contract-v7-version-fenced-lexical-core-aux-columns-fks-index-directions-collations-exact-checks-autoincrement-cookie-fenced.cookie-{cookie}"
+            "schema-{CURRENT_SCHEMA_VERSION}.contract-v8-version-fenced-lexical-core-aux-columns-fks-index-directions-collations-exact-checks-autoincrement-no-hidden-columns-no-triggers-cookie-fenced.cookie-{cookie}"
         );
         conn.execute_with_params(
             "INSERT INTO metadata (key, value) VALUES (?, ?)",
