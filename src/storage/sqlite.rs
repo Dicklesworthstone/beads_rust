@@ -15901,10 +15901,7 @@ fn sqlite_wal_frame_state(db_path: &Path) -> Result<WalFrameState> {
                 .to_string(),
         });
     }
-    if initial_metadata.len() == 0 {
-        return Ok(WalFrameState::AbsentOrEmpty);
-    }
-    if initial_metadata.len() < 32 {
+    if initial_metadata.len() != 0 && initial_metadata.len() < 32 {
         return Err(BeadsError::SyncConflict {
             message: format!(
                 "Refusing schema preflight because the {}-byte WAL header is truncated",
@@ -15949,6 +15946,10 @@ fn sqlite_wal_frame_state(db_path: &Path) -> Result<WalFrameState> {
                 message: "WAL changed identity during schema preflight".to_string(),
             });
         }
+    }
+
+    if initial_metadata.len() == 0 {
+        return Ok(WalFrameState::AbsentOrEmpty);
     }
 
     let mut header = [0_u8; 32];
@@ -16139,17 +16140,38 @@ fn heal_namespace_sidecar_modes_under_authority(
     authority: &crate::sync::DatabaseFamilyWriteLock,
 ) -> Result<()> {
     verify_namespace_healing_authority(db_path, authority)?;
-    if !namespace_sidecar_mode_repair_required(db_path)? {
-        return Ok(());
-    }
-    verify_namespace_healing_schema_precondition(db_path)?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-        for suffix in crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES {
-            let sidecar = database_sidecar_path(db_path, suffix);
+        let repair_witnesses = namespace_sidecar_mode_repair_witnesses(db_path)?;
+        if repair_witnesses.is_empty() {
+            return Ok(());
+        }
+        verify_namespace_healing_schema_precondition(db_path)?;
+
+        // Revalidate the complete witnessed set immediately before the first
+        // chmod. A later invalid family member must not be discovered only
+        // after an earlier member has already been changed.
+        for witness in &repair_witnesses {
+            let metadata = std::fs::symlink_metadata(&witness.path)?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || (metadata.dev(), metadata.ino()) != witness.identity
+                || metadata.permissions().mode() != witness.mode
+            {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Fsqlite namespace sidecar {} changed after the family preflight",
+                        witness.path.display()
+                    ),
+                });
+            }
+        }
+
+        for witness in repair_witnesses {
+            let sidecar = witness.path;
             let initial_metadata = match std::fs::symlink_metadata(&sidecar) {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -16164,6 +16186,16 @@ fn heal_namespace_sidecar_modes_under_authority(
                 });
             }
             let observed_mode = initial_metadata.permissions().mode();
+            if (initial_metadata.dev(), initial_metadata.ino()) != witness.identity
+                || observed_mode != witness.mode
+            {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Fsqlite namespace sidecar {} changed identity after the family preflight",
+                        sidecar.display()
+                    ),
+                });
+            }
             if observed_mode & 0o077 == 0 {
                 continue;
             }
@@ -16182,7 +16214,7 @@ fn heal_namespace_sidecar_modes_under_authority(
             maybe_swap_namespace_sidecar_after_open_for_test(&sidecar)?;
             let handle_metadata = sidecar_file.metadata()?;
             let pre_chmod_metadata = std::fs::symlink_metadata(&sidecar)?;
-            let initial_identity = (initial_metadata.dev(), initial_metadata.ino());
+            let initial_identity = witness.identity;
             let handle_identity = (handle_metadata.dev(), handle_metadata.ino());
             let pre_chmod_identity = (pre_chmod_metadata.dev(), pre_chmod_metadata.ino());
             if !handle_metadata.is_file()

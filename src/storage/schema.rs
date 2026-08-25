@@ -4037,6 +4037,46 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_schema_refuses_future_version_before_any_repair_or_pragma_write() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("future-schema-refusal.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+
+        conn.execute("DROP INDEX idx_comments_created_at")
+            .expect("make schema repair observable");
+        conn.execute("PRAGMA foreign_keys = OFF")
+            .expect("make runtime pragma mutation observable");
+        let future_version = CURRENT_SCHEMA_VERSION + 1;
+        conn.execute(&format!("PRAGMA user_version = {future_version}"))
+            .expect("stamp future schema");
+        let cookie_before = runtime_schema_cookie(&conn).expect("read damaged schema cookie");
+
+        let error = apply_schema(&conn).expect_err("future schema must be refused");
+        assert!(
+            error.to_string().contains("newer than supported"),
+            "future-version refusal should be explicit: {error}"
+        );
+        assert_eq!(
+            runtime_user_version(&conn).expect("read refused future version"),
+            i64::from(future_version)
+        );
+        assert_eq!(
+            runtime_schema_cookie(&conn).expect("read post-refusal cookie"),
+            cookie_before,
+            "future-version refusal must occur before repair DDL"
+        );
+        assert!(
+            !index_exists(&conn, "idx_comments_created_at"),
+            "future-version refusal must not recreate a missing index"
+        );
+        assert!(
+            !foreign_keys_enabled(&conn).expect("read post-refusal pragma"),
+            "future-version refusal must not apply connection pragmas"
+        );
+    }
+
+    #[test]
     fn test_v6_repair_integer_datetime_columns() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("beads.db");
@@ -4612,7 +4652,15 @@ mod tests {
         // pre-reviewed-era versions (< 13) deliberately keep the shipped
         // general upgrade path (see test_db_migrate_happy_path's 7->current),
         // while the stamp-integrity refusals below are fully retained.
-        for (from, target) in [(13, 14), (14, 14), (15, 15), (13, 16)] {
+        let current = current_schema_version_u32().expect("current version");
+        let future = current.checked_add(1).expect("future version");
+        for (from, target) in [
+            (13, 14),
+            (14, 14),
+            (15, 15),
+            (13, 16),
+            (future, current),
+        ] {
             let temp = TempDir::new().expect("tempdir");
             let db_path = temp.path().join(format!("refuse-{from}-{target}.db"));
             let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
@@ -4792,6 +4840,63 @@ mod tests {
                 "v16 migration missing capacity_exemption_history.{column}"
             );
         }
+    }
+
+    #[test]
+    fn test_reviewed_v16_refuses_malformed_capacity_schema_before_v17_writes() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("malformed-reviewed-v16.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+
+        conn.execute("DROP TABLE capacity_exemptions")
+            .expect("remove canonical exemption state table");
+        conn.execute(
+            "CREATE TABLE capacity_exemptions (
+                issue_id TEXT NOT NULL,
+                capacity_kind TEXT NOT NULL,
+                capacity_name TEXT NOT NULL,
+                provider TEXT,
+                reason TEXT NOT NULL,
+                granted_by TEXT NOT NULL,
+                granted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                expires_at DATETIME,
+                ended_at DATETIME,
+                ended_action TEXT,
+                ended_by TEXT,
+                PRIMARY KEY (issue_id, capacity_kind, capacity_name),
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            )",
+        )
+        .expect("plant nullable provider in same-name v16 table");
+        conn.execute(
+            "CREATE INDEX idx_capacity_exemptions_capacity
+             ON capacity_exemptions(capacity_kind, capacity_name)",
+        )
+        .expect("restore same-name v16 index");
+        conn.execute("DROP TABLE capacity_occupancy")
+            .expect("make v17 creation observable");
+        conn.execute("PRAGMA user_version = 16")
+            .expect("stamp reviewed v16 source");
+
+        let error = run_migrations_atomic(
+            &conn,
+            16,
+            current_schema_version_u32().expect("current version"),
+        )
+        .expect_err("malformed v16 source must be refused");
+        assert!(
+            error.to_string().contains("v16 post-check failed"),
+            "v16 shape refusal should be explicit: {error}"
+        );
+        assert_eq!(
+            connection_user_version(&conn).expect("read rolled-back source version"),
+            16
+        );
+        assert!(
+            !table_exists(&conn, "capacity_occupancy"),
+            "v16 attestation must run before applying v17 DDL"
+        );
     }
 
     #[test]
@@ -5730,6 +5835,33 @@ mod tests {
     }
 
     #[test]
+    fn test_rebuild_issues_table_quotes_database_sourced_index_names() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("quoted-index-rebuild.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        conn.execute("INSERT INTO issues (id, title) VALUES ('quoted-index', 'Preserve me')")
+            .expect("seed issue");
+        conn.execute(r#"CREATE INDEX "idx_issues_hostile""quote" ON issues(title)"#)
+            .expect("plant an index name containing a quote");
+
+        rebuild_issues_table(&conn)
+            .expect("database-sourced index names must be quoted as identifiers");
+
+        let preserved = conn
+            .query_row("SELECT title FROM issues WHERE id = 'quoted-index'")
+            .expect("read preserved issue after rebuild");
+        assert_eq!(
+            preserved.get(0).and_then(SqliteValue::as_text),
+            Some("Preserve me")
+        );
+        assert!(
+            !index_exists(&conn, "idx_issues_hostile\"quote"),
+            "the hostile-name index should have been dropped, not reparsed as SQL"
+        );
+    }
+
+    #[test]
     fn test_rebuild_issues_table_restores_foreign_keys_when_begin_fails() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("locked-rebuild.db");
@@ -6337,6 +6469,63 @@ mod tests {
         assert!(
             !issues_required_checks_canonical(&conn),
             "comment text is not evidence that a CHECK constraint is enforced"
+        );
+        assert!(!runtime_schema_compatible(&conn));
+        assert!(attest_runtime_schema_cookie(&conn).is_err());
+    }
+
+    #[test]
+    fn test_runtime_schema_contract_rejects_extra_write_restricting_check() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("extra-issue-check.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let schema = SCHEMA_SQL.replace(
+            "title TEXT NOT NULL CHECK(length(title) <= 500),",
+            "title TEXT NOT NULL CHECK(length(title) <= 500) CHECK(length(title) >= 1),",
+        );
+        assert_ne!(schema, SCHEMA_SQL, "the fixture must add a CHECK");
+        execute_batch(&conn, &schema).expect("install extra-CHECK schema");
+        conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+            .expect("stamp current version");
+
+        let empty_title = conn.execute("INSERT INTO issues (id, title) VALUES ('empty-title', '')");
+        assert!(
+            empty_title.is_err(),
+            "the extra CHECK must reject a title accepted by the canonical schema"
+        );
+        let stored_sql = conn
+            .query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'issues'")
+            .expect("read issue DDL");
+        let stored_sql = stored_sql
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .expect("issue DDL text");
+        for required in [
+            "CHECK(length(title) <= 500)",
+            "CHECK(priority >= 0 AND priority <= 4)",
+            ISSUES_CLOSED_AT_CHECK,
+        ] {
+            assert!(
+                sql_contains_token_sequence(stored_sql, required),
+                "the prior subsequence checker must false-green this fixture"
+            );
+        }
+        assert!(
+            core_runtime_table_canonical(
+                &conn,
+                "issues",
+                ISSUES_RUNTIME_COLUMNS,
+                &[],
+                ISSUES_RUNTIME_INDEXES,
+                true,
+                None,
+                false,
+            ),
+            "the fixture must differ from the runtime manifest only in CHECK semantics"
+        );
+        assert!(
+            !issues_required_checks_canonical(&conn),
+            "the exact CHECK set must reject an extra write restriction"
         );
         assert!(!runtime_schema_compatible(&conn));
         assert!(attest_runtime_schema_cookie(&conn).is_err());
