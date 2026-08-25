@@ -970,13 +970,20 @@ fn install_compacted_candidate(
         }
         if let Err(error) = fs::rename(candidate_path, displaced_main) {
             let exchange_rollback = exchange_database_paths(db_path, candidate_path);
-            let authority_rollback =
-                write_authority.restore_retained_database_inode_after_authorized_replace();
-            return match (exchange_rollback, authority_rollback) {
-                (Ok(()), Ok(())) => Err(BeadsError::Io(error)),
-                (exchange_result, authority_result) => Err(BeadsError::internal(format!(
+            return match exchange_rollback {
+                Ok(()) => match write_authority
+                    .restore_retained_database_inode_after_authorized_replace()
+                {
+                    Ok(()) => Err(BeadsError::Io(error)),
+                    Err(authority_error) => Err(BeadsError::internal(format!(
+                        "could not retain exchanged pre-compaction database ({error}); exchange \
+                         rollback succeeded, but authority rollback failed ({authority_error})"
+                    ))),
+                },
+                Err(exchange_error) => Err(BeadsError::internal(format!(
                     "could not retain exchanged pre-compaction database ({error}); exchange \
-                     rollback={exchange_result:?}, authority rollback={authority_result:?}"
+                     rollback also failed ({exchange_error}); replacement authority remains \
+                     bound to the still-installed database"
                 ))),
             };
         }
