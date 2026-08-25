@@ -4069,25 +4069,13 @@ fn additive_file_identity(path: &Path) -> Result<(u64, u64)> {
     Ok(additive_metadata_identity(&metadata))
 }
 
-/// Windows/fallback file-identity witness.
+/// Non-Unix auxiliary identity for reviewed source-file snapshots.
 ///
-/// GitHub #412 follow-up: the previous `(len, modified)` witness was
-/// *content-sensitive* — the SQLite engine mutates the database's length and
-/// mtime on every write, so the database-inode authority immediately reported
-/// "Database inode changed while its write authority was held" on the first
-/// mutating open. (On v0.2.20 this was masked by the whole-file mandatory
-/// lock failing even earlier.)
-///
-/// Identity must be stable across in-place writes and change on file
-/// *replacement*. Creation time has exactly those semantics on Windows: it
-/// survives writes and renames of the same file, while atomic replacement
-/// (rename of a freshly created temp file over the destination — the only
-/// replacement mechanism the sync layer uses) installs a file whose creation
-/// time differs. Timestamps carry 100ns resolution, so an accidental
-/// collision between the displaced file and its replacement is negligible.
-/// When the filesystem cannot report a creation time, fall back to the
-/// modified time rather than a constant so distinct files still tend to
-/// differ.
+/// This creation/modified-time witness is never accepted as SQLite database
+/// inode authority: [`additive_file_identity`] fails closed on these targets.
+/// Source snapshots separately bind exact content bytes, size, and timestamps;
+/// this tuple only adds a best-effort replacement signal for that read-only
+/// source route.
 #[cfg(not(unix))]
 fn additive_metadata_identity(metadata: &fs::Metadata) -> (u64, u64) {
     #[allow(clippy::cast_possible_truncation)]
@@ -4337,6 +4325,7 @@ pub(crate) fn apply_reviewed_additive_reconcile_under_authority(
             "Reviewed additive reconciliation workspace or database identity changed while acquiring the database authority lock".to_string(),
         ));
     }
+    write_authority.verify_database_authority()?;
     let mut storage = redact_reviewed_path_result(
         SqliteStorage::open_current_for_reconcile(&canonical_database, request.lock_timeout_ms),
         &canonical_database,
@@ -4349,6 +4338,7 @@ pub(crate) fn apply_reviewed_additive_reconcile_under_authority(
             database_path_descriptor(&canonical_database)
         ))
     })?;
+    write_authority.verify_database_authority()?;
     storage.attach_write_authority(std::sync::Arc::clone(&write_authority));
     if additive_file_identity(&canonical_database)? != database_identity {
         return Err(BeadsError::Config(

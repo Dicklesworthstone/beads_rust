@@ -2710,8 +2710,12 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
     }
     create_cols.push(ISSUES_CLOSED_AT_CHECK.to_string());
 
+    // Qualify every staging-table reference. A connection-local TEMP table
+    // may legally use the same name and shadows unqualified DML even though it
+    // is absent from main.sqlite_master; it must never intercept migration
+    // rows or be dropped as if it were our staging table.
     let create_sql = format!(
-        "CREATE TABLE issues_rebuild_tmp ({})",
+        "CREATE TABLE main.issues_rebuild_tmp ({})",
         create_cols.join(", ")
     );
     conn.execute(&create_sql)?;
@@ -2733,26 +2737,26 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
 
     // Copy data out to the temp table.
     let copy_out_sql = format!(
-        "INSERT INTO issues_rebuild_tmp ({cols}) SELECT {cols} FROM issues",
+        "INSERT INTO main.issues_rebuild_tmp ({cols}) SELECT {cols} FROM main.issues",
         cols = projected_columns.join(", ")
     );
     conn.execute(&copy_out_sql)?;
 
     // Drop the original table, then CREATE it fresh (not via RENAME) so
     // that fsqlite's in-memory schema cache registers all columns.
-    conn.execute("DROP TABLE issues")?;
+    conn.execute("DROP TABLE main.issues")?;
 
-    let create_canonical = format!("CREATE TABLE issues ({})", create_cols.join(", "));
+    let create_canonical = format!("CREATE TABLE main.issues ({})", create_cols.join(", "));
     conn.execute(&create_canonical)?;
 
     // Copy data back.
     let copy_back_sql = format!(
-        "INSERT INTO issues ({cols}) SELECT {cols} FROM issues_rebuild_tmp",
+        "INSERT INTO main.issues ({cols}) SELECT {cols} FROM main.issues_rebuild_tmp",
         cols = projected_columns.join(", ")
     );
     conn.execute(&copy_back_sql)?;
 
-    conn.execute("DROP TABLE issues_rebuild_tmp")?;
+    conn.execute("DROP TABLE main.issues_rebuild_tmp")?;
 
     Ok(())
 }
@@ -2855,20 +2859,20 @@ fn rebuild_kv_table_without_unique(conn: &Connection, table: &str) -> Result<()>
             )));
         }
         conn.execute(&format!(
-            "CREATE TABLE {tmp_table} (
+            "CREATE TABLE main.{tmp_table} (
                 key TEXT NOT NULL,
                 value TEXT NOT NULL
             )"
         ))?;
 
         conn.execute(&format!(
-            "INSERT INTO {tmp_table} (key, value)
+            "INSERT INTO main.{tmp_table} (key, value)
              SELECT key, value
-             FROM {table}"
+             FROM main.{table}"
         ))?;
 
-        conn.execute(&format!("DROP TABLE {table}"))?;
-        conn.execute(&format!("ALTER TABLE {tmp_table} RENAME TO {table}"))?;
+        conn.execute(&format!("DROP TABLE main.{table}"))?;
+        conn.execute(&format!("ALTER TABLE main.{tmp_table} RENAME TO {table}"))?;
         Ok(())
     })();
 
@@ -6066,6 +6070,42 @@ mod tests {
     }
 
     #[test]
+    fn test_rebuild_issues_table_does_not_use_temp_staging_shadow() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("issues-temp-staging-shadow.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        conn.execute("INSERT INTO issues (id, title) VALUES ('owned', 'Original')")
+            .expect("seed canonical issue");
+        conn.execute("CREATE TEMP TABLE issues_rebuild_tmp (sentinel TEXT NOT NULL)")
+            .expect("plant TEMP staging-name shadow");
+        conn.execute("INSERT INTO temp.issues_rebuild_tmp (sentinel) VALUES ('preserve-temp')")
+            .expect("seed TEMP staging-name sentinel");
+
+        rebuild_issues_table(&conn)
+            .expect("main-qualified rebuild must ignore the TEMP staging shadow");
+
+        let sentinel = conn
+            .query_row("SELECT sentinel FROM temp.issues_rebuild_tmp")
+            .expect("read preserved TEMP sentinel");
+        assert_eq!(
+            sentinel.get(0).and_then(SqliteValue::as_text),
+            Some("preserve-temp")
+        );
+        let issue = conn
+            .query_row("SELECT title FROM main.issues WHERE id = 'owned'")
+            .expect("read issue preserved through main-schema staging table");
+        assert_eq!(
+            issue.get(0).and_then(SqliteValue::as_text),
+            Some("Original")
+        );
+        assert!(
+            !table_exists(&conn, "issues_rebuild_tmp"),
+            "the main-schema staging table must be removed"
+        );
+    }
+
+    #[test]
     fn test_rebuild_kv_table_preserves_preexisting_staging_table() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("kv-staging-collision.db");
@@ -6099,6 +6139,42 @@ mod tests {
         assert_eq!(
             original.get(0).and_then(SqliteValue::as_text),
             Some("original")
+        );
+    }
+
+    #[test]
+    fn test_rebuild_kv_table_does_not_use_temp_staging_shadow() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("kv-temp-staging-shadow.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        conn.execute("INSERT INTO config (key, value) VALUES ('owned', 'original')")
+            .expect("seed canonical config");
+        conn.execute("CREATE TEMP TABLE config_rebuild_tmp (sentinel TEXT NOT NULL)")
+            .expect("plant TEMP staging-name shadow");
+        conn.execute("INSERT INTO temp.config_rebuild_tmp (sentinel) VALUES ('preserve-temp')")
+            .expect("seed TEMP staging-name sentinel");
+
+        rebuild_kv_table_without_unique(&conn, "config")
+            .expect("main-qualified KV rebuild must ignore the TEMP staging shadow");
+
+        let sentinel = conn
+            .query_row("SELECT sentinel FROM temp.config_rebuild_tmp")
+            .expect("read preserved TEMP sentinel");
+        assert_eq!(
+            sentinel.get(0).and_then(SqliteValue::as_text),
+            Some("preserve-temp")
+        );
+        let original = conn
+            .query_row("SELECT value FROM main.config WHERE key = 'owned'")
+            .expect("read config row preserved through main-schema staging table");
+        assert_eq!(
+            original.get(0).and_then(SqliteValue::as_text),
+            Some("original")
+        );
+        assert!(
+            !table_exists(&conn, "config_rebuild_tmp"),
+            "the main-schema staging table must be removed"
         );
     }
 

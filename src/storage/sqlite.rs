@@ -16008,6 +16008,7 @@ impl StableSchemaSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WalSchemaPreflight {
     committed_user_version: Option<u32>,
+    has_committed_frames: bool,
 }
 
 fn wal_checksum(
@@ -16048,6 +16049,7 @@ fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
     let Some(mut wal_source) = StableSchemaSource::open_optional(&wal_path, "WAL")? else {
         return Ok(WalSchemaPreflight {
             committed_user_version: None,
+            has_committed_frames: false,
         });
     };
     let wal_len = wal_source.initial_len;
@@ -16055,6 +16057,7 @@ fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
         wal_source.verify_path(&wal_path, "WAL")?;
         return Ok(WalSchemaPreflight {
             committed_user_version: None,
+            has_committed_frames: false,
         });
     }
     if wal_len < 32 {
@@ -16119,6 +16122,7 @@ fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
     let mut running_checksum = expected_checksum;
     let mut pending_page_one_version = None;
     let mut committed_page_one_version = None;
+    let mut has_committed_frames = false;
     let mut frame = vec![0_u8; frame_size_usize];
     let mut last_inspected_frame_offset = None;
     for frame_index in 0..frame_count {
@@ -16196,6 +16200,7 @@ fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
             ));
         }
         if database_size != 0 {
+            has_committed_frames = true;
             committed_page_one_version = pending_page_one_version;
         }
     }
@@ -16226,6 +16231,7 @@ fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
 
     Ok(WalSchemaPreflight {
         committed_user_version: committed_page_one_version,
+        has_committed_frames,
     })
 }
 
