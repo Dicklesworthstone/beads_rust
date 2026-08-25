@@ -30,11 +30,13 @@ const REQUIRED_PLATFORMS: &[&str] = &[
 
 #[derive(Debug, Deserialize)]
 struct Workflow {
+    permissions: BTreeMap<String, String>,
     jobs: BTreeMap<String, Job>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Job {
+    permissions: Option<BTreeMap<String, String>>,
     steps: Vec<Step>,
 }
 
@@ -53,6 +55,8 @@ struct Step {
 struct ActionInputs {
     #[serde(rename = "ref")]
     checkout_ref: Option<String>,
+    #[serde(rename = "persist-credentials")]
+    persist_credentials: Option<bool>,
     toolchain: Option<String>,
 }
 
@@ -132,6 +136,15 @@ fn release_workflow_checkout_refs_are_unambiguous() -> Result<(), String> {
                 "checkout step must have exactly one release-tag ref, found {checkout_ref:?}"
             ));
         }
+        let persist_credentials = step
+            .action_inputs
+            .as_ref()
+            .and_then(|inputs| inputs.persist_credentials);
+        if persist_credentials != Some(false) {
+            return Err(format!(
+                "release checkout must not persist write-capable credentials, found {persist_credentials:?}"
+            ));
+        }
     }
 
     if checkout_steps == 5 {
@@ -141,6 +154,60 @@ fn release_workflow_checkout_refs_are_unambiguous() -> Result<(), String> {
             "expected five release checkout steps, found {checkout_steps}"
         ))
     }
+}
+
+#[test]
+fn release_workflow_scopes_write_permissions_to_publication_job() -> Result<(), String> {
+    let workflow = parse_release_workflow()?;
+    let expected_top_level = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
+    if workflow.permissions != expected_top_level {
+        return Err(format!(
+            "release workflow top-level permissions must be read-only, found {:?}",
+            workflow.permissions
+        ));
+    }
+
+    let expected_release_permissions = BTreeMap::from([
+        ("actions".to_owned(), "read".to_owned()),
+        ("attestations".to_owned(), "write".to_owned()),
+        ("contents".to_owned(), "write".to_owned()),
+        ("id-token".to_owned(), "write".to_owned()),
+    ]);
+    for (job_name, job) in &workflow.jobs {
+        if job_name == "create-release" {
+            if job.permissions.as_ref() != Some(&expected_release_permissions) {
+                return Err(format!(
+                    "create-release permissions are incomplete or overbroad: {:?}",
+                    job.permissions
+                ));
+            }
+        } else if job.permissions.is_some() {
+            return Err(format!(
+                "non-publication job {job_name} must inherit read-only permissions, found {:?}",
+                job.permissions
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn release_workflow_uses_native_macos_runners_for_both_architectures() -> Result<(), String> {
+    let workflow = read_to_string(Path::new(RELEASE_WORKFLOW))?;
+
+    require_contains(
+        &workflow,
+        "- target: x86_64-apple-darwin\n            os: macos-15-intel",
+    )?;
+    require_contains(
+        &workflow,
+        "- target: aarch64-apple-darwin\n            os: macos-14",
+    )?;
+    require_not_contains(
+        &workflow,
+        "- target: x86_64-apple-darwin\n            os: macos-15\n",
+    )
 }
 
 #[test]

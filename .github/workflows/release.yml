@@ -32,9 +32,7 @@ env:
   MINISIGN_PUBLIC_KEY: 'RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB'
 
 permissions:
-  contents: write
-  id-token: write      # Required for SLSA provenance
-  attestations: write  # Required for artifact attestations
+  contents: read
 
 jobs:
   preflight:
@@ -47,6 +45,7 @@ jobs:
           # Check out the requested tag on workflow_dispatch so the Cargo.toml
           # we verify matches the artifacts that will actually be built.
           ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
 
       - name: Verify tag matches Cargo.toml version
         env:
@@ -92,6 +91,7 @@ jobs:
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
@@ -193,7 +193,7 @@ jobs:
             linker: ""
           # macOS Intel
           - target: x86_64-apple-darwin
-            os: macos-15
+            os: macos-15-intel
             archive: tar.gz
             name: darwin_amd64
             can_run: true
@@ -219,6 +219,7 @@ jobs:
           # On workflow_dispatch, build from the requested tag so the binary's
           # embedded version matches what we publish.
           ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
           fetch-depth: 0  # Full history for vergen
 
       - name: Install Rust toolchain
@@ -409,6 +410,11 @@ jobs:
     if: always() && !cancelled()
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+      id-token: write      # Required for SLSA provenance
+      attestations: write  # Required for artifact attestations
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -417,6 +423,7 @@ jobs:
           # changelog, and any cargo install --tag invocations agree with the
           # tagged artifacts.
           ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Determine release asset version
@@ -671,6 +678,7 @@ jobs:
         with:
           # cargo publish must build from the tagged source, not the branch HEAD.
           ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
