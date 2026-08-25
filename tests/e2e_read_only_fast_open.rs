@@ -201,6 +201,11 @@ fn status_and_report_commands() -> Vec<MatrixCommand> {
             "count_by_label_json",
             strings(["count", "--by", "label", "--json"]),
         ),
+        normalized_json_command(
+            "coordination_status_json",
+            strings(["coordination", "status", "--json"]),
+            &["generated_at"],
+        ),
         exact_command("stale_json", strings(["stale", "--days", "0", "--json"])),
         exact_command("lint_json", strings(["lint", "--json"])),
         exact_command("sync_status_json", strings(["sync", "--status", "--json"])),

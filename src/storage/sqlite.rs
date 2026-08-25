@@ -15855,15 +15855,7 @@ fn future_schema_error(version: u32, current_schema_version: u32) -> BeadsError 
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WalFrameState {
-    AbsentOrEmpty,
-    HeaderOnly,
-    FramesPresent,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WalSchemaPreflight {
-    frame_state: WalFrameState,
     committed_user_version: Option<u32>,
 }
 
@@ -15902,7 +15894,6 @@ fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(WalSchemaPreflight {
-                frame_state: WalFrameState::AbsentOrEmpty,
                 committed_user_version: None,
             });
         }
@@ -15963,7 +15954,6 @@ fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
 
     if initial_metadata.len() == 0 {
         return Ok(WalSchemaPreflight {
-            frame_state: WalFrameState::AbsentOrEmpty,
             committed_user_version: None,
         });
     }
@@ -16038,7 +16028,6 @@ fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
             }
         }
         return Ok(WalSchemaPreflight {
-            frame_state: WalFrameState::HeaderOnly,
             committed_user_version: None,
         });
     }
@@ -16170,13 +16159,8 @@ fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
     }
 
     Ok(WalSchemaPreflight {
-        frame_state: WalFrameState::FramesPresent,
         committed_user_version: committed_page_one_version,
     })
-}
-
-fn sqlite_wal_frame_state(db_path: &Path) -> Result<WalFrameState> {
-    Ok(sqlite_wal_schema_preflight(db_path)?.frame_state)
 }
 
 fn preflight_effective_schema_before_writable_open(db_path: &Path) -> Result<()> {
@@ -16224,11 +16208,15 @@ fn verify_namespace_healing_schema_precondition(db_path: &Path) -> Result<()> {
         ));
     }
 
-    if sqlite_wal_frame_state(db_path)? == WalFrameState::FramesPresent {
-        return Err(BeadsError::SyncConflict {
-            message: "Refusing fsqlite namespace sidecar repair because WAL frames make the effective schema version uncertain"
-                .to_string(),
-        });
+    let wal_preflight = sqlite_wal_schema_preflight(db_path)?;
+    let effective_version = wal_preflight
+        .committed_user_version
+        .unwrap_or(header_version);
+    if effective_version > current_schema_version {
+        return Err(future_schema_error(
+            effective_version,
+            current_schema_version,
+        ));
     }
     Ok(())
 }
@@ -27058,7 +27046,6 @@ mod tests {
              the WAL-miss scenario cannot be proven"
         );
         let wal_preflight = sqlite_wal_schema_preflight(&db_path).unwrap();
-        assert_eq!(wal_preflight.frame_state, WalFrameState::FramesPresent);
         assert_eq!(
             wal_preflight.committed_user_version,
             Some(4242),
@@ -29239,7 +29226,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_wal_only_future_schema_is_refused_by_byte_neutral_read_only_preflight() {
+    fn test_wal_only_future_schema_is_refused_by_byte_neutral_preflight() {
+        use std::os::unix::fs::PermissionsExt;
+
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("wal_only_future_schema.db");
         let current_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap();
@@ -29266,9 +29255,11 @@ mod tests {
             "the fixture must keep the future version out of the main header"
         );
         assert_eq!(
-            sqlite_wal_frame_state(&db_path).unwrap(),
-            WalFrameState::FramesPresent,
-            "the fixture must carry the future version in WAL frames"
+            sqlite_wal_schema_preflight(&db_path)
+                .unwrap()
+                .committed_user_version,
+            Some(future_version),
+            "the fixture must carry the future version in WAL page-one frames"
         );
         let family_before = directory_bytes_and_modes(temp.path());
 
@@ -29285,7 +29276,39 @@ mod tests {
             family_before,
             "future-version preflight must not create, chmod, or rewrite any family member"
         );
-        writer.close().unwrap();
+
+        let sidecars = existing_namespace_sidecars(&db_path);
+        assert!(!sidecars.is_empty(), "namespace sidecar fixture");
+        for sidecar in &sidecars {
+            fs::set_permissions(sidecar, fs::Permissions::from_mode(0o664)).unwrap();
+        }
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                temp.path(),
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+        let permissive_family_before = directory_bytes_and_modes(temp.path());
+        let gated_error = SqliteStorage::open_with_timeout_under_write_authority(
+            &db_path,
+            Some(50),
+            &authority,
+        )
+        .expect_err("WAL-only future schema must precede authority-gated chmod");
+        assert!(
+            gated_error
+                .to_string()
+                .contains("newer than this br binary supports"),
+            "unexpected authority-gated WAL future error: {gated_error}"
+        );
+        assert_eq!(
+            directory_bytes_and_modes(temp.path()),
+            permissive_family_before,
+            "authority-gated future refusal must leave permissive sidecar modes unchanged"
+        );
+        drop(writer);
     }
 
     #[cfg(unix)]

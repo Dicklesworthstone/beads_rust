@@ -17,7 +17,7 @@ const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
 // caused rustc to interpret hundreds of thousands of loop iterations on every
 // schema rebuild, overwhelming the compile-time savings of the runtime fast
 // path itself.
-const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str = "v11-version-fenced-lexical-core-aux-columns-fks-match-immediate-index-and-primary-key-directions-implicit-binary-collations-default-conflicts-exact-checks-autoincrement-rowid-nonstrict-no-hidden-columns-no-triggers-cookie-fenced";
+const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str = "v13-exact-ddl-version-domain-cookie-fenced";
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 const GATE_RESULT_HISTORY_MIGRATION_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS gate_result_history (
@@ -755,7 +755,7 @@ pub(crate) fn execute_batch(conn: &Connection, sql: &str) -> Result<()> {
 ///
 /// Returns an error if the SQL execution fails or pragmas cannot be set.
 pub fn apply_schema(conn: &Connection) -> Result<()> {
-    refuse_future_schema_version(conn, "schema application")?;
+    validate_schema_version_for_mutation(conn, "schema application")?;
     refuse_persistent_triggers(conn, "schema application")?;
 
     // Detect a truly fresh (empty) database before any DDL runs.
@@ -830,13 +830,18 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
 
 fn connection_user_version(conn: &Connection) -> Result<u32> {
     let row = conn.query_row("PRAGMA user_version")?;
-    Ok(row
+    let version = row
         .get(0)
         .and_then(|v| match v {
-            fsqlite_types::value::SqliteValue::Integer(n) => u32::try_from(*n).ok(),
+            fsqlite_types::value::SqliteValue::Integer(n) => Some(*n),
             _ => None,
         })
-        .unwrap_or(0))
+        .ok_or_else(|| BeadsError::internal("PRAGMA user_version returned no integer value"))?;
+    u32::try_from(version).map_err(|_| {
+        BeadsError::internal(format!(
+            "PRAGMA user_version returned invalid value {version} outside the unsigned schema-version domain"
+        ))
+    })
 }
 
 /// Source schema versions accepted by the reviewed, receipt-bound
@@ -855,8 +860,13 @@ fn current_schema_version_u32() -> Result<u32> {
     })
 }
 
-fn refuse_future_schema_version(conn: &Connection, operation: &str) -> Result<()> {
+fn validate_schema_version_for_mutation(conn: &Connection, operation: &str) -> Result<()> {
     let declared = runtime_user_version(conn)?;
+    if declared < 0 {
+        return Err(BeadsError::Config(format!(
+            "{operation} refused: database schema version {declared} is invalid"
+        )));
+    }
     if declared > i64::from(CURRENT_SCHEMA_VERSION) {
         return Err(BeadsError::Config(format!(
             "{operation} refused: database schema version {declared} is newer than supported version {CURRENT_SCHEMA_VERSION}"
@@ -1059,14 +1069,7 @@ pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) 
     // transaction: `run_migrations` opens BEGIN IMMEDIATE / COMMIT around the
     // step bundles that need atomicity and fsqlite rejects nested BEGINs; the
     // caller's pre-migrate snapshot is the full-rollback safety net.
-    let row = conn.query_row("PRAGMA user_version")?;
-    let current = row
-        .get(0)
-        .and_then(|v| match v {
-            fsqlite_types::value::SqliteValue::Integer(n) => u32::try_from(*n).ok(),
-            _ => None,
-        })
-        .unwrap_or(0);
+    let current = connection_user_version(conn)?;
     if current != from {
         return Err(BeadsError::internal(format!(
             "schema migrate refused — user_version mismatch (expected {from}, got {current})"
@@ -1077,14 +1080,7 @@ pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) 
     conn.execute(&format!("PRAGMA user_version = {target_version}"))
         .map_err(BeadsError::Database)?;
 
-    let post = conn
-        .query_row("PRAGMA user_version")?
-        .get(0)
-        .and_then(|v| match v {
-            fsqlite_types::value::SqliteValue::Integer(n) => u32::try_from(*n).ok(),
-            _ => None,
-        })
-        .unwrap_or(0);
+    let post = connection_user_version(conn)?;
     if post != target_version {
         return Err(BeadsError::internal(format!(
             "schema migrate post-check failed — expected user_version={target_version}, observed {post}"
@@ -1095,7 +1091,7 @@ pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) 
 }
 
 pub(crate) fn apply_runtime_compatible_schema(conn: &Connection) -> Result<()> {
-    refuse_future_schema_version(conn, "runtime schema repair")?;
+    validate_schema_version_for_mutation(conn, "runtime schema repair")?;
     refuse_persistent_triggers(conn, "runtime schema repair")?;
 
     // The table layouts are already safe to operate on, so we can skip the
@@ -2235,10 +2231,7 @@ fn table_check_constraints_canonical(
         return false;
     };
 
-    actual.len() == expected.len()
-        && expected
-            .iter()
-            .all(|required| actual.contains(required))
+    actual.len() == expected.len() && expected.iter().all(|required| actual.contains(required))
 }
 
 fn table_declaration_clauses_canonical(conn: &Connection, table: &str) -> bool {
@@ -2731,6 +2724,13 @@ fn rebuild_issues_table(conn: &Connection) -> Result<()> {
 /// Inner helper for [`rebuild_issues_table`] that performs the actual work
 /// inside an already-open transaction.
 fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) -> Result<()> {
+    if table_exists(conn, "issues_rebuild_tmp") {
+        return Err(BeadsError::Config(
+            "Cannot rebuild issues table: staging table issues_rebuild_tmp already exists"
+                .to_string(),
+        ));
+    }
+
     // Drop all indexes on the issues table first (they'll be recreated by SCHEMA_SQL)
     let index_rows =
         conn.query("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='issues' AND sql IS NOT NULL")?;
@@ -2751,8 +2751,6 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
 
     // Create the new table with canonical column order
     // Use a temporary name to avoid conflicts
-    conn.execute("DROP TABLE IF EXISTS issues_rebuild_tmp")?;
-
     // Build CREATE TABLE for the new table with only columns that exist in the old table
     // plus any missing columns with defaults
     // Build the canonical column list: id, content_hash, title, then the
@@ -2917,7 +2915,11 @@ fn rebuild_kv_table_without_unique(conn: &Connection, table: &str) -> Result<()>
     conn.execute("BEGIN EXCLUSIVE")?;
 
     let result = (|| -> Result<()> {
-        conn.execute(&format!("DROP TABLE IF EXISTS {tmp_table}"))?;
+        if table_exists(conn, &tmp_table) {
+            return Err(BeadsError::Config(format!(
+                "Cannot rebuild {table} table: staging table {tmp_table} already exists"
+            )));
+        }
         conn.execute(&format!(
             "CREATE TABLE {tmp_table} (
                 key TEXT NOT NULL,
@@ -3792,6 +3794,7 @@ fn schema_migration_shape_error(detail: impl std::fmt::Display) -> BeadsError {
 fn sql_default_matches(actual: Option<&str>, expected: Option<&str>) -> bool {
     match (actual, expected) {
         (None, None) => true,
+        (Some(actual), Some(expected)) if expected.starts_with('\'') => actual.trim() == expected,
         (Some(actual), Some(expected)) => actual.trim().eq_ignore_ascii_case(expected),
         _ => false,
     }
@@ -3881,6 +3884,7 @@ fn attest_gate_result_history_foreign_key(conn: &Connection) -> Result<()> {
     let to = row.get(4).and_then(SqliteValue::as_text);
     let on_update = row.get(5).and_then(SqliteValue::as_text);
     let on_delete = row.get(6).and_then(SqliteValue::as_text);
+    let match_policy = row.get(7).and_then(SqliteValue::as_text);
     let sequence = row.get(1).and_then(SqliteValue::as_integer);
     if sequence != Some(0)
         || table != Some("issues")
@@ -3888,11 +3892,12 @@ fn attest_gate_result_history_foreign_key(conn: &Connection) -> Result<()> {
         || to != Some("id")
         || !on_update.is_some_and(|value| value.eq_ignore_ascii_case("NO ACTION"))
         || !on_delete.is_some_and(|value| value.eq_ignore_ascii_case("CASCADE"))
+        || !match_policy.is_some_and(|value| value.eq_ignore_ascii_case("NONE"))
     {
         return Err(schema_migration_shape_error(format!(
             "gate_result_history foreign key is not canonical \
              (seq={sequence:?}, table={table:?}, from={from:?}, to={to:?}, \
-             on_update={on_update:?}, on_delete={on_delete:?})"
+             on_update={on_update:?}, on_delete={on_delete:?}, match={match_policy:?})"
         )));
     }
     Ok(())
@@ -3957,8 +3962,11 @@ fn attest_gate_result_history_schema(conn: &Connection) -> Result<()> {
     attest_gate_result_history_columns(conn)?;
     attest_gate_result_history_foreign_key(conn)?;
     attest_gate_result_history_indexes(conn)?;
-    if !runtime_primary_key_shape_canonical(conn, "gate_result_history", GATE_RESULT_HISTORY_COLUMNS)
-    {
+    if !runtime_primary_key_shape_canonical(
+        conn,
+        "gate_result_history",
+        GATE_RESULT_HISTORY_COLUMNS,
+    ) {
         return Err(schema_migration_shape_error(
             "gate_result_history primary-key direction or collation is not canonical",
         ));
@@ -3966,6 +3974,11 @@ fn attest_gate_result_history_schema(conn: &Connection) -> Result<()> {
     if !runtime_table_options_canonical(conn, "gate_result_history") {
         return Err(schema_migration_shape_error(
             "gate_result_history must be a non-STRICT rowid table",
+        ));
+    }
+    if !table_declaration_clauses_canonical(conn, "gate_result_history") {
+        return Err(schema_migration_shape_error(
+            "gate_result_history overrides a canonical collation, conflict, or foreign-key timing policy",
         ));
     }
     if !table_check_constraints_canonical(conn, "gate_result_history", &[]) {
@@ -4282,6 +4295,29 @@ mod tests {
             !foreign_keys_enabled(&conn).expect("read post-refusal pragma"),
             "future-version refusal must not apply connection pragmas"
         );
+
+        conn.execute("PRAGMA user_version = -1")
+            .expect("stamp invalid negative schema version");
+        let negative_error =
+            apply_schema(&conn).expect_err("negative schema version must be refused");
+        assert!(
+            negative_error.to_string().contains("version -1 is invalid"),
+            "negative-version refusal should be explicit: {negative_error}"
+        );
+        assert_eq!(
+            runtime_user_version(&conn).expect("read refused negative version"),
+            -1
+        );
+        assert!(
+            connection_user_version(&conn).is_err(),
+            "migration source parsing must not alias -1 to legacy version zero"
+        );
+        assert_eq!(
+            runtime_schema_cookie(&conn).expect("read negative-refusal cookie"),
+            cookie_before,
+            "negative-version refusal must occur before repair DDL"
+        );
+        assert!(!index_exists(&conn, "idx_comments_created_at"));
     }
 
     #[test]
@@ -6064,6 +6100,71 @@ mod tests {
     }
 
     #[test]
+    fn test_rebuild_issues_table_preserves_preexisting_staging_table() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("issues-staging-collision.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        conn.execute("CREATE TABLE issues_rebuild_tmp (sentinel TEXT NOT NULL)")
+            .expect("plant unrelated staging-name table");
+        conn.execute("INSERT INTO issues_rebuild_tmp (sentinel) VALUES ('preserve-me')")
+            .expect("seed staging-name sentinel");
+
+        let error = rebuild_issues_table(&conn)
+            .expect_err("rebuild must fail closed on a staging-name collision");
+        assert!(
+            error.to_string().contains("staging table issues_rebuild_tmp already exists"),
+            "collision refusal should be explicit: {error}"
+        );
+        let sentinel = conn
+            .query_row("SELECT sentinel FROM issues_rebuild_tmp")
+            .expect("read preserved staging-name sentinel");
+        assert_eq!(
+            sentinel.get(0).and_then(SqliteValue::as_text),
+            Some("preserve-me")
+        );
+        assert!(
+            index_exists(&conn, "idx_issues_status"),
+            "the refused rebuild must leave existing indexes intact"
+        );
+    }
+
+    #[test]
+    fn test_rebuild_kv_table_preserves_preexisting_staging_table() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("kv-staging-collision.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        conn.execute("INSERT INTO config (key, value) VALUES ('owned', 'original')")
+            .expect("seed canonical config");
+        conn.execute("CREATE TABLE config_rebuild_tmp (sentinel TEXT NOT NULL)")
+            .expect("plant unrelated staging-name table");
+        conn.execute("INSERT INTO config_rebuild_tmp (sentinel) VALUES ('preserve-me')")
+            .expect("seed staging-name sentinel");
+
+        let error = rebuild_kv_table_without_unique(&conn, "config")
+            .expect_err("KV rebuild must fail closed on a staging-name collision");
+        assert!(
+            error.to_string().contains("staging table config_rebuild_tmp already exists"),
+            "collision refusal should be explicit: {error}"
+        );
+        let sentinel = conn
+            .query_row("SELECT sentinel FROM config_rebuild_tmp")
+            .expect("read preserved staging-name sentinel");
+        assert_eq!(
+            sentinel.get(0).and_then(SqliteValue::as_text),
+            Some("preserve-me")
+        );
+        let original = conn
+            .query_row("SELECT value FROM config WHERE key = 'owned'")
+            .expect("read preserved config row");
+        assert_eq!(
+            original.get(0).and_then(SqliteValue::as_text),
+            Some("original")
+        );
+    }
+
+    #[test]
     fn test_rebuild_issues_table_restores_foreign_keys_when_begin_fails() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("locked-rebuild.db");
@@ -6514,10 +6615,8 @@ mod tests {
         )
         .expect("plant a write-restricting CHECK outside issues");
         assert!(
-            conn.execute(
-                "INSERT INTO labels (issue_id, label) VALUES ('label-check-owner', '')"
-            )
-            .is_err(),
+            conn.execute("INSERT INTO labels (issue_id, label) VALUES ('label-check-owner', '')")
+                .is_err(),
             "the extra CHECK must reject a label accepted by the canonical schema"
         );
         assert!(
@@ -6564,6 +6663,106 @@ mod tests {
             !runtime_primary_key_shape_canonical(&conn, "issues", ISSUES_RUNTIME_COLUMNS),
             "primary-key collation is part of its uniqueness semantics"
         );
+        assert!(!runtime_schema_compatible(&conn));
+        assert!(attest_runtime_schema_cookie(&conn).is_err());
+    }
+
+    #[test]
+    fn test_runtime_schema_contract_rejects_primary_key_replace_policy() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("replace-policy-issue-primary-key.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let schema = SCHEMA_SQL.replacen(
+            "id TEXT PRIMARY KEY,",
+            "id TEXT PRIMARY KEY ON CONFLICT REPLACE,",
+            1,
+        );
+        assert_ne!(schema, SCHEMA_SQL, "the fixture must alter the issue PK");
+        execute_batch(&conn, &schema).expect("install REPLACE issue primary key");
+        conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+            .expect("stamp current version");
+
+        conn.execute("INSERT INTO issues (id, title) VALUES ('same-id', 'Original')")
+            .expect("seed original issue");
+        conn.execute("INSERT INTO issues (id, title) VALUES ('same-id', 'Replacement')")
+            .expect("noncanonical conflict policy must replace the duplicate row");
+        let title = conn
+            .query_row("SELECT title FROM issues WHERE id = 'same-id'")
+            .expect("read replaced issue");
+        assert_eq!(
+            title.get(0).and_then(SqliteValue::as_text),
+            Some("Replacement"),
+            "canonical PRIMARY KEY would abort instead of replacing"
+        );
+        assert!(
+            runtime_primary_key_shape_canonical(&conn, "issues", ISSUES_RUNTIME_COLUMNS),
+            "PRAGMA key shape must exercise the hidden conflict-policy seam"
+        );
+        assert!(!table_declaration_clauses_canonical(&conn, "issues"));
+        assert!(!runtime_schema_compatible(&conn));
+        assert!(attest_runtime_schema_cookie(&conn).is_err());
+    }
+
+    #[test]
+    fn test_runtime_schema_contract_rejects_ordinary_column_collation_override() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("nocase-issue-title.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let schema = SCHEMA_SQL.replace(
+            "title TEXT NOT NULL CHECK(length(title) <= 500),",
+            "title TEXT NOT NULL COLLATE NOCASE CHECK(length(title) <= 500),",
+        );
+        assert_ne!(schema, SCHEMA_SQL, "the fixture must alter title collation");
+        execute_batch(&conn, &schema).expect("install NOCASE title column");
+        conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+            .expect("stamp current version");
+
+        conn.execute("INSERT INTO issues (id, title) VALUES ('title-upper', 'Case-Sensitive')")
+            .expect("seed upper-case title");
+        conn.execute("INSERT INTO issues (id, title) VALUES ('title-lower', 'case-sensitive')")
+            .expect("seed lower-case title");
+        let count = conn
+            .query_row("SELECT COUNT(*) FROM issues WHERE title = 'case-sensitive'")
+            .expect("exercise title equality");
+        assert_eq!(
+            count.get(0).and_then(SqliteValue::as_integer),
+            Some(2),
+            "NOCASE must match a row the canonical implicit BINARY column does not"
+        );
+        assert!(
+            core_runtime_columns_canonical(&conn, "issues", ISSUES_RUNTIME_COLUMNS, true),
+            "table_xinfo must exercise the hidden column-collation seam"
+        );
+        assert!(!table_declaration_clauses_canonical(&conn, "issues"));
+        assert!(!runtime_schema_compatible(&conn));
+        assert!(attest_runtime_schema_cookie(&conn).is_err());
+    }
+
+    #[test]
+    fn test_runtime_schema_contract_preserves_string_default_case() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("upper-case-status-default.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let schema = SCHEMA_SQL.replace(
+            "status TEXT NOT NULL DEFAULT 'open',",
+            "status TEXT NOT NULL DEFAULT 'OPEN',",
+        );
+        assert_ne!(schema, SCHEMA_SQL, "the fixture must alter status default");
+        execute_batch(&conn, &schema).expect("install upper-case status default");
+        conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+            .expect("stamp current version");
+
+        conn.execute("INSERT INTO issues (id, title) VALUES ('default-status', 'Default status')")
+            .expect("insert row using altered default");
+        let status = conn
+            .query_row("SELECT status FROM issues WHERE id = 'default-status'")
+            .expect("read defaulted status");
+        assert_eq!(
+            status.get(0).and_then(SqliteValue::as_text),
+            Some("OPEN"),
+            "quoted default case is persisted data, not case-insensitive SQL syntax"
+        );
+        assert!(!sql_default_matches(Some("'OPEN'"), Some("'open'")));
         assert!(!runtime_schema_compatible(&conn));
         assert!(attest_runtime_schema_cookie(&conn).is_err());
     }
@@ -6626,6 +6825,61 @@ mod tests {
             !runtime_table_options_canonical(&conn, "dependencies"),
             "canonical dependencies is an ordinary rowid table"
         );
+        assert!(!runtime_schema_compatible(&conn));
+        assert!(attest_runtime_schema_cookie(&conn).is_err());
+    }
+
+    #[test]
+    fn test_runtime_schema_contract_rejects_deferred_foreign_keys() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("deferred-label-foreign-key.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+
+        conn.execute("BEGIN IMMEDIATE")
+            .expect("start canonical FK probe");
+        assert!(
+            conn.execute(
+                "INSERT INTO labels (issue_id, label) VALUES ('late-parent', 'canonical')"
+            )
+            .is_err(),
+            "canonical label FK must reject child-before-parent immediately"
+        );
+        conn.execute("ROLLBACK").expect("finish canonical FK probe");
+
+        execute_batch(
+            &conn,
+            r"
+            DROP INDEX idx_labels_label;
+            DROP INDEX idx_labels_issue;
+            DROP TABLE labels;
+            CREATE TABLE labels (
+                issue_id TEXT NOT NULL,
+                label TEXT NOT NULL,
+                PRIMARY KEY (issue_id, label),
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+                    DEFERRABLE INITIALLY DEFERRED
+            );
+            CREATE INDEX idx_labels_label ON labels(label);
+            CREATE INDEX idx_labels_issue ON labels(issue_id);
+            ",
+        )
+        .expect("plant deferred FK with otherwise canonical PRAGMA shape");
+
+        conn.execute("BEGIN IMMEDIATE")
+            .expect("start deferred FK probe");
+        conn.execute("INSERT INTO labels (issue_id, label) VALUES ('late-parent', 'deferred')")
+            .expect("deferred FK must accept child before parent");
+        conn.execute("INSERT INTO issues (id, title) VALUES ('late-parent', 'Late parent')")
+            .expect("satisfy deferred FK before commit");
+        conn.execute("COMMIT")
+            .expect("commit satisfied deferred FK");
+
+        assert!(
+            core_runtime_foreign_keys_canonical(&conn, "labels", &["issue_id"]),
+            "foreign_key_list must exercise the hidden timing-policy seam"
+        );
+        assert!(!table_declaration_clauses_canonical(&conn, "labels"));
         assert!(!runtime_schema_compatible(&conn));
         assert!(attest_runtime_schema_cookie(&conn).is_err());
     }
@@ -7017,7 +7271,7 @@ mod tests {
         apply_schema(&conn).expect("schema");
         let cookie = attest_runtime_schema_cookie(&conn).expect("attest current schema");
         let prior_witness = format!(
-            "schema-{CURRENT_SCHEMA_VERSION}.contract-v8-version-fenced-lexical-core-aux-columns-fks-index-directions-collations-exact-checks-autoincrement-no-hidden-columns-no-triggers-cookie-fenced.cookie-{cookie}"
+            "schema-{CURRENT_SCHEMA_VERSION}.contract-v12-version-fenced-lexical-core-aux-columns-fks-match-immediate-index-and-primary-key-directions-implicit-binary-collations-case-exact-literal-defaults-default-conflicts-exact-checks-autoincrement-rowid-nonstrict-no-hidden-columns-no-triggers-cookie-fenced.cookie-{cookie}"
         );
         conn.execute_with_params(
             "INSERT INTO metadata (key, value) VALUES (?, ?)",

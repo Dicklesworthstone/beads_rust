@@ -482,16 +482,14 @@ fn main() {
                     authority,
                     allow_external_jsonl,
                 ) {
-                    Ok(FastOpenAutoImportReprobe::ImportRequired) => {}
-                    Ok(FastOpenAutoImportReprobe::Current) => {
-                        should_attempt_auto_import = false;
-                    }
-                    Ok(FastOpenAutoImportReprobe::Pending(state)) => {
-                        if !pending_merge_warning_emitted {
-                            emit_pending_sync_merge_warning(&state, json_error_mode);
-                        }
-                        should_attempt_auto_import = false;
-                    }
+                    Ok(reprobe) => apply_fast_open_auto_import_reprobe(
+                        reprobe,
+                        &mut should_attempt_auto_import,
+                        &mut pending_merge_warning_emitted,
+                        &mut overrides,
+                        &mut ctx.overrides,
+                        json_error_mode,
+                    ),
                     Err(error) => handle_error(&error, json_error_mode, color_error_mode),
                 }
             }
@@ -1335,12 +1333,14 @@ fn force_pending_merge_read_only_mode(
     overrides: &mut config::CliOverrides,
     ctx: &mut StartupContext,
 ) {
+    force_pending_merge_read_only_overrides(overrides);
+    force_pending_merge_read_only_overrides(&mut ctx.overrides);
+}
+
+fn force_pending_merge_read_only_overrides(overrides: &mut config::CliOverrides) {
     overrides.no_auto_import = Some(true);
     overrides.no_auto_flush = Some(true);
     overrides.read_only_fast_open = true;
-    ctx.overrides.no_auto_import = Some(true);
-    ctx.overrides.no_auto_flush = Some(true);
-    ctx.overrides.read_only_fast_open = true;
 }
 
 fn pending_sync_merge_refusal_error(state: &commands::doctor::PendingSyncMergeState) -> BeadsError {
@@ -1460,6 +1460,29 @@ fn reopen_and_reprobe_fast_open_auto_import_under_authority(
         Ok(FastOpenAutoImportReprobe::ImportRequired)
     } else {
         Ok(FastOpenAutoImportReprobe::Current)
+    }
+}
+
+fn apply_fast_open_auto_import_reprobe(
+    reprobe: FastOpenAutoImportReprobe,
+    should_attempt_auto_import: &mut bool,
+    pending_merge_warning_emitted: &mut bool,
+    overrides: &mut config::CliOverrides,
+    startup_overrides: &mut config::CliOverrides,
+    json_error_mode: bool,
+) {
+    match reprobe {
+        FastOpenAutoImportReprobe::ImportRequired => {}
+        FastOpenAutoImportReprobe::Current => *should_attempt_auto_import = false,
+        FastOpenAutoImportReprobe::Pending(state) => {
+            if !*pending_merge_warning_emitted {
+                emit_pending_sync_merge_warning(&state, json_error_mode);
+                *pending_merge_warning_emitted = true;
+            }
+            force_pending_merge_read_only_overrides(overrides);
+            force_pending_merge_read_only_overrides(startup_overrides);
+            *should_attempt_auto_import = false;
+        }
     }
 }
 
@@ -3150,17 +3173,41 @@ mod tests {
             )
             .expect("database authority"),
         );
+        let pending_reprobe = reopen_and_reprobe_fast_open_auto_import_under_authority(
+            &mut fast_storage,
+            &paths,
+            &fast_overrides,
+            &authority,
+            false,
+        )
+        .expect("pending reprobe");
         assert!(matches!(
-            reopen_and_reprobe_fast_open_auto_import_under_authority(
-                &mut fast_storage,
-                &paths,
-                &fast_overrides,
-                &authority,
-                false,
-            )
-            .expect("pending reprobe"),
+            &pending_reprobe,
             FastOpenAutoImportReprobe::Pending(_)
         ));
+
+        let mut dispatch_overrides = fast_overrides.clone();
+        dispatch_overrides.read_only_fast_open = false;
+        let mut pending_ctx = StartupContext::empty(fast_overrides.clone());
+        pending_ctx.overrides.read_only_fast_open = false;
+        let mut should_attempt_auto_import = true;
+        let mut warning_emitted = false;
+        apply_fast_open_auto_import_reprobe(
+            pending_reprobe,
+            &mut should_attempt_auto_import,
+            &mut warning_emitted,
+            &mut dispatch_overrides,
+            &mut pending_ctx.overrides,
+            false,
+        );
+
+        assert!(!should_attempt_auto_import);
+        assert!(warning_emitted);
+        for forced in [&dispatch_overrides, &pending_ctx.overrides] {
+            assert_eq!(forced.no_auto_import, Some(true));
+            assert_eq!(forced.no_auto_flush, Some(true));
+            assert!(forced.read_only_fast_open);
+        }
     }
 
     #[test]

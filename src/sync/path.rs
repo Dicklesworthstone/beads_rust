@@ -1893,7 +1893,7 @@ pub(crate) fn pin_jsonl_target(path: &Path) -> Result<PinnedJsonlName> {
 /// still denies delete sharing, so the named leaf cannot be replaced until the
 /// caller has compared its identity and drops the returned guard.
 #[cfg(windows)]
-pub(super) fn open_regular_authority_source(path: &Path) -> Result<Option<OpenedJsonlSource>> {
+pub(crate) fn open_regular_authority_source(path: &Path) -> Result<Option<OpenedJsonlSource>> {
     let pinned = pin_windows_name_without_leaf_open(path)?;
     let opened = pinned.open_optional_regular_for_authority_identity()?;
     pinned.parent.verify_route()?;
