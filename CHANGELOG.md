@@ -109,9 +109,15 @@ replacement, crash, and schema-drift races.
 
 ### Packaging and regression coverage
 
-- Package version metadata moves to 0.5.0. Cargo now points at the repository's
-  rider-bearing `LICENSE` via `license-file` instead of incorrectly declaring
-  the package as plain SPDX MIT
+- The locked HTTP/2 stack moves from `h2` 0.4.15 to 0.4.17, incorporating the
+  upstream fix for [RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258.html)
+  and its follow-up stream/error-budget hardening
+  ([10bcadca](https://github.com/Dicklesworthstone/beads_rust/commit/10bcadca)).
+- Cargo and Nix source metadata move to 0.5.0; checksummed Homebrew, AUR, and
+  Scoop metadata remains pinned to the last public assets until the v0.5.0
+  release is published and its real hashes can be recorded. Cargo now points
+  at the repository's rider-bearing `LICENSE` via `license-file` instead of
+  incorrectly declaring the package as plain SPDX MIT
   ([413f9948](https://github.com/Dicklesworthstone/beads_rust/commit/413f9948)).
 - Every platform archive now contains the rider-bearing `LICENSE`. Release
   signing is fail-closed for all seven archives, including the Windows zip:
@@ -128,8 +134,11 @@ replacement, crash, and schema-drift races.
 - Package-manager metadata no longer represents the custom rider as plain MIT:
   Homebrew uses `:cannot_represent`, AUR uses
   `LicenseRef-MIT-OpenAI-Anthropic-Rider`, Nix uses `licenses.unfree`, and Scoop
-  links the repository license. Homebrew, AUR, and Nix install the actual
-  rider-bearing file; Scoop receives it inside the release zip
+  links the repository license. The v0.5.0 archives let the post-publication
+  Homebrew and AUR revisions install the actual rider-bearing file, Nix installs
+  it from source, and Scoop receives it inside the release zip. The staged
+  Homebrew/AUR definitions remain installable against v0.4.1, whose archives
+  predate the bundled license
   ([f64d9de2](https://github.com/Dicklesworthstone/beads_rust/commit/f64d9de2)).
 - New inline and end-to-end counterexamples cover custom ready groups, scheduler
   label/assignee evidence, canonical-inode fast-open reprobes, config-route

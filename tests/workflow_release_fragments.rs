@@ -57,6 +57,9 @@ struct ActionInputs {
     checkout_ref: Option<String>,
     #[serde(rename = "persist-credentials")]
     persist_credentials: Option<bool>,
+    pattern: Option<String>,
+    #[serde(rename = "merge-multiple")]
+    merge_multiple: Option<bool>,
     toolchain: Option<String>,
 }
 
@@ -70,7 +73,9 @@ struct ShellOutput {
 fn release_workflow_exposes_expected_fragment_steps() -> Result<(), String> {
     for step_name in [
         "Validate reliability override",
+        "Verify tag matches Cargo.toml version",
         "Validate required artifacts present",
+        "Verify all release signatures",
         "Generate combined checksums",
         "Verify all checksums",
         "Create archive (tar.gz)",
@@ -132,7 +137,7 @@ fn release_workflow_checkout_refs_are_unambiguous() -> Result<(), String> {
             .action_inputs
             .as_ref()
             .and_then(|inputs| inputs.checkout_ref.as_deref());
-        if checkout_ref != Some("${{ github.event.inputs.tag || github.ref }}") {
+        if checkout_ref != Some("${{ github.ref }}") {
             return Err(format!(
                 "checkout step must have exactly one release-tag ref, found {checkout_ref:?}"
             ));
@@ -155,6 +160,55 @@ fn release_workflow_checkout_refs_are_unambiguous() -> Result<(), String> {
             "expected five release checkout steps, found {checkout_steps}"
         ))
     }
+}
+
+#[test]
+fn release_workflow_requires_an_exact_existing_tag_at_the_checked_out_commit(
+) -> Result<(), String> {
+    let script = release_step_script("Verify tag matches Cargo.toml version")?;
+
+    require_contains(&script, "EXPECTED_TAG=\"v${CARGO_VERSION}\"")?;
+    require_contains(&script, "if [ \"$TAG\" != \"$EXPECTED_TAG\" ]")?;
+    require_contains(&script, "EXPECTED_REF=\"refs/tags/${TAG}\"")?;
+    require_contains(&script, "if [ \"$EVENT_REF\" != \"$EXPECTED_REF\" ]")?;
+    require_contains(&script, "dispatch the workflow with --ref $TAG")?;
+    require_contains(
+        &script,
+        "git rev-parse --verify \"refs/tags/${TAG}^{commit}\"",
+    )?;
+    require_contains(&script, "HEAD_COMMIT=$(git rev-parse HEAD)")?;
+    require_contains(
+        &script,
+        "if [ \"$TAG_COMMIT\" != \"$HEAD_COMMIT\" ] || [ \"$TAG_COMMIT\" != \"$EVENT_SHA\" ]",
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn release_workflow_downloads_only_platform_build_artifacts() -> Result<(), String> {
+    let workflow = parse_release_workflow()?;
+    let download = workflow
+        .jobs
+        .get("create-release")
+        .ok_or_else(|| "missing create-release job".to_owned())?
+        .steps
+        .iter()
+        .find(|step| step.name.as_deref() == Some("Download all artifacts"))
+        .ok_or_else(|| "missing Download all artifacts step".to_owned())?;
+    let inputs = download
+        .action_inputs
+        .as_ref()
+        .ok_or_else(|| "Download all artifacts has no inputs".to_owned())?;
+
+    if inputs.pattern.as_deref() != Some("br-*") || inputs.merge_multiple != Some(true) {
+        return Err(format!(
+            "release artifact download must select only br-* and merge it, found pattern={:?}, merge_multiple={:?}",
+            inputs.pattern, inputs.merge_multiple
+        ));
+    }
+
+    Ok(())
 }
 
 #[test]
@@ -203,12 +257,34 @@ fn release_workflow_uses_native_macos_runners_for_both_architectures() -> Result
     )?;
     require_contains(
         &workflow,
-        "- target: aarch64-apple-darwin\n            os: macos-14",
+        "- target: aarch64-apple-darwin\n            os: macos-15",
     )?;
     require_not_contains(
         &workflow,
         "- target: x86_64-apple-darwin\n            os: macos-15\n",
     )
+}
+
+#[test]
+fn release_workflow_uses_native_linux_arm64_and_tag_scoped_concurrency() -> Result<(), String> {
+    let workflow = read_to_string(Path::new(RELEASE_WORKFLOW))?;
+
+    require_contains(
+        &workflow,
+        "group: release-${{ github.event.inputs.tag || github.ref_name }}",
+    )?;
+    require_contains(
+        &workflow,
+        "- target: aarch64-unknown-linux-gnu\n            os: ubuntu-24.04-arm",
+    )?;
+    require_contains(
+        &workflow,
+        "name: linux_arm64\n            can_run: true\n            linker: \"\"",
+    )?;
+    require_not_contains(&workflow, "gcc-aarch64-linux-gnu")?;
+    require_not_contains(&workflow, "libc6-dev-arm64-cross")?;
+
+    Ok(())
 }
 
 #[test]
@@ -292,9 +368,40 @@ fn release_sbom_generation_uses_digest_pinned_syft_without_remote_script_executi
         "-o cyclonedx-json=artifacts/sbom.cdx.json",
     )?;
     require_contains(&script, "-o spdx-json=artifacts/sbom.spdx.json")?;
+    require_contains(&script, "test -s artifacts/sbom.cdx.json")?;
+    require_contains(&script, "test -s artifacts/sbom.spdx.json")?;
+    require_contains(&script, "jq -e . artifacts/sbom.cdx.json >/dev/null")?;
+    require_contains(&script, "jq -e . artifacts/sbom.spdx.json >/dev/null")?;
+    require_contains(&workflow, "fail_on_unmatched_files: true")?;
     require_not_contains(&workflow, "raw.githubusercontent.com/anchore/syft")?;
     require_not_contains(&workflow, "anchore/sbom-action")?;
     require_not_contains(&script, "curl")
+}
+
+#[test]
+fn release_assembler_reverifies_signatures_and_attests_before_publication() -> Result<(), String> {
+    let workflow = read_to_string(Path::new(RELEASE_WORKFLOW))?;
+    let script = release_step_script("Verify all release signatures")?;
+
+    require_contains(&script, "for archive in \"${ARCHIVES[@]}\"")?;
+    require_contains(
+        &script,
+        "minisign -Vm \"$archive\" -x \"${archive}.minisig\" -P \"$MINISIGN_PUBLIC_KEY\"",
+    )?;
+    for platform in REQUIRED_PLATFORMS {
+        require_contains(&script, &format!("br-${{ASSET_VERSION}}-{platform}"))?;
+    }
+    let attest = workflow
+        .find("- name: Generate SLSA provenance attestations")
+        .ok_or_else(|| "missing SLSA provenance step".to_owned())?;
+    let publish = workflow
+        .find("- name: Create GitHub Release")
+        .ok_or_else(|| "missing GitHub release step".to_owned())?;
+    if attest >= publish {
+        return Err("SLSA provenance must succeed before public release creation".to_owned());
+    }
+
+    Ok(())
 }
 
 #[test]

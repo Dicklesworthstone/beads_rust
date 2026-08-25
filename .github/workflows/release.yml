@@ -22,7 +22,7 @@ on:
 
 # Ensure only one release runs at a time
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
@@ -42,26 +42,40 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          # Check out the requested tag on workflow_dispatch so the Cargo.toml
-          # we verify matches the artifacts that will actually be built.
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          # A manual retry must be dispatched on the requested tag ref; the
+          # preflight below proves the event, checkout, and tag resolve alike.
+          ref: ${{ github.ref }}
           persist-credentials: false
 
       - name: Verify tag matches Cargo.toml version
         env:
           INPUT_TAG: ${{ github.event.inputs.tag }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
         run: |
-          # On workflow_dispatch, GITHUB_REF_NAME is the branch (e.g. "main"), not a tag.
-          # Honor the explicit `tag` input when provided; fall back to GITHUB_REF_NAME
-          # for tag-push events.
+          set -euo pipefail
+          # Manual runs supply the exact tag input and must also select that
+          # tag with --ref; tag-push events derive it from GITHUB_REF_NAME.
           TAG="${INPUT_TAG:-$GITHUB_REF_NAME}"
           CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          TAG_VERSION="${TAG#v}"
-          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
-            echo "Error: Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
+          EXPECTED_TAG="v${CARGO_VERSION}"
+          if [ "$TAG" != "$EXPECTED_TAG" ]; then
+            echo "Error: release tag must be exactly $EXPECTED_TAG, got $TAG"
             exit 1
           fi
-          echo "Version check passed: $CARGO_VERSION (resolved from tag: $TAG)"
+          EXPECTED_REF="refs/tags/${TAG}"
+          if [ "$EVENT_REF" != "$EXPECTED_REF" ]; then
+            echo "Error: release workflow must run on $EXPECTED_REF, got $EVENT_REF"
+            echo "For a manual retry, dispatch the workflow with --ref $TAG"
+            exit 1
+          fi
+          TAG_COMMIT=$(git rev-parse --verify "refs/tags/${TAG}^{commit}")
+          HEAD_COMMIT=$(git rev-parse HEAD)
+          if [ "$TAG_COMMIT" != "$HEAD_COMMIT" ] || [ "$TAG_COMMIT" != "$EVENT_SHA" ]; then
+            echo "Error: tag=$TAG_COMMIT checkout=$HEAD_COMMIT event=$EVENT_SHA do not identify one commit"
+            exit 1
+          fi
+          echo "Version and ref checks passed: $CARGO_VERSION ($TAG at $TAG_COMMIT)"
 
   reliability-gates:
     name: Release Reliability Gates
@@ -90,7 +104,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.ref }}
           persist-credentials: false
 
       - name: Install Rust toolchain
@@ -101,7 +115,7 @@ jobs:
 
       - name: Cache cargo
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2.9.1
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # upstream snapshot 2026-08-17
 
       - name: Failure-corpus replay and doctor/recovery postconditions
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
@@ -178,11 +192,11 @@ jobs:
             linker: ""
           # Linux ARM64 (gnu)
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
             archive: tar.gz
             name: linux_arm64
-            can_run: false
-            linker: aarch64-linux-gnu-gcc
+            can_run: true
+            linker: ""
           # Linux ARM64 (musl) — statically linked, no glibc dependency
           # (Alpine Linux on aarch64 needs this; #284)
           - target: aarch64-unknown-linux-musl
@@ -200,7 +214,7 @@ jobs:
             linker: ""
           # macOS Apple Silicon (native)
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             archive: tar.gz
             name: darwin_arm64
             can_run: true
@@ -216,9 +230,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          # On workflow_dispatch, build from the requested tag so the binary's
-          # embedded version matches what we publish.
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          # Preflight requires both automatic and manual runs to use the exact
+          # release tag ref.
+          ref: ${{ github.ref }}
           persist-credentials: false
           fetch-depth: 0  # Full history for vergen
 
@@ -236,12 +250,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Install cross toolchains
-        if: matrix.target == 'aarch64-unknown-linux-gnu' || matrix.target == 'x86_64-pc-windows-gnu'
+        if: matrix.target == 'x86_64-pc-windows-gnu'
         run: |
           sudo apt-get update
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
-          elif [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ]; then
+          if [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ]; then
             sudo apt-get install -y mingw-w64 zip
           fi
 
@@ -260,16 +272,13 @@ jobs:
         if: matrix.linker != ''
         run: |
           case "${{ matrix.target }}" in
-            aarch64-unknown-linux-gnu)
-              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=${{ matrix.linker }}" >> "$GITHUB_ENV"
-              ;;
             x86_64-pc-windows-gnu)
               echo "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=${{ matrix.linker }}" >> "$GITHUB_ENV"
               ;;
           esac
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2.9.1
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # upstream snapshot 2026-08-17
         with:
           key: release-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}
 
@@ -284,8 +293,8 @@ jobs:
         env:
           INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
-          # On workflow_dispatch, GITHUB_REF_NAME is the branch (e.g. "main"),
-          # so derive the tag from the explicit input when present.
+          # Manual runs use the required tag input; tag pushes derive the same
+          # value from GITHUB_REF_NAME.
           TAG="${INPUT_TAG:-$GITHUB_REF_NAME}"
           EXPECTED="${TAG#v}"  # strip leading v
           BINARY="br"
@@ -418,11 +427,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          # On workflow_dispatch, the default ref is the branch (e.g. "main"),
-          # but the release needs to be cut from the requested tag so the SBOM,
-          # changelog, and any cargo install --tag invocations agree with the
-          # tagged artifacts.
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          # Preflight requires this event ref to be the exact release tag so
+          # the SBOM, changelog, artifacts, and provenance agree.
+          ref: ${{ github.ref }}
           persist-credentials: false
           fetch-depth: 0
 
@@ -441,6 +448,7 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           path: artifacts
+          pattern: br-*
           merge-multiple: true
 
       - name: List artifacts
@@ -475,6 +483,28 @@ jobs:
             exit 1
           fi
           echo "All required release archives, checksums, and signatures are present."
+
+      - name: Install minisign for aggregate verification
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
+      - name: Verify all release signatures
+        run: |
+          set -euo pipefail
+          ASSET_VERSION="${{ steps.asset_version.outputs.asset_version }}"
+          ARCHIVES=(
+            "artifacts/br-${ASSET_VERSION}-linux_amd64.tar.gz"
+            "artifacts/br-${ASSET_VERSION}-linux_musl_amd64.tar.gz"
+            "artifacts/br-${ASSET_VERSION}-linux_arm64.tar.gz"
+            "artifacts/br-${ASSET_VERSION}-linux_musl_arm64.tar.gz"
+            "artifacts/br-${ASSET_VERSION}-darwin_amd64.tar.gz"
+            "artifacts/br-${ASSET_VERSION}-darwin_arm64.tar.gz"
+            "artifacts/br-${ASSET_VERSION}-windows_amd64.zip"
+          )
+          for archive in "${ARCHIVES[@]}"; do
+            minisign -Vm "$archive" -x "${archive}.minisig" -P "$MINISIGN_PUBLIC_KEY"
+          done
 
       - name: Generate combined checksums
         run: |
@@ -651,6 +681,17 @@ jobs:
           "$SYFT_BIN" dir:. \
             -o cyclonedx-json=artifacts/sbom.cdx.json \
             -o spdx-json=artifacts/sbom.spdx.json
+          test -s artifacts/sbom.cdx.json
+          test -s artifacts/sbom.spdx.json
+          jq -e . artifacts/sbom.cdx.json >/dev/null
+          jq -e . artifacts/sbom.spdx.json >/dev/null
+
+      - name: Generate SLSA provenance attestations
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: |
+            artifacts/br-${{ steps.asset_version.outputs.asset_version }}-*.tar.gz
+            artifacts/br-${{ steps.asset_version.outputs.asset_version }}-*.zip
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2
@@ -660,6 +701,7 @@ jobs:
           body_path: RELEASE_NOTES.md
           draft: false
           prerelease: ${{ contains(steps.asset_version.outputs.release_tag, '-') }}
+          fail_on_unmatched_files: true
           files: |
             artifacts/br-${{ steps.asset_version.outputs.asset_version }}-*.tar.gz
             artifacts/br-${{ steps.asset_version.outputs.asset_version }}-*.zip
@@ -671,13 +713,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate SLSA provenance attestations
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
-        with:
-          subject-path: |
-            artifacts/br-${{ steps.asset_version.outputs.asset_version }}-*.tar.gz
-            artifacts/br-${{ steps.asset_version.outputs.asset_version }}-*.zip
-
   update-crates-io:
     name: Publish to crates.io
     needs: create-release
@@ -688,7 +723,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # cargo publish must build from the tagged source, not the branch HEAD.
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.ref }}
           persist-credentials: false
 
       - name: Install Rust toolchain
