@@ -822,15 +822,27 @@ fn resume_commit_ready_migration(
 
     migration.write_authority.verify_database_authority()?;
     let logical_live = logical_witness(&migration.db_path)?;
-    if logical_live != marker.logical_after {
-        let observed = if logical_live == marker.logical_before {
-            "the original pre-migration generation"
-        } else {
-            "an unrecognized database generation"
+    if logical_live == marker.logical_before {
+        let failed = FailedMigrationReceipt {
+            schema_version: FAILED_SCHEMA.to_string(),
+            run_id: marker.run_id.clone(),
+            database_path: marker.database_path.clone(),
+            plan_token: marker.plan_token.clone(),
+            marked_at: marker.marked_at.clone(),
+            error: "commit-ready migration intent was interrupted before the replacement became live; the original logical generation remains authoritative"
+                .to_string(),
+            raw_before: marker.raw_before.clone(),
+            logical_before: marker.logical_before.clone(),
+            raw_observed_after_failure: raw_family_witness(&migration.db_path).ok(),
+            logical_observed_after_failure: Some(logical_live),
         };
+        write_json_new(&run_dir.join("failed.json"), &failed)?;
+        return Ok(None);
+    }
+    if logical_live != marker.logical_after {
         return Err(BeadsError::internal(format!(
             "commit-ready schema migration {} cannot be resumed because the live database is \
-             {observed}; retained all recovery artifacts at {}",
+             an unrecognized generation; retained all recovery artifacts at {}",
             marker.run_id,
             run_dir.display()
         )));
@@ -1851,6 +1863,8 @@ fn validate_applied_receipt(
             args.run_id
         )));
     }
+    let marker: CommitReadyMigrationReceipt = read_json(&run_dir.join("commit-ready.json"))?;
+    validate_applied_against_commit_ready(applied, &marker, run_dir)?;
     Ok(())
 }
 
@@ -3306,6 +3320,78 @@ mod tests {
         assert!(
             failure.to_string().contains("could not prove"),
             "uncertain disposition must explain the missing proof: {failure}"
+        );
+    }
+
+    #[test]
+    fn commit_ready_marker_resumes_applied_receipt_and_normal_undo() {
+        let (_temp, migration) = reviewed_v14_migration_context();
+        let original_logical = logical_witness(&migration.db_path).expect("original witness");
+        let plan = build_plan(&migration.db_path).expect("build migration plan");
+        let forecast = plan.forecast.clone().expect("eligible forecast");
+        let plan_token = plan.plan_token.clone().expect("plan token");
+        let run_id = allocate_run_id(&migration.beads_dir).expect("allocate run");
+        let run_dir = migration_runs_root(&migration.beads_dir).join(&run_id);
+        let before_dir = run_dir.join("before");
+        ensure_new_directory(&before_dir).expect("create before directory");
+        copy_family_to_backup(&migration.db_path, &before_dir, &plan.raw_witness)
+            .expect("copy recovery family");
+        verify_backup_family(&migration.db_path, &before_dir, &plan.raw_witness)
+            .expect("verify recovery family");
+        let marked_at = Utc::now().to_rfc3339();
+        let prepared = PreparedMigrationReceipt {
+            schema_version: PREPARED_SCHEMA.to_string(),
+            run_id: run_id.clone(),
+            database_path: plan.database_path.clone(),
+            plan_token: plan_token.clone(),
+            marked_at: marked_at.clone(),
+            forecast: forecast.clone(),
+            raw_before: plan.raw_witness,
+            logical_before: plan.logical_witness,
+        };
+        write_json_new(&run_dir.join("prepared.json"), &prepared).expect("write prepared receipt");
+
+        let effects = apply_reviewed_migration(
+            &migration.db_path,
+            forecast.from_version,
+            forecast.to_version,
+            &marked_at,
+            &run_dir,
+            &migration.write_authority,
+        )
+        .expect("install reviewed replacement");
+        assert!(effects.post_migration_maintenance_completed);
+        assert!(run_dir.join("commit-ready.json").is_file());
+        assert!(
+            !run_dir.join("applied.json").exists(),
+            "the fixture must stop at the crash boundary before applied receipt publication"
+        );
+
+        let (applied, resumed_before_dir) = resume_commit_ready_migration(
+            &DoctorMigrateSchemaApplyArgs {
+                plan_token,
+                json: false,
+            },
+            &migration,
+        )
+        .expect("resume commit-ready migration")
+        .expect("committed generation must materialize applied receipt");
+        assert_eq!(resumed_before_dir, before_dir);
+        assert!(applied.attested);
+        assert!(run_dir.join("applied.json").is_file());
+
+        execute_undo(
+            &DoctorMigrateSchemaUndoArgs {
+                run_id,
+                dry_run: false,
+                json: false,
+            },
+            &migration,
+        )
+        .expect("normal undo after resumed receipt");
+        assert_eq!(
+            logical_witness(&migration.db_path).expect("restored original witness"),
+            original_logical
         );
     }
 
