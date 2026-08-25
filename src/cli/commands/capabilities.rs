@@ -555,6 +555,7 @@ fn command_safety_notes(name: &str) -> &'static [&'static str] {
         "search" => &[
             "Search is read-only; prefer `--format json` or `--format toon` for parsing.",
             "Use list-style filters after the query to narrow result sets.",
+            "Closed issues are hidden by default; a trailing text note and a JSON/TOON `hidden_closed_count` field report how many matches that hid — pass `--all` to include them.",
         ],
         "count" => &[
             "Count is read-only; grouped output is selected with `--by` or `--by-*` aliases.",

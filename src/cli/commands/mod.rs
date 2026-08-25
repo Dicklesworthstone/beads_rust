@@ -535,6 +535,55 @@ where
                 return Err(operation_err);
             }
 
+            // GitHub #441: a `-wal-cert` sidecar left behind by a different
+            // fsqlite engine generation fails every cert-regenerating write
+            // while reads stay healthy. The certificate is derived state, so
+            // the fix is to quarantine the sidecar pair (verified backups in
+            // `.br_recovery`; the `-wal` file is real data and is never
+            // touched), reopen the healthy database in place, and retry the
+            // write once — without the JSONL rebuild below, which is heavier
+            // and wedges when the JSONL merge anchor is stale. Only attempted
+            // while the main database file is present: a missing database is
+            // the orphaned-sidecar open path's job, not this one's.
+            if crate::config::is_stale_wal_certificate_version_error(&operation_err)
+                && storage_ctx.paths.db_path.is_file()
+                && !storage_ctx.no_db
+            {
+                match storage_ctx.quarantine_stale_wal_certificate_sidecars_and_reopen() {
+                    Ok(quarantined_paths) => {
+                        tracing::warn!(
+                            command = command,
+                            original_error = %operation_err,
+                            db_path = %storage_ctx.paths.db_path.display(),
+                            quarantined_paths = ?quarantined_paths,
+                            "Write hit a stale parallel-WAL certificate sidecar; quarantined the certificate sidecars and retrying the write once"
+                        );
+                        return operation(&mut storage_ctx.storage).map_err(|retry_err| {
+                            BeadsError::WithContext {
+                                context: format!(
+                                    "retry after quarantining stale WAL-certificate sidecars ({}) failed during {command} write; original write error: {operation_err}",
+                                    quarantined_paths
+                                        .iter()
+                                        .map(|path| path.display().to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ),
+                                source: Box::new(retry_err),
+                            }
+                        });
+                    }
+                    Err(quarantine_err) => {
+                        tracing::warn!(
+                            command = command,
+                            original_error = %operation_err,
+                            quarantine_error = %quarantine_err,
+                            db_path = %storage_ctx.paths.db_path.display(),
+                            "Failed to quarantine stale parallel-WAL certificate sidecars; falling back to JSONL recovery"
+                        );
+                    }
+                }
+            }
+
             let mut recovery_signal =
                 should_attempt_mutation_jsonl_recovery(storage_ctx, &operation_err, None);
             let mut probe_error: Option<BeadsError> = None;
@@ -911,6 +960,121 @@ mod tests {
             "attribution must survive the JSONL-recovery retry (F1)"
         );
         assert_eq!(status_event.model.as_deref(), Some("opus-4"));
+    }
+
+    #[test]
+    fn stale_wal_certificate_sidecar_write_quarantines_and_retries() {
+        // GitHub #441: a `-wal-cert` sidecar left behind by a different
+        // fsqlite engine generation fails every cert-regenerating write with
+        // `WAL file is corrupt: parallel WAL certificate suffix has
+        // unsupported record version N` while reads stay healthy. The retry
+        // helper must quarantine the certificate sidecar pair into
+        // `.br_recovery` (verified backups, bytes preserved), reopen the
+        // healthy database in place, and retry the write — never touching
+        // the `-wal` file itself and never depending on a JSONL rebuild.
+        let (_temp, mut storage_ctx) = storage_ctx_with_exported_issue();
+        let db_path = storage_ctx.paths.db_path.clone();
+        let beads_dir = storage_ctx.paths.beads_dir.clone();
+        let wal_path = std::path::PathBuf::from(format!("{}-wal", db_path.display()));
+        let cert_path = std::path::PathBuf::from(format!("{}-wal-cert", db_path.display()));
+        let head_path = std::path::PathBuf::from(format!("{}-wal-cert-head", db_path.display()));
+
+        // Fabricate a durable-certificate sidecar whose envelope version is
+        // strictly newer than this build's
+        // `PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION`: fsqlite's
+        // append-boundary repair (`validate_incomplete_certificate_suffix`)
+        // rejects it as `WalCorrupt { .. unsupported record version .. }`.
+        // Layout per fsqlite-wal 0.3.9: 8-byte `FSQLCERT` magic, then a
+        // little-endian u16 record version at bytes 8..10.
+        let mut stale_cert = Vec::from(*b"FSQLCERT");
+        stale_cert.extend_from_slice(&999_u16.to_le_bytes());
+        fs::write(&cert_path, &stale_cert).expect("write stale wal-cert sidecar");
+        fs::write(&head_path, b"stale-cert-head").expect("write stale wal-cert-head sidecar");
+        let wal_existed_before = wal_path.exists();
+
+        let mut attempts = 0;
+        retry_mutation_with_jsonl_recovery(
+            &mut storage_ctx,
+            true,
+            "update",
+            Some("bd-1"),
+            |storage| {
+                attempts += 1;
+                let update = crate::storage::IssueUpdate {
+                    status: Some(crate::model::Status::InProgress),
+                    ..Default::default()
+                };
+                storage.update_issue("bd-1", &update, "tester").map(|_| ())
+            },
+        )
+        .expect("write should succeed after stale wal-cert quarantine");
+        assert_eq!(
+            attempts, 2,
+            "the stale certificate should fail exactly one attempt before the quarantined retry"
+        );
+
+        let updated = storage_ctx
+            .storage
+            .get_issue("bd-1")
+            .expect("load issue after retry")
+            .expect("issue exists after retry");
+        assert_eq!(updated.status, crate::model::Status::InProgress);
+
+        // Both certificate sidecars were quarantined into `.br_recovery`
+        // with their original bytes preserved.
+        let recovery_dir = beads_dir.join(".br_recovery");
+        let backups: Vec<_> = fs::read_dir(&recovery_dir)
+            .expect("recovery dir exists after quarantine")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+        let backup_named = |prefix: &str| {
+            backups.iter().find(|path| {
+                path.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    name.starts_with(prefix) && name.ends_with(".stale-wal-cert")
+                })
+            })
+        };
+        let cert_backup = backup_named("beads.db-wal-cert.")
+            .expect("quarantined -wal-cert backup present in .br_recovery");
+        assert_eq!(
+            fs::read(cert_backup).expect("read quarantined -wal-cert backup"),
+            stale_cert,
+            "-wal-cert bytes must be preserved in the recovery backup"
+        );
+        let head_backup = backup_named("beads.db-wal-cert-head.")
+            .expect("quarantined -wal-cert-head backup present in .br_recovery");
+        assert_eq!(
+            fs::read(head_backup).expect("read quarantined -wal-cert-head backup"),
+            b"stale-cert-head",
+            "-wal-cert-head bytes must be preserved in the recovery backup"
+        );
+
+        // The `-wal` file itself is real data, never derived state: it must
+        // not be quarantined (the engine may still legitimately rewrite it).
+        assert!(
+            !backups.iter().any(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("beads.db-wal."))
+            }),
+            "the -wal file must never be quarantined by the stale-cert path"
+        );
+        if wal_existed_before {
+            assert!(
+                wal_path.exists(),
+                "the -wal file must remain in the live database family"
+            );
+        }
+
+        // The stale sidecar bytes are gone from the live family: either the
+        // path no longer exists or the engine regenerated fresh contents.
+        if let Ok(live_cert) = fs::read(&cert_path) {
+            assert_ne!(
+                live_cert, stale_cert,
+                "the live -wal-cert must no longer hold the stale-generation record"
+            );
+        }
     }
 
     #[test]

@@ -402,7 +402,13 @@ fn insert_issue_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
             items_at: Some("."),
             item_schema: Some("IssueWithCounts"),
             error_envelope_on_stderr: false,
-            notes: None,
+            notes: Some(
+                "Bare array when no closed matches were hidden. When the default \
+                 closed-issue exclusion hid matches, the shape becomes a wrapper \
+                 object `{\"issues\": [...], \"hidden_closed_count\": N}` (iterate \
+                 with `.issues[]`); pass `--all` (or a terminal `--status`) to \
+                 include closed issues instead.",
+            ),
         },
     );
 }

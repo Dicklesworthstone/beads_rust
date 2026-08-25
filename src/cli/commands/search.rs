@@ -180,18 +180,49 @@ fn render_search_results(
         return Ok(());
     }
 
+    // #445: the default corpus excludes closed issues, so a zero-result
+    // search can be mistaken for absence of historical evidence. Count what
+    // that exclusion hid so every mode can surface it. CSV keeps its legacy
+    // row-only shape and never reports the count.
+    let hidden_closed_count = if matches!(output_format, OutputFormat::Csv) {
+        0
+    } else {
+        count_hidden_closed_matches(storage, query, list_args)?
+    };
+
     match output_format {
         OutputFormat::Json => {
             let mut relation_metadata = load_search_relation_metadata(storage, &issues)?;
-            early_ctx.json_array(
-                issues
-                    .into_iter()
-                    .map(|issue| issue_with_counts(issue, &mut relation_metadata)),
-            );
+            let rows = issues
+                .into_iter()
+                .map(|issue| issue_with_counts(issue, &mut relation_metadata));
+            if hidden_closed_count > 0 {
+                early_ctx.json_array_count(
+                    "issues",
+                    rows,
+                    "hidden_closed_count",
+                    hidden_closed_count,
+                );
+            } else {
+                early_ctx.json_array(rows);
+            }
             return Ok(());
         }
         OutputFormat::Toon => {
             let issues_with_counts = attach_counts(storage, issues)?;
+            if hidden_closed_count > 0 {
+                // TOON mirrors the JSON wrapper shape when closed matches
+                // were hidden; the legacy bare-array shape is preserved
+                // otherwise.
+                early_ctx.toon_with_stats(
+                    &SearchResultsWithHidden {
+                        issues: &issues_with_counts,
+                        hidden_closed_count,
+                    },
+                    list_args.stats,
+                );
+                return Ok(());
+            }
             if early_ctx.toon_issue_counts_array_with_stats(&issues_with_counts, list_args.stats) {
                 return Ok(());
             }
@@ -251,6 +282,7 @@ fn render_search_results(
             table = table.context_snippets(context_snippets);
         }
         ctx.render(&table.build());
+        emit_hidden_closed_note(&ctx, hidden_closed_count);
         return Ok(());
     }
 
@@ -263,8 +295,58 @@ fn render_search_results(
         let line = format_issue_line_with(issue, format_options);
         ctx.print_line(&line);
     }
+    emit_hidden_closed_note(&ctx, hidden_closed_count);
 
     Ok(())
+}
+
+/// JSON/TOON wrapper emitted only when the default closed-issue exclusion
+/// hid matches (#445); the legacy bare-array shape is preserved otherwise.
+#[derive(serde::Serialize)]
+struct SearchResultsWithHidden<'a> {
+    issues: &'a [IssueWithCounts],
+    hidden_closed_count: usize,
+}
+
+/// Trailing stdout note for text modes when the default closed-issue
+/// exclusion hid matches (#445). Printed even when the visible result set
+/// is empty — that is exactly when the narrowed corpus is most misleading.
+fn emit_hidden_closed_note(ctx: &OutputContext, hidden_closed_count: usize) {
+    if hidden_closed_count > 0 {
+        ctx.info(&format!(
+            "note: {hidden_closed_count} closed match(es) hidden; rerun with --all to include them"
+        ));
+    }
+}
+
+/// Count the closed matches hidden by the default status exclusion (#445).
+///
+/// Returns 0 without querying when the search already includes closed
+/// issues, or under `--overdue` (closed issues are terminal and never
+/// overdue-visible). Tombstones are always hidden and never counted.
+fn count_hidden_closed_matches(
+    storage: &SqliteStorage,
+    query: &str,
+    list_args: &ListArgs,
+) -> Result<usize> {
+    let mut filters = build_filters(list_args)?;
+    if filters.include_closed || list_args.overdue {
+        return Ok(0);
+    }
+    filters.limit = None;
+    filters.offset = None;
+    filters.sort = None;
+    filters.reverse = false;
+    if needs_client_filters(list_args) {
+        // Client-side filters (id, priority bounds, desc/notes contains)
+        // cannot run in SQL; count by filtering the closed matches the same
+        // way the visible set was filtered.
+        filters.statuses = Some(vec![Status::Closed]);
+        filters.include_closed = true;
+        let issues = storage.search_issues(query, &filters)?;
+        return Ok(apply_client_filters(issues, list_args)?.len());
+    }
+    storage.count_closed_search_matches(query, &filters)
 }
 
 #[derive(Default)]

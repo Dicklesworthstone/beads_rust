@@ -162,6 +162,14 @@ struct FailedMigrationReceipt {
     plan_token: String,
     marked_at: String,
     error: String,
+    // Additive diagnostic marker naming the maintenance/install stage that was
+    // in progress when the failure surfaced (issue #443/#446 made Windows
+    // failures undiagnosable without it). Optional so pre-existing receipts
+    // keep deserializing and the schema string stays `failed.v1`; nothing
+    // validates receipts strictly against unknown or missing fields
+    // (`validate_failed_against_commit_ready` compares only identity fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failed_stage: Option<String>,
     raw_before: RawFamilyWitness,
     logical_before: LogicalDatabaseWitness,
     raw_observed_after_failure: Option<RawFamilyWitness>,
@@ -490,6 +498,7 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
     sync_directory(&run_dir)?;
 
     migration.write_authority.verify_database_authority()?;
+    let mut failed_stage: Option<String> = None;
     let migration_result = apply_reviewed_migration(
         &migration.db_path,
         forecast.from_version,
@@ -497,13 +506,19 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
         &marked_at,
         &run_dir,
         &migration.write_authority,
+        &mut failed_stage,
     );
     let authority_result = migration.write_authority.verify_database_authority();
     let authority_verified_after = authority_result.is_ok();
     let migration_result = match (migration_result, authority_result) {
         (Ok(effects), Ok(())) => Ok(effects),
         (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(authority_error)) => Err(authority_error),
+        (Ok(_), Err(authority_error)) => {
+            // The maintenance pipeline itself completed; the stage it last
+            // entered would misattribute this post-apply authority failure.
+            mark_stage(&mut failed_stage, "post-apply-authority-verification");
+            Err(authority_error)
+        }
         (Err(error), Err(authority_error)) => Err(BeadsError::WithContext {
             context: format!(
                 "reviewed schema migration failed and its database authority could not be \
@@ -522,6 +537,7 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
                 plan_token: recomputed_token.to_string(),
                 marked_at,
                 error: error.to_string(),
+                failed_stage,
                 raw_before: plan.raw_witness,
                 logical_before: plan.logical_witness,
                 raw_observed_after_failure: raw_family_witness(&migration.db_path).ok(),
@@ -852,6 +868,9 @@ fn resume_commit_ready_migration(
             marked_at: marker.marked_at.clone(),
             error: "commit-ready migration intent was interrupted before the replacement became live; the original logical generation remains authoritative"
                 .to_string(),
+            // The interrupting process died without recording its stage; a
+            // fabricated marker here would misattribute the interruption.
+            failed_stage: None,
             raw_before: marker.raw_before.clone(),
             logical_before: marker.logical_before.clone(),
             raw_observed_after_failure: Some(raw_live_after_probe),
@@ -1134,8 +1153,23 @@ fn apply_reviewed_migration(
     marked_at: &str,
     run_dir: &Path,
     write_authority: &Arc<DatabaseFamilyWriteLock>,
+    failed_stage: &mut Option<String>,
 ) -> Result<ReviewedSchemaMigrationEffectsReceipt> {
-    run_post_migration_maintenance(db_path, from, to, marked_at, run_dir, write_authority)
+    run_post_migration_maintenance(
+        db_path,
+        from,
+        to,
+        marked_at,
+        run_dir,
+        write_authority,
+        failed_stage,
+    )
+}
+
+/// Record the maintenance/install stage now being entered so a failure
+/// anywhere inside it lands in the failure receipt as `failed_stage`.
+fn mark_stage(failed_stage: &mut Option<String>, stage: &str) {
+    *failed_stage = Some(stage.to_string());
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1146,7 +1180,9 @@ fn run_post_migration_maintenance(
     marked_at: &str,
     run_dir: &Path,
     write_authority: &Arc<DatabaseFamilyWriteLock>,
+    failed_stage: &mut Option<String>,
 ) -> Result<ReviewedSchemaMigrationEffectsReceipt> {
+    mark_stage(failed_stage, "source-witness");
     write_authority.verify_database_authority()?;
     let source_logical = logical_witness(db_path)?;
     let source_permissions_witness = raw_family_witness(db_path)?;
@@ -1157,6 +1193,7 @@ fn run_post_migration_maintenance(
     // Build and migrate a replacement database without mutating the live
     // family.  The live main file and sidecars remain the rollback authority
     // until the fully attested candidate is atomically installed below.
+    mark_stage(failed_stage, "vacuum-candidate");
     let source_conn = Connection::open(db_path.to_string_lossy().into_owned())?;
     let escaped_path = candidate_path.to_string_lossy().replace('\'', "''");
     let candidate_result = source_conn
@@ -1178,6 +1215,7 @@ fn run_post_migration_maintenance(
             post_migration_maintenance_completed: false,
         }
     } else {
+        mark_stage(failed_stage, "candidate-schema-migration");
         let conn = Connection::open(candidate_path.to_string_lossy().into_owned())?;
         conn.execute("PRAGMA foreign_keys = ON")?;
         conn.execute("BEGIN IMMEDIATE")?;
@@ -1199,6 +1237,7 @@ fn run_post_migration_maintenance(
         ReviewedSchemaMigrationEffectsReceipt::from(result?)
     };
 
+    mark_stage(failed_stage, "candidate-maintenance");
     let candidate_conn = Connection::open(candidate_path.to_string_lossy().into_owned())?;
     let maintenance_result = (|| {
         candidate_conn.execute("REINDEX")?;
@@ -1211,14 +1250,30 @@ fn run_post_migration_maintenance(
         (Ok(()), Ok(())) => {}
     }
 
+    mark_stage(failed_stage, "candidate-durability");
     set_file_permissions(&candidate_path, source_unix_mode)?;
-    File::open(&candidate_path)
+    // The durability barrier must hold a WRITABLE handle: Windows
+    // `FlushFileBuffers` demands write access, so syncing through a read-only
+    // `File::open` handle fails deterministically with `ERROR_ACCESS_DENIED`
+    // (os error 5) on NTFS — the issue #443/#446 failure. POSIX fsync accepts
+    // either mode, so opening read+write changes nothing elsewhere.
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&candidate_path)
         .and_then(|file| file.sync_all())
-        .map_err(BeadsError::Io)?;
+        .map_err(|error| BeadsError::WithContext {
+            context: format!(
+                "could not make the schema-migration candidate durable at {}",
+                candidate_path.display()
+            ),
+            source: Box::new(BeadsError::Io(error)),
+        })?;
     if let Some(parent) = candidate_path.parent() {
         sync_directory(parent)?;
     }
 
+    mark_stage(failed_stage, "candidate-attestation");
     let candidate_logical = logical_witness(&candidate_path)?;
     let candidate_matches_reviewed_operation = if from == to {
         logical_witnesses_match_except_integrity(&source_logical, &candidate_logical)
@@ -1250,17 +1305,32 @@ fn run_post_migration_maintenance(
     }
     let source_raw = raw_family_witness(db_path)?;
     let candidate_raw = raw_family_witness(&candidate_path)?;
+    mark_stage(failed_stage, "candidate-sidecar-retention");
     let candidate_sidecars_dir = run_dir.join("maintenance-candidate-sidecars");
-    move_present_sidecars_new(&candidate_path, &candidate_sidecars_dir, &candidate_raw)?;
+    move_present_sidecars_new(
+        &candidate_path,
+        &candidate_sidecars_dir,
+        &candidate_raw,
+        "candidate-sidecar-retention",
+    )?;
+    mark_stage(failed_stage, "commit-ready-marker");
     let mut committed_effects = effects;
     committed_effects.post_migration_maintenance_completed = true;
     persist_commit_ready_marker(run_dir, db_path, &candidate_logical, committed_effects)?;
 
+    mark_stage(failed_stage, "lock-replacement-candidate");
     let replacement_lock = write_authority.lock_database_replacement_candidate(&candidate_path)?;
+    mark_stage(failed_stage, "displace-live-sidecars");
     let displaced_dir = run_dir.join("maintenance-displaced");
     ensure_new_directory(&displaced_dir)?;
-    move_present_sidecars_new(db_path, &displaced_dir, &source_raw)?;
+    move_present_sidecars_new(
+        db_path,
+        &displaced_dir,
+        &source_raw,
+        "displace-live-sidecars",
+    )?;
     let displaced_main = backup_component_path(&displaced_dir, db_path, "")?;
+    mark_stage(failed_stage, "install-compacted-candidate");
     if let Err(failure) = install_compacted_candidate(
         &candidate_path,
         db_path,
@@ -1268,7 +1338,14 @@ fn run_post_migration_maintenance(
         replacement_lock,
         write_authority,
     ) {
-        let CompactedInstallFailure { disposition, error } = failure;
+        let CompactedInstallFailure {
+            disposition,
+            error,
+            stage,
+        } = failure;
+        if let Some(stage) = stage {
+            mark_stage(failed_stage, stage);
+        }
         if disposition == CompactedInstallFailureDisposition::LiveStateUncertain {
             return Err(BeadsError::WithContext {
                 context: format!(
@@ -1280,7 +1357,12 @@ fn run_post_migration_maintenance(
                 source: Box::new(error),
             });
         }
-        let rollback = restore_present_sidecars(db_path, &displaced_dir, &source_raw);
+        let rollback = restore_present_sidecars(
+            db_path,
+            &displaced_dir,
+            &source_raw,
+            "rollback-restore-live-sidecars",
+        );
         return match rollback {
             Ok(()) => Err(error),
             Err(rollback_error) => Err(BeadsError::internal(format!(
@@ -1289,6 +1371,7 @@ fn run_post_migration_maintenance(
             ))),
         };
     }
+    mark_stage(failed_stage, "post-install-verification");
     let post_install_result = (|| {
         verify_backup_family(db_path, &displaced_dir, &source_raw)?;
         let installed_logical = logical_witness(db_path)?;
@@ -1316,6 +1399,7 @@ fn run_post_migration_maintenance(
         ));
     }
 
+    mark_stage(failed_stage, "finalize-replacement");
     if let Err(error) = write_authority.finalize_database_replacement() {
         return Err(rollback_after_compacted_install_failure(
             db_path,
@@ -1411,10 +1495,99 @@ fn rename_path_no_replace(_source: &Path, _destination: &Path) -> Result<()> {
     ))
 }
 
+/// Retry budget for Windows open-handle rename contention: ten attempts with
+/// linearly growing pauses of `45ms * attempt` (~2s total sleep).
+const FILE_CONTENTION_RETRY_ATTEMPTS: u32 = 10;
+const FILE_CONTENTION_RETRY_STEP: std::time::Duration = std::time::Duration::from_millis(45);
+
+/// Whether an error is the Windows-specific transient refusal to rename a
+/// file that another process still holds open without `FILE_SHARE_DELETE`:
+/// `ERROR_ACCESS_DENIED` (os error 5) or `ERROR_SHARING_VIOLATION` (os error
+/// 32), typically from an antivirus scanner, search indexer, or backup agent
+/// briefly touching the SQLite family (issue #443/#446). Only these two codes
+/// are retriable; everything else is a real failure.
+#[cfg(windows)]
+fn is_windows_file_contention(error: &BeadsError) -> bool {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    match error {
+        BeadsError::Io(io_error) => matches!(
+            io_error.raw_os_error(),
+            Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
+        ),
+        _ => false,
+    }
+}
+
+#[cfg(not(windows))]
+const fn is_windows_file_contention(_error: &BeadsError) -> bool {
+    false
+}
+
+/// No-replace rename hardened against transient Windows sharing conflicts.
+///
+/// On non-Windows platforms the contention classifier never matches, so this
+/// is a transparent passthrough to [`rename_path_no_replace`] with behavior
+/// identical to calling it directly.
+fn rename_stage_no_replace(stage: &str, source: &Path, destination: &Path) -> Result<()> {
+    retry_through_file_contention(
+        stage,
+        source,
+        destination,
+        std::thread::sleep,
+        is_windows_file_contention,
+        || rename_path_no_replace(source, destination),
+    )
+}
+
+/// Run `operation` up to [`FILE_CONTENTION_RETRY_ATTEMPTS`] times, sleeping
+/// between attempts, while `is_transient` classifies the failure as Windows
+/// open-handle contention. Any other error returns unchanged on the attempt
+/// that produced it; an exhausted budget names the stage and both paths so
+/// the failure receipt pinpoints the blocked rename.
+fn retry_through_file_contention<S, C, F>(
+    stage: &str,
+    source: &Path,
+    destination: &Path,
+    mut sleep: S,
+    is_transient: C,
+    mut operation: F,
+) -> Result<()>
+where
+    S: FnMut(std::time::Duration),
+    C: Fn(&BeadsError) -> bool,
+    F: FnMut() -> Result<()>,
+{
+    let mut attempt: u32 = 1;
+    loop {
+        let error = match operation() {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        if !is_transient(&error) {
+            return Err(error);
+        }
+        if attempt >= FILE_CONTENTION_RETRY_ATTEMPTS {
+            return Err(BeadsError::WithContext {
+                context: format!(
+                    "schema-migration stage {stage} could not rename {} to {} after {attempt} \
+                     attempts; another process still holds the file open without delete sharing",
+                    source.display(),
+                    destination.display()
+                ),
+                source: Box::new(error),
+            });
+        }
+        sleep(FILE_CONTENTION_RETRY_STEP.saturating_mul(attempt));
+        attempt += 1;
+    }
+}
+
 fn move_present_sidecars_new(
     source_base: &Path,
     destination_dir: &Path,
     expected: &RawFamilyWitness,
+    stage: &str,
 ) -> Result<()> {
     let present_sidecars = expected
         .components
@@ -1425,6 +1598,7 @@ fn move_present_sidecars_new(
         return Ok(());
     }
     ensure_directory(destination_dir)?;
+    let rollback_stage = format!("{stage}-rollback");
     let mut moved = Vec::with_capacity(present_sidecars.len());
     for component in present_sidecars {
         let source = family_component_path(source_base, &component.suffix);
@@ -1443,7 +1617,8 @@ fn move_present_sidecars_new(
         let destination = match prepared_move {
             Ok(destination) => destination,
             Err(error) => {
-                let rollback = restore_moved_components(source_base, destination_dir, &moved);
+                let rollback =
+                    restore_moved_components(source_base, destination_dir, &moved, &rollback_stage);
                 return match rollback {
                     Ok(()) => Err(error),
                     Err(rollback_error) => Err(BeadsError::internal(format!(
@@ -1454,8 +1629,9 @@ fn move_present_sidecars_new(
                 };
             }
         };
-        if let Err(error) = rename_path_no_replace(&source, &destination) {
-            let rollback = restore_moved_components(source_base, destination_dir, &moved);
+        if let Err(error) = rename_stage_no_replace(stage, &source, &destination) {
+            let rollback =
+                restore_moved_components(source_base, destination_dir, &moved, &rollback_stage);
             return match rollback {
                 Ok(()) => Err(error),
                 Err(rollback_error) => Err(BeadsError::internal(format!(
@@ -1476,7 +1652,8 @@ fn move_present_sidecars_new(
             verify_component_bytes(&destination, &moved_metadata, component)
         })();
         if let Err(error) = moved_verification {
-            let rollback = restore_moved_components(source_base, destination_dir, &moved);
+            let rollback =
+                restore_moved_components(source_base, destination_dir, &moved, &rollback_stage);
             return match rollback {
                 Ok(()) => Err(error),
                 Err(rollback_error) => Err(BeadsError::internal(format!(
@@ -1493,7 +1670,8 @@ fn move_present_sidecars_new(
         sync_directory(destination_dir)
     };
     if let Err(error) = sync_result {
-        let rollback = restore_moved_components(source_base, destination_dir, &moved);
+        let rollback =
+            restore_moved_components(source_base, destination_dir, &moved, &rollback_stage);
         return match rollback {
             Ok(()) => Err(error),
             Err(rollback_error) => Err(BeadsError::internal(format!(
@@ -1509,6 +1687,7 @@ fn restore_moved_components(
     destination_base: &Path,
     source_dir: &Path,
     components: &[RawComponentWitness],
+    stage: &str,
 ) -> Result<()> {
     for component in components.iter().rev() {
         let source = backup_component_path(source_dir, destination_base, &component.suffix)?;
@@ -1520,7 +1699,7 @@ fn restore_moved_components(
             ))
         })?;
         verify_component_bytes(&source, &source_metadata, component)?;
-        rename_path_no_replace(&source, &destination)?;
+        rename_stage_no_replace(stage, &source, &destination)?;
         let restored_metadata = secure_file_metadata(&destination)?.ok_or_else(|| {
             BeadsError::internal(format!(
                 "schema-migration component disappeared after restoration: {}",
@@ -1539,6 +1718,7 @@ fn restore_present_sidecars(
     destination_base: &Path,
     source_dir: &Path,
     expected: &RawFamilyWitness,
+    stage: &str,
 ) -> Result<()> {
     let components = expected
         .components
@@ -1546,7 +1726,7 @@ fn restore_present_sidecars(
         .filter(|component| component.present && !component.suffix.is_empty())
         .cloned()
         .collect::<Vec<_>>();
-    restore_moved_components(destination_base, source_dir, &components)
+    restore_moved_components(destination_base, source_dir, &components, stage)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
@@ -1567,6 +1747,9 @@ enum CompactedInstallFailureDisposition {
 struct CompactedInstallFailure {
     disposition: CompactedInstallFailureDisposition,
     error: BeadsError,
+    /// The installation-state-machine step whose failure produced this value;
+    /// surfaced as `failed_stage` in the failure receipt.
+    stage: Option<&'static str>,
 }
 
 impl CompactedInstallFailure {
@@ -1574,6 +1757,7 @@ impl CompactedInstallFailure {
         Self {
             disposition: CompactedInstallFailureDisposition::OriginalRestored,
             error,
+            stage: None,
         }
     }
 
@@ -1581,7 +1765,13 @@ impl CompactedInstallFailure {
         Self {
             disposition: CompactedInstallFailureDisposition::LiveStateUncertain,
             error,
+            stage: None,
         }
+    }
+
+    fn at_stage(mut self, stage: &'static str) -> Self {
+        self.stage = Some(stage);
+        self
     }
 
     fn from_original_state(
@@ -1645,8 +1835,16 @@ where
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
     {
-        rename_path_no_replace(db_path, _candidate_path)?;
-        rename_path_no_replace(displaced_main, db_path)?;
+        rename_stage_no_replace(
+            "install-rollback-rename-live-to-candidate",
+            db_path,
+            _candidate_path,
+        )?;
+        rename_stage_no_replace(
+            "install-rollback-rename-displaced-to-live",
+            displaced_main,
+            db_path,
+        )?;
         write_authority.restore_retained_database_inode_after_authorized_replace()?;
     }
 
@@ -1694,10 +1892,10 @@ where
     let displaced_metadata = match secure_file_metadata(displaced_main) {
         Ok(metadata) => metadata,
         Err(error) => {
-            return Err(CompactedInstallFailure::from_original_state(
-                error,
-                write_authority,
-            ));
+            return Err(
+                CompactedInstallFailure::from_original_state(error, write_authority)
+                    .at_stage("install-preflight"),
+            );
         }
     };
     if displaced_metadata.is_some() {
@@ -1707,16 +1905,17 @@ where
                 displaced_main.display()
             )),
             write_authority,
-        ));
+        )
+        .at_stage("install-preflight"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     {
         if let Err(error) = exchange_database_paths(candidate_path, db_path) {
-            return Err(CompactedInstallFailure::from_original_state(
-                error,
-                write_authority,
-            ));
+            return Err(
+                CompactedInstallFailure::from_original_state(error, write_authority)
+                    .at_stage("install-exchange-candidate-with-live"),
+            );
         }
         if let Err(error) =
             write_authority.verify_staged_database_recovery_authority(candidate_path)
@@ -1724,7 +1923,8 @@ where
             let rollback = exchange_database_paths(candidate_path, db_path)
                 .and_then(|()| write_authority.verify_database_authority())
                 .and_then(|()| db_path.parent().map_or(Ok(()), &mut sync));
-            return Err(CompactedInstallFailure::after_rollback(error, rollback));
+            return Err(CompactedInstallFailure::after_rollback(error, rollback)
+                .at_stage("install-verify-staged-authority"));
         }
         if let Err(error) = write_authority.adopt_locked_database_replacement(replacement_lock) {
             let rollback = exchange_database_paths(candidate_path, db_path)
@@ -1733,50 +1933,81 @@ where
                 })
                 .and_then(|()| write_authority.verify_database_authority())
                 .and_then(|()| db_path.parent().map_or(Ok(()), &mut sync));
-            return Err(CompactedInstallFailure::after_rollback(error, rollback));
+            return Err(CompactedInstallFailure::after_rollback(error, rollback)
+                .at_stage("install-adopt-replacement"));
         }
-        if let Err(error) = rename_path_no_replace(candidate_path, displaced_main) {
+        if let Err(error) = rename_stage_no_replace(
+            "install-rename-candidate-to-displaced",
+            candidate_path,
+            displaced_main,
+        ) {
             let rollback = exchange_database_paths(db_path, candidate_path)
                 .and_then(|()| {
                     write_authority.restore_retained_database_inode_after_authorized_replace()
                 })
                 .and_then(|()| write_authority.verify_database_authority())
                 .and_then(|()| db_path.parent().map_or(Ok(()), &mut sync));
-            return Err(CompactedInstallFailure::after_rollback(error, rollback));
+            return Err(CompactedInstallFailure::after_rollback(error, rollback)
+                .at_stage("install-rename-candidate-to-displaced"));
         }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
     {
-        if let Err(error) = rename_path_no_replace(db_path, displaced_main) {
-            return Err(CompactedInstallFailure::from_original_state(
-                error,
-                write_authority,
-            ));
+        if let Err(error) =
+            rename_stage_no_replace("install-rename-live-to-displaced", db_path, displaced_main)
+        {
+            return Err(
+                CompactedInstallFailure::from_original_state(error, write_authority)
+                    .at_stage("install-rename-live-to-displaced"),
+            );
         }
         if let Err(error) =
             write_authority.verify_staged_database_recovery_authority(displaced_main)
         {
-            let rollback = rename_path_no_replace(displaced_main, db_path)
-                .and_then(|()| write_authority.verify_database_authority())
-                .and_then(|()| db_path.parent().map_or(Ok(()), &mut sync));
-            return Err(CompactedInstallFailure::after_rollback(error, rollback));
+            let rollback = rename_stage_no_replace(
+                "install-rollback-rename-displaced-to-live",
+                displaced_main,
+                db_path,
+            )
+            .and_then(|()| write_authority.verify_database_authority())
+            .and_then(|()| db_path.parent().map_or(Ok(()), &mut sync));
+            return Err(CompactedInstallFailure::after_rollback(error, rollback)
+                .at_stage("install-verify-staged-authority"));
         }
-        if let Err(error) = rename_path_no_replace(candidate_path, db_path) {
-            let rollback = rename_path_no_replace(displaced_main, db_path)
-                .and_then(|()| write_authority.verify_database_authority())
-                .and_then(|()| db_path.parent().map_or(Ok(()), &mut sync));
-            return Err(CompactedInstallFailure::after_rollback(error, rollback));
+        if let Err(error) =
+            rename_stage_no_replace("install-rename-candidate-to-live", candidate_path, db_path)
+        {
+            let rollback = rename_stage_no_replace(
+                "install-rollback-rename-displaced-to-live",
+                displaced_main,
+                db_path,
+            )
+            .and_then(|()| write_authority.verify_database_authority())
+            .and_then(|()| db_path.parent().map_or(Ok(()), &mut sync));
+            return Err(CompactedInstallFailure::after_rollback(error, rollback)
+                .at_stage("install-rename-candidate-to-live"));
         }
         if let Err(error) = write_authority.adopt_locked_database_replacement(replacement_lock) {
-            let rollback = rename_path_no_replace(db_path, candidate_path)
-                .and_then(|()| rename_path_no_replace(displaced_main, db_path))
-                .and_then(|()| {
-                    write_authority.restore_retained_database_inode_after_authorized_replace()
-                })
-                .and_then(|()| write_authority.verify_database_authority())
-                .and_then(|()| db_path.parent().map_or(Ok(()), &mut sync));
-            return Err(CompactedInstallFailure::after_rollback(error, rollback));
+            let rollback = rename_stage_no_replace(
+                "install-rollback-rename-live-to-candidate",
+                db_path,
+                candidate_path,
+            )
+            .and_then(|()| {
+                rename_stage_no_replace(
+                    "install-rollback-rename-displaced-to-live",
+                    displaced_main,
+                    db_path,
+                )
+            })
+            .and_then(|()| {
+                write_authority.restore_retained_database_inode_after_authorized_replace()
+            })
+            .and_then(|()| write_authority.verify_database_authority())
+            .and_then(|()| db_path.parent().map_or(Ok(()), &mut sync));
+            return Err(CompactedInstallFailure::after_rollback(error, rollback)
+                .at_stage("install-adopt-replacement"));
         }
     }
 
@@ -1792,7 +2023,9 @@ where
             write_authority,
             &mut sync,
         );
-        return Err(CompactedInstallFailure::after_rollback(error, rollback));
+        return Err(
+            CompactedInstallFailure::after_rollback(error, rollback).at_stage("install-durability")
+        );
     }
     Ok(())
 }
@@ -1836,9 +2069,19 @@ fn rollback_after_compacted_install_failure(
     let rollback_result = (|| {
         ensure_new_directory(&failed_dir)?;
         let installed_raw = raw_family_witness(db_path)?;
-        move_present_sidecars_new(db_path, &failed_dir, &installed_raw)?;
+        move_present_sidecars_new(
+            db_path,
+            &failed_dir,
+            &installed_raw,
+            "rollback-quarantine-installed-sidecars",
+        )?;
         rollback_compacted_install(db_path, displaced_main, &failed_dir, write_authority)?;
-        restore_present_sidecars(db_path, displaced_dir, source_raw)?;
+        restore_present_sidecars(
+            db_path,
+            displaced_dir,
+            source_raw,
+            "rollback-restore-live-sidecars",
+        )?;
         write_authority.verify_database_authority()?;
         let restored_raw = raw_family_witness(db_path)?;
         if restored_raw != *source_raw {
@@ -1900,8 +2143,8 @@ fn rollback_compacted_install(
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
     {
-        rename_path_no_replace(db_path, &failed_main)?;
-        rename_path_no_replace(displaced_main, db_path)?;
+        rename_stage_no_replace("rollback-quarantine-installed-main", db_path, &failed_main)?;
+        rename_stage_no_replace("rollback-restore-displaced-main", displaced_main, db_path)?;
         write_authority.restore_retained_database_inode_after_authorized_replace()?;
     }
 
@@ -4114,6 +4357,7 @@ mod tests {
             plan_token: marker.plan_token.clone(),
             marked_at: marker.marked_at.clone(),
             error: "simulated process failure after namespace installation".to_string(),
+            failed_stage: None,
             raw_before: marker.raw_before.clone(),
             logical_before: marker.logical_before.clone(),
             raw_observed_after_failure: None,
@@ -4127,12 +4371,18 @@ mod tests {
             &candidate_path,
             &run_dir.join("maintenance-candidate-sidecars"),
             &candidate_raw,
+            "candidate-sidecar-retention",
         )
         .expect("retain candidate sidecars");
         let displaced_dir = run_dir.join("maintenance-displaced");
         ensure_new_directory(&displaced_dir).expect("create displaced directory");
-        move_present_sidecars_new(&migration.db_path, &displaced_dir, &source_raw)
-            .expect("retain source sidecars");
+        move_present_sidecars_new(
+            &migration.db_path,
+            &displaced_dir,
+            &source_raw,
+            "displace-live-sidecars",
+        )
+        .expect("retain source sidecars");
         let replacement_lock = migration
             .write_authority
             .lock_database_replacement_candidate(&candidate_path)
@@ -4557,5 +4807,235 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn contention_retry_recovers_after_transient_sharing_conflicts() {
+        let sleeps = std::cell::RefCell::new(Vec::new());
+        let attempts = std::cell::Cell::new(0_u32);
+        retry_through_file_contention(
+            "candidate-sidecar-retention",
+            Path::new("candidate.db-wal"),
+            Path::new("retained.db-wal"),
+            |delay| sleeps.borrow_mut().push(delay),
+            |_error| true,
+            || {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                if attempt < 2 {
+                    Err(BeadsError::Io(std::io::Error::other(
+                        "injected transient sharing conflict",
+                    )))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect("the attempt after the transient conflicts clear must succeed");
+        assert_eq!(attempts.get(), 3, "two failures then one success");
+        assert_eq!(
+            sleeps.borrow().as_slice(),
+            &[
+                FILE_CONTENTION_RETRY_STEP,
+                FILE_CONTENTION_RETRY_STEP.saturating_mul(2),
+            ],
+            "backoff must grow linearly with the attempt number"
+        );
+    }
+
+    #[test]
+    fn contention_retry_exhaustion_names_stage_and_both_paths() {
+        let sleeps = std::cell::Cell::new(0_u32);
+        let attempts = std::cell::Cell::new(0_u32);
+        let error = retry_through_file_contention(
+            "install-rename-candidate-to-live",
+            Path::new("pinned-source.db"),
+            Path::new("blocked-destination.db"),
+            |_delay| sleeps.set(sleeps.get() + 1),
+            |_error| true,
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(BeadsError::Io(std::io::Error::other(
+                    "injected persistent sharing conflict",
+                )))
+            },
+        )
+        .expect_err("a persistent sharing conflict must exhaust the retry budget");
+        assert_eq!(attempts.get(), FILE_CONTENTION_RETRY_ATTEMPTS);
+        assert_eq!(
+            sleeps.get(),
+            FILE_CONTENTION_RETRY_ATTEMPTS - 1,
+            "no sleep may follow the final attempt"
+        );
+        let message = error.to_string();
+        for needle in [
+            "install-rename-candidate-to-live",
+            "pinned-source.db",
+            "blocked-destination.db",
+            "injected persistent sharing conflict",
+        ] {
+            assert!(
+                message.contains(needle),
+                "exhaustion error must name {needle}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_contention_rename_errors_pass_through_without_retry() {
+        let attempts = std::cell::Cell::new(0_u32);
+        let error = retry_through_file_contention(
+            "displace-live-sidecars",
+            Path::new("source.db-journal"),
+            Path::new("destination.db-journal"),
+            |_delay| panic!("a non-contention error must never sleep"),
+            // The real classifier: non-Io errors are never contention, and on
+            // non-Windows platforms nothing is, so behavior stays byte-identical.
+            is_windows_file_contention,
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(BeadsError::internal("hard rename failure"))
+            },
+        )
+        .expect_err("a non-contention error must surface unchanged");
+        assert_eq!(attempts.get(), 1, "no retry may follow a hard failure");
+        assert!(
+            error.to_string().contains("hard rename failure"),
+            "the causal error must pass through unchanged: {error}"
+        );
+    }
+
+    #[test]
+    fn failed_receipt_stage_marker_is_additive_and_optional() {
+        let witness = LogicalDatabaseWitness {
+            user_version: 14,
+            integrity_check: "ok".to_string(),
+            schema_sha256: String::new(),
+            contents_sha256: String::new(),
+            tables: Vec::new(),
+        };
+        let mut receipt = FailedMigrationReceipt {
+            schema_version: FAILED_SCHEMA.to_string(),
+            run_id: "run".to_string(),
+            database_path: "beads.db".to_string(),
+            plan_token: "token".to_string(),
+            marked_at: "2026-08-25T00:00:00Z".to_string(),
+            error: "boom".to_string(),
+            failed_stage: None,
+            raw_before: RawFamilyWitness {
+                components: Vec::new(),
+            },
+            logical_before: witness,
+            raw_observed_after_failure: None,
+            logical_observed_after_failure: None,
+        };
+        let without_stage = serde_json::to_string(&receipt).expect("serialize stage-less receipt");
+        assert!(
+            !without_stage.contains("failed_stage"),
+            "an absent stage must not change the receipt encoding: {without_stage}"
+        );
+        let decoded: FailedMigrationReceipt =
+            serde_json::from_str(&without_stage).expect("pre-marker receipts must deserialize");
+        assert_eq!(decoded.failed_stage, None);
+
+        receipt.failed_stage = Some("candidate-sidecar-retention".to_string());
+        let with_stage = serde_json::to_string(&receipt).expect("serialize staged receipt");
+        assert!(
+            with_stage.contains("\"failed_stage\":\"candidate-sidecar-retention\""),
+            "a recorded stage must round-trip: {with_stage}"
+        );
+    }
+
+    #[test]
+    fn maintenance_failure_records_the_stage_that_was_in_progress() {
+        let (_temp, migration) = reviewed_v14_migration_context();
+        let plan = build_plan(&migration.db_path).expect("build plan");
+        let forecast = plan.forecast.clone().expect("eligible forecast");
+        let run_id = allocate_run_id(&migration.beads_dir).expect("allocate run");
+        let run_dir = migration_runs_root(&migration.beads_dir).join(&run_id);
+        let marked_at = Utc::now().to_rfc3339();
+        let prepared = PreparedMigrationReceipt {
+            schema_version: PREPARED_SCHEMA.to_string(),
+            run_id: run_id.clone(),
+            database_path: plan.database_path,
+            plan_token: plan.plan_token.expect("plan token"),
+            marked_at: marked_at.clone(),
+            forecast: forecast.clone(),
+            raw_before: plan.raw_witness,
+            logical_before: plan.logical_witness,
+        };
+        write_json_new(&run_dir.join("prepared.json"), &prepared).expect("write prepared receipt");
+        // Occupy the marker path so the pipeline fails exactly when it tries
+        // to persist the commit-ready marker: the candidate is fully built and
+        // attested, and no earlier stage has any reason to fail.
+        fs::write(run_dir.join("commit-ready.json"), b"{}").expect("occupy marker path");
+
+        let mut failed_stage = None;
+        run_post_migration_maintenance(
+            &migration.db_path,
+            forecast.from_version,
+            forecast.to_version,
+            &marked_at,
+            &run_dir,
+            &migration.write_authority,
+            &mut failed_stage,
+        )
+        .expect_err("an occupied commit-ready marker path must fail the pipeline");
+        assert_eq!(
+            failed_stage.as_deref(),
+            Some("commit-ready-marker"),
+            "the marker must name the stage that was in progress"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_apply_failure_records_failed_stage_in_failure_receipt() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_temp, migration) = reviewed_v14_migration_context();
+        let plan = build_plan(&migration.db_path).expect("build plan");
+        // The run directory tree must already exist: with the database
+        // directory read-only below, `allocate_run_id` could not create it.
+        let runs_root = migration_runs_root(&migration.beads_dir);
+        ensure_directory(&migration.beads_dir.join(".br_recovery")).expect("recovery root");
+        ensure_directory(&runs_root).expect("runs root");
+        // Deny entry creation in the database directory itself: the VACUUM
+        // INTO candidate cannot be created there, forcing the maintenance
+        // pipeline to fail while the nested run directory stays writable for
+        // the failure receipt.
+        let original_permissions = fs::metadata(&migration.beads_dir)
+            .expect("beads dir metadata")
+            .permissions();
+        fs::set_permissions(&migration.beads_dir, fs::Permissions::from_mode(0o555))
+            .expect("make database directory read-only");
+        let result = execute_apply(
+            &DoctorMigrateSchemaApplyArgs {
+                plan_token: plan.plan_token.expect("plan token"),
+                json: false,
+            },
+            &migration,
+        );
+        fs::set_permissions(&migration.beads_dir, original_permissions)
+            .expect("restore database directory permissions");
+        result.expect_err("a read-only database directory must fail the apply");
+
+        let run_dir = fs::read_dir(&runs_root)
+            .expect("read migration runs")
+            .next()
+            .expect("one run")
+            .expect("run entry")
+            .path();
+        let failed: FailedMigrationReceipt =
+            read_json(&run_dir.join("failed.json")).expect("read failure receipt");
+        assert_eq!(
+            failed.failed_stage.as_deref(),
+            Some("vacuum-candidate"),
+            "the receipt must pinpoint the stage that could not proceed"
+        );
+        assert!(
+            !run_dir.join("maintenance-candidate-sidecars").exists(),
+            "the failure precedes candidate sidecar retention"
+        );
     }
 }

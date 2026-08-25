@@ -1336,9 +1336,35 @@ fn hardened_git_command(
         command
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", null_device());
+    } else {
+        // Effective-config probes exist to observe the same configuration
+        // Git itself would honor for the caller. The hardening sweep above
+        // removed every `GIT_*` variable, including Git's documented
+        // read-location overrides for the system/global config files. That
+        // made external neutralization such as `GIT_CONFIG_SYSTEM=/dev/null`
+        // silently ineffective while the host's real /etc/gitconfig still
+        // leaked into the probes. Restore exactly the location keys from the
+        // caller environment: they only select which *existing files* are
+        // read (the caller already controls global scope via `HOME`), unlike
+        // `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*` value injection, which stays
+        // stripped.
+        for key in EFFECTIVE_CONFIG_SCOPE_ENV_KEYS {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
     }
     command
 }
+
+/// Git's read-location overrides for configuration scope, preserved for
+/// effective-config probes so `br` observes the same configuration files the
+/// caller's own `git` invocations would read.
+const EFFECTIVE_CONFIG_SCOPE_ENV_KEYS: [&str; 3] = [
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_NOSYSTEM",
+];
 
 fn is_git_process_environment_key(key: &OsStr) -> bool {
     let uppercase = key.to_string_lossy().to_ascii_uppercase();
@@ -1797,14 +1823,19 @@ mod tests {
                 ))
             })
             .collect::<std::collections::BTreeMap<_, _>>();
-        assert!(
-            !env.contains_key("GIT_CONFIG_GLOBAL"),
-            "effective config must retain Git's normal global precedence"
-        );
-        assert!(
-            !env.contains_key("GIT_CONFIG_NOSYSTEM"),
-            "effective config must retain Git's normal system precedence"
-        );
+        // The effective-config probe must never force its own isolation
+        // values; the only permitted entries for these keys mirror what the
+        // caller environment already carries (Git's documented read-location
+        // overrides), so external neutralization such as
+        // `GIT_CONFIG_SYSTEM=/dev/null` keeps working while a caller without
+        // those variables retains Git's normal system/global precedence.
+        for key in super::EFFECTIVE_CONFIG_SCOPE_ENV_KEYS {
+            assert_eq!(
+                env.get(key).map(std::ffi::OsString::from),
+                std::env::var_os(key),
+                "effective config probe must mirror the caller's {key}"
+            );
+        }
     }
 
     #[test]

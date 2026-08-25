@@ -225,7 +225,15 @@ pub struct ImportResultOutput {
     pub tombstone_skipped: usize,
     pub orphans_removed: usize,
     pub blocked_cache_rebuilt: bool,
+    /// Old-id -> new-id receipt emitted when `--rename-prefix` rewrote ids.
+    /// Omitted entirely when no rename happened (legacy JSON shape).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prefix_renames: Vec<crate::sync::ImportPrefixRename>,
 }
+
+/// Maximum witness rows printed per list in human-readable sync output;
+/// machine modes always carry the complete manifests.
+const HUMAN_WITNESS_LIMIT: usize = 32;
 
 /// Maximum ids serialized per preview list in a reconcile receipt.
 ///
@@ -1306,7 +1314,6 @@ fn render_additive_reconcile_receipt(
     ctx: &OutputContext,
     machine_readable: bool,
 ) {
-    const HUMAN_WITNESS_LIMIT: usize = 32;
     if machine_readable {
         ctx.json_pretty(receipt);
         return;
@@ -3170,6 +3177,7 @@ fn emit_auto_rebuild_import_result(
         tombstone_skipped: 0,
         orphans_removed: 0,
         blocked_cache_rebuilt: true,
+        prefix_renames: Vec::new(),
     };
     if use_json {
         ctx.json_pretty(&result);
@@ -3262,6 +3270,7 @@ fn execute_import(
                 tombstone_skipped: 0,
                 orphans_removed: 0,
                 blocked_cache_rebuilt: false,
+                prefix_renames: Vec::new(),
             };
             ctx.json_pretty(&result);
         } else if should_render_human_sync_output(ctx, use_json) {
@@ -3413,6 +3422,7 @@ fn execute_import(
                         tombstone_skipped: 0,
                         orphans_removed: 0,
                         blocked_cache_rebuilt: false,
+                        prefix_renames: Vec::new(),
                     };
                     ctx.json_pretty(&result);
                 } else if should_render_human_sync_output(ctx, use_json) {
@@ -3720,6 +3730,7 @@ fn execute_import(
         tombstone_skipped: import_result.tombstone_skipped,
         orphans_removed: import_result.orphans_removed,
         blocked_cache_rebuilt: true,
+        prefix_renames: import_result.prefix_renames.clone(),
     };
 
     if use_json {
@@ -3747,6 +3758,24 @@ fn execute_import(
                 "  Orphans removed: {} issues (not in JSONL)",
                 result.orphans_removed
             );
+        }
+        if !result.prefix_renames.is_empty() {
+            println!("  Prefix renames: {} issues", result.prefix_renames.len());
+            for rename in result.prefix_renames.iter().take(HUMAN_WITNESS_LIMIT) {
+                match rename.fallback.as_deref() {
+                    Some(reason) => println!(
+                        "    {} -> {} (fallback: {reason})",
+                        rename.old_id, rename.new_id
+                    ),
+                    None => println!("    {} -> {}", rename.old_id, rename.new_id),
+                }
+            }
+            if result.prefix_renames.len() > HUMAN_WITNESS_LIMIT {
+                println!(
+                    "    ... {} more; use --json for the complete mapping",
+                    result.prefix_renames.len() - HUMAN_WITNESS_LIMIT
+                );
+            }
         }
         println!("  Rebuilt blocked cache");
     }
@@ -3804,6 +3833,36 @@ fn render_import_result_rich(result: &ImportResultOutput, ctx: &OutputContext) {
         text.append_styled(&result.orphans_removed.to_string(), theme.warning.clone());
         text.append_styled(" (not in JSONL)", theme.muted.clone());
         text.append("\n");
+    }
+
+    // Prefix renames (--rename-prefix receipt)
+    if !result.prefix_renames.is_empty() {
+        text.append_styled("Prefix renames     ", theme.dimmed.clone());
+        text.append_styled(
+            &result.prefix_renames.len().to_string(),
+            theme.accent.clone(),
+        );
+        text.append_styled(" issues", theme.dimmed.clone());
+        text.append("\n");
+        for rename in result.prefix_renames.iter().take(HUMAN_WITNESS_LIMIT) {
+            text.append_styled("  ", theme.dimmed.clone());
+            text.append(&rename.old_id);
+            text.append_styled(" -> ", theme.dimmed.clone());
+            text.append_styled(&rename.new_id, theme.info.clone());
+            if let Some(reason) = rename.fallback.as_deref() {
+                text.append_styled(&format!(" (fallback: {reason})"), theme.warning.clone());
+            }
+            text.append("\n");
+        }
+        if result.prefix_renames.len() > HUMAN_WITNESS_LIMIT {
+            text.append_styled(
+                &format!(
+                    "  ... {} more; use --json for the complete mapping\n",
+                    result.prefix_renames.len() - HUMAN_WITNESS_LIMIT
+                ),
+                theme.muted.clone(),
+            );
+        }
     }
 
     // Cache rebuilt

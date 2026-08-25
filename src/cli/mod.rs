@@ -3022,6 +3022,20 @@ pub struct SyncArgs {
     pub orphans: Option<String>,
 
     /// Rename issues with wrong prefix to expected prefix during import
+    ///
+    /// Replaces only the prefix segment and keeps the id remainder intact
+    /// (`oldp-cargo-license-spdx-ay8` -> `newp-cargo-license-spdx-ay8`); a
+    /// doubled prefix collapses once (`oldp-oldp-x-3un` -> `newp-x-3un`).
+    /// If the preserved id would collide with an existing id, that issue
+    /// falls back to a freshly generated id. Every rewrite is reported as a
+    /// `prefix_renames` old_id -> new_id mapping in the sync output (with a
+    /// `fallback` marker for regenerated ids), and each issue's old id is
+    /// stashed in its external_ref when that field is empty.
+    ///
+    /// Notes: without --force the import (and therefore the rename) is
+    /// skipped when the JSONL content hash is unchanged since the last
+    /// import, and a following `br sync --flush-only` needs `--force` to
+    /// write the renamed ids back to the JSONL.
     #[arg(long)]
     pub rename_prefix: bool,
 

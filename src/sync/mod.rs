@@ -2869,6 +2869,24 @@ pub enum OrphanMode {
     Allow,
 }
 
+/// Witness for one `--rename-prefix` id rewrite (old id -> new id).
+///
+/// `fallback` is `None` when the rename preserved the id remainder
+/// (`oldp-slug-hash` -> `newp-slug-hash`); otherwise it names why the id had
+/// to be regenerated from scratch instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ImportPrefixRename {
+    /// Issue id as it appeared in the JSONL source.
+    pub old_id: String,
+    /// Issue id after the prefix rewrite.
+    pub new_id: String,
+    /// Reason the remainder-preserving rename was abandoned for this id
+    /// (`regenerated-on-collision` or `regenerated-unparseable-id`); absent
+    /// when the remainder was preserved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+}
+
 /// Result of a JSONL import.
 #[derive(Debug, Clone, Default)]
 pub struct ImportResult {
@@ -2900,6 +2918,9 @@ pub struct ImportResult {
     pub blocked_cache_entries: usize,
     /// Number of child-counter rows rebuilt after import.
     pub child_counter_entries: usize,
+    /// Old-id -> new-id receipt for `--rename-prefix` rewrites (empty when
+    /// the flag was off or no id needed renaming).
+    pub prefix_renames: Vec<ImportPrefixRename>,
 }
 
 /// Versioned receipt schema for lossless additive JSONL reconciliation.
@@ -12684,17 +12705,56 @@ fn collect_import_validation_plan(
     Ok(plan)
 }
 
+/// `--rename-prefix` receipt reason: the remainder-preserving id was already
+/// taken (in the DB, the JSONL, or by an earlier rename in this import).
+const PREFIX_RENAME_FALLBACK_COLLISION: &str = "regenerated-on-collision";
+/// `--rename-prefix` receipt reason: the old id had no separable prefix
+/// segment, or the preserved remainder would not form a valid id under the
+/// configured prefix.
+const PREFIX_RENAME_FALLBACK_UNPARSEABLE: &str = "regenerated-unparseable-id";
+
+/// Rewrite only the prefix segment of a mismatched issue id, keeping the
+/// remainder (slug and hash) intact: `oldp-cargo-license-spdx-ay8` becomes
+/// `newp-cargo-license-spdx-ay8` under prefix `newp`.
+///
+/// The old prefix is the id's first `-`-separated segment — the same
+/// first-segment semantics `parse_id`/`id_matches_expected_prefix` use to
+/// detect the mismatch, so arbitrary in-the-wild prefixes work without any
+/// prefix registry. A doubled prefix collapses exactly once, not
+/// recursively: `oldp-oldp-x-3un` -> `x-3un` remainder, while
+/// `oldp-oldp-oldp-x` keeps `oldp-x`.
+///
+/// Returns `None` when the id has no prefix segment or the remainder is
+/// empty; the caller falls back to regenerating a fresh id.
+fn prefix_preserving_rename(old_id: &str, new_prefix: &str) -> Option<String> {
+    let (old_prefix, mut remainder) = old_id.split_once('-')?;
+    if old_prefix.is_empty() {
+        return None;
+    }
+    if let Some(deduped) = remainder
+        .strip_prefix(old_prefix)
+        .and_then(|rest| rest.strip_prefix('-'))
+        && !deduped.is_empty()
+    {
+        remainder = deduped;
+    }
+    if remainder.is_empty() {
+        return None;
+    }
+    Some(format!("{new_prefix}-{remainder}"))
+}
+
 fn build_prefix_renames(
     storage: &SqliteStorage,
     plan: &ImportValidationPlan,
     expected_prefix: Option<&str>,
-) -> Result<HashMap<String, String>> {
+) -> Result<(HashMap<String, String>, Vec<ImportPrefixRename>)> {
     if plan.prefix_mismatches.is_empty() {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), Vec::new()));
     }
 
     let Some(prefix) = expected_prefix else {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), Vec::new()));
     };
 
     let generator = IdGenerator::new(IdConfig::with_prefix(prefix)?);
@@ -12703,21 +12763,48 @@ fn build_prefix_renames(
 
     let mut generated_ids = HashSet::new();
     let mut renames = HashMap::with_capacity(plan.prefix_mismatches.len());
+    let mut receipt = Vec::with_capacity(plan.prefix_mismatches.len());
 
     for seed in &plan.prefix_mismatches {
-        let new_id = generator.generate(
-            &seed.title,
-            seed.description.as_deref(),
-            seed.created_by.as_deref(),
-            seed.created_at,
-            plan.record_count,
-            |candidate| Ok(occupied_ids.contains(candidate) || generated_ids.contains(candidate)),
-        )?;
+        let preserved = prefix_preserving_rename(&seed.old_id, prefix)
+            .filter(|candidate| id_matches_expected_prefix(candidate, prefix));
+        let (new_id, fallback) = match preserved {
+            Some(candidate)
+                if !occupied_ids.contains(&candidate) && !generated_ids.contains(&candidate) =>
+            {
+                (candidate, None)
+            }
+            preserved => {
+                // Never silently re-mint over an occupied id: regenerate via
+                // the collision-checked generator and record why.
+                let reason = if preserved.is_some() {
+                    PREFIX_RENAME_FALLBACK_COLLISION
+                } else {
+                    PREFIX_RENAME_FALLBACK_UNPARSEABLE
+                };
+                let regenerated = generator.generate(
+                    &seed.title,
+                    seed.description.as_deref(),
+                    seed.created_by.as_deref(),
+                    seed.created_at,
+                    plan.record_count,
+                    |candidate| {
+                        Ok(occupied_ids.contains(candidate) || generated_ids.contains(candidate))
+                    },
+                )?;
+                (regenerated, Some(reason.to_string()))
+            }
+        };
         generated_ids.insert(new_id.clone());
+        receipt.push(ImportPrefixRename {
+            old_id: seed.old_id.clone(),
+            new_id: new_id.clone(),
+            fallback,
+        });
         renames.insert(seed.old_id.clone(), new_id);
     }
 
-    Ok(renames)
+    Ok((renames, receipt))
 }
 
 fn apply_prefix_renames(issue: &mut Issue, renames: &HashMap<String, String>) {
@@ -12726,9 +12813,11 @@ fn apply_prefix_renames(issue: &mut Issue, renames: &HashMap<String, String>) {
     if let Some(new_id) = renames.get(&issue.id) {
         if issue.external_ref.is_none() {
             issue.external_ref = Some(issue.id.clone());
+            // content_hash covers external_ref but not the id itself, so the
+            // stash above is the only mutation here that moves the hash.
+            issue.content_hash = Some(content_hash(issue));
         }
         issue.id.clone_from(new_id);
-        issue.content_hash = Some(content_hash(issue));
     }
 
     for dep in &mut issue.dependencies {
@@ -13163,7 +13252,9 @@ fn import_from_jsonl_snapshot_impl(
 
     // Step 5: Handle renames if requested
     let prefix_renames = if config.rename_on_import {
-        build_prefix_renames(storage, &validation_plan, expected_prefix)?
+        let (renames, receipt) = build_prefix_renames(storage, &validation_plan, expected_prefix)?;
+        result.prefix_renames = receipt;
+        renames
     } else {
         HashMap::new()
     };
@@ -22678,6 +22769,207 @@ mod tests {
         assert_eq!(
             hash1, hash2,
             "Hashes should be identical regardless of empty lines or whitespace"
+        );
+    }
+
+    #[test]
+    fn test_prefix_preserving_rename_keeps_slug_and_hash() {
+        assert_eq!(
+            prefix_preserving_rename("oldp-cargo-license-spdx-ay8", "newp").as_deref(),
+            Some("newp-cargo-license-spdx-ay8")
+        );
+        assert_eq!(
+            prefix_preserving_rename("oldp-ay8", "newp").as_deref(),
+            Some("newp-ay8")
+        );
+    }
+
+    #[test]
+    fn test_prefix_preserving_rename_collapses_doubled_prefix_once() {
+        assert_eq!(
+            prefix_preserving_rename("oldp-oldp-central-build-inputs-3un", "newp").as_deref(),
+            Some("newp-central-build-inputs-3un")
+        );
+        // Never recursive: a tripled prefix keeps one interior occurrence.
+        assert_eq!(
+            prefix_preserving_rename("oldp-oldp-oldp-x", "newp").as_deref(),
+            Some("newp-oldp-x")
+        );
+    }
+
+    #[test]
+    fn test_prefix_preserving_rename_rejects_unsplittable_ids() {
+        assert_eq!(prefix_preserving_rename("nodashid", "newp"), None);
+        assert_eq!(prefix_preserving_rename("-abc", "newp"), None);
+        assert_eq!(prefix_preserving_rename("oldp-", "newp"), None);
+    }
+
+    fn prefix_rename_seed(old_id: &str, title: &str) -> PrefixRenameSeed {
+        PrefixRenameSeed {
+            old_id: old_id.to_string(),
+            title: title.to_string(),
+            description: None,
+            created_by: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_build_prefix_renames_preserves_remainder_and_reports_receipt() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let mut plan = ImportValidationPlan {
+            record_count: 3,
+            ..ImportValidationPlan::default()
+        };
+        plan.prefix_mismatches
+            .push(prefix_rename_seed("oldp-cargo-license-spdx-ay8", "Slugged"));
+        plan.prefix_mismatches.push(prefix_rename_seed(
+            "oldp-oldp-central-build-inputs-3un",
+            "Doubled",
+        ));
+        plan.prefix_mismatches
+            .push(prefix_rename_seed("nodashid", "Unsplittable"));
+
+        let (renames, receipt) = build_prefix_renames(&storage, &plan, Some("newp")).unwrap();
+
+        assert_eq!(
+            renames
+                .get("oldp-cargo-license-spdx-ay8")
+                .map(String::as_str),
+            Some("newp-cargo-license-spdx-ay8"),
+            "slug and hash must survive the prefix rewrite"
+        );
+        assert_eq!(
+            renames
+                .get("oldp-oldp-central-build-inputs-3un")
+                .map(String::as_str),
+            Some("newp-central-build-inputs-3un"),
+            "doubled prefix must collapse exactly once"
+        );
+        let fallback_id = renames.get("nodashid").expect("unsplittable id renamed");
+        assert!(
+            fallback_id.starts_with("newp-"),
+            "fallback must still use the configured prefix: {fallback_id}"
+        );
+
+        assert_eq!(receipt.len(), 3);
+        assert_eq!(receipt[0].old_id, "oldp-cargo-license-spdx-ay8");
+        assert_eq!(receipt[0].new_id, "newp-cargo-license-spdx-ay8");
+        assert_eq!(receipt[0].fallback, None);
+        assert_eq!(receipt[1].new_id, "newp-central-build-inputs-3un");
+        assert_eq!(receipt[1].fallback, None);
+        assert_eq!(receipt[2].old_id, "nodashid");
+        assert_eq!(
+            receipt[2].fallback.as_deref(),
+            Some(PREFIX_RENAME_FALLBACK_UNPARSEABLE)
+        );
+    }
+
+    #[test]
+    fn test_build_prefix_renames_falls_back_on_collision_without_reminting() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        storage
+            .upsert_issue_for_import(&make_test_issue("newp-taken-ay8", "Occupant"))
+            .unwrap();
+        let mut plan = ImportValidationPlan {
+            record_count: 1,
+            ..ImportValidationPlan::default()
+        };
+        plan.prefix_mismatches
+            .push(prefix_rename_seed("oldp-taken-ay8", "Collider"));
+
+        let (renames, receipt) = build_prefix_renames(&storage, &plan, Some("newp")).unwrap();
+
+        let new_id = renames.get("oldp-taken-ay8").expect("collision renamed");
+        assert_ne!(
+            new_id, "newp-taken-ay8",
+            "must not silently re-mint over the occupied id"
+        );
+        assert!(new_id.starts_with("newp-"), "unexpected fallback: {new_id}");
+        assert_eq!(receipt.len(), 1);
+        assert_eq!(
+            receipt[0].fallback.as_deref(),
+            Some(PREFIX_RENAME_FALLBACK_COLLISION)
+        );
+        assert_eq!(&receipt[0].new_id, new_id);
+    }
+
+    #[test]
+    fn test_apply_prefix_renames_stashes_old_id_and_rewrites_references() {
+        let mut issue = make_test_issue("oldp-cargo-license-spdx-ay8", "Renamed");
+        issue.content_hash = Some(crate::util::content_hash(&issue));
+        issue.dependencies.push(Dependency {
+            issue_id: "oldp-cargo-license-spdx-ay8".to_string(),
+            depends_on_id: "oldp-oldp-central-build-inputs-3un".to_string(),
+            dep_type: DependencyType::Blocks,
+            created_at: Utc::now(),
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        });
+        issue.comments.push(Comment {
+            id: 1,
+            issue_id: "oldp-cargo-license-spdx-ay8".to_string(),
+            author: "tester".to_string(),
+            body: "hello".to_string(),
+            created_at: Utc::now(),
+        });
+
+        let renames: HashMap<String, String> = [
+            (
+                "oldp-cargo-license-spdx-ay8".to_string(),
+                "newp-cargo-license-spdx-ay8".to_string(),
+            ),
+            (
+                "oldp-oldp-central-build-inputs-3un".to_string(),
+                "newp-central-build-inputs-3un".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        apply_prefix_renames(&mut issue, &renames);
+
+        assert_eq!(issue.id, "newp-cargo-license-spdx-ay8");
+        assert_eq!(
+            issue.external_ref.as_deref(),
+            Some("oldp-cargo-license-spdx-ay8"),
+            "old id must be stashed in external_ref"
+        );
+        assert_eq!(
+            issue.content_hash.as_deref(),
+            Some(crate::util::content_hash(&issue).as_str()),
+            "hash must be recomputed after the external_ref stash"
+        );
+        assert_eq!(
+            issue.dependencies[0].issue_id,
+            "newp-cargo-license-spdx-ay8"
+        );
+        assert_eq!(
+            issue.dependencies[0].depends_on_id,
+            "newp-central-build-inputs-3un"
+        );
+        assert_eq!(issue.comments[0].issue_id, "newp-cargo-license-spdx-ay8");
+    }
+
+    #[test]
+    fn test_apply_prefix_renames_keeps_existing_external_ref_and_hash() {
+        let mut issue = make_test_issue("oldp-abc", "Keeps ref");
+        issue.external_ref = Some("gh-123".to_string());
+        let stable_hash = crate::util::content_hash(&issue);
+        issue.content_hash = Some(stable_hash.clone());
+
+        let renames: HashMap<String, String> = [("oldp-abc".to_string(), "newp-abc".to_string())]
+            .into_iter()
+            .collect();
+        apply_prefix_renames(&mut issue, &renames);
+
+        assert_eq!(issue.id, "newp-abc");
+        assert_eq!(issue.external_ref.as_deref(), Some("gh-123"));
+        assert_eq!(
+            issue.content_hash.as_deref(),
+            Some(stable_hash.as_str()),
+            "content hash excludes the id, so a pure id swap must not move it"
         );
     }
 }

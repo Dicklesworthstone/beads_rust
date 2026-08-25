@@ -1308,6 +1308,37 @@ fn should_attempt_jsonl_recovery_after_open(
         )
 }
 
+/// Stable diagnostic prefix fsqlite emits when the `-wal-cert` sidecar holds
+/// a durable-certificate record whose envelope version this engine build does
+/// not decode (GitHub #441: upgrading `br` across an fsqlite engine
+/// generation leaves the old sidecar behind, and every cert-regenerating
+/// write fails with this message while reads stay healthy).
+///
+/// fsqlite reports the condition as `FrankenError::WalCorrupt` with the
+/// version baked into a free-form `detail` string — there is no dedicated
+/// typed variant to match on (verified against fsqlite-core 0.3.9
+/// `wal_adapter.rs::validate_incomplete_certificate_suffix`), so this matches
+/// the typed `WalCorrupt` variant plus this conservative substring. The
+/// trailing version number is intentionally excluded so every unsupported
+/// version (past or future) classifies the same way.
+const FSQLITE_WAL_CERT_UNSUPPORTED_RECORD_VERSION_DETAIL: &str =
+    "parallel WAL certificate suffix has unsupported record version";
+
+/// True when a write failed because the parallel-WAL durability-certificate
+/// sidecar (`-wal-cert`) was written by a different fsqlite engine
+/// generation. The certificate is derived state: quarantining the sidecar
+/// lets the engine regenerate it on the next write, whereas a full JSONL
+/// rebuild is both heavier and unnecessary (and wedges entirely when the
+/// JSONL merge anchor is stale, as in GitHub #441).
+#[must_use]
+pub(crate) fn is_stale_wal_certificate_version_error(err: &BeadsError) -> bool {
+    matches!(
+        err,
+        BeadsError::Database(FrankenError::WalCorrupt { detail })
+            if detail.contains(FSQLITE_WAL_CERT_UNSUPPORTED_RECORD_VERSION_DETAIL)
+    )
+}
+
 fn is_duplicate_schema_entry_open_error(detail: &str) -> bool {
     let detail = detail.trim();
     let detail_lower = detail.to_ascii_lowercase();
@@ -4239,6 +4270,88 @@ impl OpenStorageResult {
         self.jsonl_write_authority = Some(jsonl_authority);
         self.auto_rebuilt = true;
         Ok(())
+    }
+
+    /// GitHub #441: quarantine the parallel-WAL durability-certificate
+    /// sidecars (`-wal-cert`, `-wal-cert-head`) into `.br_recovery` as
+    /// verified backups and reopen the same database file in place.
+    ///
+    /// Used when a write fails with
+    /// [`is_stale_wal_certificate_version_error`]: the certificate is derived
+    /// state left behind by a different fsqlite engine generation, and the
+    /// engine regenerates it on the next successful write. The `-wal` file
+    /// itself is never touched — it is real data, not derived state — and
+    /// this path deliberately avoids the JSONL rebuild machinery so recovery
+    /// cannot wedge on a stale JSONL merge anchor.
+    ///
+    /// Returns the recovery-directory backup paths of the quarantined
+    /// sidecars (empty when neither sidecar existed on disk).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error in `--no-db` mode, without an owned database-family
+    /// authority, when the quarantine rename/verification fails, or when the
+    /// database cannot be reopened afterwards.
+    pub(crate) fn quarantine_stale_wal_certificate_sidecars_and_reopen(
+        &mut self,
+    ) -> Result<Vec<PathBuf>> {
+        if self.no_db {
+            return Err(BeadsError::Config(
+                "cannot quarantine WAL-certificate sidecars while --no-db mode is active"
+                    .to_string(),
+            ));
+        }
+        let write_authority =
+            self.write_authority
+                .clone()
+                .ok_or_else(|| {
+                    BeadsError::SyncConflict {
+                message:
+                    "WAL-certificate sidecar quarantine requires an owned database-family authority"
+                        .to_string(),
+            }
+                })?;
+        write_authority.verify_database_authority()?;
+
+        // Preserve state staged on the storage being replaced, mirroring
+        // `recover_database_from_jsonl` (#312 hardening, F1): the failed
+        // write did not commit, so the retry must still see it.
+        let preserved_attribution = self.storage.take_pending_event_attribution();
+        let preserved_workflow_policy = self.storage.workflow_policy();
+
+        // Close the live connection before renaming sidecars out of the
+        // family: the engine caches descriptors for the certificate sidecar,
+        // and a retry through the old handle could keep reading the stale
+        // bytes through the renamed inode.
+        self.storage = SqliteStorage::open_memory()?;
+
+        let db_path_str = self.paths.db_path.to_string_lossy();
+        let quarantined = quarantine_database_artifacts(
+            &self.paths.db_path,
+            &self.paths.beads_dir,
+            FSQLITE_WAL_CERT_SIDECAR_SUFFIXES
+                .iter()
+                .map(|suffix| PathBuf::from(format!("{db_path_str}{suffix}"))),
+            "stale-wal-cert",
+        )?;
+        warn!(
+            db_path = %self.paths.db_path.display(),
+            quarantined_paths = ?quarantined,
+            "Quarantined stale parallel-WAL certificate sidecars into the recovery directory; the engine will regenerate them on the next write"
+        );
+
+        let mut storage = SqliteStorage::open_with_timeout_under_write_authority(
+            &self.paths.db_path,
+            self.resolved_lock_timeout,
+            &write_authority,
+        )?;
+        write_authority.verify_database_authority()?;
+        storage.set_workflow_policy(preserved_workflow_policy);
+        if let Some(attribution) = preserved_attribution {
+            storage.set_pending_event_attribution(attribution);
+        }
+        self.storage = storage;
+        Ok(quarantined)
     }
 
     pub(crate) fn verify_retained_jsonl_source_current(&self) -> Result<()> {
