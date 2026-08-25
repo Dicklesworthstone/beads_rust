@@ -15787,33 +15787,52 @@ fn remove_temp_db_files(path: &Path) {
 /// `Database error: unable to open database file: '<sidecar>'`, which reads as
 /// database corruption. This preflight is deliberately observational so the
 /// lock-free read-only opener can decline instead of chmod.
+#[cfg(unix)]
+#[derive(Debug)]
+struct NamespaceSidecarModeWitness {
+    path: PathBuf,
+    identity: (u64, u64),
+    mode: u32,
+}
+
+#[cfg(unix)]
+fn namespace_sidecar_mode_repair_witnesses(
+    db_path: &Path,
+) -> Result<Vec<NamespaceSidecarModeWitness>> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let mut witnesses = Vec::new();
+    for suffix in crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES {
+        let sidecar = database_sidecar_path(db_path, suffix);
+        let metadata = match std::fs::symlink_metadata(&sidecar) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(BeadsError::Io(error)),
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Refusing unsafe fsqlite namespace sidecar {}: expected a regular file, not a symlink or special file",
+                    sidecar.display()
+                ),
+            });
+        }
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            witnesses.push(NamespaceSidecarModeWitness {
+                path: sidecar,
+                identity: (metadata.dev(), metadata.ino()),
+                mode,
+            });
+        }
+    }
+    Ok(witnesses)
+}
+
 fn namespace_sidecar_mode_repair_required(db_path: &Path) -> Result<bool> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut repair_required = false;
-        for suffix in crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES {
-            let sidecar = database_sidecar_path(db_path, suffix);
-            let metadata = match std::fs::symlink_metadata(&sidecar) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(BeadsError::Io(error)),
-            };
-            if !metadata.is_file() || metadata.file_type().is_symlink() {
-                return Err(BeadsError::SyncConflict {
-                    message: format!(
-                        "Refusing unsafe fsqlite namespace sidecar {}: expected a regular file, not a symlink or special file",
-                        sidecar.display()
-                    ),
-                });
-            }
-            let mode = metadata.permissions().mode();
-            if mode & 0o077 != 0 {
-                repair_required = true;
-            }
-        }
-        Ok(repair_required)
+        Ok(!namespace_sidecar_mode_repair_witnesses(db_path)?.is_empty())
     }
     #[cfg(not(unix))]
     {
@@ -28964,6 +28983,84 @@ mod tests {
             fs::read(&db_path).unwrap(),
             database_bytes_before,
             "a rejected open must leave the main database bytes unchanged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_wal_only_future_schema_is_refused_by_byte_neutral_read_only_preflight() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("wal_only_future_schema.db");
+        let current_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap();
+        let future_version = current_version.checked_add(1).unwrap();
+        {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            storage.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        assert_eq!(
+            database_header_user_version(&db_path),
+            Some(current_version),
+            "the settled main header must start current"
+        );
+
+        let writer = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        writer.execute("PRAGMA wal_autocheckpoint=0").unwrap();
+        writer
+            .execute(&format!("PRAGMA user_version = {future_version}"))
+            .unwrap();
+        assert_eq!(connection_user_version(&writer), Some(future_version));
+        assert_eq!(
+            database_header_user_version(&db_path),
+            Some(current_version),
+            "the fixture must keep the future version out of the main header"
+        );
+        assert_eq!(
+            sqlite_wal_frame_state(&db_path).unwrap(),
+            WalFrameState::FramesPresent,
+            "the fixture must carry the future version in WAL frames"
+        );
+        let family_before = directory_bytes_and_modes(temp.path());
+
+        let error = SqliteStorage::open_with_timeout(&db_path, Some(50))
+            .expect_err("a WAL-only future version must be refused before writable open");
+        assert!(
+            error
+                .to_string()
+                .contains("newer than this br binary supports"),
+            "unexpected WAL-only future error: {error}"
+        );
+        assert_eq!(
+            directory_bytes_and_modes(temp.path()),
+            family_before,
+            "future-version preflight must not create, chmod, or rewrite any family member"
+        );
+        writer.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_header_length_wal_preflight_rejects_invalid_32_byte_header() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("invalid_header_only_wal.db");
+        {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            storage.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        let wal_path = database_sidecar_path(&db_path, "-wal");
+        let invalid_header = [0_u8; 32];
+        fs::write(&wal_path, invalid_header).unwrap();
+        let family_before = directory_bytes_and_modes(temp.path());
+
+        let error = SqliteStorage::open_with_timeout(&db_path, Some(50))
+            .expect_err("WAL length alone must not authorize a writable open");
+        assert!(
+            error.to_string().contains("WAL magic"),
+            "unexpected invalid WAL header error: {error}"
+        );
+        assert_eq!(
+            directory_bytes_and_modes(temp.path()),
+            family_before,
+            "invalid header-only WAL refusal must be byte and mode neutral"
         );
     }
 

@@ -947,6 +947,11 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
             "Migrating database to schema version 16 (capacity exemptions - GitHub #384 phase 4)"
         );
         apply_capacity_exemptions_migration_in_transaction(conn)?;
+    } else {
+        // A source stamped at v16 promises that the exemption state and
+        // append-only history already exist. Refuse drift rather than letting
+        // the v17 step bless a malformed same-name table at the new version.
+        attest_capacity_exemptions_schema(conn)?;
     }
 
     tracing::info!(
@@ -1141,6 +1146,10 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
         rows.iter()
             .any(|row| row.get(1).and_then(SqliteValue::as_text) == Some(column))
     })
+}
+
+fn quote_sql_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 const ISSUE_COLUMNS: &[(&str, &str)] = &[
@@ -2011,6 +2020,83 @@ fn sql_contains_token_sequence(sql: &str, expected: &str) -> bool {
             .any(|tokens| tokens == expected_tokens)
 }
 
+fn parenthesized_sql_tokens(
+    tokens: &[SqlEvidenceToken],
+    open_parenthesis: usize,
+) -> Option<(Vec<SqlEvidenceToken>, usize)> {
+    if tokens.get(open_parenthesis) != Some(&SqlEvidenceToken::Symbol('(')) {
+        return None;
+    }
+
+    let mut depth = 1_usize;
+    for (index, token) in tokens.iter().enumerate().skip(open_parenthesis + 1) {
+        match token {
+            SqlEvidenceToken::Symbol('(') => depth += 1,
+            SqlEvidenceToken::Symbol(')') => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some((tokens[open_parenthesis + 1..index].to_vec(), index));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Return the exact token stream of every CHECK constraint in a CREATE TABLE
+/// statement. Only CHECK keywords at the table body's structural depth are
+/// constraints; a same-named function inside another expression is not.
+fn table_check_expressions(sql: &str) -> Option<Vec<Vec<SqlEvidenceToken>>> {
+    let tokens = sql_evidence_tokens(sql);
+    let table_body_open = tokens
+        .iter()
+        .position(|token| *token == SqlEvidenceToken::Symbol('('))?;
+    let mut checks = Vec::new();
+    let mut depth = 1_usize;
+    let mut index = table_body_open + 1;
+
+    while index < tokens.len() {
+        if depth == 1
+            && matches!(
+                tokens.get(index),
+                Some(SqlEvidenceToken::Unquoted(keyword)) if keyword == "check"
+            )
+        {
+            let (expression, close_parenthesis) =
+                parenthesized_sql_tokens(&tokens, index + 1)?;
+            checks.push(expression);
+            index = close_parenthesis + 1;
+            continue;
+        }
+
+        match tokens.get(index) {
+            Some(SqlEvidenceToken::Symbol('(')) => depth += 1,
+            Some(SqlEvidenceToken::Symbol(')')) => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(checks);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn expected_check_expression(sql: &str) -> Option<Vec<SqlEvidenceToken>> {
+    let tokens = sql_evidence_tokens(sql);
+    if !matches!(
+        tokens.first(),
+        Some(SqlEvidenceToken::Unquoted(keyword)) if keyword == "check"
+    ) {
+        return None;
+    }
+    let (expression, close_parenthesis) = parenthesized_sql_tokens(&tokens, 1)?;
+    (close_parenthesis + 1 == tokens.len()).then_some(expression)
+}
+
 fn compact_sql_fragment(sql: &str) -> String {
     sql_without_comments(sql)
         .chars()
@@ -2049,6 +2135,47 @@ fn auxiliary_runtime_table_canonical(
     auxiliary_runtime_columns_canonical(conn, table, columns)
         && auxiliary_runtime_issue_foreign_key_canonical(conn, table)
         && auxiliary_runtime_indexes_canonical(conn, table, indexes)
+}
+
+fn capacity_exemptions_schema_canonical(conn: &Connection) -> bool {
+    auxiliary_runtime_table_canonical(
+        conn,
+        "capacity_exemptions",
+        CAPACITY_EXEMPTION_COLUMNS,
+        CAPACITY_EXEMPTION_INDEXES,
+    ) && auxiliary_runtime_table_canonical(
+        conn,
+        "capacity_exemption_history",
+        CAPACITY_EXEMPTION_HISTORY_COLUMNS,
+        CAPACITY_EXEMPTION_HISTORY_INDEXES,
+    ) && table_declares_autoincrement_primary_key(conn, "capacity_exemption_history", "id")
+}
+
+fn capacity_occupancy_schema_canonical(conn: &Connection) -> bool {
+    auxiliary_runtime_table_canonical(
+        conn,
+        "capacity_occupancy",
+        CAPACITY_OCCUPANCY_COLUMNS,
+        CAPACITY_OCCUPANCY_INDEXES,
+    )
+}
+
+fn attest_capacity_exemptions_schema(conn: &Connection) -> Result<()> {
+    if capacity_exemptions_schema_canonical(conn) {
+        return Ok(());
+    }
+    Err(BeadsError::internal(
+        "schema migrate v16 post-check failed — capacity exemption tables are not canonical",
+    ))
+}
+
+fn attest_capacity_occupancy_schema(conn: &Connection) -> Result<()> {
+    if capacity_occupancy_schema_canonical(conn) {
+        return Ok(());
+    }
+    Err(BeadsError::internal(
+        "schema migrate v17 post-check failed — capacity_occupancy is not canonical",
+    ))
 }
 
 fn core_runtime_default_matches(
@@ -2177,13 +2304,19 @@ fn issues_required_checks_canonical(conn: &Connection) -> bool {
     let Some(sql) = row.get(0).and_then(SqliteValue::as_text) else {
         return false;
     };
-    [
+    let expected = [
         "CHECK(length(title) <= 500)",
         "CHECK(priority >= 0 AND priority <= 4)",
         ISSUES_CLOSED_AT_CHECK,
     ]
     .iter()
-    .all(|required| sql_contains_token_sequence(sql, required))
+    .map(|required| expected_check_expression(required))
+    .collect::<Option<Vec<_>>>();
+    let actual = table_check_expressions(sql);
+
+    matches!((actual, expected), (Some(actual), Some(expected))
+        if actual.len() == expected.len()
+            && expected.iter().all(|required| actual.contains(required)))
 }
 
 fn blocked_cache_table_canonical(conn: &Connection) -> bool {
@@ -2428,7 +2561,10 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
         conn.query("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='issues' AND sql IS NOT NULL")?;
     for row in &index_rows {
         if let Some(name) = row.get(0).and_then(SqliteValue::as_text) {
-            conn.execute(&format!("DROP INDEX IF EXISTS \"{name}\""))?;
+            conn.execute(&format!(
+                "DROP INDEX IF EXISTS {}",
+                quote_sql_identifier(name)
+            ))?;
         }
     }
 
@@ -2834,27 +2970,9 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
     // produced by a pre-#398 reviewed migration, which never created them)
     // is healed by `apply_schema` on the next open instead of failing at
     // runtime with "no such table".
-    let capacity_exemptions_ok = auxiliary_runtime_table_canonical(
-        conn,
-        "capacity_exemptions",
-        CAPACITY_EXEMPTION_COLUMNS,
-        CAPACITY_EXEMPTION_INDEXES,
-    );
-    let capacity_exemption_history_ok =
-        auxiliary_runtime_table_canonical(
-            conn,
-            "capacity_exemption_history",
-            CAPACITY_EXEMPTION_HISTORY_COLUMNS,
-            CAPACITY_EXEMPTION_HISTORY_INDEXES,
-        ) && table_declares_autoincrement_primary_key(conn, "capacity_exemption_history", "id");
-    let capacity_occupancy_ok = auxiliary_runtime_table_canonical(
-        conn,
-        "capacity_occupancy",
-        CAPACITY_OCCUPANCY_COLUMNS,
-        CAPACITY_OCCUPANCY_INDEXES,
-    );
-    let capacity_ok =
-        capacity_exemptions_ok && capacity_exemption_history_ok && capacity_occupancy_ok;
+    let capacity_exemptions_ok = capacity_exemptions_schema_canonical(conn);
+    let capacity_occupancy_ok = capacity_occupancy_schema_canonical(conn);
+    let capacity_ok = capacity_exemptions_ok && capacity_occupancy_ok;
     let compatible = version_ok
         && issues_ok
         && dependencies_ok
@@ -2890,7 +3008,6 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
             gate_results_ok,
             gate_history_ok,
             capacity_exemptions_ok,
-            capacity_exemption_history_ok,
             capacity_occupancy_ok,
             capacity_ok,
             "runtime schema compatibility check failed"
@@ -3702,7 +3819,8 @@ fn apply_capacity_exemptions_migration_in_transaction(conn: &Connection) -> Resu
         CREATE INDEX IF NOT EXISTS idx_capacity_exemption_history_issue
             ON capacity_exemption_history(issue_id, id);
     ",
-    )
+    )?;
+    attest_capacity_exemptions_schema(conn)
 }
 
 /// v17 (GitHub #384 phase 5) migration step: capacity occupancy attribution.
@@ -3729,7 +3847,8 @@ fn apply_capacity_occupancy_migration_in_transaction(conn: &Connection) -> Resul
         CREATE INDEX IF NOT EXISTS idx_capacity_occupancy_session
             ON capacity_occupancy(session) WHERE session IS NOT NULL;
     ",
-    )
+    )?;
+    attest_capacity_occupancy_schema(conn)
 }
 
 fn rebuild_content_hashes_for_current_format_in_transaction(
