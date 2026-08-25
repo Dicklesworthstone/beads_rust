@@ -9,8 +9,11 @@ mod common;
 use beads_rust::franken_sync::Connection;
 use common::cli::{BrRun, BrWorkspace, parse_created_id, run_br, run_br_with_env};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
+use std::path::Path;
 use std::time::{Duration, Instant};
+use walkdir::WalkDir;
 
 const DISABLE_FAST_OPEN_ENV: (&str, &str) = ("BR_DISABLE_READ_ONLY_FAST_OPEN", "1");
 
@@ -310,6 +313,64 @@ fn strings<const N: usize>(values: [&str; N]) -> Vec<String> {
     values.into_iter().map(str::to_string).collect()
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct RegularFileEvidence {
+    bytes: Vec<u8>,
+    readonly: bool,
+    platform_mode: Option<u32>,
+}
+
+#[cfg(unix)]
+fn platform_mode(metadata: &fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    Some(metadata.permissions().mode())
+}
+
+#[cfg(not(unix))]
+const fn platform_mode(_metadata: &fs::Metadata) -> Option<u32> {
+    None
+}
+
+fn regular_file_evidence(root: &Path) -> BTreeMap<String, RegularFileEvidence> {
+    WalkDir::new(root)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_map(|entry| {
+            let entry = entry.unwrap_or_else(|error| {
+                panic!("walk {} for fast-open evidence: {error}", root.display())
+            });
+            entry.file_type().is_file().then(|| {
+                let relative = entry
+                    .path()
+                    .strip_prefix(root)
+                    .expect("walked path stays below evidence root")
+                    .to_string_lossy()
+                    .into_owned();
+                let bytes = fs::read(entry.path()).unwrap_or_else(|error| {
+                    panic!(
+                        "read {} for fast-open evidence: {error}",
+                        entry.path().display()
+                    )
+                });
+                let metadata = entry.metadata().unwrap_or_else(|error| {
+                    panic!(
+                        "stat {} for fast-open evidence: {error}",
+                        entry.path().display()
+                    )
+                });
+                (
+                    relative,
+                    RegularFileEvidence {
+                        bytes,
+                        readonly: metadata.permissions().readonly(),
+                        platform_mode: platform_mode(&metadata),
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
 fn run_command(workspace: &BrWorkspace, command: &MatrixCommand, disable_fast_open: bool) -> BrRun {
     if disable_fast_open {
         return run_br_with_env(
@@ -406,11 +467,19 @@ fn cli_read_only_fast_open_matrix_bypasses_held_write_lock() {
         .open(&lock_path)
         .expect("open write lock");
     write_lock.lock().expect("hold write lock");
+    let beads_dir = seed.workspace.root.join(".beads");
+    let before = regular_file_evidence(&beads_dir);
 
     for command in matrix_commands(&seed) {
         let fast = run_command(&seed.workspace, &command, false);
         assert_success(&fast, command.label);
     }
+
+    assert_eq!(
+        regular_file_evidence(&beads_dir),
+        before,
+        "read-only fast-open matrix changed file bytes or modes under .beads"
+    );
 
     let blocked_conservative = run_command(
         &seed.workspace,

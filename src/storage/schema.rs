@@ -1443,13 +1443,42 @@ const BLOCKED_CACHE_RUNTIME_INDEXES: &[ExpectedRuntimeIndex] = &[runtime_index(
     false,
 )];
 
-// Most partial-index predicates affect only planner eligibility: SQLite will
-// not use a partial index for a query that does not imply the predicate. The
-// external-reference index is different because its UNIQUE bit is part of the
-// data model. A weaker predicate can silently admit duplicate non-NULL
-// external references, so its WHERE clause is part of the runtime contract.
+// Exact partial-index predicates. Unquoted SQL syntax is case-insensitive, but
+// string-literal bytes are data and must compare exactly.
 const SEMANTIC_PARTIAL_INDEX_PREDICATES: &[(&str, &str)] =
-    &[("idx_issues_external_ref_unique", "external_ref IS NOT NULL")];
+    &[
+        ("idx_issues_assignee", "assignee IS NOT NULL"),
+        ("idx_issues_external_ref_unique", "external_ref IS NOT NULL"),
+        ("idx_issues_ephemeral", "ephemeral = 1"),
+        ("idx_issues_pinned", "pinned = 1"),
+        ("idx_issues_tombstone", "status = 'tombstone'"),
+        ("idx_issues_due_at", "due_at IS NOT NULL"),
+        ("idx_issues_defer_until", "defer_until IS NOT NULL"),
+        (
+            "idx_issues_ready",
+            "status = 'open' AND ephemeral = 0 AND pinned = 0 AND is_template = 0",
+        ),
+        (
+            "idx_issues_list_active_order",
+            "status NOT IN ('closed', 'tombstone') AND (is_template = 0 OR is_template IS NULL)",
+        ),
+        ("idx_dependencies_thread", "thread_id != ''"),
+        (
+            "idx_dependencies_blocking",
+            "(type = 'blocks' OR type = 'parent-child' OR type = 'conditional-blocks' OR type = 'waits-for')",
+        ),
+        ("idx_events_actor", "actor != ''"),
+        ("idx_close_metadata_bypassed", "bypassed_policy = 1"),
+        ("idx_capacity_occupancy_actor", "actor IS NOT NULL"),
+        (
+            "idx_capacity_occupancy_harness",
+            "harness IS NOT NULL",
+        ),
+        (
+            "idx_capacity_occupancy_session",
+            "session IS NOT NULL",
+        ),
+    ];
 
 // Complete runtime column manifests for auxiliary tables. `Some(definition)`
 // marks a column SQLite can add without inventing audit data or installing an
@@ -2159,17 +2188,15 @@ fn table_declaration_clauses_canonical(conn: &Connection, table: &str) -> bool {
     // None of those policies are surfaced completely by table_xinfo or
     // foreign_key_list, so reject any explicit override lexically while still
     // ignoring comments, string literals, and quoted identifiers.
-    ["COLLATE", "ON CONFLICT", "DEFERRABLE", "INITIALLY"]
+    [
+        "COLLATE",
+        "ON CONFLICT",
+        "MATCH",
+        "DEFERRABLE",
+        "INITIALLY",
+    ]
         .iter()
         .all(|clause| !sql_contains_token_sequence(sql, clause))
-}
-
-fn compact_sql_fragment(sql: &str) -> String {
-    sql_without_comments(sql)
-        .chars()
-        .filter(|character| !character.is_ascii_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect()
 }
 
 fn semantic_partial_index_predicate_canonical(conn: &Connection, index: &str) -> bool {
@@ -2188,9 +2215,19 @@ fn semantic_partial_index_predicate_canonical(conn: &Connection, index: &str) ->
     let Some(sql) = row.get(0).and_then(SqliteValue::as_text) else {
         return false;
     };
-    let normalized = compact_sql_fragment(sql);
-    let expected_suffix = format!("where{}", compact_sql_fragment(predicate));
-    normalized.trim_end_matches(';').ends_with(&expected_suffix)
+    let mut tokens = sql_evidence_tokens(sql);
+    if tokens.last() == Some(&SqlEvidenceToken::Symbol(';')) {
+        tokens.pop();
+    }
+    let Some(where_position) = tokens.iter().rposition(
+        |token| matches!(token, SqlEvidenceToken::Unquoted(keyword) if keyword == "where"),
+    ) else {
+        return false;
+    };
+    let expected = sql_evidence_tokens(predicate);
+    tokens
+        .get(where_position + 1..)
+        .is_some_and(|actual| actual == expected.as_slice())
 }
 
 fn auxiliary_runtime_table_canonical(
