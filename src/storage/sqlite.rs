@@ -2502,7 +2502,22 @@ impl SqliteStorage {
         lock_timeout_ms: Option<u64>,
     ) -> Result<Option<Self>> {
         let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
-        if checked_database_header_user_version(path)?.is_none() {
+        let Some(header_version) = checked_database_header_user_version(path)? else {
+            return Ok(None);
+        };
+        if header_version > current_schema_version {
+            return Ok(None);
+        }
+
+        // A current main header is not sufficient authority for a read-write
+        // engine open: the effective user_version may live only in a committed
+        // WAL page-one frame. Inspect it byte-neutrally first so refusing an
+        // unknown future version cannot create or rewrite namespace sidecars.
+        let wal_preflight = sqlite_wal_schema_preflight(path)?;
+        let effective_version = wal_preflight
+            .committed_user_version
+            .unwrap_or(header_version);
+        if effective_version != current_schema_version {
             return Ok(None);
         }
 
@@ -29449,6 +29464,18 @@ mod tests {
             directory_bytes_and_modes(temp.path()),
             family_before,
             "future-version preflight must not create, chmod, or rewrite any family member"
+        );
+
+        assert!(
+            SqliteStorage::open_current_for_reconcile(&db_path, Some(50))
+                .expect("WAL-only future schema must be classified without an engine open")
+                .is_none(),
+            "reviewed reconciliation must refuse a WAL-only future schema"
+        );
+        assert_eq!(
+            directory_bytes_and_modes(temp.path()),
+            family_before,
+            "reviewed-reconcile future refusal must leave the database family byte and mode neutral"
         );
 
         let sidecars = existing_namespace_sidecars(&db_path);

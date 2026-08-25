@@ -2331,14 +2331,17 @@ fn validate_completed_undo_receipt(
             args.run_id
         )));
     }
-    let applied_sha256 = file_sha256(&run_dir.join("applied.json"))?;
+    let applied_path = run_dir.join("applied.json");
+    let applied_sha256 = file_sha256(&applied_path)?;
     if !constant_time_text_eq(&applied_sha256, &receipt.applied_receipt_sha256) {
         return Err(BeadsError::internal(format!(
             "schema migration run {} failed its applied-to-undo receipt hash chain",
             args.run_id
         )));
     }
-    let _ = validate_quarantine_path(receipt, &run_dir)?;
+    let applied: AppliedMigrationReceipt = read_json(&applied_path)?;
+    validate_applied_receipt(&applied, args, migration, &run_dir)?;
+    let quarantine_dir = validate_quarantine_path(receipt, &run_dir)?;
     let logical_restored = receipt.logical_restored.as_ref().ok_or_else(|| {
         BeadsError::internal(format!(
             "schema migration run {} completed undo receipt omits its logical witness",
@@ -2352,6 +2355,22 @@ fn validate_completed_undo_receipt(
         ))
     })?;
     validate_raw_family_witness(raw_restored)?;
+    if receipt.raw_expected_before != applied.raw_before
+        || receipt.logical_expected_before != applied.logical_before
+        || receipt.logical_live_before_undo.as_ref() != applied.logical_after.as_ref()
+        || raw_restored != &applied.raw_before
+        || logical_restored != &applied.logical_before
+    {
+        return Err(BeadsError::internal(format!(
+            "schema migration run {} has an internally inconsistent completed undo receipt",
+            args.run_id
+        )));
+    }
+    verify_backup_family(
+        &migration.db_path,
+        &quarantine_dir,
+        &receipt.raw_live_before_undo,
+    )?;
     if logical_witness(&migration.db_path)? != *logical_restored
         || !stable_raw_eq(&raw_family_witness(&migration.db_path)?, raw_restored)
     {
@@ -3654,6 +3673,26 @@ mod tests {
                 .next()
                 .is_some(),
             "undo must retain the displaced applied state"
+        );
+        let completed: UndoReceipt =
+            read_json(&runs_root.join(run_id).join("undone.json")).expect("completed undo receipt");
+        let mut inconsistent = completed.clone();
+        inconsistent.logical_expected_before.user_version += 1;
+        let inconsistent_error = validate_completed_undo_receipt(
+            &inconsistent,
+            &DoctorMigrateSchemaUndoArgs {
+                run_id: run_id.clone(),
+                dry_run: false,
+                json: false,
+            },
+            &migration,
+        )
+        .expect_err("completed undo receipt must remain bound to the applied receipt");
+        assert!(
+            inconsistent_error
+                .to_string()
+                .contains("internally inconsistent"),
+            "causal completed-receipt error must remain visible: {inconsistent_error}"
         );
         execute_undo(
             &DoctorMigrateSchemaUndoArgs {
