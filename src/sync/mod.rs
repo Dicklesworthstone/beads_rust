@@ -917,6 +917,55 @@ impl DatabaseFamilyWriteLock {
         Ok(())
     }
 
+    /// Release only the displaced inode retained by one nested replacement.
+    ///
+    /// An enclosing recovery can already have older retired inode locks that
+    /// must remain live until the outer command commits. The staged path
+    /// identifies the one nested generation that is now safe to finalize.
+    pub(crate) fn finalize_nested_database_replacement(
+        &self,
+        staged_database_path: &Path,
+    ) -> Result<()> {
+        self.verify_database_authority()?;
+        let staged_identity = authority_path_identity(
+            staged_database_path,
+            "nested database replacement source",
+            &database_path_descriptor(staged_database_path),
+        )?;
+        let mut database_authority =
+            self.database_authority
+                .lock()
+                .map_err(|_| BeadsError::SyncConflict {
+                    message: "Database inode authority state was poisoned".to_string(),
+                })?;
+
+        let mut retained_index = None;
+        for (index, lock) in database_authority.retired_locks.iter().enumerate() {
+            let identity = authority_file_identity(
+                lock,
+                staged_database_path,
+                "nested retained database authority",
+                &database_path_descriptor(staged_database_path),
+            )?;
+            if identity == staged_identity {
+                retained_index = Some(index);
+                break;
+            }
+        }
+        let retained_index = retained_index.ok_or_else(|| BeadsError::SyncConflict {
+            message: "Nested database replacement source was not retained under lock".to_string(),
+        })?;
+        verify_locked_file_identity(
+            &database_authority.retired_locks[retained_index],
+            staged_database_path,
+            "nested retained database authority",
+            true,
+        )?;
+        database_authority.retired_locks.swap_remove(retained_index);
+        drop(database_authority);
+        Ok(())
+    }
+
     /// Re-adopt the still-locked original inode after a failed replacement is
     /// rolled back into place.
     pub(crate) fn restore_retained_database_inode_after_authorized_replace(&self) -> Result<()> {
@@ -16452,6 +16501,81 @@ mod tests {
         )
         .expect("hard-link alias authority is available after the original authority drops");
         drop(alias_authority);
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    ))]
+    #[test]
+    fn nested_database_replacement_finalization_preserves_older_retired_inode_lock() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let database_path = beads_dir.join("beads.db");
+        let outer_retained_path = beads_dir.join("outer-retained.db");
+        let nested_retained_path = beads_dir.join("nested-retained.db");
+        let nested_candidate_path = beads_dir.join("nested-candidate.db");
+        fs::write(&database_path, b"outer database generation").unwrap();
+        let authority = blocking_database_family_write_lock_with_timeout(
+            &beads_dir,
+            &database_path,
+            Some(1_000),
+        )
+        .unwrap();
+        authority.bind_database_inode_for_mutation().unwrap();
+
+        install_database_candidate_no_replace(&database_path, &outer_retained_path).unwrap();
+        authority
+            .install_empty_database_replacement_and_bind()
+            .unwrap();
+
+        fs::write(&nested_candidate_path, b"nested database generation").unwrap();
+        let nested_candidate_lock = authority
+            .lock_database_replacement_candidate(&nested_candidate_path)
+            .unwrap();
+        install_database_candidate_no_replace(&database_path, &nested_retained_path).unwrap();
+        install_database_candidate_no_replace(&nested_candidate_path, &database_path).unwrap();
+        authority
+            .adopt_locked_database_replacement(nested_candidate_lock)
+            .unwrap();
+
+        assert_eq!(
+            authority.database_authority.lock().unwrap().retired_locks.len(),
+            2,
+            "the enclosing and nested replacement sources must both remain locked before commit"
+        );
+        authority
+            .finalize_nested_database_replacement(&nested_retained_path)
+            .unwrap();
+
+        let database_authority = authority.database_authority.lock().unwrap();
+        assert_eq!(
+            database_authority.retired_locks.len(),
+            1,
+            "nested finalization must release exactly one displaced inode lock"
+        );
+        let remaining_identity = authority_file_identity(
+            &database_authority.retired_locks[0],
+            &outer_retained_path,
+            "outer retained database authority",
+            &database_path_descriptor(&outer_retained_path),
+        )
+        .unwrap();
+        assert_eq!(
+            remaining_identity,
+            authority_path_identity(
+                &outer_retained_path,
+                "outer retained database authority",
+                &database_path_descriptor(&outer_retained_path),
+            )
+            .unwrap(),
+            "nested finalization must preserve the enclosing recovery's exact rollback inode"
+        );
+        drop(database_authority);
+        authority.verify_database_authority().unwrap();
     }
 
     #[test]

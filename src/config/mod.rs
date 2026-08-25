@@ -2842,12 +2842,13 @@ pub(crate) fn db_sidecar_suffixes() -> impl Iterator<Item = &'static &'static st
 }
 
 /// Compact a database at `db_path` by writing a fresh copy via `VACUUM
-/// INTO` to a temp file, atomically replacing the original, and returning a
-/// reopened storage connection.
+/// INTO`, staging the complete original family in recovery, installing the
+/// candidate without replacement, and returning a reopened storage connection.
 ///
 /// Preconditions: the caller must pass a `storage` handle whose connection
-/// was opened against `db_path` (the helper names its temp file
-/// `.<stem>.vacuum.<pid>.tmp` next to `db_path` and installs it there).
+/// was opened against `db_path` (the helper names a unique temp file
+/// `.<stem>.vacuum.<pid>.<timestamp>.tmp` next to `db_path` and installs it
+/// there).
 /// Passing mismatched storage and db_path would copy the storage's actual
 /// DB contents over db_path.
 ///
@@ -2856,10 +2857,11 @@ pub(crate) fn db_sidecar_suffixes() -> impl Iterator<Item = &'static &'static st
 /// best-available working handle or an error before the caller can continue:
 ///
 /// * VACUUM INTO failed — returns the unchanged pre-compaction connection.
-/// * Rename failed — returns a connection reopened against the still-intact
-///   original `db_path`; the compacted temp file is removed.
-/// * Reopen failed after replacing the handle — returns an error, ensuring
-///   live code cannot continue on a throwaway placeholder connection.
+/// * Install failed — restores and reopens the complete retained family when
+///   the canonical namespace is still empty.
+/// * Validation, durability, or reopen failed after installation — rolls back
+///   the exact retained main inode and sidecar generation, then returns an
+///   error so live code cannot continue on a throwaway connection.
 ///
 /// Cosmetic compaction failures remain non-fatal when the original handle is
 /// still usable. Failures after the original connection has been closed are
@@ -3089,6 +3091,9 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
         .and_then(|mut reopened| {
             write_authority.verify_database_authority()?;
             reopened.attach_write_authority(Arc::clone(write_authority));
+            write_authority.finalize_nested_database_replacement(
+                staged_database.expect("the retained main was verified before installation"),
+            )?;
             Ok(reopened)
         })
         .map_err(|error| BeadsError::WithContext {

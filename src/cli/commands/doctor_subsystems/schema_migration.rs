@@ -622,6 +622,7 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
     validate_applied_against_commit_ready(&applied, &commit_ready, &run_dir)?;
     write_json_new(&run_dir.join("applied.json"), &applied)?;
     sync_directory(&run_dir)?;
+    migration.write_authority.finalize_database_replacement()?;
 
     if !applied.attested {
         return Err(BeadsError::internal(format!(
@@ -808,6 +809,7 @@ fn resume_commit_ready_migration(
             logical_live.as_ref(),
             &applied.run_id,
         )?;
+        migration.write_authority.finalize_database_replacement()?;
         return Ok(Some((applied, before_dir)));
     }
 
@@ -886,7 +888,6 @@ fn resume_commit_ready_migration(
         &marker,
         &migration.write_authority,
     )?;
-    migration.write_authority.finalize_database_replacement()?;
     let applied = AppliedMigrationReceipt {
         schema_version: APPLIED_SCHEMA.to_string(),
         run_id: marker.run_id.clone(),
@@ -907,6 +908,7 @@ fn resume_commit_ready_migration(
     validate_applied_against_commit_ready(&applied, &marker, &run_dir)?;
     write_json_new(&applied_path, &applied)?;
     sync_directory(&run_dir)?;
+    migration.write_authority.finalize_database_replacement()?;
     drop(retained_original_guard);
     Ok(Some((applied, before_dir)))
 }
@@ -1307,17 +1309,6 @@ fn run_post_migration_maintenance(
         ));
     }
 
-    if let Err(error) = write_authority.finalize_database_replacement() {
-        return Err(rollback_after_compacted_install_failure(
-            db_path,
-            &displaced_main,
-            &displaced_dir,
-            &source_raw,
-            run_dir,
-            write_authority,
-            error,
-        ));
-    }
     Ok(committed_effects)
 }
 
@@ -3678,6 +3669,60 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    fn pre_adoption_fence_rejects_same_byte_foreign_canonical_inode() {
+        let (_temp, migration) = reviewed_v14_migration_context();
+        let original_metadata = fs::metadata(&migration.db_path).expect("original metadata");
+        let foreign = migration.beads_dir.join("same-byte-foreign.db");
+        let retained_original = migration.beads_dir.join("externally-retained-original.db");
+        let candidate = migration.beads_dir.join("fenced-candidate.db");
+        let displaced = migration.beads_dir.join("must-remain-absent.db");
+        fs::copy(&migration.db_path, &foreign).expect("copy same-byte foreign inode");
+        fs::write(&candidate, b"candidate generation").expect("write candidate");
+        let replacement_lock = migration
+            .write_authority
+            .lock_database_replacement_candidate(&candidate)
+            .expect("lock candidate");
+
+        rename_path_no_replace(&migration.db_path, &retained_original)
+            .expect("stage original outside canonical path");
+        rename_path_no_replace(&foreign, &migration.db_path)
+            .expect("install same-byte foreign canonical inode");
+        let foreign_metadata = fs::metadata(&migration.db_path).expect("foreign metadata");
+        assert!(
+            !same_file_identity(&original_metadata, &foreign_metadata),
+            "fixture must use a distinct inode with identical bytes"
+        );
+
+        let failure = install_compacted_candidate(
+            &candidate,
+            &migration.db_path,
+            &displaced,
+            replacement_lock,
+            &migration.write_authority,
+        )
+        .expect_err("staged-original inode fence must reject a same-byte foreign target");
+        assert_eq!(
+            failure.disposition,
+            CompactedInstallFailureDisposition::LiveStateUncertain
+        );
+        assert!(
+            failure.to_string().contains("generation changed")
+                || failure.to_string().contains("authority"),
+            "causal inode mismatch must remain visible: {failure}"
+        );
+        assert_eq!(
+            fs::read(&candidate).expect("candidate restored by compensating exchange"),
+            b"candidate generation"
+        );
+        assert!(
+            !displaced.exists(),
+            "a rejected foreign target must never be accepted as the displaced original"
+        );
+        assert!(retained_original.is_file(), "the true original stays retained");
+    }
+
+    #[test]
     #[cfg(any(
         target_os = "linux",
         target_os = "android",
@@ -3797,6 +3842,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     fn commit_ready_marker_resumes_applied_receipt_and_normal_undo() {
         let (_temp, migration) = reviewed_v14_migration_context();
         let original_logical = logical_witness(&migration.db_path).expect("original witness");
@@ -4025,6 +4071,51 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    ))]
+    fn interrupted_preinstall_sidecar_move_restores_exact_receipt_family() {
+        let (_temp, migration) = reviewed_v14_migration_context();
+        let journal = family_component_path(&migration.db_path, "-journal");
+        fs::write(&journal, b"receipt-bound journal bytes").expect("write journal fixture");
+        let expected = raw_family_witness(&migration.db_path).expect("expected raw family");
+        let run_dir = migration.beads_dir.join("preinstall-sidecar-crash");
+        let before_dir = run_dir.join("before");
+        let displaced_dir = run_dir.join("maintenance-displaced");
+        ensure_new_directory(&before_dir).expect("create before dir");
+        copy_family_to_backup(&migration.db_path, &before_dir, &expected)
+            .expect("copy exact family");
+        ensure_new_directory(&displaced_dir).expect("create displaced dir");
+        let displaced_journal =
+            backup_component_path(&displaced_dir, &migration.db_path, "-journal")
+                .expect("displaced journal path");
+        rename_path_no_replace(&journal, &displaced_journal)
+            .expect("simulate sidecar move before main exchange");
+        assert!(!journal.exists(), "fixture must expose the sidecar gap");
+
+        let restored = restore_interrupted_preinstall_family(
+            &migration.db_path,
+            &before_dir,
+            &displaced_dir,
+            &expected,
+            &migration.write_authority,
+        )
+        .expect("reconcile interrupted sidecar move");
+        assert_eq!(restored, expected);
+        assert_eq!(
+            raw_family_witness(&migration.db_path).expect("live exact family"),
+            expected
+        );
+        migration
+            .write_authority
+            .verify_database_authority()
+            .expect("original main remains authoritative");
+    }
+
+    #[test]
     fn reviewed_undo_refuses_a_changed_post_migration_database() {
         let (_temp, migration) = reviewed_v14_migration_context();
         let plan = build_plan(&migration.db_path).expect("build plan");
@@ -4123,6 +4214,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     fn reviewed_undo_resumes_after_partial_quarantine() {
         let (_temp, migration) = reviewed_v14_migration_context();
         let original = build_plan(&migration.db_path)
@@ -4174,10 +4266,34 @@ mod tests {
         write_json_new(&run_dir.join("undo-prepared.json"), &receipt).expect("write prepared undo");
         ensure_new_directory(&quarantine_dir).expect("create quarantine");
 
-        let quarantined_main =
-            backup_component_path(&quarantine_dir, &migration.db_path, "").expect("backup path");
-        fs::rename(&migration.db_path, &quarantined_main).expect("simulate first quarantine move");
-        set_file_permissions(&quarantined_main, None).expect("harden quarantined file");
+        let restored_candidate_dir = run_dir.join("undo-restored-candidate");
+        ensure_directory(&restored_candidate_dir).expect("create restore candidate dir");
+        let restored_candidate =
+            backup_component_path(&restored_candidate_dir, &migration.db_path, "")
+                .expect("restored candidate path");
+        let before_main = backup_component_path(&run_dir.join("before"), &migration.db_path, "")
+            .expect("before main");
+        let restored_main = component_for_suffix(&applied.raw_before, "").expect("main witness");
+        copy_regular_file_new(&before_main, &restored_candidate, restored_main.unix_mode)
+            .expect("stage restored main");
+        exchange_database_paths(&restored_candidate, &migration.db_path)
+            .expect("simulate atomic undo exchange before quarantine retention");
+
+        let beads_dir = migration.beads_dir.clone();
+        let db_path = migration.db_path.clone();
+        drop(migration);
+        let migration = MigrationContext {
+            write_authority: Arc::new(
+                crate::sync::blocking_database_family_write_lock_with_timeout(
+                    &beads_dir,
+                    &db_path,
+                    Some(1000),
+                )
+                .expect("reacquire authority after simulated undo crash"),
+            ),
+            beads_dir,
+            db_path,
+        };
 
         execute_undo(
             &DoctorMigrateSchemaUndoArgs {
