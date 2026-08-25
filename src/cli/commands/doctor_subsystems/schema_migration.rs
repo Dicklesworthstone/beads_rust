@@ -480,6 +480,7 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
         &migration.write_authority,
     );
     let authority_result = migration.write_authority.verify_database_authority();
+    let authority_verified_after = authority_result.is_ok();
     let migration_result = match (migration_result, authority_result) {
         (Ok(effects), Ok(())) => Ok(effects),
         (Err(error), Ok(())) => Err(error),
@@ -505,7 +506,9 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
                 raw_before: plan.raw_witness,
                 logical_before: plan.logical_witness,
                 raw_observed_after_failure: raw_family_witness(&migration.db_path).ok(),
-                logical_observed_after_failure: logical_witness(&migration.db_path).ok(),
+                logical_observed_after_failure: authority_verified_after
+                    .then(|| logical_witness(&migration.db_path).ok())
+                    .flatten(),
             };
             write_json_new(&run_dir.join("failed.json"), &failed)?;
             return Err(BeadsError::WithContext {
@@ -2427,7 +2430,14 @@ fn quarantine_live_family_resuming(
                 ))
             })?;
             verify_component_bytes(&source, &source_metadata, component)?;
-            fs::rename(&source, &destination).map_err(BeadsError::Io)?;
+            rename_path_no_replace(&source, &destination)?;
+            let quarantined_metadata = secure_file_metadata(&destination)?.ok_or_else(|| {
+                BeadsError::internal(format!(
+                    "schema migration undo component disappeared after quarantine: {}",
+                    destination.display()
+                ))
+            })?;
+            verify_component_bytes(&destination, &quarantined_metadata, component)?;
             set_file_permissions(&destination, None)?;
             continue;
         }

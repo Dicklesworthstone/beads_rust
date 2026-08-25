@@ -2209,8 +2209,7 @@ fn blocked_cache_table_canonical(conn: &Connection) -> bool {
 }
 
 fn runtime_user_version(conn: &Connection) -> Result<i64> {
-    conn.query_row("PRAGMA user_version")
-        .map_err(BeadsError::from)?
+    conn.query_row("PRAGMA user_version")?
         .get(0)
         .and_then(SqliteValue::as_integer)
         .ok_or_else(|| BeadsError::internal("PRAGMA user_version returned no integer value"))
@@ -6120,7 +6119,7 @@ mod tests {
             (status = 'closed' AND closed_at IS NOT NULL) OR
             (status = 'tombstone') OR
             (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL)
-            )",
+        )",
             &format!("        CHECK (1) /* {ISSUES_CLOSED_AT_CHECK} */"),
         );
         assert_ne!(
