@@ -73,6 +73,7 @@ fn release_workflow_exposes_expected_fragment_steps() -> Result<(), String> {
         "Create archive (zip)",
         "Sign release archive with Ed25519",
         "Generate changelog",
+        "Generate SBOMs (CycloneDX and SPDX)",
     ] {
         release_step_script(step_name)?;
     }
@@ -189,11 +190,33 @@ fn release_workflow_uses_the_pinned_toolchain_and_lockfile() -> Result<(), Strin
         "Concurrent command-family integrity stress",
         "Build release binary",
     ] {
-        require_contains(&release_step_script(step_name)?, "cargo ")?;
-        require_contains(&release_step_script(step_name)?, "--locked")?;
+        let script = release_step_script(step_name)?;
+        require_contains(&script, "cargo ")?;
+        require_contains(&script, "--locked")?;
     }
 
     Ok(())
+}
+
+#[test]
+fn release_sbom_generation_uses_pinned_syft_without_remote_script_execution() -> Result<(), String>
+{
+    let workflow = read_to_string(Path::new(RELEASE_WORKFLOW))?;
+    let script = release_step_script("Generate SBOMs (CycloneDX and SPDX)")?;
+
+    require_contains(
+        &workflow,
+        "uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610",
+    )?;
+    require_contains(&workflow, "syft-version: v1.42.3")?;
+    require_contains(&script, r#""${{ steps.syft.outputs.cmd }}" dir:."#)?;
+    require_contains(
+        &script,
+        "-o cyclonedx-json=artifacts/sbom.cdx.json",
+    )?;
+    require_contains(&script, "-o spdx-json=artifacts/sbom.spdx.json")?;
+    require_not_contains(&workflow, "raw.githubusercontent.com/anchore/syft")?;
+    require_not_contains(&script, "curl")
 }
 
 #[test]

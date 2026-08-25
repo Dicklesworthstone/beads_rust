@@ -620,11 +620,19 @@ jobs:
           echo "=== Generated release notes ==="
           cat RELEASE_NOTES.md
 
-      - name: Generate SBOM (CycloneDX)
+      - name: Install pinned Syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
+        with:
+          syft-version: v1.42.3
+
+      - name: Generate SBOMs (CycloneDX and SPDX)
+        env:
+          SYFT_CHECK_FOR_APP_UPDATE: 'false'
         run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
-          syft dir:. -o cyclonedx-json > artifacts/sbom.cdx.json
-          syft dir:. -o spdx-json > artifacts/sbom.spdx.json
+          "${{ steps.syft.outputs.cmd }}" dir:. \
+            -o cyclonedx-json=artifacts/sbom.cdx.json \
+            -o spdx-json=artifacts/sbom.spdx.json
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2
