@@ -191,9 +191,9 @@ replacement, crash, and schema-drift races.
   upstream fix for [RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258.html)
   and its follow-up stream/error-budget hardening
   ([10bcadca](https://github.com/Dicklesworthstone/beads_rust/commit/10bcadca)).
-- Cargo, Nix, Homebrew, AUR, and Scoop metadata now targets 0.5.1. The
-  checksummed package definitions use the hashes of the published DSR-built
-  archives. Cargo points at the repository's rider-bearing `LICENSE` via
+- For v0.5.1, Cargo and Nix source metadata moved to 0.5.1; the checksummed
+  Homebrew, AUR, and Scoop definitions now use the published DSR-built archive
+  hashes. Cargo points at the repository's rider-bearing `LICENSE` via
   `license-file` instead of incorrectly declaring the package as plain SPDX MIT
   ([413f9948](https://github.com/Dicklesworthstone/beads_rust/commit/413f9948)).
 - Every platform archive now contains the rider-bearing `LICENSE`. DSR signed
