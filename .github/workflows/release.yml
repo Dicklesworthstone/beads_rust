@@ -29,6 +29,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  MINISIGN_PUBLIC_KEY: 'RWS7nGFfBYC+MWeZLEaowkjNi77w5FEOk49fEhX2jZ6gpd9uQ4vzVIrF'
 
 permissions:
   contents: write
@@ -364,16 +365,27 @@ jobs:
         if: runner.os == 'macOS'
         run: shasum -a 256 -c br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
 
-      - name: Sign archive with Ed25519 (Linux/macOS)
-        if: runner.os != 'Windows' && env.MINISIGN_SECRET_KEY != ''
+      - name: Sign release archive with Ed25519
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
         run: |
+          set -euo pipefail
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::error::MINISIGN_SECRET_KEY is required for every release archive"
+            exit 1
+          fi
+          archive="br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }}"
+          signature="${archive}.minisig"
           signing_key="$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/minisign-key.XXXXXX")"
           trap 'rm -f "$signing_key"' EXIT
           chmod 600 "$signing_key"
           printf '%s\n' "$MINISIGN_SECRET_KEY" > "$signing_key"
-          minisign -Sm br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }} -s "$signing_key" -t "br ${{ github.event.inputs.tag || github.ref_name }} ${{ matrix.name }}"
+          minisign -Sm "$archive" -s "$signing_key" -t "br ${{ github.event.inputs.tag || github.ref_name }} ${{ matrix.name }}"
+          if [ ! -s "$signature" ]; then
+            echo "::error::minisign did not produce required signature: $signature"
+            exit 1
+          fi
+          minisign -Vm "$archive" -x "$signature" -P "$MINISIGN_PUBLIC_KEY"
 
       - name: Upload artifacts
         if: ${{ env.ACT != 'true' }}
@@ -437,18 +449,31 @@ jobs:
         run: |
           ASSET_VERSION="${{ steps.asset_version.outputs.asset_version }}"
           MISSING=()
-          for platform in linux_amd64 linux_musl_amd64 linux_arm64 linux_musl_arm64 darwin_amd64 darwin_arm64 windows_amd64; do
-            if ! compgen -G "artifacts/br-${ASSET_VERSION}-${platform}.*" > /dev/null; then
-              MISSING+=("$platform")
-            fi
+          ARCHIVES=(
+            "artifacts/br-${ASSET_VERSION}-linux_amd64.tar.gz"
+            "artifacts/br-${ASSET_VERSION}-linux_musl_amd64.tar.gz"
+            "artifacts/br-${ASSET_VERSION}-linux_arm64.tar.gz"
+            "artifacts/br-${ASSET_VERSION}-linux_musl_arm64.tar.gz"
+            "artifacts/br-${ASSET_VERSION}-darwin_amd64.tar.gz"
+            "artifacts/br-${ASSET_VERSION}-darwin_arm64.tar.gz"
+            "artifacts/br-${ASSET_VERSION}-windows_amd64.zip"
+          )
+          for archive in "${ARCHIVES[@]}"; do
+            for required_file in "$archive" "${archive}.sha256" "${archive}.minisig"; do
+              if [ ! -s "$required_file" ]; then
+                MISSING+=("${required_file#artifacts/}")
+              fi
+            done
           done
           if [ ${#MISSING[@]} -gt 0 ]; then
-            echo "::error::Missing required platform artifacts: ${MISSING[*]}"
-            echo "Release cannot proceed without all required platforms."
-            echo "Missing: ${MISSING[*]}"
+            echo "::error::Missing or empty required release artifacts: ${MISSING[*]}"
+            echo "Release cannot proceed without every archive, checksum, and signature."
+            for missing_file in "${MISSING[@]}"; do
+              echo "Missing or empty: $missing_file"
+            done
             exit 1
           fi
-          echo "All required platform artifacts present."
+          echo "All required release archives, checksums, and signatures are present."
 
       - name: Generate combined checksums
         run: |
@@ -587,8 +612,9 @@ jobs:
 
           ```bash
           # Download the .minisig file for your binary
-          # Public key: RWSp4vEOdKsY8e95W9/4eLrSJ2B2GHv4U+CKMBXqRX3JhPrPn8J0DWBG
-          minisign -Vm br-${{ steps.asset_version.outputs.asset_version }}-*.tar.gz -P RWSp4vEOdKsY8e95W9/4eLrSJ2B2GHv4U+CKMBXqRX3JhPrPn8J0DWBG
+          # Public key: ${{ env.MINISIGN_PUBLIC_KEY }}
+          minisign -Vm br-${{ steps.asset_version.outputs.asset_version }}-linux_amd64.tar.gz \
+            -P '${{ env.MINISIGN_PUBLIC_KEY }}'
           ```
 
           ## Full Changelog

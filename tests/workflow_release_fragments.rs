@@ -10,6 +10,11 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const RELEASE_WORKFLOW: &str = ".github/workflows/release.yml";
+const README: &str = "README.md";
+const CURRENT_MINISIGN_PUBLIC_KEY: &str =
+    "RWS7nGFfBYC+MWeZLEaowkjNi77w5FEOk49fEhX2jZ6gpd9uQ4vzVIrF";
+const RETIRED_MINISIGN_PUBLIC_KEY: &str =
+    "RWSp4vEOdKsY8e95W9/4eLrSJ2B2GHv4U+CKMBXqRX3JhPrPn8J0DWBG";
 const REQUIRED_PLATFORMS: &[&str] = &[
     "linux_amd64",
     "linux_musl_amd64",
@@ -34,6 +39,17 @@ struct Job {
 struct Step {
     name: Option<String>,
     run: Option<String>,
+    uses: Option<String>,
+    #[serde(rename = "if")]
+    condition: Option<String>,
+    #[serde(rename = "with")]
+    action_inputs: Option<ActionInputs>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActionInputs {
+    #[serde(rename = "ref")]
+    checkout_ref: Option<String>,
 }
 
 struct ShellOutput {
@@ -49,7 +65,7 @@ fn release_workflow_exposes_expected_fragment_steps() -> Result<(), String> {
         "Validate required artifacts present",
         "Generate combined checksums",
         "Verify all checksums",
-        "Sign archive with Ed25519 (Linux/macOS)",
+        "Sign release archive with Ed25519",
         "Generate changelog",
     ] {
         release_step_script(step_name)?;
@@ -71,11 +87,77 @@ fn release_workflow_uses_tagless_asset_file_names() -> Result<(), String> {
         &workflow,
         "br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}",
     )?;
-    require_contains(&workflow, "artifacts/br-${ASSET_VERSION}-${platform}.*")?;
+    require_contains(
+        &workflow,
+        "artifacts/br-${ASSET_VERSION}-linux_amd64.tar.gz",
+    )?;
+    require_contains(
+        &workflow,
+        "artifacts/br-${ASSET_VERSION}-windows_amd64.zip",
+    )?;
+    require_not_contains(&workflow, "artifacts/br-${ASSET_VERSION}-${platform}.*")?;
     require_not_contains(&workflow, "br-${{ github.ref_name }}-${{ matrix.name }}")?;
     require_not_contains(&workflow, "artifacts/br-${{ github.ref_name }}-*")?;
 
     Ok(())
+}
+
+#[test]
+fn release_workflow_checkout_refs_are_unambiguous() -> Result<(), String> {
+    let workflow = parse_release_workflow()?;
+    let mut checkout_steps = 0;
+
+    for step in workflow.jobs.values().flat_map(|job| &job.steps) {
+        let Some(action) = step.uses.as_deref() else {
+            continue;
+        };
+        if !action.starts_with("actions/checkout@") {
+            continue;
+        }
+
+        checkout_steps += 1;
+        let checkout_ref = step
+            .action_inputs
+            .as_ref()
+            .and_then(|inputs| inputs.checkout_ref.as_deref());
+        if checkout_ref != Some("${{ github.event.inputs.tag || github.ref }}") {
+            return Err(format!(
+                "checkout step must have exactly one release-tag ref, found {checkout_ref:?}"
+            ));
+        }
+    }
+
+    if checkout_steps == 5 {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected five release checkout steps, found {checkout_steps}"
+        ))
+    }
+}
+
+#[test]
+fn release_signatures_use_the_documented_current_trust_anchor() -> Result<(), String> {
+    let workflow = read_to_string(Path::new(RELEASE_WORKFLOW))?;
+    let readme = read_to_string(Path::new(README))?;
+    let changelog_script = release_step_script("Generate changelog")?;
+    let signing_script = release_step_script("Sign release archive with Ed25519")?;
+
+    require_contains(&readme, CURRENT_MINISIGN_PUBLIC_KEY)?;
+    require_contains(&workflow, CURRENT_MINISIGN_PUBLIC_KEY)?;
+    require_not_contains(&workflow, RETIRED_MINISIGN_PUBLIC_KEY)?;
+    require_contains(
+        &changelog_script,
+        "# Public key: ${{ env.MINISIGN_PUBLIC_KEY }}",
+    )?;
+    require_contains(
+        &changelog_script,
+        "-P '${{ env.MINISIGN_PUBLIC_KEY }}'",
+    )?;
+    require_contains(
+        &signing_script,
+        "minisign -Vm \"$archive\" -x \"$signature\" -P \"$MINISIGN_PUBLIC_KEY\"",
+    )
 }
 
 #[test]
@@ -126,12 +208,15 @@ fn required_artifact_fragment_reports_missing_platforms() -> Result<(), String> 
     let fixture = WorkflowFixture::new()?;
     fixture.create_artifacts_dir()?;
     for platform in REQUIRED_PLATFORMS {
-        fixture.write_release_artifact(platform, b"binary")?;
+        fixture.write_release_artifact_set(platform, b"binary")?;
     }
 
     let complete = run_bash_step(&script, fixture.root(), &[])?;
     require_success(&complete)?;
-    require_contains(&complete.stdout, "All required platform artifacts present")?;
+    require_contains(
+        &complete.stdout,
+        "All required release archives, checksums, and signatures are present",
+    )?;
 
     let missing = WorkflowFixture::new()?;
     missing.create_artifacts_dir()?;
@@ -140,12 +225,29 @@ fn required_artifact_fragment_reports_missing_platforms() -> Result<(), String> 
         .copied()
         .filter(|platform| *platform != "windows_amd64")
     {
-        missing.write_release_artifact(platform, b"binary")?;
+        missing.write_release_artifact_set(platform, b"binary")?;
     }
 
     let result = run_bash_step(&script, missing.root(), &[])?;
     require_failure(&result, "missing platform should fail")?;
-    require_contains(&result.stdout, "windows_amd64")
+    require_contains(&result.stdout, "br-9.9.9-windows_amd64.zip")?;
+
+    let missing_signature = WorkflowFixture::new()?;
+    missing_signature.create_artifacts_dir()?;
+    for platform in REQUIRED_PLATFORMS {
+        if *platform == "windows_amd64" {
+            missing_signature.write_release_archive_and_checksum(platform, b"binary")?;
+        } else {
+            missing_signature.write_release_artifact_set(platform, b"binary")?;
+        }
+    }
+
+    let result = run_bash_step(&script, missing_signature.root(), &[])?;
+    require_failure(&result, "missing signature sidecar should fail")?;
+    require_contains(
+        &result.stdout,
+        "br-9.9.9-windows_amd64.zip.minisig",
+    )
 }
 
 #[test]
