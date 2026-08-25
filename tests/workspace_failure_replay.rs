@@ -296,14 +296,11 @@ fn prepare_current_wal_without_shm(fixture: &FixtureWorkspace) {
         "active WAL must not reuse the unrelated historical placeholder"
     );
 
+    // FrankenSQLite may leave either no SHM or a zero-length placeholder after
+    // this import. Preserve the exact artifact when it exists; its size does
+    // not make it part of the active WAL-only topology exercised below.
     let current_shm = match fs::read(&shm_path) {
-        Ok(bytes) => {
-            assert!(
-                !bytes.is_empty(),
-                "current import-generated SHM must be nonempty before preservation"
-            );
-            Some(bytes)
-        }
+        Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => panic!("read current import-generated SHM: {error}"),
     };
