@@ -2008,10 +2008,21 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
     )?;
     restore_backup_family_resuming(&migration.db_path, &before_dir, &applied.raw_before)?;
 
+    // Prove the byte-for-byte restore before opening SQLite: a read-only open
+    // may legitimately create or rewrite the volatile shared-memory sidecar.
+    let raw_restored_exact = raw_family_witness(&migration.db_path)?;
+    if raw_restored_exact != applied.raw_before {
+        return Err(BeadsError::internal(format!(
+            "schema migration undo for run {} did not reproduce the exact receipt-bound raw \
+             pre-state; the displaced applied state remains quarantined at {}",
+            args.run_id,
+            quarantine_dir.display()
+        )));
+    }
     let logical_restored = logical_witness(&migration.db_path)?;
-    let raw_restored = raw_family_witness(&migration.db_path)?;
+    let raw_restored_after_probe = raw_family_witness(&migration.db_path)?;
     if logical_restored != applied.logical_before
-        || raw_restored != applied.raw_before
+        || !stable_raw_eq(&raw_restored_after_probe, &raw_restored_exact)
     {
         return Err(BeadsError::internal(format!(
             "schema migration undo for run {} did not reproduce the verified pre-state; \
@@ -2020,7 +2031,7 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
             quarantine_dir.display()
         )));
     }
-    receipt.raw_restored = Some(raw_restored);
+    receipt.raw_restored = Some(raw_restored_exact);
     receipt.logical_restored = Some(logical_restored);
     receipt.dry_run = false;
     migration.write_authority.verify_database_authority()?;
@@ -2031,10 +2042,10 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
     sync_directory(&restored_candidate_dir)?;
     sync_directory(&run_dir)?;
     migration.write_authority.verify_database_authority()?;
-    migration.write_authority.finalize_database_replacement()?;
-    drop(quarantined_main_guard);
     write_json_new(&run_dir.join("undone.json"), &receipt)?;
     sync_directory(&run_dir)?;
+    migration.write_authority.finalize_database_replacement()?;
+    drop(quarantined_main_guard);
     emit_undo(&receipt, args.json)
 }
 
@@ -2328,7 +2339,7 @@ fn validate_completed_undo_receipt(
     })?;
     validate_raw_family_witness(raw_restored)?;
     if logical_witness(&migration.db_path)? != *logical_restored
-        || raw_family_witness(&migration.db_path)? != *raw_restored
+        || !stable_raw_eq(&raw_family_witness(&migration.db_path)?, raw_restored)
     {
         return Err(BeadsError::internal(format!(
             "schema migration run {} was previously undone, but the live database family has since changed",
@@ -3813,22 +3824,113 @@ mod tests {
         };
         write_json_new(&run_dir.join("prepared.json"), &prepared).expect("write prepared receipt");
 
-        let effects = apply_reviewed_migration(
-            &migration.db_path,
+        // Build the reviewed generation and stop at the actual crash point:
+        // the namespace exchange has completed, but none of the post-install
+        // directory barriers or authority finalization has run.
+        let candidate_path = maintenance_candidate_path(&migration.db_path, &run_dir)
+            .expect("candidate path");
+        let source_conn =
+            Connection::open(migration.db_path.to_string_lossy().into_owned()).expect("open source");
+        let escaped_candidate = candidate_path.to_string_lossy().replace('\'', "''");
+        source_conn
+            .execute(&format!("VACUUM INTO '{escaped_candidate}'"))
+            .expect("build candidate");
+        close_connection(source_conn).expect("close source");
+        let candidate_conn = Connection::open(candidate_path.to_string_lossy().into_owned())
+            .expect("open candidate");
+        candidate_conn.execute("BEGIN IMMEDIATE").expect("begin migration");
+        let reviewed_effects = run_reviewed_schema_migration_steps_in_transaction(
+            &candidate_conn,
             forecast.from_version,
             forecast.to_version,
             &marked_at,
-            &run_dir,
-            &migration.write_authority,
         )
-        .expect("install reviewed replacement");
-        assert!(effects.post_migration_maintenance_completed);
+        .expect("run reviewed migration");
+        candidate_conn.execute("COMMIT").expect("commit candidate");
+        candidate_conn.execute("REINDEX").expect("reindex candidate");
+        candidate_conn
+            .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint candidate");
+        close_connection(candidate_conn).expect("close candidate");
+        let candidate_logical = logical_witness(&candidate_path).expect("candidate witness");
+        let mut effects = ReviewedSchemaMigrationEffectsReceipt::from(reviewed_effects);
+        effects.post_migration_maintenance_completed = true;
+        persist_commit_ready_marker(
+            &run_dir,
+            &migration.db_path,
+            &candidate_logical,
+            effects,
+        )
+        .expect("persist commit-ready marker");
+
+        let marker: CommitReadyMigrationReceipt =
+            read_json(&run_dir.join("commit-ready.json")).expect("read marker");
+        let failed = FailedMigrationReceipt {
+            schema_version: FAILED_SCHEMA.to_string(),
+            run_id: marker.run_id.clone(),
+            database_path: marker.database_path.clone(),
+            plan_token: marker.plan_token.clone(),
+            marked_at: marker.marked_at.clone(),
+            error: "simulated process failure after namespace installation".to_string(),
+            raw_before: marker.raw_before.clone(),
+            logical_before: marker.logical_before.clone(),
+            raw_observed_after_failure: None,
+            logical_observed_after_failure: None,
+        };
+        write_json_new(&run_dir.join("failed.json"), &failed).expect("write failed receipt");
+
+        let source_raw = raw_family_witness(&migration.db_path).expect("source raw");
+        let candidate_raw = raw_family_witness(&candidate_path).expect("candidate raw");
+        move_present_sidecars_new(
+            &candidate_path,
+            &run_dir.join("maintenance-candidate-sidecars"),
+            &candidate_raw,
+        )
+        .expect("retain candidate sidecars");
+        let displaced_dir = run_dir.join("maintenance-displaced");
+        ensure_new_directory(&displaced_dir).expect("create displaced directory");
+        move_present_sidecars_new(&migration.db_path, &displaced_dir, &source_raw)
+            .expect("retain source sidecars");
+        let replacement_lock = migration
+            .write_authority
+            .lock_database_replacement_candidate(&candidate_path)
+            .expect("lock candidate");
+        exchange_database_paths(&candidate_path, &migration.db_path)
+            .expect("exchange candidate and live main");
+        migration
+            .write_authority
+            .verify_staged_database_recovery_authority(&candidate_path)
+            .expect("prove displaced original authority");
+        migration
+            .write_authority
+            .adopt_locked_database_replacement(replacement_lock)
+            .expect("adopt installed candidate");
+        let displaced_main =
+            backup_component_path(&displaced_dir, &migration.db_path, "").expect("displaced main");
+        rename_path_no_replace(&candidate_path, &displaced_main)
+            .expect("retain original main without running barriers");
+
         assert!(run_dir.join("commit-ready.json").is_file());
         assert!(
             !run_dir.join("applied.json").exists(),
             "the fixture must stop at the crash boundary before applied receipt publication"
         );
 
+        let beads_dir = migration.beads_dir.clone();
+        let db_path = migration.db_path.clone();
+        drop(migration);
+        let migration = MigrationContext {
+            write_authority: Arc::new(
+                crate::sync::blocking_database_family_write_lock_with_timeout(
+                    &beads_dir,
+                    &db_path,
+                    Some(1000),
+                )
+                .expect("reacquire authority after simulated crash"),
+            ),
+            beads_dir,
+            db_path,
+        };
         let (applied, resumed_before_dir) = resume_commit_ready_migration(
             &DoctorMigrateSchemaApplyArgs {
                 plan_token,
@@ -3841,6 +3943,10 @@ mod tests {
         assert_eq!(resumed_before_dir, before_dir);
         assert!(applied.attested);
         assert!(run_dir.join("applied.json").is_file());
+        assert!(
+            run_dir.join("failed.json").is_file(),
+            "a pre-existing failure receipt must not suppress promotion of the exact live after-state"
+        );
 
         execute_undo(
             &DoctorMigrateSchemaUndoArgs {
