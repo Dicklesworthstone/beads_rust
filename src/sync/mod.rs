@@ -58,31 +58,6 @@ const DEFAULT_JSONL_EXPORT_PARALLELISM: usize = 64;
 const IMPORT_EXPORT_HASH_BATCH_SIZE: usize = 512;
 const MAX_JSONL_TEMP_PATH_ATTEMPTS: u32 = 64;
 
-#[cfg(test)]
-thread_local! {
-    static REPLACE_DATABASE_BEFORE_FINALIZE_LOCKED_VERIFY: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-}
-
-#[cfg(test)]
-fn maybe_replace_database_before_finalize_locked_verify(path: &Path) -> Result<()> {
-    let replace = REPLACE_DATABASE_BEFORE_FINALIZE_LOCKED_VERIFY
-        .with(|configured| configured.replace(false));
-    if !replace {
-        return Ok(());
-    }
-    let mut retained = path.as_os_str().to_os_string();
-    retained.push(".test-retained-before-finalize-verify");
-    fs::rename(path, PathBuf::from(retained))?;
-    fs::write(path, b"foreign database generation installed by finalize hook")?;
-    Ok(())
-}
-
-#[cfg(not(test))]
-fn maybe_replace_database_before_finalize_locked_verify(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
 /// Exact source state used by stale-overwrite guards.
 ///
 /// `Missing` is intentionally distinct from a present zero-byte file.
@@ -516,11 +491,6 @@ fn update_sync_path_digest(hasher: &mut Sha256, path: &Path) {
 }
 
 impl DatabaseFamilyWriteLock {
-    #[cfg(test)]
-    fn arm_database_replacement_before_finalize_locked_verify_for_test() {
-        REPLACE_DATABASE_BEFORE_FINALIZE_LOCKED_VERIFY.with(|configured| configured.set(true));
-    }
-
     #[must_use]
     pub fn authority_path_sha256(&self) -> &str {
         &self.authority_path_sha256
@@ -556,43 +526,6 @@ impl DatabaseFamilyWriteLock {
                 message: "Canonical database path changed while its write authority was held"
                     .to_string(),
             });
-        }
-        Ok(())
-    }
-
-    fn verify_database_inode_authority_locked(
-        &self,
-        database_authority: &DatabaseInodeAuthority,
-    ) -> Result<()> {
-        if let Some(database_lock) = database_authority.lock.as_ref() {
-            let current_identity = verify_locked_file_identity(
-                database_lock,
-                &self.canonical_database_path,
-                "database write authority",
-                true,
-            )?;
-            if database_authority.identity != Some(current_identity) {
-                return Err(BeadsError::SyncConflict {
-                    message: "Database inode changed while its write authority was held"
-                        .to_string(),
-                });
-            }
-        } else {
-            match fs::symlink_metadata(&self.canonical_database_path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Ok(_) => {
-                    return Err(BeadsError::SyncConflict {
-                        message: "Database appeared before its inode authority was bound"
-                            .to_string(),
-                    });
-                }
-                Err(error) => {
-                    return Err(BeadsError::Config(format!(
-                        "Could not verify missing database authority {}: {error}",
-                        database_path_descriptor(&self.canonical_database_path)
-                    )));
-                }
-            }
         }
         Ok(())
     }
@@ -837,12 +770,6 @@ impl DatabaseFamilyWriteLock {
     /// original inode for the currently visible database generation.
     pub(crate) fn database_target_authority_state(&self) -> Result<DatabaseTargetAuthorityState> {
         self.verify_common_authority()?;
-        let database_authority =
-            self.database_authority
-                .lock()
-                .map_err(|_| BeadsError::SyncConflict {
-                    message: "Database inode authority state was poisoned".to_string(),
-                })?;
         let target_metadata = match fs::symlink_metadata(&self.canonical_database_path) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                 return Ok(DatabaseTargetAuthorityState::Foreign);
@@ -863,14 +790,21 @@ impl DatabaseFamilyWriteLock {
         let Some(target_identity) = target_metadata else {
             return Ok(DatabaseTargetAuthorityState::Missing);
         };
+
+        let database_authority =
+            self.database_authority
+                .lock()
+                .map_err(|_| BeadsError::SyncConflict {
+                    message: "Database inode authority state was poisoned".to_string(),
+                })?;
         let Some(database_lock) = database_authority.lock.as_ref() else {
             return Ok(DatabaseTargetAuthorityState::Foreign);
         };
-        let retained_identity = verify_locked_file_identity(
+        let retained_identity = authority_file_identity(
             database_lock,
             &self.canonical_database_path,
             "retained database recovery authority",
-            true,
+            &database_path_descriptor(&self.canonical_database_path),
         )?;
         if database_authority.identity == Some(retained_identity)
             && retained_identity == target_identity
@@ -888,17 +822,17 @@ impl DatabaseFamilyWriteLock {
         staged_database_path: &Path,
     ) -> Result<()> {
         self.verify_common_authority()?;
+        let staged_identity = authority_path_identity(
+            staged_database_path,
+            "staged database recovery target",
+            &database_path_descriptor(staged_database_path),
+        )?;
         let database_authority =
             self.database_authority
                 .lock()
                 .map_err(|_| BeadsError::SyncConflict {
                     message: "Database inode authority state was poisoned".to_string(),
                 })?;
-        let staged_identity = authority_path_identity(
-            staged_database_path,
-            "staged database recovery target",
-            &database_path_descriptor(staged_database_path),
-        )?;
         let database_lock =
             database_authority
                 .lock
@@ -906,11 +840,11 @@ impl DatabaseFamilyWriteLock {
                 .ok_or_else(|| BeadsError::SyncConflict {
                     message: "Staged database has no retained inode authority".to_string(),
                 })?;
-        let retained_identity = verify_locked_file_identity(
+        let retained_identity = authority_file_identity(
             database_lock,
             staged_database_path,
             "retained database recovery authority",
-            true,
+            &database_path_descriptor(staged_database_path),
         )?;
         if database_authority.identity != Some(retained_identity)
             || staged_identity != retained_identity
@@ -972,67 +906,14 @@ impl DatabaseFamilyWriteLock {
     /// Drop locks for displaced database inodes only after recovery has
     /// irreversibly accepted the replacement.
     pub(crate) fn finalize_database_replacement(&self) -> Result<()> {
-        self.verify_common_authority()?;
-        let mut database_authority = self
-            .database_authority
+        self.verify_database_authority()?;
+        self.database_authority
             .lock()
             .map_err(|_| BeadsError::SyncConflict {
                 message: "Database inode authority state was poisoned".to_string(),
-            })?;
-        maybe_replace_database_before_finalize_locked_verify(&self.canonical_database_path)?;
-        self.verify_database_inode_authority_locked(&database_authority)?;
-        database_authority.retired_locks.clear();
-        Ok(())
-    }
-
-    /// Release only the displaced inode retained by one nested replacement.
-    ///
-    /// An enclosing recovery can already have older retired inode locks that
-    /// must remain live until the outer command commits. The staged path
-    /// identifies the one nested generation that is now safe to finalize.
-    pub(crate) fn finalize_nested_database_replacement(
-        &self,
-        staged_database_path: &Path,
-    ) -> Result<()> {
-        self.verify_common_authority()?;
-        let mut database_authority =
-            self.database_authority
-                .lock()
-                .map_err(|_| BeadsError::SyncConflict {
-                    message: "Database inode authority state was poisoned".to_string(),
-                })?;
-        maybe_replace_database_before_finalize_locked_verify(&self.canonical_database_path)?;
-        self.verify_database_inode_authority_locked(&database_authority)?;
-        let staged_identity = authority_path_identity(
-            staged_database_path,
-            "nested database replacement source",
-            &database_path_descriptor(staged_database_path),
-        )?;
-
-        let mut retained_index = None;
-        for (index, lock) in database_authority.retired_locks.iter().enumerate() {
-            let identity = authority_file_identity(
-                lock,
-                staged_database_path,
-                "nested retained database authority",
-                &database_path_descriptor(staged_database_path),
-            )?;
-            if identity == staged_identity {
-                retained_index = Some(index);
-                break;
-            }
-        }
-        let retained_index = retained_index.ok_or_else(|| BeadsError::SyncConflict {
-            message: "Nested database replacement source was not retained under lock".to_string(),
-        })?;
-        verify_locked_file_identity(
-            &database_authority.retired_locks[retained_index],
-            staged_database_path,
-            "nested retained database authority",
-            true,
-        )?;
-        database_authority.retired_locks.swap_remove(retained_index);
-        drop(database_authority);
+            })?
+            .retired_locks
+            .clear();
         Ok(())
     }
 
@@ -1055,17 +936,17 @@ impl DatabaseFamilyWriteLock {
         finalize_older_replacements: bool,
     ) -> Result<()> {
         self.verify_common_authority()?;
+        let target_identity = authority_path_identity(
+            &self.canonical_database_path,
+            "restored database write authority",
+            &database_path_descriptor(&self.canonical_database_path),
+        )?;
         let mut database_authority =
             self.database_authority
                 .lock()
                 .map_err(|_| BeadsError::SyncConflict {
                     message: "Database inode authority state was poisoned".to_string(),
                 })?;
-        let target_identity = authority_path_identity(
-            &self.canonical_database_path,
-            "restored database write authority",
-            &database_path_descriptor(&self.canonical_database_path),
-        )?;
 
         if database_authority.identity == Some(target_identity) {
             let current_lock =
@@ -1185,12 +1066,6 @@ impl DatabaseFamilyWriteLock {
     /// database family to a legitimately missing state.
     pub(crate) fn clear_database_inode_after_authorized_remove(&self) -> Result<()> {
         self.verify_common_authority()?;
-        let mut database_authority =
-            self.database_authority
-                .lock()
-                .map_err(|_| BeadsError::SyncConflict {
-                    message: "Database inode authority state was poisoned".to_string(),
-                })?;
         match fs::symlink_metadata(&self.canonical_database_path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Ok(_) => {
@@ -1205,6 +1080,12 @@ impl DatabaseFamilyWriteLock {
                 )));
             }
         }
+        let mut database_authority =
+            self.database_authority
+                .lock()
+                .map_err(|_| BeadsError::SyncConflict {
+                    message: "Database inode authority state was poisoned".to_string(),
+                })?;
         database_authority.lock = None;
         database_authority.identity = None;
         database_authority.retired_locks.clear();
@@ -1220,7 +1101,37 @@ impl DatabaseFamilyWriteLock {
                 .map_err(|_| BeadsError::SyncConflict {
                     message: "Database inode authority state was poisoned".to_string(),
                 })?;
-        self.verify_database_inode_authority_locked(&database_authority)
+        if let Some(database_lock) = database_authority.lock.as_ref() {
+            let current_identity = verify_locked_file_identity(
+                database_lock,
+                &self.canonical_database_path,
+                "database write authority",
+                true,
+            )?;
+            if database_authority.identity != Some(current_identity) {
+                return Err(BeadsError::SyncConflict {
+                    message: "Database inode changed while its write authority was held"
+                        .to_string(),
+                });
+            }
+        } else {
+            match fs::symlink_metadata(&self.canonical_database_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(BeadsError::SyncConflict {
+                        message: "Database appeared before its inode authority was bound"
+                            .to_string(),
+                    });
+                }
+                Err(error) => {
+                    return Err(BeadsError::Config(format!(
+                        "Could not verify missing database authority {}: {error}",
+                        database_path_descriptor(&self.canonical_database_path)
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1768,18 +1679,6 @@ fn verify_locked_file_identity(
         lock_path.display().to_string()
     };
     let opened = authority_file_identity(file, lock_path, role, &lock_path_display)?;
-    #[cfg(windows)]
-    let current_guard = path::open_regular_authority_source(lock_path)?.ok_or_else(|| {
-        BeadsError::Config(format!(
-            "Locked {role} path disappeared at {lock_path_display}"
-        ))
-    })?;
-    #[cfg(windows)]
-    let current = (
-        current_guard.identity().device_id(),
-        current_guard.identity().inode(),
-    );
-    #[cfg(not(windows))]
     let current = authority_path_identity(lock_path, role, &lock_path_display)?;
     if opened != current {
         return Err(BeadsError::Config(format!(
@@ -1787,9 +1686,6 @@ fn verify_locked_file_identity(
             lock_path_display
         )));
     }
-    // On Windows, `current_guard` deliberately remains live through the
-    // comparison above. Its handle denies delete sharing, closing the
-    // path-open-to-compare replacement gap.
     Ok(opened)
 }
 
@@ -16556,132 +16452,6 @@ mod tests {
         )
         .expect("hard-link alias authority is available after the original authority drops");
         drop(alias_authority);
-    }
-
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "android",
-        target_vendor = "apple",
-        windows
-    ))]
-    #[test]
-    fn database_replacement_finalization_reverifies_before_retiring_locks() {
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join(".beads");
-        fs::create_dir_all(&beads_dir).unwrap();
-        let database_path = beads_dir.join("beads.db");
-        let original_retained_path = beads_dir.join("original-retained.db");
-        fs::write(&database_path, b"original database generation").unwrap();
-        let authority = blocking_database_family_write_lock_with_timeout(
-            &beads_dir,
-            &database_path,
-            Some(1_000),
-        )
-        .unwrap();
-        authority.bind_database_inode_for_mutation().unwrap();
-        install_database_candidate_no_replace(&database_path, &original_retained_path).unwrap();
-        authority
-            .install_empty_database_replacement_and_bind()
-            .unwrap();
-        assert_eq!(
-            authority.database_authority.lock().unwrap().retired_locks.len(),
-            1,
-            "the displaced original must remain locked before finalization"
-        );
-
-        DatabaseFamilyWriteLock::arm_database_replacement_before_finalize_locked_verify_for_test();
-        let error = authority
-            .finalize_database_replacement()
-            .expect_err("a canonical-path swap at finalization must fail closed");
-        assert!(
-            error.to_string().contains("database write authority"),
-            "unexpected finalization identity error: {error}"
-        );
-        assert_eq!(
-            authority.database_authority.lock().unwrap().retired_locks.len(),
-            1,
-            "failed finalization must not release the displaced inode lock"
-        );
-        assert_eq!(
-            fs::read(&database_path).unwrap(),
-            b"foreign database generation installed by finalize hook",
-            "the hook must causally replace the canonical generation"
-        );
-    }
-
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "android",
-        target_vendor = "apple",
-        windows
-    ))]
-    #[test]
-    fn nested_database_replacement_finalization_preserves_older_retired_inode_lock() {
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join(".beads");
-        fs::create_dir_all(&beads_dir).unwrap();
-        let database_path = beads_dir.join("beads.db");
-        let outer_retained_path = beads_dir.join("outer-retained.db");
-        let nested_retained_path = beads_dir.join("nested-retained.db");
-        let nested_candidate_path = beads_dir.join("nested-candidate.db");
-        fs::write(&database_path, b"outer database generation").unwrap();
-        let authority = blocking_database_family_write_lock_with_timeout(
-            &beads_dir,
-            &database_path,
-            Some(1_000),
-        )
-        .unwrap();
-        authority.bind_database_inode_for_mutation().unwrap();
-
-        install_database_candidate_no_replace(&database_path, &outer_retained_path).unwrap();
-        authority
-            .install_empty_database_replacement_and_bind()
-            .unwrap();
-
-        fs::write(&nested_candidate_path, b"nested database generation").unwrap();
-        let nested_candidate_lock = authority
-            .lock_database_replacement_candidate(&nested_candidate_path)
-            .unwrap();
-        install_database_candidate_no_replace(&database_path, &nested_retained_path).unwrap();
-        install_database_candidate_no_replace(&nested_candidate_path, &database_path).unwrap();
-        authority
-            .adopt_locked_database_replacement(nested_candidate_lock)
-            .unwrap();
-
-        assert_eq!(
-            authority.database_authority.lock().unwrap().retired_locks.len(),
-            2,
-            "the enclosing and nested replacement sources must both remain locked before commit"
-        );
-        authority
-            .finalize_nested_database_replacement(&nested_retained_path)
-            .unwrap();
-
-        let database_authority = authority.database_authority.lock().unwrap();
-        assert_eq!(
-            database_authority.retired_locks.len(),
-            1,
-            "nested finalization must release exactly one displaced inode lock"
-        );
-        let remaining_identity = authority_file_identity(
-            &database_authority.retired_locks[0],
-            &outer_retained_path,
-            "outer retained database authority",
-            &database_path_descriptor(&outer_retained_path),
-        )
-        .unwrap();
-        assert_eq!(
-            remaining_identity,
-            authority_path_identity(
-                &outer_retained_path,
-                "outer retained database authority",
-                &database_path_descriptor(&outer_retained_path),
-            )
-            .unwrap(),
-            "nested finalization must preserve the enclosing recovery's exact rollback inode"
-        );
-        drop(database_authority);
-        authority.verify_database_authority().unwrap();
     }
 
     #[test]

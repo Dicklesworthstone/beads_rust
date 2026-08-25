@@ -959,19 +959,7 @@ fn open_sqlite_storage_with_recovery_strategy(
         authority.verify_database_authority()?;
     }
 
-    if let Some(authority) = write_authority {
-        if crate::sync::database_write_authority_sha256(&paths.db_path)?
-            != authority.authority_path_sha256()
-        {
-            return Err(BeadsError::SyncConflict {
-                message: "Truncated WAL quarantine path does not match the held database-family authority"
-                    .to_string(),
-            });
-        }
-        authority.verify_database_authority()?;
-        quarantine_truncated_wal_sidecar(&paths.db_path, beads_dir);
-        authority.verify_database_authority()?;
-    }
+    quarantine_truncated_wal_sidecar(&paths.db_path, beads_dir);
 
     let prepare_fresh_storage = || -> Result<(SqliteStorage, RecoveryBackupSet)> {
         let authority = write_authority.ok_or_else(|| BeadsError::SyncConflict {
@@ -985,17 +973,7 @@ fn open_sqlite_storage_with_recovery_strategy(
         )
     };
 
-    let storage_open = write_authority.map_or_else(
-        || SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout),
-        |authority| {
-            SqliteStorage::open_with_timeout_under_write_authority(
-                &paths.db_path,
-                lock_timeout,
-                authority,
-            )
-        },
-    );
-    match storage_open {
+    match SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout) {
         Ok(storage) => match storage.detect_recoverable_open_anomaly() {
             Ok(None) => Ok(SqliteRecoveryOpenResult {
                 storage,
@@ -1198,11 +1176,7 @@ fn prepare_fresh_storage_for_deferred_import(
         SuccessfulRecoveryDisposition::RetainBackupUntilCommandSuccess,
         |fresh_witness| {
             write_authority.verify_fresh_database_replacement_witness(&fresh_witness)?;
-            SqliteStorage::open_with_timeout_under_write_authority(
-                db_path,
-                lock_timeout,
-                write_authority,
-            )
+            SqliteStorage::open_with_timeout(db_path, lock_timeout)
         },
     )?;
     let recovery_dir = backup_set.recovery_dir.clone();
@@ -2504,11 +2478,7 @@ fn rebuild_database_family(
     fresh_witness: FreshDatabaseReplacementWitness,
 ) -> Result<(SqliteStorage, ImportResult)> {
     write_authority.verify_database_authority()?;
-    let mut storage = SqliteStorage::open_with_timeout_under_write_authority(
-        db_path,
-        lock_timeout,
-        write_authority,
-    )?;
+    let mut storage = SqliteStorage::open_with_timeout(db_path, lock_timeout)?;
     storage.attach_write_authority(Arc::clone(write_authority));
     write_authority.verify_database_authority()?;
     storage.set_config("issue_prefix", prefix)?;
@@ -2872,13 +2842,12 @@ pub(crate) fn db_sidecar_suffixes() -> impl Iterator<Item = &'static &'static st
 }
 
 /// Compact a database at `db_path` by writing a fresh copy via `VACUUM
-/// INTO`, staging the complete original family in recovery, installing the
-/// candidate without replacement, and returning a reopened storage connection.
+/// INTO` to a temp file, atomically replacing the original, and returning a
+/// reopened storage connection.
 ///
 /// Preconditions: the caller must pass a `storage` handle whose connection
-/// was opened against `db_path` (the helper names a unique temp file
-/// `.<stem>.vacuum.<pid>.<timestamp>.tmp` next to `db_path` and installs it
-/// there).
+/// was opened against `db_path` (the helper names its temp file
+/// `.<stem>.vacuum.<pid>.tmp` next to `db_path` and installs it there).
 /// Passing mismatched storage and db_path would copy the storage's actual
 /// DB contents over db_path.
 ///
@@ -2887,11 +2856,10 @@ pub(crate) fn db_sidecar_suffixes() -> impl Iterator<Item = &'static &'static st
 /// best-available working handle or an error before the caller can continue:
 ///
 /// * VACUUM INTO failed — returns the unchanged pre-compaction connection.
-/// * Install failed — restores and reopens the complete retained family when
-///   the canonical namespace is still empty.
-/// * Validation, durability, or reopen failed after installation — rolls back
-///   the exact retained main inode and sidecar generation, then returns an
-///   error so live code cannot continue on a throwaway connection.
+/// * Rename failed — returns a connection reopened against the still-intact
+///   original `db_path`; the compacted temp file is removed.
+/// * Reopen failed after replacing the handle — returns an error, ensuring
+///   live code cannot continue on a throwaway placeholder connection.
 ///
 /// Cosmetic compaction failures remain non-fatal when the original handle is
 /// still usable. Failures after the original connection has been closed are
@@ -2917,12 +2885,12 @@ pub(crate) fn compact_database_via_vacuum_into_in_place(
         db_path,
         lock_timeout,
         &write_authority,
-        |path, timeout| {
-            SqliteStorage::open_with_timeout_under_write_authority(path, timeout, &write_authority)
+        SqliteStorage::open_with_timeout,
+        || Ok(()),
+        || Ok(()),
+        |from, to| {
+            crate::util::sync_rename_parent_directories(from, to).map_err(BeadsError::Io)
         },
-        || Ok(()),
-        || Ok(()),
-        |from, to| crate::util::sync_rename_parent_directories(from, to).map_err(BeadsError::Io),
     )
 }
 
@@ -2937,12 +2905,12 @@ fn compact_database_via_vacuum_into_in_place_under_write_authority(
         db_path,
         lock_timeout,
         write_authority,
-        |path, timeout| {
-            SqliteStorage::open_with_timeout_under_write_authority(path, timeout, write_authority)
+        SqliteStorage::open_with_timeout,
+        || Ok(()),
+        || Ok(()),
+        |from, to| {
+            crate::util::sync_rename_parent_directories(from, to).map_err(BeadsError::Io)
         },
-        || Ok(()),
-        || Ok(()),
-        |from, to| crate::util::sync_rename_parent_directories(from, to).map_err(BeadsError::Io),
     )
 }
 
@@ -3036,14 +3004,21 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
         std::process::id(),
         Utc::now().format("%Y%m%d_%H%M%S_%f")
     );
-    let retained_family =
-        match move_database_family_to_recovery(db_path, recovery_parent, &compaction_stamp) {
-            Ok(backup_set) => backup_set,
-            Err(stage_error) => {
-                remove_locked_compaction_candidate(write_authority, &replacement_lock, &temp_path);
-                return Err(stage_error);
-            }
-        };
+    let retained_family = match move_database_family_to_recovery(
+        db_path,
+        recovery_parent,
+        &compaction_stamp,
+    ) {
+        Ok(backup_set) => backup_set,
+        Err(stage_error) => {
+            remove_locked_compaction_candidate(
+                write_authority,
+                &replacement_lock,
+                &temp_path,
+            );
+            return Err(stage_error);
+        }
+    };
     let staged_database = retained_family
         .files
         .iter()
@@ -3052,7 +3027,9 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
         .ok_or_else(|| BeadsError::SyncConflict {
             message: "Compaction could not stage the retained database generation".to_string(),
         })
-        .and_then(|staged| write_authority.verify_staged_database_recovery_authority(staged))
+        .and_then(|staged| {
+            write_authority.verify_staged_database_recovery_authority(staged)
+        })
         .and_then(|()| verify_recovery_backup_set(&retained_family));
     if let Err(authority_error) = staged_verification {
         let rollback_result = rollback_renamed_paths_no_replace(
@@ -3112,9 +3089,6 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
         .and_then(|mut reopened| {
             write_authority.verify_database_authority()?;
             reopened.attach_write_authority(Arc::clone(write_authority));
-            write_authority.finalize_nested_database_replacement(
-                staged_database.expect("the retained main was verified before installation"),
-            )?;
             Ok(reopened)
         })
         .map_err(|error| BeadsError::WithContext {
@@ -3128,9 +3102,10 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
     match post_install_result {
         Ok(reopened) => Ok(reopened),
         Err(install_error) => {
-            if let Err(rollback_error) =
-                rollback_compacted_database_install(&retained_family, write_authority)
-            {
+            if let Err(rollback_error) = rollback_compacted_database_install(
+                &retained_family,
+                write_authority,
+            ) {
                 return Err(BeadsError::WithContext {
                     context: format!(
                         "Compacted database installation failed ({install_error}); restoring the retained pre-compaction family also failed"
@@ -3148,8 +3123,8 @@ fn remove_locked_compaction_candidate(
     replacement_lock: &fs::File,
     temp_path: &Path,
 ) {
-    if let Err(error) =
-        write_authority.verify_locked_database_replacement_candidate(temp_path, replacement_lock)
+    if let Err(error) = write_authority
+        .verify_locked_database_replacement_candidate(temp_path, replacement_lock)
     {
         tracing::warn!(
             error = %error,
@@ -4416,18 +4391,15 @@ impl OpenStorageResult {
         if had_original_database_family {
             write_authority.restore_retained_database_inode_after_authorized_replace()?;
             write_authority.verify_database_authority()?;
-            let mut restored_storage = SqliteStorage::open_with_timeout_under_write_authority(
-                &self.paths.db_path,
-                self.resolved_lock_timeout,
-                &write_authority,
-            )
-            .map_err(|reopen_err| BeadsError::WithContext {
-                context: format!(
-                    "Restored the original database family at '{}' but failed to reopen it",
-                    self.paths.db_path.display()
-                ),
-                source: Box::new(reopen_err),
-            })?;
+            let mut restored_storage =
+                SqliteStorage::open_with_timeout(&self.paths.db_path, self.resolved_lock_timeout)
+                    .map_err(|reopen_err| BeadsError::WithContext {
+                    context: format!(
+                        "Restored the original database family at '{}' but failed to reopen it",
+                        self.paths.db_path.display()
+                    ),
+                    source: Box::new(reopen_err),
+                })?;
             write_authority.verify_database_authority()?;
             restored_storage.attach_write_authority(Arc::clone(&write_authority));
             self.storage = restored_storage;
@@ -9024,9 +8996,7 @@ routing:
             "unexpected authority error: {error}"
         );
         assert_eq!(
-            fs::metadata(&db_path)
-                .expect("inspect preserved foreign")
-                .ino(),
+            fs::metadata(&db_path).expect("inspect preserved foreign").ino(),
             foreign_inode,
             "the foreign generation must return to the canonical path"
         );
@@ -9871,9 +9841,7 @@ routing:
                     .find(|path| {
                         path.file_name()
                             .and_then(|name| name.to_str())
-                            .is_some_and(|name| {
-                                name.starts_with("beads.db.") && name.ends_with(".bak")
-                            })
+                            .is_some_and(|name| name.starts_with("beads.db.") && name.ends_with(".bak"))
                     })
                     .expect("find staged main database");
                 fs::rename(&staged_database, &retained_original)
