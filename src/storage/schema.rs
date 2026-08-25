@@ -50,6 +50,22 @@ struct ExpectedSchemaColumn {
     primary_key_position: i64,
 }
 
+const fn schema_column(
+    name: &'static str,
+    data_type: &'static str,
+    not_null: bool,
+    default_value: Option<&'static str>,
+    primary_key_position: i64,
+) -> ExpectedSchemaColumn {
+    ExpectedSchemaColumn {
+        name,
+        data_type,
+        not_null,
+        default_value,
+        primary_key_position,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AuxiliaryRuntimeColumn {
     expected: ExpectedSchemaColumn,
@@ -80,7 +96,22 @@ const fn auxiliary_runtime_column(
 struct ExpectedRuntimeIndex {
     name: &'static str,
     columns: &'static [&'static str],
+    unique: bool,
     partial: bool,
+}
+
+const fn runtime_index(
+    name: &'static str,
+    columns: &'static [&'static str],
+    unique: bool,
+    partial: bool,
+) -> ExpectedRuntimeIndex {
+    ExpectedRuntimeIndex {
+        name,
+        columns,
+        unique,
+        partial,
+    }
 }
 
 const GATE_RESULT_HISTORY_COLUMNS: &[ExpectedSchemaColumn] = &[
@@ -1208,6 +1239,259 @@ const EVENT_COLUMNS: &[(&str, &str)] = &[
     ("model", "TEXT"),
 ];
 
+const ISSUES_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
+    schema_column("id", "TEXT", false, None, 1),
+    schema_column("content_hash", "TEXT", false, None, 0),
+    schema_column("title", "TEXT", true, None, 0),
+    schema_column("description", "TEXT", true, Some("''"), 0),
+    schema_column("design", "TEXT", true, Some("''"), 0),
+    schema_column("acceptance_criteria", "TEXT", true, Some("''"), 0),
+    schema_column("notes", "TEXT", true, Some("''"), 0),
+    schema_column("status", "TEXT", true, Some("'open'"), 0),
+    schema_column("priority", "INTEGER", true, Some("2"), 0),
+    schema_column("issue_type", "TEXT", true, Some("'task'"), 0),
+    schema_column("assignee", "TEXT", false, None, 0),
+    schema_column("owner", "TEXT", false, Some("''"), 0),
+    schema_column("estimated_minutes", "INTEGER", false, None, 0),
+    schema_column(
+        "created_at",
+        "DATETIME",
+        true,
+        Some("CURRENT_TIMESTAMP"),
+        0,
+    ),
+    schema_column("created_by", "TEXT", false, Some("''"), 0),
+    schema_column(
+        "updated_at",
+        "DATETIME",
+        true,
+        Some("CURRENT_TIMESTAMP"),
+        0,
+    ),
+    schema_column("closed_at", "DATETIME", false, None, 0),
+    schema_column("close_reason", "TEXT", false, Some("''"), 0),
+    schema_column("closed_by_session", "TEXT", false, Some("''"), 0),
+    schema_column("due_at", "DATETIME", false, None, 0),
+    schema_column("defer_until", "DATETIME", false, None, 0),
+    schema_column("external_ref", "TEXT", false, None, 0),
+    schema_column("source_system", "TEXT", false, Some("''"), 0),
+    schema_column("source_repo", "TEXT", true, Some("'.'"), 0),
+    schema_column("deleted_at", "DATETIME", false, None, 0),
+    schema_column("deleted_by", "TEXT", false, Some("''"), 0),
+    schema_column("delete_reason", "TEXT", false, Some("''"), 0),
+    schema_column("original_type", "TEXT", false, Some("''"), 0),
+    schema_column("compaction_level", "INTEGER", false, Some("0"), 0),
+    schema_column("compacted_at", "DATETIME", false, None, 0),
+    schema_column("compacted_at_commit", "TEXT", false, None, 0),
+    schema_column("original_size", "INTEGER", false, None, 0),
+    schema_column("sender", "TEXT", false, Some("''"), 0),
+    schema_column("ephemeral", "INTEGER", true, Some("0"), 0),
+    schema_column("pinned", "INTEGER", true, Some("0"), 0),
+    schema_column("is_template", "INTEGER", true, Some("0"), 0),
+    schema_column("source_repo_path", "TEXT", false, None, 0),
+    schema_column("agent_context", "TEXT", false, None, 0),
+];
+
+const DEPENDENCIES_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
+    schema_column("issue_id", "TEXT", true, None, 1),
+    schema_column("depends_on_id", "TEXT", true, None, 2),
+    schema_column("type", "TEXT", true, Some("'blocks'"), 0),
+    schema_column(
+        "created_at",
+        "DATETIME",
+        true,
+        Some("CURRENT_TIMESTAMP"),
+        0,
+    ),
+    schema_column("created_by", "TEXT", true, Some("''"), 0),
+    schema_column("metadata", "TEXT", false, Some("'{}'"), 0),
+    schema_column("thread_id", "TEXT", false, Some("''"), 0),
+];
+
+const LABELS_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
+    schema_column("issue_id", "TEXT", true, None, 1),
+    schema_column("label", "TEXT", true, None, 2),
+];
+
+const COMMENTS_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
+    schema_column("id", "INTEGER", false, None, 1),
+    schema_column("issue_id", "TEXT", true, None, 0),
+    schema_column("author", "TEXT", true, None, 0),
+    schema_column("text", "TEXT", true, None, 0),
+    schema_column(
+        "created_at",
+        "DATETIME",
+        true,
+        Some("CURRENT_TIMESTAMP"),
+        0,
+    ),
+];
+
+const EVENTS_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
+    schema_column("id", "INTEGER", false, None, 1),
+    schema_column("issue_id", "TEXT", true, None, 0),
+    schema_column("event_type", "TEXT", true, None, 0),
+    schema_column("actor", "TEXT", true, Some("''"), 0),
+    schema_column("old_value", "TEXT", false, None, 0),
+    schema_column("new_value", "TEXT", false, None, 0),
+    schema_column("comment", "TEXT", false, None, 0),
+    schema_column(
+        "created_at",
+        "DATETIME",
+        true,
+        Some("CURRENT_TIMESTAMP"),
+        0,
+    ),
+    schema_column("agent_name", "TEXT", false, None, 0),
+    schema_column("harness", "TEXT", false, None, 0),
+    schema_column("model", "TEXT", false, None, 0),
+];
+
+const CONFIG_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
+    schema_column("key", "TEXT", true, None, 0),
+    schema_column("value", "TEXT", true, None, 0),
+];
+const METADATA_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = CONFIG_RUNTIME_COLUMNS;
+const DIRTY_ISSUES_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
+    schema_column("issue_id", "TEXT", false, None, 1),
+    schema_column(
+        "marked_at",
+        "DATETIME",
+        true,
+        Some("CURRENT_TIMESTAMP"),
+        0,
+    ),
+];
+const EXPORT_HASHES_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
+    schema_column("issue_id", "TEXT", false, None, 1),
+    schema_column("content_hash", "TEXT", true, None, 0),
+    schema_column(
+        "exported_at",
+        "DATETIME",
+        true,
+        Some("CURRENT_TIMESTAMP"),
+        0,
+    ),
+];
+const BLOCKED_CACHE_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
+    schema_column("issue_id", "TEXT", false, None, 1),
+    schema_column("blocked_by", "TEXT", true, None, 0),
+    schema_column(
+        "blocked_at",
+        "DATETIME",
+        true,
+        Some("CURRENT_TIMESTAMP"),
+        0,
+    ),
+];
+const CHILD_COUNTERS_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
+    schema_column("parent_id", "TEXT", false, None, 1),
+    schema_column("last_child", "INTEGER", true, Some("0"), 0),
+];
+
+const ISSUES_RUNTIME_INDEXES: &[ExpectedRuntimeIndex] = &[
+    runtime_index("idx_issues_status", &["status"], false, false),
+    runtime_index("idx_issues_priority", &["priority"], false, false),
+    runtime_index("idx_issues_issue_type", &["issue_type"], false, false),
+    runtime_index("idx_issues_assignee", &["assignee"], false, true),
+    runtime_index("idx_issues_created_at", &["created_at"], false, false),
+    runtime_index("idx_issues_updated_at", &["updated_at"], false, false),
+    runtime_index(
+        "idx_issues_content_hash",
+        &["content_hash"],
+        false,
+        false,
+    ),
+    runtime_index(
+        "idx_issues_external_ref_unique",
+        &["external_ref"],
+        true,
+        true,
+    ),
+    runtime_index("idx_issues_ephemeral", &["ephemeral"], false, true),
+    runtime_index("idx_issues_pinned", &["pinned"], false, true),
+    runtime_index("idx_issues_tombstone", &["status"], false, true),
+    runtime_index("idx_issues_due_at", &["due_at"], false, true),
+    runtime_index("idx_issues_defer_until", &["defer_until"], false, true),
+    runtime_index(
+        "idx_issues_ready",
+        &["status", "priority", "created_at"],
+        false,
+        true,
+    ),
+    runtime_index(
+        "idx_issues_status_priority_created",
+        &["status", "priority", "created_at"],
+        false,
+        false,
+    ),
+    runtime_index(
+        "idx_issues_list_active_order",
+        &["priority", "created_at"],
+        false,
+        true,
+    ),
+];
+
+const DEPENDENCIES_RUNTIME_INDEXES: &[ExpectedRuntimeIndex] = &[
+    runtime_index("idx_dependencies_issue", &["issue_id"], false, false),
+    runtime_index(
+        "idx_dependencies_depends_on",
+        &["depends_on_id"],
+        false,
+        false,
+    ),
+    runtime_index("idx_dependencies_type", &["type"], false, false),
+    runtime_index(
+        "idx_dependencies_depends_on_type",
+        &["depends_on_id", "type"],
+        false,
+        false,
+    ),
+    runtime_index("idx_dependencies_thread", &["thread_id"], false, true),
+    runtime_index(
+        "idx_dependencies_blocking",
+        &["depends_on_id", "issue_id"],
+        false,
+        true,
+    ),
+];
+const LABELS_RUNTIME_INDEXES: &[ExpectedRuntimeIndex] = &[
+    runtime_index("idx_labels_label", &["label"], false, false),
+    runtime_index("idx_labels_issue", &["issue_id"], false, false),
+];
+const COMMENTS_RUNTIME_INDEXES: &[ExpectedRuntimeIndex] = &[
+    runtime_index("idx_comments_issue", &["issue_id"], false, false),
+    runtime_index(
+        "idx_comments_created_at",
+        &["created_at"],
+        false,
+        false,
+    ),
+];
+const EVENTS_RUNTIME_INDEXES: &[ExpectedRuntimeIndex] = &[
+    runtime_index("idx_events_issue", &["issue_id"], false, false),
+    runtime_index("idx_events_type", &["event_type"], false, false),
+    runtime_index("idx_events_created_at", &["created_at"], false, false),
+    runtime_index("idx_events_actor", &["actor"], false, true),
+];
+const CONFIG_RUNTIME_INDEXES: &[ExpectedRuntimeIndex] =
+    &[runtime_index("idx_config_key", &["key"], false, false)];
+const METADATA_RUNTIME_INDEXES: &[ExpectedRuntimeIndex] =
+    &[runtime_index("idx_metadata_key", &["key"], false, false)];
+const DIRTY_ISSUES_RUNTIME_INDEXES: &[ExpectedRuntimeIndex] = &[runtime_index(
+    "idx_dirty_issues_marked_at",
+    &["marked_at"],
+    false,
+    false,
+)];
+const BLOCKED_CACHE_RUNTIME_INDEXES: &[ExpectedRuntimeIndex] = &[runtime_index(
+    "idx_blocked_cache_blocked_at",
+    &["blocked_at"],
+    false,
+    false,
+)];
+
 // Complete runtime column manifests for auxiliary tables. `Some(definition)`
 // marks a column SQLite can add without inventing audit data or installing an
 // incorrect non-constant default. `None` means a malformed existing table must
@@ -1240,11 +1524,13 @@ const CLOSE_METADATA_INDEXES: &[ExpectedRuntimeIndex] = &[
     ExpectedRuntimeIndex {
         name: "idx_close_metadata_recorded_at",
         columns: &["recorded_at"],
+        unique: false,
         partial: false,
     },
     ExpectedRuntimeIndex {
         name: "idx_close_metadata_bypassed",
         columns: &["bypassed_policy"],
+        unique: false,
         partial: true,
     },
 ];
@@ -1275,6 +1561,7 @@ const GATE_RESULTS_COLUMNS: &[AuxiliaryRuntimeColumn] = &[
 const GATE_RESULTS_INDEXES: &[ExpectedRuntimeIndex] = &[ExpectedRuntimeIndex {
     name: "idx_gate_results_issue",
     columns: &["issue_id"],
+    unique: false,
     partial: false,
 }];
 
@@ -1301,6 +1588,7 @@ const CAPACITY_EXEMPTION_COLUMNS: &[AuxiliaryRuntimeColumn] = &[
 const CAPACITY_EXEMPTION_INDEXES: &[ExpectedRuntimeIndex] = &[ExpectedRuntimeIndex {
     name: "idx_capacity_exemptions_capacity",
     columns: &["capacity_kind", "capacity_name"],
+    unique: false,
     partial: false,
 }];
 
@@ -1326,6 +1614,7 @@ const CAPACITY_EXEMPTION_HISTORY_COLUMNS: &[AuxiliaryRuntimeColumn] = &[
 const CAPACITY_EXEMPTION_HISTORY_INDEXES: &[ExpectedRuntimeIndex] = &[ExpectedRuntimeIndex {
     name: "idx_capacity_exemption_history_issue",
     columns: &["issue_id", "id"],
+    unique: false,
     partial: false,
 }];
 
@@ -1348,16 +1637,19 @@ const CAPACITY_OCCUPANCY_INDEXES: &[ExpectedRuntimeIndex] = &[
     ExpectedRuntimeIndex {
         name: "idx_capacity_occupancy_actor",
         columns: &["actor"],
+        unique: false,
         partial: true,
     },
     ExpectedRuntimeIndex {
         name: "idx_capacity_occupancy_harness",
         columns: &["harness"],
+        unique: false,
         partial: true,
     },
     ExpectedRuntimeIndex {
         name: "idx_capacity_occupancy_session",
         columns: &["session"],
+        unique: false,
         partial: true,
     },
 ];
@@ -1512,16 +1804,17 @@ fn auxiliary_runtime_indexes_canonical(
         else {
             return false;
         };
-        let explicit_non_unique = index_row.get(2).and_then(SqliteValue::as_integer) == Some(0)
-            && index_row
-                .get(3)
-                .and_then(SqliteValue::as_text)
-                .is_some_and(|value| value.eq_ignore_ascii_case("c"));
+        let uniqueness_matches = index_row.get(2).and_then(SqliteValue::as_integer)
+            == Some(i64::from(expected.unique));
+        let explicitly_created = index_row
+            .get(3)
+            .and_then(SqliteValue::as_text)
+            .is_some_and(|value| value.eq_ignore_ascii_case("c"));
         let partial = index_row
             .get(4)
             .and_then(SqliteValue::as_integer)
             .is_some_and(|value| value != 0);
-        if !explicit_non_unique || partial != expected.partial {
+        if !uniqueness_matches || !explicitly_created || partial != expected.partial {
             return false;
         }
 
@@ -1548,6 +1841,147 @@ fn auxiliary_runtime_table_canonical(
     auxiliary_runtime_columns_canonical(conn, table, columns)
         && auxiliary_runtime_issue_foreign_key_canonical(conn, table)
         && auxiliary_runtime_indexes_canonical(conn, table, indexes)
+}
+
+fn core_runtime_default_matches(
+    table: &str,
+    column: &str,
+    actual: Option<&str>,
+    expected: Option<&str>,
+) -> bool {
+    sql_default_matches(actual, expected)
+        || matches!(
+            (table, column, actual, expected),
+            (
+                "comments",
+                "author" | "text",
+                Some("''"),
+                None
+            ) | ("events", "event_type", Some("''"), None)
+        )
+}
+
+fn core_runtime_columns_canonical(
+    conn: &Connection,
+    table: &str,
+    columns: &[ExpectedSchemaColumn],
+    order_sensitive: bool,
+) -> bool {
+    let escaped_table = table.replace('\'', "''");
+    let Ok(rows) = conn.query(&format!("PRAGMA table_info('{escaped_table}')")) else {
+        return false;
+    };
+    if rows.len() != columns.len() {
+        return false;
+    }
+
+    columns.iter().enumerate().all(|(position, expected)| {
+        let matches = |row: &Vec<SqliteValue>| {
+            let name = row.get(1).and_then(SqliteValue::as_text);
+            let data_type = row.get(2).and_then(SqliteValue::as_text);
+            let not_null = row
+                .get(3)
+                .and_then(SqliteValue::as_integer)
+                .is_some_and(|value| value != 0);
+            let default_value = row.get(4).and_then(SqliteValue::as_text);
+            let primary_key_position = row.get(5).and_then(SqliteValue::as_integer);
+            name == Some(expected.name)
+                && data_type.is_some_and(|value| value.eq_ignore_ascii_case(expected.data_type))
+                && not_null == expected.not_null
+                && core_runtime_default_matches(
+                    table,
+                    expected.name,
+                    default_value,
+                    expected.default_value,
+                )
+                && primary_key_position == Some(expected.primary_key_position)
+        };
+        if order_sensitive {
+            rows.get(position).is_some_and(matches)
+        } else {
+            rows.iter().any(matches)
+        }
+    })
+}
+
+fn core_runtime_foreign_keys_canonical(
+    conn: &Connection,
+    table: &str,
+    issue_reference_columns: &[&str],
+) -> bool {
+    let escaped_table = table.replace('\'', "''");
+    let Ok(rows) = conn.query(&format!("PRAGMA foreign_key_list('{escaped_table}')")) else {
+        return false;
+    };
+    rows.len() == issue_reference_columns.len()
+        && rows
+            .iter()
+            .zip(issue_reference_columns)
+            .enumerate()
+            .all(|(sequence, (row, from))| {
+                row.get(1).and_then(SqliteValue::as_integer)
+                    == i64::try_from(sequence).ok()
+                    && row.get(2).and_then(SqliteValue::as_text) == Some("issues")
+                    && row.get(3).and_then(SqliteValue::as_text) == Some(*from)
+                    && row.get(4).and_then(SqliteValue::as_text) == Some("id")
+                    && row
+                        .get(5)
+                        .and_then(SqliteValue::as_text)
+                        .is_some_and(|value| value.eq_ignore_ascii_case("NO ACTION"))
+                    && row
+                        .get(6)
+                        .and_then(SqliteValue::as_text)
+                        .is_some_and(|value| value.eq_ignore_ascii_case("CASCADE"))
+            })
+}
+
+fn table_has_no_unique_indexes(conn: &Connection, table: &str) -> bool {
+    let escaped_table = table.replace('\'', "''");
+    conn.query(&format!("PRAGMA index_list('{escaped_table}')"))
+        .is_ok_and(|rows| {
+            rows.iter()
+                .all(|row| row.get(2).and_then(SqliteValue::as_integer) == Some(0))
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn core_runtime_table_canonical(
+    conn: &Connection,
+    table: &str,
+    columns: &[ExpectedSchemaColumn],
+    issue_reference_columns: &[&str],
+    indexes: &[ExpectedRuntimeIndex],
+    order_sensitive: bool,
+    autoincrement_primary_key: Option<&str>,
+    forbid_unique_indexes: bool,
+) -> bool {
+    core_runtime_columns_canonical(conn, table, columns, order_sensitive)
+        && core_runtime_foreign_keys_canonical(conn, table, issue_reference_columns)
+        && auxiliary_runtime_indexes_canonical(conn, table, indexes)
+        && autoincrement_primary_key
+            .is_none_or(|column| table_declares_autoincrement_primary_key(conn, table, column))
+        && (!forbid_unique_indexes || table_has_no_unique_indexes(conn, table))
+}
+
+fn issues_required_checks_canonical(conn: &Connection) -> bool {
+    let Ok(row) = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'issues'",
+    ) else {
+        return false;
+    };
+    let Some(sql) = row.get(0).and_then(SqliteValue::as_text) else {
+        return false;
+    };
+    let normalized = sql
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    normalized.contains("check(length(title) <= 500)")
+        && normalized.contains("check(priority >= 0 and priority <= 4)")
+        && normalized.contains("status = 'closed' and closed_at is not null")
+        && normalized.contains("status = 'tombstone'")
+        && normalized.contains("status not in ('closed', 'tombstone') and closed_at is null")
 }
 
 fn table_has_columns(conn: &Connection, table: &str, required_columns: &[&str]) -> bool {
@@ -1603,7 +2037,7 @@ fn current_schema_version_declared(conn: &Connection) -> bool {
     conn.query_row("PRAGMA user_version")
         .ok()
         .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
-        .is_some_and(|version| version >= i64::from(CURRENT_SCHEMA_VERSION))
+        .is_some_and(|version| version == i64::from(CURRENT_SCHEMA_VERSION))
 }
 
 fn core_runtime_tables_exist(conn: &Connection) -> bool {
@@ -2090,35 +2524,116 @@ fn run_pre_schema_migrations(conn: &Connection) -> Result<bool> {
 
 pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
     let version_ok = current_schema_version_declared(conn);
-    let core_tables_ok = core_runtime_tables_exist(conn);
-    let issues_ok = issues_column_order_matches(conn);
-    let dependencies_ok = table_has_columns(conn, "dependencies", &["issue_id", "depends_on_id"])
-        && DEPENDENCY_COLUMNS
-            .iter()
-            .all(|(name, _)| column_exists(conn, "dependencies", name));
-    let labels_ok = table_has_columns(conn, "labels", &["issue_id", "label"]);
-    let comments_ok = table_has_columns(conn, "comments", &["id", "issue_id"])
-        && COMMENT_COLUMNS
-            .iter()
-            .all(|(name, _)| column_exists(conn, "comments", name));
-    let events_ok = table_has_columns(conn, "events", &["id", "issue_id"])
-        && EVENT_COLUMNS
-            .iter()
-            .all(|(name, _)| column_exists(conn, "events", name));
-    let config_ok = table_has_columns(conn, "config", &["key", "value"])
-        && index_exists(conn, "idx_config_key")
-        && !kv_table_uses_primary_key(conn, "config");
-    let metadata_ok = table_has_columns(conn, "metadata", &["key", "value"])
-        && index_exists(conn, "idx_metadata_key")
-        && !kv_table_uses_primary_key(conn, "metadata");
-    let dirty_issues_ok = table_has_columns(conn, "dirty_issues", &["issue_id", "marked_at"]);
-    let export_hashes_ok = table_has_columns(
+    let issues_ok = core_runtime_table_canonical(
+        conn,
+        "issues",
+        ISSUES_RUNTIME_COLUMNS,
+        &[],
+        ISSUES_RUNTIME_INDEXES,
+        true,
+        None,
+        false,
+    ) && issues_required_checks_canonical(conn);
+    let dependencies_ok = core_runtime_table_canonical(
+        conn,
+        "dependencies",
+        DEPENDENCIES_RUNTIME_COLUMNS,
+        &["issue_id"],
+        DEPENDENCIES_RUNTIME_INDEXES,
+        false,
+        None,
+        false,
+    );
+    let labels_ok = core_runtime_table_canonical(
+        conn,
+        "labels",
+        LABELS_RUNTIME_COLUMNS,
+        &["issue_id"],
+        LABELS_RUNTIME_INDEXES,
+        false,
+        None,
+        false,
+    );
+    let comments_ok = core_runtime_table_canonical(
+        conn,
+        "comments",
+        COMMENTS_RUNTIME_COLUMNS,
+        &["issue_id"],
+        COMMENTS_RUNTIME_INDEXES,
+        false,
+        Some("id"),
+        false,
+    );
+    let events_ok = core_runtime_table_canonical(
+        conn,
+        "events",
+        EVENTS_RUNTIME_COLUMNS,
+        &["issue_id"],
+        EVENTS_RUNTIME_INDEXES,
+        false,
+        Some("id"),
+        false,
+    );
+    let config_ok = core_runtime_table_canonical(
+        conn,
+        "config",
+        CONFIG_RUNTIME_COLUMNS,
+        &[],
+        CONFIG_RUNTIME_INDEXES,
+        false,
+        None,
+        true,
+    );
+    let metadata_ok = core_runtime_table_canonical(
+        conn,
+        "metadata",
+        METADATA_RUNTIME_COLUMNS,
+        &[],
+        METADATA_RUNTIME_INDEXES,
+        false,
+        None,
+        true,
+    );
+    let dirty_issues_ok = core_runtime_table_canonical(
+        conn,
+        "dirty_issues",
+        DIRTY_ISSUES_RUNTIME_COLUMNS,
+        &["issue_id"],
+        DIRTY_ISSUES_RUNTIME_INDEXES,
+        false,
+        None,
+        false,
+    );
+    let export_hashes_ok = core_runtime_table_canonical(
         conn,
         "export_hashes",
-        &["issue_id", "content_hash", "exported_at"],
+        EXPORT_HASHES_RUNTIME_COLUMNS,
+        &["issue_id"],
+        &[],
+        false,
+        None,
+        false,
     );
-    let blocked_cache_ok = blocked_cache_table_canonical(conn);
-    let child_counters_ok = table_has_columns(conn, "child_counters", &["parent_id", "last_child"]);
+    let blocked_cache_ok = core_runtime_table_canonical(
+        conn,
+        "blocked_issues_cache",
+        BLOCKED_CACHE_RUNTIME_COLUMNS,
+        &["issue_id"],
+        BLOCKED_CACHE_RUNTIME_INDEXES,
+        false,
+        None,
+        false,
+    );
+    let child_counters_ok = core_runtime_table_canonical(
+        conn,
+        "child_counters",
+        CHILD_COUNTERS_RUNTIME_COLUMNS,
+        &["parent_id"],
+        &[],
+        false,
+        None,
+        false,
+    );
     let close_metadata_ok = auxiliary_runtime_table_canonical(
         conn,
         "close_metadata",
@@ -2158,12 +2673,7 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
     );
     let capacity_ok =
         capacity_exemptions_ok && capacity_exemption_history_ok && capacity_occupancy_ok;
-    let indexes_ok = REQUIRED_RUNTIME_INDEXES
-        .iter()
-        .all(|index| index_exists(conn, index));
-
     let compatible = version_ok
-        && core_tables_ok
         && issues_ok
         && dependencies_ok
         && labels_ok
@@ -2178,13 +2688,11 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
         && close_metadata_ok
         && gate_results_ok
         && gate_history_ok
-        && capacity_ok
-        && indexes_ok;
+        && capacity_ok;
 
     if !compatible {
         tracing::debug!(
             version_ok,
-            core_tables_ok,
             issues_ok,
             dependencies_ok,
             labels_ok,
@@ -2203,7 +2711,6 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
             capacity_exemption_history_ok,
             capacity_occupancy_ok,
             capacity_ok,
-            indexes_ok,
             "runtime schema compatibility check failed"
         );
     }

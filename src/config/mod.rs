@@ -2030,6 +2030,49 @@ fn recovery_backup_verification(
     }
 }
 
+fn expected_recovery_artifact_fingerprint(
+    verification: &RecoveryBackupVerification,
+) -> RecoveryArtifactFingerprint {
+    RecoveryArtifactFingerprint {
+        kind: verification.kind.clone(),
+        size_bytes: verification.size_bytes,
+        sha256: verification.sha256.clone(),
+        symlink_target: verification.symlink_target.clone(),
+    }
+}
+
+fn verify_recovery_backup_set(backup_set: &RecoveryBackupSet) -> Result<()> {
+    if backup_set.files.len() != backup_set.verified_files.len() {
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "Verified backup manifest in '{}' is incomplete",
+                backup_set.recovery_dir.display()
+            ),
+        });
+    }
+    for ((original, backup), verification) in backup_set
+        .files
+        .iter()
+        .zip(&backup_set.verified_files)
+    {
+        if verification.original != original.display().to_string()
+            || verification.backup != backup.display().to_string()
+        {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Verified backup manifest in '{}' does not match its recovery paths",
+                    backup_set.recovery_dir.display()
+                ),
+            });
+        }
+        verify_recovery_backup_artifact(
+            backup,
+            &expected_recovery_artifact_fingerprint(verification),
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MissingRenameSourcePolicy {
     Skip,
@@ -3676,64 +3719,13 @@ impl OpenStorageResult {
                     .to_string(),
             }
         })?);
-        if backup_set.files.len() != backup_set.verified_files.len() {
-            return Err(BeadsError::SyncConflict {
-                message: format!(
-                    "Refusing deferred recovery rollback because the verified backup manifest in '{}' is incomplete; the live database was left untouched",
-                    backup_set.recovery_dir.display()
-                ),
-            });
-        }
-        for ((original, backup), verification) in
-            backup_set.files.iter().zip(&backup_set.verified_files)
-        {
-            if verification.original != original.display().to_string()
-                || verification.backup != backup.display().to_string()
-            {
-                return Err(BeadsError::SyncConflict {
-                    message: format!(
-                        "Refusing deferred recovery rollback because the verified backup manifest in '{}' does not match its recovery paths; the live database was left untouched",
-                        backup_set.recovery_dir.display()
-                    ),
-                });
-            }
-            match fs::symlink_metadata(backup) {
-                Ok(_) => {
-                    let expected = RecoveryArtifactFingerprint {
-                        kind: verification.kind.clone(),
-                        size_bytes: verification.size_bytes,
-                        sha256: verification.sha256.clone(),
-                        symlink_target: verification.symlink_target.clone(),
-                    };
-                    verify_recovery_backup_artifact(backup, &expected).map_err(|error| {
-                        BeadsError::WithContext {
-                            context: format!(
-                                "Refusing deferred recovery rollback because a verified backup in '{}' changed; the live database was left untouched",
-                                backup_set.recovery_dir.display()
-                            ),
-                            source: Box::new(error),
-                        }
-                    })?;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(BeadsError::SyncConflict {
-                        message: format!(
-                            "Refusing deferred recovery rollback because an expected verified backup is missing from '{}'; the live database was left untouched",
-                            backup_set.recovery_dir.display()
-                        ),
-                    });
-                }
-                Err(error) => {
-                    return Err(BeadsError::WithContext {
-                        context: format!(
-                            "Could not inspect a deferred recovery backup in '{}'",
-                            backup_set.recovery_dir.display()
-                        ),
-                        source: Box::new(error),
-                    });
-                }
-            }
-        }
+        verify_recovery_backup_set(&backup_set).map_err(|error| BeadsError::WithContext {
+            context: format!(
+                "Refusing deferred recovery rollback because its verified backup set in '{}' is incomplete or changed; the live database was left untouched",
+                backup_set.recovery_dir.display()
+            ),
+            source: Box::new(error),
+        })?;
         if write_authority.database_target_authority_state()?
             != crate::sync::DatabaseTargetAuthorityState::Held
         {
