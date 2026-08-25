@@ -16535,13 +16535,14 @@ fn checked_database_header_user_version(path: &Path) -> Result<Option<u32>> {
     ])))
 }
 
+#[cfg(test)]
 fn database_header_user_version(path: &Path) -> Option<u32> {
     checked_database_header_user_version(path).ok().flatten()
 }
 
 /// Read `PRAGMA user_version` through an open connection (issue #373).
 ///
-/// Unlike [`database_header_user_version`], which peeks raw file-header bytes,
+/// Unlike raw file-header inspection, which sees only checkpointed bytes,
 /// this observes the *effective* schema version — including a value that lives
 /// only in an uncheckpointed WAL written by another process. Relying on the
 /// header alone can make a current database read as stale (header still at the

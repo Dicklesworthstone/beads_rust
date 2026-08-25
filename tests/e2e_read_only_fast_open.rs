@@ -11,6 +11,7 @@ use common::cli::{BrRun, BrWorkspace, parse_created_id, run_br, run_br_with_env}
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -325,6 +326,15 @@ struct RegularFileEvidence {
     unix_mode: u32,
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
 fn regular_file_evidence(root: &Path) -> BTreeMap<String, RegularFileEvidence> {
     let mut evidence = BTreeMap::new();
     for entry in WalkDir::new(root).sort_by_file_name() {
@@ -357,7 +367,7 @@ fn regular_file_evidence(root: &Path) -> BTreeMap<String, RegularFileEvidence> {
             relative,
             RegularFileEvidence {
                 size_bytes: bytes.len(),
-                sha256: format!("{:x}", Sha256::digest(&bytes)),
+                sha256: sha256_hex(&bytes),
                 readonly: metadata.permissions().readonly(),
                 #[cfg(unix)]
                 unix_mode: metadata.permissions().mode(),

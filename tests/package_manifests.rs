@@ -375,14 +375,15 @@ fn test_source_install_documentation_uses_locked_resolution() {
 
 /// Test that all package manifests carry a version no newer than Cargo.toml.
 ///
-/// The `update-package-manifests.yml` workflow rewrites every packaging
-/// manifest (Homebrew, Scoop, AUR) after a release is published, driven by
-/// the release tag and the checksums attached to the release.  During
-/// development Cargo.toml is bumped ahead of the manifests: the manifests
-/// catch up only once a tagged release has been built and CI has rewritten
-/// them.  This test therefore asserts "manifest version parses and is not
-/// ahead of Cargo.toml" rather than requiring exact equality, which would
-/// otherwise fail on every pre-release commit.
+/// The manually dispatched `update-package-manifests.yml` workflow rewrites
+/// every checksummed packaging manifest (Homebrew, Scoop, AUR) after a release
+/// is published, driven by its tag and attached checksums. A release created
+/// with `GITHUB_TOKEN` cannot recursively trigger that workflow, so this is an
+/// explicit post-publication step. During development Cargo.toml is bumped
+/// ahead of the manifests; they catch up only after the tagged assets exist.
+/// This test therefore asserts "manifest version parses and is not ahead of
+/// Cargo.toml" rather than requiring exact equality, which would otherwise
+/// fail on every pre-release commit.
 #[test]
 fn test_version_consistency() -> Result<(), String> {
     fn parse_version(raw: &str, source: &str) -> Result<semver::Version, String> {
