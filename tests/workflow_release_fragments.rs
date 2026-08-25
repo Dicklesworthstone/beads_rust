@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 
 const RELEASE_WORKFLOW: &str = ".github/workflows/release.yml";
 const README: &str = "README.md";
+const RUST_TOOLCHAIN_MANIFEST: &str = "rust-toolchain.toml";
 const CURRENT_MINISIGN_PUBLIC_KEY: &str =
     "RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB";
 const PREVIOUS_MINISIGN_PUBLIC_KEY: &str =
@@ -52,6 +53,7 @@ struct Step {
 struct ActionInputs {
     #[serde(rename = "ref")]
     checkout_ref: Option<String>,
+    toolchain: Option<String>,
 }
 
 struct ShellOutput {
@@ -138,6 +140,60 @@ fn release_workflow_checkout_refs_are_unambiguous() -> Result<(), String> {
             "expected five release checkout steps, found {checkout_steps}"
         ))
     }
+}
+
+#[test]
+fn release_workflow_uses_the_pinned_toolchain_and_lockfile() -> Result<(), String> {
+    let workflow = parse_release_workflow()?;
+    let toolchain_manifest = read_to_string(Path::new(RUST_TOOLCHAIN_MANIFEST))?;
+    let toolchain: toml::Value = toml::from_str(&toolchain_manifest)
+        .map_err(|error| format!("failed to parse {RUST_TOOLCHAIN_MANIFEST}: {error}"))?;
+    let pinned_channel = toolchain
+        .get("toolchain")
+        .and_then(|value| value.get("channel"))
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| format!("{RUST_TOOLCHAIN_MANIFEST} is missing toolchain.channel"))?;
+
+    let toolchain_steps: Vec<&Step> = workflow
+        .jobs
+        .values()
+        .flat_map(|job| &job.steps)
+        .filter(|step| {
+            step.uses
+                .as_deref()
+                .is_some_and(|action| action.starts_with("dtolnay/rust-toolchain@"))
+        })
+        .collect();
+    if toolchain_steps.len() != 3 {
+        return Err(format!(
+            "expected three Rust toolchain steps, found {}",
+            toolchain_steps.len()
+        ));
+    }
+    for step in toolchain_steps {
+        let configured = step
+            .action_inputs
+            .as_ref()
+            .and_then(|inputs| inputs.toolchain.as_deref());
+        if configured != Some(pinned_channel) {
+            return Err(format!(
+                "release toolchain must match {RUST_TOOLCHAIN_MANIFEST}: expected {pinned_channel:?}, found {configured:?}"
+            ));
+        }
+    }
+
+    for step_name in [
+        "Failure-corpus replay and doctor/recovery postconditions",
+        "Crash-injection sync matrix",
+        "Long-lived single-workspace stress",
+        "Concurrent command-family integrity stress",
+        "Build release binary",
+    ] {
+        require_contains(&release_step_script(step_name)?, "cargo ")?;
+        require_contains(&release_step_script(step_name)?, "--locked")?;
+    }
+
+    Ok(())
 }
 
 #[test]

@@ -97,7 +97,7 @@ jobs:
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-08-20
 
       - name: Cache cargo
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
@@ -105,20 +105,20 @@ jobs:
 
       - name: Failure-corpus replay and doctor/recovery postconditions
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
-        run: cargo test --test workspace_failure_replay -- --nocapture
+        run: cargo test --locked --test workspace_failure_replay -- --nocapture
         env:
           RUST_LOG: beads_rust=debug
 
       - name: Crash-injection sync matrix
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
-        run: cargo test --test e2e_sync_failure_injection -- --nocapture
+        run: cargo test --locked --test e2e_sync_failure_injection -- --nocapture
         env:
           HARNESS_ARTIFACTS: 1
           NO_COLOR: 1
 
       - name: Long-lived single-workspace stress
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
-        run: cargo test --test e2e_workspace_scenarios scenario_long_lived_single_workspace_stress_suite -- --nocapture
+        run: cargo test --locked --test e2e_workspace_scenarios scenario_long_lived_single_workspace_stress_suite -- --nocapture
         env:
           BR_LONG_STRESS_ITERATIONS: 8
           HARNESS_ARTIFACTS: 1
@@ -126,7 +126,7 @@ jobs:
 
       - name: Concurrent command-family integrity stress
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
-        run: cargo test --test e2e_concurrency e2e_interleaved_command_families_preserve_workspace_integrity -- --nocapture
+        run: cargo test --locked --test e2e_concurrency e2e_interleaved_command_families_preserve_workspace_integrity -- --nocapture
         env:
           HARNESS_ARTIFACTS: 1
           NO_COLOR: 1
@@ -224,7 +224,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-08-20
           targets: ${{ matrix.target }}
 
       - name: Ensure target is installed
@@ -273,7 +273,7 @@ jobs:
           key: release-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} --features self_update
+        run: cargo build --locked --release --target ${{ matrix.target }} --features self_update
         env:
           VERGEN_GIT_SHA: ${{ github.sha }}
           VERGEN_GIT_BRANCH: ${{ github.ref_name }}
@@ -667,7 +667,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-08-20
 
       - name: Publish to crates.io
         # `--locked` pins resolution to Cargo.lock; without it, a nightly-only
