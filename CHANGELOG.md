@@ -116,11 +116,21 @@ replacement, crash, and schema-drift races.
 - Every platform archive now contains the rider-bearing `LICENSE`. Release
   signing is fail-closed for all seven archives, including the Windows zip:
   the job requires the secret key, verifies each generated signature against
-  the current `RWS7nGFf...` trust anchor, and refuses release creation unless
-  every exact archive, checksum, and `.minisig` triplet is present and nonempty.
-  Generated release notes no longer advertise the retired unrecoverable key
+  the recoverable DSR key `RWTQoKUb...` (ID `36B847D11BA5A0D0`), and refuses
+  release creation unless every exact archive, checksum, and `.minisig`
+  triplet is present and nonempty. Raw v0.4.1 sidecars already used this key;
+  v0.5.0 unifies DSR and GitHub Actions on it and corrects the documentation
+  drift. `RWS7nGFf...` remains v0.4.0 history, while the older CI-era
+  `RWSp4vEO...` key is unrecoverable
   ([ada0b658](https://github.com/Dicklesworthstone/beads_rust/commit/ada0b658),
-  [78fc31a1](https://github.com/Dicklesworthstone/beads_rust/commit/78fc31a1)).
+  [78fc31a1](https://github.com/Dicklesworthstone/beads_rust/commit/78fc31a1),
+  [f64d9de2](https://github.com/Dicklesworthstone/beads_rust/commit/f64d9de2)).
+- Package-manager metadata no longer represents the custom rider as plain MIT:
+  Homebrew uses `:cannot_represent`, AUR uses
+  `LicenseRef-MIT-OpenAI-Anthropic-Rider`, Nix uses `licenses.unfree`, and Scoop
+  links the repository license. Homebrew, AUR, and Nix install the actual
+  rider-bearing file; Scoop receives it inside the release zip
+  ([f64d9de2](https://github.com/Dicklesworthstone/beads_rust/commit/f64d9de2)).
 - New inline and end-to-end counterexamples cover custom ready groups, scheduler
   label/assignee evidence, canonical-inode fast-open reprobes, config-route
   drift, future schemas in WAL, same-cookie version changes, runtime schema
