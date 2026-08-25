@@ -3000,25 +3000,37 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
     // cannot keep using a throwaway placeholder if reopening fails.
     drop(storage);
 
-    before_candidate_install()?;
+    if let Err(error) = replacement_lock.sync_all() {
+        remove_locked_compaction_candidate(write_authority, &replacement_lock, &temp_path);
+        return Err(BeadsError::WithContext {
+            context: format!(
+                "Failed to make compacted database candidate '{}' durable before installation",
+                temp_path.display()
+            ),
+            source: Box::new(error),
+        });
+    }
+    if let Err(error) = before_candidate_install() {
+        remove_locked_compaction_candidate(write_authority, &replacement_lock, &temp_path);
+        return Err(error);
+    }
 
-    // Claim the exact database generation retained by the write authority
-    // before installing the candidate. Both moves are atomic no-replace
-    // operations: a foreign generation that wins either namespace race is
-    // preserved, never overwritten by compaction.
-    let retained_path = db_path.with_file_name(format!(
-        ".{stem}.vacuum.{}.{}.retained",
+    // Move the complete live family aside before installing the compacted
+    // main file. Atomic no-replace renames plus the retained-inode check form
+    // an expected-authority exchange: a foreign generation that wins either
+    // namespace race is preserved rather than overwritten.
+    let recovery_parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let compaction_stamp = format!(
+        "vacuum-{}-{}",
         std::process::id(),
         Utc::now().format("%Y%m%d_%H%M%S_%f")
-    ));
-    let retained_database = match rename_existing_paths_no_replace(
-        std::iter::once((db_path.to_path_buf(), retained_path)),
-        "stage the database generation before compacted installation",
-        MissingRenameSourcePolicy::Error,
+    );
+    let retained_family = match move_database_family_to_recovery(
+        db_path,
+        recovery_parent,
+        &compaction_stamp,
     ) {
-        Ok(mut retained) => retained
-            .pop()
-            .expect("required database staging returns one path"),
+        Ok(backup_set) => backup_set,
         Err(stage_error) => {
             remove_locked_compaction_candidate(
                 write_authority,
@@ -3028,18 +3040,28 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
             return Err(stage_error);
         }
     };
-    if let Err(authority_error) =
-        write_authority.verify_staged_database_recovery_authority(&retained_database.1)
-    {
+    let staged_database = retained_family
+        .files
+        .iter()
+        .find_map(|(original, backup)| (original == db_path).then_some(backup));
+    let staged_verification = staged_database
+        .ok_or_else(|| BeadsError::SyncConflict {
+            message: "Compaction could not stage the retained database generation".to_string(),
+        })
+        .and_then(|staged| {
+            write_authority.verify_staged_database_recovery_authority(staged)
+        })
+        .and_then(|()| verify_recovery_backup_set(&retained_family));
+    if let Err(authority_error) = staged_verification {
         let rollback_result = rollback_renamed_paths_no_replace(
-            std::slice::from_ref(&retained_database),
-            "abort compacted database installation after the staged authority changed",
+            &retained_family.files,
+            "abort compacted database installation after staged-family verification failed",
         );
         remove_locked_compaction_candidate(write_authority, &replacement_lock, &temp_path);
         if let Err(rollback_error) = rollback_result {
             return Err(BeadsError::WithContext {
                 context: format!(
-                    "Compaction staged a foreign database generation ({authority_error}); restoring it without replacement also failed"
+                    "Compaction staged an unverified database family ({authority_error}); restoring it without replacement also failed"
                 ),
                 source: Box::new(rollback_error),
             });
@@ -3047,24 +3069,17 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
         return Err(authority_error);
     }
 
-    if let Err(err) = rename_recovery_path_no_replace(&temp_path, db_path) {
-        tracing::warn!(
-            error = %err,
-            temp_path = %temp_path.display(),
-            db_path = %db_path.display(),
-            retained_path = %retained_database.1.display(),
-            "Failed to atomically install compacted database without replacement"
-        );
+    if let Err(install_error) = rename_recovery_path_no_replace(&temp_path, db_path) {
         let rollback_result = rollback_renamed_paths_no_replace(
-            std::slice::from_ref(&retained_database),
-            "restore the retained database after compacted installation failed",
+            &retained_family.files,
+            "restore the retained database family after compacted installation failed",
         );
         remove_locked_compaction_candidate(write_authority, &replacement_lock, &temp_path);
         if let Err(rollback_error) = rollback_result {
             return Err(BeadsError::WithContext {
                 context: format!(
-                    "Failed to install the compacted database without replacement ({err}); retained the prior database at '{}' because its canonical path was no longer empty",
-                    retained_database.1.display()
+                    "Failed to install the compacted database without replacement ({install_error}); retained the prior family in '{}' because its canonical namespace was no longer empty",
+                    retained_family.recovery_dir.display()
                 ),
                 source: Box::new(rollback_error),
             });
@@ -3075,52 +3090,110 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
                 reopened.attach_write_authority(Arc::clone(write_authority));
                 Ok(reopened)
             })
-            .map_err(|reopen_err| BeadsError::WithContext {
+            .map_err(|reopen_error| BeadsError::WithContext {
                 context: format!(
-                    "Failed to reopen original database at '{}' after VACUUM INTO install failed ({err})",
-                    db_path.display()
+                    "Failed to reopen the retained database after compacted installation failed ({install_error})"
                 ),
-                source: Box::new(reopen_err),
+                source: Box::new(reopen_error),
             });
     }
-    write_authority.adopt_locked_database_replacement(replacement_lock)?;
-    write_authority.verify_database_authority()?;
-    if let Err(error) = crate::util::sync_rename_parent_directories(&temp_path, db_path) {
-        return Err(BeadsError::WithContext {
-            context: format!(
-                "Installed the compacted database at '{}' under retained inode authority, but failed to make the namespace replacement durable",
-                db_path.display()
-            ),
-            source: Box::new(error),
-        });
-    }
 
-    // Clean up the stale sidecars from the pre-compaction file. These
-    // describe a DIFFERENT file layout than the one we just installed, so
-    // leaving them in place can mislead the next open into a recovery
-    // attempt. Best-effort: if a sidecar can't be removed, log and
-    // continue — next open will still work because the compacted db_path
-    // header declares the canonical layout.
-    remove_db_sidecars(db_path);
-    // `rename` moved only the temp file itself, so the engine sidecars the
-    // VACUUM target accumulated are now orphans next to the installed
-    // database. Left behind they leak one pair of files per compaction and
-    // trip the sync path allowlist.
-    remove_db_sidecars(&temp_path);
-
-    reopen_storage(db_path, lock_timeout)
+    let post_install_result = write_authority
+        .adopt_locked_database_replacement(replacement_lock)
+        .and_then(|()| write_authority.verify_database_authority())
+        .and_then(|()| after_candidate_adoption())
+        .and_then(|()| sync_candidate_install(&temp_path, db_path))
+        .and_then(|()| {
+            // The pre-compaction sidecars are already retained with their main
+            // file. Only temp-family sidecars belong to the new candidate.
+            remove_db_sidecars(&temp_path);
+            reopen_storage(db_path, lock_timeout)
+        })
         .and_then(|mut reopened| {
             write_authority.verify_database_authority()?;
             reopened.attach_write_authority(Arc::clone(write_authority));
             Ok(reopened)
         })
-        .map_err(|err| BeadsError::WithContext {
+        .map_err(|error| BeadsError::WithContext {
             context: format!(
-                "Failed to reopen compacted database after VACUUM INTO at '{}'",
+                "Failed to reopen compacted database after VACUUM INTO or validate its installation at '{}'",
                 db_path.display()
             ),
-            source: Box::new(err),
-        })
+            source: Box::new(error),
+        });
+
+    match post_install_result {
+        Ok(reopened) => Ok(reopened),
+        Err(install_error) => {
+            if let Err(rollback_error) = rollback_compacted_database_install(
+                &retained_family,
+                write_authority,
+            ) {
+                return Err(BeadsError::WithContext {
+                    context: format!(
+                        "Compacted database installation failed ({install_error}); restoring the retained pre-compaction family also failed"
+                    ),
+                    source: Box::new(rollback_error),
+                });
+            }
+            Err(install_error)
+        }
+    }
+}
+
+fn remove_locked_compaction_candidate(
+    write_authority: &crate::sync::DatabaseFamilyWriteLock,
+    replacement_lock: &fs::File,
+    temp_path: &Path,
+) {
+    if let Err(error) = write_authority
+        .verify_locked_database_replacement_candidate(temp_path, replacement_lock)
+    {
+        tracing::warn!(
+            error = %error,
+            temp_path = %temp_path.display(),
+            "Refusing to remove a compaction candidate path that no longer names the locked candidate"
+        );
+        return;
+    }
+    if let Err(error) = fs::remove_file(temp_path) {
+        tracing::warn!(
+            error = %error,
+            temp_path = %temp_path.display(),
+            "Failed to remove an unused locked compaction candidate"
+        );
+    }
+    remove_db_sidecars(temp_path);
+}
+
+fn rollback_compacted_database_install(
+    retained_family: &RecoveryBackupSet,
+    write_authority: &crate::sync::DatabaseFamilyWriteLock,
+) -> Result<()> {
+    restore_database_family_after_failed_rebuild_before_live_staging(
+        retained_family,
+        || {
+            if write_authority.database_target_authority_state()?
+                == crate::sync::DatabaseTargetAuthorityState::Held
+            {
+                return Ok(());
+            }
+            Err(BeadsError::SyncConflict {
+                message: "Refusing compaction rollback because the installed database is no longer the retained candidate generation"
+                    .to_string(),
+            })
+        },
+        |staged_paths| {
+            verify_staged_database_recovery_authority(
+                retained_family,
+                staged_paths,
+                write_authority,
+                crate::sync::DatabaseTargetAuthorityState::Held,
+            )
+        },
+    )?;
+    write_authority.restore_nested_retained_database_inode_after_authorized_replace()?;
+    write_authority.verify_database_authority()
 }
 
 fn rebuild_database_family_with_backup<T, F>(
@@ -8805,6 +8878,11 @@ routing:
             &write_authority,
             |_, _| -> Result<SqliteStorage> {
                 Err(BeadsError::Config("simulated reopen failure".to_string()))
+            },
+            || Ok(()),
+            || Ok(()),
+            |from, to| {
+                crate::util::sync_rename_parent_directories(from, to).map_err(BeadsError::Io)
             },
         );
 
