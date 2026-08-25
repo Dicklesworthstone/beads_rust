@@ -290,6 +290,30 @@ fn test_cargo_metadata() {
     );
 }
 
+#[test]
+fn test_source_and_nix_manifests_preserve_custom_license_metadata() {
+    let pkgbuild_git = fs::read_to_string("packaging/aur/PKGBUILD-git")
+        .expect("Failed to read source AUR PKGBUILD");
+    assert!(
+        pkgbuild_git.contains("license=('LicenseRef-MIT-OpenAI-Anthropic-Rider')"),
+        "source PKGBUILD must use the custom rider LicenseRef"
+    );
+    assert!(
+        pkgbuild_git.contains("/usr/share/licenses/${pkgname}/LICENSE"),
+        "source PKGBUILD must install the rider-bearing license text"
+    );
+
+    let flake = fs::read_to_string("flake.nix").expect("Failed to read flake.nix");
+    assert!(
+        flake.contains("license = licenses.unfree;"),
+        "Nix metadata must not classify the rider-bearing license as MIT/free"
+    );
+    assert!(
+        flake.contains("$out/share/licenses/beads_rust/LICENSE"),
+        "Nix package must install the rider-bearing license text"
+    );
+}
+
 /// Source-install instructions must be unambiguous and use the validated lockfile.
 ///
 /// Without `--locked`, `cargo install` resolves a fresh dependency graph that
