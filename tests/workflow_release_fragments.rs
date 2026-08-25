@@ -323,7 +323,17 @@ fn verify_checksums_fragment_fails_on_corrupt_checksum() -> Result<(), String> {
 }
 
 #[test]
-fn signing_fragment_uses_private_ephemeral_key_file() -> Result<(), String> {
+fn linux_minisign_install_uses_authenticated_distribution_package() -> Result<(), String> {
+    let script = release_step_script("Install minisign (Linux)")?;
+
+    require_contains(&script, "sudo apt-get update")?;
+    require_contains(&script, "sudo apt-get install -y minisign")?;
+    require_not_contains(&script, "curl")?;
+    require_not_contains(&script, "tar xz")
+}
+
+#[test]
+fn signing_fragment_streams_the_private_key_without_persisting_it() -> Result<(), String> {
     let step_name = "Sign release archive with Ed25519";
     let script = release_step_script(step_name)?;
     let condition = release_step_condition(step_name)?;
@@ -335,14 +345,14 @@ fn signing_fragment_uses_private_ephemeral_key_file() -> Result<(), String> {
     }
 
     require_contains(&script, "MINISIGN_SECRET_KEY is required")?;
-    require_contains(&script, "mktemp")?;
-    require_contains(&script, "RUNNER_TEMP")?;
-    require_contains(&script, "chmod 600 \"$signing_key\"")?;
-    require_contains(&script, "trap 'rm -f \"$signing_key\"' EXIT")?;
-    require_contains(&script, "printf '%s\\n' \"$MINISIGN_SECRET_KEY\"")?;
-    require_contains(&script, "-s \"$signing_key\"")?;
+    require_contains(
+        &script,
+        "-s <(printf '%s\\n' \"$MINISIGN_SECRET_KEY\")",
+    )?;
     require_contains(&script, "if [ ! -s \"$signature\" ]")?;
-    require_not_contains(&script, "/tmp/minisign.key")?;
+    require_not_contains(&script, "mktemp")?;
+    require_not_contains(&script, "signing_key")?;
+    require_not_contains(&script, "rm -f")?;
     require_not_contains(&script, "echo \"$MINISIGN_SECRET_KEY\"")?;
 
     let fixture = WorkflowFixture::new()?;

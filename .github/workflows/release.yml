@@ -335,14 +335,8 @@ jobs:
       - name: Install minisign (Linux)
         if: runner.os == 'Linux'
         run: |
-          curl -sL https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-linux.tar.gz | tar xz
-          # Use architecture-appropriate binary (x86_64 or aarch64)
-          ARCH=$(uname -m)
-          if [[ "$ARCH" == "aarch64" ]] || [[ "$ARCH" == "arm64" ]]; then
-            sudo mv minisign-linux/aarch64/minisign /usr/local/bin/
-          else
-            sudo mv minisign-linux/x86_64/minisign /usr/local/bin/
-          fi
+          sudo apt-get update
+          sudo apt-get install -y minisign
 
       - name: Generate checksum (Linux)
         if: runner.os == 'Linux'
@@ -378,11 +372,9 @@ jobs:
           fi
           archive="br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }}"
           signature="${archive}.minisig"
-          signing_key="$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/minisign-key.XXXXXX")"
-          trap 'rm -f "$signing_key"' EXIT
-          chmod 600 "$signing_key"
-          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$signing_key"
-          minisign -Sm "$archive" -s "$signing_key" -t "br ${{ github.event.inputs.tag || github.ref_name }} ${{ matrix.name }}"
+          minisign -Sm "$archive" \
+            -s <(printf '%s\n' "$MINISIGN_SECRET_KEY") \
+            -t "br ${{ github.event.inputs.tag || github.ref_name }} ${{ matrix.name }}"
           if [ ! -s "$signature" ]; then
             echo "::error::minisign did not produce required signature: $signature"
             exit 1
