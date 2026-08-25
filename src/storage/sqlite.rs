@@ -1832,8 +1832,8 @@ impl SqliteStorage {
 
     #[cfg(test)]
     fn maybe_change_user_version_after_runtime_compatibility(conn: &Connection) -> Result<()> {
-        let version = CHANGE_USER_VERSION_AFTER_RUNTIME_COMPATIBILITY
-            .with(|pending| pending.replace(0));
+        let version =
+            CHANGE_USER_VERSION_AFTER_RUNTIME_COMPATIBILITY.with(|pending| pending.replace(0));
         if version != 0 {
             conn.execute(&format!("PRAGMA user_version = {version}"))?;
         }
@@ -15964,13 +15964,12 @@ impl StableSchemaSource {
 
     fn verify_path(&self, path: &Path, description: &str) -> Result<()> {
         let handle_metadata = self.file.metadata()?;
-        let path_metadata = std::fs::symlink_metadata(path).map_err(|error| {
-            BeadsError::SyncConflict {
+        let path_metadata =
+            std::fs::symlink_metadata(path).map_err(|error| BeadsError::SyncConflict {
                 message: format!(
                     "{description} changed while its schema preflight was being verified: {error}"
                 ),
-            }
-        })?;
+            })?;
         if !handle_metadata.is_file()
             || handle_metadata.len() != self.initial_len
             || path_metadata.file_type().is_symlink()
@@ -16026,12 +16025,7 @@ struct WalSchemaPreflight {
     has_committed_frames: bool,
 }
 
-fn wal_checksum(
-    bytes: &[u8],
-    mut s1: u32,
-    mut s2: u32,
-    big_endian_words: bool,
-) -> (u32, u32) {
+fn wal_checksum(bytes: &[u8], mut s1: u32, mut s2: u32, big_endian_words: bool) -> (u32, u32) {
     debug_assert!(bytes.len().is_multiple_of(8));
     for chunk in bytes.chunks_exact(8) {
         let first = [chunk[0], chunk[1], chunk[2], chunk[3]];
@@ -16089,7 +16083,9 @@ fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
     let magic = u32::from_be_bytes(header[..4].try_into().unwrap_or([0; 4]));
     if !matches!(magic, 0x377f_0682 | 0x377f_0683) {
         return Err(BeadsError::SyncConflict {
-            message: format!("Refusing schema preflight because WAL magic {magic:#010x} is invalid"),
+            message: format!(
+                "Refusing schema preflight because WAL magic {magic:#010x} is invalid"
+            ),
         });
     }
     let format_version = u32::from_be_bytes(header[4..8].try_into().unwrap_or([0; 4]));
@@ -16237,8 +16233,9 @@ fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
         wal_source.file.read_exact(&mut frame)?;
         if frame != expected_boundary {
             return Err(BeadsError::SyncConflict {
-                message: "WAL recovery boundary changed while its schema preflight was being verified"
-                    .to_string(),
+                message:
+                    "WAL recovery boundary changed while its schema preflight was being verified"
+                        .to_string(),
             });
         }
     }
@@ -16295,10 +16292,7 @@ fn verify_namespace_healing_schema_precondition(db_path: &Path) -> Result<()> {
         }
     })?;
     if header_version > current_schema_version {
-        return Err(future_schema_error(
-            header_version,
-            current_schema_version,
-        ));
+        return Err(future_schema_error(header_version, current_schema_version));
     }
 
     let wal_preflight = sqlite_wal_schema_preflight(db_path)?;
@@ -16331,8 +16325,9 @@ fn verify_namespace_healing_authority(
         != crate::sync::DatabaseTargetAuthorityState::Held
     {
         return Err(BeadsError::SyncConflict {
-            message: "Fsqlite namespace sidecar repair requires a bound live database inode authority"
-                .to_string(),
+            message:
+                "Fsqlite namespace sidecar repair requires a bound live database inode authority"
+                    .to_string(),
         });
     }
     Ok(())
@@ -19854,7 +19849,10 @@ mod tests {
                 storage.inspect_pending_sync_merge().unwrap(),
                 PendingSyncMergeInspection::Valid(_)
             ));
-            storage.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            storage
+                .conn
+                .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
         }
 
         let sidecars = existing_namespace_sidecars(&db_path);
@@ -19872,11 +19870,8 @@ mod tests {
         );
         let family_before = directory_bytes_and_modes(temp.path());
 
-        let error = SqliteStorage::inspect_pending_sync_merge_under_authority(
-            &db_path,
-            &authority,
-        )
-        .expect_err("pending inspection must not chmod before its verdict");
+        let error = SqliteStorage::inspect_pending_sync_merge_under_authority(&db_path, &authority)
+            .expect_err("pending inspection must not chmod before its verdict");
         assert!(
             error
                 .to_string()
@@ -20245,12 +20240,7 @@ mod tests {
             frame[40..42].copy_from_slice(&512_u16.to_be_bytes());
             frame[84..88].copy_from_slice(&user_version.to_be_bytes());
         }
-        let after_header = wal_checksum(
-            &frame[..8],
-            running_checksum.0,
-            running_checksum.1,
-            false,
-        );
+        let after_header = wal_checksum(&frame[..8], running_checksum.0, running_checksum.1, false);
         let checksum = wal_checksum(&frame[24..], after_header.0, after_header.1, false);
         frame[16..20].copy_from_slice(&checksum.0.to_be_bytes());
         frame[20..24].copy_from_slice(&checksum.1.to_be_bytes());
@@ -20280,7 +20270,10 @@ mod tests {
                 None,
             );
             storage.create_issue(&issue, "tester").unwrap();
-            storage.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            storage
+                .conn
+                .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
         }
 
         let loosened = existing_namespace_sidecars(&db_path);
@@ -20324,12 +20317,9 @@ mod tests {
             )
             .unwrap(),
         );
-        let storage = SqliteStorage::open_with_timeout_under_write_authority(
-            &db_path,
-            Some(50),
-            &authority,
-        )
-        .expect("authority-gated open must repair the sidecar mode");
+        let storage =
+            SqliteStorage::open_with_timeout_under_write_authority(&db_path, Some(50), &authority)
+                .expect("authority-gated open must repair the sidecar mode");
         assert!(storage.get_issue("bd-ns").unwrap().is_some());
         drop(storage);
 
@@ -20357,7 +20347,10 @@ mod tests {
         let db_path = temp.path().join("sidecar_swap.db");
         {
             let storage = SqliteStorage::open(&db_path).unwrap();
-            storage.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            storage
+                .conn
+                .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
         }
         let sidecars = existing_namespace_sidecars(&db_path);
         let target = sidecars
@@ -20380,12 +20373,9 @@ mod tests {
         );
         SqliteStorage::arm_namespace_sidecar_swap_after_open_for_test(victim.clone());
 
-        let error = SqliteStorage::open_with_timeout_under_write_authority(
-            &db_path,
-            Some(50),
-            &authority,
-        )
-        .expect_err("a sidecar symlink swap must fail closed");
+        let error =
+            SqliteStorage::open_with_timeout_under_write_authority(&db_path, Some(50), &authority)
+                .expect_err("a sidecar symlink swap must fail closed");
         assert!(
             error.to_string().contains("changed identity"),
             "unexpected sidecar swap error: {error}"
@@ -20402,8 +20392,7 @@ mod tests {
             victim_mode_before,
             "the swapped-in symlink target must never be chmodded"
         );
-        let retained =
-            database_sidecar_path(&target, ".test-retained-after-open-symlink-swap");
+        let retained = database_sidecar_path(&target, ".test-retained-after-open-symlink-swap");
         assert_eq!(
             fs::metadata(retained).unwrap().permissions().mode() & 0o077,
             0o064,
@@ -20422,7 +20411,10 @@ mod tests {
         let db_path = temp.path().join("sidecar_family_preflight.db");
         {
             let storage = SqliteStorage::open(&db_path).unwrap();
-            storage.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            storage
+                .conn
+                .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
         }
         let first = database_sidecar_path(
             &db_path,
@@ -20454,14 +20446,13 @@ mod tests {
             .unwrap(),
         );
 
-        let error = SqliteStorage::open_with_timeout_under_write_authority(
-            &db_path,
-            Some(50),
-            &authority,
-        )
-        .expect_err("a later unsafe sidecar must abort before any chmod");
+        let error =
+            SqliteStorage::open_with_timeout_under_write_authority(&db_path, Some(50), &authority)
+                .expect_err("a later unsafe sidecar must abort before any chmod");
         assert!(
-            error.to_string().contains("unsafe fsqlite namespace sidecar"),
+            error
+                .to_string()
+                .contains("unsafe fsqlite namespace sidecar"),
             "unexpected family preflight error: {error}"
         );
         assert_eq!(
@@ -29425,7 +29416,10 @@ mod tests {
         let future_version = current_version.checked_add(1).unwrap();
         {
             let storage = SqliteStorage::open(&db_path).unwrap();
-            storage.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            storage
+                .conn
+                .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
         }
         assert_eq!(
             database_header_user_version(&db_path),
@@ -29493,12 +29487,9 @@ mod tests {
             .unwrap(),
         );
         let permissive_family_before = directory_bytes_and_modes(temp.path());
-        let gated_error = SqliteStorage::open_with_timeout_under_write_authority(
-            &db_path,
-            Some(50),
-            &authority,
-        )
-        .expect_err("WAL-only future schema must precede authority-gated chmod");
+        let gated_error =
+            SqliteStorage::open_with_timeout_under_write_authority(&db_path, Some(50), &authority)
+                .expect_err("WAL-only future schema must precede authority-gated chmod");
         assert!(
             gated_error
                 .to_string()
@@ -29520,7 +29511,10 @@ mod tests {
         let db_path = temp.path().join("invalid_header_only_wal.db");
         {
             let storage = SqliteStorage::open(&db_path).unwrap();
-            storage.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            storage
+                .conn
+                .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
         }
         let wal_path = database_sidecar_path(&db_path, "-wal");
         let invalid_header = [0_u8; 32];
@@ -29548,14 +29542,7 @@ mod tests {
             let db_path = temp.path().join(format!("{tail_kind}_wal_tail.db"));
             let wal_path = database_sidecar_path(&db_path, "-wal");
             let (mut wal, mut running_checksum) = synthetic_wal_header(salts);
-            append_synthetic_wal_frame(
-                &mut wal,
-                &mut running_checksum,
-                1,
-                1,
-                salts,
-                Some(73),
-            );
+            append_synthetic_wal_frame(&mut wal, &mut running_checksum, 1, 1, salts, Some(73));
             if tail_kind == "reused" {
                 append_synthetic_wal_frame(
                     &mut wal,
@@ -29593,22 +29580,8 @@ mod tests {
         let wal_path = database_sidecar_path(&db_path, "-wal");
         let salts = (0x1122_3344, 0x5566_7788);
         let (mut wal, mut running_checksum) = synthetic_wal_header(salts);
-        append_synthetic_wal_frame(
-            &mut wal,
-            &mut running_checksum,
-            1,
-            1,
-            salts,
-            Some(81),
-        );
-        append_synthetic_wal_frame(
-            &mut wal,
-            &mut running_checksum,
-            1,
-            0,
-            salts,
-            Some(9_999),
-        );
+        append_synthetic_wal_frame(&mut wal, &mut running_checksum, 1, 1, salts, Some(81));
+        append_synthetic_wal_frame(&mut wal, &mut running_checksum, 1, 0, salts, Some(9_999));
         fs::write(&wal_path, &wal).unwrap();
         let bytes_before = fs::read(&wal_path).unwrap();
 
@@ -29649,14 +29622,7 @@ mod tests {
         let wal_path = database_sidecar_path(&db_path, "-wal");
         let salts = (0x1357_9BDF, 0x2468_ACE0);
         let (mut wal, mut running_checksum) = synthetic_wal_header(salts);
-        append_synthetic_wal_frame(
-            &mut wal,
-            &mut running_checksum,
-            2,
-            1,
-            salts,
-            None,
-        );
+        append_synthetic_wal_frame(&mut wal, &mut running_checksum, 2, 1, salts, None);
         fs::write(&wal_path, &wal).unwrap();
         let bytes_before = fs::read(&wal_path).unwrap();
 
@@ -29693,14 +29659,7 @@ mod tests {
             }
             let wal_path = database_sidecar_path(&db_path, "-wal");
             let (mut wal, mut running_checksum) = synthetic_wal_header(salts);
-            append_synthetic_wal_frame(
-                &mut wal,
-                &mut running_checksum,
-                1,
-                1,
-                salts,
-                Some(future),
-            );
+            append_synthetic_wal_frame(&mut wal, &mut running_checksum, 1, 1, salts, Some(future));
             fs::write(&wal_path, &wal).unwrap();
             let observed_main_before = fs::read(&db_path).ok();
             let wal_before = fs::read(&wal_path).unwrap();
@@ -29745,7 +29704,10 @@ mod tests {
                 .conn
                 .execute(&format!("PRAGMA user_version = {future_version}"))
                 .unwrap();
-            storage.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            storage
+                .conn
+                .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
         }
         assert_eq!(
             database_header_user_version(&db_path),
@@ -29773,12 +29735,9 @@ mod tests {
             .unwrap(),
         );
 
-        let error = SqliteStorage::open_with_timeout_under_write_authority(
-            &db_path,
-            Some(50),
-            &authority,
-        )
-        .expect_err("future schema must be refused before any sidecar chmod");
+        let error =
+            SqliteStorage::open_with_timeout_under_write_authority(&db_path, Some(50), &authority)
+                .expect_err("future schema must be refused before any sidecar chmod");
         assert!(
             error
                 .to_string()
@@ -29810,10 +29769,8 @@ mod tests {
             let initial_cookie = {
                 let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
                 apply_schema(&conn).unwrap();
-                conn.execute(
-                    "DELETE FROM metadata WHERE key = 'runtime_schema_witness_v1'",
-                )
-                .unwrap();
+                conn.execute("DELETE FROM metadata WHERE key = 'runtime_schema_witness_v1'")
+                    .unwrap();
                 let cookie = crate::storage::schema::runtime_schema_cookie(&conn).unwrap();
                 conn.close().unwrap();
                 cookie
@@ -29841,9 +29798,7 @@ mod tests {
                 "the fixture must exercise a user_version-only same-cookie change"
             );
             let witness_count = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM metadata WHERE key = 'runtime_schema_witness_v1'",
-                )
+                .query_row("SELECT COUNT(*) FROM metadata WHERE key = 'runtime_schema_witness_v1'")
                 .unwrap()
                 .get(0)
                 .and_then(SqliteValue::as_integer);

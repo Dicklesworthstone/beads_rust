@@ -617,8 +617,7 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
         attestation_errors,
         undo_command: format!("br doctor migrate-schema undo {run_id}"),
     };
-    let commit_ready: CommitReadyMigrationReceipt =
-        read_json(&run_dir.join("commit-ready.json"))?;
+    let commit_ready: CommitReadyMigrationReceipt = read_json(&run_dir.join("commit-ready.json"))?;
     validate_applied_against_commit_ready(&applied, &commit_ready, &run_dir)?;
     write_json_new(&run_dir.join("applied.json"), &applied)?;
     sync_directory(&run_dir)?;
@@ -739,10 +738,8 @@ fn validate_commit_ready_marker(
     if !constant_time_text_eq(&recomputed_token, &marker.plan_token)
         || marker.effects.from_version != marker.forecast.from_version
         || marker.effects.to_version != marker.forecast.to_version
-        || marker.effects.content_hash_rows_rebuilt
-            != marker.forecast.content_hash_rows_rebuilt
-        || marker.effects.gate_result_history_created
-            != marker.forecast.gate_result_history_created
+        || marker.effects.content_hash_rows_rebuilt != marker.forecast.content_hash_rows_rebuilt
+        || marker.effects.gate_result_history_created != marker.forecast.gate_result_history_created
         || marker.effects.post_migration_maintenance_completed
             != marker.forecast.post_migration_maintenance
         || marker.logical_after.user_version != marker.forecast.to_version
@@ -1997,11 +1994,8 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
     let restored_candidate_dir = run_dir.join("undo-restored-candidate");
     ensure_directory(&restored_candidate_dir)?;
     set_private_directory_permissions(&restored_candidate_dir)?;
-    let restored_candidate = backup_component_path(
-        &restored_candidate_dir,
-        &migration.db_path,
-        "",
-    )?;
+    let restored_candidate =
+        backup_component_path(&restored_candidate_dir, &migration.db_path, "")?;
     let quarantined_main_guard = install_undo_restored_main_resuming(
         &migration.db_path,
         &before_dir,
@@ -2095,9 +2089,8 @@ fn install_undo_restored_main_resuming(
         ));
     }
     let quarantined_main = backup_component_path(quarantine_dir, db_path, "")?;
-    let live_metadata = secure_file_metadata(db_path)?.ok_or_else(|| {
-        BeadsError::internal("schema-migration undo found no live main database")
-    })?;
+    let live_metadata = secure_file_metadata(db_path)?
+        .ok_or_else(|| BeadsError::internal("schema-migration undo found no live main database"))?;
     let live_matches_applied = component_bytes_match(db_path, &live_metadata, applied_main)?;
     let live_matches_restored = component_bytes_match(db_path, &live_metadata, restored_main)?;
 
@@ -2109,10 +2102,7 @@ fn install_undo_restored_main_resuming(
             ));
         }
         let guard = write_authority.lock_database_replacement_candidate(&quarantined_main)?;
-        write_authority.verify_locked_database_replacement_candidate(
-            &quarantined_main,
-            &guard,
-        )?;
+        write_authority.verify_locked_database_replacement_candidate(&quarantined_main, &guard)?;
         write_authority.verify_database_authority()?;
         return Ok(Some(guard));
     }
@@ -3110,7 +3100,9 @@ fn write_json_new<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     })?;
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| BeadsError::internal(format!("system clock precedes Unix epoch: {error}")))?
+        .map_err(|error| {
+            BeadsError::internal(format!("system clock precedes Unix epoch: {error}"))
+        })?
         .as_nanos();
     let mut staged = None;
     for attempt in 0_u16..=u16::MAX {
@@ -3126,8 +3118,7 @@ fn write_json_new<T: Serialize>(path: &Path, value: &T) -> Result<()> {
                 staged = Some((staged_path, file));
                 break;
             }
-            Err(BeadsError::Io(error))
-                if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(BeadsError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
     }

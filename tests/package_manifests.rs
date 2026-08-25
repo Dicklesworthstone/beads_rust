@@ -238,8 +238,7 @@ fn test_pkgbuild_syntax() {
 #[test]
 fn test_cargo_metadata() {
     let cargo_toml = fs::read_to_string("Cargo.toml").expect("Failed to read Cargo.toml");
-    let manifest: toml::Value =
-        toml::from_str(&cargo_toml).expect("Cargo.toml must be valid TOML");
+    let manifest: toml::Value = toml::from_str(&cargo_toml).expect("Cargo.toml must be valid TOML");
     let package = manifest
         .get("package")
         .and_then(toml::Value::as_table)

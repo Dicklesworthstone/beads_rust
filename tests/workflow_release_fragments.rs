@@ -108,10 +108,7 @@ fn release_workflow_uses_tagless_asset_file_names() -> Result<(), String> {
         &workflow,
         "artifacts/br-${ASSET_VERSION}-linux_amd64.tar.gz",
     )?;
-    require_contains(
-        &workflow,
-        "artifacts/br-${ASSET_VERSION}-windows_amd64.zip",
-    )?;
+    require_contains(&workflow, "artifacts/br-${ASSET_VERSION}-windows_amd64.zip")?;
     require_not_contains(&workflow, "artifacts/br-${ASSET_VERSION}-${platform}.*")?;
     require_not_contains(&workflow, "br-${{ github.ref_name }}-${{ matrix.name }}")?;
     require_not_contains(&workflow, "artifacts/br-${{ github.ref_name }}-*")?;
@@ -163,8 +160,8 @@ fn release_workflow_checkout_refs_are_unambiguous() -> Result<(), String> {
 }
 
 #[test]
-fn release_workflow_requires_an_exact_existing_tag_at_the_checked_out_commit(
-) -> Result<(), String> {
+fn release_workflow_requires_an_exact_existing_tag_at_the_checked_out_commit() -> Result<(), String>
+{
     let script = release_step_script("Verify tag matches Cargo.toml version")?;
 
     require_contains(&script, "EXPECTED_TAG=\"v${CARGO_VERSION}\"")?;
@@ -343,8 +340,8 @@ fn release_workflow_uses_the_pinned_toolchain_and_lockfile() -> Result<(), Strin
 }
 
 #[test]
-fn release_sbom_generation_uses_digest_pinned_syft_without_remote_script_execution(
-) -> Result<(), String> {
+fn release_sbom_generation_uses_digest_pinned_syft_without_remote_script_execution()
+-> Result<(), String> {
     let workflow = read_to_string(Path::new(RELEASE_WORKFLOW))?;
     let install_script = release_step_script("Install digest-verified Syft")?;
     let script = release_step_script("Generate SBOMs (CycloneDX and SPDX)")?;
@@ -363,10 +360,7 @@ fn release_sbom_generation_uses_digest_pinned_syft_without_remote_script_executi
     require_contains(&install_script, "tar -xzf \"$syft_archive_path\"")?;
     require_contains(&install_script, "test -x \"$RUNNER_TEMP/syft\"")?;
     require_contains(&script, r#""$SYFT_BIN" dir:."#)?;
-    require_contains(
-        &script,
-        "-o cyclonedx-json=artifacts/sbom.cdx.json",
-    )?;
+    require_contains(&script, "-o cyclonedx-json=artifacts/sbom.cdx.json")?;
     require_contains(&script, "-o spdx-json=artifacts/sbom.spdx.json")?;
     require_contains(&script, "test -s artifacts/sbom.cdx.json")?;
     require_contains(&script, "test -s artifacts/sbom.spdx.json")?;
@@ -420,10 +414,7 @@ fn release_signatures_use_the_documented_current_trust_anchor() -> Result<(), St
         &changelog_script,
         "# Public key: ${{ env.MINISIGN_PUBLIC_KEY }}",
     )?;
-    require_contains(
-        &changelog_script,
-        "-P '${{ env.MINISIGN_PUBLIC_KEY }}'",
-    )?;
+    require_contains(&changelog_script, "-P '${{ env.MINISIGN_PUBLIC_KEY }}'")?;
     require_contains(
         &signing_script,
         "minisign -Vm \"$archive\" -x \"$signature\" -P \"$MINISIGN_PUBLIC_KEY\"",
@@ -528,10 +519,7 @@ fn required_artifact_fragment_reports_missing_platforms() -> Result<(), String> 
 
     let result = run_bash_step(&script, missing_signature.root(), &[])?;
     require_failure(&result, "missing signature sidecar should fail")?;
-    require_contains(
-        &result.stdout,
-        "br-9.9.9-windows_amd64.zip.minisig",
-    )
+    require_contains(&result.stdout, "br-9.9.9-windows_amd64.zip.minisig")
 }
 
 #[test]
@@ -609,10 +597,7 @@ fn signing_fragment_streams_the_private_key_without_persisting_it() -> Result<()
     }
 
     require_contains(&script, "MINISIGN_SECRET_KEY is required")?;
-    require_contains(
-        &script,
-        "-s <(printf '%s\\n' \"$MINISIGN_SECRET_KEY\")",
-    )?;
+    require_contains(&script, "-s <(printf '%s\\n' \"$MINISIGN_SECRET_KEY\")")?;
     require_contains(&script, "if [ ! -s \"$signature\" ]")?;
     require_not_contains(&script, "mktemp")?;
     require_not_contains(&script, "signing_key")?;
@@ -620,11 +605,7 @@ fn signing_fragment_streams_the_private_key_without_persisting_it() -> Result<()
     require_not_contains(&script, "echo \"$MINISIGN_SECRET_KEY\"")?;
 
     let fixture = WorkflowFixture::new()?;
-    let missing_secret = run_bash_step(
-        &script,
-        fixture.root(),
-        &[("MINISIGN_SECRET_KEY", "")],
-    )?;
+    let missing_secret = run_bash_step(&script, fixture.root(), &[("MINISIGN_SECRET_KEY", "")])?;
     require_failure(&missing_secret, "missing signing secret should fail closed")?;
     require_contains(
         &missing_secret.stdout,

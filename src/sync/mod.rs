@@ -66,15 +66,18 @@ thread_local! {
 
 #[cfg(test)]
 fn maybe_replace_database_before_finalize_locked_verify(path: &Path) -> Result<()> {
-    let replace = REPLACE_DATABASE_BEFORE_FINALIZE_LOCKED_VERIFY
-        .with(|configured| configured.replace(false));
+    let replace =
+        REPLACE_DATABASE_BEFORE_FINALIZE_LOCKED_VERIFY.with(|configured| configured.replace(false));
     if !replace {
         return Ok(());
     }
     let mut retained = path.as_os_str().to_os_string();
     retained.push(".test-retained-before-finalize-verify");
     fs::rename(path, PathBuf::from(retained))?;
-    fs::write(path, b"foreign database generation installed by finalize hook")?;
+    fs::write(
+        path,
+        b"foreign database generation installed by finalize hook",
+    )?;
     Ok(())
 }
 
@@ -966,12 +969,12 @@ impl DatabaseFamilyWriteLock {
     /// irreversibly accepted the replacement.
     pub(crate) fn finalize_database_replacement(&self) -> Result<()> {
         self.verify_common_authority()?;
-        let mut database_authority = self
-            .database_authority
-            .lock()
-            .map_err(|_| BeadsError::SyncConflict {
-                message: "Database inode authority state was poisoned".to_string(),
-            })?;
+        let mut database_authority =
+            self.database_authority
+                .lock()
+                .map_err(|_| BeadsError::SyncConflict {
+                    message: "Database inode authority state was poisoned".to_string(),
+                })?;
         maybe_replace_database_before_finalize_locked_verify(&self.canonical_database_path)?;
         self.verify_database_inode_authority_locked(&database_authority)?;
         database_authority.retired_locks.clear();
@@ -16513,13 +16516,17 @@ mod tests {
             .install_empty_database_replacement_and_bind()
             .unwrap();
         assert_eq!(
-            authority.database_authority.lock().unwrap().retired_locks.len(),
+            authority
+                .database_authority
+                .lock()
+                .unwrap()
+                .retired_locks
+                .len(),
             1,
             "the displaced original must remain locked before finalization"
         );
 
-        DatabaseFamilyWriteLock::
-            arm_database_replacement_before_finalize_locked_verify_for_test();
+        DatabaseFamilyWriteLock::arm_database_replacement_before_finalize_locked_verify_for_test();
         let error = authority
             .finalize_database_replacement()
             .expect_err("a canonical-path swap at finalization must fail closed");
@@ -16529,7 +16536,12 @@ mod tests {
             "unexpected finalization identity error: {error}"
         );
         assert_eq!(
-            authority.database_authority.lock().unwrap().retired_locks.len(),
+            authority
+                .database_authority
+                .lock()
+                .unwrap()
+                .retired_locks
+                .len(),
             1,
             "failed finalization must not release the displaced inode lock"
         );

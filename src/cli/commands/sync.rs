@@ -3028,12 +3028,7 @@ fn replace_database_from_jsonl_snapshot(
             let reopened = cli
                 .database_family_write_authority_for(beads_dir, db_path)
                 .map_or_else(
-                    || {
-                        crate::storage::SqliteStorage::open_with_timeout(
-                            db_path,
-                            cli.lock_timeout,
-                        )
-                    },
+                    || crate::storage::SqliteStorage::open_with_timeout(db_path, cli.lock_timeout),
                     |authority| {
                         crate::storage::SqliteStorage::open_with_timeout_under_write_authority(
                             db_path,
