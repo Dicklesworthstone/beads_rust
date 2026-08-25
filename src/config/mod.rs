@@ -2841,26 +2841,6 @@ pub(crate) fn db_sidecar_suffixes() -> impl Iterator<Item = &'static &'static st
         .chain(FSQLITE_WAL_CERT_SIDECAR_SUFFIXES.iter())
 }
 
-/// Best-effort removal of every engine sidecar belonging to `db_path`.
-///
-/// Used both to drop the pre-compaction sidecars after an atomic swap and to
-/// clean up the temp target's sidecars, which `rename` leaves behind because
-/// it only moves the main file.
-fn remove_db_sidecars(db_path: &Path) {
-    for suffix in db_sidecar_suffixes() {
-        let sidecar = PathBuf::from(format!("{}{}", db_path.to_string_lossy(), suffix));
-        if fs::symlink_metadata(&sidecar).is_ok()
-            && let Err(err) = fs::remove_file(&sidecar)
-        {
-            tracing::debug!(
-                error = %err,
-                sidecar = %sidecar.display(),
-                "Failed to remove database sidecar; next open will re-derive it"
-            );
-        }
-    }
-}
-
 /// Compact a database at `db_path` by writing a fresh copy via `VACUUM
 /// INTO` to a temp file, atomically replacing the original, and returning a
 /// reopened storage connection.
@@ -2934,6 +2914,7 @@ fn compact_database_via_vacuum_into_in_place_under_write_authority(
     )
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn compact_database_via_vacuum_into_in_place_with_reopener(
     storage: SqliteStorage,
     db_path: &Path,
@@ -2954,8 +2935,9 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
         tracing::debug!(
             error = %err,
             db_path = %db_path.display(),
-            "Pre-VACUUM-INTO WAL checkpoint failed (non-fatal); compaction may miss uncheckpointed frames"
+            "Pre-VACUUM-INTO WAL checkpoint failed; skipping cosmetic compaction so committed WAL frames cannot be omitted"
         );
+        return Ok(storage);
     }
 
     // Unique temp path next to the real DB so the subsequent rename is on
@@ -2965,15 +2947,11 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
         .file_stem()
         .and_then(|s| s.to_str())
         .map_or_else(|| "beads".to_string(), str::to_string);
-    let temp_path = db_path.with_file_name(format!(".{stem}.vacuum.{}.tmp", std::process::id()));
-    // Defensive: if a previous aborted rebuild from this same PID left a
-    // stale temp file behind, remove it before `VACUUM INTO` tries to
-    // open it. Stale temp files from other (crashed) PIDs are left alone
-    // because we cannot safely distinguish "crashed process" from
-    // "concurrent rebuild holding the temp open" without coordinating
-    // via the `.write.lock` we already depend on upstream.
-    let _ = fs::remove_file(&temp_path);
-    remove_db_sidecars(&temp_path);
+    let temp_path = db_path.with_file_name(format!(
+        ".{stem}.vacuum.{}.{}.tmp",
+        std::process::id(),
+        Utc::now().format("%Y%m%d_%H%M%S_%f")
+    ));
 
     let temp_path_display = temp_path.display().to_string();
     // Escape single quotes the SQL way (doubling) for the literal path
@@ -2989,8 +2967,9 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
             db_path = %db_path.display(),
             "`VACUUM INTO` compaction failed; keeping the in-place rebuild which may still show unused tail pages under upstream sqlite3"
         );
-        let _ = fs::remove_file(&temp_path);
-        remove_db_sidecars(&temp_path);
+        // `VACUUM INTO` creates its destination with no-clobber semantics, but
+        // a failed operation has not established an inode witness. Preserve
+        // every resulting path instead of guessing that it is ours to delete.
         return Ok(storage);
     }
     let replacement_lock = write_authority.lock_database_replacement_candidate(&temp_path)?;
@@ -3104,9 +3083,7 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
         .and_then(|()| after_candidate_adoption())
         .and_then(|()| sync_candidate_install(&temp_path, db_path))
         .and_then(|()| {
-            // The pre-compaction sidecars are already retained with their main
-            // file. Only temp-family sidecars belong to the new candidate.
-            remove_db_sidecars(&temp_path);
+            move_private_compaction_sidecars_to_recovery(&temp_path)?;
             reopen_storage(db_path, lock_timeout)
         })
         .and_then(|mut reopened| {
@@ -3162,8 +3139,28 @@ fn remove_locked_compaction_candidate(
             temp_path = %temp_path.display(),
             "Failed to remove an unused locked compaction candidate"
         );
+    } else if let Err(error) = crate::util::sync_parent_directory(temp_path) {
+        tracing::warn!(
+            error = %error,
+            temp_path = %temp_path.display(),
+            "Unused locked compaction candidate was removed, but the namespace change was not made durable"
+        );
     }
-    remove_db_sidecars(temp_path);
+    if let Err(error) = move_private_compaction_sidecars_to_recovery(temp_path) {
+        tracing::warn!(
+            error = %error,
+            temp_path = %temp_path.display(),
+            "Failed to retain private compaction sidecars in recovery"
+        );
+    }
+}
+
+fn move_private_compaction_sidecars_to_recovery(temp_path: &Path) -> Result<()> {
+    let recovery_parent = temp_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut sidecar_backup =
+        prepare_missing_database_cleanup_for_recovery(temp_path, recovery_parent)?;
+    move_orphaned_database_sidecars_to_recovery(&mut sidecar_backup)?;
+    verify_recovery_backup_set(&sidecar_backup)
 }
 
 fn rollback_compacted_database_install(

@@ -38,6 +38,8 @@ use std::time::Duration;
 thread_local! {
     static REPLACE_ATTACHED_DATABASE_AFTER_COMMIT: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static CHANGE_USER_VERSION_AFTER_RUNTIME_COMPATIBILITY: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Number of mutations between WAL checkpoint attempts.
@@ -1820,6 +1822,21 @@ impl SqliteStorage {
         REPLACE_ATTACHED_DATABASE_AFTER_COMMIT.with(|replace| replace.set(true));
     }
 
+    #[cfg(test)]
+    fn arm_user_version_change_after_runtime_compatibility_for_test(version: u32) {
+        CHANGE_USER_VERSION_AFTER_RUNTIME_COMPATIBILITY.with(|pending| pending.set(version));
+    }
+
+    #[cfg(test)]
+    fn maybe_change_user_version_after_runtime_compatibility(conn: &Connection) -> Result<()> {
+        let version = CHANGE_USER_VERSION_AFTER_RUNTIME_COMPATIBILITY
+            .with(|pending| pending.replace(0));
+        if version != 0 {
+            conn.execute(&format!("PRAGMA user_version = {version}"))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn attach_write_authority(
         &mut self,
         authority: Arc<crate::sync::DatabaseFamilyWriteLock>,
@@ -2348,12 +2365,19 @@ impl SqliteStorage {
         let schema_current = effective_schema_version == Some(current_schema_version);
         let schema_cookie_before = crate::storage::schema::runtime_schema_cookie(&conn)?;
         let runtime_compatible = runtime_schema_compatible(&conn);
+        #[cfg(test)]
+        Self::maybe_change_user_version_after_runtime_compatibility(&conn)?;
         let schema_cookie_after = crate::storage::schema::runtime_schema_cookie(&conn)?;
 
         let attested_cookie = if schema_current && runtime_compatible {
             crate::storage::schema::apply_runtime_pragmas(&conn)?;
-            if schema_cookie_before == schema_cookie_after {
-                schema_cookie_after
+            let final_schema_cookie = crate::storage::schema::runtime_schema_cookie(&conn)?;
+            let final_user_version = connection_user_version(&conn);
+            if schema_cookie_before == schema_cookie_after
+                && schema_cookie_after == final_schema_cookie
+                && final_user_version == Some(current_schema_version)
+            {
+                final_schema_cookie
             } else {
                 attest_runtime_schema_cookie(&conn)?
             }
@@ -28334,6 +28358,65 @@ mod tests {
             database_bytes_before,
             "a rejected open must leave the main database bytes unchanged"
         );
+    }
+
+    #[test]
+    fn test_open_with_timeout_fences_same_cookie_user_version_change_after_compatibility() {
+        let current = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap();
+        let changed_versions = [
+            ("downgrade", current.checked_sub(1).unwrap()),
+            ("future", current.checked_add(1).unwrap()),
+        ];
+
+        for (label, changed_version) in changed_versions {
+            let temp = TempDir::new().unwrap();
+            let db_path = temp.path().join(format!("same_cookie_{label}.db"));
+            let initial_cookie = {
+                let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+                apply_schema(&conn).unwrap();
+                conn.execute(
+                    "DELETE FROM metadata WHERE key = 'runtime_schema_witness_v1'",
+                )
+                .unwrap();
+                let cookie = crate::storage::schema::runtime_schema_cookie(&conn).unwrap();
+                conn.close().unwrap();
+                cookie
+            };
+
+            SqliteStorage::arm_user_version_change_after_runtime_compatibility_for_test(
+                changed_version,
+            );
+            let error = SqliteStorage::open_with_timeout(&db_path, Some(50))
+                .expect_err("a version-only change after compatibility must fail closed");
+            assert!(
+                error.to_string().contains("runtime schema version"),
+                "unexpected {label} fence error: {error}"
+            );
+
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            assert_eq!(
+                connection_user_version(&conn),
+                Some(changed_version),
+                "the failed open must not rewrite the concurrently changed version"
+            );
+            assert_eq!(
+                crate::storage::schema::runtime_schema_cookie(&conn).unwrap(),
+                initial_cookie,
+                "the fixture must exercise a user_version-only same-cookie change"
+            );
+            let witness_count = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM metadata WHERE key = 'runtime_schema_witness_v1'",
+                )
+                .unwrap()
+                .get(0)
+                .and_then(SqliteValue::as_integer);
+            assert_eq!(
+                witness_count,
+                Some(0),
+                "a rejected same-cookie version change must not mint a runtime witness"
+            );
+        }
     }
 
     #[test]
