@@ -104,8 +104,14 @@ replacement, crash, and schema-drift races.
   `2x` median-and-tail target was not achieved.
 - A database carrying the previous runtime-witness contract performs the full
   schema attestation on lock-free reads until an ordinary writable open records
-  the current witness. The upgrade-only cost was not measured on the final
-  safety tree, and the read-only path intentionally does not persist a witness.
+  the current witness. On the final runtime bytes, a balanced 100-sample
+  `release-perf` profile measured the prior-contract path at `90.605341 ms`
+  median / `101.779796 ms` p95 and the current-witness fast path at
+  `51.977261 ms` / `67.686561 ms`, reductions of `42.633337%` / `33.497056%`.
+  The conservative current-witness control with fast-open disabled measured
+  `84.227769 ms` / `116.585020 ms`; output was identical and all database
+  witnesses and integrity checks remained valid. The read-only path
+  intentionally does not persist a witness.
 
 ### Packaging and regression coverage
 
