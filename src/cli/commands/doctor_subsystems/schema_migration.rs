@@ -879,6 +879,13 @@ fn resume_commit_ready_migration(
         )));
     }
     let raw_live = raw_family_witness(&migration.db_path)?;
+    let retained_original_guard = certify_resumed_installed_generation(
+        &migration.db_path,
+        &before_dir,
+        &run_dir,
+        &marker,
+        &migration.write_authority,
+    )?;
     migration.write_authority.finalize_database_replacement()?;
     let applied = AppliedMigrationReceipt {
         schema_version: APPLIED_SCHEMA.to_string(),
@@ -900,7 +907,71 @@ fn resume_commit_ready_migration(
     validate_applied_against_commit_ready(&applied, &marker, &run_dir)?;
     write_json_new(&applied_path, &applied)?;
     sync_directory(&run_dir)?;
+    drop(retained_original_guard);
     Ok(Some((applied, before_dir)))
+}
+
+fn certify_resumed_installed_generation(
+    db_path: &Path,
+    before_dir: &Path,
+    run_dir: &Path,
+    marker: &CommitReadyMigrationReceipt,
+    write_authority: &Arc<DatabaseFamilyWriteLock>,
+) -> Result<File> {
+    verify_backup_family(db_path, before_dir, &marker.raw_before)?;
+    write_authority.verify_database_authority()?;
+    let displaced_dir = run_dir.join("maintenance-displaced");
+    let displaced_metadata = fs::symlink_metadata(&displaced_dir).map_err(BeadsError::Io)?;
+    if !displaced_metadata.is_dir() || displaced_metadata.file_type().is_symlink() {
+        return Err(BeadsError::internal(format!(
+            "schema-migration displaced path is not a real directory: {}",
+            displaced_dir.display()
+        )));
+    }
+    let displaced_main = backup_component_path(&displaced_dir, db_path, "")?;
+    let candidate_path = maintenance_candidate_path(db_path, run_dir)?;
+    let displaced_exists = secure_file_metadata(&displaced_main)?.is_some();
+    let candidate_exists = secure_file_metadata(&candidate_path)?.is_some();
+    if displaced_exists && candidate_exists {
+        return Err(BeadsError::internal(format!(
+            "resumed schema migration {} found two possible retained original mains; refusing to choose between {} and {}",
+            marker.run_id,
+            displaced_main.display(),
+            candidate_path.display()
+        )));
+    }
+    let guard = if displaced_exists {
+        write_authority.lock_database_replacement_candidate(&displaced_main)?
+    } else if candidate_exists {
+        let guard = write_authority.lock_database_replacement_candidate(&candidate_path)?;
+        write_authority.verify_locked_database_replacement_candidate(&candidate_path, &guard)?;
+        rename_path_no_replace(&candidate_path, &displaced_main)?;
+        write_authority.verify_locked_database_replacement_candidate(&displaced_main, &guard)?;
+        guard
+    } else {
+        return Err(BeadsError::internal(format!(
+            "resumed schema migration {} has no retained original main database",
+            marker.run_id
+        )));
+    };
+    write_authority.verify_locked_database_replacement_candidate(&displaced_main, &guard)?;
+    let retained_logical = logical_witness(&displaced_main)?;
+    if retained_logical != marker.logical_before {
+        return Err(BeadsError::internal(format!(
+            "resumed schema migration {} retained an unrecognized displaced generation at {}",
+            marker.run_id,
+            displaced_main.display()
+        )));
+    }
+    sync_directory(before_dir)?;
+    sync_directory(&displaced_dir)?;
+    if let Some(parent) = db_path.parent() {
+        sync_directory(parent)?;
+    }
+    sync_directory(run_dir)?;
+    write_authority.verify_locked_database_replacement_candidate(&displaced_main, &guard)?;
+    write_authority.verify_database_authority()?;
+    Ok(guard)
 }
 
 fn restore_interrupted_preinstall_family(
@@ -1911,6 +1982,24 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
     } else {
         ensure_new_directory(&quarantine_dir)?;
     }
+    require_atomic_undo_exchange()?;
+    let restored_candidate_dir = run_dir.join("undo-restored-candidate");
+    ensure_directory(&restored_candidate_dir)?;
+    set_private_directory_permissions(&restored_candidate_dir)?;
+    let restored_candidate = backup_component_path(
+        &restored_candidate_dir,
+        &migration.db_path,
+        "",
+    )?;
+    let quarantined_main_guard = install_undo_restored_main_resuming(
+        &migration.db_path,
+        &before_dir,
+        &restored_candidate,
+        &quarantine_dir,
+        &receipt.raw_live_before_undo,
+        &applied.raw_before,
+        &migration.write_authority,
+    )?;
     quarantine_live_family_resuming(
         &migration.db_path,
         &quarantine_dir,
@@ -1922,7 +2011,7 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
     let logical_restored = logical_witness(&migration.db_path)?;
     let raw_restored = raw_family_witness(&migration.db_path)?;
     if logical_restored != applied.logical_before
-        || !stable_raw_eq(&raw_restored, &applied.raw_before)
+        || raw_restored != applied.raw_before
     {
         return Err(BeadsError::internal(format!(
             "schema migration undo for run {} did not reproduce the verified pre-state; \
@@ -1934,9 +2023,186 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
     receipt.raw_restored = Some(raw_restored);
     receipt.logical_restored = Some(logical_restored);
     receipt.dry_run = false;
+    migration.write_authority.verify_database_authority()?;
+    if let Some(parent) = migration.db_path.parent() {
+        sync_directory(parent)?;
+    }
+    sync_directory(&quarantine_dir)?;
+    sync_directory(&restored_candidate_dir)?;
+    sync_directory(&run_dir)?;
+    migration.write_authority.verify_database_authority()?;
+    migration.write_authority.finalize_database_replacement()?;
+    drop(quarantined_main_guard);
     write_json_new(&run_dir.join("undone.json"), &receipt)?;
     sync_directory(&run_dir)?;
     emit_undo(&receipt, args.json)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn require_atomic_undo_exchange() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn require_atomic_undo_exchange() -> Result<()> {
+    Err(BeadsError::Config(
+        "schema-migration undo requires an atomic path-exchange primitive on this platform"
+            .to_string(),
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn install_undo_restored_main_resuming(
+    db_path: &Path,
+    before_dir: &Path,
+    restored_candidate: &Path,
+    quarantine_dir: &Path,
+    applied: &RawFamilyWitness,
+    restored: &RawFamilyWitness,
+    write_authority: &Arc<DatabaseFamilyWriteLock>,
+) -> Result<Option<File>> {
+    let applied_main = component_for_suffix(applied, "")?;
+    let restored_main = component_for_suffix(restored, "")?;
+    if !applied_main.present || !restored_main.present {
+        return Err(BeadsError::internal(
+            "schema-migration undo receipts must witness both main database files",
+        ));
+    }
+    let quarantined_main = backup_component_path(quarantine_dir, db_path, "")?;
+    let live_metadata = secure_file_metadata(db_path)?.ok_or_else(|| {
+        BeadsError::internal("schema-migration undo found no live main database")
+    })?;
+    let live_matches_applied = component_bytes_match(db_path, &live_metadata, applied_main)?;
+    let live_matches_restored = component_bytes_match(db_path, &live_metadata, restored_main)?;
+
+    if let Some(quarantined_metadata) = secure_file_metadata(&quarantined_main)? {
+        verify_component_bytes(&quarantined_main, &quarantined_metadata, applied_main)?;
+        if !live_matches_restored {
+            return Err(BeadsError::internal(
+                "schema-migration undo has a quarantined applied main but the live main is not the receipt-bound original",
+            ));
+        }
+        let guard = write_authority.lock_database_replacement_candidate(&quarantined_main)?;
+        write_authority.verify_locked_database_replacement_candidate(
+            &quarantined_main,
+            &guard,
+        )?;
+        write_authority.verify_database_authority()?;
+        return Ok(Some(guard));
+    }
+
+    if let Some(candidate_metadata) = secure_file_metadata(restored_candidate)? {
+        if component_bytes_match(restored_candidate, &candidate_metadata, applied_main)?
+            && live_matches_restored
+        {
+            let guard = write_authority.lock_database_replacement_candidate(restored_candidate)?;
+            write_authority
+                .verify_locked_database_replacement_candidate(restored_candidate, &guard)?;
+            write_authority.verify_database_authority()?;
+            rename_path_no_replace(restored_candidate, &quarantined_main)?;
+            write_authority
+                .verify_locked_database_replacement_candidate(&quarantined_main, &guard)?;
+            sync_directory(quarantine_dir)?;
+            if let Some(parent) = db_path.parent() {
+                sync_directory(parent)?;
+            }
+            return Ok(Some(guard));
+        }
+        if !component_bytes_match(restored_candidate, &candidate_metadata, restored_main)? {
+            return Err(BeadsError::internal(format!(
+                "schema-migration undo staging path contains an unrecognized generation: {}",
+                restored_candidate.display()
+            )));
+        }
+    } else {
+        if !live_matches_applied {
+            return Err(BeadsError::internal(
+                "schema-migration undo cannot classify the live main database before staging",
+            ));
+        }
+        let backup_main = backup_component_path(before_dir, db_path, "")?;
+        copy_regular_file_new(&backup_main, restored_candidate, restored_main.unix_mode)?;
+        if let Some(parent) = restored_candidate.parent() {
+            sync_directory(parent)?;
+        }
+    }
+
+    if !live_matches_applied {
+        return Err(BeadsError::internal(
+            "schema-migration undo staging is prepared, but the live main is no longer the applied generation",
+        ));
+    }
+    write_authority.verify_database_authority()?;
+    let replacement_lock =
+        write_authority.lock_database_replacement_candidate(restored_candidate)?;
+    write_authority
+        .verify_locked_database_replacement_candidate(restored_candidate, &replacement_lock)?;
+    exchange_database_paths(restored_candidate, db_path)?;
+    if let Err(error) =
+        write_authority.verify_staged_database_recovery_authority(restored_candidate)
+    {
+        let rollback = exchange_database_paths(restored_candidate, db_path)
+            .and_then(|()| write_authority.verify_database_authority());
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(BeadsError::WithContext {
+                context: format!(
+                    "schema-migration undo rejected a foreign displaced main and rollback could not re-prove the applied authority ({rollback_error})"
+                ),
+                source: Box::new(error),
+            }),
+        };
+    }
+    if let Err(error) = write_authority.adopt_locked_database_replacement(replacement_lock) {
+        let rollback = exchange_database_paths(restored_candidate, db_path)
+            .and_then(|()| {
+                write_authority.restore_retained_database_inode_after_authorized_replace()
+            })
+            .and_then(|()| write_authority.verify_database_authority());
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(BeadsError::WithContext {
+                context: format!(
+                    "schema-migration undo could not adopt its prelocked original and rollback could not re-prove the applied authority ({rollback_error})"
+                ),
+                source: Box::new(error),
+            }),
+        };
+    }
+    rename_path_no_replace(restored_candidate, &quarantined_main)?;
+    if let Some(parent) = db_path.parent() {
+        sync_directory(parent)?;
+    }
+    sync_directory(quarantine_dir)?;
+    write_authority.verify_database_authority()?;
+    Ok(None)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+#[allow(clippy::too_many_arguments)]
+fn install_undo_restored_main_resuming(
+    _db_path: &Path,
+    _before_dir: &Path,
+    _restored_candidate: &Path,
+    _quarantine_dir: &Path,
+    _applied: &RawFamilyWitness,
+    _restored: &RawFamilyWitness,
+    _write_authority: &Arc<DatabaseFamilyWriteLock>,
+) -> Result<Option<File>> {
+    require_atomic_undo_exchange()?;
+    unreachable!("unsupported schema-migration undo exchange returned success")
+}
+
+fn component_bytes_match(
+    path: &Path,
+    metadata: &fs::Metadata,
+    expected: &RawComponentWitness,
+) -> Result<bool> {
+    let (length, sha256) = hash_regular_file(path, metadata)?;
+    Ok(expected.present
+        && expected.length == Some(length)
+        && expected.sha256.as_deref() == Some(&sha256))
 }
 
 fn validate_applied_receipt(
@@ -2061,9 +2327,11 @@ fn validate_completed_undo_receipt(
         ))
     })?;
     validate_raw_family_witness(raw_restored)?;
-    if logical_witness(&migration.db_path)? != *logical_restored {
+    if logical_witness(&migration.db_path)? != *logical_restored
+        || raw_family_witness(&migration.db_path)? != *raw_restored
+    {
         return Err(BeadsError::internal(format!(
-            "schema migration run {} was previously undone, but the live database has since changed",
+            "schema migration run {} was previously undone, but the live database family has since changed",
             args.run_id
         )));
     }
