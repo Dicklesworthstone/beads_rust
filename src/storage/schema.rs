@@ -17,7 +17,7 @@ const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
 // caused rustc to interpret hundreds of thousands of loop iterations on every
 // schema rebuild, overwhelming the compile-time savings of the runtime fast
 // path itself.
-const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str = "v7-version-fenced-lexical-core-aux-columns-fks-index-directions-collations-exact-checks-autoincrement-cookie-fenced";
+const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str = "v8-version-fenced-lexical-core-aux-columns-fks-index-directions-collations-exact-checks-autoincrement-no-hidden-columns-no-triggers-cookie-fenced";
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 const GATE_RESULT_HISTORY_MIGRATION_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS gate_result_history (
@@ -1659,7 +1659,7 @@ fn auxiliary_runtime_columns_canonical(
     columns: &[AuxiliaryRuntimeColumn],
 ) -> bool {
     let escaped_table = table.replace('\'', "''");
-    let Ok(rows) = conn.query(&format!("PRAGMA table_info('{escaped_table}')")) else {
+    let Ok(rows) = conn.query(&format!("PRAGMA table_xinfo('{escaped_table}')")) else {
         return false;
     };
     if rows.len() != columns.len() {
@@ -1677,12 +1677,14 @@ fn auxiliary_runtime_columns_canonical(
                 .is_some_and(|value| value != 0);
             let default_value = row.get(4).and_then(SqliteValue::as_text);
             let primary_key_position = row.get(5).and_then(SqliteValue::as_integer);
+            let hidden = row.get(6).and_then(SqliteValue::as_integer);
 
             name == Some(expected.name)
                 && data_type.is_some_and(|value| value.eq_ignore_ascii_case(expected.data_type))
                 && not_null == expected.not_null
                 && sql_default_matches(default_value, expected.default_value)
                 && primary_key_position == Some(expected.primary_key_position)
+                && hidden == Some(0)
         })
     })
 }
@@ -2198,7 +2200,7 @@ fn core_runtime_columns_canonical(
     order_sensitive: bool,
 ) -> bool {
     let escaped_table = table.replace('\'', "''");
-    let Ok(rows) = conn.query(&format!("PRAGMA table_info('{escaped_table}')")) else {
+    let Ok(rows) = conn.query(&format!("PRAGMA table_xinfo('{escaped_table}')")) else {
         return false;
     };
     if rows.len() != columns.len() {
@@ -2229,11 +2231,13 @@ fn core_runtime_column_matches(
         .is_some_and(|value| value != 0);
     let default_value = row.get(4).and_then(SqliteValue::as_text);
     let primary_key_position = row.get(5).and_then(SqliteValue::as_integer);
+    let hidden = row.get(6).and_then(SqliteValue::as_integer);
     name == Some(expected.name)
         && data_type.is_some_and(|value| value.eq_ignore_ascii_case(expected.data_type))
         && not_null == expected.not_null
         && core_runtime_default_matches(table, expected.name, default_value, expected.default_value)
         && primary_key_position == Some(expected.primary_key_position)
+        && hidden == Some(0)
 }
 
 fn core_runtime_foreign_keys_canonical(
@@ -2419,11 +2423,11 @@ const EXPECTED_ISSUE_COLUMN_ORDER: &[&str] = &[
 /// Returns `true` if the column order matches, `false` if it differs or the
 /// table doesn't exist.
 fn issues_column_order_matches(conn: &Connection) -> bool {
-    // Use PRAGMA table_info to detect both existence and column order in a
-    // single query.  Avoid querying sqlite_master separately because
+    // Use PRAGMA table_xinfo to detect existence, column order, and generated
+    // columns in a single query. Avoid querying sqlite_master separately because
     // fsqlite's in-memory sqlite_master can return inconsistent results
     // when queried multiple times within the same connection session.
-    let Ok(rows) = conn.query("PRAGMA table_info(issues)") else {
+    let Ok(rows) = conn.query("PRAGMA table_xinfo(issues)") else {
         return false;
     };
 
@@ -2437,6 +2441,14 @@ fn issues_column_order_matches(conn: &Connection) -> bool {
     }
 
     if actual_columns.len() != EXPECTED_ISSUE_COLUMN_ORDER.len() {
+        return false;
+    }
+
+    if rows.iter().any(|row| {
+        row.get(6)
+            .and_then(SqliteValue::as_integer)
+            .is_none_or(|hidden| hidden != 0)
+    }) {
         return false;
     }
 
@@ -2838,9 +2850,15 @@ fn run_pre_schema_migrations(conn: &Connection) -> Result<bool> {
     Ok(issues_rebuilt)
 }
 
+fn runtime_has_no_persistent_triggers(conn: &Connection) -> bool {
+    conn.query("SELECT 1 FROM sqlite_master WHERE type = 'trigger' LIMIT 1")
+        .is_ok_and(|rows| rows.is_empty())
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
     let version_ok = current_schema_version_declared(conn);
+    let triggers_ok = runtime_has_no_persistent_triggers(conn);
     let issues_ok = core_runtime_table_canonical(
         conn,
         "issues",
@@ -2973,6 +2991,7 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
     let capacity_occupancy_ok = capacity_occupancy_schema_canonical(conn);
     let capacity_ok = capacity_exemptions_ok && capacity_occupancy_ok;
     let compatible = version_ok
+        && triggers_ok
         && issues_ok
         && dependencies_ok
         && labels_ok
@@ -2992,6 +3011,7 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
     if !compatible {
         tracing::debug!(
             version_ok,
+            triggers_ok,
             issues_ok,
             dependencies_ok,
             labels_ok,
@@ -3614,7 +3634,7 @@ fn sql_default_matches(actual: Option<&str>, expected: Option<&str>) -> bool {
 }
 
 fn attest_gate_result_history_columns(conn: &Connection) -> Result<()> {
-    let rows = conn.query("PRAGMA table_info('gate_result_history')")?;
+    let rows = conn.query("PRAGMA table_xinfo('gate_result_history')")?;
     if rows.len() != GATE_RESULT_HISTORY_COLUMNS.len() {
         return Err(schema_migration_shape_error(format!(
             "gate_result_history has {} columns, expected {}",
@@ -3650,17 +3670,26 @@ fn attest_gate_result_history_columns(conn: &Connection) -> Result<()> {
                         "gate_result_history.{name} has no primary-key position"
                     ))
                 })?;
+        let hidden = row
+            .get(6)
+            .and_then(SqliteValue::as_integer)
+            .ok_or_else(|| {
+                schema_migration_shape_error(format!(
+                    "gate_result_history.{name} has no hidden-column flag"
+                ))
+            })?;
 
         if name != expected.name
             || !data_type.eq_ignore_ascii_case(expected.data_type)
             || not_null != expected.not_null
             || !sql_default_matches(default_value, expected.default_value)
             || primary_key_position != expected.primary_key_position
+            || hidden != 0
         {
             return Err(schema_migration_shape_error(format!(
                 "gate_result_history column {position} is not canonical \
                  (observed name={name:?}, type={data_type:?}, not_null={not_null}, \
-                 default={default_value:?}, pk={primary_key_position}; expected \
+                 default={default_value:?}, pk={primary_key_position}, hidden={hidden}; expected \
                  name={:?}, type={:?}, not_null={}, default={:?}, pk={})",
                 expected.name,
                 expected.data_type,

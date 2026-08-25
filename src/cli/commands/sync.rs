@@ -3025,13 +3025,24 @@ fn replace_database_from_jsonl_snapshot(
     let (mut rebuilt_storage, import_result, _) = match recovery {
         Ok(rebuilt) => rebuilt,
         Err(error) => {
-            if let Ok(mut reopened) =
-                crate::storage::SqliteStorage::open_with_timeout(db_path, cli.lock_timeout)
-            {
-                if let Some(authority) = cli.database_family_write_authority_for(beads_dir, db_path)
-                {
-                    reopened.attach_write_authority(std::sync::Arc::clone(authority));
-                }
+            let reopened = cli
+                .database_family_write_authority_for(beads_dir, db_path)
+                .map_or_else(
+                    || {
+                        crate::storage::SqliteStorage::open_with_timeout(
+                            db_path,
+                            cli.lock_timeout,
+                        )
+                    },
+                    |authority| {
+                        crate::storage::SqliteStorage::open_with_timeout_under_write_authority(
+                            db_path,
+                            cli.lock_timeout,
+                            authority,
+                        )
+                    },
+                );
+            if let Ok(reopened) = reopened {
                 *storage = reopened;
             }
             return Err(error);
@@ -3670,9 +3681,24 @@ fn execute_import(
         ) {
             Ok(compacted_storage) => *storage = compacted_storage,
             Err(err) => {
-                if let Ok(reopened) =
-                    crate::storage::SqliteStorage::open_with_timeout(db_path, cli.lock_timeout)
-                {
+                let reopened = cli
+                    .database_family_write_authority_for(beads_dir, db_path)
+                    .map_or_else(
+                        || {
+                            crate::storage::SqliteStorage::open_with_timeout(
+                                db_path,
+                                cli.lock_timeout,
+                            )
+                        },
+                        |authority| {
+                            crate::storage::SqliteStorage::open_with_timeout_under_write_authority(
+                                db_path,
+                                cli.lock_timeout,
+                                authority,
+                            )
+                        },
+                    );
+                if let Ok(reopened) = reopened {
                     *storage = reopened;
                 }
                 return Err(err);
