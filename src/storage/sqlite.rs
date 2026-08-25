@@ -41,7 +41,7 @@ thread_local! {
     static CHANGE_USER_VERSION_AFTER_RUNTIME_COMPATIBILITY: std::cell::Cell<u32> =
         const { std::cell::Cell::new(0) };
     #[cfg(unix)]
-    static SWAP_NAMESPACE_SIDECAR_BEFORE_OPEN: std::cell::RefCell<Option<PathBuf>> =
+    static SWAP_NAMESPACE_SIDECAR_AFTER_OPEN: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -1841,8 +1841,8 @@ impl SqliteStorage {
     }
 
     #[cfg(all(test, unix))]
-    fn arm_namespace_sidecar_swap_before_open_for_test(victim: PathBuf) {
-        SWAP_NAMESPACE_SIDECAR_BEFORE_OPEN.with(|pending| {
+    fn arm_namespace_sidecar_swap_after_open_for_test(victim: PathBuf) {
+        SWAP_NAMESPACE_SIDECAR_AFTER_OPEN.with(|pending| {
             *pending.borrow_mut() = Some(victim);
         });
     }
@@ -15914,19 +15914,19 @@ fn verify_namespace_healing_authority(
 }
 
 #[cfg(all(test, unix))]
-fn maybe_swap_namespace_sidecar_before_open_for_test(sidecar: &Path) -> Result<()> {
-    let victim = SWAP_NAMESPACE_SIDECAR_BEFORE_OPEN.with(|pending| pending.borrow_mut().take());
+fn maybe_swap_namespace_sidecar_after_open_for_test(sidecar: &Path) -> Result<()> {
+    let victim = SWAP_NAMESPACE_SIDECAR_AFTER_OPEN.with(|pending| pending.borrow_mut().take());
     let Some(victim) = victim else {
         return Ok(());
     };
-    let retained = database_sidecar_path(sidecar, ".test-retained-before-symlink-swap");
+    let retained = database_sidecar_path(sidecar, ".test-retained-after-open-symlink-swap");
     std::fs::rename(sidecar, &retained)?;
     std::os::unix::fs::symlink(victim, sidecar)?;
     Ok(())
 }
 
 #[cfg(not(all(test, unix)))]
-fn maybe_swap_namespace_sidecar_before_open_for_test(_sidecar: &Path) -> Result<()> {
+fn maybe_swap_namespace_sidecar_after_open_for_test(_sidecar: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -15967,7 +15967,6 @@ fn heal_namespace_sidecar_modes_under_authority(
                 continue;
             }
 
-            maybe_swap_namespace_sidecar_before_open_for_test(&sidecar)?;
             let mut options = std::fs::OpenOptions::new();
             options.read(true);
             options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
@@ -15979,6 +15978,7 @@ fn heal_namespace_sidecar_modes_under_authority(
                     ),
                 }
             })?;
+            maybe_swap_namespace_sidecar_after_open_for_test(&sidecar)?;
             let handle_metadata = sidecar_file.metadata()?;
             let pre_chmod_metadata = std::fs::symlink_metadata(&sidecar)?;
             let initial_identity = (initial_metadata.dev(), initial_metadata.ino());
@@ -18563,6 +18563,12 @@ impl SqliteStorage {
         if !is_sqlite {
             return Ok(PendingSyncMergeInspection::Absent);
         }
+        // This is the writable fast-open fallback's first engine open. The
+        // caller has already bound the exact database inode, so any required
+        // namespace-sidecar repair belongs here rather than in the preceding
+        // lock-free read-only probe.
+        heal_namespace_sidecar_modes_under_authority(path, authority)?;
+        authority.verify_database_authority()?;
         let Some(mut storage) = Self::open_current_read_only(path)? else {
             let found = effective_database_user_version(path)?;
             return match found {
@@ -19619,15 +19625,21 @@ mod tests {
         }
     }
 
-    /// GitHub #403: fsqlite refuses to open a namespace sidecar
-    /// (`-fsqlite-ns-gate` / `-fsqlite-ns-use`) that carries any bit in
-    /// `0o077`, and the refusal surfaced as a bare "unable to open database
-    /// file" naming the sidecar — wedging every command until a human noticed
-    /// the mode. The open path now repairs the mode first, because the
-    /// sidecars are regenerable engine state rather than user data.
+    #[cfg(unix)]
+    fn existing_namespace_sidecars(db_path: &Path) -> Vec<PathBuf> {
+        crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES
+            .iter()
+            .map(|suffix| database_sidecar_path(db_path, suffix))
+            .filter(|path| path.is_file())
+            .collect()
+    }
+
+    /// GitHub #403: the lock-free fast path must not chmod a namespace
+    /// sidecar. It declines without changing any bytes or mode, then the same
+    /// database opens and heals only after its exact family authority is held.
     #[cfg(unix)]
     #[test]
-    fn over_permissive_namespace_sidecar_mode_is_healed_before_open() {
+    fn lock_free_fast_open_is_nonmutating_before_authority_gated_sidecar_heal() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = TempDir::new().unwrap();
@@ -19644,28 +19656,56 @@ mod tests {
                 None,
             );
             storage.create_issue(&issue, "tester").unwrap();
+            storage.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
         }
 
-        let mut loosened = Vec::new();
-        for suffix in crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES {
-            let mut sidecar = db_path.as_os_str().to_os_string();
-            sidecar.push(suffix);
-            let sidecar = PathBuf::from(sidecar);
-            if sidecar.is_file() {
-                fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o664)).unwrap();
-                loosened.push(sidecar);
-            }
+        let loosened = existing_namespace_sidecars(&db_path);
+        for sidecar in &loosened {
+            fs::set_permissions(sidecar, fs::Permissions::from_mode(0o664)).unwrap();
         }
         assert!(
             !loosened.is_empty(),
             "expected fsqlite namespace sidecars beside {}",
             db_path.display()
         );
+        let database_before = fs::read(&db_path).unwrap();
+        let sidecars_before: Vec<_> = loosened
+            .iter()
+            .map(|sidecar| {
+                (
+                    sidecar.clone(),
+                    fs::read(sidecar).unwrap(),
+                    fs::metadata(sidecar).unwrap().permissions().mode(),
+                )
+            })
+            .collect();
 
-        // Pre-fix this open failed with a bare `DATABASE_ERROR` naming the
-        // sidecar; the database itself was never damaged.
-        let storage = SqliteStorage::open(&db_path)
-            .expect("open must repair the sidecar mode instead of failing");
+        assert!(
+            SqliteStorage::open_current_read_only(&db_path)
+                .expect("read-only fast preflight")
+                .is_none(),
+            "a mode repair must route through the authority-acquiring fallback"
+        );
+        assert_eq!(fs::read(&db_path).unwrap(), database_before);
+        for (sidecar, bytes, mode) in &sidecars_before {
+            assert_eq!(fs::read(sidecar).unwrap(), *bytes);
+            assert_eq!(fs::metadata(sidecar).unwrap().permissions().mode(), *mode);
+        }
+
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                temp.path(),
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+        let storage = SqliteStorage::open_with_timeout_under_write_authority(
+            &db_path,
+            Some(50),
+            &authority,
+        )
+        .expect("authority-gated open must repair the sidecar mode");
         assert!(storage.get_issue("bd-ns").unwrap().is_some());
         drop(storage);
 
@@ -19679,6 +19719,72 @@ mod tests {
                 mode & 0o7777
             );
         }
+    }
+
+    /// A namespace-sidecar path swap after its no-follow handle is open must
+    /// fail the immediate path/handle identity fence before fchmod. The symlink
+    /// target therefore keeps its deliberately permissive mode.
+    #[cfg(unix)]
+    #[test]
+    fn authority_gated_sidecar_heal_rejects_symlink_swap_before_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("sidecar_swap.db");
+        {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            storage.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        let sidecars = existing_namespace_sidecars(&db_path);
+        let target = sidecars
+            .first()
+            .expect("fsqlite namespace sidecar fixture")
+            .clone();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o664)).unwrap();
+
+        let victim = temp.path().join("outside-family-victim");
+        fs::write(&victim, b"must-not-be-chmodded").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).unwrap();
+        let victim_mode_before = fs::metadata(&victim).unwrap().permissions().mode();
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                temp.path(),
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+        SqliteStorage::arm_namespace_sidecar_swap_after_open_for_test(victim.clone());
+
+        let error = SqliteStorage::open_with_timeout_under_write_authority(
+            &db_path,
+            Some(50),
+            &authority,
+        )
+        .expect_err("a sidecar symlink swap must fail closed");
+        assert!(
+            error.to_string().contains("changed identity"),
+            "unexpected sidecar swap error: {error}"
+        );
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the hook must install the causal symlink swap"
+        );
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode(),
+            victim_mode_before,
+            "the swapped-in symlink target must never be chmodded"
+        );
+        let retained =
+            database_sidecar_path(&target, ".test-retained-after-open-symlink-swap");
+        assert_eq!(
+            fs::metadata(retained).unwrap().permissions().mode() & 0o077,
+            0o064,
+            "the handle-bound original must not be chmodded before the path identity fence"
+        );
     }
 
     /// GitHub #399: a status move that `workflow.transitions` forbids must be
@@ -28589,6 +28695,74 @@ mod tests {
             database_bytes_before,
             "a rejected open must leave the main database bytes unchanged"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_future_schema_refusal_precedes_authority_gated_sidecar_heal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("future_schema_permissive_sidecar.db");
+        let future_version = u32::try_from(CURRENT_SCHEMA_VERSION)
+            .unwrap()
+            .checked_add(1)
+            .unwrap();
+        {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .conn
+                .execute(&format!("PRAGMA user_version = {future_version}"))
+                .unwrap();
+            storage.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        assert_eq!(
+            database_header_user_version(&db_path),
+            Some(future_version),
+            "the fixture must put the future version in the main header"
+        );
+
+        let sidecars = existing_namespace_sidecars(&db_path);
+        assert!(!sidecars.is_empty(), "namespace sidecar fixture");
+        let mut modes_before = Vec::new();
+        for sidecar in &sidecars {
+            fs::set_permissions(sidecar, fs::Permissions::from_mode(0o664)).unwrap();
+            modes_before.push((
+                sidecar.clone(),
+                fs::metadata(sidecar).unwrap().permissions().mode(),
+            ));
+        }
+        let database_before = fs::read(&db_path).unwrap();
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                temp.path(),
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+
+        let error = SqliteStorage::open_with_timeout_under_write_authority(
+            &db_path,
+            Some(50),
+            &authority,
+        )
+        .expect_err("future schema must be refused before any sidecar chmod");
+        assert!(
+            error
+                .to_string()
+                .contains("newer than this br binary supports"),
+            "unexpected future-schema sidecar error: {error}"
+        );
+        assert_eq!(fs::read(&db_path).unwrap(), database_before);
+        for (sidecar, mode_before) in modes_before {
+            assert_eq!(
+                fs::metadata(&sidecar).unwrap().permissions().mode(),
+                mode_before,
+                "future-schema refusal changed {} before returning",
+                sidecar.display()
+            );
+        }
     }
 
     #[test]

@@ -973,7 +973,17 @@ fn open_sqlite_storage_with_recovery_strategy(
         )
     };
 
-    match SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout) {
+    let storage_open = write_authority.map_or_else(
+        || SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout),
+        |authority| {
+            SqliteStorage::open_with_timeout_under_write_authority(
+                &paths.db_path,
+                lock_timeout,
+                authority,
+            )
+        },
+    );
+    match storage_open {
         Ok(storage) => match storage.detect_recoverable_open_anomaly() {
             Ok(None) => Ok(SqliteRecoveryOpenResult {
                 storage,
@@ -1176,7 +1186,11 @@ fn prepare_fresh_storage_for_deferred_import(
         SuccessfulRecoveryDisposition::RetainBackupUntilCommandSuccess,
         |fresh_witness| {
             write_authority.verify_fresh_database_replacement_witness(&fresh_witness)?;
-            SqliteStorage::open_with_timeout(db_path, lock_timeout)
+            SqliteStorage::open_with_timeout_under_write_authority(
+                db_path,
+                lock_timeout,
+                write_authority,
+            )
         },
     )?;
     let recovery_dir = backup_set.recovery_dir.clone();
@@ -2478,7 +2492,11 @@ fn rebuild_database_family(
     fresh_witness: FreshDatabaseReplacementWitness,
 ) -> Result<(SqliteStorage, ImportResult)> {
     write_authority.verify_database_authority()?;
-    let mut storage = SqliteStorage::open_with_timeout(db_path, lock_timeout)?;
+    let mut storage = SqliteStorage::open_with_timeout_under_write_authority(
+        db_path,
+        lock_timeout,
+        write_authority,
+    )?;
     storage.attach_write_authority(Arc::clone(write_authority));
     write_authority.verify_database_authority()?;
     storage.set_config("issue_prefix", prefix)?;
@@ -2887,7 +2905,13 @@ pub(crate) fn compact_database_via_vacuum_into_in_place(
         db_path,
         lock_timeout,
         &write_authority,
-        SqliteStorage::open_with_timeout,
+        |path, timeout| {
+            SqliteStorage::open_with_timeout_under_write_authority(
+                path,
+                timeout,
+                &write_authority,
+            )
+        },
         || Ok(()),
         || Ok(()),
         |from, to| {
@@ -2907,7 +2931,13 @@ fn compact_database_via_vacuum_into_in_place_under_write_authority(
         db_path,
         lock_timeout,
         write_authority,
-        SqliteStorage::open_with_timeout,
+        |path, timeout| {
+            SqliteStorage::open_with_timeout_under_write_authority(
+                path,
+                timeout,
+                write_authority,
+            )
+        },
         || Ok(()),
         || Ok(()),
         |from, to| {
@@ -4396,9 +4426,12 @@ impl OpenStorageResult {
         if had_original_database_family {
             write_authority.restore_retained_database_inode_after_authorized_replace()?;
             write_authority.verify_database_authority()?;
-            let mut restored_storage =
-                SqliteStorage::open_with_timeout(&self.paths.db_path, self.resolved_lock_timeout)
-                    .map_err(|reopen_err| BeadsError::WithContext {
+            let mut restored_storage = SqliteStorage::open_with_timeout_under_write_authority(
+                &self.paths.db_path,
+                self.resolved_lock_timeout,
+                &write_authority,
+            )
+            .map_err(|reopen_err| BeadsError::WithContext {
                     context: format!(
                         "Restored the original database family at '{}' but failed to reopen it",
                         self.paths.db_path.display()

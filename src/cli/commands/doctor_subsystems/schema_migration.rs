@@ -2041,6 +2041,9 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+// Keep one fallible cross-platform call site; unsupported builds fail before
+// creating a staged restore or mutating the live namespace.
+#[allow(clippy::unnecessary_wraps)]
 fn require_atomic_undo_exchange() -> Result<()> {
     Ok(())
 }
@@ -2188,8 +2191,10 @@ fn install_undo_restored_main_resuming(
     _restored: &RawFamilyWitness,
     _write_authority: &Arc<DatabaseFamilyWriteLock>,
 ) -> Result<Option<File>> {
-    require_atomic_undo_exchange()?;
-    unreachable!("unsupported schema-migration undo exchange returned success")
+    Err(BeadsError::Config(
+        "schema-migration undo requires an atomic path-exchange primitive on this platform"
+            .to_string(),
+    ))
 }
 
 fn component_bytes_match(
