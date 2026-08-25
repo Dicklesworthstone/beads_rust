@@ -17,7 +17,7 @@ const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
 // caused rustc to interpret hundreds of thousands of loop iterations on every
 // schema rebuild, overwhelming the compile-time savings of the runtime fast
 // path itself.
-const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str = "v6-version-fenced-lexical-core-aux-columns-fks-index-directions-collations-checks-autoincrement-cookie-fenced";
+const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str = "v7-version-fenced-lexical-core-aux-columns-fks-index-directions-collations-exact-checks-autoincrement-cookie-fenced";
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 const GATE_RESULT_HISTORY_MIGRATION_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS gate_result_history (
@@ -755,6 +755,8 @@ pub(crate) fn execute_batch(conn: &Connection, sql: &str) -> Result<()> {
 ///
 /// Returns an error if the SQL execution fails or pragmas cannot be set.
 pub fn apply_schema(conn: &Connection) -> Result<()> {
+    refuse_future_schema_version(conn, "schema application")?;
+
     // Detect a truly fresh (empty) database before any DDL runs.
     // On a fresh DB, SCHEMA_SQL creates everything at the current version,
     // so running migrations is unnecessary and harmful — e.g. the v3/v4
@@ -850,6 +852,16 @@ fn current_schema_version_u32() -> Result<u32> {
             "current schema version {CURRENT_SCHEMA_VERSION} cannot be represented as u32"
         ))
     })
+}
+
+fn refuse_future_schema_version(conn: &Connection, operation: &str) -> Result<()> {
+    let declared = runtime_user_version(conn)?;
+    if declared > i64::from(CURRENT_SCHEMA_VERSION) {
+        return Err(BeadsError::Config(format!(
+            "{operation} refused: database schema version {declared} is newer than supported version {CURRENT_SCHEMA_VERSION}"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_reviewed_schema_migration(
@@ -988,6 +1000,11 @@ pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) 
              ({supported_target}), got {target_version}"
         )));
     }
+    if from > supported_target {
+        return Err(BeadsError::internal(format!(
+            "schema migrate refused — source schema {from} is newer than supported version {supported_target}"
+        )));
+    }
     if REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         let marked_at = Utc::now().to_rfc3339();
         validate_reviewed_schema_migration(conn, from, target_version, &marked_at)?;
@@ -1055,6 +1072,8 @@ pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) 
 }
 
 pub(crate) fn apply_runtime_compatible_schema(conn: &Connection) -> Result<()> {
+    refuse_future_schema_version(conn, "runtime schema repair")?;
+
     // The table layouts are already safe to operate on, so we can skip the
     // heavier pre-schema rebuilds and just restore any missing canonical DDL.
     execute_batch(conn, SCHEMA_SQL)?;

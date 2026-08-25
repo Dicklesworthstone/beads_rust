@@ -15813,14 +15813,13 @@ fn namespace_sidecar_mode_repair_required(db_path: &Path) -> Result<bool> {
                 repair_required = true;
             }
         }
-        return Ok(repair_required);
+        Ok(repair_required)
     }
     #[cfg(not(unix))]
     {
         let _ = db_path;
+        Ok(false)
     }
-    #[cfg(not(unix))]
-    return Ok(false);
 }
 
 fn database_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
@@ -19817,6 +19816,34 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
+    fn directory_bytes_and_modes(dir: &Path) -> BTreeMap<String, (Vec<u8>, u32)> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut snapshot = BTreeMap::new();
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let metadata = fs::symlink_metadata(entry.path()).unwrap();
+            let bytes = if metadata.is_file() {
+                fs::read(entry.path()).unwrap()
+            } else if metadata.file_type().is_symlink() {
+                fs::read_link(entry.path())
+                    .unwrap()
+                    .as_os_str()
+                    .to_string_lossy()
+                    .as_bytes()
+                    .to_vec()
+            } else {
+                Vec::new()
+            };
+            snapshot.insert(
+                entry.file_name().to_string_lossy().into_owned(),
+                (bytes, metadata.permissions().mode()),
+            );
+        }
+        snapshot
+    }
+
     /// GitHub #403: the lock-free fast path must not chmod a namespace
     /// sidecar. It declines without changing any bytes or mode, then the same
     /// database opens and heals only after its exact family authority is held.
@@ -19967,6 +19994,66 @@ mod tests {
             fs::metadata(retained).unwrap().permissions().mode() & 0o077,
             0o064,
             "the handle-bound original must not be chmodded before the path identity fence"
+        );
+    }
+
+    /// The family-wide type/mode preflight must inspect every namespace
+    /// sidecar before chmodding the first repair candidate.
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_heal_preflights_later_symlink_before_first_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("sidecar_family_preflight.db");
+        {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            storage.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        let first = database_sidecar_path(
+            &db_path,
+            crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES[0],
+        );
+        let second = database_sidecar_path(
+            &db_path,
+            crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES[1],
+        );
+        if !first.is_file() {
+            fs::write(&first, b"first-sidecar").unwrap();
+        }
+        fs::set_permissions(&first, fs::Permissions::from_mode(0o664)).unwrap();
+        let first_mode_before = fs::metadata(&first).unwrap().permissions().mode();
+
+        let victim = temp.path().join("later-sidecar-symlink-victim");
+        fs::write(&victim, b"outside-family").unwrap();
+        if second.exists() {
+            let retained = database_sidecar_path(&second, ".test-retained-before-preflight");
+            fs::rename(&second, retained).unwrap();
+        }
+        std::os::unix::fs::symlink(&victim, &second).unwrap();
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                temp.path(),
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+
+        let error = SqliteStorage::open_with_timeout_under_write_authority(
+            &db_path,
+            Some(50),
+            &authority,
+        )
+        .expect_err("a later unsafe sidecar must abort before any chmod");
+        assert!(
+            error.to_string().contains("unsafe fsqlite namespace sidecar"),
+            "unexpected family preflight error: {error}"
+        );
+        assert_eq!(
+            fs::metadata(&first).unwrap().permissions().mode(),
+            first_mode_before,
+            "the first permissive sidecar was chmodded before the later symlink was rejected"
         );
     }
 

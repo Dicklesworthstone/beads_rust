@@ -960,6 +960,14 @@ fn open_sqlite_storage_with_recovery_strategy(
     }
 
     if let Some(authority) = write_authority {
+        if crate::sync::database_write_authority_sha256(&paths.db_path)?
+            != authority.authority_path_sha256()
+        {
+            return Err(BeadsError::SyncConflict {
+                message: "Truncated WAL quarantine path does not match the held database-family authority"
+                    .to_string(),
+            });
+        }
         authority.verify_database_authority()?;
         quarantine_truncated_wal_sidecar(&paths.db_path, beads_dir);
         authority.verify_database_authority()?;
