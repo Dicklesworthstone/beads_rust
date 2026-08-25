@@ -303,10 +303,7 @@ fn install_database_candidate_no_replace(candidate: &Path, target: &Path) -> Res
 /// implementations, so recovery code must use the same native no-replace
 /// primitive as fresh-database installation.
 #[cfg(windows)]
-pub(crate) fn rename_path_no_replace_windows(
-    from: &Path,
-    to: &Path,
-) -> std::io::Result<()> {
+pub(crate) fn rename_path_no_replace_windows(from: &Path, to: &Path) -> std::io::Result<()> {
     db_inode_lock::rename_database_candidate_no_replace(from, to)
 }
 

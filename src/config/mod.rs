@@ -2042,8 +2042,9 @@ fn verify_staged_database_family_witness(
             .any(|witness| witness.original == *original)
     }) {
         return Err(BeadsError::SyncConflict {
-            message: "Recovery staged an unexpected database-family path after its final authority check"
-                .to_string(),
+            message:
+                "Recovery staged an unexpected database-family path after its final authority check"
+                    .to_string(),
         });
     }
 
@@ -11003,6 +11004,85 @@ routing:
         assert_eq!(
             fs::read(&backup_path).expect("read returned original backup"),
             b"original-db"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_rejects_same_byte_database_swap_after_final_authority_check() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::write(&db_path, b"original-db").expect("write original database");
+        let authority = crate::sync::blocking_database_family_write_lock_with_timeout(
+            &beads_dir,
+            &db_path,
+            Some(1_000),
+        )
+        .expect("acquire database-family authority");
+        let backup_set = move_database_family_to_recovery(&db_path, &beads_dir, "fixed-stamp")
+            .expect("move original database into recovery");
+        authority
+            .install_empty_database_replacement_and_bind()
+            .expect("install retained replacement");
+        fs::write(&db_path, b"same-rebuilt-bytes").expect("write retained replacement bytes");
+
+        let foreign_candidate = beads_dir.join("foreign-database-generation");
+        fs::write(&foreign_candidate, b"same-rebuilt-bytes")
+            .expect("write same-byte foreign generation");
+        let foreign_inode = fs::metadata(&foreign_candidate)
+            .expect("inspect foreign generation")
+            .ino();
+
+        let error = restore_database_family_after_failed_rebuild_before_live_staging(
+            &backup_set,
+            || {
+                assert_eq!(
+                    authority.database_target_authority_state()?,
+                    crate::sync::DatabaseTargetAuthorityState::Held,
+                    "the final authority check must observe the retained replacement"
+                );
+                fs::rename(&foreign_candidate, &db_path)?;
+                Ok(())
+            },
+            |staged_paths| {
+                verify_staged_database_recovery_authority(
+                    &backup_set,
+                    staged_paths,
+                    &authority,
+                    crate::sync::DatabaseTargetAuthorityState::Held,
+                )
+            },
+        )
+        .expect_err("same-byte foreign source swap must fail the staged-inode check");
+
+        assert!(
+            error.to_string().contains("generation changed"),
+            "unexpected staged-authority error: {error}"
+        );
+        assert_eq!(
+            fs::metadata(&db_path)
+                .expect("inspect restored foreign generation")
+                .ino(),
+            foreign_inode,
+            "the foreign generation must be returned to the canonical path"
+        );
+        assert_eq!(
+            fs::read(&db_path).expect("read restored foreign generation"),
+            b"same-rebuilt-bytes"
+        );
+        let original_backup = backup_set
+            .files
+            .iter()
+            .find_map(|(original, backup)| (original == &db_path).then_some(backup))
+            .expect("original database backup path");
+        assert_eq!(
+            fs::read(original_backup).expect("read returned original backup"),
+            b"original-db",
+            "the original backup must remain public and uninstalled"
         );
     }
 

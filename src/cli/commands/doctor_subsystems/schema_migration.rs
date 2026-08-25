@@ -43,7 +43,7 @@ use crate::storage::schema::{
     CURRENT_SCHEMA_VERSION, REVIEWED_MIGRATION_SOURCE_VERSIONS, ReviewedSchemaMigrationEffects,
     run_reviewed_schema_migration_steps_in_transaction, runtime_schema_compatible,
 };
-use crate::sync::DatabaseFamilyWriteLock;
+use crate::sync::{DatabaseFamilyWriteLock, DatabaseTargetAuthorityState};
 
 const PLAN_SCHEMA: &str = "br.doctor.schema_migration.plan.v1";
 const PREPARED_SCHEMA: &str = "br.doctor.schema_migration.prepared.v1";
@@ -479,7 +479,19 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
         &run_dir,
         &migration.write_authority,
     );
-    migration.write_authority.verify_database_authority()?;
+    let authority_result = migration.write_authority.verify_database_authority();
+    let migration_result = match (migration_result, authority_result) {
+        (Ok(effects), Ok(())) => Ok(effects),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(authority_error)) => Err(authority_error),
+        (Err(error), Err(authority_error)) => Err(BeadsError::WithContext {
+            context: format!(
+                "reviewed schema migration failed and its database authority could not be \
+                 re-verified afterward ({authority_error})"
+            ),
+            source: Box::new(error),
+        }),
+    };
     let effects = match migration_result {
         Ok(effects) => effects,
         Err(error) => {
@@ -829,6 +841,51 @@ fn require_absent_family(base_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn rename_path_no_replace(source: &Path, destination: &Path) -> Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+    match renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(()),
+        Err(error) if error == rustix::io::Errno::EXIST => Err(BeadsError::SyncConflict {
+            message: format!(
+                "refusing to overwrite schema-migration artifact {}",
+                destination.display()
+            ),
+        }),
+        Err(error) => Err(BeadsError::Io(std::io::Error::from(error))),
+    }
+}
+
+#[cfg(windows)]
+fn rename_path_no_replace(source: &Path, destination: &Path) -> Result<()> {
+    match crate::sync::rename_path_no_replace_windows(source, destination) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(BeadsError::SyncConflict {
+                message: format!(
+                    "refusing to overwrite schema-migration artifact {}",
+                    destination.display()
+                ),
+            })
+        }
+        Err(error) => Err(BeadsError::Io(error)),
+    }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    windows
+)))]
+fn rename_path_no_replace(_source: &Path, _destination: &Path) -> Result<()> {
+    Err(BeadsError::Config(
+        "this platform does not provide the atomic no-replace rename required by reviewed schema migration"
+            .to_string(),
+    ))
+}
+
 fn move_present_sidecars_new(
     source_base: &Path,
     destination_dir: &Path,
@@ -847,20 +904,6 @@ fn move_present_sidecars_new(
     for component in present_sidecars {
         let source = family_component_path(source_base, &component.suffix);
         let destination = backup_component_path(destination_dir, source_base, &component.suffix)?;
-        if secure_file_metadata(&destination)?.is_some() {
-            let rollback = restore_moved_components(source_base, destination_dir, &moved);
-            return match rollback {
-                Ok(()) => Err(BeadsError::internal(format!(
-                    "refusing to overwrite retained schema-migration sidecar {}",
-                    destination.display()
-                ))),
-                Err(rollback_error) => Err(BeadsError::internal(format!(
-                    "refusing to overwrite retained schema-migration sidecar {}; rollback of \
-                     prior sidecar moves also failed: {rollback_error}",
-                    destination.display()
-                ))),
-            };
-        }
         let metadata = secure_file_metadata(&source)?.ok_or_else(|| {
             BeadsError::internal(format!(
                 "schema-migration sidecar disappeared before retention: {}",
@@ -868,10 +911,10 @@ fn move_present_sidecars_new(
             ))
         })?;
         verify_component_bytes(&source, &metadata, component)?;
-        if let Err(error) = fs::rename(&source, &destination) {
+        if let Err(error) = rename_path_no_replace(&source, &destination) {
             let rollback = restore_moved_components(source_base, destination_dir, &moved);
             return match rollback {
-                Ok(()) => Err(BeadsError::Io(error)),
+                Ok(()) => Err(error),
                 Err(rollback_error) => Err(BeadsError::internal(format!(
                     "could not retain schema-migration sidecar {} ({error}); rollback of prior \
                      sidecar moves also failed: {rollback_error}",
@@ -879,30 +922,59 @@ fn move_present_sidecars_new(
                 ))),
             };
         }
-        moved.push(component.suffix.clone());
+        moved.push((*component).clone());
+        let moved_metadata = secure_file_metadata(&destination)?.ok_or_else(|| {
+            BeadsError::internal(format!(
+                "schema-migration sidecar disappeared after retention: {}",
+                destination.display()
+            ))
+        })?;
+        if let Err(error) = verify_component_bytes(&destination, &moved_metadata, component) {
+            let rollback = restore_moved_components(source_base, destination_dir, &moved);
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(BeadsError::internal(format!(
+                    "retained schema-migration sidecar {} failed its post-move witness \
+                     ({error}); rollback also failed ({rollback_error})",
+                    destination.display()
+                ))),
+            };
+        }
     }
-    if let Some(parent) = source_base.parent() {
-        sync_directory(parent)?;
+    let sync_result = if let Some(parent) = source_base.parent() {
+        sync_directory(parent).and_then(|()| sync_directory(destination_dir))
+    } else {
+        sync_directory(destination_dir)
+    };
+    if let Err(error) = sync_result {
+        let rollback = restore_moved_components(source_base, destination_dir, &moved);
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(BeadsError::internal(format!(
+                "retained schema-migration sidecars could not be made durable ({error}); \
+                 rollback also failed ({rollback_error})"
+            ))),
+        };
     }
-    sync_directory(destination_dir)
+    Ok(())
 }
 
 fn restore_moved_components(
     destination_base: &Path,
     source_dir: &Path,
-    suffixes: &[String],
+    components: &[RawComponentWitness],
 ) -> Result<()> {
-    for suffix in suffixes.iter().rev() {
-        let source = backup_component_path(source_dir, destination_base, suffix)?;
-        let destination = family_component_path(destination_base, suffix);
-        if secure_file_metadata(&destination)?.is_some() {
-            return Err(BeadsError::internal(format!(
-                "cannot restore retained schema-migration component because its live path exists: \
-                 {}",
+    for component in components.iter().rev() {
+        let source = backup_component_path(source_dir, destination_base, &component.suffix)?;
+        let destination = family_component_path(destination_base, &component.suffix);
+        rename_path_no_replace(&source, &destination)?;
+        let restored_metadata = secure_file_metadata(&destination)?.ok_or_else(|| {
+            BeadsError::internal(format!(
+                "schema-migration component disappeared after restoration: {}",
                 destination.display()
-            )));
-        }
-        fs::rename(&source, &destination).map_err(BeadsError::Io)?;
+            ))
+        })?;
+        verify_component_bytes(&destination, &restored_metadata, component)?;
     }
     if let Some(parent) = destination_base.parent() {
         sync_directory(parent)?;
@@ -915,13 +987,13 @@ fn restore_present_sidecars(
     source_dir: &Path,
     expected: &RawFamilyWitness,
 ) -> Result<()> {
-    let suffixes = expected
+    let components = expected
         .components
         .iter()
         .filter(|component| component.present && !component.suffix.is_empty())
-        .map(|component| component.suffix.clone())
+        .cloned()
         .collect::<Vec<_>>();
-    restore_moved_components(destination_base, source_dir, &suffixes)
+    restore_moved_components(destination_base, source_dir, &components)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
@@ -932,18 +1004,147 @@ fn exchange_database_paths(left: &Path, right: &Path) -> Result<()> {
         .map_err(|error| BeadsError::Io(std::io::Error::from(error)))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactedInstallFailureDisposition {
+    OriginalRestored,
+    LiveStateUncertain,
+}
+
+#[derive(Debug)]
+struct CompactedInstallFailure {
+    disposition: CompactedInstallFailureDisposition,
+    error: BeadsError,
+}
+
+impl CompactedInstallFailure {
+    fn restored(error: BeadsError) -> Self {
+        Self {
+            disposition: CompactedInstallFailureDisposition::OriginalRestored,
+            error,
+        }
+    }
+
+    fn uncertain(error: BeadsError) -> Self {
+        Self {
+            disposition: CompactedInstallFailureDisposition::LiveStateUncertain,
+            error,
+        }
+    }
+
+    fn from_original_state(
+        error: BeadsError,
+        write_authority: &Arc<DatabaseFamilyWriteLock>,
+    ) -> Self {
+        match write_authority.verify_database_authority() {
+            Ok(()) => Self::restored(error),
+            Err(authority_error) => Self::uncertain(BeadsError::WithContext {
+                context: format!(
+                    "schema-migration installation failed before replacement, but the original \
+                     database authority could not be re-verified ({authority_error})"
+                ),
+                source: Box::new(error),
+            }),
+        }
+    }
+
+    fn after_rollback(error: BeadsError, rollback: Result<()>) -> Self {
+        match rollback {
+            Ok(()) => Self::restored(error),
+            Err(rollback_error) => Self::uncertain(BeadsError::WithContext {
+                context: format!(
+                    "schema-migration installation failed and rollback could not prove the \
+                     original database generation durable and authoritative ({rollback_error})"
+                ),
+                source: Box::new(error),
+            }),
+        }
+    }
+}
+
+impl std::fmt::Display for CompactedInstallFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+fn rollback_installed_main_to_original<F>(
+    candidate_path: &Path,
+    db_path: &Path,
+    displaced_main: &Path,
+    write_authority: &Arc<DatabaseFamilyWriteLock>,
+    sync: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&Path) -> Result<()>,
+{
+    if write_authority.database_target_authority_state()?
+        != DatabaseTargetAuthorityState::Held
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "refusing schema-migration rollback because the live database is no longer the authority-held replacement"
+                .to_string(),
+        });
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        exchange_database_paths(db_path, displaced_main)?;
+        write_authority.restore_retained_database_inode_after_authorized_replace()?;
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    {
+        rename_path_no_replace(db_path, candidate_path)?;
+        rename_path_no_replace(displaced_main, db_path)?;
+        write_authority.restore_retained_database_inode_after_authorized_replace()?;
+    }
+
+    write_authority.verify_database_authority()?;
+    if let Some(parent) = db_path.parent() {
+        sync(parent)?;
+    }
+    if let Some(parent) = displaced_main.parent() {
+        sync(parent)?;
+    }
+    Ok(())
+}
+
 fn install_compacted_candidate(
     candidate_path: &Path,
     db_path: &Path,
     displaced_main: &Path,
     replacement_lock: File,
     write_authority: &Arc<DatabaseFamilyWriteLock>,
-) -> Result<()> {
+) -> std::result::Result<(), CompactedInstallFailure> {
+    install_compacted_candidate_with_sync(
+        candidate_path,
+        db_path,
+        displaced_main,
+        replacement_lock,
+        write_authority,
+        sync_directory,
+    )
+}
+
+fn install_compacted_candidate_with_sync<F>(
+    candidate_path: &Path,
+    db_path: &Path,
+    displaced_main: &Path,
+    replacement_lock: File,
+    write_authority: &Arc<DatabaseFamilyWriteLock>,
+    mut sync: F,
+) -> std::result::Result<(), CompactedInstallFailure>
+where
+    F: FnMut(&Path) -> Result<()>,
+{
     if secure_file_metadata(displaced_main)?.is_some() {
-        return Err(BeadsError::internal(format!(
-            "refusing to overwrite retained pre-compaction database {}",
-            displaced_main.display()
-        )));
+        return Err(CompactedInstallFailure::from_original_state(
+            BeadsError::internal(format!(
+                "refusing to overwrite retained pre-compaction database {}",
+                displaced_main.display()
+            )),
+            write_authority,
+        ));
     }
 
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
