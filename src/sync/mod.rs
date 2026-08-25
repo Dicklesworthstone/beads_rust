@@ -16518,7 +16518,8 @@ mod tests {
             "the displaced original must remain locked before finalization"
         );
 
-        DatabaseFamilyWriteLock::arm_database_replacement_before_finalize_locked_verify_for_test();
+        DatabaseFamilyWriteLock::
+            arm_database_replacement_before_finalize_locked_verify_for_test();
         let error = authority
             .finalize_database_replacement()
             .expect_err("a canonical-path swap at finalization must fail closed");

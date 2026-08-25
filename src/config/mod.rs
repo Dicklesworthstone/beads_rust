@@ -951,10 +951,10 @@ fn open_sqlite_storage_with_recovery_strategy(
             write_authority,
         );
     }
+    let authority = write_authority.ok_or_else(|| BeadsError::SyncConflict {
+        message: "Writable database recovery has no database-family authority".to_string(),
+    })?;
     if !paths.db_path.is_file() {
-        let authority = write_authority.ok_or_else(|| BeadsError::SyncConflict {
-            message: "Missing database creation has no database-family authority".to_string(),
-        })?;
         let _fresh_witness = authority.install_empty_database_replacement_and_bind()?;
         authority.verify_database_authority()?;
     }
@@ -973,7 +973,11 @@ fn open_sqlite_storage_with_recovery_strategy(
         )
     };
 
-    match SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout) {
+    match SqliteStorage::open_with_timeout_under_write_authority(
+        &paths.db_path,
+        lock_timeout,
+        authority,
+    ) {
         Ok(storage) => match storage.detect_recoverable_open_anomaly() {
             Ok(None) => Ok(SqliteRecoveryOpenResult {
                 storage,
@@ -1176,7 +1180,11 @@ fn prepare_fresh_storage_for_deferred_import(
         SuccessfulRecoveryDisposition::RetainBackupUntilCommandSuccess,
         |fresh_witness| {
             write_authority.verify_fresh_database_replacement_witness(&fresh_witness)?;
-            SqliteStorage::open_with_timeout(db_path, lock_timeout)
+            SqliteStorage::open_with_timeout_under_write_authority(
+                db_path,
+                lock_timeout,
+                write_authority,
+            )
         },
     )?;
     let recovery_dir = backup_set.recovery_dir.clone();
@@ -2478,8 +2486,11 @@ fn rebuild_database_family(
     fresh_witness: FreshDatabaseReplacementWitness,
 ) -> Result<(SqliteStorage, ImportResult)> {
     write_authority.verify_database_authority()?;
-    let mut storage = SqliteStorage::open_with_timeout(db_path, lock_timeout)?;
-    storage.attach_write_authority(Arc::clone(write_authority));
+    let mut storage = SqliteStorage::open_with_timeout_under_write_authority(
+        db_path,
+        lock_timeout,
+        write_authority,
+    )?;
     write_authority.verify_database_authority()?;
     storage.set_config("issue_prefix", prefix)?;
     let import_result = import_from_jsonl_snapshot_into_fresh_replacement(
@@ -2885,7 +2896,13 @@ pub(crate) fn compact_database_via_vacuum_into_in_place(
         db_path,
         lock_timeout,
         &write_authority,
-        SqliteStorage::open_with_timeout,
+        |path, timeout| {
+            SqliteStorage::open_with_timeout_under_write_authority(
+                path,
+                timeout,
+                &write_authority,
+            )
+        },
         || Ok(()),
         || Ok(()),
         |from, to| {
@@ -2905,7 +2922,13 @@ fn compact_database_via_vacuum_into_in_place_under_write_authority(
         db_path,
         lock_timeout,
         write_authority,
-        SqliteStorage::open_with_timeout,
+        |path, timeout| {
+            SqliteStorage::open_with_timeout_under_write_authority(
+                path,
+                timeout,
+                write_authority,
+            )
+        },
         || Ok(()),
         || Ok(()),
         |from, to| {
@@ -4391,9 +4414,12 @@ impl OpenStorageResult {
         if had_original_database_family {
             write_authority.restore_retained_database_inode_after_authorized_replace()?;
             write_authority.verify_database_authority()?;
-            let mut restored_storage =
-                SqliteStorage::open_with_timeout(&self.paths.db_path, self.resolved_lock_timeout)
-                    .map_err(|reopen_err| BeadsError::WithContext {
+            let restored_storage = SqliteStorage::open_with_timeout_under_write_authority(
+                &self.paths.db_path,
+                self.resolved_lock_timeout,
+                &write_authority,
+            )
+            .map_err(|reopen_err| BeadsError::WithContext {
                     context: format!(
                         "Restored the original database family at '{}' but failed to reopen it",
                         self.paths.db_path.display()
@@ -4401,7 +4427,6 @@ impl OpenStorageResult {
                     source: Box::new(reopen_err),
                 })?;
             write_authority.verify_database_authority()?;
-            restored_storage.attach_write_authority(Arc::clone(&write_authority));
             self.storage = restored_storage;
         } else {
             write_authority.clear_database_inode_after_authorized_remove()?;

@@ -2056,6 +2056,9 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+// Keep one fallible cross-platform call site; unsupported builds fail before
+// creating a staged restore or mutating the live namespace.
+#[allow(clippy::unnecessary_wraps)]
 fn require_atomic_undo_exchange() -> Result<()> {
     Ok(())
 }
@@ -3965,6 +3968,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     fn commit_ready_marker_resumes_applied_receipt_and_normal_undo() {
         let (_temp, migration) = reviewed_v14_migration_context();
         let original_logical = logical_witness(&migration.db_path).expect("original witness");
@@ -3992,22 +3996,112 @@ mod tests {
         };
         write_json_new(&run_dir.join("prepared.json"), &prepared).expect("write prepared receipt");
 
-        let effects = apply_reviewed_migration(
-            &migration.db_path,
+        // Build the reviewed generation and stop at the actual crash point:
+        // the namespace exchange has completed, but none of the post-install
+        // directory barriers or authority finalization has run.
+        let candidate_path =
+            maintenance_candidate_path(&migration.db_path, &run_dir).expect("candidate path");
+        let source_conn = Connection::open(migration.db_path.to_string_lossy().into_owned())
+            .expect("open source");
+        let escaped_candidate = candidate_path.to_string_lossy().replace('\'', "''");
+        source_conn
+            .execute(&format!("VACUUM INTO '{escaped_candidate}'"))
+            .expect("build candidate");
+        close_connection(source_conn).expect("close source");
+        let candidate_conn = Connection::open(candidate_path.to_string_lossy().into_owned())
+            .expect("open candidate");
+        candidate_conn
+            .execute("BEGIN IMMEDIATE")
+            .expect("begin migration");
+        let reviewed_effects = run_reviewed_schema_migration_steps_in_transaction(
+            &candidate_conn,
             forecast.from_version,
             forecast.to_version,
             &marked_at,
-            &run_dir,
-            &migration.write_authority,
         )
-        .expect("install reviewed replacement");
-        assert!(effects.post_migration_maintenance_completed);
+        .expect("run reviewed migration");
+        candidate_conn.execute("COMMIT").expect("commit candidate");
+        candidate_conn
+            .execute("REINDEX")
+            .expect("reindex candidate");
+        candidate_conn
+            .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint candidate");
+        close_connection(candidate_conn).expect("close candidate");
+        let candidate_logical = logical_witness(&candidate_path).expect("candidate witness");
+        let mut effects = ReviewedSchemaMigrationEffectsReceipt::from(reviewed_effects);
+        effects.post_migration_maintenance_completed = true;
+        persist_commit_ready_marker(&run_dir, &migration.db_path, &candidate_logical, effects)
+            .expect("persist commit-ready marker");
+
+        let marker: CommitReadyMigrationReceipt =
+            read_json(&run_dir.join("commit-ready.json")).expect("read marker");
+        let failed = FailedMigrationReceipt {
+            schema_version: FAILED_SCHEMA.to_string(),
+            run_id: marker.run_id.clone(),
+            database_path: marker.database_path.clone(),
+            plan_token: marker.plan_token.clone(),
+            marked_at: marker.marked_at.clone(),
+            error: "simulated process failure after namespace installation".to_string(),
+            raw_before: marker.raw_before.clone(),
+            logical_before: marker.logical_before.clone(),
+            raw_observed_after_failure: None,
+            logical_observed_after_failure: None,
+        };
+        write_json_new(&run_dir.join("failed.json"), &failed).expect("write failed receipt");
+
+        let source_raw = raw_family_witness(&migration.db_path).expect("source raw");
+        let candidate_raw = raw_family_witness(&candidate_path).expect("candidate raw");
+        move_present_sidecars_new(
+            &candidate_path,
+            &run_dir.join("maintenance-candidate-sidecars"),
+            &candidate_raw,
+        )
+        .expect("retain candidate sidecars");
+        let displaced_dir = run_dir.join("maintenance-displaced");
+        ensure_new_directory(&displaced_dir).expect("create displaced directory");
+        move_present_sidecars_new(&migration.db_path, &displaced_dir, &source_raw)
+            .expect("retain source sidecars");
+        let replacement_lock = migration
+            .write_authority
+            .lock_database_replacement_candidate(&candidate_path)
+            .expect("lock candidate");
+        exchange_database_paths(&candidate_path, &migration.db_path)
+            .expect("exchange candidate and live main");
+        migration
+            .write_authority
+            .verify_staged_database_recovery_authority(&candidate_path)
+            .expect("prove displaced original authority");
+        migration
+            .write_authority
+            .adopt_locked_database_replacement(replacement_lock)
+            .expect("adopt installed candidate");
+        let displaced_main =
+            backup_component_path(&displaced_dir, &migration.db_path, "").expect("displaced main");
+        rename_path_no_replace(&candidate_path, &displaced_main)
+            .expect("retain original main without running barriers");
+
         assert!(run_dir.join("commit-ready.json").is_file());
         assert!(
             !run_dir.join("applied.json").exists(),
             "the fixture must stop at the crash boundary before applied receipt publication"
         );
 
+        let beads_dir = migration.beads_dir.clone();
+        let db_path = migration.db_path.clone();
+        drop(migration);
+        let migration = MigrationContext {
+            write_authority: Arc::new(
+                crate::sync::blocking_database_family_write_lock_with_timeout(
+                    &beads_dir,
+                    &db_path,
+                    Some(1000),
+                )
+                .expect("reacquire authority after simulated crash"),
+            ),
+            beads_dir,
+            db_path,
+        };
         let (applied, resumed_before_dir) = resume_commit_ready_migration(
             &DoctorMigrateSchemaApplyArgs {
                 plan_token,
@@ -4020,6 +4114,10 @@ mod tests {
         assert_eq!(resumed_before_dir, before_dir);
         assert!(applied.attested);
         assert!(run_dir.join("applied.json").is_file());
+        assert!(
+            run_dir.join("failed.json").is_file(),
+            "a pre-existing failure receipt must not suppress promotion of the exact live after-state"
+        );
 
         execute_undo(
             &DoctorMigrateSchemaUndoArgs {
@@ -4241,6 +4339,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     fn reviewed_undo_resumes_after_partial_quarantine() {
         let (_temp, migration) = reviewed_v14_migration_context();
         let original = build_plan(&migration.db_path)
@@ -4292,10 +4391,34 @@ mod tests {
         write_json_new(&run_dir.join("undo-prepared.json"), &receipt).expect("write prepared undo");
         ensure_new_directory(&quarantine_dir).expect("create quarantine");
 
-        let quarantined_main =
-            backup_component_path(&quarantine_dir, &migration.db_path, "").expect("backup path");
-        fs::rename(&migration.db_path, &quarantined_main).expect("simulate first quarantine move");
-        set_file_permissions(&quarantined_main, None).expect("harden quarantined file");
+        let restored_candidate_dir = run_dir.join("undo-restored-candidate");
+        ensure_directory(&restored_candidate_dir).expect("create restore candidate dir");
+        let restored_candidate =
+            backup_component_path(&restored_candidate_dir, &migration.db_path, "")
+                .expect("restored candidate path");
+        let before_main = backup_component_path(&run_dir.join("before"), &migration.db_path, "")
+            .expect("before main");
+        let restored_main = component_for_suffix(&applied.raw_before, "").expect("main witness");
+        copy_regular_file_new(&before_main, &restored_candidate, restored_main.unix_mode)
+            .expect("stage restored main");
+        exchange_database_paths(&restored_candidate, &migration.db_path)
+            .expect("simulate atomic undo exchange before quarantine retention");
+
+        let beads_dir = migration.beads_dir.clone();
+        let db_path = migration.db_path.clone();
+        drop(migration);
+        let migration = MigrationContext {
+            write_authority: Arc::new(
+                crate::sync::blocking_database_family_write_lock_with_timeout(
+                    &beads_dir,
+                    &db_path,
+                    Some(1000),
+                )
+                .expect("reacquire authority after simulated undo crash"),
+            ),
+            beads_dir,
+            db_path,
+        };
 
         execute_undo(
             &DoctorMigrateSchemaUndoArgs {

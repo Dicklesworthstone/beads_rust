@@ -16019,8 +16019,8 @@ fn wal_checksum(
 ) -> (u32, u32) {
     debug_assert!(bytes.len().is_multiple_of(8));
     for chunk in bytes.chunks_exact(8) {
-        let first: [u8; 4] = chunk[..4].try_into().unwrap_or([0; 4]);
-        let second: [u8; 4] = chunk[4..].try_into().unwrap_or([0; 4]);
+        let first = [chunk[0], chunk[1], chunk[2], chunk[3]];
+        let second = [chunk[4], chunk[5], chunk[6], chunk[7]];
         let x0 = if big_endian_words {
             u32::from_be_bytes(first)
         } else {
