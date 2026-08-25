@@ -1857,7 +1857,7 @@ fn core_runtime_columns_canonical(
 
 fn core_runtime_column_matches(
     table: &str,
-    row: &[SqliteValue],
+    row: &fsqlite::Row,
     expected: &ExpectedSchemaColumn,
 ) -> bool {
     let name = row.get(1).and_then(SqliteValue::as_text);

@@ -3327,8 +3327,170 @@ fn move_database_family_to_recovery(
     })
 }
 
+#[derive(Debug)]
+struct ClaimedRecoveryBackup {
+    original: PathBuf,
+    backup: PathBuf,
+    claimed: PathBuf,
+}
+
+fn recovery_restore_claim_path(
+    backup_set: &RecoveryBackupSet,
+    backup: &Path,
+    nonce: &str,
+    ordinal: usize,
+) -> PathBuf {
+    let filename = backup
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("beads.db.bak");
+    backup_set
+        .recovery_dir
+        .join(format!(".{filename}.restore-staging.{nonce}.{ordinal}.bak"))
+}
+
+fn claimed_recovery_backup_paths(
+    claimed_backups: &[ClaimedRecoveryBackup],
+) -> Vec<RecoveryBackupPath> {
+    claimed_backups
+        .iter()
+        .map(|claimed| (claimed.backup.clone(), claimed.claimed.clone()))
+        .collect()
+}
+
+fn rollback_claimed_recovery_backups(
+    claimed_backups: &[ClaimedRecoveryBackup],
+    operation: &str,
+) -> Result<()> {
+    rollback_renamed_paths_no_replace(&claimed_recovery_backup_paths(claimed_backups), operation)
+}
+
+fn claim_recovery_backup_set_for_restore(
+    backup_set: &RecoveryBackupSet,
+) -> Result<Vec<ClaimedRecoveryBackup>> {
+    verify_recovery_backup_manifest(backup_set)?;
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        Utc::now().format("%Y%m%d_%H%M%S_%f")
+    );
+    let claim_paths = backup_set
+        .files
+        .iter()
+        .enumerate()
+        .map(|(ordinal, (_, backup))| {
+            (
+                backup.clone(),
+                recovery_restore_claim_path(backup_set, backup, &nonce, ordinal),
+            )
+        });
+    let claimed_paths = rename_existing_paths_no_replace(
+        claim_paths,
+        "claim verified recovery backups for restore",
+        MissingRenameSourcePolicy::Error,
+    )?;
+    let claimed_backups = backup_set
+        .files
+        .iter()
+        .zip(claimed_paths)
+        .map(|((original, backup), (claimed_backup, claimed))| {
+            debug_assert_eq!(backup, &claimed_backup);
+            ClaimedRecoveryBackup {
+                original: original.clone(),
+                backup: backup.clone(),
+                claimed,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for (claimed, verification) in claimed_backups.iter().zip(&backup_set.verified_files) {
+        if let Err(verify_error) = verify_recovery_backup_artifact(
+            &claimed.claimed,
+            &expected_recovery_artifact_fingerprint(verification),
+        ) {
+            if let Err(rollback_error) = rollback_claimed_recovery_backups(
+                &claimed_backups,
+                "claim verified recovery backups for restore",
+            ) {
+                return Err(BeadsError::WithContext {
+                    context: format!(
+                        "Claimed recovery backup '{}' failed verification ({verify_error}); returning claimed backups to their public recovery names also failed",
+                        claimed.claimed.display()
+                    ),
+                    source: Box::new(rollback_error),
+                });
+            }
+            return Err(BeadsError::WithContext {
+                context: format!(
+                    "Refusing database-family restore because claimed recovery backup '{}' no longer matches its recorded fingerprint; the live database was left untouched",
+                    claimed.claimed.display()
+                ),
+                source: Box::new(verify_error),
+            });
+        }
+    }
+
+    Ok(claimed_backups)
+}
+
 fn restore_database_family_after_failed_rebuild(backup_set: &RecoveryBackupSet) -> Result<()> {
-    let rebuilt_backups = rename_existing_paths(
+    restore_database_family_after_failed_rebuild_with_hooks(backup_set, || Ok(()), || Ok(()))
+}
+
+fn restore_database_family_after_failed_rebuild_before_live_staging<F>(
+    backup_set: &RecoveryBackupSet,
+    before_live_staging: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    restore_database_family_after_failed_rebuild_with_hooks(backup_set, before_live_staging, || {
+        Ok(())
+    })
+}
+
+fn database_family_has_live_paths(db_path: &Path) -> Result<bool> {
+    database_family_paths(db_path)
+        .into_iter()
+        .try_fold(false, |found, path| match fs::symlink_metadata(&path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(found),
+            Err(error) => Err(BeadsError::WithContext {
+                context: format!(
+                    "Failed to inspect live database-family path '{}' during recovery rollback",
+                    path.display()
+                ),
+                source: Box::new(error),
+            }),
+        })
+}
+
+fn restore_database_family_after_failed_rebuild_with_hooks<B, R>(
+    backup_set: &RecoveryBackupSet,
+    before_live_staging: B,
+    before_claimed_restore: R,
+) -> Result<()>
+where
+    B: FnOnce() -> Result<()>,
+    R: FnOnce() -> Result<()>,
+{
+    let claimed_backups = claim_recovery_backup_set_for_restore(backup_set)?;
+    if let Err(authority_error) = before_live_staging() {
+        if let Err(rollback_error) = rollback_claimed_recovery_backups(
+            &claimed_backups,
+            "abort recovery restore before staging the live database family",
+        ) {
+            return Err(BeadsError::WithContext {
+                context: format!(
+                    "Recovery restore authority check failed ({authority_error}); returning claimed backups to their public recovery names also failed"
+                ),
+                source: Box::new(rollback_error),
+            });
+        }
+        return Err(authority_error);
+    }
+
+    let rebuilt_backups = match rename_existing_paths_no_replace(
         database_family_paths(&backup_set.db_path)
             .into_iter()
             .map(|rebuilt| {
@@ -3341,30 +3503,86 @@ fn restore_database_family_after_failed_rebuild(backup_set: &RecoveryBackupSet) 
             }),
         "stage rebuilt database files after failed recovery",
         MissingRenameSourcePolicy::Skip,
-    )?;
-
-    if let Err(restore_err) = rename_existing_paths(
-        backup_set
-            .files
-            .iter()
-            .map(|(original, backup)| (backup.clone(), original.clone())),
-        "restore the original database family after failed recovery",
-        MissingRenameSourcePolicy::Error,
     ) {
-        if let Err(rollback_err) = rollback_renamed_paths(
-            &rebuilt_backups,
-            "restore the original database family after failed recovery",
-        ) {
+        Ok(rebuilt_backups) => rebuilt_backups,
+        Err(stage_error) => {
+            if let Err(rollback_error) = rollback_claimed_recovery_backups(
+                &claimed_backups,
+                "abort recovery restore after rebuilt-family staging failed",
+            ) {
+                return Err(BeadsError::WithContext {
+                    context: format!(
+                        "Failed to stage rebuilt database files ({stage_error}); returning claimed backups to their public recovery names also failed"
+                    ),
+                    source: Box::new(rollback_error),
+                });
+            }
+            return Err(stage_error);
+        }
+    };
+
+    let restore_result = before_claimed_restore().and_then(|()| {
+        rename_existing_paths_no_replace(
+            claimed_backups
+                .iter()
+                .map(|claimed| (claimed.claimed.clone(), claimed.original.clone())),
+            "restore the claimed original database family after failed recovery",
+            MissingRenameSourcePolicy::Error,
+        )
+        .map(|_| ())
+    });
+
+    if let Err(restore_error) = restore_result {
+        let live_family_inspection = database_family_has_live_paths(&backup_set.db_path);
+        let live_family_present = live_family_inspection
+            .as_ref()
+            .map_or(true, |present| *present);
+        let claimed_rollback = rollback_claimed_recovery_backups(
+            &claimed_backups,
+            "abort recovery restore after claimed-backup restore failed",
+        );
+        let rebuilt_rollback = if live_family_present {
+            Ok(())
+        } else {
+            rollback_renamed_paths_no_replace(
+                &rebuilt_backups,
+                "restore the rebuilt database family after original-family restore failed",
+            )
+        };
+
+        if let Err(rollback_error) = claimed_rollback {
             return Err(BeadsError::WithContext {
                 context: format!(
-                    "Failed to restore the original database family ({restore_err}); \
-                     rolling staged rebuilt files back into place also failed"
+                    "Failed to restore the claimed original database family ({restore_error}); returning claimed backups to their public recovery names also failed"
                 ),
-                source: Box::new(rollback_err),
+                source: Box::new(rollback_error),
             });
         }
-
-        return Err(restore_err);
+        if let Err(rollback_error) = rebuilt_rollback {
+            return Err(BeadsError::WithContext {
+                context: format!(
+                    "Failed to restore the claimed original database family ({restore_error}); restoring the staged rebuilt database family without replacement also failed"
+                ),
+                source: Box::new(rollback_error),
+            });
+        }
+        if let Err(inspection_error) = live_family_inspection {
+            return Err(BeadsError::WithContext {
+                context: format!(
+                    "Failed to restore the claimed original database family ({restore_error}); refused to replace the staged rebuilt family because the live namespace could not be inspected"
+                ),
+                source: Box::new(inspection_error),
+            });
+        }
+        if live_family_present {
+            return Err(BeadsError::WithContext {
+                context:
+                    "Refused to overwrite a database-family path that appeared during recovery restore; preserved that live generation and retained the failed rebuilt generation in recovery"
+                        .to_string(),
+                source: Box::new(restore_error),
+            });
+        }
+        return Err(restore_error);
     }
 
     Ok(())
@@ -3924,7 +4142,17 @@ impl OpenStorageResult {
         }
 
         self.storage = SqliteStorage::open_memory()?;
-        restore_database_family_after_failed_rebuild(&backup_set)?;
+        restore_database_family_after_failed_rebuild_before_live_staging(&backup_set, || {
+            if write_authority.database_target_authority_state()?
+                == crate::sync::DatabaseTargetAuthorityState::Held
+            {
+                return Ok(());
+            }
+            Err(BeadsError::SyncConflict {
+                message: "Refusing deferred recovery rollback because the live database changed after its storage handle was released; it was left untouched"
+                    .to_string(),
+            })
+        })?;
         if had_original_database_family {
             write_authority.restore_retained_database_inode_after_authorized_replace()?;
             write_authority.verify_database_authority()?;
@@ -10511,6 +10739,12 @@ routing:
         // restore step fails with a missing-backup error.
         let wal_backup_file =
             recovery_dir.join(recovery_backup_filename(&wal_path, "fixed-stamp", "bak"));
+        let expected_backup = RecoveryArtifactFingerprint {
+            kind: "file".to_string(),
+            size_bytes: Some(12),
+            sha256: Some("0".repeat(64)),
+            symlink_target: None,
+        };
 
         let err = restore_database_family_after_failed_rebuild(&RecoveryBackupSet {
             db_path: db_path.clone(),
@@ -10518,7 +10752,11 @@ routing:
             stamp: "fixed-stamp".to_string(),
             had_original_database: true,
             files: vec![(wal_path.clone(), wal_backup_file.clone())],
-            verified_files: Vec::new(),
+            verified_files: vec![recovery_backup_verification(
+                &wal_path,
+                &wal_backup_file,
+                &expected_backup,
+            )],
         })
         .expect_err("missing backup should fail restore");
         assert!(
@@ -10554,6 +10792,167 @@ routing:
         assert!(
             !rebuild_failed_wal.exists(),
             "rolled back wal backup should not remain in recovery dir"
+        );
+    }
+
+    #[test]
+    fn restore_claims_and_verifies_backup_before_staging_live_database() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let recovery_dir = recovery_dir_for_db_path(&db_path, &beads_dir);
+        fs::create_dir_all(&recovery_dir).expect("create recovery dir");
+        fs::write(&db_path, b"rebuilt-db").expect("write rebuilt db");
+
+        let backup_path =
+            recovery_dir.join(recovery_backup_filename(&db_path, "fixed-stamp", "bak"));
+        fs::write(&backup_path, b"original-db").expect("write original backup");
+        let fingerprint = recovery_artifact_fingerprint(&backup_path).expect("fingerprint backup");
+        let verification = recovery_backup_verification(&db_path, &backup_path, &fingerprint);
+        fs::write(&backup_path, b"substituted-backup").expect("substitute backup bytes");
+
+        let error = restore_database_family_after_failed_rebuild(&RecoveryBackupSet {
+            db_path: db_path.clone(),
+            recovery_dir: recovery_dir.clone(),
+            stamp: "fixed-stamp".to_string(),
+            had_original_database: true,
+            files: vec![(db_path.clone(), backup_path.clone())],
+            verified_files: vec![verification],
+        })
+        .expect_err("substituted claimed backup must fail closed");
+
+        assert!(
+            error.to_string().contains("recorded fingerprint")
+                && error
+                    .to_string()
+                    .contains("live database was left untouched"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read(&db_path).expect("read live database"),
+            b"rebuilt-db",
+            "backup verification failure must precede destructive live staging"
+        );
+        assert_eq!(
+            fs::read(&backup_path).expect("read returned public backup"),
+            b"substituted-backup",
+            "failed claimed verification must return the exact claimed artifact"
+        );
+        let rebuild_failed = recovery_dir.join(recovery_backup_filename(
+            &db_path,
+            "fixed-stamp",
+            "rebuild-failed",
+        ));
+        assert!(
+            !rebuild_failed.exists(),
+            "live database must not be staged before claimed backup verification"
+        );
+    }
+
+    #[test]
+    fn restore_late_authority_refusal_returns_claim_and_leaves_live_database() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let recovery_dir = recovery_dir_for_db_path(&db_path, &beads_dir);
+        fs::create_dir_all(&recovery_dir).expect("create recovery dir");
+        fs::write(&db_path, b"retained-replacement").expect("write retained replacement");
+
+        let backup_path =
+            recovery_dir.join(recovery_backup_filename(&db_path, "fixed-stamp", "bak"));
+        fs::write(&backup_path, b"original-db").expect("write original backup");
+        let fingerprint = recovery_artifact_fingerprint(&backup_path).expect("fingerprint backup");
+        let verification = recovery_backup_verification(&db_path, &backup_path, &fingerprint);
+        let backup_set = RecoveryBackupSet {
+            db_path: db_path.clone(),
+            recovery_dir: recovery_dir.clone(),
+            stamp: "fixed-stamp".to_string(),
+            had_original_database: true,
+            files: vec![(db_path.clone(), backup_path.clone())],
+            verified_files: vec![verification],
+        };
+
+        let error = restore_database_family_after_failed_rebuild_with_hooks(
+            &backup_set,
+            || {
+                Err(BeadsError::SyncConflict {
+                    message: "late authority refusal".to_string(),
+                })
+            },
+            || Ok(()),
+        )
+        .expect_err("late authority refusal must abort before live staging");
+
+        assert!(
+            error.to_string().contains("late authority refusal"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read(&db_path).expect("read retained replacement"),
+            b"retained-replacement"
+        );
+        assert_eq!(
+            fs::read(&backup_path).expect("read returned original backup"),
+            b"original-db"
+        );
+    }
+
+    #[test]
+    fn restore_no_replace_preserves_database_that_appears_after_live_staging() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let recovery_dir = recovery_dir_for_db_path(&db_path, &beads_dir);
+        fs::create_dir_all(&recovery_dir).expect("create recovery dir");
+        fs::write(&db_path, b"rebuilt-db").expect("write rebuilt database");
+
+        let backup_path =
+            recovery_dir.join(recovery_backup_filename(&db_path, "fixed-stamp", "bak"));
+        fs::write(&backup_path, b"original-db").expect("write original backup");
+        let fingerprint = recovery_artifact_fingerprint(&backup_path).expect("fingerprint backup");
+        let verification = recovery_backup_verification(&db_path, &backup_path, &fingerprint);
+        let backup_set = RecoveryBackupSet {
+            db_path: db_path.clone(),
+            recovery_dir: recovery_dir.clone(),
+            stamp: "fixed-stamp".to_string(),
+            had_original_database: true,
+            files: vec![(db_path.clone(), backup_path.clone())],
+            verified_files: vec![verification],
+        };
+
+        let error = restore_database_family_after_failed_rebuild_with_hooks(
+            &backup_set,
+            || Ok(()),
+            || {
+                fs::write(&db_path, b"foreign-generation")?;
+                Ok(())
+            },
+        )
+        .expect_err("restore must refuse to replace a newly appeared database");
+
+        assert!(
+            error.to_string().contains("preserved that live generation"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read(&db_path).expect("read foreign database"),
+            b"foreign-generation",
+            "restore must never replace a generation that appears in the final window"
+        );
+        assert_eq!(
+            fs::read(&backup_path).expect("read returned original backup"),
+            b"original-db",
+            "the claimed original must return to its public backup name"
+        );
+        let rebuild_failed = recovery_dir.join(recovery_backup_filename(
+            &db_path,
+            "fixed-stamp",
+            "rebuild-failed",
+        ));
+        assert_eq!(
+            fs::read(&rebuild_failed).expect("read retained rebuilt database"),
+            b"rebuilt-db",
+            "the displaced rebuilt generation must remain available for diagnosis"
         );
     }
 

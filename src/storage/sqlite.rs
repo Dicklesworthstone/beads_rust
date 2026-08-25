@@ -2334,9 +2334,18 @@ impl SqliteStorage {
         // pair). The reviewed `br doctor migrate-schema` lifecycle remains
         // the explicit, receipt-bound alternative for operator-driven
         // migrations of supported version pairs.
-        let schema_current = connection_user_version(&conn)
-            .or_else(|| database_header_user_version(path))
-            .is_some_and(|version| version >= u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0));
+        let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
+        let effective_schema_version =
+            connection_user_version(&conn).or_else(|| database_header_user_version(path));
+        if let Some(version) = effective_schema_version
+            && version > current_schema_version
+        {
+            return Err(BeadsError::Config(format!(
+                "Database schema version {version} is newer than this br binary supports \
+                 ({current_schema_version}); refusing to modify or downgrade it"
+            )));
+        }
+        let schema_current = effective_schema_version == Some(current_schema_version);
         let schema_cookie_before = crate::storage::schema::runtime_schema_cookie(&conn)?;
         let runtime_compatible = runtime_schema_compatible(&conn);
         let schema_cookie_after = crate::storage::schema::runtime_schema_cookie(&conn)?;
@@ -28278,6 +28287,53 @@ mod tests {
         );
 
         lock_conn.execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn test_open_with_timeout_refuses_future_schema_without_downgrade() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("future_schema.db");
+        let future_version = u32::try_from(CURRENT_SCHEMA_VERSION)
+            .unwrap()
+            .checked_add(1)
+            .unwrap();
+
+        {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .conn
+                .execute(&format!("PRAGMA user_version = {future_version}"))
+                .unwrap();
+        }
+        assert_eq!(
+            effective_database_user_version(&db_path).unwrap(),
+            Some(future_version),
+            "the fixture must expose the future version through the effective connection state"
+        );
+        let database_bytes_before = fs::read(&db_path).unwrap();
+
+        let error = SqliteStorage::open_with_timeout(&db_path, Some(50))
+            .expect_err("ordinary open must reject an unknown future schema");
+
+        assert!(
+            error
+                .to_string()
+                .contains("newer than this br binary supports")
+                && error
+                    .to_string()
+                    .contains("refusing to modify or downgrade"),
+            "unexpected future-schema error: {error}"
+        );
+        assert_eq!(
+            effective_database_user_version(&db_path).unwrap(),
+            Some(future_version),
+            "a rejected open must not stamp the future database back to the current version"
+        );
+        assert_eq!(
+            fs::read(&db_path).unwrap(),
+            database_bytes_before,
+            "a rejected open must leave the main database bytes unchanged"
+        );
     }
 
     #[test]
