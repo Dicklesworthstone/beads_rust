@@ -33,8 +33,8 @@ fn test_homebrew_formula_syntax() {
         "Formula must have a homepage"
     );
     assert!(
-        content.contains("license \""),
-        "Formula must have a license"
+        content.contains("license :cannot_represent"),
+        "Formula must mark the rider-bearing license as non-SPDX"
     );
     assert!(
         content.contains("version \""),
@@ -115,6 +115,11 @@ fn test_scoop_manifest_schema() {
         json.get("license").is_some(),
         "Manifest must have 'license' field"
     );
+    assert_eq!(
+        json.get("license").and_then(serde_json::Value::as_str),
+        Some("https://github.com/Dicklesworthstone/beads_rust/blob/main/LICENSE"),
+        "Scoop must link to the repository's rider-bearing license"
+    );
     assert!(json.get("bin").is_some(), "Manifest must have 'bin' field");
 
     // Architecture section
@@ -178,7 +183,10 @@ fn test_pkgbuild_syntax() {
     assert!(content.contains("pkgdesc="), "PKGBUILD must define pkgdesc");
     assert!(content.contains("arch="), "PKGBUILD must define arch");
     assert!(content.contains("url="), "PKGBUILD must define url");
-    assert!(content.contains("license="), "PKGBUILD must define license");
+    assert!(
+        content.contains("license=('LicenseRef-MIT-OpenAI-Anthropic-Rider')"),
+        "PKGBUILD must use a custom SPDX LicenseRef for the rider-bearing license"
+    );
 
     // Source arrays for both architectures
     assert!(
@@ -204,6 +212,10 @@ fn test_pkgbuild_syntax() {
     assert!(
         content.contains("package()"),
         "PKGBUILD must have package() function"
+    );
+    assert!(
+        content.contains("/usr/share/licenses/${pkgname}/LICENSE"),
+        "PKGBUILD must install the rider-bearing license text"
     );
 
     // Check bash syntax if bash is available
