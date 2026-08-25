@@ -15,6 +15,111 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
+## v0.5.0 -- 2026-08-25
+
+Safety-focused storage and recovery release, with a retained profile-driven
+speedup for structured `ready` output. The user-facing changes are deliberately
+narrow: ready/scheduler robot output is more truthful, while database opens,
+recovery, compaction, and reviewed schema migration now fail closed across more
+replacement, crash, and schema-drift races.
+
+### Ready and scheduler output correctness
+
+- Structured `ready` output now hydrates labels with one batched lookup after
+  candidate filtering and truncation instead of running a correlated aggregate
+  for every row. JSON and TOON retain their complete label contract, text keeps
+  its lean projection, and a custom-only ready status group such as `[rework]`
+  no longer loses its sole candidate
+  ([79fb0e1f](https://github.com/Dicklesworthstone/beads_rust/commit/79fb0e1f),
+  [7cf131ba](https://github.com/Dicklesworthstone/beads_rust/commit/7cf131ba),
+  [8050afa4](https://github.com/Dicklesworthstone/beads_rust/commit/8050afa4)).
+- Empty `ready` text distinguishes a completed workspace, filters that hide
+  otherwise-ready work, and active work that is not currently actionable; it
+  no longer invents an exhaustive blocked/deferred/in-progress diagnosis.
+- Scheduler recommendations carry the same labels in the issue payload and
+  domain-contention evidence, treat blank or whitespace-only assignees as
+  unassigned, and honor custom-only ready status groups
+  ([346974cf](https://github.com/Dicklesworthstone/beads_rust/commit/346974cf),
+  [685333c1](https://github.com/Dicklesworthstone/beads_rust/commit/685333c1)).
+
+### Fast-open and schema safety
+
+- A read-only fast-open process that waits for write authority now discards its
+  pre-lock connection, reopens the canonical database inode, and rechecks JSONL
+  freshness and pending-merge state against the frozen startup route. Probe
+  errors are fatal instead of being downgraded into potentially stale output
+  ([8050afa4](https://github.com/Dicklesworthstone/beads_rust/commit/8050afa4),
+  [b541b73f](https://github.com/Dicklesworthstone/beads_rust/commit/b541b73f)).
+- Runtime compatibility attests the full writable schema generation: supported
+  `user_version`, tables and columns, defaults, primary/foreign keys, indexes,
+  partial predicates, checks, table options, and the absence of persistent
+  triggers. A schema-cookie witness keeps the steady-state fast path cheap and
+  invalidates after DDL or contract changes
+  ([346974cf](https://github.com/Dicklesworthstone/beads_rust/commit/346974cf)).
+- Writable and authority-gated healing paths inspect both the stable database
+  header and committed WAL page-one frames before opening or changing sidecar
+  modes. A future schema, malformed committed WAL, unreadable main header, or
+  changing recovery boundary is refused byte-neutrally before migration or
+  downgrade can occur
+  ([041c4a6c](https://github.com/Dicklesworthstone/beads_rust/commit/041c4a6c),
+  [cac52b43](https://github.com/Dicklesworthstone/beads_rust/commit/cac52b43)).
+- Pending sync-merge protection now classifies reconcile apply and capacity
+  exemption mutations as writes that must refuse; reconcile dry-runs and
+  exemption listings remain available as read-only diagnostics.
+
+### Recovery, compaction, and reviewed migration
+
+- Database replacement paths retain and reverify exact inode authority through
+  installation, finalization, rollback, and recovery. No-replace moves refuse
+  foreign targets, staged backup generations are fingerprinted before restore,
+  and namespace durability failures either restore the attested original or
+  return an explicit uncertain state without mixing generations
+  ([1feb09dd](https://github.com/Dicklesworthstone/beads_rust/commit/1feb09dd),
+  [21eac9c8](https://github.com/Dicklesworthstone/beads_rust/commit/21eac9c8),
+  [cd5ac3e1](https://github.com/Dicklesworthstone/beads_rust/commit/cd5ac3e1)).
+- `doctor migrate-schema apply` persists a receipt-bound commit-ready marker
+  before installing its compacted candidate. A retry can distinguish the exact
+  original, exact installed generation, and an unrecognized generation after a
+  crash; apply and undo preserve raw-family witnesses and keep recovery
+  artifacts when proof is incomplete. Migration rebuilds also refuse staging
+  table collisions, including TEMP-schema shadows.
+- Windows replacement uses an atomic no-replace move and retained-handle file
+  identity rather than creation-time equality, closing same-timestamp and
+  replace-between-check-and-use gaps
+  ([8050afa4](https://github.com/Dicklesworthstone/beads_rust/commit/8050afa4),
+  [66972c60](https://github.com/Dicklesworthstone/beads_rust/commit/66972c60)).
+
+### Performance evidence and limits
+
+- The matched-host A/B that replaced correlated ready-label aggregation with
+  post-truncation batching measured `62.802528 -> 45.135305 ms` median
+  (`28.131388%` lower) and `72.785260 -> 50.091848 ms` p95 (`31.178582%`
+  lower), with byte-identical JSON/TOON/text outputs and the text control within
+  the `5%` regression guardrail. Those numbers compare the recorded
+  `e2e814af` and `79fb0e1f` revisions; they are not presented as an
+  exact-current profile of the later safety wave.
+- The profile-first campaign completed its 50 serial passes and retained only
+  measured candidates. Rejected, reverted, within-noise, and blocked ideas now
+  have retry predicates in `docs/progress/perf-negative-results.md`; the broad
+  `2x` median-and-tail target was not achieved.
+- A database carrying the previous runtime-witness contract performs the full
+  schema attestation on lock-free reads until an ordinary writable open records
+  the current witness. The upgrade-only cost was not measured on the final
+  safety tree, and the read-only path intentionally does not persist a witness.
+
+### Packaging and regression coverage
+
+- Package version metadata moves to 0.5.0. Cargo now points at the repository's
+  rider-bearing `LICENSE` via `license-file` instead of incorrectly declaring
+  the package as plain SPDX MIT
+  ([413f9948](https://github.com/Dicklesworthstone/beads_rust/commit/413f9948)).
+- New inline and end-to-end counterexamples cover custom ready groups, scheduler
+  label/assignee evidence, canonical-inode fast-open reprobes, config-route
+  drift, future schemas in WAL, same-cookie version changes, runtime schema
+  shape drift, schema-migration crash resume/rollback, and Windows replacement
+  identity. Performance figures above remain revision-scoped; this changelog
+  does not promote earlier gate runs into exact-current release certification.
+
 ## v0.4.1 -- 2026-08-24 (Release)
 
 Windows recovery wave. v0.4.0 was effectively unusable on Windows (GitHub
@@ -69,10 +174,7 @@ migrated workspaces on every platform.
   ([70928a3f](https://github.com/Dicklesworthstone/beads_rust/commit/70928a3f)).
   v0.4.1 also shipped SQL-side label projection for structured `ready` output
   (GitHub #309,
-  [0064a5dd](https://github.com/Dicklesworthstone/beads_rust/commit/0064a5dd));
-  the current tree has since replaced that correlated projection with faster
-  post-truncation batched hydration, as recorded in the performance
-  negative-results ledger.
+  [0064a5dd](https://github.com/Dicklesworthstone/beads_rust/commit/0064a5dd)).
 
 ## v0.4.0 -- 2026-08-22 (Release)
 

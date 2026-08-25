@@ -320,14 +320,16 @@ jobs:
         if: matrix.archive == 'tar.gz'
         run: |
           cd target/${{ matrix.target }}/release
-          tar -czvf ../../../br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.tar.gz br
+          cp ../../../LICENSE LICENSE
+          tar -czvf ../../../br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.tar.gz br LICENSE
           cd ../../..
 
       - name: Create archive (zip)
         if: matrix.archive == 'zip'
         run: |
           cd target/${{ matrix.target }}/release
-          zip -j ../../../br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.zip br.exe
+          cp ../../../LICENSE LICENSE
+          zip -j ../../../br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.zip br.exe LICENSE
           cd ../../..
 
       - name: Install minisign (Linux)

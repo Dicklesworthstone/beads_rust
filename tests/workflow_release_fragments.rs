@@ -272,6 +272,9 @@ fn combined_checksums_fragment_is_null_safe_and_replaces_existing_file() -> Resu
 #[test]
 fn verify_checksums_fragment_accepts_spaces_and_leading_dashes() -> Result<(), String> {
     let script = release_step_script("Verify all checksums")?;
+    if script.matches("=== Verifying all checksums ===").count() != 1 {
+        return Err("checksum verification banner must appear exactly once".to_owned());
+    }
     let fixture = WorkflowFixture::new()?;
     fixture.create_artifacts_dir()?;
     fixture.write_artifact_with_checksum("artifact with spaces.tar.gz", b"space-safe")?;
@@ -301,16 +304,38 @@ fn verify_checksums_fragment_fails_on_corrupt_checksum() -> Result<(), String> {
 
 #[test]
 fn signing_fragment_uses_private_ephemeral_key_file() -> Result<(), String> {
-    let script = release_step_script("Sign archive with Ed25519 (Linux/macOS)")?;
+    let step_name = "Sign release archive with Ed25519";
+    let script = release_step_script(step_name)?;
+    let condition = release_step_condition(step_name)?;
 
+    if let Some(condition) = condition {
+        return Err(format!(
+            "release signing must not be conditionally skipped, found: {condition}"
+        ));
+    }
+
+    require_contains(&script, "MINISIGN_SECRET_KEY is required")?;
     require_contains(&script, "mktemp")?;
     require_contains(&script, "RUNNER_TEMP")?;
     require_contains(&script, "chmod 600 \"$signing_key\"")?;
     require_contains(&script, "trap 'rm -f \"$signing_key\"' EXIT")?;
     require_contains(&script, "printf '%s\\n' \"$MINISIGN_SECRET_KEY\"")?;
     require_contains(&script, "-s \"$signing_key\"")?;
+    require_contains(&script, "if [ ! -s \"$signature\" ]")?;
     require_not_contains(&script, "/tmp/minisign.key")?;
-    require_not_contains(&script, "echo \"$MINISIGN_SECRET_KEY\"")
+    require_not_contains(&script, "echo \"$MINISIGN_SECRET_KEY\"")?;
+
+    let fixture = WorkflowFixture::new()?;
+    let missing_secret = run_bash_step(
+        &script,
+        fixture.root(),
+        &[("MINISIGN_SECRET_KEY", "")],
+    )?;
+    require_failure(&missing_secret, "missing signing secret should fail closed")?;
+    require_contains(
+        &missing_secret.stdout,
+        "MINISIGN_SECRET_KEY is required for every release archive",
+    )
 }
 
 #[test]
@@ -328,9 +353,7 @@ fn changelog_fragment_keeps_previous_tag_and_reliability_paths() -> Result<(), S
 }
 
 fn release_step_script(step_name: &str) -> Result<String, String> {
-    let raw = read_to_string(Path::new(RELEASE_WORKFLOW))?;
-    let workflow: Workflow = serde_yml::from_str(&raw)
-        .map_err(|error| format!("failed to parse {RELEASE_WORKFLOW}: {error}"))?;
+    let workflow = parse_release_workflow()?;
 
     let Some(step) = workflow
         .jobs
@@ -346,6 +369,27 @@ fn release_step_script(step_name: &str) -> Result<String, String> {
     };
 
     Ok(run.to_owned())
+}
+
+fn release_step_condition(step_name: &str) -> Result<Option<String>, String> {
+    let workflow = parse_release_workflow()?;
+
+    let Some(step) = workflow
+        .jobs
+        .values()
+        .flat_map(|job| &job.steps)
+        .find(|step| step.name.as_deref() == Some(step_name))
+    else {
+        return Err(format!("release workflow step not found: {step_name}"));
+    };
+
+    Ok(step.condition.clone())
+}
+
+fn parse_release_workflow() -> Result<Workflow, String> {
+    let raw = read_to_string(Path::new(RELEASE_WORKFLOW))?;
+    serde_yml::from_str(&raw)
+        .map_err(|error| format!("failed to parse {RELEASE_WORKFLOW}: {error}"))
 }
 
 fn run_bash_step(
@@ -453,11 +497,20 @@ impl WorkflowFixture {
             .map_err(|error| format!("failed to write {}: {error}", path.display()))
     }
 
-    fn write_release_artifact(&self, platform: &str, bytes: &[u8]) -> Result<(), String> {
-        let mut name = String::from("br-9.9.9-");
-        name.push_str(platform);
-        name.push_str(".tar.gz");
-        self.write_artifact(&name, bytes)
+    fn write_release_archive_and_checksum(
+        &self,
+        platform: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let name = release_archive_name(platform);
+        self.write_artifact(&name, bytes)?;
+        self.write_artifact(&format!("{name}.sha256"), b"checksum")
+    }
+
+    fn write_release_artifact_set(&self, platform: &str, bytes: &[u8]) -> Result<(), String> {
+        let name = release_archive_name(platform);
+        self.write_release_archive_and_checksum(platform, bytes)?;
+        self.write_artifact(&format!("{name}.minisig"), b"signature")
     }
 
     fn read_artifact(&self, name: &str) -> Result<String, String> {
@@ -472,6 +525,15 @@ impl WorkflowFixture {
             format!("{digest}  {name}\n").as_bytes(),
         )
     }
+}
+
+fn release_archive_name(platform: &str) -> String {
+    let extension = if platform == "windows_amd64" {
+        "zip"
+    } else {
+        "tar.gz"
+    };
+    format!("br-9.9.9-{platform}.{extension}")
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
