@@ -2671,7 +2671,10 @@ mod tests {
 
         let ready = Cli::parse_from(["br", "--no-auto-import", "--no-auto-flush", "ready"]);
         assert!(build_cli_overrides(&ready).read_only_fast_open);
+    }
 
+    #[test]
+    fn read_only_fast_open_classifies_auxiliary_read_and_write_commands() {
         let changelog = Cli::parse_from([
             "br",
             "--no-auto-import",
