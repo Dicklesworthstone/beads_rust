@@ -2907,6 +2907,10 @@ pub(crate) fn compact_database_via_vacuum_into_in_place(
         &write_authority,
         SqliteStorage::open_with_timeout,
         || Ok(()),
+        || Ok(()),
+        |from, to| {
+            crate::util::sync_rename_parent_directories(from, to).map_err(BeadsError::Io)
+        },
     )
 }
 
@@ -2923,6 +2927,10 @@ fn compact_database_via_vacuum_into_in_place_under_write_authority(
         write_authority,
         SqliteStorage::open_with_timeout,
         || Ok(()),
+        || Ok(()),
+        |from, to| {
+            crate::util::sync_rename_parent_directories(from, to).map_err(BeadsError::Io)
+        },
     )
 }
 
@@ -2933,6 +2941,8 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
     write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
     reopen_storage: impl Fn(&Path, Option<u64>) -> Result<SqliteStorage>,
     before_candidate_install: impl FnOnce() -> Result<()>,
+    after_candidate_adoption: impl FnOnce() -> Result<()>,
+    sync_candidate_install: impl FnOnce(&Path, &Path) -> Result<()>,
 ) -> Result<SqliteStorage> {
     // Drain any WAL frames the prior VACUUM/REINDEX (run by the caller)
     // left behind, so `VACUUM INTO` sees the fully-committed on-disk

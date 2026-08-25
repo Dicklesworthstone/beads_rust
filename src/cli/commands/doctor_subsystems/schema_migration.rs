@@ -821,8 +821,18 @@ fn resume_commit_ready_migration(
     }
 
     migration.write_authority.verify_database_authority()?;
+    let raw_live_before_logical_probe = raw_family_witness(&migration.db_path)?;
     let logical_live = logical_witness(&migration.db_path)?;
     if logical_live == marker.logical_before {
+        if raw_live_before_logical_probe != marker.raw_before {
+            return Err(BeadsError::internal(format!(
+                "commit-ready schema migration {} still has the original logical generation but \
+                 its raw family changed during the interrupted installation; refusing automatic \
+                 retry and retaining recovery artifacts at {}",
+                marker.run_id,
+                run_dir.display()
+            )));
+        }
         let failed = FailedMigrationReceipt {
             schema_version: FAILED_SCHEMA.to_string(),
             run_id: marker.run_id.clone(),
@@ -833,7 +843,7 @@ fn resume_commit_ready_migration(
                 .to_string(),
             raw_before: marker.raw_before.clone(),
             logical_before: marker.logical_before.clone(),
-            raw_observed_after_failure: raw_family_witness(&migration.db_path).ok(),
+            raw_observed_after_failure: Some(raw_live_before_logical_probe),
             logical_observed_after_failure: Some(logical_live),
         };
         write_json_new(&run_dir.join("failed.json"), &failed)?;
@@ -3392,6 +3402,67 @@ mod tests {
         assert_eq!(
             logical_witness(&migration.db_path).expect("restored original witness"),
             original_logical
+        );
+    }
+
+    #[test]
+    fn pre_install_commit_ready_marker_classifies_original_generation_for_retry() {
+        let (_temp, migration) = reviewed_v14_migration_context();
+        let plan = build_plan(&migration.db_path).expect("build migration plan");
+        let forecast = plan.forecast.clone().expect("eligible forecast");
+        let plan_token = plan.plan_token.clone().expect("plan token");
+        let run_id = allocate_run_id(&migration.beads_dir).expect("allocate run");
+        let run_dir = migration_runs_root(&migration.beads_dir).join(&run_id);
+        let before_dir = run_dir.join("before");
+        ensure_new_directory(&before_dir).expect("create before directory");
+        copy_family_to_backup(&migration.db_path, &before_dir, &plan.raw_witness)
+            .expect("copy recovery family");
+        let marked_at = Utc::now().to_rfc3339();
+        let prepared = PreparedMigrationReceipt {
+            schema_version: PREPARED_SCHEMA.to_string(),
+            run_id: run_id.clone(),
+            database_path: plan.database_path,
+            plan_token: plan_token.clone(),
+            marked_at,
+            forecast: forecast.clone(),
+            raw_before: plan.raw_witness,
+            logical_before: plan.logical_witness.clone(),
+        };
+        write_json_new(&run_dir.join("prepared.json"), &prepared).expect("write prepared receipt");
+        let mut expected_after = plan.logical_witness;
+        expected_after.user_version = forecast.to_version;
+        expected_after.integrity_check = "ok".to_string();
+        persist_commit_ready_marker(
+            &run_dir,
+            &migration.db_path,
+            &expected_after,
+            ReviewedSchemaMigrationEffectsReceipt {
+                from_version: forecast.from_version,
+                to_version: forecast.to_version,
+                content_hash_rows_rebuilt: forecast.content_hash_rows_rebuilt,
+                gate_result_history_created: forecast.gate_result_history_created,
+                post_migration_maintenance_completed: true,
+            },
+        )
+        .expect("persist pre-install commit-ready marker");
+
+        let resumed = resume_commit_ready_migration(
+            &DoctorMigrateSchemaApplyArgs {
+                plan_token,
+                json: false,
+            },
+            &migration,
+        )
+        .expect("classify interrupted pre-install intent");
+        assert!(
+            resumed.is_none(),
+            "an unchanged original generation must be retried, never called applied"
+        );
+        assert!(run_dir.join("failed.json").is_file());
+        assert!(!run_dir.join("applied.json").exists());
+        assert_eq!(
+            logical_witness(&migration.db_path).expect("unchanged original witness"),
+            prepared.logical_before
         );
     }
 

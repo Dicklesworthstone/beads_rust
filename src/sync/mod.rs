@@ -920,6 +920,21 @@ impl DatabaseFamilyWriteLock {
     /// Re-adopt the still-locked original inode after a failed replacement is
     /// rolled back into place.
     pub(crate) fn restore_retained_database_inode_after_authorized_replace(&self) -> Result<()> {
+        self.readopt_retained_database_inode_after_authorized_replace(true)
+    }
+
+    /// Re-adopt a rolled-back replacement source while retaining older inode
+    /// locks needed by an enclosing recovery transaction.
+    pub(crate) fn restore_nested_retained_database_inode_after_authorized_replace(
+        &self,
+    ) -> Result<()> {
+        self.readopt_retained_database_inode_after_authorized_replace(false)
+    }
+
+    fn readopt_retained_database_inode_after_authorized_replace(
+        &self,
+        finalize_older_replacements: bool,
+    ) -> Result<()> {
         self.verify_common_authority()?;
         let target_identity = authority_path_identity(
             &self.canonical_database_path,
@@ -948,7 +963,9 @@ impl DatabaseFamilyWriteLock {
                 "restored database write authority",
                 true,
             )?;
-            database_authority.retired_locks.clear();
+            if finalize_older_replacements {
+                database_authority.retired_locks.clear();
+            }
             return Ok(());
         }
 
@@ -979,7 +996,9 @@ impl DatabaseFamilyWriteLock {
             database_authority.retired_locks.push(displaced_lock);
         }
         database_authority.identity = Some(target_identity);
-        database_authority.retired_locks.clear();
+        if finalize_older_replacements {
+            database_authority.retired_locks.clear();
+        }
         drop(database_authority);
         Ok(())
     }
