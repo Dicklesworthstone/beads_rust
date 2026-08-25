@@ -10067,6 +10067,93 @@ routing:
         assert!(db_path.is_file(), "database should be rebuilt from JSONL");
     }
 
+    /// The config-layer fast-open fallback must not repair engine namespace
+    /// permissions until it owns the database-family authority, then must use
+    /// the authority-gated opener that performs the repair.
+    #[cfg(unix)]
+    #[test]
+    fn read_only_fast_open_repairs_namespace_modes_only_under_authority() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        drop(SqliteStorage::open(&db_path).expect("initialize current schema"));
+
+        let sidecars: Vec<_> = FSQLITE_NAMESPACE_SIDECAR_SUFFIXES
+            .iter()
+            .map(|suffix| PathBuf::from(format!("{}{suffix}", db_path.display())))
+            .filter(|path| path.is_file())
+            .collect();
+        assert!(
+            !sidecars.is_empty(),
+            "fsqlite should create namespace sidecars for the fixture"
+        );
+        for sidecar in &sidecars {
+            fs::set_permissions(sidecar, fs::Permissions::from_mode(0o664))
+                .expect("loosen namespace sidecar mode");
+        }
+        let before: Vec<_> = sidecars
+            .iter()
+            .map(|sidecar| {
+                (
+                    fs::read(sidecar).expect("read namespace sidecar"),
+                    fs::metadata(sidecar)
+                        .expect("inspect namespace sidecar")
+                        .permissions()
+                        .mode(),
+                )
+            })
+            .collect();
+
+        let held_lock = crate::sync::blocking_write_lock(&beads_dir)
+            .expect("hold competing database-family lock");
+        let blocked_cli = CliOverrides {
+            lock_timeout: Some(1),
+            read_only_fast_open: true,
+            ..CliOverrides::default()
+        };
+        open_storage_with_cli(&beads_dir, &blocked_cli)
+            .expect_err("permission repair must wait for database-family authority");
+        for (sidecar, (bytes, mode)) in sidecars.iter().zip(&before) {
+            assert_eq!(fs::read(sidecar).expect("reread namespace sidecar"), *bytes);
+            assert_eq!(
+                fs::metadata(sidecar)
+                    .expect("reinspect namespace sidecar")
+                    .permissions()
+                    .mode(),
+                *mode,
+                "blocked fast-open fallback must not chmod {}",
+                sidecar.display()
+            );
+        }
+        drop(held_lock);
+
+        let opened = open_storage_with_cli(
+            &beads_dir,
+            &CliOverrides {
+                lock_timeout: Some(1_000),
+                read_only_fast_open: true,
+                ..CliOverrides::default()
+            },
+        )
+        .expect("authority-gated fallback should repair namespace modes");
+        drop(opened);
+        for sidecar in sidecars {
+            let mode = fs::metadata(&sidecar)
+                .expect("inspect repaired namespace sidecar")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "authority-gated fallback left {} group/other accessible",
+                sidecar.display()
+            );
+        }
+    }
+
     #[test]
     fn read_only_fast_open_heals_runtime_incomplete_current_schema_under_authority() {
         let temp = TempDir::new().expect("tempdir");

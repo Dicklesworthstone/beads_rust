@@ -3598,6 +3598,26 @@ mod tests {
         assert!(applied.attested);
         assert!(applied.forecast.post_migration_maintenance);
         assert!(applied.effects.post_migration_maintenance_completed);
+        let marker: CommitReadyMigrationReceipt =
+            read_json(&runs_root.join(run_id).join("commit-ready.json"))
+                .expect("commit-ready receipt");
+        let mut malformed_applied = applied.clone();
+        malformed_applied
+            .raw_after
+            .as_mut()
+            .expect("raw committed witness")
+            .components
+            .pop();
+        let malformed_error = validate_applied_against_commit_ready(
+            &malformed_applied,
+            &marker,
+            &runs_root.join(run_id),
+        )
+        .expect_err("malformed raw committed witness must be rejected");
+        assert!(
+            malformed_error.to_string().contains("raw witness"),
+            "causal raw-witness validation error must remain visible: {malformed_error}"
+        );
         assert_eq!(
             applied
                 .logical_after
