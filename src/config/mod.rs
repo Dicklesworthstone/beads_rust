@@ -9845,9 +9845,8 @@ routing:
                     .find(|path| {
                         path.file_name()
                             .and_then(|name| name.to_str())
-                            .is_some_and(|name| {
-                                name.starts_with("beads.db.") && name.ends_with(".bak")
-                            })
+                            .is_some_and(|name| name.starts_with("beads.db."))
+                            && path.extension().is_some_and(|extension| extension == "bak")
                     })
                     .expect("find staged main database");
                 fs::rename(&staged_database, &retained_original)

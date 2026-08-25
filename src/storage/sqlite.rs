@@ -16026,8 +16026,9 @@ struct WalSchemaPreflight {
 }
 
 fn wal_checksum(bytes: &[u8], mut s1: u32, mut s2: u32, big_endian_words: bool) -> (u32, u32) {
-    debug_assert!(bytes.len().is_multiple_of(8));
-    for chunk in bytes.chunks_exact(8) {
+    let (chunks, remainder) = bytes.as_chunks::<8>();
+    debug_assert!(remainder.is_empty());
+    for chunk in chunks {
         let first = [chunk[0], chunk[1], chunk[2], chunk[3]];
         let second = [chunk[4], chunk[5], chunk[6], chunk[7]];
         let x0 = if big_endian_words {
@@ -16053,6 +16054,9 @@ fn wal_checksum(bytes: &[u8], mut s1: u32, mut s2: u32, big_endian_words: bool) 
 /// after the last commit are ignored. Header and valid page-one corruption are
 /// still hard failures because accepting either would manufacture schema
 /// authority that SQLite itself does not provide.
+// Keep the complete fail-closed recovery scan together so its retained-handle
+// verification and schema-authority transitions remain auditable in order.
+#[allow(clippy::too_many_lines)]
 fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
     let wal_path = database_sidecar_path(db_path, "-wal");
     let Some(mut wal_source) = StableSchemaSource::open_optional(&wal_path, "WAL")? else {
@@ -16346,6 +16350,9 @@ fn maybe_swap_namespace_sidecar_after_open_for_test(sidecar: &Path) -> Result<()
 }
 
 #[cfg(not(all(test, unix)))]
+// Match the test-only hook's fallible signature so the security-sensitive call
+// site is identical in test and production configurations.
+#[allow(clippy::unnecessary_wraps)]
 fn maybe_swap_namespace_sidecar_after_open_for_test(_sidecar: &Path) -> Result<()> {
     Ok(())
 }
@@ -16353,6 +16360,9 @@ fn maybe_swap_namespace_sidecar_after_open_for_test(_sidecar: &Path) -> Result<(
 /// Repair namespace sidecar modes only under the exact live database-family
 /// authority. Every chmod targets a no-follow file handle whose inode is
 /// matched to both the pre-open and immediate pre-chmod path witnesses.
+// Keep the authority, inode, schema, chmod, and postcondition checks in one
+// ordered fail-closed procedure; splitting them would obscure that sequence.
+#[allow(clippy::too_many_lines)]
 fn heal_namespace_sidecar_modes_under_authority(
     db_path: &Path,
     authority: &crate::sync::DatabaseFamilyWriteLock,
@@ -16414,7 +16424,7 @@ fn heal_namespace_sidecar_modes_under_authority(
                     ),
                 });
             }
-            if observed_mode & 0o077 == 0 {
+            if observed_mode.is_multiple_of(0o100) {
                 continue;
             }
 

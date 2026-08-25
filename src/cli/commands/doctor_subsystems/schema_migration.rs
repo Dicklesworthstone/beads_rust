@@ -735,13 +735,17 @@ fn validate_commit_ready_marker(
         &marker.logical_before,
         &marker.forecast,
     )?;
+    // The effects receipt records whether maintenance completed, while the
+    // forecast records whether that maintenance was required.
+    let maintenance_completion_disagrees_with_forecast =
+        marker.effects.post_migration_maintenance_completed
+            != marker.forecast.post_migration_maintenance;
     if !constant_time_text_eq(&recomputed_token, &marker.plan_token)
         || marker.effects.from_version != marker.forecast.from_version
         || marker.effects.to_version != marker.forecast.to_version
         || marker.effects.content_hash_rows_rebuilt != marker.forecast.content_hash_rows_rebuilt
         || marker.effects.gate_result_history_created != marker.forecast.gate_result_history_created
-        || marker.effects.post_migration_maintenance_completed
-            != marker.forecast.post_migration_maintenance
+        || maintenance_completion_disagrees_with_forecast
         || marker.logical_after.user_version != marker.forecast.to_version
         || !integrity_check_is_clean(&marker.logical_after.integrity_check)
     {
@@ -1907,6 +1911,10 @@ fn rollback_compacted_install(
     sync_directory(failed_dir)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "undo is a linear crash-recovery protocol whose operation ordering is safety-critical"
+)]
 fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext) -> Result<()> {
     validate_run_id(&args.run_id)?;
     let run_dir = migration_runs_root(&migration.beads_dir).join(&args.run_id);
@@ -3566,6 +3574,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the end-to-end apply-and-undo proof is clearest as one ordered scenario"
+    )]
     fn reviewed_plan_apply_and_undo_round_trip_exact_logical_state() {
         let (_temp, migration) = reviewed_v14_migration_context();
         let plan = build_plan(&migration.db_path).expect("build plan");
@@ -4024,6 +4036,10 @@ mod tests {
 
     #[test]
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the crash-resume fixture keeps each persisted state transition visible in order"
+    )]
     fn commit_ready_marker_resumes_applied_receipt_and_normal_undo() {
         let (_temp, migration) = reviewed_v14_migration_context();
         let original_logical = logical_witness(&migration.db_path).expect("original witness");

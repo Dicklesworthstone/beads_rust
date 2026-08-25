@@ -81,11 +81,6 @@ fn maybe_replace_database_before_finalize_locked_verify(path: &Path) -> Result<(
     Ok(())
 }
 
-#[cfg(not(test))]
-fn maybe_replace_database_before_finalize_locked_verify(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
 /// Exact source state used by stale-overwrite guards.
 ///
 /// `Missing` is intentionally distinct from a present zero-byte file.
@@ -916,6 +911,7 @@ impl DatabaseFamilyWriteLock {
                     .to_string(),
             });
         }
+        drop(database_authority);
         Ok(())
     }
 
@@ -975,9 +971,11 @@ impl DatabaseFamilyWriteLock {
                 .map_err(|_| BeadsError::SyncConflict {
                     message: "Database inode authority state was poisoned".to_string(),
                 })?;
+        #[cfg(test)]
         maybe_replace_database_before_finalize_locked_verify(&self.canonical_database_path)?;
         self.verify_database_inode_authority_locked(&database_authority)?;
         database_authority.retired_locks.clear();
+        drop(database_authority);
         Ok(())
     }
 
