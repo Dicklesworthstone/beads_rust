@@ -253,6 +253,7 @@ fn prepare_current_orphan_shm_sidecar(fixture: &FixtureWorkspace) {
     fs::write(shm_path, shm).expect("restore orphan SHM fixture");
 }
 
+#[allow(clippy::too_many_lines)]
 fn prepare_current_wal_without_shm(fixture: &FixtureWorkspace) {
     let db_path = current_database_path(fixture);
     let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));

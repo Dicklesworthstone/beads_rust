@@ -18,9 +18,9 @@ pub use path::{
     validate_sync_path, validate_sync_path_with_external, validate_temp_file_path,
 };
 pub(crate) use path::{
-    JsonlSourceSnapshot, PinnedJsonlName, capture_jsonl_source_snapshot,
-    capture_optional_jsonl_source_snapshot, capture_optional_jsonl_source_snapshot_until,
-    pin_jsonl_target,
+    JsonlSourceSnapshot, PinnedJsonlName, authority_paths_equivalent,
+    capture_jsonl_source_snapshot, capture_optional_jsonl_source_snapshot,
+    capture_optional_jsonl_source_snapshot_until, pin_jsonl_target,
 };
 
 use crate::error::{BeadsError, Result};
@@ -478,7 +478,15 @@ impl JsonlFamilyWriteLock {
                     .to_string(),
             });
         }
-        if self.pinned_jsonl_name.display_path() != self.canonical_jsonl_path {
+        // The pinned route keeps its lexical spelling while the sidecar key is
+        // a `fs::canonicalize` product; resolve both through the shared
+        // comparison convention so Windows verbatim/8.3 spellings of one
+        // target agree, while a genuinely different target still conflicts
+        // (#413).
+        if !authority_paths_equivalent(
+            self.pinned_jsonl_name.display_path(),
+            &self.canonical_jsonl_path,
+        ) {
             return Err(BeadsError::SyncConflict {
                 message: "Pinned JSONL target changed while its write authority was held"
                     .to_string(),
@@ -1359,7 +1367,12 @@ pub fn blocking_jsonl_family_write_lock_with_timeout(
         });
     }
     let pinned_jsonl_name = pin_jsonl_target(jsonl_path)?;
-    if pinned_jsonl_name.display_path() != canonical_jsonl_path {
+    // The pinned route is deliberately lexical (its no-follow traversal has
+    // already rejected reparse points), while the sidecar key above is a
+    // `fs::canonicalize` product — a verbatim `\\?\` spelling on Windows.
+    // Compare through the shared convention so one target always matches
+    // itself, while a genuinely different route still conflicts (#413).
+    if !authority_paths_equivalent(pinned_jsonl_name.display_path(), &canonical_jsonl_path) {
         return Err(BeadsError::SyncConflict {
             message: "Pinned JSONL route does not match the canonical sidecar write authority"
                 .to_string(),
@@ -1835,16 +1848,27 @@ enum ConditionalPublicationHookPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConditionalNamespaceChange {
     #[cfg_attr(
-        not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            windows
+        )),
         allow(dead_code)
     )]
     RenamedCreate,
     Exchanged,
-    /// The filesystem rejected the flagged rename, so the staged generation
-    /// was installed with a plain rename after the destination witness was
-    /// re-verified under the held JSONL authority (#419).
+    /// The platform could not perform the flagged (or, on Windows, any
+    /// handle-relative) atomic exchange, so the staged generation was
+    /// installed with a plain rename after the destination witness was
+    /// re-verified under the held JSONL authority (#419, #413).
     #[cfg_attr(
-        not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            windows
+        )),
         allow(dead_code)
     )]
     ReplacedUnderAuthority,
@@ -1887,6 +1911,25 @@ fn flagged_rename_unsupported(error: rustix::io::Errno) -> bool {
         || error == Errno::NOSYS
         || error == Errno::NOTSUP
         || error == Errno::OPNOTSUPP
+}
+
+/// Whether a parent-directory sync failure is the platform's honest "cannot
+/// certify" answer rather than a real durability failure.
+///
+/// Only Windows qualifies, and only for the deliberate `Unsupported` answer
+/// from `PinnedJsonlParent::fsync`: Windows exposes no unprivileged
+/// directory-entry fsync, so a completed and re-verified publication must not
+/// be reported as failed for lacking a certificate the platform cannot issue
+/// (#413). Every other error — and every non-Windows error, byte-identical to
+/// before — still fails the durable-publication contract.
+#[cfg(windows)]
+fn parent_sync_uncertifiable_on_platform(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::Unsupported
+}
+
+#[cfg(not(windows))]
+const fn parent_sync_uncertifiable_on_platform(_error: &std::io::Error) -> bool {
+    false
 }
 
 /// Install the staged generation with a plain rename after re-verifying the
@@ -2011,7 +2054,98 @@ fn perform_conditional_namespace_change(
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+/// Publish the staged JSONL generation on Windows under the held write
+/// authority (#413).
+///
+/// Windows has no `renameat2` analogue reachable through the retained parent
+/// capability, so both branches re-verify state through the pinned handles
+/// and then rename by path, following the witness-checked fallback design
+/// that shipped for Unix flagged-rename refusal in #419:
+///
+/// * A `Missing` destination uses the same native atomic no-replace rename as
+///   fresh-database installation (`MoveFileExW` without `REPLACE_EXISTING`),
+///   so the create tier keeps its no-clobber guarantee and still reports
+///   `RenamedCreate`. A destination that appears first surfaces as the same
+///   refuse-to-overwrite conflict as on Unix.
+/// * A `Present` destination has no atomic exchange at all: the destination
+///   witness is re-verified under the held authority, the staged generation
+///   is installed with a plain replacing rename, and the receipt records the
+///   `ReplacedUnderAuthority` downgrade exactly as the Unix fallback does. A
+///   destination that disappeared since the witness was taken fails the
+///   re-verification, and every other rename error (`EACCES` and friends)
+///   keeps its destination-state kind.
+///
+/// The renames are path-based rather than capability-relative, so the
+/// retained parent route is re-witnessed immediately before and after the
+/// namespace change; the caller additionally re-captures the published leaf
+/// through the pinned handles and fails closed if the route was substituted.
+#[cfg(windows)]
+fn perform_conditional_namespace_change(
+    staged_name: &PinnedJsonlName,
+    output_name: &PinnedJsonlName,
+    expected_previous_state: &JsonlSourceStateWitness,
+) -> Result<ConditionalNamespaceChange> {
+    if staged_name.parent().identity() != output_name.parent().identity() {
+        return Err(BeadsError::SyncConflict {
+            message:
+                "Conditional JSONL publication names do not share one retained parent capability"
+                    .to_string(),
+        });
+    }
+
+    staged_name.parent().verify_route()?;
+    let staged_path = staged_name
+        .parent()
+        .canonical_path()
+        .join(staged_name.leaf());
+    let output_path = output_name
+        .parent()
+        .canonical_path()
+        .join(output_name.leaf());
+
+    let change = match expected_previous_state {
+        JsonlSourceStateWitness::Missing => {
+            match rename_path_no_replace_windows(&staged_path, &output_path) {
+                Ok(()) => ConditionalNamespaceChange::RenamedCreate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(BeadsError::SyncConflict {
+                        message:
+                            "JSONL appeared before the atomic no-replace publication; refusing to overwrite it"
+                                .to_string(),
+                    });
+                }
+                Err(error) => return Err(BeadsError::Io(error)),
+            }
+        }
+        JsonlSourceStateWitness::Present { .. } => {
+            tracing::warn!(
+                output_path = %output_name.display_path().display(),
+                "Windows provides no atomic JSONL exchange; publishing with a \
+                 witness-checked replacing rename under the held write authority \
+                 (non-atomic against foreign writers; recorded in the receipt)"
+            );
+            verify_expected_jsonl_source_state_observed(
+                output_name.capture_optional()?.as_ref(),
+                None,
+                Some(expected_previous_state),
+            )?;
+            // `std::fs::rename` replaces an existing Windows destination. A
+            // disappearance since the witness was taken already failed the
+            // re-verification above, so any error here is surfaced verbatim.
+            fs::rename(&staged_path, &output_path).map_err(BeadsError::Io)?;
+            ConditionalNamespaceChange::ReplacedUnderAuthority
+        }
+    };
+    staged_name.parent().verify_route()?;
+    Ok(change)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    windows
+)))]
 fn perform_conditional_namespace_change(
     _staged_name: &PinnedJsonlName,
     _output_name: &PinnedJsonlName,
@@ -2193,12 +2327,23 @@ where
 
     hook(ConditionalPublicationHookPhase::ParentFsync)
         .map_err(|error| published_but_unwitnessed(output_path, displaced_path, error))?;
-    sync_parent(jsonl_authority).map_err(|source| BeadsError::JsonlPublishedButNotDurable {
-        output_path: output_path.to_path_buf(),
-        recovery_path: cleanup_candidate.map(Path::to_path_buf),
-        content_sha256: content_sha256.to_string(),
-        source,
-    })?;
+    if let Err(source) = sync_parent(jsonl_authority) {
+        if parent_sync_uncertifiable_on_platform(&source) {
+            tracing::warn!(
+                output_path = %output_path.display(),
+                error = %source,
+                "published JSONL generation is verified, but this platform cannot \
+                 certify directory-entry durability for its name"
+            );
+        } else {
+            return Err(BeadsError::JsonlPublishedButNotDurable {
+                output_path: output_path.to_path_buf(),
+                recovery_path: cleanup_candidate.map(Path::to_path_buf),
+                content_sha256: content_sha256.to_string(),
+                source,
+            });
+        }
+    }
     jsonl_authority
         .verify_jsonl_authority()
         .map_err(|error| published_but_unwitnessed(output_path, displaced_path, error))?;
@@ -17702,6 +17847,86 @@ mod tests {
         assert_eq!(publication.source.content_sha256(), content_sha256);
     }
 
+    /// #413: acquiring and re-verifying the JSONL-family authority must
+    /// succeed on Windows even though the canonical sidecar key is a verbatim
+    /// `\\?\` spelling while the pinned route stays lexical.
+    #[cfg(windows)]
+    #[test]
+    fn windows_jsonl_family_authority_reconciles_verbatim_sidecar_key() {
+        let temp = TempDir::new().unwrap();
+        let output_path = temp.path().join("issues.jsonl");
+        let contents = b"{\"id\":\"existing\"}\n";
+        fs::write(&output_path, contents).unwrap();
+
+        let authority = blocking_jsonl_family_write_lock_with_timeout(&output_path, None)
+            .expect("Windows JSONL authority acquisition must not conflict with itself");
+        authority
+            .verify_jsonl_authority()
+            .expect("re-verify the held Windows authority");
+        let captured = authority
+            .capture_optional_target()
+            .expect("capture through the held Windows authority")
+            .expect("existing target should be captured");
+        assert_eq!(captured.size(), contents.len() as u64);
+
+        // First exports run before the leaf exists; the missing-leaf
+        // convention must reconcile the same way.
+        let missing = temp.path().join("fresh.jsonl");
+        let fresh_authority = blocking_jsonl_family_write_lock_with_timeout(&missing, None)
+            .expect("Windows authority over a missing JSONL leaf");
+        assert!(
+            fresh_authority
+                .capture_optional_target()
+                .expect("capture the missing Windows target")
+                .is_none()
+        );
+    }
+
+    /// #413: Windows conditional publication installs a missing destination
+    /// with the native atomic no-replace rename and replaces an existing one
+    /// with the witness-checked under-authority fallback recorded in the
+    /// receipt.
+    #[cfg(windows)]
+    #[test]
+    fn windows_conditional_publication_creates_then_replaces_under_authority() {
+        let temp = TempDir::new().unwrap();
+        let output_path = temp.path().join("issues.jsonl");
+
+        let temp_path = export_temp_path(&output_path);
+        fs::write(&temp_path, b"{\"id\":\"new\"}\n").unwrap();
+        let created = publish_staged_file_conditionally(&temp_path, &output_path)
+            .expect("create-tier Windows publication");
+        assert_eq!(
+            created.atomicity(),
+            ExportPublicationAtomicity::CreateNoReplace
+        );
+        assert!(!created.atomicity().is_downgraded());
+        assert_eq!(fs::read(&output_path).unwrap(), b"{\"id\":\"new\"}\n");
+        assert!(
+            !temp_path.exists(),
+            "the no-replace rename must consume the staged name"
+        );
+
+        let replacement_path = export_temp_path(&output_path);
+        fs::write(&replacement_path, b"{\"id\":\"replacement\"}\n").unwrap();
+        let replaced = publish_staged_file_conditionally(&replacement_path, &output_path)
+            .expect("replace-tier Windows publication");
+        assert_eq!(
+            replaced.atomicity(),
+            ExportPublicationAtomicity::ReplaceUnderAuthority
+        );
+        assert!(replaced.atomicity().is_downgraded());
+        assert_eq!(replaced.atomicity().as_str(), "replace-under-authority");
+        assert_eq!(
+            fs::read(&output_path).unwrap(),
+            b"{\"id\":\"replacement\"}\n"
+        );
+        assert!(
+            !replacement_path.exists(),
+            "the replacing rename must consume the staged name"
+        );
+    }
+
     #[cfg(unix)]
     fn assert_parent_route_replacement_is_contained(
         replacement_phase: ConditionalPublicationHookPhase,
@@ -22959,9 +23184,8 @@ mod tests {
         let stable_hash = crate::util::content_hash(&issue);
         issue.content_hash = Some(stable_hash.clone());
 
-        let renames: HashMap<String, String> = [("oldp-abc".to_string(), "newp-abc".to_string())]
-            .into_iter()
-            .collect();
+        let renames: HashMap<String, String> =
+            std::iter::once(("oldp-abc".to_string(), "newp-abc".to_string())).collect();
         apply_prefix_renames(&mut issue, &renames);
 
         assert_eq!(issue.id, "newp-abc");

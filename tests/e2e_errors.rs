@@ -691,6 +691,7 @@ fn e2e_sync_rename_prefix_applies_after_missing_db_recovery_without_force() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_sync_rename_prefix_preserves_id_remainder_and_reports_mapping() {
     // Issue #442: `--rename-prefix` used to regenerate ids from scratch,
     // dropping descriptive slugs (`oldp-cargo-license-spdx-ay8` became

@@ -189,6 +189,109 @@ fn normalize_path_lexically(path: &Path) -> Option<PathBuf> {
     Some(normalized)
 }
 
+/// Reduces a Windows verbatim spelling (`\\?\C:\…`, `\\?\UNC\server\share\…`)
+/// to its plain equivalent without touching the filesystem.
+///
+/// This is a *comparison* aid only: authority checks never open or traverse
+/// through the simplified spelling. Non-verbatim inputs and verbatim device
+/// prefixes with no plain equivalent pass through unchanged.
+#[cfg(windows)]
+fn strip_verbatim_prefix_lexically(path: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path.to_path_buf();
+    };
+    let mut simplified = match prefix.kind() {
+        Prefix::VerbatimDisk(disk) => PathBuf::from(format!(r"{}:\", char::from(disk))),
+        Prefix::VerbatimUNC(server, share) => {
+            let mut unc = std::ffi::OsString::from(r"\\");
+            unc.push(server);
+            unc.push(r"\");
+            unc.push(share);
+            PathBuf::from(unc)
+        }
+        _ => return path.to_path_buf(),
+    };
+    for component in components {
+        match component {
+            Component::RootDir => {}
+            other => simplified.push(other.as_os_str()),
+        }
+    }
+    simplified
+}
+
+/// One shared spelling for authority-path comparisons (#413).
+///
+/// Windows mixes lexically absolute pinned routes
+/// (`C:\repo\.beads\issues.jsonl`, possibly through 8.3 short aliases such as
+/// `RUNNER~1`) with `fs::canonicalize` products
+/// (`\\?\C:\repo\.beads\issues.jsonl`). Byte comparison of those spellings can
+/// never succeed even though they name one filesystem object, so every
+/// equality or containment decision between a pinned/display route and a
+/// canonical one resolves both operands through this function first.
+///
+/// It deliberately runs at *comparison* time on throwaway copies:
+/// [`pin_jsonl_target`]'s no-follow, component-by-component traversal has
+/// already rejected reparse routes before any comparison happens, so resolving
+/// a copy of the spelling here cannot be steered by one and the pinned
+/// traversal itself stays strictly lexical.
+///
+/// On non-Windows targets this is the identity function, keeping every
+/// existing byte-exact comparison untouched.
+#[cfg(windows)]
+pub(crate) fn comparable_authority_path(path: &Path) -> PathBuf {
+    // Full resolution reconciles verbatim prefixes and 8.3 short aliases in
+    // one step and is exact: two distinct objects never resolve equal.
+    if let Ok(resolved) = dunce::canonicalize(path) {
+        return resolved;
+    }
+    // A missing leaf (first export) still has an existing parent: resolve the
+    // parent and re-attach the exact leaf, mirroring the missing-leaf
+    // convention of the canonical sidecar authority key.
+    if let (Some(parent), Some(leaf)) = (path.parent(), path.file_name())
+        && let Ok(resolved_parent) = dunce::canonicalize(parent)
+    {
+        return resolved_parent.join(leaf);
+    }
+    // Nothing on disk to witness: fall back to a purely lexical spelling so
+    // two references to one never-created route still agree, while genuinely
+    // different routes stay distinct.
+    let lexical = normalize_path_lexically(path).unwrap_or_else(|| path.to_path_buf());
+    strip_verbatim_prefix_lexically(&lexical)
+}
+
+/// Non-Windows targets already use one spelling convention per comparison
+/// site, so the shared form is the identity and comparisons stay byte-exact.
+#[cfg(not(windows))]
+#[inline]
+pub(crate) fn comparable_authority_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+/// Whether two authority-path spellings name the same filesystem target under
+/// the shared comparison convention (#413).
+///
+/// A byte-equal pair short-circuits without touching the filesystem. A
+/// genuinely different pair still compares unequal because both sides resolve
+/// through [`comparable_authority_path`], never just one.
+pub(crate) fn authority_paths_equivalent(left: &Path, right: &Path) -> bool {
+    left == right || comparable_authority_path(left) == comparable_authority_path(right)
+}
+
+/// Whether `candidate` is `ancestor` itself or is contained inside it under
+/// the shared comparison convention (#413).
+///
+/// Both operands resolve through [`comparable_authority_path`] before the
+/// prefix check, so a Windows verbatim child of a plain directory is
+/// contained, while genuinely external paths remain outside.
+pub(crate) fn authority_path_within(candidate: &Path, ancestor: &Path) -> bool {
+    candidate.starts_with(ancestor)
+        || comparable_authority_path(candidate).starts_with(comparable_authority_path(ancestor))
+}
+
 fn symlink_escape_for_existing_ancestor(
     path: &Path,
     canonical_beads: &Path,
@@ -645,13 +748,19 @@ pub fn validate_sync_path_with_external(
     // internal branch, whose validate_sync_path re-normalizes and runs the
     // symlink-escape checks itself.
     let normalized_resolved = normalize_path_lexically(&resolved_path);
+    // The final disjunct resolves both operands to the shared comparison
+    // spelling: on Windows a verbatim (`\\?\`) or 8.3-aliased descendant of a
+    // plain `.beads` still classifies internal instead of being refused as
+    // external (#413). Like the lexical widening above, this only routes into
+    // the *stricter* internal branch, which re-validates the path itself.
     let is_internal = path.starts_with(beads_dir)
         || path.starts_with(&canonical_beads)
         || resolved_path.starts_with(beads_dir)
         || resolved_path.starts_with(&canonical_beads)
         || normalized_resolved.as_deref().is_some_and(|normalized| {
             normalized.starts_with(beads_dir) || normalized.starts_with(&canonical_beads)
-        });
+        })
+        || authority_path_within(&resolved_path, beads_dir);
 
     // CRITICAL: Git paths are ALWAYS rejected, even with allow_external. Do
     // not disclose an absolute external path while reporting that rejection.
@@ -760,10 +869,14 @@ pub fn require_safe_sync_overwrite_path(
     } else {
         path.to_path_buf()
     };
+    // As in `validate_sync_path_with_external`, the shared-spelling disjunct
+    // keeps Windows verbatim/8.3 descendants of a plain `.beads` in the
+    // stricter internal branch instead of refusing them as external (#413).
     let is_internal = resolved_path.starts_with(beads_dir)
         || resolved_path.starts_with(&canonical_beads)
         || path.starts_with(beads_dir)
-        || path.starts_with(&canonical_beads);
+        || path.starts_with(&canonical_beads)
+        || authority_path_within(&resolved_path, beads_dir);
 
     if is_internal {
         let validation = validate_sync_path(path, beads_dir);
@@ -1057,7 +1170,12 @@ impl PinnedJsonlName {
                 external_path_descriptor(path)
             ))
         })?;
-        if parent != self.parent.canonical_path() {
+        // The retained parent route is a lexical spelling; a sibling may
+        // arrive as a canonical (Windows verbatim or 8.3-resolved) spelling of
+        // the same directory. Compare through the shared convention so one
+        // directory always matches itself, while a genuinely different parent
+        // still refuses the capability (#413).
+        if !authority_paths_equivalent(parent, self.parent.canonical_path()) {
             return Err(BeadsError::SyncConflict {
                 message:
                     "JSONL sibling path does not belong to the retained parent-directory capability"
@@ -2702,6 +2820,138 @@ mod tests {
         let beads_dir = temp.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("create beads dir");
         (temp, beads_dir)
+    }
+
+    /// #413: the shared comparison convention must treat one route as equal
+    /// to itself (existing or not yet created) and must never merge two
+    /// genuinely different routes, on every platform.
+    #[test]
+    fn authority_path_comparison_contract_holds_for_shared_and_distinct_routes() {
+        let (temp, beads_dir) = setup_test_beads_dir();
+        let target = beads_dir.join("issues.jsonl");
+        std::fs::write(&target, b"{}\n").expect("write JSONL fixture");
+        let sibling = beads_dir.join("other.jsonl");
+        std::fs::write(&sibling, b"{}\n").expect("write sibling fixture");
+        let missing = beads_dir.join("missing.jsonl");
+
+        assert!(authority_paths_equivalent(&target, &target));
+        assert!(authority_paths_equivalent(
+            &missing,
+            &beads_dir.join("missing.jsonl")
+        ));
+        assert!(
+            !authority_paths_equivalent(&target, &sibling),
+            "distinct existing routes must never compare equal"
+        );
+        assert!(
+            !authority_paths_equivalent(&missing, &target),
+            "a missing route must never match an existing sibling"
+        );
+
+        assert!(authority_path_within(&target, &beads_dir));
+        assert!(authority_path_within(&missing, &beads_dir));
+        let external = temp.path().join("elsewhere").join("issues.jsonl");
+        assert!(
+            !authority_path_within(&external, &beads_dir),
+            "a genuinely external route must stay outside the beads directory"
+        );
+    }
+
+    /// #413: on non-Windows targets the shared spelling is the identity, so
+    /// every pre-existing byte-exact comparison stays byte-identical.
+    #[cfg(not(windows))]
+    #[test]
+    fn comparable_authority_path_is_identity_off_windows() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let target = beads_dir.join("issues.jsonl");
+        assert_eq!(comparable_authority_path(&target), target);
+        assert_eq!(
+            comparable_authority_path(Path::new("relative/route.jsonl")),
+            Path::new("relative/route.jsonl")
+        );
+    }
+
+    /// #413: a `fs::canonicalize` verbatim (`\\?\`) spelling and the plain
+    /// pinned spelling of one Windows target must compare equal, for both an
+    /// existing leaf and a not-yet-created one, while different targets keep
+    /// failing the comparison.
+    #[cfg(windows)]
+    #[test]
+    fn windows_verbatim_and_plain_spellings_of_one_route_are_equivalent() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let target = beads_dir.join("issues.jsonl");
+        std::fs::write(&target, b"{}\n").expect("write JSONL fixture");
+        let sibling = beads_dir.join("other.jsonl");
+        std::fs::write(&sibling, b"{}\n").expect("write sibling fixture");
+
+        let plain = dunce::canonicalize(&target).expect("dunce-canonicalize target");
+        let verbatim = std::fs::canonicalize(&target).expect("std-canonicalize target");
+        assert!(authority_paths_equivalent(&plain, &verbatim));
+        assert!(authority_paths_equivalent(&target, &verbatim));
+        assert!(
+            !authority_paths_equivalent(&verbatim, &sibling),
+            "a verbatim spelling must still refuse a genuinely different leaf"
+        );
+
+        let verbatim_parent = std::fs::canonicalize(&beads_dir).expect("std-canonicalize parent");
+        let missing_plain = beads_dir.join("missing.jsonl");
+        let missing_verbatim = verbatim_parent.join("missing.jsonl");
+        assert!(authority_paths_equivalent(
+            &missing_plain,
+            &missing_verbatim
+        ));
+        assert!(!authority_paths_equivalent(
+            &missing_verbatim,
+            &beads_dir.join("different.jsonl")
+        ));
+    }
+
+    /// #413: a verbatim child of a plain `.beads` directory is contained; a
+    /// genuinely external verbatim path stays outside and is still refused by
+    /// the sync-path boundary.
+    #[cfg(windows)]
+    #[test]
+    fn windows_verbatim_child_of_plain_beads_dir_classifies_internal() {
+        let (temp, beads_dir) = setup_test_beads_dir();
+        let target = beads_dir.join("issues.jsonl");
+        std::fs::write(&target, b"{}\n").expect("write JSONL fixture");
+        let verbatim_child = std::fs::canonicalize(&target).expect("std-canonicalize target");
+        assert!(authority_path_within(&verbatim_child, &beads_dir));
+        validate_sync_path_with_external(&verbatim_child, &beads_dir, false)
+            .expect("verbatim descendant of a plain beads dir must classify internal");
+
+        let external_dir = temp.path().join("external");
+        std::fs::create_dir_all(&external_dir).expect("create external dir");
+        let external = external_dir.join("escape.jsonl");
+        std::fs::write(&external, b"{}\n").expect("write external fixture");
+        let verbatim_external = std::fs::canonicalize(&external).expect("canonicalize external");
+        assert!(!authority_path_within(&verbatim_external, &beads_dir));
+        validate_sync_path_with_external(&verbatim_external, &beads_dir, false)
+            .expect_err("a genuinely external verbatim path must still be refused");
+    }
+
+    /// #413: the lexical verbatim strip is a pure spelling reduction — it
+    /// never touches the filesystem and leaves non-verbatim and device
+    /// prefixes alone.
+    #[cfg(windows)]
+    #[test]
+    fn windows_strip_verbatim_prefix_is_lexical_only() {
+        assert_eq!(
+            strip_verbatim_prefix_lexically(Path::new(r"\\?\C:\does\not\exist.jsonl")),
+            Path::new(r"C:\does\not\exist.jsonl")
+        );
+        assert_eq!(
+            strip_verbatim_prefix_lexically(Path::new(r"\\?\UNC\server\share\x.jsonl")),
+            Path::new(r"\\server\share\x.jsonl")
+        );
+        assert_eq!(
+            strip_verbatim_prefix_lexically(Path::new(r"C:\plain\route.jsonl")),
+            Path::new(r"C:\plain\route.jsonl")
+        );
+        assert_eq!(
+            strip_verbatim_prefix_lexically(Path::new(r"\\.\PIPE\name")),
+            Path::new(r"\\.\PIPE\name")
+        );
     }
 
     #[cfg(any(unix, windows))]

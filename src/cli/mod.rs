@@ -3843,7 +3843,7 @@ mod tests {
         "`save <NAME> [FILTERS...]`",
         "no free-form query string argument",
         "`--allow-external-jsonl` | Allow JSONL path outside `.beads/`",
-        "`--rename-prefix` | During import, rewrite mismatched issue IDs",
+        "`--rename-prefix` | During import, rewrite mismatched issue-ID prefixes",
         "`--rebuild` | During import, rebuild SQLite from JSONL",
         "`--notes-contains <TEXT>` | Notes contains substring",
         "`--format <FMT>` | Output format: text, json, csv, toon",
