@@ -1693,9 +1693,7 @@ fn table_declares_autoincrement_primary_key(conn: &Connection, table: &str, colu
     let Some(sql) = row.get(0).and_then(SqliteValue::as_text) else {
         return false;
     };
-    let normalized = compact_sql_fragment(sql);
-    let expected = compact_sql_fragment(&format!("{column} INTEGER PRIMARY KEY AUTOINCREMENT"));
-    normalized.contains(&expected)
+    sql_contains_token_sequence(sql, &format!("{column} INTEGER PRIMARY KEY AUTOINCREMENT"))
 }
 
 fn runtime_index_key_shape_canonical(
@@ -1884,6 +1882,130 @@ fn sql_without_comments(sql: &str) -> String {
     output
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SqlEvidenceToken {
+    Unquoted(String),
+    StringLiteral(String),
+    QuotedIdentifier(String),
+    Symbol(char),
+}
+
+fn sql_evidence_tokens(sql: &str) -> Vec<SqlEvidenceToken> {
+    let bytes = sql.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte.is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if byte == b'-' && index + 1 < bytes.len() && bytes[index + 1] == b'-' {
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if byte == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'*' {
+            index += 2;
+            while index + 1 < bytes.len()
+                && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+            {
+                index += 1;
+            }
+            index = (index + 2).min(bytes.len());
+            continue;
+        }
+        if byte == b'\'' {
+            let start = index;
+            index += 1;
+            while index < bytes.len() {
+                if bytes[index] == b'\'' {
+                    if index + 1 < bytes.len() && bytes[index + 1] == b'\'' {
+                        index += 2;
+                    } else {
+                        index += 1;
+                        break;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            tokens.push(SqlEvidenceToken::StringLiteral(
+                sql[start..index].to_string(),
+            ));
+            continue;
+        }
+        if byte == b'"' || byte == b'`' {
+            let start = index;
+            let delimiter = byte;
+            index += 1;
+            while index < bytes.len() {
+                if bytes[index] == delimiter {
+                    if index + 1 < bytes.len() && bytes[index + 1] == delimiter {
+                        index += 2;
+                    } else {
+                        index += 1;
+                        break;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            tokens.push(SqlEvidenceToken::QuotedIdentifier(
+                sql[start..index].to_string(),
+            ));
+            continue;
+        }
+        if byte == b'[' {
+            let start = index;
+            index += 1;
+            while index < bytes.len() && bytes[index] != b']' {
+                index += 1;
+            }
+            if index < bytes.len() {
+                index += 1;
+            }
+            tokens.push(SqlEvidenceToken::QuotedIdentifier(
+                sql[start..index].to_string(),
+            ));
+            continue;
+        }
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$') {
+            let start = index;
+            index += 1;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'_' | b'$'))
+            {
+                index += 1;
+            }
+            tokens.push(SqlEvidenceToken::Unquoted(
+                sql[start..index].to_ascii_lowercase(),
+            ));
+            continue;
+        }
+
+        let Some(symbol) = sql[index..].chars().next() else {
+            break;
+        };
+        tokens.push(SqlEvidenceToken::Symbol(symbol));
+        index += symbol.len_utf8();
+    }
+
+    tokens
+}
+
+fn sql_contains_token_sequence(sql: &str, expected: &str) -> bool {
+    let actual_tokens = sql_evidence_tokens(sql);
+    let expected_tokens = sql_evidence_tokens(expected);
+    !expected_tokens.is_empty()
+        && actual_tokens
+            .windows(expected_tokens.len())
+            .any(|tokens| tokens == expected_tokens)
+}
+
 fn compact_sql_fragment(sql: &str) -> String {
     sql_without_comments(sql)
         .chars()
@@ -2050,14 +2172,13 @@ fn issues_required_checks_canonical(conn: &Connection) -> bool {
     let Some(sql) = row.get(0).and_then(SqliteValue::as_text) else {
         return false;
     };
-    let normalized = compact_sql_fragment(sql);
     [
         "CHECK(length(title) <= 500)",
         "CHECK(priority >= 0 AND priority <= 4)",
         ISSUES_CLOSED_AT_CHECK,
     ]
     .iter()
-    .all(|required| normalized.contains(&compact_sql_fragment(required)))
+    .all(|required| sql_contains_token_sequence(sql, required))
 }
 
 fn blocked_cache_table_canonical(conn: &Connection) -> bool {
@@ -4164,12 +4285,17 @@ mod tests {
         );
         let malformed_autoincrement = GATE_RESULT_HISTORY_MIGRATION_SQL
             .replace("INTEGER PRIMARY KEY AUTOINCREMENT", "INTEGER PRIMARY KEY");
+        let comment_spoofed_autoincrement = GATE_RESULT_HISTORY_MIGRATION_SQL.replace(
+            "INTEGER PRIMARY KEY AUTOINCREMENT",
+            "INTEGER PRIMARY KEY /* id INTEGER PRIMARY KEY AUTOINCREMENT */",
+        );
 
         for (label, schema_sql) in [
             ("column_type", malformed_type),
             ("foreign_key", malformed_foreign_key),
             ("index_order", malformed_index),
             ("autoincrement", malformed_autoincrement),
+            ("comment_spoofed_autoincrement", comment_spoofed_autoincrement),
         ] {
             let (_temp, conn) = reviewed_v14_with_gate_history_schema(&schema_sql);
             let error = run_migrations_atomic(
@@ -5842,6 +5968,51 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_schema_contract_rejects_non_binary_external_ref_unique_collation() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("nonbinary_external_ref_index.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+
+        execute_batch(
+            &conn,
+            r"
+            DROP INDEX idx_issues_external_ref_unique;
+            CREATE UNIQUE INDEX idx_issues_external_ref_unique
+                ON issues(external_ref COLLATE NOCASE) WHERE external_ref IS NOT NULL;
+            INSERT INTO issues (id, title, external_ref)
+                VALUES ('external-ref-upper', 'External ref upper', 'Case-Sensitive-Ref');
+            ",
+        )
+        .expect("plant a same-name UNIQUE index with noncanonical collation");
+        let case_variant = conn.execute(
+            "INSERT INTO issues (id, title, external_ref) \
+             VALUES ('external-ref-lower', 'External ref lower', 'case-sensitive-ref')",
+        );
+        assert!(
+            case_variant.is_err(),
+            "NOCASE must materially reject references the canonical BINARY index permits"
+        );
+        assert!(
+            semantic_partial_index_predicate_canonical(
+                &conn,
+                "idx_issues_external_ref_unique"
+            ),
+            "the fixture must retain the canonical partial-index predicate"
+        );
+        assert!(
+            !runtime_index_key_shape_canonical(
+                &conn,
+                "idx_issues_external_ref_unique",
+                &["external_ref"]
+            ),
+            "the index collation is part of its write semantics"
+        );
+        assert!(!runtime_schema_compatible(&conn));
+        assert!(attest_runtime_schema_cookie(&conn).is_err());
+    }
+
+    #[test]
     fn test_runtime_schema_contract_rejects_unexpected_unique_index() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("unexpected_unique_index.db");
@@ -5873,6 +6044,110 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_schema_contract_rejects_unexpected_gate_history_unique_index() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("unexpected_gate_history_unique_index.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+
+        execute_batch(
+            &conn,
+            r"
+            INSERT INTO issues (id, title) VALUES ('gate-owner-a', 'Gate owner A');
+            INSERT INTO issues (id, title) VALUES ('gate-owner-b', 'Gate owner B');
+            CREATE UNIQUE INDEX rogue_unique_gate_provider
+                ON gate_result_history(provider);
+            INSERT INTO gate_result_history
+                (issue_id, from_status, to_status, status_revision, gate, provider)
+                VALUES ('gate-owner-a', 'open', 'closed', 1, 'tests', 'provider-a');
+            ",
+        )
+        .expect("plant an unexpected write-restricting gate-history index");
+        let shared_provider = conn.execute(
+            "INSERT INTO gate_result_history \
+             (issue_id, from_status, to_status, status_revision, gate, provider) \
+             VALUES ('gate-owner-b', 'open', 'closed', 1, 'tests', 'provider-a')",
+        );
+        assert!(
+            shared_provider.is_err(),
+            "the rogue index must reject otherwise-valid history from a shared provider"
+        );
+        assert!(
+            attest_gate_result_history_schema(&conn).is_err(),
+            "gate-history attestation must reject unexpected UNIQUE indexes"
+        );
+        assert!(!runtime_schema_compatible(&conn));
+        assert!(attest_runtime_schema_cookie(&conn).is_err());
+    }
+
+    #[test]
+    fn test_runtime_schema_contract_ignores_check_text_inside_comments() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("comment_spoofed_issue_checks.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut schema = SCHEMA_SQL.replace(
+            "title TEXT NOT NULL CHECK(length(title) <= 500),",
+            "title TEXT NOT NULL /* CHECK(length(title) <= 500) */ ,",
+        );
+        schema = schema.replace(
+            "priority INTEGER NOT NULL DEFAULT 2 CHECK(priority >= 0 AND priority <= 4),",
+            "priority INTEGER NOT NULL DEFAULT 2 \
+             /* CHECK(priority >= 0 AND priority <= 4) */ ,",
+        );
+        schema = schema.replace(
+            r"        CHECK (
+            (status = 'closed' AND closed_at IS NOT NULL) OR
+            (status = 'tombstone') OR
+            (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL)
+        )",
+            &format!("        CHECK (1) /* {ISSUES_CLOSED_AT_CHECK} */"),
+        );
+        assert_ne!(schema, SCHEMA_SQL, "the fixture must weaken the issue checks");
+        execute_batch(&conn, &schema).expect("install comment-spoofed schema");
+        conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+            .expect("stamp current version without applying canonical checks");
+
+        conn.execute_with_params(
+            "INSERT INTO issues (id, title) VALUES (?, ?)",
+            &[
+                SqliteValue::from("too-long-title"),
+                SqliteValue::from("x".repeat(501)),
+            ],
+        )
+        .expect("the weakened table must admit a title over 500 characters");
+        conn.execute(
+            "INSERT INTO issues (id, title, priority) \
+             VALUES ('bad-priority', 'Bad priority', 99)",
+        )
+        .expect("the weakened table must admit an out-of-range priority");
+        conn.execute(
+            "INSERT INTO issues (id, title, status) \
+             VALUES ('closed-without-time', 'Closed without time', 'closed')",
+        )
+        .expect("the weakened table must admit closed status without closed_at");
+
+        assert!(
+            core_runtime_table_canonical(
+                &conn,
+                "issues",
+                ISSUES_RUNTIME_COLUMNS,
+                &[],
+                ISSUES_RUNTIME_INDEXES,
+                true,
+                None,
+                false,
+            ),
+            "the fixture must differ from the runtime manifest only in CHECK semantics"
+        );
+        assert!(
+            !issues_required_checks_canonical(&conn),
+            "comment text is not evidence that a CHECK constraint is enforced"
+        );
+        assert!(!runtime_schema_compatible(&conn));
+        assert!(attest_runtime_schema_cookie(&conn).is_err());
+    }
+
+    #[test]
     fn test_runtime_schema_witness_rejects_prior_contract_token() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("prior_runtime_schema_witness.db");
@@ -5880,7 +6155,7 @@ mod tests {
         apply_schema(&conn).expect("schema");
         let cookie = attest_runtime_schema_cookie(&conn).expect("attest current schema");
         let prior_witness = format!(
-            "schema-{CURRENT_SCHEMA_VERSION}.contract-v2-exact-columns-fks-indexes-history-autoincrement-cookie-fenced.cookie-{cookie}"
+            "schema-{CURRENT_SCHEMA_VERSION}.contract-v3-exact-core-aux-columns-fks-index-shapes-checks-autoincrement-cookie-fenced.cookie-{cookie}"
         );
         conn.execute_with_params(
             "INSERT INTO metadata (key, value) VALUES (?, ?)",

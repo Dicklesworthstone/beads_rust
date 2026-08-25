@@ -775,6 +775,12 @@ struct RecoveryArtifactFingerprint {
     symlink_target: Option<String>,
 }
 
+#[derive(Debug)]
+struct RecoveryLivePathWitness {
+    original: PathBuf,
+    fingerprint: Option<RecoveryArtifactFingerprint>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JsonlRecoveryStrategy {
     RebuildFromJsonl,
@@ -2001,6 +2007,76 @@ fn recovery_artifact_fingerprint(path: &Path) -> Result<RecoveryArtifactFingerpr
     })
 }
 
+fn capture_live_database_family_witness(db_path: &Path) -> Result<Vec<RecoveryLivePathWitness>> {
+    database_family_paths(db_path)
+        .into_iter()
+        .map(|original| {
+            let fingerprint = match fs::symlink_metadata(&original) {
+                Ok(_) => Some(recovery_artifact_fingerprint(&original)?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(BeadsError::WithContext {
+                        context: format!(
+                            "Failed to witness live database-family path '{}' before recovery rollback",
+                            original.display()
+                        ),
+                        source: Box::new(error),
+                    });
+                }
+            };
+            Ok(RecoveryLivePathWitness {
+                original,
+                fingerprint,
+            })
+        })
+        .collect()
+}
+
+fn verify_staged_database_family_witness(
+    witnesses: &[RecoveryLivePathWitness],
+    staged_paths: &[RecoveryBackupPath],
+) -> Result<()> {
+    if staged_paths.iter().any(|(original, _)| {
+        !witnesses
+            .iter()
+            .any(|witness| witness.original == *original)
+    }) {
+        return Err(BeadsError::SyncConflict {
+            message: "Recovery staged an unexpected database-family path after its final authority check"
+                .to_string(),
+        });
+    }
+
+    for witness in witnesses {
+        let staged_path = staged_paths
+            .iter()
+            .find_map(|(original, staged)| (original == &witness.original).then_some(staged));
+        match (&witness.fingerprint, staged_path) {
+            (None, None) => {}
+            (Some(expected), Some(staged)) => {
+                verify_recovery_backup_artifact(staged, expected).map_err(|error| {
+                    BeadsError::WithContext {
+                        context: format!(
+                            "Live database-family path '{}' changed between its final recovery witness and staging; refusing to install the original backup",
+                            witness.original.display()
+                        ),
+                        source: Box::new(error),
+                    }
+                })?;
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Live database-family path '{}' appeared or disappeared between its final recovery witness and staging; refusing to install the original backup",
+                        witness.original.display()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn verify_recovery_backup_artifact(
     backup: &Path,
     expected: &RecoveryArtifactFingerprint,
@@ -2106,7 +2182,7 @@ fn rename_recovery_path_no_replace(from: &Path, to: &Path) -> Result<()> {
 
 #[cfg(windows)]
 fn rename_recovery_path_no_replace(from: &Path, to: &Path) -> Result<()> {
-    match crate::sync::rename_recovery_path_no_replace_windows(from, to) {
+    match crate::sync::rename_path_no_replace_windows(from, to) {
         Ok(()) => Ok(()),
         Err(error) => match fs::symlink_metadata(to) {
             Ok(_) => Err(BeadsError::SyncConflict {
@@ -3125,24 +3201,36 @@ fn rollback_database_family_after_recovery_failure(
         return Ok(RecoveryRollbackDisposition::PreservedLiveTarget);
     }
 
-    restore_database_family_after_failed_rebuild_before_live_staging(backup_set, || {
-        let late_target_state = write_authority.database_target_authority_state()?;
-        let late_sidecar_exists = database_family_has_live_sidecars(&backup_set.db_path)?;
-        let late_target_must_be_preserved = late_target_state
-            == DatabaseTargetAuthorityState::Foreign
-            || (late_target_state == DatabaseTargetAuthorityState::Missing && late_sidecar_exists)
-            || (phase == RecoveryFailurePhase::Install
-                && late_target_state == DatabaseTargetAuthorityState::Held
-                && late_sidecar_exists);
-        if late_target_state != target_state || late_target_must_be_preserved {
-            return Err(BeadsError::SyncConflict {
-                message: format!(
-                    "Refusing recovery rollback because the live database family changed while its backups were being claimed (expected {target_state:?}, found {late_target_state:?}); it was left untouched"
-                ),
-            });
-        }
-        Ok(())
-    })?;
+    restore_database_family_after_failed_rebuild_before_live_staging(
+        backup_set,
+        || {
+            let late_target_state = write_authority.database_target_authority_state()?;
+            let late_sidecar_exists = database_family_has_live_sidecars(&backup_set.db_path)?;
+            let late_target_must_be_preserved = late_target_state
+                == DatabaseTargetAuthorityState::Foreign
+                || (late_target_state == DatabaseTargetAuthorityState::Missing
+                    && late_sidecar_exists)
+                || (phase == RecoveryFailurePhase::Install
+                    && late_target_state == DatabaseTargetAuthorityState::Held
+                    && late_sidecar_exists);
+            if late_target_state != target_state || late_target_must_be_preserved {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Refusing recovery rollback because the live database family changed while its backups were being claimed (expected {target_state:?}, found {late_target_state:?}); it was left untouched"
+                    ),
+                });
+            }
+            Ok(())
+        },
+        |staged_paths| {
+            verify_staged_database_recovery_authority(
+                backup_set,
+                staged_paths,
+                write_authority,
+                target_state,
+            )
+        },
+    )?;
     if backup_set.had_original_database {
         write_authority.restore_retained_database_inode_after_authorized_replace()?;
     } else {
@@ -3167,6 +3255,37 @@ fn database_family_has_live_sidecars(db_path: &Path) -> Result<bool> {
                 source: Box::new(error),
             }),
         })
+}
+
+fn verify_staged_database_recovery_authority(
+    backup_set: &RecoveryBackupSet,
+    staged_paths: &[RecoveryBackupPath],
+    write_authority: &crate::sync::DatabaseFamilyWriteLock,
+    expected_target_state: crate::sync::DatabaseTargetAuthorityState,
+) -> Result<()> {
+    use crate::sync::DatabaseTargetAuthorityState;
+
+    let staged_database = staged_paths
+        .iter()
+        .find_map(|(original, staged)| (original == &backup_set.db_path).then_some(staged));
+    match expected_target_state {
+        DatabaseTargetAuthorityState::Held => {
+            let staged_database = staged_database.ok_or_else(|| BeadsError::SyncConflict {
+                message: "The retained database generation disappeared before recovery rollback could stage it"
+                    .to_string(),
+            })?;
+            write_authority.verify_staged_database_recovery_authority(staged_database)
+        }
+        DatabaseTargetAuthorityState::Missing if staged_database.is_none() => Ok(()),
+        DatabaseTargetAuthorityState::Missing => Err(BeadsError::SyncConflict {
+            message: "A database generation appeared after the final missing-target recovery check; refusing to install the original backup"
+                .to_string(),
+        }),
+        DatabaseTargetAuthorityState::Foreign => Err(BeadsError::SyncConflict {
+            message: "A foreign database generation reached recovery staging; refusing to install the original backup"
+                .to_string(),
+        }),
+    }
 }
 
 fn prepare_database_family_backup_for_recovery(
@@ -3363,20 +3482,33 @@ fn claim_recovery_backup_set_for_restore(
     Ok(claimed_backups)
 }
 
+#[cfg(test)]
 fn restore_database_family_after_failed_rebuild(backup_set: &RecoveryBackupSet) -> Result<()> {
-    restore_database_family_after_failed_rebuild_with_hooks(backup_set, || Ok(()), || Ok(()))
+    restore_database_family_after_failed_rebuild_before_live_staging(
+        backup_set,
+        || Ok(()),
+        |_| Ok(()),
+    )
 }
 
-fn restore_database_family_after_failed_rebuild_before_live_staging<F>(
+fn restore_database_family_after_failed_rebuild_before_live_staging<B, A>(
     backup_set: &RecoveryBackupSet,
-    before_live_staging: F,
+    before_live_staging: B,
+    after_live_staging: A,
 ) -> Result<()>
 where
-    F: FnOnce() -> Result<()>,
+    B: FnOnce() -> Result<()>,
+    A: FnOnce(&[RecoveryBackupPath]) -> Result<()>,
 {
-    restore_database_family_after_failed_rebuild_with_hooks(backup_set, before_live_staging, || {
-        Ok(())
-    })
+    let live_family_witness = capture_live_database_family_witness(&backup_set.db_path)?;
+    restore_database_family_after_failed_rebuild_with_hooks(
+        backup_set,
+        before_live_staging,
+        |staged_paths| {
+            verify_staged_database_family_witness(&live_family_witness, staged_paths)?;
+            after_live_staging(staged_paths)
+        },
+    )
 }
 
 fn database_family_has_live_paths(db_path: &Path) -> Result<bool> {
@@ -3403,7 +3535,7 @@ fn restore_database_family_after_failed_rebuild_with_hooks<B, R>(
 ) -> Result<()>
 where
     B: FnOnce() -> Result<()>,
-    R: FnOnce() -> Result<()>,
+    R: FnOnce(&[RecoveryBackupPath]) -> Result<()>,
 {
     let claimed_backups = claim_recovery_backup_set_for_restore(backup_set)?;
     if let Err(authority_error) = before_live_staging() {
@@ -3452,7 +3584,7 @@ where
         }
     };
 
-    let restore_result = before_claimed_restore().and_then(|()| {
+    let restore_result = before_claimed_restore(&rebuilt_backups).and_then(|()| {
         rename_existing_paths_no_replace(
             claimed_backups
                 .iter()
@@ -4073,17 +4205,28 @@ impl OpenStorageResult {
         }
 
         self.storage = SqliteStorage::open_memory()?;
-        restore_database_family_after_failed_rebuild_before_live_staging(&backup_set, || {
-            if write_authority.database_target_authority_state()?
-                == crate::sync::DatabaseTargetAuthorityState::Held
-            {
-                return Ok(());
-            }
-            Err(BeadsError::SyncConflict {
-                message: "Refusing deferred recovery rollback because the live database changed after its storage handle was released; it was left untouched"
-                    .to_string(),
-            })
-        })?;
+        restore_database_family_after_failed_rebuild_before_live_staging(
+            &backup_set,
+            || {
+                if write_authority.database_target_authority_state()?
+                    == crate::sync::DatabaseTargetAuthorityState::Held
+                {
+                    return Ok(());
+                }
+                Err(BeadsError::SyncConflict {
+                    message: "Refusing deferred recovery rollback because the live database changed after its storage handle was released; it was left untouched"
+                        .to_string(),
+                })
+            },
+            |staged_paths| {
+                verify_staged_database_recovery_authority(
+                    &backup_set,
+                    staged_paths,
+                    &write_authority,
+                    crate::sync::DatabaseTargetAuthorityState::Held,
+                )
+            },
+        )?;
         if had_original_database_family {
             write_authority.restore_retained_database_inode_after_authorized_replace()?;
             write_authority.verify_database_authority()?;
@@ -10845,7 +10988,7 @@ routing:
                     message: "late authority refusal".to_string(),
                 })
             },
-            || Ok(()),
+            |_| Ok(()),
         )
         .expect_err("late authority refusal must abort before live staging");
 
@@ -10889,7 +11032,7 @@ routing:
         let error = restore_database_family_after_failed_rebuild_with_hooks(
             &backup_set,
             || Ok(()),
-            || {
+            |_| {
                 fs::write(&db_path, b"foreign-generation")?;
                 Ok(())
             },
