@@ -800,8 +800,10 @@ fn resume_commit_ready_migration(
     if secure_file_metadata(&applied_path)?.is_some() {
         let applied: AppliedMigrationReceipt = read_json(&applied_path)?;
         validate_applied_against_commit_ready(&applied, &marker, &run_dir)?;
-        let raw_live = raw_family_witness(&migration.db_path)?;
         let logical_live = logical_witness(&migration.db_path).ok();
+        // Capture the fallback raw witness after the SQLite probe so a
+        // legitimate shared-memory sidecar rewrite cannot stale it immediately.
+        let raw_live = raw_family_witness(&migration.db_path)?;
         require_unchanged_applied_state(
             &applied,
             &raw_live,
@@ -1944,8 +1946,11 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
         )?;
         receipt
     } else {
-        let raw_live = raw_family_witness(&migration.db_path)?;
         let logical_live = logical_witness(&migration.db_path).ok();
+        // The receipt later governs exact quarantine moves. Capture it after
+        // the SQLite probe, which may legitimately rewrite the volatile -shm
+        // sidecar even though the logical database is unchanged.
+        let raw_live = raw_family_witness(&migration.db_path)?;
         require_unchanged_applied_state(&applied, &raw_live, logical_live.as_ref(), &args.run_id)?;
 
         let quarantine_id = format!(
@@ -4389,8 +4394,8 @@ mod tests {
         let applied_path = run_dir.join("applied.json");
         let applied: AppliedMigrationReceipt =
             read_json(&applied_path).expect("read applied receipt");
-        let raw_live = raw_family_witness(&migration.db_path).expect("raw live state");
         let logical_live = logical_witness(&migration.db_path).expect("logical live state");
+        let raw_live = raw_family_witness(&migration.db_path).expect("raw live state");
         let quarantine_dir = run_dir.join("undo-quarantine/undo-resume-fixture");
         let receipt = UndoReceipt {
             schema_version: UNDO_SCHEMA.to_string(),

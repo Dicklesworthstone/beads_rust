@@ -959,12 +959,11 @@ fn open_sqlite_storage_with_recovery_strategy(
         authority.verify_database_authority()?;
     }
 
+    authority.verify_database_authority()?;
     quarantine_truncated_wal_sidecar(&paths.db_path, beads_dir);
+    authority.verify_database_authority()?;
 
     let prepare_fresh_storage = || -> Result<(SqliteStorage, RecoveryBackupSet)> {
-        let authority = write_authority.ok_or_else(|| BeadsError::SyncConflict {
-            message: "Deferred database recovery has no database-family authority".to_string(),
-        })?;
         prepare_fresh_storage_for_deferred_import(
             &paths.db_path,
             beads_dir,
@@ -4420,12 +4419,12 @@ impl OpenStorageResult {
                 &write_authority,
             )
             .map_err(|reopen_err| BeadsError::WithContext {
-                    context: format!(
-                        "Restored the original database family at '{}' but failed to reopen it",
-                        self.paths.db_path.display()
-                    ),
-                    source: Box::new(reopen_err),
-                })?;
+                context: format!(
+                    "Restored the original database family at '{}' but failed to reopen it",
+                    self.paths.db_path.display()
+                ),
+                source: Box::new(reopen_err),
+            })?;
             write_authority.verify_database_authority()?;
             self.storage = restored_storage;
         } else {
@@ -10114,8 +10113,14 @@ routing:
             read_only_fast_open: true,
             ..CliOverrides::default()
         };
-        open_storage_with_cli(&beads_dir, &blocked_cli)
+        let blocked_error = open_storage_with_cli(&beads_dir, &blocked_cli)
             .expect_err("permission repair must wait for database-family authority");
+        assert!(
+            blocked_error
+                .to_string()
+                .contains("Timed out after 1ms waiting for write lock"),
+            "unexpected blocked fallback error: {blocked_error}"
+        );
         for (sidecar, (bytes, mode)) in sidecars.iter().zip(&before) {
             assert_eq!(fs::read(sidecar).expect("reread namespace sidecar"), *bytes);
             assert_eq!(
