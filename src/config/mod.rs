@@ -3231,6 +3231,33 @@ where
     let mut backup_set =
         prepare_database_family_backup_for_recovery(db_path, beads_dir, write_authority)?;
     before_install();
+    let staged_backup_verification = verify_recovery_backup_set(&backup_set).and_then(|()| {
+        if !backup_set.had_original_database {
+            return Ok(());
+        }
+        let staged_database = backup_set
+            .files
+            .iter()
+            .find_map(|(original, backup)| (original == db_path).then_some(backup))
+            .ok_or_else(|| BeadsError::SyncConflict {
+                message: "Recovery backup manifest lost its staged main database".to_string(),
+            })?;
+        write_authority.verify_staged_database_recovery_authority(staged_database)
+    });
+    if let Err(verification_error) = staged_backup_verification {
+        if let Err(rollback_error) = rollback_renamed_paths_no_replace(
+            &backup_set.files,
+            "abort database recovery before fresh installation after staged-backup verification failed",
+        ) {
+            return Err(BeadsError::WithContext {
+                context: format!(
+                    "Staged recovery backup verification failed ({verification_error}); restoring the staged family without replacement also failed"
+                ),
+                source: Box::new(rollback_error),
+            });
+        }
+        return Err(verification_error);
+    }
     let fresh_witness = match write_authority.install_empty_database_replacement_and_bind() {
         Ok(witness) => witness,
         Err(install_err) => {
@@ -8846,6 +8873,7 @@ routing:
     fn vacuum_into_reopen_failure_returns_error_without_storage_handle() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("beads.db");
+        let sidecar_path = PathBuf::from(format!("{}-wal-cert", db_path.display()));
         let mut storage = SqliteStorage::open(&db_path).expect("create storage");
         let now = Utc::now();
         let issue = Issue {
@@ -8879,7 +8907,10 @@ routing:
             |_, _| -> Result<SqliteStorage> {
                 Err(BeadsError::Config("simulated reopen failure".to_string()))
             },
-            || Ok(()),
+            || {
+                fs::write(&sidecar_path, b"pre-compaction sidecar")?;
+                Ok(())
+            },
             || Ok(()),
             |from, to| {
                 crate::util::sync_rename_parent_directories(from, to).map_err(BeadsError::Io)
@@ -8906,6 +8937,211 @@ routing:
             .expect("query compacted database")
             .expect("seeded issue should remain in compacted database");
         assert_eq!(recovered.title, "Survives compacted reopen failure");
+        assert_eq!(
+            fs::read(&sidecar_path).expect("read restored pre-compaction sidecar"),
+            b"pre-compaction sidecar",
+            "reopen failure must restore the sidecar generation staged with the prior main database"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vacuum_into_preserves_same_byte_foreign_swap_after_candidate_lock() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let retained_original = temp.path().join("retained-original.db");
+        let foreign_candidate = temp.path().join("foreign.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("create storage");
+        storage
+            .set_config("issue_prefix", "bd")
+            .expect("seed database");
+        storage.checkpoint_full().expect("checkpoint seed database");
+        let original_inode = fs::metadata(&db_path).expect("inspect original").ino();
+        fs::copy(&db_path, &foreign_candidate).expect("copy same-byte foreign candidate");
+        let foreign_inode = fs::metadata(&foreign_candidate)
+            .expect("inspect foreign candidate")
+            .ino();
+        let write_authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                temp.path(),
+                &db_path,
+                Some(1_000),
+            )
+            .expect("acquire compaction authority"),
+        );
+        write_authority
+            .bind_database_inode_for_mutation()
+            .expect("bind compaction database inode");
+        storage.attach_write_authority(Arc::clone(&write_authority));
+
+        let error = compact_database_via_vacuum_into_in_place_with_reopener(
+            storage,
+            &db_path,
+            Some(50),
+            &write_authority,
+            SqliteStorage::open_with_timeout,
+            || {
+                fs::rename(&db_path, &retained_original)?;
+                fs::rename(&foreign_candidate, &db_path)?;
+                Ok(())
+            },
+            || Ok(()),
+            |from, to| {
+                crate::util::sync_rename_parent_directories(from, to).map_err(BeadsError::Io)
+            },
+        )
+        .expect_err("same-byte foreign swap must abort compacted installation");
+
+        assert!(
+            error.to_string().contains("generation changed"),
+            "unexpected authority error: {error}"
+        );
+        assert_eq!(
+            fs::metadata(&db_path).expect("inspect preserved foreign").ino(),
+            foreign_inode,
+            "the foreign generation must return to the canonical path"
+        );
+        assert_eq!(
+            fs::metadata(&retained_original)
+                .expect("inspect retained original")
+                .ino(),
+            original_inode,
+            "the authority-owned original inode must remain recoverable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vacuum_into_post_adoption_failure_restores_main_and_sidecar() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let sidecar_path = PathBuf::from(format!("{}-wal-cert", db_path.display()));
+        let mut storage = SqliteStorage::open(&db_path).expect("create storage");
+        storage
+            .set_config("issue_prefix", "bd")
+            .expect("seed database");
+        storage.checkpoint_full().expect("checkpoint seed database");
+        let original_inode = fs::metadata(&db_path).expect("inspect original").ino();
+        let write_authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                temp.path(),
+                &db_path,
+                Some(1_000),
+            )
+            .expect("acquire compaction authority"),
+        );
+        write_authority
+            .bind_database_inode_for_mutation()
+            .expect("bind compaction database inode");
+        storage.attach_write_authority(Arc::clone(&write_authority));
+
+        let error = compact_database_via_vacuum_into_in_place_with_reopener(
+            storage,
+            &db_path,
+            Some(50),
+            &write_authority,
+            SqliteStorage::open_with_timeout,
+            || {
+                fs::write(&sidecar_path, b"retained sidecar")?;
+                Ok(())
+            },
+            || {
+                Err(BeadsError::Config(
+                    "simulated post-adoption validation failure".to_string(),
+                ))
+            },
+            |from, to| {
+                crate::util::sync_rename_parent_directories(from, to).map_err(BeadsError::Io)
+            },
+        )
+        .expect_err("post-adoption failure must roll back the compacted install");
+
+        assert!(
+            error
+                .to_string()
+                .contains("simulated post-adoption validation failure"),
+            "unexpected post-adoption error: {error}"
+        );
+        assert_eq!(
+            fs::metadata(&db_path).expect("inspect restored main").ino(),
+            original_inode,
+            "post-adoption failure must restore the exact pre-compaction main inode"
+        );
+        assert_eq!(
+            fs::read(&sidecar_path).expect("read restored sidecar"),
+            b"retained sidecar"
+        );
+        assert_eq!(
+            write_authority
+                .database_target_authority_state()
+                .expect("classify restored database"),
+            crate::sync::DatabaseTargetAuthorityState::Held
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vacuum_into_parent_sync_failure_restores_retained_main() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("create storage");
+        storage
+            .set_config("issue_prefix", "bd")
+            .expect("seed database");
+        storage.checkpoint_full().expect("checkpoint seed database");
+        let original_inode = fs::metadata(&db_path).expect("inspect original").ino();
+        let write_authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                temp.path(),
+                &db_path,
+                Some(1_000),
+            )
+            .expect("acquire compaction authority"),
+        );
+        write_authority
+            .bind_database_inode_for_mutation()
+            .expect("bind compaction database inode");
+        storage.attach_write_authority(Arc::clone(&write_authority));
+
+        let error = compact_database_via_vacuum_into_in_place_with_reopener(
+            storage,
+            &db_path,
+            Some(50),
+            &write_authority,
+            SqliteStorage::open_with_timeout,
+            || Ok(()),
+            || Ok(()),
+            |_, _| {
+                Err(BeadsError::Config(
+                    "simulated parent-directory sync failure".to_string(),
+                ))
+            },
+        )
+        .expect_err("durability-barrier failure must roll back the compacted install");
+
+        assert!(
+            error
+                .to_string()
+                .contains("simulated parent-directory sync failure"),
+            "unexpected durability error: {error}"
+        );
+        assert_eq!(
+            fs::metadata(&db_path).expect("inspect restored main").ino(),
+            original_inode,
+            "durability failure must restore the exact pre-compaction inode"
+        );
+        assert_eq!(
+            write_authority
+                .database_target_authority_state()
+                .expect("classify restored database"),
+            crate::sync::DatabaseTargetAuthorityState::Held
+        );
     }
 
     #[test]
@@ -9572,6 +9808,77 @@ routing:
                 .all(|bytes| bytes != b"concurrent database generation"
                     && bytes != b"concurrent sidecar generation"),
             "concurrent family bytes must never be moved into recovery"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_rejects_same_byte_staged_backup_inode_swap_before_fresh_install() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let recovery_dir = recovery_dir_for_db_path(&db_path, &beads_dir);
+        let retained_original = beads_dir.join("retained-exact-original.db");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::write(&db_path, b"same recovery bytes").expect("write original database");
+        let original_inode = fs::metadata(&db_path).expect("inspect original").ino();
+        let authority = crate::sync::blocking_database_family_write_lock_with_timeout(
+            &beads_dir,
+            &db_path,
+            Some(1_000),
+        )
+        .expect("acquire existing database authority");
+
+        let error = rebuild_database_family_with_backup_before_install(
+            &db_path,
+            &beads_dir,
+            &authority,
+            SuccessfulRecoveryDisposition::FinalizeImmediately,
+            || {
+                let staged_database = fs::read_dir(&recovery_dir)
+                    .expect("list recovery dir")
+                    .filter_map(std::result::Result::ok)
+                    .map(|entry| entry.path())
+                    .find(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with("beads.db.") && name.ends_with(".bak"))
+                    })
+                    .expect("find staged main database");
+                fs::rename(&staged_database, &retained_original)
+                    .expect("retain exact authority-owned backup inode");
+                fs::copy(&retained_original, &staged_database)
+                    .expect("plant same-byte foreign backup inode");
+            },
+            |_| -> Result<()> {
+                panic!("fresh installation must not run after staged-backup identity changes")
+            },
+        )
+        .expect_err("same-byte staged backup swap must fail exact authority verification");
+
+        assert!(
+            error.to_string().contains("generation changed"),
+            "unexpected staged-backup authority error: {error}"
+        );
+        assert_eq!(
+            fs::read(&db_path).expect("read preserved same-byte foreign database"),
+            b"same recovery bytes"
+        );
+        assert_ne!(
+            fs::metadata(&db_path)
+                .expect("inspect preserved foreign database")
+                .ino(),
+            original_inode,
+            "the same-byte foreign inode must not be mistaken for the retained original"
+        );
+        assert_eq!(
+            fs::metadata(&retained_original)
+                .expect("inspect retained exact original")
+                .ino(),
+            original_inode,
+            "the exact authority-owned original must remain recoverable"
         );
     }
 

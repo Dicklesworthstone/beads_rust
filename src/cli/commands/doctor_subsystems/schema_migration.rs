@@ -768,7 +768,7 @@ fn resume_commit_ready_migration(
         Err(error) => return Err(BeadsError::Io(error)),
     };
     let database_path = migration.db_path.display().to_string();
-    let mut matched = None;
+    let mut matched = Vec::new();
     for entry in entries {
         let entry = entry.map_err(BeadsError::Io)?;
         let file_type = entry.file_type().map_err(BeadsError::Io)?;
@@ -787,19 +787,10 @@ fn resume_commit_ready_migration(
         {
             continue;
         }
-        let applied_exists = secure_file_metadata(&run_dir.join("applied.json"))?.is_some();
-        let failed_exists = secure_file_metadata(&run_dir.join("failed.json"))?.is_some();
-        if failed_exists && !applied_exists {
-            continue;
-        }
-        if matched.is_some() {
-            return Err(BeadsError::internal(
-                "multiple commit-ready schema migrations match this plan token",
-            ));
-        }
-        matched = Some((run_dir, marker));
+        matched.push((run_dir, marker));
     }
-    let Some((run_dir, marker)) = matched else {
+    matched.sort_by(|left, right| left.1.run_id.cmp(&right.1.run_id));
+    let Some((run_dir, marker)) = matched.pop() else {
         return Ok(None);
     };
     let before_dir = run_dir.join("before");
@@ -822,13 +813,30 @@ fn resume_commit_ready_migration(
 
     migration.write_authority.verify_database_authority()?;
     let raw_live_before_logical_probe = raw_family_witness(&migration.db_path)?;
-    let logical_live = logical_witness(&migration.db_path)?;
-    if logical_live == marker.logical_before {
-        if raw_live_before_logical_probe != marker.raw_before {
+    let original_main = component_for_suffix(&marker.raw_before, "")?;
+    let live_main = component_for_suffix(&raw_live_before_logical_probe, "")?;
+    let main_still_matches_original = live_main.present == original_main.present
+        && live_main.length == original_main.length
+        && live_main.sha256 == original_main.sha256;
+    if raw_live_before_logical_probe == marker.raw_before || main_still_matches_original {
+        let raw_live = restore_interrupted_preinstall_family(
+            &migration.db_path,
+            &before_dir,
+            &run_dir.join("maintenance-displaced"),
+            &marker.raw_before,
+            &migration.write_authority,
+        )?;
+        let logical_live = logical_witness(&migration.db_path)?;
+        migration.write_authority.verify_database_authority()?;
+        let raw_live_after_probe = raw_family_witness(&migration.db_path)?;
+        if logical_live != marker.logical_before
+            || raw_live_after_probe != marker.raw_before
+            || raw_live != marker.raw_before
+        {
             return Err(BeadsError::internal(format!(
-                "commit-ready schema migration {} still has the original logical generation but \
-                 its raw family changed during the interrupted installation; refusing automatic \
-                 retry and retaining recovery artifacts at {}",
+                "commit-ready schema migration {} could not prove the exact original family \
+                 after reconciling an interrupted pre-install state; retained recovery \
+                 artifacts at {}",
                 marker.run_id,
                 run_dir.display()
             )));
@@ -843,12 +851,19 @@ fn resume_commit_ready_migration(
                 .to_string(),
             raw_before: marker.raw_before.clone(),
             logical_before: marker.logical_before.clone(),
-            raw_observed_after_failure: Some(raw_live_before_logical_probe),
+            raw_observed_after_failure: Some(raw_live_after_probe),
             logical_observed_after_failure: Some(logical_live),
         };
-        write_json_new(&run_dir.join("failed.json"), &failed)?;
+        let failed_path = run_dir.join("failed.json");
+        if secure_file_metadata(&failed_path)?.is_some() {
+            let existing: FailedMigrationReceipt = read_json(&failed_path)?;
+            validate_failed_against_commit_ready(&existing, &marker, &run_dir)?;
+        } else {
+            write_json_new(&failed_path, &failed)?;
+        }
         return Ok(None);
     }
+    let logical_live = logical_witness(&migration.db_path)?;
     if logical_live != marker.logical_after {
         return Err(BeadsError::internal(format!(
             "commit-ready schema migration {} cannot be resumed because the live database is \
@@ -884,7 +899,122 @@ fn resume_commit_ready_migration(
     };
     validate_applied_against_commit_ready(&applied, &marker, &run_dir)?;
     write_json_new(&applied_path, &applied)?;
+    sync_directory(&run_dir)?;
     Ok(Some((applied, before_dir)))
+}
+
+fn restore_interrupted_preinstall_family(
+    db_path: &Path,
+    before_dir: &Path,
+    displaced_dir: &Path,
+    expected: &RawFamilyWitness,
+    write_authority: &Arc<DatabaseFamilyWriteLock>,
+) -> Result<RawFamilyWitness> {
+    write_authority.verify_database_authority()?;
+    let expected_main = component_for_suffix(expected, "")?;
+    let live_main = family_component_path(db_path, "");
+    let live_main_metadata = secure_file_metadata(&live_main)?.ok_or_else(|| {
+        BeadsError::internal("interrupted schema migration no longer has a live main database")
+    })?;
+    verify_component_bytes(&live_main, &live_main_metadata, expected_main)?;
+    let displaced_main = backup_component_path(displaced_dir, db_path, "")?;
+    if secure_file_metadata(&displaced_main)?.is_some() {
+        return Err(BeadsError::internal(format!(
+            "interrupted schema migration already displaced its original main database to {}; \
+             refusing to classify it as a pre-install state",
+            displaced_main.display()
+        )));
+    }
+
+    for component in expected
+        .components
+        .iter()
+        .filter(|component| !component.suffix.is_empty())
+    {
+        let live = family_component_path(db_path, &component.suffix);
+        let displaced = backup_component_path(displaced_dir, db_path, &component.suffix)?;
+        let live_metadata = secure_file_metadata(&live)?;
+        let displaced_metadata = secure_file_metadata(&displaced)?;
+        if !component.present {
+            if live_metadata.is_some() {
+                return Err(BeadsError::internal(format!(
+                    "interrupted schema migration found an unexpected live sidecar {}; \
+                     refusing to remove or overwrite it",
+                    live.display()
+                )));
+            }
+            continue;
+        }
+        if let Some(metadata) = live_metadata {
+            verify_component_bytes(&live, &metadata, component)?;
+            continue;
+        }
+        if let Some(metadata) = displaced_metadata
+            && verify_component_bytes(&displaced, &metadata, component).is_ok()
+        {
+            rename_path_no_replace(&displaced, &live)?;
+            let restored_metadata = secure_file_metadata(&live)?.ok_or_else(|| {
+                BeadsError::internal(format!(
+                    "interrupted schema-migration sidecar disappeared after restoration: {}",
+                    live.display()
+                ))
+            })?;
+            verify_component_bytes(&live, &restored_metadata, component)?;
+            set_file_permissions(&live, component.unix_mode)?;
+            continue;
+        }
+
+        // The live engine may have rewritten a sidecar after prepared.json was
+        // captured. Preserve that displaced evidence and restore the exact
+        // receipt-bound bytes from the immutable recovery bundle.
+        let backup = backup_component_path(before_dir, db_path, &component.suffix)?;
+        copy_regular_file_new(&backup, &live, component.unix_mode)?;
+    }
+    if let Some(parent) = db_path.parent() {
+        sync_directory(parent)?;
+    }
+    match fs::symlink_metadata(displaced_dir) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            sync_directory(displaced_dir)?;
+        }
+        Ok(_) => {
+            return Err(BeadsError::internal(format!(
+                "schema-migration displaced path is not a real directory: {}",
+                displaced_dir.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(BeadsError::Io(error)),
+    }
+    write_authority.verify_database_authority()?;
+    let restored = raw_family_witness(db_path)?;
+    if restored != *expected {
+        return Err(BeadsError::internal(
+            "interrupted schema migration did not restore the exact receipt-bound raw family",
+        ));
+    }
+    Ok(restored)
+}
+
+fn validate_failed_against_commit_ready(
+    failed: &FailedMigrationReceipt,
+    marker: &CommitReadyMigrationReceipt,
+    run_dir: &Path,
+) -> Result<()> {
+    if failed.schema_version != FAILED_SCHEMA
+        || failed.run_id != marker.run_id
+        || failed.database_path != marker.database_path
+        || !constant_time_text_eq(&failed.plan_token, &marker.plan_token)
+        || failed.marked_at != marker.marked_at
+        || failed.raw_before != marker.raw_before
+        || failed.logical_before != marker.logical_before
+    {
+        return Err(BeadsError::internal(format!(
+            "failed schema-migration receipt in {} is inconsistent with its commit-ready marker",
+            run_dir.display()
+        )));
+    }
+    Ok(())
 }
 
 fn validate_applied_against_commit_ready(
@@ -906,10 +1036,8 @@ fn validate_applied_against_commit_ready(
         || applied.effects != marker.effects
         || applied.raw_before != marker.raw_before
         || applied.logical_before != marker.logical_before
-        || applied
-            .logical_after
-            .as_ref()
-            .is_some_and(|logical_after| logical_after != &marker.logical_after)
+        || applied.raw_after.is_none()
+        || applied.logical_after.as_ref() != Some(&marker.logical_after)
     {
         return Err(BeadsError::internal(format!(
             "applied schema-migration receipt in {} is inconsistent with its commit-ready marker",
@@ -2640,13 +2768,53 @@ fn verify_backup_family(
 
 fn write_json_new<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let encoded = serde_json::to_vec_pretty(value).map_err(BeadsError::Json)?;
-    let mut file = open_private_file_new(path)?;
+    let parent = path.parent().ok_or_else(|| {
+        BeadsError::internal(format!(
+            "schema migration receipt path has no parent: {}",
+            path.display()
+        ))
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        BeadsError::internal(format!(
+            "schema migration receipt path has no file name: {}",
+            path.display()
+        ))
+    })?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| BeadsError::internal(format!("system clock precedes Unix epoch: {error}")))?
+        .as_nanos();
+    let mut staged = None;
+    for attempt in 0_u16..=u16::MAX {
+        let mut staged_name = OsString::from(".");
+        staged_name.push(file_name);
+        staged_name.push(format!(
+            ".write-{}-{nonce}-{attempt}.tmp",
+            std::process::id()
+        ));
+        let staged_path = parent.join(staged_name);
+        match open_private_file_new(&staged_path) {
+            Ok(file) => {
+                staged = Some((staged_path, file));
+                break;
+            }
+            Err(BeadsError::Io(error))
+                if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let (staged_path, mut file) = staged.ok_or_else(|| {
+        BeadsError::internal(format!(
+            "could not allocate a unique staged receipt beside {}",
+            path.display()
+        ))
+    })?;
     file.write_all(&encoded).map_err(BeadsError::Io)?;
     file.write_all(b"\n").map_err(BeadsError::Io)?;
     file.sync_all().map_err(BeadsError::Io)?;
-    if let Some(parent) = path.parent() {
-        sync_directory(parent)?;
-    }
+    drop(file);
+    rename_path_no_replace(&staged_path, path)?;
+    sync_directory(parent)?;
     Ok(())
 }
 
