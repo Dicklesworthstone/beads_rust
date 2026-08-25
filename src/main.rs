@@ -482,14 +482,15 @@ fn main() {
                     authority,
                     allow_external_jsonl,
                 ) {
-                    Ok(reprobe) => apply_fast_open_auto_import_reprobe(
-                        reprobe,
-                        &mut should_attempt_auto_import,
-                        &mut pending_merge_warning_emitted,
-                        &mut overrides,
-                        &mut ctx.overrides,
-                        json_error_mode,
-                    ),
+                    Ok(reprobe) => {
+                        should_attempt_auto_import = apply_fast_open_auto_import_reprobe(
+                            reprobe,
+                            &mut pending_merge_warning_emitted,
+                            &mut overrides,
+                            &mut ctx.overrides,
+                            json_error_mode,
+                        );
+                    }
                     Err(error) => handle_error(&error, json_error_mode, color_error_mode),
                 }
             }
@@ -1465,15 +1466,14 @@ fn reopen_and_reprobe_fast_open_auto_import_under_authority(
 
 fn apply_fast_open_auto_import_reprobe(
     reprobe: FastOpenAutoImportReprobe,
-    should_attempt_auto_import: &mut bool,
     pending_merge_warning_emitted: &mut bool,
     overrides: &mut config::CliOverrides,
     startup_overrides: &mut config::CliOverrides,
     json_error_mode: bool,
-) {
+) -> bool {
     match reprobe {
-        FastOpenAutoImportReprobe::ImportRequired => {}
-        FastOpenAutoImportReprobe::Current => *should_attempt_auto_import = false,
+        FastOpenAutoImportReprobe::ImportRequired => true,
+        FastOpenAutoImportReprobe::Current => false,
         FastOpenAutoImportReprobe::Pending(state) => {
             if !*pending_merge_warning_emitted {
                 emit_pending_sync_merge_warning(&state, json_error_mode);
@@ -1481,7 +1481,7 @@ fn apply_fast_open_auto_import_reprobe(
             }
             force_pending_merge_read_only_overrides(overrides);
             force_pending_merge_read_only_overrides(startup_overrides);
-            *should_attempt_auto_import = false;
+            false
         }
     }
 }
@@ -3190,11 +3190,9 @@ mod tests {
         dispatch_overrides.read_only_fast_open = false;
         let mut pending_ctx = StartupContext::empty(fast_overrides.clone());
         pending_ctx.overrides.read_only_fast_open = false;
-        let mut should_attempt_auto_import = true;
         let mut warning_emitted = false;
-        apply_fast_open_auto_import_reprobe(
+        let should_attempt_auto_import = apply_fast_open_auto_import_reprobe(
             pending_reprobe,
-            &mut should_attempt_auto_import,
             &mut warning_emitted,
             &mut dispatch_overrides,
             &mut pending_ctx.overrides,

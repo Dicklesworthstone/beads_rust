@@ -17,7 +17,7 @@ const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
 // caused rustc to interpret hundreds of thousands of loop iterations on every
 // schema rebuild, overwhelming the compile-time savings of the runtime fast
 // path itself.
-const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str = "v13-exact-ddl-version-domain-cookie-fenced";
+const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str = "v14-exact-ddl-version-domain-cookie-fenced";
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 const GATE_RESULT_HISTORY_MIGRATION_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS gate_result_history (
@@ -1908,114 +1908,23 @@ fn auxiliary_runtime_indexes_canonical(
 
     expected_indexes_match
         && index_rows.iter().all(|row| {
-            let unique = row
-                .get(2)
-                .and_then(SqliteValue::as_integer)
-                .is_some_and(|value| value != 0);
-            if !unique {
-                return true;
-            }
-
             let Some(name) = row.get(1).and_then(SqliteValue::as_text) else {
                 return false;
             };
             match row.get(3).and_then(SqliteValue::as_text) {
                 // A canonical PRIMARY KEY may have an automatic backing index.
                 Some(origin) if origin.eq_ignore_ascii_case("pk") => true,
-                // Explicit unique indexes are accepted only when their exact
-                // name and UNIQUE shape are in this table's manifest.
+                // Every explicit index must be in the exact table manifest.
+                // Even a non-UNIQUE expression or partial index is maintained
+                // on writes and can reject otherwise-valid canonical data.
                 Some(origin) if origin.eq_ignore_ascii_case("c") => indexes
                     .iter()
-                    .any(|expected| expected.name == name && expected.unique),
+                    .any(|expected| expected.name == name),
                 // An automatic UNIQUE constraint (origin `u`) or an unknown
                 // origin changes which otherwise-valid rows can be written.
                 _ => false,
             }
         })
-}
-
-fn sql_without_comments(sql: &str) -> String {
-    let bytes = sql.as_bytes();
-    let mut output = String::with_capacity(sql.len());
-    let mut copy_start = 0;
-    let mut index = 0;
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut in_line_comment = false;
-    let mut in_block_comment = false;
-
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if in_line_comment {
-            if byte == b'\n' {
-                in_line_comment = false;
-                copy_start = index;
-            }
-            index += 1;
-            continue;
-        }
-        if in_block_comment {
-            if byte == b'*' && index + 1 < bytes.len() && bytes[index + 1] == b'/' {
-                in_block_comment = false;
-                index += 2;
-                copy_start = index;
-            } else {
-                index += 1;
-            }
-            continue;
-        }
-        if in_single_quote {
-            if byte == b'\'' {
-                if index + 1 < bytes.len() && bytes[index + 1] == b'\'' {
-                    index += 2;
-                } else {
-                    in_single_quote = false;
-                    index += 1;
-                }
-            } else {
-                index += 1;
-            }
-            continue;
-        }
-        if in_double_quote {
-            if byte == b'"' {
-                if index + 1 < bytes.len() && bytes[index + 1] == b'"' {
-                    index += 2;
-                } else {
-                    in_double_quote = false;
-                    index += 1;
-                }
-            } else {
-                index += 1;
-            }
-            continue;
-        }
-
-        if byte == b'\'' {
-            in_single_quote = true;
-            index += 1;
-        } else if byte == b'"' {
-            in_double_quote = true;
-            index += 1;
-        } else if byte == b'-' && index + 1 < bytes.len() && bytes[index + 1] == b'-' {
-            output.push_str(&sql[copy_start..index]);
-            output.push(' ');
-            in_line_comment = true;
-            index += 2;
-        } else if byte == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'*' {
-            output.push_str(&sql[copy_start..index]);
-            output.push(' ');
-            in_block_comment = true;
-            index += 2;
-        } else {
-            index += 1;
-        }
-    }
-
-    if !in_line_comment && !in_block_comment {
-        output.push_str(&sql[copy_start..]);
-    }
-    output
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

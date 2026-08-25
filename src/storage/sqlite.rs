@@ -28,7 +28,7 @@ use fsqlite_types::SqliteValue;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -15852,6 +15852,158 @@ fn future_schema_error(version: u32, current_schema_version: u32) -> BeadsError 
         "Database schema version {version} is newer than this br binary supports \
          ({current_schema_version}); refusing to modify or downgrade it"
     ))
+}
+
+/// A regular schema-family file held open through byte inspection.
+///
+/// Unix opens are no-follow and retain the inode. Windows opens retain the
+/// delete-denying handle returned by the pinned-path authority surface, then
+/// compare a second guarded path open before the result is trusted. This keeps
+/// a path replacement from turning a header or WAL read into evidence about a
+/// different filesystem object.
+#[derive(Debug)]
+struct StableSchemaSource {
+    file: std::fs::File,
+    initial_len: u64,
+    #[cfg(unix)]
+    identity: (u64, u64),
+    #[cfg(windows)]
+    identity: crate::sync::path::JsonlFileIdentity,
+}
+
+impl StableSchemaSource {
+    fn open_optional(path: &Path, description: &str) -> Result<Option<Self>> {
+        let initial_metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(BeadsError::Io(error)),
+        };
+        if initial_metadata.file_type().is_symlink() || !initial_metadata.is_file() {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Refusing schema preflight because the {description} path is not a regular file"
+                ),
+            });
+        }
+
+        #[cfg(windows)]
+        let (file, identity) = {
+            let source = crate::sync::path::open_regular_authority_source(path)?.ok_or_else(|| {
+                BeadsError::SyncConflict {
+                    message: format!(
+                        "{description} disappeared before its guarded schema-preflight handle could be opened"
+                    ),
+                }
+            })?;
+            let identity = source.identity();
+            (source.into_file(), identity)
+        };
+
+        #[cfg(not(windows))]
+        let file = {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            }
+            options.open(path).map_err(|error| BeadsError::SyncConflict {
+                message: format!(
+                    "{description} changed before its no-follow schema-preflight handle could be opened: {error}"
+                ),
+            })?
+        };
+
+        let handle_metadata = file.metadata()?;
+        if !handle_metadata.is_file() || handle_metadata.len() != initial_metadata.len() {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "{description} changed identity or length during schema preflight"
+                ),
+            });
+        }
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+
+            let identity = (initial_metadata.dev(), initial_metadata.ino());
+            if (handle_metadata.dev(), handle_metadata.ino()) != identity {
+                return Err(BeadsError::SyncConflict {
+                    message: format!("{description} changed identity during schema preflight"),
+                });
+            }
+            identity
+        };
+
+        let source = Self {
+            file,
+            initial_len: initial_metadata.len(),
+            #[cfg(unix)]
+            identity,
+            #[cfg(windows)]
+            identity,
+        };
+        source.verify_path(path, description)?;
+        Ok(Some(source))
+    }
+
+    fn verify_path(&self, path: &Path, description: &str) -> Result<()> {
+        let handle_metadata = self.file.metadata()?;
+        let path_metadata = std::fs::symlink_metadata(path).map_err(|error| {
+            BeadsError::SyncConflict {
+                message: format!(
+                    "{description} changed while its schema preflight was being verified: {error}"
+                ),
+            }
+        })?;
+        if !handle_metadata.is_file()
+            || handle_metadata.len() != self.initial_len
+            || path_metadata.file_type().is_symlink()
+            || !path_metadata.is_file()
+            || path_metadata.len() != self.initial_len
+        {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "{description} changed identity or length while its schema preflight was being verified"
+                ),
+            });
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            if (handle_metadata.dev(), handle_metadata.ino()) != self.identity
+                || (path_metadata.dev(), path_metadata.ino()) != self.identity
+            {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "{description} changed identity while its schema preflight was being verified"
+                    ),
+                });
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            let current_guard = crate::sync::path::open_regular_authority_source(path)?
+                .ok_or_else(|| BeadsError::SyncConflict {
+                    message: format!(
+                        "{description} disappeared while its schema preflight was being verified"
+                    ),
+                })?;
+            if current_guard.identity() != self.identity {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "{description} changed identity while its schema preflight was being verified"
+                    ),
+                });
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
