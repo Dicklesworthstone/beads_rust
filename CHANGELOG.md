@@ -191,32 +191,28 @@ replacement, crash, and schema-drift races.
   upstream fix for [RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258.html)
   and its follow-up stream/error-budget hardening
   ([10bcadca](https://github.com/Dicklesworthstone/beads_rust/commit/10bcadca)).
-- Cargo and Nix source metadata move to 0.5.1; checksummed Homebrew, AUR, and
-  Scoop metadata remains pinned to the last public assets until the v0.5.1
-  release is published and its real hashes can be recorded. Cargo now points
-  at the repository's rider-bearing `LICENSE` via `license-file` instead of
-  incorrectly declaring the package as plain SPDX MIT
+- Cargo, Nix, Homebrew, AUR, and Scoop metadata now targets 0.5.1. The
+  checksummed package definitions use the hashes of the published DSR-built
+  archives. Cargo points at the repository's rider-bearing `LICENSE` via
+  `license-file` instead of incorrectly declaring the package as plain SPDX MIT
   ([413f9948](https://github.com/Dicklesworthstone/beads_rust/commit/413f9948)).
-- Every platform archive now contains the rider-bearing `LICENSE`. Release
-  signing is fail-closed for all seven archives, including the Windows zip:
-  the job requires the secret key, verifies each generated signature against
-  the recoverable DSR key `RWTQoKUb...` (ID `36B847D11BA5A0D0`), and refuses
-  release creation unless every exact archive, checksum, and `.minisig`
-  triplet is present and nonempty. Raw v0.4.1 sidecars already used this key;
-  v0.5.1 unifies DSR and GitHub Actions on it and corrects the documentation
-  drift. `RWS7nGFf...` remains v0.4.0 history, while the older CI-era
-  `RWSp4vEO...` key is unrecoverable
+- Every platform archive now contains the rider-bearing `LICENSE`. DSR signed
+  all seven archives, including the Windows zip, and verified each signature
+  against the recoverable key `RWTQoKUb...` (ID `36B847D11BA5A0D0`) before
+  publication. The public release includes every canonical archive, checksum
+  sidecar, `.minisig`, SBOM, and SLSA provenance file. No GitHub Actions
+  workflow was used. Raw v0.4.1 sidecars already used this key; v0.5.1 corrects
+  the documentation drift. `RWS7nGFf...` remains v0.4.0 history, while the
+  older CI-era `RWSp4vEO...` key is unrecoverable
   ([ada0b658](https://github.com/Dicklesworthstone/beads_rust/commit/ada0b658),
   [78fc31a1](https://github.com/Dicklesworthstone/beads_rust/commit/78fc31a1),
   [f64d9de2](https://github.com/Dicklesworthstone/beads_rust/commit/f64d9de2)).
 - Package-manager metadata no longer represents the custom rider as plain MIT:
   Homebrew uses `:cannot_represent`, AUR uses
   `LicenseRef-MIT-OpenAI-Anthropic-Rider`, Nix uses `licenses.unfree`, and Scoop
-  links the repository license. The v0.5.1 archives let the post-publication
-  Homebrew and AUR revisions install the actual rider-bearing file, Nix installs
-  it from source, and Scoop receives it inside the release zip. The staged
-  Homebrew/AUR definitions remain installable against v0.4.1, whose archives
-  predate the bundled license
+  links the repository license. The v0.5.1 Homebrew and AUR definitions install
+  the bundled rider-bearing file, Nix installs it from source, and Scoop
+  receives it inside the release zip
   ([f64d9de2](https://github.com/Dicklesworthstone/beads_rust/commit/f64d9de2)).
 - New inline and end-to-end counterexamples cover custom ready groups, scheduler
   label/assignee evidence, canonical-inode fast-open reprobes, config-route
