@@ -714,6 +714,32 @@ fn split_sql_statements(sql: &str) -> Vec<&str> {
 /// fsqlite does not support `execute_batch`, so we split the SQL script
 /// into individual statements (respecting string literals and comments)
 /// and execute each one individually.
+/// Every `CREATE [UNIQUE] INDEX` statement from [`SCHEMA_SQL`], with the
+/// canonical spelling preserved verbatim (leading comment lines included in
+/// the returned slice; SQLite stores schema text starting at `CREATE`).
+///
+/// The reviewed schema migration uses this to re-create the auxiliary
+/// indexes on a `VACUUM INTO` candidate: the engine re-serializes DDL text
+/// while rebuilding `sqlite_master` (comments stripped, parenthesization
+/// normalized), and the re-spelled partial-index predicates would otherwise
+/// fail the token-level canonical attestation
+/// (`semantic_partial_index_predicate_canonical`).
+pub(crate) fn canonical_index_creation_statements() -> Vec<&'static str> {
+    split_sql_statements(SCHEMA_SQL)
+        .into_iter()
+        .filter(|stmt| {
+            let stripped: String = stmt
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with("--"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let upper = stripped.trim().to_ascii_uppercase();
+            upper.starts_with("CREATE INDEX") || upper.starts_with("CREATE UNIQUE INDEX")
+        })
+        .collect()
+}
+
 pub(crate) fn execute_batch(conn: &Connection, sql: &str) -> Result<()> {
     for stmt in split_sql_statements(sql) {
         let res = conn.execute(stmt);
@@ -2389,19 +2415,23 @@ fn core_runtime_table_canonical(
     autoincrement_primary_key: Option<&str>,
     forbid_unique_indexes: bool,
 ) -> bool {
-    core_runtime_columns_canonical(conn, table, columns, order_sensitive)
-        && core_runtime_foreign_keys_canonical(conn, table, issue_reference_columns)
-        && auxiliary_runtime_indexes_canonical(conn, table, indexes)
-        && runtime_primary_key_shape_canonical(conn, table, columns)
-        && runtime_table_options_canonical(conn, table)
-        && (table == "issues" || table_check_constraints_canonical(conn, table, &[]))
-        && table_declaration_clauses_canonical(conn, table)
-        && autoincrement_primary_key
-            .is_none_or(|column| table_declares_autoincrement_primary_key(conn, table, column))
-        && (!forbid_unique_indexes || table_has_no_unique_indexes(conn, table))
+    let cols = core_runtime_columns_canonical(conn, table, columns, order_sensitive);
+    let fks = core_runtime_foreign_keys_canonical(conn, table, issue_reference_columns);
+    let idx = auxiliary_runtime_indexes_canonical(conn, table, indexes);
+    let pk = runtime_primary_key_shape_canonical(conn, table, columns);
+    let opts = runtime_table_options_canonical(conn, table);
+    let checks = table == "issues" || table_check_constraints_canonical(conn, table, &[]);
+    let clauses = table_declaration_clauses_canonical(conn, table);
+    let ai = autoincrement_primary_key
+        .is_none_or(|column| table_declares_autoincrement_primary_key(conn, table, column));
+    let uniq = !forbid_unique_indexes || table_has_no_unique_indexes(conn, table);
+    tracing::debug!(
+        "DIAG core_runtime_table_canonical table={table} cols={cols} fks={fks} idx={idx} pk={pk} opts={opts} checks={checks} clauses={clauses} ai={ai} uniq={uniq}"
+    );
+    cols && fks && idx && pk && opts && checks && clauses && ai && uniq
 }
 
-fn issues_required_checks_canonical(conn: &Connection) -> bool {
+pub(crate) fn issues_required_checks_canonical(conn: &Connection) -> bool {
     table_check_constraints_canonical(
         conn,
         "issues",
@@ -2618,7 +2648,7 @@ fn finish_foreign_key_suppressed_result<T>(
 ///   2. Copy data from old table
 ///   3. Drop old table
 ///   4. Rename new table
-fn rebuild_issues_table(conn: &Connection) -> Result<()> {
+pub(crate) fn rebuild_issues_table(conn: &Connection) -> Result<()> {
     let existing_rows = conn.query("PRAGMA table_info('issues')")?;
     let existing_columns: Vec<String> = existing_rows
         .iter()

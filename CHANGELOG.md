@@ -71,6 +71,21 @@ and search stops hiding the fact that it hid something.
   and JSON/TOON gain `hidden_closed_count` when (and only when) matches were
   hidden; the legacy bare-array shape is preserved otherwise.
 
+### Reviewed schema migration: 13–16 → 17 upgrades repaired
+
+- Every reviewed migration from an older schema failed its canonical-shape
+  attestation on all platforms: the engine's `VACUUM INTO` re-serializes DDL
+  text (comments stripped, predicates re-parenthesized), so the candidate's
+  partial-index predicates and issues CHECK constraints no longer
+  token-matched the canonical schema. The maintenance pipeline now re-creates
+  every auxiliary index from the canonical DDL and rebuilds the issues table
+  when its declaration text drifted, so migrated databases carry the exact
+  canonical spellings.
+- Plan-token semantics tightened: re-applying the token of an already
+  completed run now refuses with a clear re-plan instruction while the
+  applied generation is still live, and legitimately re-derives after an
+  undo. Both real-fixture upgrade e2e suites (schema 15 and 16) pass again.
+
 ### Test and release infrastructure
 
 - `install.sh` routes glibc hosts older than the gnu artifact floor to the

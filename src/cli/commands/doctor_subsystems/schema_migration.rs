@@ -815,19 +815,36 @@ fn resume_commit_ready_migration(
 
     let applied_path = run_dir.join("applied.json");
     if secure_file_metadata(&applied_path)?.is_some() {
+        // A completed run has consumed its plan token: the token binds a plan
+        // to the database state it was computed from, and that state no
+        // longer exists after the apply. Re-reporting success here would let
+        // a scripted re-apply believe it performed a migration, so while the
+        // live database still carries this run's applied generation the
+        // re-apply refuses and directs the caller to re-plan. After an undo
+        // the live database is a different generation again, the token
+        // legitimately re-derives from the restored state, and the completed
+        // run no longer speaks for it — fall through to a fresh apply.
         let applied: AppliedMigrationReceipt = read_json(&applied_path)?;
         validate_applied_against_commit_ready(&applied, &marker, &run_dir)?;
         let logical_live = logical_witness(&migration.db_path).ok();
         // Capture the fallback raw witness after the SQLite probe so a
         // legitimate shared-memory sidecar rewrite cannot stale it immediately.
         let raw_live = raw_family_witness(&migration.db_path)?;
-        require_unchanged_applied_state(
+        if require_unchanged_applied_state(
             &applied,
             &raw_live,
             logical_live.as_ref(),
             &applied.run_id,
-        )?;
-        return Ok(Some((applied, before_dir)));
+        )
+        .is_ok()
+        {
+            return Err(BeadsError::internal(format!(
+                "schema migration plan token was already consumed by completed run {}; \
+                 run `br doctor migrate-schema plan` again for the current database state",
+                applied.run_id
+            )));
+        }
+        return Ok(None);
     }
 
     migration.write_authority.verify_database_authority()?;
@@ -1240,6 +1257,33 @@ fn run_post_migration_maintenance(
     mark_stage(failed_stage, "candidate-maintenance");
     let candidate_conn = Connection::open(candidate_path.to_string_lossy().into_owned())?;
     let maintenance_result = (|| {
+        // The engine's VACUUM INTO re-serializes DDL text while rebuilding
+        // sqlite_master (comments stripped, predicates re-parenthesized), so
+        // the candidate's index spellings no longer token-match the canonical
+        // schema and the shape attestation below would refuse an otherwise
+        // correct migration. Index DDL is derived state: drop every explicit
+        // index and re-execute the canonical CREATE INDEX statements so the
+        // candidate carries the exact SCHEMA_SQL spelling.
+        // The same re-serialization also mangles the issues table's CHECK
+        // constraint spellings, which `issues_required_checks_canonical`
+        // token-compares. A table's declaration text can only be corrected by
+        // rebuilding it; the canonical rebuild is the same machinery runtime
+        // schema repair uses, gated so a candidate whose text survived intact
+        // skips the extra copy.
+        if !crate::storage::schema::issues_required_checks_canonical(&candidate_conn) {
+            crate::storage::schema::rebuild_issues_table(&candidate_conn)?;
+        }
+        let index_rows = candidate_conn
+            .query("SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL")?;
+        for row in &index_rows {
+            if let Some(name) = row.get(0).and_then(SqliteValue::as_text) {
+                let escaped = name.replace('"', "\"\"");
+                candidate_conn.execute(&format!("DROP INDEX IF EXISTS \"{escaped}\""))?;
+            }
+        }
+        for statement in crate::storage::schema::canonical_index_creation_statements() {
+            candidate_conn.execute(statement)?;
+        }
         candidate_conn.execute("REINDEX")?;
         candidate_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
         Ok(())
