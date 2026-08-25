@@ -617,8 +617,7 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
         attestation_errors,
         undo_command: format!("br doctor migrate-schema undo {run_id}"),
     };
-    let commit_ready: CommitReadyMigrationReceipt =
-        read_json(&run_dir.join("commit-ready.json"))?;
+    let commit_ready: CommitReadyMigrationReceipt = read_json(&run_dir.join("commit-ready.json"))?;
     validate_applied_against_commit_ready(&applied, &commit_ready, &run_dir)?;
     write_json_new(&run_dir.join("applied.json"), &applied)?;
     sync_directory(&run_dir)?;
@@ -740,10 +739,8 @@ fn validate_commit_ready_marker(
     if !constant_time_text_eq(&recomputed_token, &marker.plan_token)
         || marker.effects.from_version != marker.forecast.from_version
         || marker.effects.to_version != marker.forecast.to_version
-        || marker.effects.content_hash_rows_rebuilt
-            != marker.forecast.content_hash_rows_rebuilt
-        || marker.effects.gate_result_history_created
-            != marker.forecast.gate_result_history_created
+        || marker.effects.content_hash_rows_rebuilt != marker.forecast.content_hash_rows_rebuilt
+        || marker.effects.gate_result_history_created != marker.forecast.gate_result_history_created
         || marker.effects.post_migration_maintenance_completed
             != marker.forecast.post_migration_maintenance
         || marker.logical_after.user_version != marker.forecast.to_version
@@ -832,7 +829,7 @@ fn resume_commit_ready_migration(
         migration.write_authority.verify_database_authority()?;
         let raw_live_after_probe = raw_family_witness(&migration.db_path)?;
         if logical_live != marker.logical_before
-            || raw_live_after_probe != marker.raw_before
+            || !stable_raw_eq(&raw_live_after_probe, &marker.raw_before)
             || raw_live != marker.raw_before
         {
             return Err(BeadsError::internal(format!(
@@ -1096,6 +1093,13 @@ fn validate_applied_against_commit_ready(
     run_dir: &Path,
 ) -> Result<()> {
     validate_commit_ready_marker(marker, run_dir)?;
+    let raw_after = applied.raw_after.as_ref().ok_or_else(|| {
+        BeadsError::internal(format!(
+            "applied schema-migration receipt in {} omits its raw committed witness",
+            run_dir.display()
+        ))
+    })?;
+    validate_raw_family_witness(raw_after)?;
     if applied.schema_version != APPLIED_SCHEMA
         || applied.run_id != marker.run_id
         || applied.database_path != marker.database_path
@@ -1109,7 +1113,6 @@ fn validate_applied_against_commit_ready(
         || applied.effects != marker.effects
         || applied.raw_before != marker.raw_before
         || applied.logical_before != marker.logical_before
-        || applied.raw_after.is_none()
         || applied.logical_after.as_ref() != Some(&marker.logical_after)
     {
         return Err(BeadsError::internal(format!(
@@ -1977,11 +1980,8 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
     let restored_candidate_dir = run_dir.join("undo-restored-candidate");
     ensure_directory(&restored_candidate_dir)?;
     set_private_directory_permissions(&restored_candidate_dir)?;
-    let restored_candidate = backup_component_path(
-        &restored_candidate_dir,
-        &migration.db_path,
-        "",
-    )?;
+    let restored_candidate =
+        backup_component_path(&restored_candidate_dir, &migration.db_path, "")?;
     let quarantined_main_guard = install_undo_restored_main_resuming(
         &migration.db_path,
         &before_dir,
@@ -2072,9 +2072,8 @@ fn install_undo_restored_main_resuming(
         ));
     }
     let quarantined_main = backup_component_path(quarantine_dir, db_path, "")?;
-    let live_metadata = secure_file_metadata(db_path)?.ok_or_else(|| {
-        BeadsError::internal("schema-migration undo found no live main database")
-    })?;
+    let live_metadata = secure_file_metadata(db_path)?
+        .ok_or_else(|| BeadsError::internal("schema-migration undo found no live main database"))?;
     let live_matches_applied = component_bytes_match(db_path, &live_metadata, applied_main)?;
     let live_matches_restored = component_bytes_match(db_path, &live_metadata, restored_main)?;
 
@@ -2086,10 +2085,7 @@ fn install_undo_restored_main_resuming(
             ));
         }
         let guard = write_authority.lock_database_replacement_candidate(&quarantined_main)?;
-        write_authority.verify_locked_database_replacement_candidate(
-            &quarantined_main,
-            &guard,
-        )?;
+        write_authority.verify_locked_database_replacement_candidate(&quarantined_main, &guard)?;
         write_authority.verify_database_authority()?;
         return Ok(Some(guard));
     }
@@ -3068,7 +3064,9 @@ fn write_json_new<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     })?;
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| BeadsError::internal(format!("system clock precedes Unix epoch: {error}")))?
+        .map_err(|error| {
+            BeadsError::internal(format!("system clock precedes Unix epoch: {error}"))
+        })?
         .as_nanos();
     let mut staged = None;
     for attempt in 0_u16..=u16::MAX {
@@ -3084,8 +3082,7 @@ fn write_json_new<T: Serialize>(path: &Path, value: &T) -> Result<()> {
                 staged = Some((staged_path, file));
                 break;
             }
-            Err(BeadsError::Io(error))
-                if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(BeadsError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
     }
@@ -3426,6 +3423,48 @@ mod tests {
     }
 
     #[test]
+    fn stable_raw_comparison_explicitly_classifies_present_shm_as_volatile() {
+        let component = |suffix: &str, sha256: &str| RawComponentWitness {
+            suffix: suffix.to_string(),
+            present: true,
+            length: Some(4096),
+            sha256: Some(sha256.repeat(64)),
+            unix_mode: None,
+        };
+        let absent = |suffix: &str| RawComponentWitness {
+            suffix: suffix.to_string(),
+            present: false,
+            length: None,
+            sha256: None,
+            unix_mode: None,
+        };
+        let before_probe = RawFamilyWitness {
+            components: vec![
+                component("", "a"),
+                absent("-wal"),
+                component("-shm", "b"),
+                absent("-journal"),
+            ],
+        };
+        let after_probe = RawFamilyWitness {
+            components: vec![
+                component("", "a"),
+                absent("-wal"),
+                component("-shm", "c"),
+                absent("-journal"),
+            ],
+        };
+        assert_ne!(
+            before_probe, after_probe,
+            "the exact pre-open witness must still record the shm bytes that were restored"
+        );
+        assert!(
+            stable_raw_eq(&before_probe, &after_probe),
+            "post-open validation must explicitly exclude only the volatile shm component"
+        );
+    }
+
+    #[test]
     fn integrity_classification_allows_only_known_page_layout_artifacts() {
         assert!(integrity_check_is_clean("ok"));
         assert!(!integrity_check_is_repairable("ok"));
@@ -3581,6 +3620,69 @@ mod tests {
         .expect("completed undo must be idempotent");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn undo_atomically_displaces_the_authority_held_main_with_hardlink_aliases() {
+        let (_temp, migration) = reviewed_v14_migration_context();
+        let plan = build_plan(&migration.db_path).expect("build plan");
+        execute_apply(
+            &DoctorMigrateSchemaApplyArgs {
+                plan_token: plan.plan_token.expect("plan token"),
+                json: false,
+            },
+            &migration,
+        )
+        .expect("apply reviewed migration");
+        let run_dir = fs::read_dir(migration_runs_root(&migration.beads_dir))
+            .expect("read migration runs")
+            .next()
+            .expect("one run")
+            .expect("run entry")
+            .path();
+        let run_id = run_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("UTF-8 run id")
+            .to_string();
+        let applied_alias = migration.beads_dir.join("applied-generation-alias.db");
+        fs::hard_link(&migration.db_path, &applied_alias).expect("create applied hardlink alias");
+        let applied_identity = fs::metadata(&applied_alias).expect("alias metadata");
+
+        execute_undo(
+            &DoctorMigrateSchemaUndoArgs {
+                run_id,
+                dry_run: false,
+                json: false,
+            },
+            &migration,
+        )
+        .expect("undo through atomic prelocked exchange");
+
+        let quarantine_root = run_dir.join("undo-quarantine");
+        let quarantine_dir = fs::read_dir(&quarantine_root)
+            .expect("read quarantine root")
+            .next()
+            .expect("one quarantine")
+            .expect("quarantine entry")
+            .path();
+        let quarantined_main = backup_component_path(&quarantine_dir, &migration.db_path, "")
+            .expect("quarantine main");
+        let quarantined_identity = fs::metadata(&quarantined_main).expect("quarantined metadata");
+        let restored_identity = fs::metadata(&migration.db_path).expect("restored metadata");
+        assert!(
+            same_file_identity(&applied_identity, &quarantined_identity),
+            "the alias-visible applied inode must be retained, not copied or overwritten"
+        );
+        assert!(
+            !same_file_identity(&applied_identity, &restored_identity),
+            "the canonical path must atomically adopt the prelocked original inode"
+        );
+        migration
+            .write_authority
+            .verify_database_authority()
+            .expect("restored canonical inode remains authoritative");
+    }
+
     #[test]
     fn reviewed_apply_refuses_stale_plan_before_creating_a_run() {
         let (_temp, migration) = reviewed_v14_migration_context();
@@ -3719,7 +3821,10 @@ mod tests {
             !displaced.exists(),
             "a rejected foreign target must never be accepted as the displaced original"
         );
-        assert!(retained_original.is_file(), "the true original stays retained");
+        assert!(
+            retained_original.is_file(),
+            "the true original stays retained"
+        );
     }
 
     #[test]
@@ -3873,10 +3978,10 @@ mod tests {
         // Build the reviewed generation and stop at the actual crash point:
         // the namespace exchange has completed, but none of the post-install
         // directory barriers or authority finalization has run.
-        let candidate_path = maintenance_candidate_path(&migration.db_path, &run_dir)
-            .expect("candidate path");
-        let source_conn =
-            Connection::open(migration.db_path.to_string_lossy().into_owned()).expect("open source");
+        let candidate_path =
+            maintenance_candidate_path(&migration.db_path, &run_dir).expect("candidate path");
+        let source_conn = Connection::open(migration.db_path.to_string_lossy().into_owned())
+            .expect("open source");
         let escaped_candidate = candidate_path.to_string_lossy().replace('\'', "''");
         source_conn
             .execute(&format!("VACUUM INTO '{escaped_candidate}'"))
@@ -3884,7 +3989,9 @@ mod tests {
         close_connection(source_conn).expect("close source");
         let candidate_conn = Connection::open(candidate_path.to_string_lossy().into_owned())
             .expect("open candidate");
-        candidate_conn.execute("BEGIN IMMEDIATE").expect("begin migration");
+        candidate_conn
+            .execute("BEGIN IMMEDIATE")
+            .expect("begin migration");
         let reviewed_effects = run_reviewed_schema_migration_steps_in_transaction(
             &candidate_conn,
             forecast.from_version,
@@ -3893,7 +4000,9 @@ mod tests {
         )
         .expect("run reviewed migration");
         candidate_conn.execute("COMMIT").expect("commit candidate");
-        candidate_conn.execute("REINDEX").expect("reindex candidate");
+        candidate_conn
+            .execute("REINDEX")
+            .expect("reindex candidate");
         candidate_conn
             .execute("PRAGMA wal_checkpoint(TRUNCATE)")
             .expect("checkpoint candidate");
@@ -3901,13 +4010,8 @@ mod tests {
         let candidate_logical = logical_witness(&candidate_path).expect("candidate witness");
         let mut effects = ReviewedSchemaMigrationEffectsReceipt::from(reviewed_effects);
         effects.post_migration_maintenance_completed = true;
-        persist_commit_ready_marker(
-            &run_dir,
-            &migration.db_path,
-            &candidate_logical,
-            effects,
-        )
-        .expect("persist commit-ready marker");
+        persist_commit_ready_marker(&run_dir, &migration.db_path, &candidate_logical, effects)
+            .expect("persist commit-ready marker");
 
         let marker: CommitReadyMigrationReceipt =
             read_json(&run_dir.join("commit-ready.json")).expect("read marker");
