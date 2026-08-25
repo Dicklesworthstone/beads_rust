@@ -398,7 +398,7 @@ The resource surface is `beads://project/info`, `beads://issues/{id}`,
 
 ```bash
 br --version
-# br 0.4.0
+# br 0.5.0
 ```
 
 ### Verify Release Signatures

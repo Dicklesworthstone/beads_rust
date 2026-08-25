@@ -1,11 +1,11 @@
 [package]
 name = "beads_rust"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
 autobenches = false
 description = "Agent-first issue tracker (SQLite + JSONL)"
-license = "MIT"
+license-file = "LICENSE"
 repository = "https://github.com/Dicklesworthstone/beads_rust"
 keywords = ["cli", "issue-tracker", "sqlite", "agent"]
 categories = ["command-line-utilities", "development-tools"]
