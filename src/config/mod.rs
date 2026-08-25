@@ -2906,6 +2906,7 @@ pub(crate) fn compact_database_via_vacuum_into_in_place(
         lock_timeout,
         &write_authority,
         SqliteStorage::open_with_timeout,
+        || Ok(()),
     )
 }
 
@@ -2921,6 +2922,7 @@ fn compact_database_via_vacuum_into_in_place_under_write_authority(
         lock_timeout,
         write_authority,
         SqliteStorage::open_with_timeout,
+        || Ok(()),
     )
 }
 
@@ -2930,6 +2932,7 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
     lock_timeout: Option<u64>,
     write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
     reopen_storage: impl Fn(&Path, Option<u64>) -> Result<SqliteStorage>,
+    before_candidate_install: impl FnOnce() -> Result<()>,
 ) -> Result<SqliteStorage> {
     // Drain any WAL frames the prior VACUUM/REINDEX (run by the caller)
     // left behind, so `VACUUM INTO` sees the fully-committed on-disk
@@ -2987,25 +2990,75 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
     // cannot keep using a throwaway placeholder if reopening fails.
     drop(storage);
 
-    // Atomic swap: rename `temp_path` onto `db_path`. On POSIX this
-    // atomically replaces the target, so there is never a moment when
-    // db_path does not exist (unlike a "remove then rename" sequence,
-    // which would leave a gap where another process could see db_path
-    // missing and create a fresh empty DB). The old sidecars are cleaned
-    // up AFTER the rename so any error there doesn't roll back the
-    // successful swap — stale `-wal`/`-shm` left alongside a clean DB
-    // are recovered automatically on next open.
-    if let Err(err) = fs::rename(&temp_path, db_path) {
+    before_candidate_install()?;
+
+    // Claim the exact database generation retained by the write authority
+    // before installing the candidate. Both moves are atomic no-replace
+    // operations: a foreign generation that wins either namespace race is
+    // preserved, never overwritten by compaction.
+    let retained_path = db_path.with_file_name(format!(
+        ".{stem}.vacuum.{}.{}.retained",
+        std::process::id(),
+        Utc::now().format("%Y%m%d_%H%M%S_%f")
+    ));
+    let retained_database = match rename_existing_paths_no_replace(
+        std::iter::once((db_path.to_path_buf(), retained_path)),
+        "stage the database generation before compacted installation",
+        MissingRenameSourcePolicy::Error,
+    ) {
+        Ok(mut retained) => retained
+            .pop()
+            .expect("required database staging returns one path"),
+        Err(stage_error) => {
+            remove_locked_compaction_candidate(
+                write_authority,
+                &replacement_lock,
+                &temp_path,
+            );
+            return Err(stage_error);
+        }
+    };
+    if let Err(authority_error) =
+        write_authority.verify_staged_database_recovery_authority(&retained_database.1)
+    {
+        let rollback_result = rollback_renamed_paths_no_replace(
+            std::slice::from_ref(&retained_database),
+            "abort compacted database installation after the staged authority changed",
+        );
+        remove_locked_compaction_candidate(write_authority, &replacement_lock, &temp_path);
+        if let Err(rollback_error) = rollback_result {
+            return Err(BeadsError::WithContext {
+                context: format!(
+                    "Compaction staged a foreign database generation ({authority_error}); restoring it without replacement also failed"
+                ),
+                source: Box::new(rollback_error),
+            });
+        }
+        return Err(authority_error);
+    }
+
+    if let Err(err) = rename_recovery_path_no_replace(&temp_path, db_path) {
         tracing::warn!(
             error = %err,
             temp_path = %temp_path.display(),
             db_path = %db_path.display(),
-            "Failed to atomically install compacted database; skipping VACUUM INTO compaction"
+            retained_path = %retained_database.1.display(),
+            "Failed to atomically install compacted database without replacement"
         );
-        let _ = fs::remove_file(&temp_path);
-        remove_db_sidecars(&temp_path);
-        // db_path is still the original file here (rename failed, so the
-        // old file is intact). Reopen it so the caller gets a valid handle.
+        let rollback_result = rollback_renamed_paths_no_replace(
+            std::slice::from_ref(&retained_database),
+            "restore the retained database after compacted installation failed",
+        );
+        remove_locked_compaction_candidate(write_authority, &replacement_lock, &temp_path);
+        if let Err(rollback_error) = rollback_result {
+            return Err(BeadsError::WithContext {
+                context: format!(
+                    "Failed to install the compacted database without replacement ({err}); retained the prior database at '{}' because its canonical path was no longer empty",
+                    retained_database.1.display()
+                ),
+                source: Box::new(rollback_error),
+            });
+        }
         return reopen_storage(db_path, lock_timeout)
             .and_then(|mut reopened| {
                 write_authority.verify_database_authority()?;

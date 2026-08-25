@@ -17,7 +17,7 @@ const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
 // caused rustc to interpret hundreds of thousands of loop iterations on every
 // schema rebuild, overwhelming the compile-time savings of the runtime fast
 // path itself.
-const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str = "v5-version-fenced-lexical-core-aux-columns-fks-index-collations-checks-autoincrement-cookie-fenced";
+const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str = "v6-version-fenced-lexical-core-aux-columns-fks-index-directions-collations-checks-autoincrement-cookie-fenced";
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 const GATE_RESULT_HISTORY_MIGRATION_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS gate_result_history (
@@ -1724,6 +1724,7 @@ fn runtime_index_key_shape_canonical(
             |(position, (row, expected_name))| {
                 row.get(0).and_then(SqliteValue::as_integer) == i64::try_from(position).ok()
                     && row.get(2).and_then(SqliteValue::as_text) == Some(*expected_name)
+                    && row.get(3).and_then(SqliteValue::as_integer) == Some(0)
                     && row
                         .get(4)
                         .and_then(SqliteValue::as_text)
@@ -3596,7 +3597,7 @@ fn attest_gate_result_history_indexes(conn: &Connection) -> Result<()> {
 
         if !runtime_index_key_shape_canonical(conn, index_name, expected_columns) {
             return Err(schema_migration_shape_error(format!(
-                "index {index_name} key columns or collations are not canonical"
+                "index {index_name} key columns, directions, or collations are not canonical"
             )));
         }
     }
@@ -6033,6 +6034,39 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_schema_contract_rejects_descending_external_ref_unique_index() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("descending_external_ref_index.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+
+        execute_batch(
+            &conn,
+            r"
+            DROP INDEX idx_issues_external_ref_unique;
+            CREATE UNIQUE INDEX idx_issues_external_ref_unique
+                ON issues(external_ref DESC) WHERE external_ref IS NOT NULL;
+            ",
+        )
+        .expect("plant a same-name descending UNIQUE index");
+
+        assert!(
+            semantic_partial_index_predicate_canonical(&conn, "idx_issues_external_ref_unique"),
+            "the fixture must retain the canonical partial-index predicate"
+        );
+        assert!(
+            !runtime_index_key_shape_canonical(
+                &conn,
+                "idx_issues_external_ref_unique",
+                &["external_ref"]
+            ),
+            "the declared key direction is part of the canonical index shape"
+        );
+        assert!(!runtime_schema_compatible(&conn));
+        assert!(attest_runtime_schema_cookie(&conn).is_err());
+    }
+
+    #[test]
     fn test_runtime_schema_contract_rejects_unexpected_unique_index() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("unexpected_unique_index.db");
@@ -6209,7 +6243,7 @@ mod tests {
         apply_schema(&conn).expect("schema");
         let cookie = attest_runtime_schema_cookie(&conn).expect("attest current schema");
         let prior_witness = format!(
-            "schema-{CURRENT_SCHEMA_VERSION}.contract-v4-comment-safe-core-aux-columns-fks-index-collations-checks-autoincrement-cookie-fenced.cookie-{cookie}"
+            "schema-{CURRENT_SCHEMA_VERSION}.contract-v5-version-fenced-lexical-core-aux-columns-fks-index-collations-checks-autoincrement-cookie-fenced.cookie-{cookie}"
         );
         conn.execute_with_params(
             "INSERT INTO metadata (key, value) VALUES (?, ?)",

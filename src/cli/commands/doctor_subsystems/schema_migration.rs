@@ -47,6 +47,7 @@ use crate::sync::{DatabaseFamilyWriteLock, DatabaseTargetAuthorityState};
 
 const PLAN_SCHEMA: &str = "br.doctor.schema_migration.plan.v1";
 const PREPARED_SCHEMA: &str = "br.doctor.schema_migration.prepared.v1";
+const COMMIT_READY_SCHEMA: &str = "br.doctor.schema_migration.commit_ready.v1";
 const APPLIED_SCHEMA: &str = "br.doctor.schema_migration.applied.v1";
 const FAILED_SCHEMA: &str = "br.doctor.schema_migration.failed.v1";
 const UNDO_SCHEMA: &str = "br.doctor.schema_migration.undo.v1";
@@ -107,7 +108,7 @@ struct MigrationPlanReceipt {
     note: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PreparedMigrationReceipt {
     schema_version: String,
     run_id: String,
@@ -117,6 +118,21 @@ struct PreparedMigrationReceipt {
     forecast: MigrationForecast,
     raw_before: RawFamilyWitness,
     logical_before: LogicalDatabaseWitness,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CommitReadyMigrationReceipt {
+    schema_version: String,
+    run_id: String,
+    database_path: String,
+    plan_token: String,
+    prepared_receipt_sha256: String,
+    marked_at: String,
+    forecast: MigrationForecast,
+    effects: ReviewedSchemaMigrationEffectsReceipt,
+    raw_before: RawFamilyWitness,
+    logical_before: LogicalDatabaseWitness,
+    logical_after: LogicalDatabaseWitness,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,7 +168,7 @@ struct FailedMigrationReceipt {
     logical_observed_after_failure: Option<LogicalDatabaseWitness>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 struct ReviewedSchemaMigrationEffectsReceipt {
     from_version: u32,
     to_version: u32,
@@ -429,6 +445,9 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
             "schema migration apply requires a non-empty --plan-token",
         ));
     }
+    if let Some((applied, before_dir)) = resume_commit_ready_migration(args, migration)? {
+        return emit_applied(&applied, args.json, &before_dir);
+    }
     let plan = build_plan(&migration.db_path)?;
     let Some(recomputed_token) = plan.plan_token.as_deref() else {
         return Err(BeadsError::internal(
@@ -598,6 +617,9 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
         attestation_errors,
         undo_command: format!("br doctor migrate-schema undo {run_id}"),
     };
+    let commit_ready: CommitReadyMigrationReceipt =
+        read_json(&run_dir.join("commit-ready.json"))?;
+    validate_applied_against_commit_ready(&applied, &commit_ready, &run_dir)?;
     write_json_new(&run_dir.join("applied.json"), &applied)?;
     sync_directory(&run_dir)?;
 
@@ -612,7 +634,11 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
         )));
     }
 
-    if args.json {
+    emit_applied(&applied, args.json, &before_dir)
+}
+
+fn emit_applied(applied: &AppliedMigrationReceipt, json: bool, before_dir: &Path) -> Result<()> {
+    if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&applied).map_err(BeadsError::Json)?
@@ -624,6 +650,249 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
         );
         println!("Undo: {}", applied.undo_command);
         println!("Recovery bundle: {}", before_dir.display());
+    }
+    Ok(())
+}
+
+fn persist_commit_ready_marker(
+    run_dir: &Path,
+    db_path: &Path,
+    logical_after: &LogicalDatabaseWitness,
+    effects: ReviewedSchemaMigrationEffectsReceipt,
+) -> Result<()> {
+    let prepared_path = run_dir.join("prepared.json");
+    let prepared_receipt_sha256 = file_sha256(&prepared_path)?;
+    let prepared: PreparedMigrationReceipt = read_json(&prepared_path)?;
+    let run_id = run_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| BeadsError::internal("schema migration run directory has no UTF-8 name"))?;
+    if prepared.run_id != run_id || prepared.database_path != db_path.display().to_string() {
+        return Err(BeadsError::internal(
+            "prepared schema-migration receipt does not name its commit-ready run and database",
+        ));
+    }
+    let marker = CommitReadyMigrationReceipt {
+        schema_version: COMMIT_READY_SCHEMA.to_string(),
+        run_id: prepared.run_id.clone(),
+        database_path: prepared.database_path.clone(),
+        plan_token: prepared.plan_token.clone(),
+        prepared_receipt_sha256,
+        marked_at: prepared.marked_at.clone(),
+        forecast: prepared.forecast.clone(),
+        effects,
+        raw_before: prepared.raw_before.clone(),
+        logical_before: prepared.logical_before.clone(),
+        logical_after: logical_after.clone(),
+    };
+    validate_commit_ready_marker(&marker, run_dir)?;
+    let marker_path = run_dir.join("commit-ready.json");
+    write_json_new(&marker_path, &marker)?;
+    let persisted: CommitReadyMigrationReceipt = read_json(&marker_path)?;
+    validate_commit_ready_marker(&persisted, run_dir)?;
+    if persisted != marker {
+        return Err(BeadsError::internal(
+            "persisted schema-migration commit-ready marker changed during read-back",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_commit_ready_marker(
+    marker: &CommitReadyMigrationReceipt,
+    run_dir: &Path,
+) -> Result<()> {
+    validate_raw_family_witness(&marker.raw_before)?;
+    let run_id = run_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| BeadsError::internal("schema migration run directory has no UTF-8 name"))?;
+    if marker.schema_version != COMMIT_READY_SCHEMA || marker.run_id != run_id {
+        return Err(BeadsError::internal(format!(
+            "invalid schema-migration commit-ready marker in {}",
+            run_dir.display()
+        )));
+    }
+    let prepared_path = run_dir.join("prepared.json");
+    let prepared_sha256 = file_sha256(&prepared_path)?;
+    let prepared: PreparedMigrationReceipt = read_json(&prepared_path)?;
+    if prepared.schema_version != PREPARED_SCHEMA
+        || !constant_time_text_eq(&prepared_sha256, &marker.prepared_receipt_sha256)
+        || prepared.run_id != marker.run_id
+        || prepared.database_path != marker.database_path
+        || !constant_time_text_eq(&prepared.plan_token, &marker.plan_token)
+        || prepared.marked_at != marker.marked_at
+        || prepared.forecast != marker.forecast
+        || prepared.raw_before != marker.raw_before
+        || prepared.logical_before != marker.logical_before
+    {
+        return Err(BeadsError::internal(format!(
+            "schema-migration commit-ready marker in {} is not bound to its prepared receipt",
+            run_dir.display()
+        )));
+    }
+    let recomputed_token = compute_plan_token(
+        &marker.database_path,
+        &marker.logical_before,
+        &marker.forecast,
+    )?;
+    if !constant_time_text_eq(&recomputed_token, &marker.plan_token)
+        || marker.effects.from_version != marker.forecast.from_version
+        || marker.effects.to_version != marker.forecast.to_version
+        || marker.effects.content_hash_rows_rebuilt
+            != marker.forecast.content_hash_rows_rebuilt
+        || marker.effects.gate_result_history_created
+            != marker.forecast.gate_result_history_created
+        || marker.effects.post_migration_maintenance_completed
+            != marker.forecast.post_migration_maintenance
+        || marker.logical_after.user_version != marker.forecast.to_version
+        || !integrity_check_is_clean(&marker.logical_after.integrity_check)
+    {
+        return Err(BeadsError::internal(format!(
+            "schema-migration commit-ready marker in {} has inconsistent effects or witnesses",
+            run_dir.display()
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn resume_commit_ready_migration(
+    args: &DoctorMigrateSchemaApplyArgs,
+    migration: &MigrationContext,
+) -> Result<Option<(AppliedMigrationReceipt, PathBuf)>> {
+    let root = migration_runs_root(&migration.beads_dir);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(BeadsError::Io(error)),
+    };
+    let database_path = migration.db_path.display().to_string();
+    let mut matched = None;
+    for entry in entries {
+        let entry = entry.map_err(BeadsError::Io)?;
+        let file_type = entry.file_type().map_err(BeadsError::Io)?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let run_dir = entry.path();
+        let marker_path = run_dir.join("commit-ready.json");
+        if secure_file_metadata(&marker_path)?.is_none() {
+            continue;
+        }
+        let marker: CommitReadyMigrationReceipt = read_json(&marker_path)?;
+        validate_commit_ready_marker(&marker, &run_dir)?;
+        if marker.database_path != database_path
+            || !constant_time_text_eq(&marker.plan_token, args.plan_token.trim())
+        {
+            continue;
+        }
+        let applied_exists = secure_file_metadata(&run_dir.join("applied.json"))?.is_some();
+        let failed_exists = secure_file_metadata(&run_dir.join("failed.json"))?.is_some();
+        if failed_exists && !applied_exists {
+            continue;
+        }
+        if matched.is_some() {
+            return Err(BeadsError::internal(
+                "multiple commit-ready schema migrations match this plan token",
+            ));
+        }
+        matched = Some((run_dir, marker));
+    }
+    let Some((run_dir, marker)) = matched else {
+        return Ok(None);
+    };
+    let before_dir = run_dir.join("before");
+    verify_backup_family(&migration.db_path, &before_dir, &marker.raw_before)?;
+
+    let applied_path = run_dir.join("applied.json");
+    if secure_file_metadata(&applied_path)?.is_some() {
+        let applied: AppliedMigrationReceipt = read_json(&applied_path)?;
+        validate_applied_against_commit_ready(&applied, &marker, &run_dir)?;
+        let raw_live = raw_family_witness(&migration.db_path)?;
+        let logical_live = logical_witness(&migration.db_path).ok();
+        require_unchanged_applied_state(
+            &applied,
+            &raw_live,
+            logical_live.as_ref(),
+            &applied.run_id,
+        )?;
+        return Ok(Some((applied, before_dir)));
+    }
+
+    migration.write_authority.verify_database_authority()?;
+    let logical_live = logical_witness(&migration.db_path)?;
+    if logical_live != marker.logical_after {
+        let observed = if logical_live == marker.logical_before {
+            "the original pre-migration generation"
+        } else {
+            "an unrecognized database generation"
+        };
+        return Err(BeadsError::internal(format!(
+            "commit-ready schema migration {} cannot be resumed because the live database is \
+             {observed}; retained all recovery artifacts at {}",
+            marker.run_id,
+            run_dir.display()
+        )));
+    }
+    if !current_runtime_shape_is_canonical(&migration.db_path)? {
+        return Err(BeadsError::internal(format!(
+            "commit-ready schema migration {} matches logically but not the canonical runtime shape",
+            marker.run_id
+        )));
+    }
+    let raw_live = raw_family_witness(&migration.db_path)?;
+    migration.write_authority.finalize_database_replacement()?;
+    let applied = AppliedMigrationReceipt {
+        schema_version: APPLIED_SCHEMA.to_string(),
+        run_id: marker.run_id.clone(),
+        database_path: marker.database_path.clone(),
+        plan_token: marker.plan_token.clone(),
+        prepared_receipt_sha256: marker.prepared_receipt_sha256.clone(),
+        marked_at: marker.marked_at.clone(),
+        forecast: marker.forecast.clone(),
+        effects: marker.effects,
+        raw_before: marker.raw_before.clone(),
+        logical_before: marker.logical_before.clone(),
+        raw_after: Some(raw_live),
+        logical_after: Some(logical_live),
+        attested: true,
+        attestation_errors: Vec::new(),
+        undo_command: format!("br doctor migrate-schema undo {}", marker.run_id),
+    };
+    validate_applied_against_commit_ready(&applied, &marker, &run_dir)?;
+    write_json_new(&applied_path, &applied)?;
+    Ok(Some((applied, before_dir)))
+}
+
+fn validate_applied_against_commit_ready(
+    applied: &AppliedMigrationReceipt,
+    marker: &CommitReadyMigrationReceipt,
+    run_dir: &Path,
+) -> Result<()> {
+    validate_commit_ready_marker(marker, run_dir)?;
+    if applied.schema_version != APPLIED_SCHEMA
+        || applied.run_id != marker.run_id
+        || applied.database_path != marker.database_path
+        || !constant_time_text_eq(&applied.plan_token, &marker.plan_token)
+        || !constant_time_text_eq(
+            &applied.prepared_receipt_sha256,
+            &marker.prepared_receipt_sha256,
+        )
+        || applied.marked_at != marker.marked_at
+        || applied.forecast != marker.forecast
+        || applied.effects != marker.effects
+        || applied.raw_before != marker.raw_before
+        || applied.logical_before != marker.logical_before
+        || applied
+            .logical_after
+            .as_ref()
+            .is_some_and(|logical_after| logical_after != &marker.logical_after)
+    {
+        return Err(BeadsError::internal(format!(
+            "applied schema-migration receipt in {} is inconsistent with its commit-ready marker",
+            run_dir.display()
+        )));
     }
     Ok(())
 }
@@ -670,7 +939,7 @@ fn run_post_migration_maintenance(
         (Ok(()), Ok(())) => {}
     }
 
-    let mut effects = if from == to {
+    let effects = if from == to {
         ReviewedSchemaMigrationEffectsReceipt {
             from_version: from,
             to_version: to,
@@ -753,6 +1022,9 @@ fn run_post_migration_maintenance(
     let candidate_raw = raw_family_witness(&candidate_path)?;
     let candidate_sidecars_dir = run_dir.join("maintenance-candidate-sidecars");
     move_present_sidecars_new(&candidate_path, &candidate_sidecars_dir, &candidate_raw)?;
+    let mut committed_effects = effects;
+    committed_effects.post_migration_maintenance_completed = true;
+    persist_commit_ready_marker(run_dir, db_path, &candidate_logical, committed_effects)?;
 
     let replacement_lock = write_authority.lock_database_replacement_candidate(&candidate_path)?;
     let displaced_dir = run_dir.join("maintenance-displaced");
@@ -825,8 +1097,7 @@ fn run_post_migration_maintenance(
             error,
         ));
     }
-    effects.post_migration_maintenance_completed = true;
-    Ok(effects)
+    Ok(committed_effects)
 }
 
 fn logical_witnesses_match_except_integrity(

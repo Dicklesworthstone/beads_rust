@@ -998,6 +998,23 @@ impl DatabaseFamilyWriteLock {
         )
     }
 
+    /// Verify that a still-private replacement path names the exact inode
+    /// locked before installation.
+    pub(crate) fn verify_locked_database_replacement_candidate(
+        &self,
+        candidate_path: &Path,
+        candidate_lock: &File,
+    ) -> Result<()> {
+        self.verify_common_authority()?;
+        verify_locked_file_identity(
+            candidate_lock,
+            candidate_path,
+            "database replacement candidate",
+            true,
+        )?;
+        Ok(())
+    }
+
     /// Adopt a pre-locked replacement immediately after its atomic install.
     ///
     /// The caller keeps the replacement inode locked across the rename, so
