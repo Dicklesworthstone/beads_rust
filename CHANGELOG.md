@@ -162,13 +162,14 @@ replacement, crash, and schema-drift races.
 
 Unpublished stabilization tag. After an earlier topology failure stopped the
 release gate before this target ran, the canonical reliability replay exposed
-a fixture whose plain-text primary database was accidentally paired with a
-committed legacy-schema WAL. Runtime correctly refused to discard those
-ambiguous committed frames; the replay setup now preserves that historical WAL
-outside the active database family so the case tests its documented
-malformed-primary recovery contract. No v0.5.0 GitHub Release, crates.io
-package, or platform assets were published. v0.5.1 supersedes this tag without
-moving or rewriting it.
+historical fixture captures that no longer modeled their manifests. Two
+malformed-primary cases paired a plain-text database with a committed
+legacy-schema WAL, while the WAL-without-SHM case restored an ASCII placeholder
+instead of a valid current-family WAL. Runtime correctly refused both ambiguous
+families. The replay setup now preserves those historical artifacts outside the
+active family and constructs the intended current topology. No v0.5.0 GitHub
+Release, crates.io package, or platform assets were published. v0.5.1
+supersedes this tag without moving or rewriting it.
 
 ## v0.4.1 -- 2026-08-24 (Release)
 

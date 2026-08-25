@@ -256,15 +256,80 @@ fn prepare_current_orphan_shm_sidecar(fixture: &FixtureWorkspace) {
 fn prepare_current_wal_without_shm(fixture: &FixtureWorkspace) {
     let db_path = current_database_path(fixture);
     let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
-    let wal = fs::read(&wal_path).expect("read historical WAL-only fixture");
+    let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
+    let historical_wal = fs::read(&wal_path).expect("read historical WAL-only fixture");
 
     prepare_current_database(fixture, "wal_without_shm_current_schema_import");
-    preserve_generated_artifact(
-        fixture,
-        &PathBuf::from(format!("{}-shm", db_path.display())),
+    let archived_historical_wal = fixture
+        .beads_dir
+        .join(".fixture_legacy_database_family")
+        .join("beads.db-wal");
+    assert_eq!(
+        fs::read(archived_historical_wal).expect("read preserved historical WAL placeholder"),
+        historical_wal,
+        "current-schema preparation must preserve the historical WAL placeholder"
     );
-    preserve_generated_artifact(fixture, &wal_path);
-    fs::write(wal_path, wal).expect("restore WAL-only fixture");
+
+    // The checked-in sidecar is a textual historical placeholder, not a WAL
+    // that belongs to the checked-in database. Restoring it beside the newly
+    // imported current-schema database would manufacture an invalid mixed
+    // family that writable startup must reject. Keep the import-generated WAL
+    // that actually belongs to the current database, preserving any generated
+    // SHM outside the active family so this replay exercises the documented
+    // healthy WAL-without-SHM topology.
+    let current_wal = fs::read(&wal_path).expect("read current import-generated WAL");
+    assert!(
+        current_wal.len() >= 32,
+        "current import-generated WAL must include a complete header"
+    );
+    let wal_magic = u32::from_be_bytes(
+        current_wal[..4]
+            .try_into()
+            .expect("WAL header prefix should contain four bytes"),
+    );
+    assert!(
+        matches!(wal_magic, 0x377f_0682 | 0x377f_0683),
+        "current import-generated WAL must have a canonical SQLite WAL magic"
+    );
+    assert_ne!(
+        current_wal, historical_wal,
+        "active WAL must not reuse the unrelated historical placeholder"
+    );
+
+    let current_shm = match fs::read(&shm_path) {
+        Ok(bytes) => {
+            assert!(
+                !bytes.is_empty(),
+                "current import-generated SHM must be nonempty before preservation"
+            );
+            Some(bytes)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("read current import-generated SHM: {error}"),
+    };
+    preserve_generated_artifact(fixture, &shm_path);
+    let archived_shm = fixture
+        .beads_dir
+        .join(".fixture_current_import_artifacts")
+        .join("beads.db-shm");
+    assert!(!shm_path.exists(), "fixture SHM should not remain active");
+    if let Some(current_shm) = current_shm {
+        assert_eq!(
+            fs::read(archived_shm).expect("read preserved current import-generated SHM"),
+            current_shm,
+            "preserved SHM should retain its exact bytes"
+        );
+    } else {
+        assert!(
+            !archived_shm.exists(),
+            "fixture should not manufacture an archived SHM"
+        );
+    }
+    assert_eq!(
+        fs::read(wal_path).expect("reread current WAL-without-SHM fixture"),
+        current_wal,
+        "removing SHM must not change the current database's WAL"
+    );
 }
 
 fn prepare_current_database(fixture: &FixtureWorkspace, label: &str) {
