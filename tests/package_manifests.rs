@@ -304,6 +304,19 @@ fn test_source_and_nix_manifests_preserve_custom_license_metadata() {
     );
 
     let flake = fs::read_to_string("flake.nix").expect("Failed to read flake.nix");
+    let cargo_toml = fs::read_to_string("Cargo.toml").expect("Failed to read Cargo.toml");
+    let cargo_manifest: toml::Value =
+        toml::from_str(&cargo_toml).expect("Cargo.toml must be valid TOML");
+    let cargo_version = cargo_manifest
+        .get("package")
+        .and_then(|package| package.get("version"))
+        .and_then(toml::Value::as_str)
+        .expect("Cargo.toml must have package.version");
+    let expected_flake_version = format!(r#"version = "{cargo_version}";"#);
+    assert!(
+        flake.contains(&expected_flake_version),
+        "Nix package version must match Cargo.toml ({cargo_version})"
+    );
     assert!(
         flake.contains("license = licenses.unfree;"),
         "Nix metadata must not classify the rider-bearing license as MIT/free"

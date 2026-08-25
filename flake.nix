@@ -91,7 +91,7 @@
           src = combinedSrc;
 
           pname = "beads_rust";
-          version = "0.1.20";
+          version = "0.5.0";
 
           strictDeps = true;
 
