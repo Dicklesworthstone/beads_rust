@@ -1,21 +1,30 @@
-use beads_rust::cli::ListArgs;
-use beads_rust::cli::commands::list;
-use beads_rust::config::CliOverrides;
-use beads_rust::output::OutputContext;
+mod common;
+
+use common::cli::{BrWorkspace, run_br};
 
 #[test]
 fn test_list_sort_aliases_are_accepted() {
-    let args = ListArgs {
-        sort: Some("created".to_string()),
-        ..Default::default()
-    };
-    let overrides = CliOverrides::default();
-    let ctx = OutputContext::from_flags(false, false, true);
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let create = run_br(&workspace, ["create", "sort alias fixture"], "create");
+    assert!(
+        create.status.success(),
+        "fixture create failed: {}",
+        create.stderr
+    );
 
-    // This should now SUCCEED
-    let result = list::execute(&args, false, &overrides, &ctx);
-
-    if let Err(e) = result {
-        panic!("Expected Ok, got {e:?}");
+    for alias in ["created", "updated"] {
+        let list = run_br(
+            &workspace,
+            ["list", "--sort", alias, "--json"],
+            &format!("list_sort_{alias}"),
+        );
+        assert!(
+            list.status.success(),
+            "list --sort {alias} failed: stdout={} stderr={}",
+            list.stdout,
+            list.stderr
+        );
     }
 }
