@@ -1189,6 +1189,57 @@ fn mark_stage(failed_stage: &mut Option<String>, stage: &str) {
     *failed_stage = Some(stage.to_string());
 }
 
+/// Extract the unquoted canonical index name from one statement returned by
+/// `canonical_index_creation_statements`.
+///
+/// Every current canonical index uses the fail-closed
+/// `CREATE [UNIQUE] INDEX IF NOT EXISTS <name>` spelling. Keeping this parser
+/// next to the reviewed migration makes the ownership boundary explicit: the
+/// maintenance pass may re-spell only those named indexes and must leave every
+/// other explicit index (including extension-schema indexes) untouched.
+fn canonical_index_name(statement: &str) -> Result<&str> {
+    let create_line = statement
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("CREATE INDEX ") || line.starts_with("CREATE UNIQUE INDEX "))
+        .ok_or_else(|| {
+            BeadsError::internal(
+                "canonical index statement did not contain a CREATE INDEX declaration",
+            )
+        })?;
+    let mut tokens = create_line.split_ascii_whitespace();
+    if tokens.next() != Some("CREATE") {
+        return Err(BeadsError::internal(
+            "canonical index statement did not begin with CREATE",
+        ));
+    }
+    let mut token = tokens.next();
+    if token == Some("UNIQUE") {
+        token = tokens.next();
+    }
+    if token != Some("INDEX")
+        || tokens.next() != Some("IF")
+        || tokens.next() != Some("NOT")
+        || tokens.next() != Some("EXISTS")
+    {
+        return Err(BeadsError::internal(
+            "canonical index statement did not use CREATE [UNIQUE] INDEX IF NOT EXISTS",
+        ));
+    }
+    let name = tokens
+        .next()
+        .ok_or_else(|| BeadsError::internal("canonical index statement omitted its index name"))?;
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return Err(BeadsError::internal(format!(
+            "canonical index statement used an unsupported quoted or non-ASCII name: {name}"
+        )));
+    }
+    Ok(name)
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_post_migration_maintenance(
     db_path: &Path,
@@ -1262,8 +1313,11 @@ fn run_post_migration_maintenance(
         // the candidate's index spellings no longer token-match the canonical
         // schema and the shape attestation below would refuse an otherwise
         // correct migration. Index DDL is derived state: drop every explicit
-        // index and re-execute the canonical CREATE INDEX statements so the
-        // candidate carries the exact SCHEMA_SQL spelling.
+        // canonical index and re-execute its CREATE INDEX statement so the
+        // candidate carries the exact SCHEMA_SQL spelling. Do not sweep every
+        // explicit index in sqlite_master: indexes on non-br extension tables
+        // are part of the operator's schema and must survive this migration
+        // with both their DDL and enforcement intact.
         // The same re-serialization also mangles the issues table's CHECK
         // constraint spellings, which `issues_required_checks_canonical`
         // token-compares. A table's declaration text can only be corrected by
@@ -1273,15 +1327,13 @@ fn run_post_migration_maintenance(
         if !crate::storage::schema::issues_required_checks_canonical(&candidate_conn) {
             crate::storage::schema::rebuild_issues_table(&candidate_conn)?;
         }
-        let index_rows = candidate_conn
-            .query("SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL")?;
-        for row in &index_rows {
-            if let Some(name) = row.get(0).and_then(SqliteValue::as_text) {
-                let escaped = name.replace('"', "\"\"");
-                candidate_conn.execute(&format!("DROP INDEX IF EXISTS \"{escaped}\""))?;
-            }
+        let canonical_index_statements =
+            crate::storage::schema::canonical_index_creation_statements();
+        for statement in &canonical_index_statements {
+            let name = canonical_index_name(statement)?;
+            candidate_conn.execute(&format!("DROP INDEX IF EXISTS {}", quote_identifier(name)))?;
         }
-        for statement in crate::storage::schema::canonical_index_creation_statements() {
+        for statement in canonical_index_statements {
             candidate_conn.execute(statement)?;
         }
         candidate_conn.execute("REINDEX")?;
@@ -3858,6 +3910,97 @@ mod tests {
                 write_authority: authority,
             },
         )
+    }
+
+    #[test]
+    fn reviewed_migration_preserves_extension_unique_index_ddl_and_enforcement() {
+        const EXTENSION_INDEX_NAME: &str = "extension_records_external_key_unique";
+        const EXTENSION_INDEX_DDL: &str = "CREATE UNIQUE INDEX extension_records_external_key_unique ON extension_records(external_key)";
+
+        let (_temp, migration) = reviewed_v14_migration_context();
+        let source_conn =
+            Connection::open(migration.db_path.to_string_lossy().into_owned()).expect("open db");
+        source_conn
+            .execute(
+                "CREATE TABLE extension_records (
+                    external_key TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )",
+            )
+            .expect("create extension table");
+        source_conn
+            .execute(EXTENSION_INDEX_DDL)
+            .expect("create extension unique index");
+        source_conn
+            .execute(
+                "INSERT INTO extension_records (external_key, payload)
+                 VALUES ('stable-key', 'before-migration')",
+            )
+            .expect("seed extension row");
+        let source_index_sql = source_conn
+            .query_row(&format!(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = '{}'",
+                EXTENSION_INDEX_NAME
+            ))
+            .expect("read source extension index DDL")
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .expect("extension index DDL is text")
+            .to_string();
+        assert_eq!(source_index_sql, EXTENSION_INDEX_DDL);
+        close_connection(source_conn).expect("close extension fixture");
+
+        let plan = build_plan(&migration.db_path).expect("build reviewed migration plan");
+        assert_eq!(
+            plan.from_version, 14,
+            "fixture must exercise a real migration"
+        );
+        assert!(plan.to_version > plan.from_version);
+        execute_apply(
+            &DoctorMigrateSchemaApplyArgs {
+                plan_token: plan.plan_token.expect("plan token"),
+                json: false,
+            },
+            &migration,
+        )
+        .expect("apply reviewed migration with extension index");
+
+        let migrated_conn =
+            Connection::open(migration.db_path.to_string_lossy().into_owned()).expect("open db");
+        let migrated_index_sql = migrated_conn
+            .query_row(&format!(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = '{}'",
+                EXTENSION_INDEX_NAME
+            ))
+            .expect("extension index survives migration")
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .expect("migrated extension index DDL is text")
+            .to_string();
+        assert_eq!(
+            migrated_index_sql, source_index_sql,
+            "reviewed migration must preserve non-br index DDL exactly"
+        );
+
+        let duplicate_error = migrated_conn
+            .execute(
+                "INSERT INTO extension_records (external_key, payload)
+                 VALUES ('stable-key', 'duplicate')",
+            )
+            .expect_err("extension unique index must remain enforced");
+        let duplicate_message = duplicate_error.to_string().to_ascii_lowercase();
+        assert!(
+            duplicate_message.contains("unique") || duplicate_message.contains("constraint"),
+            "expected unique/constraint failure, got: {duplicate_error}"
+        );
+        let row_count = migrated_conn
+            .query_row("SELECT COUNT(*) FROM extension_records")
+            .expect("count extension rows")
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .expect("extension row count is integer");
+        assert_eq!(row_count, 1, "failed duplicate insert must not add a row");
+        close_connection(migrated_conn).expect("close migrated extension fixture");
     }
 
     #[test]
