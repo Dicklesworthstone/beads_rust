@@ -272,7 +272,7 @@ fn measure_cold_warm(
 
 /// Create a fresh workspace with br initialized and populated.
 fn create_br_workspace(br_path: &Path, issue_count: usize) -> std::io::Result<(TempDir, PathBuf)> {
-    let temp_dir = TempDir::new()?;
+    let temp_dir = TempDir::new_in(common::cli::isolated_temp_root())?;
     let root = temp_dir.path().to_path_buf();
 
     // Create minimal git scaffold

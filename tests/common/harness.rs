@@ -635,7 +635,8 @@ pub struct TestWorkspace {
 impl TestWorkspace {
     /// Create a new test workspace
     pub fn new(suite: &str, test: &str) -> Self {
-        let temp_dir = TempDir::new().expect("create temp dir");
+        let temp_dir = TempDir::new_in(super::cli::isolated_temp_root())
+            .expect("create isolated temp dir");
         let root = temp_dir.path().to_path_buf();
         let beads_dir = root.join(".beads");
         let logger = ArtifactLogger::new(suite, test);
@@ -1512,6 +1513,11 @@ mod tests {
     #[test]
     fn test_workspace_basic() {
         let mut ws = TestWorkspace::new("harness", "test_workspace_basic");
+        assert!(
+            !super::super::cli::is_inside_beads_workspace(&ws.root),
+            "harness workspace {} must not inherit an enclosing tracker",
+            ws.root.display()
+        );
         let result = ws.init_br();
         result.assert_success();
         assert!(ws.file_exists(".beads/beads.db"));

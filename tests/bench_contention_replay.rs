@@ -212,7 +212,7 @@ fn build_plan(profile: &ContentionProfile) -> Vec<PlannedCommand> {
 }
 
 fn run_contention_lab(profile: ContentionProfile) -> io::Result<ContentionRun> {
-    let temp_dir = TempDir::new()?;
+    let temp_dir = TempDir::new_in(common::cli::isolated_temp_root())?;
     let root = temp_dir.path().to_path_buf();
     initialize_workspace(&root)?;
 
@@ -371,7 +371,7 @@ fn replay_contention_trace(trace: &ContentionTrace) -> io::Result<ReplayReport> 
         });
     }
 
-    let temp_dir = TempDir::new()?;
+    let temp_dir = TempDir::new_in(common::cli::isolated_temp_root())?;
     let root = temp_dir.path().to_path_buf();
     initialize_workspace(&root)?;
 

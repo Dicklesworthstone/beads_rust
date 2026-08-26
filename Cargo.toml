@@ -200,6 +200,11 @@ strip = false
 [profile.dev]
 opt-level = 1
 
+# Unoptimized fsqlite schema paths can exhaust Linux's default main-thread
+# stack in integration-test child binaries before the test assertions run.
+[profile.test]
+opt-level = 1
+
 [features]
 default = ["self_update"]
 mcp = ["dep:fastmcp-rust"]

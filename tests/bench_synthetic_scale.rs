@@ -385,7 +385,7 @@ impl SyntheticDataset {
     /// Returns an error if the temporary workspace or any CLI command fails.
     pub fn generate(config: SyntheticConfig, br_path: &Path) -> std::io::Result<Self> {
         let start = Instant::now();
-        let temp_dir = TempDir::new()?;
+        let temp_dir = TempDir::new_in(common::cli::isolated_temp_root())?;
         let root = temp_dir.path().to_path_buf();
         let beads_dir = root.join(".beads");
         let manifest_path = root.join("synthetic-corpus-manifest.json");
@@ -417,12 +417,7 @@ impl SyntheticDataset {
             &root,
             "br sync --import-only",
         )?;
-        let doctor_ok = run_br_status(
-            br_path,
-            ["doctor", "--json", "--no-auto-import", "--no-auto-flush"],
-            &root,
-            "br doctor",
-        )?;
+        let doctor_ok = doctor_workspace_is_healthy(br_path, &root)?;
         let sync_status_clean = sync_status_is_clean(br_path, &root)?;
         let jsonl_health = validate_generated_jsonl(&beads_dir.join("issues.jsonl"))?;
 
@@ -487,7 +482,7 @@ impl SyntheticDataset {
         br_path: &Path,
     ) -> std::io::Result<Self> {
         let start = Instant::now();
-        let temp_dir = TempDir::new()?;
+        let temp_dir = TempDir::new_in(common::cli::isolated_temp_root())?;
         let root = temp_dir.path().to_path_buf();
         let beads_dir = root.join(".beads");
         let manifest_path = root.join("synthetic-corpus-manifest.json");
@@ -1064,6 +1059,46 @@ fn run_br_status<const N: usize>(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )))
+}
+
+fn doctor_workspace_is_healthy(br_path: &Path, workspace: &Path) -> std::io::Result<bool> {
+    let output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
+        .args(["doctor", "--json", "--no-auto-import", "--no-auto-flush"])
+        .current_dir(workspace)
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", "error")
+        .env("PATH", common::cli::deduplicated_br_path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    if !matches!(output.status.code(), Some(0 | 1)) {
+        return Err(std::io::Error::other(format!(
+            "br doctor failed: stdout={}; stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    let report: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        std::io::Error::other(format!(
+            "br doctor emitted invalid JSON: {error}; stdout={}",
+            String::from_utf8_lossy(&output.stdout)
+        ))
+    })?;
+    let checks = report
+        .get("checks")
+        .and_then(Value::as_array)
+        .ok_or_else(|| std::io::Error::other("br doctor JSON omitted checks"))?;
+    let workspace_healthy = report
+        .get("workspace_health")
+        .and_then(Value::as_str)
+        .is_some_and(|health| health == "healthy");
+    let has_error = checks
+        .iter()
+        .any(|check| check.get("status").and_then(Value::as_str) == Some("error"));
+
+    Ok(workspace_healthy && !has_error)
 }
 
 fn sync_status_is_clean(br_path: &Path, workspace: &Path) -> std::io::Result<bool> {
