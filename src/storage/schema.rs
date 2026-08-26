@@ -2368,8 +2368,28 @@ fn table_check_constraints_canonical(
     else {
         return false;
     };
+    // Storage engines may re-parenthesize CHECK bodies exactly like index
+    // predicates, so compare through the same precedence-aware
+    // canonicalization instead of raw token slices.
+    let canonical_actual = actual
+        .iter()
+        .map(|tokens| canonical_predicate_text(tokens))
+        .collect::<Option<Vec<_>>>();
+    let Some(canonical_actual) = canonical_actual else {
+        return false;
+    };
+    let Some(canonical_expected) = expected
+        .iter()
+        .map(|tokens| canonical_predicate_text(tokens))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
 
-    actual.len() == expected.len() && expected.iter().all(|required| actual.contains(required))
+    canonical_actual.len() == canonical_expected.len()
+        && canonical_expected
+            .iter()
+            .all(|required| canonical_actual.contains(required))
 }
 
 fn table_declaration_clauses_canonical(conn: &Connection, table: &str) -> bool {
