@@ -3945,17 +3945,15 @@ pub(crate) fn quarantine_database_artifacts<I>(
 where
     I: IntoIterator<Item = PathBuf>,
 {
-    Ok(
-        quarantine_database_artifacts_with_original_paths(
-            db_path,
-            beads_dir,
-            artifact_paths,
-            suffix,
-        )?
-        .into_iter()
-        .map(|(_, backup)| backup)
-        .collect(),
-    )
+    Ok(quarantine_database_artifacts_with_original_paths(
+        db_path,
+        beads_dir,
+        artifact_paths,
+        suffix,
+    )?
+    .into_iter()
+    .map(|(_, backup)| backup)
+    .collect())
 }
 
 fn quarantine_database_artifacts_with_original_paths<I>(
@@ -4490,8 +4488,7 @@ impl OpenStorageResult {
                 }
 
                 let rollback_error =
-                    rollback_renamed_paths(&quarantined, "stale WAL-certificate quarantine")
-                        .err();
+                    rollback_renamed_paths(&quarantined, "stale WAL-certificate quarantine").err();
                 if let Err(authority_error) = verify_database_authority() {
                     return Err(BeadsError::WithContext {
                         context: format!(
@@ -8948,6 +8945,172 @@ routing:
             &db_path,
             &jsonl_path
         ));
+    }
+
+    #[test]
+    fn wal_certificate_reopen_failure_restores_persistent_state_before_error() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let mut storage_ctx =
+            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
+
+        let now = Utc::now();
+        let issue = Issue {
+            id: "bd-wal-state".to_string(),
+            title: "Persistent across WAL-certificate rollback".to_string(),
+            created_at: now,
+            updated_at: now,
+            ..Issue::default()
+        };
+        storage_ctx
+            .storage
+            .create_issue(&issue, "tester")
+            .expect("seed issue");
+        let workflow = crate::close_policy::Workflow {
+            strict: true,
+            statuses: vec!["open".to_string(), "in_progress".to_string()],
+            ..crate::close_policy::Workflow::default()
+        };
+        storage_ctx.storage.set_workflow_policy(workflow.clone());
+        let attribution = crate::storage::EventAttribution::new(
+            Some("wal-agent"),
+            Some("wal-harness"),
+            Some("wal-model"),
+            Some("wal-session"),
+        );
+        storage_ctx
+            .storage
+            .set_pending_event_attribution(attribution.clone());
+
+        let db_path = storage_ctx.paths.db_path.clone();
+        let lock_timeout = storage_ctx.resolved_lock_timeout;
+        let authority = Arc::clone(
+            storage_ctx
+                .write_authority
+                .as_ref()
+                .expect("retained database authority"),
+        );
+        let reopen_attempts = std::cell::Cell::new(0_u8);
+        let error = storage_ctx
+            .quarantine_stale_wal_certificate_sidecars_and_reopen_with(
+                || Ok(Vec::new()),
+                || {
+                    let attempt = reopen_attempts.get();
+                    reopen_attempts.set(attempt + 1);
+                    if attempt == 0 {
+                        Err(BeadsError::Config(
+                            "simulated first reopen failure".to_string(),
+                        ))
+                    } else {
+                        SqliteStorage::open_with_timeout_under_write_authority(
+                            &db_path,
+                            lock_timeout,
+                            &authority,
+                        )
+                    }
+                },
+                || authority.verify_database_authority(),
+            )
+            .expect_err("first reopen failure must be surfaced after rollback");
+
+        assert_eq!(reopen_attempts.get(), 2, "rollback must retry the reopen");
+        assert!(
+            error
+                .to_string()
+                .contains("persistent storage was restored"),
+            "unexpected transition error: {error}"
+        );
+        assert!(!storage_ctx.database_transition_failed_closed);
+        assert_eq!(storage_ctx.storage.workflow_policy(), workflow);
+        assert_eq!(
+            storage_ctx.storage.pending_event_attribution_for_review(),
+            attribution
+        );
+        let restored_issue = storage_ctx
+            .storage
+            .get_issue("bd-wal-state")
+            .expect("query restored storage")
+            .expect("seeded issue must remain in persistent storage");
+        assert_eq!(
+            restored_issue.title,
+            "Persistent across WAL-certificate rollback"
+        );
+    }
+
+    #[test]
+    fn wal_certificate_unrecoverable_reopen_fails_closed_with_retry_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let mut storage_ctx =
+            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
+        fs::write(&storage_ctx.paths.jsonl_path, "{}\n").expect("write JSONL witness");
+
+        let workflow = crate::close_policy::Workflow {
+            strict: true,
+            statuses: vec!["open".to_string(), "blocked".to_string()],
+            ..crate::close_policy::Workflow::default()
+        };
+        storage_ctx.storage.set_workflow_policy(workflow.clone());
+        let attribution = crate::storage::EventAttribution::new(
+            Some("fail-closed-agent"),
+            Some("fail-closed-harness"),
+            Some("fail-closed-model"),
+            Some("fail-closed-session"),
+        );
+        storage_ctx
+            .storage
+            .set_pending_event_attribution(attribution.clone());
+
+        let reopen_attempts = std::cell::Cell::new(0_u8);
+        let error = storage_ctx
+            .quarantine_stale_wal_certificate_sidecars_and_reopen_with(
+                || Ok(Vec::new()),
+                || {
+                    let attempt = reopen_attempts.get() + 1;
+                    reopen_attempts.set(attempt);
+                    Err(BeadsError::Config(format!(
+                        "simulated reopen failure {attempt}"
+                    )))
+                },
+                || Ok(()),
+            )
+            .expect_err("unrecoverable reopen must fail closed");
+
+        assert_eq!(reopen_attempts.get(), 2, "reopen must be retried once");
+        assert!(
+            error.to_string().contains("recovery is fail-closed"),
+            "unexpected transition error: {error}"
+        );
+        assert!(storage_ctx.database_transition_failed_closed);
+        assert_eq!(storage_ctx.storage.workflow_policy(), workflow);
+        assert_eq!(
+            storage_ctx.storage.pending_event_attribution_for_review(),
+            attribution
+        );
+
+        let recoverable_error = BeadsError::Database(FrankenError::WalCorrupt {
+            detail: "bad wal".to_string(),
+        });
+        assert!(
+            !storage_ctx.should_attempt_jsonl_recovery(&recoverable_error),
+            "the state-carrying sentinel must never become a JSONL recovery source"
+        );
+        let recovery_error = storage_ctx
+            .recover_database_from_jsonl()
+            .expect_err("direct JSONL recovery must also fail closed");
+        assert!(
+            recovery_error
+                .to_string()
+                .contains("prior database-handle transition"),
+            "unexpected direct recovery error: {recovery_error}"
+        );
+        assert_eq!(
+            storage_ctx.storage.pending_event_attribution_for_review(),
+            attribution,
+            "refused recovery must not consume pending attribution"
+        );
     }
 
     #[test]
