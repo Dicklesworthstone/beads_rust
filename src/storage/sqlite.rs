@@ -31740,11 +31740,7 @@ mod tests {
         ] {
             storage.create_issue(&issue, "tester").unwrap();
         }
-        for issue_id in [
-            "bd-s-count-direct",
-            "bd-s-count-comment",
-            "bd-s-count-open",
-        ] {
+        for issue_id in ["bd-s-count-direct", "bd-s-count-comment", "bd-s-count-open"] {
             storage
                 .add_comment(issue_id, "tester", "first NEEDLE comment")
                 .unwrap();
