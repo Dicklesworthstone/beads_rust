@@ -2101,9 +2101,9 @@ fn sql_contains_token_sequence(sql: &str, expected: &str) -> bool {
 enum PredicateExpr {
     /// A maximal run of non-structural tokens, e.g. one comparison operand chain.
     Atom(Vec<SqlEvidenceToken>),
-    Not(Box<PredicateExpr>),
-    And(Vec<PredicateExpr>),
-    Or(Vec<PredicateExpr>),
+    Not(Box<Self>),
+    And(Vec<Self>),
+    Or(Vec<Self>),
 }
 
 struct PredicateParser<'a> {

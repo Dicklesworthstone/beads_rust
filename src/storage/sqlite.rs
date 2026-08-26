@@ -9662,10 +9662,7 @@ impl SqliteStorage {
         exclude_blocked_in_sql: bool,
         blocked_ids: Option<&HashSet<String>>,
     ) -> Result<Vec<Issue>> {
-        let parent_member_ids = filters
-            .parent_member_ids
-            .as_deref()
-            .unwrap_or_default();
+        let parent_member_ids = filters.parent_member_ids.as_deref().unwrap_or_default();
         let chunk_size = ready_parent_membership_sql_capacity(filters).max(1);
         let mut issues = Vec::new();
         for member_chunk in parent_member_ids.chunks(chunk_size) {
@@ -17098,18 +17095,16 @@ fn ready_parent_membership_exceeds_sql_parameter_limit(
     };
 
     let configured_priority_count = filters.priorities.as_ref().map_or(0, Vec::len);
-    let hybrid_priority_count = if sort == ReadySortPolicy::Hybrid
-        && filters.limit.is_some_and(|limit| limit > 0)
-    {
-        ready_hybrid_high_bucket_priorities(filters.priorities.as_deref()).len()
-    } else {
-        0
-    };
+    let hybrid_priority_count =
+        if sort == ReadySortPolicy::Hybrid && filters.limit.is_some_and(|limit| limit > 0) {
+            ready_hybrid_high_bucket_priorities(filters.priorities.as_deref()).len()
+        } else {
+            0
+        };
     let non_parent_parameter_count = ready_non_parent_parameter_count(filters)
         .saturating_add(hybrid_priority_count.saturating_sub(configured_priority_count));
 
-    parent_member_ids.len()
-        > SQLITE_VAR_LIMIT.saturating_sub(non_parent_parameter_count)
+    parent_member_ids.len() > SQLITE_VAR_LIMIT.saturating_sub(non_parent_parameter_count)
 }
 
 fn ready_parent_membership_sql_capacity(filters: &ReadyFilters) -> usize {
