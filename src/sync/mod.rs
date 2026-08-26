@@ -11118,10 +11118,9 @@ fn compute_jsonl_newer_impl(storage: &SqliteStorage, jsonl_path: &Path) -> Resul
     };
     let stored_size_matches =
         stored_size.as_deref().and_then(parse_jsonl_size_witness) == Some(observed.size);
-    let stored_mtime_matches =
-        stored_mtime.as_deref() == Some(observed.mtime_witness.as_str());
-    let refresh_witness = (!jsonl_newer && (!stored_mtime_matches || !stored_size_matches))
-        .then(|| observed.clone());
+    let stored_mtime_matches = stored_mtime.as_deref() == Some(observed.mtime_witness.as_str());
+    let refresh_witness =
+        (!jsonl_newer && (!stored_mtime_matches || !stored_size_matches)).then(|| observed.clone());
 
     Ok(JsonlNewerProbe {
         jsonl_exists: true,
@@ -19489,7 +19488,10 @@ mod tests {
             .set_times(std::fs::FileTimes::new().set_modified(original_witness.mtime))
             .unwrap();
         let restored_witness = observed_jsonl_witness(&jsonl_path).unwrap();
-        assert_eq!(restored_witness.mtime_witness, original_witness.mtime_witness);
+        assert_eq!(
+            restored_witness.mtime_witness,
+            original_witness.mtime_witness
+        );
         assert_eq!(restored_witness.size, original_witness.size);
 
         let staleness = compute_staleness(&storage, &jsonl_path).unwrap();

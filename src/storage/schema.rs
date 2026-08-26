@@ -7527,10 +7527,8 @@ mod tests {
 
     #[test]
     fn test_predicate_canonicalization_preserves_precedence_boundaries() {
-        let flat_or_first =
-            sql_evidence_tokens("a AND b OR c");
-        let grouped_and =
-            sql_evidence_tokens("a AND (b OR c)");
+        let flat_or_first = sql_evidence_tokens("a AND b OR c");
+        let grouped_and = sql_evidence_tokens("a AND (b OR c)");
         assert_ne!(
             canonical_predicate_text(&flat_or_first),
             canonical_predicate_text(&grouped_and),
