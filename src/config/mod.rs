@@ -3945,6 +3945,28 @@ pub(crate) fn quarantine_database_artifacts<I>(
 where
     I: IntoIterator<Item = PathBuf>,
 {
+    Ok(
+        quarantine_database_artifacts_with_original_paths(
+            db_path,
+            beads_dir,
+            artifact_paths,
+            suffix,
+        )?
+        .into_iter()
+        .map(|(_, backup)| backup)
+        .collect(),
+    )
+}
+
+fn quarantine_database_artifacts_with_original_paths<I>(
+    db_path: &Path,
+    beads_dir: &Path,
+    artifact_paths: I,
+    suffix: &str,
+) -> Result<Vec<RecoveryBackupPath>>
+where
+    I: IntoIterator<Item = PathBuf>,
+{
     let stamp = Utc::now().format("%Y%m%d_%H%M%S_%f").to_string();
     let recovery_dir = recovery_dir_for_db_path(db_path, beads_dir);
     fs::create_dir_all(&recovery_dir)?;
@@ -3966,10 +3988,7 @@ where
         "Verified quarantined database artifact backups"
     );
 
-    Ok(renamed_paths
-        .into_iter()
-        .map(|(_, backup)| backup)
-        .collect())
+    Ok(renamed_paths)
 }
 
 /// Open storage using resolved config paths, returning the storage and paths used.
@@ -4053,6 +4072,12 @@ pub struct OpenStorageResult {
     loaded_jsonl_state: JsonlSourceStateWitness,
     loaded_jsonl_source: RetainedJsonlSource,
     pending_recovery_backup: Option<RecoveryBackupSet>,
+    /// Set only when a storage-replacement transition has released the live
+    /// connection and cannot restore a verified persistent handle. The
+    /// state-carrying temporary storage remains available for orderly error
+    /// propagation, but JSONL recovery must not mistake it for the database
+    /// generation that failed.
+    database_transition_failed_closed: bool,
 }
 
 impl OpenStorageResult {
@@ -4177,7 +4202,8 @@ impl OpenStorageResult {
 
     #[must_use]
     pub(crate) fn should_attempt_jsonl_recovery(&self, err: &BeadsError) -> bool {
-        !self.no_db
+        !self.database_transition_failed_closed
+            && !self.no_db
             && should_attempt_jsonl_recovery(err, &self.paths.db_path, &self.paths.jsonl_path)
     }
 
@@ -4198,6 +4224,12 @@ impl OpenStorageResult {
                 "cannot rebuild SQLite database from JSONL while --no-db mode is active"
                     .to_string(),
             ));
+        }
+        if self.database_transition_failed_closed {
+            return Err(BeadsError::SyncConflict {
+                message: "Refusing JSONL recovery because a prior database-handle transition could not restore a verified persistent storage connection"
+                    .to_string(),
+            });
         }
         let write_authority =
             self.write_authority
@@ -4313,45 +4345,206 @@ impl OpenStorageResult {
                 })?;
         write_authority.verify_database_authority()?;
 
+        let quarantine_db_path = self.paths.db_path.clone();
+        let reopen_db_path = self.paths.db_path.clone();
+        let quarantine_beads_dir = self.paths.beads_dir.clone();
+        let resolved_lock_timeout = self.resolved_lock_timeout;
+        let reopen_authority = Arc::clone(&write_authority);
+        let verify_authority = Arc::clone(&write_authority);
+        self.quarantine_stale_wal_certificate_sidecars_and_reopen_with(
+            move || {
+                let db_path_str = quarantine_db_path.to_string_lossy();
+                quarantine_database_artifacts_with_original_paths(
+                    &quarantine_db_path,
+                    &quarantine_beads_dir,
+                    FSQLITE_WAL_CERT_SIDECAR_SUFFIXES
+                        .iter()
+                        .map(|suffix| PathBuf::from(format!("{db_path_str}{suffix}"))),
+                    "stale-wal-cert",
+                )
+            },
+            move || {
+                SqliteStorage::open_with_timeout_under_write_authority(
+                    &reopen_db_path,
+                    resolved_lock_timeout,
+                    &reopen_authority,
+                )
+            },
+            move || verify_authority.verify_database_authority(),
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn quarantine_stale_wal_certificate_sidecars_and_reopen_with<Q, R, V>(
+        &mut self,
+        quarantine_sidecars: Q,
+        mut reopen_storage: R,
+        mut verify_database_authority: V,
+    ) -> Result<Vec<PathBuf>>
+    where
+        Q: FnOnce() -> Result<Vec<RecoveryBackupPath>>,
+        R: FnMut() -> Result<SqliteStorage>,
+        V: FnMut() -> Result<()>,
+    {
+        if self.database_transition_failed_closed {
+            return Err(BeadsError::SyncConflict {
+                message: "Refusing WAL-certificate quarantine because a prior database-handle transition did not restore verified persistent storage"
+                    .to_string(),
+            });
+        }
+
         // Preserve state staged on the storage being replaced, mirroring
         // `recover_database_from_jsonl` (#312 hardening, F1): the failed
         // write did not commit, so the retry must still see it.
-        let preserved_attribution = self.storage.take_pending_event_attribution();
+        // Prepare and fully populate the fail-closed sentinel before releasing
+        // the live connection. If creating it fails, the live handle and its
+        // staged attribution remain untouched.
+        let mut fail_closed_storage = SqliteStorage::open_memory()?;
         let preserved_workflow_policy = self.storage.workflow_policy();
+        let preserved_attribution = self.storage.take_pending_event_attribution();
+        fail_closed_storage.set_workflow_policy(preserved_workflow_policy.clone());
+        if let Some(attribution) = preserved_attribution.as_ref() {
+            fail_closed_storage.set_pending_event_attribution(attribution.clone());
+        }
 
         // Close the live connection before renaming sidecars out of the
         // family: the engine caches descriptors for the certificate sidecar,
         // and a retry through the old handle could keep reading the stale
         // bytes through the renamed inode.
-        self.storage = SqliteStorage::open_memory()?;
+        let live_storage = std::mem::replace(&mut self.storage, fail_closed_storage);
+        self.database_transition_failed_closed = true;
+        drop(live_storage);
 
-        let db_path_str = self.paths.db_path.to_string_lossy();
-        let quarantined = quarantine_database_artifacts(
-            &self.paths.db_path,
-            &self.paths.beads_dir,
-            FSQLITE_WAL_CERT_SIDECAR_SUFFIXES
-                .iter()
-                .map(|suffix| PathBuf::from(format!("{db_path_str}{suffix}"))),
-            "stale-wal-cert",
-        )?;
-        warn!(
-            db_path = %self.paths.db_path.display(),
-            quarantined_paths = ?quarantined,
-            "Quarantined stale parallel-WAL certificate sidecars into the recovery directory; the engine will regenerate them on the next write"
-        );
+        let quarantined = match quarantine_sidecars() {
+            Ok(paths) => paths,
+            Err(quarantine_error) => {
+                if let Err(authority_error) = verify_database_authority() {
+                    return Err(BeadsError::WithContext {
+                        context: format!(
+                            "WAL-certificate quarantine failed ({quarantine_error}); refusing to reopen or JSONL-recover because database authority also changed"
+                        ),
+                        source: Box::new(authority_error),
+                    });
+                }
+                let mut restored_storage = reopen_storage().map_err(|reopen_error| {
+                    BeadsError::WithContext {
+                        context: format!(
+                            "WAL-certificate quarantine failed ({quarantine_error}); its rollback did not yield a reopenable persistent storage handle, so recovery is fail-closed"
+                        ),
+                        source: Box::new(reopen_error),
+                    }
+                })?;
+                verify_database_authority().map_err(|authority_error| {
+                    BeadsError::WithContext {
+                        context: format!(
+                            "WAL-certificate quarantine failed ({quarantine_error}); the restored storage handle could not be verified, so recovery is fail-closed"
+                        ),
+                        source: Box::new(authority_error),
+                    }
+                })?;
+                restored_storage.set_workflow_policy(preserved_workflow_policy);
+                if let Some(attribution) = preserved_attribution {
+                    restored_storage.set_pending_event_attribution(attribution);
+                }
+                self.storage = restored_storage;
+                self.database_transition_failed_closed = false;
+                return Err(quarantine_error);
+            }
+        };
 
-        let mut storage = SqliteStorage::open_with_timeout_under_write_authority(
-            &self.paths.db_path,
-            self.resolved_lock_timeout,
-            &write_authority,
-        )?;
-        write_authority.verify_database_authority()?;
-        storage.set_workflow_policy(preserved_workflow_policy);
-        if let Some(attribution) = preserved_attribution {
-            storage.set_pending_event_attribution(attribution);
+        let quarantined_paths = quarantined
+            .iter()
+            .map(|(_, backup)| backup.clone())
+            .collect::<Vec<_>>();
+
+        match reopen_storage() {
+            Ok(mut storage) => {
+                verify_database_authority().map_err(|authority_error| {
+                    BeadsError::WithContext {
+                        context: "Quarantined stale WAL-certificate sidecars but could not verify the reopened database generation; recovery is fail-closed"
+                            .to_string(),
+                        source: Box::new(authority_error),
+                    }
+                })?;
+                storage.set_workflow_policy(preserved_workflow_policy);
+                if let Some(attribution) = preserved_attribution {
+                    storage.set_pending_event_attribution(attribution);
+                }
+                self.storage = storage;
+                self.database_transition_failed_closed = false;
+                warn!(
+                    db_path = %self.paths.db_path.display(),
+                    quarantined_paths = ?quarantined_paths,
+                    "Quarantined stale parallel-WAL certificate sidecars into the recovery directory; the engine will regenerate them on the next write"
+                );
+                Ok(quarantined_paths)
+            }
+            Err(first_reopen_error) => {
+                if let Err(authority_error) = verify_database_authority() {
+                    return Err(BeadsError::WithContext {
+                        context: format!(
+                            "Quarantined stale WAL-certificate sidecars but the database could not be reopened ({first_reopen_error}); refusing namespace rollback because database authority changed"
+                        ),
+                        source: Box::new(authority_error),
+                    });
+                }
+
+                let rollback_error =
+                    rollback_renamed_paths(&quarantined, "stale WAL-certificate quarantine")
+                        .err();
+                if let Err(authority_error) = verify_database_authority() {
+                    return Err(BeadsError::WithContext {
+                        context: format!(
+                            "Database authority changed while rolling back stale WAL-certificate quarantine after reopen failed ({first_reopen_error}); recovery is fail-closed"
+                        ),
+                        source: Box::new(authority_error),
+                    });
+                }
+
+                let mut restored_storage = reopen_storage().map_err(|second_reopen_error| {
+                    let rollback_detail = rollback_error.as_ref().map_or_else(
+                        || "sidecar rollback completed".to_string(),
+                        |error| format!("sidecar rollback also failed: {error}"),
+                    );
+                    BeadsError::WithContext {
+                        context: format!(
+                            "Persistent storage reopen failed after WAL-certificate quarantine ({first_reopen_error}); {rollback_detail}; the database still could not be reopened, so recovery is fail-closed"
+                        ),
+                        source: Box::new(second_reopen_error),
+                    }
+                })?;
+                verify_database_authority().map_err(|authority_error| {
+                    BeadsError::WithContext {
+                        context: format!(
+                            "Persistent storage reopened only after WAL-certificate quarantine failed ({first_reopen_error}), but its database generation could not be verified; recovery is fail-closed"
+                        ),
+                        source: Box::new(authority_error),
+                    }
+                })?;
+                restored_storage.set_workflow_policy(preserved_workflow_policy);
+                if let Some(attribution) = preserved_attribution {
+                    restored_storage.set_pending_event_attribution(attribution);
+                }
+                self.storage = restored_storage;
+                self.database_transition_failed_closed = false;
+
+                let rollback_detail = rollback_error.map_or_else(
+                    || "the sidecars were rolled back and persistent storage was restored"
+                        .to_string(),
+                    |error| {
+                        format!(
+                            "sidecar rollback also failed ({error}), but verified persistent storage was restored"
+                        )
+                    },
+                );
+                Err(BeadsError::WithContext {
+                    context: format!(
+                        "Failed to reopen persistent storage after WAL-certificate quarantine; {rollback_detail}"
+                    ),
+                    source: Box::new(first_reopen_error),
+                })
+            }
         }
-        self.storage = storage;
-        Ok(quarantined)
     }
 
     pub(crate) fn verify_retained_jsonl_source_current(&self) -> Result<()> {
@@ -5011,6 +5204,7 @@ fn open_storage_with_startup_config_impl(
             loaded_jsonl_state,
             loaded_jsonl_source,
             pending_recovery_backup: None,
+            database_transition_failed_closed: false,
         })
     } else {
         let (mut sqlite_open, owned_write_authority) = open_sqlite_storage_for_startup(
@@ -5063,6 +5257,7 @@ fn open_storage_with_startup_config_impl(
             loaded_jsonl_state,
             loaded_jsonl_source,
             pending_recovery_backup: sqlite_open.pending_recovery_backup,
+            database_transition_failed_closed: false,
         })
     }
 }
