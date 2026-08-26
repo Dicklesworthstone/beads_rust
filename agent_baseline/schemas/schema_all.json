@@ -5397,12 +5397,12 @@
       "notes": "JSON/TOON modes wrap the concise agent guide; text mode prints the guide directly."
     },
     "search": {
-      "shape": "array",
-      "jq_filter": ".[]",
-      "items_at": ".",
+      "shape": "object",
+      "jq_filter": ".issues[]",
+      "items_at": ".issues",
       "item_schema": "IssueWithCounts",
       "error_envelope_on_stderr": false,
-      "notes": "Bare array when no closed matches were hidden. When the default closed-issue exclusion hid matches, the shape becomes a wrapper object `{\"issues\": [...], \"hidden_closed_count\": N}` (iterate with `.issues[]`); pass `--all` (or a terminal `--status`) to include closed issues instead."
+      "notes": "Stable wrapper object `{\"issues\": [...], \"hidden_closed_count\": N}`; iterate with `.issues[]`. The count is zero when no closed matches were hidden or the selected corpus already includes closed issues."
     },
     "show": {
       "shape": "array",
