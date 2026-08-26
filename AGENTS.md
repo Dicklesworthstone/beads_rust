@@ -352,7 +352,7 @@ beads_rust/
 ```toml
 [features]
 default = ["self_update"]
-self_update = ["dep:self_update"]   # Self-update from GitHub releases (rustls TLS, signature verification)
+self_update = ["dep:self_update"]   # Self-update from GitHub releases (rustls TLS, mandatory .sha256 sidecar verification; minisign signatures are published for manual verification)
 ```
 
 ### Core Types Quick Reference
