@@ -1312,8 +1312,8 @@ fn run_post_migration_maintenance(
         // sqlite_master (comments stripped, predicates re-parenthesized), so
         // the candidate's index spellings no longer token-match the canonical
         // schema and the shape attestation below would refuse an otherwise
-        // correct migration. Index DDL is derived state: drop every explicit
-        // canonical index and re-execute its CREATE INDEX statement so the
+        // correct migration. Index DDL is derived state: drop each canonical
+        // index and re-execute its CREATE INDEX statement so the
         // candidate carries the exact SCHEMA_SQL spelling. Do not sweep every
         // explicit index in sqlite_master: indexes on non-br extension tables
         // are part of the operator's schema and must survive this migration
@@ -3939,8 +3939,8 @@ mod tests {
             .expect("seed extension row");
         let source_index_sql = source_conn
             .query_row(&format!(
-                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = '{}'",
-                EXTENSION_INDEX_NAME
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = \
+                 '{EXTENSION_INDEX_NAME}'"
             ))
             .expect("read source extension index DDL")
             .get(0)
@@ -3969,8 +3969,8 @@ mod tests {
             Connection::open(migration.db_path.to_string_lossy().into_owned()).expect("open db");
         let migrated_index_sql = migrated_conn
             .query_row(&format!(
-                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = '{}'",
-                EXTENSION_INDEX_NAME
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = \
+                 '{EXTENSION_INDEX_NAME}'"
             ))
             .expect("extension index survives migration")
             .get(0)
