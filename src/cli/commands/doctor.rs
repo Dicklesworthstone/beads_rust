@@ -25261,8 +25261,19 @@ version = "2026-05-11-abc123"
 
         execute_repair_indexes(&beads_dir, &paths, &ctx, &args, &cli).unwrap();
 
-        let storage = SqliteStorage::open(&db_path).unwrap();
-        assert!(storage.get_issue("bd-ri-quoted-1").unwrap().is_some());
+        // The two deliberately noncanonical indexes must remain present so
+        // this test exercises their quoted REINDEX statements.  A normal
+        // SqliteStorage open correctly rejects unexpected explicit indexes,
+        // so inspect the preserved issue through the raw connection instead.
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let issue = conn
+            .query_row("SELECT id FROM issues WHERE id = 'bd-ri-quoted-1'")
+            .unwrap();
+        assert_eq!(
+            issue.get(0).and_then(SqliteValue::as_text),
+            Some("bd-ri-quoted-1")
+        );
+        conn.close().unwrap();
     }
 
     #[test]

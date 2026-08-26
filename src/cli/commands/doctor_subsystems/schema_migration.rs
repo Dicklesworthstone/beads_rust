@@ -1255,13 +1255,12 @@ fn run_post_migration_maintenance(
     let source_logical = logical_witness(db_path)?;
     let source_permissions_witness = raw_family_witness(db_path)?;
     let source_unix_mode = component_for_suffix(&source_permissions_witness, "")?.unix_mode;
-    let candidate_path = maintenance_candidate_path(db_path, run_dir)?;
-    require_absent_family(&candidate_path)?;
-
     // Build and migrate a replacement database without mutating the live
     // family.  The live main file and sidecars remain the rollback authority
     // until the fully attested candidate is atomically installed below.
     mark_stage(failed_stage, "vacuum-candidate");
+    let candidate_path = maintenance_candidate_path(db_path, run_dir)?;
+    require_absent_family(&candidate_path)?;
     let source_conn = Connection::open(db_path.to_string_lossy().into_owned())?;
     let escaped_path = candidate_path.to_string_lossy().replace('\'', "''");
     let candidate_result = source_conn
@@ -3873,11 +3872,13 @@ mod tests {
         assert!(validate_run_id("20260727T120000.000000Z-1-0").is_ok());
     }
 
-    fn reviewed_v14_migration_context() -> (TempDir, MigrationContext) {
+    fn reviewed_v14_migration_context_with_database_name(
+        database_name: &str,
+    ) -> (TempDir, MigrationContext) {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
         fs::create_dir(&beads_dir).expect("create beads dir");
-        let db_path = beads_dir.join("beads.db");
+        let db_path = beads_dir.join(database_name);
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open db");
         crate::storage::schema::apply_schema(&conn).expect("create current schema");
         conn.execute(
@@ -3910,6 +3911,10 @@ mod tests {
                 write_authority: authority,
             },
         )
+    }
+
+    fn reviewed_v14_migration_context() -> (TempDir, MigrationContext) {
+        reviewed_v14_migration_context_with_database_name("beads.db")
     }
 
     #[test]
@@ -5178,24 +5183,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn forced_apply_failure_records_failed_stage_in_failure_receipt() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let (_temp, migration) = reviewed_v14_migration_context();
+        // The live database name itself fits within the usual Unix NAME_MAX,
+        // while the run-id-bearing VACUUM candidate name does not.  This
+        // forces the candidate stage to fail even for root, unlike directory
+        // mode-bit tests whose write restriction root legitimately bypasses.
+        let database_name = format!("{}.db", "b".repeat(226));
+        let (_temp, migration) = reviewed_v14_migration_context_with_database_name(&database_name);
         let plan = build_plan(&migration.db_path).expect("build plan");
-        // The run directory tree must already exist: with the database
-        // directory read-only below, `allocate_run_id` could not create it.
         let runs_root = migration_runs_root(&migration.beads_dir);
-        ensure_directory(&migration.beads_dir.join(".br_recovery")).expect("recovery root");
-        ensure_directory(&runs_root).expect("runs root");
-        // Deny entry creation in the database directory itself: the VACUUM
-        // INTO candidate cannot be created there, forcing the maintenance
-        // pipeline to fail while the nested run directory stays writable for
-        // the failure receipt.
-        let original_permissions = fs::metadata(&migration.beads_dir)
-            .expect("beads dir metadata")
-            .permissions();
-        fs::set_permissions(&migration.beads_dir, fs::Permissions::from_mode(0o555))
-            .expect("make database directory read-only");
         let result = execute_apply(
             &DoctorMigrateSchemaApplyArgs {
                 plan_token: plan.plan_token.expect("plan token"),
@@ -5203,9 +5198,7 @@ mod tests {
             },
             &migration,
         );
-        fs::set_permissions(&migration.beads_dir, original_permissions)
-            .expect("restore database directory permissions");
-        result.expect_err("a read-only database directory must fail the apply");
+        result.expect_err("an overlong VACUUM candidate name must fail the apply");
 
         let run_dir = fs::read_dir(&runs_root)
             .expect("read migration runs")

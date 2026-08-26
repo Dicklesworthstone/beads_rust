@@ -872,11 +872,17 @@ impl DatabaseFamilyWriteLock {
         let Some(database_lock) = database_authority.lock.as_ref() else {
             return Ok(DatabaseTargetAuthorityState::Foreign);
         };
-        let retained_identity = verify_locked_file_identity(
+        // The retained handle may name an original generation that recovery
+        // has already staged out of the canonical namespace.  Requiring that
+        // handle to still match the canonical path would turn the exact
+        // `Foreign` condition this method exists to classify into an error.
+        // Re-witness the handle itself, then compare its recorded identity and
+        // the independently witnessed canonical target below.
+        let retained_identity = authority_file_identity(
             database_lock,
             &self.canonical_database_path,
             "retained database recovery authority",
-            true,
+            &database_path_descriptor(&self.canonical_database_path),
         )?;
         if database_authority.identity == Some(retained_identity)
             && retained_identity == target_identity
@@ -1738,10 +1744,11 @@ fn verify_locked_file_identity(
     #[cfg(not(windows))]
     let current = authority_path_identity(lock_path, role, &lock_path_display)?;
     if opened != current {
-        return Err(BeadsError::Config(format!(
-            "{role} identity changed before lock authority was established at {}",
-            lock_path_display
-        )));
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "{role} generation changed (locked-file identity changed) at {lock_path_display}"
+            ),
+        });
     }
     Ok(opened)
 }
@@ -15421,6 +15428,7 @@ mod tests {
 
         let error = verify_locked_file_identity(&held, &authority_path, "test authority", false)
             .expect_err("stable handle identity must reject the distinct replacement");
+        assert!(matches!(error, BeadsError::SyncConflict { .. }));
         assert!(error.to_string().contains("identity changed"));
     }
 

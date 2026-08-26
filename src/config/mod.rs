@@ -1293,6 +1293,23 @@ fn should_attempt_jsonl_recovery(open_err: &BeadsError, db_path: &Path, jsonl_pa
         // family up and recreates it.
         BeadsError::Database(FrankenError::Io(io_err))
             if io_err.kind() == std::io::ErrorKind::IsADirectory
+    ) || matches!(
+        open_err,
+        // Exact runtime attestation can now reject a malformed current-version
+        // table after the ordinary schema repair ran.  With an authoritative
+        // JSONL source present, this is the same recoverable structural damage
+        // as the older engine-level malformed-schema errors above.
+        BeadsError::Config(detail)
+            if detail == "runtime schema remains incompatible after repair"
+    ) || matches!(
+        open_err,
+        // Schema preflight reports non-regular database-family members as a
+        // fail-closed SyncConflict before fsqlite can turn them into an I/O
+        // error.  Recovery moves the blocking member into the verified backup
+        // set, so preserve the established directory-sidecar recovery path.
+        BeadsError::SyncConflict { message }
+            if message.starts_with("Refusing schema preflight because the ")
+                && message.ends_with(" path is not a regular file")
     )
 }
 
@@ -10452,11 +10469,14 @@ routing:
                         })
                 })
                 .collect();
-            assert_eq!(backups.len(), 1, "{original_name} backup count");
+            let sentinel_backups: Vec<_> = backups
+                .iter()
+                .filter(|path| fs::read(path).is_ok_and(|bytes| bytes == *sentinel))
+                .collect();
             assert_eq!(
-                fs::read(&backups[0]).expect("read quarantined sidecar"),
-                *sentinel,
-                "{original_name} bytes must be preserved"
+                sentinel_backups.len(),
+                1,
+                "original {original_name} sentinel backup count among {backups:?}"
             );
 
             let live_path = beads_dir.join(&original_name);
@@ -10533,11 +10553,12 @@ routing:
     }
 
     /// The config-layer fast-open fallback must not repair engine namespace
-    /// permissions until it owns the database-family authority, then must use
-    /// the authority-gated opener that performs the repair.
+    /// permissions until it owns the database-family authority. Startup must
+    /// also classify any pending sync saga before its first mutation, so modes
+    /// that prevent that read-only verdict must fail closed without a chmod.
     #[cfg(unix)]
     #[test]
-    fn read_only_fast_open_repairs_namespace_modes_only_under_authority() {
+    fn read_only_fast_open_refuses_namespace_repair_before_pending_verdict() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = TempDir::new().expect("tempdir");
@@ -10601,7 +10622,7 @@ routing:
         }
         drop(held_lock);
 
-        let opened = open_storage_with_cli(
+        let error = open_storage_with_cli(
             &beads_dir,
             &CliOverrides {
                 lock_timeout: Some(1_000),
@@ -10609,17 +10630,22 @@ routing:
                 ..CliOverrides::default()
             },
         )
-        .expect("authority-gated fallback should repair namespace modes");
-        drop(opened);
-        for sidecar in sidecars {
-            let mode = fs::metadata(&sidecar)
-                .expect("inspect repaired namespace sidecar")
-                .permissions()
-                .mode();
+        .expect_err("startup must classify pending sync state before namespace repair");
+        assert!(
+            error
+                .to_string()
+                .contains("repair would require mutation before the pending-saga verdict"),
+            "unexpected fail-closed startup error: {error}"
+        );
+        for (sidecar, (bytes, mode)) in sidecars.iter().zip(&before) {
+            assert_eq!(fs::read(sidecar).expect("reread namespace sidecar"), *bytes);
             assert_eq!(
-                mode & 0o077,
-                0,
-                "authority-gated fallback left {} group/other accessible",
+                fs::metadata(sidecar)
+                    .expect("reinspect namespace sidecar")
+                    .permissions()
+                    .mode(),
+                *mode,
+                "fail-closed pending-saga inspection must not chmod {}",
                 sidecar.display()
             );
         }
@@ -11373,15 +11399,16 @@ routing:
                     })
             })
             .collect();
+        let sentinel_backups: Vec<_> = wal_backups
+            .iter()
+            .filter(|path| {
+                fs::read_to_string(path.join("sentinel.txt")).is_ok_and(|text| text == "keep me")
+            })
+            .collect();
         assert_eq!(
-            wal_backups.len(),
+            sentinel_backups.len(),
             1,
-            "wal directory should be backed up once"
-        );
-        assert_eq!(
-            fs::read_to_string(wal_backups[0].join("sentinel.txt"))
-                .expect("read backed-up sentinel"),
-            "keep me"
+            "original wal directory sentinel backup count among {wal_backups:?}"
         );
     }
 
