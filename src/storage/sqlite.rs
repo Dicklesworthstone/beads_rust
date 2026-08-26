@@ -1533,6 +1533,18 @@ const SEARCH_NEEDLE_PREDICATE: &str = "(instr(lower(title), ?) > 0 \
                 WHERE comments.issue_id = issues.id \
                   AND instr(lower(comments.text), ?) > 0))";
 
+/// Equivalent search predicate for whole-corpus counts.
+///
+/// Unlike the result query, the hidden-closed count must inspect every eligible
+/// closed issue. Materializing the matching comment issue IDs once avoids
+/// rerunning the comment lookup for every outer issue while preserving the
+/// exact substring and deduplication semantics of `SEARCH_NEEDLE_PREDICATE`.
+const SEARCH_COUNT_NEEDLE_PREDICATE: &str = "(instr(lower(title), ?) > 0 \
+     OR instr(lower(description), ?) > 0 \
+     OR instr(lower(id), ?) > 0 \
+     OR issues.id IN (SELECT comments.issue_id FROM comments \
+                      WHERE instr(lower(comments.text), ?) > 0))";
+
 #[derive(Clone, Copy)]
 enum BlockedIssueProjection {
     Full,
@@ -9310,7 +9322,7 @@ impl SqliteStorage {
         }
 
         sql.push_str(" AND ");
-        sql.push_str(SEARCH_NEEDLE_PREDICATE);
+        sql.push_str(SEARCH_COUNT_NEEDLE_PREDICATE);
         let needle = trimmed.to_ascii_lowercase();
         params.push(SqliteValue::from(needle.as_str()));
         params.push(SqliteValue::from(needle.as_str()));
@@ -31673,6 +31685,78 @@ mod tests {
         let case_results = storage.search_issues("authentication", &filters).unwrap();
         let case_ids: Vec<_> = case_results.iter().map(|issue| issue.id.as_str()).collect();
         assert_eq!(case_ids, vec!["bd-s-description"]);
+    }
+
+    #[test]
+    fn test_count_closed_search_matches_deduplicates_matching_comments() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2025, 9, 1, 0, 0, 0).unwrap();
+
+        let direct_match = make_issue(
+            "bd-s-count-direct",
+            "needle in title",
+            Status::Closed,
+            2,
+            None,
+            created_at,
+            None,
+        );
+        let comment_match = make_issue(
+            "bd-s-count-comment",
+            "comment-only closed match",
+            Status::Closed,
+            2,
+            None,
+            created_at,
+            None,
+        );
+        let open_comment_match = make_issue(
+            "bd-s-count-open",
+            "open comment match",
+            Status::Open,
+            2,
+            None,
+            created_at,
+            None,
+        );
+        let closed_non_match = make_issue(
+            "bd-s-count-absent",
+            "closed without the token",
+            Status::Closed,
+            2,
+            None,
+            created_at,
+            None,
+        );
+
+        for issue in [
+            direct_match,
+            comment_match,
+            open_comment_match,
+            closed_non_match,
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        for issue_id in [
+            "bd-s-count-direct",
+            "bd-s-count-comment",
+            "bd-s-count-open",
+        ] {
+            storage
+                .add_comment(issue_id, "tester", "first NEEDLE comment")
+                .unwrap();
+            storage
+                .add_comment(issue_id, "tester", "second needle comment")
+                .unwrap();
+        }
+
+        assert_eq!(
+            storage
+                .count_closed_search_matches("NeEdLe", &ListFilters::default())
+                .unwrap(),
+            2,
+            "each closed issue must be counted once regardless of how many fields or comments match"
+        );
     }
 
     #[test]
