@@ -10469,13 +10469,12 @@ routing:
                         })
                 })
                 .collect();
-            let sentinel_backups: Vec<_> = backups
+            let sentinel_backup_count = backups
                 .iter()
                 .filter(|path| fs::read(path).is_ok_and(|bytes| bytes == *sentinel))
-                .collect();
+                .count();
             assert_eq!(
-                sentinel_backups.len(),
-                1,
+                sentinel_backup_count, 1,
                 "original {original_name} sentinel backup count among {backups:?}"
             );
 
@@ -11399,15 +11398,14 @@ routing:
                     })
             })
             .collect();
-        let sentinel_backups: Vec<_> = wal_backups
+        let sentinel_backup_count = wal_backups
             .iter()
             .filter(|path| {
                 fs::read_to_string(path.join("sentinel.txt")).is_ok_and(|text| text == "keep me")
             })
-            .collect();
+            .count();
         assert_eq!(
-            sentinel_backups.len(),
-            1,
+            sentinel_backup_count, 1,
             "original wal directory sentinel backup count among {wal_backups:?}"
         );
     }
