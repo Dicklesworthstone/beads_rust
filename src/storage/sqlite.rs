@@ -31692,7 +31692,7 @@ mod tests {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let created_at = Utc.with_ymd_and_hms(2025, 9, 1, 0, 0, 0).unwrap();
 
-        let direct_match = make_issue(
+        let mut direct_match = make_issue(
             "bd-s-count-direct",
             "needle in title",
             Status::Closed,
@@ -31701,7 +31701,8 @@ mod tests {
             created_at,
             None,
         );
-        let comment_match = make_issue(
+        direct_match.closed_at = Some(created_at);
+        let mut comment_match = make_issue(
             "bd-s-count-comment",
             "comment-only closed match",
             Status::Closed,
@@ -31710,6 +31711,7 @@ mod tests {
             created_at,
             None,
         );
+        comment_match.closed_at = Some(created_at);
         let open_comment_match = make_issue(
             "bd-s-count-open",
             "open comment match",
@@ -31719,7 +31721,7 @@ mod tests {
             created_at,
             None,
         );
-        let closed_non_match = make_issue(
+        let mut closed_non_match = make_issue(
             "bd-s-count-absent",
             "closed without the token",
             Status::Closed,
@@ -31728,6 +31730,7 @@ mod tests {
             created_at,
             None,
         );
+        closed_non_match.closed_at = Some(created_at);
 
         for issue in [
             direct_match,
