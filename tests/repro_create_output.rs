@@ -1,9 +1,16 @@
+mod common;
+
 use assert_cmd::prelude::*;
 use std::process::Command;
+use tempfile::TempDir;
+
+fn isolated_tempdir() -> TempDir {
+    TempDir::new_in(common::cli::isolated_temp_root()).expect("create isolated temp dir")
+}
 
 #[test]
 fn test_create_json_output_is_single_object() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = isolated_tempdir();
     let path = temp.path();
 
     let bin = assert_cmd::cargo::cargo_bin!("br");
@@ -43,7 +50,7 @@ fn test_create_json_output_is_single_object() {
 
 #[test]
 fn test_create_dry_run_plain_output_is_line_oriented() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = isolated_tempdir();
     let path = temp.path();
 
     let bin = assert_cmd::cargo::cargo_bin!("br");
