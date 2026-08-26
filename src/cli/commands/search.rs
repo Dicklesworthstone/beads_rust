@@ -196,37 +196,18 @@ fn render_search_results(
             let rows = issues
                 .into_iter()
                 .map(|issue| issue_with_counts(issue, &mut relation_metadata));
-            if hidden_closed_count > 0 {
-                early_ctx.json_array_count(
-                    "issues",
-                    rows,
-                    "hidden_closed_count",
-                    hidden_closed_count,
-                );
-            } else {
-                early_ctx.json_array(rows);
-            }
+            early_ctx.json_array_count("issues", rows, "hidden_closed_count", hidden_closed_count);
             return Ok(());
         }
         OutputFormat::Toon => {
             let issues_with_counts = attach_counts(storage, issues)?;
-            if hidden_closed_count > 0 {
-                // TOON mirrors the JSON wrapper shape when closed matches
-                // were hidden; the legacy bare-array shape is preserved
-                // otherwise.
-                early_ctx.toon_with_stats(
-                    &SearchResultsWithHidden {
-                        issues: &issues_with_counts,
-                        hidden_closed_count,
-                    },
-                    list_args.stats,
-                );
-                return Ok(());
-            }
-            if early_ctx.toon_issue_counts_array_with_stats(&issues_with_counts, list_args.stats) {
-                return Ok(());
-            }
-            early_ctx.toon_with_stats(&issues_with_counts, list_args.stats);
+            early_ctx.toon_with_stats(
+                &SearchResults {
+                    issues: &issues_with_counts,
+                    hidden_closed_count,
+                },
+                list_args.stats,
+            );
             return Ok(());
         }
         OutputFormat::Csv => {
@@ -300,10 +281,10 @@ fn render_search_results(
     Ok(())
 }
 
-/// JSON/TOON wrapper emitted only when the default closed-issue exclusion
-/// hid matches (#445); the legacy bare-array shape is preserved otherwise.
+/// Stable JSON/TOON search envelope. The count is zero when the selected
+/// corpus already includes closed issues or no closed matches were hidden.
 #[derive(serde::Serialize)]
-struct SearchResultsWithHidden<'a> {
+struct SearchResults<'a> {
     issues: &'a [IssueWithCounts],
     hidden_closed_count: usize,
 }

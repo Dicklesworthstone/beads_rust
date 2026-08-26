@@ -908,10 +908,10 @@ of the corpus, so a bounded, relevance-ordered result set is the default.
 **Closed issues are excluded by default** (tombstones always). When that
 exclusion hides matches, text output ends with a trailing note
 (`note: N closed match(es) hidden; rerun with --all to include them`), and
-JSON/TOON output becomes a wrapper object with a `hidden_closed_count` field
-alongside `issues` — the legacy bare-array shape is preserved when nothing was
-hidden. Pass `--all` (or a terminal `--status` such as `closed`) to include
-closed issues.
+JSON/TOON output always uses the stable wrapper
+`{"issues": [...], "hidden_closed_count": N}`. The count is zero when nothing
+was hidden or the selected corpus already includes closed issues. Pass `--all`
+(or a terminal `--status` such as `closed`) to include closed issues.
 
 **Examples:**
 ```bash

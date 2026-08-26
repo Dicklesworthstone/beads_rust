@@ -194,8 +194,12 @@ fn e2e_queries_ready_stale_count_search() {
     );
     assert!(search.status.success(), "search failed: {}", search.stderr);
     let search_payload = extract_json_payload(&search.stdout);
-    let search_json: Vec<Value> = serde_json::from_str(&search_payload).expect("search json");
-    assert!(search_json.iter().any(|item| item["id"] == blocker_id));
+    let search_json: Value = serde_json::from_str(&search_payload).expect("search json");
+    let search_issues = search_json["issues"]
+        .as_array()
+        .expect("search issues array");
+    assert!(search_issues.iter().any(|item| item["id"] == blocker_id));
+    assert_eq!(search_json["hidden_closed_count"], 0);
 
     let search_text = run_br(&workspace, ["search", "Blocker"], "search_text");
     assert!(

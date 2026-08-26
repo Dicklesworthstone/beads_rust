@@ -187,8 +187,7 @@ fn search_basic_single_word() {
     );
     assert!(search.status.success(), "search failed: {}", search.stderr);
 
-    let payload = extract_json_payload(&search.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = extract_issues_array(&search.stdout);
 
     // Should find issues with "authentication" in title or description
     assert!(
@@ -217,11 +216,8 @@ fn search_case_insensitive() {
     let search_lower = run_br(&workspace, ["search", "database", "--json"], "search_lower");
     assert!(search_lower.status.success());
 
-    let upper_payload = extract_json_payload(&search_upper.stdout);
-    let lower_payload = extract_json_payload(&search_lower.stdout);
-
-    let upper_json: Vec<Value> = serde_json::from_str(&upper_payload).expect("parse upper");
-    let lower_json: Vec<Value> = serde_json::from_str(&lower_payload).expect("parse lower");
+    let upper_json = extract_issues_array(&search_upper.stdout);
+    let lower_json = extract_issues_array(&search_lower.stdout);
 
     // Both should find the same results (case-insensitive)
     assert_eq!(
@@ -243,8 +239,7 @@ fn search_multiple_words() {
     );
     assert!(search.status.success(), "search failed: {}", search.stderr);
 
-    let payload = extract_json_payload(&search.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = extract_issues_array(&search.stdout);
 
     // Should find issues containing "Authentication"
     assert!(
@@ -261,8 +256,7 @@ fn search_partial_word() {
     let search = run_br(&workspace, ["search", "auth", "--json"], "search_partial");
     assert!(search.status.success(), "search failed: {}", search.stderr);
 
-    let payload = extract_json_payload(&search.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = extract_issues_array(&search.stdout);
 
     assert!(json.len() >= 2, "Partial word search should find matches");
 }
@@ -306,8 +300,7 @@ fn search_with_type_filter() {
     );
     assert!(search.status.success(), "search failed: {}", search.stderr);
 
-    let payload = extract_json_payload(&search.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = extract_issues_array(&search.stdout);
 
     assert_eq!(
         json.len(),
@@ -329,8 +322,7 @@ fn search_with_priority_filter() {
     );
     assert!(search.status.success(), "search failed: {}", search.stderr);
 
-    let payload = extract_json_payload(&search.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = extract_issues_array(&search.stdout);
 
     assert_eq!(json.len(), 1, "Should find exactly 1 P0 API issue");
     assert_eq!(json[0]["priority"], 0);
@@ -347,8 +339,7 @@ fn search_with_label_filter() {
     );
     assert!(search.status.success(), "search failed: {}", search.stderr);
 
-    let payload = extract_json_payload(&search.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = extract_issues_array(&search.stdout);
 
     assert_eq!(json.len(), 1, "Should find 1 bug with auth label");
     assert!(
@@ -474,10 +465,11 @@ fn search_toon_reports_hidden_closed_count() {
 }
 
 #[test]
-fn search_hidden_closed_count_absent_without_closed_matches() {
+fn search_machine_output_reports_zero_without_closed_matches() {
     let (workspace, _ids) = setup_search_workspace();
 
-    // No closed issue mentions "database": legacy shapes must be preserved.
+    // No closed issue mentions "database", but the machine envelope remains
+    // stable and reports an explicit zero.
     let json_search = run_br(
         &workspace,
         ["search", "database", "--json"],
@@ -487,8 +479,24 @@ fn search_hidden_closed_count_absent_without_closed_matches() {
     let payload = extract_json_payload(&json_search.stdout);
     let json: Value = serde_json::from_str(&payload).expect("parse json");
     assert!(
-        json.is_array(),
-        "JSON should stay a bare array when nothing was hidden: {json}"
+        json["issues"].is_array(),
+        "JSON should always carry search rows under 'issues': {json}"
+    );
+    assert_eq!(
+        json["hidden_closed_count"], 0,
+        "JSON should report an explicit zero when nothing was hidden: {json}"
+    );
+
+    let toon_search = run_br(
+        &workspace,
+        ["search", "database", "--format", "toon"],
+        "search_no_hidden_toon",
+    );
+    assert!(toon_search.status.success());
+    assert!(
+        toon_search.stdout.contains("hidden_closed_count"),
+        "TOON should use the same stable wrapper when the count is zero: {}",
+        toon_search.stdout
     );
 
     let text_search = run_br(&workspace, ["search", "database"], "search_no_hidden_text");
@@ -501,7 +509,7 @@ fn search_hidden_closed_count_absent_without_closed_matches() {
 }
 
 #[test]
-fn search_hidden_closed_count_absent_with_all_flag() {
+fn search_machine_output_reports_zero_with_all_flag() {
     let (workspace, _ids) = setup_search_workspace();
 
     let search = run_br(
@@ -514,13 +522,17 @@ fn search_hidden_closed_count_absent_with_all_flag() {
     let payload = extract_json_payload(&search.stdout);
     let json: Value = serde_json::from_str(&payload).expect("parse json");
     assert!(
-        json.is_array(),
-        "--all includes closed issues, so the legacy array shape stays: {json}"
+        json["issues"].is_array(),
+        "--all should preserve the stable search envelope: {json}"
+    );
+    assert_eq!(
+        json["hidden_closed_count"], 0,
+        "--all includes closed issues, so none are hidden: {json}"
     );
 }
 
 #[test]
-fn search_hidden_closed_count_absent_with_status_closed() {
+fn search_machine_output_reports_zero_with_status_closed() {
     let (workspace, _ids) = setup_search_workspace();
 
     let search = run_br(
@@ -533,8 +545,12 @@ fn search_hidden_closed_count_absent_with_status_closed() {
     let payload = extract_json_payload(&search.stdout);
     let json: Value = serde_json::from_str(&payload).expect("parse json");
     assert!(
-        json.is_array(),
-        "--status closed already includes closed issues, so the legacy array shape stays: {json}"
+        json["issues"].is_array(),
+        "--status closed should preserve the stable search envelope: {json}"
+    );
+    assert_eq!(
+        json["hidden_closed_count"], 0,
+        "--status closed already includes closed issues: {json}"
     );
 }
 
@@ -570,10 +586,11 @@ fn search_json_output_structure() {
     assert!(search.status.success(), "search failed: {}", search.stderr);
 
     let payload = extract_json_payload(&search.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json: Value = serde_json::from_str(&payload).expect("parse json");
+    assert_eq!(json["hidden_closed_count"], 0);
+    let issues = json["issues"].as_array().expect("search issues array");
 
-    if !json.is_empty() {
-        let first = &json[0];
+    if let Some(first) = issues.first() {
         assert!(first.get("id").is_some(), "Missing 'id' field");
         assert!(first.get("title").is_some(), "Missing 'title' field");
         assert!(first.get("status").is_some(), "Missing 'status' field");
@@ -599,9 +616,14 @@ fn search_no_results() {
     );
 
     let payload = extract_json_payload(&search.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json: Value = serde_json::from_str(&payload).expect("parse json");
 
-    assert_eq!(json.len(), 0, "Should find no results");
+    assert_eq!(
+        json["issues"],
+        serde_json::json!([]),
+        "Should find no results"
+    );
+    assert_eq!(json["hidden_closed_count"], 0);
 }
 
 #[test]
@@ -613,8 +635,10 @@ fn search_empty_query() {
 
     // Either succeeds with all results or fails with error
     if search.status.success() {
-        let payload = extract_json_payload(&search.stdout);
-        let _json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+        let json: Value = serde_json::from_str(&extract_json_payload(&search.stdout))
+            .expect("parse search envelope");
+        assert!(json["issues"].is_array());
+        assert!(json["hidden_closed_count"].is_number());
     }
     // If it fails, that's also acceptable behavior
 }
@@ -643,8 +667,7 @@ fn search_special_characters() {
     let search = run_br(&workspace, ["search", "C++", "--json"], "search_cpp");
     assert!(search.status.success(), "search failed: {}", search.stderr);
 
-    let payload = extract_json_payload(&search.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = extract_issues_array(&search.stdout);
 
     assert_eq!(json.len(), 1, "Should find the C++ issue");
 }
@@ -656,8 +679,7 @@ fn search_with_numbers() {
     let search = run_br(&workspace, ["search", "2.0", "--json"], "search_version");
     assert!(search.status.success(), "search failed: {}", search.stderr);
 
-    let payload = extract_json_payload(&search.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = extract_issues_array(&search.stdout);
 
     assert!(!json.is_empty(), "Should find version 2.0 issue");
     assert!(json[0]["title"].as_str().unwrap().contains("2.0"));
@@ -683,8 +705,7 @@ fn search_finds_content_in_description() {
     let search = run_br(&workspace, ["search", "TOTP", "--json"], "search_desc");
     assert!(search.status.success(), "search failed: {}", search.stderr);
 
-    let payload = extract_json_payload(&search.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = extract_issues_array(&search.stdout);
 
     assert_eq!(json.len(), 1, "Should find issue with TOTP in description");
     assert!(json[0]["title"].as_str().unwrap().contains("two-factor"));
@@ -702,8 +723,7 @@ fn search_finds_content_in_title_only() {
     );
     assert!(search.status.success(), "search failed: {}", search.stderr);
 
-    let payload = extract_json_payload(&search.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = extract_issues_array(&search.stdout);
 
     assert_eq!(json.len(), 1, "Should find issue with Dashboard in title");
     assert!(json[0]["title"].as_str().unwrap().contains("Dashboard"));

@@ -250,49 +250,6 @@ fn toon_lines_len(lines: &[String]) -> usize {
     lines.iter().map(String::len).sum::<usize>() + lines.len().saturating_sub(1)
 }
 
-fn write_toon_issue_counts_array_to_writer<W: Write>(
-    writer: &mut W,
-    rows: &[IssueWithCounts],
-    fields: &[&'static str],
-) -> serde_json::Result<()> {
-    if rows.is_empty() {
-        return writer.write_all(b"[0]:").map_err(serde_json::Error::io);
-    }
-
-    let mut header = String::new();
-    header.push('[');
-    header.push_str(&rows.len().to_string());
-    header.push_str("]{");
-    for (index, field) in fields.iter().enumerate() {
-        if index > 0 {
-            header.push(',');
-        }
-        header.push_str(field);
-    }
-    header.push_str("}:");
-    writer
-        .write_all(header.as_bytes())
-        .map_err(serde_json::Error::io)?;
-
-    let mut line = String::new();
-    for row in rows {
-        line.clear();
-        line.push_str("  ");
-        for (index, field) in fields.iter().enumerate() {
-            if index > 0 {
-                line.push(',');
-            }
-            push_toon_issue_counts_field(&mut line, row, field);
-        }
-        writer.write_all(b"\n").map_err(serde_json::Error::io)?;
-        writer
-            .write_all(line.as_bytes())
-            .map_err(serde_json::Error::io)?;
-    }
-
-    Ok(())
-}
-
 fn write_toon_list_page_to_writer<W: Write>(
     writer: &mut W,
     page: &ListPage,
@@ -441,166 +398,6 @@ fn write_toon_issue_source_fields<W: Write>(
     write_toon_true_field_if_set(writer, line, "pinned", issue.pinned)?;
     write_toon_true_field_if_set(writer, line, "is_template", issue.is_template)?;
     write_toon_labels_field(writer, line, &issue.labels)
-}
-
-fn issue_counts_toon_fields(row: &IssueWithCounts) -> Option<Vec<&'static str>> {
-    let issue = &row.issue;
-    if !issue.labels.is_empty() || !issue.dependencies.is_empty() || !issue.comments.is_empty() {
-        return None;
-    }
-
-    let mut fields = Vec::with_capacity(32);
-    fields.push("id");
-    fields.push("title");
-    push_optional_toon_field(&mut fields, issue.description.as_ref(), "description");
-    push_optional_toon_field(&mut fields, issue.design.as_ref(), "design");
-    push_optional_toon_field(
-        &mut fields,
-        issue.acceptance_criteria.as_ref(),
-        "acceptance_criteria",
-    );
-    push_optional_toon_field(&mut fields, issue.notes.as_ref(), "notes");
-    fields.push("status");
-    fields.push("priority");
-    fields.push("issue_type");
-    push_optional_toon_field(&mut fields, issue.assignee.as_ref(), "assignee");
-    push_optional_toon_field(&mut fields, issue.owner.as_ref(), "owner");
-    push_optional_toon_field(
-        &mut fields,
-        issue.estimated_minutes.as_ref(),
-        "estimated_minutes",
-    );
-    fields.push("created_at");
-    push_optional_toon_field(&mut fields, issue.created_by.as_ref(), "created_by");
-    fields.push("updated_at");
-    push_optional_toon_field(&mut fields, issue.closed_at.as_ref(), "closed_at");
-    push_optional_toon_field(&mut fields, issue.close_reason.as_ref(), "close_reason");
-    push_optional_toon_field(
-        &mut fields,
-        issue.closed_by_session.as_ref(),
-        "closed_by_session",
-    );
-    push_optional_toon_field(&mut fields, issue.due_at.as_ref(), "due_at");
-    push_optional_toon_field(&mut fields, issue.defer_until.as_ref(), "defer_until");
-    push_optional_toon_field(&mut fields, issue.external_ref.as_ref(), "external_ref");
-    push_optional_toon_field(&mut fields, issue.source_system.as_ref(), "source_system");
-    push_optional_toon_field(&mut fields, issue.source_repo.as_ref(), "source_repo");
-    push_optional_toon_field(
-        &mut fields,
-        issue.source_repo_path.as_ref(),
-        "source_repo_path",
-    );
-    push_optional_toon_field(&mut fields, issue.deleted_at.as_ref(), "deleted_at");
-    push_optional_toon_field(&mut fields, issue.deleted_by.as_ref(), "deleted_by");
-    push_optional_toon_field(&mut fields, issue.delete_reason.as_ref(), "delete_reason");
-    push_optional_toon_field(&mut fields, issue.original_type.as_ref(), "original_type");
-    fields.push("compaction_level");
-    push_optional_toon_field(&mut fields, issue.compacted_at.as_ref(), "compacted_at");
-    push_optional_toon_field(
-        &mut fields,
-        issue.compacted_at_commit.as_ref(),
-        "compacted_at_commit",
-    );
-    push_optional_toon_field(&mut fields, issue.original_size.as_ref(), "original_size");
-    push_optional_toon_field(&mut fields, issue.sender.as_ref(), "sender");
-    if issue.ephemeral {
-        fields.push("ephemeral");
-    }
-    if issue.pinned {
-        fields.push("pinned");
-    }
-    if issue.is_template {
-        fields.push("is_template");
-    }
-    fields.push("dependency_count");
-    fields.push("dependent_count");
-
-    Some(fields)
-}
-
-fn push_optional_toon_field<T>(
-    fields: &mut Vec<&'static str>,
-    value: Option<&T>,
-    field: &'static str,
-) {
-    if value.is_some() {
-        fields.push(field);
-    }
-}
-
-fn uniform_issue_counts_toon_fields(rows: &[IssueWithCounts]) -> Option<Vec<&'static str>> {
-    let first = rows.first()?;
-    let fields = issue_counts_toon_fields(first)?;
-    if rows
-        .iter()
-        .skip(1)
-        .all(|row| issue_counts_toon_fields(row).is_some_and(|row_fields| row_fields == fields))
-    {
-        Some(fields)
-    } else {
-        None
-    }
-}
-
-fn push_toon_issue_counts_field(out: &mut String, row: &IssueWithCounts, field: &str) {
-    let issue = &row.issue;
-    match field {
-        "id" => push_toon_string_value(out, &issue.id),
-        "title" => push_toon_string_value(out, &issue.title),
-        "description" => push_toon_string_value(out, issue.description.as_deref().unwrap_or("")),
-        "design" => push_toon_string_value(out, issue.design.as_deref().unwrap_or("")),
-        "acceptance_criteria" => {
-            push_toon_string_value(out, issue.acceptance_criteria.as_deref().unwrap_or(""));
-        }
-        "notes" => push_toon_string_value(out, issue.notes.as_deref().unwrap_or("")),
-        "status" => push_toon_string_value(out, issue.status.as_str()),
-        "priority" => out.push_str(&issue.priority.0.to_string()),
-        "issue_type" => push_toon_string_value(out, issue.issue_type.as_str()),
-        "assignee" => push_toon_string_value(out, issue.assignee.as_deref().unwrap_or("")),
-        "owner" => push_toon_string_value(out, issue.owner.as_deref().unwrap_or("")),
-        "estimated_minutes" => {
-            out.push_str(&issue.estimated_minutes.unwrap_or_default().to_string());
-        }
-        "created_at" => push_toon_datetime_value(out, &issue.created_at),
-        "created_by" => push_toon_string_value(out, issue.created_by.as_deref().unwrap_or("")),
-        "updated_at" => push_toon_datetime_value(out, &issue.updated_at),
-        "closed_at" => push_optional_toon_datetime_value(out, issue.closed_at.as_ref()),
-        "close_reason" => push_toon_string_value(out, issue.close_reason.as_deref().unwrap_or("")),
-        "closed_by_session" => {
-            push_toon_string_value(out, issue.closed_by_session.as_deref().unwrap_or(""));
-        }
-        "due_at" => push_optional_toon_datetime_value(out, issue.due_at.as_ref()),
-        "defer_until" => push_optional_toon_datetime_value(out, issue.defer_until.as_ref()),
-        "external_ref" => push_toon_string_value(out, issue.external_ref.as_deref().unwrap_or("")),
-        "source_system" => {
-            push_toon_string_value(out, issue.source_system.as_deref().unwrap_or(""));
-        }
-        "source_repo" => push_toon_string_value(out, issue.source_repo.as_deref().unwrap_or("")),
-        "source_repo_path" => {
-            push_toon_string_value(out, issue.source_repo_path.as_deref().unwrap_or(""));
-        }
-        "deleted_at" => push_optional_toon_datetime_value(out, issue.deleted_at.as_ref()),
-        "deleted_by" => push_toon_string_value(out, issue.deleted_by.as_deref().unwrap_or("")),
-        "delete_reason" => {
-            push_toon_string_value(out, issue.delete_reason.as_deref().unwrap_or(""));
-        }
-        "original_type" => {
-            push_toon_string_value(out, issue.original_type.as_deref().unwrap_or(""));
-        }
-        "compaction_level" => {
-            out.push_str(&issue.compaction_level.unwrap_or_default().to_string());
-        }
-        "compacted_at" => push_optional_toon_datetime_value(out, issue.compacted_at.as_ref()),
-        "compacted_at_commit" => {
-            push_toon_string_value(out, issue.compacted_at_commit.as_deref().unwrap_or(""));
-        }
-        "original_size" => out.push_str(&issue.original_size.unwrap_or_default().to_string()),
-        "sender" => push_toon_string_value(out, issue.sender.as_deref().unwrap_or("")),
-        "ephemeral" | "pinned" | "is_template" => out.push_str("true"),
-        "dependency_count" => out.push_str(&row.dependency_count.to_string()),
-        "dependent_count" => out.push_str(&row.dependent_count.to_string()),
-        _ => {}
-    }
 }
 
 fn write_toon_newline_and_line<W: Write>(writer: &mut W, line: &str) -> serde_json::Result<()> {
@@ -768,14 +565,6 @@ fn write_toon_bool_line<W: Write>(
 
 fn push_toon_datetime_value(out: &mut String, value: &DateTime<Utc>) {
     push_toon_string_value(out, &value.to_rfc3339_opts(SecondsFormat::AutoSi, true));
-}
-
-fn push_optional_toon_datetime_value(out: &mut String, value: Option<&DateTime<Utc>>) {
-    if let Some(value) = value {
-        push_toon_datetime_value(out, value);
-    } else {
-        out.push_str("null");
-    }
 }
 
 fn push_toon_string_value(out: &mut String, value: &str) {
@@ -1268,37 +1057,6 @@ impl OutputContext {
                 self.report_serialization_error("JSON", &err);
             }
         }
-    }
-
-    pub(crate) fn toon_issue_counts_array_with_stats(
-        &self,
-        values: &[IssueWithCounts],
-        show_stats: bool,
-    ) -> bool {
-        if !self.is_toon() {
-            return false;
-        }
-        if Self::should_emit_toon_stats(show_stats, std::env::var("TOON_STATS").is_ok()) {
-            return false;
-        }
-        let fields = if values.is_empty() {
-            Vec::new()
-        } else if let Some(fields) = uniform_issue_counts_toon_fields(values) {
-            fields
-        } else {
-            return false;
-        };
-
-        let stdout = io::stdout();
-        let mut out = io::BufWriter::with_capacity(JSON_OUTPUT_BUFFER_CAPACITY, stdout.lock());
-        if let Err(err) = write_toon_issue_counts_array_to_writer(&mut out, values, &fields) {
-            self.report_serialization_error("TOON", &err);
-            return true;
-        }
-        if let Err(err) = write_json_trailer_to_writer(&mut out) {
-            self.report_serialization_error("TOON", &err);
-        }
-        true
     }
 
     pub(crate) fn toon_list_page_with_stats(&self, page: &ListPage, show_stats: bool) -> bool {
@@ -1837,43 +1595,6 @@ mod tests {
     }
 
     #[test]
-    fn write_toon_issue_counts_array_to_writer_matches_materialized_encode_output() {
-        let rows = vec![
-            IssueWithCounts {
-                issue: toon_test_issue("bd-c-00002", "Blocked 2"),
-                dependency_count: 0,
-                dependent_count: 1,
-            },
-            IssueWithCounts {
-                issue: toon_test_issue("bd-c-00001", "123"),
-                dependency_count: 2,
-                dependent_count: 0,
-            },
-        ];
-        let fields = uniform_issue_counts_toon_fields(&rows).expect("uniform primitive fields");
-        let mut streamed = Vec::new();
-
-        write_toon_issue_counts_array_to_writer(&mut streamed, &rows, &fields)
-            .expect("streaming issue count TOON output failed");
-
-        let mut toon_value = JsonValue::from(
-            serde_json::to_value(&rows).expect("materialized issue count JSON failed"),
-        );
-        sanitize_toon_value(&mut toon_value);
-        let lines = encode_lines(toon_value, Some(toon_encode_options()));
-        let mut materialized = Vec::new();
-        write_toon_lines_to_writer(&mut materialized, &lines)
-            .expect("materialized TOON line output failed");
-
-        assert_eq!(streamed, materialized);
-        assert!(
-            String::from_utf8(streamed)
-                .expect("TOON output should be utf8")
-            .starts_with("[2]{id,title,description,design,acceptance_criteria,notes,status,priority,issue_type,created_at,created_by,updated_at,source_repo,compaction_level,dependency_count,dependent_count}:")
-        );
-    }
-
-    #[test]
     fn write_toon_list_page_to_writer_matches_materialized_encode_output() {
         let closed_at = Utc
             .with_ymd_and_hms(2026, 4, 2, 1, 40, 2)
@@ -1933,19 +1654,6 @@ mod tests {
                 .expect("TOON output should be utf8")
                 .starts_with("issues[2]:\n  - id: bd-c-00004")
         );
-    }
-
-    #[test]
-    fn uniform_issue_counts_toon_fields_rejects_nonprimitive_relation_fields() {
-        let mut issue = toon_test_issue("bd-c-00003", "Labeled");
-        issue.labels.push("perf".to_string());
-        let rows = vec![IssueWithCounts {
-            issue,
-            dependency_count: 0,
-            dependent_count: 0,
-        }];
-
-        assert!(uniform_issue_counts_toon_fields(&rows).is_none());
     }
 
     fn toon_test_issue(id: &str, title: &str) -> Issue {

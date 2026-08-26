@@ -737,10 +737,11 @@ where
 
 /// Count the issues in a `--json` payload, tolerating both output shapes.
 ///
-/// `beads_rust-ecr6`: br and bd do not agree on the envelope. `bd list --json`
-/// and `br ready|blocked|search --json` return a bare array, but
-/// `br list --json` returns `{"issues":[…],"total":…,"limit":…,"offset":…,
-/// "has_more":…}`. The harness compared counts with
+/// `beads_rust-ecr6`: br and bd do not agree on the envelope. `bd list|search
+/// --json` and `br ready|blocked --json` return a bare array, while `br list`
+/// and `br search` use wrapper objects with `issues`. The list wrapper also
+/// includes `total`, `limit`, `offset`, and `has_more`. The harness compared
+/// counts with
 /// `value.as_array().map(|a| a.len()).unwrap_or(0)`, which yields **0 for every
 /// `br list --json` payload regardless of content** — so `br` looked empty
 /// everywhere.

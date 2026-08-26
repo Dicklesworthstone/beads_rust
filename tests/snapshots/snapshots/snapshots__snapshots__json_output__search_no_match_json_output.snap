@@ -1,5 +1,8 @@
 ---
 source: tests/snapshots/json_output.rs
-expression: normalize_json(&json)
+expression: SnapshotJson(&normalize_json(&json))
 ---
-[]
+{
+  "issues": [],
+  "hidden_closed_count": 0
+}
