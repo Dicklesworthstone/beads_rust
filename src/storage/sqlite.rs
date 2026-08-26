@@ -33271,19 +33271,26 @@ mod tests {
             "bd-wide-child-0001".to_string(),
             "bd-wide-child-0002".to_string(),
         ];
-        for (projection, name) in [
-            (ReadyIssueProjection::Full, "full"),
-            (ReadyIssueProjection::Command, "command"),
-            (ReadyIssueProjection::Summary, "summary"),
-        ] {
-            let issues = storage
-                .get_ready_issues_with_projection(&filters, ReadySortPolicy::Oldest, projection)
-                .unwrap();
-            let ids = issues
-                .into_iter()
-                .map(|issue| issue.id)
-                .collect::<Vec<_>>();
-            assert_eq!(ids, expected, "{name} projection changed sort/limit semantics");
+        for (cache_state, stale) in [("healthy", false), ("stale", true)] {
+            if stale {
+                storage.mark_blocked_cache_stale().unwrap();
+            } else {
+                storage.rebuild_blocked_cache(true).unwrap();
+            }
+            for (projection, name) in [
+                (ReadyIssueProjection::Full, "full"),
+                (ReadyIssueProjection::Command, "command"),
+                (ReadyIssueProjection::Summary, "summary"),
+            ] {
+                let issues = storage
+                    .get_ready_issues_with_projection(&filters, ReadySortPolicy::Oldest, projection)
+                    .unwrap();
+                let ids = issues.into_iter().map(|issue| issue.id).collect::<Vec<_>>();
+                assert_eq!(
+                    ids, expected,
+                    "{cache_state} cache, {name} projection changed sort/limit semantics"
+                );
+            }
         }
     }
 
