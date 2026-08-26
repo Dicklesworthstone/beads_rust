@@ -1,8 +1,12 @@
+mod common;
+
 use assert_cmd::Command;
+use tempfile::TempDir;
 
 #[test]
 fn test_list_sort_title_case_insensitive() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp =
+        TempDir::new_in(common::cli::isolated_temp_root()).expect("create isolated temp dir");
     let path = temp.path();
 
     // Init

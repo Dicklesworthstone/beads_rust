@@ -49,10 +49,14 @@ fn run_ok(cwd: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+fn isolated_tempdir() -> TempDir {
+    TempDir::new_in(common::cli::isolated_temp_root()).expect("create isolated temp dir")
+}
+
 /// Build a workspace whose metadata claims the 2-row JSONL was imported while
 /// the DB only holds 1 issue. Returns the workspace tempdir.
 fn lying_metadata_workspace() -> TempDir {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let ws = tmp.path();
     run_ok(ws, &["init", "--prefix", "jd"]);
     run_ok(
@@ -147,7 +151,7 @@ fn import_shortcut_rejects_uncovered_hash_match_and_imports() {
 
 #[test]
 fn healthy_workspace_reports_no_drift() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let ws = tmp.path();
     run_ok(ws, &["init", "--prefix", "jd"]);
     run_ok(
