@@ -16,6 +16,10 @@ use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
+fn isolated_tempdir() -> TempDir {
+    TempDir::new_in(common::cli::isolated_temp_root()).expect("create isolated tempdir")
+}
+
 /// Hermetic `br` invocation rooted at `cwd` (same shape as the doctor
 /// chokepoint e2e).
 fn br_cmd(cwd: &Path) -> Command {
@@ -36,7 +40,7 @@ fn br_cmd(cwd: &Path) -> Command {
 
 #[test]
 fn doctor_fails_loudly_when_write_lock_is_a_directory() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let ws = tmp.path();
     let out = br_cmd(ws).arg("init").output().expect("br init spawned");
     assert!(out.status.success(), "br init failed: {out:?}");
@@ -67,7 +71,7 @@ fn doctor_fails_loudly_when_write_lock_is_a_directory() {
 
 #[test]
 fn mutating_command_fails_loudly_when_write_lock_is_a_directory() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let ws = tmp.path();
     let out = br_cmd(ws).arg("init").output().expect("br init spawned");
     assert!(out.status.success(), "br init failed: {out:?}");

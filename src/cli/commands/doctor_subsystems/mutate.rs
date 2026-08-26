@@ -342,6 +342,11 @@ pub struct ActionRecord {
     pub run_id: String,
     /// Stable fixer identifier.
     pub fixer_id: String,
+    /// Backup path relative to the run's `backups/` directory when repeated
+    /// mutations of the same workspace path require a versioned snapshot.
+    /// Omitted for the first snapshot, whose legacy location is `path`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_path: Option<String>,
     /// Whether step 6 succeeded.
     pub ok: bool,
     /// For [`Op::Rename`] only — destination path. `doctor undo` reads
@@ -500,6 +505,27 @@ fn write_verbatim_backup(src: &Path, dst: &Path, bytes: &[u8]) -> std::io::Resul
     Ok(())
 }
 
+fn verbatim_backup_path(run_dir: &Path, rel: &Path) -> (PathBuf, Option<String>) {
+    let backups = run_dir.join("backups");
+    let primary = backups.join(rel);
+    if !primary.exists() {
+        return (primary, None);
+    }
+
+    let stamp = now_ns();
+    for collision in 0_u32.. {
+        let relative = PathBuf::from(".versions")
+            .join(format!("{stamp}-{collision}"))
+            .join(rel);
+        let candidate = backups.join(&relative);
+        if !candidate.exists() {
+            return (candidate, Some(relative.to_string_lossy().into_owned()));
+        }
+    }
+
+    unreachable!("u32 backup-path collision space exhausted")
+}
+
 /// Strict byte-by-byte comparison of two files. Used to verify the
 /// verbatim backup matches the live file before we proceed with the
 /// mutation.
@@ -607,7 +633,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     //     a TOCTOU window between cmp_strict and execute_atomic where a
     //     concurrent writer could swap the file (and its mode) under us.
     let rel = path.strip_prefix(&ctx.repo_root).unwrap_or(path);
-    let backup = ctx.run_dir.join("backups").join(rel);
+    let (backup, backup_path) = verbatim_backup_path(&ctx.run_dir, rel);
     let existing_mode = if before_bytes_or_missing.is_some() {
         match fs::metadata(path) {
             Ok(meta) => Some(metadata_mode(&meta)),
@@ -667,6 +693,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         finished_at_ns,
         run_id: ctx.run_id.clone(),
         fixer_id: ctx.fixer_id.clone(),
+        backup_path,
         ok: true,
         rename_to,
         rolled_back: None,
@@ -1380,8 +1407,9 @@ fn execute_atomic(
 ///    `before_hash`. Missing files use the empty-input sentinel.
 /// 2. Enforce write_scopes for every target.
 /// 3. Write a verbatim backup of each existing target to
-///    `<run-dir>/backups/<rel-path>` and verify byte-identical via
-///    `cmp_strict` (same belt-and-braces tripwire `mutate()` uses).
+///    `<run-dir>/backups/<rel-path>`, or a versioned sibling when that
+///    path was already backed up earlier in the run, and verify
+///    byte-identical via `cmp_strict` (the same tripwire `mutate()` uses).
 /// 4. Run the closure (the legacy fixer's actual work).
 /// 5. Read each target AGAIN and compute `after_hash`.
 /// 6. Append one `actions.jsonl` line per target with `op = "legacy_op"`,
@@ -1411,10 +1439,19 @@ pub fn record_legacy_op<F>(
 where
     F: FnOnce() -> Result<(), BeadsError>,
 {
+    struct LegacyPreState {
+        path: PathBuf,
+        backup: PathBuf,
+        backup_path: Option<String>,
+        before_hash: String,
+        existed_before: bool,
+        bytes: Option<Vec<u8>>,
+    }
+
     // (1) + (2) + (3): pre-state capture for every target. We collect
     // before doing any disk write so a precondition failure on path N
     // does not leave a partial backup tree behind for paths 0..N-1.
-    let mut pre_state: Vec<(PathBuf, PathBuf, String, bool)> = Vec::with_capacity(paths.len());
+    let mut pre_state = Vec::with_capacity(paths.len());
     for path in paths {
         ensure_in_scope(&ctx.capabilities, path)?;
         let bytes_or_missing = match fs::read(path) {
@@ -1427,24 +1464,31 @@ where
             None => SHA256_EMPTY_PREFIXED.to_string(),
         };
         let rel = path.strip_prefix(&ctx.repo_root).unwrap_or(path);
-        let backup = ctx.run_dir.join("backups").join(rel);
-        let existed = bytes_or_missing.is_some();
-        if !ctx.dry_run
-            && let Some(bytes) = bytes_or_missing
-        {
-            write_verbatim_backup(path, &backup, &bytes).map_err(BeadsError::Io)?;
-            cmp_strict(path, &backup).map_err(BeadsError::Io)?;
-        }
-        pre_state.push((path.to_path_buf(), backup, before_hash, existed));
+        let (backup, backup_path) = verbatim_backup_path(&ctx.run_dir, rel);
+        pre_state.push(LegacyPreState {
+            path: path.to_path_buf(),
+            backup,
+            backup_path,
+            before_hash,
+            existed_before: bytes_or_missing.is_some(),
+            bytes: bytes_or_missing,
+        });
     }
 
     let started_at_ns = now_ns().saturating_sub(ctx.start_ns);
 
     if ctx.dry_run {
-        for (path, _, _, _) in &pre_state {
-            eprintln!("[dry-run] would mutate {}: legacy_op", path.display());
+        for state in &pre_state {
+            eprintln!("[dry-run] would mutate {}: legacy_op", state.path.display());
         }
         return Ok(());
+    }
+
+    for state in &pre_state {
+        if let Some(bytes) = &state.bytes {
+            write_verbatim_backup(&state.path, &state.backup, bytes).map_err(BeadsError::Io)?;
+            cmp_strict(&state.path, &state.backup).map_err(BeadsError::Io)?;
+        }
     }
 
     // (4) Run the legacy work. If it errors, we still record the audit
@@ -1457,9 +1501,12 @@ where
     let finished_at_ns = now_ns().saturating_sub(ctx.start_ns);
 
     // (5) + (6): post-state hash + actions.jsonl line per path.
-    for (path, _, before_hash, existed_before) in &pre_state {
-        let rel = path.strip_prefix(&ctx.repo_root).unwrap_or(path);
-        let after_bytes_or_missing = match fs::read(path) {
+    for state in &pre_state {
+        let rel = state
+            .path
+            .strip_prefix(&ctx.repo_root)
+            .unwrap_or(&state.path);
+        let after_bytes_or_missing = match fs::read(&state.path) {
             Ok(b) => Some(b),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(BeadsError::Io(e)),
@@ -1471,12 +1518,13 @@ where
         let record = ActionRecord {
             path: rel.to_string_lossy().into_owned(),
             op: "legacy_op",
-            before_hash: before_hash.clone(),
+            before_hash: state.before_hash.clone(),
             after_hash,
             started_at_ns,
             finished_at_ns,
             run_id: ctx.run_id.clone(),
             fixer_id: fixer_id.to_string(),
+            backup_path: state.backup_path.clone(),
             ok: legacy_ok,
             rename_to: None,
             rolled_back: None,
@@ -1491,7 +1539,7 @@ where
         // audit log. We append the extra field manually because
         // ActionRecord is a stable wire contract shared with non-legacy
         // ops.
-        if !existed_before {
+        if !state.existed_before {
             line = line.trim_end_matches('}').to_string() + ",\"existed_before\":false}";
         }
         line.push('\n');
@@ -1697,6 +1745,83 @@ mod tests {
                 .is_some_and(|msg| msg.contains("legacy fixer failed")),
             "legacy action should preserve closure error text: {action}"
         );
+    }
+
+    #[test]
+    fn repeated_legacy_ops_preserve_each_pre_mutation_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let target = beads_dir.join("repeated.txt");
+        fs::write(&target, b"original").unwrap();
+
+        let (ctx, actions_path) = make_ctx(tmp.path(), false);
+        record_legacy_op(&ctx, "first", &[&target], || {
+            fs::write(&target, b"intermediate").map_err(BeadsError::Io)
+        })
+        .unwrap();
+        record_legacy_op(&ctx, "second", &[&target], || {
+            fs::write(&target, b"final").map_err(BeadsError::Io)
+        })
+        .unwrap();
+
+        let actions = fs::read_to_string(actions_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(actions.len(), 2);
+        assert!(actions[0].get("backup_path").is_none());
+        let second_backup = actions[1]["backup_path"]
+            .as_str()
+            .expect("repeated path should use a versioned backup");
+
+        assert_eq!(
+            fs::read(ctx.run_dir.join("backups/.beads/repeated.txt")).unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            fs::read(ctx.run_dir.join("backups").join(second_backup)).unwrap(),
+            b"intermediate"
+        );
+        assert_eq!(actions[0]["before_hash"], sha256_hex_prefixed(b"original"));
+        assert_eq!(
+            actions[1]["before_hash"],
+            sha256_hex_prefixed(b"intermediate")
+        );
+        assert_eq!(fs::read(target).unwrap(), b"final");
+    }
+
+    #[test]
+    fn legacy_op_validates_every_target_before_writing_backups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let in_scope = beads_dir.join("in-scope.txt");
+        fs::write(&in_scope, b"original").unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        let out_of_scope = outside.path().join("out-of-scope.txt");
+        fs::write(&out_of_scope, b"outside").unwrap();
+
+        let (ctx, actions_path) = make_ctx(tmp.path(), false);
+        let invoked = std::cell::Cell::new(false);
+        let error = record_legacy_op(
+            &ctx,
+            "preflight-all-targets",
+            &[&in_scope, &out_of_scope],
+            || {
+                invoked.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("an out-of-scope target must reject the whole legacy operation");
+
+        assert!(error.to_string().contains("outside write_scopes"));
+        assert!(!invoked.get(), "legacy closure must not run after refusal");
+        assert_eq!(fs::read(&in_scope).unwrap(), b"original");
+        assert!(!ctx.run_dir.join("backups/.beads/in-scope.txt").exists());
+        assert_eq!(fs::metadata(actions_path).unwrap().len(), 0);
     }
 
     #[test]

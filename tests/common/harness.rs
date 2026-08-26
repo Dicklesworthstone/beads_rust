@@ -635,8 +635,8 @@ pub struct TestWorkspace {
 impl TestWorkspace {
     /// Create a new test workspace
     pub fn new(suite: &str, test: &str) -> Self {
-        let temp_dir = TempDir::new_in(super::cli::isolated_temp_root())
-            .expect("create isolated temp dir");
+        let temp_dir =
+            TempDir::new_in(super::cli::isolated_temp_root()).expect("create isolated temp dir");
         let root = temp_dir.path().to_path_buf();
         let beads_dir = root.join(".beads");
         let logger = ArtifactLogger::new(suite, test);

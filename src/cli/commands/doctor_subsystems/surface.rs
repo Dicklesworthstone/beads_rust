@@ -606,6 +606,10 @@ struct StoredActionRecord {
     path: String,
     op: String,
     before_hash: String,
+    /// Backup path relative to this run's `backups/` directory. Older and
+    /// first-write records omit it and use the workspace-relative `path`.
+    #[serde(default)]
+    backup_path: Option<String>,
     #[serde(default)]
     rename_to: Option<String>,
     /// Workspace-relative paths of the JSON snapshot files written by
@@ -923,18 +927,14 @@ fn restore_one(
     backups_dir: &Path,
     record: &StoredActionRecord,
 ) -> UndoStep {
-    let target = match workspace_relative_path(repo_root, &record.path) {
+    let target = match validated_action_target_path(repo_root, record) {
         Ok(target) => target,
-        Err(e) => {
-            return UndoStep {
-                path: record.path.clone(),
-                op: record.op.clone(),
-                status: format!("failed_invalid_action_path:{e}"),
-                backup_used: None,
-            };
-        }
+        Err(step) => return step,
     };
-    let backup = backups_dir.join(&record.path);
+    let backup = match validated_action_backup_path(backups_dir, record) {
+        Ok(backup) => backup,
+        Err(step) => return step,
+    };
 
     // For Rename ops we recorded an empty after-hash; the recovery is
     // to move the renamed file back from its destination.
@@ -1338,6 +1338,52 @@ fn workspace_relative_path(repo_root: &Path, rel: &str) -> std::result::Result<P
     Ok(repo_root.join(path))
 }
 
+fn validated_action_target_path(
+    repo_root: &Path,
+    record: &StoredActionRecord,
+) -> std::result::Result<PathBuf, UndoStep> {
+    workspace_relative_path(repo_root, &record.path).map_err(|error| UndoStep {
+        path: record.path.clone(),
+        op: record.op.clone(),
+        status: format!("failed_invalid_action_path:{error}"),
+        backup_used: None,
+    })
+}
+
+fn action_backup_path(
+    backups_dir: &Path,
+    record: &StoredActionRecord,
+) -> std::result::Result<PathBuf, String> {
+    let relative = record.backup_path.as_deref().unwrap_or(&record.path);
+    let path = Path::new(relative);
+    if path.is_absolute() {
+        return Err("absolute".to_string());
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err("path_traversal".to_string());
+    }
+    Ok(backups_dir.join(path))
+}
+
+fn validated_action_backup_path(
+    backups_dir: &Path,
+    record: &StoredActionRecord,
+) -> std::result::Result<PathBuf, UndoStep> {
+    action_backup_path(backups_dir, record).map_err(|error| UndoStep {
+        path: record.path.clone(),
+        op: record.op.clone(),
+        status: format!("failed_invalid_backup_path:{error}"),
+        backup_used: None,
+    })
+}
+
 /// Convert one JSON value back into an `SqliteValue` for re-binding.
 /// Mirrors the inverse of `mutate.rs::sqlite_value_to_json`.
 fn json_to_sqlite_value(
@@ -1546,18 +1592,14 @@ fn plan_one(
     backups_dir: &Path,
     record: &StoredActionRecord,
 ) -> UndoStep {
-    let target = match workspace_relative_path(repo_root, &record.path) {
+    let target = match validated_action_target_path(repo_root, record) {
         Ok(target) => target,
-        Err(e) => {
-            return UndoStep {
-                path: record.path.clone(),
-                op: record.op.clone(),
-                status: format!("failed_invalid_action_path:{e}"),
-                backup_used: None,
-            };
-        }
+        Err(step) => return step,
     };
-    let backup = backups_dir.join(&record.path);
+    let backup = match validated_action_backup_path(backups_dir, record) {
+        Ok(backup) => backup,
+        Err(step) => return step,
+    };
     if record.op == "rename"
         && let Some(rt) = &record.rename_to
     {
@@ -2103,6 +2145,7 @@ mod tests {
             path: ".beads/beads.db".to_string(),
             op: "db_exec".to_string(),
             before_hash: "sha256:test".to_string(),
+            backup_path: None,
             rename_to: None,
             db_snapshots: vec![".doctor/runs/r/backups/db/cache.json".to_string()],
             db_snapshot_sha256: Vec::new(),
@@ -2128,6 +2171,7 @@ mod tests {
             path: ".beads/beads.db".to_string(),
             op: "db_exec".to_string(),
             before_hash: "sha256:test".to_string(),
+            backup_path: None,
             rename_to: None,
             db_snapshots: vec![".doctor/runs/r/backups/db/cache.json".to_string()],
             db_snapshot_sha256: Vec::new(),
@@ -2160,6 +2204,33 @@ mod tests {
     }
 
     #[test]
+    fn versioned_backup_paths_cannot_escape_backups_dir() {
+        let tmp = unique_temp_root("versioned-backup-paths");
+        let backups = tmp.path().join("backups");
+        let mut record = StoredActionRecord {
+            path: ".beads/beads.db".to_string(),
+            op: "legacy_op".to_string(),
+            before_hash: "sha256:test".to_string(),
+            backup_path: Some(".versions/1/.beads/beads.db".to_string()),
+            rename_to: None,
+            db_snapshots: Vec::new(),
+            db_snapshot_sha256: Vec::new(),
+            affected_tables: None,
+            affected_predicate: None,
+        };
+
+        assert_eq!(
+            action_backup_path(&backups, &record).unwrap(),
+            backups.join(".versions/1/.beads/beads.db")
+        );
+        record.backup_path = Some("../outside.db".to_string());
+        assert_eq!(
+            action_backup_path(&backups, &record).unwrap_err(),
+            "path_traversal"
+        );
+    }
+
+    #[test]
     fn doctor_undo_run_ids_are_identifiers_not_paths() {
         assert!(validate_run_id_arg("20260101T000000Z__abc123").is_ok());
 
@@ -2181,6 +2252,7 @@ mod tests {
             path: "../outside.db".to_string(),
             op: "db_exec".to_string(),
             before_hash: "sha256:test".to_string(),
+            backup_path: None,
             rename_to: None,
             db_snapshots: vec![".doctor/runs/r/backups/db/cache.json".to_string()],
             db_snapshot_sha256: Vec::new(),
@@ -2209,6 +2281,7 @@ mod tests {
             path: ".beads/foo.txt".to_string(),
             op: "write_file".to_string(),
             before_hash: sha256_bytes_hex_prefixed(b"original"),
+            backup_path: None,
             rename_to: None,
             db_snapshots: Vec::new(),
             db_snapshot_sha256: Vec::new(),
@@ -2236,6 +2309,7 @@ mod tests {
             path: ".beads/beads.db".to_string(),
             op: "db_exec".to_string(),
             before_hash: "sha256:test".to_string(),
+            backup_path: None,
             rename_to: None,
             db_snapshots: vec![rel.to_string()],
             db_snapshot_sha256: vec!["sha256:not-the-snapshot".to_string()],
@@ -2636,6 +2710,7 @@ mod tests {
             path: ".beads/renamed.txt".to_string(),
             op: "rename".to_string(),
             before_hash: sha256_bytes_hex_prefixed(b"payload"),
+            backup_path: None,
             rename_to: Some(outside_source.to_string_lossy().into_owned()),
             db_snapshots: Vec::new(),
             db_snapshot_sha256: Vec::new(),
@@ -2808,6 +2883,7 @@ mod tests {
             path: ".beads/beads.db".to_string(),
             op: "db_exec".to_string(),
             before_hash: "sha256:test".to_string(),
+            backup_path: None,
             rename_to: None,
             db_snapshots: vec![snap_rel.to_string()],
             db_snapshot_sha256: vec![expected_sha],

@@ -81,6 +81,10 @@ fn br_init(cwd: &Path) {
     );
 }
 
+fn isolated_tempdir() -> TempDir {
+    TempDir::new_in(common::cli::isolated_temp_root()).expect("create isolated tempdir")
+}
+
 /// Plant the `gitignore.beads_inner` failure: a root `.gitignore` whose
 /// `.beads/` line shadows br's own ignore rules.
 fn corrupt_root_gitignore(cwd: &Path) {
@@ -341,7 +345,7 @@ fn single_cache_row(db_path: &Path) -> (String, String) {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn chokepoint_round_trip_gitignore() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
 
     br_init(&root);
@@ -515,7 +519,7 @@ fn chokepoint_round_trip_gitignore() {
 
 #[test]
 fn repair_refuses_when_run_dir_creation_fails() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     br_init(&root);
     corrupt_root_gitignore(&root);
@@ -576,7 +580,7 @@ fn repair_refuses_when_run_dir_creation_fails() {
 #[test]
 #[ignore = "WP3 incomplete: --dry-run still creates repair run-dir/gitignore scaffolding before pure dry-run preflight"]
 fn chokepoint_dry_run_writes_no_files() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     br_init(&root);
     corrupt_root_gitignore(&root);
@@ -616,7 +620,7 @@ fn chokepoint_dry_run_writes_no_files() {
 
 #[test]
 fn chokepoint_idempotence() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     br_init(&root);
     corrupt_root_gitignore(&root);
@@ -692,7 +696,7 @@ fn chokepoint_idempotence() {
 
 #[test]
 fn chokepoint_undo_latest_resolves() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     br_init(&root);
     corrupt_root_gitignore(&root);
@@ -737,7 +741,7 @@ fn chokepoint_undo_latest_resolves() {
 
 #[test]
 fn chokepoint_capabilities_envelope_v1() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     // capabilities is repo-independent; we just need a cwd.
 
@@ -795,7 +799,7 @@ fn chokepoint_capabilities_envelope_v1() {
 
 #[test]
 fn chokepoint_robot_triage_envelope_v1() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     br_init(&root);
 
@@ -869,7 +873,7 @@ fn chokepoint_robot_triage_envelope_v1() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn chokepoint_db_exec_round_trip() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     let beads_dir = root.join(".beads");
     fs::create_dir_all(&beads_dir).expect("mkdir .beads");
@@ -971,7 +975,7 @@ fn chokepoint_db_exec_round_trip() {
 
 #[test]
 fn chokepoint_db_exec_undo_replay() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     let beads_dir = root.join(".beads");
     fs::create_dir_all(&beads_dir).expect("mkdir .beads");
@@ -1043,7 +1047,7 @@ fn chokepoint_db_exec_undo_replay() {
 
 #[test]
 fn chokepoint_repair_acquires_workspace_lock() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
 
     // Init a real workspace so .beads/.write.lock has a parent that
@@ -1156,7 +1160,7 @@ fn chokepoint_repair_acquires_workspace_lock() {
 fn chokepoint_repair_dry_run_refuses_on_lock_contention() {
     use std::time::{Duration, Instant};
 
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     br_init(&root);
 
@@ -1232,7 +1236,7 @@ fn chokepoint_repair_dry_run_refuses_on_lock_contention() {
 /// remain unchanged on refusal.
 #[test]
 fn chokepoint_refuse_gate_blocks_downgrade() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
 
     // Real init so .beads/.write.lock + metadata.json + a real DB
@@ -1345,7 +1349,7 @@ fn chokepoint_refuse_gate_blocks_downgrade() {
 /// refuse-unsafe gates before snapshotting or running REINDEX.
 #[test]
 fn chokepoint_repair_indexes_refuse_gate_blocks_downgrade() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
 
     br_init(&root);
@@ -1434,7 +1438,7 @@ fn chokepoint_repair_indexes_refuse_gate_blocks_downgrade() {
 
 #[test]
 fn chokepoint_doctor_in_non_beads_dir_exits_no_input() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     // Intentionally NO `br init` — this dir has no `.beads/`.
     assert!(!root.join(".beads").exists());
@@ -1463,22 +1467,21 @@ fn chokepoint_doctor_in_non_beads_dir_exits_no_input() {
 
 // ---------------------------------------------------------------------------
 // Test 12 (bead `beads_rust-8fud`): remaining legacy DB repair paths
-// (VACUUM, REINDEX, blocked-cache rebuild) route through the
+// (VACUUM, REINDEX, blocked-cache rebuild, and JSONL rebuild) route through the
 // chokepoint's `record_legacy_op` helper, so any disk mutation under
 // those fixers must produce a `legacy_op` line in `actions.jsonl` with
 // a `fixer_id` that names the legacy fn AND a verbatim backup under
 // `<run-dir>/backups/<rel-path>` whose SHA-256 matches the recorded
 // `before_hash`.
 //
-// We exercise the VACUUM path because it is the one most likely to
-// rewrite the DB file in ways that defeat naive byte-equality undo;
-// proving the audit + backup exist is the minimum-viable contract per
-// the bead's pitfall note.
+// We exercise page corruption because it forces a DB-family rewrite, either
+// through VACUUM when the database can still open or through the broader JSONL
+// rebuild fallback. Both must preserve the same audit and backup contract.
 // ---------------------------------------------------------------------------
 #[test]
 #[allow(clippy::too_many_lines)]
-fn legacy_op_audit_for_vacuum_via_page_corruption() {
-    let tmp = TempDir::new().expect("tempdir");
+fn legacy_op_audit_for_page_corruption_repair() {
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     br_init(&root);
 
@@ -1516,7 +1519,8 @@ fn legacy_op_audit_for_vacuum_via_page_corruption() {
     let _ = fs::remove_file(root.join(".beads").join("beads.db-shm"));
 
     // Overwrite a non-header page so `PRAGMA integrity_check` reports
-    // page-level corruption (the trigger for `repair_via_vacuum`).
+    // page-level corruption (a trigger for `repair_via_vacuum` or, if the
+    // damaged database cannot open, the JSONL rebuild fallback).
     {
         use std::io::{Seek, SeekFrom, Write};
 
@@ -1530,7 +1534,7 @@ fn legacy_op_audit_for_vacuum_via_page_corruption() {
         f.write_all(&junk).expect("corrupt page-2");
     }
 
-    // Capture the pre-VACUUM SHA-256 so we can compare to the backup.
+    // Capture the pre-repair SHA-256 so we can compare it to the backup.
     let pre_repair_db_bytes = fs::read(&db_path).expect("read corrupted db");
     let pre_repair_db_hash = sha256_hex(&pre_repair_db_bytes);
 
@@ -1566,6 +1570,7 @@ fn legacy_op_audit_for_vacuum_via_page_corruption() {
         "repair_via_vacuum",
         "repair_partial_indexes",
         "repair_recoverable_db_state",
+        "doctor.jsonl_rebuild",
     ]
     .into_iter()
     .collect();
@@ -1612,7 +1617,7 @@ fn legacy_op_audit_for_vacuum_via_page_corruption() {
         .trim_start_matches("sha256:");
     assert_eq!(
         recorded_before, pre_repair_db_hash,
-        "before_hash on legacy_op line does not match pre-VACUUM DB SHA-256"
+        "before_hash on legacy_op line does not match pre-repair DB SHA-256"
     );
 
     let backup_path = run_dir.join("backups").join(".beads").join("beads.db");
@@ -1626,14 +1631,13 @@ fn legacy_op_audit_for_vacuum_via_page_corruption() {
     assert_eq!(
         backup_hash,
         pre_repair_db_hash,
-        "backup bytes at {} do not match pre-VACUUM DB SHA-256",
+        "backup bytes at {} do not match pre-repair DB SHA-256",
         backup_path.display()
     );
 
     // Run `br doctor undo` and verify it does not fault on legacy_op
-    // entries. The byte-exact post-VACUUM restoration may not match
-    // pre-VACUUM (VACUUM rewrites the file at the page level so the
-    // post-VACUUM hash differs even after a notional roundtrip), but
+    // entries. The byte-exact post-repair restoration may not match
+    // the pre-repair file (DB-family rewrites change page-level bytes), but
     // undo must not surface as a hard failure for the legacy_op rows.
     let run_id = run_dir
         .file_name()
@@ -1732,7 +1736,7 @@ fn seed_dirty_issue_and_corrupt_db(root: &Path) -> String {
 
 #[test]
 fn repair_rebuild_preserves_dirty_unflushed_issue() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     let dirty_id = seed_dirty_issue_and_corrupt_db(&root);
 
@@ -1800,7 +1804,7 @@ fn startup_auto_recovery_preserves_dirty_unflushed_issue() {
     // Same corruption, but recovered by the startup probe's automatic
     // rebuild (config-layer `rebuild_with_tombstone_preservation`) when a
     // plain read command opens the workspace — no doctor involved.
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     let dirty_id = seed_dirty_issue_and_corrupt_db(&root);
 
@@ -1840,7 +1844,7 @@ fn startup_auto_recovery_preserves_dirty_unflushed_issue() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn e2e_reviewed_schema_migration_plan_apply_barrier_and_non_deleting_undo() {
-    let temp = TempDir::new().expect("tempdir");
+    let temp = isolated_tempdir();
     let root = temp.path().to_path_buf();
     br_init(&root);
     let db_path = root.join(".beads/beads.db");
