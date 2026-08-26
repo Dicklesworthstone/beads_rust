@@ -1469,8 +1469,10 @@ const BLOCKED_CACHE_RUNTIME_INDEXES: &[ExpectedRuntimeIndex] = &[runtime_index(
     false,
 )];
 
-// Exact partial-index predicates. Unquoted SQL syntax is case-insensitive, but
-// string-literal bytes are data and must compare exactly.
+// Partial-index predicates, compared semantically via a precedence-aware
+// canonicalization (`canonical_predicate_text`): grouping parentheses are
+// ignored because storage engines may re-parenthesize stored DDL, while
+// operator order and string-literal bytes must still match exactly.
 const EXPECTED_RUNTIME_PARTIAL_INDEX_PREDICATES: &[(&str, &str)] = &[
     ("idx_issues_assignee", "assignee IS NOT NULL"),
     ("idx_issues_external_ref_unique", "external_ref IS NOT NULL"),
@@ -2088,6 +2090,184 @@ fn sql_contains_token_sequence(sql: &str, expected: &str) -> bool {
             .any(|tokens| tokens == expected_tokens)
 }
 
+/// A boolean predicate parsed over SQL evidence tokens. Grouping parentheses
+/// are structural during parsing and deliberately absent from the canonical
+/// rendering, which re-derives only the parentheses that SQL operator
+/// precedence (`NOT` > `AND` > `OR`) still requires. Storage engines may
+/// rewrite DDL with redundant explicit grouping (frankensqlite does), so the
+/// runtime contract compares predicates modulo that normalization while
+/// remaining sensitive to operator order, string-literal bytes, and any
+/// regrouping that changes meaning.
+enum PredicateExpr {
+    /// A maximal run of non-structural tokens, e.g. one comparison operand chain.
+    Atom(Vec<SqlEvidenceToken>),
+    Not(Box<PredicateExpr>),
+    And(Vec<PredicateExpr>),
+    Or(Vec<PredicateExpr>),
+}
+
+struct PredicateParser<'a> {
+    tokens: &'a [SqlEvidenceToken],
+    position: usize,
+}
+
+impl<'a> PredicateParser<'a> {
+    fn peek(&self) -> Option<&'a SqlEvidenceToken> {
+        self.tokens.get(self.position)
+    }
+
+    fn is_keyword(&self, keyword: &str) -> bool {
+        matches!(
+            self.peek(),
+            Some(SqlEvidenceToken::Unquoted(word)) if word == keyword
+        )
+    }
+
+    fn parse_or(&mut self) -> Option<PredicateExpr> {
+        let mut operands = vec![self.parse_and()?];
+        while self.is_keyword("or") {
+            self.position += 1;
+            operands.push(self.parse_and()?);
+        }
+        Some(if operands.len() == 1 {
+            operands.pop().expect("operand list is never empty")
+        } else {
+            PredicateExpr::Or(operands)
+        })
+    }
+
+    fn parse_and(&mut self) -> Option<PredicateExpr> {
+        let mut operands = vec![self.parse_factor()?];
+        while self.is_keyword("and") {
+            self.position += 1;
+            operands.push(self.parse_factor()?);
+        }
+        Some(if operands.len() == 1 {
+            operands.pop().expect("operand list is never empty")
+        } else {
+            PredicateExpr::And(operands)
+        })
+    }
+
+    fn parse_factor(&mut self) -> Option<PredicateExpr> {
+        if self.is_keyword("not") {
+            self.position += 1;
+            return Some(PredicateExpr::Not(Box::new(self.parse_factor()?)));
+        }
+        if matches!(self.peek(), Some(SqlEvidenceToken::Symbol('('))) {
+            self.position += 1;
+            let grouped = self.parse_or()?;
+            if !matches!(self.peek(), Some(SqlEvidenceToken::Symbol(')'))) {
+                return None;
+            }
+            self.position += 1;
+            return Some(grouped);
+        }
+        let start = self.position;
+        let mut depth = 0usize;
+        while let Some(token) = self.peek() {
+            match token {
+                SqlEvidenceToken::Symbol('(') => depth += 1,
+                // An unbalanced closer belongs to the caller's group.
+                SqlEvidenceToken::Symbol(')') if depth == 0 => break,
+                SqlEvidenceToken::Symbol(')') => depth -= 1,
+                SqlEvidenceToken::Unquoted(word)
+                    if depth == 0 && (word == "and" || word == "or") =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+            self.position += 1;
+        }
+        if self.position == start {
+            return None;
+        }
+        Some(PredicateExpr::Atom(
+            self.tokens[start..self.position].to_vec(),
+        ))
+    }
+}
+
+fn parse_predicate_tokens(tokens: &[SqlEvidenceToken]) -> Option<PredicateExpr> {
+    let mut parser = PredicateParser {
+        tokens,
+        position: 0,
+    };
+    let expression = parser.parse_or()?;
+    (parser.position == tokens.len()).then_some(expression)
+}
+
+fn render_evidence_token(token: &SqlEvidenceToken, out: &mut String) {
+    match token {
+        SqlEvidenceToken::Unquoted(text)
+        | SqlEvidenceToken::StringLiteral(text)
+        | SqlEvidenceToken::QuotedIdentifier(text) => out.push_str(text),
+        SqlEvidenceToken::Symbol(symbol) => out.push(*symbol),
+    }
+}
+
+fn render_predicate(expr: &PredicateExpr, out: &mut String) {
+    match expr {
+        PredicateExpr::Atom(tokens) => {
+            for (index, token) in tokens.iter().enumerate() {
+                if index > 0 {
+                    out.push(' ');
+                }
+                render_evidence_token(token, out);
+            }
+        }
+        PredicateExpr::Not(operand) => {
+            out.push_str("not");
+            match &**operand {
+                // `NOT` binds tighter than `AND`/`OR`; a negated conjunction or
+                // disjunction must keep its grouping to preserve meaning.
+                PredicateExpr::Atom(_) | PredicateExpr::Not(_) => {
+                    out.push(' ');
+                    render_predicate(operand, out);
+                }
+                _ => {
+                    out.push_str(" (");
+                    render_predicate(operand, out);
+                    out.push(')');
+                }
+            }
+        }
+        PredicateExpr::And(operands) => {
+            for (index, operand) in operands.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(" and ");
+                }
+                match operand {
+                    PredicateExpr::Or(_) => {
+                        out.push('(');
+                        render_predicate(operand, out);
+                        out.push(')');
+                    }
+                    _ => render_predicate(operand, out),
+                }
+            }
+        }
+        PredicateExpr::Or(operands) => {
+            for (index, operand) in operands.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(" or ");
+                }
+                render_predicate(operand, out);
+            }
+        }
+    }
+}
+
+/// Canonicalize a predicate token stream for semantic comparison, or `None`
+/// when the stream is not a well-formed boolean expression.
+fn canonical_predicate_text(tokens: &[SqlEvidenceToken]) -> Option<String> {
+    let parsed = parse_predicate_tokens(tokens)?;
+    let mut rendered = String::new();
+    render_predicate(&parsed, &mut rendered);
+    Some(rendered)
+}
+
 fn parenthesized_sql_tokens(
     tokens: &[SqlEvidenceToken],
     open_parenthesis: usize,
@@ -2239,9 +2419,14 @@ fn semantic_partial_index_predicate_canonical(conn: &Connection, index: &str) ->
         return false;
     };
     let expected = sql_evidence_tokens(predicate);
-    tokens
-        .get(where_position + 1..)
-        .is_some_and(|actual| actual == expected.as_slice())
+    let Some(actual) = tokens.get(where_position + 1..) else {
+        return false;
+    };
+    // Compare modulo redundant grouping parentheses (storage engines may
+    // re-parenthesize DDL), but sensitive to operator order and literals.
+    canonical_predicate_text(actual).is_some_and(|actual| {
+        canonical_predicate_text(&expected).is_some_and(|expected| actual == expected)
+    })
 }
 
 fn auxiliary_runtime_table_canonical(
@@ -7242,6 +7427,127 @@ mod tests {
         );
         assert!(!runtime_schema_compatible(&conn));
         assert!(attest_runtime_schema_cookie(&conn).is_err());
+    }
+
+    #[test]
+    fn test_partial_index_predicate_canonical_accepts_engine_paren_normalization() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("paren_normalized_ready_index.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+
+        execute_batch(
+            &conn,
+            r"
+            DROP INDEX idx_issues_ready;
+            CREATE INDEX idx_issues_ready
+                ON issues(status, priority, created_at)
+                WHERE (((status = 'open') AND (ephemeral = 0)) AND (pinned = 0)) AND (is_template = 0);
+            ",
+        )
+        .expect("plant the exact frankensqlite-normalized ready predicate");
+
+        assert!(
+            semantic_partial_index_predicate_canonical(&conn, "idx_issues_ready"),
+            "redundant grouping parentheses must not fail the runtime contract"
+        );
+        assert!(runtime_schema_compatible(&conn));
+        assert!(attest_runtime_schema_cookie(&conn).is_ok());
+    }
+
+    #[test]
+    fn test_partial_index_predicate_canonical_accepts_regrouped_disjunction() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("regrouped_blocking_index.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+
+        execute_batch(
+            &conn,
+            r"
+            DROP INDEX idx_dependencies_blocking;
+            CREATE INDEX idx_dependencies_blocking
+                ON dependencies(depends_on_id, issue_id)
+                WHERE (((type = 'blocks') OR (type = 'parent-child')) OR (type = 'conditional-blocks')) OR (type = 'waits-for');
+            ",
+        )
+        .expect("plant a left-nested disjunction of the canonical blocking types");
+
+        assert!(
+            semantic_partial_index_predicate_canonical(&conn, "idx_dependencies_blocking"),
+            "associative regrouping of OR operands preserves meaning"
+        );
+        assert!(runtime_schema_compatible(&conn));
+    }
+
+    #[test]
+    fn test_partial_index_predicate_canonical_rejects_negated_operand() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("negated_ready_index.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+
+        execute_batch(
+            &conn,
+            r"
+            DROP INDEX idx_issues_ready;
+            CREATE INDEX idx_issues_ready
+                ON issues(status, priority, created_at)
+                WHERE status = 'open' AND ephemeral = 0 AND pinned = 0 AND NOT (is_template = 0);
+            ",
+        )
+        .expect("plant a semantically different negated predicate");
+
+        assert!(
+            !semantic_partial_index_predicate_canonical(&conn, "idx_issues_ready"),
+            "canonicalization must stay sensitive to operator semantics"
+        );
+        assert!(!runtime_schema_compatible(&conn));
+    }
+
+    #[test]
+    fn test_predicate_canonicalization_preserves_precedence_boundaries() {
+        let flat_or_first =
+            sql_evidence_tokens("a AND b OR c");
+        let grouped_and =
+            sql_evidence_tokens("a AND (b OR c)");
+        assert_ne!(
+            canonical_predicate_text(&flat_or_first),
+            canonical_predicate_text(&grouped_and),
+            "AND binds tighter than OR; regrouping across that boundary changes meaning"
+        );
+
+        let not_disjunction = sql_evidence_tokens("not (a OR b)");
+        let not_conjunct_only = sql_evidence_tokens("not a OR b");
+        assert_ne!(
+            canonical_predicate_text(&not_disjunction),
+            canonical_predicate_text(&not_conjunct_only),
+            "NOT binds tighter than OR; moving its operand boundary changes meaning"
+        );
+
+        let redundant_grouping = sql_evidence_tokens("((a) AND ((b)))");
+        let flat_conjunction = sql_evidence_tokens("a AND b");
+        assert_eq!(
+            canonical_predicate_text(&redundant_grouping),
+            canonical_predicate_text(&flat_conjunction),
+            "redundant grouping must canonicalize to the flat conjunction"
+        );
+
+        let left_associated = sql_evidence_tokens("(a AND b) AND c");
+        let right_associated = sql_evidence_tokens("a AND (b AND c)");
+        assert_eq!(
+            canonical_predicate_text(&left_associated),
+            canonical_predicate_text(&right_associated),
+            "AND is associative; either grouping must canonicalize identically"
+        );
+
+        let mixed_literal_case = sql_evidence_tokens("status = 'OPEN'");
+        let canonical_literal_case = sql_evidence_tokens("status = 'open'");
+        assert_ne!(
+            canonical_predicate_text(&mixed_literal_case),
+            canonical_predicate_text(&canonical_literal_case),
+            "string-literal bytes are data and must compare exactly"
+        );
     }
 
     #[test]
