@@ -10981,9 +10981,11 @@ fn pending_export_state(
     ))
 }
 
-/// Compute staleness based on JSONL mtime + content hash and DB dirty state.
+/// Compute staleness based on the JSONL content hash and DB dirty state.
 ///
-/// Uses Lstat (`symlink_metadata`) for JSONL mtime to match classic bd behavior.
+/// Mtime and size are retained as diagnostic witnesses, but they are not
+/// trusted as proof of unchanged content: a same-size rewrite can restore the
+/// previous mtime.
 ///
 /// # Errors
 ///
@@ -10996,8 +10998,7 @@ pub fn compute_staleness(storage: &SqliteStorage, jsonl_path: &Path) -> Result<S
 /// Compute staleness and opportunistically persist refreshed JSONL witnesses.
 ///
 /// When the stored content hash still matches but the cached mtime/size witness
-/// is stale or incomplete, this updates the metadata so later commands can skip
-/// re-hashing an unchanged JSONL file.
+/// is stale or incomplete, this updates the diagnostic metadata.
 ///
 /// # Errors
 ///
@@ -11107,75 +11108,20 @@ fn compute_jsonl_newer_impl(storage: &SqliteStorage, jsonl_path: &Path) -> Resul
     let stored_mtime = storage.get_metadata(METADATA_JSONL_MTIME)?;
     let stored_size = storage.get_metadata(METADATA_JSONL_SIZE)?;
     let stored_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
-    let mut refresh_witness = None;
-
-    if stored_mtime.as_deref() == Some(observed.mtime_witness.as_str()) {
-        let stored_size_matches =
-            stored_size.as_deref().and_then(parse_jsonl_size_witness) == Some(observed.size);
-        let jsonl_newer = if stored_size_matches {
-            stored_hash.is_none()
-        } else {
-            stored_hash.as_ref().is_none_or(|hash| {
-                compute_jsonl_hash(jsonl_path).map_or(true, |current_hash| &current_hash != hash)
-            })
-        };
-
-        if !jsonl_newer && stored_hash.is_some() && !stored_size_matches {
-            refresh_witness = Some(observed.clone());
-        }
-
-        return Ok(JsonlNewerProbe {
-            jsonl_exists: true,
-            jsonl_mtime: Some(observed.mtime),
-            jsonl_newer,
-            refresh_witness,
-        });
-    }
-
-    let last_import_time = storage.get_metadata(METADATA_LAST_IMPORT_TIME)?;
-    let last_export_time = storage.get_metadata(METADATA_LAST_EXPORT_TIME)?;
-
-    // Get the latest known sync time (either import or export)
-    let mut latest_sync_ts: Option<chrono::DateTime<Utc>> = None;
-
-    if let Some(import_time) = &last_import_time
-        && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(import_time)
-    {
-        latest_sync_ts = Some(ts.with_timezone(&Utc));
-    }
-
-    if let Some(export_time) = &last_export_time
-        && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(export_time)
-    {
-        let ts_utc = ts.with_timezone(&Utc);
-        if latest_sync_ts.is_none_or(|latest| ts_utc > latest) {
-            latest_sync_ts = Some(ts_utc);
-        }
-    }
-
-    // JSONL is newer if it was modified after the latest sync.
-    // If metadata is missing or invalid, assume JSONL is newer (safe default).
-    let mtime_newer = latest_sync_ts.is_none_or(|sync_ts| {
-        let sync_sys_time = std::time::SystemTime::from(sync_ts);
-        observed.mtime > sync_sys_time
-    });
-
-    let jsonl_newer = if mtime_newer {
-        stored_hash.as_ref().is_none_or(|stored_hash| {
-            compute_jsonl_hash(jsonl_path).map_or(true, |current_hash| &current_hash != stored_hash)
-        })
-    } else {
-        false
+    // Mtime and size are mutable filesystem metadata, not a content identity.
+    // In particular, external tooling can rewrite a file with the same length
+    // and restore its prior mtime. Only the canonical content hash proves that
+    // the JSONL still represents the state recorded by the database.
+    let jsonl_newer = match stored_hash {
+        Some(stored_hash) => compute_jsonl_hash(jsonl_path)? != stored_hash,
+        None => true,
     };
-
-    if !jsonl_newer && stored_hash.is_some() {
-        let stored_size_matches =
-            stored_size.as_deref().and_then(parse_jsonl_size_witness) == Some(observed.size);
-        if stored_mtime.as_deref() != Some(observed.mtime_witness.as_str()) || !stored_size_matches
-        {
-            refresh_witness = Some(observed.clone());
-        }
-    }
+    let stored_size_matches =
+        stored_size.as_deref().and_then(parse_jsonl_size_witness) == Some(observed.size);
+    let stored_mtime_matches =
+        stored_mtime.as_deref() == Some(observed.mtime_witness.as_str());
+    let refresh_witness = (!jsonl_newer && (!stored_mtime_matches || !stored_size_matches))
+        .then(|| observed.clone());
 
     Ok(JsonlNewerProbe {
         jsonl_exists: true,
@@ -19511,6 +19457,46 @@ mod tests {
         assert!(staleness.jsonl_exists);
         assert!(staleness.jsonl_newer);
         assert!(staleness.jsonl_mtime.is_some());
+    }
+
+    #[test]
+    fn test_compute_staleness_detects_same_size_rewrite_with_restored_mtime() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+        let original = b"{\"id\":\"bd-1\"}\n";
+        let replacement = b"{\"id\":\"bd-2\"}\n";
+        assert_eq!(original.len(), replacement.len());
+
+        fs::write(&jsonl_path, original).unwrap();
+        let original_witness = observed_jsonl_witness(&jsonl_path).unwrap();
+        let original_hash = compute_jsonl_hash(&jsonl_path).unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_CONTENT_HASH, &original_hash)
+            .unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_MTIME, &original_witness.mtime_witness)
+            .unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_SIZE, &original_witness.size.to_string())
+            .unwrap();
+
+        fs::write(&jsonl_path, replacement).unwrap();
+        File::options()
+            .write(true)
+            .open(&jsonl_path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(original_witness.mtime))
+            .unwrap();
+        let restored_witness = observed_jsonl_witness(&jsonl_path).unwrap();
+        assert_eq!(restored_witness.mtime_witness, original_witness.mtime_witness);
+        assert_eq!(restored_witness.size, original_witness.size);
+
+        let staleness = compute_staleness(&storage, &jsonl_path).unwrap();
+        assert!(
+            staleness.jsonl_newer,
+            "content hash must detect a rewrite even when mtime and size match"
+        );
     }
 
     #[test]
