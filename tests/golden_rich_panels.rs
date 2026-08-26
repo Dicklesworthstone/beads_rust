@@ -4,6 +4,8 @@
 //! output. These tests run `br` under `script(1)` so stdout is a pseudo-terminal
 //! and the Rich renderer observes the requested terminal width.
 
+mod common;
+
 use assert_cmd::Command;
 use insta::assert_snapshot;
 use regex::Regex;
@@ -100,7 +102,8 @@ fn create_issue(
 }
 
 fn init_fixture() -> RichFixture {
-    let temp_dir = TempDir::new().expect("temp dir");
+    let temp_dir =
+        TempDir::new_in(common::cli::isolated_temp_root()).expect("create isolated temp dir");
     let root = temp_dir.path().to_path_buf();
 
     run_setup_br(&root, &["init", "--prefix", "rich"]);
