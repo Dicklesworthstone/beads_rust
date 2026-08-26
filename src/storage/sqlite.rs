@@ -9525,6 +9525,15 @@ impl SqliteStorage {
             filters
         };
 
+        if ready_parent_membership_exceeds_sql_parameter_limit(filters, sort) {
+            return self.query_ready_issues_for_oversized_parent_membership(
+                filters,
+                sort,
+                projection,
+                readiness.blocked_cache_stale,
+            );
+        }
+
         // Read-only path: if the cache is stale, compute blocked IDs in memory
         // instead of persisting (issue #216 — read ops must not write).
         if readiness.blocked_cache_stale {
@@ -9597,6 +9606,95 @@ impl SqliteStorage {
         }
 
         Ok(members)
+    }
+
+    /// Query an oversized parent-membership set through multiple bounded SQL
+    /// statements. SQLite counts bound variables across the whole statement,
+    /// so splitting one `IN` predicate into `OR`-connected chunks does not make
+    /// more variables legal. Separate statements do; their results are merged,
+    /// deduplicated, globally sorted, and limited afterwards.
+    fn query_ready_issues_for_oversized_parent_membership(
+        &self,
+        filters: &ReadyFilters,
+        sort: ReadySortPolicy,
+        projection: ReadyIssueProjection,
+        blocked_cache_stale: bool,
+    ) -> Result<Vec<Issue>> {
+        tracing::debug!(
+            parent_member_count = filters.parent_member_ids.as_ref().map_or(0, Vec::len),
+            "Querying oversized ready parent membership in bounded chunks"
+        );
+
+        if blocked_cache_stale {
+            let blocked_ids = match Self::compute_blocked_issues_map_impl(&self.conn) {
+                Ok(map) => map.into_keys().collect(),
+                Err(error) => self.recover_blocked_ids("ready_parent_chunks_stale", &error)?,
+            };
+            return self.query_ready_parent_membership_chunks(
+                filters,
+                sort,
+                projection,
+                false,
+                Some(&blocked_ids),
+            );
+        }
+
+        match self.query_ready_parent_membership_chunks(filters, sort, projection, true, None) {
+            Ok(issues) => Ok(issues),
+            Err(error) => {
+                let blocked_ids = self.recover_blocked_ids("ready_parent_chunks_query", &error)?;
+                self.query_ready_parent_membership_chunks(
+                    filters,
+                    sort,
+                    projection,
+                    false,
+                    Some(&blocked_ids),
+                )
+            }
+        }
+    }
+
+    fn query_ready_parent_membership_chunks(
+        &self,
+        filters: &ReadyFilters,
+        sort: ReadySortPolicy,
+        projection: ReadyIssueProjection,
+        exclude_blocked_in_sql: bool,
+        blocked_ids: Option<&HashSet<String>>,
+    ) -> Result<Vec<Issue>> {
+        let parent_member_ids = filters
+            .parent_member_ids
+            .as_deref()
+            .unwrap_or_default();
+        let chunk_size = ready_parent_membership_sql_capacity(filters).max(1);
+        let mut issues = Vec::new();
+        for member_chunk in parent_member_ids.chunks(chunk_size) {
+            let mut chunk_filters = filters.clone();
+            chunk_filters.parent_member_ids = Some(member_chunk.to_vec());
+            chunk_filters.limit = None;
+            let mut chunk_issues = self.query_ready_issue_candidates_with_projection(
+                &chunk_filters,
+                sort,
+                exclude_blocked_in_sql,
+                false,
+                projection,
+            )?;
+            if let Some(blocked_ids) = blocked_ids {
+                chunk_issues.retain(|issue| !blocked_ids.contains(&issue.id));
+            }
+            issues.extend(chunk_issues);
+        }
+
+        let mut seen_ids = HashSet::with_capacity(issues.len());
+        issues.retain(|issue| seen_ids.insert(issue.id.clone()));
+        sort_ready_issues(&mut issues, sort);
+        if let Some(limit) = filters.limit
+            && limit > 0
+            && issues.len() > limit
+        {
+            issues.truncate(limit);
+        }
+        Ok(issues)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -16989,6 +17087,60 @@ fn ready_hybrid_high_bucket_priorities(priorities: Option<&[Priority]>) -> Vec<P
                 .collect()
         },
     )
+}
+
+fn ready_parent_membership_exceeds_sql_parameter_limit(
+    filters: &ReadyFilters,
+    sort: ReadySortPolicy,
+) -> bool {
+    let Some(parent_member_ids) = filters.parent_member_ids.as_deref() else {
+        return false;
+    };
+
+    let configured_priority_count = filters.priorities.as_ref().map_or(0, Vec::len);
+    let hybrid_priority_count = if sort == ReadySortPolicy::Hybrid
+        && filters.limit.is_some_and(|limit| limit > 0)
+    {
+        ready_hybrid_high_bucket_priorities(filters.priorities.as_deref()).len()
+    } else {
+        0
+    };
+    let non_parent_parameter_count = ready_non_parent_parameter_count(filters)
+        .saturating_add(hybrid_priority_count.saturating_sub(configured_priority_count));
+
+    parent_member_ids.len()
+        > SQLITE_VAR_LIMIT.saturating_sub(non_parent_parameter_count)
+}
+
+fn ready_parent_membership_sql_capacity(filters: &ReadyFilters) -> usize {
+    SQLITE_VAR_LIMIT.saturating_sub(ready_non_parent_parameter_count(filters))
+}
+
+fn ready_non_parent_parameter_count(filters: &ReadyFilters) -> usize {
+    filters
+        .labels_and
+        .len()
+        .saturating_add(filters.labels_or.len())
+        .saturating_add(filters.types.as_ref().map_or(0, Vec::len))
+        .saturating_add(filters.priorities.as_ref().map_or(0, Vec::len))
+        .saturating_add(usize::from(filters.assignee.is_some()))
+}
+
+fn sort_ready_issues(issues: &mut [Issue], sort: ReadySortPolicy) {
+    match sort {
+        ReadySortPolicy::Hybrid => sort_ready_hybrid(issues),
+        ReadySortPolicy::Priority => issues.sort_unstable_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.id.cmp(&right.id))
+        }),
+        ReadySortPolicy::Oldest => issues.sort_unstable_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        }),
+    }
 }
 
 fn parse_status(s: Option<&str>) -> Status {
@@ -33046,6 +33198,93 @@ mod tests {
             .get_ready_issues(&filters_nonexistent, ReadySortPolicy::Oldest)
             .unwrap();
         assert_eq!(res.len(), 0, "Non-existent parent should return empty");
+    }
+
+    #[test]
+    fn test_get_ready_issues_oversized_parent_membership_preserves_sort_and_limit() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 8, 26, 0, 0, 0).unwrap();
+        let parent = make_issue(
+            "bd-wide-parent",
+            "Wide parent",
+            Status::Open,
+            2,
+            None,
+            created_at,
+            None,
+        );
+        let unrelated = make_issue(
+            "bd-wide-unrelated",
+            "Unrelated",
+            Status::Open,
+            2,
+            None,
+            created_at,
+            None,
+        );
+        storage.create_issue(&parent, "tester").unwrap();
+        storage.create_issue(&unrelated, "tester").unwrap();
+
+        // More than SQLite's total bound-variable budget. The historical
+        // implementation emitted multiple `id IN (...)` chunks in one
+        // statement, but SQLite still counted every placeholder together.
+        let child_count = SQLITE_VAR_LIMIT + 101;
+        storage.conn.execute("BEGIN IMMEDIATE").unwrap();
+        for index in 0..child_count {
+            let id = format!("bd-wide-child-{index:04}");
+            let offset = i64::try_from(index).expect("child index fits in i64");
+            let timestamp = (created_at + chrono::Duration::seconds(offset)).to_rfc3339();
+            storage
+                .conn
+                .execute_with_params(
+                    "INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at) \
+                     VALUES (?, ?, 'open', 2, 'task', ?, ?)",
+                    &[
+                        SqliteValue::from(id.as_str()),
+                        SqliteValue::from(id.as_str()),
+                        SqliteValue::from(timestamp.as_str()),
+                        SqliteValue::from(timestamp.as_str()),
+                    ],
+                )
+                .unwrap();
+            storage
+                .conn
+                .execute_with_params(
+                    "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by) \
+                     VALUES (?, 'bd-wide-parent', 'parent-child', ?, 'tester')",
+                    &[
+                        SqliteValue::from(id.as_str()),
+                        SqliteValue::from(timestamp.as_str()),
+                    ],
+                )
+                .unwrap();
+        }
+        storage.conn.execute("COMMIT").unwrap();
+
+        let filters = ReadyFilters {
+            parent: Some("bd-wide-parent".to_string()),
+            limit: Some(3),
+            ..Default::default()
+        };
+        let expected = vec![
+            "bd-wide-child-0000".to_string(),
+            "bd-wide-child-0001".to_string(),
+            "bd-wide-child-0002".to_string(),
+        ];
+        for (projection, name) in [
+            (ReadyIssueProjection::Full, "full"),
+            (ReadyIssueProjection::Command, "command"),
+            (ReadyIssueProjection::Summary, "summary"),
+        ] {
+            let issues = storage
+                .get_ready_issues_with_projection(&filters, ReadySortPolicy::Oldest, projection)
+                .unwrap();
+            let ids = issues
+                .into_iter()
+                .map(|issue| issue.id)
+                .collect::<Vec<_>>();
+            assert_eq!(ids, expected, "{name} projection changed sort/limit semantics");
+        }
     }
 
     /// Regression: `--parent` combined with `--label` must return their
