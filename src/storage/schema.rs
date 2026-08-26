@@ -2695,11 +2695,29 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
         ));
     }
 
-    // Drop all indexes on the issues table first (they'll be recreated by SCHEMA_SQL)
-    let index_rows =
-        conn.query("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='issues' AND sql IS NOT NULL")?;
+    // Preserve exact DDL for operator-defined indexes attached to the canonical
+    // issues table. Dropping the table removes every attached index, but only
+    // br-owned indexes are recreated by SCHEMA_SQL. Without this snapshot an
+    // extension UNIQUE index (and therefore its constraint) silently vanishes
+    // whenever a legacy issues table needs a canonical rebuild.
+    let index_rows = conn.query(
+        "SELECT name, sql FROM main.sqlite_master
+         WHERE type = 'index' AND tbl_name = 'issues' AND sql IS NOT NULL",
+    )?;
+    let mut extension_index_sql = Vec::new();
     for row in &index_rows {
         if let Some(name) = row.get(0).and_then(SqliteValue::as_text) {
+            let is_canonical = ISSUES_RUNTIME_INDEXES
+                .iter()
+                .any(|expected| expected.name == name);
+            if !is_canonical {
+                let sql = row.get(1).and_then(SqliteValue::as_text).ok_or_else(|| {
+                    BeadsError::Config(format!(
+                        "Cannot preserve extension index {name}: sqlite_master omitted its DDL"
+                    ))
+                })?;
+                extension_index_sql.push(sql.to_string());
+            }
             conn.execute(&format!(
                 "DROP INDEX IF EXISTS main.{}",
                 quote_sql_identifier(name)
@@ -2787,6 +2805,14 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
     conn.execute(&copy_back_sql)?;
 
     conn.execute("DROP TABLE main.issues_rebuild_tmp")?;
+
+    // Canonical indexes are deliberately left for SCHEMA_SQL (or the reviewed
+    // migration's canonical-index pass) so stale br-owned definitions are not
+    // preserved. Operator-defined indexes retain their exact recorded DDL and
+    // enforcement semantics.
+    for sql in extension_index_sql {
+        conn.execute(&sql)?;
+    }
 
     Ok(())
 }
@@ -3603,6 +3629,16 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
     execute_batch(
         conn,
         r"
+        -- Core issue filters and ordering. These must be re-asserted here,
+        -- not only in SCHEMA_SQL: the v3 NOT NULL migration can rebuild the
+        -- issues table after SCHEMA_SQL has already run.
+        CREATE INDEX IF NOT EXISTS idx_issues_status ON issues(status);
+        CREATE INDEX IF NOT EXISTS idx_issues_priority ON issues(priority);
+        CREATE INDEX IF NOT EXISTS idx_issues_issue_type ON issues(issue_type);
+        CREATE INDEX IF NOT EXISTS idx_issues_assignee ON issues(assignee) WHERE assignee IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_issues_created_at ON issues(created_at);
+        CREATE INDEX IF NOT EXISTS idx_issues_updated_at ON issues(updated_at);
+
         -- Export/sync patterns
         CREATE INDEX IF NOT EXISTS idx_issues_content_hash ON issues(content_hash);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_issues_external_ref_unique ON issues(external_ref) WHERE external_ref IS NOT NULL;
@@ -6041,7 +6077,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rebuild_issues_table_quotes_database_sourced_index_names() {
+    fn test_rebuild_issues_table_preserves_quoted_extension_index_names() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("quoted-index-rebuild.db");
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
@@ -6062,9 +6098,107 @@ mod tests {
             Some("Preserve me")
         );
         assert!(
-            !index_exists(&conn, "idx_issues_hostile\"quote"),
-            "the hostile-name index should have been dropped, not reparsed as SQL"
+            index_exists(&conn, "idx_issues_hostile\"quote"),
+            "the quoted extension index should survive without reparsing its name as SQL"
         );
+    }
+
+    #[test]
+    fn test_rebuild_issues_table_preserves_extension_unique_index() {
+        const INDEX_NAME: &str = "extension_issues_source_title_unique";
+        const INDEX_DDL: &str = "CREATE UNIQUE INDEX extension_issues_source_title_unique ON issues(source_system, title) WHERE source_system != ''";
+
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("extension-index-rebuild.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        conn.execute(INDEX_DDL)
+            .expect("plant extension unique index on issues");
+        conn.execute(
+            "INSERT INTO issues (id, title, source_system)
+             VALUES ('extension-index', 'Preserve me', 'external')",
+        )
+        .expect("seed indexed issue");
+
+        rebuild_issues_table(&conn).expect("rebuild issues table");
+
+        let rebuilt_ddl = conn
+            .query_row(&format!(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = '{INDEX_NAME}'"
+            ))
+            .expect("extension index survives issues rebuild")
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .expect("extension index DDL is text")
+            .to_string();
+        assert_eq!(rebuilt_ddl, INDEX_DDL);
+
+        let duplicate_error = conn
+            .execute(
+                "INSERT INTO issues (id, title, source_system)
+                 VALUES ('extension-index-duplicate', 'Preserve me', 'external')",
+            )
+            .expect_err("extension unique index must remain enforced");
+        let duplicate_message = duplicate_error.to_string().to_ascii_lowercase();
+        assert!(
+            duplicate_message.contains("unique") || duplicate_message.contains("constraint"),
+            "expected unique/constraint failure, got: {duplicate_error}"
+        );
+    }
+
+    #[test]
+    fn test_v3_issues_rebuild_restores_canonical_and_extension_indexes() {
+        const EXTENSION_INDEX_NAME: &str = "extension_issues_source_title_unique";
+
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("v3-index-preservation.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let legacy_schema = SCHEMA_SQL
+            .replace(
+                "ephemeral INTEGER NOT NULL DEFAULT 0",
+                "ephemeral INTEGER DEFAULT 0",
+            )
+            .replace(
+                "pinned INTEGER NOT NULL DEFAULT 0",
+                "pinned INTEGER DEFAULT 0",
+            )
+            .replace(
+                "is_template INTEGER NOT NULL DEFAULT 0",
+                "is_template INTEGER DEFAULT 0",
+            );
+        assert_ne!(legacy_schema, SCHEMA_SQL, "fixture must weaken v3 flags");
+        execute_batch(&conn, &legacy_schema).expect("apply legacy schema");
+        conn.execute("PRAGMA user_version = 2")
+            .expect("stamp pre-v3 schema");
+        conn.execute(
+            "CREATE UNIQUE INDEX extension_issues_source_title_unique
+             ON issues(source_system, title) WHERE source_system != ''",
+        )
+        .expect("plant extension index");
+
+        apply_schema(&conn).expect("migrate v2 database to current schema");
+
+        for expected in ISSUES_RUNTIME_INDEXES {
+            assert!(
+                index_exists(&conn, expected.name),
+                "v3 rebuild lost canonical index {}",
+                expected.name
+            );
+        }
+        assert!(
+            index_exists(&conn, EXTENSION_INDEX_NAME),
+            "v3 rebuild lost operator-defined issues index"
+        );
+        conn.execute(
+            "INSERT INTO issues (id, title, source_system)
+             VALUES ('v3-extension', 'Preserve me', 'external')",
+        )
+        .expect("seed extension-indexed issue");
+        conn.execute(
+            "INSERT INTO issues (id, title, source_system)
+             VALUES ('v3-extension-duplicate', 'Preserve me', 'external')",
+        )
+        .expect_err("extension unique index must remain enforced after migration");
     }
 
     #[test]
