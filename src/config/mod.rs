@@ -4205,6 +4205,20 @@ impl OpenStorageResult {
             && should_attempt_jsonl_recovery(err, &self.paths.db_path, &self.paths.jsonl_path)
     }
 
+    /// True when a storage-replacement transition could not restore a
+    /// verified persistent database handle. Callers must surface the
+    /// transition error instead of attempting recovery through the
+    /// state-carrying in-memory sentinel.
+    #[must_use]
+    pub(crate) const fn database_transition_is_fail_closed(&self) -> bool {
+        self.database_transition_failed_closed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_database_transition_failed_closed_for_test(&mut self) {
+        self.database_transition_failed_closed = true;
+    }
+
     /// Rebuild the current SQLite database from the resolved JSONL export.
     ///
     /// On success, `auto_rebuilt` is set to `true` so downstream code can
