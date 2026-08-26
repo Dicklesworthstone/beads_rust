@@ -88,9 +88,13 @@ and search stops hiding the fact that it hid something.
 
 ### Test and release infrastructure
 
-- `install.sh` routes glibc hosts older than the gnu artifact floor to the
-  statically linked musl artifact, closing the loader-failure gap on
-  Debian 12 / Ubuntu 22.04 / RHEL 9 / AL2023 (#444).
+- Linux gnu release artifacts are now cross-compiled with cargo-zigbuild
+  against an explicit glibc 2.28 floor, asserted with readelf before
+  packaging; musl artifacts are asserted to carry zero GLIBC references
+  (#444). `install.sh` additionally routes glibc hosts older than the gnu
+  artifact floor to the statically linked musl artifact, closing the
+  loader-failure gap on Debian 12 / Ubuntu 22.04 / RHEL 9 / AL2023 even if
+  a future floor drifts.
 - The linked-worktree vcs-status e2e test is hermetic against host git
   config, and effective-config probes honor caller `GIT_CONFIG_SYSTEM` /
   `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_NOSYSTEM` read-location overrides (#437).

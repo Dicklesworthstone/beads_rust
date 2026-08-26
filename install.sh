@@ -138,14 +138,15 @@ INSTALL_MIGRATION_SKILL=0
 MAX_RETRIES=3
 DOWNLOAD_TIMEOUT=120
 INSTALLER_VERSION="2.1.0"
-# Minimum glibc the published linux gnu artifacts require (#444). The gnu
-# builds inherit the release builder's glibc, so hosts below this floor fail
-# in the loader before main with "version `GLIBC_x.y' not found". Keep this
-# in sync with the release pipeline's measured floor
-# (objdump -T br | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1).
+# Minimum glibc the published linux gnu artifacts require (#444). From
+# v0.5.2 the gnu builds are cross-compiled with cargo-zigbuild against an
+# explicit glibc 2.28 floor and the release pipeline asserts it with readelf
+# before packaging; releases v0.4.x-v0.5.1 inherited the build host's glibc
+# (2.39 floor). Keep this in sync with the release pipeline's measured floor
+# (readelf --dyn-syms br | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1).
 # Hosts below the floor are routed to the statically linked musl artifact,
 # which has zero GLIBC_* references and runs on any distribution.
-GNU_ARTIFACT_GLIBC_FLOOR="${GNU_ARTIFACT_GLIBC_FLOOR:-2.39}"
+GNU_ARTIFACT_GLIBC_FLOOR="${GNU_ARTIFACT_GLIBC_FLOOR:-2.28}"
 
 # Colors for fallback output
 RED='\033[0;31m'
