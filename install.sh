@@ -1408,11 +1408,53 @@ except Exception as exc:
 PY
 }
 
+# Windows ships a python3 App Execution Alias that exists on PATH but only
+# prints an install hint, so `command -v python3` alone is a lie there.
+# Every python3 branch must go through this functional probe instead.
+python3_is_functional() {
+    command -v python3 >/dev/null 2>&1 && python3 -c 'pass' >/dev/null 2>&1
+}
+
+# PowerShell fallback for zip member validation on Windows hosts without a
+# working python3 (stock Git-for-Windows). Applies the same policy as
+# validate_archive_members_python: no absolute paths, no drive prefixes, no
+# parent-directory traversal in any entry name.
+validate_zip_archive_members_powershell() {
+    local archive_path="$1"
+    local script_path="${TMP:-${TMPDIR:-/tmp}}/br-validate-zip.ps1"
+    local win_zip verdict
+    win_zip=$(cygpath -w "$archive_path" 2>/dev/null || printf '%s' "$archive_path")
+    cat > "$script_path" <<'PS1'
+param([string]$ZipPath)
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+try {
+    foreach ($entry in $zip.Entries) {
+        $name = $entry.FullName
+        if ($name -match '^[A-Za-z]:') { Write-Output 'UNSAFE'; exit 0 }
+        if ($name.StartsWith('/') -or $name.StartsWith('\')) { Write-Output 'UNSAFE'; exit 0 }
+        if (($name -split '[/\\]') -contains '..') { Write-Output 'UNSAFE'; exit 0 }
+    }
+    Write-Output 'SAFE'
+} finally { $zip.Dispose() }
+PS1
+    verdict=$(powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+        -File "$(cygpath -w "$script_path" 2>/dev/null || printf '%s' "$script_path")" \
+        -ZipPath "$win_zip" 2>/dev/null | tr -d '\r' | tail -1)
+    rm -f "$script_path" 2>/dev/null || true
+    if [ "$verdict" = "SAFE" ]; then
+        return 0
+    fi
+    log_error "Release zip failed member validation (verdict: ${verdict:-powershell-error})"
+    return 1
+}
+
 validate_tar_archive_members() {
     local archive_path="$1"
     local member line entry_type
 
-    if command -v python3 >/dev/null 2>&1; then
+    if python3_is_functional; then
         validate_archive_members_python "$archive_path" "tar"
         return $?
     fi
@@ -1438,12 +1480,17 @@ validate_tar_archive_members() {
 validate_zip_archive_members() {
     local archive_path="$1"
 
-    if command -v python3 >/dev/null 2>&1; then
+    if python3_is_functional; then
         validate_archive_members_python "$archive_path" "zip"
         return $?
     fi
 
-    log_error "python3 is required to validate zip archive members safely"
+    if command -v powershell.exe >/dev/null 2>&1; then
+        validate_zip_archive_members_powershell "$archive_path"
+        return $?
+    fi
+
+    log_error "python3 (or PowerShell on Windows) is required to validate zip archive members safely"
     return 1
 }
 
@@ -1519,7 +1566,7 @@ download_release() {
                 if ! bsdtar -xf "$TMP/$archive_name" -C "$extract_dir" 2>/dev/null; then
                     return 1
                 fi
-            elif command -v python3 &>/dev/null; then
+            elif python3_is_functional; then
                 if ! python3 - "$TMP/$archive_name" "$extract_dir" <<'PY'
 import sys
 import zipfile
@@ -1531,8 +1578,18 @@ PY
                 then
                     return 1
                 fi
+            elif command -v powershell.exe &>/dev/null; then
+                # Stock Git-for-Windows has no unzip, bsdtar, or working
+                # python3; Expand-Archive is always available there.
+                local win_zip win_dest
+                win_zip=$(cygpath -w "$TMP/$archive_name" 2>/dev/null || printf '%s' "$TMP/$archive_name")
+                win_dest=$(cygpath -w "$extract_dir" 2>/dev/null || printf '%s' "$extract_dir")
+                if ! powershell.exe -NoProfile -NonInteractive -Command \
+                    "Expand-Archive -LiteralPath '$win_zip' -DestinationPath '$win_dest' -Force" >/dev/null 2>&1; then
+                    return 1
+                fi
             else
-                log_error "No zip extractor available (need unzip, bsdtar, or python3)"
+                log_error "No zip extractor available (need unzip, bsdtar, python3, or PowerShell)"
                 return 1
             fi
             ;;
