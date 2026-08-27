@@ -111,7 +111,7 @@ jobs:
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: nightly-2026-08-20
+          toolchain: nightly-2026-08-25
 
       - name: Cache cargo
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
@@ -239,7 +239,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: nightly-2026-08-20
+          toolchain: nightly-2026-08-25
           targets: ${{ matrix.target }}
 
       - name: Ensure target is installed
@@ -729,7 +729,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: nightly-2026-08-20
+          toolchain: nightly-2026-08-25
 
       - name: Publish to crates.io
         # `--locked` pins resolution to Cargo.lock; without it, a nightly-only
