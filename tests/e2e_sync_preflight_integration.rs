@@ -679,17 +679,17 @@ fn cli_import_salvages_one_malformed_record_with_durable_receipt() {
         ["--json", "sync", "--status"],
         "status_after_salvage",
     );
-    assert!(status.status.success(), "sync status failed: {}", status.stderr);
+    assert!(
+        status.status.success(),
+        "sync status failed: {}",
+        status.stderr
+    );
     let status_json: serde_json::Value =
         serde_json::from_str(&status.stdout).expect("parse sync status");
     assert_eq!(status_json["db_newer"], true);
     assert_eq!(status_json["coverage_drift"], true);
 
-    let flush = run_br(
-        &workspace,
-        ["sync", "--flush-only"],
-        "flush_after_salvage",
-    );
+    let flush = run_br(&workspace, ["sync", "--flush-only"], "flush_after_salvage");
     assert!(
         flush.status.success(),
         "ordinary flush could not restore salvaged coverage: {}",

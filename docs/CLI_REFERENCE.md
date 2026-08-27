@@ -1413,7 +1413,7 @@ br sync [OPTIONS]
 | `--error-policy <POLICY>` | Export error handling: strict, best-effort, partial, required-core |
 | `--orphans <MODE>` | Orphan handling: strict, resurrect, skip, allow |
 | `--rename-prefix` | During import, rewrite mismatched issue-ID prefixes into the configured default prefix, preserving the id remainder |
-| `--skip-invalid-records` | With `--import-only`, explicitly salvage valid JSONL records while preserving and reporting every rejected source line |
+| `--skip-invalid-records` | With plain additive `--import-only`, explicitly salvage valid JSONL records while preserving and reporting every rejected source line |
 | `--rebuild` | During import, rebuild SQLite from JSONL and remove DB entries absent from JSONL |
 | `--dry-run` | With `--reconcile`, preview the plan without any mutation |
 | `--apply` | Apply a conflict-free `--reconcile-additive` plan transactionally |
@@ -1455,11 +1455,13 @@ br sync [OPTIONS]
 
 **Malformed-record salvage (`--skip-invalid-records`):**
 - This is an explicit recovery operation and is valid only with `--import-only`; normal import remains fail-closed on every invalid record.
+- Salvage is additive. It rejects `--force`, `--rebuild`, and `--rename-prefix` so a malformed source row cannot authorize deletion or ID rewriting.
 - Merge-conflict markers are never skipped. Resolve `<<<<<<<` / `=======` / `>>>>>>>` regions before salvage.
 - br validates each nonblank line as a complete issue record, rejects invalid or duplicate records, and refuses to publish an empty survivor set.
-- Before replacing the tracked JSONL, br stores the exact original bytes in a protected, non-rotating `.beads/.br_history/*pre-salvage*.jsonl` backup with target metadata.
+- Before replacing the tracked JSONL, br stores the exact original bytes in a protected `.beads/.br_history/*pre-salvage*.jsonl` backup with target metadata. Automatic age/count rotation excludes protected backups; an explicit history-prune command can still remove them.
 - The cleaned generation is staged, revalidated, conditionally published under the JSONL-family write authority, and then imported from the exact published snapshot.
-- Text output names every rejected line up to the normal human witness limit. `--json`/`--robot` emits the complete `salvage` receipt, including source/recovered digests, all line/error entries, the exact backup path, and publication atomicity.
+- Valid database rows absent from the survivor generation are preserved. br records their count in `database_records_requiring_export`, sets `needs_flush`, and directs the operator to run `br sync --flush-only` to restore the canonical JSONL.
+- Text output names every rejected line up to the normal human witness limit. `--json`/`--robot` emits the complete `salvage` receipt, including source/recovered digests, all line/error entries, the exact backup path, publication atomicity, preserved-record count, and whether `needs_flush` was armed.
 
 **Additive reconciliation semantics:**
 - `br sync --reconcile-additive --robot` is the default dry-run. It opens the current database read-only, compares exact issue IDs, and emits a hash-bound `br.sync.additive-reconciliation.v2` receipt plus a `plan_sha256` review token.

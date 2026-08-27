@@ -997,11 +997,17 @@ run the explicit salvage operation:
 br sync --import-only --skip-invalid-records --json
 ```
 
-br first preserves the exact original bytes in a protected, non-rotating
-`.beads/.br_history/*pre-salvage*.jsonl` backup. It then reports every rejected
-line, refuses if no valid records would remain, conditionally publishes the
-validated survivor generation, and imports that exact snapshot. Unresolved git
-conflict markers are never skipped.
+br first preserves the exact original bytes in a protected
+`.beads/.br_history/*pre-salvage*.jsonl` backup that automatic history rotation
+does not remove. It then reports every rejected line, refuses if no valid
+records would remain, conditionally publishes the validated survivor
+generation, and imports that exact snapshot. Salvage is additive and cannot be
+combined with `--force`, `--rebuild`, or `--rename-prefix`. If valid database
+rows were represented only by rejected JSONL records, the receipt reports how
+many were preserved, arms `needs_flush`, and directs you to run
+`br sync --flush-only` to restore JSONL coverage. Unresolved git conflict
+markers are never skipped. Explicit history-prune commands can still remove a
+protected backup, so retain it until recovery is verified.
 
 ### Sync Issues After Git Merge
 

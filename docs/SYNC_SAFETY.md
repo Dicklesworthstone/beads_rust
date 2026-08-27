@@ -23,7 +23,7 @@ guards.
 |-----------|-------------|
 | **Export** (`--flush-only`) | Writes issues from SQLite to `.beads/issues.jsonl` |
 | **Import** (`--import-only`) | Reads issues from JSONL into SQLite |
-| **Salvage import** (`--import-only --skip-invalid-records`) | Explicitly removes invalid records after preserving an exact protected source backup, then imports the validated survivor generation |
+| **Salvage import** (`--import-only --skip-invalid-records`) | Explicit additive recovery: removes invalid records after preserving an exact protected source backup, then imports the validated survivor generation |
 | **Merge** (`--merge`) | Three-way merge of base snapshot, SQLite, and JSONL |
 | **Additive reconciliation** (`--reconcile-additive`) | Plans exact-ID recovery of JSONL-only rows while preserving SQLite-only rows and events |
 | **Additive apply** (`--reconcile-additive --apply`) | Applies a conflict-free, hash-bound additive plan transactionally |
@@ -155,11 +155,18 @@ br sync --import-only --skip-invalid-records --json
 ```
 
 Salvage does not weaken the default parser. It retains exact original bytes in
-a protected `.beads/.br_history/*pre-salvage*.jsonl` backup, reports every
-rejected line in robot output, refuses when no valid record would remain, and
-still hard-fails on merge-conflict markers. The cleaned file is conditionally
-published under the same JSONL-family authority used by normal sync and the
-import consumes that exact immutable generation.
+a protected `.beads/.br_history/*pre-salvage*.jsonl` backup excluded from
+automatic age/count rotation, reports every rejected line in robot output,
+refuses when no valid record would remain, and still hard-fails on
+merge-conflict markers. Explicit history pruning can still remove the backup.
+The cleaned file is conditionally published under the same JSONL-family
+authority used by normal sync and the import consumes that exact immutable
+generation.
+
+The recovery is additive and rejects `--force`, `--rebuild`, and
+`--rename-prefix`. If the database preserves valid records absent from the
+cleaned JSONL, the receipt reports `database_records_requiring_export`, sets
+`needs_flush`, and a normal `br sync --flush-only` restores full JSONL coverage.
 
 **When to use --force:**
 - After a deliberate database reset
