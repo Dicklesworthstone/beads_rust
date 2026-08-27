@@ -4404,6 +4404,103 @@ fn row_bool(row: &Row, index: usize) -> bool {
     })
 }
 
+/// Human-readable per-index runtime-contract diagnostic for operator tooling.
+///
+/// For every expected explicit index in the core-table manifests, reports
+/// which canonicality sub-checks pass or fail, including the exact
+/// WHERE-predicate text the semantic comparator extracts. Consumers:
+/// `examples/schema_diag.rs` and operators debugging
+/// "runtime schema remains incompatible after repair" against a live copy.
+pub fn runtime_index_diagnostics(conn: &Connection) -> String {
+    let tables: &[(&str, &[ExpectedRuntimeIndex])] = &[
+        ("issues", ISSUES_RUNTIME_INDEXES),
+        ("dependencies", DEPENDENCIES_RUNTIME_INDEXES),
+        ("events", EVENTS_RUNTIME_INDEXES),
+    ];
+    let mut out = String::from("table|index|present|unique_ok|origin|partial_ok|key_ok|predicate_ok|actual_predicate\n");
+    for (table, indexes) in tables {
+        let escaped_table = table.replace('\'', "''");
+        let index_rows = match conn.query(&format!("PRAGMA index_list('{escaped_table}')")) {
+            Ok(rows) => rows,
+            Err(e) => {
+                out.push_str(&format!("{table}|<index_list error: {e}>|||||||\n"));
+                continue;
+            }
+        };
+        for expected in *indexes {
+            let row = index_rows
+                .iter()
+                .find(|row| row.get(1).and_then(SqliteValue::as_text) == Some(expected.name));
+            let Some(row) = row else {
+                out.push_str(&format!("{table}|{}|absent||||||\n", expected.name));
+                continue;
+            };
+            let unique_ok =
+                row.get(2).and_then(SqliteValue::as_integer) == Some(i64::from(expected.unique));
+            let origin = row
+                .get(3)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("?")
+                .to_string();
+            let partial = row
+                .get(4)
+                .and_then(SqliteValue::as_integer)
+                .is_some_and(|value| value != 0);
+            let partial_ok = partial == expected.partial;
+            let key_ok = runtime_index_key_shape_canonical(conn, expected.name, expected.columns);
+            let (predicate_ok, actual_predicate) = predicate_diagnostic(conn, expected.name);
+            out.push_str(&format!(
+                "{table}|{}|{}|{}|{}|{}|{key_ok}|{predicate_ok}|{actual_predicate}\n",
+                expected.name,
+                true,
+                unique_ok,
+                origin,
+                partial_ok,
+            ));
+        }
+    }
+    out
+}
+
+/// Extract and canonically render a partial index's stored WHERE predicate,
+/// mirroring `semantic_partial_index_predicate_canonical`'s extraction path.
+fn predicate_diagnostic(conn: &Connection, index: &str) -> (bool, String) {
+    let Some((_, predicate)) = EXPECTED_RUNTIME_PARTIAL_INDEX_PREDICATES
+        .iter()
+        .find(|(expected_index, _)| *expected_index == index)
+    else {
+        return (true, "<not partial>".to_string());
+    };
+    let escaped_index = index.replace('\'', "''");
+    let Ok(row) = conn.query_row(&format!(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = '{escaped_index}'"
+    )) else {
+        return (false, "<sqlite_master read failed>".to_string());
+    };
+    let Some(sql) = row.get(0).and_then(SqliteValue::as_text) else {
+        return (false, "<null or non-text sql>".to_string());
+    };
+    let mut tokens = sql_evidence_tokens(sql);
+    if tokens.last() == Some(&SqlEvidenceToken::Symbol(';')) {
+        tokens.pop();
+    }
+    let Some(where_position) = tokens.iter().rposition(
+        |token| matches!(token, SqlEvidenceToken::Unquoted(keyword) if keyword == "where"),
+    ) else {
+        return (false, format!("<no where clause in {sql}>"));
+    };
+    let Some(actual) = tokens.get(where_position + 1..) else {
+        return (false, "<empty predicate>".to_string());
+    };
+    let actual_canonical = canonical_predicate_text(actual)
+        .unwrap_or_else(|| "<canonicalize failed>".to_string());
+    let ok = canonical_predicate_text(actual).is_some_and(|actual| {
+        canonical_predicate_text(&sql_evidence_tokens(predicate))
+            .is_some_and(|expected| actual == expected)
+    });
+    (ok, actual_canonical)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
