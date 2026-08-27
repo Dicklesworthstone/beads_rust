@@ -3737,11 +3737,7 @@ impl SyncMergePendingReceipt {
         }
         if !matches!(
             self.intent.resolution.as_str(),
-            "manual"
-                | "force-db"
-                | "force-jsonl"
-                | "force-newer"
-                | "source-repo-path-migration"
+            "manual" | "force-db" | "force-jsonl" | "force-newer" | "source-repo-path-migration"
         ) {
             return Err(BeadsError::SyncConflict {
                 message: format!(

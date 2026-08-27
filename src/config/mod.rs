@@ -2711,15 +2711,47 @@ fn verify_rebuilt_issue_semantics(
                     "post-recovery semantic validation failed: imported issue {} is not addressable by its JSONL id",
                     expected.id
                 ))
-            })?;
+        })?;
         if !actual.sync_equals(expected) {
+            let differing_fields = sync_mismatch_field_names(&actual, expected);
             return Err(BeadsError::Config(format!(
-                "post-recovery semantic validation failed: imported issue {} does not match its normalized JSONL payload",
-                expected.id
+                "post-recovery semantic validation failed: imported issue {} does not match its normalized JSONL payload (differing fields: {})",
+                expected.id,
+                differing_fields.join(", ")
             )));
         }
     }
     Ok(())
+}
+
+fn sync_mismatch_field_names(
+    actual: &crate::model::Issue,
+    expected: &crate::model::Issue,
+) -> Vec<String> {
+    let Ok(serde_json::Value::Object(actual)) = serde_json::to_value(actual) else {
+        return vec!["unknown".to_string()];
+    };
+    let Ok(serde_json::Value::Object(expected)) = serde_json::to_value(expected) else {
+        return vec!["unknown".to_string()];
+    };
+    let mut fields = actual
+        .keys()
+        .chain(expected.keys())
+        .filter(|field| {
+            !matches!(
+                field.as_str(),
+                "created_at" | "updated_at" | "agent_context"
+            )
+        })
+        .filter(|field| actual.get(*field) != expected.get(*field))
+        .cloned()
+        .collect::<Vec<_>>();
+    fields.sort_unstable();
+    fields.dedup();
+    if fields.is_empty() {
+        fields.push("unknown".to_string());
+    }
+    fields
 }
 
 fn verify_rebuilt_table_count(
