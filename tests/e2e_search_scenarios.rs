@@ -13,6 +13,7 @@ mod common;
 
 use common::cli::{BrWorkspace, extract_issues_array, extract_json_payload, run_br};
 use serde_json::Value;
+use std::fs;
 
 fn parse_created_id(stdout: &str) -> String {
     let line = stdout.lines().next().unwrap_or("");
@@ -444,6 +445,99 @@ fn search_json_reports_hidden_closed_count() {
         json["issues"].is_array(),
         "wrapper should carry the result rows under 'issues': {json}"
     );
+    assert_eq!(json["limit"], 50);
+    assert_eq!(json["offset"], 0);
+    assert_eq!(json["has_more"], false);
+}
+
+#[test]
+fn search_default_page_discloses_additional_matches() {
+    let _log = common::test_log("search_default_page_discloses_additional_matches");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init_search_page");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let timestamp = "2026-08-27T00:00:00Z";
+    let mut jsonl = (0..60)
+        .map(|index| {
+            serde_json::to_string(&serde_json::json!({
+                "id": format!("bd-search-{index:02}"),
+                "title": format!("Needle result {index:02}"),
+                "description": "pagination-search-needle",
+                "status": "open",
+                "priority": 2,
+                "issue_type": "task",
+                "created_at": timestamp,
+                "updated_at": timestamp
+            }))
+            .expect("serialize search fixture")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    jsonl.push('\n');
+    fs::write(workspace.root.join(".beads/issues.jsonl"), jsonl)
+        .expect("write search pagination fixture");
+
+    let import = run_br(
+        &workspace,
+        ["sync", "--import-only", "--force"],
+        "import_search_page",
+    );
+    assert!(
+        import.status.success(),
+        "fixture import failed: stdout={} stderr={}",
+        import.stdout,
+        import.stderr
+    );
+
+    let text = run_br(
+        &workspace,
+        ["search", "pagination-search-needle"],
+        "search_default_text_page",
+    );
+    assert!(text.status.success(), "search text failed: {}", text.stderr);
+    assert!(
+        text.stdout.contains("Showing 50 issue(s)")
+            && text.stdout.contains("more matches exist")
+            && text.stdout.contains("--limit 0"),
+        "text search must disclose the bounded page: {}",
+        text.stdout
+    );
+
+    let json = run_br(
+        &workspace,
+        ["search", "pagination-search-needle", "--json"],
+        "search_default_json_page",
+    );
+    assert!(json.status.success(), "search json failed: {}", json.stderr);
+    let page: Value = serde_json::from_str(&json.stdout).expect("parse search page");
+    assert_eq!(page["issues"].as_array().map(Vec::len), Some(50));
+    assert_eq!(page["hidden_closed_count"], 0);
+    assert_eq!(page["limit"], 50);
+    assert_eq!(page["offset"], 0);
+    assert_eq!(page["has_more"], true);
+
+    let unlimited = run_br(
+        &workspace,
+        [
+            "search",
+            "pagination-search-needle",
+            "--limit",
+            "0",
+            "--json",
+        ],
+        "search_unlimited_json_page",
+    );
+    assert!(
+        unlimited.status.success(),
+        "unlimited search failed: {}",
+        unlimited.stderr
+    );
+    let page: Value = serde_json::from_str(&unlimited.stdout).expect("parse unlimited search");
+    assert_eq!(page["issues"].as_array().map(Vec::len), Some(60));
+    assert_eq!(page["limit"], 0);
+    assert_eq!(page["offset"], 0);
+    assert_eq!(page["has_more"], false);
 }
 
 #[test]

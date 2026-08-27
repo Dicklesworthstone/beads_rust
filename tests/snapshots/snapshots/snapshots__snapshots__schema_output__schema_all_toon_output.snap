@@ -1,5 +1,6 @@
 ---
 source: tests/snapshots/schema_output.rs
+assertion_line: 858
 expression: normalized_toon
 ---
 tool: br
@@ -523,6 +524,75 @@ schemas:
         format: date-time
     required[9]: blocked_by,blocked_by_count,created_at,id,issue_type,priority,status,title,updated_at
     "$defs":
+      IssueType:
+        description: Issue type category.
+        anyOf[2]:
+          - type: string
+            enum[7]: task,bug,feature,epic,chore,docs,question
+          - type: string
+      Priority:
+        description: "Issue priority (0=Critical, 4=Backlog)."
+        type: integer
+        format: int32
+      Status:
+        description: Issue lifecycle status.
+        anyOf[2]:
+          - type: string
+            enum[8]: open,in_progress,blocked,deferred,draft,closed,tombstone,pinned
+          - type: string
+  BlockedPage:
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+    title: BlockedPage
+    description: "Paginated machine-readable output from `br blocked`.\n\n`total` is the complete filtered blocked set before `limit` is applied.\nThis prevents a bounded page from being mistaken for the complete\ndependency-graph result (GitHub #452)."
+    type: object
+    properties:
+      issues:
+        type: array
+        items:
+          "$ref": #/$defs/BlockedIssueOutput
+      total:
+        type: integer
+        format: uint
+        minimum: 0
+      limit:
+        type: integer
+        format: uint
+        minimum: 0
+      offset:
+        type: integer
+        format: uint
+        minimum: 0
+      has_more.type: boolean
+    required[5]: issues,total,limit,offset,has_more
+    "$defs":
+      BlockedIssueOutput:
+        description: "Minimal issue output for blocked command (bd parity).\n\nContains only the fields that bd's blocked command outputs, plus `blocked_by` info.\nDoes NOT include: `compaction_level`, `original_size`"
+        type: object
+        properties:
+          blocked_by:
+            type: array
+            items.type: string
+          blocked_by_count:
+            type: integer
+            format: uint
+            minimum: 0
+          created_at:
+            type: string
+            format: date-time
+          created_by.type[2]: string,"null"
+          description.type[2]: string,"null"
+          id.type: string
+          issue_type:
+            "$ref": #/$defs/IssueType
+          priority:
+            "$ref": #/$defs/Priority
+          status:
+            "$ref": #/$defs/Status
+          title.type: string
+          updated_at:
+            type: string
+            format: date-time
+        required[9]: blocked_by,blocked_by_count,created_at,id,issue_type,priority,status,title,updated_at
       IssueType:
         description: Issue type category.
         anyOf[2]:
@@ -2472,11 +2542,12 @@ schemas:
         enum[8]: clean,modified,deleted,untracked,ignored,unmerged,comparison_unavailable,absent
 commands:
   blocked:
-    shape: array
-    jq_filter: ".[]"
-    items_at: .
+    shape: object
+    jq_filter: ".issues[]"
+    items_at: .issues
     item_schema: BlockedIssue
     error_envelope_on_stderr: false
+    notes: "Wrapper object with `total`, `limit`, `offset`, and `has_more`; iterate with `.issues[]`."
   capabilities:
     shape: object
     jq_filter: .
@@ -2553,7 +2624,7 @@ commands:
     items_at: .issues
     item_schema: IssueWithCounts
     error_envelope_on_stderr: false
-    notes: "Stable wrapper object `{\"issues\": [...], \"hidden_closed_count\": N}`; iterate with `.issues[]`. The count is zero when no closed matches were hidden or the selected corpus already includes closed issues."
+    notes: "Stable wrapper object `{\"issues\": [...], \"hidden_closed_count\": N}`; iterate with `.issues[]`. The count is zero when no closed matches were hidden or the selected corpus already includes closed issues. Pagination metadata also reports `limit`, `offset`, and `has_more`; `has_more` discloses truncation."
   show:
     shape: array
     jq_filter: ".[0]"
