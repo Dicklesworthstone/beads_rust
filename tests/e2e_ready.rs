@@ -1,6 +1,6 @@
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_issues_array, extract_json_payload, run_br};
 use serde_json::Value;
 use std::fs;
 
@@ -459,8 +459,7 @@ fn ready_respects_external_dependencies() {
         "blocked before failed: {}",
         blocked_before.stderr
     );
-    let blocked_payload = extract_json_payload(&blocked_before.stdout);
-    let blocked_json: Vec<Value> = serde_json::from_str(&blocked_payload).expect("blocked json");
+    let blocked_json = extract_issues_array(&blocked_before.stdout);
     assert!(
         blocked_json.iter().any(|item| item["id"] == issue_id),
         "blocked list should include external-blocked issue"
@@ -511,8 +510,7 @@ fn ready_respects_external_dependencies() {
         "blocked after failed: {}",
         blocked_after.stderr
     );
-    let blocked_payload = extract_json_payload(&blocked_after.stdout);
-    let blocked_json: Vec<Value> = serde_json::from_str(&blocked_payload).expect("blocked json");
+    let blocked_json = extract_issues_array(&blocked_after.stdout);
     assert!(
         !blocked_json.iter().any(|item| item["id"] == issue_id),
         "blocked list should clear after external dependency is satisfied"

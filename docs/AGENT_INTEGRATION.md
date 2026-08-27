@@ -119,9 +119,19 @@ br list --json --limit 5   # JSON always wins
 ### JSON Output Characteristics
 
 - **Always valid JSON** - parseable even on errors
-- **Arrays for lists** - `br list`, `br ready`, `br search`
-- **Objects for single items** - `br show`, `br create`
+- **Paginated objects** - `br list` and `br blocked` put rows under `.issues`
+  alongside `total`, `limit`, `offset`, and `has_more`
+- **Command-specific objects** - `br search` puts rows under `.issues` and
+  reports its additional search metadata
+- **Arrays for unpaginated collections** - for example `br ready` and `br stale`
 - **Structured errors** - error object with code and hints
+
+Discover the current envelope before parsing unfamiliar commands:
+
+```bash
+br schema commands --format json | jq '.commands.blocked'
+br blocked --json | jq '.issues[]'
+```
 
 ### Example Output
 

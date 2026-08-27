@@ -7525,6 +7525,21 @@ impl SqliteStorage {
                 "DELETE FROM child_counters WHERE parent_id = ?",
                 &[SqliteValue::from(id)],
             )?;
+            // Keep hard deletion independent of connection-level foreign-key
+            // enforcement. The fsqlite connection can legitimately have
+            // enforcement disabled around schema/recovery work, so relying on
+            // ON DELETE CASCADE here leaves DB-only workflow evidence orphaned
+            // after a successful purge (GitHub #453).
+            for statement in [
+                "DELETE FROM close_metadata WHERE issue_id = ?",
+                "DELETE FROM gate_results WHERE issue_id = ?",
+                "DELETE FROM gate_result_history WHERE issue_id = ?",
+                "DELETE FROM capacity_exemptions WHERE issue_id = ?",
+                "DELETE FROM capacity_exemption_history WHERE issue_id = ?",
+                "DELETE FROM capacity_occupancy WHERE issue_id = ?",
+            ] {
+                conn.execute_with_params(statement, &[SqliteValue::from(id)])?;
+            }
             conn.execute_with_params("DELETE FROM issues WHERE id = ?", &[SqliteValue::from(id)])?;
 
             // Record the intentional removal so the exporter's stale-database
@@ -24663,6 +24678,96 @@ mod tests {
             .and_then(SqliteValue::as_integer)
             .unwrap_or(0);
         assert_eq!(event_count, 0);
+    }
+
+    #[test]
+    fn test_purge_issue_removes_every_issue_owned_auxiliary_row() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-purge-aux",
+            "Purge auxiliary state",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        storage
+            .conn
+            .execute(
+                "INSERT INTO close_metadata (issue_id, bypassed_policy) \
+                 VALUES ('bd-purge-aux', 0)",
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute(
+                "INSERT INTO gate_results (issue_id, gate, provider, passed) \
+                 VALUES ('bd-purge-aux', 'review', 'test', 1)",
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute(
+                "INSERT INTO gate_result_history \
+                 (issue_id, from_status, to_status, status_revision, gate, provider, passed) \
+                 VALUES ('bd-purge-aux', 'open', 'closed', 1, 'review', 'test', 1)",
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute(
+                "INSERT INTO capacity_exemptions \
+                 (issue_id, capacity_kind, capacity_name, provider, reason, granted_by) \
+                 VALUES ('bd-purge-aux', 'status', 'open', 'test', 'test', 'tester')",
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute(
+                "INSERT INTO capacity_exemption_history \
+                 (issue_id, capacity_kind, capacity_name, action, provider, actor) \
+                 VALUES ('bd-purge-aux', 'status', 'open', 'grant', 'test', 'tester')",
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO capacity_occupancy (issue_id, actor) \
+                 VALUES ('bd-purge-aux', 'tester')",
+            )
+            .unwrap();
+
+        storage.purge_issue("bd-purge-aux", "tester").unwrap();
+
+        for table in [
+            "close_metadata",
+            "gate_results",
+            "gate_result_history",
+            "capacity_exemptions",
+            "capacity_exemption_history",
+            "capacity_occupancy",
+        ] {
+            let count = storage
+                .conn
+                .query_row(&format!(
+                    "SELECT COUNT(*) FROM {table} WHERE issue_id = 'bd-purge-aux'"
+                ))
+                .unwrap()
+                .get(0)
+                .and_then(SqliteValue::as_integer)
+                .unwrap_or_default();
+            assert_eq!(count, 0, "purge left an issue-owned row in {table}");
+        }
+
+        let foreign_key_violations = storage.conn.query("PRAGMA foreign_key_check").unwrap();
+        assert!(
+            foreign_key_violations.is_empty(),
+            "purge left foreign-key violations: {foreign_key_violations:?}"
+        );
     }
 
     #[test]

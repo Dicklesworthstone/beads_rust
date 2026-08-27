@@ -738,9 +738,9 @@ where
 /// Count the issues in a `--json` payload, tolerating both output shapes.
 ///
 /// `beads_rust-ecr6`: br and bd do not agree on the envelope. `bd list|search
-/// --json` and `br ready|blocked --json` return a bare array, while `br list`
-/// and `br search` use wrapper objects with `issues`. The list wrapper also
-/// includes `total`, `limit`, `offset`, and `has_more`. The harness compared
+/// --json` and `br ready --json` return a bare array, while `br list`, `br
+/// blocked`, and `br search` use wrapper objects with `issues`. Paginated
+/// wrappers also include `total`, `limit`, `offset`, and `has_more`. The harness compared
 /// counts with
 /// `value.as_array().map(|a| a.len()).unwrap_or(0)`, which yields **0 for every
 /// `br list --json` payload regardless of content** — so `br` looked empty
@@ -2303,10 +2303,7 @@ fn conformance_blocked_shows_blockers() {
         serde_json::from_str(&extract_json_payload(&bd_blocked_out.stdout)).unwrap_or_default();
 
     fn has_blocker(val: &Value, blocked_id: &str, blocker_id: &str) -> bool {
-        let Some(arr) = val.as_array() else {
-            return false;
-        };
-        for item in arr {
+        for item in issue_items(val) {
             if item.get("id").and_then(|v| v.as_str()) != Some(blocked_id) {
                 continue;
             }
@@ -2421,10 +2418,7 @@ fn conformance_blocked_multiple_blockers() {
         serde_json::from_str(&extract_json_payload(&bd_blocked_out.stdout)).unwrap_or_default();
 
     fn has_blocker(val: &Value, blocked_id: &str, blocker_id: &str) -> bool {
-        let Some(arr) = val.as_array() else {
-            return false;
-        };
-        for item in arr {
+        for item in issue_items(val) {
             if item.get("id").and_then(|v| v.as_str()) != Some(blocked_id) {
                 continue;
             }

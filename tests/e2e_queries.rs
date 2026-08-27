@@ -4,6 +4,7 @@ use common::cli::{
     BrWorkspace, extract_issues_array, extract_json_payload, run_br, run_br_with_env,
 };
 use serde_json::Value;
+use std::fs;
 
 fn parse_created_id(stdout: &str) -> String {
     let line = stdout.lines().next().unwrap_or("");
@@ -173,8 +174,15 @@ fn e2e_queries_ready_stale_count_search() {
         blocked.stderr
     );
     let blocked_payload = extract_json_payload(&blocked.stdout);
-    let blocked_json: Vec<Value> = serde_json::from_str(&blocked_payload).expect("blocked json");
-    assert!(blocked_json.iter().any(|item| item["id"] == blocked_id));
+    let blocked_json: Value = serde_json::from_str(&blocked_payload).expect("blocked json");
+    let blocked_issues = blocked_json["issues"]
+        .as_array()
+        .expect("blocked issues array");
+    assert!(blocked_issues.iter().any(|item| item["id"] == blocked_id));
+    assert_eq!(blocked_json["total"], 1);
+    assert_eq!(blocked_json["limit"], 50);
+    assert_eq!(blocked_json["offset"], 0);
+    assert_eq!(blocked_json["has_more"], false);
 
     let blocked_text = run_br(&workspace, ["blocked"], "blocked_text");
     assert!(
@@ -293,6 +301,117 @@ fn e2e_queries_ready_stale_count_search() {
     assert!(stale_json.len() >= 2);
     assert!(stale_json.iter().any(|item| item["id"] == blocker_id));
     assert!(stale_json.iter().any(|item| item["id"] == blocked_id));
+}
+
+#[test]
+fn e2e_blocked_default_page_reports_true_total_and_truncation() {
+    let _log = common::test_log("e2e_blocked_default_page_reports_true_total_and_truncation");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init_blocked_page");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let timestamp = "2026-08-27T00:00:00Z";
+    let mut records = vec![serde_json::json!({
+        "id": "bd-blocker",
+        "title": "The blocker",
+        "status": "open",
+        "priority": 1,
+        "issue_type": "task",
+        "created_at": timestamp,
+        "updated_at": timestamp
+    })];
+    for index in 0..60 {
+        let id = format!("bd-blocked-{index:02}");
+        records.push(serde_json::json!({
+            "id": id.clone(),
+            "title": format!("Blocked issue {index:02}"),
+            "status": "open",
+            "priority": 2,
+            "issue_type": "task",
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "dependencies": [{
+                "issue_id": id,
+                "depends_on_id": "bd-blocker",
+                "type": "blocks",
+                "created_at": timestamp,
+                "created_by": "fixture",
+                "metadata": "{}",
+                "thread_id": ""
+            }]
+        }));
+    }
+    let mut jsonl = records
+        .iter()
+        .map(|record| serde_json::to_string(record).expect("serialize blocked fixture"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    jsonl.push('\n');
+    fs::write(workspace.root.join(".beads/issues.jsonl"), jsonl)
+        .expect("write blocked pagination fixture");
+
+    let import = run_br(
+        &workspace,
+        ["sync", "--import-only", "--force"],
+        "import_blocked_page",
+    );
+    assert!(
+        import.status.success(),
+        "fixture import failed: stdout={} stderr={}",
+        import.stdout,
+        import.stderr
+    );
+
+    let text = run_br(&workspace, ["blocked"], "blocked_default_text_page");
+    assert!(
+        text.status.success(),
+        "blocked text failed: {}",
+        text.stderr
+    );
+    assert!(
+        text.stdout.contains("Blocked issues (60)"),
+        "header must report the complete filtered total: {}",
+        text.stdout
+    );
+    assert!(
+        text.stderr.contains("Showing 50 of 60 blocked issues"),
+        "text output must disclose truncation: {}",
+        text.stderr
+    );
+
+    let json = run_br(
+        &workspace,
+        ["blocked", "--json"],
+        "blocked_default_json_page",
+    );
+    assert!(
+        json.status.success(),
+        "blocked json failed: {}",
+        json.stderr
+    );
+    let page: Value = serde_json::from_str(&json.stdout).expect("parse blocked page");
+    assert_eq!(page["issues"].as_array().map(Vec::len), Some(50));
+    assert_eq!(page["total"], 60);
+    assert_eq!(page["limit"], 50);
+    assert_eq!(page["offset"], 0);
+    assert_eq!(page["has_more"], true);
+
+    let unlimited = run_br(
+        &workspace,
+        ["blocked", "--limit", "0", "--json"],
+        "blocked_unlimited_json_page",
+    );
+    assert!(
+        unlimited.status.success(),
+        "blocked unlimited json failed: {}",
+        unlimited.stderr
+    );
+    let page: Value = serde_json::from_str(&unlimited.stdout).expect("parse unlimited page");
+    assert_eq!(page["issues"].as_array().map(Vec::len), Some(60));
+    assert_eq!(page["total"], 60);
+    assert_eq!(page["limit"], 0);
+    assert_eq!(page["offset"], 0);
+    assert_eq!(page["has_more"], false);
 }
 
 #[test]

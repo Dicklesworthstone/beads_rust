@@ -96,6 +96,20 @@ pub struct BlockedIssueOutput {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Paginated machine-readable output from `br blocked`.
+///
+/// `total` is the complete filtered blocked set before `limit` is applied.
+/// This prevents a bounded page from being mistaken for the complete
+/// dependency-graph result (GitHub #452).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BlockedPage {
+    pub issues: Vec<BlockedIssueOutput>,
+    pub total: usize,
+    pub limit: usize,
+    pub offset: usize,
+    pub has_more: bool,
+}
+
 impl From<Issue> for StaleIssue {
     fn from(issue: Issue) -> Self {
         Self {

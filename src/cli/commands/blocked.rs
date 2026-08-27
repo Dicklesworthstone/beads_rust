@@ -9,9 +9,9 @@ use crate::config::{
     should_use_color,
 };
 use crate::error::Result;
-use crate::format::{BlockedIssue, BlockedIssueOutput, sanitize_terminal_inline};
+use crate::format::{BlockedIssue, BlockedIssueOutput, BlockedPage, sanitize_terminal_inline};
 use crate::model::{IssueType, Priority};
-use crate::output::{OutputContext, OutputMode};
+use crate::output::{JsonArrayPageMeta, OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
 use std::path::Path;
 use std::str::FromStr;
@@ -103,7 +103,7 @@ fn execute_inner(
         && !storage.may_have_blocked_command_results()?
     {
         let blocked_issues = Vec::new();
-        output_structured_blocked(args, output_format, &fast_ctx, &blocked_issues);
+        output_structured_blocked(args, output_format, &fast_ctx, &blocked_issues, 0);
         return Ok(());
     }
 
@@ -208,9 +208,17 @@ fn execute_inner(
     // Sort by priority (ascending), then by blocker count (descending)
     sort_blocked_issues(&mut blocked_issues);
 
-    // Apply limit
-    if args.limit > 0 && blocked_issues.len() > args.limit {
+    let total = blocked_issues.len();
+    let truncated = args.limit > 0 && total > args.limit;
+    if truncated {
         blocked_issues.truncate(args.limit);
+    }
+
+    if truncated && !quiet && !matches!(output_format, OutputFormat::Json | OutputFormat::Toon) {
+        eprintln!(
+            "[note] Showing {} of {total} blocked issues. Use --limit 0 for all results.",
+            blocked_issues.len()
+        );
     }
 
     for bi in &blocked_issues {
@@ -230,14 +238,14 @@ fn execute_inner(
 
     match output_format {
         OutputFormat::Json | OutputFormat::Toon => {
-            output_structured_blocked(args, output_format, &ctx, &blocked_issues);
+            output_structured_blocked(args, output_format, &ctx, &blocked_issues, total);
         }
         OutputFormat::Text | OutputFormat::Csv => {
             let max_width = if args.wrap { ctx.width() } else { 0 };
             if matches!(ctx.mode(), OutputMode::Rich) {
-                render_blocked_rich(&blocked_issues, args.detailed, storage, max_width);
+                render_blocked_rich(&blocked_issues, total, args.detailed, storage, max_width);
             } else {
-                print_text_output(&blocked_issues, args.detailed, storage, max_width);
+                print_text_output(&blocked_issues, total, args.detailed, storage, max_width);
             }
         }
     }
@@ -258,12 +266,29 @@ fn output_structured_blocked(
     output_format: OutputFormat,
     ctx: &OutputContext,
     blocked_issues: &[BlockedIssue],
+    total: usize,
 ) {
+    let page_meta = JsonArrayPageMeta {
+        total,
+        limit: args.limit,
+        offset: 0,
+        has_more: args.limit > 0 && blocked_issues.len() < total,
+    };
     match output_format {
-        OutputFormat::Json => ctx.json_array(blocked_issues.iter().map(blocked_issue_output)),
+        OutputFormat::Json => ctx.json_array_page(
+            "issues",
+            blocked_issues.iter().map(blocked_issue_output),
+            page_meta,
+        ),
         OutputFormat::Toon => {
-            let output = blocked_issue_outputs(blocked_issues);
-            ctx.toon_with_stats(&output, args.stats);
+            let page = BlockedPage {
+                issues: blocked_issue_outputs(blocked_issues),
+                total: page_meta.total,
+                limit: page_meta.limit,
+                offset: page_meta.offset,
+                has_more: page_meta.has_more,
+            };
+            ctx.toon_with_stats(&page, args.stats);
         }
         OutputFormat::Text | OutputFormat::Csv => {}
     }
@@ -354,6 +379,7 @@ fn filter_by_labels(
 
 fn print_text_output(
     blocked_issues: &[BlockedIssue],
+    total: usize,
     verbose: bool,
     storage: &crate::storage::SqliteStorage,
     max_width: usize,
@@ -367,7 +393,7 @@ fn print_text_output(
     }
 
     // Match bd format: 🚫 Blocked issues (N):
-    println!("\n🚫 Blocked issues ({}):\n", blocked_issues.len());
+    println!("\n🚫 Blocked issues ({total}):\n");
 
     for bi in blocked_issues {
         let priority = bi.issue.priority.0;
@@ -445,6 +471,7 @@ fn blocker_id_from_ref(blocker_ref: &str) -> &str {
 
 fn render_blocked_rich(
     blocked_issues: &[BlockedIssue],
+    total: usize,
     verbose: bool,
     storage: &crate::storage::SqliteStorage,
     max_width: usize,
@@ -476,7 +503,7 @@ fn render_blocked_rich(
     let mut header = Text::new("");
     header.append_styled("\u{1f6ab} ", Style::new().color(color("red")));
     header.append_styled("Blocked issues", Style::new().bold().color(color("red")));
-    header.append_styled(&format!(" ({})", blocked_issues.len()), Style::new().dim());
+    header.append_styled(&format!(" ({total})"), Style::new().dim());
     console.print_text(&header);
     console.print("");
 
@@ -561,10 +588,11 @@ fn render_blocked_rich(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::BlockedArgs;
+    use crate::cli::{BlockedArgs, Cli, Commands};
     use crate::logging::init_test_logging;
     use crate::model::{Issue, IssueType, Priority, Status};
     use chrono::{TimeZone, Utc};
+    use clap::Parser;
     use tracing::info;
 
     fn make_issue(id: &str, title: &str, priority: i32, issue_type: IssueType) -> Issue {
@@ -639,6 +667,22 @@ mod tests {
         assert!(args.label.is_empty());
         assert!(!args.robot);
         info!("test_blocked_args_defaults: assertions passed");
+    }
+
+    #[test]
+    fn test_blocked_clap_default_and_unlimited_limit() {
+        let cli = Cli::try_parse_from(["br", "blocked"]).expect("parse blocked defaults");
+        let Commands::Blocked(args) = cli.command else {
+            panic!("expected blocked command");
+        };
+        assert_eq!(args.limit, 50, "clap default must remain a 50-row page");
+
+        let cli = Cli::try_parse_from(["br", "blocked", "--limit", "0"])
+            .expect("parse unlimited blocked output");
+        let Commands::Blocked(args) = cli.command else {
+            panic!("expected blocked command");
+        };
+        assert_eq!(args.limit, 0, "zero must continue to mean unlimited");
     }
 
     #[test]

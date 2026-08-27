@@ -2,19 +2,25 @@
 source: tests/snapshots/json_output.rs
 expression: normalize_json(&json)
 ---
-[
-  {
-    "blocked_by": [
-      "ISSUE_ID"
-    ],
-    "blocked_by_count": 1,
-    "created_at": "TIMESTAMP",
-    "created_by": "ACTOR",
-    "id": "ISSUE_ID",
-    "issue_type": "task",
-    "priority": 2,
-    "status": "open",
-    "title": "Blocked issue",
-    "updated_at": "TIMESTAMP"
-  }
-]
+{
+  "issues": [
+    {
+      "blocked_by": [
+        "ISSUE_ID"
+      ],
+      "blocked_by_count": 1,
+      "created_at": "TIMESTAMP",
+      "created_by": "ACTOR",
+      "id": "ISSUE_ID",
+      "issue_type": "task",
+      "priority": 2,
+      "status": "open",
+      "title": "Blocked issue",
+      "updated_at": "TIMESTAMP"
+    }
+  ],
+  "total": 1,
+  "limit": 50,
+  "offset": 0,
+  "has_more": false
+}

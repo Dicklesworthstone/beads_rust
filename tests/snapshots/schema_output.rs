@@ -18,6 +18,7 @@ use toon_rust::options::{DecodeOptions, ExpandPathsMode};
 const EXPECTED_SCHEMA_NAMES: &[&str] = &[
     "AdditiveReconcileReceipt",
     "BlockedIssue",
+    "BlockedPage",
     "CoordinationClaimRow",
     "CoordinationStatusOutput",
     "CountGroup",

@@ -5,7 +5,9 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, parse_list_issues, run_br};
+use common::cli::{
+    BrWorkspace, extract_issues_array, extract_json_payload, parse_list_issues, run_br,
+};
 use serde_json::Value;
 use std::fs;
 
@@ -156,8 +158,12 @@ fn e2e_json_flag_blocked() {
 
     let payload = extract_json_payload(&blocked.stdout);
     let json: Value = serde_json::from_str(&payload).expect("valid JSON");
-    // Should be valid JSON (empty array when no blocked issues)
-    assert!(json.is_array());
+    assert!(json.is_object());
+    assert!(extract_issues_array(&blocked.stdout).is_empty());
+    assert_eq!(json["total"], 0);
+    assert_eq!(json["limit"], 50);
+    assert_eq!(json["offset"], 0);
+    assert_eq!(json["has_more"], false);
 }
 
 #[test]

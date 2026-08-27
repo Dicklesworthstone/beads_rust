@@ -19,7 +19,8 @@ use crate::cli::{
 use crate::coordination::{CoordinationClaimRow, CoordinationStatusOutput};
 use crate::error::Result;
 use crate::format::{
-    BlockedIssueOutput, IssueDetails, IssueWithCounts, ReadyIssue, StaleIssue, Statistics,
+    BlockedIssueOutput, BlockedPage, IssueDetails, IssueWithCounts, ReadyIssue, StaleIssue,
+    Statistics,
 };
 use crate::model::Issue;
 use crate::output::{OutputContext, OutputMode};
@@ -194,6 +195,7 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
             schemas.insert("ReadyIssue", schema_for_output::<ReadyIssue>());
             schemas.insert("StaleIssue", schema_for_output::<StaleIssue>());
             schemas.insert("BlockedIssue", schema_for_output::<BlockedIssueOutput>());
+            schemas.insert("BlockedPage", schema_for_output::<BlockedPage>());
             schemas.insert("TreeNode", schema_for_output::<TreeNode>());
             schemas.insert("CountGroup", schema_for_output::<CountGroup>());
             schemas.insert("Statistics", schema_for_output::<Statistics>());
@@ -233,6 +235,7 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
         }
         SchemaTarget::BlockedIssue => {
             schemas.insert("BlockedIssue", schema_for_output::<BlockedIssueOutput>());
+            schemas.insert("BlockedPage", schema_for_output::<BlockedPage>());
         }
         SchemaTarget::TreeNode => {
             schemas.insert("TreeNode", schema_for_output::<TreeNode>());
@@ -375,12 +378,14 @@ fn insert_issue_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
     commands.insert(
         "blocked",
         CommandShape {
-            shape: "array",
-            jq_filter: ".[]",
-            items_at: Some("."),
+            shape: "object",
+            jq_filter: ".issues[]",
+            items_at: Some(".issues"),
             item_schema: Some("BlockedIssue"),
             error_envelope_on_stderr: false,
-            notes: None,
+            notes: Some(
+                "Wrapper object with `total`, `limit`, `offset`, and `has_more`; iterate with `.issues[]`.",
+            ),
         },
     );
     commands.insert(

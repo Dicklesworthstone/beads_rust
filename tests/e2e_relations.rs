@@ -582,8 +582,7 @@ fn e2e_dep_add_list_blocked_remove() {
         "blocked failed: {}",
         blocked_view.stderr
     );
-    let blocked_payload = extract_json_payload(&blocked_view.stdout);
-    let blocked_json: Vec<Value> = serde_json::from_str(&blocked_payload).expect("blocked json");
+    let blocked_json = extract_issues_array(&blocked_view.stdout);
     assert!(
         blocked_json.iter().any(|item| item["id"] == blocked_id),
         "blocked issue missing from blocked list"
@@ -606,8 +605,7 @@ fn e2e_dep_add_list_blocked_remove() {
         "blocked after remove failed: {}",
         blocked_view.stderr
     );
-    let blocked_payload = extract_json_payload(&blocked_view.stdout);
-    let blocked_json: Vec<Value> = serde_json::from_str(&blocked_payload).expect("blocked json");
+    let blocked_json = extract_issues_array(&blocked_view.stdout);
     assert!(
         !blocked_json.iter().any(|item| item["id"] == blocked_id),
         "blocked issue still present after dep remove"

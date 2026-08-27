@@ -18,7 +18,9 @@
 
 mod common;
 
+use beads_rust::franken_sync::Connection;
 use common::cli::{BrWorkspace, run_br};
+use fsqlite_types::SqliteValue;
 use serde_json::Value;
 use std::fs;
 
@@ -313,5 +315,106 @@ fn e2e_hard_delete_flush_still_prunes_purged_issues() {
     assert!(
         jsonl_after.contains("Keeper"),
         "keeper issue must survive the post-purge flush"
+    );
+}
+
+/// GitHub #453: hard deletion must remove DB-only capacity attribution rather
+/// than leaving an orphan that poisons additive-reconcile health checks.
+#[test]
+fn e2e_hard_delete_removes_capacity_occupancy_and_preserves_db_health() {
+    let _log =
+        common::test_log("e2e_hard_delete_removes_capacity_occupancy_and_preserves_db_health");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "Occupied victim"], "create_victim");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let victim_id = parse_created_id(&create.stdout);
+    assert!(!victim_id.is_empty(), "no id in: {}", create.stdout);
+
+    let occupy = run_br(
+        &workspace,
+        ["update", &victim_id, "--status", "in_progress"],
+        "occupy_victim",
+    );
+    assert!(occupy.status.success(), "update failed: {}", occupy.stderr);
+
+    let db_path = workspace.root.join(".beads/beads.db");
+    {
+        let conn = Connection::open(db_path.to_string_lossy().into_owned())
+            .expect("open database before purge");
+        let rows = conn
+            .query_with_params(
+                "SELECT COUNT(*) FROM capacity_occupancy WHERE issue_id = ?",
+                &[SqliteValue::from(victim_id.as_str())],
+            )
+            .expect("count occupancy before purge");
+        let count = rows
+            .first()
+            .and_then(|row| row.get(0))
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or_default();
+        assert_eq!(count, 1, "status transition must seed occupancy evidence");
+    }
+
+    let purge = run_br(
+        &workspace,
+        ["delete", &victim_id, "--force", "--hard"],
+        "hard_delete_occupied_victim",
+    );
+    assert!(
+        purge.status.success(),
+        "hard delete failed: {}",
+        purge.stderr
+    );
+
+    {
+        let conn = Connection::open(db_path.to_string_lossy().into_owned())
+            .expect("open database after purge");
+        let issue_rows = conn
+            .query_with_params(
+                "SELECT COUNT(*) FROM issues WHERE id = ?",
+                &[SqliteValue::from(victim_id.as_str())],
+            )
+            .expect("count issue after purge");
+        let occupancy_rows = conn
+            .query_with_params(
+                "SELECT COUNT(*) FROM capacity_occupancy WHERE issue_id = ?",
+                &[SqliteValue::from(victim_id.as_str())],
+            )
+            .expect("count occupancy after purge");
+        let issue_count = issue_rows
+            .first()
+            .and_then(|row| row.get(0))
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or_default();
+        let occupancy_count = occupancy_rows
+            .first()
+            .and_then(|row| row.get(0))
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or_default();
+        assert_eq!(issue_count, 0, "purged issue row survived");
+        assert_eq!(occupancy_count, 0, "purged capacity occupancy row survived");
+
+        let foreign_key_violations = conn
+            .query("PRAGMA foreign_key_check")
+            .expect("check foreign keys after purge");
+        assert!(
+            foreign_key_violations.is_empty(),
+            "hard delete left foreign-key violations: {foreign_key_violations:?}"
+        );
+    }
+
+    let reconcile = run_br(
+        &workspace,
+        ["sync", "--reconcile-additive", "--robot"],
+        "reconcile_after_hard_delete",
+    );
+    assert!(
+        reconcile.status.success(),
+        "additive reconcile health preflight failed after hard delete: stdout={} stderr={}",
+        reconcile.stdout,
+        reconcile.stderr
     );
 }

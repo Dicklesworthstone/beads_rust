@@ -503,7 +503,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 |---------|-------------|---------|
 | `list` | List issues | `br list --status open --priority 0-1` |
 | `ready` | Actionable work | `br ready` |
-| `blocked` | Blocked issues | `br blocked` |
+| `blocked` | Blocked issues | `br blocked --json \| jq '.issues[]'` |
 | `search` | Full-text search | `br search "authentication"` |
 | `stale` | Stale issues | `br stale --days 30` |
 | `coordination status` | Hidden in-progress claim diagnosis | `br coordination status --json` |
