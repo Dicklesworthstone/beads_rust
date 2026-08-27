@@ -269,7 +269,7 @@ Every `--repair` lays down `<repo>/.doctor/runs/<run-id>/`:
   backups/          # verbatim pre-mutation copies
   report.json       # final report (written at end of run)
   undo.sh           # pure-bash fallback when br itself is broken
-.doctor/latest -> runs/<run-id>/   # atomic symlink
+.doctor/latest -> runs/<run-id>/   # best-effort convenience symlink
 ```
 
 ## What `br doctor` will NEVER do
@@ -1777,10 +1777,10 @@ fn find_latest_run(runs_root: &Path) -> Result<Option<String>> {
     if !runs_root.is_dir() {
         return Ok(None);
     }
-    if let Some(run_id) = latest_run_from_symlink(runs_root)? {
-        return Ok(Some(run_id));
-    }
-    let mut best: Option<String> = None;
+    // The convenience symlink can be absent on Windows when the process
+    // lacks symlink privileges, or stale after a run that could not update
+    // it. Treat it as one validated candidate and still scan the run dirs.
+    let mut best = latest_run_from_symlink(runs_root)?;
     for entry in fs::read_dir(runs_root).map_err(BeadsError::Io)? {
         let entry = entry.map_err(BeadsError::Io)?;
         if !entry.file_type().map_err(BeadsError::Io)?.is_dir() {
@@ -2787,7 +2787,7 @@ mod tests {
     }
 
     #[test]
-    fn test_doctor_undo_latest_prefers_latest_symlink() {
+    fn test_doctor_undo_latest_ignores_stale_symlink() {
         use std::os::unix::fs::symlink;
 
         let tmp = unique_temp_root("undo-latest-link");
@@ -2801,7 +2801,7 @@ mod tests {
         symlink("runs/20260101T000000Z__linked", repo.join(".doctor/latest")).unwrap();
 
         let latest = find_latest_run(&runs_root).unwrap().unwrap();
-        assert_eq!(latest, "20260101T000000Z__linked");
+        assert_eq!(latest, "20260102T000000Z__newer");
     }
 
     #[test]

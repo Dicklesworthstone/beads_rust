@@ -103,13 +103,39 @@ fn collect_search_results_for_output(
     query: &str,
     list_args: &ListArgs,
     output_format: OutputFormat,
-) -> Result<Vec<Issue>> {
-    collect_search_results_with_projection(
+) -> Result<SearchPage> {
+    let limit = list_args.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+    let offset = list_args.offset.unwrap_or(DEFAULT_LIST_OFFSET);
+    let mut probe_args = list_args.clone();
+    if limit > 0 {
+        // Fetch one sentinel row beyond the requested page so bounded search
+        // output can disclose truncation without counting or hydrating the
+        // entire matching corpus (GitHub #452).
+        probe_args.limit = Some(limit.saturating_add(1));
+    }
+    let mut issues = collect_search_results_with_projection(
         storage,
         query,
-        list_args,
+        &probe_args,
         matches!(output_format, OutputFormat::Text),
-    )
+    )?;
+    let has_more = limit > 0 && issues.len() > limit;
+    if has_more {
+        issues.truncate(limit);
+    }
+    Ok(SearchPage {
+        issues,
+        limit,
+        offset,
+        has_more,
+    })
+}
+
+struct SearchPage {
+    issues: Vec<Issue>,
+    limit: usize,
+    offset: usize,
+    has_more: bool,
 }
 
 fn collect_search_results_with_projection(
@@ -167,13 +193,19 @@ fn collect_search_results_with_projection(
 #[allow(clippy::too_many_lines)]
 fn render_search_results(
     storage: &SqliteStorage,
-    issues: Vec<Issue>,
+    page: SearchPage,
     query: &str,
     list_args: &ListArgs,
     output_format: OutputFormat,
     cli: &config::CliOverrides,
     storage_ctx: &config::OpenStorageResult,
 ) -> Result<()> {
+    let SearchPage {
+        issues,
+        limit,
+        offset,
+        has_more,
+    } = page;
     let quiet = cli.quiet.unwrap_or(false);
     let early_ctx = OutputContext::from_output_format(output_format, quiet, true);
     if matches!(early_ctx.mode(), OutputMode::Quiet) {
@@ -195,8 +227,15 @@ fn render_search_results(
             let mut relation_metadata = load_search_relation_metadata(storage, &issues)?;
             let rows = issues
                 .into_iter()
-                .map(|issue| issue_with_counts(issue, &mut relation_metadata));
-            early_ctx.json_array_count("issues", rows, "hidden_closed_count", hidden_closed_count);
+                .map(|issue| issue_with_counts(issue, &mut relation_metadata))
+                .collect::<Vec<_>>();
+            early_ctx.json(&SearchResults {
+                issues: &rows,
+                hidden_closed_count,
+                limit,
+                offset,
+                has_more,
+            });
             return Ok(());
         }
         OutputFormat::Toon => {
@@ -205,6 +244,9 @@ fn render_search_results(
                 &SearchResults {
                     issues: &issues_with_counts,
                     hidden_closed_count,
+                    limit,
+                    offset,
+                    has_more,
                 },
                 list_args.stats,
             );
@@ -214,6 +256,7 @@ fn render_search_results(
             let fields = csv::parse_fields(list_args.fields.as_deref());
             let csv_output = csv::format_csv(&issues, &fields);
             print!("{csv_output}");
+            emit_search_truncation_note(issues.len(), limit, offset, has_more, true);
             return Ok(());
         }
         OutputFormat::Text => {}
@@ -249,8 +292,9 @@ fn render_search_results(
         let mut table = IssueTable::new(&issues, ctx.theme())
             .columns(columns)
             .title(format!(
-                "Search: \"{}\" - {} result{}",
+                "Search: \"{}\" - {}{} result{}",
                 query,
+                if has_more { "showing " } else { "" },
                 issues.len(),
                 if issues.len() == 1 { "" } else { "s" }
             ))
@@ -264,29 +308,64 @@ fn render_search_results(
         }
         ctx.render(&table.build());
         emit_hidden_closed_note(&ctx, hidden_closed_count);
+        emit_search_truncation_note(issues.len(), limit, offset, has_more, false);
         return Ok(());
     }
 
-    ctx.info(&format!(
-        "Found {} issue(s) matching '{}'",
-        issues.len(),
-        query
-    ));
+    if has_more {
+        ctx.info(&format!(
+            "Showing {} issue(s) matching '{}'",
+            issues.len(),
+            query
+        ));
+    } else {
+        ctx.info(&format!(
+            "Found {} issue(s) matching '{}'",
+            issues.len(),
+            query
+        ));
+    }
     for issue in &issues {
         let line = format_issue_line_with(issue, format_options);
         ctx.print_line(&line);
     }
     emit_hidden_closed_note(&ctx, hidden_closed_count);
+    emit_search_truncation_note(issues.len(), limit, offset, has_more, false);
 
     Ok(())
 }
 
-/// Stable JSON/TOON search envelope. The count is zero when the selected
-/// corpus already includes closed issues or no closed matches were hidden.
+/// Stable JSON/TOON search envelope. `has_more` discloses whether the bounded
+/// page omitted additional matches; the hidden-closed count is zero when the
+/// selected corpus already includes closed issues or no closed matches were
+/// hidden.
 #[derive(serde::Serialize)]
 struct SearchResults<'a> {
     issues: &'a [IssueWithCounts],
     hidden_closed_count: usize,
+    limit: usize,
+    offset: usize,
+    has_more: bool,
+}
+
+fn emit_search_truncation_note(
+    shown: usize,
+    limit: usize,
+    offset: usize,
+    has_more: bool,
+    stderr: bool,
+) {
+    if !has_more {
+        return;
+    }
+    let note = format!(
+        "note: showing {shown} search result(s) from offset {offset}; more matches exist. Use --limit 0 for all results (current limit: {limit})"
+    );
+    if stderr {
+        eprintln!("{note}");
+    } else {
+        println!("{note}");
+    }
 }
 
 /// Trailing stdout note for text modes when the default closed-issue

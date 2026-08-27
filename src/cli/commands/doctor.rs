@@ -252,14 +252,7 @@ impl DoctorRepairSession {
     /// `fixer_id` may be a placeholder; callers update it via
     /// [`Self::with_fixer`] before each `mutate()` call.
     fn new(repo_root: &Path, dry_run: bool) -> Result<Self> {
-        let run = run_dir::create_run_dir(repo_root)?;
-        // Re-open the actions.jsonl in append mode under our own handle —
-        // create_run_dir already touches the file, but doesn't return a
-        // handle.
-        let actions_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&run.actions_file)?;
+        let (run, actions_file) = run_dir::create_repair_run_dir(repo_root)?;
         let mut capabilities = Capabilities::for_repo(repo_root);
         // Allow the root .gitignore explicitly. It lives at <repo_root>/
         // which is outside .beads/ and .doctor/.

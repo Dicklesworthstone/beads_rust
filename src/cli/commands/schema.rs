@@ -411,7 +411,8 @@ fn insert_issue_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
                 "Stable wrapper object `{\"issues\": [...], \
                  \"hidden_closed_count\": N}`; iterate with `.issues[]`. The count \
                  is zero when no closed matches were hidden or the selected corpus \
-                 already includes closed issues.",
+                 already includes closed issues. Pagination metadata also reports \
+                 `limit`, `offset`, and `has_more`; `has_more` discloses truncation.",
             ),
         },
     );

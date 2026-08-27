@@ -903,15 +903,18 @@ br search <QUERY> [OPTIONS]
 Supports all filter options from `list`. Unlike `list`/`ready` (which are
 complete by default), `search` results are **capped at 50 by default**
 (`--limit <N>`, `0`=unlimited) — a broad text query can match a large fraction
-of the corpus, so a bounded, relevance-ordered result set is the default.
+of the corpus, so a bounded, relevance-ordered result set is the default. Text
+and CSV output explicitly note when more matches exist; JSON/TOON reports
+`limit`, `offset`, and `has_more`.
 
 **Closed issues are excluded by default** (tombstones always). When that
 exclusion hides matches, text output ends with a trailing note
 (`note: N closed match(es) hidden; rerun with --all to include them`), and
 JSON/TOON output always uses the stable wrapper
-`{"issues": [...], "hidden_closed_count": N}`. The count is zero when nothing
-was hidden or the selected corpus already includes closed issues. Pass `--all`
-(or a terminal `--status` such as `closed`) to include closed issues.
+`{"issues": [...], "hidden_closed_count": N, "limit": N, "offset": N,
+"has_more": bool}`. The hidden count is zero when nothing was hidden or the
+selected corpus already includes closed issues. Pass `--all` (or a terminal
+`--status` such as `closed`) to include closed issues.
 
 **Examples:**
 ```bash

@@ -8,7 +8,7 @@
 //!   backups/        # verbatim pre-mutation copies
 //!   report.json     # final report (written at end of run)
 //!   undo.sh         # pure-bash fallback when br itself is broken
-//! <repo>/.doctor/latest -> runs/<run-id>/   # atomic symlink
+//! <repo>/.doctor/latest -> runs/<run-id>/   # best-effort convenience symlink
 //! ```
 //!
 //! ## Run identifier
@@ -28,7 +28,9 @@
 //!
 //! `<repo>/.doctor/latest` is updated with a tmp-symlink + rename so
 //! readers either see the previous run or the new run, never a torn
-//! state.
+//! state. On Windows hosts where symlink creation specifically fails
+//! with `ERROR_PRIVILEGE_NOT_HELD` (1314), the run remains successful:
+//! `br doctor undo latest` also scans the validated run directories.
 //!
 //! ## .gitignore
 //!
@@ -52,6 +54,7 @@ use crate::error::BeadsError;
 pub const ENV_RUNS_DIR: &str = "BR_DOCTOR_RUNS_DIR";
 
 static RUN_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+const WINDOWS_ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
 
 #[cfg(unix)]
 fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
@@ -107,7 +110,8 @@ pub struct RunDir {
     /// `<root>/undo.sh` (only after [`write_undo_sh`] is called).
     pub undo_script: PathBuf,
     /// `<repo_root>/.doctor/latest` (or the `BR_DOCTOR_RUNS_DIR`
-    /// equivalent). Symlink to `root`.
+    /// equivalent). Best-effort symlink to `root`; it may be absent on
+    /// Windows when the process lacks symlink privileges.
     pub latest_link: PathBuf,
 }
 
@@ -117,7 +121,8 @@ pub struct RunDir {
 /// On success:
 /// - The run directory exists with `backups/`, `actions.jsonl`,
 ///   `report.json`.
-/// - `<runs_root>/../latest` symlink points at the new run dir.
+/// - `<runs_root>/../latest` points at the new run dir when the platform
+///   permits symlink creation.
 /// - `<repo>/.gitignore` contains `.doctor/` (added if missing).
 ///
 /// # Errors
@@ -125,6 +130,26 @@ pub struct RunDir {
 /// Returns [`BeadsError`] for I/O faults or for the case where
 /// `repo_root` does not exist.
 pub fn create_run_dir(repo_root: &Path) -> Result<RunDir, BeadsError> {
+    let (run, _actions_file) = create_run_dir_with_actions_file(repo_root)?;
+    Ok(run)
+}
+
+/// Create a fresh repair run directory and return the already-open append
+/// handle for its `actions.jsonl` audit log.
+///
+/// Keeping the initial handle avoids a close-then-immediate-reopen seam that
+/// can be rejected by Windows antivirus or endpoint-security software.
+///
+/// # Errors
+///
+/// Returns [`BeadsError`] under the same conditions as [`create_run_dir`].
+pub fn create_repair_run_dir(repo_root: &Path) -> Result<(RunDir, std::fs::File), BeadsError> {
+    create_run_dir_with_actions_file(repo_root)
+}
+
+fn create_run_dir_with_actions_file(
+    repo_root: &Path,
+) -> Result<(RunDir, std::fs::File), BeadsError> {
     if !repo_root.exists() {
         return Err(BeadsError::internal(format!(
             "doctor: repo_root {} does not exist",
@@ -155,7 +180,7 @@ pub fn create_run_dir(repo_root: &Path) -> Result<RunDir, BeadsError> {
     fs::create_dir_all(&backups).map_err(BeadsError::Io)?;
 
     let actions_file = root.join("actions.jsonl");
-    OpenOptions::new()
+    let actions_handle = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&actions_file)
@@ -178,16 +203,19 @@ pub fn create_run_dir(repo_root: &Path) -> Result<RunDir, BeadsError> {
     let latest_link = runs_root.parent().unwrap_or(&runs_root).join("latest");
     update_latest_symlink(&latest_link, &root)?;
 
-    Ok(RunDir {
-        run_id,
-        repo_root: repo_root.to_path_buf(),
-        root,
-        backups,
-        actions_file,
-        report_file,
-        undo_script,
-        latest_link,
-    })
+    Ok((
+        RunDir {
+            run_id,
+            repo_root: repo_root.to_path_buf(),
+            root,
+            backups,
+            actions_file,
+            report_file,
+            undo_script,
+            latest_link,
+        },
+        actions_handle,
+    ))
 }
 
 /// Resolve where `runs/` should live for a given repo, honoring the
@@ -257,12 +285,25 @@ fn update_latest_symlink(latest_link: &Path, target: &Path) -> Result<(), BeadsE
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(BeadsError::Io(e)),
     }
-    create_symlink(&rel_target, &tmp).map_err(BeadsError::Io)?;
+    if let Err(error) = create_symlink(&rel_target, &tmp) {
+        if cfg!(windows) && is_windows_symlink_privilege_error(&error) {
+            tracing::warn!(
+                path = %latest_link.display(),
+                "doctor: Windows symlink privilege unavailable; latest run remains discoverable by directory scan"
+            );
+            return Ok(());
+        }
+        return Err(BeadsError::Io(error));
+    }
     // `fs::rename` over an existing symlink atomically replaces it on
     // Unix.
     fs::rename(&tmp, latest_link).map_err(BeadsError::Io)?;
     fsync_dir(latest_link.parent().unwrap_or_else(|| Path::new(".")))?;
     Ok(())
+}
+
+fn is_windows_symlink_privilege_error(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(WINDOWS_ERROR_PRIVILEGE_NOT_HELD)
 }
 
 /// Ensure `<repo>/.gitignore` contains a `.doctor/` ignore rule. Adds
@@ -518,6 +559,20 @@ mod tests {
     }
 
     #[test]
+    fn create_repair_run_dir_returns_initial_actions_handle() {
+        let tmp = unique_temp_root("initial-actions-handle");
+        let (run, mut actions_file) = create_repair_run_dir(tmp.path()).expect("create repair run");
+
+        writeln!(actions_file, "{{\"op\":\"test\"}}").expect("append audit line");
+        actions_file.sync_data().expect("sync audit line");
+
+        assert_eq!(
+            fs::read_to_string(&run.actions_file).expect("read actions"),
+            "{\"op\":\"test\"}\n"
+        );
+    }
+
+    #[test]
     fn second_run_replaces_latest_atomically() {
         let tmp = unique_temp_root("atomic");
 
@@ -548,6 +603,15 @@ mod tests {
     fn fsync_dir_accepts_existing_directory() {
         let tmp = unique_temp_root("fsync-dir");
         fsync_dir(tmp.path()).expect("fsync temp dir");
+    }
+
+    #[test]
+    fn windows_symlink_fallback_matches_only_privilege_error() {
+        let privilege_error = std::io::Error::from_raw_os_error(1314);
+        let ordinary_access_denied = std::io::Error::from_raw_os_error(5);
+
+        assert!(is_windows_symlink_privilege_error(&privilege_error));
+        assert!(!is_windows_symlink_privilege_error(&ordinary_access_denied));
     }
 
     #[test]
