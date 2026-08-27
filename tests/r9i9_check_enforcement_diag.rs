@@ -56,7 +56,10 @@ fn two_table_level_checks_on_same_column_enforced() {
     let fine = conn.execute("INSERT INTO issues (id, title) VALUES ('y', 'fine')");
     println!("two_table_level: empty={empty:?} fine={fine:?}");
     assert!(fine.is_ok());
-    assert!(empty.is_err(), "second table-level CHECK must reject empty title");
+    assert!(
+        empty.is_err(),
+        "second table-level CHECK must reject empty title"
+    );
 }
 
 #[test]
