@@ -3064,6 +3064,9 @@ pub struct ImportResult {
     pub dependencies_imported: usize,
     /// Number of comment rows imported from JSONL for applied issue records.
     pub comments_imported: usize,
+    /// Byte-identical repeated comment objects removed while normalizing the
+    /// JSONL source. Conflicting duplicate IDs remain a hard validation error.
+    pub exact_duplicate_comments_deduplicated: usize,
     /// Number of export-hash rows recorded for the imported JSONL snapshot.
     pub export_hashes_recorded: usize,
     /// Number of blocked-cache rows rebuilt after import.
@@ -3073,6 +3076,11 @@ pub struct ImportResult {
     /// Old-id -> new-id receipt for `--rename-prefix` rewrites (empty when
     /// the flag was off or no id needed renaming).
     pub prefix_renames: Vec<ImportPrefixRename>,
+    /// Complete semantic post-state expected for every issue row written by
+    /// this import. Fresh-family rebuilds verify these witnesses after all
+    /// VACUUM/REINDEX/compaction work so a storage-engine field shift cannot
+    /// pass merely because table counts still match.
+    pub(crate) applied_issues: Vec<Issue>,
 }
 
 /// Versioned receipt schema for lossless additive JSONL reconciliation.
@@ -3729,7 +3737,11 @@ impl SyncMergePendingReceipt {
         }
         if !matches!(
             self.intent.resolution.as_str(),
-            "manual" | "force-db" | "force-jsonl" | "force-newer"
+            "manual"
+                | "force-db"
+                | "force-jsonl"
+                | "force-newer"
+                | "source-repo-path-migration"
         ) {
             return Err(BeadsError::SyncConflict {
                 message: format!(
@@ -12745,7 +12757,7 @@ fn determine_action(
 /// - Recomputes `content_hash`
 /// - Sets ephemeral=true if ID contains "-wisp-"
 /// - Applies defaults and repairs `closed_at` invariant
-fn normalize_issue(issue: &mut Issue) {
+fn normalize_issue(issue: &mut Issue) -> usize {
     use crate::util::content_hash;
 
     // Deduplicate labels
@@ -12794,6 +12806,22 @@ fn normalize_issue(issue: &mut Issue) {
                 .collect();
         }
     }
+
+    // A damaged comments tree has historically exported the same comment
+    // object more than once. Re-importing that recovery artifact should be
+    // lossless: collapse only byte-for-byte semantic duplicates while leaving
+    // same-ID/different-payload pairs for the strict validator to reject.
+    let comments_before = issue.comments.len();
+    if comments_before > 1 {
+        let mut unique = Vec::with_capacity(comments_before);
+        for comment in issue.comments.drain(..) {
+            if !unique.contains(&comment) {
+                unique.push(comment);
+            }
+        }
+        issue.comments = unique;
+    }
+    let exact_duplicate_comments_deduplicated = comments_before - issue.comments.len();
 
     // Normalize legacy Go-beads (bd) terminal status aliases that survived
     // JSONL import as `Status::Custom(_)`. Leaving them unmapped is
@@ -12846,6 +12874,7 @@ fn normalize_issue(issue: &mut Issue) {
     // Recompute after all import repairs so the stored row hash matches the
     // canonical issue state used by collision detection and export hashes.
     issue.content_hash = Some(content_hash(issue));
+    exact_duplicate_comments_deduplicated
 }
 
 #[derive(Debug)]
@@ -12870,11 +12899,11 @@ struct ImportMetadataMaps {
     id_by_hash: HashMap<String, String>,
 }
 
-fn parse_normalized_import_issue(trimmed: &str, line_num: usize) -> Result<Issue> {
+fn parse_normalized_import_issue(trimmed: &str, line_num: usize) -> Result<(Issue, usize)> {
     let mut issue: Issue = serde_json::from_str(trimmed)
         .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {line_num}: {e}")))?;
 
-    normalize_issue(&mut issue);
+    let exact_duplicate_comments_deduplicated = normalize_issue(&mut issue);
 
     if let Err(errors) = IssueValidator::validate(&issue) {
         let details = errors
@@ -12888,12 +12917,12 @@ fn parse_normalized_import_issue(trimmed: &str, line_num: usize) -> Result<Issue
         )));
     }
 
-    Ok(issue)
+    Ok((issue, exact_duplicate_comments_deduplicated))
 }
 
 fn for_each_jsonl_import_issue(
     source: &JsonlSourceSnapshot,
-    mut handle_issue: impl FnMut(usize, Issue) -> Result<()>,
+    mut handle_issue: impl FnMut(usize, Issue, usize) -> Result<()>,
 ) -> Result<()> {
     let mut reader = source.reader();
     let mut line = String::new();
@@ -12903,8 +12932,9 @@ fn for_each_jsonl_import_issue(
         line_num += 1;
         let trimmed = line.trim();
         if !trimmed.is_empty() {
-            let issue = parse_normalized_import_issue(trimmed, line_num)?;
-            handle_issue(line_num, issue)?;
+            let (issue, exact_duplicate_comments_deduplicated) =
+                parse_normalized_import_issue(trimmed, line_num)?;
+            handle_issue(line_num, issue, exact_duplicate_comments_deduplicated)?;
         }
         line.clear();
     }
@@ -12920,7 +12950,7 @@ fn collect_import_validation_plan(
     let mut plan = ImportValidationPlan::default();
     let mut seen_ids = HashSet::new();
 
-    for_each_jsonl_import_issue(source, |line_num, issue| {
+    for_each_jsonl_import_issue(source, |line_num, issue, _| {
         let prefix_mismatch = !config.skip_prefix_validation
             && expected_prefix.is_some_and(|prefix| {
                 !id_matches_expected_prefix(&issue.id, prefix)
@@ -13166,7 +13196,7 @@ fn scan_import_collision_renames(
     let progress =
         create_progress_bar(record_count as u64, "Scanning issues", config.show_progress);
 
-    for_each_jsonl_import_issue(source, |_line_num, mut issue| {
+    for_each_jsonl_import_issue(source, |_line_num, mut issue, _| {
         apply_prefix_renames(&mut issue, prefix_renames);
 
         if issue.ephemeral {
@@ -13317,64 +13347,69 @@ fn stream_import_actions_in_tx(
     progress.set_position(0);
     storage.clear_all_export_hashes_in_tx()?;
 
-    for_each_jsonl_import_issue(source, |_line_num, mut issue| {
-        apply_prefix_renames(&mut issue, prefix_renames);
+    for_each_jsonl_import_issue(
+        source,
+        |_line_num, mut issue, exact_duplicate_comments_deduplicated| {
+            tx_result.exact_duplicate_comments_deduplicated +=
+                exact_duplicate_comments_deduplicated;
+            apply_prefix_renames(&mut issue, prefix_renames);
 
-        if issue.ephemeral {
-            progress.inc(1);
-            return Ok(());
-        }
-
-        handle_duplicate_external_ref(&mut issue, &mut seen_external_refs, config)?;
-
-        let computed_hash = crate::util::content_hash(&issue);
-        let collision = detect_collision(
-            &issue,
-            &metadata.id_by_ext_ref,
-            &metadata.id_by_hash,
-            &metadata.meta_by_id,
-            &computed_hash,
-        );
-        let action = determine_action(
-            &collision,
-            &issue,
-            &metadata.meta_by_id,
-            config.force_upsert,
-        )?;
-        let target_id = match &collision {
-            CollisionResult::Match { existing_id, .. } => existing_id.clone(),
-            CollisionResult::NewIssue => issue.id.clone(),
-        };
-
-        apply_collision_renames(&mut issue, collision_renames);
-        process_import_action(
-            storage,
-            &action,
-            &issue,
-            &mut tx_result,
-            fresh_relation_tables_proven_empty,
-        )?;
-
-        if let Some((export_id, export_hash)) = export_hash_entry_for_import_action(
-            storage,
-            &action,
-            &target_id,
-            &issue,
-            &computed_hash,
-        )? {
-            export_hash_ids.insert(export_id.clone());
-            export_hash_batch.push((export_id, export_hash));
-            if export_hash_batch.len() >= IMPORT_EXPORT_HASH_BATCH_SIZE {
-                storage.insert_export_hashes_after_clear_in_tx(&export_hash_batch)?;
-                export_hash_batch.clear();
+            if issue.ephemeral {
+                progress.inc(1);
+                return Ok(());
             }
-        } else {
-            uncertified_local_wins += 1;
-        }
 
-        progress.inc(1);
-        Ok(())
-    })?;
+            handle_duplicate_external_ref(&mut issue, &mut seen_external_refs, config)?;
+
+            let computed_hash = crate::util::content_hash(&issue);
+            let collision = detect_collision(
+                &issue,
+                &metadata.id_by_ext_ref,
+                &metadata.id_by_hash,
+                &metadata.meta_by_id,
+                &computed_hash,
+            );
+            let action = determine_action(
+                &collision,
+                &issue,
+                &metadata.meta_by_id,
+                config.force_upsert,
+            )?;
+            let target_id = match &collision {
+                CollisionResult::Match { existing_id, .. } => existing_id.clone(),
+                CollisionResult::NewIssue => issue.id.clone(),
+            };
+
+            apply_collision_renames(&mut issue, collision_renames);
+            process_import_action(
+                storage,
+                &action,
+                &issue,
+                &mut tx_result,
+                fresh_relation_tables_proven_empty,
+            )?;
+
+            if let Some((export_id, export_hash)) = export_hash_entry_for_import_action(
+                storage,
+                &action,
+                &target_id,
+                &issue,
+                &computed_hash,
+            )? {
+                export_hash_ids.insert(export_id.clone());
+                export_hash_batch.push((export_id, export_hash));
+                if export_hash_batch.len() >= IMPORT_EXPORT_HASH_BATCH_SIZE {
+                    storage.insert_export_hashes_after_clear_in_tx(&export_hash_batch)?;
+                    export_hash_batch.clear();
+                }
+            } else {
+                uncertified_local_wins += 1;
+            }
+
+            progress.inc(1);
+            Ok(())
+        },
+    )?;
 
     if !export_hash_batch.is_empty() {
         storage.insert_export_hashes_after_clear_in_tx(&export_hash_batch)?;
@@ -13639,6 +13674,7 @@ fn process_import_action(
             result.imported_count += 1;
             result.created_count += 1;
             record_imported_relation_counts(result, issue);
+            result.applied_issues.push(issue.clone());
         }
         CollisionAction::Update { existing_id } => {
             // When updating by external_ref or content_hash, the incoming issue may have
@@ -13646,11 +13682,13 @@ fn process_import_action(
             if existing_id == &issue.id {
                 storage.upsert_issue_for_import_in_tx(issue)?;
                 sync_issue_relations(storage, issue)?;
+                result.applied_issues.push(issue.clone());
             } else {
                 let mut updated_issue = issue.clone();
                 updated_issue.id.clone_from(existing_id);
                 storage.upsert_issue_for_import_in_tx(&updated_issue)?;
                 sync_issue_relations(storage, &updated_issue)?;
+                result.applied_issues.push(updated_issue);
             }
             result.imported_count += 1;
             result.updated_count += 1;
@@ -13953,7 +13991,7 @@ where
     let mut record_count = 0usize;
     let mut ephemeral_skipped = 0usize;
 
-    for_each_jsonl_import_issue(source, |line_num, mut issue| {
+    for_each_jsonl_import_issue(source, |line_num, mut issue, _| {
         record_count += 1;
         if issue.ephemeral {
             ephemeral_skipped += 1;
@@ -19988,6 +20026,60 @@ mod tests {
 
         // Issue ID containing "-wisp-" should be marked ephemeral
         assert!(issue.ephemeral);
+    }
+
+    #[test]
+    fn test_normalize_issue_deduplicates_only_identical_comments() {
+        let mut issue = make_test_issue("bd-comment-dedupe", "Comment recovery");
+        let comment = crate::model::Comment {
+            id: 42,
+            issue_id: issue.id.clone(),
+            author: "reporter".to_string(),
+            body: "recovery evidence".to_string(),
+            created_at: issue.created_at,
+        };
+        let mut conflicting = comment.clone();
+        conflicting.body = "different evidence".to_string();
+        issue.comments = vec![comment.clone(), comment, conflicting.clone()];
+
+        let deduplicated = normalize_issue(&mut issue);
+
+        assert_eq!(deduplicated, 1);
+        assert_eq!(issue.comments.len(), 2);
+        assert_eq!(issue.comments[1], conflicting);
+    }
+
+    #[test]
+    fn test_import_recovers_identical_duplicate_comments_with_receipt_count() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+        let mut issue = make_test_issue("bd-comment-recovery", "Comment recovery");
+        let comment = crate::model::Comment {
+            id: 42,
+            issue_id: issue.id.clone(),
+            author: "reporter".to_string(),
+            body: "recovery evidence".to_string(),
+            created_at: issue.created_at,
+        };
+        issue.comments = vec![comment.clone(), comment];
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+
+        let result = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+
+        assert_eq!(result.exact_duplicate_comments_deduplicated, 1);
+        assert_eq!(result.comments_imported, 1);
+        assert_eq!(storage.get_comments(&issue.id).unwrap().len(), 1);
     }
 
     #[test]

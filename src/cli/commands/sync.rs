@@ -226,6 +226,10 @@ pub struct ImportResultOutput {
     pub tombstone_skipped: usize,
     pub orphans_removed: usize,
     pub blocked_cache_rebuilt: bool,
+    /// Byte-identical repeated comment objects removed during import. A
+    /// same-ID comment with different content remains a hard error.
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub exact_duplicate_comments_deduplicated: usize,
     /// Old-id -> new-id receipt emitted when `--rename-prefix` rewrote ids.
     /// Omitted entirely when no rename happened (legacy JSON shape).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -233,6 +237,10 @@ pub struct ImportResultOutput {
     /// Present when --skip-invalid-records published a recovered JSONL source.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub salvage: Option<JsonlSalvageReceipt>,
+}
+
+const fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 const SOURCE_REPO_PATH_MIGRATION_SCHEMA: &str = "br.sync.source-repo-path-migration.v1";
@@ -3307,6 +3315,7 @@ fn emit_auto_rebuild_import_result(
         tombstone_skipped: 0,
         orphans_removed: 0,
         blocked_cache_rebuilt: true,
+        exact_duplicate_comments_deduplicated: 0,
         prefix_renames: Vec::new(),
         salvage: None,
     };
@@ -3401,6 +3410,7 @@ fn execute_import(
                 tombstone_skipped: 0,
                 orphans_removed: 0,
                 blocked_cache_rebuilt: false,
+                exact_duplicate_comments_deduplicated: 0,
                 prefix_renames: Vec::new(),
                 salvage: None,
             };
@@ -3569,6 +3579,7 @@ fn execute_import(
                         tombstone_skipped: 0,
                         orphans_removed: 0,
                         blocked_cache_rebuilt: false,
+                        exact_duplicate_comments_deduplicated: 0,
                         prefix_renames: Vec::new(),
                         salvage: salvage_receipt.clone(),
                     };
@@ -3893,6 +3904,7 @@ fn execute_import(
         tombstone_skipped: import_result.tombstone_skipped,
         orphans_removed: import_result.orphans_removed,
         blocked_cache_rebuilt: true,
+        exact_duplicate_comments_deduplicated: import_result.exact_duplicate_comments_deduplicated,
         prefix_renames: import_result.prefix_renames.clone(),
         salvage: salvage_receipt.clone(),
     };
@@ -3903,6 +3915,12 @@ fn execute_import(
         return Ok(published_salvage_source);
     } else if ctx.is_rich() {
         render_import_result_rich(&result, ctx);
+        if result.exact_duplicate_comments_deduplicated > 0 {
+            ctx.warning(&format!(
+                "Deduplicated {} byte-identical repeated comment object(s); conflicting duplicate IDs are still rejected",
+                result.exact_duplicate_comments_deduplicated
+            ));
+        }
         if let Some(salvage) = &result.salvage {
             ctx.warning(&format!(
                 "JSONL salvage retained {} valid record(s), rejected {} invalid record(s); exact source backup: {}",
@@ -3941,6 +3959,12 @@ fn execute_import(
             println!(
                 "  Orphans removed: {} issues (not in JSONL)",
                 result.orphans_removed
+            );
+        }
+        if result.exact_duplicate_comments_deduplicated > 0 {
+            println!(
+                "  Warning: deduplicated {} byte-identical repeated comment object(s); conflicting duplicate IDs are still rejected",
+                result.exact_duplicate_comments_deduplicated
             );
         }
         if !result.prefix_renames.is_empty() {

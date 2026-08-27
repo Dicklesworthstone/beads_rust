@@ -17,6 +17,10 @@ use std::io::{self, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
+/// Default logical-byte ceiling for ordinary `.br_history` backup pairs.
+/// Protected recovery evidence is excluded from automatic budget rotation.
+pub const DEFAULT_HISTORY_MAX_BYTES: u64 = 1_073_741_824;
+
 /// Configuration for history backups.
 #[derive(Debug, Clone)]
 pub struct HistoryConfig {
@@ -658,7 +662,75 @@ fn rotate_history(history_dir: &Path, config: &HistoryConfig, target_key: &str) 
         tracing::debug!("Pruned {} old backup(s) for {}", deleted_count, target_key);
     }
 
+    let max_bytes = std::env::var("BR_HISTORY_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_HISTORY_MAX_BYTES);
+    let byte_pruned = prune_history_to_byte_budget(history_dir, max_bytes, false)?;
+    if byte_pruned > 0 {
+        tracing::debug!(
+            byte_pruned,
+            max_bytes,
+            "Pruned ordinary history backup pairs to the global logical-byte budget"
+        );
+    }
+
     Ok(())
+}
+
+fn backup_pair_size(entry: &BackupEntry) -> Result<u64> {
+    let metadata_path = backup_metadata_path(&entry.path);
+    let metadata_size = history_artifact_metadata(&metadata_path, "backup metadata")?
+        .map_or(0, |metadata| metadata.len());
+    Ok(entry.size.saturating_add(metadata_size))
+}
+
+fn prune_history_to_byte_budget(
+    history_dir: &Path,
+    max_bytes: u64,
+    include_protected: bool,
+) -> Result<usize> {
+    let mut backups = list_backups(history_dir, None)?
+        .into_iter()
+        .filter(|entry| include_protected || !entry.protected)
+        .map(|entry| {
+            let pair_size = backup_pair_size(&entry)?;
+            Ok((entry, pair_size))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    backups.sort_by(|(left, _), (right, _)| {
+        right
+            .timestamp
+            .cmp(&left.timestamp)
+            .then_with(|| right.path.cmp(&left.path))
+    });
+
+    let mut total_bytes = backups
+        .iter()
+        .fold(0_u64, |total, (_, size)| total.saturating_add(*size));
+    let mut deleted = 0usize;
+
+    // Always retain the globally newest pair, even if that single snapshot is
+    // larger than the configured budget. This leaves one usable restore point
+    // and makes the oversized-newest disposition explicit and deterministic.
+    while total_bytes > max_bytes && backups.len().saturating_sub(deleted) > 1 {
+        let index = backups.len() - 1 - deleted;
+        let (entry, pair_size) = &backups[index];
+        remove_backup_artifacts(&entry.path)?;
+        total_bytes = total_bytes.saturating_sub(*pair_size);
+        deleted += 1;
+    }
+
+    if total_bytes > max_bytes && !backups.is_empty() {
+        tracing::warn!(
+            total_bytes,
+            max_bytes,
+            newest = %backups[0].0.path.display(),
+            "Newest history backup pair alone exceeds the logical-byte budget; retaining it and pruning every older ordinary pair"
+        );
+    }
+
+    Ok(deleted)
 }
 
 /// List available backups sorted by date (newest first).
@@ -784,6 +856,7 @@ pub fn prune_backups(
     history_dir: &Path,
     keep: usize,
     older_than_days: Option<u32>,
+    max_bytes: Option<u64>,
 ) -> Result<usize> {
     let cutoff = older_than_days.map(|days| {
         let max_safe_days = 365_i64 * 1000;
@@ -818,6 +891,10 @@ pub fn prune_backups(
                 deleted_count += 1;
             }
         }
+    }
+
+    if let Some(max_bytes) = max_bytes {
+        deleted_count += prune_history_to_byte_budget(history_dir, max_bytes, true)?;
     }
 
     Ok(deleted_count)
@@ -1128,10 +1205,63 @@ mod tests {
         let metadata_path = backup_metadata_path(&backup.path);
         assert!(metadata_path.is_file());
 
-        let deleted = prune_backups(&history_dir, 0, None).unwrap();
+        let deleted = prune_backups(&history_dir, 0, None, None).unwrap();
         assert_eq!(deleted, 1);
         assert!(!backup.path.exists());
         assert!(!metadata_path.exists());
+    }
+
+    #[test]
+    fn test_byte_budget_prunes_oldest_pairs_globally_and_retains_oversized_newest() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let config = HistoryConfig {
+            min_interval_secs: 0,
+            ..HistoryConfig::default()
+        };
+        let issues = beads_dir.join("issues.jsonl");
+        let external = beads_dir.join("external.jsonl");
+
+        fs::write(&issues, vec![b'a'; 32]).unwrap();
+        backup_before_export(&beads_dir, &config, &issues).unwrap();
+        fs::write(&external, vec![b'b'; 64]).unwrap();
+        backup_before_export(&beads_dir, &config, &external).unwrap();
+        fs::write(&issues, vec![b'c'; 96]).unwrap();
+        backup_before_export(&beads_dir, &config, &issues).unwrap();
+
+        let before = list_backups(&history_dir, None).unwrap();
+        assert_eq!(before.len(), 3);
+        assert_eq!(
+            before
+                .iter()
+                .map(|entry| entry.target_key.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            2,
+            "fixture must span two target stems"
+        );
+        let newest_path = before[0].path.clone();
+        let newest_pair_size = backup_pair_size(&before[0]).unwrap();
+        let removed = prune_history_to_byte_budget(&history_dir, newest_pair_size, false).unwrap();
+
+        assert_eq!(removed, 2);
+        let remaining = list_backups(&history_dir, None).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].path, newest_path);
+        assert!(backup_metadata_path(&newest_path).is_file());
+
+        let removed_oversized = prune_history_to_byte_budget(&history_dir, 0, false).unwrap();
+        assert_eq!(removed_oversized, 0);
+        assert!(
+            newest_path.is_file(),
+            "newest oversized snapshot is retained"
+        );
+        assert!(
+            backup_metadata_path(&newest_path).is_file(),
+            "newest oversized metadata sidecar is retained"
+        );
     }
 
     #[test]
@@ -1252,7 +1382,7 @@ mod tests {
         }
 
         // Keep 3
-        let deleted = prune_backups(history_dir, 3, None).unwrap();
+        let deleted = prune_backups(history_dir, 3, None, None).unwrap();
         assert_eq!(deleted, 2);
         assert_eq!(list_backups(history_dir, None).unwrap().len(), 3);
 
@@ -1260,7 +1390,7 @@ mod tests {
         // Files remaining: 0, 1, 2 days old.
         // older_than 2 means delete anything older than 48h (effectively file 2)
         // file 1 (24h old) is kept.
-        let deleted_age = prune_backups(history_dir, 100, Some(2)).unwrap();
+        let deleted_age = prune_backups(history_dir, 100, Some(2), None).unwrap();
         assert_eq!(deleted_age, 1);
         assert_eq!(list_backups(history_dir, None).unwrap().len(), 2);
     }
@@ -1281,7 +1411,7 @@ mod tests {
             File::create(history_dir.join(format!("{stem}.{ts}.jsonl"))).unwrap();
         }
 
-        let deleted = prune_backups(history_dir, 1, None).unwrap();
+        let deleted = prune_backups(history_dir, 1, None, None).unwrap();
         assert_eq!(deleted, 2);
         assert_eq!(list_backups(history_dir, Some("issues.")).unwrap().len(), 1);
         assert_eq!(
@@ -1344,7 +1474,7 @@ mod tests {
         fs::remove_file(backup_metadata_path(&backup_path)).unwrap();
         fs::create_dir(backup_metadata_path(&backup_path)).unwrap();
 
-        let err = prune_backups(&history_dir, 0, None).unwrap_err();
+        let err = prune_backups(&history_dir, 0, None, None).unwrap_err();
         assert!(
             matches!(&err, BeadsError::Config(_)),
             "unexpected error: {err:?}"

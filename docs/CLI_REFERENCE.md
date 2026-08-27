@@ -2031,10 +2031,19 @@ br history <COMMAND>
 | Command | Description |
 |---------|-------------|
 | `list` | List backups |
+| `diff <BACKUP>` | Compare a backup with its target JSONL |
 | `restore <BACKUP>` | Restore from backup |
+| `prune [--keep N] [--older-than DAYS] [--max-bytes BYTES]` | Remove oldest complete backup+metadata pairs by per-target count/age and an optional global logical-byte budget |
 
 **Notes:**
 - Backups are created during `br sync --flush-only` when overwriting a JSONL file inside `.beads/`, including custom `BEADS_JSONL` paths that still target `.beads/`.
+- Ordinary automatic rotation applies a 1 GiB global logical-byte budget across
+  all target stems after the per-target count/age limits. Set
+  `BR_HISTORY_MAX_BYTES` to an integer byte count to override it. Protected
+  pre-salvage evidence is excluded from automatic rotation.
+- Byte-budget pruning removes the oldest complete snapshot+metadata pairs
+  deterministically. The globally newest pair is retained even when that one
+  snapshot alone exceeds the budget; every older eligible pair is removed.
 
 ---
 

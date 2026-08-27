@@ -3194,6 +3194,12 @@ pub enum HistoryCommands {
         /// Remove backups older than N days
         #[arg(long)]
         older_than: Option<u32>,
+        /// Global logical-byte budget across all backup+metadata pairs
+        ///
+        /// Oldest complete pairs are removed until within budget. The newest
+        /// pair is always retained even when it alone exceeds this value.
+        #[arg(long, value_name = "BYTES")]
+        max_bytes: Option<u64>,
     },
 }
 

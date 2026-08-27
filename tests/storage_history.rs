@@ -200,7 +200,7 @@ fn rotation_by_age_deletes_old() {
     write_file(&hdir.join(format!("issues.{old_ts}.jsonl")), b"old");
 
     // Prune: keep 100, older than 30 days
-    let deleted = prune_backups(&hdir, 100, Some(30)).unwrap();
+    let deleted = prune_backups(&hdir, 100, Some(30), None).unwrap();
     assert_eq!(deleted, 1, "should delete 1 old backup");
 
     let remaining = list_backups(&hdir, None).unwrap();
@@ -361,7 +361,7 @@ fn prune_zero_keep_deletes_all() {
 
     assert_eq!(list_backups(hdir, None).unwrap().len(), 5);
 
-    let deleted = prune_backups(hdir, 0, None).unwrap();
+    let deleted = prune_backups(hdir, 0, None, None).unwrap();
     assert_eq!(deleted, 5);
     assert!(list_backups(hdir, None).unwrap().is_empty());
 }
@@ -373,7 +373,7 @@ fn prune_zero_keep_deletes_all() {
 #[test]
 fn prune_empty_dir_is_noop() {
     let temp = TempDir::new().unwrap();
-    let deleted = prune_backups(temp.path(), 10, None).unwrap();
+    let deleted = prune_backups(temp.path(), 10, None, None).unwrap();
     assert_eq!(deleted, 0);
 }
 

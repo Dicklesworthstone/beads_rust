@@ -467,7 +467,8 @@ fn source_repo_path_migration_reconciles_and_is_idempotent() {
     );
     assert!(
         apply_run.status.success(),
-        "migration apply failed: {}",
+        "migration apply failed: stdout={} stderr={}",
+        apply_run.stdout,
         apply_run.stderr
     );
     let applied = parse_json_value(&apply_run.stdout);

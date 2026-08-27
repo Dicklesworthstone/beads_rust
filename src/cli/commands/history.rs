@@ -348,9 +348,11 @@ pub fn execute(args: HistoryArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 ctx,
             )
         }
-        Some(HistoryCommands::Prune { keep, older_than }) => {
-            prune_backups(&history_dir, keep, older_than, ctx)
-        }
+        Some(HistoryCommands::Prune {
+            keep,
+            older_than,
+            max_bytes,
+        }) => prune_backups(&history_dir, keep, older_than, max_bytes, ctx),
         Some(HistoryCommands::List) | None => list_backups(&history_dir, ctx),
     }
 }
@@ -637,9 +639,11 @@ fn prune_backups(
     history_dir: &Path,
     keep: usize,
     older_than_days: Option<u32>,
+    max_bytes: Option<u64>,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let deleted = crate::sync::history::prune_backups(history_dir, keep, older_than_days)?;
+    let deleted =
+        crate::sync::history::prune_backups(history_dir, keep, older_than_days, max_bytes)?;
 
     if ctx.is_json() {
         let output = json!({
@@ -647,6 +651,7 @@ fn prune_backups(
             "deleted": deleted,
             "keep": keep,
             "older_than_days": older_than_days,
+            "max_bytes": max_bytes,
         });
         ctx.json_pretty(&output);
         return Ok(());
@@ -658,6 +663,7 @@ fn prune_backups(
             "deleted": deleted,
             "keep": keep,
             "older_than_days": older_than_days,
+            "max_bytes": max_bytes,
         });
         ctx.toon(&output);
         return Ok(());
@@ -676,6 +682,9 @@ fn prune_backups(
             ));
         } else {
             body.push_str(&format!("\nCriteria: keep {keep} newest backups"));
+        }
+        if let Some(bytes) = max_bytes {
+            body.push_str(&format!("\nGlobal logical-byte budget: {bytes} bytes"));
         }
         let panel = Panel::from_text(&body)
             .title(Text::styled("History Prune", theme.panel_title.clone()))

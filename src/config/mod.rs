@@ -2687,7 +2687,38 @@ fn verify_rebuilt_database_postconditions(
     )?;
     verify_blocked_cache_payloads(storage)?;
     verify_child_counters(storage, import_result.child_counter_entries)?;
+    verify_rebuilt_issue_semantics(storage, &import_result.applied_issues)?;
 
+    Ok(())
+}
+
+fn verify_rebuilt_issue_semantics(
+    storage: &SqliteStorage,
+    expected_issues: &[crate::model::Issue],
+) -> Result<()> {
+    for expected in expected_issues {
+        let actual = storage
+            .get_issue_for_export(&expected.id)
+            .map_err(|source| BeadsError::WithContext {
+                context: format!(
+                    "Post-recovery validation failed while reading imported issue {}",
+                    expected.id
+                ),
+                source: Box::new(source),
+            })?
+            .ok_or_else(|| {
+                BeadsError::Config(format!(
+                    "post-recovery semantic validation failed: imported issue {} is not addressable by its JSONL id",
+                    expected.id
+                ))
+            })?;
+        if !actual.sync_equals(expected) {
+            return Err(BeadsError::Config(format!(
+                "post-recovery semantic validation failed: imported issue {} does not match its normalized JSONL payload",
+                expected.id
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -10813,6 +10844,31 @@ routing:
 
         verify_rebuilt_database_postconditions(&fixture.storage, &fixture.import_result)
             .expect("relation-rich rebuild state should satisfy postconditions");
+    }
+
+    #[test]
+    fn rebuilt_database_postconditions_reject_semantic_field_shift_with_equal_counts() {
+        let fixture = relation_rich_rebuild_fixture();
+        let expected = fixture
+            .storage
+            .get_issue_for_export("bd-parent")
+            .expect("read expected issue")
+            .expect("expected issue exists");
+        let mut import_result = fixture.import_result.clone();
+        import_result.applied_issues.push(expected);
+
+        fixture
+            .storage
+            .execute_raw("UPDATE issues SET title = 'shifted-field-value' WHERE id = 'bd-parent'")
+            .expect("inject semantic drift without changing row counts");
+
+        let err = verify_rebuilt_database_postconditions(&fixture.storage, &import_result)
+            .expect_err("semantic field shift must fail post-rebuild validation");
+        assert!(
+            err.to_string()
+                .contains("does not match its normalized JSONL payload"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

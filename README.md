@@ -547,7 +547,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `lint` | Check issues for missing template sections | `br lint --status all` |
 | `orphans` | List open issues referenced in commits | `br orphans` |
 | `changelog` | Generate changelog from closed issues | `br changelog --since-tag v0.1.44` |
-| `history` | Manage local history backups | `br history list` |
+| `history` | Manage bounded local history backups | `br history prune --max-bytes 1073741824` |
 | `status` | Alias for project statistics | `br status` |
 
 ### Agents & Tooling
