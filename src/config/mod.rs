@@ -2697,6 +2697,17 @@ fn verify_rebuilt_issue_semantics(
     expected_issues: &[crate::model::Issue],
 ) -> Result<()> {
     for expected in expected_issues {
+        // These two legacy columns are NOT NULL in the on-disk schema and
+        // therefore materialize their historical defaults even when an older
+        // JSONL record omits them. Compare against that persisted canonical
+        // representation so the verifier remains strict without rejecting a
+        // lossless import solely because `None` round-trips as the schema
+        // default.
+        let mut persisted_expected = expected.clone();
+        persisted_expected
+            .source_repo
+            .get_or_insert_with(|| ".".to_string());
+        persisted_expected.original_size.get_or_insert(0);
         let actual = storage
             .get_issue_for_export(&expected.id)
             .map_err(|source| BeadsError::WithContext {
@@ -2712,8 +2723,8 @@ fn verify_rebuilt_issue_semantics(
                     expected.id
                 ))
         })?;
-        if !actual.sync_equals(expected) {
-            let differing_fields = sync_mismatch_field_names(&actual, expected);
+        if !actual.sync_equals(&persisted_expected) {
+            let differing_fields = sync_mismatch_field_names(&actual, &persisted_expected);
             return Err(BeadsError::Config(format!(
                 "post-recovery semantic validation failed: imported issue {} does not match its normalized JSONL payload (differing fields: {})",
                 expected.id,
