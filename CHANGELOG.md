@@ -15,20 +15,24 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
-## v0.5.3 -- 2026-08-26 (Release)
+## v0.5.3 -- 2026-08-27 (Release)
 
 Storage-correctness and release-hardening follow-up. The dependency stack now
-consumes the published FrankenSQLite 0.3.10 schema fixes, machine-readable
+consumes the published FrankenSQLite 0.3.11 schema fixes, machine-readable
 search output has one stable envelope, oversized parent filters stay within
 SQLite's parameter limit, and recovery paths preserve their evidence on more
 fail-closed exits.
 
 ### Storage engine and schema correctness
 
-- The complete `fsqlite` family moves to 0.3.10. Consecutive column `CHECK`
+- The complete `fsqlite` family moves to 0.3.11. Consecutive column `CHECK`
   clauses are now extracted from the original DDL coordinate system even when
   comments precede `CREATE TABLE`, so both the maximum and non-empty title
   constraints remain enforced.
+- Compound table and column `CHECK` expressions with nested grouping now keep
+  parseable source on the live schema path rather than becoming malformed and
+  silently unenforced until reopen. VDBE code generation also fails closed if
+  malformed internal CHECK metadata ever reaches it.
 - `ALTER TABLE main.<staging> RENAME TO ...` now targets the persistent table
   when a same-named TEMP staging table is visible. The TEMP binding survives,
   persisted DDL is canonical and unqualified, and stock SQLite can reopen the

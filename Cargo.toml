@@ -46,7 +46,7 @@ clap_complete = { version = "4.6.9", features = ["unstable-dynamic"] }
 # depends on fsqlite-ext-json internally, but the 0.3.9+ extension enables
 # only serde_json's `preserve_order`; the old viral `arbitrary_precision`
 # feature no longer affects br's JSON/TOON serializers.
-fsqlite = { version = "0.3.10", default-features = false, features = [
+fsqlite = { version = "0.3.11", default-features = false, features = [
     "native",
     "linux-asupersync-uring",
     "fts5",
@@ -54,20 +54,20 @@ fsqlite = { version = "0.3.10", default-features = false, features = [
     "icu",
     "misc",
 ] }
-fsqlite-types = "0.3.10"
-fsqlite-error = "0.3.10"
-fsqlite-core = "0.3.10"
-fsqlite-func = "0.3.10"
-fsqlite-vdbe = "0.3.10"
-fsqlite-vfs = "0.3.10"
-fsqlite-pager = "0.3.10"
-fsqlite-parser = "0.3.10"
-fsqlite-planner = "0.3.10"
-fsqlite-wal = "0.3.10"
-fsqlite-btree = "0.3.10"
-fsqlite-ast = "0.3.10"
-fsqlite-mvcc = "0.3.10"
-fsqlite-observability = "0.3.10"
+fsqlite-types = "0.3.11"
+fsqlite-error = "0.3.11"
+fsqlite-core = "0.3.11"
+fsqlite-func = "0.3.11"
+fsqlite-vdbe = "0.3.11"
+fsqlite-vfs = "0.3.11"
+fsqlite-pager = "0.3.11"
+fsqlite-parser = "0.3.11"
+fsqlite-planner = "0.3.11"
+fsqlite-wal = "0.3.11"
+fsqlite-btree = "0.3.11"
+fsqlite-ast = "0.3.11"
+fsqlite-mvcc = "0.3.11"
+fsqlite-observability = "0.3.11"
 
 # Current-thread runtime that drives fsqlite 0.3's async (!Send) futures to
 # completion behind the synchronous `franken_sync::Connection` bridge.
@@ -215,7 +215,7 @@ self_update = [
 
 # NOTE: no `[patch.crates-io]` here.
 #
-# All dependencies — fsqlite 0.3.10, its fsqlite-* transitive crates, and
+# All dependencies — fsqlite 0.3.11, its fsqlite-* transitive crates, and
 # fastmcp-rust 0.7.0 — are published on crates.io, so this crate
 # resolves everything from the registry out of the box.  That makes
 # `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked`
