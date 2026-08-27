@@ -60,6 +60,10 @@ pub struct BackupEntry {
     /// Protected backups are explicit recovery evidence and never participate
     /// in automatic age/count rotation.
     pub protected: bool,
+    /// True only when the snapshot has a readable, valid metadata sidecar.
+    /// Global byte-budget pruning is intentionally limited to these verified
+    /// complete pairs so it cannot delete unclassifiable recovery evidence.
+    metadata_verified: bool,
 }
 
 struct BackupFileGuard {
@@ -412,15 +416,20 @@ fn backup_target_details(
     history_dir: &Path,
     backup_path: &Path,
     backup_name: &str,
-) -> (PathBuf, String, bool) {
+) -> (PathBuf, String, bool, bool) {
     let Some(beads_dir) = history_dir.parent() else {
         let fallback = PathBuf::from(backup_name);
-        return (fallback, format!("orphan-history:{backup_name}"), false);
+        return (
+            fallback,
+            format!("orphan-history:{backup_name}"),
+            false,
+            false,
+        );
     };
 
     match read_backup_metadata(backup_path) {
         Ok(Some(metadata)) => match metadata.target.resolve_path(beads_dir) {
-            Ok(target_path) => (target_path, metadata.target.key(), metadata.protected),
+            Ok(target_path) => (target_path, metadata.target.key(), metadata.protected, true),
             Err(err) => {
                 tracing::warn!(
                     backup = %backup_path.display(),
@@ -431,19 +440,20 @@ fn backup_target_details(
                     invalid_metadata_target_path(backup_name),
                     format!("invalid-metadata:{backup_name}"),
                     false,
+                    false,
                 )
             }
         },
         Ok(None) => legacy_backup_target_path(beads_dir, backup_name).map_or_else(
             |_| {
                 let fallback = PathBuf::from(backup_name);
-                (fallback, format!("legacy-name:{backup_name}"), false)
+                (fallback, format!("legacy-name:{backup_name}"), false, false)
             },
             |target_path| {
                 let target_key = BackupMetadata::from_target_path(beads_dir, &target_path)
                     .target
                     .key();
-                (target_path, target_key, false)
+                (target_path, target_key, false, false)
             },
         ),
         Err(err) => {
@@ -455,6 +465,7 @@ fn backup_target_details(
             (
                 invalid_metadata_target_path(backup_name),
                 format!("invalid-metadata:{backup_name}"),
+                false,
                 false,
             )
         }
@@ -678,11 +689,21 @@ fn rotate_history(history_dir: &Path, config: &HistoryConfig, target_key: &str) 
     Ok(())
 }
 
-fn backup_pair_size(entry: &BackupEntry) -> Result<u64> {
+fn backup_pair_size(entry: &BackupEntry) -> Result<Option<u64>> {
+    if !entry.metadata_verified {
+        return Ok(None);
+    }
+
     let metadata_path = backup_metadata_path(&entry.path);
     let metadata_size = history_artifact_metadata(&metadata_path, "backup metadata")?
-        .map_or(0, |metadata| metadata.len());
-    Ok(entry.size.saturating_add(metadata_size))
+        .ok_or_else(|| BeadsError::SyncConflict {
+            message: format!(
+                "History backup metadata disappeared before byte-budget pruning: {}",
+                metadata_path.display()
+            ),
+        })?
+        .len();
+    Ok(Some(entry.size.saturating_add(metadata_size)))
 }
 
 fn prune_history_to_byte_budget(
@@ -690,14 +711,15 @@ fn prune_history_to_byte_budget(
     max_bytes: u64,
     include_protected: bool,
 ) -> Result<usize> {
-    let mut backups = list_backups(history_dir, None)?
-        .into_iter()
-        .filter(|entry| include_protected || !entry.protected)
-        .map(|entry| {
-            let pair_size = backup_pair_size(&entry)?;
-            Ok((entry, pair_size))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut backups = Vec::new();
+    for entry in list_backups(history_dir, None)? {
+        if (!include_protected && entry.protected) || !entry.metadata_verified {
+            continue;
+        }
+        if let Some(pair_size) = backup_pair_size(&entry)? {
+            backups.push((entry, pair_size));
+        }
+    }
     backups.sort_by(|(left, _), (right, _)| {
         right
             .timestamp
@@ -787,7 +809,8 @@ pub fn list_backups(history_dir: &Path, filter_prefix: Option<&str>) -> Result<V
                 continue;
             }
         };
-        let (target_path, target_key, protected) = backup_target_details(history_dir, &path, name);
+        let (target_path, target_key, protected, metadata_verified) =
+            backup_target_details(history_dir, &path, name);
 
         backups.push(BackupEntry {
             path,
@@ -796,6 +819,7 @@ pub fn list_backups(history_dir: &Path, filter_prefix: Option<&str>) -> Result<V
             target_path,
             target_key,
             protected,
+            metadata_verified,
         });
     }
 
@@ -1243,7 +1267,7 @@ mod tests {
             "fixture must span two target stems"
         );
         let newest_path = before[0].path.clone();
-        let newest_pair_size = backup_pair_size(&before[0]).unwrap();
+        let newest_pair_size = backup_pair_size(&before[0]).unwrap().unwrap();
         let removed = prune_history_to_byte_budget(&history_dir, newest_pair_size, false).unwrap();
 
         assert_eq!(removed, 2);
@@ -1262,6 +1286,32 @@ mod tests {
             backup_metadata_path(&newest_path).is_file(),
             "newest oversized metadata sidecar is retained"
         );
+    }
+
+    #[test]
+    fn test_byte_budget_preserves_unclassifiable_incomplete_pairs() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        fs::create_dir_all(&history_dir).unwrap();
+        let target = beads_dir.join("issues.jsonl");
+        let config = HistoryConfig {
+            min_interval_secs: 0,
+            ..HistoryConfig::default()
+        };
+
+        let unclassifiable = history_dir.join("issues.20200101_000000.jsonl");
+        fs::write(&unclassifiable, b"preserve unclassifiable bytes\n").unwrap();
+        let invalid_metadata = backup_metadata_path(&unclassifiable);
+        fs::write(&invalid_metadata, b"{not-json").unwrap();
+
+        fs::write(&target, b"newest valid restore point\n").unwrap();
+        backup_before_export(&beads_dir, &config, &target).unwrap();
+
+        let removed = prune_history_to_byte_budget(&history_dir, 0, false).unwrap();
+        assert_eq!(removed, 0, "the sole verified pair must be retained");
+        assert!(unclassifiable.is_file());
+        assert!(invalid_metadata.is_file());
     }
 
     #[test]

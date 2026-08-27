@@ -854,3 +854,54 @@ fn e2e_history_prune_json_output() {
     assert!(json.get("deleted").is_some(), "should have deleted count");
     assert_eq!(json["keep"], 10, "keep should be 10");
 }
+
+#[test]
+fn e2e_history_prune_max_bytes_keeps_only_oversized_newest_pair() {
+    let _log = common::test_log("e2e_history_prune_max_bytes_keeps_only_oversized_newest_pair");
+    let workspace = setup_workspace_with_jsonl();
+
+    for i in 0..3 {
+        thread::sleep(Duration::from_millis(1100));
+        create_issue(
+            &workspace,
+            &format!("Byte-budget history issue {i}"),
+            &format!("create_byte_budget_{i}"),
+        );
+        sync_flush(&workspace);
+    }
+
+    let backups_before = list_backup_files(&workspace);
+    assert!(
+        backups_before.len() >= 3,
+        "fixture should contain at least three backups: {backups_before:?}"
+    );
+
+    let prune = run_br(
+        &workspace,
+        [
+            "--json",
+            "history",
+            "prune",
+            "--keep",
+            "100",
+            "--max-bytes",
+            "1",
+        ],
+        "history_prune_max_bytes",
+    );
+    assert!(prune.status.success(), "prune failed: {}", prune.stderr);
+    let receipt: serde_json::Value = serde_json::from_str(&prune.stdout).expect("valid prune JSON");
+    assert_eq!(receipt["max_bytes"].as_u64(), Some(1));
+    assert_eq!(
+        receipt["deleted"].as_u64(),
+        Some((backups_before.len() - 1) as u64),
+        "a one-byte budget must prune every older pair: {receipt}"
+    );
+
+    let backups_after = list_backup_files(&workspace);
+    assert_eq!(
+        backups_after.len(),
+        1,
+        "the newest restore point must survive even when it alone exceeds the budget"
+    );
+}
