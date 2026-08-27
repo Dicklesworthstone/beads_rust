@@ -9008,6 +9008,12 @@ pub struct JsonlSalvageReceipt {
     pub rejected_records: Vec<JsonlSalvageRejectedRecord>,
     pub backup_path: String,
     pub publication_atomicity: String,
+    /// Exportable database records not certified by the recovered JSONL.
+    /// These rows are preserved by the additive import and require a later
+    /// full export to restore DB/JSONL coverage.
+    pub database_records_requiring_export: usize,
+    /// Whether this salvage armed `needs_flush` for those preserved rows.
+    pub needs_flush_set: bool,
 }
 
 pub(crate) struct JsonlSalvageResult {
@@ -9018,7 +9024,7 @@ pub(crate) struct JsonlSalvageResult {
 fn classify_jsonl_salvage_record(
     line: &[u8],
     seen_ids: &mut HashSet<String>,
-) -> Option<Result<(), String>> {
+) -> Option<std::result::Result<(), String>> {
     let trimmed = line.trim_ascii();
     if trimmed.is_empty() {
         return None;
@@ -9142,6 +9148,8 @@ pub(crate) fn salvage_invalid_jsonl_records_under_authority(
             rejected_records,
             backup_path: backup_path.to_string_lossy().into_owned(),
             publication_atomicity: publication.atomicity.as_str().to_string(),
+            database_records_requiring_export: 0,
+            needs_flush_set: false,
         },
     }))
 }

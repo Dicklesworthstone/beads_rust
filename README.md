@@ -987,6 +987,22 @@ while the JSONL still holds rows the database never imported.
 `--import-only`; after import it removes database entries that are absent from
 JSONL, while preserving deletion tombstones used by sync.
 
+### Error: invalid issue record in JSONL
+
+Normal import deliberately fails closed on malformed or semantically invalid
+records. For an inherited historical file that cannot be repaired by hand,
+run the explicit salvage operation:
+
+```bash
+br sync --import-only --skip-invalid-records --json
+```
+
+br first preserves the exact original bytes in a protected, non-rotating
+`.beads/.br_history/*pre-salvage*.jsonl` backup. It then reports every rejected
+line, refuses if no valid records would remain, conditionally publishes the
+validated survivor generation, and imports that exact snapshot. Unresolved git
+conflict markers are never skipped.
+
 ### Sync Issues After Git Merge
 
 ```bash

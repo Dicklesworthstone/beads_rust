@@ -620,19 +620,17 @@ fn cli_import_salvages_one_malformed_record_with_durable_receipt() {
     let mut lines = original.lines();
     let first = lines.next().expect("first exported issue");
     let second = lines.next().expect("second exported issue");
-    assert!(lines.next().is_none(), "fixture should export exactly two rows");
+    assert!(
+        lines.next().is_none(),
+        "fixture should export exactly two rows"
+    );
 
     let corrupted = format!("{first}\n{second}beads: synchronize issue state and metadata\n");
     fs::write(&jsonl_path, &corrupted).expect("inject historical trailing text");
 
     let import = run_br(
         &workspace,
-        [
-            "--json",
-            "sync",
-            "--import-only",
-            "--skip-invalid-records",
-        ],
+        ["--json", "sync", "--import-only", "--skip-invalid-records"],
         "import_salvage",
     );
     assert!(
@@ -648,6 +646,8 @@ fn cli_import_salvages_one_malformed_record_with_durable_receipt() {
         .expect("salvage receipt must be present");
     assert_eq!(salvage["valid_records"], 1);
     assert_eq!(salvage["rejected_records"][0]["line"], 2);
+    assert_eq!(salvage["database_records_requiring_export"], 1);
+    assert_eq!(salvage["needs_flush_set"], true);
     assert!(
         salvage["rejected_records"][0]["error"]
             .as_str()
@@ -673,6 +673,37 @@ fn cli_import_salvages_one_malformed_record_with_durable_receipt() {
         "ordinary command remained blocked after salvage: {}",
         list.stderr
     );
+
+    let status = run_br(
+        &workspace,
+        ["--json", "sync", "--status"],
+        "status_after_salvage",
+    );
+    assert!(status.status.success(), "sync status failed: {}", status.stderr);
+    let status_json: serde_json::Value =
+        serde_json::from_str(&status.stdout).expect("parse sync status");
+    assert_eq!(status_json["db_newer"], true);
+    assert_eq!(status_json["coverage_drift"], true);
+
+    let flush = run_br(
+        &workspace,
+        ["sync", "--flush-only"],
+        "flush_after_salvage",
+    );
+    assert!(
+        flush.status.success(),
+        "ordinary flush could not restore salvaged coverage: {}",
+        flush.stderr
+    );
+    assert_eq!(
+        fs::read_to_string(&jsonl_path).expect("read re-exported JSONL"),
+        original
+    );
+    assert_eq!(
+        fs::read(backup_path).expect("re-read exact salvage backup"),
+        corrupted.as_bytes(),
+        "later export must not rotate or rewrite the protected salvage backup"
+    );
 }
 
 /// The opt-in is not permission to erase an entirely invalid source.
@@ -690,7 +721,9 @@ fn cli_import_salvage_refuses_when_no_valid_records_remain() {
     );
     assert!(!import.status.success(), "all-invalid salvage must refuse");
     assert!(
-        import.stderr.contains("no valid issue records would remain"),
+        import
+            .stderr
+            .contains("no valid issue records would remain"),
         "unexpected refusal: {}",
         import.stderr
     );

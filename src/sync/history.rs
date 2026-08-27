@@ -53,6 +53,9 @@ pub struct BackupEntry {
     pub size: u64,
     pub target_path: PathBuf,
     pub target_key: String,
+    /// Protected backups are explicit recovery evidence and never participate
+    /// in automatic age/count rotation.
+    pub protected: bool,
 }
 
 struct BackupFileGuard {
@@ -143,12 +146,15 @@ impl BackupTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct BackupMetadata {
     target: BackupTarget,
+    #[serde(default)]
+    protected: bool,
 }
 
 impl BackupMetadata {
     fn from_target_path(beads_dir: &Path, target_path: &Path) -> Self {
         Self {
             target: BackupTarget::from_target_path(beads_dir, target_path),
+            protected: false,
         }
     }
 }
@@ -336,7 +342,17 @@ fn read_backup_metadata(backup_path: &Path) -> Result<Option<BackupMetadata>> {
 }
 
 fn write_backup_metadata(beads_dir: &Path, target_path: &Path, backup_path: &Path) -> Result<()> {
-    let metadata = BackupMetadata::from_target_path(beads_dir, target_path);
+    write_backup_metadata_with_protection(beads_dir, target_path, backup_path, false)
+}
+
+fn write_backup_metadata_with_protection(
+    beads_dir: &Path,
+    target_path: &Path,
+    backup_path: &Path,
+    protected: bool,
+) -> Result<()> {
+    let mut metadata = BackupMetadata::from_target_path(beads_dir, target_path);
+    metadata.protected = protected;
     let contents = serde_json::to_vec(&metadata).map_err(|err| {
         BeadsError::Config(format!(
             "Failed to serialize history backup metadata for '{}': {err}",
@@ -392,15 +408,15 @@ fn backup_target_details(
     history_dir: &Path,
     backup_path: &Path,
     backup_name: &str,
-) -> (PathBuf, String) {
+) -> (PathBuf, String, bool) {
     let Some(beads_dir) = history_dir.parent() else {
         let fallback = PathBuf::from(backup_name);
-        return (fallback, format!("orphan-history:{backup_name}"));
+        return (fallback, format!("orphan-history:{backup_name}"), false);
     };
 
     match read_backup_metadata(backup_path) {
         Ok(Some(metadata)) => match metadata.target.resolve_path(beads_dir) {
-            Ok(target_path) => (target_path, metadata.target.key()),
+            Ok(target_path) => (target_path, metadata.target.key(), metadata.protected),
             Err(err) => {
                 tracing::warn!(
                     backup = %backup_path.display(),
@@ -410,19 +426,20 @@ fn backup_target_details(
                 (
                     invalid_metadata_target_path(backup_name),
                     format!("invalid-metadata:{backup_name}"),
+                    false,
                 )
             }
         },
         Ok(None) => legacy_backup_target_path(beads_dir, backup_name).map_or_else(
             |_| {
                 let fallback = PathBuf::from(backup_name);
-                (fallback, format!("legacy-name:{backup_name}"))
+                (fallback, format!("legacy-name:{backup_name}"), false)
             },
             |target_path| {
                 let target_key = BackupMetadata::from_target_path(beads_dir, &target_path)
                     .target
                     .key();
-                (target_path, target_key)
+                (target_path, target_key, false)
             },
         ),
         Err(err) => {
@@ -434,6 +451,7 @@ fn backup_target_details(
             (
                 invalid_metadata_target_path(backup_name),
                 format!("invalid-metadata:{backup_name}"),
+                false,
             )
         }
     }
@@ -593,7 +611,7 @@ pub(crate) fn backup_before_jsonl_salvage(
     io::copy(&mut source.reader(), &mut backup_file).map_err(BeadsError::Io)?;
     backup_file.sync_all().map_err(BeadsError::Io)?;
     crate::util::sync_parent_directory(&backup_path).map_err(BeadsError::Io)?;
-    write_backup_metadata(beads_dir, target_path, &backup_path)?;
+    write_backup_metadata_with_protection(beads_dir, target_path, &backup_path, true)?;
     backup_guard.persist();
 
     Ok(backup_path)
@@ -607,7 +625,7 @@ pub(crate) fn backup_before_jsonl_salvage(
 fn rotate_history(history_dir: &Path, config: &HistoryConfig, target_key: &str) -> Result<()> {
     let mut backups: Vec<_> = list_backups(history_dir, None)?
         .into_iter()
-        .filter(|entry| entry.target_key == target_key)
+        .filter(|entry| entry.target_key == target_key && !entry.protected)
         .collect();
 
     if backups.is_empty() {
@@ -697,7 +715,7 @@ pub fn list_backups(history_dir: &Path, filter_prefix: Option<&str>) -> Result<V
                 continue;
             }
         };
-        let (target_path, target_key) = backup_target_details(history_dir, &path, name);
+        let (target_path, target_key, protected) = backup_target_details(history_dir, &path, name);
 
         backups.push(BackupEntry {
             path,
@@ -705,6 +723,7 @@ pub fn list_backups(history_dir: &Path, filter_prefix: Option<&str>) -> Result<V
             size: metadata.len(),
             target_path,
             target_key,
+            protected,
         });
     }
 
@@ -717,7 +736,7 @@ pub fn list_backups(history_dir: &Path, filter_prefix: Option<&str>) -> Result<V
 fn get_latest_backup(history_dir: &Path, target_key: &str) -> Result<Option<BackupEntry>> {
     Ok(list_backups(history_dir, None)?
         .into_iter()
-        .find(|entry| entry.target_key == target_key))
+        .find(|entry| entry.target_key == target_key && !entry.protected))
 }
 
 fn snapshot_and_file_are_identical(source: &JsonlSourceSnapshot, path: &Path) -> Result<bool> {
@@ -873,6 +892,36 @@ mod tests {
                 .iter()
                 .any(|b| b.path.to_string_lossy().contains(&t3.to_string()))
         );
+    }
+
+    #[test]
+    fn protected_salvage_backup_is_excluded_from_rotation() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        fs::create_dir_all(&history_dir).unwrap();
+        let target_path = beads_dir.join("issues.jsonl");
+        let timestamp = (Utc::now() - chrono::Duration::days(60))
+            .format("%Y%m%d_%H%M%S")
+            .to_string();
+        let backup_path = history_dir.join(format!("issues.pre-salvage.{timestamp}.jsonl"));
+        fs::write(&backup_path, b"malformed historical bytes\n").unwrap();
+        write_backup_metadata_with_protection(&beads_dir, &target_path, &backup_path, true)
+            .unwrap();
+
+        let config = HistoryConfig {
+            enabled: true,
+            max_count: 0,
+            max_age_days: 0,
+            min_interval_secs: 0,
+        };
+        let target_key = target_key_for_path(&beads_dir, &target_path);
+        rotate_history(&history_dir, &config, &target_key).unwrap();
+
+        let remaining = list_backups(&history_dir, None).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining[0].protected);
+        assert_eq!(remaining[0].path, backup_path);
     }
 
     #[test]

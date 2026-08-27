@@ -735,6 +735,13 @@ pub fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
             reason: "--skip-invalid-records can only be used with --import-only".to_string(),
         });
     }
+    if args.skip_invalid_records && (args.force || args.rebuild || args.rename_prefix) {
+        return Err(BeadsError::Validation {
+            field: "skip_invalid_records".to_string(),
+            reason: "--skip-invalid-records is an additive recovery mode and cannot be combined with --force, --rebuild, or --rename-prefix"
+                .to_string(),
+        });
+    }
     if args.apply && !args.reconcile_additive {
         return Err(BeadsError::Validation {
             field: "apply".to_string(),
@@ -3392,7 +3399,7 @@ fn execute_import(
         );
         crate::sync::verify_jsonl_source_snapshot_current(source, jsonl_authority)?;
         emit_auto_rebuild_import_result(storage, use_json, ctx)?;
-        return Ok(None);
+        return Ok(published_salvage_source);
     }
 
     // Check staleness (unless --force or --rebuild)
@@ -3552,6 +3559,21 @@ fn execute_import(
     } else {
         import_from_jsonl_snapshot(storage, source, &import_config, target_prefix.as_deref())?
     };
+
+    if let Some(salvage) = salvage_receipt.as_mut() {
+        let exportable_records = storage.count_exportable_issues()?;
+        let records_requiring_export =
+            exportable_records.saturating_sub(import_result.export_hashes_recorded);
+        salvage.database_records_requiring_export = records_requiring_export;
+        if records_requiring_export > 0 {
+            storage.set_metadata("needs_flush", "true")?;
+            salvage.needs_flush_set = true;
+            warn!(
+                records_requiring_export,
+                "JSONL salvage preserved database records absent from the recovered source; a full export is required"
+            );
+        }
+    }
 
     info!(
         created_or_updated = import_result.imported_count,
@@ -3765,9 +3787,29 @@ fn execute_import(
     if use_json {
         ctx.json_pretty(&result);
     } else if !should_render_human_sync_output(ctx, use_json) {
-        return Ok(());
+        return Ok(published_salvage_source);
     } else if ctx.is_rich() {
         render_import_result_rich(&result, ctx);
+        if let Some(salvage) = &result.salvage {
+            ctx.warning(&format!(
+                "JSONL salvage retained {} valid record(s), rejected {} invalid record(s); exact source backup: {}",
+                salvage.valid_records,
+                salvage.rejected_records.len(),
+                salvage.backup_path
+            ));
+            for rejected in salvage.rejected_records.iter().take(HUMAN_WITNESS_LIMIT) {
+                ctx.warning(&format!(
+                    "Rejected JSONL line {}: {}",
+                    rejected.line, rejected.error
+                ));
+            }
+            if salvage.needs_flush_set {
+                ctx.warning(&format!(
+                    "{} preserved database record(s) require `br sync --flush-only` to restore JSONL coverage",
+                    salvage.database_records_requiring_export
+                ));
+            }
+        }
     } else {
         let processed = import_result.imported_count
             + import_result.skipped_count
@@ -3812,7 +3854,10 @@ fn execute_import(
                 salvage.valid_records,
                 salvage.rejected_records.len()
             );
-            println!("  Exact source backup: {}", salvage.backup_path);
+            println!(
+                "  Exact source backup: {}",
+                sanitize_terminal_inline(&salvage.backup_path)
+            );
             for rejected in salvage.rejected_records.iter().take(HUMAN_WITNESS_LIMIT) {
                 println!(
                     "    Rejected line {}: {}",
@@ -3824,6 +3869,12 @@ fn execute_import(
                 println!(
                     "    ... {} more; use --json for the complete rejection receipt",
                     salvage.rejected_records.len() - HUMAN_WITNESS_LIMIT
+                );
+            }
+            if salvage.needs_flush_set {
+                println!(
+                    "  Follow-up: {} preserved database record(s) require `br sync --flush-only`",
+                    salvage.database_records_requiring_export
                 );
             }
         }
@@ -5504,6 +5555,52 @@ mod tests {
             ..SyncArgs::default()
         };
         assert!(should_defer_jsonl_recovery(&rename_import));
+
+        let salvage_import = SyncArgs {
+            import_only: true,
+            skip_invalid_records: true,
+            ..SyncArgs::default()
+        };
+        validate_sync_mode_args(&salvage_import).unwrap();
+        assert!(should_defer_jsonl_recovery(&salvage_import));
+
+        let bare_salvage = SyncArgs {
+            skip_invalid_records: true,
+            ..SyncArgs::default()
+        };
+        let error = validate_sync_mode_args(&bare_salvage)
+            .expect_err("salvage must require explicit import mode");
+        assert!(
+            matches!(&error, BeadsError::Validation { field, .. } if field == "skip_invalid_records")
+        );
+        assert!(!should_defer_jsonl_recovery(&bare_salvage));
+
+        for destructive in [
+            SyncArgs {
+                import_only: true,
+                skip_invalid_records: true,
+                force: true,
+                ..SyncArgs::default()
+            },
+            SyncArgs {
+                import_only: true,
+                skip_invalid_records: true,
+                rebuild: true,
+                ..SyncArgs::default()
+            },
+            SyncArgs {
+                import_only: true,
+                skip_invalid_records: true,
+                rename_prefix: true,
+                ..SyncArgs::default()
+            },
+        ] {
+            let error = validate_sync_mode_args(&destructive)
+                .expect_err("salvage must reject destructive import modifiers");
+            assert!(
+                matches!(&error, BeadsError::Validation { field, .. } if field == "skip_invalid_records")
+            );
+        }
 
         let bare_rename = SyncArgs {
             rename_prefix: true,

@@ -1413,6 +1413,7 @@ br sync [OPTIONS]
 | `--error-policy <POLICY>` | Export error handling: strict, best-effort, partial, required-core |
 | `--orphans <MODE>` | Orphan handling: strict, resurrect, skip, allow |
 | `--rename-prefix` | During import, rewrite mismatched issue-ID prefixes into the configured default prefix, preserving the id remainder |
+| `--skip-invalid-records` | With `--import-only`, explicitly salvage valid JSONL records while preserving and reporting every rejected source line |
 | `--rebuild` | During import, rebuild SQLite from JSONL and remove DB entries absent from JSONL |
 | `--dry-run` | With `--reconcile`, preview the plan without any mutation |
 | `--apply` | Apply a conflict-free `--reconcile-additive` plan transactionally |
@@ -1452,6 +1453,14 @@ br sync [OPTIONS]
 - The import output reports every rewrite as a `prefix_renames` list of `{old_id, new_id, fallback?}` entries (text and `--json`/`--robot`); use it to fix up external references. The field is omitted from JSON when no rename happened.
 - Without `--force`, the import short-circuits (skipping the rename) when the JSONL content hash is unchanged since the last import; and a following `br sync --flush-only` needs `--force` to write the renamed ids back to the JSONL.
 
+**Malformed-record salvage (`--skip-invalid-records`):**
+- This is an explicit recovery operation and is valid only with `--import-only`; normal import remains fail-closed on every invalid record.
+- Merge-conflict markers are never skipped. Resolve `<<<<<<<` / `=======` / `>>>>>>>` regions before salvage.
+- br validates each nonblank line as a complete issue record, rejects invalid or duplicate records, and refuses to publish an empty survivor set.
+- Before replacing the tracked JSONL, br stores the exact original bytes in a protected, non-rotating `.beads/.br_history/*pre-salvage*.jsonl` backup with target metadata.
+- The cleaned generation is staged, revalidated, conditionally published under the JSONL-family write authority, and then imported from the exact published snapshot.
+- Text output names every rejected line up to the normal human witness limit. `--json`/`--robot` emits the complete `salvage` receipt, including source/recovered digests, all line/error entries, the exact backup path, and publication atomicity.
+
 **Additive reconciliation semantics:**
 - `br sync --reconcile-additive --robot` is the default dry-run. It opens the current database read-only, compares exact issue IDs, and emits a hash-bound `br.sync.additive-reconciliation.v2` receipt plus a `plan_sha256` review token.
 - The planner preserves SQLite-only issues, audit events, close metadata, gate-result history, runtime config, and every unmodified relation row. It never performs content-hash identity merges, physical deletes, JSONL writes, base-snapshot writes, or merge-note writes.
@@ -1469,6 +1478,9 @@ br sync --flush-only
 
 # Import from JSONL
 br sync --import-only
+
+# Recover valid rows from a historical JSONL containing malformed records
+br sync --import-only --skip-invalid-records --json
 
 # Merge DB and JSONL after both changed
 br sync --merge
