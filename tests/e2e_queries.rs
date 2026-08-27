@@ -303,13 +303,7 @@ fn e2e_queries_ready_stale_count_search() {
     assert!(stale_json.iter().any(|item| item["id"] == blocked_id));
 }
 
-#[test]
-fn e2e_blocked_default_page_reports_true_total_and_truncation() {
-    let _log = common::test_log("e2e_blocked_default_page_reports_true_total_and_truncation");
-    let workspace = BrWorkspace::new();
-    let init = run_br(&workspace, ["init"], "init_blocked_page");
-    assert!(init.status.success(), "init failed: {}", init.stderr);
-
+fn blocked_page_fixture_jsonl() -> String {
     let timestamp = "2026-08-27T00:00:00Z";
     let mut records = vec![serde_json::json!({
         "id": "bd-blocker",
@@ -347,8 +341,21 @@ fn e2e_blocked_default_page_reports_true_total_and_truncation() {
         .collect::<Vec<_>>()
         .join("\n");
     jsonl.push('\n');
-    fs::write(workspace.root.join(".beads/issues.jsonl"), jsonl)
-        .expect("write blocked pagination fixture");
+    jsonl
+}
+
+#[test]
+fn e2e_blocked_default_page_reports_true_total_and_truncation() {
+    let _log = common::test_log("e2e_blocked_default_page_reports_true_total_and_truncation");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init_blocked_page");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    fs::write(
+        workspace.root.join(".beads/issues.jsonl"),
+        blocked_page_fixture_jsonl(),
+    )
+    .expect("write blocked pagination fixture");
 
     let import = run_br(
         &workspace,
