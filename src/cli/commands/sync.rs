@@ -19,7 +19,7 @@ use crate::sync::witness::{
 use crate::sync::{
     AdditiveReconcileReceipt, AdditiveReconcileStatus, ConflictResolution, ExpectedJsonlSourceRef,
     ExpectedStagedExport, ExportConfig, ExportEntityType, ExportError, ExportErrorPolicy,
-    ImportConfig, ImportResult, JsonlSourceSnapshot, JsonlSourceStateWitness,
+    ImportConfig, ImportResult, JsonlSalvageReceipt, JsonlSourceSnapshot, JsonlSourceStateWitness,
     METADATA_JSONL_CONTENT_HASH, METADATA_LAST_EXPORT_TIME, METADATA_LAST_IMPORT_TIME,
     MergeContext, OrphanMode, ReconcileActionKind, ReconcileApplyOutcome, ReconcilePlan,
     ReviewedAdditiveReconcilePlanRequest, ReviewedAdditiveReconcileRequest,
@@ -35,9 +35,9 @@ use crate::sync::{
     read_issues_from_jsonl_snapshot, refresh_base_snapshot_from_flushed_jsonl_snapshot,
     refresh_base_snapshot_from_flushed_jsonl_snapshot_under_authority,
     require_safe_sync_overwrite_path, require_valid_sync_path, restore_tombstones_after_rebuild,
-    scan_jsonl_snapshot_for_tombstone_filter, snapshot_tombstones, three_way_merge,
-    tombstones_missing_from_jsonl_tombstones, validate_no_git_path,
-    validate_sync_path_with_external,
+    salvage_invalid_jsonl_records_under_authority, scan_jsonl_snapshot_for_tombstone_filter,
+    snapshot_tombstones, three_way_merge, tombstones_missing_from_jsonl_tombstones,
+    validate_no_git_path, validate_sync_path_with_external,
 };
 use crate::util::id::split_prefix_remainder;
 use rich_rust::prelude::*;
@@ -229,6 +229,9 @@ pub struct ImportResultOutput {
     /// Omitted entirely when no rename happened (legacy JSON shape).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub prefix_renames: Vec<crate::sync::ImportPrefixRename>,
+    /// Present when --skip-invalid-records published a recovered JSONL source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub salvage: Option<JsonlSalvageReceipt>,
 }
 
 /// Maximum witness rows printed per list in human-readable sync output;
@@ -715,7 +718,8 @@ fn resolve_sync_startup_paths(
 /// duplicate external_ref cleanup) are applied in the same invocation instead
 /// of being skipped by open-time recovery.
 fn should_defer_jsonl_recovery(args: &SyncArgs) -> bool {
-    args.reconcile_additive || (args.import_only && args.rename_prefix)
+    args.reconcile_additive
+        || (args.import_only && (args.rename_prefix || args.skip_invalid_records))
 }
 
 /// Reject argument combinations that must fail BEFORE opening storage or
@@ -725,6 +729,12 @@ fn should_defer_jsonl_recovery(args: &SyncArgs) -> bool {
 /// `recover_database_from_jsonl` has already moved the existing DB aside.
 #[allow(clippy::too_many_lines)]
 pub fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
+    if args.skip_invalid_records && !args.import_only {
+        return Err(BeadsError::Validation {
+            field: "skip_invalid_records".to_string(),
+            reason: "--skip-invalid-records can only be used with --import-only".to_string(),
+        });
+    }
     if args.apply && !args.reconcile_additive {
         return Err(BeadsError::Validation {
             field: "apply".to_string(),
@@ -945,7 +955,7 @@ fn maybe_delegate_rebuild(
     args: &SyncArgs,
     open_result: &mut config::OpenStorageResult,
 ) -> Result<()> {
-    let delegation_would_drop_user_flags = args.rename_prefix;
+    let delegation_would_drop_user_flags = args.rename_prefix || args.skip_invalid_records;
     let should_delegate = args.rebuild
         && args.import_only
         && !open_result.no_db
@@ -1066,7 +1076,7 @@ fn dispatch_sync_subcommand(
                 &options.db_path,
                 ctx,
             )
-            .map(|()| SyncDispatchCompletion::default())
+            .map(SyncDispatchCompletion::published)
         }
         SyncOperation::Unspecified => Err(BeadsError::Validation {
             field: "mode".to_string(),
@@ -3178,6 +3188,7 @@ fn emit_auto_rebuild_import_result(
         orphans_removed: 0,
         blocked_cache_rebuilt: true,
         prefix_renames: Vec::new(),
+        salvage: None,
     };
     if use_json {
         ctx.json_pretty(&result);
@@ -3208,7 +3219,7 @@ fn execute_import(
     retained_authority: Option<&crate::sync::JsonlFamilyWriteLock>,
     db_path: &std::path::Path,
     ctx: &OutputContext,
-) -> Result<()> {
+) -> Result<Option<Arc<JsonlSourceSnapshot>>> {
     info!("Starting JSONL import");
     let jsonl_path = &path_policy.jsonl_path;
     debug!(
@@ -3271,13 +3282,29 @@ fn execute_import(
                 orphans_removed: 0,
                 blocked_cache_rebuilt: false,
                 prefix_renames: Vec::new(),
+                salvage: None,
             };
             ctx.json_pretty(&result);
         } else if should_render_human_sync_output(ctx, use_json) {
             println!("No JSONL file found at {}", jsonl_path.display());
         }
-        return Ok(());
+        return Ok(None);
     };
+    let mut published_salvage_source = None;
+    let mut salvage_receipt = None;
+    if args.skip_invalid_records
+        && let Some(salvage) = salvage_invalid_jsonl_records_under_authority(
+            source,
+            jsonl_path,
+            &path_policy.beads_dir,
+            path_policy.allow_external_jsonl,
+            jsonl_authority,
+        )?
+    {
+        salvage_receipt = Some(salvage.receipt);
+        published_salvage_source = Some(salvage.source);
+    }
+    let source = published_salvage_source.as_deref().unwrap_or(source);
     let source_content_hash = compute_jsonl_snapshot_content_hash(source)?;
 
     // If the storage was just rebuilt from JSONL during the open sequence
@@ -3365,7 +3392,7 @@ fn execute_import(
         );
         crate::sync::verify_jsonl_source_snapshot_current(source, jsonl_authority)?;
         emit_auto_rebuild_import_result(storage, use_json, ctx)?;
-        return Ok(());
+        return Ok(None);
     }
 
     // Check staleness (unless --force or --rebuild)
@@ -3423,12 +3450,13 @@ fn execute_import(
                         orphans_removed: 0,
                         blocked_cache_rebuilt: false,
                         prefix_renames: Vec::new(),
+                        salvage: salvage_receipt.clone(),
                     };
                     ctx.json_pretty(&result);
                 } else if should_render_human_sync_output(ctx, use_json) {
                     println!("JSONL is current (hash unchanged since last import)");
                 }
-                return Ok(());
+                return Ok(published_salvage_source);
             }
         }
     }
@@ -3731,6 +3759,7 @@ fn execute_import(
         orphans_removed: import_result.orphans_removed,
         blocked_cache_rebuilt: true,
         prefix_renames: import_result.prefix_renames.clone(),
+        salvage: salvage_receipt.clone(),
     };
 
     if use_json {
@@ -3777,10 +3806,31 @@ fn execute_import(
                 );
             }
         }
+        if let Some(salvage) = &result.salvage {
+            println!(
+                "  JSONL salvage: retained {} valid record(s), rejected {} invalid record(s)",
+                salvage.valid_records,
+                salvage.rejected_records.len()
+            );
+            println!("  Exact source backup: {}", salvage.backup_path);
+            for rejected in salvage.rejected_records.iter().take(HUMAN_WITNESS_LIMIT) {
+                println!(
+                    "    Rejected line {}: {}",
+                    rejected.line,
+                    sanitize_terminal_inline(&rejected.error)
+                );
+            }
+            if salvage.rejected_records.len() > HUMAN_WITNESS_LIMIT {
+                println!(
+                    "    ... {} more; use --json for the complete rejection receipt",
+                    salvage.rejected_records.len() - HUMAN_WITNESS_LIMIT
+                );
+            }
+        }
         println!("  Rebuilt blocked cache");
     }
 
-    Ok(())
+    Ok(published_salvage_source)
 }
 
 /// Render import result with rich formatting.

@@ -566,6 +566,39 @@ pub(crate) fn backup_before_export_snapshot(
     Ok(())
 }
 
+/// Preserve the exact source generation before an operator-authorized JSONL
+/// salvage. Unlike ordinary export history, this backup is never throttled,
+/// deduplicated, or rotated: rejected source bytes must remain recoverable.
+///
+/// # Errors
+///
+/// Returns an error if the history directory, backup, metadata, or durability
+/// certificate cannot be created safely.
+pub(crate) fn backup_before_jsonl_salvage(
+    beads_dir: &Path,
+    target_path: &Path,
+    source: &JsonlSourceSnapshot,
+) -> Result<PathBuf> {
+    let history_dir = beads_dir.join(".br_history");
+    ensure_history_dir_path(&history_dir)?;
+
+    let target_stem = target_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("issues");
+    let salvage_stem = format!("{target_stem}.pre-salvage");
+    let (backup_path, mut backup_file) = create_backup_file(&history_dir, &salvage_stem)?;
+    let mut backup_guard = BackupFileGuard::new(backup_path.clone());
+
+    io::copy(&mut source.reader(), &mut backup_file).map_err(BeadsError::Io)?;
+    backup_file.sync_all().map_err(BeadsError::Io)?;
+    crate::util::sync_parent_directory(&backup_path).map_err(BeadsError::Io)?;
+    write_backup_metadata(beads_dir, target_path, &backup_path)?;
+    backup_guard.persist();
+
+    Ok(backup_path)
+}
+
 /// Rotate history backups based on config limits.
 ///
 /// # Errors

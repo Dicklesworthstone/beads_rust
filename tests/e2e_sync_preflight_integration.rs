@@ -609,3 +609,120 @@ fn cli_import_shows_preflight_failure() {
 
     eprintln!("✓ CLI import shows preflight failure clearly");
 }
+
+/// Explicit salvage keeps a byte-exact backup, reports the rejected line, and
+/// publishes a JSONL generation that ordinary commands can read again.
+#[test]
+fn cli_import_salvages_one_malformed_record_with_durable_receipt() {
+    let workspace = setup_workspace_with_issues();
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let original = fs::read_to_string(&jsonl_path).expect("read exported JSONL");
+    let mut lines = original.lines();
+    let first = lines.next().expect("first exported issue");
+    let second = lines.next().expect("second exported issue");
+    assert!(lines.next().is_none(), "fixture should export exactly two rows");
+
+    let corrupted = format!("{first}\n{second}beads: synchronize issue state and metadata\n");
+    fs::write(&jsonl_path, &corrupted).expect("inject historical trailing text");
+
+    let import = run_br(
+        &workspace,
+        [
+            "--json",
+            "sync",
+            "--import-only",
+            "--skip-invalid-records",
+        ],
+        "import_salvage",
+    );
+    assert!(
+        import.status.success(),
+        "salvage import failed: {}",
+        import.stderr
+    );
+
+    let receipt: serde_json::Value =
+        serde_json::from_str(&import.stdout).expect("parse salvage receipt");
+    let salvage = receipt
+        .get("salvage")
+        .expect("salvage receipt must be present");
+    assert_eq!(salvage["valid_records"], 1);
+    assert_eq!(salvage["rejected_records"][0]["line"], 2);
+    assert!(
+        salvage["rejected_records"][0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("trailing characters"))
+    );
+
+    let backup_path = salvage["backup_path"]
+        .as_str()
+        .map(Path::new)
+        .expect("backup path must be a string");
+    assert_eq!(
+        fs::read(backup_path).expect("read exact salvage backup"),
+        corrupted.as_bytes()
+    );
+    assert_eq!(
+        fs::read_to_string(&jsonl_path).expect("read recovered JSONL"),
+        format!("{first}\n")
+    );
+
+    let list = run_br(&workspace, ["--json", "list"], "list_after_salvage");
+    assert!(
+        list.status.success(),
+        "ordinary command remained blocked after salvage: {}",
+        list.stderr
+    );
+}
+
+/// The opt-in is not permission to erase an entirely invalid source.
+#[test]
+fn cli_import_salvage_refuses_when_no_valid_records_remain() {
+    let workspace = setup_workspace_with_issues();
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let corrupted = b"not-json\nalso-not-json\n";
+    fs::write(&jsonl_path, corrupted).expect("replace fixture with invalid records");
+
+    let import = run_br(
+        &workspace,
+        ["sync", "--import-only", "--skip-invalid-records"],
+        "import_salvage_all_invalid",
+    );
+    assert!(!import.status.success(), "all-invalid salvage must refuse");
+    assert!(
+        import.stderr.contains("no valid issue records would remain"),
+        "unexpected refusal: {}",
+        import.stderr
+    );
+    assert_eq!(
+        fs::read(&jsonl_path).expect("read refused source"),
+        corrupted
+    );
+}
+
+/// Merge markers retain their stronger fail-closed class even when malformed
+/// record salvage is explicitly requested.
+#[test]
+fn cli_import_salvage_never_skips_merge_conflict_markers() {
+    let workspace = setup_workspace_with_issues();
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let original = fs::read_to_string(&jsonl_path).expect("read JSONL");
+    let conflicted = format!("<<<<<<< HEAD\n{original}=======\n>>>>>>> incoming\n");
+    fs::write(&jsonl_path, &conflicted).expect("inject conflict markers");
+
+    let import = run_br(
+        &workspace,
+        ["sync", "--import-only", "--skip-invalid-records"],
+        "import_salvage_conflict_markers",
+    );
+    assert!(!import.status.success(), "conflict salvage must refuse");
+    assert!(
+        import.stderr.to_lowercase().contains("conflict marker"),
+        "unexpected refusal: {}",
+        import.stderr
+    );
+    assert_eq!(
+        fs::read_to_string(&jsonl_path).expect("read refused source"),
+        conflicted
+    );
+}

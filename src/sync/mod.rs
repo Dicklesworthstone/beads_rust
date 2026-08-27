@@ -8992,6 +8992,160 @@ pub(crate) fn validate_jsonl_snapshot_issue_records(
     validate_jsonl_issue_records_from_reader(source.reader())
 }
 
+/// One source record explicitly rejected by JSONL salvage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct JsonlSalvageRejectedRecord {
+    pub line: usize,
+    pub error: String,
+}
+
+/// Durable receipt for an operator-authorized malformed-record salvage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct JsonlSalvageReceipt {
+    pub original_raw_sha256: String,
+    pub recovered_raw_sha256: String,
+    pub valid_records: usize,
+    pub rejected_records: Vec<JsonlSalvageRejectedRecord>,
+    pub backup_path: String,
+    pub publication_atomicity: String,
+}
+
+pub(crate) struct JsonlSalvageResult {
+    pub source: Arc<JsonlSourceSnapshot>,
+    pub receipt: JsonlSalvageReceipt,
+}
+
+fn classify_jsonl_salvage_record(
+    line: &[u8],
+    seen_ids: &mut HashSet<String>,
+) -> Option<Result<(), String>> {
+    let trimmed = line.trim_ascii();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut issue = match serde_json::from_slice::<Issue>(trimmed) {
+        Ok(issue) => issue,
+        Err(error) => return Some(Err(error.to_string())),
+    };
+    normalize_issue(&mut issue);
+    if let Err(errors) = IssueValidator::validate(&issue) {
+        return Some(Err(errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")));
+    }
+    if !seen_ids.insert(issue.id.clone()) {
+        return Some(Err(format!("Duplicate issue id '{}'", issue.id)));
+    }
+    Some(Ok(()))
+}
+
+/// Remove invalid issue records from one immutable JSONL generation, retain an
+/// exact non-rotating backup, and conditionally publish the validated result.
+/// Blank lines are retained and merge-conflict markers remain a hard failure.
+///
+/// Returns `Ok(None)` when every nonblank record is already valid.
+pub(crate) fn salvage_invalid_jsonl_records_under_authority(
+    source: &JsonlSourceSnapshot,
+    output_path: &Path,
+    beads_dir: &Path,
+    allow_external_jsonl: bool,
+    jsonl_authority: &JsonlFamilyWriteLock,
+) -> Result<Option<JsonlSalvageResult>> {
+    validate_sync_path_with_external(output_path, beads_dir, allow_external_jsonl)?;
+    verify_jsonl_source_snapshot_current(source, jsonl_authority)?;
+    ensure_no_conflict_markers_snapshot(source)?;
+
+    let export_config = ExportConfig {
+        beads_dir: Some(beads_dir.to_path_buf()),
+        allow_external_jsonl,
+        ..ExportConfig::default()
+    };
+    let (temp_path, pinned_temp, temp_file) =
+        create_full_export_temp_file_under_authority(output_path, &export_config, jsonl_authority)?;
+    let temp_guard = TempFileGuard::new_retained(temp_path.clone());
+    let mut writer = BufWriter::new(temp_file);
+    let mut reader = source.reader();
+    let mut line = Vec::with_capacity(4096);
+    let mut line_number = 0;
+    let mut valid_records = 0;
+    let mut rejected_records = Vec::new();
+    let mut seen_ids = HashSet::new();
+
+    loop {
+        line.clear();
+        let bytes_read = reader.read_until(b'\n', &mut line)?;
+        if bytes_read == 0 {
+            break;
+        }
+        line_number += 1;
+
+        match classify_jsonl_salvage_record(&line, &mut seen_ids) {
+            None => writer.write_all(&line)?,
+            Some(Ok(())) => {
+                writer.write_all(&line)?;
+                valid_records += 1;
+            }
+            Some(Err(error)) => rejected_records.push(JsonlSalvageRejectedRecord {
+                line: line_number,
+                error,
+            }),
+        }
+    }
+
+    if rejected_records.is_empty() {
+        return Ok(None);
+    }
+    if valid_records == 0 {
+        return Err(BeadsError::Config(
+            "Refusing JSONL salvage because no valid issue records would remain".to_string(),
+        ));
+    }
+
+    writer.flush()?;
+    writer
+        .into_inner()
+        .map_err(|error| BeadsError::Io(error.into_error()))?
+        .sync_all()?;
+
+    let staged_source = pinned_temp.capture()?;
+    let staged_validation = validate_jsonl_snapshot_issue_records(&staged_source)?;
+    if staged_validation.invalid_count != 0 || staged_validation.record_count != valid_records {
+        return Err(BeadsError::SyncConflict {
+            message: "Staged JSONL salvage did not reproduce the validated survivor set"
+                .to_string(),
+        });
+    }
+
+    let backup_path = history::backup_before_jsonl_salvage(beads_dir, output_path, source)?;
+    verify_jsonl_source_snapshot_current(source, jsonl_authority)?;
+    let recovered_raw_sha256 = staged_source.raw_sha256().to_string();
+    let publication = publish_staged_jsonl_conditionally(
+        &temp_path,
+        temp_guard,
+        output_path,
+        &staged_source,
+        &source.state_witness(),
+        staged_source.content_sha256(),
+        jsonl_authority,
+        None,
+    )?;
+
+    Ok(Some(JsonlSalvageResult {
+        source: publication.source,
+        receipt: JsonlSalvageReceipt {
+            original_raw_sha256: source.raw_sha256().to_string(),
+            recovered_raw_sha256,
+            valid_records,
+            rejected_records,
+            backup_path: backup_path.to_string_lossy().into_owned(),
+            publication_atomicity: publication.atomicity.as_str().to_string(),
+        },
+    }))
+}
+
 /// Run preflight checks for export operation.
 ///
 /// This function is read-only and validates:
