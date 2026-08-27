@@ -13,9 +13,10 @@ pub mod path;
 pub mod witness;
 
 pub use path::{
-    ALLOWED_EXACT_NAMES, ALLOWED_EXTENSIONS, PathValidation, is_sync_path_allowed,
-    require_safe_sync_overwrite_path, require_valid_sync_path, validate_no_git_path,
-    validate_sync_path, validate_sync_path_with_external, validate_temp_file_path,
+    ALLOWED_EXACT_NAMES, ALLOWED_EXTENSIONS, PathValidation, canonical_source_repo_path,
+    is_sync_path_allowed, require_safe_sync_overwrite_path, require_valid_sync_path,
+    validate_no_git_path, validate_sync_path, validate_sync_path_with_external,
+    validate_temp_file_path,
 };
 pub(crate) use path::{
     JsonlSourceSnapshot, PinnedJsonlName, authority_paths_equivalent,
@@ -13430,8 +13431,68 @@ fn stream_import_actions_in_tx(
 
     tx_result.blocked_cache_entries = storage.rebuild_blocked_cache_in_tx()?;
     tx_result.child_counter_entries = storage.rebuild_child_counters_in_tx()?;
+    verify_applied_import_issue_semantics(storage, &tx_result.applied_issues)?;
 
     Ok(tx_result)
+}
+
+/// Materialize legacy schema defaults that are written even when older JSONL
+/// records omit the corresponding optional fields.
+pub(crate) fn canonicalize_persisted_issue_defaults(issue: &mut Issue) {
+    issue.source_repo.get_or_insert_with(|| ".".to_string());
+    issue.original_size.get_or_insert(0);
+}
+
+/// Compare every persisted import field while retaining the order-independent
+/// relation semantics used by normal sync comparisons.
+pub(crate) fn persisted_import_issue_equals(actual: &Issue, expected: &Issue) -> bool {
+    actual.sync_equals(expected)
+        && actual.content_hash == expected.content_hash
+        && actual.created_at == expected.created_at
+        && actual.updated_at == expected.updated_at
+        && actual.agent_context == expected.agent_context
+}
+
+fn verify_applied_import_issue_semantics(
+    storage: &SqliteStorage,
+    expected_issues: &[Issue],
+) -> Result<()> {
+    if expected_issues.is_empty() {
+        return Ok(());
+    }
+
+    let ids = expected_issues
+        .iter()
+        .map(|issue| issue.id.clone())
+        .collect::<Vec<_>>();
+    let actual_by_id = storage
+        .get_issues_for_export(&ids)?
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect::<HashMap<_, _>>();
+
+    for expected in expected_issues {
+        let actual = actual_by_id.get(&expected.id).ok_or_else(|| {
+            BeadsError::SyncConflict {
+                message: format!(
+                    "Import semantic verification failed: issue {} was written but is not addressable by its JSONL id; rolling back the import",
+                    expected.id
+                ),
+            }
+        })?;
+        let mut persisted_expected = expected.clone();
+        canonicalize_persisted_issue_defaults(&mut persisted_expected);
+        if !persisted_import_issue_equals(actual, &persisted_expected) {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Import semantic verification failed: issue {} does not match its normalized JSONL payload; rolling back the import",
+                    expected.id
+                ),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Import issues from a JSONL file.
@@ -20076,6 +20137,41 @@ mod tests {
         assert_eq!(result.exact_duplicate_comments_deduplicated, 1);
         assert_eq!(result.comments_imported, 1);
         assert_eq!(storage.get_comments(&issue.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_import_semantic_verifier_rejects_field_shift_with_equal_counts() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+        let issue = make_test_issue("bd-import-semantic", "Expected title");
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+
+        let result = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+        assert_eq!(result.applied_issues.len(), 1);
+
+        storage
+            .execute_raw(
+                "UPDATE issues SET updated_at = '2035-01-02T03:04:05Z' WHERE id = 'bd-import-semantic'",
+            )
+            .unwrap();
+        let err = verify_applied_import_issue_semantics(&storage, &result.applied_issues)
+            .expect_err("equal row counts must not hide a field shift");
+        assert!(
+            err.to_string()
+                .contains("does not match its normalized JSONL payload"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

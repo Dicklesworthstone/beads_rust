@@ -2615,6 +2615,27 @@ fn verify_rebuilt_database_postconditions(
     storage: &SqliteStorage,
     import_result: &ImportResult,
 ) -> Result<()> {
+    let integrity_messages =
+        storage
+            .integrity_check_messages()
+            .map_err(|source| BeadsError::WithContext {
+                context: "Post-recovery validation failed while running PRAGMA integrity_check"
+                    .to_string(),
+                source: Box::new(source),
+            })?;
+    if integrity_messages.len() != 1 || !integrity_messages[0].trim().eq_ignore_ascii_case("ok") {
+        let diagnostic = integrity_messages
+            .iter()
+            .take(8)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(BeadsError::Config(format!(
+            "post-recovery validation failed: rebuilt database did not pass PRAGMA integrity_check ({} diagnostic row(s): {diagnostic})",
+            integrity_messages.len()
+        )));
+    }
+
     let issue_count = storage
         .count_issues()
         .map_err(|source| BeadsError::WithContext {
@@ -2696,6 +2717,20 @@ fn verify_rebuilt_issue_semantics(
     storage: &SqliteStorage,
     expected_issues: &[crate::model::Issue],
 ) -> Result<()> {
+    let expected_ids = expected_issues
+        .iter()
+        .map(|issue| issue.id.clone())
+        .collect::<Vec<_>>();
+    let actual_by_id = storage
+        .get_issues_for_export(&expected_ids)
+        .map_err(|source| BeadsError::WithContext {
+            context: "Post-recovery validation failed while reading imported issues".to_string(),
+            source: Box::new(source),
+        })?
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect::<HashMap<_, _>>();
+
     for expected in expected_issues {
         // These two legacy columns are NOT NULL in the on-disk schema and
         // therefore materialize their historical defaults even when an older
@@ -2704,27 +2739,15 @@ fn verify_rebuilt_issue_semantics(
         // lossless import solely because `None` round-trips as the schema
         // default.
         let mut persisted_expected = expected.clone();
-        persisted_expected
-            .source_repo
-            .get_or_insert_with(|| ".".to_string());
-        persisted_expected.original_size.get_or_insert(0);
-        let actual = storage
-            .get_issue_for_export(&expected.id)
-            .map_err(|source| BeadsError::WithContext {
-                context: format!(
-                    "Post-recovery validation failed while reading imported issue {}",
-                    expected.id
-                ),
-                source: Box::new(source),
-            })?
-            .ok_or_else(|| {
+        crate::sync::canonicalize_persisted_issue_defaults(&mut persisted_expected);
+        let actual = actual_by_id.get(&expected.id).ok_or_else(|| {
                 BeadsError::Config(format!(
                     "post-recovery semantic validation failed: imported issue {} is not addressable by its JSONL id",
                     expected.id
                 ))
-        })?;
-        if !actual.sync_equals(&persisted_expected) {
-            let differing_fields = sync_mismatch_field_names(&actual, &persisted_expected);
+            })?;
+        if !crate::sync::persisted_import_issue_equals(actual, &persisted_expected) {
+            let differing_fields = sync_mismatch_field_names(actual, &persisted_expected);
             return Err(BeadsError::Config(format!(
                 "post-recovery semantic validation failed: imported issue {} does not match its normalized JSONL payload (differing fields: {})",
                 expected.id,
@@ -2739,24 +2762,22 @@ fn sync_mismatch_field_names(
     actual: &crate::model::Issue,
     expected: &crate::model::Issue,
 ) -> Vec<String> {
-    let Ok(serde_json::Value::Object(actual)) = serde_json::to_value(actual) else {
+    let content_hash_differs = actual.content_hash != expected.content_hash;
+    let Ok(serde_json::Value::Object(actual_fields)) = serde_json::to_value(actual) else {
         return vec!["unknown".to_string()];
     };
-    let Ok(serde_json::Value::Object(expected)) = serde_json::to_value(expected) else {
+    let Ok(serde_json::Value::Object(expected_fields)) = serde_json::to_value(expected) else {
         return vec!["unknown".to_string()];
     };
-    let mut fields = actual
+    let mut fields = actual_fields
         .keys()
-        .chain(expected.keys())
-        .filter(|field| {
-            !matches!(
-                field.as_str(),
-                "created_at" | "updated_at" | "agent_context"
-            )
-        })
-        .filter(|field| actual.get(*field) != expected.get(*field))
+        .chain(expected_fields.keys())
+        .filter(|field| actual_fields.get(*field) != expected_fields.get(*field))
         .cloned()
         .collect::<Vec<_>>();
+    if content_hash_differs {
+        fields.push("content_hash".to_string());
+    }
     fields.sort_unstable();
     fields.dedup();
     if fields.is_empty() {

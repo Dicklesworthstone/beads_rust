@@ -815,6 +815,118 @@ fn import_only_heals_false_equal_and_dry_run_sees_it() {
 }
 
 #[test]
+fn force_import_repairs_exact_duplicate_comments_and_reports_the_repair() {
+    let ws = BrWorkspace::new();
+    init_workspace(&ws, "duplicate_comment");
+    let issue_id = create_issue(
+        &ws,
+        "Duplicate comment recovery",
+        "duplicate_comment_create",
+    );
+    let flush = run_br(
+        &ws,
+        ["sync", "--flush-only", "--json"],
+        "duplicate_comment_flush",
+    );
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+
+    let mut lines = read_jsonl_lines(&ws);
+    assert_eq!(lines.len(), 1, "fixture should contain one issue row");
+    let mut row: Value = serde_json::from_str(&lines[0]).expect("issue row");
+    let duplicate = json!({
+        "id": 7,
+        "issue_id": issue_id,
+        "author": "recovery-probe",
+        "text": "preserve one exact copy",
+        "created_at": "2026-08-27T12:00:00Z"
+    });
+    row["comments"] = json!([duplicate.clone(), duplicate]);
+    lines[0] = serde_json::to_string(&row).expect("serialize duplicated comment row");
+    write_jsonl_lines(&ws, &lines);
+
+    let import = run_br(
+        &ws,
+        [
+            "--no-auto-import",
+            "sync",
+            "--import-only",
+            "--force",
+            "--json",
+        ],
+        "duplicate_comment_import",
+    );
+    assert!(
+        import.status.success(),
+        "force import failed: stdout={} stderr={}",
+        import.stdout,
+        import.stderr
+    );
+    let receipt = parse_json_value(&import.stdout);
+    assert_eq!(
+        receipt["exact_duplicate_comments_deduplicated"].as_u64(),
+        Some(1),
+        "repair count must be explicit in robot output: {receipt}"
+    );
+
+    let show = run_br(&ws, ["show", &issue_id, "--json"], "duplicate_comment_show");
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let shown = parse_json_value(&show.stdout);
+    let issue = shown.get(0).unwrap_or(&shown);
+    let comments = issue["comments"].as_array().expect("comments array");
+    assert_eq!(comments.len(), 1, "only one exact comment copy may remain");
+    assert_eq!(comments[0]["text"], "preserve one exact copy");
+}
+
+#[test]
+fn show_fails_loudly_when_jsonl_id_is_missing_from_database() {
+    let ws = BrWorkspace::new();
+    init_workspace(&ws, "show_divergence");
+    let issue_id = create_issue(&ws, "JSONL remains authoritative", "show_divergence_create");
+    let flush = run_br(
+        &ws,
+        ["sync", "--flush-only", "--json"],
+        "show_divergence_flush",
+    );
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+
+    let mut storage = SqliteStorage::open(&db_path(&ws)).expect("open storage");
+    storage
+        .purge_issue(&issue_id, "show-divergence-test")
+        .expect("remove only the database row");
+    drop(storage);
+
+    let show = run_br(
+        &ws,
+        ["--no-auto-import", "show", &issue_id, "--json"],
+        "show_divergence_probe",
+    );
+    assert!(!show.status.success(), "divergent show must fail closed");
+    let output = format!("{}{}", show.stdout, show.stderr);
+    assert!(
+        output.contains("exists in JSONL but is not addressable in SQLite")
+            && output.contains("refusing a false missing-issue result"),
+        "show must distinguish database loss from a genuinely absent id: {output}"
+    );
+
+    let hash_suffix = issue_id.rsplit('-').next().expect("generated hash suffix");
+    let partial_show = run_br(
+        &ws,
+        ["--no-auto-import", "show", hash_suffix, "--json"],
+        "show_divergence_partial_probe",
+    );
+    assert!(
+        !partial_show.status.success(),
+        "divergent partial-id show must fail closed"
+    );
+    let partial_output = format!("{}{}", partial_show.stdout, partial_show.stderr);
+    assert!(
+        partial_output.contains("exists in JSONL but is not addressable in SQLite")
+            && partial_output.contains("refusing a false missing-issue result"),
+        "partial-id resolution must also distinguish database loss: {partial_output}"
+    );
+}
+
+#[test]
 fn dry_run_mutates_no_files_and_is_deterministic() {
     let ws = BrWorkspace::new();
     build_false_equal_workspace(&ws, "nomut");

@@ -14,7 +14,7 @@ use crate::format::{
 use crate::model::{Dependency, Issue, Priority, Status};
 use crate::output::{IssuePanel, OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
-use crate::sync::{path as sync_path, read_issues_from_jsonl};
+use crate::sync::{get_issue_ids_from_jsonl, path as sync_path, read_issues_from_jsonl};
 use crate::util::id::{IdResolver, ResolverConfig, normalize_id};
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -477,6 +477,7 @@ fn load_issue_details_for_route(
             &target_ids,
             &resolver,
             &storage_ctx.storage,
+            &storage_ctx.paths.jsonl_path,
             &external_db_paths,
         )?;
         return Ok((details_list, use_color));
@@ -523,7 +524,13 @@ fn load_issue_details_for_route(
             beads_dir,
             cli,
         )?;
-        load_issue_details_from_storage(&target_ids, &resolver, storage, &external_db_paths)?
+        load_issue_details_from_storage(
+            &target_ids,
+            &resolver,
+            storage,
+            &startup.paths.jsonl_path,
+            &external_db_paths,
+        )?
     };
 
     Ok((details_list, use_color))
@@ -533,19 +540,36 @@ fn load_issue_details_from_storage(
     target_ids: &[String],
     resolver: &IdResolver,
     storage: &SqliteStorage,
+    jsonl_path: &Path,
     external_db_paths: &HashMap<String, PathBuf>,
 ) -> Result<Vec<IssueDetails>> {
     let mut external_statuses: Option<HashMap<String, bool>> = None;
     let mut details_list = Vec::with_capacity(target_ids.len());
 
     for id_input in target_ids {
-        let resolution = resolver.resolve_fallible(
+        let resolution = match resolver.resolve_fallible(
             id_input,
             |id| storage.id_exists(id),
             |hash| storage.find_ids_by_hash(hash),
-        )?;
+        ) {
+            Ok(resolution) => resolution,
+            Err(BeadsError::IssueNotFound { id }) => {
+                fail_if_jsonl_contains_missing_database_id(
+                    jsonl_path,
+                    resolver,
+                    &[id_input.as_str(), id.as_str()],
+                )?;
+                return Err(BeadsError::IssueNotFound { id });
+            }
+            Err(error) => return Err(error),
+        };
 
         let Some(mut details) = storage.get_issue_details(&resolution.id, true, false, 10)? else {
+            fail_if_jsonl_contains_missing_database_id(
+                jsonl_path,
+                resolver,
+                &[resolution.id.as_str()],
+            )?;
             return Err(BeadsError::IssueNotFound { id: resolution.id });
         };
 
@@ -564,6 +588,46 @@ fn load_issue_details_from_storage(
     }
 
     Ok(details_list)
+}
+
+fn fail_if_jsonl_contains_missing_database_id(
+    jsonl_path: &Path,
+    resolver: &IdResolver,
+    candidate_ids: &[&str],
+) -> Result<()> {
+    if !jsonl_path.is_file() {
+        return Ok(());
+    }
+    let jsonl_ids = get_issue_ids_from_jsonl(jsonl_path)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    for candidate in candidate_ids {
+        match resolver.resolve_fallible(
+            candidate,
+            |id| Ok(jsonl_ids.iter().any(|known| known == id)),
+            |hash| Ok(crate::util::id::find_matching_ids(&jsonl_ids, hash)),
+        ) {
+            Ok(resolution) => {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Database/JSONL divergence: issue {} exists in JSONL but is not addressable in SQLite; refusing a false missing-issue result. Run `br doctor --repair` against a preserved workspace copy before trusting database-backed reads",
+                        resolution.id
+                    ),
+                });
+            }
+            Err(BeadsError::AmbiguousId { matches, .. }) if !matches.is_empty() => {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Database/JSONL divergence: {candidate:?} matches {} issue IDs in JSONL but none are addressable in SQLite; refusing a false missing-issue result. Run `br doctor --repair` against a preserved workspace copy before trusting database-backed reads",
+                        matches.len()
+                    ),
+                });
+            }
+            Err(BeadsError::IssueNotFound { .. } | BeadsError::InvalidId { .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn load_issue_details_from_jsonl(
