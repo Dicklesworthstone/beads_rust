@@ -6,6 +6,7 @@ use crate::format::{format_type_label, sanitize_terminal_inline};
 use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
 use crate::storage::{BulkDependencyInsert, EventAttribution, SqliteStorage};
+use crate::sync::canonical_source_repo_path;
 use crate::util::id::{IdGenerationInput, IdGenerator, IdResolver, ResolverConfig, child_id};
 use crate::util::markdown_import::{parse_dependency, parse_markdown_file};
 use crate::util::time::parse_flexible_timestamp;
@@ -60,37 +61,6 @@ pub(crate) fn canonical_source_repo(beads_dir: &Path) -> Option<String> {
         None
     } else {
         Some(name)
-    }
-}
-
-/// Derive the absolute canonical path of the source repository (the
-/// parent of `.beads/`) for the `source_repo_path` field on `Issue`.
-/// Distinct from [`canonical_source_repo`], which returns just the
-/// basename. Used by fleet automation to disambiguate two clones of
-/// the same repo at different paths on the same machine (see
-/// beads_rust#289). Falls back to `None` if `canonicalize` fails —
-/// the caller treats the field as optional and leaves it unset, which
-/// matches the schema contract (`source_repo_path TEXT` nullable).
-pub(crate) fn canonical_source_repo_path(beads_dir: &Path) -> Option<String> {
-    let parent = beads_dir.parent()?;
-    let parent = if parent.as_os_str().is_empty()
-        && beads_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| matches!(name, ".beads" | "_beads"))
-    {
-        Path::new(".")
-    } else if parent.as_os_str().is_empty() {
-        return None;
-    } else {
-        parent
-    };
-    let canonical = parent.canonicalize().ok()?;
-    let path_str = canonical.to_string_lossy().into_owned();
-    if path_str.is_empty() {
-        None
-    } else {
-        Some(path_str)
     }
 }
 

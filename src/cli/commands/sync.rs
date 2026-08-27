@@ -3,7 +3,6 @@
 //! Provides explicit JSONL sync actions without git operations.
 //! Supports `--flush-only` (export) and `--import-only` (import).
 
-use crate::cli::commands::create::canonical_source_repo_path;
 use crate::cli::{DEFAULT_WITNESS_PARALLELISM, SyncArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -27,9 +26,10 @@ use crate::sync::{
     SYNC_RECONCILE_SCHEMA_VERSION, SyncMergeIntent, SyncMergeNoteWitness, SyncMergePendingPhase,
     SyncMergePendingReceipt, analyze_jsonl_snapshot,
     apply_reviewed_additive_reconcile_under_authority, apply_sync_reconcile,
-    canonical_sync_path_sha256, capture_sync_database_witness, compute_jsonl_snapshot_content_hash,
-    compute_staleness, database_write_authority_sha256, ensure_no_conflict_markers_snapshot,
-    export_temp_path, export_to_jsonl_with_policy_expected_under_authorities,
+    canonical_source_repo_path, canonical_sync_path_sha256, capture_sync_database_witness,
+    compute_jsonl_snapshot_content_hash, compute_staleness, database_write_authority_sha256,
+    ensure_no_conflict_markers_snapshot, export_temp_path,
+    export_to_jsonl_with_policy_expected_under_authorities,
     export_to_jsonl_with_policy_expected_under_authority, finalize_export_under_authority,
     get_issue_ids_from_jsonl_snapshot, id_matches_expected_prefix, import_from_jsonl_snapshot,
     load_base_snapshot_from_source, plan_reviewed_additive_reconcile, plan_sync_reconcile,
@@ -239,6 +239,9 @@ pub struct ImportResultOutput {
     pub salvage: Option<JsonlSalvageReceipt>,
 }
 
+// Serde's `skip_serializing_if` callback receives `&T`, including for Copy
+// scalar fields, so this signature cannot take `usize` by value.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 const fn is_zero_usize(value: &usize) -> bool {
     *value == 0
 }
@@ -1099,8 +1102,9 @@ fn dispatch_sync_subcommand(
     open_result: &mut config::OpenStorageResult,
 ) -> Result<SyncDispatchCompletion> {
     let options = sync_dispatch_options(args, cli, ctx, open_result);
+    let operation = sync_operation(args);
 
-    match sync_operation(args) {
+    match operation {
         SyncOperation::Status => execute_status(
             &open_result.storage,
             path_policy,
@@ -1121,6 +1125,37 @@ fn dispatch_sync_subcommand(
             message: "reviewed additive reconciliation bypassed its sole lock-owning command path"
                 .to_string(),
         }),
+        SyncOperation::MigrateSourceRepoPath
+        | SyncOperation::Flush
+        | SyncOperation::Merge
+        | SyncOperation::Import => dispatch_publishing_sync_subcommand(
+            args,
+            cli,
+            ctx,
+            beads_dir,
+            path_policy,
+            open_result,
+            &options,
+        ),
+        SyncOperation::Unspecified => Err(BeadsError::Validation {
+            field: "mode".to_string(),
+            reason:
+                "Must specify one of --flush-only, --import-only, --merge, --reconcile, --reconcile-additive, --migrate-source-repo-path, --status, or --witness"
+                    .to_string(),
+        }),
+    }
+}
+
+fn dispatch_publishing_sync_subcommand(
+    args: &SyncArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    beads_dir: &Path,
+    path_policy: &SyncPathPolicy,
+    open_result: &mut config::OpenStorageResult,
+    options: &SyncDispatchOptions,
+) -> Result<SyncDispatchCompletion> {
+    match sync_operation(args) {
         SyncOperation::MigrateSourceRepoPath => {
             let no_db = open_result.no_db;
             let (storage, retained_source, expected_source, jsonl_authority) =
@@ -1201,12 +1236,11 @@ fn dispatch_sync_subcommand(
             )
             .map(SyncDispatchCompletion::published)
         }
-        SyncOperation::Unspecified => Err(BeadsError::Validation {
-            field: "mode".to_string(),
-            reason:
-                "Must specify one of --flush-only, --import-only, --merge, --reconcile, --reconcile-additive, --migrate-source-repo-path, --status, or --witness"
-                    .to_string(),
-        }),
+        SyncOperation::Status
+        | SyncOperation::Witness
+        | SyncOperation::Reconcile
+        | SyncOperation::ReconcileAdditive
+        | SyncOperation::Unspecified => unreachable!("non-publishing operation was pre-dispatched"),
     }
 }
 
@@ -5140,7 +5174,9 @@ fn execute_source_repo_path_migration(
     };
     let pending_receipt =
         storage.apply_sync_merge_atomically(&plan.changed_kept, &[], &[], &intent)?;
-    plan.receipt.warnings = pending_receipt.capacity_warnings.clone();
+    plan.receipt
+        .warnings
+        .clone_from(&pending_receipt.capacity_warnings);
     let _ = storage.take_capacity_warnings();
 
     let reconciled = reconcile_pending_sync_merge_artifacts(

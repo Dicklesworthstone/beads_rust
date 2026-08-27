@@ -54,6 +54,32 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 use tracing::{debug, warn};
 
+/// Derive the absolute canonical path of the source repository (the parent of
+/// `.beads/`) for the `source_repo_path` field on an issue.
+///
+/// This lives in the process-free sync boundary because both issue creation
+/// and source-path migration need the same path identity without delegating
+/// from sync code into a process-capable CLI command module.
+#[must_use]
+pub fn canonical_source_repo_path(beads_dir: &Path) -> Option<String> {
+    let parent = beads_dir.parent()?;
+    let parent = if parent.as_os_str().is_empty()
+        && beads_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, ".beads" | "_beads"))
+    {
+        Path::new(".")
+    } else if parent.as_os_str().is_empty() {
+        return None;
+    } else {
+        parent
+    };
+    let canonical = parent.canonicalize().ok()?;
+    let path_str = canonical.to_string_lossy().into_owned();
+    (!path_str.is_empty()).then_some(path_str)
+}
+
 fn raw_os_str_sha256(value: &OsStr) -> String {
     let mut hasher = Sha256::new();
     #[cfg(unix)]
