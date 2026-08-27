@@ -15,6 +15,49 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
+## v0.5.3 -- 2026-08-26 (Release)
+
+Storage-correctness and release-hardening follow-up. The dependency stack now
+consumes the published FrankenSQLite 0.3.10 schema fixes, machine-readable
+search output has one stable envelope, oversized parent filters stay within
+SQLite's parameter limit, and recovery paths preserve their evidence on more
+fail-closed exits.
+
+### Storage engine and schema correctness
+
+- The complete `fsqlite` family moves to 0.3.10. Consecutive column `CHECK`
+  clauses are now extracted from the original DDL coordinate system even when
+  comments precede `CREATE TABLE`, so both the maximum and non-empty title
+  constraints remain enforced.
+- `ALTER TABLE main.<staging> RENAME TO ...` now targets the persistent table
+  when a same-named TEMP staging table is visible. The TEMP binding survives,
+  persisted DDL is canonical and unqualified, and stock SQLite can reopen the
+  result with a clean `PRAGMA integrity_check`.
+- Reviewed schema comparisons normalize redundant partial-index grouping and
+  canonical `CHECK` spellings without weakening the fail-closed contract;
+  rebuilds also retain the full issues-index inventory.
+
+### Search and large dependency sets
+
+- JSON and TOON search results always use the stable
+  `{issues, hidden_closed_count}` envelope, including zero matches and cases
+  where no closed issue was hidden.
+- Ready/list parent-membership filters are chunked instead of exceeding
+  SQLite's bound-parameter ceiling on large graphs.
+
+### Recovery, sync, and test isolation
+
+- JSONL freshness checks hash the ledger before accepting it as current, and
+  fail-closed database replacement no longer falls through to JSONL recovery.
+- Schema-repair failures preserve the original authority and each recovery
+  action retains its own snapshot rather than overwriting earlier evidence.
+- Create, list-sort, golden-output, recovery, and benchmark fixtures now use
+  isolated workspaces so an enclosing Beads checkout cannot change results.
+- The Windows release installer validates and extracts ZIP artifacts on stock
+  Git-for-Windows environments.
+
+---
+
 ## v0.5.2 -- 2026-08-25 (Release)
 
 Cross-platform correctness release driven by a full GitHub-issue triage pass.

@@ -1,6 +1,6 @@
 [package]
 name = "beads_rust"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2024"
 rust-version = "1.88"
 autobenches = false
@@ -42,16 +42,11 @@ clap_complete = { version = "4.6.9", features = ["unstable-dynamic"] }
 
 # Database (pure-Rust SQLite with concurrent writer support)
 # NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
-# Default features minus `json`: br issues no JSON1 SQL. Note this does
-# NOT fully remove fsqlite-ext-json — fsqlite-core 0.3.9 hard-depends on
-# it — so serde_json's `arbitrary_precision` feature (enabled by
-# ext-json 0.3.6+) is still unified into every build. That feature makes
-# `serde_json::Number` serialize as a private newtype struct through
-# non-serde_json serializers; `br` output bytes are unaffected (verified
-# for --json and TOON), and the insta snapshot harness compensates via
-# tests/snapshots `SnapshotJson`. Dropping the flag upstream in
-# fsqlite-ext-json would let this trim actually remove the crate.
-fsqlite = { version = "0.3.9", default-features = false, features = [
+# Default features minus `json`: br issues no JSON1 SQL. fsqlite-core still
+# depends on fsqlite-ext-json internally, but the 0.3.9+ extension enables
+# only serde_json's `preserve_order`; the old viral `arbitrary_precision`
+# feature no longer affects br's JSON/TOON serializers.
+fsqlite = { version = "0.3.10", default-features = false, features = [
     "native",
     "linux-asupersync-uring",
     "fts5",
@@ -59,20 +54,20 @@ fsqlite = { version = "0.3.9", default-features = false, features = [
     "icu",
     "misc",
 ] }
-fsqlite-types = "0.3.9"
-fsqlite-error = "0.3.9"
-fsqlite-core = "0.3.9"
-fsqlite-func = "0.3.9"
-fsqlite-vdbe = "0.3.9"
-fsqlite-vfs = "0.3.9"
-fsqlite-pager = "0.3.9"
-fsqlite-parser = "0.3.9"
-fsqlite-planner = "0.3.9"
-fsqlite-wal = "0.3.9"
-fsqlite-btree = "0.3.9"
-fsqlite-ast = "0.3.9"
-fsqlite-mvcc = "0.3.9"
-fsqlite-observability = "0.3.9"
+fsqlite-types = "0.3.10"
+fsqlite-error = "0.3.10"
+fsqlite-core = "0.3.10"
+fsqlite-func = "0.3.10"
+fsqlite-vdbe = "0.3.10"
+fsqlite-vfs = "0.3.10"
+fsqlite-pager = "0.3.10"
+fsqlite-parser = "0.3.10"
+fsqlite-planner = "0.3.10"
+fsqlite-wal = "0.3.10"
+fsqlite-btree = "0.3.10"
+fsqlite-ast = "0.3.10"
+fsqlite-mvcc = "0.3.10"
+fsqlite-observability = "0.3.10"
 
 # Current-thread runtime that drives fsqlite 0.3's async (!Send) futures to
 # completion behind the synchronous `franken_sync::Connection` bridge.
@@ -220,7 +215,7 @@ self_update = [
 
 # NOTE: no `[patch.crates-io]` here.
 #
-# All dependencies — fsqlite 0.3.9, its fsqlite-* transitive crates, and
+# All dependencies — fsqlite 0.3.10, its fsqlite-* transitive crates, and
 # fastmcp-rust 0.7.0 — are published on crates.io, so this crate
 # resolves everything from the registry out of the box.  That makes
 # `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked`
