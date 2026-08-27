@@ -127,7 +127,7 @@
 
 | Command | Key Flags | Mutating | Test File(s) | Status |
 |---------|-----------|----------|--------------|--------|
-| `sync` | `--flush-only`, `--import-only`, `--merge`, `--status`, `--witness`, `--reconcile-additive`, `--apply`, `--expect-plan-sha256`, `--force`, `--force-db`, `--force-jsonl`, `--rename-prefix`, `--rebuild`, `--allow-external-jsonl`, `--manifest`, `--error-policy`, `--orphans`, `--robot` | ✏️ | `e2e_sync_artifacts.rs`, `e2e_sync_failure_injection.rs`, `e2e_sync_fuzz_edge_cases.rs`, `e2e_sync_git_safety.rs`, `e2e_sync_status_health.rs`, `e2e_sync_preflight_integration.rs`, `e2e_basic_lifecycle.rs`, `jsonl_import_export.rs` | ✅ |
+| `sync` | `--flush-only`, `--import-only`, `--merge`, `--status`, `--witness`, `--reconcile-additive`, `--migrate-source-repo-path`, `--apply`, `--expect-plan-sha256`, `--force`, `--force-db`, `--force-jsonl`, `--rename-prefix`, `--rebuild`, `--allow-external-jsonl`, `--manifest`, `--error-policy`, `--orphans`, `--robot` | ✏️ | `e2e_sync_artifacts.rs`, `e2e_sync_failure_injection.rs`, `e2e_sync_fuzz_edge_cases.rs`, `e2e_sync_git_safety.rs`, `e2e_sync_status_health.rs`, `e2e_sync_preflight_integration.rs`, `e2e_sync_reconcile.rs`, `e2e_basic_lifecycle.rs`, `jsonl_import_export.rs` | ✅ |
 | `vcs-status` | `--jsonl`, `--allow-external-jsonl`, `--timeout-ms`, `--robot`, global JSON/TOON | 📖 | `e2e_vcs_status.rs`, VCS runner unit tests | ✅ |
 
 **Safety-critical test files:**
