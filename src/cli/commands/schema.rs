@@ -215,6 +215,10 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
                 "AdditiveReconcileReceipt",
                 schema_for_output::<AdditiveReconcileReceipt>(),
             );
+            schemas.insert(
+                "SourceRepoPathMigrationReceipt",
+                schema_for_output::<crate::cli::commands::sync::SourceRepoPathMigrationReceipt>(),
+            );
             schemas.insert("VcsExportStatus", schema_for_output::<VcsExportStatus>());
             schemas.insert("ErrorEnvelope", schema_for_output::<ErrorEnvelope>());
         }
@@ -310,6 +314,21 @@ fn build_commands(target: SchemaTarget) -> BTreeMap<&'static str, CommandShape> 
                 "Dry-run by default. Apply requires the exact plan_sha256 from an \
                  identically configured reviewed dry-run via --expect-plan-sha256. \
                  Structured machine-mode errors are currently emitted on stdout.",
+            ),
+        },
+    );
+    commands.insert(
+        "sync --migrate-source-repo-path",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".",
+            items_at: None,
+            item_schema: Some("SourceRepoPathMigrationReceipt"),
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "Read-only plan by default. Apply requires the exact plan_sha256 from an \
+                 identically configured reviewed dry-run via --expect-plan-sha256. Uses the \
+                 crash-recoverable sync publication saga and never probes Git.",
             ),
         },
     );
@@ -764,6 +783,22 @@ mod tests {
         assert_eq!(
             stats.error_envelope_on_stderr,
             status.error_envelope_on_stderr
+        );
+    }
+
+    #[test]
+    fn source_repo_path_migration_schema_and_command_shape_are_discoverable() {
+        let schemas = build_schemas(SchemaTarget::All);
+        assert!(schemas.contains_key("SourceRepoPathMigrationReceipt"));
+
+        let commands = build_commands(SchemaTarget::Commands);
+        let migration = commands
+            .get("sync --migrate-source-repo-path")
+            .expect("migration command shape must exist");
+        assert_eq!(migration.shape, "object");
+        assert_eq!(
+            migration.item_schema,
+            Some("SourceRepoPathMigrationReceipt")
         );
     }
 

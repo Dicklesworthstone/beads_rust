@@ -614,7 +614,7 @@ pub struct WorkflowCapacityViolation {
 /// machine consumers can use one stable vocabulary. `hard_limit` remains
 /// optional because a project may configure an advisory ceiling without a
 /// corresponding hard stop.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkflowCapacityWarning {
     pub issue_id: String,
     pub from_status: Option<String>,

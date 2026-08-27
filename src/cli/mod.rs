@@ -2935,17 +2935,28 @@ pub struct SyncArgs {
     #[arg(long = "reconcile-additive")]
     pub reconcile_additive: bool,
 
-    /// Apply a conflict-free additive reconciliation plan transactionally
+    /// Reconcile JSONL and normalize source_repo_path atomically
     ///
-    /// Without this flag, --reconcile-additive only prints the dry-run plan.
-    #[arg(long, requires = "reconcile_additive")]
+    /// Read-only by default. Builds a hash-bound plan that preserves the
+    /// portable source_repo value, imports source-only/newer rows, and rewrites
+    /// source_repo_path to the canonical current workspace path. Combine with
+    /// --apply and the exact --expect-plan-sha256 token to commit DB and JSONL
+    /// through the crash-recoverable sync publication saga.
+    #[arg(long = "migrate-source-repo-path")]
+    pub migrate_source_repo_path: bool,
+
+    /// Apply a reviewed reconciliation or migration plan transactionally
+    ///
+    /// Without this flag, reviewed migration/reconciliation modes only print
+    /// their dry-run plan.
+    #[arg(long)]
     pub apply: bool,
 
-    /// SHA-256 from the reviewed additive-reconciliation dry-run receipt
+    /// SHA-256 from the reviewed dry-run receipt
     ///
     /// Required with --apply. The command refuses mutation if the exact source,
-    /// database, resolution set, or expected post-state now produces another
-    /// plan token.
+    /// database, selected operation, resolution set, or expected post-state
+    /// now produces another plan token.
     #[arg(long = "expect-plan-sha256", value_name = "SHA256", requires = "apply")]
     pub expect_plan_sha256: Option<String>,
 

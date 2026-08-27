@@ -418,8 +418,8 @@ script verifies automatically.
 > `RWS7nGFfBYC+MWeZLEaowkjNi77w5FEOk49fEhX2jZ6gpd9uQ4vzVIrF` (key ID
 > `31BE80055F619CBB`). v0.4.1 moved to the recoverable DSR key shown above,
 > but its release documentation did not record that rotation. From v0.5.1,
-> the same current key is installed in both DSR and GitHub Actions and is
-> verified before upload. Releases before v0.4.0 either shipped no
+> the current key is installed in the DSR release path and verified before
+> upload. Releases before v0.4.0 either shipped no
 > `.minisig` or used an unrecoverable CI-era key; treat those signatures as
 > unverifiable (see GitHub #411).
 
@@ -571,6 +571,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `sync` | Explicit DB ↔ JSONL modes | `br sync --flush-only` |
 | `sync --witness` | Read-only deterministic JSONL witness | `br sync --witness --robot` |
 | `sync --reconcile-additive` | Lossless exact-ID recovery plan/apply | `br sync --reconcile-additive --robot` |
+| `sync --migrate-source-repo-path` | Reconcile rows and normalize machine-specific source paths | `br sync --migrate-source-repo-path --robot` |
 | `doctor` | Run diagnostics | `br doctor` |
 | `doctor migrate-schema` | Plan/apply/undo an explicit receipt-bound schema upgrade | `br doctor migrate-schema plan --json` |
 | `stats` | Project statistics | `br stats` |
@@ -891,7 +892,8 @@ Pull from git       ──►      git pull         ──►    JSONL updated
 ```
 
 Bare `br sync` is intentionally refused; choose `--flush-only`, `--import-only`,
-`--merge`, `--reconcile`, `--reconcile-additive`, `--status`, or `--witness`
+`--merge`, `--reconcile`, `--reconcile-additive`,
+`--migrate-source-repo-path`, `--status`, or `--witness`
 so the data direction and authority are explicit. `br sync --status` never
 probes Git; run `br vcs-status --json` only when Git visibility is explicitly
 wanted.
@@ -1008,6 +1010,24 @@ many were preserved, arms `needs_flush`, and directs you to run
 `br sync --flush-only` to restore JSONL coverage. Unresolved git conflict
 markers are never skipped. Explicit history-prune commands can still remove a
 protected backup, so retain it until recovery is verified.
+
+### Reconcile portable source repository paths
+
+To reconcile valid rows from both stores while replacing stale
+machine-specific `source_repo_path` values with the canonical current workspace
+path, review and apply an exact hash-bound plan:
+
+```bash
+plan="$(br sync --migrate-source-repo-path --robot)"
+plan_sha256="$(printf '%s\n' "$plan" | jq -r .plan_sha256)"
+br sync --migrate-source-repo-path --apply \
+  --expect-plan-sha256 "$plan_sha256" --robot
+```
+
+The portable `source_repo` name is preserved. Apply uses the durable sync
+publication receipt so an interruption after the database commit or JSONL
+publication is resumed safely. Sync still does not probe Git; use
+`br vcs-status --json` separately when staged/worktree state matters.
 
 ### Sync Issues After Git Merge
 

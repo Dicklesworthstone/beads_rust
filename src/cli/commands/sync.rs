@@ -3,6 +3,7 @@
 //! Provides explicit JSONL sync actions without git operations.
 //! Supports `--flush-only` (export) and `--import-only` (import).
 
+use crate::cli::commands::create::canonical_source_repo_path;
 use crate::cli::{DEFAULT_WITNESS_PARALLELISM, SyncArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -43,7 +44,7 @@ use crate::util::id::split_prefix_remainder;
 use rich_rust::prelude::*;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, IsTerminal};
 use std::path::{Component, Path, PathBuf};
@@ -232,6 +233,63 @@ pub struct ImportResultOutput {
     /// Present when --skip-invalid-records published a recovered JSONL source.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub salvage: Option<JsonlSalvageReceipt>,
+}
+
+const SOURCE_REPO_PATH_MIGRATION_SCHEMA: &str = "br.sync.source-repo-path-migration.v1";
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct SourceRepoPathMigrationReceipt {
+    schema: &'static str,
+    mode: &'static str,
+    applied: bool,
+    no_op: bool,
+    plan_sha256: String,
+    target_path: String,
+    target_path_sha256: String,
+    source_records: usize,
+    database_records: usize,
+    source_only_created: usize,
+    source_newer_updated: usize,
+    database_newer_preserved: usize,
+    equal_records: usize,
+    tombstones_preserved: usize,
+    ephemeral_source_records_skipped: usize,
+    paths_normalized: usize,
+    changed_issue_ids: Vec<String>,
+    jsonl_rewrite_required: bool,
+    source_repo_preserved: bool,
+    vcs_status: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt_id: Option<String>,
+}
+
+struct SourceRepoPathMigrationPlan {
+    receipt: SourceRepoPathMigrationReceipt,
+    changed_kept: Vec<crate::model::Issue>,
+    database_before: crate::sync::AdditiveDatabaseWitness,
+    source_before: JsonlSourceStateWitness,
+    source_before_content_sha256: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SourceRepoPathMigrationPlanDigest<'a> {
+    schema: &'static str,
+    target_path: &'a str,
+    source_before: &'a JsonlSourceStateWitness,
+    source_before_content_sha256: Option<&'a str>,
+    database_before: &'a crate::sync::AdditiveDatabaseWitness,
+    changed_issue_witnesses: &'a [crate::sync::SyncMergeKeptIssueWitness],
+    source_records: usize,
+    source_only_created: usize,
+    source_newer_updated: usize,
+    database_newer_preserved: usize,
+    equal_records: usize,
+    tombstones_preserved: usize,
+    ephemeral_source_records_skipped: usize,
+    paths_normalized: usize,
+    jsonl_rewrite_required: bool,
 }
 
 /// Maximum witness rows printed per list in human-readable sync output;
@@ -506,6 +564,7 @@ enum SyncOperation {
     Status,
     Witness,
     ReconcileAdditive,
+    MigrateSourceRepoPath,
     Flush,
     Merge,
     Import,
@@ -542,6 +601,10 @@ enum DeferredSyncOutput {
         receipt_id: String,
         phase_before: SyncMergePendingPhase,
         capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
+        use_json: bool,
+    },
+    SourceRepoPathMigration {
+        receipt: SourceRepoPathMigrationReceipt,
         use_json: bool,
     },
 }
@@ -719,6 +782,7 @@ fn resolve_sync_startup_paths(
 /// of being skipped by open-time recovery.
 fn should_defer_jsonl_recovery(args: &SyncArgs) -> bool {
     args.reconcile_additive
+        || args.migrate_source_repo_path
         || (args.import_only && (args.rename_prefix || args.skip_invalid_records))
 }
 
@@ -742,18 +806,19 @@ pub fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
                 .to_string(),
         });
     }
-    if args.apply && !args.reconcile_additive {
+    if args.apply && !(args.reconcile_additive || args.migrate_source_repo_path) {
         return Err(BeadsError::Validation {
             field: "apply".to_string(),
-            reason: "--apply can only be used with --reconcile-additive".to_string(),
+            reason:
+                "--apply can only be used with --reconcile-additive or --migrate-source-repo-path"
+                    .to_string(),
         });
     }
-    if args.reconcile_additive && args.apply && args.expect_plan_sha256.is_none() {
+    if args.apply && args.expect_plan_sha256.is_none() {
         return Err(BeadsError::Validation {
             field: "expect_plan_sha256".to_string(),
-            reason:
-                "--apply requires --expect-plan-sha256 from the reviewed reconciliation dry run"
-                    .to_string(),
+            reason: "--apply requires --expect-plan-sha256 from the reviewed dry-run receipt"
+                .to_string(),
         });
     }
     if let Some(plan_sha256) = &args.expect_plan_sha256
@@ -805,18 +870,40 @@ pub fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
         }
     }
 
+    if args.migrate_source_repo_path {
+        let irrelevant = [
+            (args.force, "--force"),
+            (args.force_db, "--force-db"),
+            (args.force_jsonl, "--force-jsonl"),
+            (args.manifest, "--manifest"),
+            (args.error_policy.is_some(), "--error-policy"),
+            (args.orphans.is_some(), "--orphans"),
+            (args.rename_prefix, "--rename-prefix"),
+            (args.rebuild, "--rebuild"),
+            (args.skip_invalid_records, "--skip-invalid-records"),
+            (!args.resolve_source_ids.is_empty(), "--resolve-source-id"),
+        ];
+        if let Some((_, flag)) = irrelevant.into_iter().find(|(present, _)| *present) {
+            return Err(BeadsError::Validation {
+                field: "migrate_source_repo_path".to_string(),
+                reason: format!("{flag} is not used by --migrate-source-repo-path"),
+            });
+        }
+    }
+
     let mode_count = u8::from(args.status)
         + u8::from(args.flush_only)
         + u8::from(args.import_only)
         + u8::from(args.merge)
         + u8::from(args.reconcile)
         + u8::from(args.witness)
-        + u8::from(args.reconcile_additive);
+        + u8::from(args.reconcile_additive)
+        + u8::from(args.migrate_source_repo_path);
     if mode_count > 1 {
         return Err(BeadsError::Validation {
             field: "mode".to_string(),
             reason:
-                "Must specify exactly one of --flush-only, --import-only, --merge, --reconcile, --reconcile-additive, --status, or --witness"
+                "Must specify exactly one of --flush-only, --import-only, --merge, --reconcile, --reconcile-additive, --migrate-source-repo-path, --status, or --witness"
                     .to_string(),
         });
     }
@@ -824,7 +911,7 @@ pub fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
         return Err(BeadsError::Validation {
             field: "mode".to_string(),
             reason:
-                "Must specify one of --flush-only, --import-only, --merge, --reconcile, --reconcile-additive, --status, or --witness"
+                "Must specify one of --flush-only, --import-only, --merge, --reconcile, --reconcile-additive, --migrate-source-repo-path, --status, or --witness"
                     .to_string(),
         });
     }
@@ -990,8 +1077,8 @@ fn maybe_delegate_rebuild(
 
 /// Dispatch to the appropriate sync-subcommand implementation based on
 /// the flag pattern (`--status` / `--flush-only` / `--merge` /
-/// `--import-only`). The status branch is read-only; the
-/// other three hold a `&mut` borrow on `open_result.storage` for the
+/// `--import-only`). Read-only branches avoid mutation; operations that can
+/// modify state hold a `&mut` borrow on `open_result.storage` for the
 /// duration of their execution. Any `Err` propagates back to
 /// `finalize_sync_result`, which is the single place that decides how to
 /// handle recovery-backup rollback.
@@ -1026,6 +1113,27 @@ fn dispatch_sync_subcommand(
             message: "reviewed additive reconciliation bypassed its sole lock-owning command path"
                 .to_string(),
         }),
+        SyncOperation::MigrateSourceRepoPath => {
+            let no_db = open_result.no_db;
+            let (storage, retained_source, expected_source, jsonl_authority) =
+                open_result.jsonl_write_context();
+            execute_source_repo_path_migration(
+                storage,
+                path_policy,
+                args,
+                options.use_json,
+                options.show_progress,
+                options.retention_days,
+                options.history_config.clone(),
+                retained_source,
+                expected_source,
+                jsonl_authority,
+                cli,
+                &options.db_path,
+                no_db,
+                ctx,
+            )
+        }
         SyncOperation::Flush => {
             let (storage, retained_source, expected_source, jsonl_authority) =
                 open_result.jsonl_write_context();
@@ -1088,7 +1196,7 @@ fn dispatch_sync_subcommand(
         SyncOperation::Unspecified => Err(BeadsError::Validation {
             field: "mode".to_string(),
             reason:
-                "Must specify one of --flush-only, --import-only, --merge, --reconcile, --reconcile-additive, --status, or --witness"
+                "Must specify one of --flush-only, --import-only, --merge, --reconcile, --reconcile-additive, --migrate-source-repo-path, --status, or --witness"
                     .to_string(),
         }),
     }
@@ -1285,6 +1393,9 @@ fn render_deferred_sync_output(output: DeferredSyncOutput, ctx: &OutputContext) 
                 }
             }
         }
+        DeferredSyncOutput::SourceRepoPathMigration { receipt, use_json } => {
+            render_source_repo_path_migration_receipt(&receipt, ctx, use_json);
+        }
     }
 }
 
@@ -1310,6 +1421,8 @@ fn sync_operation(args: &SyncArgs) -> SyncOperation {
         SyncOperation::Witness
     } else if args.reconcile_additive {
         SyncOperation::ReconcileAdditive
+    } else if args.migrate_source_repo_path {
+        SyncOperation::MigrateSourceRepoPath
     } else if args.status {
         SyncOperation::Status
     } else if args.flush_only {
@@ -4559,6 +4672,493 @@ fn resume_pending_sync_merge(
     ))
 }
 
+fn hydrate_exportable_database_issues(
+    storage: &crate::storage::SqliteStorage,
+) -> Result<BTreeMap<String, crate::model::Issue>> {
+    let mut issues = storage.get_all_issues_for_export()?;
+    let dependencies = storage.get_all_dependency_records()?;
+    let labels = storage.get_all_labels()?;
+    let comments = storage.get_all_comments()?;
+
+    for issue in &mut issues {
+        if let Some(issue_dependencies) = dependencies.get(&issue.id) {
+            issue.dependencies.clone_from(issue_dependencies);
+        }
+        if let Some(issue_labels) = labels.get(&issue.id) {
+            issue.labels.clone_from(issue_labels);
+        }
+        if let Some(issue_comments) = comments.get(&issue.id) {
+            issue.comments.clone_from(issue_comments);
+        }
+    }
+
+    Ok(issues
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect())
+}
+
+fn normalize_issue_source_repo_path(issue: &mut crate::model::Issue, target_path: &str) -> bool {
+    let changed = issue.source_repo_path.as_deref() != Some(target_path);
+    issue.source_repo_path = Some(target_path.to_string());
+    issue.content_hash = Some(issue.compute_content_hash());
+    changed
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_source_repo_path_migration_plan(
+    storage: &crate::storage::SqliteStorage,
+    beads_dir: &Path,
+    source: Option<&JsonlSourceSnapshot>,
+) -> Result<SourceRepoPathMigrationPlan> {
+    let target_path = canonical_source_repo_path(beads_dir).ok_or_else(|| {
+        BeadsError::Config(format!(
+            "Cannot resolve the canonical workspace path above {}",
+            beads_dir.display()
+        ))
+    })?;
+    if !Path::new(&target_path).is_absolute() {
+        return Err(BeadsError::SyncConflict {
+            message: "Canonical source_repo_path migration target is not absolute".to_string(),
+        });
+    }
+
+    let database_before = capture_sync_database_witness(storage)?;
+    let original_database = hydrate_exportable_database_issues(storage)?;
+    if capture_sync_database_witness(storage)? != database_before {
+        return Err(BeadsError::SyncConflict {
+            message:
+                "Database changed while the source_repo_path migration plan was being hydrated"
+                    .to_string(),
+        });
+    }
+
+    let source_before = source.map_or(
+        JsonlSourceStateWitness::Missing,
+        JsonlSourceSnapshot::state_witness,
+    );
+    let source_before_content_sha256 = source
+        .map(JsonlSourceSnapshot::content_sha256)
+        .map(str::to_string);
+    let source_issues = if let Some(source) = source {
+        ensure_no_conflict_markers_snapshot(source)?;
+        let validation = crate::sync::validate_jsonl_snapshot_issue_records(source)?;
+        if validation.invalid_count != 0 {
+            return Err(BeadsError::Config(format!(
+                "Cannot migrate source_repo_path: JSONL contains {} invalid record(s): {}",
+                validation.invalid_count,
+                validation.preview_messages().join("; ")
+            )));
+        }
+        read_issues_from_jsonl_snapshot(source)?
+    } else {
+        Vec::new()
+    };
+    let source_records = source_issues.len();
+
+    let mut normalized_issue_ids = BTreeSet::new();
+    let mut final_by_id = original_database.clone();
+    for issue in final_by_id.values_mut() {
+        if normalize_issue_source_repo_path(issue, &target_path) {
+            normalized_issue_ids.insert(issue.id.clone());
+        }
+    }
+
+    let mut normalized_source = BTreeMap::new();
+    let mut source_only_created = 0usize;
+    let mut source_newer_updated = 0usize;
+    let mut database_newer_preserved = 0usize;
+    let mut equal_records = 0usize;
+    let mut tombstones_preserved = 0usize;
+    let mut ephemeral_source_records_skipped = 0usize;
+
+    for mut incoming in source_issues {
+        if incoming.ephemeral || incoming.id.contains("-wisp-") {
+            ephemeral_source_records_skipped += 1;
+            continue;
+        }
+        if normalize_issue_source_repo_path(&mut incoming, &target_path) {
+            normalized_issue_ids.insert(incoming.id.clone());
+        }
+        normalized_source.insert(incoming.id.clone(), incoming.clone());
+
+        match final_by_id.get(&incoming.id) {
+            None => {
+                source_only_created += 1;
+                final_by_id.insert(incoming.id.clone(), incoming);
+            }
+            Some(existing) if existing.status == crate::model::Status::Tombstone => {
+                tombstones_preserved += 1;
+            }
+            Some(existing) => match incoming.updated_at.cmp(&existing.updated_at) {
+                std::cmp::Ordering::Greater => {
+                    source_newer_updated += 1;
+                    final_by_id.insert(incoming.id.clone(), incoming);
+                }
+                std::cmp::Ordering::Less => {
+                    database_newer_preserved += 1;
+                }
+                std::cmp::Ordering::Equal if existing.sync_equals(&incoming) => {
+                    equal_records += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    return Err(BeadsError::SyncConflict {
+                        message: format!(
+                            "Issue {} has equal timestamps but divergent DB/JSONL payloads; resolve it before source_repo_path migration",
+                            incoming.id
+                        ),
+                    });
+                }
+            },
+        }
+    }
+
+    let mut external_ref_owners = HashMap::<String, String>::new();
+    for issue in final_by_id.values() {
+        if let Some(external_ref) = issue.external_ref.as_ref()
+            && let Some(existing_id) =
+                external_ref_owners.insert(external_ref.clone(), issue.id.clone())
+            && existing_id != issue.id
+        {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "source_repo_path migration projection contains duplicate external_ref {external_ref:?} on {existing_id} and {}",
+                    issue.id
+                ),
+            });
+        }
+    }
+
+    let jsonl_rewrite_required = normalized_source.len() != final_by_id.len()
+        || final_by_id.iter().any(|(issue_id, issue)| {
+            normalized_source
+                .get(issue_id)
+                .is_none_or(|source_issue| !source_issue.sync_equals(issue))
+        });
+    let mut changed_kept = final_by_id
+        .values()
+        .filter(|issue| {
+            original_database
+                .get(&issue.id)
+                .is_none_or(|before| !before.sync_equals(issue))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    changed_kept.sort_by(|left, right| left.id.cmp(&right.id));
+    let changed_issue_ids = changed_kept
+        .iter()
+        .map(|issue| issue.id.clone())
+        .collect::<Vec<_>>();
+    let changed_issue_witnesses = crate::sync::sync_merge_kept_issue_witnesses(&changed_kept)?;
+    let digest_input = SourceRepoPathMigrationPlanDigest {
+        schema: SOURCE_REPO_PATH_MIGRATION_SCHEMA,
+        target_path: &target_path,
+        source_before: &source_before,
+        source_before_content_sha256: source_before_content_sha256.as_deref(),
+        database_before: &database_before,
+        changed_issue_witnesses: &changed_issue_witnesses,
+        source_records,
+        source_only_created,
+        source_newer_updated,
+        database_newer_preserved,
+        equal_records,
+        tombstones_preserved,
+        ephemeral_source_records_skipped,
+        paths_normalized: normalized_issue_ids.len(),
+        jsonl_rewrite_required,
+    };
+    let plan_bytes = serde_json::to_vec(&digest_input)?;
+    let plan_sha256 = crate::util::hex_encode(&Sha256::digest(plan_bytes));
+    let target_path_sha256 = crate::util::hex_encode(&Sha256::digest(target_path.as_bytes()));
+    let no_op = changed_kept.is_empty() && !jsonl_rewrite_required;
+
+    Ok(SourceRepoPathMigrationPlan {
+        receipt: SourceRepoPathMigrationReceipt {
+            schema: SOURCE_REPO_PATH_MIGRATION_SCHEMA,
+            mode: "dry_run",
+            applied: false,
+            no_op,
+            plan_sha256,
+            target_path,
+            target_path_sha256,
+            source_records,
+            database_records: original_database.len(),
+            source_only_created,
+            source_newer_updated,
+            database_newer_preserved,
+            equal_records,
+            tombstones_preserved,
+            ephemeral_source_records_skipped,
+            paths_normalized: normalized_issue_ids.len(),
+            changed_issue_ids,
+            jsonl_rewrite_required,
+            source_repo_preserved: true,
+            vcs_status: "not_probed",
+            warnings: Vec::new(),
+            receipt_id: None,
+        },
+        changed_kept,
+        database_before,
+        source_before,
+        source_before_content_sha256,
+    })
+}
+
+fn render_source_repo_path_migration_receipt(
+    receipt: &SourceRepoPathMigrationReceipt,
+    ctx: &OutputContext,
+    use_json: bool,
+) {
+    if use_json {
+        ctx.json_pretty(receipt);
+        return;
+    }
+    if !should_render_human_sync_output(ctx, use_json) {
+        return;
+    }
+    println!(
+        "source_repo_path migration {}: plan_sha256={}",
+        if receipt.applied { "complete" } else { "plan" },
+        receipt.plan_sha256
+    );
+    println!(
+        "  Target: {}",
+        sanitize_terminal_inline(&receipt.target_path)
+    );
+    println!(
+        "  Source-only: {}  source-newer: {}  DB-newer preserved: {}  equal: {}",
+        receipt.source_only_created,
+        receipt.source_newer_updated,
+        receipt.database_newer_preserved,
+        receipt.equal_records
+    );
+    println!(
+        "  Paths normalized: {}  changed DB rows: {}  JSONL rewrite: {}",
+        receipt.paths_normalized,
+        receipt.changed_issue_ids.len(),
+        receipt.jsonl_rewrite_required
+    );
+    println!("  source_repo preserved: yes; VCS status: not probed");
+    if receipt.no_op {
+        println!("  Result: already normalized; no mutation required");
+    } else if !receipt.applied {
+        println!(
+            "  Apply: br sync --migrate-source-repo-path --apply --expect-plan-sha256 {}",
+            receipt.plan_sha256
+        );
+    }
+    for warning in &receipt.warnings {
+        ctx.warning(&warning.to_string());
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn execute_source_repo_path_migration(
+    storage: &mut crate::storage::SqliteStorage,
+    path_policy: &SyncPathPolicy,
+    args: &SyncArgs,
+    use_json: bool,
+    show_progress: bool,
+    retention_days: Option<u64>,
+    history_config: HistoryConfig,
+    retained_source: config::RetainedJsonlSourceRef<'_>,
+    expected_source: &JsonlSourceStateWitness,
+    retained_authority: Option<&crate::sync::JsonlFamilyWriteLock>,
+    cli: &config::CliOverrides,
+    db_path: &Path,
+    no_db: bool,
+    ctx: &OutputContext,
+) -> Result<SyncDispatchCompletion> {
+    let jsonl_path = &path_policy.jsonl_path;
+    let owned_jsonl_authority = retained_authority
+        .is_none()
+        .then(|| {
+            crate::sync::blocking_jsonl_family_write_lock_with_timeout(jsonl_path, cli.lock_timeout)
+        })
+        .transpose()?;
+    let jsonl_authority = retained_authority
+        .or(owned_jsonl_authority.as_ref())
+        .expect("JSONL authority is retained or acquired");
+    jsonl_authority.verify_jsonl_authority()?;
+    let captured_source = jsonl_authority.capture_optional_target()?;
+    let source = captured_source.as_ref();
+    let observed_source = source.map_or(
+        JsonlSourceStateWitness::Missing,
+        JsonlSourceSnapshot::state_witness,
+    );
+    if !matches!(retained_source, config::RetainedJsonlSourceRef::Uncaptured)
+        && &observed_source != expected_source
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "Retained JSONL source does not match its startup witness".to_string(),
+        });
+    }
+
+    let base_path = path_policy.beads_dir.join("beads.base.jsonl");
+    if let Some(receipt) = storage.pending_sync_merge_receipt()? {
+        let base_authority = crate::sync::blocking_jsonl_family_write_lock_with_timeout(
+            &base_path,
+            cli.lock_timeout,
+        )?;
+        base_authority.verify_jsonl_authority()?;
+        let base_source = base_authority.capture_optional_target()?;
+        let (reconciled, deferred_output) = resume_pending_sync_merge(
+            storage,
+            db_path,
+            path_policy,
+            args,
+            use_json,
+            show_progress,
+            history_config,
+            source,
+            jsonl_authority,
+            base_source.as_ref(),
+            &base_authority,
+            receipt,
+            no_db,
+        )?;
+        return Ok(SyncDispatchCompletion {
+            published_source: Some(reconciled.published_source),
+            owned_jsonl_authority,
+            pending_merge: Some(PendingSyncMergeCompletion {
+                receipt: reconciled.terminal_receipt,
+                base_authority,
+            }),
+            deferred_output: Some(deferred_output),
+        });
+    }
+
+    let mut plan = build_source_repo_path_migration_plan(storage, &path_policy.beads_dir, source)?;
+    if !args.apply {
+        render_source_repo_path_migration_receipt(&plan.receipt, ctx, use_json);
+        return Ok(SyncDispatchCompletion::default());
+    }
+    let expected_plan_sha256 =
+        args.expect_plan_sha256
+            .as_deref()
+            .ok_or_else(|| BeadsError::Validation {
+                field: "expect_plan_sha256".to_string(),
+                reason: "--apply requires the exact reviewed migration plan token".to_string(),
+            })?;
+    if expected_plan_sha256 != plan.receipt.plan_sha256 {
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "source_repo_path migration plan changed: expected {expected_plan_sha256}, current {}",
+                plan.receipt.plan_sha256
+            ),
+        });
+    }
+    plan.receipt.mode = "apply";
+    plan.receipt.applied = true;
+    if plan.receipt.no_op {
+        render_source_repo_path_migration_receipt(&plan.receipt, ctx, use_json);
+        return Ok(SyncDispatchCompletion::default());
+    }
+
+    jsonl_authority.verify_jsonl_authority()?;
+    let recaptured_source = jsonl_authority.capture_optional_target()?;
+    let recaptured_state = recaptured_source.as_ref().map_or(
+        JsonlSourceStateWitness::Missing,
+        JsonlSourceSnapshot::state_witness,
+    );
+    if recaptured_state != plan.source_before
+        || recaptured_source
+            .as_ref()
+            .map(JsonlSourceSnapshot::content_sha256)
+            != plan.source_before_content_sha256.as_deref()
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "JSONL changed after the source_repo_path migration plan was reviewed"
+                .to_string(),
+        });
+    }
+
+    let base_authority =
+        crate::sync::blocking_jsonl_family_write_lock_with_timeout(&base_path, cli.lock_timeout)?;
+    base_authority.verify_jsonl_authority()?;
+    let base_source = base_authority.capture_optional_target()?;
+    let base_state = base_source.as_ref().map_or(
+        JsonlSourceStateWitness::Missing,
+        JsonlSourceSnapshot::state_witness,
+    );
+    let changed_kept_ids = plan
+        .changed_kept
+        .iter()
+        .map(|issue| issue.id.clone())
+        .collect::<Vec<_>>();
+    let kept_issue_witnesses = crate::sync::sync_merge_kept_issue_witnesses(&plan.changed_kept)?;
+    let migration_as_of = chrono::Utc::now();
+    let actor = cli.actor.as_deref().unwrap_or("br");
+    let intent = SyncMergeIntent {
+        schema_version: 2,
+        database_authority_sha256: database_write_authority_sha256(db_path)?,
+        jsonl_authority_sha256: jsonl_authority.authority_path_sha256().to_string(),
+        jsonl_path_sha256: canonical_sync_path_sha256(jsonl_authority.canonical_jsonl_path()),
+        jsonl_before: plan.source_before.clone(),
+        jsonl_before_content_sha256: plan.source_before_content_sha256.clone(),
+        base_authority_sha256: base_authority.authority_path_sha256().to_string(),
+        base_before: base_state,
+        base_before_content_sha256: base_source
+            .as_ref()
+            .map(JsonlSourceSnapshot::content_sha256)
+            .map(str::to_string),
+        resolution: "source-repo-path-migration".to_string(),
+        actor: actor.to_string(),
+        event_attribution: storage.pending_event_attribution_for_review(),
+        capacity_policy: storage.workflow_capacity_policy_for_review(),
+        retention_days,
+        export_as_of: migration_as_of,
+        changed_kept_issue_ids: changed_kept_ids,
+        kept_issue_witnesses,
+        deleted_issue_ids: Vec::new(),
+        note_witnesses: Vec::new(),
+        database_before: plan.database_before,
+    };
+    let pending_receipt =
+        storage.apply_sync_merge_atomically(&plan.changed_kept, &[], &[], &intent)?;
+    plan.receipt.warnings = pending_receipt.capacity_warnings.clone();
+    let _ = storage.take_capacity_warnings();
+
+    let reconciled = reconcile_pending_sync_merge_artifacts(
+        storage,
+        db_path,
+        path_policy,
+        args,
+        show_progress,
+        history_config,
+        source,
+        jsonl_authority,
+        base_source.as_ref(),
+        &base_authority,
+        pending_receipt,
+        no_db,
+    )
+    .map_err(|source| {
+        if no_db {
+            source
+        } else {
+            BeadsError::CommittedStateUnwitnessed {
+                operation: "source_repo_path migration artifact reconciliation".to_string(),
+                source: Box::new(source),
+            }
+        }
+    })?;
+    plan.receipt.receipt_id = Some(reconciled.terminal_receipt.receipt_id.clone());
+
+    Ok(SyncDispatchCompletion {
+        published_source: Some(reconciled.published_source),
+        owned_jsonl_authority,
+        pending_merge: Some(PendingSyncMergeCompletion {
+            receipt: reconciled.terminal_receipt,
+            base_authority,
+        }),
+        deferred_output: Some(DeferredSyncOutput::SourceRepoPathMigration {
+            receipt: plan.receipt,
+            use_json,
+        }),
+    })
+}
+
 /// Execute the --merge operation.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn execute_merge(
@@ -5403,7 +6003,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_sync_mode_args_apply_requires_additive_reconciliation() {
+    fn test_validate_sync_mode_args_apply_requires_reviewed_operation() {
         let bare_apply = SyncArgs {
             apply: true,
             ..SyncArgs::default()
@@ -5443,6 +6043,52 @@ mod tests {
             assert!(
                 matches!(&err, BeadsError::Validation { field, .. } if field == "expect_plan_sha256")
             );
+        }
+    }
+
+    #[test]
+    fn test_validate_sync_mode_args_accepts_source_repo_path_migration() {
+        let dry_run = SyncArgs {
+            migrate_source_repo_path: true,
+            ..SyncArgs::default()
+        };
+        validate_sync_mode_args(&dry_run).unwrap();
+        assert_eq!(
+            sync_operation(&dry_run),
+            SyncOperation::MigrateSourceRepoPath
+        );
+        assert!(should_defer_jsonl_recovery(&dry_run));
+
+        let apply = SyncArgs {
+            apply: true,
+            expect_plan_sha256: Some("a".repeat(64)),
+            ..dry_run.clone()
+        };
+        validate_sync_mode_args(&apply).unwrap();
+    }
+
+    #[test]
+    fn test_validate_sync_mode_args_rejects_irrelevant_migration_flags() {
+        for args in [
+            SyncArgs {
+                migrate_source_repo_path: true,
+                force: true,
+                ..SyncArgs::default()
+            },
+            SyncArgs {
+                migrate_source_repo_path: true,
+                rebuild: true,
+                ..SyncArgs::default()
+            },
+            SyncArgs {
+                migrate_source_repo_path: true,
+                resolve_source_ids: vec!["br-1".to_string()],
+                ..SyncArgs::default()
+            },
+        ] {
+            let error = validate_sync_mode_args(&args)
+                .expect_err("migration-only mode must reject unrelated mutation flags");
+            assert!(matches!(error, BeadsError::Validation { .. }));
         }
     }
 

@@ -1401,6 +1401,7 @@ br sync [OPTIONS]
 | `--status` | Show sync status (read-only) |
 | `--witness` | Compute a deterministic read-only JSONL integrity witness |
 | `--reconcile-additive` | Plan a lossless exact-ID JSONL-to-SQLite reconciliation (read-only by default) |
+| `--migrate-source-repo-path` | Reconcile DB/JSONL rows and plan canonical `source_repo_path` normalization (read-only by default) |
 
 **Options:**
 | Option | Description |
@@ -1416,8 +1417,8 @@ br sync [OPTIONS]
 | `--skip-invalid-records` | With plain additive `--import-only`, explicitly salvage valid JSONL records while preserving and reporting every rejected source line |
 | `--rebuild` | During import, rebuild SQLite from JSONL and remove DB entries absent from JSONL |
 | `--dry-run` | With `--reconcile`, preview the plan without any mutation |
-| `--apply` | Apply a conflict-free `--reconcile-additive` plan transactionally |
-| `--expect-plan-sha256 <SHA256>` | Required with additive `--apply`; must equal the exact reviewed dry-run token |
+| `--apply` | Apply a reviewed `--reconcile-additive` or `--migrate-source-repo-path` plan |
+| `--expect-plan-sha256 <SHA256>` | Required with `--apply`; must equal the exact reviewed dry-run token |
 | `--resolve-source-id <ISSUE_ID>` | Explicitly choose the allowed non-lifecycle JSONL scalar fields for one reviewed shared-ID conflict when JSONL is not older; repeat per ID |
 | `--robot` | Machine-readable output |
 
@@ -1473,6 +1474,12 @@ br sync [OPTIONS]
 - Stale or missing `issues.content_hash` values are explicit token-bound repairs. They never alter issue timestamps, relations, dirty tracking, or audit events, and a second plan must be a true no-op.
 - The receipt distinguishes distinct conflicted issues from total conflict observations; includes complete ID/diff/remap manifests and their SHA-256 digests; and reports pre-existing, projected, and newly introduced blocking-cycle components.
 
+**Portable source path migration (`--migrate-source-repo-path`):**
+- The default invocation emits a `br.sync.source-repo-path-migration.v1` dry-run receipt. It reconciles JSONL-only and newer shared rows without deleting SQLite-only rows, preserves tombstones, and fails closed on equal-timestamp semantic drift.
+- Every surviving `source_repo_path` is planned for the canonical current workspace directory. The portable `source_repo` display name is preserved rather than replaced by a machine-specific path.
+- Apply requires the exact `plan_sha256` and uses the durable DB/JSONL/base publication saga. If interrupted after the database transaction or JSONL publication, the next migration or merge invocation resumes the pending receipt before starting new work.
+- Migration does not probe Git. Its receipt reports `vcs_status: "not_probed"`; run `br vcs-status --json` separately when staged/worktree state must be reviewed.
+
 **Examples:**
 ```bash
 # Export to JSONL explicitly; useful as a final check before committing .beads/
@@ -1516,6 +1523,12 @@ br sync --reconcile-additive \
   --apply \
   --expect-plan-sha256 "$(jq -r .plan_sha256 /tmp/additive-plan.json)" \
   --robot
+
+# Reconcile both stores and normalize machine-specific source paths
+path_plan="$(br sync --migrate-source-repo-path --robot)"
+path_plan_sha256="$(printf '%s\n' "$path_plan" | jq -r .plan_sha256)"
+br sync --migrate-source-repo-path \
+  --apply --expect-plan-sha256 "$path_plan_sha256" --robot
 
 # Check sync status
 br sync --status

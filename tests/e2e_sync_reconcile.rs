@@ -313,6 +313,385 @@ fn bare_sync_refused_and_reconcile_mode_exclusive() {
 }
 
 // ============================================================================
+// Portable source_repo_path migration (#402)
+// ============================================================================
+
+#[test]
+fn source_repo_path_migration_reconciles_and_is_idempotent() {
+    let ws = BrWorkspace::new();
+    init_workspace(&ws, "pathmig");
+    let database_newer_id = create_issue(&ws, "Database-newer row", "pathmig_db");
+    let source_newer_id = create_issue(&ws, "Source-newer row", "pathmig_source");
+    let flush = run_br(&ws, ["sync", "--flush-only", "--json"], "pathmig_flush");
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+
+    let database_update = run_br(
+        &ws,
+        [
+            "update",
+            &database_newer_id,
+            "--source-repo",
+            "portable-db-name",
+            "--source-repo-path",
+            "/home/foreign-checkout/database-copy",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "--json",
+        ],
+        "pathmig_db_update",
+    );
+    assert!(
+        database_update.status.success(),
+        "database update failed: {}",
+        database_update.stderr
+    );
+
+    let mut lines = read_jsonl_lines(&ws);
+    let template = lines
+        .iter()
+        .find(|line| row_id(line) == source_newer_id)
+        .expect("source-newer template")
+        .clone();
+    let source_index = lines
+        .iter()
+        .position(|line| row_id(line) == source_newer_id)
+        .expect("source-newer row");
+    lines[source_index] = set_row_field(
+        &lines[source_index],
+        "description",
+        json!("newer source payload"),
+    );
+    lines[source_index] = set_row_field(
+        &lines[source_index],
+        "updated_at",
+        json!("2030-01-01T00:00:00Z"),
+    );
+    lines[source_index] = set_row_field(
+        &lines[source_index],
+        "source_repo",
+        json!("portable-jsonl-name"),
+    );
+    lines[source_index] = set_row_field(
+        &lines[source_index],
+        "source_repo_path",
+        json!("/tmp/foreign-checkout/source-copy"),
+    );
+
+    let mut source_only: Value = serde_json::from_str(&clone_row(
+        &template,
+        "br-pathnew1",
+        "Source-only row",
+        "2030-01-02T00:00:00Z",
+        "2030-01-02T00:00:00Z",
+    ))
+    .expect("source-only row");
+    source_only["source_repo"] = json!("portable-source-only-name");
+    source_only["source_repo_path"] = json!("/var/tmp/foreign-checkout/source-only-copy");
+    lines.push(serde_json::to_string(&source_only).expect("serialize source-only row"));
+    write_jsonl_lines(&ws, &lines);
+
+    let jsonl_before_plan = fs::read(jsonl_path(&ws)).expect("JSONL before dry-run");
+    let database_before_plan = SqliteStorage::open(&db_path(&ws))
+        .expect("open DB before dry-run")
+        .get_issue(&database_newer_id)
+        .expect("read database-newer row")
+        .expect("database-newer row exists");
+    let plan_run = run_br(
+        &ws,
+        [
+            "sync",
+            "--migrate-source-repo-path",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "pathmig_plan",
+    );
+    assert!(
+        plan_run.status.success(),
+        "migration plan failed: {}",
+        plan_run.stderr
+    );
+    let plan = parse_json_value(&plan_run.stdout);
+    assert_eq!(
+        plan["schema"].as_str(),
+        Some("br.sync.source-repo-path-migration.v1")
+    );
+    assert_eq!(plan["mode"].as_str(), Some("dry_run"));
+    assert_eq!(plan["applied"].as_bool(), Some(false));
+    assert_eq!(plan["no_op"].as_bool(), Some(false));
+    assert_eq!(plan["source_only_created"].as_u64(), Some(1));
+    assert_eq!(plan["source_newer_updated"].as_u64(), Some(1));
+    assert_eq!(plan["database_newer_preserved"].as_u64(), Some(1));
+    assert_eq!(plan["jsonl_rewrite_required"].as_bool(), Some(true));
+    assert_eq!(plan["source_repo_preserved"].as_bool(), Some(true));
+    assert_eq!(plan["vcs_status"].as_str(), Some("not_probed"));
+    let target = fs::canonicalize(&ws.root)
+        .expect("canonical workspace")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(plan["target_path"].as_str(), Some(target.as_str()));
+    let token = plan["plan_sha256"]
+        .as_str()
+        .expect("plan token")
+        .to_string();
+    assert_eq!(token.len(), 64);
+    assert_eq!(
+        fs::read(jsonl_path(&ws)).expect("JSONL after dry-run"),
+        jsonl_before_plan,
+        "dry-run must not rewrite JSONL"
+    );
+    let database_after_plan = SqliteStorage::open(&db_path(&ws))
+        .expect("open DB after dry-run")
+        .get_issue(&database_newer_id)
+        .expect("read database-newer row")
+        .expect("database-newer row exists");
+    assert_eq!(
+        database_after_plan.source_repo_path, database_before_plan.source_repo_path,
+        "dry-run must not normalize the database"
+    );
+
+    let apply_run = run_br(
+        &ws,
+        [
+            "sync",
+            "--migrate-source-repo-path",
+            "--apply",
+            "--expect-plan-sha256",
+            &token,
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "pathmig_apply",
+    );
+    assert!(
+        apply_run.status.success(),
+        "migration apply failed: {}",
+        apply_run.stderr
+    );
+    let applied = parse_json_value(&apply_run.stdout);
+    assert_eq!(applied["mode"].as_str(), Some("apply"));
+    assert_eq!(applied["applied"].as_bool(), Some(true));
+    assert_eq!(applied["no_op"].as_bool(), Some(false));
+    assert_eq!(applied["plan_sha256"].as_str(), Some(token.as_str()));
+    assert!(applied["receipt_id"].as_str().is_some());
+
+    let storage = SqliteStorage::open(&db_path(&ws)).expect("open normalized DB");
+    let database_newer = storage
+        .get_issue(&database_newer_id)
+        .expect("read database-newer")
+        .expect("database-newer exists");
+    let source_newer = storage
+        .get_issue(&source_newer_id)
+        .expect("read source-newer")
+        .expect("source-newer exists");
+    let imported = storage
+        .get_issue("br-pathnew1")
+        .expect("read source-only")
+        .expect("source-only exists");
+    for issue in [&database_newer, &source_newer, &imported] {
+        assert_eq!(
+            issue.source_repo_path.as_deref(),
+            Some(target.as_str()),
+            "{} retained a foreign source_repo_path",
+            issue.id
+        );
+    }
+    assert_eq!(
+        database_newer.source_repo.as_deref(),
+        Some("portable-db-name")
+    );
+    assert_eq!(
+        source_newer.source_repo.as_deref(),
+        Some("portable-jsonl-name")
+    );
+    assert_eq!(
+        source_newer.description.as_deref(),
+        Some("newer source payload")
+    );
+    assert_eq!(
+        imported.source_repo.as_deref(),
+        Some("portable-source-only-name")
+    );
+
+    let normalized_jsonl = read_jsonl_lines(&ws)
+        .into_iter()
+        .map(|line| {
+            let row: Value = serde_json::from_str(&line).expect("normalized JSONL row");
+            (row["id"].as_str().expect("row id").to_string(), row)
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        normalized_jsonl.len(),
+        3,
+        "migration lost or duplicated rows"
+    );
+    for row in normalized_jsonl.values() {
+        assert_eq!(row["source_repo_path"].as_str(), Some(target.as_str()));
+    }
+    assert_eq!(
+        normalized_jsonl[&database_newer_id]["source_repo"].as_str(),
+        Some("portable-db-name")
+    );
+    assert_eq!(
+        normalized_jsonl[&source_newer_id]["source_repo"].as_str(),
+        Some("portable-jsonl-name")
+    );
+    assert_eq!(
+        normalized_jsonl["br-pathnew1"]["source_repo"].as_str(),
+        Some("portable-source-only-name")
+    );
+
+    let idempotent_plan = run_br(
+        &ws,
+        [
+            "sync",
+            "--migrate-source-repo-path",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "pathmig_idempotent_plan",
+    );
+    assert!(idempotent_plan.status.success());
+    let idempotent = parse_json_value(&idempotent_plan.stdout);
+    assert_eq!(idempotent["no_op"].as_bool(), Some(true));
+    let idempotent_token = idempotent["plan_sha256"]
+        .as_str()
+        .expect("idempotent token");
+    let normalized_bytes = fs::read(jsonl_path(&ws)).expect("normalized JSONL bytes");
+    let idempotent_apply = run_br(
+        &ws,
+        [
+            "sync",
+            "--migrate-source-repo-path",
+            "--apply",
+            "--expect-plan-sha256",
+            idempotent_token,
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "pathmig_idempotent_apply",
+    );
+    assert!(idempotent_apply.status.success());
+    let idempotent_applied = parse_json_value(&idempotent_apply.stdout);
+    assert_eq!(idempotent_applied["applied"].as_bool(), Some(true));
+    assert_eq!(idempotent_applied["no_op"].as_bool(), Some(true));
+    assert!(idempotent_applied.get("receipt_id").is_none());
+    assert_eq!(
+        fs::read(jsonl_path(&ws)).expect("JSONL after idempotent apply"),
+        normalized_bytes,
+        "idempotent apply must not rewrite JSONL"
+    );
+
+    let stale_plan_token = idempotent_token.to_string();
+    let drift = run_br(
+        &ws,
+        [
+            "update",
+            &database_newer_id,
+            "--source-repo-path",
+            "/tmp/newer-foreign-checkout",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "--json",
+        ],
+        "pathmig_stale_drift",
+    );
+    assert!(
+        drift.status.success(),
+        "drift update failed: {}",
+        drift.stderr
+    );
+    let stale_apply = run_br(
+        &ws,
+        [
+            "sync",
+            "--migrate-source-repo-path",
+            "--apply",
+            "--expect-plan-sha256",
+            &stale_plan_token,
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "pathmig_stale_apply",
+    );
+    assert!(!stale_apply.status.success(), "stale plan token must fail");
+    assert!(format!("{}{}", stale_apply.stdout, stale_apply.stderr).contains("plan changed"));
+    let drifted = SqliteStorage::open(&db_path(&ws))
+        .expect("open drifted DB")
+        .get_issue(&database_newer_id)
+        .expect("read drifted row")
+        .expect("drifted row exists");
+    assert_eq!(
+        drifted.source_repo_path.as_deref(),
+        Some("/tmp/newer-foreign-checkout"),
+        "stale apply must not partially normalize the database"
+    );
+    assert_eq!(
+        fs::read(jsonl_path(&ws)).expect("JSONL after stale apply"),
+        normalized_bytes,
+        "stale apply must not rewrite JSONL"
+    );
+}
+
+#[test]
+fn source_repo_path_migration_rejects_equal_timestamp_payload_conflict() {
+    let ws = BrWorkspace::new();
+    init_workspace(&ws, "pathconflict");
+    let id = create_issue(&ws, "Equal timestamp row", "pathconflict_create");
+    let flush = run_br(
+        &ws,
+        ["sync", "--flush-only", "--json"],
+        "pathconflict_flush",
+    );
+    assert!(flush.status.success());
+    let mut lines = read_jsonl_lines(&ws);
+    lines[0] = set_row_field(&lines[0], "description", json!("divergent source payload"));
+    lines[0] = set_row_field(
+        &lines[0],
+        "source_repo_path",
+        json!("/tmp/equal-timestamp-foreign-copy"),
+    );
+    write_jsonl_lines(&ws, &lines);
+    let jsonl_before = fs::read(jsonl_path(&ws)).expect("JSONL before conflict");
+
+    let run = run_br(
+        &ws,
+        [
+            "sync",
+            "--migrate-source-repo-path",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "pathconflict_plan",
+    );
+    assert!(!run.status.success(), "equal-timestamp drift must fail");
+    assert!(
+        format!("{}{}", run.stdout, run.stderr)
+            .contains("equal timestamps but divergent DB/JSONL payloads")
+    );
+    assert_eq!(
+        fs::read(jsonl_path(&ws)).expect("JSONL after conflict"),
+        jsonl_before
+    );
+    let issue = SqliteStorage::open(&db_path(&ws))
+        .expect("open conflict DB")
+        .get_issue(&id)
+        .expect("read conflict row")
+        .expect("conflict row exists");
+    assert_ne!(
+        issue.description.as_deref(),
+        Some("divergent source payload"),
+        "failed plan must not import the source payload"
+    );
+}
+
+// ============================================================================
 // The false-equal state (the bug this mode exists to repair)
 // ============================================================================
 
