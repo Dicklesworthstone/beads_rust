@@ -2882,8 +2882,19 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// A temp directory under the *canonical* system temp root.
+    ///
+    /// br hands sync canonical workspace paths, so the pinned no-follow
+    /// JSONL traversal never meets a symlinked ancestor; on macOS the raw
+    /// `TMPDIR` lives under `/var` -> `/private/var`, which would make these
+    /// tests stricter than br itself.
+    fn canonical_temp_dir() -> TempDir {
+        let root = dunce::canonicalize(std::env::temp_dir()).expect("canonicalize temp root");
+        TempDir::new_in(root).expect("create temp dir")
+    }
+
     fn setup_test_beads_dir() -> (TempDir, PathBuf) {
-        let temp = TempDir::new().expect("create temp dir");
+        let temp = canonical_temp_dir();
         let beads_dir = temp.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("create beads dir");
         (temp, beads_dir)
@@ -3381,7 +3392,7 @@ mod tests {
     fn test_symlink_escape_rejected() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new().expect("create temp dir");
+        let temp = canonical_temp_dir();
         let beads_dir = temp.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("create beads dir");
 
@@ -3429,7 +3440,7 @@ mod tests {
     fn test_symlinked_ancestor_above_workspace_is_not_an_escape() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new().expect("create temp dir");
+        let temp = canonical_temp_dir();
         let real_root = temp.path().join("real");
         let real_beads = real_root.join(".beads");
         std::fs::create_dir_all(&real_beads).expect("create real beads dir");
@@ -3466,7 +3477,7 @@ mod tests {
     fn test_validate_no_git_path_rejects_symlinked_git_parent() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new().expect("create temp dir");
+        let temp = canonical_temp_dir();
         let git_dir = temp.path().join(".git");
         std::fs::create_dir_all(&git_dir).expect("create .git dir");
 
@@ -3486,7 +3497,7 @@ mod tests {
     fn test_validate_no_git_path_rejects_missing_descendant_under_symlinked_git_parent() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new().expect("create temp dir");
+        let temp = canonical_temp_dir();
         let git_dir = temp.path().join(".git");
         std::fs::create_dir_all(&git_dir).expect("create .git dir");
 
@@ -3507,7 +3518,7 @@ mod tests {
     {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new().expect("create temp dir");
+        let temp = canonical_temp_dir();
         let beads_dir = temp.path().join(".beads");
         let git_dir = temp.path().join(".git");
         std::fs::create_dir_all(&beads_dir).expect("create beads dir");
@@ -3537,7 +3548,7 @@ mod tests {
     fn test_validate_sync_path_with_external_rejects_symlinked_jsonl() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new().expect("create temp dir");
+        let temp = canonical_temp_dir();
         let beads_dir = temp.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("create beads dir");
 
@@ -3988,7 +3999,7 @@ mod tests {
     fn pin_jsonl_target_rejects_symlinked_and_non_directory_parents() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new().expect("create temp directory");
+        let temp = canonical_temp_dir();
         let outside = temp.path().join("outside");
         let linked_parent = temp.path().join("linked-parent");
         let non_directory_parent = temp.path().join("not-a-directory");
@@ -4020,7 +4031,7 @@ mod tests {
     fn pin_jsonl_target_rejects_symlinked_and_nonregular_leaves() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new().expect("create temp directory");
+        let temp = canonical_temp_dir();
         let parent = temp.path().join("parent");
         let outside = temp.path().join("outside.jsonl");
         let symlink_leaf = parent.join("linked.jsonl");
@@ -4056,7 +4067,7 @@ mod tests {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
-        let temp = TempDir::new().expect("create temp directory");
+        let temp = canonical_temp_dir();
         let parent = temp.path().join("parent");
         std::fs::create_dir(&parent).expect("create parent directory");
         let pinned =
@@ -4087,7 +4098,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn pinned_jsonl_parent_detects_route_replacement() {
-        let temp = TempDir::new().expect("create temp directory");
+        let temp = canonical_temp_dir();
         let routed_parent = temp.path().join("live");
         let displaced_parent = temp.path().join("displaced");
         std::fs::create_dir(&routed_parent).expect("create routed parent");
@@ -4112,7 +4123,7 @@ mod tests {
     fn pinned_jsonl_parent_reports_disappeared_or_symlinked_route_as_conflict() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new().expect("create temp directory");
+        let temp = canonical_temp_dir();
         let routed_parent = temp.path().join("live");
         let displaced_parent = temp.path().join("displaced");
         std::fs::create_dir(&routed_parent).expect("create routed parent");
@@ -4165,7 +4176,7 @@ mod tests {
         use std::io::{Read, Write};
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = TempDir::new().expect("create temp directory");
+        let temp = canonical_temp_dir();
         let routed_parent = temp.path().join("live");
         let displaced_parent = temp.path().join("displaced");
         let target_path = routed_parent.join("issues.jsonl");
@@ -4241,7 +4252,7 @@ mod tests {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
-        let temp = TempDir::new().expect("create temp directory");
+        let temp = canonical_temp_dir();
         let parent = temp.path().join("parent");
         std::fs::create_dir(&parent).expect("create parent directory");
         let pinned =
@@ -4716,7 +4727,7 @@ mod tests {
         use std::io::{Read, Seek, SeekFrom, Write};
         use std::os::unix::fs::MetadataExt;
 
-        let temp = TempDir::new().expect("create temp directory");
+        let temp = canonical_temp_dir();
         let beads_dir = temp.path().join(".beads");
         std::fs::create_dir(&beads_dir).expect("create .beads");
 
@@ -4749,7 +4760,7 @@ mod tests {
 
     #[test]
     fn private_snapshot_backing_falls_back_to_the_temp_directory() {
-        let temp = TempDir::new().expect("create temp directory");
+        let temp = canonical_temp_dir();
         let missing_parent = temp.path().join("does-not-exist");
 
         open_private_snapshot_backing(Some(&missing_parent))

@@ -66,6 +66,14 @@ fn setup_storage_with_issues(count: usize) -> SqliteStorage {
     storage
 }
 
+/// A temp directory under the canonical system temp root: br routes sync
+/// through canonical workspace paths, so the pinned no-follow JSONL traversal
+/// never meets a symlinked ancestor (macOS `/var` -> `/private/var`).
+fn canonical_temp_dir() -> TempDir {
+    let root = dunce::canonicalize(std::env::temp_dir()).unwrap();
+    TempDir::new_in(root).unwrap()
+}
+
 fn setup_beads_dir(temp: &TempDir) -> std::path::PathBuf {
     let beads_dir = temp.path().join(".beads");
     fs::create_dir_all(&beads_dir).unwrap();
@@ -95,7 +103,7 @@ fn concurrent_exports_no_corruption() {
     // Two separate storages writing to two separate paths (concurrent same-path
     // needs file-level locking which is OS-dependent; here we verify independent
     // concurrent exports don't interfere with each other).
-    let temp = TempDir::new().unwrap();
+    let temp = canonical_temp_dir();
     let beads_dir = setup_beads_dir(&temp);
 
     // Export all concurrently using threads - create storage inside each thread
@@ -148,7 +156,7 @@ fn export_rejects_path_traversal() {
     let _log = common::test_log("export_rejects_path_traversal");
 
     let storage = setup_storage_with_issues(1);
-    let temp = TempDir::new().unwrap();
+    let temp = canonical_temp_dir();
     let beads_dir = setup_beads_dir(&temp);
 
     // Attempt to export to a path outside beads_dir via traversal
@@ -178,7 +186,7 @@ fn export_rejects_outside_beads_dir() {
     let _log = common::test_log("export_rejects_outside_beads_dir");
 
     let storage = setup_storage_with_issues(1);
-    let temp = TempDir::new().unwrap();
+    let temp = canonical_temp_dir();
     let beads_dir = setup_beads_dir(&temp);
 
     // Path directly outside .beads/
@@ -205,7 +213,7 @@ fn export_rejects_git_path() {
     let _log = common::test_log("export_rejects_git_path");
 
     let storage = setup_storage_with_issues(1);
-    let temp = TempDir::new().unwrap();
+    let temp = canonical_temp_dir();
     let beads_dir = setup_beads_dir(&temp);
 
     // Create a .git dir inside beads to test rejection
@@ -236,7 +244,7 @@ fn temp_file_cleaned_up_on_failure() {
     let _log = common::test_log("temp_file_cleaned_up_on_failure");
 
     let storage = setup_storage_with_issues(3);
-    let temp = TempDir::new().unwrap();
+    let temp = canonical_temp_dir();
     let beads_dir = setup_beads_dir(&temp);
     let jsonl_path = beads_dir.join("issues.jsonl");
     let temp_path = export_temp_path_for_test(&jsonl_path);
@@ -270,7 +278,7 @@ fn temp_file_cleaned_up_on_failure() {
 fn re_export_overwrites_cleanly() {
     let _log = common::test_log("re_export_overwrites_cleanly");
 
-    let temp = TempDir::new().unwrap();
+    let temp = canonical_temp_dir();
     let beads_dir = setup_beads_dir(&temp);
     let jsonl_path = beads_dir.join("issues.jsonl");
 
@@ -314,7 +322,7 @@ fn successive_exports_idempotent() {
     let _log = common::test_log("successive_exports_idempotent");
 
     let storage = setup_storage_with_issues(5);
-    let temp = TempDir::new().unwrap();
+    let temp = canonical_temp_dir();
     let beads_dir = setup_beads_dir(&temp);
     let jsonl_path = beads_dir.join("issues.jsonl");
     let config = default_config(&beads_dir);
@@ -353,7 +361,7 @@ fn export_produces_valid_jsonl_per_line() {
     let _log = common::test_log("export_produces_valid_jsonl_per_line");
 
     let storage = setup_storage_with_issues(20);
-    let temp = TempDir::new().unwrap();
+    let temp = canonical_temp_dir();
     let beads_dir = setup_beads_dir(&temp);
     let jsonl_path = beads_dir.join("issues.jsonl");
     let config = default_config(&beads_dir);
@@ -396,7 +404,7 @@ fn export_rejects_symlink_escape() {
     let _log = common::test_log("export_rejects_symlink_escape");
 
     let storage = setup_storage_with_issues(1);
-    let temp = TempDir::new().unwrap();
+    let temp = canonical_temp_dir();
     let beads_dir = setup_beads_dir(&temp);
 
     // Create an outside directory
@@ -429,7 +437,7 @@ fn export_rejects_existing_temp_symlink_and_preserves_live_jsonl() {
     let _log = common::test_log("export_rejects_existing_temp_symlink_and_preserves_live_jsonl");
 
     let storage = setup_storage_with_issues(1);
-    let temp = TempDir::new().unwrap();
+    let temp = canonical_temp_dir();
     let beads_dir = setup_beads_dir(&temp);
     let jsonl_path = beads_dir.join("issues.jsonl");
     let temp_path = export_temp_path_for_test(&jsonl_path);
@@ -461,7 +469,7 @@ fn export_skips_stale_regular_temp_file_and_preserves_it() {
     let _log = common::test_log("export_skips_stale_regular_temp_file_and_preserves_it");
 
     let storage = setup_storage_with_issues(1);
-    let temp = TempDir::new().unwrap();
+    let temp = canonical_temp_dir();
     let beads_dir = setup_beads_dir(&temp);
     let jsonl_path = beads_dir.join("issues.jsonl");
     let stale_temp_path = export_temp_path_for_test(&jsonl_path);
@@ -498,7 +506,7 @@ fn export_external_path_with_flag() {
     let _log = common::test_log("export_external_path_with_flag");
 
     let storage = setup_storage_with_issues(3);
-    let temp = TempDir::new().unwrap();
+    let temp = canonical_temp_dir();
     let beads_dir = setup_beads_dir(&temp);
 
     // External path outside .beads/
@@ -536,7 +544,7 @@ fn export_external_still_rejects_git() {
     let _log = common::test_log("export_external_still_rejects_git");
 
     let storage = setup_storage_with_issues(1);
-    let temp = TempDir::new().unwrap();
+    let temp = canonical_temp_dir();
     let beads_dir = setup_beads_dir(&temp);
 
     // Create .git directory and target within it
@@ -567,7 +575,7 @@ fn export_count_matches_file_line_count() {
     let _log = common::test_log("export_count_matches_file_line_count");
 
     let storage = setup_storage_with_issues(50);
-    let temp = TempDir::new().unwrap();
+    let temp = canonical_temp_dir();
     let beads_dir = setup_beads_dir(&temp);
     let jsonl_path = beads_dir.join("issues.jsonl");
     let config = default_config(&beads_dir);
