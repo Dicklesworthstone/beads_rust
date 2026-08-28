@@ -242,7 +242,12 @@ pub fn isolated_workspace_failure_fixture(
         })?;
 
     let temp_dir = TempDir::new()?;
-    let root = temp_dir.path().to_path_buf();
+    // Canonicalize the workspace root so it matches what `br where`/`info`
+    // report: br resolves its database/JSONL paths through the canonical
+    // `.beads` dir, and on macOS the raw system temp root is `/var/...` (a
+    // symlink to `/private/var/...`). Comparing an un-canonicalized fixture
+    // path against br's canonical output would spuriously fail there.
+    let root = dunce::canonicalize(temp_dir.path())?;
     copy_workspace_failure_fixture_root(&fixture.root, &root)?;
 
     Ok(IsolatedWorkspaceFailureFixture {
