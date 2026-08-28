@@ -101,7 +101,7 @@ unicode-width = "0.2.2"
 semver = "1.0.28"
 
 # MCP server (optional; gated behind the `mcp` feature)
-fastmcp-rust = { version = "0.7.0", optional = true }
+fastmcp-rust = { version = "=0.7.0", optional = true }
 
 # Self-update (optional; gated behind the `self_update` feature)
 self_update = { version = "1.0.0-rc.4", features = ["reqwest", "rustls", "github", "progress-bar", "archive-tar", "compression-tar-gz"], default-features = false, optional = true }
@@ -171,8 +171,8 @@ strip = false
 [profile.dev]
 opt-level = 1
 
-# Unoptimized fsqlite schema paths can exhaust Linux's default main-thread
-# stack in integration-test child binaries before the test assertions run.
+# The storage/schema test surface is large enough to benefit materially from
+# modest optimization without changing release behavior.
 [profile.test]
 opt-level = 1
 
@@ -191,17 +191,15 @@ self_update = [
 
 # NOTE: no `[patch.crates-io]` here.
 #
-# All dependencies — fsqlite 0.3.11, its fsqlite-* transitive crates, and
-# fastmcp-rust 0.7.0 — are published on crates.io, so this crate
-# resolves everything from the registry out of the box.  That makes
+# All dependencies — including bundled stock SQLite, the retained fsqlite
+# value/error vocabulary, and fastmcp-rust 0.7.0 — are published on crates.io,
+# so this crate resolves everything from the registry out of the box. That makes
 # `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked`
-# work without requiring sibling `frankensqlite` or `fastmcp_rust`
-# checkouts (issue #250 bug 1).
+# work without requiring sibling checkouts (issue #250 bug 1).
 #
-# Local co-development: contributors who want to hack on frankensqlite
-# or fastmcp_rust alongside beads_rust can add a workspace-level
-# `.cargo/config.toml` with their own `[patch.crates-io]` table.  See
-# `scripts/dev-local-frankensqlite.toml` for a ready-to-copy template.
+# Local co-development: contributors who want to hack on FastMCP alongside br
+# can add a workspace-level `.cargo/config.toml` with their own
+# `[patch.crates-io]` table.
 
 [lints.rust]
 # Deny (not forbid): three sanctioned `#[allow(unsafe_code)]` carve-outs exist —

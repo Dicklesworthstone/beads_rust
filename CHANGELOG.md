@@ -15,6 +15,47 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
+## v0.5.4 -- 2026-08-28 (Release)
+
+Emergency storage-safety release. Real migrated workspaces exposed two
+FrankenSQLite 0.3.11 failures that synthetic fixtures had missed: page aliasing
+during large JSONL rebuilds and corruption under short-lived multi-process br
+workloads. br now runs its existing storage facade on bundled stock SQLite,
+while retaining the same database schema, JSONL format, CLI contracts, and
+shared value/error types.
+
+### Storage safety and recovery
+
+- The synchronous storage facade now uses bundled stock SQLite. This removes
+  the corrupting runtime path reported in #457 and #458 without changing the
+  `SqliteStorage` or sync architecture.
+- Force-import and recovery re-read every imported issue inside the
+  transaction and compare normalized semantic fields, so field shifts or an
+  unaddressable source ID fail before publication.
+- Byte-identical duplicate comments in a damaged export are deduplicated for
+  recovery; conflicting duplicates still fail closed.
+- `show` checks the immutable JSONL ID set before reporting a missing partial
+  ID, preventing corrupt lookup state from masquerading as a normal miss.
+- History byte-budget pruning now removes only verified snapshot/metadata
+  pairs and refuses mismatched evidence.
+
+### Windows doctor and sync maintenance
+
+- Doctor repair reuses the initially opened `actions.jsonl` handle instead of
+  reopening the run log, fixing repeated Windows repair failures caused by
+  file-sharing rules (#450).
+- Creating the `.doctor/latest` convenience link is best effort when Windows
+  returns `ERROR_PRIVILEGE_NOT_HELD`; run-directory receipts remain canonical,
+  and undo discovers them without relying on the link (#456).
+- Additive `sync --reconcile` gained hash-bound dry-run/apply receipts,
+  source-path migration integration, and expanded history/preflight coverage.
+
+### Release reproducibility
+
+- The rusqlite/libsqlite3 resolution is committed in `Cargo.lock`, unused
+  FrankenSQLite runtime crates leave the release graph, and FastMCP is now
+  truly exact-pinned at `=0.7.0` as the manifest comment intended.
+
 ## v0.5.3 -- 2026-08-27 (Release)
 
 Storage-correctness and release-hardening follow-up. The dependency stack now
