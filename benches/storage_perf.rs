@@ -660,12 +660,19 @@ fn bench_import(c: &mut Criterion) {
             let bench_start = log_bench_start(&bench_name);
             b.iter_with_setup(
                 || {
-                    // Create temp file with JSONL data
+                    // Create temp file with JSONL data. Canonicalize the temp
+                    // root the way br's config routing does before handing a
+                    // path to sync: on macOS the raw temp root is `/var/...`
+                    // (a symlink to `/private/var/...`), which the pinned
+                    // no-follow JSONL traversal rejects as a symlinked
+                    // ancestor. br never hits that because it routes canonical
+                    // paths; the bench must not be stricter than br.
                     let dir = TempDir::new().unwrap();
-                    let jsonl_path = dir.path().join("issues.jsonl");
+                    let base = dunce::canonicalize(dir.path()).unwrap();
+                    let jsonl_path = base.join("issues.jsonl");
                     std::fs::write(&jsonl_path, data).unwrap();
 
-                    let db_path = dir.path().join("import.db");
+                    let db_path = base.join("import.db");
                     let storage = SqliteStorage::open(&db_path).unwrap();
                     (dir, storage, jsonl_path)
                 },
