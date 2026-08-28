@@ -4,8 +4,8 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 pub use fsqlite_error::FrankenError;
-use fsqlite_types::value::SmallText;
 pub use fsqlite_types::SqliteValue;
+use fsqlite_types::value::SmallText;
 use rusqlite::ffi::{self, ErrorCode};
 use rusqlite::types::{ToSql, ToSqlOutput, ValueRef};
 
@@ -69,8 +69,7 @@ fn query_statement(
         let mut values = Vec::with_capacity(column_count);
         for index in 0..column_count {
             values.push(row_value(
-                row.get_ref(index)
-                    .map_err(|error| map_error(error, path))?,
+                row.get_ref(index).map_err(|error| map_error(error, path))?,
             ));
         }
         output.push(Row { values });
@@ -148,11 +147,7 @@ fn message_error(message: &str) -> Option<FrankenError> {
     None
 }
 
-fn sqlite_failure(
-    error: ffi::Error,
-    message: Option<String>,
-    path: &Path,
-) -> FrankenError {
+fn sqlite_failure(error: ffi::Error, message: Option<String>, path: &Path) -> FrankenError {
     let detail = error_detail(message, error);
     if let Some(mapped) = message_error(&detail) {
         return mapped;
@@ -498,8 +493,10 @@ mod tests {
             conn.query_row("SELECT k FROM t"),
             Err(FrankenError::QueryReturnedNoRows)
         ));
-        conn.execute("INSERT INTO t VALUES (1)").expect("insert one");
-        conn.execute("INSERT INTO t VALUES (2)").expect("insert two");
+        conn.execute("INSERT INTO t VALUES (1)")
+            .expect("insert one");
+        conn.execute("INSERT INTO t VALUES (2)")
+            .expect("insert two");
         assert!(matches!(
             conn.query_row("SELECT k FROM t"),
             Err(FrankenError::QueryReturnedMultipleRows)

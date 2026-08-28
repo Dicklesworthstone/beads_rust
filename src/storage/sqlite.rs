@@ -2,8 +2,8 @@
 
 use crate::error::{BeadsError, Result};
 use crate::format::{IssueDetails, IssueWithDependencyMetadata, RollupSummary};
-use crate::franken_sync::{Connection, Row};
 use crate::franken_sync::compat::{OpenFlags, open_with_flags};
+use crate::franken_sync::{Connection, Row};
 use crate::model::{
     Comment, Dependency, DependencyType, Event, EventType, Issue, IssueType, Priority, Status,
 };
@@ -49,13 +49,10 @@ thread_local! {
 const WAL_CHECKPOINT_INTERVAL: u32 = 50;
 /// Per-statement busy spin timeout before SQLite returns SQLITE_BUSY.
 ///
-/// Set to 0 (#243): frankensqlite's busy_timeout implementation uses a
-/// hot spin loop (not sleep-based) that consumes 100% CPU and prevents
-/// the competing writer from making progress. With busy_timeout=0,
-/// `BEGIN IMMEDIATE` returns SQLITE_BUSY immediately when the write lock
-/// is held, allowing the application-level retry loop (8 attempts with
-/// jittered exponential backoff via thread::sleep) to provide proper
-/// desynchronization. This is critical for multi-agent concurrent access.
+/// Kept at 0 so `BEGIN IMMEDIATE` returns `SQLITE_BUSY` immediately and the
+/// application-level retry loop (8 attempts with jittered exponential
+/// backoff) remains the single bounded retry policy. Cross-process mutations
+/// are serialized by the workspace `.write.lock` before reaching SQLite.
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 0;
 const SQLITE_VAR_LIMIT: usize = 900;
 const REDUNDANT_LABEL_COVERAGE_MIN_CANDIDATES: usize = 8_192;
@@ -2361,10 +2358,9 @@ impl SqliteStorage {
         preflight_effective_schema_before_writable_open(path)?;
         let conn = Connection::open(path.to_string_lossy().into_owned())?;
 
-        // Set busy_timeout. Default is 0 (#243) — frankensqlite's busy
-        // handler hot-spins, so we rely on application-level retry (see
-        // `with_write_transaction`). The `.write.lock` flock serializes
-        // concurrent mutating processes before they reach this point.
+        // Keep SQLite's busy handler aligned with the caller's requested
+        // bound. The `.write.lock` serializes normal mutating processes, while
+        // `with_write_transaction` provides the bounded database-level retry.
         if let Some(timeout_ms) = lock_timeout_ms {
             conn.execute(&format!("PRAGMA busy_timeout={timeout_ms}"))?;
         }
@@ -19724,9 +19720,7 @@ fn insert_comment_row(conn: &Connection, issue_id: &str, author: &str, text: &st
     Ok(comment_id)
 }
 
-fn gate_result_record_from_row(
-    row: &Row,
-) -> Result<crate::close_policy::GateResultRecord> {
+fn gate_result_record_from_row(row: &Row) -> Result<crate::close_policy::GateResultRecord> {
     let required_text = |index: usize, name: &str| {
         row.get(index)
             .and_then(SqliteValue::as_text)

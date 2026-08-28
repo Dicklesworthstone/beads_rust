@@ -131,11 +131,11 @@ fn main() {
 
     // Phase 1.5: Acquire exclusive write lock before any DB-family open that
     // may apply schema, recover, quarantine sidecars, write metadata, or read
-    // from fsqlite while another process is in a write transaction.
+    // from SQLite while another process is in a write transaction.
     //
-    // Issue #243: frankensqlite deadlocks when multiple processes attempt
-    // concurrent writes to the same database file. Serialize all mutating
-    // operations through a blocking flock on `.beads/.write.lock`. Normal
+    // Issue #243 established the cross-process authority boundary: serialize
+    // all mutating operations through a blocking flock on
+    // `.beads/.write.lock`. Normal
     // storage open is not guaranteed read-only in recovery/schema paths, so
     // DB-family commands hold authority even when they first try the
     // current-schema read-only fast-open path. That keeps the pending-saga

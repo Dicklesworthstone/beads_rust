@@ -701,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn wal_without_shm_is_expected_for_frankensqlite() {
+    fn wal_without_shm_is_recoverable_by_sqlite() {
         let (_dir, db_path, jsonl_path) = setup_workspace();
         let mut f = std::fs::File::create(&db_path).unwrap();
         f.write_all(b"SQLite format 3\0").unwrap();
@@ -715,7 +715,7 @@ mod tests {
             !anomalies
                 .iter()
                 .any(|a| matches!(a, AnomalyClass::SidecarMismatch { .. })),
-            "WAL-without-SHM is expected for frankensqlite and should not be a sidecar mismatch: {anomalies:?}"
+            "SQLite can recreate a missing SHM index, so WAL-without-SHM should not be a sidecar mismatch: {anomalies:?}"
         );
         let classification = WorkspaceClassification::from_anomalies(anomalies);
         assert_eq!(classification.health, WorkspaceHealth::Healthy);

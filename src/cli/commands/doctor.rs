@@ -2354,15 +2354,12 @@ fn inspect_database_sidecars(db_path: &Path) -> Result<SidecarInspection> {
     }
 
     if wal_kind.is_regular_file() && !shm_kind.exists() {
-        // frankensqlite manages the WAL index in process-local memory rather than in an SHM
-        // file, so a WAL without a sibling SHM is the normal operating state — not an error.
-        // Record the layout as informational so callers can observe it, but do not
-        // degrade an otherwise healthy workspace: doctor treats every warning as a
-        // failed health check. We also do not
-        // quarantine the WAL, because the WAL is valid and the database is accessible.
-        // The db.write_probe check validates liveness.
+        // SQLite can recreate a missing shared-memory WAL index from the WAL
+        // itself. Record the layout as informational, but do not quarantine a
+        // valid WAL or degrade an otherwise healthy workspace. The integrity
+        // and rollback-only write probes below remain the authoritative gates.
         inspection.informational_findings.push(format!(
-            "WAL sidecar exists without a matching SHM sidecar at {} (expected for frankensqlite)",
+            "WAL sidecar exists without a matching SHM sidecar at {}; SQLite can recreate the transient WAL index",
             PathBuf::from(format!("{}-wal", db_path.to_string_lossy())).display()
         ));
     }
@@ -2376,18 +2373,7 @@ fn inspect_database_sidecars(db_path: &Path) -> Result<SidecarInspection> {
         inspection.quarantine_candidates.push(shm_path);
     }
 
-    if shm_kind.is_regular_file() && wal_kind.is_regular_file() {
-        // frankensqlite never reads or writes the classic `-shm` index — the
-        // WAL index lives in process-local memory — so an SHM beside a live
-        // WAL is inert heritage (e.g. an orphan the engine's own open later
-        // paired with a fresh WAL). Classify it explicitly instead of
-        // silently absorbing it into a "full family" that this engine does
-        // not actually use; the file stays in place because it is harmless.
-        inspection.informational_findings.push(format!(
-            "SHM sidecar at {} is inert beside the WAL (a WAL-only family is expected for frankensqlite; the WAL index lives in process memory)",
-            PathBuf::from(format!("{}-shm", db_path.to_string_lossy())).display()
-        ));
-    }
+    // A regular WAL plus regular SHM is the normal stock-SQLite WAL family.
 
     if !db_kind.is_regular_file() {
         let has_dangling_sidecars = database_sidecar_paths(db_path)

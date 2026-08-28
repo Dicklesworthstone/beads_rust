@@ -2544,11 +2544,7 @@ fn core_runtime_columns_canonical(
     })
 }
 
-fn core_runtime_column_matches(
-    table: &str,
-    row: &Row,
-    expected: &ExpectedSchemaColumn,
-) -> bool {
+fn core_runtime_column_matches(table: &str, row: &Row, expected: &ExpectedSchemaColumn) -> bool {
     let name = row.get(1).and_then(SqliteValue::as_text);
     let data_type = row.get(2).and_then(SqliteValue::as_text);
     let not_null = row

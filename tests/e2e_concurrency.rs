@@ -337,12 +337,11 @@ fn extract_issues_array(stdout: &str) -> Vec<serde_json::Value> {
 
 /// Assert that `br doctor` reports the workspace as healthy.
 ///
-/// If the initial check fails with only recoverable fsqlite-layer issues
-/// (WAL-without-SHM, minor page accounting gaps after concurrent load), this
-/// runs `doctor --repair` which checkpoints the WAL and reconciles page
-/// accounting. `doctor --repair` exits non-zero only when post-repair
-/// verification still fails, so a successful repair exit code means the
-/// workspace is clean. Unrecoverable failures surface the original report.
+/// If the initial check fails with only recoverable storage-layer issues, this
+/// runs `doctor --repair`, which checkpoints the WAL and reconciles derived
+/// state. `doctor --repair` exits non-zero only when post-repair verification
+/// still fails, so a successful repair exit code means the workspace is clean.
+/// Unrecoverable failures surface the original report.
 fn assert_doctor_healthy(root: &PathBuf) {
     let doctor = run_br_in_dir(root, ["doctor", "--json"]);
     if doctor.success {
