@@ -370,7 +370,9 @@ fn symlink_escape_for_existing_ancestor(
         // Judge where the *candidate* lands once this ancestor is followed,
         // not where the ancestor alone points, so an internal symlink whose
         // target is itself inside the beads directory is not misreported.
-        let remainder = path.strip_prefix(ancestor).unwrap_or(Path::new(""));
+        let remainder = path
+            .strip_prefix(ancestor)
+            .unwrap_or_else(|_| Path::new(""));
         let rerooted = target.join(remainder);
         let rerooted = normalize_path_lexically(&rerooted).unwrap_or(rerooted);
         if !path_within(&rerooted, canonical_beads) {
