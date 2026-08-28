@@ -17,35 +17,32 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ## v0.5.4 -- 2026-08-28 (Release)
 
-Emergency storage-safety release. Real migrated workspaces exposed two
-FrankenSQLite 0.3.11 failures that synthetic fixtures had missed: page aliasing
-during large JSONL rebuilds and corruption under short-lived multi-process br
-workloads. br now runs its existing storage facade on bundled stock SQLite,
-while retaining the same database schema, JSONL format, CLI contracts, and
-shared value/error types.
+Storage-safety and Windows follow-up. Real migrated workspaces exposed
+FrankenSQLite 0.3.11 page-aliasing corruption under short-lived multi-process
+br workloads (#457, #458, #460, #461); the engine-side fix is tracked upstream
+in FrankenSQLite #399/#385. br stays on FrankenSQLite — a memory-safe,
+FFI-free Rust engine — and this release hardens the caller-side containment,
+adds the multi-process stress gate that reproduces the corruption, and fixes
+the Windows doctor/long-path defects.
 
 ### Storage safety and recovery
 
-- The synchronous storage facade now uses bundled stock SQLite. This removes
-  the corrupting runtime path reported in #457, #458, and #460 without
-  changing the `SqliteStorage` or sync architecture.
 - Force-import and recovery re-read every imported issue inside the
   transaction and compare normalized semantic fields, so field shifts or an
   unaddressable source ID fail before publication.
 - Byte-identical duplicate comments in a damaged export are deduplicated for
   recovery; conflicting duplicates still fail closed.
 - Repeated `comments add` exports preserve every prior comment ID and body;
-  stock-SQLite regression coverage reads the published JSONL directly so
-  duplicated newest-comment rows cannot pass through cross-store agreement
-  (#461).
+  regression coverage reads the published JSONL directly so duplicated
+  newest-comment rows cannot pass through cross-store agreement (#461).
 - `show` checks the immutable JSONL ID set before reporting a missing partial
   ID, preventing corrupt lookup state from masquerading as a normal miss.
 - History byte-budget pruning now removes only verified snapshot/metadata
   pairs and refuses mismatched evidence.
-- Text-mode `list --limit N` with no other filter no longer fails with
-  `internal error: no query solution`: the paged list query dropped an
-  `INDEXED BY` hint that stock SQLite cannot honor, and spells its template
-  predicate so the planner can still use the partial list index (#463).
+- Text-mode `list --limit N` with no other filter no longer depends on an
+  `INDEXED BY` hint that a planner may refuse with `no query solution`; the
+  paged list query spells its template predicate so the partial list index
+  stays provably applicable instead (#463).
 - `scripts/br-stress.sh` runs the multi-process mixed workload that exposed
   #457 against a copy of a real `.beads/` family and fails on any integrity,
   count, recovery-artifact, or doctor regression.
@@ -62,11 +59,10 @@ shared value/error types.
   directory handle for fsync on Windows, which always fails with
   `ERROR_ACCESS_DENIED` and turned every `doctor --repair` into an
   `os error 5` refusal there (#450, #456).
-- Long workspace paths on Windows: database and `VACUUM INTO` targets whose
-  absolute path nears `MAX_PATH` are handed to SQLite in extended-length
-  (`\\?\`) form, br's own no-replace `MoveFileExW` renames (fresh-database
-  install, recovery staging, base-snapshot publication) use the same
-  spelling, and sync path validation compares plain and extended-length
+- Long workspace paths on Windows: br's no-replace `MoveFileExW` renames
+  (fresh-database install, recovery staging, base-snapshot publication) use
+  the extended-length (`\\?\`) spelling once the absolute path nears
+  `MAX_PATH`, and sync path validation compares plain and extended-length
   spellings as the same location instead of rejecting `.beads/issues.jsonl`
   as outside its own directory (#462).
 - Additive `sync --reconcile` gained hash-bound dry-run/apply receipts,
@@ -74,9 +70,8 @@ shared value/error types.
 
 ### Release reproducibility
 
-- The rusqlite/libsqlite3 resolution is committed in `Cargo.lock`, unused
-  FrankenSQLite runtime crates leave the release graph, and FastMCP is now
-  truly exact-pinned at `=0.7.0` as the manifest comment intended.
+- FastMCP is now truly exact-pinned at `=0.7.0` as the manifest comment
+  intended.
 
 ## v0.5.3 -- 2026-08-27 (Release)
 
