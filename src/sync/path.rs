@@ -343,9 +343,19 @@ pub(crate) fn authority_path_within(candidate: &Path, ancestor: &Path) -> bool {
 
 fn symlink_escape_for_existing_ancestor(
     path: &Path,
+    beads_dir: &Path,
     canonical_beads: &Path,
 ) -> Option<PathValidation> {
     for ancestor in path.ancestors() {
+        // Only a symlink at or below the beads directory can carry a member
+        // *out* of it. A symlinked ancestor above the workspace (macOS `/var`
+        // -> `/private/var`, `/tmp` -> `/private/tmp`, a symlinked home) is
+        // ordinary filesystem layout: the canonical prefix checks that follow
+        // decide those paths, keeping their traversal/outside classification
+        // (beads_rust-rr1s).
+        if !(path_within(ancestor, beads_dir) || path_within(ancestor, canonical_beads)) {
+            continue;
+        }
         let Ok(metadata) = std::fs::symlink_metadata(ancestor) else {
             continue;
         };
@@ -358,11 +368,8 @@ fn symlink_escape_for_existing_ancestor(
             .map(|target| resolve_symlink_target_for_validation(ancestor, &target))
             .unwrap_or_else(|_| ancestor.to_path_buf());
         // Judge where the *candidate* lands once this ancestor is followed,
-        // not where the ancestor alone points. A symlinked ancestor above the
-        // workspace (macOS `/var` -> `/private/var`, `/tmp` -> `/private/tmp`,
-        // a symlinked home) re-roots the whole path inside the canonical
-        // beads directory and is fine; a symlink that carries the candidate
-        // outside it is the escape this check exists for (beads_rust-rr1s).
+        // not where the ancestor alone points, so an internal symlink whose
+        // target is itself inside the beads directory is not misreported.
         let remainder = path.strip_prefix(ancestor).unwrap_or(Path::new(""));
         let rerooted = target.join(remainder);
         let rerooted = normalize_path_lexically(&rerooted).unwrap_or(rerooted);
@@ -517,7 +524,9 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
         }
     };
 
-    if let Some(result) = symlink_escape_for_existing_ancestor(&normalized_path, &canonical_beads) {
+    if let Some(result) =
+        symlink_escape_for_existing_ancestor(&normalized_path, beads_dir, &canonical_beads)
+    {
         warn!(
             path = %path.display(),
             reason = %result.rejection_reason().unwrap_or_default(),
