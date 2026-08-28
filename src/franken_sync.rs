@@ -1,30 +1,15 @@
-//! Synchronous facade over the async FrankenSQLite 0.3 engine API.
+//! Stable storage-facade module retained for source compatibility.
 //!
-//! fsqlite 0.2 made every engine entry point `async` with `!Send` futures
-//! (the engine is `Rc<RefCell<..>>` internally; it was already `!Send` at
-//! 0.1.x — only the call shape changed), and fsqlite 0.3 moved the runtime
-//! family to asupersync 0.4.4. br's storage layer is fully synchronous, so
-//! this module preserves the pre-0.2 blocking call shape by driving each
-//! engine future to completion on the calling thread with a private
-//! current-thread `asupersync` runtime (the proven sqlmodel/cass
-//! `block_on` bridge pattern; see coding_agent_session_search
-//! `src/franken_sync.rs`).
-//!
-//! Every future is created, polled, and dropped entirely within one bridge
-//! call, so the engine's `Rc<RefCell<..>>` state never crosses a thread
-//! boundary between poll steps. `Runtime::block_on` has no `Send` bound and
-//! saves/restores the ambient runtime handle, so nesting inside a consumer's
-//! own `block_on` is safe.
-//!
-//! The runtime lives in a thread-local slot and is *taken out* while a
-//! future is being driven: a reentrant bridge call (e.g. SQL issued from
-//! inside a row-mapping closure) finds the slot empty and builds a fresh
-//! runtime instead of re-entering `block_on` on the same runtime instance.
-//!
-//! Everything outside this module refers to the engine through
-//! `crate::franken_sync::` (or `beads_rust::franken_sync::` from integration
-//! tests); only this module names the `fsqlite` dependency directly for
-//! connection/statement driving.
+//! v0.5.4 routes this API through bundled stock SQLite because FrankenSQLite
+//! 0.3.11 can corrupt real migrated br database families (GitHub #457/#458).
+
+pub use crate::stock_sqlite::*;
+
+// Retain the retired adapter as noncompiled source until the upstream engine
+// once again satisfies br's real-corpus durability gate. This keeps the
+// emergency backend switch reviewable without deleting historical code.
+#[cfg(any())]
+mod retired_fsqlite_facade {
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -499,4 +484,5 @@ mod tests {
 
         assert_eq!(row_count, 1);
     }
+}
 }

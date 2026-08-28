@@ -1,6 +1,6 @@
 [package]
 name = "beads_rust"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2024"
 rust-version = "1.88"
 autobenches = false
@@ -40,40 +40,16 @@ path = "src/main.rs"
 clap = { version = "4.6.6", features = ["derive", "env", "unstable-ext"] }
 clap_complete = { version = "4.6.9", features = ["unstable-dynamic"] }
 
-# Database (pure-Rust SQLite with concurrent writer support)
-# NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
-# Default features minus `json`: br issues no JSON1 SQL. fsqlite-core still
-# depends on fsqlite-ext-json internally, but the 0.3.9+ extension enables
-# only serde_json's `preserve_order`; the old viral `arbitrary_precision`
-# feature no longer affects br's JSON/TOON serializers.
-fsqlite = { version = "0.3.11", default-features = false, features = [
-    "native",
-    "linux-asupersync-uring",
-    "fts5",
-    "rtree",
-    "icu",
-    "misc",
-] }
+# Database. v0.5.4 temporarily routes the synchronous storage facade through
+# bundled stock SQLite after fsqlite 0.3.11 produced repeatable page aliasing
+# on real migrated br families (GitHub #457/#458). Keep the established value
+# and error vocabulary so the rest of the storage layer remains unchanged.
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 fsqlite-types = "0.3.11"
 fsqlite-error = "0.3.11"
-fsqlite-core = "0.3.11"
-fsqlite-func = "0.3.11"
-fsqlite-vdbe = "0.3.11"
-fsqlite-vfs = "0.3.11"
-fsqlite-pager = "0.3.11"
-fsqlite-parser = "0.3.11"
-fsqlite-planner = "0.3.11"
-fsqlite-wal = "0.3.11"
-fsqlite-btree = "0.3.11"
-fsqlite-ast = "0.3.11"
-fsqlite-mvcc = "0.3.11"
-fsqlite-observability = "0.3.11"
 
-# Current-thread runtime that drives fsqlite 0.3's async (!Send) futures to
-# completion behind the synchronous `franken_sync::Connection` bridge.
-# Pinned =0.4.9 to match both the fsqlite family's requirement
-# (>=0.4.3,<0.5) and fastmcp-rust 0.7.0's exact =0.4.9 pin, so `--features
-# mcp` builds carry a single asupersync version (beads_rust-fiop).
+# Pinned =0.4.9 to match fastmcp-rust 0.7.0's exact pin, so `--features mcp`
+# builds carry a single asupersync version (beads_rust-fiop).
 # default-features = false mirrors fsqlite's own spec.
 asupersync = { version = "=0.4.9", default-features = false }
 

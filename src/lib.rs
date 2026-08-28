@@ -42,6 +42,7 @@ pub mod model;
 pub mod output;
 pub mod policy;
 pub mod shutdown;
+mod stock_sqlite;
 pub mod storage;
 pub mod sync;
 pub mod util;

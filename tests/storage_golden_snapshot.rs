@@ -4,6 +4,7 @@
 //! row shape, event sequence, content hash, and JSONL field layout.
 
 use beads_rust::franken_sync::Connection;
+use beads_rust::franken_sync::Row;
 use beads_rust::model::{Issue, IssueType, Priority, Status};
 use beads_rust::storage::{IssueUpdate, SqliteStorage};
 use chrono::{TimeZone, Utc};
@@ -13,14 +14,14 @@ use serde_json::Value;
 use std::fmt::Write;
 use tempfile::TempDir;
 
-fn value_text(row: &fsqlite::Row, idx: usize) -> String {
+fn value_text(row: &Row, idx: usize) -> String {
     row.get(idx)
         .and_then(SqliteValue::as_text)
         .unwrap_or("")
         .to_string()
 }
 
-fn value_i64(row: &fsqlite::Row, idx: usize) -> i64 {
+fn value_i64(row: &Row, idx: usize) -> i64 {
     row.get(idx).and_then(SqliteValue::as_integer).unwrap_or(0)
 }
 

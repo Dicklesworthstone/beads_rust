@@ -1,6 +1,6 @@
 //! Database schema definitions and migration logic.
 
-use crate::franken_sync::Connection;
+use crate::franken_sync::{Connection, Row};
 use chrono::Utc;
 use fsqlite_types::SqliteValue;
 
@@ -2546,7 +2546,7 @@ fn core_runtime_columns_canonical(
 
 fn core_runtime_column_matches(
     table: &str,
-    row: &fsqlite::Row,
+    row: &Row,
     expected: &ExpectedSchemaColumn,
 ) -> bool {
     let name = row.get(1).and_then(SqliteValue::as_text);
@@ -4389,17 +4389,17 @@ fn rebuild_content_hashes_for_current_format(conn: &Connection) -> Result<usize>
     }
 }
 
-fn row_text(row: &fsqlite::Row, index: usize) -> Option<String> {
+fn row_text(row: &Row, index: usize) -> Option<String> {
     row.get(index)
         .and_then(SqliteValue::as_text)
         .map(str::to_string)
 }
 
-fn row_optional_text(row: &fsqlite::Row, index: usize) -> Option<String> {
+fn row_optional_text(row: &Row, index: usize) -> Option<String> {
     row_text(row, index).filter(|value| !value.is_empty())
 }
 
-fn row_bool(row: &fsqlite::Row, index: usize) -> bool {
+fn row_bool(row: &Row, index: usize) -> bool {
     row.get(index).is_some_and(|value| {
         value.as_integer().map_or_else(
             || value.as_text().is_some_and(|text| text != "0"),

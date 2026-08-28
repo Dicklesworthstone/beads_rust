@@ -2,7 +2,7 @@
 
 use crate::error::{BeadsError, Result};
 use crate::format::{IssueDetails, IssueWithDependencyMetadata, RollupSummary};
-use crate::franken_sync::Connection;
+use crate::franken_sync::{Connection, Row};
 use crate::franken_sync::compat::{OpenFlags, open_with_flags};
 use crate::model::{
     Comment, Dependency, DependencyType, Event, EventType, Issue, IssueType, Priority, Status,
@@ -1636,7 +1636,7 @@ impl ReadyIssueProjection {
         }
     }
 
-    fn parse_row(self, row: &fsqlite::Row) -> Result<Issue> {
+    fn parse_row(self, row: &Row) -> Result<Issue> {
         match self {
             Self::Full => SqliteStorage::issue_from_row(row),
             Self::Command => SqliteStorage::ready_issue_from_row(row),
@@ -1668,7 +1668,7 @@ impl SearchIssueProjection {
         }
     }
 
-    fn parse_issue(self, row: &fsqlite::Row) -> Result<Issue> {
+    fn parse_issue(self, row: &Row) -> Result<Issue> {
         match self {
             Self::Full => SqliteStorage::issue_from_row(row),
             Self::CommandText => SqliteStorage::search_command_issue_from_row(row),
@@ -1725,7 +1725,7 @@ impl BlockedIssueProjection {
         }
     }
 
-    fn parse_issue(self, row: &fsqlite::Row) -> Result<Issue> {
+    fn parse_issue(self, row: &Row) -> Result<Issue> {
         match self {
             Self::Full => SqliteStorage::issue_from_row(row),
             Self::Command => SqliteStorage::blocked_command_issue_from_row(row),
@@ -4222,7 +4222,7 @@ impl SqliteStorage {
     }
 
     fn capacity_exemption_record_from_row(
-        row: &fsqlite::Row,
+        row: &Row,
         now: chrono::DateTime<Utc>,
     ) -> Option<crate::close_policy::CapacityExemptionRecord> {
         let text = |index: usize| {
@@ -15339,7 +15339,7 @@ impl SqliteStorage {
         })
     }
 
-    fn issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+    fn issue_from_row(row: &Row) -> Result<Issue> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -15420,7 +15420,7 @@ impl SqliteStorage {
         })
     }
 
-    fn ready_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+    fn ready_issue_from_row(row: &Row) -> Result<Issue> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -15485,7 +15485,7 @@ impl SqliteStorage {
         })
     }
 
-    fn blocked_command_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+    fn blocked_command_issue_from_row(row: &Row) -> Result<Issue> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -15550,7 +15550,7 @@ impl SqliteStorage {
         })
     }
 
-    fn stale_command_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+    fn stale_command_issue_from_row(row: &Row) -> Result<Issue> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -15615,7 +15615,7 @@ impl SqliteStorage {
         })
     }
 
-    fn lint_command_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+    fn lint_command_issue_from_row(row: &Row) -> Result<Issue> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -15674,7 +15674,7 @@ impl SqliteStorage {
         })
     }
 
-    fn search_command_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+    fn search_command_issue_from_row(row: &Row) -> Result<Issue> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -15739,7 +15739,7 @@ impl SqliteStorage {
         })
     }
 
-    fn command_summary_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+    fn command_summary_issue_from_row(row: &Row) -> Result<Issue> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -15798,7 +15798,7 @@ impl SqliteStorage {
         })
     }
 
-    fn stats_issue_from_row(row: &fsqlite::Row) -> Result<StatsIssueRow> {
+    fn stats_issue_from_row(row: &Row) -> Result<StatsIssueRow> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -15839,7 +15839,7 @@ impl SqliteStorage {
         })
     }
 
-    fn stats_summary_issue_from_row(row: &fsqlite::Row) -> Result<StatsIssueRow> {
+    fn stats_summary_issue_from_row(row: &Row) -> Result<StatsIssueRow> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -15868,7 +15868,7 @@ impl SqliteStorage {
         })
     }
 
-    fn changelog_issue_from_row(row: &fsqlite::Row) -> Result<ChangelogIssueRow> {
+    fn changelog_issue_from_row(row: &Row) -> Result<ChangelogIssueRow> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -17165,7 +17165,7 @@ fn parse_issue_type(s: Option<&str>) -> IssueType {
 }
 
 fn dependency_metadata_from_row(
-    row: &fsqlite::Row,
+    row: &Row,
     row_role: &str,
     allow_external_placeholder: bool,
 ) -> Result<IssueWithDependencyMetadata> {
@@ -19725,7 +19725,7 @@ fn insert_comment_row(conn: &Connection, issue_id: &str, author: &str, text: &st
 }
 
 fn gate_result_record_from_row(
-    row: &fsqlite::Row,
+    row: &Row,
 ) -> Result<crate::close_policy::GateResultRecord> {
     let required_text = |index: usize, name: &str| {
         row.get(index)
@@ -19776,7 +19776,7 @@ fn fetch_comment(conn: &Connection, comment_id: i64) -> Result<Comment> {
     comment_from_row(&row)
 }
 
-fn comment_from_row(row: &fsqlite::Row) -> Result<Comment> {
+fn comment_from_row(row: &Row) -> Result<Comment> {
     let id = row
         .get(0)
         .and_then(SqliteValue::as_integer)
@@ -31172,7 +31172,7 @@ mod tests {
             .unwrap();
         eprintln!(
             "[DIAG] 1. count(*) no WHERE: {:?}",
-            r1.first().map(fsqlite::Row::values)
+            r1.first().map(Row::values)
         );
 
         // 2: count with literal WHERE
@@ -31181,7 +31181,7 @@ mod tests {
             .unwrap();
         eprintln!(
             "[DIAG] 2. count(*) literal WHERE: {:?}",
-            r2.first().map(fsqlite::Row::values)
+            r2.first().map(Row::values)
         );
 
         // 3: count with bind WHERE
@@ -31202,7 +31202,7 @@ mod tests {
             .unwrap();
         eprintln!(
             "[DIAG] 3. count(*) bind WHERE: {:?}",
-            r3.first().map(fsqlite::Row::values)
+            r3.first().map(Row::values)
         );
 
         // Also get EXPLAIN for the working non-aggregate version
@@ -31222,7 +31222,7 @@ mod tests {
             .unwrap();
         eprintln!(
             "[DIAG] 4. select k bind WHERE: {:?}",
-            r4.first().map(fsqlite::Row::values)
+            r4.first().map(Row::values)
         );
 
         // 5: count(k) with bind WHERE
@@ -31234,7 +31234,7 @@ mod tests {
             .unwrap();
         eprintln!(
             "[DIAG] 5. count(k) bind WHERE: {:?}",
-            r5.first().map(fsqlite::Row::values)
+            r5.first().map(Row::values)
         );
 
         // 6: count with bind WHERE but no match
@@ -31246,7 +31246,7 @@ mod tests {
             .unwrap();
         eprintln!(
             "[DIAG] 6. count(*) bind WHERE no match: {:?}",
-            r6.first().map(fsqlite::Row::values)
+            r6.first().map(Row::values)
         );
 
         let c = r3
