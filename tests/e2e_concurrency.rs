@@ -3006,6 +3006,122 @@ fn e2e_parallel_mixed_db_commands_preserve_sqlite_integrity() {
     assert_upstream_sqlite_integrity_ok(&root, "after repeated status/doctor reads");
 }
 
+/// Regression for #460: repeated writers touching an issue whose description
+/// spans SQLite overflow pages must not lose the issue or damage the freelist.
+#[test]
+fn e2e_parallel_writes_preserve_large_description_and_freelist() {
+    let _log = common::test_log("e2e_parallel_writes_preserve_large_description_and_freelist");
+
+    let temp_dir = isolated_temp_dir("large-description concurrency temp dir");
+    let root = temp_dir.path().to_path_buf();
+
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "init failed: {}", init.stderr);
+
+    let description = (0..96)
+        .map(|index| {
+            format!(
+                "overflow-page-line-{index:04}: {}\n",
+                "abcdef0123456789".repeat(8)
+            )
+        })
+        .collect::<String>();
+    assert!(description.len() > 14_000);
+
+    let created = run_br_in_dir(
+        &root,
+        [
+            "create",
+            "Large overflow-page regression record",
+            "--description",
+            &description,
+        ],
+    );
+    assert!(
+        created.success,
+        "large issue create failed: stdout={} stderr={}",
+        created.stdout, created.stderr
+    );
+    let issue_id = parse_created_id(&created.stdout);
+    assert!(!issue_id.is_empty(), "created issue id missing");
+
+    let barrier = Arc::new(Barrier::new(4));
+    let shared_root = Arc::new(root.clone());
+    let handles = (0..4)
+        .map(|worker| {
+            let barrier = Arc::clone(&barrier);
+            let root = Arc::clone(&shared_root);
+            let issue_id = issue_id.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                (0..12)
+                    .map(|index| {
+                        if index % 2 == 0 {
+                            run_br_in_dir(
+                                &root,
+                                [
+                                    "--lock-timeout",
+                                    "15000",
+                                    "update",
+                                    &issue_id,
+                                    "--notes",
+                                    &format!("overflow write {worker}-{index}"),
+                                    "--json",
+                                ],
+                            )
+                        } else {
+                            run_br_in_dir(
+                                &root,
+                                [
+                                    "--lock-timeout",
+                                    "15000",
+                                    "comments",
+                                    "add",
+                                    &issue_id,
+                                    "--message",
+                                    &format!("overflow comment {worker}-{index}"),
+                                    "--json",
+                                ],
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for (worker, handle) in handles.into_iter().enumerate() {
+        let results = handle.join().expect("overflow writer panicked");
+        assert!(
+            results.iter().all(|result| result.success),
+            "overflow writer {worker} failed: {results:?}"
+        );
+        assert_no_integrity_failure_signals("overflow writer", &results);
+    }
+
+    let show = run_br_in_dir(&root, ["--no-auto-import", "show", &issue_id, "--json"]);
+    assert!(
+        show.success,
+        "large issue vanished after writes: stdout={} stderr={}",
+        show.stdout, show.stderr
+    );
+    let shown: serde_json::Value =
+        serde_json::from_str(&extract_json_payload(&show.stdout)).expect("show JSON");
+    assert_eq!(shown[0]["description"].as_str(), Some(description.as_str()));
+
+    let jsonl = fs::read_to_string(root.join(".beads/issues.jsonl")).expect("read JSONL");
+    let exported = jsonl
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse JSONL row"))
+        .find(|issue| issue["id"].as_str() == Some(issue_id.as_str()))
+        .expect("large issue must remain exported");
+    assert_eq!(exported["description"].as_str(), Some(description.as_str()));
+
+    assert_doctor_has_no_page_anomalies(&root, "after overflow-page writes");
+    assert_upstream_sqlite_integrity_ok(&root, "after overflow-page writes");
+}
+
 /// Test that routed access remains bounded even while the routed workspace
 /// itself is mutating, not just the invoking workspace.
 #[test]
