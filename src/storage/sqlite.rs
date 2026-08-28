@@ -2,7 +2,7 @@
 
 use crate::error::{BeadsError, Result};
 use crate::format::{IssueDetails, IssueWithDependencyMetadata, RollupSummary};
-use crate::franken_sync::compat::{OpenFlags, open_with_flags};
+use crate::franken_sync::compat::{OpenFlags, open_read_only_immutable, open_with_flags};
 use crate::franken_sync::{Connection, Row};
 use crate::model::{
     Comment, Dependency, DependencyType, Event, EventType, Issue, IssueType, Priority, Status,
@@ -2464,10 +2464,15 @@ impl SqliteStorage {
         if namespace_sidecar_mode_repair_required(path)? {
             return Ok(None);
         }
-        let conn = open_with_flags(
-            path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
+        let wal_preflight = sqlite_wal_schema_preflight(path)?;
+        let conn = if wal_preflight.has_committed_frames {
+            open_with_flags(
+                path.to_string_lossy().as_ref(),
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?
+        } else {
+            open_read_only_immutable(path)?
+        };
         // Now that the connection is open, consult the effective schema version
         // (WAL-aware) and fall back to the header peek. Reviewed reconciliation
         // is intentionally exact-version only: a future schema may add columns,

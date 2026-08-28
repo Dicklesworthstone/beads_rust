@@ -218,6 +218,37 @@ fn map_error(error: rusqlite::Error, path: &Path) -> FrankenError {
     }
 }
 
+fn immutable_read_only_uri(path: &Path) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+    };
+    let path = absolute_path.to_string_lossy();
+    let mut uri = String::with_capacity(path.len() + 32);
+    uri.push_str("file:");
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' | b'~' => {
+                uri.push(char::from(byte));
+            }
+            #[cfg(windows)]
+            b'\\' => uri.push('/'),
+            #[cfg(windows)]
+            b':' => uri.push(':'),
+            _ => {
+                uri.push('%');
+                uri.push(char::from(HEX[usize::from(byte >> 4)]));
+                uri.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            }
+        }
+    }
+    uri.push_str("?mode=ro&immutable=1");
+    uri
+}
+
 /// Synchronous connection backed by bundled stock SQLite.
 pub struct Connection {
     inner: Option<rusqlite::Connection>,
@@ -427,9 +458,9 @@ impl PreparedStatement<'_> {
 
 /// rusqlite-style open flags, retained behind the historical compatibility API.
 pub mod compat {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
-    use super::{Connection, FrankenError, map_error};
+    use super::{Connection, FrankenError, immutable_read_only_uri, map_error};
 
     pub use rusqlite::OpenFlags;
 
@@ -439,6 +470,19 @@ pub mod compat {
         let inner = rusqlite::Connection::open_with_flags(&path, flags)
             .map_err(|error| map_error(error, &path))?;
         Ok(Connection::from_inner(inner, path))
+    }
+
+    /// Open an immutable read-only snapshot without creating SQLite sidecars.
+    ///
+    /// Callers must first prove that no committed WAL frames are needed for
+    /// the visible database state. SQLite intentionally ignores WAL content
+    /// for immutable URIs.
+    pub fn open_read_only_immutable(path: &Path) -> Result<Connection, FrankenError> {
+        let uri = immutable_read_only_uri(path);
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
+        let inner = rusqlite::Connection::open_with_flags(&uri, flags)
+            .map_err(|error| map_error(error, path))?;
+        Ok(Connection::from_inner(inner, path.to_path_buf()))
     }
 }
 
@@ -517,5 +561,36 @@ mod tests {
         )
         .expect("open read-only");
         assert!(conn.execute("INSERT INTO t VALUES (1)").is_err());
+    }
+
+    #[test]
+    fn immutable_read_only_open_creates_no_sidecars() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("immutable readonly.db");
+        let conn = Connection::open(db.to_string_lossy().into_owned()).expect("create database");
+        conn.execute("CREATE TABLE t (k INTEGER)").expect("create");
+        conn.execute("INSERT INTO t VALUES (7)").expect("insert");
+        conn.close().expect("close writer");
+
+        let directory_names = || {
+            let mut names = std::fs::read_dir(dir.path())
+                .expect("read temp directory")
+                .map(|entry| entry.expect("directory entry").file_name())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        let before = directory_names();
+        let conn = compat::open_read_only_immutable(&db).expect("open immutable read-only");
+        assert_eq!(
+            conn.query_row("SELECT k FROM t")
+                .expect("query")
+                .get(0)
+                .and_then(SqliteValue::as_integer),
+            Some(7)
+        );
+        assert!(conn.execute("INSERT INTO t VALUES (8)").is_err());
+        conn.close().expect("close reader");
+        assert_eq!(directory_names(), before);
     }
 }
