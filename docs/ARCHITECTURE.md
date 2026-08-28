@@ -198,10 +198,8 @@ br sync --flush-only
 
 ### SqliteStorage
 
-The primary storage implementation uses bundled stock SQLite through a narrow
-synchronous facade. The facade retains `fsqlite-types` and `fsqlite-error` as
-its public value/error vocabulary, so the storage and sync layers remain
-stable while the runtime engine is isolated behind one module.
+The primary storage implementation using the fsqlite stack (`fsqlite`,
+`fsqlite-types`, and `fsqlite-error`).
 
 ```rust
 pub struct SqliteStorage {
@@ -764,8 +762,7 @@ impl IssueValidator {
 | Crate | Purpose |
 |-------|---------|
 | `clap` | CLI parsing with derive macros |
-| `rusqlite` + bundled SQLite | Runtime SQLite engine and connection facade |
-| `fsqlite-types` + `fsqlite-error` | Stable shared storage values and error vocabulary |
+| `fsqlite` + `fsqlite-types` + `fsqlite-error` | SQLite engine facade plus shared storage types/errors |
 | `serde` + `serde_json` | Serialization |
 | `chrono` | Timestamps |
 | `sha2` | Content hashing |

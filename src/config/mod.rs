@@ -3106,12 +3106,7 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
         Utc::now().format("%Y%m%d_%H%M%S_%f")
     ));
 
-    // Hand SQLite the engine spelling of the target (extended-length on
-    // Windows when the path nears `MAX_PATH`, #462); the filesystem-side
-    // rename/backup logic below keeps using `temp_path` itself.
-    let temp_path_display = crate::franken_sync::engine_path(&temp_path)
-        .display()
-        .to_string();
+    let temp_path_display = temp_path.display().to_string();
     // Escape single quotes the SQL way (doubling) for the literal path
     // embedded in the `VACUUM INTO` statement. The temp path is
     // constructed from the DB path + our own PID suffix, so in practice

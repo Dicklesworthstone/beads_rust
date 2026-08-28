@@ -40,16 +40,41 @@ path = "src/main.rs"
 clap = { version = "4.6.6", features = ["derive", "env", "unstable-ext"] }
 clap_complete = { version = "4.6.9", features = ["unstable-dynamic"] }
 
-# Database. v0.5.4 temporarily routes the synchronous storage facade through
-# bundled stock SQLite after fsqlite 0.3.11 produced repeatable page aliasing
-# on real migrated br families (GitHub #457/#458). Keep the established value
-# and error vocabulary so the rest of the storage layer remains unchanged.
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+# Database (pure-Rust SQLite with concurrent writer support). br never links a
+# C SQLite: the storage engine is FrankenSQLite, memory-safe Rust end to end.
+# NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
+# Default features minus `json`: br issues no JSON1 SQL. fsqlite-core still
+# depends on fsqlite-ext-json internally, but the 0.3.9+ extension enables
+# only serde_json's `preserve_order`; the old viral `arbitrary_precision`
+# feature no longer affects br's JSON/TOON serializers.
+fsqlite = { version = "0.3.11", default-features = false, features = [
+    "native",
+    "linux-asupersync-uring",
+    "fts5",
+    "rtree",
+    "icu",
+    "misc",
+] }
 fsqlite-types = "0.3.11"
 fsqlite-error = "0.3.11"
+fsqlite-core = "0.3.11"
+fsqlite-func = "0.3.11"
+fsqlite-vdbe = "0.3.11"
+fsqlite-vfs = "0.3.11"
+fsqlite-pager = "0.3.11"
+fsqlite-parser = "0.3.11"
+fsqlite-planner = "0.3.11"
+fsqlite-wal = "0.3.11"
+fsqlite-btree = "0.3.11"
+fsqlite-ast = "0.3.11"
+fsqlite-mvcc = "0.3.11"
+fsqlite-observability = "0.3.11"
 
-# Pinned =0.4.9 to match fastmcp-rust 0.7.0's exact pin, so `--features mcp`
-# builds carry a single asupersync version (beads_rust-fiop).
+# Current-thread runtime that drives fsqlite 0.3's async (!Send) futures to
+# completion behind the synchronous `franken_sync::Connection` bridge.
+# Pinned =0.4.9 to match both the fsqlite family's requirement
+# (>=0.4.3,<0.5) and fastmcp-rust 0.7.0's exact =0.4.9 pin, so `--features
+# mcp` builds carry a single asupersync version (beads_rust-fiop).
 # default-features = false mirrors fsqlite's own spec.
 asupersync = { version = "=0.4.9", default-features = false }
 
@@ -171,8 +196,8 @@ strip = false
 [profile.dev]
 opt-level = 1
 
-# The storage/schema test surface is large enough to benefit materially from
-# modest optimization without changing release behavior.
+# Unoptimized fsqlite schema paths can exhaust Linux's default main-thread
+# stack in integration-test child binaries before the test assertions run.
 [profile.test]
 opt-level = 1
 
@@ -191,15 +216,17 @@ self_update = [
 
 # NOTE: no `[patch.crates-io]` here.
 #
-# All dependencies — including bundled stock SQLite, the retained fsqlite
-# value/error vocabulary, and fastmcp-rust 0.7.0 — are published on crates.io,
-# so this crate resolves everything from the registry out of the box. That makes
+# All dependencies — fsqlite 0.3.11, its fsqlite-* transitive crates, and
+# fastmcp-rust 0.7.0 — are published on crates.io, so this crate
+# resolves everything from the registry out of the box.  That makes
 # `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked`
-# work without requiring sibling checkouts (issue #250 bug 1).
+# work without requiring sibling `frankensqlite` or `fastmcp_rust`
+# checkouts (issue #250 bug 1).
 #
-# Local co-development: contributors who want to hack on FastMCP alongside br
-# can add a workspace-level `.cargo/config.toml` with their own
-# `[patch.crates-io]` table.
+# Local co-development: contributors who want to hack on frankensqlite
+# or fastmcp_rust alongside beads_rust can add a workspace-level
+# `.cargo/config.toml` with their own `[patch.crates-io]` table.  See
+# `scripts/dev-local-frankensqlite.toml` for a ready-to-copy template.
 
 [lints.rust]
 # Deny (not forbid): three sanctioned `#[allow(unsafe_code)]` carve-outs exist —
