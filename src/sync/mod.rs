@@ -1335,6 +1335,177 @@ fn jsonl_write_authority_path(jsonl_path: &Path) -> Result<PathBuf> {
     Ok(parent.join(format!(".br-jsonl-write-{}.lock", &digest[..24])))
 }
 
+fn database_opener_lease_path(database_path: &Path) -> Result<PathBuf> {
+    let canonical_key = canonical_database_authority_key(database_path)?;
+    let parent = canonical_key.parent().ok_or_else(|| {
+        BeadsError::Config(format!(
+            "Canonical database path {} has no parent for opener lease",
+            database_path_descriptor(&canonical_key)
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"beads-rust-database-openers-v1\0");
+    update_sync_path_digest(&mut hasher, &canonical_key);
+    let digest = hex_encode(&hasher.finalize());
+    Ok(parent.join(format!(".br-db-openers-{}.lock", &digest[..24])))
+}
+
+/// Upper bound on waiting for a peer's exclusive (checkpointing) hold of the
+/// opener lease. A checkpoint is short; a longer wait means the lease is
+/// degraded and the caller proceeds without it rather than hanging br.
+const OPENER_LEASE_WAIT_MS: u64 = 5_000;
+
+/// Open a dedicated lock sidecar (create if missing) without following
+/// symlinks or admitting special files.
+fn open_lock_sidecar(path: &Path, role: &str) -> Result<File> {
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err(BeadsError::Config(format!(
+            "Refusing unsafe {role} path {}: expected a regular file, not a symlink or special file",
+            path.display()
+        )));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    options.open(path).map_err(|error| {
+        BeadsError::Config(format!(
+            "Failed to open {role} at {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+/// Shared lease held by every br process that has a persistent database open.
+///
+/// FrankenSQLite's multi-process WAL checkpoint does not yet register against
+/// the read snapshots of peer processes (FrankenSQLite #399/#385): a
+/// `wal_checkpoint(TRUNCATE)` — and, after enough rounds, even PASSIVE — run
+/// by one short-lived `br` process while another has the database open is the
+/// interleaving behind the page-aliasing corruption in GitHub #457/#460/#461.
+/// The same discriminator shows concurrent processes that never checkpoint
+/// stay clean. br therefore checkpoints only while it can prove it is the sole
+/// opener: every opener holds this lease shared for the lifetime of its
+/// storage handle, and a checkpoint first upgrades to the exclusive hold.
+/// While that exclusive hold lasts, new openers wait, so no process starts
+/// reading a WAL that is about to be reset.
+///
+/// The lease is advisory and never blocks br from working: if it cannot be
+/// registered within [`OPENER_LEASE_WAIT_MS`] it degrades to "peers unknown",
+/// which simply disables checkpointing for that handle.
+#[derive(Debug)]
+pub struct DatabaseOpenerLease {
+    path: PathBuf,
+    shared: Option<File>,
+}
+
+impl DatabaseOpenerLease {
+    /// Register this process as an opener of `database_path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the lease sidecar path cannot be derived or
+    /// is unsafe (symlink / special file); lock contention degrades instead.
+    #[allow(clippy::incompatible_msrv)]
+    pub fn register(database_path: &Path) -> Result<Self> {
+        let path = database_opener_lease_path(database_path)?;
+        let shared = Self::acquire_shared(&path)?;
+        Ok(Self { path, shared })
+    }
+
+    /// Whether this handle currently holds its shared registration.
+    #[must_use]
+    pub fn is_registered(&self) -> bool {
+        self.shared.is_some()
+    }
+
+    #[allow(clippy::incompatible_msrv)]
+    fn acquire_shared(path: &Path) -> Result<Option<File>> {
+        let file = open_lock_sidecar(path, "database opener lease")?;
+        let started = Instant::now();
+        let timeout = Duration::from_millis(OPENER_LEASE_WAIT_MS);
+        loop {
+            match file.try_lock_shared() {
+                Ok(()) => return Ok(Some(file)),
+                Err(TryLockError::WouldBlock) => {}
+                Err(TryLockError::Error(error)) => {
+                    tracing::warn!(
+                        error = %error,
+                        lease = %path.display(),
+                        "database opener lease unavailable; checkpoints are disabled for this handle"
+                    );
+                    return Ok(None);
+                }
+            }
+            if started.elapsed() >= timeout {
+                tracing::warn!(
+                    lease = %path.display(),
+                    "a peer held the database opener lease exclusively for too long; proceeding unregistered with checkpoints disabled"
+                );
+                return Ok(None);
+            }
+            thread::sleep(WRITE_LOCK_POLL_INTERVAL);
+        }
+    }
+
+    /// Try to become the sole opener.
+    ///
+    /// Returns the exclusive hold when no other process has the database
+    /// open. Returns `None` — with the shared registration restored — when a
+    /// peer is present or the lease is degraded. Callers must hand the hold
+    /// back through [`Self::release_exclusive`] once the checkpoint is done.
+    #[allow(clippy::incompatible_msrv)]
+    pub fn try_exclusive(&mut self) -> Option<File> {
+        // Whole-file locks are per open file description, so this handle's
+        // own shared registration must be released before probing.
+        self.shared.take()?;
+        let exclusive = match open_lock_sidecar(&self.path, "database opener lease") {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::warn!(error = %error, "database opener lease reopen failed");
+                self.restore_shared();
+                return None;
+            }
+        };
+        match exclusive.try_lock() {
+            Ok(()) => Some(exclusive),
+            Err(TryLockError::WouldBlock) => {
+                drop(exclusive);
+                self.restore_shared();
+                None
+            }
+            Err(TryLockError::Error(error)) => {
+                tracing::warn!(error = %error, "database opener lease exclusive probe failed");
+                drop(exclusive);
+                self.restore_shared();
+                None
+            }
+        }
+    }
+
+    /// Return an exclusive hold obtained from [`Self::try_exclusive`] and
+    /// re-register this handle as an ordinary shared opener.
+    pub fn release_exclusive(&mut self, exclusive: File) {
+        drop(exclusive);
+        self.restore_shared();
+    }
+
+    fn restore_shared(&mut self) {
+        match Self::acquire_shared(&self.path) {
+            Ok(shared) => self.shared = shared,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "database opener lease could not be re-registered; checkpoints stay disabled"
+                );
+                self.shared = None;
+            }
+        }
+    }
+}
+
 /// Acquire the stable JSONL-family authority honored by no-DB sessions.
 pub fn blocking_jsonl_family_write_lock_with_timeout(
     jsonl_path: &Path,
@@ -23537,5 +23708,90 @@ mod tests {
             Some(stable_hash.as_str()),
             "content hash excludes the id, so a pure id swap must not move it"
         );
+    }
+
+    /// GH #457/#460/#461 caller-side containment: the exclusive opener hold
+    /// is refused while a peer holds the shared lease, a refused probe leaves
+    /// the shared registration in place, and a released hold rejoins it.
+    #[test]
+    fn opener_lease_refuses_exclusive_while_a_peer_is_registered() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut first = DatabaseOpenerLease::register(&db_path).unwrap();
+        assert!(first.is_registered());
+        let second = DatabaseOpenerLease::register(&db_path).unwrap();
+        assert!(second.is_registered());
+
+        assert!(
+            first.try_exclusive().is_none(),
+            "a registered peer must veto the exclusive hold"
+        );
+        assert!(
+            first.is_registered(),
+            "a refused probe must restore the shared registration"
+        );
+
+        drop(second);
+        let hold = first
+            .try_exclusive()
+            .expect("the sole opener takes the exclusive hold");
+        assert!(!first.is_registered());
+        first.release_exclusive(hold);
+        assert!(first.is_registered());
+    }
+
+    /// A newcomer waits out an in-flight exclusive hold instead of opening a
+    /// database whose WAL is being reset, then registers once it is released.
+    #[test]
+    fn opener_lease_newcomer_waits_for_an_exclusive_hold_to_end() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut holder = DatabaseOpenerLease::register(&db_path).unwrap();
+        let hold = holder.try_exclusive().expect("sole opener");
+
+        let newcomer_path = db_path.clone();
+        let newcomer = thread::spawn(move || {
+            let started = Instant::now();
+            let lease = DatabaseOpenerLease::register(&newcomer_path).unwrap();
+            (lease.is_registered(), started.elapsed())
+        });
+        thread::sleep(Duration::from_millis(200));
+        holder.release_exclusive(hold);
+
+        let (registered, waited) = newcomer.join().unwrap();
+        assert!(
+            registered,
+            "newcomer must register after the hold is released"
+        );
+        assert!(
+            waited >= Duration::from_millis(150),
+            "newcomer must have waited for the exclusive hold, waited {waited:?}"
+        );
+        assert!(holder.is_registered());
+    }
+
+    /// `checkpoint_full` is vetoed while another handle has the same persistent
+    /// database open and runs again once that handle is gone.
+    #[test]
+    fn storage_checkpoint_is_skipped_while_a_peer_has_the_database_open() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut writer = SqliteStorage::open(&db_path).unwrap();
+        let peer = SqliteStorage::open(&db_path).unwrap();
+
+        let error = writer
+            .checkpoint_full()
+            .expect_err("a peer opener must veto the checkpoint");
+        assert!(
+            error
+                .to_string()
+                .contains("another br process has the database open"),
+            "{error}"
+        );
+
+        drop(peer);
+        writer
+            .checkpoint_full()
+            .expect("the sole opener checkpoints normally");
     }
 }

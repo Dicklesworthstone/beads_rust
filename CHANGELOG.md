@@ -27,6 +27,17 @@ the Windows doctor/long-path defects.
 
 ### Storage safety and recovery
 
+- WAL checkpoints now run only when br can prove it is the sole opener of
+  the database. Every persistent open holds a shared `.br-db-openers-*.lock`
+  lease next to the database; the periodic PASSIVE checkpoint, the
+  quiescent-point TRUNCATE, and the exit-time TRUNCATE first upgrade that
+  lease to exclusive and are skipped when another process has the database
+  open, while new openers wait out an in-flight checkpoint. FrankenSQLite's
+  multi-process checkpoint does not yet register peer read snapshots
+  (FrankenSQLite #399/#385), and a checkpoint racing another short-lived br
+  process is the interleaving behind the page-aliasing corruption in #457,
+  #460, and #461; the same engine reproducer shows concurrent processes that
+  never checkpoint stay clean.
 - Force-import and recovery re-read every imported issue inside the
   transaction and compare normalized semantic fields, so field shifts or an
   unaddressable source ID fail before publication.

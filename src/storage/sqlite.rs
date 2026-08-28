@@ -1364,6 +1364,11 @@ pub struct SqliteStorage {
     write_authority: Option<Arc<crate::sync::DatabaseFamilyWriteLock>>,
     /// Track mutations to trigger periodic WAL checkpoints.
     mutation_count: u32,
+    /// Shared registration as an opener of the persistent database. Held for
+    /// the lifetime of this handle so any br process can tell whether it is
+    /// the sole opener before running a WAL checkpoint (see
+    /// [`crate::sync::DatabaseOpenerLease`]). `None` for ephemeral databases.
+    opener_lease: Option<crate::sync::DatabaseOpenerLease>,
     /// When set, this storage owns an ephemeral on-disk temp database (created
     /// by [`SqliteStorage::open_memory`]) that must be unlinked — together with
     /// its WAL/SHM/journal sidecars — when the connection is dropped. FrankenSQLite
@@ -1398,6 +1403,16 @@ pub struct SqliteStorage {
     /// command layer immediately after success, so warnings cannot leak into
     /// an unrelated command.
     last_capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
+}
+
+/// Outcome of [`SqliteStorage::admit_checkpoint`].
+enum CheckpointAdmission {
+    /// This process is the only opener; the exclusive opener hold (if the
+    /// database is persistent) must be returned through
+    /// [`SqliteStorage::release_checkpoint_admission`].
+    Sole(Option<std::fs::File>),
+    /// Another process has the database open; no checkpoint may run.
+    PeersPresent,
 }
 
 /// Context for a mutation operation, tracking side effects.
@@ -2356,6 +2371,9 @@ impl SqliteStorage {
         // Authority-aware startup/recovery callers use
         // `open_with_timeout_under_write_authority` below.
         preflight_effective_schema_before_writable_open(path)?;
+        // Register as an opener before the engine open so this process never
+        // starts reading a WAL that a peer's exclusive checkpoint is resetting.
+        let opener_lease = Some(crate::sync::DatabaseOpenerLease::register(path)?);
         let conn = Connection::open(path.to_string_lossy().into_owned())?;
 
         // Keep SQLite's busy handler aligned with the caller's requested
@@ -2421,6 +2439,7 @@ impl SqliteStorage {
             mutation_count: 0,
             temp_db_path: None,
             pending_event_attribution: None,
+            opener_lease,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
             workflow_transition_policy: crate::close_policy::Workflow::default(),
             last_capacity_warnings: Vec::new(),
@@ -2464,6 +2483,7 @@ impl SqliteStorage {
         if namespace_sidecar_mode_repair_required(path)? {
             return Ok(None);
         }
+        let opener_lease = Some(crate::sync::DatabaseOpenerLease::register(path)?);
         let conn = open_with_flags(
             path.to_string_lossy().as_ref(),
             OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -2483,6 +2503,7 @@ impl SqliteStorage {
             mutation_count: 0,
             temp_db_path: None,
             pending_event_attribution: None,
+            opener_lease,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
             workflow_transition_policy: crate::close_policy::Workflow::default(),
             last_capacity_warnings: Vec::new(),
@@ -2537,6 +2558,7 @@ impl SqliteStorage {
                 message: "Token-bound reconciliation requires authority-gated fsqlite namespace sidecar repair before opening the database".to_string(),
             });
         }
+        let opener_lease = Some(crate::sync::DatabaseOpenerLease::register(path)?);
         let conn = open_with_flags(
             path.to_string_lossy().as_ref(),
             OpenFlags::SQLITE_OPEN_READ_WRITE,
@@ -2556,6 +2578,7 @@ impl SqliteStorage {
             mutation_count: 0,
             temp_db_path: None,
             pending_event_attribution: None,
+            opener_lease,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
             workflow_transition_policy: crate::close_policy::Workflow::default(),
             last_capacity_warnings: Vec::new(),
@@ -2626,6 +2649,7 @@ impl SqliteStorage {
             mutation_count: 0,
             temp_db_path: Some(path.to_path_buf()),
             pending_event_attribution: None,
+            opener_lease: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
             workflow_transition_policy: crate::close_policy::Workflow::default(),
             last_capacity_warnings: Vec::new(),
@@ -3442,7 +3466,7 @@ impl SqliteStorage {
     /// Attempt a WAL checkpoint (PASSIVE mode) to flush WAL back to the main
     /// database file. Errors are logged but do not propagate — checkpoint
     /// failure is non-fatal and will be retried on the next interval.
-    fn try_wal_checkpoint(&self) {
+    fn try_wal_checkpoint(&mut self) {
         // Issue #219: TRUNCATE mode requires an exclusive lock, which blocks
         // all concurrent readers and writers.  Under parallel agent operations
         // this was a major source of "database is busy" errors.  PASSIVE mode
@@ -3450,6 +3474,20 @@ impl SqliteStorage {
         // so it never blocks other connections.  The WAL file may grow slightly
         // larger between checkpoints, but journal_size_limit (set in
         // apply_runtime_pragmas) caps it.
+        let hold = match self.admit_checkpoint() {
+            CheckpointAdmission::Sole(hold) => hold,
+            CheckpointAdmission::PeersPresent => {
+                tracing::debug!(
+                    "Skipping periodic WAL checkpoint: another process has the database open"
+                );
+                return;
+            }
+        };
+        self.passive_checkpoint_as_sole_opener();
+        self.release_checkpoint_admission(hold);
+    }
+
+    fn passive_checkpoint_as_sole_opener(&self) {
         if let Err(e) = self.verify_attached_database_authority() {
             tracing::warn!(error = %e, "Skipping WAL checkpoint after database authority changed");
             return;
@@ -3458,6 +3496,34 @@ impl SqliteStorage {
             tracing::debug!(error = %e, "WAL checkpoint failed (non-fatal, will retry later)");
         } else if let Err(e) = self.verify_attached_database_authority() {
             tracing::warn!(error = %e, "Database authority changed during WAL checkpoint");
+        }
+    }
+
+    /// Prove this process is the only opener of the persistent database
+    /// before a WAL checkpoint.
+    ///
+    /// FrankenSQLite's multi-process checkpoint does not yet register against
+    /// peer processes' read snapshots (FrankenSQLite #399/#385), so a
+    /// checkpoint run while another `br` has the database open is the
+    /// interleaving behind the page-aliasing corruption in GitHub
+    /// #457/#460/#461. Ephemeral databases have no peers and are always
+    /// admitted.
+    fn admit_checkpoint(&mut self) -> CheckpointAdmission {
+        match self.opener_lease.as_mut() {
+            None => CheckpointAdmission::Sole(None),
+            Some(lease) => lease
+                .try_exclusive()
+                .map_or(CheckpointAdmission::PeersPresent, |hold| {
+                    CheckpointAdmission::Sole(Some(hold))
+                }),
+        }
+    }
+
+    /// Hand back the exclusive opener hold taken by [`Self::admit_checkpoint`]
+    /// and rejoin the shared opener registration.
+    fn release_checkpoint_admission(&mut self, hold: Option<std::fs::File>) {
+        if let (Some(lease), Some(hold)) = (self.opener_lease.as_mut(), hold) {
+            lease.release_exclusive(hold);
         }
     }
 
@@ -3474,9 +3540,27 @@ impl SqliteStorage {
     ///
     /// # Errors
     ///
-    /// Returns an error only if even a PASSIVE checkpoint fails. TRUNCATE
-    /// failure is downgraded to a warning because it is best-effort.
-    pub(crate) fn checkpoint_full(&self) -> Result<()> {
+    /// Returns an error when another process has the database open (no
+    /// checkpoint is attempted at all; see [`Self::admit_checkpoint`]) or if
+    /// even a PASSIVE checkpoint fails. TRUNCATE failure is downgraded to a
+    /// warning because it is best-effort.
+    pub(crate) fn checkpoint_full(&mut self) -> Result<()> {
+        let hold = match self.admit_checkpoint() {
+            CheckpointAdmission::Sole(hold) => hold,
+            CheckpointAdmission::PeersPresent => {
+                return Err(BeadsError::Config(
+                    "WAL checkpoint skipped: another br process has the database open \
+                     (FrankenSQLite checkpoints are only safe for a sole opener)"
+                        .to_string(),
+                ));
+            }
+        };
+        let result = self.checkpoint_full_as_sole_opener();
+        self.release_checkpoint_admission(hold);
+        result
+    }
+
+    fn checkpoint_full_as_sole_opener(&self) -> Result<()> {
         self.verify_attached_database_authority()?;
         if let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
             tracing::debug!(
@@ -19873,13 +19957,29 @@ impl Drop for SqliteStorage {
         // (`crate::shutdown`) returns from main without re-entering
         // `with_write_transaction` — get one final TRUNCATE here so WAL
         // frames are not stranded on disk after the process ends (#270).
-        if self.mutation_count > 0
-            && let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        {
-            tracing::debug!(error = %e, "WAL checkpoint on drop failed (non-fatal)");
+        //
+        // The checkpoint runs only while this process provably is the sole
+        // opener; the exclusive opener hold is kept until the connection is
+        // closed so no peer starts reading a WAL this teardown is resetting.
+        let mut exit_hold = None;
+        if self.mutation_count > 0 {
+            match self.admit_checkpoint() {
+                CheckpointAdmission::Sole(hold) => {
+                    exit_hold = hold;
+                    if let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
+                        tracing::debug!(error = %e, "WAL checkpoint on drop failed (non-fatal)");
+                    }
+                }
+                CheckpointAdmission::PeersPresent => {
+                    tracing::debug!(
+                        "Skipping exit WAL checkpoint: another process has the database open"
+                    );
+                }
+            }
         }
         // Explicitly close the connection to avoid fsqlite drop_close warnings.
         let _ = self.conn.close_in_place();
+        drop(exit_hold);
         // Ephemeral temp databases (open_memory) are unlinked here, after the
         // connection is closed, so the file and its WAL/SHM/journal sidecars are
         // not left behind in TMPDIR (#299). Persistent databases have
@@ -33612,6 +33712,7 @@ mod tests {
             mutation_count: 0,
             temp_db_path: None,
             pending_event_attribution: None,
+            opener_lease: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
             workflow_transition_policy: crate::close_policy::Workflow::default(),
             last_capacity_warnings: Vec::new(),

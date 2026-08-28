@@ -3069,7 +3069,7 @@ fn compact_database_via_vacuum_into_in_place_under_write_authority(
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn compact_database_via_vacuum_into_in_place_with_reopener(
-    storage: SqliteStorage,
+    mut storage: SqliteStorage,
     db_path: &Path,
     lock_timeout: Option<u64>,
     write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
