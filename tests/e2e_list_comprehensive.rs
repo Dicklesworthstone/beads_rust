@@ -1159,8 +1159,8 @@ fn e2e_list_custom_type() {
 }
 
 /// Regression for GitHub #463: text-mode `br list --limit N` with no other
-/// filter used an `INDEXED BY` hint that stock SQLite could not honor, so the
-/// command failed with "internal error: no query solution".
+/// filter used an `INDEXED BY` hint the planner could refuse, so the command
+/// failed with "internal error: no query solution".
 #[test]
 fn e2e_list_limit_text_output_without_status_filter() {
     let _log = common::test_log("e2e_list_limit_text_output_without_status_filter");
