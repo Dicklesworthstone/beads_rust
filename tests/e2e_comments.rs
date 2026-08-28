@@ -107,6 +107,38 @@ fn e2e_comments_add_multiple_verify_order() {
         add3.stderr
     );
 
+    // Regression for #461: each `comments add` auto-flush must preserve the
+    // earlier comment rows instead of repeating the newest row into every
+    // pre-existing slot. Validate the published ledger directly so agreement
+    // between two damaged query surfaces cannot make this test pass.
+    let jsonl = std::fs::read_to_string(workspace.root.join(".beads/issues.jsonl"))
+        .expect("read issues.jsonl");
+    let exported_issue = jsonl
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("parse JSONL issue"))
+        .find(|issue| issue["id"].as_str() == Some(id.as_str()))
+        .expect("find commented issue in JSONL");
+    let exported_comments = exported_issue["comments"]
+        .as_array()
+        .expect("comments array");
+    let exported_ids: Vec<i64> = exported_comments
+        .iter()
+        .map(|comment| comment["id"].as_i64().expect("numeric comment id"))
+        .collect();
+    let exported_bodies: Vec<&str> = exported_comments
+        .iter()
+        .map(|comment| comment["text"].as_str().expect("comment body"))
+        .collect();
+    assert_eq!(exported_ids.len(), 3);
+    assert!(
+        exported_ids.windows(2).all(|pair| pair[0] != pair[1]),
+        "comment ids must remain distinct in JSONL: {exported_ids:?}"
+    );
+    assert_eq!(
+        exported_bodies,
+        ["First comment", "Second comment", "Third comment"]
+    );
+
     // List comments in JSON format to verify order
     let list = run_br(&workspace, ["comments", "list", &id, "--json"], "list_json");
     assert!(list.status.success(), "list json failed: {}", list.stderr);

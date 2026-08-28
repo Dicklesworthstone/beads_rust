@@ -27,13 +27,17 @@ shared value/error types.
 ### Storage safety and recovery
 
 - The synchronous storage facade now uses bundled stock SQLite. This removes
-  the corrupting runtime path reported in #457 and #458 without changing the
-  `SqliteStorage` or sync architecture.
+  the corrupting runtime path reported in #457, #458, and #460 without
+  changing the `SqliteStorage` or sync architecture.
 - Force-import and recovery re-read every imported issue inside the
   transaction and compare normalized semantic fields, so field shifts or an
   unaddressable source ID fail before publication.
 - Byte-identical duplicate comments in a damaged export are deduplicated for
   recovery; conflicting duplicates still fail closed.
+- Repeated `comments add` exports preserve every prior comment ID and body;
+  stock-SQLite regression coverage reads the published JSONL directly so
+  duplicated newest-comment rows cannot pass through cross-store agreement
+  (#461).
 - `show` checks the immutable JSONL ID set before reporting a missing partial
   ID, preventing corrupt lookup state from masquerading as a normal miss.
 - History byte-budget pruning now removes only verified snapshot/metadata
