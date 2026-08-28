@@ -357,7 +357,16 @@ fn symlink_escape_for_existing_ancestor(
         let target = std::fs::read_link(ancestor)
             .map(|target| resolve_symlink_target_for_validation(ancestor, &target))
             .unwrap_or_else(|_| ancestor.to_path_buf());
-        if !path_within(&target, canonical_beads) {
+        // Judge where the *candidate* lands once this ancestor is followed,
+        // not where the ancestor alone points. A symlinked ancestor above the
+        // workspace (macOS `/var` -> `/private/var`, `/tmp` -> `/private/tmp`,
+        // a symlinked home) re-roots the whole path inside the canonical
+        // beads directory and is fine; a symlink that carries the candidate
+        // outside it is the escape this check exists for (beads_rust-rr1s).
+        let remainder = path.strip_prefix(ancestor).unwrap_or(Path::new(""));
+        let rerooted = target.join(remainder);
+        let rerooted = normalize_path_lexically(&rerooted).unwrap_or(rerooted);
+        if !path_within(&rerooted, canonical_beads) {
             return Some(PathValidation::SymlinkEscape {
                 path: ancestor.to_path_buf(),
                 target,
@@ -3398,6 +3407,48 @@ mod tests {
         assert!(
             matches!(result, PathValidation::NonRegularFile { .. }),
             "internal relative symlink should be rejected as non-regular, not as an escape: {result:?}"
+        );
+    }
+
+    /// beads_rust-rr1s: a symlinked ancestor *above* the workspace (macOS
+    /// `/var` -> `/private/var`, `/tmp` -> `/private/tmp`) re-roots the
+    /// candidate inside the canonical beads directory and must be allowed,
+    /// while a symlinked ancestor that carries the candidate elsewhere stays
+    /// rejected.
+    #[cfg(unix)]
+    #[test]
+    fn test_symlinked_ancestor_above_workspace_is_not_an_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("create temp dir");
+        let real_root = temp.path().join("real");
+        let real_beads = real_root.join(".beads");
+        std::fs::create_dir_all(&real_beads).expect("create real beads dir");
+        std::fs::write(real_beads.join("issues.jsonl"), "{}\n").expect("write jsonl");
+        let link_root = temp.path().join("link");
+        symlink(&real_root, &link_root).expect("symlink workspace root");
+
+        let linked_beads = link_root.join(".beads");
+        let result = validate_sync_path(&linked_beads.join("issues.jsonl"), &linked_beads);
+        assert!(
+            result.is_allowed(),
+            "a workspace reached through a symlinked ancestor must validate: {result:?}"
+        );
+        let new_file = validate_sync_path(&linked_beads.join("fresh.jsonl"), &linked_beads);
+        assert!(
+            new_file.is_allowed(),
+            "a not-yet-created file under the symlinked workspace must validate: {new_file:?}"
+        );
+
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join(".beads")).expect("create elsewhere");
+        let stray_link = temp.path().join("stray");
+        symlink(&elsewhere, &stray_link).expect("symlink elsewhere");
+        let stray =
+            validate_sync_path(&stray_link.join(".beads").join("issues.jsonl"), &real_beads);
+        assert!(
+            !stray.is_allowed(),
+            "a symlinked ancestor leading outside the beads dir must still be rejected: {stray:?}"
         );
     }
 
