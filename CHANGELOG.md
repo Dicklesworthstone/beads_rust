@@ -42,6 +42,13 @@ shared value/error types.
   ID, preventing corrupt lookup state from masquerading as a normal miss.
 - History byte-budget pruning now removes only verified snapshot/metadata
   pairs and refuses mismatched evidence.
+- Text-mode `list --limit N` with no other filter no longer fails with
+  `internal error: no query solution`: the paged list query dropped an
+  `INDEXED BY` hint that stock SQLite cannot honor, and spells its template
+  predicate so the planner can still use the partial list index (#463).
+- `scripts/br-stress.sh` runs the multi-process mixed workload that exposed
+  #457 against a copy of a real `.beads/` family and fails on any integrity,
+  count, recovery-artifact, or doctor regression.
 
 ### Windows doctor and sync maintenance
 
@@ -51,6 +58,15 @@ shared value/error types.
 - Creating the `.doctor/latest` convenience link is best effort when Windows
   returns `ERROR_PRIVILEGE_NOT_HELD`; run-directory receipts remain canonical,
   and undo discovers them without relying on the link (#456).
+- Doctor run-directory, report, and mutate durability steps no longer open a
+  directory handle for fsync on Windows, which always fails with
+  `ERROR_ACCESS_DENIED` and turned every `doctor --repair` into an
+  `os error 5` refusal there (#450, #456).
+- Long workspace paths on Windows: database and `VACUUM INTO` targets whose
+  absolute path nears `MAX_PATH` are handed to SQLite in extended-length
+  (`\\?\`) form, and sync path validation compares plain and extended-length
+  spellings as the same location instead of rejecting `.beads/issues.jsonl`
+  as outside its own directory (#462).
 - Additive `sync --reconcile` gained hash-bound dry-run/apply receipts,
   source-path migration integration, and expanded history/preflight coverage.
 
