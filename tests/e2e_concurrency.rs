@@ -14,6 +14,7 @@ use beads_rust::franken_sync::Connection;
 use common::dataset_registry::{DatasetRegistry, IsolatedDataset, KnownDataset};
 use fsqlite_types::SqliteValue;
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::path::Path;
 use std::path::PathBuf;
@@ -3008,6 +3009,16 @@ fn e2e_parallel_mixed_db_commands_preserve_sqlite_integrity() {
 
 /// Regression for #460: repeated writers touching an issue whose description
 /// spans SQLite overflow pages must not lose the issue or damage the freelist.
+fn overflow_page_description() -> String {
+    let mut description = String::with_capacity(15_000);
+    let payload = "abcdef0123456789".repeat(8);
+    for index in 0..96 {
+        writeln!(description, "overflow-page-line-{index:04}: {payload}")
+            .expect("writing to a String cannot fail");
+    }
+    description
+}
+
 #[test]
 fn e2e_parallel_writes_preserve_large_description_and_freelist() {
     let _log = common::test_log("e2e_parallel_writes_preserve_large_description_and_freelist");
@@ -3018,14 +3029,7 @@ fn e2e_parallel_writes_preserve_large_description_and_freelist() {
     let init = run_br_in_dir(&root, ["init"]);
     assert!(init.success, "init failed: {}", init.stderr);
 
-    let description = (0..96)
-        .map(|index| {
-            format!(
-                "overflow-page-line-{index:04}: {}\n",
-                "abcdef0123456789".repeat(8)
-            )
-        })
-        .collect::<String>();
+    let description = overflow_page_description();
     assert!(description.len() > 14_000);
 
     let created = run_br_in_dir(
