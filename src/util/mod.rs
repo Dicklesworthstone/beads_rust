@@ -226,6 +226,57 @@ pub fn sync_directory_best_effort(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Longest path the legacy Win32 file APIs accept without the extended-length
+/// prefix: `MAX_PATH` (260) less the terminating NUL and the longest sidecar
+/// suffix (`-journal`) SQLite appends to a database name.
+#[cfg(windows)]
+pub const WINDOWS_LEGACY_PATH_BUDGET: usize = 260 - 1 - "-journal".len();
+
+/// The spelling of `path` for callers that reach Win32 directly.
+///
+/// Rust's standard library transparently upgrades long paths to the Windows
+/// extended-length (`\\?\`) form, but raw `MoveFileExW` calls and SQLite's
+/// Win32 VFS pass the exact bytes they are given to the kernel, so a path
+/// that nears `MAX_PATH` fails with `ERROR_PATH_NOT_FOUND` (GitHub #462).
+/// Long absolute disk and UNC paths are rewritten to the extended-length
+/// form; every other path — and every path on non-Windows targets — is
+/// returned unchanged so error messages keep the operator's own spelling.
+#[cfg(windows)]
+#[must_use]
+pub fn windows_extended_length_path(path: &Path) -> PathBuf {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::{Component, Prefix};
+
+    if path.as_os_str().is_empty() {
+        return path.to_path_buf();
+    }
+    let Ok(absolute) = std::path::absolute(path) else {
+        return path.to_path_buf();
+    };
+    if absolute.as_os_str().encode_wide().count() <= WINDOWS_LEGACY_PATH_BUDGET {
+        return path.to_path_buf();
+    }
+    let Some(Component::Prefix(prefix)) = absolute.components().next() else {
+        return path.to_path_buf();
+    };
+    let spelled = absolute.as_os_str().to_string_lossy();
+    match prefix.kind() {
+        // `std::path::absolute` resolves `.`/`..` and normalizes separators,
+        // which is exactly the shape the verbatim prefix requires.
+        Prefix::Disk(_) => PathBuf::from(format!(r"\\?\{spelled}")),
+        Prefix::UNC(..) => PathBuf::from(format!(r"\\?\UNC\{}", &spelled[2..])),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Identity off Windows: there is no extended-length spelling to apply.
+#[cfg(not(windows))]
+#[inline]
+#[must_use]
+pub fn windows_extended_length_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> io::Result<()> {
     fs::File::open(path)?.sync_all()

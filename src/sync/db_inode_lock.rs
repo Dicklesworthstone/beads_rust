@@ -136,6 +136,9 @@ pub fn rename_database_candidate_no_replace(
     use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
 
     fn nul_terminated(path: &std::path::Path) -> std::io::Result<Vec<u16>> {
+        // `MoveFileExW` gets these bytes verbatim, so a long workspace path
+        // needs the extended-length spelling here (#462).
+        let path = crate::util::windows_extended_length_path(path);
         let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
         if encoded.contains(&0) {
             return Err(std::io::Error::new(

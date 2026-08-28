@@ -218,55 +218,20 @@ fn map_error(error: rusqlite::Error, path: &Path) -> FrankenError {
     }
 }
 
-/// Longest path SQLite's Win32 VFS can open without the extended-length
-/// prefix: `MAX_PATH` (260) less the terminating NUL and the longest sidecar
-/// suffix (`-journal`) SQLite appends to the main database name.
-#[cfg(windows)]
-const WINDOWS_LEGACY_PATH_BUDGET: usize = 260 - 1 - "-journal".len();
-
 /// The spelling of `path` handed to the SQLite engine.
 ///
-/// Rust's standard library transparently upgrades long paths to the Windows
-/// extended-length (`\\?\`) form, but SQLite's Win32 VFS passes the exact
-/// bytes it is given to `CreateFileW`, so a database (or `VACUUM INTO`
-/// target) whose absolute path nears `MAX_PATH` fails with
-/// `ERROR_PATH_NOT_FOUND` (GitHub #462). Long absolute disk and UNC paths are
-/// rewritten to the extended-length form; every other path — and every path
-/// on non-Windows targets — is returned unchanged so error messages and
-/// sidecar names keep the operator's own spelling.
-#[cfg(windows)]
+/// SQLite's Win32 VFS passes the exact bytes it is given to `CreateFileW`, so
+/// a database (or `VACUUM INTO` target) whose absolute path nears `MAX_PATH`
+/// fails with `ERROR_PATH_NOT_FOUND` (GitHub #462). Long Windows paths are
+/// therefore rewritten to the extended-length (`\\?\`) form via
+/// [`crate::util::windows_extended_length_path`]; `:memory:`, shorter paths,
+/// and every path on non-Windows targets are returned unchanged.
 #[must_use]
 pub fn engine_path(path: &Path) -> PathBuf {
-    use std::os::windows::ffi::OsStrExt;
-    use std::path::{Component, Prefix};
-
-    if path == Path::new(":memory:") || path.as_os_str().is_empty() {
+    if path == Path::new(":memory:") {
         return path.to_path_buf();
     }
-    let Ok(absolute) = std::path::absolute(path) else {
-        return path.to_path_buf();
-    };
-    if absolute.as_os_str().encode_wide().count() <= WINDOWS_LEGACY_PATH_BUDGET {
-        return path.to_path_buf();
-    }
-    let Some(Component::Prefix(prefix)) = absolute.components().next() else {
-        return path.to_path_buf();
-    };
-    let spelled = absolute.as_os_str().to_string_lossy();
-    match prefix.kind() {
-        // `std::path::absolute` resolves `.`/`..` and normalizes separators,
-        // which is exactly the shape the verbatim prefix requires.
-        Prefix::Disk(_) => PathBuf::from(format!(r"\\?\{spelled}")),
-        Prefix::UNC(..) => PathBuf::from(format!(r"\\?\UNC\{}", &spelled[2..])),
-        _ => path.to_path_buf(),
-    }
-}
-
-/// The spelling of `path` handed to the SQLite engine (identity off Windows).
-#[cfg(not(windows))]
-#[must_use]
-pub fn engine_path(path: &Path) -> PathBuf {
-    path.to_path_buf()
+    crate::util::windows_extended_length_path(path)
 }
 
 fn immutable_read_only_uri(path: &Path) -> String {
@@ -677,7 +642,7 @@ mod tests {
 
         let long_dir = format!(r"C:\{}", r"segment\".repeat(40));
         let long_db = format!(r"{long_dir}.beads\beads.db");
-        assert!(long_db.len() > WINDOWS_LEGACY_PATH_BUDGET);
+        assert!(long_db.len() > crate::util::WINDOWS_LEGACY_PATH_BUDGET);
         assert_eq!(
             engine_path(Path::new(&long_db)),
             Path::new(&format!(r"\\?\{long_db}"))

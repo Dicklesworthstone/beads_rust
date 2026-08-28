@@ -64,7 +64,9 @@ shared value/error types.
   `os error 5` refusal there (#450, #456).
 - Long workspace paths on Windows: database and `VACUUM INTO` targets whose
   absolute path nears `MAX_PATH` are handed to SQLite in extended-length
-  (`\\?\`) form, and sync path validation compares plain and extended-length
+  (`\\?\`) form, br's own no-replace `MoveFileExW` renames (fresh-database
+  install, recovery staging, base-snapshot publication) use the same
+  spelling, and sync path validation compares plain and extended-length
   spellings as the same location instead of rejecting `.beads/issues.jsonl`
   as outside its own directory (#462).
 - Additive `sync --reconcile` gained hash-bound dry-run/apply receipts,
