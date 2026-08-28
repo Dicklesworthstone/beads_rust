@@ -8013,6 +8013,9 @@ impl SqliteStorage {
                 break;
             }
 
+            // `is_template = 0` (not the `OR IS NULL` spelling) so stock
+            // SQLite can serve this from `idx_issues_list_active_order`; see
+            // `list_text_issues_by_priority_window` (#463).
             let sql = format!(
                 r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                          status, priority, issue_type, assignee, owner, estimated_minutes,
@@ -8023,7 +8026,7 @@ impl SqliteStorage {
                          sender, ephemeral, pinned, is_template, source_repo_path, agent_context
                   FROM issues
                   WHERE {status_filter}
-                    AND (is_template = 0 OR is_template IS NULL)
+                    AND is_template = 0
                     AND priority = ?
                   ORDER BY created_at DESC, id ASC
                   LIMIT {remaining}"
@@ -8131,11 +8134,19 @@ impl SqliteStorage {
             }
 
             let query_limit = remaining.saturating_add(offset);
+            // Spell the template predicate as the bare `is_template = 0` so the
+            // planner can prove it implies `idx_issues_list_active_order`'s
+            // partial-index predicate: `is_template` is `NOT NULL`, so stock
+            // SQLite folds `is_template IS NULL` to a constant at resolve time
+            // and the `(… OR is_template IS NULL)` spelling no longer matches
+            // the index's stored predicate. No `INDEXED BY`: when the planner
+            // cannot use a hinted index it fails the whole statement with
+            // "no query solution" instead of picking another plan (#463).
             let rows = self.conn.query_with_params(
                 "SELECT id, title, status, priority, issue_type, created_at, updated_at
-                 FROM issues INDEXED BY idx_issues_list_active_order
+                 FROM issues
                  WHERE status NOT IN ('closed', 'tombstone')
-                   AND (is_template = 0 OR is_template IS NULL)
+                   AND is_template = 0
                    AND priority = ?
                  ORDER BY created_at DESC, id ASC
                  LIMIT ?",

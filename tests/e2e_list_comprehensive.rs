@@ -1157,3 +1157,55 @@ fn e2e_list_custom_type() {
         "no issues should match custom type filter"
     );
 }
+
+/// Regression for GitHub #463: text-mode `br list --limit N` with no other
+/// filter used an `INDEXED BY` hint that stock SQLite could not honor, so the
+/// command failed with "internal error: no query solution".
+#[test]
+fn e2e_list_limit_text_output_without_status_filter() {
+    let _log = common::test_log("e2e_list_limit_text_output_without_status_filter");
+    let (workspace, ids) = setup_diverse_workspace();
+
+    let list = run_br(&workspace, ["list", "--limit", "1"], "list_limit_text");
+    assert!(
+        list.status.success(),
+        "list --limit 1 failed: {}\n{}",
+        list.stderr,
+        list.stdout
+    );
+    let shown = ids.iter().filter(|id| list.stdout.contains(*id)).count();
+    assert_eq!(shown, 1, "expected exactly one issue row:\n{}", list.stdout);
+
+    let paged = run_br(
+        &workspace,
+        ["list", "--limit", "2", "--offset", "1"],
+        "list_limit_offset_text",
+    );
+    assert!(
+        paged.status.success(),
+        "list --limit 2 --offset 1 failed: {}",
+        paged.stderr
+    );
+    let shown = ids.iter().filter(|id| paged.stdout.contains(*id)).count();
+    assert_eq!(
+        shown, 2,
+        "expected exactly two issue rows:\n{}",
+        paged.stdout
+    );
+
+    let unlimited = run_br(&workspace, ["list"], "list_default_text");
+    assert!(
+        unlimited.status.success(),
+        "bare list failed: {}",
+        unlimited.stderr
+    );
+    let shown = ids
+        .iter()
+        .filter(|id| unlimited.stdout.contains(*id))
+        .count();
+    assert!(
+        shown > 2,
+        "bare list should show every visible issue:\n{}",
+        unlimited.stdout
+    );
+}
