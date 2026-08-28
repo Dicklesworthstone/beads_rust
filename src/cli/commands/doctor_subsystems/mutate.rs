@@ -554,14 +554,11 @@ fn now_ns() -> u128 {
 /// kernel-side tmpfs configurations) reject fsync on a directory; we
 /// treat `InvalidInput` as best-effort and only propagate genuine
 /// I/O faults so a perfectly successful mutate is not turned into a
-/// false negative.
+/// false negative. Windows has no directory fsync (opening a directory
+/// handle fails with `ERROR_ACCESS_DENIED`, #450), so the step is
+/// skipped there.
 fn fsync_dir(dir: &Path) -> std::io::Result<()> {
-    let d = fs::File::open(dir)?;
-    match d.sync_all() {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
-        Err(e) => Err(e),
-    }
+    crate::util::sync_directory_best_effort(dir)
 }
 
 /// The single disk-mutation chokepoint for `br doctor --repair`.

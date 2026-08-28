@@ -249,6 +249,29 @@ fn strip_verbatim_prefix_lexically(path: &Path) -> PathBuf {
     simplified
 }
 
+/// Whether `candidate` is `ancestor` or lies inside it, ignoring the Windows
+/// extended-length (`\\?\`) spelling on either side.
+///
+/// `dunce::canonicalize` only drops the verbatim prefix when the result is
+/// representable as a legacy path, so once a `.beads/` path nears `MAX_PATH`
+/// the directory can canonicalize to `C:\…` while a longer file inside it
+/// canonicalizes to `\\?\C:\…`; a byte-wise prefix check then rejects a
+/// legitimate member as outside the directory (GitHub #462). The comparison
+/// stays lexical: nothing here touches the filesystem.
+#[cfg(windows)]
+pub(crate) fn path_within(candidate: &Path, ancestor: &Path) -> bool {
+    candidate.starts_with(ancestor)
+        || strip_verbatim_prefix_lexically(candidate)
+            .starts_with(strip_verbatim_prefix_lexically(ancestor))
+}
+
+/// Off Windows there is no verbatim spelling, so this is `Path::starts_with`.
+#[cfg(not(windows))]
+#[inline]
+pub(crate) fn path_within(candidate: &Path, ancestor: &Path) -> bool {
+    candidate.starts_with(ancestor)
+}
+
 /// One shared spelling for authority-path comparisons (#413).
 ///
 /// Windows mixes lexically absolute pinned routes
@@ -334,7 +357,7 @@ fn symlink_escape_for_existing_ancestor(
         let target = std::fs::read_link(ancestor)
             .map(|target| resolve_symlink_target_for_validation(ancestor, &target))
             .unwrap_or_else(|_| ancestor.to_path_buf());
-        if !target.starts_with(canonical_beads) {
+        if !path_within(&target, canonical_beads) {
             return Some(PathValidation::SymlinkEscape {
                 path: ancestor.to_path_buf(),
                 target,
@@ -495,8 +518,8 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
     }
 
     if had_parent_dir
-        && !normalized_path.starts_with(beads_dir)
-        && !normalized_path.starts_with(&canonical_beads)
+        && !path_within(&normalized_path, beads_dir)
+        && !path_within(&normalized_path, &canonical_beads)
     {
         let result = PathValidation::TraversalAttempt {
             path: path.to_path_buf(),
@@ -537,8 +560,8 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
             // For non-existent files, we can't canonicalize, so check prefix
             if !normalized_path.exists() {
                 // Check if the path starts with the beads directory
-                if normalized_path.starts_with(beads_dir)
-                    || normalized_path.starts_with(&canonical_beads)
+                if path_within(&normalized_path, beads_dir)
+                    || path_within(&normalized_path, &canonical_beads)
                 {
                     return validate_extension_and_name(&normalized_path);
                 }
@@ -561,7 +584,7 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
         && let Ok(target) = std::fs::read_link(&normalized_path)
     {
         let canonical_target = resolve_symlink_target_for_validation(&normalized_path, &target);
-        if !canonical_target.starts_with(&canonical_beads) {
+        if !path_within(&canonical_target, &canonical_beads) {
             let result = PathValidation::SymlinkEscape {
                 path: path.to_path_buf(),
                 target: canonical_target,
@@ -612,7 +635,7 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
         canonical_path.join(normalized_path.file_name().unwrap_or_default())
     };
 
-    if !effective_canonical.starts_with(&canonical_beads) {
+    if !path_within(&effective_canonical, &canonical_beads) {
         let result = PathValidation::OutsideBeadsDir {
             path: path.to_path_buf(),
             beads_dir: canonical_beads,
@@ -779,12 +802,12 @@ pub fn validate_sync_path_with_external(
     // plain `.beads` still classifies internal instead of being refused as
     // external (#413). Like the lexical widening above, this only routes into
     // the *stricter* internal branch, which re-validates the path itself.
-    let is_internal = path.starts_with(beads_dir)
-        || path.starts_with(&canonical_beads)
-        || resolved_path.starts_with(beads_dir)
-        || resolved_path.starts_with(&canonical_beads)
+    let is_internal = path_within(path, beads_dir)
+        || path_within(path, &canonical_beads)
+        || path_within(&resolved_path, beads_dir)
+        || path_within(&resolved_path, &canonical_beads)
         || normalized_resolved.as_deref().is_some_and(|normalized| {
-            normalized.starts_with(beads_dir) || normalized.starts_with(&canonical_beads)
+            path_within(normalized, beads_dir) || path_within(normalized, &canonical_beads)
         })
         || authority_path_within(&resolved_path, beads_dir);
 
@@ -898,10 +921,10 @@ pub fn require_safe_sync_overwrite_path(
     // As in `validate_sync_path_with_external`, the shared-spelling disjunct
     // keeps Windows verbatim/8.3 descendants of a plain `.beads` in the
     // stricter internal branch instead of refusing them as external (#413).
-    let is_internal = resolved_path.starts_with(beads_dir)
-        || resolved_path.starts_with(&canonical_beads)
-        || path.starts_with(beads_dir)
-        || path.starts_with(&canonical_beads)
+    let is_internal = path_within(&resolved_path, beads_dir)
+        || path_within(&resolved_path, &canonical_beads)
+        || path_within(path, beads_dir)
+        || path_within(path, &canonical_beads)
         || authority_path_within(&resolved_path, beads_dir);
 
     if is_internal {
@@ -983,14 +1006,14 @@ pub fn validate_temp_file_path(
     let canonical_beads =
         dunce::canonicalize(beads_dir).unwrap_or_else(|_| beads_dir.to_path_buf());
     let temp_is_external =
-        !temp_path.starts_with(beads_dir) && !temp_path.starts_with(&canonical_beads);
+        !path_within(temp_path, beads_dir) && !path_within(temp_path, &canonical_beads);
     let safe_temp = if temp_is_external {
         external_path_descriptor(temp_path)
     } else {
         temp_path.display().to_string()
     };
     let target_is_external =
-        !target_path.starts_with(beads_dir) && !target_path.starts_with(&canonical_beads);
+        !path_within(target_path, beads_dir) && !path_within(target_path, &canonical_beads);
     let safe_target = if target_is_external {
         external_path_descriptor(target_path)
     } else {
@@ -2978,6 +3001,54 @@ mod tests {
             strip_verbatim_prefix_lexically(Path::new(r"\\.\PIPE\name")),
             Path::new(r"\\.\PIPE\name")
         );
+    }
+
+    /// #462: a verbatim (`\\?\`) member of a plain directory — the shape
+    /// `dunce::canonicalize` produces once a long `.beads/` path crosses
+    /// `MAX_PATH` — is still inside that directory, in either spelling
+    /// combination, while genuinely external routes stay outside.
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_within_ignores_verbatim_prefix_on_either_side() {
+        let plain_dir = Path::new(r"C:\repo\.beads");
+        let verbatim_dir = Path::new(r"\\?\C:\repo\.beads");
+        let plain_member = Path::new(r"C:\repo\.beads\issues.jsonl");
+        let verbatim_member = Path::new(r"\\?\C:\repo\.beads\issues.jsonl");
+
+        assert!(path_within(verbatim_member, plain_dir));
+        assert!(path_within(plain_member, verbatim_dir));
+        assert!(path_within(verbatim_member, verbatim_dir));
+        assert!(path_within(plain_member, plain_dir));
+        assert!(path_within(plain_dir, plain_dir));
+
+        assert!(!path_within(
+            Path::new(r"\\?\C:\repo\.beads2\x.jsonl"),
+            plain_dir
+        ));
+        assert!(!path_within(
+            Path::new(r"C:\elsewhere\issues.jsonl"),
+            verbatim_dir
+        ));
+        assert!(!path_within(
+            Path::new(r"\\?\UNC\server\share\issues.jsonl"),
+            plain_dir
+        ));
+    }
+
+    /// Off Windows there is no verbatim spelling, so `path_within` is exactly
+    /// `Path::starts_with`.
+    #[cfg(not(windows))]
+    #[test]
+    fn path_within_matches_starts_with_off_windows() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let member = beads_dir.join("issues.jsonl");
+        assert!(path_within(&member, &beads_dir));
+        assert!(path_within(&beads_dir, &beads_dir));
+        assert!(!path_within(&beads_dir, &member));
+        assert!(!path_within(
+            Path::new("/definitely/elsewhere.jsonl"),
+            &beads_dir
+        ));
     }
 
     #[cfg(any(unix, windows))]

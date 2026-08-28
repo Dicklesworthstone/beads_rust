@@ -218,15 +218,71 @@ fn map_error(error: rusqlite::Error, path: &Path) -> FrankenError {
     }
 }
 
+/// Longest path SQLite's Win32 VFS can open without the extended-length
+/// prefix: `MAX_PATH` (260) less the terminating NUL and the longest sidecar
+/// suffix (`-journal`) SQLite appends to the main database name.
+#[cfg(windows)]
+const WINDOWS_LEGACY_PATH_BUDGET: usize = 260 - 1 - "-journal".len();
+
+/// The spelling of `path` handed to the SQLite engine.
+///
+/// Rust's standard library transparently upgrades long paths to the Windows
+/// extended-length (`\\?\`) form, but SQLite's Win32 VFS passes the exact
+/// bytes it is given to `CreateFileW`, so a database (or `VACUUM INTO`
+/// target) whose absolute path nears `MAX_PATH` fails with
+/// `ERROR_PATH_NOT_FOUND` (GitHub #462). Long absolute disk and UNC paths are
+/// rewritten to the extended-length form; every other path — and every path
+/// on non-Windows targets — is returned unchanged so error messages and
+/// sidecar names keep the operator's own spelling.
+#[cfg(windows)]
+#[must_use]
+pub fn engine_path(path: &Path) -> PathBuf {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::{Component, Prefix};
+
+    if path == Path::new(":memory:") || path.as_os_str().is_empty() {
+        return path.to_path_buf();
+    }
+    let Ok(absolute) = std::path::absolute(path) else {
+        return path.to_path_buf();
+    };
+    if absolute.as_os_str().encode_wide().count() <= WINDOWS_LEGACY_PATH_BUDGET {
+        return path.to_path_buf();
+    }
+    let Some(Component::Prefix(prefix)) = absolute.components().next() else {
+        return path.to_path_buf();
+    };
+    let spelled = absolute.as_os_str().to_string_lossy();
+    match prefix.kind() {
+        // `std::path::absolute` resolves `.`/`..` and normalizes separators,
+        // which is exactly the shape the verbatim prefix requires.
+        Prefix::Disk(_) => PathBuf::from(format!(r"\\?\{spelled}")),
+        Prefix::UNC(..) => PathBuf::from(format!(r"\\?\UNC\{}", &spelled[2..])),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// The spelling of `path` handed to the SQLite engine (identity off Windows).
+#[cfg(not(windows))]
+#[must_use]
+pub fn engine_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
 fn immutable_read_only_uri(path: &Path) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
-    let absolute_path = if path.is_absolute() {
-        path.to_path_buf()
+    let engine = engine_path(path);
+    let absolute_path = if engine.is_absolute() {
+        engine
     } else {
-        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+        std::env::current_dir().map_or_else(|_| engine.clone(), |cwd| cwd.join(&engine))
     };
     let path = absolute_path.to_string_lossy();
+    // An extended-length spelling must reach the VFS byte-for-byte, so its
+    // backslashes are percent-encoded instead of being rewritten as `/`.
+    #[cfg(windows)]
+    let verbatim = path.starts_with(r"\\?\");
     let mut uri = String::with_capacity(path.len() + 32);
     uri.push_str("file:");
     for byte in path.bytes() {
@@ -235,7 +291,7 @@ fn immutable_read_only_uri(path: &Path) -> String {
                 uri.push(char::from(byte));
             }
             #[cfg(windows)]
-            b'\\' => uri.push('/'),
+            b'\\' if !verbatim => uri.push('/'),
             #[cfg(windows)]
             b':' => uri.push(':'),
             _ => {
@@ -270,7 +326,7 @@ impl Connection {
         let inner = if path == Path::new(":memory:") {
             rusqlite::Connection::open_in_memory()
         } else {
-            rusqlite::Connection::open(&path)
+            rusqlite::Connection::open(engine_path(&path))
         }
         .map_err(|error| map_error(error, &path))?;
         Ok(Self {
@@ -460,14 +516,14 @@ impl PreparedStatement<'_> {
 pub mod compat {
     use std::path::{Path, PathBuf};
 
-    use super::{Connection, FrankenError, immutable_read_only_uri, map_error};
+    use super::{Connection, FrankenError, engine_path, immutable_read_only_uri, map_error};
 
     pub use rusqlite::OpenFlags;
 
     /// Open a database with explicit flags.
     pub fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection, FrankenError> {
         let path = PathBuf::from(path);
-        let inner = rusqlite::Connection::open_with_flags(&path, flags)
+        let inner = rusqlite::Connection::open_with_flags(engine_path(&path), flags)
             .map_err(|error| map_error(error, &path))?;
         Ok(Connection::from_inner(inner, path))
     }
@@ -592,5 +648,86 @@ mod tests {
         assert!(conn.execute("INSERT INTO t VALUES (8)").is_err());
         conn.close().expect("close reader");
         assert_eq!(directory_names(), before);
+    }
+
+    /// Off Windows the engine spelling is the operator's own spelling.
+    #[cfg(not(windows))]
+    #[test]
+    fn engine_path_is_identity_off_windows() {
+        let long = format!("/tmp/{}/beads.db", "segment/".repeat(60));
+        assert_eq!(engine_path(Path::new(&long)), Path::new(&long));
+        assert_eq!(
+            engine_path(Path::new("relative.db")),
+            Path::new("relative.db")
+        );
+        assert_eq!(engine_path(Path::new(":memory:")), Path::new(":memory:"));
+    }
+
+    /// #462: only paths that would overflow `MAX_PATH` (with room for
+    /// SQLite's `-journal` sidecar suffix) are upgraded to the extended-length
+    /// form; short paths, relative spellings, and `:memory:` keep their bytes.
+    #[cfg(windows)]
+    #[test]
+    fn engine_path_upgrades_only_long_windows_paths() {
+        assert_eq!(engine_path(Path::new(":memory:")), Path::new(":memory:"));
+        assert_eq!(
+            engine_path(Path::new(r"C:\repo\.beads\beads.db")),
+            Path::new(r"C:\repo\.beads\beads.db")
+        );
+
+        let long_dir = format!(r"C:\{}", r"segment\".repeat(40));
+        let long_db = format!(r"{long_dir}.beads\beads.db");
+        assert!(long_db.len() > WINDOWS_LEGACY_PATH_BUDGET);
+        assert_eq!(
+            engine_path(Path::new(&long_db)),
+            Path::new(&format!(r"\\?\{long_db}"))
+        );
+
+        let long_unc = format!(r"\\server\share\{}beads.db", r"segment\".repeat(40));
+        assert_eq!(
+            engine_path(Path::new(&long_unc)),
+            Path::new(&format!(r"\\?\UNC\{}", &long_unc[2..]))
+        );
+
+        let already_verbatim = format!(r"\\?\{long_db}");
+        assert_eq!(
+            engine_path(Path::new(&already_verbatim)),
+            Path::new(&already_verbatim)
+        );
+
+        let uri = immutable_read_only_uri(Path::new(&long_db));
+        assert!(uri.starts_with("file:%5C%5C%3F%5CC:%5C"), "{uri}");
+        assert!(uri.ends_with("?mode=ro&immutable=1"), "{uri}");
+        assert!(!uri[5..uri.len() - "?mode=ro&immutable=1".len()].contains('?'));
+    }
+
+    /// A database whose absolute path is well past `MAX_PATH` opens, writes,
+    /// and reopens through the extended-length engine spelling (#462).
+    #[cfg(windows)]
+    #[test]
+    fn long_windows_database_path_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut deep = dir.path().to_path_buf();
+        while deep.as_os_str().len() < 300 {
+            deep.push("a-long-directory-segment-name");
+        }
+        std::fs::create_dir_all(&deep).expect("create deep directory");
+        let db = deep.join("beads.db");
+
+        let conn = Connection::open(db.to_string_lossy().into_owned()).expect("open long path");
+        conn.execute("CREATE TABLE t (k INTEGER)").expect("create");
+        conn.execute("INSERT INTO t VALUES (7)").expect("insert");
+        conn.close().expect("close");
+
+        let reader = compat::open_read_only_immutable(&db).expect("immutable open");
+        assert_eq!(
+            reader
+                .query_row("SELECT k FROM t")
+                .expect("query")
+                .get(0)
+                .and_then(SqliteValue::as_integer),
+            Some(7)
+        );
+        reader.close().expect("close reader");
     }
 }

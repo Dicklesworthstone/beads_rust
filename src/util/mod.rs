@@ -206,6 +206,26 @@ fn parent_for_directory_sync(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
+/// Best-effort directory fsync for audit and report directories.
+///
+/// Filesystems that reject directory fsync outright (some tmpfs
+/// configurations report `InvalidInput`) are tolerated so a successful write
+/// is not turned into a false failure. Non-Unix targets have no portable
+/// directory fsync at all: on Windows `File::open` on a directory fails with
+/// `ERROR_ACCESS_DENIED` (GitHub #450, #456), so the step is skipped there
+/// exactly as [`sync_parent_directory`] skips it.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error for genuine faults other than
+/// `InvalidInput`.
+pub fn sync_directory_best_effort(path: &Path) -> io::Result<()> {
+    match sync_directory(path) {
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        result => result,
+    }
+}
+
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> io::Result<()> {
     fs::File::open(path)?.sync_all()

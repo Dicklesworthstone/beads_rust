@@ -41,7 +41,7 @@
 
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -397,13 +397,12 @@ fn ensure_doctor_in_gitignore(repo_root: &Path) -> Result<(), BeadsError> {
     Ok(())
 }
 
+/// Best-effort directory fsync after a rename into `dir`. Skipped on
+/// Windows, where opening a directory handle for `FlushFileBuffers` fails
+/// with `ERROR_ACCESS_DENIED` and turned every repeated `--repair` into an
+/// `os error 5` failure (#450, #456).
 fn fsync_dir(dir: &Path) -> Result<(), BeadsError> {
-    let file = fs::File::open(dir).map_err(BeadsError::Io)?;
-    match file.sync_all() {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == ErrorKind::InvalidInput => Ok(()),
-        Err(e) => Err(BeadsError::Io(e)),
-    }
+    crate::util::sync_directory_best_effort(dir).map_err(BeadsError::Io)
 }
 
 /// Write `<run-dir>/undo.sh` — a pure-bash fallback that reads

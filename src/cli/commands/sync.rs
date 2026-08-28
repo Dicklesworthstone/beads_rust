@@ -1862,7 +1862,7 @@ fn validate_operator_requested_sync_path(beads_dir: &Path, jsonl_path: &Path) ->
         };
         let canonical_target =
             dunce::canonicalize(&absolute_target).unwrap_or_else(|_| absolute_target.clone());
-        if !canonical_target.starts_with(&canonical_beads) {
+        if !crate::sync::path::path_within(&canonical_target, &canonical_beads) {
             return Err(BeadsError::Config(format!(
                 "Refusing to use JSONL path through symlink escaping .beads: {} -> {}",
                 candidate.display(),

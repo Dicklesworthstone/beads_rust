@@ -1880,14 +1880,9 @@ fn mark_report_undone(run_dir_path: &Path, run_id: &str) -> Result<()> {
 /// Fsync a directory entry so a freshly-renamed file is durable across
 /// power loss. Best-effort: filesystems that reject directory fsync
 /// (some tmpfs variants) are tolerated by treating InvalidInput as
-/// success.
+/// success, and Windows (no directory fsync, #450) skips the step.
 fn fsync_report_dir(dir: &Path) -> Result<()> {
-    let file = fs::File::open(dir).map_err(BeadsError::Io)?;
-    match file.sync_all() {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
-        Err(e) => Err(BeadsError::Io(e)),
-    }
+    crate::util::sync_directory_best_effort(dir).map_err(BeadsError::Io)
 }
 
 fn now_ns() -> u128 {
