@@ -6306,8 +6306,27 @@ impl SqliteStorage {
                 }
             }
 
-            let blocked_cache_plan = BlockedCacheRefreshPlan::from_context(&ctx);
+            let mut blocked_cache_plan = BlockedCacheRefreshPlan::from_context(&ctx);
             if blocked_cache_plan.is_some() {
+                // An Incremental refresh only rewrites its own connected
+                // component and then declares the WHOLE cache fresh, which is
+                // sound only if the cache was already consistent. If a prior
+                // Deferred write left the cache stale (its edge is committed
+                // but not yet in blocked_issues_cache), an Incremental refresh
+                // would clear the stale marker while that earlier change is
+                // still missing — reporting a blocked issue as ready. Upgrade
+                // to a Full rebuild in that case (Full is always correct), so
+                // "the next non-deferred write rebuilds the cache" holds.
+                if matches!(
+                    blocked_cache_plan,
+                    Some(BlockedCacheRefreshPlan::Incremental(_))
+                ) && Self::metadata_equals(
+                    &storage.conn,
+                    BLOCKED_CACHE_STATE_KEY,
+                    BLOCKED_CACHE_STATE_STALE,
+                )? {
+                    blocked_cache_plan = Some(BlockedCacheRefreshPlan::Full);
+                }
                 storage.set_metadata_in_tx(BLOCKED_CACHE_STATE_KEY, BLOCKED_CACHE_STATE_STALE)?;
             }
 
@@ -28107,6 +28126,46 @@ mod tests {
         assert_eq!(
             count, 1,
             "stale cache entry should persist (reads must not mutate cache)"
+        );
+    }
+
+    #[test]
+    fn test_incremental_refresh_after_deferred_write_rebuilds_fully() {
+        // Regression: an Incremental blocked-cache refresh only recomputes its
+        // own parent-child component but then declares the whole cache fresh.
+        // If a prior Deferred write left the cache stale (its blocking edge is
+        // committed but not yet in blocked_issues_cache), an unrelated
+        // Incremental write must NOT clear the stale marker while that earlier
+        // change is still missing — it must upgrade to a Full rebuild.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for (id, title) in [("bd-x", "X"), ("bd-y", "Y"), ("bd-z", "Z"), ("bd-w", "W")] {
+            let issue = make_issue(id, title, Status::Open, 2, None, Utc::now(), None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        // A "blocks" dependency uses the Deferred plan: commits the edge and
+        // marks the cache stale, but does NOT write blocked_issues_cache.
+        storage
+            .add_dependency("bd-x", "bd-y", "blocks", "tester")
+            .unwrap();
+        assert!(
+            storage.blocked_cache_marked_stale().unwrap(),
+            "add_dependency must leave the cache stale"
+        );
+
+        // An UNRELATED set_parent uses the Incremental plan. bd-x is outside
+        // bd-z/bd-w's parent-child component, so a naive incremental refresh
+        // would clear the stale marker with bd-x still absent from the cache.
+        storage.set_parent("bd-z", Some("bd-w"), "tester").unwrap();
+
+        assert!(
+            !storage.blocked_cache_marked_stale().unwrap(),
+            "the incremental-after-deferred write should have fully rebuilt and cleared stale"
+        );
+        assert!(
+            storage.is_blocked("bd-x").unwrap(),
+            "bd-x must still be reported blocked by open bd-y after the unrelated \
+             incremental write (regression: incremental cleared stale with bd-x missing)"
         );
     }
 
