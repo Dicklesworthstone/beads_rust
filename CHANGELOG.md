@@ -15,6 +15,29 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
+## v0.5.5 -- 2026-08-29 (Release)
+
+Engine fix for the multi-process page-aliasing corruption. br moves to
+FrankenSQLite 0.3.12, which fixes the root cause end-to-end; the caller-side
+containment from v0.5.4 stays in place as defense in depth.
+
+### Storage safety
+
+- Bumped the FrankenSQLite family to **0.3.12**. The engine now registers each
+  on-disk read transaction as a cross-process WAL reader (a `WAL_READ_LOCK`
+  slot with its pinned frame published to `aReadMark`) and gates the WAL
+  checkpoint reset on the peer-reader horizon: a `wal_checkpoint(TRUNCATE)` no
+  longer resets the WAL out from under a peer process mid-read, and a peer's
+  commit-fold no longer reclaims live pages across a WAL-generation boundary.
+  This is the root-cause fix for the page-aliasing corruption in #457, #458,
+  #460, and #461 (FrankenSQLite #399 / #385 leaf-1). Verified: the
+  concurrent-process TRUNCATE-checkpoint discriminator that reproduced this now
+  runs every round clean with stock `integrity_check` ok (it corrupted in round
+  0 before the fix); the multi-process `scripts/br-stress.sh` gate stays clean
+  on the 0.3.12 engine.
+- br's sole-opener checkpoint containment (v0.5.4) is retained as defense in
+  depth; the two protections are independent.
+
 ## v0.5.4 -- 2026-08-28 (Release)
 
 Storage-safety and Windows follow-up. Real migrated workspaces exposed
