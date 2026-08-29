@@ -729,6 +729,12 @@ impl Issue {
             || self.ephemeral != other.ephemeral
             || self.pinned != other.pinned
             || self.is_template != other.is_template
+            // Inherited governance context (beads_rust#297): a live,
+            // JSONL-serialized payload field, so an agent_context-only change
+            // must count as a difference. Omitting it here silently dropped a
+            // peer's context update during three-way merge / import de-dup
+            // (persisted_import_issue_equals had to re-add it as a workaround).
+            || self.agent_context != other.agent_context
         {
             return false;
         }
@@ -1678,6 +1684,30 @@ mod tests {
 
         assert!(!issue1.sync_equals(&issue2));
         assert!(!issue2.sync_equals(&issue1));
+    }
+
+    #[test]
+    fn test_issue_sync_equals_detects_agent_context_changes() {
+        // beads_rust#297: an agent_context-only change is a real payload
+        // difference; if sync_equals ignored it, three-way merge / import
+        // de-dup would silently drop a peer's inherited-context update.
+        let mut issue1 = create_test_issue();
+        issue1.agent_context = Some(r#"{"constraints":["no network"]}"#.to_string());
+
+        let mut issue2 = issue1.clone();
+        issue2.agent_context = Some(r#"{"constraints":["offline only"]}"#.to_string());
+        assert!(!issue1.sync_equals(&issue2));
+        assert!(!issue2.sync_equals(&issue1));
+
+        // Setting vs. clearing the field is also a difference.
+        let mut issue3 = issue1.clone();
+        issue3.agent_context = None;
+        assert!(!issue1.sync_equals(&issue3));
+        assert!(!issue3.sync_equals(&issue1));
+
+        // Identical agent_context still compares equal.
+        let issue4 = issue1.clone();
+        assert!(issue1.sync_equals(&issue4));
     }
 
     #[test]
