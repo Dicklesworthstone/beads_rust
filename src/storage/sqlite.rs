@@ -16878,8 +16878,16 @@ fn checked_database_header_user_version(path: &Path) -> Result<Option<u32>> {
     ])))
 }
 
-#[cfg(test)]
-fn database_header_user_version(path: &Path) -> Option<u32> {
+/// Best-effort, engine-free read of the checkpointed schema `user_version`
+/// from the SQLite file header.
+///
+/// Returns `None` when the path is absent, is not a SQLite database, is too
+/// short to carry a header, or cannot be read — this never surfaces an error,
+/// so it is safe for the `br doctor health` sub-200 ms tripwire (#464), which
+/// must not open the engine or fail. Reports the *checkpointed* header value;
+/// callers that need the WAL-resident effective version use
+/// [`effective_database_user_version`] instead.
+pub(crate) fn database_header_user_version(path: &Path) -> Option<u32> {
     checked_database_header_user_version(path).ok().flatten()
 }
 

@@ -45,6 +45,8 @@ use crate::cli::{
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
+use crate::storage::schema::CURRENT_SCHEMA_VERSION;
+use crate::storage::sqlite::database_header_user_version;
 
 #[cfg(unix)]
 fn metadata_mode(metadata: &fs::Metadata) -> u32 {
@@ -363,6 +365,15 @@ pub struct HealthOutput {
     pub merge_artifacts_present: bool,
     pub orphan_write_lock: bool,
     pub orphan_sync_lock: bool,
+    /// Checkpointed schema `user_version` read from the database file header,
+    /// or `None` when there is no readable SQLite database to probe (#464).
+    pub schema_user_version: Option<u32>,
+    /// Schema version this binary requires ([`CURRENT_SCHEMA_VERSION`]).
+    pub schema_expected: i32,
+    /// `false` when a database is present but its header schema version is a
+    /// non-zero value other than [`CURRENT_SCHEMA_VERSION`] — mutations refuse
+    /// such a database even though the file exists.
+    pub schema_compatible: bool,
     pub elapsed_ms: u128,
     /// One-line summary suitable for stdout.
     pub line: String,
@@ -403,6 +414,9 @@ fn build_health_output(repo_root: &Path, start: Instant) -> HealthOutput {
             merge_artifacts_present: false,
             orphan_write_lock: false,
             orphan_sync_lock: false,
+            schema_user_version: None,
+            schema_expected: CURRENT_SCHEMA_VERSION,
+            schema_compatible: true,
             elapsed_ms: start.elapsed().as_millis(),
             line,
         };
@@ -411,6 +425,25 @@ fn build_health_output(repo_root: &Path, start: Instant) -> HealthOutput {
     let db = beads.join("beads.db");
     let db_present = db.is_file();
     let jsonl_present = beads.join("issues.jsonl").is_file() || beads.join("beads.jsonl").is_file();
+
+    // Engine-free schema-version tripwire (#464): a database file can exist yet
+    // carry a schema version this binary refuses to mutate ("Schema version
+    // mismatch: expected N, found M"). Read the checkpointed header version
+    // (no engine open, well under the 200 ms budget) and treat any present,
+    // non-zero value other than CURRENT_SCHEMA_VERSION as an incompatibility so
+    // `health` no longer reports "healthy" on a tracker that rejects every
+    // write. A value of 0 (no user_version set) stays indeterminate.
+    let schema_expected = CURRENT_SCHEMA_VERSION;
+    let schema_user_version = if db_present {
+        database_header_user_version(&db)
+    } else {
+        None
+    };
+    let schema_incompatible = matches!(
+        schema_user_version,
+        Some(found) if found != 0 && i64::from(found) != i64::from(schema_expected)
+    );
+    let schema_compatible = !schema_incompatible;
 
     // MERGE_* artifacts indicate a torn previous merge.
     let merge_artifacts_present = match fs::read_dir(&beads) {
@@ -426,7 +459,8 @@ fn build_health_output(repo_root: &Path, start: Instant) -> HealthOutput {
     let orphan_write_lock = beads.join(".write.lock").exists();
     let orphan_sync_lock = beads.join(".sync.lock").exists();
 
-    let findings_present = !db_present || !jsonl_present || merge_artifacts_present;
+    let findings_present =
+        !db_present || !jsonl_present || merge_artifacts_present || schema_incompatible;
 
     let (status, exit_code) = if findings_present {
         ("findings_present", DoctorExitCode::FindingsPresent.as_i32())
@@ -440,9 +474,18 @@ fn build_health_output(repo_root: &Path, start: Instant) -> HealthOutput {
         "{status}  br={ver} doctor=1 db={db} jsonl={jsonl}",
         status = status,
         ver = env!("CARGO_PKG_VERSION"),
-        db = if db_present { "ok" } else { "missing" },
+        db = if !db_present {
+            "missing"
+        } else if schema_incompatible {
+            "schema_incompatible"
+        } else {
+            "ok"
+        },
         jsonl = if jsonl_present { "ok" } else { "missing" },
     );
+    if schema_incompatible && let Some(found) = schema_user_version {
+        line.push_str(&format!(" schema={found}/{schema_expected}"));
+    }
     if merge_artifacts_present {
         line.push_str(" merge_artifacts=present");
     }
@@ -463,6 +506,9 @@ fn build_health_output(repo_root: &Path, start: Instant) -> HealthOutput {
         merge_artifacts_present,
         orphan_write_lock,
         orphan_sync_lock,
+        schema_user_version,
+        schema_expected,
+        schema_compatible,
         elapsed_ms: start.elapsed().as_millis(),
         line,
     }
@@ -2121,6 +2167,84 @@ mod tests {
         assert!(!output.orphan_sync_lock);
         assert!(output.line.contains("merge_artifacts=present"));
         assert!(output.line.contains("write_lock=present"));
+    }
+
+    #[test]
+    fn doctor_health_flags_schema_incompatible_database() {
+        // #464: a database file that exists but carries a schema version this
+        // binary refuses to mutate ("Schema version mismatch: expected N,
+        // found M") must not read as "healthy" — agents gate on this tripwire.
+        let tmp = unique_temp_root("health-schema-stale");
+        let repo = tmp.path();
+        let beads = repo.join(".beads");
+        fs::create_dir_all(&beads).unwrap();
+        let db_path = beads.join("beads.db");
+        {
+            let storage = crate::storage::SqliteStorage::open(&db_path).unwrap();
+            storage.execute_raw("PRAGMA user_version = 15").unwrap();
+        }
+        fs::write(beads.join("issues.jsonl"), b"").unwrap();
+
+        let output = build_health_output(repo, Instant::now());
+
+        assert_eq!(
+            output.schema_user_version,
+            Some(15),
+            "checkpointed header schema version must be read"
+        );
+        assert_eq!(output.schema_expected, CURRENT_SCHEMA_VERSION);
+        assert!(
+            !output.schema_compatible,
+            "schema 15 is incompatible with {CURRENT_SCHEMA_VERSION}"
+        );
+        assert_eq!(output.status, "findings_present");
+        assert_ne!(output.exit_code, 0, "must not exit healthy on a stale schema");
+        assert!(output.db_present, "the database file is present");
+        assert!(
+            output.line.contains("db=schema_incompatible"),
+            "line: {}",
+            output.line
+        );
+        assert!(
+            output
+                .line
+                .contains(&format!("schema=15/{CURRENT_SCHEMA_VERSION}")),
+            "line: {}",
+            output.line
+        );
+    }
+
+    #[test]
+    fn doctor_health_accepts_current_schema_database() {
+        // Guard against a false positive: a genuine current-schema database
+        // must still read as healthy (the header probe returns the expected
+        // version, not a spurious mismatch).
+        let tmp = unique_temp_root("health-schema-ok");
+        let repo = tmp.path();
+        let beads = repo.join(".beads");
+        fs::create_dir_all(&beads).unwrap();
+        let db_path = beads.join("beads.db");
+        {
+            // A fresh database is created at CURRENT_SCHEMA_VERSION.
+            let _storage = crate::storage::SqliteStorage::open(&db_path).unwrap();
+        }
+        fs::write(beads.join("issues.jsonl"), b"").unwrap();
+
+        let output = build_health_output(repo, Instant::now());
+
+        assert_eq!(
+            output.schema_user_version,
+            u32::try_from(CURRENT_SCHEMA_VERSION).ok(),
+            "fresh database must report the current schema version"
+        );
+        assert!(output.schema_compatible);
+        assert_eq!(output.status, "healthy");
+        assert!(output.line.contains("db=ok"), "line: {}", output.line);
+        assert!(
+            !output.line.contains("schema="),
+            "no schema token when compatible: {}",
+            output.line
+        );
     }
 
     #[test]
