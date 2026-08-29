@@ -14,7 +14,7 @@ This changelog is organized by capability rather than diff order. Each version s
 - Release links: `https://github.com/Dicklesworthstone/beads_rust/releases/tag/<TAG>`
 
 **Scope window:** every version from inception (v0.1.0, 2026-01-18) through the current
-release (v0.5.6, 2026-08-29). The full per-version detail is in the sections
+release (v0.5.7, 2026-08-29). The full per-version detail is in the sections
 below; the timeline names the recent line and the milestone anchors.
 
 ## Version Timeline
@@ -23,6 +23,7 @@ Recent line (0.5.x — storage-safety and the multi-process corruption program):
 
 | Version | Date | Kind | Headline |
 |---|---|---|---|
+| [v0.5.7](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.7) | 2026-08-29 | Release | `doctor health` schema-incompatibility tripwire (#464); FrankenSQLite 0.3.13 reader-slot follow-up |
 | [v0.5.6](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.6) | 2026-08-29 | Release | Review-round correctness/hygiene fixes (agent_context merge, blocked-cache, temp-sidecar leak) |
 | [v0.5.5](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.5) | 2026-08-29 | Release | FrankenSQLite 0.3.12 engine fix (cross-process WAL reader registration) for the page-aliasing corruption |
 | [v0.5.4](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.4) | 2026-08-28 | Release | Sole-opener WAL checkpoint containment; Windows doctor/long-path fixes; #463 query fix |
@@ -47,6 +48,7 @@ The commits to inspect first for the current storage-safety program (the
 multi-process page-aliasing corruption and its fallout), newest first. Full
 per-version detail is in the sections below.
 
+- [8b504e5c](https://github.com/Dicklesworthstone/beads_rust/commit/8b504e5c) — `br doctor health` reads the schema `user_version` from the database header (engine-free) and reports `db=schema_incompatible` (exit 1) instead of `healthy` on a tracker that refuses every mutation, #464 (v0.5.7).
 - [6a6839f9](https://github.com/Dicklesworthstone/beads_rust/commit/6a6839f9) — `sync_equals` now compares `agent_context`, stopping silent merge data loss (v0.5.6).
 - [e202f67b](https://github.com/Dicklesworthstone/beads_rust/commit/e202f67b) — blocked-cache: upgrade an incremental refresh to a full rebuild when already stale (v0.5.6).
 - [18840874](https://github.com/Dicklesworthstone/beads_rust/commit/18840874) — reap all FrankenSQLite sidecars for ephemeral temp databases, a #299 regression (v0.5.6).
@@ -58,6 +60,52 @@ per-version detail is in the sections below.
 The engine-side fix itself lives in FrankenSQLite (cross-repo, so not linked to
 this repo): commits `55c186682` + `5946b3b7c` in
 <https://github.com/Dicklesworthstone/frankensqlite>, shipped as fsqlite 0.3.12.
+
+---
+
+## v0.5.7 -- 2026-08-29 (Release)
+
+A doctor-consistency fix for agents plus the FrankenSQLite **0.3.13** engine
+follow-up, cut after a five-round fresh-eyes review of the 0.5.x storage-safety
+program. No schema or public-API changes.
+
+### Doctor consistency: the health schema tripwire (#464)
+
+`br doctor health` is the sub-200 ms, engine-free liveness gate agents run
+before touching a tracker. It previously reported `healthy  ... db=ok`
+(exit 0) whenever the `beads.db` file merely existed — even when the database
+carried a schema `user_version` this binary refuses to mutate ("Schema version
+mismatch: expected 17, found N"), so a "healthy" verdict could sit on a tracker
+that rejected every write.
+
+Health now reads the checkpointed schema version straight from the SQLite file
+header (a pure byte read — no engine open, still well under budget) and, when a
+present, non-zero version differs from the one this binary requires, reports
+`findings_present` (exit 1) with `db=schema_incompatible` and a
+`schema=<found>/<expected>` token, plus `schema_user_version` /
+`schema_expected` / `schema_compatible` JSON fields. A non-SQLite or unset
+header stays indeterminate, so a genuine current-schema database is never
+falsely flagged. This makes the fast tripwire agree with what `br create`/`br
+add` actually do, and points operators at `br doctor migrate-schema`.
+
+### Engine: FrankenSQLite 0.3.13
+
+Moves br to FrankenSQLite [0.3.13](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.13),
+a GH#399 follow-up that rounds out the cross-process WAL reader-slot lifecycle:
+on a failed reader-slot *release*, the engine now restores the stale slot id
+(mirroring the register path) instead of dropping it while the shm SHARED claim
+stays held. The 0.3.12 corruption fix (cross-process WAL reader registration +
+checkpoint-horizon gating) it builds on remains in place. Engine commit:
+`b1c4609d9` in <https://github.com/Dicklesworthstone/frankensqlite>.
+
+### Issue triage
+
+Independently verified and closed: **#465** (fresh `br init` + `br doctor`
+gitignore check — reconciled in v0.5.6; the init template and doctor detector
+now share one `INNER_GITIGNORE_EXPECTATIONS` list), **#428** (migrate-schema
+16→17 integrity — the migration is now two-phase and integrity-gated, and the
+engine freelist/orphaned-page corruption family is fixed; verified clean on the
+real v0.2.19 schema-16 fixture), and **#464** above.
 
 ---
 

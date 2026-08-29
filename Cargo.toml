@@ -1,6 +1,6 @@
 [package]
 name = "beads_rust"
-version = "0.5.6"
+version = "0.5.7"
 edition = "2024"
 rust-version = "1.88"
 autobenches = false
@@ -47,7 +47,7 @@ clap_complete = { version = "4.6.9", features = ["unstable-dynamic"] }
 # depends on fsqlite-ext-json internally, but the 0.3.9+ extension enables
 # only serde_json's `preserve_order`; the old viral `arbitrary_precision`
 # feature no longer affects br's JSON/TOON serializers.
-fsqlite = { version = "0.3.12", default-features = false, features = [
+fsqlite = { version = "0.3.13", default-features = false, features = [
     "native",
     "linux-asupersync-uring",
     "fts5",
@@ -55,20 +55,20 @@ fsqlite = { version = "0.3.12", default-features = false, features = [
     "icu",
     "misc",
 ] }
-fsqlite-types = "0.3.12"
-fsqlite-error = "0.3.12"
-fsqlite-core = "0.3.12"
-fsqlite-func = "0.3.12"
-fsqlite-vdbe = "0.3.12"
-fsqlite-vfs = "0.3.12"
-fsqlite-pager = "0.3.12"
-fsqlite-parser = "0.3.12"
-fsqlite-planner = "0.3.12"
-fsqlite-wal = "0.3.12"
-fsqlite-btree = "0.3.12"
-fsqlite-ast = "0.3.12"
-fsqlite-mvcc = "0.3.12"
-fsqlite-observability = "0.3.12"
+fsqlite-types = "0.3.13"
+fsqlite-error = "0.3.13"
+fsqlite-core = "0.3.13"
+fsqlite-func = "0.3.13"
+fsqlite-vdbe = "0.3.13"
+fsqlite-vfs = "0.3.13"
+fsqlite-pager = "0.3.13"
+fsqlite-parser = "0.3.13"
+fsqlite-planner = "0.3.13"
+fsqlite-wal = "0.3.13"
+fsqlite-btree = "0.3.13"
+fsqlite-ast = "0.3.13"
+fsqlite-mvcc = "0.3.13"
+fsqlite-observability = "0.3.13"
 
 # Current-thread runtime that drives fsqlite 0.3's async (!Send) futures to
 # completion behind the synchronous `franken_sync::Connection` bridge.
@@ -216,7 +216,7 @@ self_update = [
 
 # NOTE: no `[patch.crates-io]` here.
 #
-# All dependencies — fsqlite 0.3.12, its fsqlite-* transitive crates, and
+# All dependencies — fsqlite 0.3.13, its fsqlite-* transitive crates, and
 # fastmcp-rust 0.7.0 — are published on crates.io, so this crate
 # resolves everything from the registry out of the box.  That makes
 # `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked`
