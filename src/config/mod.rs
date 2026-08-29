@@ -2986,7 +2986,16 @@ pub(crate) const FSQLITE_WAL_CERT_SIDECAR_SUFFIXES: &[&str] = &["-wal-cert", "-w
 /// The classic SQLite sidecars.
 pub(crate) const CLASSIC_SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm", "-journal"];
 
-/// Every engine-managed sidecar suffix, classic and fsqlite-specific.
+/// The engine-managed sidecar suffixes produced by br's fsqlite
+/// configuration — the classic `-wal`/`-shm`/`-journal` set plus the
+/// namespace-admission and WAL-durability-certificate sidecars.
+///
+/// This is deliberately scoped to the sidecars br can actually create: it
+/// does not enumerate fsqlite suffixes gated behind features br never
+/// enables (e.g. WAL-FEC `-wal-fec*`, `-wal-seg-*` segments, or the
+/// advisory `-lock-*` files fsqlite self-removes). If br ever turns on one
+/// of those features, add its suffix here and to the coverage tests so the
+/// temp-file reaper (#299) keeps up.
 pub(crate) fn db_sidecar_suffixes() -> impl Iterator<Item = &'static &'static str> {
     CLASSIC_SIDECAR_SUFFIXES
         .iter()
