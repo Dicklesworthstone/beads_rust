@@ -23,7 +23,10 @@ enum RelativeTimeError {
 /// Returns an error if:
 /// - The time format is invalid or unrecognized
 /// - A relative duration has an invalid unit (only m, h, d, w supported)
-/// - The local time is ambiguous (e.g., during DST transitions)
+/// - The local time does not exist (the skipped hour of a DST spring-forward
+///   transition). An *ambiguous* local time (the repeated hour of a
+///   fall-back transition) is not an error: it resolves to the earlier of the
+///   two UTC instants.
 ///
 /// # Panics
 ///
