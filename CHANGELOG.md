@@ -13,7 +13,98 @@ This changelog is organized by capability rather than diff order. Each version s
 - Commit links: `https://github.com/Dicklesworthstone/beads_rust/commit/<HASH>`
 - Release links: `https://github.com/Dicklesworthstone/beads_rust/releases/tag/<TAG>`
 
+**Scope window:** every version from inception (v0.1.0, 2026-01-18) through the current
+release (v0.5.6, 2026-08-29). The full per-version detail is in the sections
+below; the timeline names the recent line and the milestone anchors.
+
+## Version Timeline
+
+Recent line (0.5.x — storage-safety and the multi-process corruption program):
+
+| Version | Date | Kind | Headline |
+|---|---|---|---|
+| [v0.5.6](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.6) | 2026-08-29 | Release | Review-round correctness/hygiene fixes (agent_context merge, blocked-cache, temp-sidecar leak) |
+| [v0.5.5](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.5) | 2026-08-29 | Release | FrankenSQLite 0.3.12 engine fix (cross-process WAL reader registration) for the page-aliasing corruption |
+| [v0.5.4](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.4) | 2026-08-28 | Release | Sole-opener WAL checkpoint containment; Windows doctor/long-path fixes; #463 query fix |
+| [v0.5.3](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.3) | 2026-08-27 | Release | Storage-correctness follow-up; adopts published FrankenSQLite 0.3.11 schema fixes |
+| v0.5.2 | 2026-08-25 | Release | Stabilization cut on the 0.5 line |
+| v0.5.1 / v0.5.0 | 2026-08-25 | Tag | Rapid 0.5 stabilization tags (no binaries) |
+
+Milestone anchors (see the per-version sections below for detail):
+
+| Version | Date | Kind | Milestone |
+|---|---|---|---|
+| [v0.4.1](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.4.1) | 2026-08-24 | Release | Windows recovery wave |
+| [v0.4.0](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.4.0) | 2026-08-22 | Release | 0.4 line |
+| [v0.3.0](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.3.0) | 2026-08-14 | Release | FrankenSQLite engine generation upgrade (0.1.18 → 0.3.1) |
+| [v0.2.22](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.2.22) | 2026-08-06 | Release | Late 0.2 stabilization |
+| [v0.2.10](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.2.10) | 2026-05-14 | Release | Mid 0.2 line |
+| v0.1.0 | 2026-01-18 | Tag | First tagged cut (inception 2026-01-15) |
+
+## Representative commits
+
+The commits to inspect first for the current storage-safety program (the
+multi-process page-aliasing corruption and its fallout), newest first. Full
+per-version detail is in the sections below.
+
+- [6a6839f9](https://github.com/Dicklesworthstone/beads_rust/commit/6a6839f9) — `sync_equals` now compares `agent_context`, stopping silent merge data loss (v0.5.6).
+- [e202f67b](https://github.com/Dicklesworthstone/beads_rust/commit/e202f67b) — blocked-cache: upgrade an incremental refresh to a full rebuild when already stale (v0.5.6).
+- [18840874](https://github.com/Dicklesworthstone/beads_rust/commit/18840874) — reap all FrankenSQLite sidecars for ephemeral temp databases, a #299 regression (v0.5.6).
+- [2327e82f](https://github.com/Dicklesworthstone/beads_rust/commit/2327e82f) — move br to FrankenSQLite 0.3.12, adopting the engine-side corruption fix (v0.5.5).
+- [dedfbed7](https://github.com/Dicklesworthstone/beads_rust/commit/dedfbed7) — sole-opener WAL checkpoint containment (v0.5.4).
+- [60ea6031](https://github.com/Dicklesworthstone/beads_rust/commit/60ea6031) — #463 partial-index / `INDEXED BY` text-list query fix (v0.5.4).
+- [4b28ee31](https://github.com/Dicklesworthstone/beads_rust/commit/4b28ee31), [2551c8b2](https://github.com/Dicklesworthstone/beads_rust/commit/2551c8b2) — Windows doctor directory-fsync + long-path handling, #450 / #456 / #462 (v0.5.4).
+
+The engine-side fix itself lives in FrankenSQLite (cross-repo, so not linked to
+this repo): commits `55c186682` + `5946b3b7c` in
+<https://github.com/Dicklesworthstone/frankensqlite>, shipped as fsqlite 0.3.12.
+
 ---
+
+## v0.5.6 -- 2026-08-29 (Release)
+
+Correctness, reliability, and resource-hygiene fixes from a deep multi-agent
+review pass over the whole codebase. No schema or public-API changes; br stays
+on FrankenSQLite 0.3.12.
+
+### Data integrity
+
+- Three-way merge and import de-duplication no longer silently drop a peer's
+  `agent_context` (the beads_rust#297 inherited-governance field). It is a live,
+  JSONL-serialized payload field but was missing from `Issue::sync_equals`, so
+  two issues differing only in `agent_context` compared equal and one blob was
+  discarded with no conflict or note; `persisted_import_issue_equals` had
+  re-added it as a workaround, confirming the omission. It is now part of the
+  equality check, with a regression test.
+  ([6a6839f9](https://github.com/Dicklesworthstone/beads_rust/commit/6a6839f9))
+- The blocked-issues cache can no longer report a blocked issue as *ready* after
+  an unrelated write. An incremental cache refresh only recomputes its own
+  parent-child component but then declared the whole cache fresh; if a prior
+  deferred write (e.g. `add_dependency`) had marked the cache stale without
+  writing the table, that change stayed missing. The mutation transaction now
+  upgrades an incremental refresh to a full rebuild whenever the cache is
+  already stale, honoring the "next non-deferred write rebuilds the cache"
+  invariant.
+  ([e202f67b](https://github.com/Dicklesworthstone/beads_rust/commit/e202f67b))
+
+### Resource hygiene
+
+- Ephemeral in-memory databases (`open_memory`) now delete every FrankenSQLite
+  sidecar on teardown, not just `-wal`/`-shm`/`-journal`. The namespace
+  (`-fsqlite-ns-gate`/`-fsqlite-ns-use`), WAL-cert (`-wal-cert`/`-wal-cert-head`),
+  and `.fsqlite-migration-state` sidecars had been leaking into `TMPDIR` (a
+  regression of the #299 cleanup — thousands of orphaned files observed); the
+  cleanup now uses the full engine sidecar set and both coverage tests assert
+  it.
+  ([18840874](https://github.com/Dicklesworthstone/beads_rust/commit/18840874))
+
+### Documentation
+
+- `parse_flexible_timestamp`'s rustdoc now correctly states that it errors on a
+  nonexistent local time (the skipped hour of a DST spring-forward) and resolves
+  an ambiguous one (the repeated hour of a fall-back) to the earlier instant,
+  instead of the reverse.
+  ([e86336a5](https://github.com/Dicklesworthstone/beads_rust/commit/e86336a5))
 
 ## v0.5.5 -- 2026-08-29 (Release)
 
@@ -584,7 +675,7 @@ the next patch version rather than rewriting that tag.
 ### Validation
 
 - Full `cargo test --all-features --no-fail-fast` on the release tree
-  (4104c31e): 21,491 passed, 0 failed (doctests included).
+  ([4104c31e](https://github.com/Dicklesworthstone/beads_rust/commit/4104c31e)): 21,491 passed, 0 failed (doctests included).
 - Release assets arch-verified per platform: the darwin_amd64 slot is a
   genuine x86_64 Mach-O built with the pinned cross target and executes
   under Rosetta; linux musl binaries are statically linked; the linux_amd64
@@ -756,8 +847,8 @@ below.
 - Read-only commands that waive auto-import and auto-flush
   (`--no-auto-import --no-auto-flush list/show/ready/...`) again bypass the
   startup writer-lock queue and open the current-schema database read-only,
-  re-landing the fast-open contract from 1b75961a that the #412 rescue
-  snapshot (251b501b) had reverted — a held `.write.lock` no longer blocks
+  re-landing the fast-open contract from [1b75961a](https://github.com/Dicklesworthstone/beads_rust/commit/1b75961a) that the #412 rescue
+  snapshot ([251b501b](https://github.com/Dicklesworthstone/beads_rust/commit/251b501b)) had reverted — a held `.write.lock` no longer blocks
   the whole read matrix, and `sync --reconcile --dry-run` proceeds under
   lock contention as documented.
 - The conservative path's implicit-migration barrier moved with it: a
