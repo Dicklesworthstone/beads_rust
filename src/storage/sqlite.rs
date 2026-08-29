@@ -16082,18 +16082,25 @@ fn finish_issue_mutation_write_probe(
     }
 }
 
-/// Best-effort removal of an ephemeral temp database and its SQLite sidecars.
+/// Best-effort removal of an ephemeral temp database and its engine sidecars.
 ///
-/// SQLite may create `-wal`, `-shm`, and `-journal` files next to the main
-/// database file; all of them must go so nothing is left in `TMPDIR` (#299).
+/// FrankenSQLite creates sidecars beside any database path it opens: the
+/// classic `-wal`/`-shm`/`-journal`, the multi-process namespace files
+/// (`-fsqlite-ns-gate`/`-fsqlite-ns-use`), the WAL-cert files
+/// (`-wal-cert`/`-wal-cert-head`), and a `.`-separated `.fsqlite-migration-state`
+/// file. All of them must go so nothing is left in `TMPDIR` (#299) — reaping
+/// only the classic three silently leaked the fsqlite-specific sidecars.
 /// Missing files are ignored; this is invoked on teardown and on a failed
 /// open, so errors are intentionally swallowed (logged at debug level).
 fn remove_temp_db_files(path: &Path) {
     let mut targets = vec![path.to_path_buf()];
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        for suffix in ["-wal", "-shm", "-journal"] {
+        for &suffix in crate::config::db_sidecar_suffixes() {
             targets.push(path.with_file_name(format!("{name}{suffix}")));
         }
+        // The migration-state sidecar is `.`-separated and is not part of
+        // `db_sidecar_suffixes()`, so append it explicitly.
+        targets.push(path.with_file_name(format!("{name}.fsqlite-migration-state")));
     }
     for target in targets {
         match std::fs::remove_file(&target) {
@@ -23478,9 +23485,18 @@ mod tests {
             .expect("temp db name");
         let leftovers: Vec<PathBuf> = std::iter::once(db_path.clone())
             .chain(
-                ["-wal", "-shm", "-journal"]
-                    .iter()
-                    .map(|s| db_path.with_file_name(format!("{name}{s}"))),
+                [
+                    "-wal",
+                    "-shm",
+                    "-journal",
+                    "-fsqlite-ns-gate",
+                    "-fsqlite-ns-use",
+                    "-wal-cert",
+                    "-wal-cert-head",
+                    ".fsqlite-migration-state",
+                ]
+                .iter()
+                .map(|s| db_path.with_file_name(format!("{name}{s}"))),
             )
             .filter(|p| p.exists())
             .collect();
@@ -23497,7 +23513,20 @@ mod tests {
     fn remove_temp_db_files_clears_all_sidecars() {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("beads_mem_test_0.db");
-        for suffix in ["", "-wal", "-shm", "-journal"] {
+        // Cover every engine-managed sidecar, not just the classic three: the
+        // fsqlite namespace / WAL-cert / migration-state files leaked before.
+        let sidecars = [
+            "",
+            "-wal",
+            "-shm",
+            "-journal",
+            "-fsqlite-ns-gate",
+            "-fsqlite-ns-use",
+            "-wal-cert",
+            "-wal-cert-head",
+            ".fsqlite-migration-state",
+        ];
+        for suffix in sidecars {
             fs::write(
                 dir.path().join(format!("beads_mem_test_0.db{suffix}")),
                 b"x",
@@ -23505,7 +23534,7 @@ mod tests {
             .unwrap();
         }
         remove_temp_db_files(&base);
-        for suffix in ["", "-wal", "-shm", "-journal"] {
+        for suffix in sidecars {
             let p = dir.path().join(format!("beads_mem_test_0.db{suffix}"));
             assert!(!p.exists(), "should have been removed: {}", p.display());
         }
