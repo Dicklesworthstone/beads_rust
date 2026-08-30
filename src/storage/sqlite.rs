@@ -18905,6 +18905,35 @@ impl SqliteStorage {
         self.insert_comment_rows_for_import(issue_id, comments)
     }
 
+    /// Delete comments owned by issues that an outer import transaction will
+    /// replace.
+    ///
+    /// Imported comment IDs are globally unique and may move between issues in
+    /// authoritative JSONL. Clearing the complete applied-owner set before any
+    /// issue is replayed makes that transfer independent of JSONL line order.
+    /// Callers must invoke this inside the same transaction that restores the
+    /// replacement rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub(crate) fn delete_comments_for_import_issue_ids_in_tx(
+        &self,
+        issue_ids: &[String],
+    ) -> Result<usize> {
+        let mut deleted = 0usize;
+        for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!("DELETE FROM comments WHERE issue_id IN ({placeholders})");
+            let params = chunk
+                .iter()
+                .map(|issue_id| SqliteValue::from(issue_id.as_str()))
+                .collect::<Vec<_>>();
+            deleted += self.conn.execute_with_params(&sql, &params)?;
+        }
+        Ok(deleted)
+    }
+
     /// Insert relation rows for an issue that was just created during import.
     ///
     /// The caller must only use this after a successful new issue insert. Update

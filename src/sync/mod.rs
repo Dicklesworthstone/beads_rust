@@ -13067,6 +13067,12 @@ struct ImportMetadataMaps {
     id_by_hash: HashMap<String, String>,
 }
 
+#[derive(Debug, Default)]
+struct ImportCollisionPlan {
+    renames: HashMap<String, String>,
+    comment_owner_ids_to_replace: Vec<String>,
+}
+
 fn parse_normalized_import_issue(trimmed: &str, line_num: usize) -> Result<(Issue, usize)> {
     let mut issue: Issue = serde_json::from_str(trimmed)
         .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {line_num}: {e}")))?;
@@ -13358,9 +13364,10 @@ fn scan_import_collision_renames(
     metadata: &ImportMetadataMaps,
     result: &mut ImportResult,
     record_count: usize,
-) -> Result<HashMap<String, String>> {
+) -> Result<ImportCollisionPlan> {
     let mut seen_external_refs = HashSet::new();
     let mut renames = HashMap::new();
+    let mut comment_owner_ids_to_replace = BTreeSet::new();
     let progress =
         create_progress_bar(record_count as u64, "Scanning issues", config.show_progress);
 
@@ -13383,7 +13390,7 @@ fn scan_import_collision_renames(
             &metadata.meta_by_id,
             &computed_hash,
         );
-        let _action = determine_action(
+        let action = determine_action(
             &collision,
             &issue,
             &metadata.meta_by_id,
@@ -13395,7 +13402,13 @@ fn scan_import_collision_renames(
         };
 
         if target_id != issue.id {
-            renames.insert(issue.id.clone(), target_id);
+            renames.insert(issue.id.clone(), target_id.clone());
+        }
+        if matches!(
+            action,
+            CollisionAction::Insert | CollisionAction::Update { .. }
+        ) {
+            comment_owner_ids_to_replace.insert(target_id);
         }
 
         progress.inc(1);
@@ -13403,7 +13416,10 @@ fn scan_import_collision_renames(
     })?;
 
     progress.finish_with_message("Scan complete");
-    Ok(renames)
+    Ok(ImportCollisionPlan {
+        renames,
+        comment_owner_ids_to_replace: comment_owner_ids_to_replace.into_iter().collect(),
+    })
 }
 
 fn apply_collision_renames(issue: &mut Issue, renames: &HashMap<String, String>) {
@@ -13501,6 +13517,7 @@ fn stream_import_actions_in_tx(
     config: &ImportConfig,
     prefix_renames: &HashMap<String, String>,
     collision_renames: &HashMap<String, String>,
+    comment_owner_ids_to_replace: &[String],
     metadata: &ImportMetadataMaps,
     base_result: &ImportResult,
     progress: &indicatif::ProgressBar,
@@ -13514,6 +13531,12 @@ fn stream_import_actions_in_tx(
 
     progress.set_position(0);
     storage.clear_all_export_hashes_in_tx()?;
+    // Comment IDs are globally unique. Release every comment row owned by an
+    // issue this transaction will replace before replaying any individual
+    // issue, so authoritative IDs can move between those issues without the
+    // result depending on JSONL line order. The enclosing transaction restores
+    // all rows if a later action or semantic verification fails.
+    storage.delete_comments_for_import_issue_ids_in_tx(comment_owner_ids_to_replace)?;
 
     for_each_jsonl_import_issue(
         source,
@@ -13785,7 +13808,7 @@ fn import_from_jsonl_snapshot_impl(
     let metadata = load_import_metadata_maps(storage)?;
 
     // Phase 1: Scan and Resolve IDs
-    let collision_renames = scan_import_collision_renames(
+    let collision_plan = scan_import_collision_renames(
         source,
         config,
         &prefix_renames,
@@ -13833,7 +13856,8 @@ fn import_from_jsonl_snapshot_impl(
             source,
             config,
             &prefix_renames,
-            &collision_renames,
+            &collision_plan.renames,
+            &collision_plan.comment_owner_ids_to_replace,
             &metadata,
             &result,
             &progress,
@@ -20308,6 +20332,137 @@ mod tests {
         assert_eq!(result.exact_duplicate_comments_deduplicated, 1);
         assert_eq!(result.comments_imported, 1);
         assert_eq!(storage.get_comments(&issue.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_import_repairs_cross_issue_comment_id_swap_before_semantic_verification() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+
+        let existing_a = make_test_issue("bd-comment-owner-a", "First owner");
+        let existing_b = make_test_issue("bd-comment-owner-b", "Second owner");
+        storage.create_issue(&existing_a, "tester").unwrap();
+        storage.create_issue(&existing_b, "tester").unwrap();
+        let stale_b_comment = storage
+            .add_comment(&existing_b.id, "bob", "comment from B")
+            .unwrap();
+
+        // Two divergent JSONL lineages independently used stale_b_comment.id.
+        // The merged JSONL kept that id for A and renumbered B, while the
+        // ignored local database still assigns the old id to B. A appears
+        // first in JSONL, so per-issue replacement used to AUTO-reallocate A
+        // before B released the authoritative id and then fail the semantic
+        // verifier because neither persisted id matched JSONL.
+        let mut incoming_a = existing_a.clone();
+        incoming_a.updated_at += chrono::Duration::minutes(1);
+        incoming_a.comments = vec![crate::model::Comment {
+            id: stale_b_comment.id,
+            issue_id: incoming_a.id.clone(),
+            author: "alice".to_string(),
+            body: "comment from A".to_string(),
+            created_at: incoming_a.updated_at,
+        }];
+
+        let mut incoming_b = existing_b.clone();
+        incoming_b.updated_at += chrono::Duration::minutes(1);
+        incoming_b.comments = vec![crate::model::Comment {
+            id: stale_b_comment.id + 1,
+            issue_id: incoming_b.id.clone(),
+            author: stale_b_comment.author.clone(),
+            body: stale_b_comment.body.clone(),
+            created_at: stale_b_comment.created_at,
+        }];
+
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&incoming_a).unwrap(),
+                serde_json::to_string(&incoming_b).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let result = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .expect("cross-issue comment ownership must converge to JSONL");
+        assert_eq!(result.updated_count, 2);
+
+        let comments_a = storage.get_comments(&incoming_a.id).unwrap();
+        let comments_b = storage.get_comments(&incoming_b.id).unwrap();
+        assert_eq!(comments_a, incoming_a.comments);
+        assert_eq!(comments_b, incoming_b.comments);
+
+        let second = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .expect("the converged import must be a true no-op");
+        assert_eq!(second.created_count, 0);
+        assert_eq!(second.updated_count, 0);
+        assert_eq!(storage.get_comments(&incoming_a.id).unwrap(), comments_a);
+        assert_eq!(storage.get_comments(&incoming_b.id).unwrap(), comments_b);
+    }
+
+    #[test]
+    fn test_import_comment_owner_preclear_preserves_skipped_issue() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+
+        let incoming_skipped = make_test_issue("bd-comment-skip", "Local winner");
+        let mut existing_skipped = incoming_skipped.clone();
+        existing_skipped.updated_at += chrono::Duration::minutes(2);
+        storage.create_issue(&existing_skipped, "tester").unwrap();
+        let local_comment = storage
+            .add_comment(&existing_skipped.id, "local", "must survive")
+            .unwrap();
+
+        let existing_updated = make_test_issue("bd-comment-update", "Applied update");
+        storage.create_issue(&existing_updated, "tester").unwrap();
+        storage
+            .add_comment(&existing_updated.id, "local", "must be replaced")
+            .unwrap();
+        let mut incoming_updated = existing_updated.clone();
+        incoming_updated.updated_at += chrono::Duration::minutes(1);
+
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&incoming_skipped).unwrap(),
+                serde_json::to_string(&incoming_updated).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let result = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+
+        assert_eq!(result.updated_count, 1);
+        assert_eq!(result.skipped_count, 1);
+        assert_eq!(
+            storage.get_comments(&incoming_skipped.id).unwrap(),
+            vec![local_comment]
+        );
+        assert!(
+            storage
+                .get_comments(&incoming_updated.id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
