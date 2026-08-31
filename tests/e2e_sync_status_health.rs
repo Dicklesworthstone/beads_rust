@@ -303,6 +303,53 @@ fn e2e_sync_status_reports_workspace_health_and_reliability_audit() {
     );
 }
 
+#[test]
+fn e2e_fresh_workspace_noop_flush_certifies_global_empty_without_cached_hash() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "fresh_empty_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let beads_dir = workspace.root.join(".beads");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let anchor_path = beads_dir.join("beads.base.jsonl");
+    let storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("open fresh database");
+    assert_eq!(storage.count_issues().expect("count fresh issues"), 0);
+    assert_eq!(
+        storage
+            .get_metadata(METADATA_JSONL_CONTENT_HASH)
+            .expect("read fresh cached hash")
+            .as_deref(),
+        None,
+        "fresh metadata exposes its empty cached-hash sentinel as missing"
+    );
+    drop(storage);
+    assert_eq!(
+        std::fs::read(&jsonl_path).expect("read fresh JSONL"),
+        b"",
+        "fresh JSONL must be globally empty"
+    );
+    assert!(!anchor_path.exists(), "fresh anchor should start absent");
+
+    let flush = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--json", "--no-auto-import"],
+        "fresh_empty_flush",
+    );
+    assert!(
+        flush.status.success(),
+        "fresh global-empty no-op flush failed: {}",
+        flush.stderr
+    );
+    let result: Value =
+        serde_json::from_str(&extract_json_payload(&flush.stdout)).expect("flush JSON payload");
+    assert_eq!(result["exported_issues"], 0, "{result}");
+    assert_eq!(
+        std::fs::read(&anchor_path).expect("read fresh anchor"),
+        std::fs::read(&jsonl_path).expect("read fresh JSONL after flush"),
+        "global-empty certification must materialize an exact merge anchor"
+    );
+}
+
 /// Issue #378: `br sync --flush-only` maintains the merge anchor
 /// (`beads.base.jsonl`) so `br doctor` and `br sync --status` agree.
 ///
