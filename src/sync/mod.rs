@@ -13483,6 +13483,7 @@ fn skipped_import_matches_stored_issue(
     if expected.id != target_id {
         expected.id = target_id.to_string();
     }
+    canonicalize_persisted_issue_defaults(&mut expected);
 
     normalize_issue_for_export(&mut stored);
     normalize_issue_for_export(&mut expected);
@@ -13630,11 +13631,18 @@ fn stream_import_actions_in_tx(
     Ok(tx_result)
 }
 
-/// Materialize legacy schema defaults that are written even when older JSONL
-/// records omit the corresponding optional fields.
+/// Materialize legacy import/storage defaults that are written even when older
+/// JSONL records omit the corresponding optional fields.
 pub(crate) fn canonicalize_persisted_issue_defaults(issue: &mut Issue) {
     issue.source_repo.get_or_insert_with(|| ".".to_string());
     issue.original_size.get_or_insert(0);
+    for dependency in &mut issue.dependencies {
+        dependency
+            .created_by
+            .get_or_insert_with(|| "import".to_string());
+        dependency.metadata.get_or_insert_with(|| "{}".to_string());
+        dependency.thread_id.get_or_insert_with(String::new);
+    }
 }
 
 /// Compare every persisted import field while retaining the order-independent
@@ -20462,6 +20470,115 @@ mod tests {
                 .get_comments(&incoming_updated.id)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_import_materializes_omitted_dependency_persistence_defaults() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+
+        let target = make_test_issue("bd-dependency-target", "Dependency target");
+        let explicit_target = make_test_issue("bd-explicit-target", "Explicit target");
+        let mut dependent = make_test_issue("bd-dependent", "Dependent issue");
+        dependent.dependencies.push(Dependency {
+            issue_id: dependent.id.clone(),
+            depends_on_id: target.id.clone(),
+            dep_type: DependencyType::Blocks,
+            created_at: dependent.created_at,
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        });
+        dependent.dependencies.push(Dependency {
+            issue_id: dependent.id.clone(),
+            depends_on_id: explicit_target.id.clone(),
+            dep_type: DependencyType::Related,
+            created_at: dependent.created_at,
+            created_by: Some("source-agent".to_string()),
+            metadata: Some(r#"{"origin":"explicit"}"#.to_string()),
+            thread_id: Some("thread-explicit".to_string()),
+        });
+
+        let dependent_json = serde_json::to_value(&dependent).unwrap();
+        let dependency_json = &dependent_json["dependencies"][0];
+        assert!(dependency_json.get("created_by").is_none());
+        assert!(dependency_json.get("metadata").is_none());
+        assert!(dependency_json.get("thread_id").is_none());
+        let explicit_dependency_json = &dependent_json["dependencies"][1];
+        assert_eq!(explicit_dependency_json["created_by"], "source-agent");
+        assert_eq!(
+            explicit_dependency_json["metadata"],
+            r#"{"origin":"explicit"}"#
+        );
+        assert_eq!(explicit_dependency_json["thread_id"], "thread-explicit");
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::to_string(&target).unwrap(),
+                serde_json::to_string(&explicit_target).unwrap(),
+                serde_json::to_string(&dependent).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let result = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .expect("omitted dependency fields must round-trip through storage defaults");
+        assert_eq!(result.created_count, 3);
+        assert_eq!(result.dependencies_imported, 2);
+
+        let stored = storage
+            .get_issue_for_export(&dependent.id)
+            .unwrap()
+            .expect("dependent issue must be addressable after import");
+        assert_eq!(stored.dependencies.len(), 2);
+        let defaulted = stored
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.depends_on_id == target.id)
+            .expect("defaulted dependency must be stored");
+        assert_eq!(defaulted.created_by.as_deref(), Some("import"));
+        assert_eq!(defaulted.metadata.as_deref(), Some("{}"));
+        assert_eq!(defaulted.thread_id.as_deref(), Some(""));
+        let explicit = stored
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.depends_on_id == explicit_target.id)
+            .expect("explicit dependency must be stored");
+        assert_eq!(explicit.created_by.as_deref(), Some("source-agent"));
+        assert_eq!(
+            explicit.metadata.as_deref(),
+            Some(r#"{"origin":"explicit"}"#)
+        );
+        assert_eq!(explicit.thread_id.as_deref(), Some("thread-explicit"));
+        verify_applied_import_issue_semantics(&storage, &result.applied_issues)
+            .expect("strict semantic verification must accept persisted defaults");
+        assert_ne!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true")
+        );
+
+        let second = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .expect("the converged import must be a true no-op");
+        assert_eq!(second.created_count, 0);
+        assert_eq!(second.updated_count, 0);
+        assert_eq!(second.skipped_count, 3);
+        assert_eq!(second.export_hashes_recorded, 3);
+        assert_ne!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true")
         );
     }
 

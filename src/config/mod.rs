@@ -2732,12 +2732,11 @@ fn verify_rebuilt_issue_semantics(
         .collect::<HashMap<_, _>>();
 
     for expected in expected_issues {
-        // These two legacy columns are NOT NULL in the on-disk schema and
-        // therefore materialize their historical defaults even when an older
-        // JSONL record omits them. Compare against that persisted canonical
-        // representation so the verifier remains strict without rejecting a
-        // lossless import solely because `None` round-trips as the schema
-        // default.
+        // Legacy issue and dependency fields materialize their historical
+        // import/storage defaults even when an older JSONL record omits them.
+        // Compare against that persisted canonical representation so the
+        // verifier remains strict without rejecting a lossless import solely
+        // because `None` round-trips as the schema default.
         let mut persisted_expected = expected.clone();
         crate::sync::canonicalize_persisted_issue_defaults(&mut persisted_expected);
         let actual = actual_by_id.get(&expected.id).ok_or_else(|| {
