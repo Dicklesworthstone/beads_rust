@@ -272,7 +272,9 @@ fn execute_inner(
                 wrap: args.wrap,
             };
             let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
-            if args.pretty {
+            if args.tree {
+                render_tree_text_issues(&ctx, &issues, format_options);
+            } else if args.pretty {
                 render_pretty_text_issues(&ctx, &issues, format_options, args.long);
             } else if matches!(ctx.mode(), OutputMode::Rich) {
                 let columns = if args.long {
@@ -720,6 +722,102 @@ fn render_long_text_issues(
         ctx.print_line(&format_issue_long_with(issue, format_options));
         if index + 1 != issues.len() {
             ctx.print_line("");
+        }
+    }
+}
+
+/// Render `br list --tree`: children indented under their parents with
+/// box-drawing connectors (GitHub #475).
+///
+/// Hierarchy is derived from dotted child IDs — `bd-abc.2.1` nests under
+/// `bd-abc.2`, which nests under `bd-abc`. When an ancestor is not part of
+/// the (filtered) result set, the nearest listed ancestor is used, and an
+/// issue with no listed ancestor renders at the top level. Root order keeps
+/// the query's sort; each child level is sorted by numeric ID segment so
+/// `.10` follows `.9`.
+fn render_tree_text_issues(
+    ctx: &OutputContext,
+    issues: &[crate::model::Issue],
+    format_options: TextFormatOptions,
+) {
+    use std::collections::HashMap;
+
+    let listed: HashMap<&str, usize> = issues
+        .iter()
+        .enumerate()
+        .map(|(index, issue)| (issue.id.as_str(), index))
+        .collect();
+
+    // Map every issue to its nearest LISTED ancestor by trimming dotted
+    // segments until a listed ID is found.
+    let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+    for (index, issue) in issues.iter().enumerate() {
+        let mut candidate = issue.id.as_str();
+        let mut parent = None;
+        while let Some(cut) = candidate.rfind('.') {
+            candidate = &candidate[..cut];
+            if let Some(&parent_index) = listed.get(candidate) {
+                if parent_index != index {
+                    parent = Some(parent_index);
+                }
+                break;
+            }
+        }
+        match parent {
+            Some(parent_index) => children.entry(parent_index).or_default().push(index),
+            None => roots.push(index),
+        }
+    }
+
+    // Sort each sibling group by the numeric value of the trailing ID
+    // segment so `.10` sorts after `.9` instead of after `.1`.
+    let segment_key = |id: &str| -> (String, u64) {
+        id.rfind('.').map_or_else(
+            || (id.to_string(), 0),
+            |cut| {
+                (
+                    id[..cut].to_string(),
+                    id[cut + 1..].parse::<u64>().unwrap_or(u64::MAX),
+                )
+            },
+        )
+    };
+    for group in children.values_mut() {
+        group.sort_by_key(|&index| segment_key(&issues[index].id));
+    }
+
+    let renderer = TreeRenderer {
+        ctx,
+        issues,
+        children: &children,
+        format_options,
+    };
+    for &root in &roots {
+        renderer.render_node(root, "", "", "");
+    }
+}
+
+/// Shared state for the recursive `br list --tree` renderer (GitHub #475).
+struct TreeRenderer<'a> {
+    ctx: &'a OutputContext,
+    issues: &'a [crate::model::Issue],
+    children: &'a std::collections::HashMap<usize, Vec<usize>>,
+    format_options: TextFormatOptions,
+}
+
+impl TreeRenderer<'_> {
+    fn render_node(&self, index: usize, prefix: &str, connector: &str, child_prefix: &str) {
+        let line = format_issue_line_with(&self.issues[index], self.format_options);
+        self.ctx.print_line(&format!("{prefix}{connector}{line}"));
+        if let Some(kids) = self.children.get(&index) {
+            for (position, &kid) in kids.iter().enumerate() {
+                let last = position + 1 == kids.len();
+                let kid_connector = if last { "└── " } else { "├── " };
+                let kid_child_prefix = if last { "    " } else { "│   " };
+                let next_prefix = format!("{prefix}{child_prefix}");
+                self.render_node(kid, &next_prefix, kid_connector, kid_child_prefix);
+            }
         }
     }
 }

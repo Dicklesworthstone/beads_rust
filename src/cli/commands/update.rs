@@ -465,6 +465,7 @@ fn prepare_single_route(
         || args.parent.is_some();
 
     validate_mutable_target_issues(&storage_ctx.storage, &resolved_ids, has_updates)?;
+    validate_text_field_overwrite_guard(&storage_ctx.storage, &resolved_ids, &update, args.force)?;
 
     // Validate labels before making any database changes
     for label in &args.add_label {
@@ -1134,6 +1135,83 @@ fn validate_mutable_target_issues(
     Ok(())
 }
 
+/// Refuse to silently overwrite a non-empty accumulating text field
+/// (GitHub #467).
+///
+/// `description`, `design`, `acceptance_criteria`, `notes`, and
+/// `agent_context` build up over an issue's life and are frequently supplied
+/// from shell variables in scripted/agent flows, where a typo, truncated
+/// heredoc, or unset variable silently destroys the whole field. Replacing a
+/// non-empty value with *different* content (including clearing it) now
+/// requires `--force`; writing into an empty field and re-writing the
+/// identical value stay silent so legitimate idempotent scripts keep working.
+fn validate_text_field_overwrite_guard(
+    storage: &SqliteStorage,
+    ids: &[String],
+    update: &IssueUpdate,
+    force: bool,
+) -> Result<()> {
+    if force {
+        return Ok(());
+    }
+    let requested: [(&str, Option<&Option<String>>); 5] = [
+        ("description", update.description.as_ref()),
+        ("design", update.design.as_ref()),
+        ("acceptance_criteria", update.acceptance_criteria.as_ref()),
+        ("notes", update.notes.as_ref()),
+        ("agent_context", update.agent_context.as_ref()),
+    ];
+    if requested.iter().all(|(_, value)| value.is_none()) {
+        return Ok(());
+    }
+    let mut violations = Vec::new();
+    for id in ids {
+        let Some(issue) = storage.get_issue(id)? else {
+            continue;
+        };
+        for (field, new_value) in &requested {
+            let Some(new_value) = new_value else {
+                continue;
+            };
+            let current = match *field {
+                "description" => issue.description.as_deref(),
+                "design" => issue.design.as_deref(),
+                "acceptance_criteria" => issue.acceptance_criteria.as_deref(),
+                "notes" => issue.notes.as_deref(),
+                "agent_context" => issue.agent_context.as_deref(),
+                _ => unreachable!(),
+            }
+            .unwrap_or("");
+            if current.is_empty() {
+                continue; // empty -> value is always safe
+            }
+            let incoming = new_value.as_deref().unwrap_or("");
+            if incoming == current {
+                continue; // value -> same value is a no-op
+            }
+            violations.push(format!(
+                "{id}: refusing to overwrite non-empty '{field}' ({} chars) with {} without --force",
+                current.chars().count(),
+                if incoming.is_empty() {
+                    "an empty value".to_string()
+                } else {
+                    format!("different content ({} chars)", incoming.chars().count())
+                },
+            ));
+        }
+    }
+    if violations.is_empty() {
+        return Ok(());
+    }
+    Err(BeadsError::validation(
+        "update",
+        format!(
+            "{}\nThese fields accumulate context; pass --force to replace, or `br show <id>` to inspect the current value first.",
+            violations.join("\n"),
+        ),
+    ))
+}
+
 /// Reject `br update --status <terminal>` and direct the user at the
 /// dedicated command for that transition.
 ///
@@ -1470,6 +1548,66 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
     use tracing::info;
+
+    /// GitHub #467: `br update` must refuse to silently replace a non-empty
+    /// accumulating text field with different content unless `--force`.
+    #[test]
+    fn test_text_field_overwrite_guard() {
+        init_test_logging();
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = Issue {
+            id: "bd-guard".to_string(),
+            title: "guard test".to_string(),
+            issue_type: IssueType::Task,
+            priority: Priority::MEDIUM,
+            description: Some("line one\nline two\nline three".to_string()),
+            ..Default::default()
+        };
+        storage.create_issue(&issue, "tester").unwrap();
+        let ids = vec!["bd-guard".to_string()];
+
+        // Non-empty -> different content: refused without force.
+        let overwrite = IssueUpdate {
+            description: Some(Some("1".to_string())),
+            ..Default::default()
+        };
+        let err =
+            validate_text_field_overwrite_guard(&storage, &ids, &overwrite, false).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("description"), "{message}");
+        assert!(message.contains("--force"), "{message}");
+
+        // Non-empty -> empty (unset shell variable case): refused too.
+        let clear = IssueUpdate {
+            description: Some(Some(String::new())),
+            ..Default::default()
+        };
+        assert!(validate_text_field_overwrite_guard(&storage, &ids, &clear, false).is_err());
+
+        // Same value: silent no-op.
+        let same = IssueUpdate {
+            description: Some(Some("line one\nline two\nline three".to_string())),
+            ..Default::default()
+        };
+        validate_text_field_overwrite_guard(&storage, &ids, &same, false).unwrap();
+
+        // Empty field -> value: always allowed.
+        let fill = IssueUpdate {
+            notes: Some(Some("fresh notes".to_string())),
+            ..Default::default()
+        };
+        validate_text_field_overwrite_guard(&storage, &ids, &fill, false).unwrap();
+
+        // Force overrides the refusal.
+        validate_text_field_overwrite_guard(&storage, &ids, &overwrite, true).unwrap();
+
+        // Untouched fields (status/priority-only updates) never trip it.
+        let status_only = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..Default::default()
+        };
+        validate_text_field_overwrite_guard(&storage, &ids, &status_only, false).unwrap();
+    }
 
     #[test]
     fn test_optional_string_field_with_value() {

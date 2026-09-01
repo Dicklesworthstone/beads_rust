@@ -86,6 +86,27 @@ struct DoctorRepairResult {
     preserved_dirty_issue_ids: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     verified_backups: Vec<config::RecoveryBackupVerification>,
+    /// Per-table counts of DB-only history rows carried across the JSONL
+    /// rebuild (GitHub #471). The JSONL export holds issue state only, so
+    /// events / gate results / close audit / capacity records must be
+    /// snapshotted from the pre-repair database and restored afterwards.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    preserved_history: Vec<PreservedHistoryTableReport>,
+    /// Loud, human-readable warnings for history that could NOT be preserved
+    /// (e.g. a corrupt page made a table unreadable before the rebuild).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    history_preservation_warnings: Vec<String>,
+}
+
+/// One preserved history table's restore outcome (GitHub #471).
+#[derive(Debug, Clone, Serialize)]
+struct PreservedHistoryTableReport {
+    table: String,
+    /// Rows restored into the rebuilt database.
+    restored: usize,
+    /// Rows skipped because their issue no longer exists after the rebuild
+    /// (the JSONL is authoritative for issue membership).
+    skipped: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -2963,6 +2984,19 @@ fn repair_database_from_jsonl_after_preflight(
     let (preserved_tombstones, preserved_dirty_issues) =
         preserved_state_for_doctor_rebuild(db_path, source);
 
+    // GitHub #471: snapshot every DB-only append-only/history table before
+    // the rebuild. The JSONL carries issue state only; without this the
+    // rebuild silently empties events, gate results, close/bypass audit
+    // records, and capacity state while reporting success.
+    let history_snapshot = snapshot_history_for_doctor_rebuild(db_path);
+    for warning in &history_snapshot.failures {
+        tracing::warn!(
+            db_path = %db_path.display(),
+            warning,
+            "doctor --repair could not snapshot part of the DB-only history before the JSONL rebuild; those rows will be lost"
+        );
+    }
+
     let recovery =
         if let Some(authority) = cli.database_family_write_authority_for(beads_dir, db_path) {
             config::repair_database_from_jsonl_snapshot_under_write_authority(
@@ -2993,6 +3027,30 @@ fn repair_database_from_jsonl_after_preflight(
     restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
     restore_dirty_issues_after_rebuild(&mut storage, &preserved_dirty_issues)?;
 
+    // GitHub #471: reattach the DB-only history captured before the rebuild.
+    // A restore failure is downgraded to a loud warning rather than failing
+    // the whole repair: at this point the rebuilt database is already the
+    // best available state, and aborting would leave the workspace corrupt
+    // AND still lose the history.
+    let mut history_preservation_warnings = history_snapshot.failures.clone();
+    let preserved_history = match storage.restore_auxiliary_history_tables(&history_snapshot) {
+        Ok(report) => report
+            .into_iter()
+            .map(|(table, restored, skipped)| PreservedHistoryTableReport {
+                table,
+                restored,
+                skipped,
+            })
+            .collect(),
+        Err(err) => {
+            history_preservation_warnings.push(format!(
+                "could not restore the {} snapshotted history row(s) into the rebuilt database: {err}",
+                history_snapshot.row_count()
+            ));
+            Vec::new()
+        }
+    };
+
     let fk_violations_cleaned = cleanup_repair_missing_issue_references(&mut storage)?;
 
     Ok(DoctorRepairResult {
@@ -3006,7 +3064,32 @@ fn repair_database_from_jsonl_after_preflight(
             .map(|preserved| preserved.issue.id.clone())
             .collect(),
         verified_backups,
+        preserved_history,
+        history_preservation_warnings,
     })
+}
+
+/// Open the pre-repair database (best effort — it is usually corrupt when
+/// this runs) and snapshot every DB-only history table so the JSONL rebuild
+/// can carry them across (GitHub #471). An unopenable database yields an
+/// empty snapshot with a loud failure entry instead of aborting the repair.
+fn snapshot_history_for_doctor_rebuild(
+    db_path: &Path,
+) -> crate::storage::sqlite::AuxiliaryHistorySnapshot {
+    let mut snapshot = crate::storage::sqlite::AuxiliaryHistorySnapshot::default();
+    if !db_path.is_file() {
+        return snapshot;
+    }
+    match SqliteStorage::open(db_path) {
+        Ok(storage) => storage.snapshot_auxiliary_history_tables(),
+        Err(err) => {
+            snapshot.failures.push(format!(
+                "could not open the pre-repair database to preserve history tables ({}): {err}",
+                crate::storage::sqlite::AUXILIARY_HISTORY_TABLES.join(", ")
+            ));
+            snapshot
+        }
+    }
 }
 
 fn cleanup_repair_missing_issue_references(storage: &mut SqliteStorage) -> Result<usize> {
@@ -3033,6 +3116,9 @@ fn cleanup_repair_missing_issue_references(storage: &mut SqliteStorage) -> Resul
         ("close_metadata", "issue_id"),
         ("gate_result_history", "issue_id"),
         ("gate_results", "issue_id"),
+        ("capacity_exemption_history", "issue_id"),
+        ("capacity_exemptions", "issue_id"),
+        ("capacity_occupancy", "issue_id"),
     ];
     let mut cleaned = 0usize;
     let mut dependency_rows_cleaned = 0usize;
@@ -13820,6 +13906,8 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             "preserved_tombstones": repair_result.preserved_tombstones,
             "preserved_dirty_issues": repair_result.preserved_dirty_issues,
             "preserved_dirty_issue_ids": &repair_result.preserved_dirty_issue_ids,
+            "preserved_history": &repair_result.preserved_history,
+            "history_preservation_warnings": &repair_result.history_preservation_warnings,
             "verified_backups": &repair_result.verified_backups,
             "post_repair": post_repair.report,
             "verified": post_repair_verified,
@@ -13837,6 +13925,29 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 "Preserved {} unflushed local issue(s) across the rebuild; run `br sync --flush-only` to export them",
                 repair_result.preserved_dirty_issues
             ));
+        }
+        if !repair_result.preserved_history.is_empty() {
+            let summary = repair_result
+                .preserved_history
+                .iter()
+                .map(|entry| {
+                    if entry.skipped > 0 {
+                        format!(
+                            "{} {} (+{} orphaned skipped)",
+                            entry.restored, entry.table, entry.skipped
+                        )
+                    } else {
+                        format!("{} {}", entry.restored, entry.table)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            ctx.info(&format!(
+                "Preserved DB-only history across the rebuild: {summary}"
+            ));
+        }
+        for warning in &repair_result.history_preservation_warnings {
+            ctx.warning(&format!("History NOT fully preserved: {warning}"));
         }
         if let Some(reason) = verification_failure_reason.as_deref() {
             ctx.warning(reason);
@@ -13937,6 +14048,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -15573,6 +15687,8 @@ mod tests {
             preserved_dirty_issues: 0,
             preserved_dirty_issue_ids: Vec::new(),
             verified_backups: Vec::new(),
+            preserved_history: Vec::new(),
+            history_preservation_warnings: Vec::new(),
         };
 
         let audit =
@@ -15647,6 +15763,8 @@ mod tests {
             preserved_dirty_issues: 0,
             preserved_dirty_issue_ids: Vec::new(),
             verified_backups: Vec::new(),
+            preserved_history: Vec::new(),
+            history_preservation_warnings: Vec::new(),
         };
         let mut session =
             DoctorRepairSession::new(temp.path(), /* dry_run = */ false).expect("session builds");
@@ -21853,6 +21971,9 @@ mod tests {
                 closed_at: None,
                 close_reason: None,
                 closed_by_session: None,
+                bypassed_policy: None,
+                bypass_reason: None,
+                policy_gates_fired: None,
                 due_at: None,
                 defer_until: None,
                 external_ref: None,
@@ -22169,6 +22290,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,

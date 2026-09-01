@@ -270,7 +270,21 @@ fn execute_list(
     let issue = storage_ctx.storage.get_issue(&issue_id)?;
     let current_status = issue.as_ref().map(|i| i.status.as_str().to_string());
     let history = storage_ctx.storage.get_gate_result_history(&issue_id)?;
-    let legacy_results = storage_ctx.storage.get_legacy_gate_results(&issue_id)?;
+    // GitHub #466: `gate_results` now mirrors every scoped report's latest
+    // (gate, provider) verdict. Rows whose (gate, provider) pair already
+    // appears in the scoped history are that mirror, not legacy data — keep
+    // only genuinely legacy rows (written by pre-#388 versions with no
+    // matching history entry) in the audit-only section.
+    let legacy_results: Vec<_> = storage_ctx
+        .storage
+        .get_legacy_gate_results(&issue_id)?
+        .into_iter()
+        .filter(|legacy| {
+            !history
+                .iter()
+                .any(|h| h.gate == legacy.gate && h.provider == legacy.provider)
+        })
+        .collect();
 
     // Compute required-gate status for each guarded transition out of the
     // current status, using the project's workflow.gates config. Absent

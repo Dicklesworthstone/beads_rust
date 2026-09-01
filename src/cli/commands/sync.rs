@@ -817,6 +817,14 @@ pub fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
                 .to_string(),
         });
     }
+    if args.dry_run && !(args.reconcile || args.reconcile_additive || args.migrate_source_repo_path)
+    {
+        return Err(BeadsError::Validation {
+            field: "dry_run".to_string(),
+            reason: "--dry-run can only be used with --reconcile, --reconcile-additive, or --migrate-source-repo-path"
+                .to_string(),
+        });
+    }
     if args.apply && !(args.reconcile_additive || args.migrate_source_repo_path) {
         return Err(BeadsError::Validation {
             field: "apply".to_string(),
@@ -2586,29 +2594,40 @@ fn execute_flush(
         // evidence fails closed; --force deliberately takes the real-export
         // path instead.
         let noop_source = source.expect("existing JSONL has an immutable snapshot");
-        let stored_content_hash = storage
+        match storage
             .get_metadata(METADATA_JSONL_CONTENT_HASH)?
             .filter(|hash| !hash.trim().is_empty())
-            .ok_or_else(|| {
-                BeadsError::Config(
+        {
+            Some(stored_content_hash) => {
+                let observed_content_hash = noop_source.content_sha256();
+                if observed_content_hash != stored_content_hash {
+                    return Err(BeadsError::Config(format!(
+                        "Refusing a no-op flush because the JSONL changed since its last certified \
+                         sync (stored hash {stored_content_hash}, observed hash \
+                         {observed_content_hash}). The merge anchor was not changed.\n\
+                         Inspect/reconcile with `br sync --merge`, accept the JSONL intentionally with \
+                         `br sync --import-only --force`, or replace it from the database with \
+                         `br sync --flush-only --force`."
+                    )));
+                }
+            }
+            // A fresh workspace has no cached content hash yet. When BOTH
+            // sides are globally empty (zero JSONL records, zero DB issues)
+            // there is nothing a stored hash could disagree about, so the
+            // no-op flush is certifiable directly (beads_rust-a6kl /
+            // GitHub #472). Any non-empty state without a cached hash stays
+            // fail-closed exactly as before.
+            None if existing_count == 0 && db_issue_count == 0 => {}
+            None => {
+                return Err(BeadsError::Config(
                     "Cannot certify a no-op flush because the stored JSONL content hash is \
                      missing. The merge anchor was not changed.\n\
                      Inspect/reconcile with `br sync --merge`, accept the JSONL intentionally \
                      with `br sync --import-only --force`, or replace it from the database with \
                      `br sync --flush-only --force`."
                         .to_string(),
-                )
-            })?;
-        let observed_content_hash = noop_source.content_sha256();
-        if observed_content_hash != stored_content_hash {
-            return Err(BeadsError::Config(format!(
-                "Refusing a no-op flush because the JSONL changed since its last certified \
-                 sync (stored hash {stored_content_hash}, observed hash \
-                 {observed_content_hash}). The merge anchor was not changed.\n\
-                 Inspect/reconcile with `br sync --merge`, accept the JSONL intentionally with \
-                 `br sync --import-only --force`, or replace it from the database with \
-                 `br sync --flush-only --force`."
-            )));
+                ));
+            }
         }
 
         // Certified: ensure the anchor holds the exact snapshot bytes (also
@@ -5674,6 +5693,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -6104,6 +6126,47 @@ mod tests {
                 matches!(&err, BeadsError::Validation { field, .. } if field == "expect_plan_sha256")
             );
         }
+    }
+
+    /// GitHub #473: the advertised additive dry-run invocation must be
+    /// reachable. `--reconcile-additive --dry-run` is the same read-only plan
+    /// mode as bare `--reconcile-additive`; it must validate instead of
+    /// demanding `--reconcile`.
+    #[test]
+    fn test_validate_sync_mode_args_allows_dry_run_with_reviewed_modes() {
+        validate_sync_mode_args(&SyncArgs {
+            reconcile_additive: true,
+            dry_run: true,
+            ..SyncArgs::default()
+        })
+        .expect("--reconcile-additive --dry-run is the documented plan mode");
+
+        validate_sync_mode_args(&SyncArgs {
+            migrate_source_repo_path: true,
+            dry_run: true,
+            ..SyncArgs::default()
+        })
+        .expect("--migrate-source-repo-path --dry-run is the documented plan mode");
+
+        // --dry-run still refuses modes where it has no meaning.
+        let err = validate_sync_mode_args(&SyncArgs {
+            flush_only: true,
+            dry_run: true,
+            ..SyncArgs::default()
+        })
+        .expect_err("--dry-run must not silently no-op with --flush-only");
+        assert!(matches!(&err, BeadsError::Validation { field, .. } if field == "dry_run"));
+
+        // And combining both reviewed modes is still exactly-one-mode.
+        assert!(
+            validate_sync_mode_args(&SyncArgs {
+                reconcile: true,
+                reconcile_additive: true,
+                dry_run: true,
+                ..SyncArgs::default()
+            })
+            .is_err()
+        );
     }
 
     #[test]

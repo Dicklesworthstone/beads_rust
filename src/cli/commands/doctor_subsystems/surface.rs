@@ -2198,7 +2198,10 @@ mod tests {
             "schema 15 is incompatible with {CURRENT_SCHEMA_VERSION}"
         );
         assert_eq!(output.status, "findings_present");
-        assert_ne!(output.exit_code, 0, "must not exit healthy on a stale schema");
+        assert_ne!(
+            output.exit_code, 0,
+            "must not exit healthy on a stale schema"
+        );
         assert!(output.db_present, "the database file is present");
         assert!(
             output.line.contains("db=schema_incompatible"),

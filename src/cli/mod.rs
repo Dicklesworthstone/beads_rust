@@ -1263,7 +1263,9 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub claim: bool,
 
-    /// Force update even if issue is blocked
+    /// Force update even if issue is blocked, and allow replacing a
+    /// non-empty description/design/acceptance-criteria/notes/agent-context
+    /// value with different content (GitHub #467)
     #[arg(long)]
     pub force: bool,
 
@@ -1846,6 +1848,13 @@ pub struct ListArgs {
     /// Use tree/pretty output format
     #[arg(long)]
     pub pretty: bool,
+
+    /// Group children under their parents with tree connectors (text output).
+    /// Hierarchy follows dotted child IDs (`bd-abc.2` under `bd-abc`); a
+    /// child whose parent is filtered out of the result set is shown at the
+    /// top level (GitHub #475).
+    #[arg(long)]
+    pub tree: bool,
 
     /// Wrap long lines instead of truncating in text output
     #[arg(long)]
@@ -2903,9 +2912,13 @@ pub struct SyncArgs {
 
     /// Preview the reconcile plan without mutating anything
     ///
-    /// Only valid with --reconcile. Opens no write transaction and performs
+    /// Valid with --reconcile, --reconcile-additive, and
+    /// --migrate-source-repo-path. Opens no write transaction and performs
     /// no metadata, cache, dirty-marker, JSONL, or base-snapshot writes.
-    #[arg(long, requires = "reconcile")]
+    /// The reviewed modes (--reconcile-additive, --migrate-source-repo-path)
+    /// already plan without mutating unless --apply is given; there this
+    /// flag is an explicit no-op alias for that default (GitHub #473).
+    #[arg(long, conflicts_with = "apply")]
     pub dry_run: bool,
 
     /// Show sync status (read-only)

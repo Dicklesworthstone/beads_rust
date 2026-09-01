@@ -137,6 +137,7 @@ impl SavedFilters {
             // Output-related fields use defaults
             long: false,
             pretty: false,
+            tree: false,
             wrap: false,
             format: None,
             stats: false,
@@ -206,6 +207,7 @@ impl SavedFilters {
             // Output fields from CLI only
             long: cli.long,
             pretty: cli.pretty,
+            tree: cli.tree,
             wrap: cli.wrap,
             format: cli.format,
             stats: cli.stats,

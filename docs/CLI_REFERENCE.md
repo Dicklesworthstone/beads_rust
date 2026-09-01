@@ -311,6 +311,7 @@ br list [OPTIONS]
 | `-r, --reverse` | Reverse sort order |
 | `--long` | Long output format |
 | `--pretty` | Tree/pretty output format |
+| `--tree` | Group children under parents with tree connectors (text output) |
 | `--wrap` | Wrap long lines instead of truncating in text output |
 | `--format <FMT>` | Output format: text, json, csv, toon |
 | `--stats` | Show token savings stats when using TOON output |
@@ -388,7 +389,7 @@ br update [OPTIONS] [IDS]...
 | `--assignee <NAME>` | Assign (empty string clears) |
 | `--owner <EMAIL>` | Set owner (empty string clears) |
 | `--claim` | Atomic claim (assignee=actor + status=in_progress) |
-| `--force` | Force update even if issue is blocked |
+| `--force` | Force update even if issue is blocked; also required to replace a non-empty description/design/acceptance-criteria/notes/agent-context value with different content |
 | `--due <DATE>` | Set due date (empty string clears) |
 | `--defer <DATE>` | Set defer date (empty string clears) |
 | `--estimate <MINUTES>` | Set time estimate |
