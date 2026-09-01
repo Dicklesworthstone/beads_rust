@@ -1353,6 +1353,41 @@ pub(crate) fn classify_pending_sync_merge_rows(
     PendingSyncMergeInspection::Valid(Box::new(receipt))
 }
 
+/// DB-only auxiliary/history tables that a JSONL rebuild would otherwise
+/// discard (GitHub #471). These never travel through the JSONL export, so a
+/// `br doctor --repair` rebuild must carry them across explicitly.
+pub(crate) const AUXILIARY_HISTORY_TABLES: &[&str] = &[
+    "events",
+    "gate_results",
+    "gate_result_history",
+    "close_metadata",
+    "capacity_occupancy",
+    "capacity_exemptions",
+    "capacity_exemption_history",
+];
+
+/// Raw rows captured from one auxiliary/history table before a rebuild.
+#[derive(Debug, Clone)]
+pub(crate) struct PreservedTableRows {
+    pub(crate) table: String,
+    pub(crate) columns: Vec<String>,
+    pub(crate) rows: Vec<Vec<SqliteValue>>,
+}
+
+/// Snapshot of every auxiliary/history table plus per-table capture failures
+/// (a corrupt source page must not abort preservation of the other tables).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AuxiliaryHistorySnapshot {
+    pub(crate) tables: Vec<PreservedTableRows>,
+    pub(crate) failures: Vec<String>,
+}
+
+impl AuxiliaryHistorySnapshot {
+    pub(crate) fn row_count(&self) -> usize {
+        self.tables.iter().map(|table| table.rows.len()).sum()
+    }
+}
+
 /// SQLite-based storage backend.
 #[derive(Debug)]
 pub struct SqliteStorage {
@@ -2840,6 +2875,164 @@ impl SqliteStorage {
         Ok(rows.iter().map(|r| r.values().to_vec()).collect())
     }
 
+    /// Snapshot every DB-only auxiliary/history table so a JSONL rebuild can
+    /// carry them across (GitHub #471). The JSONL export holds issue state
+    /// only; without this, `br doctor --repair` silently empties the entire
+    /// provenance layer (events, gate results, close/bypass audit, capacity
+    /// records) while reporting success.
+    ///
+    /// Fault-tolerant by design: the source DB is typically corrupt when this
+    /// runs, so each table is captured independently and a failed read is
+    /// reported in the returned `failures` list instead of aborting — a
+    /// partially preserved history beats none.
+    pub(crate) fn snapshot_auxiliary_history_tables(&self) -> AuxiliaryHistorySnapshot {
+        let mut snapshot = AuxiliaryHistorySnapshot::default();
+        for &table in AUXILIARY_HISTORY_TABLES {
+            if !crate::storage::schema::table_exists(&self.conn, table) {
+                continue;
+            }
+            let capture = (|| -> Result<PreservedTableRows> {
+                let mut columns = Vec::new();
+                for row in self.conn.query(&format!("PRAGMA table_info({table})"))? {
+                    if let Some(name) = row.get(1).and_then(SqliteValue::as_text) {
+                        columns.push(name.to_string());
+                    }
+                }
+                if columns.is_empty() {
+                    return Err(BeadsError::Config(format!(
+                        "PRAGMA table_info({table}) returned no columns"
+                    )));
+                }
+                let order_by = if columns.iter().any(|c| c == "id") {
+                    " ORDER BY id ASC"
+                } else {
+                    ""
+                };
+                let rows = self
+                    .conn
+                    .query(&format!(
+                        "SELECT {} FROM {table}{order_by}",
+                        columns.join(", ")
+                    ))?
+                    .iter()
+                    .map(|row| row.values().to_vec())
+                    .collect();
+                Ok(PreservedTableRows {
+                    table: table.to_string(),
+                    columns,
+                    rows,
+                })
+            })();
+            match capture {
+                Ok(preserved) => {
+                    if !preserved.rows.is_empty() {
+                        snapshot.tables.push(preserved);
+                    }
+                }
+                Err(err) => snapshot
+                    .failures
+                    .push(format!("{table}: could not snapshot rows ({err})")),
+            }
+        }
+        snapshot
+    }
+
+    /// Restore auxiliary/history rows captured by
+    /// [`Self::snapshot_auxiliary_history_tables`] into a freshly rebuilt
+    /// database (GitHub #471). Returns per-table `(restored, skipped)` counts.
+    ///
+    /// * Columns are intersected with the rebuilt schema so a snapshot taken
+    ///   from an older schema still restores its shared columns.
+    /// * Rows whose `issue_id` no longer exists after the rebuild are skipped
+    ///   (the rebuild is authoritative for issue membership and the tables all
+    ///   have `ON DELETE CASCADE` foreign keys to `issues`).
+    /// * For append-only tables with an autoincrement `id`, the original ids
+    ///   are kept when the rebuilt table is empty; if the rebuild already
+    ///   wrote rows (e.g. import events), the snapshot ids are dropped and the
+    ///   rows appended in original order so nothing collides or is lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a restore write fails.
+    pub(crate) fn restore_auxiliary_history_tables(
+        &self,
+        snapshot: &AuxiliaryHistorySnapshot,
+    ) -> Result<Vec<(String, usize, usize)>> {
+        let mut report = Vec::new();
+        if snapshot.tables.is_empty() {
+            return Ok(report);
+        }
+        let live_issue_ids: std::collections::HashSet<String> = self
+            .conn
+            .query("SELECT id FROM issues")?
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
+            .collect();
+        self.with_connection_write_transaction(|conn| {
+            for preserved in &snapshot.tables {
+                let table = preserved.table.as_str();
+                if !crate::storage::schema::table_exists(conn, table) {
+                    continue;
+                }
+                let mut target_columns = std::collections::HashSet::new();
+                for row in conn.query(&format!("PRAGMA table_info({table})"))? {
+                    if let Some(name) = row.get(1).and_then(SqliteValue::as_text) {
+                        target_columns.insert(name.to_string());
+                    }
+                }
+                let target_row_count = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"))?
+                    .get(0)
+                    .and_then(SqliteValue::as_integer)
+                    .unwrap_or(0);
+                let drop_id = preserved.columns.iter().any(|c| c == "id") && target_row_count > 0;
+                let keep: Vec<usize> = preserved
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, name)| {
+                        target_columns.contains(*name) && !(drop_id && *name == "id")
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                if keep.is_empty() {
+                    continue;
+                }
+                let issue_id_index = preserved.columns.iter().position(|c| c == "issue_id");
+                let column_list = keep
+                    .iter()
+                    .map(|&i| preserved.columns[i].as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let placeholders = vec!["?"; keep.len()].join(", ");
+                let insert = format!(
+                    "INSERT OR IGNORE INTO {table} ({column_list}) VALUES ({placeholders})"
+                );
+                let mut restored = 0usize;
+                let mut skipped = 0usize;
+                for row in &preserved.rows {
+                    if let Some(index) = issue_id_index {
+                        let owner = row.get(index).and_then(|v| v.as_text());
+                        if !owner.is_some_and(|id| live_issue_ids.contains(id)) {
+                            skipped += 1;
+                            continue;
+                        }
+                    }
+                    let params: Vec<SqliteValue> =
+                        keep.iter().filter_map(|&i| row.get(i).cloned()).collect();
+                    if params.len() != keep.len() {
+                        skipped += 1;
+                        continue;
+                    }
+                    restored += conn.execute_with_params(&insert, &params)?;
+                }
+                report.push((preserved.table.clone(), restored, skipped));
+            }
+            Ok(())
+        })?;
+        Ok(report)
+    }
+
     /// Check whether a foreign-key-backed table contains rows whose reference
     /// column points at a missing issue.
     ///
@@ -3920,6 +4113,28 @@ impl SqliteStorage {
                 BeadsError::Config(format!("gate-result history row {id} missing after insert"))
             })?;
             recorded = Some(gate_result_record_from_row(row)?);
+            // GitHub #466: mirror the verdict into the current-state
+            // `gate_results` table. One row per (issue, gate, provider) with
+            // the provider's most-recent verdict; a re-report overwrites the
+            // prior row exactly as the schema comment promises. Transition
+            // enforcement never reads this table (it consults the scoped
+            // history above); the mirror keeps the documented current-state
+            // view populated for external queries. Runs after the
+            // last_insert_rowid() capture so it cannot disturb the history
+            // row lookup.
+            conn.execute_with_params(
+                "INSERT OR REPLACE INTO gate_results (
+                    issue_id, gate, provider, passed, note, recorded_by, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                &[
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(gate),
+                    SqliteValue::from(provider),
+                    SqliteValue::from(i64::from(passed)),
+                    note.map_or(SqliteValue::Null, SqliteValue::from),
+                    SqliteValue::from(recorded_by),
+                ],
+            )?;
             Ok(())
         })?;
         recorded.ok_or_else(|| {
@@ -14600,7 +14815,51 @@ impl SqliteStorage {
             issues.push(Self::issue_from_row(row)?);
         }
 
+        self.attach_close_bypass_audit_for_export(&mut issues)?;
+
         Ok(issues)
+    }
+
+    /// Project the close-policy bypass audit trail from `close_metadata`
+    /// onto issues being exported (GitHub #474). Without this a
+    /// `--bypass-policy` close is recorded only in the gitignored local
+    /// database and is invisible in the shared JSONL record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the audit query fails.
+    pub(crate) fn attach_close_bypass_audit_for_export(&self, issues: &mut [Issue]) -> Result<()> {
+        if issues.is_empty() || !crate::storage::schema::table_exists(&self.conn, "close_metadata")
+        {
+            return Ok(());
+        }
+        let rows = self.conn.query(
+            "SELECT issue_id, bypass_reason, policy_gates_fired
+             FROM close_metadata WHERE bypassed_policy = 1",
+        )?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut audit: HashMap<String, (Option<String>, Option<Vec<String>>)> = HashMap::new();
+        for row in &rows {
+            let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let reason = row.get(1).and_then(SqliteValue::as_text).map(String::from);
+            let gates = row
+                .get(2)
+                .and_then(SqliteValue::as_text)
+                .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok());
+            audit.insert(issue_id.to_string(), (reason, gates));
+        }
+        for issue in issues.iter_mut() {
+            if let Some((reason, gates)) = audit.get(&issue.id) {
+                issue.bypassed_policy = Some(true);
+                issue.bypass_reason.clone_from(reason);
+                issue.policy_gates_fired.clone_from(gates);
+            }
+        }
+        Ok(())
     }
 
     /// Get all dependency records for all issues.
@@ -15500,6 +15759,9 @@ impl SqliteStorage {
             closed_at: get_opt_datetime(16)?,
             close_reason: get_non_empty_str(17),
             closed_by_session: get_non_empty_str(18),
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: get_opt_datetime(19)?,
             defer_until: get_opt_datetime(20)?,
             external_ref: get_opt_str(21),
@@ -15570,6 +15832,9 @@ impl SqliteStorage {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -15635,6 +15900,9 @@ impl SqliteStorage {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -15700,6 +15968,9 @@ impl SqliteStorage {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -15759,6 +16030,9 @@ impl SqliteStorage {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -15824,6 +16098,9 @@ impl SqliteStorage {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -15883,6 +16160,9 @@ impl SqliteStorage {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -17819,6 +18099,8 @@ impl SqliteStorage {
             }
         }
 
+        self.attach_close_bypass_audit_for_export(&mut issues)?;
+
         Ok(issues)
     }
 
@@ -18586,10 +18868,50 @@ impl SqliteStorage {
                     issue.id
                 ))));
             }
+            self.persist_imported_close_bypass_audit_in_tx(issue)?;
             return Ok(true);
         }
 
-        Ok(self.insert_issue_row_for_import(issue, &timestamps)? > 0)
+        let inserted = self.insert_issue_row_for_import(issue, &timestamps)? > 0;
+        if inserted {
+            self.persist_imported_close_bypass_audit_in_tx(issue)?;
+        }
+        Ok(inserted)
+    }
+
+    /// Persist an imported close-policy bypass audit trail into
+    /// `close_metadata` (GitHub #474). A locally recorded row wins — the
+    /// machine that performed the bypass holds the richer record (closer
+    /// attribution columns) — so this is insert-only.
+    fn persist_imported_close_bypass_audit_in_tx(&self, issue: &Issue) -> Result<()> {
+        if issue.bypassed_policy != Some(true) {
+            return Ok(());
+        }
+        let gates_json = issue
+            .policy_gates_fired
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|err| {
+                BeadsError::Config(format!(
+                    "could not serialize imported policy_gates_fired for {}: {err}",
+                    issue.id
+                ))
+            })?;
+        self.conn.execute_with_params(
+            "INSERT OR IGNORE INTO close_metadata \
+             (issue_id, bypassed_policy, bypass_reason, policy_gates_fired) \
+             VALUES (?, 1, ?, ?)",
+            &[
+                SqliteValue::from(issue.id.as_str()),
+                issue
+                    .bypass_reason
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+                gates_json.map_or(SqliteValue::Null, SqliteValue::from),
+            ],
+        )?;
+        Ok(())
     }
 
     /// Check whether relation rows already exist for an imported issue ID.
@@ -20108,6 +20430,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             external_ref: None,
             source_system: None,
@@ -21180,6 +21505,30 @@ mod tests {
         assert_eq!(
             storage.get_gate_result_history("bd-cycle").unwrap().len(),
             2
+        );
+
+        // GitHub #466: every scoped report must also mirror the latest
+        // (gate, provider) verdict into the current-state `gate_results`
+        // table. Two reports from the same provider collapse into one row
+        // carrying the most recent verdict/note.
+        let mirror = storage
+            .conn
+            .query("SELECT issue_id, gate, provider, passed, note FROM gate_results")
+            .unwrap();
+        assert_eq!(
+            mirror.len(),
+            1,
+            "gate_results must hold exactly one current-state row per (issue, gate, provider)"
+        );
+        let row = &mirror[0];
+        assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some("bd-cycle"));
+        assert_eq!(row.get(1).and_then(SqliteValue::as_text), Some("ci_green"));
+        assert_eq!(row.get(2).and_then(SqliteValue::as_text), Some("ci"));
+        assert_eq!(row.get(3).and_then(SqliteValue::as_integer), Some(1));
+        assert_eq!(
+            row.get(4).and_then(SqliteValue::as_text),
+            Some("cycle two"),
+            "a re-report must overwrite the mirror row with the latest verdict"
         );
     }
 
@@ -23621,6 +23970,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             defer_until: None,
             due_at: None,
             external_ref: None,
@@ -24957,6 +25309,183 @@ mod tests {
         assert!(
             foreign_key_violations.is_empty(),
             "purge left foreign-key violations: {foreign_key_violations:?}"
+        );
+    }
+
+    /// GitHub #471: the auxiliary/history snapshot must carry every DB-only
+    /// table across a rebuild, keep ids when the target tables are empty,
+    /// and skip rows whose issue did not survive the rebuild.
+    #[test]
+    fn test_auxiliary_history_snapshot_restores_after_rebuild() {
+        let t1 = Utc.with_ymd_and_hms(2025, 5, 1, 0, 0, 0).unwrap();
+        let mut source = SqliteStorage::open_memory().unwrap();
+        let survivor = make_issue("bd-hist-keep", "survives", Status::Open, 2, None, t1, None);
+        let dropped = make_issue("bd-hist-drop", "dropped", Status::Open, 2, None, t1, None);
+        source.create_issue(&survivor, "tester").unwrap();
+        source.create_issue(&dropped, "tester").unwrap();
+        for (issue, gate) in [("bd-hist-keep", "review"), ("bd-hist-drop", "review")] {
+            source
+                .conn
+                .execute_with_params(
+                    "INSERT INTO gate_result_history \
+                     (issue_id, from_status, to_status, status_revision, gate, provider, passed) \
+                     VALUES (?, 'open', 'closed', 1, ?, 'test', 1)",
+                    &[SqliteValue::from(issue), SqliteValue::from(gate)],
+                )
+                .unwrap();
+        }
+        source
+            .conn
+            .execute(
+                "INSERT INTO close_metadata (issue_id, bypassed_policy, bypass_reason) \
+                 VALUES ('bd-hist-keep', 1, 'urgent')",
+            )
+            .unwrap();
+        source
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO capacity_occupancy (issue_id, actor) \
+                 VALUES ('bd-hist-keep', 'tester')",
+            )
+            .unwrap();
+        let source_events = source.get_events("bd-hist-keep", 0).unwrap().len();
+        assert!(source_events > 0, "creation must have produced events");
+
+        let snapshot = source.snapshot_auxiliary_history_tables();
+        assert!(snapshot.failures.is_empty(), "{:?}", snapshot.failures);
+        assert!(snapshot.row_count() > 0);
+
+        // Rebuild target holds only the survivor (as after a JSONL rebuild
+        // whose export lacked the dropped issue).
+        let mut rebuilt = SqliteStorage::open_memory().unwrap();
+        rebuilt.create_issue(&survivor, "import").unwrap();
+        let report = rebuilt.restore_auxiliary_history_tables(&snapshot).unwrap();
+
+        let restored_events = rebuilt
+            .conn
+            .query_row("SELECT COUNT(*) FROM events WHERE issue_id = 'bd-hist-keep'")
+            .unwrap()
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap();
+        assert!(
+            restored_events >= i64::try_from(source_events).unwrap(),
+            "survivor events must be preserved (got {restored_events})"
+        );
+        let gate_rows = rebuilt
+            .conn
+            .query("SELECT issue_id FROM gate_result_history")
+            .unwrap();
+        assert_eq!(gate_rows.len(), 1, "only the survivor's gate history stays");
+        assert_eq!(
+            gate_rows[0].get(0).and_then(SqliteValue::as_text),
+            Some("bd-hist-keep")
+        );
+        let close_reason = rebuilt
+            .conn
+            .query_row("SELECT bypass_reason FROM close_metadata WHERE issue_id = 'bd-hist-keep'")
+            .unwrap()
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .map(String::from);
+        assert_eq!(close_reason.as_deref(), Some("urgent"));
+        let occupancy = rebuilt
+            .conn
+            .query_row("SELECT COUNT(*) FROM capacity_occupancy")
+            .unwrap()
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap();
+        assert_eq!(occupancy, 1);
+        assert!(
+            report
+                .iter()
+                .any(|(table, restored, _)| table == "gate_result_history" && *restored == 1),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|(table, _, skipped)| table == "gate_result_history" && *skipped == 1),
+            "dropped issue's history must be counted as skipped: {report:?}"
+        );
+        let fk = rebuilt.conn.query("PRAGMA foreign_key_check").unwrap();
+        assert!(fk.is_empty(), "restore left FK violations: {fk:?}");
+    }
+
+    /// GitHub #474: a bypassed close must travel through the JSONL export
+    /// and re-import into `close_metadata` on another machine.
+    #[test]
+    fn test_close_bypass_audit_exports_and_imports() {
+        let t1 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut issue = make_issue(
+            "bd-bypassed",
+            "bypassed close",
+            Status::Closed,
+            2,
+            None,
+            t1,
+            None,
+        );
+        issue.closed_at = Some(t1);
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .conn
+            .execute(
+                "INSERT INTO close_metadata \
+                 (issue_id, bypassed_policy, bypass_reason, policy_gates_fired) \
+                 VALUES ('bd-bypassed', 1, 'demonstrating the export gap', \
+                         '[\"typed_references_required\"]')",
+            )
+            .unwrap();
+
+        let exported = storage
+            .get_issues_for_export(&["bd-bypassed".to_string()])
+            .unwrap();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].bypassed_policy, Some(true));
+        assert_eq!(
+            exported[0].bypass_reason.as_deref(),
+            Some("demonstrating the export gap")
+        );
+        assert_eq!(
+            exported[0].policy_gates_fired.as_deref(),
+            Some(&["typed_references_required".to_string()][..])
+        );
+        let line = serde_json::to_string(&exported[0]).unwrap();
+        assert!(line.contains("\"bypassed_policy\":true"), "{line}");
+        assert!(line.contains("bypass_reason"), "{line}");
+
+        // A non-bypassed close serializes no audit fields (additive schema).
+        let mut clean = make_issue("bd-clean", "clean close", Status::Closed, 2, None, t1, None);
+        clean.closed_at = Some(t1);
+        storage.create_issue(&clean, "tester").unwrap();
+        let clean_export = storage
+            .get_issues_for_export(&["bd-clean".to_string()])
+            .unwrap();
+        let clean_line = serde_json::to_string(&clean_export[0]).unwrap();
+        assert!(!clean_line.contains("bypassed_policy"), "{clean_line}");
+
+        // Import the exported record on a "different machine".
+        let other = SqliteStorage::open_memory().unwrap();
+        let parsed: Issue = serde_json::from_str(&line).unwrap();
+        other.upsert_issue_for_import(&parsed).unwrap();
+        let row = other
+            .conn
+            .query_row(
+                "SELECT bypassed_policy, bypass_reason, policy_gates_fired \
+                 FROM close_metadata WHERE issue_id = 'bd-bypassed'",
+            )
+            .unwrap();
+        assert_eq!(row.get(0).and_then(SqliteValue::as_integer), Some(1));
+        assert_eq!(
+            row.get(1).and_then(SqliteValue::as_text),
+            Some("demonstrating the export gap")
+        );
+        assert_eq!(
+            row.get(2).and_then(SqliteValue::as_text),
+            Some("[\"typed_references_required\"]")
         );
     }
 
@@ -27089,6 +27618,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             defer_until: None,
             due_at: None,
             external_ref: None,
@@ -27170,6 +27702,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             defer_until: None,
             due_at: None,
             external_ref: None,
@@ -27245,6 +27780,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             defer_until: None,
             due_at: None,
             external_ref: None,
@@ -27377,6 +27915,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             defer_until: None,
             due_at: None,
             external_ref: None,
@@ -27995,6 +28536,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             defer_until: None,
             due_at: None,
             external_ref: None,

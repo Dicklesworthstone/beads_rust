@@ -530,6 +530,22 @@ pub struct Issue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed_by_session: Option<String>,
 
+    /// Close-policy bypass audit trail (GitHub #474). Serialized into the
+    /// JSONL export only when the close bypassed policy so a bypassed close
+    /// is reviewable off-machine; absent means "not bypassed" (pre-change
+    /// exports stay valid). Backed by the DB-only `close_metadata` table;
+    /// excluded from `content_hash` and from `sync_equals`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypassed_policy: Option<bool>,
+
+    /// Operator-supplied reason for the policy bypass (GitHub #474).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypass_reason: Option<String>,
+
+    /// Names of the close-policy gates the bypass overrode (GitHub #474).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_gates_fired: Option<Vec<String>>,
+
     /// Due date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due_at: Option<DateTime<Utc>>,
@@ -649,6 +665,9 @@ impl Default for Issue {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -1020,6 +1039,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -1489,6 +1511,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             source_repo_path: None,
