@@ -779,7 +779,10 @@ fn e2e_doctor_repair_preserves_history_tables() {
         let rows = conn
             .query("SELECT COUNT(*) FROM events")
             .expect("count events");
-        let count = rows[0].get(0).and_then(|v| v.as_integer()).unwrap_or(0);
+        let count = rows[0]
+            .get(0)
+            .and_then(beads_rust::franken_sync::SqliteValue::as_integer)
+            .unwrap_or(0);
         // Inject the recoverable anomaly that forces the JSONL rebuild path.
         conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')")
             .expect("insert duplicate config row a");
@@ -813,7 +816,10 @@ fn e2e_doctor_repair_preserves_history_tables() {
         let rows = conn
             .query("SELECT COUNT(*) FROM events")
             .expect("count events after repair");
-        rows[0].get(0).and_then(|v| v.as_integer()).unwrap_or(0)
+        rows[0]
+            .get(0)
+            .and_then(beads_rust::franken_sync::SqliteValue::as_integer)
+            .unwrap_or(0)
     };
     assert!(
         events_after >= events_before,

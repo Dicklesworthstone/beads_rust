@@ -182,7 +182,9 @@ fn e2e_list_tree_output_groups_children_under_parents() {
     for title in ["child one", "child two"] {
         let child = run_br(
             &workspace,
-            ["create", title, "-t", "task", "-p", "2", "--parent", &epic_id],
+            [
+                "create", title, "-t", "task", "-p", "2", "--parent", &epic_id,
+            ],
             "create_child",
         );
         assert!(
@@ -221,11 +223,9 @@ fn e2e_list_tree_output_groups_children_under_parents() {
         &lines[epic_line..]
     );
     assert!(
-        lines
-            .iter()
-            .any(|line| line.contains("standalone")
-                && !line.starts_with("├──")
-                && !line.starts_with("└──")),
+        lines.iter().any(|line| line.contains("standalone")
+            && !line.starts_with("├──")
+            && !line.starts_with("└──")),
         "an issue without a listed parent stays at the top level: {}",
         tree.stdout
     );
