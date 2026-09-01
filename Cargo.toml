@@ -126,7 +126,7 @@ unicode-width = "0.2.2"
 semver = "1.0.28"
 
 # MCP server (optional; gated behind the `mcp` feature)
-fastmcp-rust = { version = "=0.7.0", optional = true }
+fastmcp-rust = { version = "=0.7.1", optional = true }
 
 # Self-update (optional; gated behind the `self_update` feature)
 self_update = { version = "1.0.0-rc.4", features = ["reqwest", "rustls", "github", "progress-bar", "archive-tar", "compression-tar-gz"], default-features = false, optional = true }

@@ -550,6 +550,91 @@ fn e2e_noop_anchor_missing_cached_hash_fails_then_force_recovers() {
     );
 }
 
+/// GitHub #472 / beads_rust-a6kl: a fresh workspace (globally empty JSONL,
+/// zero DB issues, no cached content hash yet) must certify a no-op flush
+/// instead of failing with "Cannot certify a no-op flush". Non-empty
+/// workspaces without a cached hash stay fail-closed (covered above).
+#[test]
+fn e2e_fresh_empty_workspace_noop_flush_certifies_without_cached_hash() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "fresh_empty_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let beads_dir = workspace.root.join(".beads");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let anchor_path = beads_dir.join("beads.base.jsonl");
+    let storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("open fresh database");
+    assert_eq!(storage.count_issues().expect("count fresh issues"), 0);
+    assert_eq!(
+        storage
+            .get_metadata(METADATA_JSONL_CONTENT_HASH)
+            .expect("read fresh cached hash")
+            .filter(|hash| !hash.trim().is_empty()),
+        None,
+        "precondition: a fresh workspace has no certified content hash"
+    );
+    drop(storage);
+
+    let flush = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--json", "--no-auto-import"],
+        "fresh_empty_flush",
+    );
+    assert!(
+        flush.status.success(),
+        "fresh global-empty no-op flush must certify: {}",
+        flush.stderr
+    );
+    assert_eq!(
+        std::fs::read(&anchor_path).expect("read fresh anchor"),
+        std::fs::read(&jsonl_path).expect("read fresh JSONL after flush"),
+        "certification must materialize a byte-exact merge anchor"
+    );
+}
+
+/// GitHub #473: the advertised additive dry-run must be reachable and
+/// bounded. `br sync --reconcile-additive --dry-run` (and the bare plan
+/// form) must emit a plan receipt and exit instead of demanding
+/// `--reconcile` or hanging while holding the database.
+#[test]
+fn e2e_reconcile_additive_dry_run_emits_bounded_plan() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "additive_dry_run_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let created = run_br(&workspace, ["create", "plan me"], "additive_dry_run_create");
+    assert!(
+        created.status.success(),
+        "create failed: {}",
+        created.stderr
+    );
+    let flush = run_br(
+        &workspace,
+        ["sync", "--flush-only"],
+        "additive_dry_run_flush",
+    );
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+
+    for args in [
+        vec!["sync", "--reconcile-additive", "--dry-run", "--json"],
+        vec!["sync", "--reconcile-additive", "--json"],
+    ] {
+        let label = args.join("_").replace("--", "");
+        let plan = run_br(&workspace, args.clone(), &label);
+        assert!(
+            plan.status.success(),
+            "{args:?} must emit a plan and exit cleanly: stdout={} stderr={}",
+            plan.stdout,
+            plan.stderr
+        );
+        let payload = extract_json_payload(&plan.stdout);
+        let receipt: Value = serde_json::from_str(&payload).expect("parse plan receipt JSON");
+        assert!(
+            receipt.get("plan_sha256").is_some() || receipt.get("status").is_some(),
+            "plan receipt must be machine-readable: {receipt}"
+        );
+    }
+}
+
 #[test]
 fn e2e_noop_anchor_accepts_whitespace_only_change_and_copies_exact_bytes() {
     let (workspace, _issue_id) = setup_certified_anchor_workspace("whitespace_only");

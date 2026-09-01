@@ -728,6 +728,115 @@ fn e2e_doctor_repair_preserves_unflushed_tombstones() {
 }
 
 #[test]
+fn e2e_doctor_repair_preserves_history_tables() {
+    // GitHub #471: `doctor --repair`'s JSONL rebuild used to silently empty
+    // every DB-only history table (events, gate results, close/bypass audit,
+    // capacity records) while reporting success. The fix snapshots those
+    // tables from the pre-repair DB and restores them after the rebuild,
+    // reporting per-table counts in the JSON envelope.
+    let _log = common::test_log("e2e_doctor_repair_preserves_history_tables");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let created = run_br(&workspace, ["create", "History carrier"], "create");
+    assert!(
+        created.status.success(),
+        "create failed: {}",
+        created.stderr
+    );
+    let issue_id = created
+        .stdout
+        .lines()
+        .next()
+        .and_then(|line| {
+            line.strip_prefix("✓ ")
+                .unwrap_or(line)
+                .strip_prefix("Created ")
+                .and_then(|rest| rest.split(':').next())
+        })
+        .expect("parse created id")
+        .trim()
+        .to_string();
+    let updated = run_br(
+        &workspace,
+        ["update", &issue_id, "--status", "in_progress"],
+        "update_status",
+    );
+    assert!(
+        updated.status.success(),
+        "update failed: {}",
+        updated.stderr
+    );
+    let flush = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+
+    let db_path = workspace.root.join(".beads").join("beads.db");
+    let events_before = {
+        let conn = Connection::open(db_path.to_string_lossy().into_owned())
+            .expect("open beads db to count events");
+        let rows = conn
+            .query("SELECT COUNT(*) FROM events")
+            .expect("count events");
+        let count = rows[0].get(0).and_then(|v| v.as_integer()).unwrap_or(0);
+        // Inject the recoverable anomaly that forces the JSONL rebuild path.
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')")
+            .expect("insert duplicate config row a");
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')")
+            .expect("insert duplicate config row b");
+        count
+    };
+    assert!(
+        events_before > 0,
+        "the workspace must carry events before the repair"
+    );
+
+    let repaired = run_br(
+        &workspace,
+        ["doctor", "--repair", "--json"],
+        "doctor_repair",
+    );
+    assert!(
+        repaired.status.success(),
+        "doctor --repair failed: exit={:?}\nstdout={}\nstderr={}",
+        repaired.status.code(),
+        repaired.stdout,
+        repaired.stderr
+    );
+    let payload = extract_json_payload(&repaired.stdout);
+    let envelope: Value = serde_json::from_str(&payload).expect("parse doctor repair json");
+
+    let events_after = {
+        let conn = Connection::open(db_path.to_string_lossy().into_owned())
+            .expect("reopen beads db to count events");
+        let rows = conn
+            .query("SELECT COUNT(*) FROM events")
+            .expect("count events after repair");
+        rows[0].get(0).and_then(|v| v.as_integer()).unwrap_or(0)
+    };
+    assert!(
+        events_after >= events_before,
+        "doctor --repair must preserve the events history across the JSONL rebuild \
+         (before={events_before}, after={events_after})\nenvelope={envelope}"
+    );
+    // When the rebuild actually ran, the envelope must account for the
+    // preserved history so the operator can see what was carried across.
+    if envelope.get("imported").is_some() {
+        let preserved = envelope
+            .get("preserved_history")
+            .and_then(Value::as_array)
+            .expect("repair envelope must report preserved_history");
+        assert!(
+            preserved
+                .iter()
+                .any(|entry| entry["table"] == "events" && entry["restored"].as_u64() > Some(0)),
+            "preserved_history must include restored events rows: {envelope}"
+        );
+    }
+}
+
+#[test]
 fn e2e_doctor_repair_preserves_unflushed_dirty_issues() {
     // Regression for #394: `doctor --repair` falls through to a JSONL rebuild
     // when light repairs don't clear the report. That rebuild imports only

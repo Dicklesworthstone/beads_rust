@@ -163,6 +163,74 @@ fn setup_diverse_workspace() -> (BrWorkspace, Vec<String>) {
 // BASIC LISTING TESTS
 // =============================================================================
 
+/// GitHub #475: `br list --tree` groups dotted child IDs under their parent
+/// with box-drawing connectors so the hierarchy is visible at a glance.
+#[test]
+fn e2e_list_tree_output_groups_children_under_parents() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let epic = run_br(
+        &workspace,
+        ["create", "Epic parent", "-t", "epic", "-p", "1"],
+        "create_epic",
+    );
+    assert!(epic.status.success(), "create epic failed: {}", epic.stderr);
+    let epic_id = parse_created_id(&epic.stdout);
+
+    for title in ["child one", "child two"] {
+        let child = run_br(
+            &workspace,
+            ["create", title, "-t", "task", "-p", "2", "--parent", &epic_id],
+            "create_child",
+        );
+        assert!(
+            child.status.success(),
+            "create child failed: {}",
+            child.stderr
+        );
+    }
+    let solo = run_br(
+        &workspace,
+        ["create", "standalone", "-t", "task", "-p", "3"],
+        "create_solo",
+    );
+    assert!(solo.status.success(), "create solo failed: {}", solo.stderr);
+
+    let tree = run_br(&workspace, ["list", "--tree"], "list_tree");
+    assert!(tree.status.success(), "list --tree failed: {}", tree.stderr);
+    let lines: Vec<&str> = tree.stdout.lines().collect();
+    let epic_line = lines
+        .iter()
+        .position(|line| line.contains("Epic parent"))
+        .expect("epic must be listed");
+    assert!(
+        !lines[epic_line].starts_with("├──") && !lines[epic_line].starts_with("└──"),
+        "the parent renders at the top level: {:?}",
+        lines[epic_line]
+    );
+    assert!(
+        lines[epic_line + 1].starts_with("├── ") && lines[epic_line + 1].contains("child one"),
+        "first child nests under the parent with a mid connector: {:?}",
+        &lines[epic_line..]
+    );
+    assert!(
+        lines[epic_line + 2].starts_with("└── ") && lines[epic_line + 2].contains("child two"),
+        "last child uses the closing connector: {:?}",
+        &lines[epic_line..]
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("standalone")
+                && !line.starts_with("├──")
+                && !line.starts_with("└──")),
+        "an issue without a listed parent stays at the top level: {}",
+        tree.stdout
+    );
+}
+
 #[test]
 fn e2e_list_basic_text_output() {
     let _log = common::test_log("e2e_list_basic_text_output");
