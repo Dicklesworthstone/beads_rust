@@ -13132,6 +13132,7 @@ fn collect_import_validation_plan(
 ) -> Result<ImportValidationPlan> {
     let mut plan = ImportValidationPlan::default();
     let mut seen_ids = HashSet::new();
+    let mut positive_comment_owners = HashMap::<i64, (String, usize)>::new();
 
     for_each_jsonl_import_issue(source, |line_num, issue, _| {
         let prefix_mismatch = !config.skip_prefix_validation
@@ -13156,6 +13157,25 @@ fn collect_import_validation_plan(
                 source.display_path().display(),
                 line_num
             )));
+        }
+
+        for comment in &issue.comments {
+            if comment.id <= 0 {
+                continue;
+            }
+            if let Some((first_issue_id, first_line_num)) =
+                positive_comment_owners.insert(comment.id, (issue.id.clone(), line_num))
+            {
+                return Err(BeadsError::Config(format!(
+                    "Duplicate positive comment id '{}' in {}: issue '{}' at line {} conflicts with issue '{}' at line {}",
+                    comment.id,
+                    source.display_path().display(),
+                    first_issue_id,
+                    first_line_num,
+                    issue.id,
+                    line_num
+                )));
+            }
         }
 
         if prefix_mismatch {
@@ -20364,6 +20384,88 @@ mod tests {
         assert_eq!(result.exact_duplicate_comments_deduplicated, 1);
         assert_eq!(result.comments_imported, 1);
         assert_eq!(storage.get_comments(&issue.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_import_rejects_cross_issue_duplicate_positive_comment_ids_before_mutation() {
+        fn assert_rejected(second_body: &str, reverse_lines: bool) {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let sentinel = make_test_issue("bd-comment-sentinel", "Existing state");
+            storage.create_issue(&sentinel, "tester").unwrap();
+            let sentinel_comment = storage
+                .add_comment(&sentinel.id, "keeper", "must remain unchanged")
+                .unwrap();
+
+            let temp_dir = TempDir::new().unwrap();
+            let jsonl_path = temp_dir.path().join("issues.jsonl");
+            let mut first = make_test_issue("bd-comment-duplicate-a", "First owner");
+            let mut second = make_test_issue("bd-comment-duplicate-b", "Second owner");
+            first.comments.push(crate::model::Comment {
+                id: 3_560,
+                issue_id: first.id.clone(),
+                author: "alice".to_string(),
+                body: "shared identity".to_string(),
+                created_at: first.created_at,
+            });
+            second.comments.push(crate::model::Comment {
+                id: 3_560,
+                issue_id: second.id.clone(),
+                author: "alice".to_string(),
+                body: second_body.to_string(),
+                created_at: first.created_at,
+            });
+            let issues = if reverse_lines {
+                [&second, &first]
+            } else {
+                [&first, &second]
+            };
+            fs::write(
+                &jsonl_path,
+                format!(
+                    "{}\n{}\n",
+                    serde_json::to_string(issues[0]).unwrap(),
+                    serde_json::to_string(issues[1]).unwrap()
+                ),
+            )
+            .unwrap();
+
+            let err = import_from_jsonl(
+                &mut storage,
+                &jsonl_path,
+                &ImportConfig::default(),
+                Some("bd-"),
+            )
+            .expect_err("cross-issue positive comment identities must be globally unique");
+            let message = err.to_string();
+            assert!(message.contains("Duplicate positive comment id '3560'"));
+            assert!(message.contains("bd-comment-duplicate-a"));
+            assert!(message.contains("bd-comment-duplicate-b"));
+            assert!(message.contains("line 1"));
+            assert!(message.contains("line 2"));
+
+            assert!(
+                storage
+                    .get_issue("bd-comment-duplicate-a")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                storage
+                    .get_issue("bd-comment-duplicate-b")
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                storage.get_comments(&sentinel.id).unwrap(),
+                vec![sentinel_comment],
+                "preflight rejection must not mutate existing comments"
+            );
+        }
+
+        for reverse_lines in [false, true] {
+            assert_rejected("different payload", reverse_lines);
+            assert_rejected("shared identity", reverse_lines);
+        }
     }
 
     #[test]
