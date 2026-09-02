@@ -4346,3 +4346,303 @@ fn e2e_sync_rebuild_accepts_legacy_prefixed_ids_without_renaming() {
         comment.stderr
     );
 }
+
+/// Every `--flag` a hint names must exist in that command's `--help`, so a
+/// hint never sends an agent to a flag that does not exist.
+fn assert_hint_flags_exist(workspace: &BrWorkspace, command: &[&str], hint: &str, label: &str) {
+    let mut args: Vec<&str> = command.to_vec();
+    args.push("--help");
+    let help = run_br(workspace, args, label);
+    assert!(
+        help.status.success(),
+        "{label}: --help failed: {}",
+        help.stderr
+    );
+    for token in hint.split_whitespace() {
+        let Some(flag) = token.strip_prefix("--") else {
+            continue;
+        };
+        let flag = flag
+            .split('=')
+            .next()
+            .unwrap_or(flag)
+            .trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
+        assert!(
+            help.stdout.contains(&format!("--{flag}")),
+            "{label}: hint names --{flag} but `br {} --help` does not list it; hint: {hint}",
+            command.join(" ")
+        );
+    }
+}
+
+fn error_payload(stdout: &str, label: &str) -> Value {
+    let json =
+        parse_error_json(stdout).unwrap_or_else(|| panic!("{label}: no JSON error: {stdout}"));
+    assert!(
+        verify_error_structure(&json),
+        "{label}: missing fields: {json}"
+    );
+    json["error"].clone()
+}
+
+/// The mistakes README examples make easy to commit each get an actionable
+/// hint in text and JSON mode, and every flag a hint names exists.
+#[test]
+fn e2e_docs_shaped_mistakes_have_actionable_hints() {
+    let _log = common::test_log("e2e_docs_shaped_mistakes_have_actionable_hints");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let first = parse_created_id(&run_br(&workspace, ["create", "First"], "create_first").stdout);
+    let second =
+        parse_created_id(&run_br(&workspace, ["create", "Second"], "create_second").stdout);
+
+    // 1. A label in front of the issue ID is named as such, not "Issue not found".
+    let label_first = run_br(
+        &workspace,
+        ["label", "add", "backend", &first],
+        "label_add_label_first",
+    );
+    assert_eq!(
+        label_first.status.code(),
+        Some(4),
+        "stderr: {}",
+        label_first.stderr
+    );
+    assert!(
+        label_first.stderr.contains("Hint:") && label_first.stderr.contains("-l backend"),
+        "text hint should show the -l form: {}",
+        label_first.stderr
+    );
+    let label_first_json = run_br(
+        &workspace,
+        ["label", "add", "backend", &first, "--json"],
+        "label_add_label_first_json",
+    );
+    assert_eq!(label_first_json.status.code(), Some(4));
+    let error = error_payload(&label_first_json.stdout, "label_add_label_first_json");
+    assert_eq!(error["code"], "VALIDATION_FAILED");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("'backend' is not an issue ID"),
+        "message: {}",
+        error["message"]
+    );
+    let hint = error["hint"].as_str().expect("label hint");
+    assert!(
+        hint.contains("br label add <issue...> backend") && hint.contains("-l backend"),
+        "hint: {hint}"
+    );
+    assert_hint_flags_exist(&workspace, &["label", "add"], hint, "label_add_help");
+    let remove_first = run_br(
+        &workspace,
+        ["label", "remove", "backend", &first, "--json"],
+        "label_remove_label_first_json",
+    );
+    let remove_hint = error_payload(&remove_first.stdout, "label_remove_label_first_json");
+    assert!(
+        remove_hint["hint"]
+            .as_str()
+            .unwrap()
+            .contains("br label remove <issue...> backend"),
+        "remove hint: {}",
+        remove_hint["hint"]
+    );
+    // The documented forms work: several positional labels and repeated -l.
+    let multi = run_br(
+        &workspace,
+        ["label", "add", &first, "backend", "urgent"],
+        "label_add_multi",
+    );
+    assert!(multi.status.success(), "stderr: {}", multi.stderr);
+    let repeated = run_br(
+        &workspace,
+        [
+            "label", "add", &second, "-l", "alpha", "-l", "beta", "--json",
+        ],
+        "label_add_repeated_flag",
+    );
+    assert!(repeated.status.success(), "stderr: {}", repeated.stderr);
+    let show = run_br(&workspace, ["show", &first, "--json"], "show_first_labels");
+    let payload: Value = serde_json::from_str(&extract_json_payload(&show.stdout)).unwrap();
+    let labels = payload
+        .as_array()
+        .and_then(|entries| entries.first())
+        .unwrap_or(&payload)["labels"]
+        .clone();
+    assert!(
+        labels.as_array().unwrap().iter().any(|l| l == "backend")
+            && labels.as_array().unwrap().iter().any(|l| l == "urgent"),
+        "labels: {labels}"
+    );
+
+    // 2. Priority filters: out of range, backwards range, word instead of number.
+    let out_of_range = run_br(
+        &workspace,
+        ["list", "--priority", "9", "--json"],
+        "list_priority_9_json",
+    );
+    assert_eq!(out_of_range.status.code(), Some(4));
+    let error = error_payload(&out_of_range.stdout, "list_priority_9_json");
+    assert_eq!(error["code"], "INVALID_PRIORITY");
+    let hint = error["hint"].as_str().expect("priority hint");
+    assert!(
+        hint.contains("0-4") && hint.contains("0-1") && hint.contains("0,2"),
+        "hint should list the range and list forms: {hint}"
+    );
+    assert_hint_flags_exist(&workspace, &["list"], hint, "list_help");
+    let backwards = run_br(
+        &workspace,
+        ["list", "--priority", "3-1"],
+        "list_priority_backwards",
+    );
+    assert_eq!(backwards.status.code(), Some(4));
+    assert!(
+        backwards.stderr.contains("Hint:") && backwards.stderr.contains("use 1-3"),
+        "backwards range hint: {}",
+        backwards.stderr
+    );
+    let word = run_br(
+        &workspace,
+        ["create", "Prio", "--priority", "high", "--json"],
+        "create_priority_word_json",
+    );
+    assert_eq!(word.status.code(), Some(4));
+    let error = error_payload(&word.stdout, "create_priority_word_json");
+    let hint = error["hint"].as_str().expect("priority word hint");
+    assert!(hint.contains("--priority 1"), "hint: {hint}");
+    assert_hint_flags_exist(&workspace, &["create"], hint, "create_help");
+    let range_ok = run_br(
+        &workspace,
+        ["list", "--priority", "0-2", "--json"],
+        "list_priority_range_ok",
+    );
+    assert!(range_ok.status.success(), "stderr: {}", range_ok.stderr);
+
+    // 3. An unknown config key is written but warned about, with nearest keys.
+    let unknown_key = run_br(
+        &workspace,
+        ["config", "set", "id.prefix", "zz"],
+        "config_set_unknown_key",
+    );
+    assert!(
+        unknown_key.status.success(),
+        "stderr: {}",
+        unknown_key.stderr
+    );
+    assert!(
+        unknown_key
+            .stderr
+            .contains("unknown config key 'id.prefix'"),
+        "stderr: {}",
+        unknown_key.stderr
+    );
+    let unknown_key_json = run_br(
+        &workspace,
+        ["config", "set", "id.prefix", "zz", "--json"],
+        "config_set_unknown_key_json",
+    );
+    assert!(unknown_key_json.status.success());
+    let payload: Value =
+        serde_json::from_str(&extract_json_payload(&unknown_key_json.stdout)).unwrap();
+    assert!(
+        payload["warning"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unknown config key"),
+        "json warning: {payload}"
+    );
+
+    // 4. A mistyped dependency type names the intended one; a bogus one lists all.
+    let typo = run_br(
+        &workspace,
+        [
+            "dep",
+            "add",
+            &first,
+            &second,
+            "--type",
+            "parent_child",
+            "--json",
+        ],
+        "dep_add_type_typo_json",
+    );
+    assert_eq!(typo.status.code(), Some(4));
+    let error = error_payload(&typo.stdout, "dep_add_type_typo_json");
+    assert_eq!(error["code"], "VALIDATION_FAILED");
+    let hint = error["hint"].as_str().expect("dep type hint");
+    assert!(hint.contains("--type parent-child"), "hint: {hint}");
+    assert_hint_flags_exist(&workspace, &["dep", "add"], hint, "dep_add_help");
+    let bogus = run_br(
+        &workspace,
+        ["dep", "add", &first, &second, "--type", "bogus"],
+        "dep_add_type_bogus",
+    );
+    assert_eq!(bogus.status.code(), Some(4));
+    assert!(
+        bogus.stderr.contains("Hint:")
+            && bogus.stderr.contains("blocks")
+            && bogus.stderr.contains("caused-by"),
+        "bogus type hint should list the types: {}",
+        bogus.stderr
+    );
+    let dep_ok = run_br(
+        &workspace,
+        ["dep", "add", &first, &second, "--type", "parent-child"],
+        "dep_add_type_ok",
+    );
+    assert!(dep_ok.status.success(), "stderr: {}", dep_ok.stderr);
+
+    // 5. The overwrite guard names the field and the --force escape hatch.
+    let seed = run_br(
+        &workspace,
+        ["update", &first, "--description", "first draft"],
+        "update_seed_description",
+    );
+    assert!(seed.status.success(), "stderr: {}", seed.stderr);
+    let clobber = run_br(
+        &workspace,
+        ["update", &first, "--description", "rewritten", "--json"],
+        "update_clobber_json",
+    );
+    assert_eq!(clobber.status.code(), Some(4));
+    let error = error_payload(&clobber.stdout, "update_clobber_json");
+    assert_eq!(error["code"], "VALIDATION_FAILED");
+    let message = error["message"].as_str().unwrap();
+    assert!(
+        message.contains("'description'") && message.contains("without --force"),
+        "message: {message}"
+    );
+    let hint = error["hint"].as_str().expect("overwrite hint");
+    assert!(
+        hint.contains("--force") && hint.contains("br show"),
+        "hint: {hint}"
+    );
+    assert_hint_flags_exist(&workspace, &["update"], hint, "update_help");
+    let clobber_text = run_br(
+        &workspace,
+        ["update", &first, "--description", "rewritten"],
+        "update_clobber_text",
+    );
+    assert!(
+        clobber_text.stderr.contains("Hint:") && clobber_text.stderr.contains("--force"),
+        "text hint: {}",
+        clobber_text.stderr
+    );
+    let forced = run_br(
+        &workspace,
+        ["update", &first, "--description", "rewritten", "--force"],
+        "update_forced",
+    );
+    assert!(forced.status.success(), "stderr: {}", forced.stderr);
+
+    // 6. A bare `br sync` lists the modes it needs, and each exists.
+    let bare_sync = run_br(&workspace, ["sync", "--json"], "sync_bare_json");
+    assert_eq!(bare_sync.status.code(), Some(4));
+    let error = error_payload(&bare_sync.stdout, "sync_bare_json");
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains("--flush-only"), "message: {message}");
+    assert_hint_flags_exist(&workspace, &["sync"], message, "sync_help");
+}

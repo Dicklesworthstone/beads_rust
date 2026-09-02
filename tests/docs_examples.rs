@@ -253,7 +253,12 @@ fn readme_flag_table(readme: &str, heading: &str) -> Vec<(usize, String)> {
         if !inside || !line.trim().starts_with('|') {
             continue;
         }
-        let first_cell = line.trim().trim_matches('|').split('|').next().unwrap_or("");
+        let first_cell = line
+            .trim()
+            .trim_matches('|')
+            .split('|')
+            .next()
+            .unwrap_or("");
         for token in first_cell.split_whitespace() {
             let token = token.trim_matches('`');
             if let Some(flag) = token.strip_prefix("--") {
@@ -306,7 +311,9 @@ fn readme_table_examples_name_real_subcommands_and_flags() {
             .is_some_and(|first| FEATURE_GATED_SUBCOMMANDS.contains(first))
             && br_help(&path[..1]).is_none()
         {
-            eprintln!("[readme_examples] README.md:{line} `{command}` skipped: feature-gated subcommand not built");
+            eprintln!(
+                "[readme_examples] README.md:{line} `{command}` skipped: feature-gated subcommand not built"
+            );
             continue;
         }
         // Longest subcommand prefix whose --help succeeds wins; positionals
