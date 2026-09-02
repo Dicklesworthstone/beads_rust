@@ -19768,6 +19768,13 @@ impl SqliteStorage {
     /// read-only storage carries the caller's authority, so
     /// `with_read_transaction` verifies it before the transaction, immediately
     /// before COMMIT, and again after COMMIT.
+    ///
+    /// Read-only contract (GitHub #476): the main database file, WAL, and
+    /// rollback journal are never written. The WAL-index (`-shm`) is the one
+    /// exception, and only its reader-mark array: the read-only connection
+    /// takes a WAL read lock so an uncheckpointed WAL is observed (#373), and
+    /// the WAL reader protocol registers that snapshot in `aReadMark` exactly
+    /// as stock SQLite does. Nothing durable changes.
     pub(crate) fn inspect_pending_sync_merge_under_authority(
         path: &Path,
         authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,

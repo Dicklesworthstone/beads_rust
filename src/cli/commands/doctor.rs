@@ -14188,6 +14188,83 @@ mod tests {
             .collect()
     }
 
+    /// Byte range of the WAL-index reader-mark array (`WalCkptInfo.aReadMark`,
+    /// five native-endian u32 values at `-shm` offsets 100..120).
+    ///
+    /// A WAL reader registers the snapshot it is reading at in this array as
+    /// part of the read-lock protocol; stock SQLite does the same. A read-only
+    /// inspection therefore cannot promise to leave these 20 bytes alone
+    /// without giving up WAL-correct reads (an uncheckpointed WAL may hold the
+    /// only copy of the pending receipt, see #373). Every other byte of the
+    /// family is covered by the read-only contract (GitHub #476).
+    const SHM_READ_MARK_RANGE: std::ops::Range<usize> = 100..120;
+
+    /// Assert that a read-only operation left the database family untouched:
+    /// the main file, WAL, and rollback journal must be byte-identical, and the
+    /// WAL-index (`-shm`) may differ only inside [`SHM_READ_MARK_RANGE`].
+    ///
+    /// Failures name the artifact and the first differing offsets instead of
+    /// dumping whole files (the raw `assert_eq!` produced a multi-megabyte
+    /// panic message that hid the actual diff).
+    fn assert_database_family_read_only(
+        before: &BTreeMap<String, Option<Vec<u8>>>,
+        after: &BTreeMap<String, Option<Vec<u8>>>,
+        context: &str,
+    ) {
+        assert_eq!(
+            before.keys().collect::<Vec<_>>(),
+            after.keys().collect::<Vec<_>>(),
+            "{context}: database-family artifact set changed"
+        );
+        for (suffix, before_bytes) in before {
+            let artifact = if suffix.is_empty() {
+                "main database file"
+            } else {
+                suffix.as_str()
+            };
+            let after_bytes = after.get(suffix).expect("artifact set verified equal");
+            let (Some(before_bytes), Some(after_bytes)) = (before_bytes, after_bytes) else {
+                assert_eq!(
+                    before_bytes.is_some(),
+                    after_bytes.is_some(),
+                    "{context}: {artifact} presence changed (before={}, after={})",
+                    before_bytes.is_some(),
+                    after_bytes.is_some()
+                );
+                continue;
+            };
+            assert_eq!(
+                before_bytes.len(),
+                after_bytes.len(),
+                "{context}: {artifact} length changed"
+            );
+            let differing: Vec<usize> = before_bytes
+                .iter()
+                .zip(after_bytes)
+                .enumerate()
+                .filter(|(offset, (before_byte, after_byte))| {
+                    before_byte != after_byte
+                        && !(suffix == "-shm" && SHM_READ_MARK_RANGE.contains(offset))
+                })
+                .map(|(offset, _)| offset)
+                .take(16)
+                .collect();
+            assert!(
+                differing.is_empty(),
+                "{context}: {artifact} bytes changed at offsets {differing:?} \
+                 (before={:?}, after={:?})",
+                differing
+                    .iter()
+                    .map(|offset| before_bytes[*offset])
+                    .collect::<Vec<_>>(),
+                differing
+                    .iter()
+                    .map(|offset| after_bytes[*offset])
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
     fn run_br(cwd: &Path, args: &[&str]) -> std::process::Output {
         let mut command = AssertCommand::cargo_bin("br").expect("locate br binary");
         command.current_dir(cwd);
@@ -14254,10 +14331,13 @@ mod tests {
             state.receipt_id.as_deref(),
             Some(receipt.receipt_id.as_str())
         );
-        assert_eq!(
-            database_family_bytes(&db_path),
-            before,
-            "read-only authority inspection must not change DB/WAL/SHM/journal bytes"
+        // The main file, WAL, and journal must be byte-identical; the
+        // WAL-index may only carry the reader mark the WAL read lock
+        // registered (GitHub #476).
+        assert_database_family_read_only(
+            &before,
+            &database_family_bytes(&db_path),
+            "read-only authority inspection",
         );
     }
 
@@ -14518,10 +14598,10 @@ mod tests {
             "newer JSONL was imported despite the pending gate:\n{}",
             String::from_utf8_lossy(&output.stdout)
         );
-        assert_eq!(
-            database_family_bytes(&db_path),
-            before_bytes,
-            "read-only command changed database-family bytes"
+        assert_database_family_read_only(
+            &before_bytes,
+            &database_family_bytes(&db_path),
+            "read-only command",
         );
         assert_eq!(
             inspect_pending_sync_merge_at_path(&db_path)
@@ -14556,10 +14636,10 @@ mod tests {
             rendered.contains("Refusing non-merge mutation") && rendered.contains("sync-merge"),
             "wrong refusal:\n{rendered}"
         );
-        assert_eq!(
-            database_family_bytes(&db_path),
-            before_bytes,
-            "refused mutation changed database-family bytes"
+        assert_database_family_read_only(
+            &before_bytes,
+            &database_family_bytes(&db_path),
+            "refused mutation",
         );
         assert_eq!(
             fs::read(&jsonl_path).expect("read JSONL after mutation"),
@@ -14605,10 +14685,10 @@ mod tests {
                 && rendered.contains("sync --merge"),
             "wrong no-DB refusal:\n{rendered}"
         );
-        assert_eq!(
-            database_family_bytes(&db_path),
-            before_bytes,
-            "refused no-DB mutation changed database-family bytes"
+        assert_database_family_read_only(
+            &before_bytes,
+            &database_family_bytes(&db_path),
+            "refused no-DB mutation",
         );
         assert_eq!(
             fs::read(&jsonl_path).expect("read JSONL after no-DB mutation"),
@@ -14644,10 +14724,10 @@ mod tests {
             report_rendered.contains("sync.merge_pending"),
             "doctor omitted the dedicated pending finding:\n{report_rendered}"
         );
-        assert_eq!(
-            database_family_bytes(&db_path),
-            before_bytes,
-            "read-only doctor changed database-family bytes"
+        assert_database_family_read_only(
+            &before_bytes,
+            &database_family_bytes(&db_path),
+            "read-only doctor",
         );
 
         let cases: &[(&str, &[&str])] = &[
@@ -14674,10 +14754,10 @@ mod tests {
                 rendered.contains("sync.merge_pending"),
                 "{name} omitted structured gate evidence:\n{rendered}"
             );
-            assert_eq!(
-                database_family_bytes(&db_path),
-                before_bytes,
-                "{name} changed database-family bytes"
+            assert_database_family_read_only(
+                &before_bytes,
+                &database_family_bytes(&db_path),
+                &format!("refused {name}"),
             );
         }
 
