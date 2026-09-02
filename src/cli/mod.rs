@@ -975,7 +975,10 @@ EXAMPLES:
     Undefer(UndeferArgs),
 
     /// Update an issue
-    Update(UpdateArgs),
+    ///
+    /// Boxed: `UpdateArgs` is the largest argument struct by a wide margin,
+    /// and keeping it inline would size every `Commands` value to it.
+    Update(Box<UpdateArgs>),
 
     /// Explicitly inspect Git visibility for the configured JSONL export
     ///

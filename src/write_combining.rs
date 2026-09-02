@@ -1688,11 +1688,11 @@ mod tests {
 
     #[test]
     fn explicit_status_update_is_candidate() {
-        let command = Commands::Update(UpdateArgs {
+        let command = Commands::Update(Box::new(UpdateArgs {
             ids: vec!["br-1".to_string()],
             status: Some("in_progress".to_string()),
             ..UpdateArgs::default()
-        });
+        }));
 
         assert_eq!(
             classify_command(&command),
@@ -1702,10 +1702,10 @@ mod tests {
 
     #[test]
     fn implicit_update_target_stays_direct() {
-        let command = Commands::Update(UpdateArgs {
+        let command = Commands::Update(Box::new(UpdateArgs {
             status: Some("in_progress".to_string()),
             ..UpdateArgs::default()
-        });
+        }));
 
         assert_eq!(
             classify_command(&command),
@@ -1715,11 +1715,11 @@ mod tests {
 
     #[test]
     fn unsupported_update_option_stays_direct() {
-        let command = Commands::Update(UpdateArgs {
+        let command = Commands::Update(Box::new(UpdateArgs {
             ids: vec!["br-1".to_string()],
             parent: Some("br-parent".to_string()),
             ..UpdateArgs::default()
-        });
+        }));
 
         assert_eq!(
             classify_command(&command),

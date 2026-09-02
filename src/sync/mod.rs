@@ -13542,7 +13542,7 @@ fn export_hash_entry_for_import_action(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn stream_import_actions_in_tx(
     storage: &SqliteStorage,
     source: &JsonlSourceSnapshot,
@@ -21506,10 +21506,8 @@ mod tests {
         let result = import_from_jsonl_snapshot(&mut storage, &source, &config, None).unwrap();
         assert_eq!(result.created_count, 12);
         assert_eq!(result.labels_imported, 12);
-        assert_eq!(
-            result.dependencies_imported,
-            1 + 2 + 3 + 0 + 1 + 2 + 3 + 0 + 1 + 2 + 3
-        );
+        // index % 4 edges per issue over 12 issues: 0+1+2+3 three times.
+        assert_eq!(result.dependencies_imported, 18);
         assert_eq!(
             storage.get_labels("bd-00007").unwrap(),
             vec!["l0".to_string()]
@@ -21526,7 +21524,7 @@ mod tests {
         // replaces rather than appends.
         let mut changed = make_test_issue("bd-00007", "Task 7 revised");
         changed.labels = vec!["renamed".to_string()];
-        changed.updated_at = changed.updated_at + chrono::Duration::seconds(60);
+        changed.updated_at += chrono::Duration::seconds(60);
         changed.dependencies = vec![Dependency {
             issue_id: "bd-00007".to_string(),
             depends_on_id: "bd-00001".to_string(),
