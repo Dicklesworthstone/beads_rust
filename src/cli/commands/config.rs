@@ -217,6 +217,10 @@ pub fn execute(
 ) -> Result<()> {
     match command {
         ConfigCommands::Path => show_paths(json_mode, overrides, ctx),
+        ConfigCommands::Schema { format } => {
+            show_config_schema(*format, json_mode, ctx);
+            Ok(())
+        }
         ConfigCommands::Edit => edit_config(),
         ConfigCommands::List { project, user } => {
             let beads_dir = discover_optional_beads_dir_with_cli(overrides)?;
@@ -363,6 +367,33 @@ fn merge_layers(layers: &[LayerWithSource]) -> ConfigLayer {
 
 fn canonical_config_key(key: &str) -> String {
     key.trim().to_lowercase().replace('-', "_")
+}
+
+/// `br config schema`: the keys br reads, from the registry in `crate::config`.
+fn show_config_schema(format: OutputFormatBasic, json_mode: bool, ctx: &OutputContext) {
+    let keys = crate::config::KNOWN_CONFIG_KEYS;
+    if json_mode || matches!(format, OutputFormatBasic::Json | OutputFormatBasic::Toon) {
+        let output = json!({
+            "schema_version": "br.config.schema.v1",
+            "keys": keys,
+            "note": "Keys under external_projects.<name> are free-form; classic bd startup keys are accepted for compatibility and otherwise ignored.",
+        });
+        ctx.json_pretty(&output);
+        return;
+    }
+    println!("{:<28} {:<10} {:<8} {}", "KEY", "TYPE", "DEFAULT", "DESCRIPTION");
+    for spec in keys {
+        println!(
+            "{:<28} {:<10} {:<8} {}",
+            spec.key,
+            spec.value_type,
+            spec.default.unwrap_or("-"),
+            spec.description
+        );
+        if !spec.aliases.is_empty() {
+            println!("{:<28} aliases: {}", "", spec.aliases.join(", "));
+        }
+    }
 }
 
 fn push_unique_config_alias(aliases: &mut Vec<String>, alias: String) {
@@ -825,6 +856,26 @@ fn set_config_value(
     if canonical_config_key(key) == "issue_prefix" {
         normalize_configured_prefix(value)?;
     }
+    // `br config set` writes any key, so a typo (or a key from stale docs such
+    // as `id.prefix`) used to succeed silently and change nothing. Warn on
+    // stderr and name the nearest keys br actually reads; the write still
+    // happens so ad-hoc tooling can stash its own keys.
+    let unknown_key_warning = if crate::config::is_known_config_key(key) {
+        None
+    } else {
+        let nearest = crate::config::nearest_config_keys(key, 3);
+        let hint = if nearest.is_empty() {
+            "run `br config schema` to list the keys br reads".to_string()
+        } else {
+            format!("nearest known keys: {}", nearest.join(", "))
+        };
+        Some(format!(
+            "unknown config key '{key}': br does not read it; {hint}"
+        ))
+    };
+    if let Some(warning) = &unknown_key_warning {
+        eprintln!("warning: {warning}");
+    }
 
     // Determine target config file
     let (config_path, is_project) =
@@ -863,12 +914,15 @@ fn set_config_value(
     );
 
     if ctx.is_json() {
-        let output = json!({
+        let mut output = json!({
             "key": key,
             "value": value,
             "path": config_path.display().to_string(),
             "scope": if is_project { "project" } else { "user" }
         });
+        if let Some(warning) = &unknown_key_warning {
+            output["warning"] = json!(warning);
+        }
         ctx.json_pretty(&output);
     } else if ctx.is_quiet() {
         return Ok(());

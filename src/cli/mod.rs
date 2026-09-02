@@ -3141,6 +3141,13 @@ pub enum ConfigCommands {
         key: String,
     },
 
+    /// List every config key br honors, with aliases, types, and defaults
+    Schema {
+        /// Output format: `text` (default) or `json`
+        #[arg(long, value_enum, default_value_t = OutputFormatBasic::Text)]
+        format: OutputFormatBasic,
+    },
+
     /// Set a config value
     Set {
         /// Config key=value pair (or key value)

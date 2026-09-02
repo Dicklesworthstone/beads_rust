@@ -952,6 +952,7 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
     ),
     ("gitignore.root", "fm-configs-gitignore-leaking-beads"),
     ("config.yaml", "fm-configs-yaml-malformed"),
+    ("config.unknown_keys", "fm-configs-unknown-keys"),
     // agent_coordination
     (
         "audit.suspect_close_reasons",
@@ -8964,6 +8965,80 @@ fn check_permissions_beads_dir(beads_dir: &Path, checks: &mut Vec<CheckResult>) 
 ///   error. Surfaces the error message + the offending file path so
 ///   the operator can open the file and fix the line `serde_yml`
 ///   names.
+/// Collect the dotted leaf keys of a YAML mapping (`sync.auto_flush`, ...).
+fn flatten_yaml_keys(value: &serde_yml::Value, prefix: &str, out: &mut Vec<String>) {
+    let Some(mapping) = value.as_mapping() else {
+        return;
+    };
+    for (key, child) in mapping {
+        let Some(key) = key.as_str() else {
+            continue;
+        };
+        let path = if prefix.is_empty() {
+            key.to_string()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        if child.is_mapping() {
+            flatten_yaml_keys(child, &path, out);
+        } else {
+            out.push(path);
+        }
+    }
+}
+
+/// `config.unknown_keys`: every leaf key in `.beads/config.yaml` that no br
+/// getter reads. `br config set` accepts any key, so stale docs (`id.prefix`,
+/// `defaults.priority`) produce files that look configured and change
+/// nothing; this check names each such key and the nearest real one.
+fn check_config_unknown_keys(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    const NAME: &str = "config.unknown_keys";
+    let config_path = beads_dir.join("config.yaml");
+    let Ok(body) = fs::read_to_string(&config_path) else {
+        push_check(checks, NAME, CheckStatus::Ok, None, None);
+        return;
+    };
+    let Ok(parsed) = serde_yml::from_str::<serde_yml::Value>(&body) else {
+        // `config.yaml` reports the parse failure; nothing to add here.
+        push_check(checks, NAME, CheckStatus::Ok, None, None);
+        return;
+    };
+    let mut keys = Vec::new();
+    flatten_yaml_keys(&parsed, "", &mut keys);
+    let unknown: Vec<serde_json::Value> = keys
+        .iter()
+        .filter(|key| !config::is_known_config_key(key))
+        .map(|key| {
+            serde_json::json!({
+                "key": key,
+                "nearest": config::nearest_config_keys(key, 3),
+            })
+        })
+        .collect();
+    if unknown.is_empty() {
+        push_check(checks, NAME, CheckStatus::Ok, None, None);
+        return;
+    }
+    let listed = unknown
+        .iter()
+        .filter_map(|entry| entry["key"].as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    push_check(
+        checks,
+        NAME,
+        CheckStatus::Warn,
+        Some(format!(
+            "config.yaml sets {} key(s) br does not read: {listed} (run `br config schema` for the keys it honors)",
+            unknown.len()
+        )),
+        Some(serde_json::json!({
+            "path": config_path.display().to_string(),
+            "unknown_keys": unknown,
+        })),
+    );
+}
+
 fn check_config_yaml(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     let config_path = beads_dir.join("config.yaml");
 
@@ -12076,6 +12151,7 @@ fn collect_doctor_report_with_mode_and_db_override(
     check_rust_log_noisy(&mut checks);
     check_permissions_beads_dir(beads_dir, &mut checks);
     check_config_yaml(beads_dir, &mut checks);
+    check_config_unknown_keys(beads_dir, &mut checks);
     check_metadata_json(beads_dir, &mut checks);
     check_binary_version_mismatch(beads_dir, &mut checks);
     check_orphaned_write_lock(beads_dir, &mut checks);
