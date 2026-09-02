@@ -914,11 +914,13 @@ fn e2e_auto_flush_honors_history_min_interval_env() {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    // Auto-flushed create publishes the first issues.jsonl (nothing to back up yet).
+    // `br init` seeds an empty issues.jsonl, so even this auto-flushed create
+    // may snapshot; every assertion below is relative to the post-create count.
     let create = run_br(&workspace, ["create", "Knob probe"], "create");
     assert!(create.status.success(), "create failed: {}", create.stderr);
     let id = common::cli::parse_created_id(&create.stdout);
     assert!(!id.is_empty(), "missing created id: {}", create.stdout);
+    let baseline = list_backup_files(&workspace).len();
 
     // The harness runs un-throttled (interval 0): this auto-flush replaces an
     // existing JSONL and therefore takes a snapshot.
@@ -931,7 +933,7 @@ fn e2e_auto_flush_honors_history_min_interval_env() {
     let seeded = list_backup_files(&workspace);
     assert_eq!(
         seeded.len(),
-        1,
+        baseline + 1,
         "control: an un-throttled auto-flush over an existing JSONL snapshots once: {seeded:?}"
     );
 
@@ -964,7 +966,7 @@ fn e2e_auto_flush_honors_history_min_interval_env() {
     );
     assert_eq!(
         list_backup_files(&workspace).len(),
-        2,
+        baseline + 2,
         "with the throttle back at 0 the auto-flush snapshots again"
     );
 }
@@ -977,11 +979,8 @@ fn e2e_auto_flush_honors_history_disabled_config() {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    let create = run_br(&workspace, ["create", "Knob probe"], "create");
-    assert!(create.status.success(), "create failed: {}", create.stderr);
-    let id = common::cli::parse_created_id(&create.stdout);
-    assert!(!id.is_empty(), "missing created id: {}", create.stdout);
-
+    // Disable before the first mutation: `br init` seeds an empty issues.jsonl,
+    // so even the auto-flushed create would otherwise snapshot it.
     let disable = run_br(
         &workspace,
         ["config", "set", "sync.history_enabled=false"],
@@ -992,6 +991,11 @@ fn e2e_auto_flush_honors_history_disabled_config() {
         "config set failed: {}",
         disable.stderr
     );
+
+    let create = run_br(&workspace, ["create", "Knob probe"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let id = common::cli::parse_created_id(&create.stdout);
+    assert!(!id.is_empty(), "missing created id: {}", create.stdout);
 
     for title in ["first", "second"] {
         let update = run_br(&workspace, ["update", &id, "--title", title], "update");

@@ -12397,7 +12397,7 @@ fn sync_jsonl_writer(mut writer: BufWriter<File>) -> Result<StagedJsonlIdentity>
         .into_inner()
         .map_err(|e| BeadsError::Io(e.into_error()))?;
     file.sync_all()?;
-    staged_jsonl_identity(&file.metadata()?)
+    Ok(staged_jsonl_identity(&file.metadata()?))
 }
 
 /// Filesystem identity of a staged temp file, compared against the published
@@ -12413,21 +12413,20 @@ struct StagedJsonlIdentity {
 }
 
 #[cfg(unix)]
-fn staged_jsonl_identity(metadata: &fs::Metadata) -> Result<StagedJsonlIdentity> {
+fn staged_jsonl_identity(metadata: &fs::Metadata) -> StagedJsonlIdentity {
     use std::os::unix::fs::MetadataExt;
-    Ok(StagedJsonlIdentity {
+    StagedJsonlIdentity {
         size: metadata.len(),
         device_id: metadata.dev(),
         inode: metadata.ino(),
-    })
+    }
 }
 
 #[cfg(not(unix))]
-#[allow(clippy::unnecessary_wraps)]
-fn staged_jsonl_identity(metadata: &fs::Metadata) -> Result<StagedJsonlIdentity> {
-    Ok(StagedJsonlIdentity {
+fn staged_jsonl_identity(metadata: &fs::Metadata) -> StagedJsonlIdentity {
+    StagedJsonlIdentity {
         size: metadata.len(),
-    })
+    }
 }
 
 /// Verify that `published_path` now names exactly the staged temp file that
@@ -12441,7 +12440,7 @@ fn verify_published_jsonl_matches_staged(
     expected_content_hash: &str,
 ) -> Result<()> {
     let metadata = fs::symlink_metadata(published_path)?;
-    let published = staged_jsonl_identity(&metadata)?;
+    let published = staged_jsonl_identity(&metadata);
     #[cfg(unix)]
     let identical = published == staged;
     #[cfg(not(unix))]
