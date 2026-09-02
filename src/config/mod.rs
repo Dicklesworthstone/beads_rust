@@ -6952,6 +6952,199 @@ pub fn claim_exclusive_from_layer(layer: &ConfigLayer) -> bool {
 ///
 /// Startup-only keys can only be set in YAML config files, not in the database.
 /// These include path settings, behavior flags, and git-related options.
+/// One configuration key br reads, with its accepted spellings.
+///
+/// This registry is the machine-readable answer to "which keys does
+/// `.beads/config.yaml` actually honor?" It backs `br config schema`, the
+/// unknown-key warning in `br config set`, and the `config.unknown_keys`
+/// doctor check. Every getter in this module must have a row here; the
+/// registry unit tests grep the getters to prove it.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ConfigKeySpec {
+    /// Canonical spelling (dotted for nested tables, snake_case otherwise).
+    pub key: &'static str,
+    /// Alternate spellings the getters accept (hyphen/underscore/dot variants
+    /// and legacy names).
+    pub aliases: &'static [&'static str],
+    /// `bool`, `string`, `integer`, `float`, `priority`, `issue_type`, or `path`.
+    pub value_type: &'static str,
+    /// Effective default when the key is absent, if there is one.
+    pub default: Option<&'static str>,
+    /// What the key does.
+    pub description: &'static str,
+}
+
+/// Every key br reads from its configuration layers.
+pub const KNOWN_CONFIG_KEYS: &[ConfigKeySpec] = &[
+    ConfigKeySpec {
+        key: "issue_prefix",
+        aliases: &["issue-prefix", "prefix"],
+        value_type: "string",
+        default: Some("br"),
+        description: "Prefix for newly created issue ids (existing ids keep theirs)",
+    },
+    ConfigKeySpec {
+        key: "min_hash_length",
+        aliases: &["min-hash-length"],
+        value_type: "integer",
+        default: Some("3"),
+        description: "Shortest hash suffix tried for new ids",
+    },
+    ConfigKeySpec {
+        key: "max_hash_length",
+        aliases: &["max-hash-length"],
+        value_type: "integer",
+        default: Some("8"),
+        description: "Longest hash suffix tried for new ids",
+    },
+    ConfigKeySpec {
+        key: "max_collision_prob",
+        aliases: &["max-collision-prob"],
+        value_type: "float",
+        default: Some("0.25"),
+        description: "Collision probability above which a longer id hash is used",
+    },
+    ConfigKeySpec {
+        key: "default_priority",
+        aliases: &["default-priority"],
+        value_type: "priority",
+        default: Some("2"),
+        description: "Priority for `br create` when --priority is not given (0-4 or P0-P4)",
+    },
+    ConfigKeySpec {
+        key: "default_type",
+        aliases: &["default-type"],
+        value_type: "issue_type",
+        default: Some("task"),
+        description: "Issue type for `br create` when --type is not given",
+    },
+    ConfigKeySpec {
+        key: "display.color",
+        aliases: &["display-color", "display_color"],
+        value_type: "bool",
+        default: None,
+        description: "Force colored (true) or plain (false) output; unset means auto-detect",
+    },
+    ConfigKeySpec {
+        key: "sync.auto_flush",
+        aliases: &["sync.auto-flush", "sync.auto.flush", "no_auto_flush", "no-auto-flush", "no.auto.flush"],
+        value_type: "bool",
+        default: Some("true"),
+        description: "Export issues.jsonl automatically after each successful mutation",
+    },
+    ConfigKeySpec {
+        key: "sync.auto_import",
+        aliases: &["sync.auto-import", "sync.auto.import", "no_auto_import", "no-auto-import", "no.auto.import"],
+        value_type: "bool",
+        default: Some("true"),
+        description: "Import a newer issues.jsonl automatically before commands run",
+    },
+    ConfigKeySpec {
+        key: "sync.history_enabled",
+        aliases: &["sync.history-enabled", "sync.history.enabled", "no_history", "no-history", "no.history"],
+        value_type: "bool",
+        default: Some("true"),
+        description: "Keep bounded JSONL history snapshots under .beads/.br_history",
+    },
+    ConfigKeySpec {
+        key: "no_db",
+        aliases: &["no-db", "no.db"],
+        value_type: "bool",
+        default: Some("false"),
+        description: "JSONL-only mode: never open the SQLite database",
+    },
+    ConfigKeySpec {
+        key: "db",
+        aliases: &["database"],
+        value_type: "path",
+        default: None,
+        description: "Database path override (relative paths resolve from the .beads cache dir)",
+    },
+    ConfigKeySpec {
+        key: "actor",
+        aliases: &[],
+        value_type: "string",
+        default: None,
+        description: "Actor recorded in audit events when --actor is not given",
+    },
+    ConfigKeySpec {
+        key: "claim_exclusive",
+        aliases: &["claim-exclusive", "claim.exclusive"],
+        value_type: "bool",
+        default: Some("false"),
+        description: "Refuse `br update --claim` on an issue another actor already holds",
+    },
+    ConfigKeySpec {
+        key: "lock_timeout",
+        aliases: &["lock-timeout"],
+        value_type: "integer",
+        default: None,
+        description: "SQLite busy / write-lock timeout in milliseconds when --lock-timeout is not given",
+    },
+    ConfigKeySpec {
+        key: "external_projects.<name>",
+        aliases: &["external-projects.<name>"],
+        value_type: "path",
+        default: None,
+        description: "Workspace path for `external:<name>:<id>` dependency ids",
+    },
+];
+
+/// Table prefixes under which any sub-key is accepted.
+const KNOWN_CONFIG_KEY_PREFIXES: &[&str] = &["external_projects.", "external-projects."];
+
+/// Whether `key` (any accepted spelling) is one br reads, one of the
+/// classic-bd startup keys it tolerates for compatibility, or a sub-key of a
+/// known table.
+#[must_use]
+pub fn is_known_config_key(key: &str) -> bool {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let underscore = lower.replace('-', "_");
+    let hyphen = lower.replace('_', "-");
+    if KNOWN_CONFIG_KEY_PREFIXES
+        .iter()
+        .any(|prefix| underscore.starts_with(prefix) || hyphen.starts_with(prefix))
+    {
+        return true;
+    }
+    KNOWN_CONFIG_KEYS.iter().any(|spec| {
+        !spec.key.contains('<')
+            && (spec.key == underscore
+                || spec
+                    .aliases
+                    .iter()
+                    .any(|alias| *alias == lower || *alias == underscore || *alias == hyphen))
+    }) || is_startup_key(trimmed)
+}
+
+/// Known canonical keys that share tokens with `key`, best first, for hints.
+#[must_use]
+pub fn nearest_config_keys(key: &str, limit: usize) -> Vec<&'static str> {
+    let lower = key.trim().to_ascii_lowercase().replace('-', "_");
+    let tokens: Vec<&str> = lower
+        .split(['.', '_', ' '])
+        .filter(|token| token.len() >= 2)
+        .collect();
+    let mut scored: Vec<(usize, &'static str)> = KNOWN_CONFIG_KEYS
+        .iter()
+        .map(|spec| {
+            let haystack = spec.key.to_ascii_lowercase();
+            let score = tokens
+                .iter()
+                .filter(|token| haystack.contains(*token))
+                .count();
+            (score, spec.key)
+        })
+        .filter(|(score, _)| *score > 0)
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    scored.into_iter().take(limit).map(|(_, key)| key).collect()
+}
+
 #[must_use]
 pub fn is_startup_key(key: &str) -> bool {
     let normalized = normalize_key(key);
