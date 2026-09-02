@@ -258,7 +258,14 @@ fn probe_rename_noreplace(root: &Path) -> String {
     }
     let verdict = match renameat_with(CWD, &from, CWD, &to, RenameFlags::NOREPLACE) {
         Err(Errno::EXIST) => "supported".to_string(),
-        Err(Errno::INVAL | Errno::NOSYS | Errno::NOTSUP | Errno::OPNOTSUPP) => {
+        // `NOTSUP` and `OPNOTSUPP` share a value on Linux, so a guard instead
+        // of an or-pattern keeps the arm reachable on every target.
+        Err(err)
+            if err == Errno::INVAL
+                || err == Errno::NOSYS
+                || err == Errno::NOTSUP
+                || err == Errno::OPNOTSUPP =>
+        {
             "unsupported".to_string()
         }
         Err(err) => format!("error: {err}"),
