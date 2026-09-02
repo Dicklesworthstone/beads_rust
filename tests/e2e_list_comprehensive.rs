@@ -1277,3 +1277,70 @@ fn e2e_list_limit_text_output_without_status_filter() {
         unlimited.stdout
     );
 }
+
+// =============================================================================
+// Priority filter forms (beads_rust-iw7k.2): README's `--priority 0-1`, comma
+// lists, and P-prefixed ranges must select the same issues on list.
+// =============================================================================
+
+fn listed_priorities(workspace: &BrWorkspace, filter: &str, step: &str) -> Vec<i64> {
+    let out = run_br(workspace, ["list", "--priority", filter, "--json"], step);
+    assert!(
+        out.status.success(),
+        "list --priority {filter} failed: {}",
+        out.stderr
+    );
+    let payload = common::cli::extract_json_payload(&out.stdout);
+    let page: serde_json::Value = serde_json::from_str(&payload).expect("list json");
+    let mut priorities: Vec<i64> = page["issues"]
+        .as_array()
+        .expect("issues array")
+        .iter()
+        .map(|issue| issue["priority"].as_i64().expect("priority"))
+        .collect();
+    priorities.sort_unstable();
+    priorities
+}
+
+#[test]
+fn e2e_list_priority_ranges_and_lists() {
+    let _log = common::test_log("e2e_list_priority_ranges_and_lists");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    for (title, priority) in [
+        ("p0", "0"),
+        ("p1", "1"),
+        ("p2", "2"),
+        ("p3", "3"),
+        ("p4", "4"),
+    ] {
+        let create = run_br(&workspace, ["create", title, "--priority", priority], title);
+        assert!(
+            create.status.success(),
+            "create {title} failed: {}",
+            create.stderr
+        );
+    }
+
+    assert_eq!(listed_priorities(&workspace, "0-1", "range"), vec![0, 1]);
+    assert_eq!(
+        listed_priorities(&workspace, "P0-P1", "p-range"),
+        vec![0, 1]
+    );
+    assert_eq!(listed_priorities(&workspace, "0,2", "list"), vec![0, 2]);
+    assert_eq!(
+        listed_priorities(&workspace, "3-4,1", "mixed"),
+        vec![1, 3, 4]
+    );
+    assert_eq!(listed_priorities(&workspace, "2", "single"), vec![2]);
+
+    let bad = run_br(
+        &workspace,
+        ["list", "--priority", "1-5", "--json"],
+        "bad range",
+    );
+    assert!(!bad.status.success(), "1-5 must be rejected");
+    let backwards = run_br(&workspace, ["list", "--priority", "3-1"], "backwards");
+    assert!(!backwards.status.success(), "3-1 must be rejected");
+}

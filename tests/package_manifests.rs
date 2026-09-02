@@ -533,10 +533,14 @@ fn test_version_metadata_matches_cargo() {
         .expect("Could not find version in Cargo.toml");
 
     let readme = fs::read_to_string("README.md").expect("Failed to read README.md");
+    // The README title is `# br - Beads Rust`; the version line is the
+    // `# br 0.5.7` comment inside the Verify Installation code block, so only
+    // a `# br ` line whose remainder parses as semver counts.
     let readme_version = readme
         .lines()
-        .find_map(|line| line.trim().strip_prefix("# br "))
+        .filter_map(|line| line.trim().strip_prefix("# br "))
         .map(str::trim)
+        .find(|rest| semver::Version::parse(rest).is_ok())
         .expect("README.md must show `# br <version>` under Verify Installation");
     assert_eq!(
         readme_version, cargo_version,
@@ -554,6 +558,12 @@ fn test_version_metadata_matches_cargo() {
     assert_eq!(
         plugin_version, cargo_version,
         ".claude-plugin/plugin.json is {plugin_version} but Cargo.toml is {cargo_version}; run scripts/bump-version.sh"
+    );
+
+    let flake = fs::read_to_string("flake.nix").expect("Failed to read flake.nix");
+    assert!(
+        flake.contains(&format!("version = \"{cargo_version}\";")),
+        "flake.nix package version does not match Cargo.toml {cargo_version}; run scripts/bump-version.sh"
     );
 
     let changelog = fs::read_to_string("CHANGELOG.md").expect("Failed to read CHANGELOG.md");

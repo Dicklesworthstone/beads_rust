@@ -1089,3 +1089,151 @@ fn e2e_harness_label_rename_nonexistent() {
 
     ws.finish(true);
 }
+
+// =============================================================================
+// Multi-label forms (beads_rust-iw7k.1): README's `label add <id> a b`,
+// `-l a -l b`, and `-l a,b` must all add every label in one invocation.
+// =============================================================================
+
+fn labels_of(workspace: &BrWorkspace, id: &str, step: &str) -> Vec<String> {
+    let list = run_br(workspace, ["label", "list", id, "--json"], step);
+    assert!(list.status.success(), "label list failed: {}", list.stderr);
+    let payload = extract_json_payload(&list.stdout);
+    serde_json::from_str(&payload).expect("labels json")
+}
+
+#[test]
+fn e2e_label_add_multiple_positional_labels() {
+    let _log = common::test_log("e2e_label_add_multiple_positional_labels");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let create = run_br(&workspace, ["create", "Positional labels"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let id = parse_created_id(&create.stdout);
+
+    let add = run_br(
+        &workspace,
+        ["label", "add", &id, "backend", "urgent"],
+        "add",
+    );
+    assert!(add.status.success(), "label add failed: {}", add.stderr);
+    assert!(
+        add.stdout.contains("Added label backend"),
+        "stdout: {}",
+        add.stdout
+    );
+    assert!(
+        add.stdout.contains("Added label urgent"),
+        "stdout: {}",
+        add.stdout
+    );
+
+    let labels = labels_of(&workspace, &id, "list");
+    assert_eq!(labels.len(), 2, "labels: {labels:?}");
+    assert!(labels.contains(&"backend".to_string()));
+    assert!(labels.contains(&"urgent".to_string()));
+}
+
+#[test]
+fn e2e_label_add_repeated_and_delimited_flags() {
+    let _log = common::test_log("e2e_label_add_repeated_and_delimited_flags");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let create = run_br(&workspace, ["create", "Flag labels"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let id = parse_created_id(&create.stdout);
+
+    let repeated = run_br(
+        &workspace,
+        ["label", "add", &id, "-l", "alpha", "-l", "beta"],
+        "repeated",
+    );
+    assert!(
+        repeated.status.success(),
+        "repeated -l failed: {}",
+        repeated.stderr
+    );
+    let delimited = run_br(
+        &workspace,
+        ["label", "add", &id, "-l", "gamma,delta"],
+        "delimited",
+    );
+    assert!(
+        delimited.status.success(),
+        "comma -l failed: {}",
+        delimited.stderr
+    );
+
+    let labels = labels_of(&workspace, &id, "list");
+    for expected in ["alpha", "beta", "gamma", "delta"] {
+        assert!(
+            labels.contains(&expected.to_string()),
+            "missing {expected}: {labels:?}"
+        );
+    }
+
+    let json = run_br(
+        &workspace,
+        ["label", "add", &id, "-l", "alpha,epsilon", "--json"],
+        "json",
+    );
+    assert!(json.status.success(), "json add failed: {}", json.stderr);
+    let payload = extract_json_payload(&json.stdout);
+    let results: Value = serde_json::from_str(&payload).expect("json add payload");
+    let entries = results.as_array().expect("array of label results");
+    assert_eq!(entries.len(), 2, "one result per label: {results}");
+    assert_eq!(entries[0]["label"], "alpha");
+    assert_eq!(entries[0]["status"], "exists");
+    assert_eq!(entries[1]["label"], "epsilon");
+    assert_eq!(entries[1]["status"], "added");
+}
+
+#[test]
+fn e2e_label_remove_multiple_labels() {
+    let _log = common::test_log("e2e_label_remove_multiple_labels");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let create = run_br(&workspace, ["create", "Remove many"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let id = parse_created_id(&create.stdout);
+    let add = run_br(
+        &workspace,
+        ["label", "add", &id, "-l", "one,two,three"],
+        "add",
+    );
+    assert!(add.status.success(), "add failed: {}", add.stderr);
+
+    let remove = run_br(
+        &workspace,
+        ["label", "remove", &id, "one", "three"],
+        "remove",
+    );
+    assert!(remove.status.success(), "remove failed: {}", remove.stderr);
+    let labels = labels_of(&workspace, &id, "list");
+    assert_eq!(labels, vec!["two".to_string()], "labels: {labels:?}");
+}
+
+#[test]
+fn e2e_label_add_multiple_issues_with_flag_labels() {
+    let _log = common::test_log("e2e_label_add_multiple_issues_with_flag_labels");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let a = parse_created_id(&run_br(&workspace, ["create", "A"], "create a").stdout);
+    let b = parse_created_id(&run_br(&workspace, ["create", "B"], "create b").stdout);
+
+    let add = run_br(
+        &workspace,
+        ["label", "add", &a, &b, "-l", "shared,extra"],
+        "add",
+    );
+    assert!(add.status.success(), "add failed: {}", add.stderr);
+    for id in [&a, &b] {
+        let labels = labels_of(&workspace, id, "list");
+        assert!(labels.contains(&"shared".to_string()), "{id}: {labels:?}");
+        assert!(labels.contains(&"extra".to_string()), "{id}: {labels:?}");
+    }
+}
