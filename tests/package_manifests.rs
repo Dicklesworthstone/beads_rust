@@ -514,3 +514,54 @@ fn test_update_package_manifests_workflow_uses_current_checksums() {
         "workflow must validate checksum file contents before updating manifests"
     );
 }
+
+/// Source-controlled version stamps must equal `Cargo.toml` exactly.
+///
+/// The 2026-09-01 reality check found README's "Verify Installation" block and
+/// `.claude-plugin/plugin.json` still saying 0.5.2 while the crate was 0.5.7.
+/// Unlike the package-manager manifests (which lag by design until their
+/// post-release checksum refresh runs, see `test_version_consistency`), these
+/// files describe the source tree itself, so they are held to equality.
+/// `scripts/bump-version.sh` moves all of them at once.
+#[test]
+fn test_version_metadata_matches_cargo() {
+    let cargo_toml = fs::read_to_string("Cargo.toml").expect("Failed to read Cargo.toml");
+    let cargo_version = cargo_toml
+        .lines()
+        .find(|line| line.starts_with("version = "))
+        .and_then(|line| line.split('"').nth(1))
+        .expect("Could not find version in Cargo.toml");
+
+    let readme = fs::read_to_string("README.md").expect("Failed to read README.md");
+    let readme_version = readme
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("# br "))
+        .map(str::trim)
+        .expect("README.md must show `# br <version>` under Verify Installation");
+    assert_eq!(
+        readme_version, cargo_version,
+        "README.md Verify Installation shows `br {readme_version}` but Cargo.toml is {cargo_version}; run scripts/bump-version.sh"
+    );
+
+    let plugin = fs::read_to_string(".claude-plugin/plugin.json")
+        .expect("Failed to read .claude-plugin/plugin.json");
+    let plugin_json: serde_json::Value =
+        serde_json::from_str(&plugin).expect("Invalid plugin.json");
+    let plugin_version = plugin_json
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .expect("plugin.json missing `version`");
+    assert_eq!(
+        plugin_version, cargo_version,
+        ".claude-plugin/plugin.json is {plugin_version} but Cargo.toml is {cargo_version}; run scripts/bump-version.sh"
+    );
+
+    let changelog = fs::read_to_string("CHANGELOG.md").expect("Failed to read CHANGELOG.md");
+    let heading = format!("## v{cargo_version}");
+    assert!(
+        changelog
+            .lines()
+            .any(|line| line == heading || line.starts_with(&format!("{heading} "))),
+        "CHANGELOG.md has no `{heading}` entry for the Cargo.toml version; run scripts/bump-version.sh"
+    );
+}
