@@ -184,8 +184,11 @@ fn run_rich_br_with_env(
     command_parts.extend(args.iter().map(|arg| sh_quote(OsStr::new(arg))));
     let env_prefix = extra_env
         .iter()
-        .map(|(key, value)| format!("{key}={} ", sh_quote(OsStr::new(value))))
-        .collect::<String>();
+        .fold(String::new(), |mut acc, (key, value)| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{key}={} ", sh_quote(OsStr::new(value)));
+            acc
+        });
     let command_line = format!(
         "stty cols {width} rows 40 && COLUMNS={width} {env_prefix}{}",
         command_parts.join(" ")

@@ -1265,6 +1265,53 @@ fn build_serve_cx() -> crate::Result<(asupersync::runtime::Runtime, fastmcp_rust
     Ok((runtime, cx))
 }
 
+/// Open the workspace once under the write lock to read the configured
+/// prefix, resolve the paths and the history config every auto-flush must
+/// use, then release everything before the server starts.
+///
+/// Everything the bootstrap open owns — the connection *and* the
+/// database-family write authority the open result keeps a clone of — must
+/// drop here. Keeping the result alive held `.beads/.write.lock` for the
+/// whole serve session: every mutating tool then timed out waiting for a
+/// lock it could never get, and CLI writes in other processes hung.
+fn bootstrap_serve_paths(
+    beads_dir: &Path,
+    startup: config::StartupConfig,
+    overrides: &config::CliOverrides,
+    lock_timeout: Option<u64>,
+) -> crate::Result<(
+    Option<String>,
+    PathBuf,
+    PathBuf,
+    crate::sync::history::HistoryConfig,
+)> {
+    let write_lock = Arc::new(
+        crate::sync::blocking_database_family_write_lock_with_timeout(
+            beads_dir,
+            &startup.paths.db_path,
+            lock_timeout,
+        )?,
+    );
+    let res = config::open_storage_with_startup_config_under_write_lock(
+        startup,
+        overrides,
+        false,
+        &write_lock,
+    )?;
+    let prefix = res
+        .storage
+        .get_config("issue_prefix")?
+        .map(|prefix| crate::util::id::normalize_configured_prefix(&prefix))
+        .transpose()?;
+    let history = res.resolved_history_config();
+    Ok((
+        prefix,
+        res.paths.db_path.clone(),
+        res.paths.jsonl_path.clone(),
+        history,
+    ))
+}
+
 pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(overrides)?;
     let startup = config::load_startup_config_with_paths(&beads_dir, overrides.db.as_ref())?;
@@ -1275,40 +1322,8 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         .lock_timeout
         .or_else(|| config::lock_timeout_from_layer(&merged_layer))
         .or(Some(crate::sync::default_write_lock_timeout_ms()));
-    let write_lock = Arc::new(
-        crate::sync::blocking_database_family_write_lock_with_timeout(
-            &beads_dir,
-            &startup.paths.db_path,
-            lock_timeout,
-        )?,
-    );
-    // The bootstrap open lives in its own scope so that everything it owns —
-    // the connection *and* the database-family write authority the open
-    // result keeps a clone of — is released before the server starts.
-    // Keeping the result alive held `.beads/.write.lock` for the whole
-    // serve session: every mutating tool then timed out waiting for the
-    // lock it could never get, and CLI writes in other processes hung.
-    let (prefix, db_path, jsonl_path, history) = {
-        let res = config::open_storage_with_startup_config_under_write_lock(
-            startup,
-            overrides,
-            false,
-            &write_lock,
-        )?;
-        let prefix = res
-            .storage
-            .get_config("issue_prefix")?
-            .map(|prefix| crate::util::id::normalize_configured_prefix(&prefix))
-            .transpose()?;
-        let history = res.resolved_history_config();
-        (
-            prefix,
-            res.paths.db_path.clone(),
-            res.paths.jsonl_path.clone(),
-            history,
-        )
-    };
-    drop(write_lock);
+    let (prefix, db_path, jsonl_path, history) =
+        bootstrap_serve_paths(&beads_dir, startup, overrides, lock_timeout)?;
     let allow_external_jsonl =
         config::implicit_external_jsonl_allowed(&beads_dir, &db_path, &jsonl_path);
     let state = std::sync::Arc::new(BeadsState {
