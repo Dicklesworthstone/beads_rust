@@ -225,7 +225,10 @@ impl McpClient {
     /// Call a tool and return its JSON payload (structured content when the
     /// server provides it, otherwise the parsed text content).
     fn call_tool(&mut self, name: &str, arguments: Value) -> Value {
-        let result = self.request("tools/call", json!({"name": name, "arguments": arguments}));
+        let mut params = serde_json::Map::new();
+        params.insert("name".to_string(), Value::String(name.to_string()));
+        params.insert("arguments".to_string(), arguments);
+        let result = self.request("tools/call", Value::Object(params));
         assert_ne!(
             result.get("isError"),
             Some(&json!(true)),
@@ -264,33 +267,26 @@ impl McpClient {
     }
 }
 
-#[test]
-fn serve_speaks_mcp_over_stdio_and_mutations_reach_the_workspace() {
-    let temp = TempDir::new().expect("tempdir");
-    let root = temp.path();
-    let init = br_command(root)
-        .args(["init", "--prefix", "mcp"])
-        .output()
-        .expect("run br init");
-    assert!(
-        init.status.success(),
-        "init failed: {}",
-        String::from_utf8_lossy(&init.stderr)
-    );
-    let seeded_id = first_id(&cli_json(root, &["create", "Seeded before serve"]));
+/// The first record of a CLI `--json` payload (some commands wrap a single
+/// record in an array).
+fn first_record(payload: Value) -> Value {
+    payload
+        .as_array()
+        .and_then(|entries| entries.first())
+        .cloned()
+        .unwrap_or(payload)
+}
 
-    let mut client = McpClient::spawn(root);
-
-    // The 2026-07-28 era is stateless: no `initialize` handshake, every frame
-    // carries the protocol version in `_meta`, and `server/discover` is the
-    // discovery request.
+/// Discovery over the stateless 2026-07-28 era: no `initialize` handshake,
+/// every frame carries the protocol version in `_meta`, `server/discover` is
+/// the discovery request, and every documented tool, resource, and prompt is
+/// listed.
+fn assert_discovery_surface(client: &mut McpClient) {
     let discovered = client.request("server/discover", json!({}));
     assert!(
         discovered.is_object(),
         "server/discover result: {discovered}"
     );
-
-    // Discovery: every documented tool, resource, and prompt is listed.
     let tools = client.request("tools/list", json!({}));
     let tool_names: BTreeSet<&str> = tools["tools"]
         .as_array()
@@ -343,6 +339,87 @@ fn serve_speaks_mcp_over_stdio_and_mutations_reach_the_workspace() {
             "missing prompt {expected}: {prompt_names:?}"
         );
     }
+}
+
+/// In-place acceptance checklist edits over MCP (GitHub #477): append, tick
+/// by text, and read the structured items back through `show_issue` and the
+/// CLI.
+fn exercise_acceptance_over_mcp(client: &mut McpClient, root: &Path, id: &str) {
+    let appended = client.call_tool(
+        "update_issue",
+        json!({"id": id, "add_acceptance": ["first criterion", "second criterion"]}),
+    );
+    assert_eq!(
+        appended["acceptance_criteria"]["total"], 2,
+        "add_acceptance: {appended}"
+    );
+    let ticked = client.call_tool(
+        "update_issue",
+        json!({"id": id, "check_acceptance": ["second"]}),
+    );
+    assert_eq!(
+        ticked["acceptance_criteria"]["remaining"], 1,
+        "check_acceptance: {ticked}"
+    );
+    let shown = client.call_tool("show_issue", json!({"id": id}));
+    assert_eq!(
+        shown["acceptance_items"][1]["checked"], true,
+        "show_issue: {shown}"
+    );
+    let record = first_record(cli_json(root, &["show", id]));
+    assert_eq!(
+        record["acceptance_items"][0]["checked"], false,
+        "CLI show: {record}"
+    );
+    assert_eq!(
+        record["acceptance_items"][1]["checked"], true,
+        "CLI show: {record}"
+    );
+    assert_eq!(
+        record["acceptance_criteria"], "- [ ] first criterion\n- [x] second criterion",
+        "CLI show: {record}"
+    );
+}
+
+/// Outside MCP: the CLI, the audit actor, and the auto-flushed JSONL all
+/// reflect the mutations made over the protocol.
+fn assert_mutations_reached_workspace(root: &Path, new_id: &str) {
+    let record = first_record(cli_json(root, &["show", new_id]));
+    assert_eq!(record["title"], "Created over MCP");
+    assert_eq!(record["status"], "closed", "record: {record}");
+    assert!(
+        record["labels"]
+            .as_array()
+            .is_some_and(|labels| labels.iter().any(|label| label == "over-mcp")),
+        "labels: {}",
+        record["labels"]
+    );
+    assert_eq!(record["created_by"], ACTOR, "record: {record}");
+    let jsonl = std::fs::read_to_string(root.join(".beads").join("issues.jsonl"))
+        .expect("issues.jsonl after serve");
+    assert!(
+        jsonl.contains(new_id),
+        "issues.jsonl should carry the MCP-created issue after auto-flush"
+    );
+}
+
+#[test]
+fn serve_speaks_mcp_over_stdio_and_mutations_reach_the_workspace() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    let init = br_command(root)
+        .args(["init", "--prefix", "mcp"])
+        .output()
+        .expect("run br init");
+    assert!(
+        init.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let seeded_id = first_id(&cli_json(root, &["create", "Seeded before serve"]));
+
+    let mut client = McpClient::spawn(root);
+    assert_discovery_surface(&mut client);
 
     // While serve is up, the CLI must still read the workspace promptly; if
     // this blocks, serve holds a workspace lock it should not.
@@ -407,6 +484,8 @@ fn serve_speaks_mcp_over_stdio_and_mutations_reach_the_workspace() {
         contains_text(&resource, &new_id),
         "resources/read beads://issues/{new_id}: {resource}"
     );
+    exercise_acceptance_over_mcp(&mut client, root, &new_id);
+
     client.call_tool(
         "close_issue",
         json!({"id": new_id, "reason": "closed over MCP"}),
@@ -418,28 +497,5 @@ fn serve_speaks_mcp_over_stdio_and_mutations_reach_the_workspace() {
         "serve exited with {status} after stdin close; stderr:\n{stderr}"
     );
 
-    // Outside MCP: the CLI, the audit actor, and the auto-flushed JSONL all
-    // reflect the mutations.
-    let shown_cli = cli_json(root, &["show", &new_id]);
-    let record = shown_cli
-        .as_array()
-        .and_then(|entries| entries.first())
-        .cloned()
-        .unwrap_or(shown_cli);
-    assert_eq!(record["title"], "Created over MCP");
-    assert_eq!(record["status"], "closed", "record: {record}");
-    assert!(
-        record["labels"]
-            .as_array()
-            .is_some_and(|labels| labels.iter().any(|label| label == "over-mcp")),
-        "labels: {}",
-        record["labels"]
-    );
-    assert_eq!(record["created_by"], ACTOR, "record: {record}");
-    let jsonl = std::fs::read_to_string(root.join(".beads").join("issues.jsonl"))
-        .expect("issues.jsonl after serve");
-    assert!(
-        jsonl.contains(&new_id),
-        "issues.jsonl should carry the MCP-created issue after auto-flush"
-    );
+    assert_mutations_reached_workspace(root, &new_id);
 }

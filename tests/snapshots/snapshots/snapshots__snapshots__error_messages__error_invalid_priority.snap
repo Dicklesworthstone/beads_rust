@@ -3,4 +3,4 @@ source: tests/snapshots/error_messages.rs
 expression: normalize_output(&output.stderr)
 ---
 Error: Priority must be 0-4, got: 99
-Hint: Use a priority between 0 (critical) and 4 (backlog)
+Hint: Priority must be 0-4 or P0-P4 (0=critical, 4=backlog); list filters also accept ranges and comma lists such as 0-1 or 0,2.

@@ -16,6 +16,7 @@ use fastmcp_rust::{
 use serde_json::{Value, json};
 
 use crate::error::{BeadsError, ErrorCode, StructuredError};
+use crate::model::acceptance::{AcceptanceCriteriaOutput, AcceptanceEdit, plan_acceptance_edit};
 use crate::model::{Comment, DependencyType, Issue, IssueType, Priority, Status};
 use crate::storage::{IssueUpdate, ListFilters, SqliteStorage};
 use crate::validation::{CommentValidator, IssueValidator, LabelValidator};
@@ -1318,6 +1319,9 @@ fn show_issue_json(storage: &SqliteStorage, id: &str) -> McpResult<Value> {
     let mut result = serde_json::to_value(&details.issue).unwrap_or_default();
     if let Some(obj) = result.as_object_mut() {
         obj.insert("labels".into(), json!(details.labels));
+        if !details.acceptance_items.is_empty() {
+            obj.insert("acceptance_items".into(), json!(details.acceptance_items));
+        }
         obj.insert("comments".into(), json!(details.comments));
         obj.insert(
             "dependencies".into(),
@@ -1899,6 +1903,50 @@ fn update_issue_result_json(issue: &Issue, coercions: &[String]) -> Value {
     result
 }
 
+/// The in-place acceptance-checklist edit an `update_issue` call asked for,
+/// validated against the issue's current field before any write (GitHub
+/// #477). `changed` is false when every requested item was already in the
+/// requested state and nothing was appended; the field is then left alone.
+struct McpAcceptancePlan {
+    edit: AcceptanceEdit,
+    changed: bool,
+}
+
+fn plan_mcp_acceptance_edit(
+    storage: &SqliteStorage,
+    id: &str,
+    args: &Value,
+) -> McpResult<Option<McpAcceptancePlan>> {
+    let check = optional_string_array_arg(args, "check_acceptance")?;
+    let uncheck = optional_string_array_arg(args, "uncheck_acceptance")?;
+    let append = optional_string_array_arg(args, "add_acceptance")?;
+    if check.is_empty() && uncheck.is_empty() && append.is_empty() {
+        return Ok(None);
+    }
+    let body = storage
+        .get_issue(id)
+        .map_err(beads_to_mcp)?
+        .and_then(|issue| issue.acceptance_criteria)
+        .unwrap_or_default();
+    let edit = plan_acceptance_edit(&body, &check, &uncheck, &append).map_err(|err| {
+        McpError::with_data(
+            McpErrorCode::InvalidParams,
+            format!("{}: {}", err.field, err.reason),
+            json!({
+                "error_type": "INVALID_ACCEPTANCE_EDIT",
+                "recoverable": true,
+                "field": err.field,
+                "hint": "Select items by 1-based index or unique item text; show_issue lists them under acceptance_items",
+                "suggested_tool_calls": [
+                    {"tool": "show_issue", "arguments": {"id": id}}
+                ]
+            }),
+        )
+    })?;
+    let changed = edit.changed_from(&body);
+    Ok(Some(McpAcceptancePlan { edit, changed }))
+}
+
 fn apply_update_issue_json(
     storage: &mut SqliteStorage,
     state: &BeadsState,
@@ -1906,7 +1954,7 @@ fn apply_update_issue_json(
 ) -> McpResult<Value> {
     let id = required_str_arg(args, "id")?;
 
-    let (updates, coercions) = parse_update_fields(&id, args)?;
+    let (mut updates, coercions) = parse_update_fields(&id, args)?;
     let labels_to_add = optional_label_array_arg(args, "labels_add")?;
     let labels_to_remove = optional_label_array_arg(args, "labels_remove")?;
     let comment = optional_str_arg(args, "comment")?;
@@ -1920,7 +1968,14 @@ fn apply_update_issue_json(
     // Validate ID exists before attempting update (placeholder + existence check).
     require_valid_issue(storage, &id)?;
 
-    let has_field_updates = UPDATE_FIELD_KEYS.iter().any(|k| args.get(k).is_some());
+    let acceptance = plan_mcp_acceptance_edit(storage, &id, args)?;
+    let acceptance_rewrite = acceptance.as_ref().is_some_and(|plan| plan.changed);
+    if let Some(plan) = acceptance.as_ref().filter(|plan| plan.changed) {
+        updates.acceptance_criteria = Some(Some(plan.edit.body.clone()));
+    }
+
+    let has_field_updates =
+        acceptance_rewrite || UPDATE_FIELD_KEYS.iter().any(|k| args.get(k).is_some());
     let has_side_effects = !labels_to_add.is_empty()
         || !labels_to_remove.is_empty()
         || comment.as_deref().is_some_and(|s| !s.is_empty());
@@ -1929,7 +1984,7 @@ fn apply_update_issue_json(
         storage
             .update_issue(&id, &updates, &state.actor)
             .map_err(beads_to_mcp)?
-    } else if has_side_effects {
+    } else if has_side_effects || acceptance.is_some() {
         match storage
             .get_issue_details(&id, false, false, 0)
             .map_err(beads_to_mcp)?
@@ -1944,7 +1999,7 @@ fn apply_update_issue_json(
             json!({
                 "error_type": "NOTHING_TO_DO",
                 "recoverable": true,
-                "hint": "Provide at least one field to update, a label operation, or a comment",
+                "hint": "Provide at least one field to update, an acceptance checklist edit, a label operation, or a comment",
                 "suggested_tool_calls": [
                     {"tool": "show_issue", "arguments": {"id": id}}
                 ]
@@ -1973,7 +2028,16 @@ fn apply_update_issue_json(
             .map_err(beads_to_mcp)?;
     }
 
-    Ok(update_issue_result_json(&issue, &coercions))
+    let mut result = update_issue_result_json(&issue, &coercions);
+    if let Some(plan) = acceptance {
+        let mut report = serde_json::to_value(AcceptanceCriteriaOutput::from_edit(&plan.edit))
+            .unwrap_or_default();
+        if let Some(obj) = report.as_object_mut() {
+            obj.insert("changed".into(), json!(plan.changed));
+        }
+        result["acceptance_criteria"] = report;
+    }
+    Ok(result)
 }
 
 fn update_issue_batch_items(args: &Value) -> McpResult<Option<Vec<Value>>> {
@@ -2128,6 +2192,21 @@ impl ToolHandler for UpdateIssueTool {
                     "external_ref": {
                         "type": ["string", "null"],
                         "description": "External tracker reference (e.g. GitHub issue URL). Null to clear."
+                    },
+                    "check_acceptance": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Tick acceptance checklist items in place without rewriting acceptance_criteria: 1-based item numbers (\"1,4\") or unique item text. show_issue lists items under acceptance_items."
+                    },
+                    "uncheck_acceptance": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Untick acceptance checklist items in place (same selectors as check_acceptance)."
+                    },
+                    "add_acceptance": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Append unchecked '- [ ] TEXT' criteria to acceptance_criteria without rewriting the field."
                     },
                     "labels_add": {
                         "type": "array",
@@ -3912,6 +3991,74 @@ mod tests {
         assert_eq!(result["title"].as_str(), Some("single update changed"));
         assert!(result.get("items").is_none());
         assert!(result.get("count").is_none());
+    }
+
+    #[test]
+    fn update_issue_edits_acceptance_checklist_in_place() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        insert_test_issue(&state, "br-mcp-acceptance", "acceptance checklist");
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = UpdateIssueTool::new(Arc::clone(&state));
+        let call = |args: Value| tool.call(&ctx, args).map(|content| content_json(&content));
+
+        let added = call(json!({
+            "id": "br-mcp-acceptance",
+            "add_acceptance": ["first criterion", "second criterion"],
+        }))
+        .expect("append items");
+        assert_eq!(added["acceptance_criteria"]["total"], 2, "{added}");
+        assert_eq!(added["acceptance_criteria"]["changed"], true, "{added}");
+        assert_eq!(
+            added["acceptance_criteria"]["added"],
+            json!([1, 2]),
+            "{added}"
+        );
+
+        let ticked = call(json!({"id": "br-mcp-acceptance", "check_acceptance": ["second"]}))
+            .expect("tick by text");
+        let items = &ticked["acceptance_criteria"]["items"];
+        assert_eq!(items[0]["checked"], false, "{ticked}");
+        assert_eq!(items[1]["checked"], true, "{ticked}");
+        assert_eq!(ticked["acceptance_criteria"]["remaining"], 1, "{ticked}");
+
+        // Re-ticking is idempotent: reported, but the field is not rewritten.
+        let again = call(json!({"id": "br-mcp-acceptance", "check_acceptance": ["2"]}))
+            .expect("idempotent tick");
+        assert_eq!(again["acceptance_criteria"]["changed"], false, "{again}");
+
+        // Bad selectors are rejected before any write, with the argument named.
+        let err = call(json!({"id": "br-mcp-acceptance", "check_acceptance": ["9"]}))
+            .expect_err("out-of-range index should fail");
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        assert!(
+            err.message.starts_with("check-acceptance:"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("does not exist"), "{}", err.message);
+
+        let stored = SqliteStorage::open(&state.db_path)
+            .expect("open storage")
+            .get_issue("br-mcp-acceptance")
+            .expect("get issue")
+            .expect("issue exists");
+        assert_eq!(
+            stored.acceptance_criteria.as_deref(),
+            Some("- [ ] first criterion\n- [x] second criterion")
+        );
+
+        // show_issue exposes the same structured view.
+        let shown = show_issue_json(
+            &SqliteStorage::open(&state.db_path).expect("open storage"),
+            "br-mcp-acceptance",
+        )
+        .expect("show issue");
+        assert_eq!(
+            shown["acceptance_items"][1]["text"], "second criterion",
+            "{shown}"
+        );
+        assert_eq!(shown["acceptance_items"][1]["checked"], true, "{shown}");
     }
 
     #[test]

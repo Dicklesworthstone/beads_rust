@@ -1477,6 +1477,7 @@ schemas:
         type: object
         properties:
           id:
+            description: "Database-local rowid. It is exported to JSONL for reference only:\nevery clone mints its own sequence, so two clones' comments routinely\nshare an id and import reassigns the local rowid when that happens.\nSync compares comments by [`Comment::sync_key`], never by `id`."
             type: integer
             format: int64
           issue_id.type: string
@@ -1632,6 +1633,11 @@ schemas:
         anyOf[2]:
           - "$ref": #/$defs/RollupSummary
           - type: "null"
+      acceptance_items:
+        description: "The `acceptance_criteria` checklist as structured items (1-based\n`index`, `text`, `checked`), the same parse `br update\n--check-acceptance` edits by; empty when the field has no checklist\n(GitHub #477)."
+        type: array
+        items:
+          "$ref": #/$defs/AcceptanceItem
       inherited_context:
         description: "Inherited governing context from ancestor beads (beads_rust#297).\nPresent only when the project has opted in to inherited-context\nemission and an ancestor supplies `agent_context`; populated for\nJSON/TOON output so structured consumers receive the same governing\ncontext that text mode renders (beads_rust#430)."
         type: array
@@ -1693,6 +1699,7 @@ schemas:
         type: object
         properties:
           id:
+            description: "Database-local rowid. It is exported to JSONL for reference only:\nevery clone mints its own sequence, so two clones' comments routinely\nshare an id and import reassigns the local rowid when that happens.\nSync compares comments by [`Comment::sync_key`], never by `id`."
             type: integer
             format: int64
           issue_id.type: string
@@ -1756,6 +1763,22 @@ schemas:
               format: uint32
               minimum: 0
         required[2]: status,descendants
+      AcceptanceItem:
+        description: One checklist item of an acceptance-criteria field.
+        type: object
+        properties:
+          index:
+            description: One-based position among the checklist items.
+            type: integer
+            format: uint
+            minimum: 0
+          text:
+            description: Item text without the bullet and checkbox.
+            type: string
+          checked:
+            description: Whether the box is ticked.
+            type: boolean
+        required[3]: index,text,checked
       InheritedBlock:
         description: One ancestor block in the inherited-context emission.
         type: object
@@ -1972,6 +1995,7 @@ schemas:
         type: object
         properties:
           id:
+            description: "Database-local rowid. It is exported to JSONL for reference only:\nevery clone mints its own sequence, so two clones' comments routinely\nshare an id and import reassigns the local rowid when that happens.\nSync compares comments by [`Comment::sync_key`], never by `id`."
             type: integer
             format: int64
           issue_id.type: string
