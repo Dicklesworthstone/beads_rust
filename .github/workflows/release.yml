@@ -80,7 +80,7 @@ jobs:
   reliability-gates:
     name: Release Reliability Gates
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 120
     needs: preflight
     steps:
       - name: Validate reliability override
@@ -117,6 +117,24 @@ jobs:
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # upstream snapshot 2026-08-17
 
+      # A release must not ship with a red unit suite or clippy: the v0.5.x
+      # line shipped eleven lib-test failures because only the four targeted
+      # reliability tests below gated the tag (beads_rust-9krz, uze9.4).
+      - name: Formatting
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (all features)
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Unit tests (lib shard)
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
+        run: scripts/test-shard.sh lib
+        env:
+          NO_COLOR: 1
+          RUST_LOG: error
+
       - name: Failure-corpus replay and doctor/recovery postconditions
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
         run: cargo test --locked --test workspace_failure_replay -- --nocapture
@@ -152,6 +170,7 @@ jobs:
             echo "## Release Reliability Gates"
             echo ""
             echo "Mandatory release reliability gates ran before artifact build:"
+            echo "- rustfmt, clippy (all features, -D warnings), unit-test shard"
             echo "- failure-corpus replay"
             echo "- crash-injection sync matrix"
             echo "- long-lived single-workspace stress"
