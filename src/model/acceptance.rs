@@ -16,14 +16,15 @@
 
 use std::ops::Range;
 
-use serde::Serialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 /// One checklist item of an acceptance-criteria field.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AcceptanceItem {
-    /// 1-based position among the checklist items.
+    /// One-based position among the checklist items.
     pub index: usize,
-    /// Item text with the bullet and checkbox removed, trimmed.
+    /// Item text without the bullet and checkbox.
     pub text: String,
     /// Whether the box is ticked.
     pub checked: bool,
@@ -106,6 +107,108 @@ impl AcceptanceEdit {
     #[must_use]
     pub fn changed_from(&self, original: &str) -> bool {
         self.body != original
+    }
+}
+
+/// Why an acceptance-edit request was rejected, keyed by the argument at
+/// fault (`check-acceptance`, `uncheck-acceptance`, or `acceptance`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptanceRequestError {
+    pub field: &'static str,
+    pub reason: String,
+}
+
+/// Resolve raw selector lists against `body` and apply the edit, validating
+/// the whole request before any byte is rewritten. `br update` and the MCP
+/// `update_issue` tool both go through here so the two surfaces accept,
+/// reject, and rewrite identically.
+///
+/// # Errors
+///
+/// Unparseable selectors, a body with no checklist while items are selected,
+/// out-of-range or ambiguous selectors, and contradictory check/uncheck
+/// requests are rejected with the argument at fault.
+pub fn plan_acceptance_edit(
+    body: &str,
+    check: &[String],
+    uncheck: &[String],
+    append: &[String],
+) -> Result<AcceptanceEdit, AcceptanceRequestError> {
+    let parse_all = |field: &'static str, raw: &[String]| {
+        let mut selectors = Vec::new();
+        for value in raw {
+            selectors.extend(
+                AcceptanceSelector::parse_list(value)
+                    .map_err(|reason| AcceptanceRequestError { field, reason })?,
+            );
+        }
+        Ok::<_, AcceptanceRequestError>(selectors)
+    };
+    let check_selectors = parse_all("check-acceptance", check)?;
+    let uncheck_selectors = parse_all("uncheck-acceptance", uncheck)?;
+    let checklist = AcceptanceChecklist::parse(body);
+    if checklist.is_empty() && !(check_selectors.is_empty() && uncheck_selectors.is_empty()) {
+        return Err(AcceptanceRequestError {
+            field: "check-acceptance",
+            reason: "acceptance_criteria has no checklist items to tick; append items first \
+                     (--add-acceptance / add_acceptance) or set the whole field \
+                     (--acceptance-criteria)"
+                .to_string(),
+        });
+    }
+    let resolve_all = |field: &'static str, selectors: &[AcceptanceSelector]| {
+        selectors
+            .iter()
+            .map(|selector| {
+                checklist
+                    .resolve(selector)
+                    .map_err(|reason| AcceptanceRequestError { field, reason })
+            })
+            .collect::<Result<Vec<usize>, AcceptanceRequestError>>()
+    };
+    let check = resolve_all("check-acceptance", &check_selectors)?;
+    let uncheck = resolve_all("uncheck-acceptance", &uncheck_selectors)?;
+    checklist
+        .edit(&check, &uncheck, append)
+        .map_err(|reason| AcceptanceRequestError {
+            field: "acceptance",
+            reason,
+        })
+}
+
+/// Structured acceptance-checklist state after an in-place edit, reported by
+/// `br update --json` and the MCP `update_issue` tool (GitHub #477).
+#[derive(Debug, Clone, Serialize)]
+pub struct AcceptanceCriteriaOutput {
+    /// Every checklist item, in document order, with 1-based `index`.
+    pub items: Vec<AcceptanceItem>,
+    pub checked_count: usize,
+    pub total: usize,
+    pub remaining: usize,
+    /// 1-based indexes this call requested to check.
+    pub checked: Vec<usize>,
+    /// 1-based indexes this call requested to uncheck.
+    pub unchecked: Vec<usize>,
+    /// 1-based indexes of the items this call appended.
+    pub added: Vec<usize>,
+}
+
+impl AcceptanceCriteriaOutput {
+    /// Summarise the checklist as it stands after `edit`.
+    #[must_use]
+    pub fn from_edit(edit: &AcceptanceEdit) -> Self {
+        let checklist = AcceptanceChecklist::parse(&edit.body);
+        let total = checklist.len();
+        let checked_count = checklist.checked_count();
+        Self {
+            items: checklist.items(),
+            checked_count,
+            total,
+            remaining: total.saturating_sub(checked_count),
+            checked: edit.checked.clone(),
+            unchecked: edit.unchecked.clone(),
+            added: edit.added.clone(),
+        }
     }
 }
 

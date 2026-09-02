@@ -11,9 +11,7 @@ use crate::cli::UpdateArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{format_status_label, format_type_label, sanitize_terminal_inline};
-use crate::model::acceptance::{
-    AcceptanceChecklist, AcceptanceEdit, AcceptanceItem, AcceptanceSelector,
-};
+use crate::model::acceptance::{AcceptanceCriteriaOutput, AcceptanceEdit, plan_acceptance_edit};
 use crate::model::{Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
 use crate::storage::{EventAttribution, IssueUpdate, SqliteStorage};
@@ -159,39 +157,6 @@ fn plan_notes_appends(
     Ok(plans)
 }
 
-/// Structured acceptance-checklist state after an in-place edit (GitHub #477).
-#[derive(Debug, Clone, Serialize)]
-struct AcceptanceCriteriaOutput {
-    /// Every checklist item, in document order, with 1-based `index`.
-    items: Vec<AcceptanceItem>,
-    checked_count: usize,
-    total: usize,
-    remaining: usize,
-    /// 1-based indexes this call requested to check.
-    checked: Vec<usize>,
-    /// 1-based indexes this call requested to uncheck.
-    unchecked: Vec<usize>,
-    /// 1-based indexes of the items this call appended.
-    added: Vec<usize>,
-}
-
-impl AcceptanceCriteriaOutput {
-    fn from_edit(edit: &AcceptanceEdit) -> Self {
-        let checklist = AcceptanceChecklist::parse(&edit.body);
-        let total = checklist.len();
-        let checked_count = checklist.checked_count();
-        Self {
-            items: checklist.items(),
-            checked_count,
-            total,
-            remaining: total.saturating_sub(checked_count),
-            checked: edit.checked.clone(),
-            unchecked: edit.unchecked.clone(),
-            added: edit.added.clone(),
-        }
-    }
-}
-
 /// Per-issue plan for the in-place acceptance-checklist flags. Computed
 /// before any write from the issue's current field value, so the whole
 /// request is validated (out-of-range index, ambiguous text, no checklist)
@@ -202,17 +167,6 @@ struct AcceptanceEditPlan {
     /// False when every requested item was already in the requested state
     /// and nothing was appended: the field is then not rewritten at all.
     changed: bool,
-}
-
-fn parse_acceptance_selectors(flag: &str, raw: &[String]) -> Result<Vec<AcceptanceSelector>> {
-    let mut selectors = Vec::new();
-    for value in raw {
-        selectors.extend(
-            AcceptanceSelector::parse_list(value)
-                .map_err(|reason| BeadsError::validation(flag, reason))?,
-        );
-    }
-    Ok(selectors)
 }
 
 fn plan_acceptance_edits(
@@ -226,9 +180,6 @@ fn plan_acceptance_edits(
     {
         return Ok(Vec::new());
     }
-    let check_selectors = parse_acceptance_selectors("check-acceptance", &args.check_acceptance)?;
-    let uncheck_selectors =
-        parse_acceptance_selectors("uncheck-acceptance", &args.uncheck_acceptance)?;
 
     let mut plans = Vec::with_capacity(ids.len());
     for id in ids {
@@ -237,31 +188,13 @@ fn plan_acceptance_edits(
             continue;
         };
         let body = issue.acceptance_criteria.unwrap_or_default();
-        let checklist = AcceptanceChecklist::parse(&body);
-        if checklist.is_empty() && !(check_selectors.is_empty() && uncheck_selectors.is_empty()) {
-            return Err(BeadsError::validation(
-                "check-acceptance",
-                format!(
-                    "{id}: acceptance_criteria has no checklist items to tick; add items with \
-                     --add-acceptance or set the field with --acceptance-criteria"
-                ),
-            ));
-        }
-        let resolve_all = |flag: &str, selectors: &[AcceptanceSelector]| -> Result<Vec<usize>> {
-            selectors
-                .iter()
-                .map(|selector| {
-                    checklist
-                        .resolve(selector)
-                        .map_err(|reason| BeadsError::validation(flag, format!("{id}: {reason}")))
-                })
-                .collect()
-        };
-        let check = resolve_all("check-acceptance", &check_selectors)?;
-        let uncheck = resolve_all("uncheck-acceptance", &uncheck_selectors)?;
-        let edit = checklist
-            .edit(&check, &uncheck, &args.add_acceptance)
-            .map_err(|reason| BeadsError::validation("acceptance", format!("{id}: {reason}")))?;
+        let edit = plan_acceptance_edit(
+            &body,
+            &args.check_acceptance,
+            &args.uncheck_acceptance,
+            &args.add_acceptance,
+        )
+        .map_err(|err| BeadsError::validation(err.field, format!("{id}: {}", err.reason)))?;
         let changed = edit.changed_from(&body);
         plans.push(AcceptanceEditPlan {
             id: id.clone(),

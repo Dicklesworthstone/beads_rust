@@ -152,6 +152,20 @@ pub struct ListPage {
     pub has_more: bool,
 }
 
+impl IssueDetails {
+    /// Fill `acceptance_items` from the issue's `acceptance_criteria` text.
+    #[must_use]
+    pub fn with_acceptance_items(mut self) -> Self {
+        self.acceptance_items = self
+            .issue
+            .acceptance_criteria
+            .as_deref()
+            .map(|body| crate::model::acceptance::AcceptanceChecklist::parse(body).items())
+            .unwrap_or_default();
+        self
+    }
+}
+
 /// Issue details with full relations for show view.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IssueDetails {
@@ -173,6 +187,12 @@ pub struct IssueDetails {
     /// local parent-child children (GitHub #384 phase 3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollup: Option<RollupSummary>,
+    /// The `acceptance_criteria` checklist as structured items (1-based
+    /// `index`, `text`, `checked`), the same parse `br update
+    /// --check-acceptance` edits by; empty when the field has no checklist
+    /// (GitHub #477).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptance_items: Vec<crate::model::acceptance::AcceptanceItem>,
     /// Inherited governing context from ancestor beads (beads_rust#297).
     /// Present only when the project has opted in to inherited-context
     /// emission and an ancestor supplies `agent_context`; populated for
@@ -445,6 +465,7 @@ mod tests {
             parent: Some("bd-parent".to_string()),
             rollup: None,
             inherited_context: Vec::new(),
+            acceptance_items: Vec::new(),
         };
 
         let json = serde_json::to_string(&details).unwrap();

@@ -917,7 +917,9 @@ fn build_issue_details_from_exact_jsonl_index(
         // deliberately omit it.
         rollup: None,
         inherited_context: Vec::new(),
-    })
+        acceptance_items: Vec::new(),
+    }
+    .with_acceptance_items())
 }
 
 fn build_issue_details_from_jsonl(
@@ -990,7 +992,9 @@ fn build_issue_details_from_jsonl(
         // deliberately omit it.
         rollup: None,
         inherited_context: Vec::new(),
-    })
+        acceptance_items: Vec::new(),
+    }
+    .with_acceptance_items())
 }
 
 fn dependency_metadata_from_jsonl(
@@ -1664,6 +1668,7 @@ mod tests {
             parent: None,
             rollup: None,
             inherited_context: Vec::new(),
+            acceptance_items: Vec::new(),
         };
         let json = serde_json::to_string_pretty(&vec![details]).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1702,6 +1707,7 @@ mod tests {
             parent: None,
             rollup: None,
             inherited_context: Vec::new(),
+            acceptance_items: Vec::new(),
         };
         let output = format_issue_details(&details, false, false);
         assert!(output.contains("Dependencies:"));
@@ -1739,6 +1745,7 @@ mod tests {
             parent: None,
             rollup: None,
             inherited_context: Vec::new(),
+            acceptance_items: Vec::new(),
         };
 
         let output = format_issue_details(&details, false, false);
@@ -1943,6 +1950,7 @@ mod tests {
             parent: None,
             rollup: None,
             inherited_context: Vec::new(),
+            acceptance_items: Vec::new(),
         };
         let local_last = IssueDetails {
             issue: make_test_issue("bd-local-2", "Local last"),
@@ -1954,6 +1962,7 @@ mod tests {
             parent: None,
             rollup: None,
             inherited_context: Vec::new(),
+            acceptance_items: Vec::new(),
         };
         let external_middle = IssueDetails {
             issue: make_test_issue("ext-middle", "External middle"),
@@ -1965,6 +1974,7 @@ mod tests {
             parent: None,
             rollup: None,
             inherited_context: Vec::new(),
+            acceptance_items: Vec::new(),
         };
 
         let ordered = reorder_details_by_requested_inputs(
