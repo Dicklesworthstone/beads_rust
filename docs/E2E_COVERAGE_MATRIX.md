@@ -5,10 +5,10 @@
 
 | Command | Dedicated e2e file(s) | Test files mentioning it | Status |
 |---|---|---|---|
-| `agents` | - | 2 | partial |
+| `agents` | e2e_agents.rs | 3 | covered |
 | `audit` | e2e_audit.rs | 6 | covered |
 | `blocked` | - | 17 | covered |
-| `capabilities` | - | 3 | covered |
+| `capabilities` | - | 4 | covered |
 | `capacity` | - | 2 | partial |
 | `changelog` | e2e_changelog.rs | 5 | covered |
 | `close` | - | 36 | covered |
@@ -17,17 +17,17 @@
 | `config` | e2e_config_precedence.rs | 20 | covered |
 | `coordination` | e2e_coordination.rs | 5 | covered |
 | `count` | - | 14 | covered |
-| `create` | e2e_create_governance_fields.rs e2e_create_output.rs | 91 | covered |
+| `create` | e2e_create_governance_fields.rs e2e_create_output.rs | 92 | covered |
 | `defer` | e2e_defer.rs | 10 | covered |
 | `delete` | - | 18 | covered |
 | `dep` | e2e_dep_tree_mermaid.rs | 32 | covered |
-| `doctor` | e2e_doctor_chokepoint.rs e2e_doctor_fixture_suite.rs e2e_doctor_write_lock_shapes.rs | 16 | covered |
+| `doctor` | e2e_doctor_chokepoint.rs e2e_doctor_fixture_suite.rs e2e_doctor_write_lock_shapes.rs | 17 | covered |
 | `epic` | e2e_epic.rs | 15 | covered |
 | `gate` | - | 3 | covered |
 | `graph` | e2e_graph_ordering.rs e2e_graph.rs | 9 | covered |
 | `history` | e2e_history_custom_path.rs e2e_history_restore_prune.rs e2e_history.rs | 9 | covered |
 | `info` | - | 15 | covered |
-| `init` | - | 96 | covered |
+| `init` | - | 97 | covered |
 | `label` | e2e_labels.rs | 21 | covered |
 | `lint` | e2e_lint.rs | 7 | covered |
 | `list` | e2e_list_comprehensive.rs e2e_list_priority.rs e2e_list_scenarios.rs | 58 | covered |
@@ -38,25 +38,25 @@
 | `reopen` | - | 9 | covered |
 | `robot-docs` | - | 1 | partial |
 | `scheduler` | e2e_scheduler.rs | 3 | covered |
-| `schema` | e2e_schema_migration_upgrade.rs e2e_schema.rs | 5 | covered |
+| `schema` | e2e_schema_migration_upgrade.rs e2e_schema.rs | 6 | covered |
 | `search` | e2e_search_scenarios.rs | 14 | covered |
-| `show` | e2e_show_inherited_context.rs | 41 | covered |
+| `show` | e2e_show_inherited_context.rs | 42 | covered |
 | `stale` | e2e_stale.rs | 10 | covered |
 | `stats` | e2e_stats.rs | 18 | covered |
-| `status` | - | 52 | covered |
+| `status` | - | 54 | covered |
 | `sync` | e2e_sync_artifacts.rs e2e_sync_failure_injection.rs e2e_sync_fuzz_edge_cases.rs e2e_sync_git_safety.rs e2e_sync_needs_flush_guard.rs e2e_sync_preflight_integration.rs e2e_sync_reconcile.rs e2e_sync_status_health.rs | 51 | covered |
 | `undefer` | e2e_undefer.rs | 7 | covered |
 | `update` | - | 45 | covered |
 | `upgrade` | e2e_upgrade.rs | 2 | covered |
 | `vcs-status` | e2e_vcs_status.rs | 2 | covered |
-| `version` | e2e_version.rs | 11 | covered |
+| `version` | e2e_version.rs | 12 | covered |
 | `where` | - | 8 | covered |
 
 ## Summary
 
 | Total commands | Covered | Partial | None |
 |---|---|---|---|
-| 46 | 43 | 3 | 0 |
+| 46 | 44 | 2 | 0 |
 
 Commands with status `none` or `partial` are tracked as e2e gaps in the
 bridge plan (`beads_rust-zxfz.4`). A dedicated file is the preferred form
