@@ -1104,7 +1104,7 @@ fn command_is_doctor_repair(command: &Commands) -> bool {
 }
 
 const fn doctor_subcommand_needs_write_lock(args: &beads_rust::cli::DoctorArgs) -> bool {
-    if args.selftest {
+    if args.selftest || args.bundle.is_some() {
         return false;
     }
     match &args.subcommand {

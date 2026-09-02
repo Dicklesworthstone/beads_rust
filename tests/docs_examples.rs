@@ -216,8 +216,7 @@ fn readme_table_examples(readme: &str) -> Vec<(usize, String)> {
             .trim_matches('|')
             .split('|')
             .map(str::trim)
-            .filter(|cell| !cell.is_empty())
-            .last()
+            .rfind(|cell| !cell.is_empty())
         else {
             continue;
         };

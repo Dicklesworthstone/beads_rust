@@ -6,7 +6,9 @@
 mod common;
 
 use beads_rust::franken_sync::Connection;
-use common::cli::{BrWorkspace, extract_json_payload, parse_list_issues, run_br, run_br_with_env};
+use common::cli::{
+    BrWorkspace, extract_json_payload, parse_created_id, parse_list_issues, run_br, run_br_with_env,
+};
 use serde_json::Value;
 use std::fs;
 
@@ -1700,5 +1702,323 @@ fn e2e_info_and_doctor_report_engine_block() {
             .contains(&format!("ENGINE frankensqlite {locked_version}")),
         "doctor text: {}",
         doctor_text.stdout
+    );
+}
+
+/// `br info --schema` reports the schema version and the real table list in
+/// JSON and text; without the flag the block is absent.
+#[test]
+fn e2e_info_schema_lists_tables_and_schema_version() {
+    let _log = common::test_log("e2e_info_schema_lists_tables_and_schema_version");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let json = run_br(
+        &workspace,
+        ["info", "--schema", "--json"],
+        "info_schema_json",
+    );
+    assert!(
+        json.status.success(),
+        "info --schema failed: {}",
+        json.stderr
+    );
+    let info: Value = serde_json::from_str(&extract_json_payload(&json.stdout)).expect("info json");
+    let schema = &info["schema"];
+    let tables: Vec<&str> = schema["tables"]
+        .as_array()
+        .expect("schema.tables array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    for expected in [
+        "issues",
+        "dependencies",
+        "events",
+        "labels",
+        "comments",
+        "config",
+    ] {
+        assert!(
+            tables.contains(&expected),
+            "missing table {expected} in {tables:?}"
+        );
+    }
+    assert!(
+        schema["schema_version"]
+            .as_str()
+            .is_some_and(|version| version.parse::<u32>().is_ok()),
+        "schema_version should be a number: {schema}"
+    );
+
+    let plain = run_br(&workspace, ["info", "--json"], "info_json_no_schema");
+    let info: Value =
+        serde_json::from_str(&extract_json_payload(&plain.stdout)).expect("info json");
+    assert!(
+        info.get("schema").is_none(),
+        "schema block must only appear with --schema: {info}"
+    );
+
+    let text = run_br(&workspace, ["info", "--schema"], "info_schema_text");
+    assert!(text.status.success(), "{}", text.stderr);
+    assert!(
+        text.stdout.contains("Schema:") && text.stdout.contains("Tables:"),
+        "text output: {}",
+        text.stdout
+    );
+}
+
+/// `br delete --cascade` removes the whole dependent subtree: the plain
+/// delete is refused while dependents exist, `--dry-run` previews the
+/// subtree without changing anything, and the real cascade tombstones every
+/// issue in it (gone from `br list`, tombstoned in `issues.jsonl`).
+#[test]
+fn e2e_delete_cascade_removes_dependents_and_dry_run_previews() {
+    let _log = common::test_log("e2e_delete_cascade_removes_dependents_and_dry_run_previews");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let parent =
+        parse_created_id(&run_br(&workspace, ["create", "Parent"], "create_parent").stdout);
+    let child = parse_created_id(&run_br(&workspace, ["create", "Child"], "create_child").stdout);
+    let grandchild =
+        parse_created_id(&run_br(&workspace, ["create", "Grandchild"], "create_grandchild").stdout);
+    for (from, to) in [(&child, &parent), (&grandchild, &child)] {
+        let dep = run_br(&workspace, ["dep", "add", from, to], "dep_add");
+        assert!(dep.status.success(), "dep add failed: {}", dep.stderr);
+    }
+
+    // Dependents block a plain delete: it becomes a zero-exit preview that
+    // names the escape hatches and changes nothing.
+    let refused = run_br(
+        &workspace,
+        ["delete", &parent, "--reason", "test"],
+        "delete_refused",
+    );
+    assert!(
+        refused.status.success(),
+        "a blocked delete is a preview, not an error: {}",
+        refused.stderr
+    );
+    let refusal_text = format!("{}\n{}", refused.stdout, refused.stderr);
+    assert!(
+        refusal_text.contains("--cascade") && refusal_text.contains("--force"),
+        "blocked delete should name --cascade and --force:\n{refusal_text}"
+    );
+    assert!(
+        refusal_text.contains("No changes made"),
+        "blocked delete should say nothing changed:\n{refusal_text}"
+    );
+    let still_listed =
+        parse_list_issues(&run_br(&workspace, ["list", "--json"], "list_after_refusal").stdout);
+    assert!(
+        still_listed.iter().any(|issue| issue["id"] == parent),
+        "blocked delete must leave the parent in place: {still_listed:?}"
+    );
+
+    // Dry run previews the subtree and changes nothing.
+    let preview = run_br(
+        &workspace,
+        ["delete", &parent, "--cascade", "--dry-run", "--json"],
+        "delete_cascade_dry_run",
+    );
+    assert!(
+        preview.status.success(),
+        "dry run failed: {}",
+        preview.stderr
+    );
+    let preview: Value =
+        serde_json::from_str(&extract_json_payload(&preview.stdout)).expect("preview json");
+    assert_eq!(preview["preview"], true, "preview: {preview}");
+    let would_delete: Vec<&str> = preview["would_delete"]
+        .as_array()
+        .expect("would_delete")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let cascade: Vec<&str> = preview["cascade_delete"]
+        .as_array()
+        .expect("cascade_delete")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        would_delete.contains(&parent.as_str()),
+        "would_delete: {would_delete:?}"
+    );
+    assert!(
+        cascade.contains(&child.as_str()) && cascade.contains(&grandchild.as_str()),
+        "cascade_delete should list both dependents: {cascade:?}"
+    );
+    let still_there =
+        parse_list_issues(&run_br(&workspace, ["list", "--json"], "list_after_dry_run").stdout);
+    for id in [&parent, &child, &grandchild] {
+        assert!(
+            still_there.iter().any(|issue| issue["id"] == *id),
+            "{id} must survive a dry run"
+        );
+    }
+
+    // The real cascade tombstones the whole subtree.
+    let deleted = run_br(
+        &workspace,
+        [
+            "delete",
+            &parent,
+            "--cascade",
+            "--reason",
+            "subtree gone",
+            "--json",
+        ],
+        "delete_cascade",
+    );
+    assert!(
+        deleted.status.success(),
+        "cascade delete failed: {}",
+        deleted.stderr
+    );
+    let deleted: Value =
+        serde_json::from_str(&extract_json_payload(&deleted.stdout)).expect("delete json");
+    let deleted_ids: Vec<&str> = deleted["deleted"]
+        .as_array()
+        .expect("deleted")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    for id in [&parent, &child, &grandchild] {
+        assert!(
+            deleted_ids.contains(&id.as_str()),
+            "{id} missing from deleted: {deleted_ids:?}"
+        );
+    }
+    assert_eq!(deleted["deleted_count"], 3, "delete result: {deleted}");
+    let remaining =
+        parse_list_issues(&run_br(&workspace, ["list", "--json"], "list_after_cascade").stdout);
+    for id in [&parent, &child, &grandchild] {
+        assert!(
+            !remaining.iter().any(|issue| issue["id"] == *id),
+            "{id} must be gone after the cascade"
+        );
+    }
+    let jsonl = fs::read_to_string(workspace.root.join(".beads").join("issues.jsonl"))
+        .expect("issues.jsonl");
+    for id in [&parent, &child, &grandchild] {
+        let record = jsonl
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|record| record["id"] == *id)
+            .unwrap_or_else(|| panic!("{id} missing from issues.jsonl"));
+        assert_eq!(
+            record["status"], "tombstone",
+            "{id} should be a tombstone: {record}"
+        );
+    }
+}
+
+fn first_record(payload: Value) -> Value {
+    payload
+        .as_array()
+        .and_then(|entries| entries.first())
+        .cloned()
+        .unwrap_or(payload)
+}
+
+/// `br show --json` exposes the acceptance-criteria checklist as structured
+/// `acceptance_items` (the same parse `--check-acceptance` edits by), and
+/// omits the field when the issue has no checklist (GitHub #477).
+#[test]
+fn e2e_show_json_exposes_acceptance_items() {
+    let _log = common::test_log("e2e_show_json_exposes_acceptance_items");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let with_list = parse_created_id(
+        &run_br(
+            &workspace,
+            [
+                "create",
+                "Checklist",
+                "--acceptance",
+                "Context line\n- [ ] first item\n- [x] second item\n* [ ] third item",
+            ],
+            "create_with_acceptance",
+        )
+        .stdout,
+    );
+    let without = parse_created_id(&run_br(&workspace, ["create", "Plain"], "create_plain").stdout);
+
+    let show = run_br(
+        &workspace,
+        ["show", &with_list, "--json"],
+        "show_with_acceptance",
+    );
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let record =
+        first_record(serde_json::from_str(&extract_json_payload(&show.stdout)).expect("show json"));
+    let items = record["acceptance_items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("acceptance_items missing: {record}"));
+    let summary: Vec<(u64, &str, bool)> = items
+        .iter()
+        .map(|item| {
+            (
+                item["index"].as_u64().expect("index"),
+                item["text"].as_str().expect("text"),
+                item["checked"].as_bool().expect("checked"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            (1, "first item", false),
+            (2, "second item", true),
+            (3, "third item", false)
+        ],
+        "items: {items:?}"
+    );
+
+    // Ticking through the update flag is reflected in the structured view.
+    let tick = run_br(
+        &workspace,
+        ["update", &with_list, "--check-acceptance", "1"],
+        "check_acceptance_1",
+    );
+    assert!(
+        tick.status.success(),
+        "check-acceptance failed: {}",
+        tick.stderr
+    );
+    let record = first_record(
+        serde_json::from_str(&extract_json_payload(
+            &run_br(
+                &workspace,
+                ["show", &with_list, "--json"],
+                "show_after_tick",
+            )
+            .stdout,
+        ))
+        .expect("show json"),
+    );
+    assert_eq!(
+        record["acceptance_items"][0]["checked"], true,
+        "record: {record}"
+    );
+    assert_eq!(
+        record["acceptance_items"][2]["checked"], false,
+        "record: {record}"
+    );
+
+    // No checklist, no field.
+    let record = first_record(
+        serde_json::from_str(&extract_json_payload(
+            &run_br(&workspace, ["show", &without, "--json"], "show_plain").stdout,
+        ))
+        .expect("show json"),
+    );
+    assert!(
+        record.get("acceptance_items").is_none(),
+        "acceptance_items must be omitted without a checklist: {record}"
     );
 }
