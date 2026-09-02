@@ -168,11 +168,26 @@ fn sh_quote(value: &OsStr) -> String {
 }
 
 fn run_rich_br(root: &Path, width: usize, args: &[&str]) -> String {
+    run_rich_br_with_env(root, width, &[], args)
+}
+
+/// Run br under a pseudo-terminal with extra `KEY=VALUE` assignments placed
+/// in front of the command (so they reach br, not `script`).
+fn run_rich_br_with_env(
+    root: &Path,
+    width: usize,
+    extra_env: &[(&str, &str)],
+    args: &[&str],
+) -> String {
     let br_bin = assert_cmd::cargo::cargo_bin!("br");
     let mut command_parts = vec![sh_quote(br_bin.as_os_str())];
     command_parts.extend(args.iter().map(|arg| sh_quote(OsStr::new(arg))));
+    let env_prefix = extra_env
+        .iter()
+        .map(|(key, value)| format!("{key}={} ", sh_quote(OsStr::new(value))))
+        .collect::<String>();
     let command_line = format!(
-        "stty cols {width} rows 40 && COLUMNS={width} {}",
+        "stty cols {width} rows 40 && COLUMNS={width} {env_prefix}{}",
         command_parts.join(" ")
     );
 
@@ -354,4 +369,34 @@ fn golden_show_rich_markdown_description() {
         "content must survive rendering:\n{width_80}"
     );
     assert_snapshot!("show_markdown_width_80", width_80);
+}
+
+/// `TERM=dumb` on a real pseudo-terminal must select Plain mode: no ANSI
+/// styling and no box-drawing panel, while the same command without it
+/// renders the Rich panel (proved by the frame assertion in the other tests).
+#[test]
+fn term_dumb_pty_selects_plain_mode() {
+    let fixture = init_fixture();
+
+    let rich = run_rich_br(&fixture.root, 80, &["show", &fixture.show_id]);
+    assert_rich_frame(&rich, "show", 80);
+
+    let dumb = run_rich_br_with_env(
+        &fixture.root,
+        80,
+        &[("TERM", "dumb")],
+        &["show", &fixture.show_id],
+    );
+    assert!(
+        !dumb.contains("\x1b["),
+        "TERM=dumb output must not contain ANSI escape codes:\n{dumb}"
+    );
+    assert!(
+        !dumb.contains('│') && !dumb.contains('╭') && !dumb.contains('─'),
+        "TERM=dumb output must not contain box drawing:\n{dumb}"
+    );
+    assert!(
+        dumb.contains(&fixture.show_id) || dumb.contains("ID-REDACTED"),
+        "plain output must still show the issue:\n{dumb}"
+    );
 }
