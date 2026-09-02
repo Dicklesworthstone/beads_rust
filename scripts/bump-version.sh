@@ -17,6 +17,7 @@
 #   packaging/homebrew/br.rb      version "…"
 #   packaging/scoop/br.json       "version": "…" and the release download URLs
 #   packaging/aur/PKGBUILD        pkgver=…
+#   flake.nix                     version = "…";  (the Nix package)
 #   CHANGELOG.md                  inserts a "## v<version> -- <date> (Unreleased)" stub
 #                                 above the newest entry when none exists for it
 #
@@ -68,6 +69,7 @@ replace_line .claude-plugin/plugin.json '^[[:space:]]*"version": "[^"]+",?$' "\"
 replace_line packaging/homebrew/br.rb '^[[:space:]]*version "[^"]+"$' "version \"$NEW\""
 replace_line packaging/aur/PKGBUILD '^pkgver=' "pkgver=$NEW"
 replace_line packaging/scoop/br.json '^[[:space:]]*"version": "[^"]+",?$' "\"version\": \"$NEW\","
+replace_line flake.nix '^[[:space:]]*version = "[^"]+";$' "version = \"$NEW\";"
 
 # Scoop URLs embed the tag and asset version literally. The manifest may lag
 # Cargo.toml (it is refreshed after release assets exist), so the version to

@@ -10,4 +10,11 @@ ignore = [
     # with malformed git timestamps. Waiting for vergen-gix to update.
     # https://rustsec.org/advisories/RUSTSEC-2025-0140
     "RUSTSEC-2025-0140",
+    # rustls-pemfile 2.2.0: unmaintained (superseded by rustls-pki-types'
+    # PemObject API). Pulled only through asupersync =0.4.9, which is pinned
+    # exactly by the fsqlite family (>=0.4.3,<0.5) and fastmcp-rust 0.7.x;
+    # br never parses PEM itself. Drop this entry when asupersync stops
+    # depending on rustls-pemfile. Recorded 2026-09-02 (beads_rust-uze9.1).
+    # https://rustsec.org/advisories/RUSTSEC-2025-0134
+    "RUSTSEC-2025-0134",
 ]
