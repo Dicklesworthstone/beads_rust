@@ -755,6 +755,18 @@ fn ascii_toon_string_is_clean(value: &str) -> Option<bool> {
     (!saw_non_ascii).then_some(true)
 }
 
+/// Whether the environment rules out Rich output regardless of flags:
+/// `NO_COLOR` is set, the terminal is `TERM=dumb` (basic consoles, editor
+/// embeds, screen readers cannot render ANSI styling or box drawing), or
+/// stdout is not a terminal. Every constructor consults this so the answer
+/// cannot differ between `br list`, `br show`, and subcommands that build
+/// their context from an explicit format.
+fn plain_output_forced_by_environment() -> bool {
+    std::env::var("NO_COLOR").is_ok()
+        || std::env::var("TERM").is_ok_and(|term| term.eq_ignore_ascii_case("dumb"))
+        || !std::io::stdout().is_terminal()
+}
+
 impl OutputContext {
     /// Detect output mode from environment and terminal state without CLI args.
     #[must_use]
@@ -800,8 +812,7 @@ impl OutputContext {
             OutputMode::Json
         } else if quiet {
             OutputMode::Quiet
-        } else if no_color || std::env::var("NO_COLOR").is_ok() || !std::io::stdout().is_terminal()
-        {
+        } else if no_color || plain_output_forced_by_environment() {
             OutputMode::Plain
         } else {
             OutputMode::Rich
@@ -824,10 +835,7 @@ impl OutputContext {
             OutputFormat::Text | OutputFormat::Csv => {
                 if quiet {
                     OutputMode::Quiet
-                } else if no_color
-                    || std::env::var("NO_COLOR").is_ok()
-                    || !std::io::stdout().is_terminal()
-                {
+                } else if no_color || plain_output_forced_by_environment() {
                     OutputMode::Plain
                 } else {
                     OutputMode::Rich
@@ -861,15 +869,7 @@ impl OutputContext {
                 OutputFormat::Text | OutputFormat::Csv => {}
             }
         }
-        if args.no_color || std::env::var("NO_COLOR").is_ok() {
-            return OutputMode::Plain;
-        }
-        // `TERM=dumb` terminals (basic consoles, some editor embeds, screen
-        // readers) cannot render box-drawing or ANSI styling.
-        if std::env::var("TERM").is_ok_and(|term| term.eq_ignore_ascii_case("dumb")) {
-            return OutputMode::Plain;
-        }
-        if !std::io::stdout().is_terminal() {
+        if args.no_color || plain_output_forced_by_environment() {
             return OutputMode::Plain;
         }
         OutputMode::Rich

@@ -1610,7 +1610,9 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
         Commands::Sync(args) => sync_mode_opens_storage(args),
         Commands::Config { command } => !matches!(
             command,
-            beads_rust::cli::ConfigCommands::Path | beads_rust::cli::ConfigCommands::Edit
+            beads_rust::cli::ConfigCommands::Path
+                | beads_rust::cli::ConfigCommands::Edit
+                | beads_rust::cli::ConfigCommands::Schema { .. }
         ),
         Commands::History(args) => matches!(
             args.command,

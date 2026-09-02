@@ -1018,9 +1018,10 @@ fn classify_dependency_remove(_args: &DepRemoveArgs) -> CommandCompatibility {
 
 fn classify_config(command: &ConfigCommands) -> CommandCompatibility {
     match command {
-        ConfigCommands::List { .. } | ConfigCommands::Get { .. } | ConfigCommands::Path => {
-            CommandCompatibility::DirectOnly(DirectOnlyReason::ReadOnly)
-        }
+        ConfigCommands::List { .. }
+        | ConfigCommands::Get { .. }
+        | ConfigCommands::Schema { .. }
+        | ConfigCommands::Path => CommandCompatibility::DirectOnly(DirectOnlyReason::ReadOnly),
         ConfigCommands::Set { .. } | ConfigCommands::Delete { .. } | ConfigCommands::Edit => {
             CommandCompatibility::DirectOnly(DirectOnlyReason::UnsafeCommand)
         }
