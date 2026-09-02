@@ -231,7 +231,7 @@ fn execute_routed_label_add(
     for label in &labels {
         validate_label(label)?;
     }
-    let mut prepared_routes = prepare_label_routes(&issue_inputs, cli, beads_dir)?;
+    let mut prepared_routes = prepare_label_routes(&issue_inputs, cli, beads_dir, "add")?;
 
     // One pass per label keeps the per-issue result ordering contract of the
     // routing reorder (one result per requested input per pass).
@@ -314,7 +314,7 @@ fn execute_routed_label_remove(
     for label in &labels {
         validate_label(label)?;
     }
-    let mut prepared_routes = prepare_label_routes(&issue_inputs, cli, beads_dir)?;
+    let mut prepared_routes = prepare_label_routes(&issue_inputs, cli, beads_dir, "remove")?;
 
     let mut results = Vec::new();
     for label in &labels {

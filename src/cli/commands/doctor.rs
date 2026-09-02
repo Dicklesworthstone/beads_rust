@@ -25181,6 +25181,9 @@ version = "2026-05-11-abc123"
             only: Vec::new(),
             skip: Vec::new(),
             unsafe_auto_fix: false,
+            selftest: false,
+            selftest_dir: None,
+            keep: false,
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);
@@ -25260,6 +25263,9 @@ version = "2026-05-11-abc123"
             only: Vec::new(),
             skip: Vec::new(),
             unsafe_auto_fix: false,
+            selftest: false,
+            selftest_dir: None,
+            keep: false,
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);
@@ -25556,6 +25562,9 @@ version = "2026-05-11-abc123"
             only: Vec::new(),
             skip: Vec::new(),
             unsafe_auto_fix: false,
+            selftest: false,
+            selftest_dir: None,
+            keep: false,
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);
@@ -25610,6 +25619,9 @@ version = "2026-05-11-abc123"
             only: Vec::new(),
             skip: Vec::new(),
             unsafe_auto_fix: false,
+            selftest: false,
+            selftest_dir: None,
+            keep: false,
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);
@@ -25676,6 +25688,9 @@ version = "2026-05-11-abc123"
             only: Vec::new(),
             skip: Vec::new(),
             unsafe_auto_fix: false,
+            selftest: false,
+            selftest_dir: None,
+            keep: false,
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);
