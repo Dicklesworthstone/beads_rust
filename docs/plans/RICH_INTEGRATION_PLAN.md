@@ -1564,9 +1564,10 @@ fn test_show_output_snapshot() {
 | Item | State in code | Reason | Revisit trigger / owner |
 |---|---|---|---|
 | Syntax highlighting | `src/format/syntax.rs::highlight_rich` discards the language and returns plain indented text; `AVAILABLE_THEMES = ["plain"]` | `Cargo.toml` keeps syntect out of the release build "until the upstream syntect stack drops unmaintained transitive crates" | a maintained highlighter with an acceptable size delta; decision in `beads_rust-suzw.1` |
-| Markdown rendering in `br show` | `src/format/markdown.rs::render_rich_markdown` is implemented and has no production caller | never wired after the `OutputContext` consolidation | `beads_rust-suzw.1` wires it behind Rich mode with goldens, or removes it |
+| Markdown rendering in `br show` | **wired 2026-09-02**: Rich mode renders a markdown description inside the issue panel via rich_rust's `Markdown` segments when `contains_markdown` is true (`src/output/components/issue_panel.rs`); golden `show_markdown_width_80`. `src/format/markdown.rs::render_markdown` remains the string-returning helper for other callers | — | — |
 | Update-diff display (§5.5) | not built | never started | operator decision in `beads_rust-suzw.1` |
-| Accessibility (`--ascii`, `TERM=dumb`, `COLORTERM`) | only `NO_COLOR` is honored | never started | `beads_rust-suzw.1` |
+| Accessibility (`TERM=dumb`) | **honored 2026-09-02**: `TERM=dumb` selects Plain mode like `NO_COLOR` (`OutputContext::detect_mode_with_env`); PTY test `term_dumb_pty_selects_plain_mode` | — | — |
+| Accessibility (`--ascii`, `COLORTERM`) | not built | never started | `beads_rust-suzw.1`; `NO_COLOR`/`--no-color`/`TERM=dumb` cover the common cases |
 | Theme variants (dark/minimal) | `src/format/theme.rs` has `Theme::dark()`/`minimal()` with no importers | superseded by `src/output/theme.rs` | removal candidate in `beads_rust-suzw.2` (operator approval) |
 | `format/rich.rs` parallel layer | 543 lines, no production callers | superseded by `src/output/context.rs` | removal candidate in `beads_rust-suzw.2` |
 
