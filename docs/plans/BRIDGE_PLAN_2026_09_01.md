@@ -656,6 +656,24 @@ graph TD
 4. Decide whether the `Storage` trait / monolith split is wanted or the plan is amended to "as built".
 5. Decide whether the coverage job gets a threshold or is removed.
 
+## 8a. Bead mapping (Phase 3a, generated 2026-09-01)
+
+All beads carry the label `reality-check-2026-09-01` plus `track-<x>` and `wave-<n>`. Children are dotted under their track epic.
+
+| Track epic | Beads (gap) |
+|---|---|
+| A `beads_rust-uze9` release and gates | `.1` A1 diagnose CI failures (G3) · `.2` A2 gates.toml + gate.sh + shards (G3) · `.3` A3 ci.yml matrix + Windows shard + re-enable (G3) · `.4` A4 release.yml gates + DSR parity + canary (G3) · `.5` A5 version audit (G19) · `.6` A6 asset family + crates.io idempotency (G23) · `.7` A7 RCH caps docs (G25) · `.8` A8 coverage decision (G22) · `.9` A9 release 0.5.8 (G2) |
+| B `beads_rust-dk45` storage engine | `.1` B1 fix #476 (G1) · `.2` B1T byte-identity test + doctor check (G1) · `.3` B2 engine operating model doc (G4) · `.4` B3 stress gate (G4) · `.5` B4 doctor/info engine block (G4) · `.6` B5 repro tests + upstream issues (G4) · `.7` B6 model-based differential test (G27) · `.8` B7 linearizability checker (G27) |
+| C `beads_rust-wqmw` docs as data | `.1` C1 README corrections (G6) · `.2` C2 README examples e2e (G6) · `.3` C3 AGENTS.md rewrite + contract test (G7) · `.4` C4 ARCHITECTURE/agent docs/matrix/HEALTH_CONTRACT (G8) · `.5` C5 generate-docs + drift test (G29) · `.6` C6 as-built section + banners (G15) |
+| D `beads_rust-iw7k` CLI ergonomics | `.1` D1 multi-label add/remove (G6) · `.2` D2 priority ranges (G6) · `.3` D3 config key registry + schema (G6) · `.4` D4 docs-shaped-mistake hints (G28) · `.5` D5 acceptance-criteria items API (G20) |
+| E `beads_rust-v7o2` doctor | `.1` E1 selftest (G26) · `.2` E1T selftest e2e + canary + issue template (G26) · `.3` E2 doctor explain + --command (G13) · `.4` E3 doctor --bundle (G21) |
+| F `beads_rust-zxfz` proof suites | `.1` F1 latency + size contracts (G10) · `.2` F2 MCP protocol e2e (G11) · `.3` F3 conformance triage (G12) · `.4` F4 e2e holes + ignored-test links + mzpz/hrhx (G16) |
+| G `beads_rust-suzw` output and architecture | `.1` G1 RICH decisions + markdown + accessibility (G14) · `.2` G2 dormant modules table + test (G9) · `.3` G3 monolith split decision (G15) |
+| H `beads_rust-di3tb` tracker and repo | `.1` H1 stale claims (G5, done 2026-09-01) · `.2` H2 GH-issue→bead rule + stale-claim gate (G5) · `.3` H3 own doctor green (G24) · `.4` H4 repo bloat decision (G18) · `.5` H5 re-verify existing sync/portability beads (G17) |
+| final | `beads_rust-0wb0w` verification pass over §7, blocked by all eight epics |
+
+Dependency edges beyond parent-child: B1T←B1; A9←B1,A2,A4,A5,A6; A3←A1,A2; A4←A2; A7←A2; A8←A2; B7←B3,B6; E1T←E1; E3←E1,E2; D4←D1,D2,D3; C1←D1,D2,D3; C2←C1; C5←C1,C3; C6←C4; G2←G1; G3←C6; verification←all epics. (Round-2 refinement removed H2←A2, B3←A2, A5←A2, F3←A3 because each could proceed before the gate manifest exists and only its registration step depends on it.)
+
 ## 9. Revision log
 
 - **r1 (2026-09-01):** initial 25-gap plan from the reality check.
