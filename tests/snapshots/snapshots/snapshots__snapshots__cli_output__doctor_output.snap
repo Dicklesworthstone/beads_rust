@@ -44,6 +44,7 @@ OK db.recovery_artifacts
 OK db.recovery_artifacts.aged
 OK db.foreign_recovery_debris
 OK db.sidecars: SHM sidecar at /TMP/.beads/beads.ID-REDACTED is inert beside the WAL (a ID-REDACTED family is expected for frankensqlite; the WAL index lives in process memory)
+OK db.read_only_open_observational
 OK schema.tables
 OK schema.columns
 OK db.recoverable_anomalies

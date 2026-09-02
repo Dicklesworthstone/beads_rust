@@ -17187,6 +17187,238 @@ fn connection_user_version(conn: &Connection) -> Option<u32> {
         .and_then(|v| u32::try_from(v).ok())
 }
 
+/// Byte range of the WAL-index reader-mark array (`WalCkptInfo.aReadMark`,
+/// five native-endian u32 values at `-shm` offsets 100..120).
+///
+/// A WAL reader registers the snapshot it reads at in this array as part of
+/// the read-lock protocol; stock SQLite does the same. A read-only open
+/// therefore cannot promise to leave these 20 bytes alone without giving up
+/// WAL-correct reads (an uncheckpointed WAL may hold the only copy of the
+/// current state, see #373). Every other byte of the database family is
+/// covered by the read-only contract (GitHub #476).
+pub(crate) const SHM_READ_MARK_RANGE: std::ops::Range<usize> = 100..120;
+
+/// Suffixes that make up a SQLite database family on disk; `""` is the main
+/// file.
+const DATABASE_FAMILY_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-journal"];
+
+/// Largest main database file the read-only-open probe will copy. Larger
+/// databases skip the probe so `br doctor` stays cheap.
+const READ_ONLY_OPEN_PROBE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Bytes of every database-family artifact keyed by suffix; a missing
+/// artifact is `None`.
+pub(crate) type DatabaseFamilySnapshot = BTreeMap<String, Option<Vec<u8>>>;
+
+fn database_family_member_path(db_path: &Path, suffix: &str) -> PathBuf {
+    if suffix.is_empty() {
+        db_path.to_path_buf()
+    } else {
+        PathBuf::from(format!("{}{suffix}", db_path.to_string_lossy()))
+    }
+}
+
+/// Read the main database file and its `-wal`, `-shm`, and `-journal`
+/// sidecars. Only "not found" is tolerated; any other read error surfaces.
+pub(crate) fn database_family_snapshot(db_path: &Path) -> std::io::Result<DatabaseFamilySnapshot> {
+    DATABASE_FAMILY_SUFFIXES
+        .into_iter()
+        .map(|suffix| {
+            let path = database_family_member_path(db_path, suffix);
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            Ok((suffix.to_string(), bytes))
+        })
+        .collect()
+}
+
+/// One database-family artifact that changed across an operation that
+/// promised to be read-only.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct FamilyByteDiff {
+    /// `"main database file"`, `"-wal"`, `"-shm"`, or `"-journal"`.
+    pub artifact: String,
+    /// `"presence"` (created or removed), `"length"`, or `"bytes"`.
+    pub kind: &'static str,
+    /// Human-readable summary of the change.
+    pub note: String,
+    /// First differing offsets (at most 16) when `kind == "bytes"`.
+    pub offsets: Vec<usize>,
+    /// Bytes before the operation at `offsets`.
+    pub before: Vec<u8>,
+    /// Bytes after the operation at `offsets`.
+    pub after: Vec<u8>,
+}
+
+/// Compare two family snapshots under the read-only contract: the main file,
+/// WAL, and rollback journal must be byte-identical, and the WAL-index may
+/// differ only inside [`SHM_READ_MARK_RANGE`]. Returns one entry per violated
+/// artifact; an empty result means the operation was observational.
+pub(crate) fn database_family_read_only_diffs(
+    before: &DatabaseFamilySnapshot,
+    after: &DatabaseFamilySnapshot,
+) -> Vec<FamilyByteDiff> {
+    let mut diffs = Vec::new();
+    let suffixes: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    for suffix in suffixes {
+        let artifact = if suffix.is_empty() {
+            "main database file".to_string()
+        } else {
+            suffix.clone()
+        };
+        let before_bytes = before.get(suffix).and_then(|bytes| bytes.as_deref());
+        let after_bytes = after.get(suffix).and_then(|bytes| bytes.as_deref());
+        match (before_bytes, after_bytes) {
+            (None, None) => {}
+            (Some(_), None) => diffs.push(FamilyByteDiff {
+                artifact,
+                kind: "presence",
+                note: "artifact was removed".to_string(),
+                offsets: Vec::new(),
+                before: Vec::new(),
+                after: Vec::new(),
+            }),
+            (None, Some(_)) => diffs.push(FamilyByteDiff {
+                artifact,
+                kind: "presence",
+                note: "artifact was created".to_string(),
+                offsets: Vec::new(),
+                before: Vec::new(),
+                after: Vec::new(),
+            }),
+            (Some(before_bytes), Some(after_bytes)) => {
+                if before_bytes.len() != after_bytes.len() {
+                    diffs.push(FamilyByteDiff {
+                        artifact,
+                        kind: "length",
+                        note: format!(
+                            "length changed from {} to {} bytes",
+                            before_bytes.len(),
+                            after_bytes.len()
+                        ),
+                        offsets: Vec::new(),
+                        before: Vec::new(),
+                        after: Vec::new(),
+                    });
+                    continue;
+                }
+                let exempt = suffix.as_str() == "-shm";
+                let offsets: Vec<usize> = before_bytes
+                    .iter()
+                    .zip(after_bytes)
+                    .enumerate()
+                    .filter(|(offset, (before_byte, after_byte))| {
+                        before_byte != after_byte
+                            && !(exempt && SHM_READ_MARK_RANGE.contains(offset))
+                    })
+                    .map(|(offset, _)| offset)
+                    .take(16)
+                    .collect();
+                if offsets.is_empty() {
+                    continue;
+                }
+                let before = offsets.iter().map(|offset| before_bytes[*offset]).collect();
+                let after = offsets.iter().map(|offset| after_bytes[*offset]).collect();
+                diffs.push(FamilyByteDiff {
+                    artifact,
+                    kind: "bytes",
+                    note: format!("bytes changed at {} offset(s)", offsets.len()),
+                    offsets,
+                    before,
+                    after,
+                });
+            }
+        }
+    }
+    diffs
+}
+
+/// Outcome of [`probe_read_only_open_is_observational`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ReadOnlyOpenProbe {
+    /// Why the probe did not run, when it did not.
+    pub skipped: Option<String>,
+    /// Whether a current-schema read-only open was possible on the copy.
+    pub opened: bool,
+    /// Family artifacts that changed in violation of the read-only contract.
+    pub diffs: Vec<FamilyByteDiff>,
+    /// Bytes copied into the scratch directory for the probe.
+    pub copied_bytes: u64,
+}
+
+/// Prove, on a private copy of the database family, that
+/// [`SqliteStorage::open_current_read_only`] is observational.
+///
+/// Every file that shares the database's name prefix (the main file, the
+/// WAL/SHM/journal sidecars, and fsqlite's namespace and certificate
+/// sidecars) is copied into a temporary directory; the four family members
+/// are snapshotted, a read-only handle is opened and dropped, and the family
+/// is snapshotted again. The caller's own database is never opened by this
+/// probe, so it is safe to run inside `br doctor` on a live workspace.
+pub(crate) fn probe_read_only_open_is_observational(db_path: &Path) -> Result<ReadOnlyOpenProbe> {
+    let main_len = std::fs::metadata(db_path)?.len();
+    if main_len > READ_ONLY_OPEN_PROBE_MAX_BYTES {
+        return Ok(ReadOnlyOpenProbe {
+            skipped: Some(format!(
+                "main database file is {main_len} bytes, above the {READ_ONLY_OPEN_PROBE_MAX_BYTES}-byte probe limit"
+            )),
+            opened: false,
+            diffs: Vec::new(),
+            copied_bytes: 0,
+        });
+    }
+    let Some(parent) = db_path.parent() else {
+        return Ok(ReadOnlyOpenProbe {
+            skipped: Some("database path has no parent directory".to_string()),
+            opened: false,
+            diffs: Vec::new(),
+            copied_bytes: 0,
+        });
+    };
+    let Some(file_name) = db_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+    else {
+        return Ok(ReadOnlyOpenProbe {
+            skipped: Some("database path has no file name".to_string()),
+            opened: false,
+            diffs: Vec::new(),
+            copied_bytes: 0,
+        });
+    };
+
+    let scratch = tempfile::tempdir()?;
+    let copy_path = scratch.path().join(&file_name);
+    let mut copied_bytes = 0_u64;
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(&file_name) || !entry.file_type()?.is_file() {
+            continue;
+        }
+        copied_bytes += std::fs::copy(entry.path(), scratch.path().join(&name))?;
+    }
+
+    let before = database_family_snapshot(&copy_path)?;
+    let opened = match SqliteStorage::open_current_read_only(&copy_path)? {
+        Some(storage) => {
+            drop(storage);
+            true
+        }
+        None => false,
+    };
+    let after = database_family_snapshot(&copy_path)?;
+    Ok(ReadOnlyOpenProbe {
+        skipped: None,
+        opened,
+        diffs: database_family_read_only_diffs(&before, &after),
+        copied_bytes,
+    })
+}
+
 fn effective_database_user_version(path: &Path) -> Result<Option<u32>> {
     if checked_database_header_user_version(path)?.is_none() {
         return Ok(None);
@@ -31012,6 +31244,154 @@ mod tests {
         assert!(
             rows.is_empty(),
             "read-only current open must not reseed missing metadata defaults"
+        );
+    }
+
+    /// Snapshot, open read-only, drop, snapshot; return the contract violations.
+    fn read_only_open_diffs(db_path: &Path) -> Vec<FamilyByteDiff> {
+        let before = database_family_snapshot(db_path).unwrap();
+        let storage = SqliteStorage::open_current_read_only(db_path)
+            .unwrap()
+            .expect("current DB should open read-only");
+        drop(storage);
+        let after = database_family_snapshot(db_path).unwrap();
+        database_family_read_only_diffs(&before, &after)
+    }
+
+    #[test]
+    fn open_current_read_only_is_observational_without_wal() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("readonly_observational.db");
+        drop(SqliteStorage::open(&db_path).unwrap());
+
+        let diffs = read_only_open_diffs(&db_path);
+        assert!(
+            diffs.is_empty(),
+            "read-only open changed the database family: {diffs:#?}"
+        );
+    }
+
+    #[test]
+    fn open_current_read_only_is_observational_with_live_wal() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("readonly_observational_wal.db");
+        // A peer handle stays open so the writer's drop sees another opener
+        // and skips its exit checkpoint (#270), leaving frames in the WAL.
+        let peer = SqliteStorage::open(&db_path).unwrap();
+        {
+            let mut writer = SqliteStorage::open(&db_path).unwrap();
+            let issue = make_issue(
+                "obs-wal-1",
+                "wal resident",
+                Status::Open,
+                2,
+                None,
+                Utc::now(),
+                None,
+            );
+            writer.create_issue(&issue, "test").unwrap();
+        }
+        let wal = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        assert!(
+            fs::metadata(&wal)
+                .map(|meta| meta.len() > 0)
+                .unwrap_or(false),
+            "fixture must leave an uncheckpointed WAL"
+        );
+
+        let diffs = read_only_open_diffs(&db_path);
+        assert!(
+            diffs.is_empty(),
+            "read-only open with a live WAL changed the database family: {diffs:#?}"
+        );
+        drop(peer);
+    }
+
+    #[test]
+    fn open_current_read_only_is_observational_with_leftover_shm() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("readonly_observational_shm.db");
+        drop(SqliteStorage::open(&db_path).unwrap());
+        drop(SqliteStorage::open(&db_path).unwrap());
+        let shm = PathBuf::from(format!("{}-shm", db_path.to_string_lossy()));
+        assert!(
+            shm.exists(),
+            "fixture must leave a WAL-index sidecar behind"
+        );
+
+        let diffs = read_only_open_diffs(&db_path);
+        assert!(
+            diffs.is_empty(),
+            "read-only open with a leftover -shm changed the database family: {diffs:#?}"
+        );
+    }
+
+    #[test]
+    fn database_family_read_only_diffs_reports_offsets_and_exempts_reader_marks() {
+        let mut before: DatabaseFamilySnapshot = BTreeMap::new();
+        before.insert(String::new(), Some(vec![0_u8; 128]));
+        before.insert("-shm".to_string(), Some(vec![0_u8; 256]));
+        before.insert("-wal".to_string(), None);
+        before.insert("-journal".to_string(), None);
+        let mut after = before.clone();
+        assert!(database_family_read_only_diffs(&before, &after).is_empty());
+
+        // Reader-mark bytes may change; anything else in -shm may not.
+        after.get_mut("-shm").unwrap().as_mut().unwrap()[104] = 0x14;
+        assert!(database_family_read_only_diffs(&before, &after).is_empty());
+        after.get_mut("-shm").unwrap().as_mut().unwrap()[8] = 1;
+        let diffs = database_family_read_only_diffs(&before, &after);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].artifact, "-shm");
+        assert_eq!(diffs[0].kind, "bytes");
+        assert_eq!(diffs[0].offsets, vec![8]);
+
+        // Header change counter bytes in the main file are always a violation.
+        let mut after = before.clone();
+        after.get_mut("").unwrap().as_mut().unwrap()[24] = 7;
+        let diffs = database_family_read_only_diffs(&before, &after);
+        assert_eq!(diffs[0].artifact, "main database file");
+        assert_eq!(diffs[0].offsets, vec![24]);
+        assert_eq!((diffs[0].before[0], diffs[0].after[0]), (0, 7));
+
+        // Presence and length changes are reported by kind.
+        let mut after = before.clone();
+        after.insert("-wal".to_string(), Some(vec![1, 2, 3]));
+        assert_eq!(
+            database_family_read_only_diffs(&before, &after)[0].kind,
+            "presence"
+        );
+        let mut after = before.clone();
+        after.get_mut("").unwrap().as_mut().unwrap().push(0);
+        assert_eq!(
+            database_family_read_only_diffs(&before, &after)[0].kind,
+            "length"
+        );
+    }
+
+    #[test]
+    fn probe_read_only_open_is_observational_on_fresh_database() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("probe.db");
+        drop(SqliteStorage::open(&db_path).unwrap());
+
+        let probe = probe_read_only_open_is_observational(&db_path).unwrap();
+        assert_eq!(probe.skipped, None);
+        assert!(
+            probe.opened,
+            "a current-schema database must open read-only on the copy"
+        );
+        assert!(
+            probe.diffs.is_empty(),
+            "probe found violations: {:#?}",
+            probe.diffs
+        );
+        assert!(probe.copied_bytes > 0);
+        // The probe never touches the caller's family: the original still opens.
+        assert!(
+            SqliteStorage::open_current_read_only(&db_path)
+                .unwrap()
+                .is_some()
         );
     }
 

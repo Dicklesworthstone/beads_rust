@@ -305,6 +305,12 @@ const DETECTOR_ROWS: &[DetectorRow] = &[
     ("db.exists", "state_files", "error", true),
     ("db.open", "state_files", "error", true),
     ("db.sidecars", "state_files", "error", true),
+    (
+        "db.read_only_open_observational",
+        "state_files",
+        "warn",
+        true,
+    ),
     ("db.recovery_artifacts", "state_files", "info", true),
     ("db.recovery_artifacts.aged", "state_files", "warn", true),
     ("db.foreign_recovery_debris", "state_files", "info", true),
