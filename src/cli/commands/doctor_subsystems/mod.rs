@@ -32,4 +32,5 @@ pub mod mutate;
 pub mod refuse_gates;
 pub mod run_dir;
 pub mod schema_migration;
+pub mod selftest;
 pub mod surface;

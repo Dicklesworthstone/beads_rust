@@ -12897,6 +12897,11 @@ fn inspect_existing_doctor_database(
 /// acquired before the pending-merge gate is violated.
 #[allow(clippy::too_many_lines)]
 pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
+    // `--selftest` never looks at the caller's workspace: it drives the
+    // binary through a lifecycle in a throwaway directory and exits.
+    if args.selftest {
+        return crate::cli::commands::doctor_subsystems::selftest::execute(args, ctx);
+    }
     // WP6: dispatch to the agent-ergonomics surface when a subcommand is
     // present. The flat handler below stays untouched.
     if let Some(sub) = &args.subcommand {

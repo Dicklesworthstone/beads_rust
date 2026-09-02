@@ -3369,6 +3369,27 @@ pub struct DoctorArgs {
     #[arg(long = "unsafe-auto-fix")]
     pub unsafe_auto_fix: bool,
 
+    /// Run this binary through a full issue lifecycle in a throwaway
+    /// workspace and print a platform/filesystem receipt
+    /// (`br.doctor.selftest.v1`). Never reads or writes the current
+    /// workspace. Exit 0 when every step passed, 1 otherwise.
+    #[arg(
+        long,
+        conflicts_with_all = ["repair", "repair_indexes", "robot_triage", "quick"]
+    )]
+    pub selftest: bool,
+
+    /// With `--selftest`, create the throwaway workspace under this
+    /// directory (default: the system temp dir) to probe a specific
+    /// filesystem such as a WSL2 DrvFS mount.
+    #[arg(long = "selftest-dir", value_name = "DIR", requires = "selftest")]
+    pub selftest_dir: Option<PathBuf>,
+
+    /// With `--selftest`, keep the throwaway workspace for inspection
+    /// instead of deleting it.
+    #[arg(long, requires = "selftest")]
+    pub keep: bool,
+
     /// Optional WP6 subcommand. When `None`, the flat doctor handler
     /// (above) runs as it always has.
     #[command(subcommand)]
@@ -3395,7 +3416,7 @@ pub enum DoctorSubcommand {
     /// Plan, apply, or undo an explicitly reviewed database schema migration.
     #[command(name = "migrate-schema")]
     MigrateSchema(DoctorMigrateSchemaArgs),
-    /// Expand a single finding (stub in WP6; full evidence later).
+    /// Explain one finding: registry entry, live observation, fixers, next commands.
     Explain(DoctorExplainArgs),
 }
 

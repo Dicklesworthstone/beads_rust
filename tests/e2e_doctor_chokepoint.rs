@@ -2193,3 +2193,112 @@ fn doctor_capabilities_command_filter_narrows_the_envelope() {
             .is_some_and(|codes| codes.len() >= 11)
     );
 }
+
+/// `br doctor --selftest` drives this binary through a full lifecycle in a
+/// throwaway workspace: exit 0 with a receipt whose every step passed, the
+/// caller's workspace byte-identical afterwards, the temp workspace removed
+/// (kept under `--selftest-dir` with `--keep`), and an unwritable
+/// `--selftest-dir` reported as a validation error rather than a panic.
+#[test]
+fn doctor_selftest_runs_lifecycle_in_throwaway_workspace() {
+    let temp = isolated_tempdir();
+    let root = temp.path();
+    br_init(root);
+    let before = hash_workspace(root);
+
+    let out = br_cmd(root)
+        .args(["doctor", "--selftest", "--json"])
+        .output()
+        .expect("spawn selftest");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "selftest failed: status={:?}\nstdout={stdout}\nstderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let receipt = parse_trailing_json(&stdout);
+    assert_eq!(receipt["schema_version"], "br.doctor.selftest.v1");
+    assert_eq!(receipt["ok"], true);
+    let steps = receipt["steps"].as_array().expect("steps array");
+    assert!(
+        steps.len() >= 30,
+        "expected a full lifecycle, got {} steps",
+        steps.len()
+    );
+    let failed: Vec<_> = steps
+        .iter()
+        .filter(|step| step["ok"] != true)
+        .map(|step| step["name"].clone())
+        .collect();
+    assert!(failed.is_empty(), "failed steps: {failed:?}");
+    assert_eq!(receipt["platform"]["os"], std::env::consts::OS);
+    assert!(receipt["fs"]["rename_noreplace"].as_str().is_some());
+    let workspace = receipt["workspace"].as_str().expect("workspace path");
+    assert!(
+        !Path::new(workspace).exists(),
+        "throwaway workspace should be removed: {workspace}"
+    );
+    assert_eq!(receipt["kept"], false);
+    assert_eq!(
+        hash_workspace(root),
+        before,
+        "selftest must not touch the caller's .beads"
+    );
+
+    // --keep leaves the workspace behind, under --selftest-dir when given.
+    let keep_dir = isolated_tempdir();
+    let kept = br_cmd(root)
+        .args(["doctor", "--selftest", "--keep", "--selftest-dir"])
+        .arg(keep_dir.path())
+        .arg("--json")
+        .output()
+        .expect("spawn selftest --keep");
+    assert!(
+        kept.status.success(),
+        "{}",
+        String::from_utf8_lossy(&kept.stderr)
+    );
+    let kept_receipt = parse_trailing_json(&String::from_utf8_lossy(&kept.stdout));
+    let kept_path = PathBuf::from(kept_receipt["workspace"].as_str().expect("kept path"));
+    assert!(
+        kept_path.starts_with(keep_dir.path())
+            && kept_path.join(".beads").join("beads.db").is_file(),
+        "kept workspace: {}",
+        kept_path.display()
+    );
+
+    // Text mode prints one line per step and a summary line.
+    let text = br_cmd(root)
+        .args(["doctor", "--selftest"])
+        .output()
+        .expect("spawn selftest text");
+    assert!(text.status.success());
+    let text_out = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text_out.contains("ok   init") && text_out.contains("selftest ok:"),
+        "text output: {text_out}"
+    );
+
+    // An unusable --selftest-dir is a clear error, not a panic.
+    let missing = root.join("no-such-dir");
+    let bad = br_cmd(root)
+        .args(["doctor", "--selftest", "--selftest-dir"])
+        .arg(&missing)
+        .arg("--json")
+        .output()
+        .expect("spawn selftest bad dir");
+    assert_eq!(
+        bad.status.code(),
+        Some(4),
+        "stderr: {}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+    let err = parse_trailing_json(&String::from_utf8_lossy(&bad.stdout));
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("throwaway workspace")),
+        "error: {err}"
+    );
+}
