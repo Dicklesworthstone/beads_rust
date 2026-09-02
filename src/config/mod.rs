@@ -7027,21 +7027,39 @@ pub const KNOWN_CONFIG_KEYS: &[ConfigKeySpec] = &[
     },
     ConfigKeySpec {
         key: "sync.auto_flush",
-        aliases: &["sync.auto-flush", "sync.auto.flush", "no_auto_flush", "no-auto-flush", "no.auto.flush"],
+        aliases: &[
+            "sync.auto-flush",
+            "sync.auto.flush",
+            "no_auto_flush",
+            "no-auto-flush",
+            "no.auto.flush",
+        ],
         value_type: "bool",
         default: Some("true"),
         description: "Export issues.jsonl automatically after each successful mutation",
     },
     ConfigKeySpec {
         key: "sync.auto_import",
-        aliases: &["sync.auto-import", "sync.auto.import", "no_auto_import", "no-auto-import", "no.auto.import"],
+        aliases: &[
+            "sync.auto-import",
+            "sync.auto.import",
+            "no_auto_import",
+            "no-auto-import",
+            "no.auto.import",
+        ],
         value_type: "bool",
         default: Some("true"),
         description: "Import a newer issues.jsonl automatically before commands run",
     },
     ConfigKeySpec {
         key: "sync.history_enabled",
-        aliases: &["sync.history-enabled", "sync.history.enabled", "no_history", "no-history", "no.history"],
+        aliases: &[
+            "sync.history-enabled",
+            "sync.history.enabled",
+            "no_history",
+            "no-history",
+            "no.history",
+        ],
         value_type: "bool",
         default: Some("true"),
         description: "Keep bounded JSONL history snapshots under .beads/.br_history",
@@ -12584,7 +12602,11 @@ mod config_key_registry_tests {
                 spec.key
             );
             for alias in spec.aliases {
-                assert!(is_known_config_key(alias), "alias {alias} of {} must be known", spec.key);
+                assert!(
+                    is_known_config_key(alias),
+                    "alias {alias} of {} must be known",
+                    spec.key
+                );
             }
         }
     }
@@ -12597,19 +12619,31 @@ mod config_key_registry_tests {
         assert!(is_known_config_key("no-git-ops"));
         assert!(is_known_config_key("sync-branch"));
         // The README's old example keys are not read by anything.
-        for unknown in ["id.prefix", "defaults.priority", "output.color", "output.date_format", ""] {
+        for unknown in [
+            "id.prefix",
+            "defaults.priority",
+            "output.color",
+            "output.date_format",
+            "",
+        ] {
             assert!(!is_known_config_key(unknown), "{unknown:?} must be unknown");
         }
     }
 
     #[test]
     fn nearest_keys_point_at_what_the_user_meant() {
-        assert_eq!(nearest_config_keys("id.prefix", 3).first(), Some(&"issue_prefix"));
+        assert_eq!(
+            nearest_config_keys("id.prefix", 3).first(),
+            Some(&"issue_prefix")
+        );
         assert_eq!(
             nearest_config_keys("defaults.priority", 3).first(),
             Some(&"default_priority")
         );
-        assert_eq!(nearest_config_keys("auto-flush", 3).first(), Some(&"sync.auto_flush"));
+        assert_eq!(
+            nearest_config_keys("auto-flush", 3).first(),
+            Some(&"sync.auto_flush")
+        );
         assert!(nearest_config_keys("zzzz", 3).is_empty());
     }
 
@@ -12625,11 +12659,17 @@ mod config_key_registry_tests {
             {
                 continue;
             }
-            let Some(start) = line.find("&[") else { continue };
-            let Some(end) = line[start..].find(']') else { continue };
+            let Some(start) = line.find("&[") else {
+                continue;
+            };
+            let Some(end) = line[start..].find(']') else {
+                continue;
+            };
             for literal in line[start + 2..start + end].split(',') {
                 let key = literal.trim().trim_matches('"');
-                if key.is_empty() || key.contains(|c: char| !(c.is_ascii_alphanumeric() || "._-".contains(c))) {
+                if key.is_empty()
+                    || key.contains(|c: char| !(c.is_ascii_alphanumeric() || "._-".contains(c)))
+                {
                     continue;
                 }
                 if !is_known_config_key(key) {
@@ -12637,6 +12677,9 @@ mod config_key_registry_tests {
                 }
             }
         }
-        assert!(missing.is_empty(), "getter keys missing from KNOWN_CONFIG_KEYS: {missing:?}");
+        assert!(
+            missing.is_empty(),
+            "getter keys missing from KNOWN_CONFIG_KEYS: {missing:?}"
+        );
     }
 }

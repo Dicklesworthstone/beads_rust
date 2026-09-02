@@ -493,8 +493,16 @@ fn e2e_config_set_unknown_key_warns_with_nearest_known_key() {
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
     // The README used to document `id.prefix`; br reads `issue_prefix`.
-    let set = run_br(&workspace, ["config", "set", "id.prefix=zzz"], "set unknown");
-    assert!(set.status.success(), "set still writes the key: {}", set.stderr);
+    let set = run_br(
+        &workspace,
+        ["config", "set", "id.prefix=zzz"],
+        "set unknown",
+    );
+    assert!(
+        set.status.success(),
+        "set still writes the key: {}",
+        set.stderr
+    );
     assert!(
         set.stderr.contains("unknown config key 'id.prefix'"),
         "stderr must warn about the unknown key:\n{}",
@@ -506,23 +514,38 @@ fn e2e_config_set_unknown_key_warns_with_nearest_known_key() {
         set.stderr
     );
 
-    let json = run_br(&workspace, ["config", "set", "output.color=true", "--json"], "set unknown json");
+    let json = run_br(
+        &workspace,
+        ["config", "set", "output.color=true", "--json"],
+        "set unknown json",
+    );
     assert!(json.status.success(), "{}", json.stderr);
     let payload: serde_json::Value =
         serde_json::from_str(common::cli::extract_json_payload(&json.stdout)).expect("json");
     assert!(
-        payload["warning"].as_str().is_some_and(|w| w.contains("output.color")),
+        payload["warning"]
+            .as_str()
+            .is_some_and(|w| w.contains("output.color")),
         "JSON output carries the warning: {payload}"
     );
 
-    let known = run_br(&workspace, ["config", "set", "default_priority=1"], "set known");
+    let known = run_br(
+        &workspace,
+        ["config", "set", "default_priority=1"],
+        "set known",
+    );
     assert!(known.status.success());
-    assert!(!known.stderr.contains("unknown config key"), "{}", known.stderr);
+    assert!(
+        !known.stderr.contains("unknown config key"),
+        "{}",
+        known.stderr
+    );
 
     // The doctor now reports the two unknown keys that landed in config.yaml.
     let doctor = run_br(&workspace, ["doctor", "--json"], "doctor");
     let report: serde_json::Value =
-        serde_json::from_str(common::cli::extract_json_payload(&doctor.stdout)).expect("doctor json");
+        serde_json::from_str(common::cli::extract_json_payload(&doctor.stdout))
+            .expect("doctor json");
     let check = report["checks"]
         .as_array()
         .expect("checks")
@@ -536,7 +559,10 @@ fn e2e_config_set_unknown_key_warns_with_nearest_known_key() {
         .iter()
         .filter_map(|e| e["key"].as_str())
         .collect();
-    assert!(unknown.contains(&"id.prefix") && unknown.contains(&"output.color"), "{check}");
+    assert!(
+        unknown.contains(&"id.prefix") && unknown.contains(&"output.color"),
+        "{check}"
+    );
 }
 
 #[test]
@@ -549,7 +575,11 @@ fn e2e_config_schema_lists_the_keys_br_reads() {
     assert!(text.stdout.contains("issue_prefix"), "{}", text.stdout);
     assert!(text.stdout.contains("sync.auto_flush"), "{}", text.stdout);
 
-    let json = run_br(&workspace, ["config", "schema", "--format", "json"], "schema json");
+    let json = run_br(
+        &workspace,
+        ["config", "schema", "--format", "json"],
+        "schema json",
+    );
     assert!(json.status.success(), "{}", json.stderr);
     let payload: serde_json::Value =
         serde_json::from_str(common::cli::extract_json_payload(&json.stdout)).expect("json");
@@ -560,7 +590,13 @@ fn e2e_config_schema_lists_the_keys_br_reads() {
         .iter()
         .filter_map(|k| k["key"].as_str())
         .collect();
-    for expected in ["issue_prefix", "default_priority", "default_type", "sync.auto_flush", "lock_timeout"] {
+    for expected in [
+        "issue_prefix",
+        "default_priority",
+        "default_type",
+        "sync.auto_flush",
+        "lock_timeout",
+    ] {
         assert!(keys.contains(&expected), "missing {expected}: {keys:?}");
     }
     assert!(!keys.contains(&"id.prefix"));

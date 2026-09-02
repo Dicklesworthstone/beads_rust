@@ -381,7 +381,10 @@ fn show_config_schema(format: OutputFormatBasic, json_mode: bool, ctx: &OutputCo
         ctx.json_pretty(&output);
         return;
     }
-    println!("{:<28} {:<10} {:<8} {}", "KEY", "TYPE", "DEFAULT", "DESCRIPTION");
+    println!(
+        "{:<28} {:<10} {:<8} {}",
+        "KEY", "TYPE", "DEFAULT", "DESCRIPTION"
+    );
     for spec in keys {
         println!(
             "{:<28} {:<10} {:<8} {}",
