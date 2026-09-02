@@ -209,15 +209,17 @@ cargo test --all-features
 
 | Directory / Pattern | Focus Areas |
 |---------------------|-------------|
-| `src/` (inline `#[cfg(test)]`) | Unit tests for each module: model, storage, sync, config, error, format, util, validation |
-| `tests/e2e_*.rs` | End-to-end CLI tests: lifecycle, labels, deps, sync, history, search, comments, epics, workspaces, errors, completions |
-| `tests/conformance*.rs` | Go/Rust parity: schema compatibility, text output matching, edge cases, labels+comments, workflows |
-| `tests/storage_*.rs` | Storage layer: CRUD, list filters, ready queries, deps, history, blocked cache, export atomicity, invariants, ID/hash parity |
-| `tests/proptest_*.rs` | Property-based tests: ID generation, hash determinism, time parsing, validation rules |
-| `tests/repro_*.rs` | Regression tests: specific bugs reproduced and prevented |
-| `tests/jsonl_import_export.rs` | JSONL round-trip fidelity |
-| `tests/markdown_import.rs` | Markdown import parsing |
-| `benches/storage_perf.rs` | Storage operation benchmarks (criterion) |
+| `src/` (inline `#[cfg(test)]`) | Unit tests for each module: model, storage, sync, config, error, format, util, validation (shard `lib`) |
+| `tests/e2e_*.rs` | End-to-end CLI tests: lifecycle, labels, deps, sync, history, search, comments, epics, workspaces, errors, agents, doctor, MCP protocol (shards `e2e-a-l`, `e2e-m-z`) |
+| `tests/conformance*.rs` | Go/Rust parity: schema compatibility, text output matching, edge cases, labels+comments, workflows (shard `misc`) |
+| `tests/storage_*.rs` | Storage layer: CRUD, list filters, ready queries, deps, history, blocked cache, export atomicity, invariants, ID/hash parity (shard `storage`) |
+| `tests/proptest_*.rs` | Property-based tests: ID generation, hash determinism, time parsing, validation rules (shard `storage`) |
+| `tests/repro_*.rs` | Regression tests: specific bugs reproduced and prevented (shard `storage`) |
+| `tests/workflow_*.rs` | GitHub workflow harnesses: action pins, release fragments (shard `storage`) |
+| `tests/snapshots/`, `tests/golden_*.rs` | insta snapshots of CLI output and PTY goldens of Rich panels (shard `misc`) |
+| `tests/docs_examples.rs`, `tests/package_manifests.rs`, `tests/agents_md_contract.rs` | Docs and manifests checked against the binary and the tree (shard `misc`) |
+| `tests/e2e_scripts/*.sh` | Shell harnesses run by CI audit gates (stale claims, sync safety witness, concurrency witness) |
+| `tests/bench*.rs`, `benches/storage_perf.rs` | Benchmarks (shard `bench`, scheduled only; criterion) |
 
 ### Test Fixtures
 
@@ -339,16 +341,16 @@ beads_rust/
 │   │   ├── progress.rs            # Progress spinners
 │   │   └── markdown_import.rs     # Markdown file import
 │   ├── close_policy.rs            # Close-time policy gates (policy.yaml)
-│   ├── policy.rs                  # Workflow policy model (gates, capacity)
+│   ├── policy.rs                  # policy.yaml documents (workflow gates, capacity, adaptive policy)
 │   ├── coordination.rs            # br coordination status (stale-claim diagnosis)
 │   ├── health.rs                  # Workspace health vocabulary
 │   ├── inheritance.rs             # Inherited context (BR_INHERITED_CONTEXT)
-│   ├── franken_sync.rs            # Sync helpers over the fsqlite connection
+│   ├── franken_sync.rs            # Synchronous facade over the async FrankenSQLite engine API
 │   ├── shutdown.rs                # Cooperative shutdown and exit_process
 │   ├── logging.rs                 # tracing-subscriber setup
 │   ├── cache.rs                   # DORMANT (zero references)
 │   ├── write_combining.rs         # DORMANT (design artifact; bench-only)
-│   └── release_public_key.bin     # Minisign public key for self-update verification
+│   └── release_public_key.bin     # Tracked Minisign public key; no code references it as of 2026-09-02 (release.yml carries the key inline)
 ├── tests/                         # Integration, conformance, property, regression, e2e_scripts/
 ├── benches/                       # Criterion benchmarks
 ├── scripts/                       # test-shard.sh, bump-version.sh, stress, release helpers
@@ -360,29 +362,32 @@ beads_rust/
 
 | Module | Key Files | Purpose |
 |--------|-----------|---------|
-| `cli` | `cli/mod.rs` | Clap argument parsing, output mode detection, 66KB dispatch logic |
-| `cli/commands` | `commands/*.rs` | 35+ subcommands: create, list, show, close, update, dep, sync, search, query, ready, graph, audit, etc. |
+| `cli` | `cli/mod.rs` | Clap argument structs for every subcommand, output mode detection |
+| `cli/commands` | `commands/*.rs`, `commands/doctor_subsystems/` | 47 top-level subcommands; the doctor's chokepoint, capabilities, explain, engine block, and selftest live under `doctor_subsystems/` |
 | `model` | `model/mod.rs` | `Issue`, `Dependency`, `Comment`, `Event`, `Label` types, content hashing, serde derives |
-| `storage` | `storage/sqlite.rs` | Core SQLite engine (181KB): CRUD, filtered queries, dependency graph, search, events |
+| `storage` | `storage/sqlite.rs` | Core FrankenSQLite engine: CRUD, filtered queries, dependency graph, search, events, integrity probes |
 | `storage` | `storage/schema.rs` | DDL migrations, table creation, index management |
 | `storage` | `storage/events.rs` | Append-only audit log for all issue mutations |
-| `sync` | `sync/mod.rs` | JSONL import/export engine (176KB): merge, dedup, conflict resolution |
+| `sync` | `sync/mod.rs` | JSONL import/export engine: merge, dedup, conflict resolution, witness-checked publication |
 | `sync` | `sync/path.rs` | `.beads/` directory discovery and path resolution |
 | `sync` | `sync/history.rs` | Snapshot-based history: restore, prune, diff |
-| `config` | `config/mod.rs` | Layered config: file + env vars + CLI flags, project-aware resolution |
-| `error` | `error/structured.rs` | `StructuredError` with `ErrorCode` enum and deterministic exit codes |
-| `validation` | `validation/mod.rs` | Input validation: titles, IDs, priorities, dates, labels |
-| `util` | `util/id.rs` | Hash-based short ID generation (e.g., `proj-abc12`) |
+| `config` | `config/mod.rs` | Layered config: file + env vars + CLI flags, project-aware resolution, `KNOWN_CONFIG_KEYS` registry |
+| `error` | `error/structured.rs` | `StructuredError` with `ErrorCode` enum, deterministic exit codes, and hints |
+| `validation` | `validation/mod.rs` | Input validation: titles, IDs, priorities (incl. `0-1`, `P0,P2` filters), dates, labels |
+| `util` | `util/id.rs` | Hash-based short ID generation and partial-ID resolution (e.g., `proj-abc12`) |
 | `util` | `util/hash.rs` | SHA-256 content hashing for deduplication |
-| `format` | `format/rich.rs` | Rich terminal output via `rich_rust` (panels, tables, colors) |
+| `output` | `output/components/issue_panel.rs` | Rich `br show` panel (renders Markdown descriptions via `rich_rust`) |
 
 ### Feature Flags
 
 ```toml
 [features]
 default = ["self_update"]
-self_update = ["dep:self_update"]   # Self-update from GitHub releases (rustls TLS, mandatory .sha256 sidecar verification; minisign signatures are published for manual verification)
+mcp = ["dep:fastmcp-rust"]           # br serve (stdio MCP server); not in the default build
+self_update = ["dep:self_update", "dep:self-replace", ...]   # Self-update from GitHub releases (rustls TLS, mandatory .sha256 sidecar verification; minisign signatures are published for manual verification)
 ```
+
+`br capabilities --format json` reports the compiled features under `build_features`.
 
 ### Core Types Quick Reference
 
@@ -410,7 +415,7 @@ self_update = ["dep:self_update"]   # Self-update from GitHub releases (rustls T
 - **Multiple output modes** — Rich (TTY), Plain (pipe/NO_COLOR), JSON (--json/--robot), Quiet (--quiet) — auto-detected
 - **Append-only audit log** — Every mutation recorded in events table for full traceability
 - **Layered configuration** — File + env vars + CLI flags with project-aware routing
-- **`unsafe_code = "forbid"`** — Zero unsafe code via crate-level lint
+- **`unsafe_code = "deny"`** — No new unsafe code; the three sanctioned carve-outs are enumerated in the Cargo.toml lints comment
 - **`clippy::pedantic` + `clippy::nursery`** — Maximum lint strictness enabled
 
 ---
