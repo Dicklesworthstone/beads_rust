@@ -91,6 +91,43 @@ publishes from the tag.
   `--append-notes <TEXT>` appends a line to `notes` without rewriting the
   field (repeatable, idempotent on re-run, conflicts with `--notes`, never
   needs `--force`); `--json` reports the resulting field (#480).
+- `br show --json` and the MCP `show_issue` tool add `acceptance_items`
+  (1-based `index`, `text`, `checked`) whenever `acceptance_criteria` holds
+  a checklist, and the MCP `update_issue` tool takes `check_acceptance`,
+  `uncheck_acceptance`, and `add_acceptance` with the same selectors as the
+  CLI flags; both surfaces validate and rewrite through one shared helper
+  (#477, bead iw7k.5).
+- Engine sidecars left behind without their database file (`-wal-cert`,
+  `-fsqlite-ns-gate`, `-wal`, ...) no longer wedge the fresh-database
+  install: the writable recovery path and `br init` move them to
+  `.beads/.br_recovery/<name>.<stamp>.orphaned-sidecar` first (bead avhq;
+  `tests/repro_avhq.rs`).
+- The reviewed schema-migration witness hashes DDL as tokens (comments,
+  whitespace, parentheses, identifier quotes, and keyword case ignored), so
+  the from==to maintenance-only plan no longer fails its `schema_sha256`
+  attestation on the `VACUUM INTO` candidate whose table text FrankenSQLite
+  re-serializes (bead 891u).
+- The four pending-merge CLI gate scenarios that only existed as
+  `#[ignore]`d unit tests now run end to end in
+  `tests/e2e_basic_lifecycle.rs` against a receipt left by a real
+  interrupted merge (bead mzpz).
+- `br doctor --bundle <out.tar.gz>` writes the incident-evidence archive
+  `docs/reliability/HEALTH_CONTRACT.md` had promised as "not yet
+  implemented": doctor/health/sync/where captures with exit codes, listings,
+  database-family hashes, the `metadata` and `sqlite_master` tables and
+  recent events via a read-only engine connection, redacted copies of
+  `metadata.json`/`config.yaml`; database bytes and `issues.jsonl` only with
+  `--include-db` / `--include-jsonl`; e-mail addresses redacted; never
+  overwrites (bead v7o2.4).
+- The release reliability job and the scheduled CI reliability gates run
+  `scripts/br-stress.sh` (8 processes, 60 s mixed workload against a copy of
+  this repo's `.beads/`), failing on any corruption post-condition (bead
+  dk45.4).
+- The fsqlite grouped/HAVING IN-subquery count defect behind the multi-label
+  AND detour (bead ro3m) is now pinned down by two tests: the literal
+  statement counts correctly on fsqlite 0.3.15, the same statement with bound
+  parameters counts 0. The detour stays; the ignored bound-parameter probe
+  flips green on a fixed engine and names the detour to remove.
 - The #467 guard is proportional to what a write would lose (#481): a
   whole-field write that keeps at least half the current length passes
   (with a warning when it also keeps fewer than half the current words);

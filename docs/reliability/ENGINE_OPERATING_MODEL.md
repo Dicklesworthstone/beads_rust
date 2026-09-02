@@ -125,11 +125,11 @@ A release without these receipts is not a release.
 
 | Bead | Symptom in br | Upstream |
 |---|---|---|
-| `beads_rust-ro3m` | `SELECT COUNT(*)` over grouped/HAVING IN-subquery returns NULL; br carries a candidate-ids workaround for multi-label AND counting | to file (frankensqlite) |
+| `beads_rust-ro3m` | `SELECT COUNT(*) ... WHERE id IN (SELECT ... GROUP BY ... HAVING COUNT(DISTINCT label) = ?)` counts 0 when the labels and threshold are bound parameters (the literal statement is right; confirmed on fsqlite 0.3.15); br routes multi-label AND counting through candidate ids. Probe: `grouped_having_in_subquery_count_with_bound_params` (ignored; run with `--ignored` after an engine bump), guard: `multi_label_and_count_matches_list` | to file (frankensqlite) |
 | `beads_rust-f3r4` | B-tree rowid-order corruption after 264 sequential dep-remove writes (GH #426) | to file |
 | `beads_rust-ajui` | migrate-schema 16→17 reports success but leaves the DB failing `integrity_check` (GH #428) | to file; br-side: post-migration `integrity_check` must fail loudly regardless |
-| `beads_rust-891u` | `VACUUM INTO` re-serializes DDL so the raw `sqlite_master` hash never matches the witness | to file; br-side: normalize DDL before hashing |
-| `beads_rust-avhq` | orphaned `-wal-cert`/`-ns` sidecars wedge open when the DB file is absent | br-side quarantine before init |
+| `beads_rust-891u` | `VACUUM INTO` re-serializes DDL so the raw `sqlite_master` hash never matches the witness | to file; br-side landed: the witness hashes DDL tokens (`ddl_token_fingerprint`, `schema_witness_survives_vacuum_into_reserialization`) |
+| `beads_rust-avhq` | orphaned `-wal-cert`/`-ns` sidecars wedge open when the DB file is absent | br-side landed: `quarantine_orphaned_sidecars` before the fresh install (`tests/repro_avhq.rs`) |
 | resolved | GH #457/#460/#461 page aliasing under concurrent checkpoints | frankensqlite #399 (fix tracked in #385, #329); contained by §3 |
 | resolved | trailing zero pages rejected where SQLite accepts them | `docs/fsqlite_trailing_pages_report.md` |
 
