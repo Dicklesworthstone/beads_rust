@@ -9,9 +9,13 @@
 //!
 //! 1. `--json` or `--robot` flags → **JSON mode** (machine-readable)
 //! 2. `--quiet` flag → **Quiet mode** (minimal output)
-//! 3. `NO_COLOR` env or `--no-color` → **Plain mode** (no ANSI codes)
-//! 4. Non-TTY stdout → **Plain mode** (piped output)
-//! 5. Otherwise → **Rich mode** (colors, tables, panels)
+//! 3. `BR_OUTPUT_FORMAT` (or the `TOON_DEFAULT_FORMAT` fallback) → **JSON** or
+//!    **Toon mode** when set to `json`/`toon`
+//! 4. `NO_COLOR` env or `--no-color` → **Plain mode** (no ANSI codes)
+//! 5. Non-TTY stdout → **Plain mode** (piped output)
+//! 6. Otherwise → **Rich mode** (colors, tables, panels)
+//!
+//! The implementation is [`context::OutputContext::detect_mode_with_env`].
 //!
 //! ## Usage
 //!

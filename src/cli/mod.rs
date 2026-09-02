@@ -1825,7 +1825,7 @@ pub struct ListArgs {
     #[arg(long, add = ArgValueCompleter::new(label_completer))]
     pub label_any: Vec<String>,
 
-    /// Filter by priority (can be repeated)
+    /// Filter by priority: 0-4 or P0-P4, ranges like 0-1, comma lists; repeatable
     #[arg(long, short = 'p', add = ArgValueCompleter::new(priority_completer))]
     pub priority: Vec<String>,
 
@@ -2304,24 +2304,24 @@ pub enum LabelCommands {
 
 #[derive(Args, Debug)]
 pub struct LabelAddArgs {
-    /// Issue ID(s) to add label to
+    /// Issue ID(s) to add label to; positional labels may follow the IDs
     #[arg(add = ArgValueCompleter::new(issue_id_completer))]
     pub issues: Vec<String>,
 
-    /// Label to add
-    #[arg(long, short = 'l', add = ArgValueCompleter::new(label_completer))]
-    pub label: Option<String>,
+    /// Label(s) to add (repeatable or comma-separated)
+    #[arg(long, short = 'l', action = clap::ArgAction::Append, value_delimiter = ',', add = ArgValueCompleter::new(label_completer))]
+    pub label: Vec<String>,
 }
 
 #[derive(Args, Debug)]
 pub struct LabelRemoveArgs {
-    /// Issue ID(s) to remove label from
+    /// Issue ID(s) to remove label from; positional labels may follow the IDs
     #[arg(add = ArgValueCompleter::new(issue_id_completer))]
     pub issues: Vec<String>,
 
-    /// Label to remove
-    #[arg(long, short = 'l', add = ArgValueCompleter::new(label_completer))]
-    pub label: Option<String>,
+    /// Label(s) to remove (repeatable or comma-separated)
+    #[arg(long, short = 'l', action = clap::ArgAction::Append, value_delimiter = ',', add = ArgValueCompleter::new(label_completer))]
+    pub label: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -2685,7 +2685,7 @@ pub struct ReadyArgs {
     #[arg(long = "type", short = 't', add = ArgValueCompleter::new(issue_type_completer))]
     pub type_: Vec<String>,
 
-    /// Filter by priority (can be repeated, 0-4)
+    /// Filter by priority: 0-4 or P0-P4, ranges like 0-1, comma lists; repeatable
     #[arg(long, short = 'p', add = ArgValueCompleter::new(priority_completer))]
     pub priority: Vec<String>,
 

@@ -61,7 +61,7 @@ fn execute_inner(args: &CountArgs, ctx: &OutputContext, storage: &SqliteStorage)
     let mut filters = ListFilters::default();
     let statuses = parse_trimmed_values(&args.status)?;
     let types = parse_trimmed_values(&args.types)?;
-    let priorities = parse_trimmed_values(&args.priority)?;
+    let priorities = crate::validation::parse_priority_filter(&args.priority)?;
 
     // `--status all` is the same meta-value `br lint` accepts: no status
     // filter, every status included (beads_rust-6ilv).

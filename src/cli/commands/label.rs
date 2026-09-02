@@ -168,40 +168,57 @@ fn format_rename_result_plain_line(old_name: &str, new_name: &str, count: usize)
     )
 }
 
-/// Parse issues and label from positional args.
+/// Parse issue IDs and labels from the positional arguments and `-l` flags.
 ///
-/// The last argument is the label, all preceding arguments are issue IDs.
-fn parse_issues_and_label(
+/// With `-l` (repeatable or comma-separated) every positional argument is an
+/// issue ID. Without it the positional list is `<issue>... <label>...`: the
+/// trailing run of arguments that do not have the `<prefix>-<hash>` shape of
+/// an issue ID are labels (so `br label add br-abc backend urgent` adds two
+/// labels), and at least the last argument is always a label, which keeps the
+/// classic `label add <issue> <label>` form working for labels that happen to
+/// look like IDs. Labels that contain a dash and might be mistaken for an ID
+/// are safest passed with `-l`.
+fn parse_issues_and_labels(
     issues: &[String],
-    label_flag: Option<&String>,
-) -> Result<(Vec<String>, String)> {
-    // If label is provided via flag, all positional args are issues
-    if let Some(label) = label_flag {
+    label_flags: &[String],
+) -> Result<(Vec<String>, Vec<String>)> {
+    const USAGE: &str =
+        "usage: label add <issue...> <label...> or label add <issue...> -l <label>[,<label>]";
+
+    if !label_flags.is_empty() {
         if issues.is_empty() {
             return Err(BeadsError::validation(
                 "issues",
                 "at least one issue ID required",
             ));
         }
-        return Ok((issues.to_vec(), label.clone()));
+        let labels: Vec<String> = label_flags
+            .iter()
+            .map(|label| label.trim().to_string())
+            .filter(|label| !label.is_empty())
+            .collect();
+        if labels.is_empty() {
+            return Err(BeadsError::validation(
+                "label",
+                "at least one label required",
+            ));
+        }
+        return Ok((issues.to_vec(), labels));
     }
 
-    // Otherwise, last positional arg is the label
     if issues.len() < 2 {
-        return Err(BeadsError::validation(
-            "arguments",
-            "usage: label add <issue...> <label> or label add <issue...> -l <label>",
-        ));
+        return Err(BeadsError::validation("arguments", USAGE));
     }
 
-    let Some((label, issue_ids)) = issues.split_last() else {
-        return Err(BeadsError::validation(
-            "arguments",
-            "usage: label add <issue...> <label> or label add <issue...> -l <label>",
-        ));
-    };
-
-    Ok((issue_ids.to_vec(), label.clone()))
+    // Walk back from the end while the argument cannot be an issue ID; keep
+    // at least one issue at the front and treat at least the last argument as
+    // a label.
+    let mut split = issues.len() - 1;
+    while split > 1 && crate::util::id::parse_id(&issues[split - 1]).is_err() {
+        split -= 1;
+    }
+    let (issue_ids, labels) = issues.split_at(split);
+    Ok((issue_ids.to_vec(), labels.to_vec()))
 }
 
 fn execute_routed_label_add(
@@ -210,22 +227,28 @@ fn execute_routed_label_add(
     ctx: &OutputContext,
     beads_dir: &Path,
 ) -> Result<()> {
-    let (issue_inputs, label) = parse_issues_and_label(&args.issues, args.label.as_ref())?;
-    validate_label(&label)?;
-    let prepared_routes = prepare_label_routes(&issue_inputs, cli, beads_dir)?;
-    let mut routed_results = Vec::new();
-
-    for mut prepared_route in prepared_routes {
-        let batch_inputs = prepared_route.issue_inputs.clone();
-        let batch_results = label_add(&mut prepared_route, &label, ctx)?;
-        routed_results.push((batch_inputs, batch_results));
+    let (issue_inputs, labels) = parse_issues_and_labels(&args.issues, &args.label)?;
+    for label in &labels {
+        validate_label(label)?;
     }
+    let mut prepared_routes = prepare_label_routes(&issue_inputs, cli, beads_dir)?;
 
-    let results = reorder_routed_items_by_requested_inputs(
-        &issue_inputs,
-        routed_results,
-        "label add routing",
-    )?;
+    // One pass per label keeps the per-issue result ordering contract of the
+    // routing reorder (one result per requested input per pass).
+    let mut results = Vec::new();
+    for label in &labels {
+        let mut routed_results = Vec::new();
+        for prepared_route in &mut prepared_routes {
+            let batch_inputs = prepared_route.issue_inputs.clone();
+            let batch_results = label_add(prepared_route, label, ctx)?;
+            routed_results.push((batch_inputs, batch_results));
+        }
+        results.extend(reorder_routed_items_by_requested_inputs(
+            &issue_inputs,
+            routed_results,
+            "label add routing",
+        )?);
+    }
     if let Some(last_result) = results.last() {
         crate::util::set_last_touched_id(beads_dir, &last_result.issue_id);
     }
@@ -287,22 +310,26 @@ fn execute_routed_label_remove(
     ctx: &OutputContext,
     beads_dir: &Path,
 ) -> Result<()> {
-    let (issue_inputs, label) = parse_issues_and_label(&args.issues, args.label.as_ref())?;
-    validate_label(&label)?;
-    let prepared_routes = prepare_label_routes(&issue_inputs, cli, beads_dir)?;
-    let mut routed_results = Vec::new();
-
-    for mut prepared_route in prepared_routes {
-        let batch_inputs = prepared_route.issue_inputs.clone();
-        let batch_results = label_remove(&mut prepared_route, &label, ctx)?;
-        routed_results.push((batch_inputs, batch_results));
+    let (issue_inputs, labels) = parse_issues_and_labels(&args.issues, &args.label)?;
+    for label in &labels {
+        validate_label(label)?;
     }
+    let mut prepared_routes = prepare_label_routes(&issue_inputs, cli, beads_dir)?;
 
-    let results = reorder_routed_items_by_requested_inputs(
-        &issue_inputs,
-        routed_results,
-        "label remove routing",
-    )?;
+    let mut results = Vec::new();
+    for label in &labels {
+        let mut routed_results = Vec::new();
+        for prepared_route in &mut prepared_routes {
+            let batch_inputs = prepared_route.issue_inputs.clone();
+            let batch_results = label_remove(prepared_route, label, ctx)?;
+            routed_results.push((batch_inputs, batch_results));
+        }
+        results.extend(reorder_routed_items_by_requested_inputs(
+            &issue_inputs,
+            routed_results,
+            "label remove routing",
+        )?);
+    }
     if let Some(last_result) = results.last() {
         crate::util::set_last_touched_id(beads_dir, &last_result.issue_id);
     }
@@ -1048,56 +1075,86 @@ mod tests {
         assert!(validate_label("provides:").is_ok());
     }
 
-    #[test]
-    fn test_parse_issues_and_label_with_flag() {
-        let issues = vec!["bd-abc".to_string(), "bd-def".to_string()];
-        let label = Some("urgent".to_string());
-
-        let (parsed_issues, parsed_label) =
-            parse_issues_and_label(&issues, label.as_ref()).unwrap();
-        assert_eq!(parsed_issues, vec!["bd-abc", "bd-def"]);
-        assert_eq!(parsed_label, "urgent");
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
     }
 
     #[test]
-    fn test_parse_issues_and_label_positional() {
-        let issues = vec![
-            "bd-abc".to_string(),
-            "bd-def".to_string(),
-            "urgent".to_string(),
-        ];
-        let label: Option<&String> = None;
-
-        let (parsed_issues, parsed_label) = parse_issues_and_label(&issues, label).unwrap();
-        assert_eq!(parsed_issues, vec!["bd-abc", "bd-def"]);
-        assert_eq!(parsed_label, "urgent");
+    fn test_parse_issues_and_labels_with_flag() {
+        let (issues, labels) =
+            parse_issues_and_labels(&strings(&["bd-abc", "bd-def"]), &strings(&["urgent"]))
+                .unwrap();
+        assert_eq!(issues, vec!["bd-abc", "bd-def"]);
+        assert_eq!(labels, vec!["urgent"]);
     }
 
     #[test]
-    fn test_parse_issues_and_label_single_issue() {
-        let issues = vec!["bd-abc".to_string(), "urgent".to_string()];
-        let label: Option<&String> = None;
-
-        let (parsed_issues, parsed_label) = parse_issues_and_label(&issues, label).unwrap();
-        assert_eq!(parsed_issues, vec!["bd-abc"]);
-        assert_eq!(parsed_label, "urgent");
+    fn test_parse_issues_and_labels_with_repeated_and_delimited_flags() {
+        // clap splits `-l a,b` into two values; `-l a -l b` arrives the same way.
+        let (issues, labels) =
+            parse_issues_and_labels(&strings(&["bd-abc"]), &strings(&["backend", "urgent"]))
+                .unwrap();
+        assert_eq!(issues, vec!["bd-abc"]);
+        assert_eq!(labels, vec!["backend", "urgent"]);
     }
 
     #[test]
-    fn test_parse_issues_and_label_missing_label() {
-        let issues = vec!["bd-abc".to_string()];
-        let label: Option<&String> = None;
-
-        let result = parse_issues_and_label(&issues, label);
-        assert!(result.is_err());
+    fn test_parse_issues_and_labels_positional_single_label() {
+        let (issues, labels) =
+            parse_issues_and_labels(&strings(&["bd-abc", "bd-def", "urgent"]), &[]).unwrap();
+        assert_eq!(issues, vec!["bd-abc", "bd-def"]);
+        assert_eq!(labels, vec!["urgent"]);
     }
 
     #[test]
-    fn test_parse_issues_and_label_no_issues_with_flag() {
-        let issues: Vec<String> = vec![];
-        let label = Some("urgent".to_string());
+    fn test_parse_issues_and_labels_positional_multiple_labels() {
+        // README form: `br label add br-abc123 backend urgent`.
+        let (issues, labels) =
+            parse_issues_and_labels(&strings(&["bd-abc", "backend", "urgent"]), &[]).unwrap();
+        assert_eq!(issues, vec!["bd-abc"]);
+        assert_eq!(labels, vec!["backend", "urgent"]);
+    }
 
-        let result = parse_issues_and_label(&issues, label.as_ref());
-        assert!(result.is_err());
+    #[test]
+    fn test_parse_issues_and_labels_positional_keeps_leading_issue() {
+        // Every positional looks like a label except the first: the first is
+        // still the issue and the rest are labels.
+        let (issues, labels) =
+            parse_issues_and_labels(&strings(&["bd-abc", "one", "two", "three"]), &[]).unwrap();
+        assert_eq!(issues, vec!["bd-abc"]);
+        assert_eq!(labels, vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn test_parse_issues_and_labels_id_like_label_uses_last_argument() {
+        // A label that parses as an issue ID falls back to the classic rule:
+        // the last argument is the label.
+        let (issues, labels) =
+            parse_issues_and_labels(&strings(&["bd-abc", "needs-review"]), &[]).unwrap();
+        assert_eq!(issues, vec!["bd-abc"]);
+        assert_eq!(labels, vec!["needs-review"]);
+    }
+
+    #[test]
+    fn test_parse_issues_and_labels_single_issue() {
+        let (issues, labels) =
+            parse_issues_and_labels(&strings(&["bd-abc", "urgent"]), &[]).unwrap();
+        assert_eq!(issues, vec!["bd-abc"]);
+        assert_eq!(labels, vec!["urgent"]);
+    }
+
+    #[test]
+    fn test_parse_issues_and_labels_missing_label() {
+        assert!(parse_issues_and_labels(&strings(&["bd-abc"]), &[]).is_err());
+    }
+
+    #[test]
+    fn test_parse_issues_and_labels_no_issues_with_flag() {
+        assert!(parse_issues_and_labels(&[], &strings(&["urgent"])).is_err());
+    }
+
+    #[test]
+    fn test_parse_issues_and_labels_blank_flag_values_rejected() {
+        assert!(parse_issues_and_labels(&strings(&["bd-abc"]), &strings(&[" ", ""])).is_err());
     }
 }

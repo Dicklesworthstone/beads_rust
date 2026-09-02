@@ -18,7 +18,6 @@ use crate::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use std::io::IsTerminal;
 use std::path::Path;
-use std::str::FromStr;
 use tracing::{debug, info, trace};
 use unicode_width::UnicodeWidthStr;
 
@@ -389,18 +388,13 @@ fn parse_types(types: &[String]) -> Result<Option<Vec<IssueType>>> {
     Ok(Some(parsed))
 }
 
-/// Parse priority filter strings to Priority values.
+/// Parse priority filter strings to Priority values (single values, ranges
+/// such as `0-1`, and comma lists share one parser with `list`).
 fn parse_priorities(priorities: &[String]) -> Result<Option<Vec<Priority>>> {
     if priorities.is_empty() {
         return Ok(None);
     }
-
-    let mut parsed = Vec::with_capacity(priorities.len());
-    for p in priorities {
-        parsed.push(Priority::from_str(p)?);
-    }
-
-    Ok(Some(parsed))
+    Ok(Some(crate::validation::parse_priority_filter(priorities)?))
 }
 
 #[cfg(test)]

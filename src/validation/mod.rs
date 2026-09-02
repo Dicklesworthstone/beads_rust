@@ -23,6 +23,48 @@ const ACTOR_MAX_CHARS: usize = 200;
 const CUSTOM_VARIANT_MAX_CHARS: usize = 50;
 pub(crate) const ISSUE_LABEL_MAX_COUNT: usize = 64;
 
+/// Parse `--priority` filter values into a de-duplicated, ascending list.
+///
+/// Every value may be a comma-separated list, and every token is either a
+/// single priority (`2`, `P2`) or an inclusive range (`0-1`, `P0-P1`).
+/// Whitespace around tokens is ignored; empty tokens are skipped. This is the
+/// one parser behind `list`, `ready`, `blocked`, and `count`, so the README's
+/// `--priority 0-1` form means the same thing everywhere.
+///
+/// # Errors
+///
+/// Returns [`BeadsError::InvalidPriority`] naming the offending token when a
+/// token is not a priority or a range, or when a range runs backwards.
+pub fn parse_priority_filter(values: &[String]) -> crate::error::Result<Vec<Priority>> {
+    use std::str::FromStr;
+
+    let mut selected = std::collections::BTreeSet::new();
+    for value in values {
+        for token in value.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            if let Some((low, high)) = token.split_once('-')
+                && !low.trim().is_empty()
+                && !high.trim().is_empty()
+            {
+                let low = Priority::from_str(low)?;
+                let high = Priority::from_str(high)?;
+                if low.0 > high.0 {
+                    return Err(BeadsError::InvalidPriority {
+                        priority: token.to_string(),
+                    });
+                }
+                selected.extend(low.0..=high.0);
+                continue;
+            }
+            selected.insert(Priority::from_str(token)?.0);
+        }
+    }
+    Ok(selected.into_iter().map(Priority).collect())
+}
+
 /// Validates issue fields and invariants.
 pub struct IssueValidator;
 
@@ -1773,5 +1815,73 @@ mod tests {
                 .expect_err("non-string dependency form must fail closed")
                 .contains("must be a version string or dependency table")
         );
+    }
+}
+
+#[cfg(test)]
+mod priority_filter_tests {
+    use super::parse_priority_filter;
+    use crate::model::Priority;
+
+    fn values(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    fn levels(priorities: &[Priority]) -> Vec<i32> {
+        priorities.iter().map(|priority| priority.0).collect()
+    }
+
+    #[test]
+    fn single_values_in_both_spellings() {
+        assert_eq!(
+            levels(&parse_priority_filter(&values(&["2"])).unwrap()),
+            vec![2]
+        );
+        assert_eq!(
+            levels(&parse_priority_filter(&values(&["P1"])).unwrap()),
+            vec![1]
+        );
+        assert_eq!(
+            levels(&parse_priority_filter(&values(&["p3"])).unwrap()),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn ranges_expand_inclusively() {
+        assert_eq!(
+            levels(&parse_priority_filter(&values(&["0-1"])).unwrap()),
+            vec![0, 1]
+        );
+        assert_eq!(
+            levels(&parse_priority_filter(&values(&["P1-P3"])).unwrap()),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            levels(&parse_priority_filter(&values(&["2-2"])).unwrap()),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn comma_lists_repeats_and_whitespace_are_merged_and_deduplicated() {
+        let parsed = parse_priority_filter(&values(&["0, 1", "1-2", " P4 ", ""])).unwrap();
+        assert_eq!(levels(&parsed), vec![0, 1, 2, 4]);
+    }
+
+    #[test]
+    fn empty_input_yields_empty_filter() {
+        assert!(parse_priority_filter(&[]).unwrap().is_empty());
+        assert!(parse_priority_filter(&values(&[" , "])).unwrap().is_empty());
+    }
+
+    #[test]
+    fn invalid_tokens_and_backwards_ranges_are_rejected() {
+        for bad in ["5", "-1", "1-5", "3-1", "high", "P0-", "-P1", "1--2"] {
+            assert!(
+                parse_priority_filter(&values(&[bad])).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
     }
 }

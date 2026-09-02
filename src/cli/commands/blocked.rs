@@ -10,7 +10,7 @@ use crate::config::{
 };
 use crate::error::Result;
 use crate::format::{BlockedIssue, BlockedIssueOutput, BlockedPage, sanitize_terminal_inline};
-use crate::model::{IssueType, Priority};
+use crate::model::IssueType;
 use crate::output::{JsonArrayPageMeta, OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
 use std::path::Path;
@@ -347,10 +347,7 @@ fn filter_by_priority(issues: &mut Vec<BlockedIssue>, priorities: &[String]) -> 
         return Ok(());
     }
 
-    let parsed = priorities
-        .iter()
-        .map(|p| Priority::from_str(p))
-        .collect::<Result<Vec<Priority>>>()?;
+    let parsed = crate::validation::parse_priority_filter(priorities)?;
 
     issues.retain(|bi| parsed.contains(&bi.issue.priority));
     Ok(())

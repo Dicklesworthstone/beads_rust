@@ -519,16 +519,12 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         )
     };
 
-    // Parse priority values (invalid values should error, not be silently dropped)
+    // Parse priority values (invalid values should error, not be silently dropped);
+    // accepts single values, ranges (`0-1`), and comma lists.
     let priorities = if args.priority.is_empty() {
         None
     } else {
-        Some(
-            args.priority
-                .iter()
-                .map(|p| p.parse())
-                .collect::<Result<Vec<Priority>>>()?,
-        )
+        Some(crate::validation::parse_priority_filter(&args.priority)?)
     };
 
     let include_closed = args.all
