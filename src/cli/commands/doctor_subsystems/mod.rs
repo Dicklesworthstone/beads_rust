@@ -26,6 +26,7 @@
 //! per-run quarantine area. See `safety_envelope.md` for the full list
 //! of invariants.
 
+pub mod bundle;
 pub mod capabilities_doctor;
 pub mod engine;
 pub mod exit_codes;

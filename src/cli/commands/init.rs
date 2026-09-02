@@ -141,7 +141,12 @@ pub fn execute(
         fs::create_dir_all(parent)?;
     }
 
-    // Initialize DB (creates file and applies schema)
+    // Initialize DB (creates file and applies schema). Engine sidecars left
+    // behind without a database file would make the fresh open fail
+    // (beads_rust-avhq), so move them aside first.
+    if !db_existed {
+        crate::config::quarantine_orphaned_sidecars(&effective_db_path, &beads_dir);
+    }
     let mut storage = SqliteStorage::open(&effective_db_path)?;
 
     // Set prefix in config table if provided, otherwise derive from directory name

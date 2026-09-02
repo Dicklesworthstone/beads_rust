@@ -2302,3 +2302,182 @@ fn doctor_selftest_runs_lifecycle_in_throwaway_workspace() {
         "error: {err}"
     );
 }
+
+/// Read every member of a `.tar.gz` bundle as (name, bytes).
+fn read_bundle(path: &Path) -> BTreeMap<String, Vec<u8>> {
+    use std::io::Read;
+    let file = fs::File::open(path).expect("open bundle");
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let mut members = BTreeMap::new();
+    for entry in archive.entries().expect("bundle entries") {
+        let mut entry = entry.expect("bundle entry");
+        let name = entry
+            .path()
+            .expect("member path")
+            .to_string_lossy()
+            .into_owned();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).expect("read member");
+        members.insert(name, bytes);
+    }
+    members
+}
+
+/// `br doctor --bundle` writes the incident-evidence archive the health
+/// contract promises: command captures, listings, family hashes, the
+/// read-only table dumps, and redacted copies; database bytes and
+/// `issues.jsonl` only on request; never overwrites an existing file.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn doctor_bundle_captures_evidence_with_redaction_and_opt_in_payloads() {
+    let temp = isolated_tempdir();
+    let cwd = temp.path();
+    br_init(cwd);
+    let created = br_cmd(cwd)
+        .args([
+            "create",
+            "Bundle fixture",
+            "--description",
+            "owner alice@example.com will review",
+            "--json",
+        ])
+        .output()
+        .expect("create issue");
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let bundle_path = cwd.join("incident.tar.gz");
+    let out = br_cmd(cwd)
+        .args(["doctor", "--bundle"])
+        .arg(&bundle_path)
+        .arg("--json")
+        .output()
+        .expect("doctor --bundle");
+    assert!(
+        out.status.success(),
+        "doctor --bundle failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&out.stdout).expect("bundle receipt json");
+    assert_eq!(receipt["schema"], "br.doctor.bundle.v1", "{receipt}");
+    assert_eq!(receipt["include_db"], false);
+    assert_eq!(receipt["include_jsonl"], false);
+
+    let members = read_bundle(&bundle_path);
+    for expected in [
+        "manifest.json",
+        "version.txt",
+        "doctor.json",
+        "doctor-repair-dry-run.json",
+        "health.json",
+        "sync-status.json",
+        "where.json",
+        "config-list.txt",
+        "listings.json",
+        "db-family.json",
+        "db-dump.json",
+        "metadata.json",
+        "config.yaml",
+        "issues.jsonl.summary.json",
+    ] {
+        assert!(
+            members.contains_key(expected),
+            "bundle lacks {expected}: {:?}",
+            members.keys().collect::<Vec<_>>()
+        );
+    }
+    assert!(
+        !members.contains_key("issues.jsonl")
+            && !members.keys().any(|name| name.starts_with("db/")),
+        "payloads must be opt-in: {:?}",
+        members.keys().collect::<Vec<_>>()
+    );
+    let manifest: Value = serde_json::from_slice(&members["manifest.json"]).expect("manifest json");
+    assert_eq!(manifest["schema"], "br.doctor.bundle.v1");
+    assert!(manifest["engine"]["name"].is_string(), "{manifest}");
+    let doctor_exit = manifest["members"]
+        .as_array()
+        .expect("manifest members")
+        .iter()
+        .find(|member| member["name"] == "doctor.json")
+        .and_then(|member| member["exit_code"].as_i64());
+    assert_eq!(doctor_exit, Some(0), "{manifest}");
+    let dump: Value = serde_json::from_slice(&members["db-dump.json"]).expect("db-dump json");
+    assert_eq!(dump["opened"], true, "{dump}");
+    assert!(
+        dump["sqlite_master"]["rows"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["name"] == "issues")),
+        "{dump}"
+    );
+    assert!(
+        dump["recent_events"]["rows"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "{dump}"
+    );
+    let family: Value = serde_json::from_slice(&members["db-family.json"]).expect("family json");
+    let main_db = &family["members"][0];
+    assert_eq!(main_db["name"], "beads.db");
+    assert_eq!(main_db["present"], true);
+    assert!(
+        main_db["sha256"]
+            .as_str()
+            .is_some_and(|hex| hex.len() == 64)
+    );
+    for (name, bytes) in &members {
+        if name.starts_with("db/") {
+            continue;
+        }
+        let text = String::from_utf8_lossy(bytes);
+        assert!(
+            !text.contains("alice@example.com"),
+            "{name} leaks an e-mail address"
+        );
+    }
+
+    // Refuses to overwrite.
+    let again = br_cmd(cwd)
+        .args(["doctor", "--bundle"])
+        .arg(&bundle_path)
+        .output()
+        .expect("second bundle");
+    assert!(
+        !again.status.success(),
+        "existing bundle must not be overwritten"
+    );
+
+    // Opt-in payloads: the JSONL is attached redacted, the database bytes verbatim.
+    let full_path = cwd.join("incident-full.tar.gz");
+    let full = br_cmd(cwd)
+        .args(["doctor", "--bundle"])
+        .arg(&full_path)
+        .args(["--include-db", "--include-jsonl", "--json"])
+        .output()
+        .expect("doctor --bundle --include-db --include-jsonl");
+    assert!(
+        full.status.success(),
+        "{}",
+        String::from_utf8_lossy(&full.stderr)
+    );
+    let full_members = read_bundle(&full_path);
+    let jsonl = String::from_utf8_lossy(&full_members["issues.jsonl"]);
+    assert!(
+        jsonl.contains("<redacted-email>") && !jsonl.contains("alice@example.com"),
+        "{jsonl}"
+    );
+    assert!(
+        full_members.contains_key("db/beads.db"),
+        "{:?}",
+        full_members.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        full_members["db/beads.db"],
+        fs::read(cwd.join(".beads").join("beads.db")).expect("read live db"),
+        "--include-db must attach the database bytes verbatim"
+    );
+}

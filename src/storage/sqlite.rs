@@ -8873,13 +8873,18 @@ impl SqliteStorage {
 
         let labels_and = filters.labels.as_deref().unwrap_or(&[]);
         let labels_or = filters.labels_or.as_deref().unwrap_or(&[]);
-        // fsqlite 0.3.6 regression: `SELECT COUNT(*) ... WHERE id IN
-        // (SELECT ... GROUP BY ... HAVING ...)` evaluates to NULL (minimal
-        // repro in the frankensqlite escalation, beads_rust-ro3m), which
-        // `unwrap_or(0)` below would silently report as zero. The bare
-        // membership subquery is unaffected, so multi-label AND counting
-        // routes through the two-step candidate-ids path instead of the
-        // uncorrelated IN fast path.
+        // fsqlite regression (seen on 0.3.6, still present on 0.3.15):
+        // `SELECT COUNT(*) ... WHERE id IN (SELECT ... GROUP BY ... HAVING
+        // COUNT(DISTINCT label) = ?)` evaluates to NULL (read as 0 below) as
+        // soon as further predicates follow the IN-subquery, which the
+        // default-visibility status and template clauses do; the minimal
+        // statement counts correctly (beads_rust-ro3m; the ignored probe
+        // `grouped_having_in_subquery_count_with_bound_params` enumerates the
+        // variants and flips green when the engine is fixed).
+        // The bare membership subquery is unaffected, so multi-label AND
+        // counting routes through the two-step candidate-ids path instead of
+        // the uncorrelated IN fast path; `multi_label_and_count_matches_list`
+        // guards the behavior.
         let multi_label_and = unique_label_refs(labels_and).len() > 1;
         let label_filters_can_use_uncorrelated_in = !multi_label_and
             && filters.statuses.as_ref().is_none_or(Vec::is_empty)
@@ -15562,17 +15567,21 @@ impl SqliteStorage {
             None
         };
 
-        Ok(Some(IssueDetails {
-            issue,
-            labels,
-            dependencies,
-            dependents,
-            comments,
-            events,
-            parent,
-            rollup,
-            inherited_context: Vec::new(),
-        }))
+        Ok(Some(
+            IssueDetails {
+                issue,
+                labels,
+                dependencies,
+                dependents,
+                comments,
+                events,
+                parent,
+                rollup,
+                inherited_context: Vec::new(),
+                acceptance_items: Vec::new(),
+            }
+            .with_acceptance_items(),
+        ))
     }
 
     /// Derived parent-child subtree rollup (GitHub #384 phase 3).
@@ -25809,6 +25818,143 @@ mod tests {
         for issue_id in ids.iter().skip(1) {
             assert_eq!(*dependency_counts.get(issue_id).unwrap_or(&0), 1);
         }
+    }
+
+    /// Three issues, two labels: only `bd-both` carries both.
+    fn storage_with_multi_label_fixture() -> SqliteStorage {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 4, 1, 0, 0, 0).unwrap();
+        for id in ["bd-both", "bd-one", "bd-other"] {
+            let issue = make_issue(id, id, Status::Open, 1, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage.add_label("bd-both", "backend", "tester").unwrap();
+        storage.add_label("bd-both", "urgent", "tester").unwrap();
+        storage.add_label("bd-one", "backend", "tester").unwrap();
+        storage.add_label("bd-other", "urgent", "tester").unwrap();
+        storage
+    }
+
+    const GROUPED_HAVING_IN_SUBQUERY_COUNT: &str =
+        "SELECT COUNT(*) FROM issues WHERE issues.id IN (
+            SELECT issue_id FROM labels
+            WHERE label IN (?, ?)
+            GROUP BY issue_id
+            HAVING COUNT(DISTINCT label) = ?
+        )";
+
+    fn first_integer(rows: &[crate::franken_sync::Row]) -> Option<i64> {
+        rows.first()
+            .and_then(|row| row.get(0))
+            .and_then(SqliteValue::as_integer)
+    }
+
+    /// beads_rust-ro3m: the public multi-label AND count must agree with the
+    /// list, whichever SQL path the engine forces it through. The literal
+    /// form of the grouped/HAVING IN-subquery is asserted too, to pin down
+    /// that the engine defect is specific to bound parameters.
+    #[test]
+    fn multi_label_and_count_matches_list() {
+        let storage = storage_with_multi_label_fixture();
+        let literal = storage
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM issues WHERE issues.id IN (
+                    SELECT issue_id FROM labels
+                    WHERE label IN ('backend', 'urgent')
+                    GROUP BY issue_id
+                    HAVING COUNT(DISTINCT label) = 2
+                )",
+            )
+            .unwrap();
+        assert_eq!(
+            first_integer(&literal),
+            Some(1),
+            "literal form: {literal:?}"
+        );
+
+        let filters = ListFilters {
+            labels: Some(vec!["backend".to_string(), "urgent".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(storage.count_issues_with_filters(&filters).unwrap(), 1);
+        let listed = storage.list_issues(&filters).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "bd-both");
+    }
+
+    /// The statement `count_issues_with_filters` runs on its uncorrelated-IN
+    /// fast path for a default multi-label AND filter (`WHERE 1=1`, the
+    /// default-visibility status clause, the template clause).
+    const PRODUCTION_SHAPED_COUNT: &str = "SELECT COUNT(*) FROM issues WHERE 1=1 AND issues.id IN (
+            SELECT issue_id
+            FROM labels
+            WHERE label IN (?,?)
+            GROUP BY issue_id
+            HAVING COUNT(DISTINCT label) = ?
+        ) AND status NOT IN ('closed', 'tombstone', 'deferred') \
+        AND (is_template = 0 OR is_template IS NULL)";
+
+    /// beads_rust-ro3m engine probe: every parametrized way of asking the
+    /// engine the multi-label AND count, so the failing variant is named.
+    /// On fsqlite 0.3.15 the two production-shaped variants return NULL
+    /// (`Ok(None)`) while the minimal statement counts 1 through both query
+    /// APIs: the grouped/HAVING IN-subquery breaks once further predicates
+    /// follow it. Run with `--ignored` after an engine bump; when every
+    /// variant counts 1, drop the `multi_label_and` detour in
+    /// `count_issues_with_filters` and un-ignore this test.
+    #[test]
+    #[ignore = "beads_rust-ro3m: fsqlite 0.3.15 returns NULL for the grouped/HAVING IN-subquery \
+                count when further predicates follow the subquery (minimal statement counts 1); \
+                rerun after an engine bump"]
+    fn grouped_having_in_subquery_count_with_bound_params() {
+        let storage = storage_with_multi_label_fixture();
+        let params = [
+            SqliteValue::from("backend"),
+            SqliteValue::from("urgent"),
+            SqliteValue::from(2_i64),
+        ];
+        let query_rows = |sql: &str| {
+            storage
+                .conn
+                .query_with_params(sql, &params)
+                .map(|rows| first_integer(&rows))
+                .map_err(|err| err.to_string())
+        };
+        let query_row = |sql: &str| {
+            storage
+                .conn
+                .query_row_with_params(sql, &params)
+                .map(|row| row.get(0).and_then(SqliteValue::as_integer))
+                .map_err(|err| err.to_string())
+        };
+        let variants = [
+            (
+                "minimal / query_with_params",
+                query_rows(GROUPED_HAVING_IN_SUBQUERY_COUNT),
+            ),
+            (
+                "minimal / query_row_with_params",
+                query_row(GROUPED_HAVING_IN_SUBQUERY_COUNT),
+            ),
+            (
+                "production-shaped / query_with_params",
+                query_rows(PRODUCTION_SHAPED_COUNT),
+            ),
+            (
+                "production-shaped / query_row_with_params",
+                query_row(PRODUCTION_SHAPED_COUNT),
+            ),
+        ];
+        let wrong: Vec<&(&str, std::result::Result<Option<i64>, String>)> = variants
+            .iter()
+            .filter(|(_, count)| !matches!(count, Ok(Some(1))))
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "fsqlite {}: these variants did not count 1: {wrong:?}",
+            option_env!("BR_FSQLITE_VERSION").unwrap_or("unknown")
+        );
     }
 
     #[test]

@@ -12932,6 +12932,11 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     if args.selftest {
         return crate::cli::commands::doctor_subsystems::selftest::execute(args, ctx);
     }
+    // `--bundle` only reads the workspace (its captured commands re-invoke
+    // this binary, which take their own locks) and writes one archive.
+    if args.bundle.is_some() {
+        return crate::cli::commands::doctor_subsystems::bundle::execute(args, cli, ctx);
+    }
     // WP6: dispatch to the agent-ergonomics surface when a subcommand is
     // present. The flat handler below stays untouched.
     if let Some(sub) = &args.subcommand {
@@ -14252,7 +14257,6 @@ mod tests {
     use crate::health::{AnomalyClass, WorkspaceHealth};
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
-    use assert_cmd::Command as AssertCommand;
     use chrono::Utc;
     use std::collections::BTreeMap;
     use std::fs;
@@ -14376,36 +14380,6 @@ mod tests {
         receipt
     }
 
-    fn pending_merge_workspace_with_newer_jsonl() -> (TempDir, PathBuf) {
-        let temp = TempDir::new().expect("pending merge workspace");
-        let beads_dir = temp.path().join(".beads");
-        fs::create_dir_all(&beads_dir).expect("create .beads");
-        let db_path = beads_dir.join("beads.db");
-        install_valid_pending_merge_receipt(&db_path);
-
-        let jsonl_path = beads_dir.join("issues.jsonl");
-        let issue = sample_issue("bd-auto-import-sentinel", "must remain outside pending DB");
-        fs::write(
-            &jsonl_path,
-            format!(
-                "{}\n",
-                serde_json::to_string(&issue).expect("serialize JSONL sentinel")
-            ),
-        )
-        .expect("write newer JSONL sentinel");
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .open(&jsonl_path)
-            .expect("open JSONL sentinel");
-        file.set_times(
-            fs::FileTimes::new()
-                .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60)),
-        )
-        .expect("make JSONL newer than database");
-
-        (temp, db_path)
-    }
-
     #[test]
     fn read_only_open_probe_check_is_ok_on_a_healthy_database() {
         let temp = TempDir::new().unwrap();
@@ -14455,28 +14429,6 @@ mod tests {
             diffs.is_empty(),
             "{context}: read-only contract violated: {diffs:#?}"
         );
-    }
-
-    fn run_br(cwd: &Path, args: &[&str]) -> std::process::Output {
-        let mut command = AssertCommand::cargo_bin("br").expect("locate br binary");
-        command.current_dir(cwd);
-        command.env("NO_COLOR", "1");
-        command.env("RUST_LOG", "warn");
-        command.env("HOME", cwd);
-        command.env_remove("BR_DISABLE_READ_ONLY_FAST_OPEN");
-        for (key, _) in std::env::vars_os() {
-            let name = key.to_string_lossy();
-            if name.starts_with("BD_")
-                || name.starts_with("BEADS_")
-                || matches!(
-                    name.as_ref(),
-                    "BR_OUTPUT_FORMAT" | "TOON_DEFAULT_FORMAT" | "TOON_STATS"
-                )
-            {
-                command.env_remove(&key);
-            }
-        }
-        command.args(args).output().expect("run br child")
     }
 
     #[test]
@@ -14762,205 +14714,12 @@ mod tests {
         );
     }
 
-    #[test]
-    #[ignore = "drives the br binary via assert_cmd; CARGO_BIN_EXE_br only exists for \
-                integration tests — relocate to tests/ to activate"]
-    fn pending_merge_read_only_cli_is_byte_identical_and_skips_newer_jsonl() {
-        let (temp, db_path) = pending_merge_workspace_with_newer_jsonl();
-        let before_bytes = database_family_bytes(&db_path);
-        let before_state = inspect_pending_sync_merge_at_path(&db_path)
-            .expect("inspect before list")
-            .expect("pending before list");
-
-        let output = run_br(temp.path(), &["--json", "list"]);
-
-        assert!(
-            output.status.success(),
-            "read-only list failed:\nstdout={}\nstderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("sync_merge_pending"),
-            "pending warning missing:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            !String::from_utf8_lossy(&output.stdout).contains("bd-auto-import-sentinel"),
-            "newer JSONL was imported despite the pending gate:\n{}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-        assert_database_family_read_only(
-            &before_bytes,
-            &database_family_bytes(&db_path),
-            "read-only command",
-        );
-        assert_eq!(
-            inspect_pending_sync_merge_at_path(&db_path)
-                .expect("inspect after list")
-                .expect("pending after list"),
-            before_state,
-            "read-only command changed pending metadata"
-        );
-    }
-
-    #[test]
-    #[ignore = "drives the br binary via assert_cmd; CARGO_BIN_EXE_br only exists for \
-                integration tests — relocate to tests/ to activate"]
-    fn pending_merge_mutation_refuses_before_auto_import_or_storage_write() {
-        let (temp, db_path) = pending_merge_workspace_with_newer_jsonl();
-        let before_bytes = database_family_bytes(&db_path);
-        let jsonl_path = temp.path().join(".beads/issues.jsonl");
-        let before_jsonl = fs::read(&jsonl_path).expect("read JSONL before mutation");
-
-        let output = run_br(
-            temp.path(),
-            &["--json", "create", "must-not-cross-pending-gate"],
-        );
-        let rendered = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        assert!(!output.status.success(), "mutation unexpectedly succeeded");
-        assert!(
-            rendered.contains("Refusing non-merge mutation") && rendered.contains("sync-merge"),
-            "wrong refusal:\n{rendered}"
-        );
-        assert_database_family_read_only(
-            &before_bytes,
-            &database_family_bytes(&db_path),
-            "refused mutation",
-        );
-        assert_eq!(
-            fs::read(&jsonl_path).expect("read JSONL after mutation"),
-            before_jsonl,
-            "refused mutation changed JSONL"
-        );
-    }
-
-    #[test]
-    #[ignore = "drives the br binary via assert_cmd; CARGO_BIN_EXE_br only exists for \
-                integration tests — relocate to tests/ to activate"]
-    fn pending_merge_refuses_no_db_jsonl_writer_without_changing_either_artifact() {
-        let (temp, db_path) = pending_merge_workspace_with_newer_jsonl();
-        let before_bytes = database_family_bytes(&db_path);
-        let before_state = inspect_pending_sync_merge_at_path(&db_path)
-            .expect("inspect before no-DB mutation")
-            .expect("pending before no-DB mutation");
-        let jsonl_path = temp.path().join(".beads/issues.jsonl");
-        let before_jsonl = fs::read(&jsonl_path).expect("read JSONL before no-DB mutation");
-
-        let output = run_br(
-            temp.path(),
-            &[
-                "--no-db",
-                "--json",
-                "create",
-                "must-not-clobber-pending-generation",
-            ],
-        );
-        let rendered = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        assert!(
-            !output.status.success(),
-            "no-DB mutation unexpectedly crossed pending gate"
-        );
-        assert!(
-            rendered.contains("no-DB JSONL mutation")
-                && rendered.contains("without `--no-db`")
-                && rendered.contains("sync --merge"),
-            "wrong no-DB refusal:\n{rendered}"
-        );
-        assert_database_family_read_only(
-            &before_bytes,
-            &database_family_bytes(&db_path),
-            "refused no-DB mutation",
-        );
-        assert_eq!(
-            fs::read(&jsonl_path).expect("read JSONL after no-DB mutation"),
-            before_jsonl,
-            "refused no-DB mutation changed JSONL bytes"
-        );
-        assert_eq!(
-            inspect_pending_sync_merge_at_path(&db_path)
-                .expect("inspect after no-DB mutation")
-                .expect("pending after no-DB mutation"),
-            before_state,
-            "refused no-DB mutation changed pending receipt"
-        );
-    }
-
-    #[test]
-    #[ignore = "drives the br binary via assert_cmd; CARGO_BIN_EXE_br only exists for \
-                integration tests — relocate to tests/ to activate"]
-    fn pending_merge_doctor_reports_read_only_and_refuses_all_mutation_surfaces() {
-        let (temp, db_path) = pending_merge_workspace_with_newer_jsonl();
-        let before_bytes = database_family_bytes(&db_path);
-        let before_state = inspect_pending_sync_merge_at_path(&db_path)
-            .expect("inspect before doctor")
-            .expect("pending before doctor");
-
-        let report = run_br(temp.path(), &["--json", "doctor"]);
-        let report_rendered = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&report.stdout),
-            String::from_utf8_lossy(&report.stderr)
-        );
-        assert!(
-            report_rendered.contains("sync.merge_pending"),
-            "doctor omitted the dedicated pending finding:\n{report_rendered}"
-        );
-        assert_database_family_read_only(
-            &before_bytes,
-            &database_family_bytes(&db_path),
-            "read-only doctor",
-        );
-
-        let cases: &[(&str, &[&str])] = &[
-            ("--repair", &["--json", "doctor", "--repair"]),
-            (
-                "--repair-indexes",
-                &["--json", "doctor", "--repair-indexes"],
-            ),
-            ("doctor undo", &["--json", "doctor", "undo", "latest"]),
-        ];
-        for (name, args) in cases {
-            let output = run_br(temp.path(), args);
-            let rendered = format!(
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert_eq!(
-                output.status.code(),
-                Some(DoctorExitCode::RefusedUnsafe.as_i32()),
-                "{name} returned the wrong status:\n{rendered}"
-            );
-            assert!(
-                rendered.contains("sync.merge_pending"),
-                "{name} omitted structured gate evidence:\n{rendered}"
-            );
-            assert_database_family_read_only(
-                &before_bytes,
-                &database_family_bytes(&db_path),
-                &format!("refused {name}"),
-            );
-        }
-
-        assert_eq!(
-            inspect_pending_sync_merge_at_path(&db_path)
-                .expect("inspect after doctor")
-                .expect("pending after doctor"),
-            before_state,
-            "doctor surfaces changed pending metadata"
-        );
-    }
+    // The four pending-merge CLI gate scenarios (read-only list skips a newer
+    // JSONL generation, `create` and `--no-db create` refused before any
+    // write, doctor read-only + every repair surface refused) run end to end
+    // in tests/e2e_basic_lifecycle.rs
+    // (`e2e_pending_merge_gate_refuses_file_only_mutations_without_changing_witnesses`),
+    // where the pending receipt comes from a real interrupted merge.
 
     fn insert_dependency_row(conn: &Connection, issue_id: &str, depends_on_id: &str) {
         conn.execute_with_params(
@@ -25215,6 +24974,10 @@ version = "2026-05-11-abc123"
             selftest: false,
             selftest_dir: None,
             keep: false,
+            bundle: None,
+            include_db: false,
+            include_jsonl: false,
+            bundle_events: 200,
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);
@@ -25297,6 +25060,10 @@ version = "2026-05-11-abc123"
             selftest: false,
             selftest_dir: None,
             keep: false,
+            bundle: None,
+            include_db: false,
+            include_jsonl: false,
+            bundle_events: 200,
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);
@@ -25596,6 +25363,10 @@ version = "2026-05-11-abc123"
             selftest: false,
             selftest_dir: None,
             keep: false,
+            bundle: None,
+            include_db: false,
+            include_jsonl: false,
+            bundle_events: 200,
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);
@@ -25653,6 +25424,10 @@ version = "2026-05-11-abc123"
             selftest: false,
             selftest_dir: None,
             keep: false,
+            bundle: None,
+            include_db: false,
+            include_jsonl: false,
+            bundle_events: 200,
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);
@@ -25722,6 +25497,10 @@ version = "2026-05-11-abc123"
             selftest: false,
             selftest_dir: None,
             keep: false,
+            bundle: None,
+            include_db: false,
+            include_jsonl: false,
+            bundle_events: 200,
             subcommand: None,
         };
         let ctx = OutputContext::from_flags(false, true, true);

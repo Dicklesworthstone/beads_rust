@@ -146,9 +146,29 @@ When a field failure occurs, the following artifacts should be collected for dia
 
 ```sh
 br doctor --bundle /tmp/incident-$(date +%Y%m%d-%H%M%S).tar.gz
+# add --include-db to attach beads.db/-wal/-shm/-journal bytes,
+# --include-jsonl to attach issues.jsonl (e-mail addresses redacted)
 ```
 
-(Not yet implemented - tracked for future work.)
+The bundle (`br.doctor.bundle.v1`, a gzip'd tar; `--json` prints a receipt
+listing every member) covers the list above:
+
+| Item | Member |
+|---|---|
+| 1-3 database family | `db-family.json` (presence, size, mtime, SHA-256 of every family member, certificates and namespace files included); bytes under `db/` only with `--include-db` |
+| 4 `issues.jsonl` | `issues.jsonl.summary.json` (SHA-256, size, record count); the file itself only with `--include-jsonl`, redacted |
+| 5 `br doctor --json` | `doctor.json` (+ `doctor.json.stderr.txt` when stderr was non-empty; the exit code is in `manifest.json`) |
+| 6 `br doctor --repair --dry-run --json` | `doctor-repair-dry-run.json` |
+| 7 environment | `manifest.json` (`br_version`, `git_sha`, `platform`, `engine` block with the engine version and sidecar inventory), `version.txt` |
+| 8 timeline | `db-dump.json` `recent_events` (newest `--bundle-events N`, default 200); the failing command and its output are still the reporter's to add |
+| 9 `.br_history/` | `listings.json` (names, sizes, mtimes of `.beads/`, `.beads/.br_recovery/`, `.beads/.br_history/`; no backup bytes) |
+| 10 `metadata` table | `db-dump.json` `metadata` (read-only engine connection; an open failure is recorded, never fatal) |
+| 11 `sqlite_master` | `db-dump.json` `sqlite_master` |
+| — | `health.json`, `sync-status.json`, `where.json`, `config-list.txt`, and copies of `metadata.json` / `config.yaml` |
+
+Every text member has e-mail addresses replaced with `<redacted-email>`.
+The command never overwrites an existing file and takes no workspace lock
+itself (the captured commands take their own, exactly as a hand-run would).
 
 ## Severity Escalation Rules
 
