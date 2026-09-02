@@ -372,13 +372,29 @@ fn canonical_config_key(key: &str) -> String {
 /// `br config schema`: the keys br reads, from the registry in `crate::config`.
 fn show_config_schema(format: OutputFormatBasic, json_mode: bool, ctx: &OutputContext) {
     let keys = crate::config::KNOWN_CONFIG_KEYS;
-    if json_mode || matches!(format, OutputFormatBasic::Json | OutputFormatBasic::Toon) {
+    // `--format json/toon` is a per-command choice, so build the machine
+    // output context from it instead of relying on the outer `--json` mode
+    // (an outer plain context would print nothing for `json_pretty`).
+    let output_format = crate::cli::resolve_output_format_basic_with_outer_mode(
+        Some(format),
+        ctx.inherited_output_mode(),
+        json_mode,
+    );
+    if matches!(
+        output_format,
+        crate::cli::OutputFormat::Json | crate::cli::OutputFormat::Toon
+    ) {
+        let machine_ctx = OutputContext::from_output_format(output_format, ctx.is_quiet(), true);
         let output = json!({
             "schema_version": "br.config.schema.v1",
             "keys": keys,
             "note": "Keys under external_projects.<name> are free-form; classic bd startup keys are accepted for compatibility and otherwise ignored.",
         });
-        ctx.json_pretty(&output);
+        if matches!(output_format, crate::cli::OutputFormat::Toon) {
+            machine_ctx.toon(&output);
+        } else {
+            machine_ctx.json_pretty(&output);
+        }
         return;
     }
     println!(
