@@ -149,6 +149,11 @@ publishes from the tag.
   flags, environment variables, `--robot` scope, command tables) and guarded
   by a test that checks every table example against `--help` -- fc000cfe;
   ARCHITECTURE and agent docs refreshed -- 5a1c3d55.
+- `self_update` moved off the `1.0.0-rc` line to 1.3.0 (API unchanged since
+  rc.6; `br upgrade` still does its own `.sha256` sidecar verification), and
+  GitHub Action pins `taiki-e/install-action` v2.87.2 and
+  `softprops/action-gh-release` v3.0.3 verified against upstream tags
+  (Dependabot #478, #479) -- 4e0203fe.
 
 ## v0.5.7 -- 2026-08-29 (Release)
 
