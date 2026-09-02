@@ -592,6 +592,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `doctor migrate-schema` | Plan/apply/undo an explicit receipt-bound schema upgrade | `br doctor migrate-schema plan --json` |
 | `doctor health` | Cheap one-line liveness summary; exit code is the verdict | `br doctor health` |
 | `doctor --selftest` | Run this binary through a full lifecycle in a throwaway workspace; prints a platform/filesystem receipt | `br doctor --selftest --json` |
+| `doctor --bundle` | Write a redacted incident-evidence archive (doctor/health/sync/where captures, listings, database-family hashes, table dumps); `--include-db` / `--include-jsonl` attach payloads | `br doctor --bundle incident.tar.gz --json` |
 | `doctor explain` | Expand one finding: registry entry, live observation, fixers, next commands | `br doctor explain fm-configs-unknown-keys` |
 | `doctor ls` / `doctor undo` | List repair runs; restore a run's backups | `br doctor undo latest --dry-run` |
 | `doctor capabilities` | Machine-readable doctor contract (detectors, fixers, exit codes) | `br doctor capabilities --format json` |
