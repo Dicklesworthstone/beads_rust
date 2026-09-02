@@ -138,6 +138,15 @@ publishes from the tag.
   field of `--json` output as well as the text `Hint:` line -- ccaf0580.
 - `br show` renders Markdown descriptions in Rich mode; `TERM=dumb` selects
   plain output on every detection path -- 5236351f, 950db95f.
+- `br serve` (MCP) no longer holds `.beads/.write.lock` for its whole
+  lifetime: the bootstrap open's result kept a clone of the database-family
+  write authority alive, so every mutating tool (`create_issue`,
+  `update_issue`, `close_issue`, `manage_dependencies`) waited 30 s and was
+  cancelled, and CLI writes in other processes timed out while a server
+  ran. Found by the new stdio protocol e2e (`tests/e2e_mcp_protocol.rs`),
+  which drives the 2026-07-28 era end to end and checks the mutations
+  through the CLI and `issues.jsonl` -- 06d738e5. `br capabilities`
+  reports `build_features` (`mcp`, `self_update`).
 
 ### Engine: FrankenSQLite 0.3.13 -> 0.3.15
 
