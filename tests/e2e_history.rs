@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, run_br};
+use common::cli::{BrWorkspace, run_br, run_br_with_env};
 use std::fs;
 use std::thread;
 use std::time::Duration;
@@ -904,4 +904,120 @@ fn e2e_history_prune_max_bytes_keeps_only_oversized_newest_pair() {
         1,
         "the newest restore point must survive even when it alone exceeds the budget"
     );
+}
+
+/// GitHub #484: the per-mutation auto-flush must honor
+/// `BR_HISTORY_MIN_INTERVAL_SECS`, not snapshot with the compiled-in default.
+#[test]
+fn e2e_auto_flush_honors_history_min_interval_env() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    // Auto-flushed create publishes the first issues.jsonl (nothing to back up yet).
+    let create = run_br(&workspace, ["create", "Knob probe"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let id = common::cli::parse_created_id(&create.stdout);
+    assert!(!id.is_empty(), "missing created id: {}", create.stdout);
+
+    // The harness runs un-throttled (interval 0): this auto-flush replaces an
+    // existing JSONL and therefore takes a snapshot.
+    let seed = run_br(
+        &workspace,
+        ["update", &id, "--title", "first"],
+        "update_seed",
+    );
+    assert!(seed.status.success(), "update failed: {}", seed.stderr);
+    let seeded = list_backup_files(&workspace);
+    assert_eq!(
+        seeded.len(),
+        1,
+        "control: an un-throttled auto-flush over an existing JSONL snapshots once: {seeded:?}"
+    );
+
+    for title in ["second", "third"] {
+        let update = run_br_with_env(
+            &workspace,
+            ["update", &id, "--title", title],
+            [("BR_HISTORY_MIN_INTERVAL_SECS", "3600")],
+            "update_throttled",
+        );
+        assert!(update.status.success(), "update failed: {}", update.stderr);
+    }
+    let throttled = list_backup_files(&workspace);
+    assert_eq!(
+        throttled, seeded,
+        "BR_HISTORY_MIN_INTERVAL_SECS=3600 must suppress per-mutation auto-flush snapshots"
+    );
+
+    // Control: the env knob is what suppressed them.
+    let control = run_br_with_env(
+        &workspace,
+        ["update", &id, "--title", "fourth"],
+        [("BR_HISTORY_MIN_INTERVAL_SECS", "0")],
+        "update_unthrottled",
+    );
+    assert!(
+        control.status.success(),
+        "update failed: {}",
+        control.stderr
+    );
+    assert_eq!(
+        list_backup_files(&workspace).len(),
+        2,
+        "with the throttle back at 0 the auto-flush snapshots again"
+    );
+}
+
+/// GitHub #484: `sync.history_enabled: false` must disable `.br_history`
+/// snapshots on the per-mutation auto-flush path, not only on `br sync`.
+#[test]
+fn e2e_auto_flush_honors_history_disabled_config() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "Knob probe"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let id = common::cli::parse_created_id(&create.stdout);
+    assert!(!id.is_empty(), "missing created id: {}", create.stdout);
+
+    let disable = run_br(
+        &workspace,
+        ["config", "set", "sync.history_enabled=false"],
+        "config_disable_history",
+    );
+    assert!(
+        disable.status.success(),
+        "config set failed: {}",
+        disable.stderr
+    );
+
+    for title in ["first", "second"] {
+        let update = run_br(&workspace, ["update", &id, "--title", title], "update");
+        assert!(update.status.success(), "update failed: {}", update.stderr);
+    }
+    assert!(
+        list_backup_files(&workspace).is_empty(),
+        "sync.history_enabled=false must leave .br_history empty after auto-flushed mutations"
+    );
+
+    // Control: re-enabling the knob makes the very next auto-flush snapshot.
+    let enable = run_br(
+        &workspace,
+        ["config", "set", "sync.history_enabled=true"],
+        "config_enable_history",
+    );
+    assert!(
+        enable.status.success(),
+        "config set failed: {}",
+        enable.stderr
+    );
+    let update = run_br(
+        &workspace,
+        ["update", &id, "--title", "third"],
+        "update_enabled",
+    );
+    assert!(update.status.success(), "update failed: {}", update.stderr);
+    assert_eq!(list_backup_files(&workspace).len(), 1);
 }

@@ -964,6 +964,10 @@ fn main() {
             }
         };
 
+        // The history knobs (`sync.history_enabled`, BR_HISTORY_MIN_INTERVAL_SECS)
+        // are resolved once here and handed to the exporter; auto-flush must
+        // never snapshot with `HistoryConfig::default()` (GitHub #484).
+        let history = res.resolved_history_config();
         if let Some(_sync_lock) = sync_lock
             && let Err(e) = auto_flush(
                 &mut res.storage,
@@ -974,6 +978,7 @@ fn main() {
                     &paths.db_path,
                     &paths.jsonl_path,
                 ),
+                history,
             )
         {
             commands::report_auto_flush_failure(

@@ -2,6 +2,7 @@ mod common;
 
 use beads_rust::model::{Issue, IssueType, Priority, Status};
 use beads_rust::storage::SqliteStorage;
+use beads_rust::sync::history::HistoryConfig;
 use beads_rust::sync::{auto_flush, compute_jsonl_hash, read_issues_from_jsonl};
 use chrono::Utc;
 use common::cli::{BrWorkspace, parse_created_id, run_br};
@@ -42,7 +43,14 @@ fn test_auto_flush_optimizes_no_content_change() {
     storage.create_issue(&issue, "tester").unwrap();
 
     // 2. First auto-flush (should export)
-    let result = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap();
+    let result = auto_flush(
+        &mut storage,
+        &beads_dir,
+        &jsonl_path,
+        false,
+        HistoryConfig::default(),
+    )
+    .unwrap();
     assert!(result.flushed, "First flush should happen");
     assert_eq!(result.exported_count, 1);
 
@@ -74,7 +82,14 @@ fn test_auto_flush_optimizes_no_content_change() {
 
     // 4. Second auto-flush should now skip the rewrite because the exported JSONL
     // would be byte-identical.
-    let result = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap();
+    let result = auto_flush(
+        &mut storage,
+        &beads_dir,
+        &jsonl_path,
+        false,
+        HistoryConfig::default(),
+    )
+    .unwrap();
 
     assert!(
         !result.flushed,
@@ -101,7 +116,14 @@ fn test_auto_flush_flush_on_label_change() {
     storage.create_issue(&issue, "tester").unwrap();
 
     // 2. First auto-flush
-    let result = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap();
+    let result = auto_flush(
+        &mut storage,
+        &beads_dir,
+        &jsonl_path,
+        false,
+        HistoryConfig::default(),
+    )
+    .unwrap();
     assert!(result.flushed);
 
     // 3. Add a label
@@ -112,7 +134,14 @@ fn test_auto_flush_flush_on_label_change() {
     assert_eq!(dirty_ids.len(), 1);
 
     // 4. Second auto-flush - SHOULD FLUSH because label was added
-    let result = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap();
+    let result = auto_flush(
+        &mut storage,
+        &beads_dir,
+        &jsonl_path,
+        false,
+        HistoryConfig::default(),
+    )
+    .unwrap();
 
     // This assertion will FAIL if my optimization is active and flawed
     assert!(result.flushed, "Should flush when label is added");
@@ -132,7 +161,14 @@ fn test_auto_flush_uses_resolved_jsonl_path() {
     // A JSONL path outside `.beads/` requires `allow_external_jsonl = true`
     // — otherwise export refuses with "Path is outside the beads directory"
     // as a safety check against wayward writes during refactors.
-    let result = auto_flush(&mut storage, &beads_dir, &custom_jsonl_path, true).unwrap();
+    let result = auto_flush(
+        &mut storage,
+        &beads_dir,
+        &custom_jsonl_path,
+        true,
+        HistoryConfig::default(),
+    )
+    .unwrap();
 
     assert!(result.flushed);
     assert!(custom_jsonl_path.exists());
@@ -149,7 +185,14 @@ fn test_auto_flush_preserves_unrelated_existing_jsonl_lines() {
 
     let mut storage = SqliteStorage::open(&db_path).unwrap();
     storage.create_issue(&make_issue("bd-1"), "tester").unwrap();
-    auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap();
+    auto_flush(
+        &mut storage,
+        &beads_dir,
+        &jsonl_path,
+        false,
+        HistoryConfig::default(),
+    )
+    .unwrap();
 
     let extra_issue = make_issue("bd-extra");
     let mut contents = fs::read_to_string(&jsonl_path).unwrap();
@@ -170,7 +213,14 @@ fn test_auto_flush_preserves_unrelated_existing_jsonl_lines() {
         )
         .unwrap();
 
-    let result = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap();
+    let result = auto_flush(
+        &mut storage,
+        &beads_dir,
+        &jsonl_path,
+        false,
+        HistoryConfig::default(),
+    )
+    .unwrap();
     assert!(result.flushed);
 
     let issues = beads_rust::sync::read_issues_from_jsonl(&jsonl_path).unwrap();
@@ -208,9 +258,15 @@ fn test_auto_flush_keeps_jsonl_id_sorted_after_creates() {
         .create_issue(&make_issue("bd-r48"), "tester")
         .unwrap();
     assert!(
-        auto_flush(&mut storage, &beads_dir, &jsonl_path, false)
-            .unwrap()
-            .flushed
+        auto_flush(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            false,
+            HistoryConfig::default()
+        )
+        .unwrap()
+        .flushed
     );
 
     // Both new ids sort *before* the row already on disk — the shape from the
@@ -221,7 +277,14 @@ fn test_auto_flush_keeps_jsonl_id_sorted_after_creates() {
     storage
         .create_issue(&make_issue("bd-a12"), "tester")
         .unwrap();
-    let flushed_creates = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap();
+    let flushed_creates = auto_flush(
+        &mut storage,
+        &beads_dir,
+        &jsonl_path,
+        false,
+        HistoryConfig::default(),
+    )
+    .unwrap();
     assert!(flushed_creates.flushed);
     assert_eq!(flushed_creates.exported_count, 3);
 
@@ -249,9 +312,15 @@ fn test_auto_flush_keeps_jsonl_id_sorted_after_creates() {
         )
         .unwrap();
     assert!(
-        auto_flush(&mut storage, &beads_dir, &jsonl_path, false)
-            .unwrap()
-            .flushed
+        auto_flush(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            false,
+            HistoryConfig::default()
+        )
+        .unwrap()
+        .flushed
     );
 
     let issues_after_update = read_issues_from_jsonl(&jsonl_path).unwrap();

@@ -359,6 +359,10 @@ pub struct BeadsState {
     pub allow_external_jsonl: bool,
     pub actor: String,
     pub issue_prefix: Option<String>,
+    /// `.br_history` policy resolved once at server start from the merged
+    /// config layer and the environment (GitHub #484); every MCP auto-flush
+    /// exports with exactly this configuration.
+    pub history: crate::sync::history::HistoryConfig,
     pub(super) read_snapshot_cache: Option<Mutex<McpReadSnapshotCache>>,
 }
 
@@ -588,6 +592,7 @@ impl BeadsState {
             &self.beads_dir,
             &self.jsonl_path,
             self.allow_external_jsonl,
+            self.history.clone(),
         )
         .map_err(|err| auto_flush_mcp_error(&self.beads_dir, &self.jsonl_path, err))?;
 
@@ -649,6 +654,7 @@ mod tests {
             allow_external_jsonl: false,
             actor: "mcp-test".to_string(),
             issue_prefix: Some("br".to_string()),
+            history: crate::sync::history::HistoryConfig::default(),
             read_snapshot_cache: None,
         }
     }
@@ -866,6 +872,77 @@ mod tests {
             .unwrap();
 
         assert_eq!(state.cached_read_json("test"), None);
+    }
+
+    /// GitHub #484: the MCP auto-flush must export with the resolved history
+    /// policy, not `HistoryConfig::default()`.
+    #[test]
+    fn with_mutation_auto_flush_honors_resolved_history_config() {
+        fn run(history: crate::sync::history::HistoryConfig) -> (TempDir, PathBuf) {
+            let temp = TempDir::new().unwrap();
+            let jsonl_path = temp.path().join(".beads").join("issues.jsonl");
+            let mut state = test_state(&temp, jsonl_path.clone());
+            state.history = history;
+
+            // First flush publishes issues.jsonl (nothing to back up yet).
+            state
+                .with_mutation(|storage| {
+                    storage
+                        .create_issue(&test_issue("br-mcp-hist", "history knob"), "mcp-test")
+                        .map_err(to_mcp)?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(jsonl_path.exists(), "first mutation must publish JSONL");
+
+            // Second flush replaces an existing JSONL: the only point where a
+            // `.br_history` snapshot can be taken.
+            state
+                .with_mutation(|storage| {
+                    storage
+                        .update_issue(
+                            "br-mcp-hist",
+                            &crate::storage::IssueUpdate {
+                                title: Some("history knob changed".to_string()),
+                                ..Default::default()
+                            },
+                            "mcp-test",
+                        )
+                        .map_err(to_mcp)?;
+                    Ok(())
+                })
+                .unwrap();
+
+            let history_dir = state.beads_dir.join(".br_history");
+            (temp, history_dir)
+        }
+
+        let (_disabled_temp, disabled) = run(crate::sync::history::HistoryConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        assert!(
+            !disabled.exists(),
+            "history disabled: MCP auto-flush must not create {}",
+            disabled.display()
+        );
+
+        let (_enabled_temp, enabled) = run(crate::sync::history::HistoryConfig {
+            enabled: true,
+            min_interval_secs: 0,
+            ..Default::default()
+        });
+        let snapshots = fs::read_dir(&enabled)
+            .expect("history dir exists when enabled")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+            })
+            .count();
+        assert_eq!(snapshots, 1, "control: enabled history snapshots once");
     }
 
     #[test]
@@ -1211,7 +1288,7 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
     // Keeping the result alive held `.beads/.write.lock` for the whole
     // serve session: every mutating tool then timed out waiting for the
     // lock it could never get, and CLI writes in other processes hung.
-    let (prefix, db_path, jsonl_path) = {
+    let (prefix, db_path, jsonl_path, history) = {
         let res = config::open_storage_with_startup_config_under_write_lock(
             startup,
             overrides,
@@ -1223,16 +1300,17 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
             .get_config("issue_prefix")?
             .map(|prefix| crate::util::id::normalize_configured_prefix(&prefix))
             .transpose()?;
+        let history = res.resolved_history_config();
         (
             prefix,
             res.paths.db_path.clone(),
             res.paths.jsonl_path.clone(),
+            history,
         )
     };
     drop(write_lock);
     let allow_external_jsonl =
         config::implicit_external_jsonl_allowed(&beads_dir, &db_path, &jsonl_path);
-
     let state = std::sync::Arc::new(BeadsState {
         db_path,
         beads_dir,
@@ -1241,6 +1319,7 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         allow_external_jsonl,
         actor: args.actor.clone(),
         issue_prefix: prefix,
+        history,
         read_snapshot_cache: mcp_read_snapshot_cache_from_env(),
     });
 

@@ -1129,6 +1129,7 @@ mod tests {
             allow_external_jsonl: false,
             actor: "mcp-resource-test".to_string(),
             issue_prefix: Some("br".to_string()),
+            history: crate::sync::history::HistoryConfig::default(),
             read_snapshot_cache: read_snapshot
                 .then(|| std::sync::Mutex::new(McpReadSnapshotCache::default())),
         })

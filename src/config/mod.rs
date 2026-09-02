@@ -4969,11 +4969,13 @@ impl OpenStorageResult {
             });
         }
 
+        let history = self.resolved_history_config();
         auto_flush(
             &mut self.storage,
             &self.paths.beads_dir,
             &self.paths.jsonl_path,
             self.allow_external_jsonl,
+            history,
         )?;
         Ok(())
     }
@@ -4986,15 +4988,32 @@ impl OpenStorageResult {
     /// of creating the `.br_history/` directory. See br#293.
     #[must_use]
     pub fn resolved_history_config(&self) -> crate::sync::history::HistoryConfig {
-        let mut cfg = crate::sync::history::HistoryConfig::default();
-        if let Some(enabled) = history_enabled_from_layer(&self.bootstrap_layer) {
-            cfg.enabled = enabled;
-        }
-        if let Some(secs) = history_min_interval_secs_from_env() {
-            cfg.min_interval_secs = secs;
-        }
-        cfg
+        resolved_history_config_from_layer(&self.bootstrap_layer)
     }
+}
+
+/// Resolve the [`HistoryConfig`](crate::sync::history::HistoryConfig) every
+/// JSONL exporter must use from the merged config layer plus the environment.
+///
+/// This is the single resolution point for the `.br_history` knobs:
+/// `sync.history_enabled` / `no-history` (#293) from the layer and
+/// `BR_HISTORY_MIN_INTERVAL_SECS` (#313) from the environment. Every export
+/// path — `br sync --flush-only`, `--no-db` flushes, the per-mutation CLI
+/// auto-flush, routed external-project auto-flushes and the MCP flush — must
+/// obtain its history configuration here so no caller can silently fall back
+/// to the compiled-in defaults (GitHub #484).
+#[must_use]
+pub fn resolved_history_config_from_layer(
+    layer: &ConfigLayer,
+) -> crate::sync::history::HistoryConfig {
+    let mut cfg = crate::sync::history::HistoryConfig::default();
+    if let Some(enabled) = history_enabled_from_layer(layer) {
+        cfg.enabled = enabled;
+    }
+    if let Some(secs) = history_min_interval_secs_from_env() {
+        cfg.min_interval_secs = secs;
+    }
+    cfg
 }
 
 /// Open storage with a preloaded startup snapshot and support for `--no-db` mode.

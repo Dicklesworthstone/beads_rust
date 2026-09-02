@@ -156,6 +156,12 @@ struct BackupMetadata {
     target: BackupTarget,
     #[serde(default)]
     protected: bool,
+    /// Exact SHA-256 of the snapshot bytes. Lets the next export decide
+    /// "identical to the latest backup" from the sidecar instead of streaming
+    /// the previous snapshot (GitHub #485). Absent on sidecars written before
+    /// the field existed; those fall back to a byte comparison.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    raw_sha256: Option<String>,
 }
 
 impl BackupMetadata {
@@ -163,6 +169,7 @@ impl BackupMetadata {
         Self {
             target: BackupTarget::from_target_path(beads_dir, target_path),
             protected: false,
+            raw_sha256: None,
         }
     }
 }
@@ -198,6 +205,7 @@ pub(crate) fn parse_backup_filename(filename: &str) -> Option<(String, DateTime<
 }
 
 fn create_backup_file(history_dir: &Path, file_stem: &str) -> Result<(PathBuf, File)> {
+    super::io_stats::record_full_write();
     let timestamp = Utc::now().format("%Y%m%d_%H%M%S_%f").to_string();
 
     create_backup_file_for_timestamp(history_dir, file_stem, &timestamp)
@@ -349,8 +357,13 @@ fn read_backup_metadata(backup_path: &Path) -> Result<Option<BackupMetadata>> {
     Ok(Some(metadata))
 }
 
-fn write_backup_metadata(beads_dir: &Path, target_path: &Path, backup_path: &Path) -> Result<()> {
-    write_backup_metadata_with_protection(beads_dir, target_path, backup_path, false)
+fn write_backup_metadata(
+    beads_dir: &Path,
+    target_path: &Path,
+    backup_path: &Path,
+    raw_sha256: Option<&str>,
+) -> Result<()> {
+    write_backup_metadata_with_protection(beads_dir, target_path, backup_path, false, raw_sha256)
 }
 
 fn write_backup_metadata_with_protection(
@@ -358,9 +371,11 @@ fn write_backup_metadata_with_protection(
     target_path: &Path,
     backup_path: &Path,
     protected: bool,
+    raw_sha256: Option<&str>,
 ) -> Result<()> {
     let mut metadata = BackupMetadata::from_target_path(beads_dir, target_path);
     metadata.protected = protected;
+    metadata.raw_sha256 = raw_sha256.map(str::to_owned);
     let contents = serde_json::to_vec(&metadata).map_err(|err| {
         BeadsError::Config(format!(
             "Failed to serialize history backup metadata for '{}': {err}",
@@ -548,7 +563,17 @@ pub(crate) fn backup_before_export_snapshot(
     // We match by full target identity so similarly named exports do not
     // collapse each other's history.
     if let Some(latest) = get_latest_backup(&history_dir, &target_key)? {
-        if snapshot_and_file_are_identical(source, &latest.path)? {
+        // Prefer the digest recorded in the sidecar; only stream the previous
+        // snapshot when it predates the field (or its sidecar is unreadable).
+        let identical = match read_backup_metadata(&latest.path)
+            .ok()
+            .flatten()
+            .and_then(|metadata| metadata.raw_sha256)
+        {
+            Some(latest_raw_sha256) => latest_raw_sha256 == source.raw_sha256(),
+            None => snapshot_and_file_are_identical(source, &latest.path)?,
+        };
+        if identical {
             tracing::debug!(
                 "Skipping backup: identical to latest {}",
                 latest.path.display()
@@ -589,7 +614,12 @@ pub(crate) fn backup_before_export_snapshot(
     io::copy(&mut source.reader(), &mut backup_file).map_err(BeadsError::Io)?;
     backup_file.sync_all().map_err(BeadsError::Io)?;
     crate::util::sync_parent_directory(&backup_path).map_err(BeadsError::Io)?;
-    write_backup_metadata(beads_dir, target_path, &backup_path)?;
+    write_backup_metadata(
+        beads_dir,
+        target_path,
+        &backup_path,
+        Some(source.raw_sha256()),
+    )?;
     backup_guard.persist();
     tracing::debug!("Created backup: {}", backup_path.display());
 
@@ -626,7 +656,13 @@ pub(crate) fn backup_before_jsonl_salvage(
     io::copy(&mut source.reader(), &mut backup_file).map_err(BeadsError::Io)?;
     backup_file.sync_all().map_err(BeadsError::Io)?;
     crate::util::sync_parent_directory(&backup_path).map_err(BeadsError::Io)?;
-    write_backup_metadata_with_protection(beads_dir, target_path, &backup_path, true)?;
+    write_backup_metadata_with_protection(
+        beads_dir,
+        target_path,
+        &backup_path,
+        true,
+        Some(source.raw_sha256()),
+    )?;
     backup_guard.persist();
 
     Ok(backup_path)
@@ -1007,7 +1043,7 @@ mod tests {
             .to_string();
         let backup_path = history_dir.join(format!("issues.pre-salvage.{timestamp}.jsonl"));
         fs::write(&backup_path, b"malformed historical bytes\n").unwrap();
-        write_backup_metadata_with_protection(&beads_dir, &target_path, &backup_path, true)
+        write_backup_metadata_with_protection(&beads_dir, &target_path, &backup_path, true, None)
             .unwrap();
 
         let config = HistoryConfig {
@@ -1519,7 +1555,7 @@ mod tests {
 
         let backup_path = history_dir.join("issues.20260307_120000_000000.jsonl");
         fs::write(&backup_path, "backup\n").unwrap();
-        write_backup_metadata(&beads_dir, &target_path, &backup_path).unwrap();
+        write_backup_metadata(&beads_dir, &target_path, &backup_path, None).unwrap();
 
         fs::remove_file(backup_metadata_path(&backup_path)).unwrap();
         fs::create_dir(backup_metadata_path(&backup_path)).unwrap();
@@ -1682,7 +1718,7 @@ mod tests {
         fs::write(&metadata_target, "do-not-touch").unwrap();
         symlink(&metadata_target, backup_metadata_path(&backup_path)).unwrap();
 
-        let err = write_backup_metadata(&beads_dir, &target_path, &backup_path).unwrap_err();
+        let err = write_backup_metadata(&beads_dir, &target_path, &backup_path, None).unwrap_err();
         assert!(matches!(err, BeadsError::Io(_)), "unexpected error: {err}");
         assert_eq!(
             fs::read_to_string(&metadata_target).unwrap(),
