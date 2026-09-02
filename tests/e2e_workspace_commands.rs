@@ -1774,6 +1774,7 @@ fn e2e_info_schema_lists_tables_and_schema_version() {
 /// subtree without changing anything, and the real cascade tombstones every
 /// issue in it (gone from `br list`, tombstoned in `issues.jsonl`).
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_delete_cascade_removes_dependents_and_dry_run_previews() {
     let _log = common::test_log("e2e_delete_cascade_removes_dependents_and_dry_run_previews");
     let workspace = BrWorkspace::new();

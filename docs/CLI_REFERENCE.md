@@ -801,6 +801,23 @@ built-in `draft < deferred < open < blocked < in_progress` ladder — or
 whole strict subtree by stored status. Issues without children omit the key
 entirely, and the JSONL fallback show paths do not emit it.
 
+**Structured acceptance criteria:**
+
+When `acceptance_criteria` contains a markdown checklist, `br show --json`
+(and the MCP `show_issue` tool) add `acceptance_items`: one object per
+checklist item, in document order, with the 1-based `index` that
+`br update --check-acceptance` / `--uncheck-acceptance` and the MCP
+`update_issue` arguments `check_acceptance` / `uncheck_acceptance` /
+`add_acceptance` accept:
+
+```json
+{"id":"br-feat","acceptance_criteria":"- [x] parser\n- [ ] docs",
+ "acceptance_items":[{"index":1,"text":"parser","checked":true},
+                     {"index":2,"text":"docs","checked":false}]}
+```
+
+Issues whose field has no checklist omit the key.
+
 ---
 
 ### scheduler
@@ -1889,6 +1906,10 @@ Checks database integrity, schema compatibility, and configuration.
 | `--selftest` | Run this binary through a full issue lifecycle in a throwaway workspace and print a `br.doctor.selftest.v1` receipt (platform, filesystem probe, engine, per-step timings). Never touches the current workspace; exit 0 when every step passed, 1 otherwise |
 | `--selftest-dir <DIR>` | With `--selftest`, create the throwaway workspace under `DIR` (probe a specific filesystem such as a WSL2 DrvFS mount) |
 | `--keep` | With `--selftest`, keep the throwaway workspace for inspection |
+| `--bundle <OUT.tar.gz>` | Write the incident-evidence archive (`br.doctor.bundle.v1`): doctor/health/sync/where captures with exit codes, `.beads/` listings, database-family hashes, the `metadata` and `sqlite_master` tables and recent events (read-only), redacted `metadata.json`/`config.yaml`; e-mail addresses are replaced with `<redacted-email>`; never overwrites an existing file; `--json` prints the member list. Member table: `docs/reliability/HEALTH_CONTRACT.md` |
+| `--include-db` | With `--bundle`, attach `beads.db`/`-wal`/`-shm`/`-journal` bytes under `db/` |
+| `--include-jsonl` | With `--bundle`, attach `issues.jsonl` (redacted) |
+| `--bundle-events <N>` | With `--bundle`, how many of the newest audit events to include (default 200) |
 
 `br doctor --json` and `br info --json` both carry an `engine` block: engine
 name and version (from `Cargo.lock` at build time), the sidecars present

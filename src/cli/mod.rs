@@ -3410,6 +3410,38 @@ pub struct DoctorArgs {
     #[arg(long, requires = "selftest")]
     pub keep: bool,
 
+    /// Write an incident-evidence bundle (`br.doctor.bundle.v1`, a
+    /// `.tar.gz`) for this workspace: doctor/health/sync/where output,
+    /// directory listings, database-family hashes, the metadata and schema
+    /// tables, recent events, and copies of `metadata.json`/`config.yaml`,
+    /// with e-mail addresses redacted. Database bytes and `issues.jsonl`
+    /// are only attached with `--include-db` / `--include-jsonl`. Refuses
+    /// to overwrite an existing file.
+    #[arg(
+        long,
+        value_name = "OUT.tar.gz",
+        conflicts_with_all = ["repair", "repair_indexes", "robot_triage", "quick", "selftest"]
+    )]
+    pub bundle: Option<PathBuf>,
+
+    /// With `--bundle`, attach the raw database family bytes (`beads.db`,
+    /// `-wal`, `-shm`, `-journal`) under `db/`.
+    #[arg(long, requires = "bundle")]
+    pub include_db: bool,
+
+    /// With `--bundle`, attach `issues.jsonl` (e-mail addresses redacted).
+    #[arg(long, requires = "bundle")]
+    pub include_jsonl: bool,
+
+    /// With `--bundle`, how many of the most recent audit events to include.
+    #[arg(
+        long = "bundle-events",
+        value_name = "N",
+        default_value_t = 200,
+        requires = "bundle"
+    )]
+    pub bundle_events: usize,
+
     /// Optional WP6 subcommand. When `None`, the flat doctor handler
     /// (above) runs as it always has.
     #[command(subcommand)]

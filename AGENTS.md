@@ -363,7 +363,7 @@ beads_rust/
 | Module | Key Files | Purpose |
 |--------|-----------|---------|
 | `cli` | `cli/mod.rs` | Clap argument structs for every subcommand, output mode detection |
-| `cli/commands` | `commands/*.rs`, `commands/doctor_subsystems/` | 47 top-level subcommands; the doctor's chokepoint, capabilities, explain, engine block, and selftest live under `doctor_subsystems/` |
+| `cli/commands` | `commands/*.rs`, `commands/doctor_subsystems/` | 47 top-level subcommands; the doctor's chokepoint, capabilities, explain, engine block, selftest, and incident bundle (`--bundle`) live under `doctor_subsystems/` |
 | `model` | `model/mod.rs` | `Issue`, `Dependency`, `Comment`, `Event`, `Label` types, content hashing, serde derives |
 | `storage` | `storage/sqlite.rs` | Core FrankenSQLite engine: CRUD, filtered queries, dependency graph, search, events, integrity probes |
 | `storage` | `storage/schema.rs` | DDL migrations, table creation, index management |

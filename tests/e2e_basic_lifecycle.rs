@@ -1881,6 +1881,33 @@ fn e2e_pending_merge_gate_refuses_file_only_mutations_without_changing_witnesses
             .collect::<Vec<_>>()
     };
 
+    // A newer JSONL generation (a sentinel issue, mtime in the future) must
+    // stay outside the database while the merge is pending: the read-only
+    // auto-import is gated exactly like mutations are.
+    let sentinel = make_issue(
+        "bd-auto-import-sentinel",
+        "must remain outside pending DB",
+        Utc::now(),
+    );
+    let mut jsonl_with_sentinel = fs::read(&jsonl_path).expect("read merge-owned JSONL");
+    jsonl_with_sentinel.extend_from_slice(
+        format!(
+            "{}\n",
+            serde_json::to_string(&sentinel).expect("serialize JSONL sentinel")
+        )
+        .as_bytes(),
+    );
+    fs::write(&jsonl_path, jsonl_with_sentinel).expect("append newer JSONL generation");
+    fs::File::options()
+        .write(true)
+        .open(&jsonl_path)
+        .expect("open JSONL sentinel")
+        .set_times(
+            fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() + Duration::from_secs(60)),
+        )
+        .expect("make JSONL newer than the database");
+
     let (receipt_raw_before, receipt_before) = read_pending_receipt();
     assert_eq!(receipt_before["schema_version"], 2);
     assert_eq!(receipt_before["phase"], "database_committed");
@@ -1993,6 +2020,106 @@ fn e2e_pending_merge_gate_refuses_file_only_mutations_without_changing_witnesses
     );
     assert_refused("br agents --add --force", &agents_add);
     assert_unchanged("br agents --add --force");
+
+    // Read-only commands stay read-only: `list` warns about the pending
+    // merge, does not import the newer JSONL generation, and leaves the
+    // database family, receipt, and every workspace file byte-identical.
+    let list = run_br(
+        &workspace,
+        ["--json", "list"],
+        "pending_gate_read_only_list",
+    );
+    assert!(
+        list.status.success(),
+        "read-only list failed under the pending gate:\nstdout:\n{}\nstderr:\n{}",
+        list.stdout,
+        list.stderr
+    );
+    assert!(
+        list.stderr.contains("sync_merge_pending"),
+        "read-only list did not warn about the pending merge:\n{}",
+        list.stderr
+    );
+    assert!(
+        !list.stdout.contains("bd-auto-import-sentinel"),
+        "newer JSONL was imported despite the pending gate:\n{}",
+        list.stdout
+    );
+    assert_unchanged("br list");
+
+    // A database mutation is refused before auto-import or any storage write.
+    let create = run_br(
+        &workspace,
+        ["--json", "create", "must-not-cross-pending-gate"],
+        "pending_gate_create",
+    );
+    assert_refused("br create", &create);
+    assert_unchanged("br create");
+
+    // The no-DB JSONL writer is refused too, without touching either artifact.
+    let no_db_create = run_br(
+        &workspace,
+        [
+            "--no-db",
+            "--json",
+            "create",
+            "must-not-clobber-pending-generation",
+        ],
+        "pending_gate_no_db_create",
+    );
+    assert!(
+        !no_db_create.status.success(),
+        "no-DB mutation unexpectedly crossed the pending gate\nstdout:\n{}\nstderr:\n{}",
+        no_db_create.stdout,
+        no_db_create.stderr
+    );
+    let no_db_rendered = format!("{}\n{}", no_db_create.stdout, no_db_create.stderr);
+    assert!(
+        no_db_rendered.contains("no-DB JSONL mutation")
+            && no_db_rendered.contains("without `--no-db`")
+            && no_db_rendered.contains("sync --merge"),
+        "wrong no-DB refusal:\n{no_db_rendered}"
+    );
+    assert_unchanged("br --no-db create");
+
+    // Doctor reports the dedicated finding without writing, and every repair
+    // surface refuses with the unsafe-refusal exit code.
+    let report = run_br(&workspace, ["--json", "doctor"], "pending_gate_doctor");
+    let report_rendered = format!("{}\n{}", report.stdout, report.stderr);
+    assert!(
+        report_rendered.contains("sync.merge_pending"),
+        "doctor omitted the dedicated pending finding:\n{report_rendered}"
+    );
+    assert_unchanged("br doctor");
+    let refused_unsafe =
+        beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode::RefusedUnsafe
+            .as_i32();
+    let repair_surfaces: [(&str, &[&str]); 3] = [
+        ("doctor --repair", &["--json", "doctor", "--repair"]),
+        (
+            "doctor --repair-indexes",
+            &["--json", "doctor", "--repair-indexes"],
+        ),
+        ("doctor undo", &["--json", "doctor", "undo", "latest"]),
+    ];
+    for (name, args) in repair_surfaces {
+        let run = run_br(
+            &workspace,
+            args.iter().copied(),
+            &format!("pending_gate_{}", name.replace([' ', '-'], "_")),
+        );
+        let rendered = format!("{}\n{}", run.stdout, run.stderr);
+        assert_eq!(
+            run.status.code(),
+            Some(refused_unsafe),
+            "{name} returned the wrong status under the pending gate:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("sync.merge_pending"),
+            "{name} omitted structured gate evidence:\n{rendered}"
+        );
+        assert_unchanged(&format!("br {name}"));
+    }
 }
 
 #[cfg(target_os = "linux")]

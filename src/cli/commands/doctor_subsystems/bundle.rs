@@ -186,7 +186,10 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         BeadsError::validation("bundle", format!("cannot locate the br executable: {err}"))
     })?;
     let display_path = out_path.display().to_string();
-    if !(display_path.ends_with(".tar.gz") || display_path.ends_with(".tgz")) {
+    let gzip_extension = out_path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gz") || ext.eq_ignore_ascii_case("tgz"));
+    if !gzip_extension {
         tracing::warn!(path = %display_path, "bundle path does not end in .tar.gz");
     }
 
@@ -420,10 +423,9 @@ fn sqlite_value_json(value: &SqliteValue) -> Value {
         SqliteValue::Null => Value::Null,
         SqliteValue::Integer(value) => json!(value),
         SqliteValue::Float(value) => json!(value),
-        SqliteValue::Text(value) => json!(value.as_bytes().len()).as_u64().map_or_else(
-            || Value::Null,
-            |_| Value::String(String::from_utf8_lossy(value.as_bytes()).into_owned()),
-        ),
+        SqliteValue::Text(value) => {
+            Value::String(String::from_utf8_lossy(value.as_bytes()).into_owned())
+        }
         SqliteValue::Blob(value) => json!({ "blob_bytes": value.as_ref().len() }),
     }
 }

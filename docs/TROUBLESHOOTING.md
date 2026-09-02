@@ -985,7 +985,17 @@ stop and preserve the evidence needed for manual repair.
 
 ### Capture the incident bundle
 
-Run these commands before attempting repair:
+One command collects everything below into a redacted archive (add
+`--include-db` / `--include-jsonl` to attach the database bytes and
+`issues.jsonl`; see `docs/reliability/HEALTH_CONTRACT.md` for the member
+list):
+
+```bash
+br doctor --bundle /tmp/incident-$(date +%Y%m%d-%H%M%S).tar.gz --json
+```
+
+If `br` itself cannot run, capture by hand instead. Run these commands
+before attempting repair:
 
 ```bash
 br doctor --json

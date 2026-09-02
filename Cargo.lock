@@ -445,6 +445,7 @@ dependencies = [
  "shell-words",
  "signal-hook 0.4.4",
  "similar 3.2.0",
+ "tar",
  "tempfile",
  "thiserror",
  "toml",

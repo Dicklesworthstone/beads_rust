@@ -4388,6 +4388,7 @@ fn error_payload(stdout: &str, label: &str) -> Value {
 /// The mistakes README examples make easy to commit each get an actionable
 /// hint in text and JSON mode, and every flag a hint names exists.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_docs_shaped_mistakes_have_actionable_hints() {
     let _log = common::test_log("e2e_docs_shaped_mistakes_have_actionable_hints");
     let workspace = BrWorkspace::new();
