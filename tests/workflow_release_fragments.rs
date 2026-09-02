@@ -209,6 +209,58 @@ fn release_workflow_downloads_only_platform_build_artifacts() -> Result<(), Stri
 }
 
 #[test]
+fn release_workflow_canaries_published_assets_with_selftest() -> Result<(), String> {
+    let workflow = parse_release_workflow()?;
+    let canary = workflow
+        .jobs
+        .get("canary")
+        .ok_or_else(|| "missing canary job".to_owned())?;
+    let step_run = |name: &str| -> Result<String, String> {
+        canary
+            .steps
+            .iter()
+            .find(|step| step.name.as_deref() == Some(name))
+            .and_then(|step| step.run.clone())
+            .ok_or_else(|| format!("canary job lacks a `{name}` run step"))
+    };
+    let download = step_run("Download the published asset")?;
+    if !download.contains("gh release download") {
+        return Err(format!(
+            "canary must download the published release asset, found:\n{download}"
+        ));
+    }
+    let selftest = step_run("Selftest the published binary")?;
+    if !selftest.contains("doctor --selftest --json") {
+        return Err(format!(
+            "canary must drive the published binary through `br doctor --selftest --json`, found:\n{selftest}"
+        ));
+    }
+    if canary.permissions.is_some() {
+        return Err(format!(
+            "canary job must inherit the workflow's read-only permissions, found {:?}",
+            canary.permissions
+        ));
+    }
+
+    let raw = read_to_string(Path::new(RELEASE_WORKFLOW))?;
+    let canary_block = raw
+        .split("\n  canary:\n")
+        .nth(1)
+        .ok_or_else(|| "canary job block not found in raw workflow".to_owned())?;
+    for platform in [
+        "linux_amd64",
+        "linux_arm64",
+        "darwin_arm64",
+        "windows_amd64",
+    ] {
+        if !canary_block.contains(&format!("name: {platform}")) {
+            return Err(format!("canary matrix must cover {platform}"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn release_workflow_scopes_write_permissions_to_publication_job() -> Result<(), String> {
     let workflow = parse_release_workflow()?;
     let expected_top_level = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);

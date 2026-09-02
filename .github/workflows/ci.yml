@@ -146,6 +146,15 @@ jobs:
           HARNESS_ARTIFACTS: 1
           NO_COLOR: 1
 
+      # Multi-process mixed workload against a copy of this repo's own
+      # .beads family (bead dk45.4); fails on any corruption post-condition.
+      - name: Multi-process mixed-workload stress
+        run: |
+          cargo build --bin br
+          scripts/br-stress.sh target/debug/br .beads 8 60
+        env:
+          NO_COLOR: 1
+
       - name: Upload reliability artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1

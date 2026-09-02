@@ -163,6 +163,19 @@ jobs:
           HARNESS_ARTIFACTS: 1
           NO_COLOR: 1
 
+      # Multi-process mixed workload against a copy of this repo's own
+      # .beads family (bead dk45.4). The script fails on any post-condition:
+      # integrity_check not ok, DB/JSONL row-count drift, malformed JSONL,
+      # doctor ERROR findings, new .br_recovery artifacts, or corruption
+      # signatures in worker stderr.
+      - name: Multi-process mixed-workload stress
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
+        run: |
+          cargo build --locked --bin br
+          scripts/br-stress.sh target/debug/br .beads 8 60
+        env:
+          NO_COLOR: 1
+
       - name: Record reliability gate outcome
         if: ${{ always() && (github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates) }}
         run: |
@@ -175,6 +188,7 @@ jobs:
             echo "- crash-injection sync matrix"
             echo "- long-lived single-workspace stress"
             echo "- concurrent command-family integrity stress"
+            echo "- multi-process mixed-workload stress (scripts/br-stress.sh, 8 workers x 60 s)"
             echo "- doctor/recovery postcondition checks"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -774,3 +788,68 @@ jobs:
           cargo publish --locked --no-verify --token "${CRATES_IO_TOKEN}"
         env:
           CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+  # Post-release canary (bead uze9.4): download the assets exactly as a user
+  # would, on a runner of each platform, and drive the published binary
+  # through `br doctor --selftest`, so a broken published build is reported
+  # by the release run itself. Runs after publication and never blocks it;
+  # each platform's receipt is uploaded as a workflow artifact.
+  canary:
+    name: Post-release canary (${{ matrix.name }})
+    needs: create-release
+    if: ${{ always() && needs.create-release.result == 'success' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux_amd64
+            archive: tar.gz
+          - os: ubuntu-24.04-arm
+            name: linux_arm64
+            archive: tar.gz
+          - os: macos-15
+            name: darwin_arm64
+            archive: tar.gz
+          - os: windows-latest
+            name: windows_amd64
+            archive: zip
+    steps:
+      - name: Download the published asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          ASSET_PATTERN: br-*-${{ matrix.name }}.${{ matrix.archive }}
+        run: |
+          set -euo pipefail
+          mkdir canary
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET_PATTERN" --dir canary
+          cd canary
+          ls -l
+          case "$ASSET_PATTERN" in
+            *.zip) unzip -o ./*.zip ;;
+            *) tar -xzf ./*.tar.gz ;;
+          esac
+
+      - name: Selftest the published binary
+        shell: bash
+        env:
+          NO_COLOR: 1
+        run: |
+          set -euo pipefail
+          cd canary
+          bin=./br
+          [ -x "$bin" ] || bin=./br.exe
+          "$bin" --version
+          "$bin" doctor --selftest --json | tee "selftest-${{ matrix.name }}.json"
+
+      - name: Upload canary receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: canary-${{ matrix.name }}
+          path: canary/selftest-${{ matrix.name }}.json
+          if-no-files-found: ignore
