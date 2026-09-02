@@ -34,6 +34,7 @@ Executable implementation: `src/health.rs`.
 | `JsonlParseError` | Unsafe | Line-by-line parse attempt | Manual edit required |
 | `JsonlConflictMarkers` | Unsafe | Scan for `<<<<<<<`/`=======`/`>>>>>>>` | Manual merge resolution |
 | `DbJsonlCountMismatch` | Degraded | Compare issue counts | Re-export from DB |
+| `DbJsonlIdSetMismatch` | Degraded | Compare the issue id sets on both sides | Additive reconcile or re-export, never delete |
 | `JsonlNewer` | Degraded | Timestamp/hash comparison | Re-import to DB |
 | `DbNewer` | Degraded | Timestamp/hash comparison | Re-export to JSONL |
 | `ExportHashMismatch` | Degraded | Compare stored hash vs computed | Re-export |
@@ -54,6 +55,8 @@ Executable implementation: `src/health.rs`.
 | Anomaly | Severity | Detection | Recovery |
 |---------|----------|-----------|----------|
 | `BlockedCacheStale` | Degraded | Metadata key check | Lazy rebuild on next read |
+| `BlockedCacheContentMismatch` | Degraded | Recompute the blocked set from the dependency graph and compare with `blocked_issues_cache` | Rebuild the cache |
+| `ReadyProjectionContentMismatch` | Degraded | Recompute the ready projection and compare with the cached projection | Rebuild the projection |
 | `ChildCountDrift` | Degraded | Compare stored vs actual dep count | Recompute |
 | `DirtyFlagMismatch` | Degraded | Compare flag vs actual dirty state | Reset flag |
 

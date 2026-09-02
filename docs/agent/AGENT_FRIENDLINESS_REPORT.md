@@ -55,13 +55,27 @@ br schema error --format json
 
 ## Interface Modality Decision
 
-Decision: CLI-only (no MCP surface in this repo).
+Decision (revised 2026-09-02): CLI-first, with an optional MCP surface.
 
-Rationale:
+The original CLI-only decision predates `br serve`. Today:
 
-- br is frequently used as a local, composable CLI primitive (shell pipes, git hooks, scripts).
-- MCP would add distribution + auth + permission surface area that is not required for the core value.
-- The existing CLI already covers the key agent needs: triage (`ready`), mutation (`update/close`), and sync (`sync --flush-only`).
+- The CLI remains the primary, composable primitive (shell pipes, scripts,
+  `--json`/`--robot`, `br capabilities`, `br schema`, `br robot-docs`).
+- `br serve` (built with `--features mcp`, non-default) exposes the same
+  workspace over MCP stdio: 7 tools (`list_issues`, `show_issue`,
+  `create_issue`, `update_issue`, `close_issue`, `manage_dependencies`,
+  `project_overview`), 12 resources (`beads://project/info`,
+  `beads://issues/{id}`, `beads://schema`, `beads://labels`,
+  `beads://issues/ready`, `beads://issues/blocked`, `beads://issues/in_progress`,
+  `beads://coordination/status`, `beads://events/recent`,
+  `beads://issues/deferred`, `beads://graph/health`, `beads://issues/bottlenecks`),
+  and 4 prompts (`triage`, `status_report`, `plan_next_work`, `polish_backlog`).
+  It never listens on a network port, never runs git, and uses the same
+  write lock, audit events, and JSONL auto-flush as the CLI.
+- Use the CLI for scripts; use MCP when an agent benefits from discoverable
+  tools, resources, and prompts. A stdio protocol e2e is tracked in
+  `beads_rust-zxfz.2`; until it lands, MCP behavior is covered by unit tests
+  in `src/mcp/` and the shutdown e2e only.
 
 ## Gaps / Next Improvements
 

@@ -1508,51 +1508,67 @@ fn test_show_output_snapshot() {
 
 ## 9. Migration Checklist
 
+> **Status (reconciled 2026-09-02 against the code):** the migration shipped
+> long ago; the boxes below were never ticked. Ticked items are verified in
+> `src/output/` and `src/cli/commands/`. Unticked items are listed in the
+> Deferred section with the reason and the bead that owns the decision.
+
 ### Phase 1: Foundation (Week 1)
-- [ ] Add rich_rust dependency to Cargo.toml
-- [ ] Create `src/output/mod.rs` module structure
-- [ ] Implement `OutputContext` with mode detection
-- [ ] Implement `Theme` with all semantic colors
-- [ ] Add `OutputContext` to command context
+- [x] Add rich_rust dependency to Cargo.toml
+- [x] Create `src/output/mod.rs` module structure
+- [x] Implement `OutputContext` with mode detection (`src/output/context.rs`, `detect_mode_with_env`)
+- [x] Implement `Theme` with all semantic colors (`src/output/theme.rs`; the parallel `src/format/theme.rs` variants are unused)
+- [x] Add `OutputContext` to command context
 
 ### Phase 2: Core Components (Week 2)
-- [ ] Implement `IssueTable` component
-- [ ] Implement `IssuePanel` component
-- [ ] Implement `DependencyTree` component
-- [ ] Implement `ProgressTracker` component
-- [ ] Implement `StatsPanel` component
+- [x] Implement `IssueTable` component (`src/output/components/issue_table.rs`, used by `list`)
+- [x] Implement `IssuePanel` component (`src/output/components/issue_panel.rs`, used by `show`)
+- [x] Implement `DependencyTree` component (built in `src/output/components/dep_tree.rs`; `dep tree` renders through `src/cli/commands/dep.rs` instead, so the component has no caller)
+- [x] Implement `ProgressTracker` component (built, no caller)
+- [x] Implement `StatsPanel` component (built, no caller; `stats` renders its own panel)
 
 ### Phase 3: High-Traffic Commands (Week 3)
-- [ ] Migrate `list` command
-- [ ] Migrate `show` command
-- [ ] Migrate `ready` command
-- [ ] Migrate `create` command
-- [ ] Migrate `close` command
-- [ ] Migrate `update` command
+- [x] Migrate `list` command
+- [x] Migrate `show` command
+- [x] Migrate `ready` command
+- [x] Migrate `create` command
+- [x] Migrate `close` command
+- [x] Migrate `update` command
 
 ### Phase 4: Medium-Traffic Commands (Week 4)
-- [ ] Migrate `search` command
-- [ ] Migrate `sync` command
-- [ ] Migrate `dep` subcommands
-- [ ] Migrate `label` subcommands
-- [ ] Migrate `blocked` command
-- [ ] Migrate `stale` command
+- [x] Migrate `search` command
+- [x] Migrate `sync` command
+- [x] Migrate `dep` subcommands
+- [x] Migrate `label` subcommands
+- [x] Migrate `blocked` command
+- [x] Migrate `stale` command
 
 ### Phase 5: Low-Traffic Commands (Week 5)
-- [ ] Migrate `init` command
-- [ ] Migrate `stats` command
-- [ ] Migrate `doctor` command
-- [ ] Migrate `config` command
-- [ ] Migrate `audit` command
-- [ ] Migrate remaining commands
+- [x] Migrate `init` command
+- [x] Migrate `stats` command
+- [x] Migrate `doctor` command
+- [x] Migrate `config` command
+- [x] Migrate `audit` command
+- [x] Migrate remaining commands
 
 ### Phase 6: Polish (Week 6)
-- [ ] Add syntax highlighting for code blocks
-- [ ] Add markdown rendering option
-- [ ] Performance optimization
-- [ ] Comprehensive testing
-- [ ] Update documentation
-- [ ] Remove `colored` dependency
+- [ ] Add syntax highlighting for code blocks (deferred, see below)
+- [ ] Add markdown rendering option (built, unwired; see below)
+- [x] Performance optimization (lazy console/width/theme via `OnceLock`)
+- [x] Comprehensive testing (`tests/golden_rich_panels.rs`, `tests/e2e_global_flags.rs`, insta snapshots)
+- [x] Update documentation (README §Design 5, AGENTS.md Output Modes)
+- [x] Remove `colored` dependency (not in `Cargo.toml`)
+
+### Deferred (as of 2026-09-02)
+
+| Item | State in code | Reason | Revisit trigger / owner |
+|---|---|---|---|
+| Syntax highlighting | `src/format/syntax.rs::highlight_rich` discards the language and returns plain indented text; `AVAILABLE_THEMES = ["plain"]` | `Cargo.toml` keeps syntect out of the release build "until the upstream syntect stack drops unmaintained transitive crates" | a maintained highlighter with an acceptable size delta; decision in `beads_rust-suzw.1` |
+| Markdown rendering in `br show` | `src/format/markdown.rs::render_rich_markdown` is implemented and has no production caller | never wired after the `OutputContext` consolidation | `beads_rust-suzw.1` wires it behind Rich mode with goldens, or removes it |
+| Update-diff display (§5.5) | not built | never started | operator decision in `beads_rust-suzw.1` |
+| Accessibility (`--ascii`, `TERM=dumb`, `COLORTERM`) | only `NO_COLOR` is honored | never started | `beads_rust-suzw.1` |
+| Theme variants (dark/minimal) | `src/format/theme.rs` has `Theme::dark()`/`minimal()` with no importers | superseded by `src/output/theme.rs` | removal candidate in `beads_rust-suzw.2` (operator approval) |
+| `format/rich.rs` parallel layer | 543 lines, no production callers | superseded by `src/output/context.rs` | removal candidate in `beads_rust-suzw.2` |
 
 ---
 

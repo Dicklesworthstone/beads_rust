@@ -35,7 +35,7 @@ This document describes the internal architecture of `beads_rust` (br), a Rust p
 
 | Feature | br (Rust) | bd (Go) |
 |---------|-----------|---------|
-| Lines of Code | ~33k | ~276k |
+| Lines of Code | ~243k (`src/**/*.rs`, `wc -l`, 2026-09-02; roughly half is inline `#[cfg(test)]`) | ~276k |
 | Backend | SQLite only | SQLite + Dolt |
 | Daemon | None | RPC daemon |
 | Git operations | Manual | Can auto-commit |
@@ -246,10 +246,24 @@ comments            -- Issue discussion threads
 events              -- Audit log
 
 -- Operational tables
-dirty_issues        -- Changed since last export
-blocked_cache       -- Precomputed blocked status
-config              -- Key-value configuration
+dirty_issues            -- Changed since last export
+blocked_issues_cache    -- Precomputed blocked status (see below)
+export_hashes           -- Per-issue content hash at last export
+child_counters          -- Next child ordinal per parent (dotted IDs)
+config                  -- Key-value configuration
+metadata                -- Workspace metadata (JSONL content hash, schema witness, ...)
+
+-- Workflow policy tables (schema v15+)
+gate_results            -- Current gate verdict per (issue, gate, provider)
+gate_result_history     -- Append-only gate verdict history
+close_metadata          -- Policy evidence recorded at close (bypass reason, gates fired)
+capacity_occupancy      -- Capacity slot accounting
+capacity_exemptions     -- Active capacity exemptions
+capacity_exemption_history -- Append-only exemption audit
 ```
+
+The authoritative list is `src/storage/schema.rs` (`CREATE TABLE IF NOT EXISTS`
+statements); `CURRENT_SCHEMA_VERSION` is defined there.
 
 ### Dirty Tracking
 
@@ -268,12 +282,17 @@ Dirty flags are cleared after successful JSONL export.
 Precomputed table for fast `ready`/`blocked` queries:
 
 ```sql
-CREATE TABLE blocked_cache (
+-- src/storage/schema.rs
+CREATE TABLE IF NOT EXISTS blocked_issues_cache (
     issue_id TEXT PRIMARY KEY,
-    is_blocked INTEGER NOT NULL,
-    blocking_ids TEXT  -- JSON array
+    blocked_by TEXT NOT NULL,
+    blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
 );
+CREATE INDEX IF NOT EXISTS idx_blocked_cache_blocked_at ON blocked_issues_cache(blocked_at);
 ```
+
+Only blocked issues have a row; `blocked_by` is the blocking issue id.
 
 Rebuilt when:
 - Dependencies change
@@ -442,17 +461,28 @@ pub enum BeadsError {
 
 ### Structured Error Output
 
+Captured from `br show nope-123 --json` on 2026-09-02 (exit code 3):
+
+<!-- from: br show nope-123 --json -->
 ```json
 {
-  "error_code": 3,
-  "kind": "not_found",
-  "message": "Issue not found: bd-xyz999",
-  "recovery_hints": [
-    "Check the issue ID spelling",
-    "Use 'br list' to find valid IDs"
-  ]
+  "error": {
+    "code": "ISSUE_NOT_FOUND",
+    "message": "Issue not found: nope-123",
+    "hint": "Run 'br list' to see available issues.",
+    "retryable": false,
+    "context": {
+      "searched_id": "nope-123"
+    }
+  }
 }
 ```
+
+`code` is the stable `ErrorCode` name (`src/error/structured.rs`), `hint` is
+the actionable next step, `retryable` tells an agent whether a plain retry can
+succeed, and `context` carries code-specific fields. The exit code is derived
+from `code` (`ErrorCode::exit_code`). `br schema error --format json` emits
+the JSON Schema for this envelope.
 
 ---
 
@@ -603,10 +633,13 @@ same vocabulary and the same recovery envelope.
 
 | State | Meaning | Expected system posture |
 |-------|---------|-------------------------|
+The vocabulary below is `WorkspaceHealth` in `src/health.rs` (`healthy`,
+`degraded`, `recoverable`, `unsafe`); every surface uses these four strings.
+
 | `healthy` | SQLite, JSONL, metadata, and derived state agree closely enough for normal operation | Proceed normally; no repair messaging |
-| `drifted` | Primary and interchange state are both readable, but freshness or path metadata disagree | Report drift explicitly; prefer import/export reconciliation over repair |
-| `degraded-recoverable` | Primary storage is damaged or incomplete, but authoritative evidence exists to rebuild safely | Preserve evidence, rebuild only through the allowed repair path, then re-verify |
-| `quarantined` | State is unsafe to mutate automatically because the authority source is ambiguous or itself damaged | Refuse risky mutation, preserve artifacts, require operator intervention |
+| `degraded` | Operable, but something disagrees: freshness or path metadata differ, derived state is stale, or a non-fatal anomaly was observed | Report the anomaly explicitly; prefer import/export reconciliation over repair |
+| `recoverable` | Primary storage is damaged or incomplete, but authoritative evidence exists to rebuild safely | Preserve evidence, rebuild only through the allowed repair path, then re-verify |
+| `unsafe` | State is unsafe to mutate automatically because the authority source is ambiguous or itself damaged | Refuse risky mutation, preserve artifacts, require operator intervention |
 
 ### Authority Model
 
@@ -642,9 +675,9 @@ These rules exist so tests and diagnostics can assert what is never allowed.
 2. Any rebuild of SQLite from JSONL must preserve the original DB family in
    `.beads/.br_recovery/` before replacement.
 3. Row-level or index-level corruption that affects writes is classified as
-   `degraded-recoverable`, not as permission to mutate around the bad row.
+   `recoverable`, not as permission to mutate around the bad row.
 4. Prefix mismatch, malformed JSONL, or unresolved conflict markers promote the
-   workspace to `quarantined` for import/rebuild purposes.
+   workspace to `unsafe` for import/rebuild purposes.
 
 ### Derived-State Rebuild Rules
 
@@ -658,13 +691,13 @@ truth, but only within the boundaries below.
    primary graph whenever authoritative issue rows are known-good.
 4. Rebuilding derived state must not hide disagreement between SQLite, JSONL,
    and metadata. If primary/interchange drift remains, the workspace is still
-   `drifted` or `quarantined`.
+   `degraded` or `unsafe`.
 
 ### Cross-Surface Reporting Contract
 
 | Surface | Must report | Must not do silently |
 |---------|-------------|----------------------|
-| Startup / open | Whether the workspace is healthy, drifted, recoverable, or quarantined; whether an automatic DB rebuild was attempted; where evidence was preserved | Auto-rebuild from ambiguous or invalid JSONL, or collapse corruption into a generic `NOT_INITIALIZED` story |
+| Startup / open | Whether the workspace is healthy, degraded, recoverable, or unsafe; whether an automatic DB rebuild was attempted; where evidence was preserved | Auto-rebuild from ambiguous or invalid JSONL, or collapse corruption into a generic `NOT_INITIALIZED` story |
 | `br doctor` | Structural anomalies, JSONL integrity, metadata drift, sync witness disagreement, and whether repair is local-derived-state-only vs full DB rebuild | Emit a clean bill of health when another surface would reject the same workspace |
 | Write recovery | Distinguish lock contention from corruption; identify when a mutation can retry once after rebuild | Retry blindly against uncertain state or persist partial side effects without surfacing them |
 | `br sync --status` / export/import preflight | Which side is newer, whether divergence is safe, and whether the requested direction is destructive | Treat stale/empty export conditions as healthy just because files exist |
