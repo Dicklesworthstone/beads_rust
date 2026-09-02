@@ -2951,12 +2951,14 @@ fn logical_witness_from_connection(
     )?;
     let mut schema_hasher = Sha256::new();
     for row in &schema_rows {
-        for index in 0..4 {
+        for index in 0..3 {
             hash_sqlite_value(
                 &mut schema_hasher,
                 row.get(index).unwrap_or(&SqliteValue::Null),
             );
         }
+        let ddl = row.get(3).and_then(SqliteValue::as_text).unwrap_or("");
+        hash_len_prefixed(&mut schema_hasher, ddl_token_fingerprint(ddl).as_bytes());
     }
     let schema_sha256 = hex_digest(schema_hasher.finalize().as_slice());
 
@@ -3058,6 +3060,77 @@ fn integrity_check_is_repairable(integrity_check: &str) -> bool {
 
 fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+/// Token fingerprint of a DDL statement for the schema witness. FrankenSQLite
+/// re-serializes `sqlite_master` text when it rebuilds a database (`VACUUM
+/// INTO`): comments stripped, whitespace collapsed to one line, keyword case
+/// and identifier quoting normalized, predicates re-parenthesized. None of
+/// that changes what the schema means, so the witness hashes the statement's
+/// tokens with comments, whitespace, parentheses, identifier quotes, and case
+/// outside string literals removed. Source and candidate then agree exactly
+/// when their schemas agree (beads_rust-891u).
+fn ddl_token_fingerprint(sql: &str) -> String {
+    fn flush(word: &mut String, tokens: &mut Vec<String>) {
+        if !word.is_empty() {
+            tokens.push(word.to_ascii_lowercase());
+            word.clear();
+        }
+    }
+    let mut tokens: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '-' if chars.peek() == Some(&'-') => {
+                flush(&mut word, &mut tokens);
+                for next in chars.by_ref() {
+                    if next == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                flush(&mut word, &mut tokens);
+                chars.next();
+                let mut previous = '\0';
+                for next in chars.by_ref() {
+                    if previous == '*' && next == '/' {
+                        break;
+                    }
+                    previous = next;
+                }
+            }
+            '\'' => {
+                flush(&mut word, &mut tokens);
+                let mut literal = String::from("'");
+                loop {
+                    match chars.next() {
+                        Some('\'') if chars.peek() == Some(&'\'') => {
+                            literal.push_str("''");
+                            chars.next();
+                        }
+                        Some('\'') | None => {
+                            literal.push('\'');
+                            break;
+                        }
+                        Some(inner) => literal.push(inner),
+                    }
+                }
+                tokens.push(literal);
+            }
+            c if c.is_whitespace() || matches!(c, '"' | '`' | '[' | ']' | '(' | ')' | ';') => {
+                flush(&mut word, &mut tokens);
+            }
+            c if c.is_alphanumeric() || matches!(c, '_' | '$' | '.') => word.push(c),
+            other => {
+                flush(&mut word, &mut tokens);
+                tokens.push(other.to_string());
+            }
+        }
+    }
+    flush(&mut word, &mut tokens);
+    tokens.join(" ")
 }
 
 fn hash_sqlite_value(hasher: &mut Sha256, value: &SqliteValue) {
@@ -3758,6 +3831,67 @@ fn sync_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn ddl_token_fingerprint_ignores_comments_whitespace_parens_quotes_and_case() {
+        let canonical = "CREATE TABLE \"labels\" (\n    -- who carries the label\n    issue_id TEXT \
+                         NOT NULL,\n    label TEXT NOT NULL CHECK (label <> ''),\n    PRIMARY KEY \
+                         (issue_id, label)\n)";
+        let reserialized = "create table labels(issue_id text not null, label text not null check \
+                            label <> '', primary key issue_id, label)";
+        assert_eq!(
+            ddl_token_fingerprint(canonical),
+            ddl_token_fingerprint(reserialized)
+        );
+        assert_ne!(
+            ddl_token_fingerprint(canonical),
+            ddl_token_fingerprint("CREATE TABLE labels (issue_id TEXT NOT NULL, label TEXT)"),
+            "a real schema difference must still change the fingerprint"
+        );
+        assert_ne!(
+            ddl_token_fingerprint("CHECK (status IN ('Open'))"),
+            ddl_token_fingerprint("CHECK (status IN ('open'))"),
+            "string literals keep their case"
+        );
+        assert_eq!(
+            ddl_token_fingerprint("DEFAULT 'it''s' /* block\ncomment */ NOT NULL"),
+            "default 'it''s' not null"
+        );
+    }
+
+    /// beads_rust-891u: the from==to maintenance-only plan attests the
+    /// `VACUUM INTO` candidate with `logical_witnesses_match_except_integrity`,
+    /// so the schema witness must survive the engine re-serializing every
+    /// table's DDL text.
+    #[test]
+    fn schema_witness_survives_vacuum_into_reserialization() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        drop(crate::storage::SqliteStorage::open(&db_path).expect("create the full br schema"));
+        let source = logical_witness(&db_path).expect("source witness");
+
+        let candidate_path = temp.path().join("candidate.db");
+        let source_conn =
+            Connection::open(db_path.to_string_lossy().into_owned()).expect("open source");
+        let escaped = candidate_path.to_string_lossy().replace('\'', "''");
+        source_conn
+            .execute(&format!("VACUUM INTO '{escaped}'"))
+            .expect("vacuum into candidate");
+        close_connection(source_conn).expect("close source");
+        let candidate = logical_witness(&candidate_path).expect("candidate witness");
+
+        assert_eq!(candidate.tables, source.tables);
+        assert_eq!(candidate.contents_sha256, source.contents_sha256);
+        assert_eq!(
+            candidate.schema_sha256,
+            source.schema_sha256,
+            "VACUUM INTO re-serialized DDL must hash identically (fsqlite {})",
+            option_env!("BR_FSQLITE_VERSION").unwrap_or("unknown")
+        );
+        assert!(logical_witnesses_match_except_integrity(
+            &source, &candidate
+        ));
+    }
 
     #[test]
     fn plan_token_binds_logical_state_not_sqlite_file_layout() {
