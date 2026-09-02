@@ -2695,7 +2695,12 @@ because downstream tooling links to them.\n\n- [ ] schema migration applied\n\
         run_acceptance_update(&beads_dir, &args).expect("append with label");
         let after = acceptance_field(&beads_dir);
         assert_eq!(after.notes, Some(format!("{GUARD_PROSE}ok\ntagged")));
-        assert_eq!(after.labels, vec!["backend".to_string()]);
+        let storage_ctx =
+            config::open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
+        assert_eq!(
+            storage_ctx.storage.get_labels("bd-ac").expect("labels"),
+            vec!["backend".to_string()]
+        );
     }
 
     #[test]
