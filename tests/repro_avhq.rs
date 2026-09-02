@@ -62,16 +62,17 @@ fn assert_orphans_quarantined(beads_dir: &Path) {
                 "{name} still carries the stale orphan bytes in the live family"
             );
         }
-        let backup = quarantined
+        // The stale bytes must be preserved under `.br_recovery/`, whether
+        // br's own quarantine moved them (`<name>.<stamp>.orphaned-sidecar`)
+        // or the JSONL rebuild's family backup did (`<name>.vacuum-*.bak`).
+        let preserved = quarantined
             .iter()
-            .find(|file| {
-                file.starts_with(&format!("{name}.")) && file.ends_with(".orphaned-sidecar")
-            })
-            .unwrap_or_else(|| panic!("{name} missing from {recovery:?}: {quarantined:?}"));
-        assert_eq!(
-            fs::read(recovery.join(backup)).expect("read quarantined sidecar"),
-            bytes,
-            "{name} bytes must survive quarantine"
+            .filter(|file| file.starts_with(&format!("{name}.")))
+            .any(|file| fs::read(recovery.join(file)).is_ok_and(|copy| copy == bytes));
+        assert!(
+            preserved,
+            "{name} stale bytes missing from {}: {quarantined:?}",
+            recovery.display()
         );
     }
 }

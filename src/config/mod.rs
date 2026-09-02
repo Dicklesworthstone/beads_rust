@@ -940,6 +940,13 @@ fn open_sqlite_storage_with_recovery_strategy(
     recovery_strategy: JsonlRecoveryStrategy,
     write_authority: Option<&Arc<crate::sync::DatabaseFamilyWriteLock>>,
 ) -> Result<SqliteRecoveryOpenResult> {
+    if !paths.db_path.is_file() {
+        // Whether the fresh database comes from the JSONL rebuild below or
+        // from the empty-replacement install, engine sidecars left behind
+        // without their database must be out of the way first
+        // (beads_rust-avhq).
+        quarantine_orphaned_sidecars(&paths.db_path, beads_dir);
+    }
     if !paths.db_path.is_file() && paths.jsonl_path.is_file() {
         return open_when_db_file_is_missing(
             beads_dir,
@@ -1158,6 +1165,68 @@ pub(crate) fn quarantine_truncated_wal_sidecar(db_path: &Path, beads_dir: &Path)
                 wal_size,
                 error = %err,
                 "failed to quarantine truncated WAL sidecar before open"
+            );
+        }
+    }
+}
+
+/// Engine sidecar suffixes that only mean something next to a database file
+/// (`docs/reliability/ENGINE_OPERATING_MODEL.md` §4).
+const DATABASE_SIDECAR_SUFFIXES: [&str; 7] = [
+    "-wal",
+    "-shm",
+    "-journal",
+    "-wal-cert",
+    "-wal-cert-head",
+    "-fsqlite-ns-gate",
+    "-fsqlite-ns-use",
+];
+
+/// beads_rust-avhq: quarantine engine sidecars left behind when the database
+/// file itself is gone (a hand-deleted `beads.db`, a partial restore, a copied
+/// `.beads/` without the DB). FrankenSQLite 0.3 reads a `-wal-cert` or
+/// namespace file as an existing family it must not re-initialize, so the
+/// fresh-database install would fail until someone deletes the orphans by
+/// hand. Moving them to `.br_recovery/` keeps the bytes inspectable and lets
+/// the install proceed. No-op when the database path exists (file or
+/// symlink) or no sidecar is present.
+pub(crate) fn quarantine_orphaned_sidecars(db_path: &Path, beads_dir: &Path) {
+    match fs::symlink_metadata(db_path) {
+        Ok(_) => return,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                error = %err,
+                "Skipping orphaned sidecar quarantine because the database path could not be inspected"
+            );
+            return;
+        }
+    }
+    let base = db_path.to_string_lossy();
+    let orphans: Vec<PathBuf> = DATABASE_SIDECAR_SUFFIXES
+        .iter()
+        .map(|suffix| PathBuf::from(format!("{base}{suffix}")))
+        .filter(|path| fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()))
+        .collect();
+    if orphans.is_empty() {
+        return;
+    }
+    match quarantine_database_artifacts(db_path, beads_dir, orphans.clone(), "orphaned-sidecar") {
+        Ok(quarantined_paths) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                orphans = ?orphans,
+                quarantined_paths = ?quarantined_paths,
+                "quarantined engine sidecars found without their database file before install"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                orphans = ?orphans,
+                error = %err,
+                "failed to quarantine orphaned engine sidecars before install"
             );
         }
     }
@@ -12004,6 +12073,77 @@ routing:
         assert!(
             !recovery_dir_for_db_path(&db_path, &beads_dir).exists(),
             "deferred refusal should not create backup artifacts"
+        );
+    }
+
+    #[test]
+    fn quarantine_orphaned_sidecars_moves_every_engine_sidecar_when_db_is_absent() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let planted: [(&str, &[u8]); 3] = [
+            ("-wal-cert", b"stale certificate"),
+            ("-fsqlite-ns-gate", b"stale namespace gate"),
+            ("-wal", b"stale frames"),
+        ];
+        for (suffix, bytes) in planted {
+            fs::write(format!("{}{suffix}", db_path.to_string_lossy()), bytes)
+                .expect("plant orphan sidecar");
+        }
+
+        quarantine_orphaned_sidecars(&db_path, &beads_dir);
+
+        let recovery_dir = recovery_dir_for_db_path(&db_path, &beads_dir);
+        let quarantined: Vec<String> = fs::read_dir(&recovery_dir)
+            .expect("list recovery dir")
+            .filter_map(std::result::Result::ok)
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+            .collect();
+        for (suffix, bytes) in planted {
+            let live = PathBuf::from(format!("{}{suffix}", db_path.to_string_lossy()));
+            assert!(
+                !live.exists(),
+                "{suffix} should be moved out of the live database family"
+            );
+            let backup = quarantined
+                .iter()
+                .find(|name| {
+                    name.starts_with(&format!("beads.db{suffix}."))
+                        && name.ends_with(".orphaned-sidecar")
+                })
+                .unwrap_or_else(|| panic!("{suffix} missing from {quarantined:?}"));
+            assert_eq!(
+                fs::read(recovery_dir.join(backup)).expect("read quarantined sidecar"),
+                bytes,
+                "{suffix} bytes must remain inspectable"
+            );
+        }
+        assert!(
+            !db_path.exists(),
+            "quarantine must not create a database file itself"
+        );
+    }
+
+    #[test]
+    fn quarantine_orphaned_sidecars_leaves_a_live_family_alone() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let cert_path = PathBuf::from(format!("{}-wal-cert", db_path.to_string_lossy()));
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::write(&db_path, b"db").expect("write db");
+        fs::write(&cert_path, b"live certificate").expect("write cert");
+
+        quarantine_orphaned_sidecars(&db_path, &beads_dir);
+
+        assert!(
+            cert_path.is_file(),
+            "a sidecar next to its database is not an orphan"
+        );
+        assert!(
+            !recovery_dir_for_db_path(&db_path, &beads_dir).exists(),
+            "a live family must not create recovery artifacts"
         );
     }
 
