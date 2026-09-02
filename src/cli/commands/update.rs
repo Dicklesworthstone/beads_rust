@@ -1427,12 +1427,10 @@ fn validate_text_field_overwrite_guard(
     if violations.is_empty() {
         return Ok(());
     }
-    Err(BeadsError::validation(
+    Err(BeadsError::validation_with_hint(
         "update",
-        format!(
-            "{}\nThese fields accumulate context; pass --force to replace, or `br show <id>` to inspect the current value first.",
-            violations.join("\n"),
-        ),
+        violations.join("\n"),
+        "These fields accumulate context: pass --force to replace the value, or run `br show <id>` first to read what is there.",
     ))
 }
 

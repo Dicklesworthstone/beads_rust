@@ -14,6 +14,7 @@ mod context;
 mod structured;
 
 pub use context::{OptionExt, ResultExt};
+pub(crate) use structured::levenshtein_distance;
 pub use structured::{ErrorCode, StructuredError};
 
 use std::path::PathBuf;
@@ -65,6 +66,15 @@ pub enum BeadsError {
     /// Field validation failed.
     #[error("Validation failed: {field}: {reason}")]
     Validation { field: String, reason: String },
+
+    /// Field validation failed for a mistake the docs make easy to commit;
+    /// carries the actionable fix so text and JSON output both show it.
+    #[error("Validation failed: {field}: {reason}")]
+    ValidationWithHint {
+        field: String,
+        reason: String,
+        hint: String,
+    },
 
     /// Multiple validation errors occurred.
     #[error("Validation errors: {errors:?}")]
@@ -366,6 +376,7 @@ impl BeadsError {
                 | Self::NotInitialized
                 | Self::IssueNotFound { .. }
                 | Self::Validation { .. }
+                | Self::ValidationWithHint { .. }
                 | Self::InvalidStatus { .. }
                 | Self::InvalidType { .. }
                 | Self::InvalidPriority { .. }
@@ -425,9 +436,9 @@ impl BeadsError {
             ),
             Self::SelfDependency { .. } => Some("An issue cannot depend on itself"),
             Self::AlreadyInitialized { .. } => Some("Use --force to reinitialize"),
-            Self::InvalidPriority { .. } => {
-                Some("Use a priority between 0 (critical) and 4 (backlog)")
-            }
+            Self::InvalidPriority { .. } => Some(
+                "Priority must be 0-4 or P0-P4 (0=critical, 4=backlog); list filters also accept ranges and comma lists such as 0-1 or 0,2.",
+            ),
             Self::InvalidStatus { .. } => Some(
                 "Valid statuses: open, in_progress, blocked, deferred, draft, closed, tombstone, pinned",
             ),
@@ -470,6 +481,20 @@ impl BeadsError {
         Self::Validation {
             field: field.into(),
             reason: reason.into(),
+        }
+    }
+
+    /// Create a validation error that carries an actionable hint.
+    #[must_use]
+    pub fn validation_with_hint(
+        field: impl Into<String>,
+        reason: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Self {
+        Self::ValidationWithHint {
+            field: field.into(),
+            reason: reason.into(),
+            hint: hint.into(),
         }
     }
 

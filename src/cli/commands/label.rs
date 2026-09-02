@@ -412,10 +412,28 @@ fn execute_label_list_command(
     }
 }
 
+/// A positional that neither parses nor resolves as an issue ID is almost
+/// always a label in the wrong position (`br label add backend br-abc`), so
+/// say that instead of "Issue not found: backend".
+fn label_issue_resolution_error(subcommand: &str, input: &str, err: BeadsError) -> BeadsError {
+    if matches!(err, BeadsError::IssueNotFound { .. }) && crate::util::id::parse_id(input).is_err()
+    {
+        return BeadsError::validation_with_hint(
+            "issues",
+            format!("'{input}' is not an issue ID and does not match any issue"),
+            format!(
+                "Labels go after all issue IDs: br label {subcommand} <issue...> {input}; or pass -l {input} to name the label explicitly."
+            ),
+        );
+    }
+    err
+}
+
 fn prepare_label_routes(
     issue_inputs: &[String],
     cli: &config::CliOverrides,
     beads_dir: &Path,
+    subcommand: &str,
 ) -> Result<Vec<PreparedLabelRoute>> {
     let routed_batches = config::routing::group_issue_inputs_by_route(issue_inputs, beads_dir)?;
     let mut prepared_routes = Vec::new();
@@ -436,7 +454,10 @@ fn prepare_label_routes(
         let resolved_ids = batch
             .issue_inputs
             .iter()
-            .map(|input| resolve_issue_id(&storage_ctx.storage, &resolver, input))
+            .map(|input| {
+                resolve_issue_id(&storage_ctx.storage, &resolver, input)
+                    .map_err(|err| label_issue_resolution_error(subcommand, input, err))
+            })
             .collect::<Result<Vec<_>>>()?;
 
         prepared_routes.push(PreparedLabelRoute {
@@ -975,6 +996,36 @@ fn render_rename_result_rich(old_name: &str, new_name: &str, count: usize, ctx: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn label_issue_resolution_error_names_misplaced_labels() {
+        let not_found = || BeadsError::IssueNotFound {
+            id: "backend".to_string(),
+        };
+        match label_issue_resolution_error("add", "backend", not_found()) {
+            BeadsError::ValidationWithHint {
+                field,
+                reason,
+                hint,
+            } => {
+                assert_eq!(field, "issues");
+                assert!(reason.contains("'backend' is not an issue ID"));
+                assert!(hint.contains("br label add <issue...> backend"));
+                assert!(hint.contains("-l backend"));
+            }
+            other => panic!("expected ValidationWithHint, got {other:?}"),
+        }
+        // ID-shaped inputs keep the not-found error (and its exit code).
+        assert!(matches!(
+            label_issue_resolution_error("remove", "bd-zzz99", not_found()),
+            BeadsError::IssueNotFound { .. }
+        ));
+        // Other errors pass through untouched.
+        assert!(matches!(
+            label_issue_resolution_error("add", "backend", BeadsError::NotInitialized),
+            BeadsError::NotInitialized
+        ));
+    }
 
     #[test]
     fn label_display_text_sanitizes_terminal_controls() {

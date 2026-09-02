@@ -806,6 +806,52 @@ fn dep_display_text(value: &str) -> String {
     sanitize_terminal_inline(value).into_owned()
 }
 
+/// Dependency types `dep add --type` accepts, in the order hints list them.
+const DEPENDENCY_TYPE_NAMES: [&str; 11] = [
+    "blocks",
+    "parent-child",
+    "conditional-blocks",
+    "waits-for",
+    "related",
+    "discovered-from",
+    "replies-to",
+    "relates-to",
+    "duplicates",
+    "supersedes",
+    "caused-by",
+];
+
+/// Closest accepted dependency type for a mistyped `--type` value: the
+/// underscore or space spelling of a real type, a unique prefix, or a name
+/// within two typos.
+fn nearest_dependency_type(input: &str) -> Option<&'static str> {
+    let normalized = input.trim().to_ascii_lowercase().replace([' ', '_'], "-");
+    if normalized.is_empty() {
+        return None;
+    }
+    if let Some(exact) = DEPENDENCY_TYPE_NAMES
+        .iter()
+        .copied()
+        .find(|name| *name == normalized)
+    {
+        return Some(exact);
+    }
+    let mut prefixed = DEPENDENCY_TYPE_NAMES
+        .iter()
+        .copied()
+        .filter(|name| name.starts_with(&normalized));
+    if let (Some(only), None) = (prefixed.next(), prefixed.next()) {
+        return Some(only);
+    }
+    DEPENDENCY_TYPE_NAMES
+        .iter()
+        .copied()
+        .map(|name| (crate::error::levenshtein_distance(&normalized, name), name))
+        .filter(|(distance, _)| *distance <= 2)
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, name)| name)
+}
+
 fn parse_dependency_type(dep_type: &str) -> Result<DependencyType> {
     let parsed: DependencyType = dep_type.parse().map_err(|_| BeadsError::Validation {
         field: "type".to_string(),
@@ -813,15 +859,23 @@ fn parse_dependency_type(dep_type: &str) -> Result<DependencyType> {
     })?;
 
     if let DependencyType::Custom(_) = parsed {
-        return Err(BeadsError::Validation {
-            field: "type".to_string(),
-            reason: format!(
-                "Unknown dependency type: '{dep_type}'. \
-                 Allowed types: blocks, parent-child, conditional-blocks, waits-for, \
-                 related, discovered-from, replies-to, relates-to, duplicates, \
-                 supersedes, caused-by"
+        let hint = nearest_dependency_type(dep_type).map_or_else(
+            || {
+                format!(
+                    "Use --type with one of: {}.",
+                    DEPENDENCY_TYPE_NAMES.join(", ")
+                )
+            },
+            |nearest| format!("Did you mean --type {nearest}?"),
+        );
+        return Err(BeadsError::validation_with_hint(
+            "type",
+            format!(
+                "Unknown dependency type: '{dep_type}'. Allowed types: {}",
+                DEPENDENCY_TYPE_NAMES.join(", ")
             ),
-        });
+            hint,
+        ));
     }
 
     Ok(parsed)
@@ -3392,5 +3446,49 @@ mod tests {
         assert!(matches!(DepDirection::Up, DepDirection::Up));
         assert!(matches!(DepDirection::Both, DepDirection::Both));
         info!("test_dep_direction_variants: assertions passed");
+    }
+
+    #[test]
+    fn nearest_dependency_type_handles_docs_shaped_typos() {
+        assert_eq!(
+            nearest_dependency_type("parent_child"),
+            Some("parent-child")
+        );
+        assert_eq!(
+            nearest_dependency_type("Parent Child"),
+            Some("parent-child")
+        );
+        assert_eq!(nearest_dependency_type("block"), Some("blocks"));
+        assert_eq!(nearest_dependency_type("parent"), Some("parent-child"));
+        assert_eq!(nearest_dependency_type("relate"), Some("related"));
+        assert_eq!(nearest_dependency_type("duplicate"), Some("duplicates"));
+        assert_eq!(nearest_dependency_type("bogus"), None);
+        assert_eq!(nearest_dependency_type(""), None);
+    }
+
+    #[test]
+    fn parse_dependency_type_unknown_carries_hint() {
+        let err = parse_dependency_type("waits_for").unwrap_err();
+        match err {
+            BeadsError::ValidationWithHint {
+                field,
+                reason,
+                hint,
+            } => {
+                assert_eq!(field, "type");
+                assert!(reason.contains("Unknown dependency type: 'waits_for'"));
+                assert!(reason.contains("caused-by"));
+                assert_eq!(hint, "Did you mean --type waits-for?");
+            }
+            other => panic!("expected ValidationWithHint, got {other:?}"),
+        }
+        let err = parse_dependency_type("zzz").unwrap_err();
+        match err {
+            BeadsError::ValidationWithHint { hint, .. } => {
+                assert!(hint.starts_with("Use --type with one of: blocks, "));
+            }
+            other => panic!("expected ValidationWithHint, got {other:?}"),
+        }
+        assert!(parse_dependency_type("Parent-Child").is_ok());
     }
 }

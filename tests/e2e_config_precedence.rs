@@ -521,7 +521,7 @@ fn e2e_config_set_unknown_key_warns_with_nearest_known_key() {
     );
     assert!(json.status.success(), "{}", json.stderr);
     let payload: serde_json::Value =
-        serde_json::from_str(common::cli::extract_json_payload(&json.stdout)).expect("json");
+        serde_json::from_str(&common::cli::extract_json_payload(&json.stdout)).expect("json");
     assert!(
         payload["warning"]
             .as_str()
@@ -544,7 +544,7 @@ fn e2e_config_set_unknown_key_warns_with_nearest_known_key() {
     // The doctor now reports the two unknown keys that landed in config.yaml.
     let doctor = run_br(&workspace, ["doctor", "--json"], "doctor");
     let report: serde_json::Value =
-        serde_json::from_str(common::cli::extract_json_payload(&doctor.stdout))
+        serde_json::from_str(&common::cli::extract_json_payload(&doctor.stdout))
             .expect("doctor json");
     let check = report["checks"]
         .as_array()
@@ -582,7 +582,7 @@ fn e2e_config_schema_lists_the_keys_br_reads() {
     );
     assert!(json.status.success(), "{}", json.stderr);
     let payload: serde_json::Value =
-        serde_json::from_str(common::cli::extract_json_payload(&json.stdout)).expect("json");
+        serde_json::from_str(&common::cli::extract_json_payload(&json.stdout)).expect("json");
     assert_eq!(payload["schema_version"], "br.config.schema.v1");
     let keys: Vec<&str> = payload["keys"]
         .as_array()

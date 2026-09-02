@@ -27,7 +27,7 @@ use std::sync::LazyLock;
 
 const PRIORITY_DETAIL_HINT: &str =
     "Priority must be 0-4 (or P0-P4): 0=critical, 1=high, 2=medium, 3=low, 4=backlog";
-const PRIORITY_SHORT_HINT: &str = "Priority must be 0-4 (0=critical, 4=backlog).";
+const PRIORITY_SHORT_HINT: &str = "Priority must be 0-4 or P0-P4 (0=critical, 4=backlog); list filters also accept ranges and comma lists such as 0-1 or 0,2.";
 const VALID_STATUS_HINT: &str =
     "Valid statuses: open, in_progress, blocked, deferred, draft, closed, tombstone, pinned";
 const VALID_TYPE_HINT: &str = "Valid types: task, bug, feature, epic, chore, docs, question";
@@ -661,6 +661,14 @@ impl StructuredError {
                 ErrorCode::ValidationFailed,
                 Some(json!({"field": field, "reason": reason})),
             ),
+            BeadsError::ValidationWithHint {
+                field,
+                reason,
+                hint,
+            } => (
+                ErrorCode::ValidationFailed,
+                Some(json!({"field": field, "reason": reason, "hint": hint})),
+            ),
             BeadsError::ValidationErrors { errors } => (
                 ErrorCode::ValidationFailed,
                 Some(json!({
@@ -950,7 +958,15 @@ impl StructuredError {
 
     /// Generate context-aware hint from error.
     fn generate_hint(err: &BeadsError, context: Option<&Value>) -> Option<String> {
-        // First check if BeadsError has a built-in suggestion
+        // Data-dependent hints come first: the static suggestion table cannot
+        // name the offending token or the value the caller probably meant.
+        match err {
+            BeadsError::ValidationWithHint { hint, .. } => return Some(hint.clone()),
+            BeadsError::InvalidPriority { priority } => return Some(priority_hint(priority)),
+            _ => {}
+        }
+
+        // Then the built-in suggestion, if the variant has one.
         if let Some(suggestion) = err.suggestion() {
             return Some(suggestion.to_string());
         }
@@ -959,12 +975,6 @@ impl StructuredError {
         match err {
             BeadsError::IssueNotFound { .. } => {
                 Some("Run 'br list' to see available issues.".to_string())
-            }
-            BeadsError::InvalidPriority { priority } => {
-                Some(detect_priority_intent(priority).map_or_else(
-                    || PRIORITY_SHORT_HINT.to_string(),
-                    |detected| flag_value_hint("priority", detected),
-                ))
             }
             BeadsError::InvalidStatus { status } => {
                 detect_status_intent(status).map(|detected| flag_value_hint("status", detected))
@@ -993,6 +1003,22 @@ impl StructuredError {
             _ => None,
         }
     }
+}
+
+/// Hint for a rejected priority token: name the value the caller probably
+/// meant (`high` → `--priority 1`), call out a backwards range, and otherwise
+/// list the accepted forms including the range and list syntax of filters.
+fn priority_hint(provided: &str) -> String {
+    if let Some((low, high)) = provided.split_once('-')
+        && let (Ok(low), Ok(high)) = (low.trim().parse::<u8>(), high.trim().parse::<u8>())
+        && low > high
+    {
+        return format!("Ranges run low to high: use {high}-{low}.");
+    }
+    detect_priority_intent(provided).map_or_else(
+        || PRIORITY_SHORT_HINT.to_string(),
+        |detected| flag_value_hint("priority", detected),
+    )
 }
 
 /// Pick the actionable hint for a batch whose per-issue skip reasons are
@@ -1215,7 +1241,7 @@ fn detect_priority_intent(input: &str) -> Option<&'static str> {
 /// Calculate the Levenshtein distance between two strings.
 ///
 /// This is used to find similar IDs when an issue is not found.
-fn levenshtein_distance(a: &str, b: &str) -> usize {
+pub(crate) fn levenshtein_distance(a: &str, b: &str) -> usize {
     let a_len = a.chars().count();
     let b_len = b.chars().count();
 
