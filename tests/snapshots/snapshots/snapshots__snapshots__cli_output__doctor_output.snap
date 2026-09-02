@@ -21,7 +21,6 @@ OK routes_jsonl: No routes.jsonl present (ID-REDACTED routing is optional)
 OK rust_log: RUST_LOG=error (quiet)
 OK permissions.beads_dir: `.beads/` and critical children are ID-REDACTED
 OK config.yaml: config.yaml parses cleanly (99 bytes)
-OK config.unknown_keys
 OK metadata.json: metadata.json parses cleanly (62 bytes); declared targets exist on disk
 HOST-DEPENDENT binary_version
 OK write_lock: .beads/.write.lock is 0s old (within 300s threshold); not stale

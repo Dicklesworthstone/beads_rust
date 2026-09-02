@@ -1,0 +1,24 @@
+---
+source: tests/golden_rich_panels.rs
+expression: width_80
+---
+╭────────────────────────────────── rich-ID  ──────────────────────────────────╮
+│ rich-ID   [P2]  open  task                                                   │
+│                                                                              │
+│ Delta issue with a markdown body                                             │
+│                                                                              │
+│ Plan                                                                         │
+│                                                                              │
+│ Use bold and  inline code  in the body.                                      │
+│   • first item                                                               │
+│   • second item                                                              │
+│                                                                              │
+│ │ a quoted note                                                              │
+│                                                                              │
+│                                                                              │
+│ ───────────────────────────────────                                          │
+│ Labels:   docs                                                               │
+│ Created:  TIMESTAMP                                                          │
+│ Updated:  TIMESTAMP                                                          │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯

@@ -9,7 +9,7 @@
 
 #![allow(clippy::default_trait_access)]
 
-use crate::cli::ConfigCommands;
+use crate::cli::{ConfigCommands, OutputFormatBasic};
 use crate::config::{
     self, CliOverrides, ConfigLayer, ConfigPaths, default_config_layer,
     discover_optional_beads_dir_with_cli, id_config_from_layer, load_legacy_user_config,
