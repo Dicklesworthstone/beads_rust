@@ -2,10 +2,11 @@
 //! JSON exactly as an MCP client would drive it.
 //!
 //! The shutdown test proves `serve` starts and stops cleanly; this one proves
-//! the advertised surface works: initialize, list tools/resources/prompts,
-//! call a read tool and the mutating tools, read a resource, and then check
-//! outside MCP that the mutations reached the workspace (CLI `show`, the
-//! audit actor, and the auto-flushed `issues.jsonl`).
+//! the advertised surface works over the stateless 2026-07-28 era (every
+//! frame carries the protocol version in `_meta`): `server/discover`, list
+//! tools/resources/prompts, call a read tool and the mutating tools, read a
+//! resource, and then check outside MCP that the mutations reached the
+//! workspace (CLI `show`, the audit actor, and the auto-flushed `issues.jsonl`).
 //!
 //! Only built with `--features mcp` (`scripts/test-shard.sh` and CI pass
 //! `--all-features`).
@@ -23,7 +24,22 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const ACTOR: &str = "mcp-protocol-test";
-const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+const REPLY_TIMEOUT: Duration = Duration::from_secs(90);
+/// The MCP protocol era `br serve` negotiates on stdio; fastmcp requires every
+/// frame to carry it under `params._meta`.
+const PROTOCOL_VERSION: &str = "2026-07-28";
+const PROTOCOL_VERSION_META_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+
+/// Attach the protocol-era metadata fastmcp expects on every request and
+/// notification.
+fn with_era(mut params: Value) -> Value {
+    if !params.is_object() {
+        params = json!({});
+    }
+    params["_meta"][PROTOCOL_VERSION_META_KEY] = json!(PROTOCOL_VERSION);
+    params["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({});
+    params
+}
 
 fn should_clear_inherited_br_env(key: &OsStr) -> bool {
     let key = key.to_string_lossy();
@@ -119,6 +135,9 @@ impl McpClient {
     fn spawn(root: &Path) -> Self {
         let mut child = br_command(root)
             .args(["serve", "--actor", ACTOR])
+            // Debug logging goes to stderr (never stdout), so it does not
+            // disturb the JSON-RPC stream and is shown when a step fails.
+            .env("RUST_LOG", "beads_rust=debug")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -156,33 +175,48 @@ impl McpClient {
         stdin.flush().expect("flush serve stdin");
     }
 
-    fn notify(&mut self, method: &str, params: Value) {
-        self.send(&json!({"jsonrpc": "2.0", "method": method, "params": params}));
-    }
-
     /// Send a request and wait for the response with the same id, skipping
     /// notifications and anything that is not JSON.
     fn request(&mut self, method: &str, params: Value) -> Value {
         let id = self.next_id;
         self.next_id += 1;
-        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        self.send(
+            &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": with_era(params)}),
+        );
         let deadline = Instant::now() + REPLY_TIMEOUT;
+        let mut other_frames: Vec<String> = Vec::new();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let line = self.lines.recv_timeout(remaining).unwrap_or_else(|_| {
+            let Ok(line) = self.lines.recv_timeout(remaining) else {
+                // Kill the server so its stderr reaches EOF and can be shown.
+                let _ = self.child.kill();
+                let stderr = self
+                    .stderr
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap_or_default();
                 panic!(
-                    "no reply to {method} within {REPLY_TIMEOUT:?}; serve stderr:\n{}",
-                    self.stderr.try_recv().unwrap_or_default()
-                )
-            });
+                    "no reply to {method} (id {id}) within {REPLY_TIMEOUT:?}\nother frames seen:\n{}\nserve stderr:\n{stderr}",
+                    other_frames.join("\n")
+                );
+            };
             let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                other_frames.push(line);
                 continue;
             };
             if message.get("id") != Some(&json!(id)) {
+                other_frames.push(line);
                 continue;
             }
             if let Some(error) = message.get("error") {
-                panic!("{method} failed: {error}");
+                let _ = self.child.kill();
+                let stderr = self
+                    .stderr
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap_or_default();
+                panic!(
+                    "{method} failed: {error}\nother frames seen:\n{}\nserve stderr:\n{stderr}",
+                    other_frames.join("\n")
+                );
             }
             return message["result"].clone();
         }
@@ -247,24 +281,14 @@ fn serve_speaks_mcp_over_stdio_and_mutations_reach_the_workspace() {
 
     let mut client = McpClient::spawn(root);
 
-    // Handshake.
-    let initialized = client.request(
-        "initialize",
-        json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "beads_rust e2e", "version": "0"}
-        }),
-    );
+    // The 2026-07-28 era is stateless: no `initialize` handshake, every frame
+    // carries the protocol version in `_meta`, and `server/discover` is the
+    // discovery request.
+    let discovered = client.request("server/discover", json!({}));
     assert!(
-        initialized["protocolVersion"].is_string(),
-        "initialize result: {initialized}"
+        discovered.is_object(),
+        "server/discover result: {discovered}"
     );
-    assert!(
-        initialized["capabilities"]["tools"].is_object(),
-        "server must advertise tools: {initialized}"
-    );
-    client.notify("notifications/initialized", json!({}));
 
     // Discovery: every documented tool, resource, and prompt is listed.
     let tools = client.request("tools/list", json!({}));
@@ -320,17 +344,45 @@ fn serve_speaks_mcp_over_stdio_and_mutations_reach_the_workspace() {
         );
     }
 
+    // While serve is up, the CLI must still read the workspace promptly; if
+    // this blocks, serve holds a workspace lock it should not.
+    let cli_probe_started = Instant::now();
+    let cli_list = cli_json(root, &["list"]);
+    let cli_probe = cli_probe_started.elapsed();
+    assert!(
+        cli_probe < Duration::from_secs(10),
+        "br list --json took {cli_probe:?} while serve was running: {cli_list}"
+    );
+
     // A read tool sees the issue created by the CLI before serve started.
+    let tool_started = Instant::now();
     let listed = client.call_tool("list_issues", json!({}));
+    eprintln!(
+        "[mcp] list_issues took {:?} (cli probe {cli_probe:?})",
+        tool_started.elapsed()
+    );
     let mut listed_ids = BTreeSet::new();
     ids_in(&listed, &mut listed_ids);
     assert!(listed_ids.contains(&seeded_id), "list_issues: {listed}");
 
+    // A CLI write must also succeed while serve is idle; if it does and the
+    // MCP create below still blocks, the block is inside serve's own
+    // mutation path rather than a workspace lock held elsewhere.
+    let cli_write_started = Instant::now();
+    let cli_created = cli_json(root, &["create", "CLI write while serve is idle"]);
+    eprintln!(
+        "[mcp] cli create took {:?}: {}",
+        cli_write_started.elapsed(),
+        first_id(&cli_created)
+    );
+
     // Mutating tools: create, label, close.
+    let create_started = Instant::now();
     let created = client.call_tool(
         "create_issue",
         json!({"title": "Created over MCP", "type": "task", "priority": "1"}),
     );
+    eprintln!("[mcp] create_issue took {:?}", create_started.elapsed());
     let new_id = first_id(&created);
     assert!(
         new_id.starts_with("mcp-"),

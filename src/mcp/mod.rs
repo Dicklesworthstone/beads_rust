@@ -1205,26 +1205,33 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
             lock_timeout,
         )?,
     );
-    let res = config::open_storage_with_startup_config_under_write_lock(
-        startup,
-        overrides,
-        false,
-        &write_lock,
-    )?;
-
-    let prefix = res
-        .storage
-        .get_config("issue_prefix")?
-        .map(|prefix| crate::util::id::normalize_configured_prefix(&prefix))
-        .transpose()?;
-    let db_path = res.paths.db_path.clone();
-    let jsonl_path = res.paths.jsonl_path.clone();
+    // The bootstrap open lives in its own scope so that everything it owns —
+    // the connection *and* the database-family write authority the open
+    // result keeps a clone of — is released before the server starts.
+    // Keeping the result alive held `.beads/.write.lock` for the whole
+    // serve session: every mutating tool then timed out waiting for the
+    // lock it could never get, and CLI writes in other processes hung.
+    let (prefix, db_path, jsonl_path) = {
+        let res = config::open_storage_with_startup_config_under_write_lock(
+            startup,
+            overrides,
+            false,
+            &write_lock,
+        )?;
+        let prefix = res
+            .storage
+            .get_config("issue_prefix")?
+            .map(|prefix| crate::util::id::normalize_configured_prefix(&prefix))
+            .transpose()?;
+        (
+            prefix,
+            res.paths.db_path.clone(),
+            res.paths.jsonl_path.clone(),
+        )
+    };
+    drop(write_lock);
     let allow_external_jsonl =
         config::implicit_external_jsonl_allowed(&beads_dir, &db_path, &jsonl_path);
-
-    // Eagerly drop the bootstrap connection; handlers will open their own.
-    drop(res.storage);
-    drop(write_lock);
 
     let state = std::sync::Arc::new(BeadsState {
         db_path,
