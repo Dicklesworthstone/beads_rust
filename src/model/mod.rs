@@ -8,6 +8,8 @@
 //! - `Comment` - Issue comments
 //! - `Event` - Audit log entries
 
+pub mod acceptance;
+
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, Serializer};

@@ -1228,6 +1228,42 @@ pub struct UpdateArgs {
     #[arg(long, visible_alias = "acceptance", allow_hyphen_values = true)]
     pub acceptance_criteria: Option<String>,
 
+    /// Tick acceptance-criteria checklist items in place (GitHub #477).
+    ///
+    /// ITEMS is either a comma-separated list of 1-based item numbers
+    /// (`1,4,5`) or a text selector that must match exactly one item
+    /// (case-insensitive; an exact match wins, otherwise a unique
+    /// substring). Repeat the flag for several text selectors. Every item is
+    /// validated before anything is written, and the rest of the field is
+    /// left byte-for-byte intact, so this never needs `--force`.
+    #[arg(
+        long,
+        value_name = "ITEMS",
+        conflicts_with = "acceptance_criteria",
+        allow_hyphen_values = true
+    )]
+    pub check_acceptance: Vec<String>,
+
+    /// Untick acceptance-criteria checklist items in place; same selectors as
+    /// `--check-acceptance`.
+    #[arg(
+        long,
+        value_name = "ITEMS",
+        conflicts_with = "acceptance_criteria",
+        allow_hyphen_values = true
+    )]
+    pub uncheck_acceptance: Vec<String>,
+
+    /// Append an unchecked acceptance criterion (`- [ ] TEXT`) to the
+    /// checklist without rewriting the field. Repeatable, like `--add-label`.
+    #[arg(
+        long,
+        value_name = "TEXT",
+        conflicts_with = "acceptance_criteria",
+        allow_hyphen_values = true
+    )]
+    pub add_acceptance: Vec<String>,
+
     /// Update additional notes
     #[arg(long, allow_hyphen_values = true)]
     pub notes: Option<String>,
@@ -3699,6 +3735,49 @@ mod tests {
             return;
         };
         assert_eq!(args.assignee.as_deref(), Some(""));
+    }
+
+    /// GitHub #477: the in-place checklist flags and a whole-field rewrite
+    /// are mutually exclusive, and the flags parse as repeatable lists.
+    #[test]
+    fn test_update_check_acceptance_conflicts_with_full_field_rewrite() {
+        for flag in [
+            "--check-acceptance",
+            "--uncheck-acceptance",
+            "--add-acceptance",
+        ] {
+            let err = Cli::try_parse_from([
+                "br",
+                "update",
+                "bd-1",
+                flag,
+                "1",
+                "--acceptance-criteria",
+                "- [ ] replaced",
+            ])
+            .expect_err("in-place flags must conflict with a full rewrite");
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+
+        let cli = Cli::parse_from([
+            "br",
+            "update",
+            "bd-1",
+            "--check-acceptance",
+            "1,4",
+            "--check-acceptance",
+            "telemetry, counter",
+            "--uncheck-acceptance",
+            "2",
+            "--add-acceptance",
+            "-starts with a dash",
+        ]);
+        let Commands::Update(args) = cli.command else {
+            panic!("expected update command");
+        };
+        assert_eq!(args.check_acceptance, vec!["1,4", "telemetry, counter"]);
+        assert_eq!(args.uncheck_acceptance, vec!["2"]);
+        assert_eq!(args.add_acceptance, vec!["-starts with a dash"]);
     }
 
     #[test]

@@ -11,6 +11,9 @@ use crate::cli::UpdateArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{format_status_label, format_type_label, sanitize_terminal_inline};
+use crate::model::acceptance::{
+    AcceptanceChecklist, AcceptanceEdit, AcceptanceItem, AcceptanceSelector,
+};
 use crate::model::{Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
 use crate::storage::{EventAttribution, IssueUpdate, SqliteStorage};
@@ -41,6 +44,12 @@ struct UpdatedIssueOutput {
     assignee: Option<String>,
     owner: Option<String>,
     updated_at: DateTime<Utc>,
+    /// Resulting acceptance checklist, present only when the call used
+    /// `--check-acceptance` / `--uncheck-acceptance` / `--add-acceptance`
+    /// (GitHub #477). Lets the caller confirm the tick landed and read the
+    /// remaining count without a follow-up `br show`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acceptance_criteria: Option<AcceptanceCriteriaOutput>,
 }
 
 impl From<&Issue> for UpdatedIssueOutput {
@@ -53,8 +62,122 @@ impl From<&Issue> for UpdatedIssueOutput {
             assignee: issue.assignee.clone(),
             owner: issue.owner.clone(),
             updated_at: issue.updated_at,
+            acceptance_criteria: None,
         }
     }
+}
+
+/// Structured acceptance-checklist state after an in-place edit (GitHub #477).
+#[derive(Debug, Clone, Serialize)]
+struct AcceptanceCriteriaOutput {
+    /// Every checklist item, in document order, with 1-based `index`.
+    items: Vec<AcceptanceItem>,
+    checked_count: usize,
+    total: usize,
+    remaining: usize,
+    /// 1-based indexes this call requested to check.
+    checked: Vec<usize>,
+    /// 1-based indexes this call requested to uncheck.
+    unchecked: Vec<usize>,
+    /// 1-based indexes of the items this call appended.
+    added: Vec<usize>,
+}
+
+impl AcceptanceCriteriaOutput {
+    fn from_edit(edit: &AcceptanceEdit) -> Self {
+        let checklist = AcceptanceChecklist::parse(&edit.body);
+        let total = checklist.len();
+        let checked_count = checklist.checked_count();
+        Self {
+            items: checklist.items(),
+            checked_count,
+            total,
+            remaining: total.saturating_sub(checked_count),
+            checked: edit.checked.clone(),
+            unchecked: edit.unchecked.clone(),
+            added: edit.added.clone(),
+        }
+    }
+}
+
+/// Per-issue plan for the in-place acceptance-checklist flags. Computed
+/// before any write from the issue's current field value, so the whole
+/// request is validated (out-of-range index, ambiguous text, no checklist)
+/// and rejected as a unit when anything is wrong.
+struct AcceptanceEditPlan {
+    id: String,
+    edit: AcceptanceEdit,
+    /// False when every requested item was already in the requested state
+    /// and nothing was appended: the field is then not rewritten at all.
+    changed: bool,
+}
+
+fn parse_acceptance_selectors(flag: &str, raw: &[String]) -> Result<Vec<AcceptanceSelector>> {
+    let mut selectors = Vec::new();
+    for value in raw {
+        selectors.extend(
+            AcceptanceSelector::parse_list(value)
+                .map_err(|reason| BeadsError::validation(flag, reason))?,
+        );
+    }
+    Ok(selectors)
+}
+
+fn plan_acceptance_edits(
+    storage: &SqliteStorage,
+    ids: &[String],
+    args: &UpdateArgs,
+) -> Result<Vec<AcceptanceEditPlan>> {
+    if args.check_acceptance.is_empty()
+        && args.uncheck_acceptance.is_empty()
+        && args.add_acceptance.is_empty()
+    {
+        return Ok(Vec::new());
+    }
+    let check_selectors = parse_acceptance_selectors("check-acceptance", &args.check_acceptance)?;
+    let uncheck_selectors =
+        parse_acceptance_selectors("uncheck-acceptance", &args.uncheck_acceptance)?;
+
+    let mut plans = Vec::with_capacity(ids.len());
+    for id in ids {
+        let Some(issue) = storage.get_issue(id)? else {
+            // Missing targets are reported by validate_mutable_target_issues.
+            continue;
+        };
+        let body = issue.acceptance_criteria.unwrap_or_default();
+        let checklist = AcceptanceChecklist::parse(&body);
+        if checklist.is_empty() && !(check_selectors.is_empty() && uncheck_selectors.is_empty()) {
+            return Err(BeadsError::validation(
+                "check-acceptance",
+                format!(
+                    "{id}: acceptance_criteria has no checklist items to tick; add items with \
+                     --add-acceptance or set the field with --acceptance-criteria"
+                ),
+            ));
+        }
+        let resolve_all = |flag: &str, selectors: &[AcceptanceSelector]| -> Result<Vec<usize>> {
+            selectors
+                .iter()
+                .map(|selector| {
+                    checklist
+                        .resolve(selector)
+                        .map_err(|reason| BeadsError::validation(flag, format!("{id}: {reason}")))
+                })
+                .collect()
+        };
+        let check = resolve_all("check-acceptance", &check_selectors)?;
+        let uncheck = resolve_all("uncheck-acceptance", &uncheck_selectors)?;
+        let edit = checklist
+            .edit(&check, &uncheck, &args.add_acceptance)
+            .map_err(|reason| BeadsError::validation("acceptance", format!("{id}: {reason}")))?;
+        let changed = edit.changed_from(&body);
+        plans.push(AcceptanceEditPlan {
+            id: id.clone(),
+            edit,
+            changed,
+        });
+    }
+    Ok(plans)
 }
 
 /// Snapshot of which fields the caller explicitly requested to change and
@@ -126,6 +249,9 @@ enum UpdateRenderItem {
         id: String,
         title: String,
         diff: Box<UpdateDiff>,
+        /// Acceptance checklist state to print after the field diff when the
+        /// call used the in-place acceptance flags (GitHub #477).
+        acceptance: Option<Box<AcceptanceCriteriaOutput>>,
     },
     NoUpdates {
         id: String,
@@ -163,6 +289,8 @@ struct PreparedUpdateRoute {
     set_labels: bool,
     valid_set_labels: Vec<String>,
     resolved_parent: ParentUpdatePlan,
+    /// In-place acceptance-checklist edits, one per target issue (GitHub #477).
+    acceptance_edits: Vec<AcceptanceEditPlan>,
     auto_flush_external: bool,
     /// Tier 1 attribution (issue #312, Layer 3 capture-only) staged onto each
     /// mutation's audit events. Recorded only — never gated or enforced on.
@@ -462,10 +590,17 @@ fn prepare_single_route(
         || !args.add_label.is_empty()
         || !args.remove_label.is_empty()
         || !args.set_labels.is_empty()
-        || args.parent.is_some();
+        || args.parent.is_some()
+        || !args.check_acceptance.is_empty()
+        || !args.uncheck_acceptance.is_empty()
+        || !args.add_acceptance.is_empty();
 
     validate_mutable_target_issues(&storage_ctx.storage, &resolved_ids, has_updates)?;
     validate_text_field_overwrite_guard(&storage_ctx.storage, &resolved_ids, &update, args.force)?;
+    // In-place checklist edits are planned from the current field value and
+    // deliberately sit outside the #467 overwrite guard: they cannot destroy
+    // content, so they must never need `--force` (GitHub #477).
+    let acceptance_edits = plan_acceptance_edits(&storage_ctx.storage, &resolved_ids, args)?;
 
     // Validate labels before making any database changes
     for label in &args.add_label {
@@ -506,6 +641,7 @@ fn prepare_single_route(
         set_labels: !args.set_labels.is_empty(),
         valid_set_labels,
         resolved_parent,
+        acceptance_edits,
         auto_flush_external,
         attribution: EventAttribution::new(
             args.agent_name.as_deref(),
@@ -553,15 +689,30 @@ fn execute_prepared_route(
         issues_before.insert(id.clone(), issue_before);
     }
 
+    // Acceptance-checklist edits are per issue (each was planned from that
+    // issue's own field), so they are merged into the shared field update
+    // per id rather than cloned uniformly (GitHub #477).
+    let acceptance_edits: HashMap<String, AcceptanceEditPlan> =
+        std::mem::take(&mut prepared.acceptance_edits)
+            .into_iter()
+            .map(|plan| (plan.id.clone(), plan))
+            .collect();
+    let has_acceptance_writes = acceptance_edits.values().any(|plan| plan.changed);
+
     let mut capacity_warnings = Vec::new();
-    if !prepared.update.is_empty() {
+    if !prepared.update.is_empty() || has_acceptance_writes {
         let mut issue_update = prepared.update.clone();
         issue_update.skip_cache_rebuild = defer_blocked_cache_rebuild;
         let atomic_updates = prepared
             .resolved_ids
             .iter()
-            .cloned()
-            .map(|id| (id, issue_update.clone()))
+            .filter_map(|id| {
+                let mut per_issue = issue_update.clone();
+                if let Some(plan) = acceptance_edits.get(id).filter(|plan| plan.changed) {
+                    per_issue.acceptance_criteria = Some(Some(plan.edit.body.clone()));
+                }
+                (!per_issue.is_empty()).then(|| (id.clone(), per_issue))
+            })
             .collect::<Vec<_>>();
 
         prepared
@@ -674,9 +825,17 @@ fn execute_prepared_route(
             issue_after_result,
         )?;
 
+        // Derived from the planned edit (the exact bytes we wrote), not from
+        // the post-write re-read, for the same #256 reason as the diff below.
+        let acceptance_state = acceptance_edits
+            .get(id)
+            .map(|plan| AcceptanceCriteriaOutput::from_edit(&plan.edit));
+
         if use_machine_output {
             if let Some(ref issue) = issue_after {
-                updated_issues.push(UpdatedIssueOutput::from(issue));
+                let mut output = UpdatedIssueOutput::from(issue);
+                output.acceptance_criteria = acceptance_state;
+                updated_issues.push(output);
             }
         } else if use_human_output && prepared.has_updates {
             // Derive the rendered title and diff from the validated
@@ -703,6 +862,7 @@ fn execute_prepared_route(
                 id: id.clone(),
                 title,
                 diff: Box::new(diff),
+                acceptance: acceptance_state.map(Box::new),
             });
         } else if use_human_output {
             render_items.push(UpdateRenderItem::NoUpdates { id: id.clone() });
@@ -743,6 +903,7 @@ fn can_use_bulk_label_only_route(prepared: &PreparedUpdateRoute) -> bool {
 
     (add_only || remove_only)
         && prepared.update.is_empty()
+        && prepared.acceptance_edits.is_empty()
         && !prepared.set_labels
         && matches!(prepared.resolved_parent, ParentUpdatePlan::Unchanged)
 }
@@ -816,6 +977,7 @@ fn execute_bulk_label_only_route(
                 id: id.clone(),
                 title: issue.map_or_else(String::new, |issue| issue.title.clone()),
                 diff: Box::new(UpdateDiff::default()),
+                acceptance: None,
             });
         } else if use_human_output {
             render_items.push(UpdateRenderItem::NoUpdates { id: id.clone() });
@@ -1017,11 +1179,73 @@ fn issue_input_text(input: &str) -> String {
     sanitize_terminal_inline(input).into_owned()
 }
 
+/// Render the acceptance checklist after an in-place edit (GitHub #477):
+/// every item with its 1-based index and box state, then a summary line
+/// naming what this call changed and how many items remain. Printing the
+/// resulting state means the caller never needs a follow-up `br show` and
+/// never infers success from the exit code alone.
+fn print_acceptance_state(id: &str, state: &AcceptanceCriteriaOutput) {
+    let plural = if state.total == 1 { "" } else { "s" };
+    println!("{id} acceptance criteria ({} item{plural})", state.total);
+    let width = state.total.to_string().len();
+    for item in &state.items {
+        println!(
+            "  [{}] {:<width$}  {}",
+            if item.checked { 'x' } else { ' ' },
+            item.index,
+            sanitize_terminal_inline(&item.text),
+        );
+    }
+    let list = |indexes: &[usize]| {
+        indexes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let mut parts = Vec::new();
+    if !state.checked.is_empty() {
+        parts.push(format!(
+            "checked {} ({})",
+            state.checked.len(),
+            list(&state.checked)
+        ));
+    }
+    if !state.unchecked.is_empty() {
+        parts.push(format!(
+            "unchecked {} ({})",
+            state.unchecked.len(),
+            list(&state.unchecked)
+        ));
+    }
+    if !state.added.is_empty() {
+        parts.push(format!(
+            "added {} ({})",
+            state.added.len(),
+            list(&state.added)
+        ));
+    }
+    parts.push(format!(
+        "{} of {} complete",
+        state.checked_count, state.total
+    ));
+    parts.push(format!("{} remaining", state.remaining));
+    println!("{}", parts.join(" · "));
+}
+
 fn print_render_items(render_items: &[UpdateRenderItem]) {
     for item in render_items {
         match item {
-            UpdateRenderItem::Summary { id, title, diff } => {
+            UpdateRenderItem::Summary {
+                id,
+                title,
+                diff,
+                acceptance,
+            } => {
                 print_update_summary(id, title, diff.as_ref());
+                if let Some(state) = acceptance {
+                    print_acceptance_state(id, state);
+                }
             }
             UpdateRenderItem::NoUpdates { id } => println!("{}", no_updates_human_line(id)),
         }
@@ -1548,6 +1772,289 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
     use tracing::info;
+
+    // === In-place acceptance checklist edits (GitHub #477) ===
+
+    const ACCEPTANCE_FIXTURE: &str = "- [ ] schema migration applied\n\
+- [ ] rollback path exercised\n\
+- [ ] telemetry counter emitted\n";
+
+    fn acceptance_workspace(acceptance: Option<&str>) -> (TempDir, std::path::PathBuf) {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let mut storage_ctx =
+            config::open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
+        let issue = Issue {
+            id: "bd-ac".to_string(),
+            title: "Acceptance target".to_string(),
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            description: Some("context that must survive".to_string()),
+            acceptance_criteria: acceptance.map(str::to_string),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            ..Issue::default()
+        };
+        storage_ctx
+            .storage
+            .create_issue(&issue, "tester")
+            .expect("create issue");
+        (temp, beads_dir)
+    }
+
+    fn acceptance_field(beads_dir: &Path) -> Issue {
+        let storage_ctx =
+            config::open_storage_with_cli(beads_dir, &CliOverrides::default()).expect("storage");
+        storage_ctx
+            .storage
+            .get_issue("bd-ac")
+            .expect("read issue")
+            .expect("issue exists")
+    }
+
+    fn run_acceptance_update(beads_dir: &Path, args: &UpdateArgs) -> Result<UpdateRouteOutput> {
+        let prepared = prepare_single_route(args, &CliOverrides::default(), beads_dir, false)?;
+        execute_prepared_route(prepared, &OutputContext::from_flags(true, false, true))
+    }
+
+    #[test]
+    fn check_acceptance_ticks_items_in_place_without_force() {
+        init_test_logging();
+        let (_temp, beads_dir) = acceptance_workspace(Some(ACCEPTANCE_FIXTURE));
+        let args = UpdateArgs {
+            ids: vec!["bd-ac".to_string()],
+            check_acceptance: vec!["1,3".to_string()],
+            ..Default::default()
+        };
+
+        let output = run_acceptance_update(&beads_dir, &args).expect("tick without --force");
+
+        let after = acceptance_field(&beads_dir);
+        assert_eq!(
+            after.acceptance_criteria.as_deref(),
+            Some(
+                "- [x] schema migration applied\n\
+- [ ] rollback path exercised\n\
+- [x] telemetry counter emitted\n"
+            )
+        );
+        assert_eq!(
+            after.description.as_deref(),
+            Some("context that must survive")
+        );
+        let state = output.updated_issues[0]
+            .acceptance_criteria
+            .as_ref()
+            .expect("acceptance state in machine output");
+        assert_eq!(state.checked, vec![1, 3]);
+        assert_eq!(state.checked_count, 2);
+        assert_eq!(state.total, 3);
+        assert_eq!(state.remaining, 1);
+        assert_eq!(state.items[1].text, "rollback path exercised");
+        assert!(!state.items[1].checked);
+        let json = serde_json::to_value(&output.updated_issues[0]).unwrap();
+        assert_eq!(json["acceptance_criteria"]["items"][0]["index"], 1);
+        assert_eq!(json["acceptance_criteria"]["items"][0]["checked"], true);
+        assert_eq!(json["acceptance_criteria"]["remaining"], 1);
+    }
+
+    #[test]
+    fn check_acceptance_by_text_and_uncheck_by_index() {
+        init_test_logging();
+        let (_temp, beads_dir) = acceptance_workspace(Some(
+            "- [x] schema migration applied\n- [ ] rollback path exercised\n",
+        ));
+        let args = UpdateArgs {
+            ids: vec!["bd-ac".to_string()],
+            check_acceptance: vec!["ROLLBACK".to_string()],
+            uncheck_acceptance: vec!["1".to_string()],
+            ..Default::default()
+        };
+
+        let output = run_acceptance_update(&beads_dir, &args).expect("text selector + uncheck");
+
+        assert_eq!(
+            acceptance_field(&beads_dir).acceptance_criteria.as_deref(),
+            Some("- [ ] schema migration applied\n- [x] rollback path exercised\n")
+        );
+        let state = output.updated_issues[0]
+            .acceptance_criteria
+            .as_ref()
+            .unwrap();
+        assert_eq!(state.checked, vec![2]);
+        assert_eq!(state.unchecked, vec![1]);
+    }
+
+    #[test]
+    fn check_acceptance_rejects_bad_requests_before_writing_anything() {
+        init_test_logging();
+        let (_temp, beads_dir) = acceptance_workspace(Some(ACCEPTANCE_FIXTURE));
+        let before = acceptance_field(&beads_dir);
+
+        // Out-of-range index in a batch: nothing applied, offender named.
+        let args = UpdateArgs {
+            ids: vec!["bd-ac".to_string()],
+            check_acceptance: vec!["1,9".to_string()],
+            ..Default::default()
+        };
+        let err = run_acceptance_update(&beads_dir, &args).unwrap_err();
+        assert!(err.to_string().contains("item 9 does not exist"), "{err}");
+
+        // Ambiguous text selector.
+        let args = UpdateArgs {
+            ids: vec!["bd-ac".to_string()],
+            check_acceptance: vec!["e".to_string()],
+            ..Default::default()
+        };
+        let err = run_acceptance_update(&beads_dir, &args).unwrap_err();
+        assert!(
+            err.to_string().contains("matches 3 acceptance items"),
+            "{err}"
+        );
+
+        // Same item checked and unchecked.
+        let args = UpdateArgs {
+            ids: vec!["bd-ac".to_string()],
+            check_acceptance: vec!["2".to_string()],
+            uncheck_acceptance: vec!["rollback".to_string()],
+            ..Default::default()
+        };
+        let err = run_acceptance_update(&beads_dir, &args).unwrap_err();
+        assert!(
+            err.to_string().contains("both checked and unchecked"),
+            "{err}"
+        );
+
+        let after = acceptance_field(&beads_dir);
+        assert_eq!(after.acceptance_criteria, before.acceptance_criteria);
+        assert_eq!(after.updated_at, before.updated_at);
+    }
+
+    #[test]
+    fn check_acceptance_without_a_checklist_is_an_error() {
+        init_test_logging();
+        let (_temp, beads_dir) = acceptance_workspace(Some("prose only, no boxes"));
+        let args = UpdateArgs {
+            ids: vec!["bd-ac".to_string()],
+            check_acceptance: vec!["1".to_string()],
+            ..Default::default()
+        };
+        let err = run_acceptance_update(&beads_dir, &args).unwrap_err();
+        assert!(err.to_string().contains("no checklist items"), "{err}");
+        assert_eq!(
+            acceptance_field(&beads_dir).acceptance_criteria.as_deref(),
+            Some("prose only, no boxes")
+        );
+    }
+
+    #[test]
+    fn check_acceptance_already_checked_does_not_rewrite_the_row() {
+        init_test_logging();
+        let (_temp, beads_dir) = acceptance_workspace(Some("- [X] done\n- [ ] open\n"));
+        let before = acceptance_field(&beads_dir);
+        let args = UpdateArgs {
+            ids: vec!["bd-ac".to_string()],
+            check_acceptance: vec!["done".to_string()],
+            ..Default::default()
+        };
+
+        let output = run_acceptance_update(&beads_dir, &args).expect("idempotent tick");
+
+        let after = acceptance_field(&beads_dir);
+        assert_eq!(
+            after.acceptance_criteria.as_deref(),
+            Some("- [X] done\n- [ ] open\n")
+        );
+        assert_eq!(
+            after.updated_at, before.updated_at,
+            "no-op must not touch the row"
+        );
+        let state = output.updated_issues[0]
+            .acceptance_criteria
+            .as_ref()
+            .expect("state still reported so the caller sees the checklist");
+        assert_eq!(state.checked, vec![1]);
+        assert_eq!(state.remaining, 1);
+    }
+
+    #[test]
+    fn add_acceptance_appends_items_to_empty_and_populated_fields() {
+        init_test_logging();
+        let (_temp, beads_dir) = acceptance_workspace(None);
+        let args = UpdateArgs {
+            ids: vec!["bd-ac".to_string()],
+            add_acceptance: vec!["first criterion".to_string()],
+            ..Default::default()
+        };
+        let output = run_acceptance_update(&beads_dir, &args).expect("append to empty field");
+        assert_eq!(
+            acceptance_field(&beads_dir).acceptance_criteria.as_deref(),
+            Some("- [ ] first criterion")
+        );
+        assert_eq!(
+            output.updated_issues[0]
+                .acceptance_criteria
+                .as_ref()
+                .unwrap()
+                .added,
+            vec![1]
+        );
+
+        // Append plus tick in one call: the tick indexes the existing list,
+        // the new item lands unchecked at the end, and nothing else changes.
+        let args = UpdateArgs {
+            ids: vec!["bd-ac".to_string()],
+            add_acceptance: vec!["second criterion".to_string()],
+            check_acceptance: vec!["1".to_string()],
+            ..Default::default()
+        };
+        let output = run_acceptance_update(&beads_dir, &args).expect("append + tick");
+        assert_eq!(
+            acceptance_field(&beads_dir).acceptance_criteria.as_deref(),
+            Some("- [x] first criterion\n- [ ] second criterion")
+        );
+        let state = output.updated_issues[0]
+            .acceptance_criteria
+            .as_ref()
+            .unwrap();
+        assert_eq!(state.added, vec![2]);
+        assert_eq!(state.checked, vec![1]);
+        assert_eq!(state.remaining, 1);
+    }
+
+    #[test]
+    fn check_acceptance_combines_with_other_field_updates() {
+        init_test_logging();
+        let (_temp, beads_dir) = acceptance_workspace(Some(ACCEPTANCE_FIXTURE));
+        let args = UpdateArgs {
+            ids: vec!["bd-ac".to_string()],
+            check_acceptance: vec!["2".to_string()],
+            priority: Some("1".to_string()),
+            add_label: vec!["reviewed".to_string()],
+            ..Default::default()
+        };
+
+        let output = run_acceptance_update(&beads_dir, &args).expect("combined update");
+
+        let after = acceptance_field(&beads_dir);
+        assert_eq!(after.priority, Priority(1));
+        let labels = config::open_storage_with_cli(&beads_dir, &CliOverrides::default())
+            .expect("storage")
+            .storage
+            .get_labels("bd-ac")
+            .expect("labels");
+        assert!(labels.contains(&"reviewed".to_string()), "{labels:?}");
+        assert!(
+            after
+                .acceptance_criteria
+                .as_deref()
+                .unwrap()
+                .contains("- [x] rollback path exercised\n")
+        );
+        assert_eq!(output.updated_issues[0].priority, 1);
+    }
 
     /// GitHub #467: `br update` must refuse to silently replace a non-empty
     /// accumulating text field with different content unless `--force`.
@@ -2185,6 +2692,7 @@ mod tests {
             set_labels: false,
             valid_set_labels: Vec::new(),
             resolved_parent: ParentUpdatePlan::Unchanged,
+            acceptance_edits: Vec::new(),
             auto_flush_external: false,
             attribution: EventAttribution::default(),
             _routed_write_lock: RoutedWorkspaceWriteLock::local(),
@@ -2268,6 +2776,7 @@ mod tests {
             set_labels: false,
             valid_set_labels: Vec::new(),
             resolved_parent: ParentUpdatePlan::Unchanged,
+            acceptance_edits: Vec::new(),
             auto_flush_external: false,
             attribution: EventAttribution::default(),
             _routed_write_lock: RoutedWorkspaceWriteLock::local(),
@@ -2390,6 +2899,7 @@ mod tests {
             set_labels: false,
             valid_set_labels: Vec::new(),
             resolved_parent: ParentUpdatePlan::Unchanged,
+            acceptance_edits: Vec::new(),
             auto_flush_external: false,
             attribution: EventAttribution::default(),
             _routed_write_lock: RoutedWorkspaceWriteLock::local(),

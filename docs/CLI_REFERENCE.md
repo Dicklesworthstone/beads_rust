@@ -380,7 +380,10 @@ br update [OPTIONS] [IDS]...
 | `--title <TEXT>` | Update title |
 | `--description <TEXT>` | Update description |
 | `--design <TEXT>` | Update design notes |
-| `--acceptance-criteria <TEXT>` | Update acceptance criteria |
+| `--acceptance-criteria <TEXT>` | Update acceptance criteria (whole field) |
+| `--check-acceptance <ITEMS>` | Tick acceptance checklist items in place: 1-based numbers (`1,4,5`) or a text selector matching exactly one item; repeatable; atomic; never needs `--force` |
+| `--uncheck-acceptance <ITEMS>` | Untick acceptance checklist items in place (same selectors) |
+| `--add-acceptance <TEXT>` | Append an unchecked `- [ ] TEXT` criterion without rewriting the field; repeatable |
 | `--notes <TEXT>` | Update additional notes |
 | `--transition-comment <TEXT>` | Add a fresh comment atomically with a status transition |
 | `-s, --status <STATUS>` | Change status |
