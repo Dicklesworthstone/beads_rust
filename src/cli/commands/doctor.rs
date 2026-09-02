@@ -3,6 +3,7 @@
 #![allow(clippy::option_if_let_else)]
 
 use crate::cli::DoctorArgs;
+use crate::cli::commands::doctor_subsystems::engine::{EngineBlock, engine_block};
 use crate::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode;
 use crate::cli::commands::doctor_subsystems::mutate as chokepoint;
 use crate::cli::commands::doctor_subsystems::mutate::{Capabilities, MutateContext, Op};
@@ -255,13 +256,11 @@ struct LocalRepairResult {
 /// stderr without touching disk. The run-dir is still created (so the
 /// caller has somewhere to inspect the planned actions) but no
 /// `actions.jsonl` lines are appended.
-#[allow(dead_code)] // WP1 scaffold; wired into legacy fixers in later doctor work packages.
 struct DoctorRepairSession {
     run: RunDir,
     ctx: MutateContext,
 }
 
-#[allow(dead_code)] // WP1 scaffold; methods are exercised once repair call sites move to mutate().
 impl DoctorRepairSession {
     /// Build a fresh session rooted at `repo_root`. Creates
     /// `<repo_root>/.doctor/runs/<run-id>/` (or the
@@ -3763,10 +3762,38 @@ fn quarantine_anomalous_sidecars(
     }
 }
 
-#[allow(clippy::unnecessary_wraps)]
+thread_local! {
+    /// The engine block for the workspace the flat doctor run resolved, so
+    /// every report printed by that run (initial, post-repair) carries it
+    /// without threading it through the ~70 `DoctorReport` constructors.
+    static ENGINE_BLOCK: std::cell::RefCell<Option<EngineBlock>> = const { std::cell::RefCell::new(None) };
+}
+
+fn set_engine_block(block: EngineBlock) {
+    ENGINE_BLOCK.with(|slot| *slot.borrow_mut() = Some(block));
+}
+
+fn current_engine_block() -> Option<EngineBlock> {
+    ENGINE_BLOCK.with(|slot| slot.borrow().clone())
+}
+
 fn print_report(report: &DoctorReport, ctx: &OutputContext) -> Result<()> {
     if ctx.is_json() {
-        ctx.json(report);
+        match current_engine_block() {
+            Some(engine) => {
+                let mut value = serde_json::to_value(report).map_err(|err| {
+                    BeadsError::validation("doctor", format!("cannot serialize report: {err}"))
+                })?;
+                if let serde_json::Value::Object(map) = &mut value {
+                    map.insert(
+                        "engine".to_string(),
+                        serde_json::to_value(&engine).unwrap_or(serde_json::Value::Null),
+                    );
+                }
+                ctx.json(&value);
+            }
+            None => ctx.json(report),
+        }
         return Ok(());
     }
     if ctx.is_quiet() {
@@ -3785,6 +3812,9 @@ fn print_report_plain(report: &DoctorReport) {
     println!("br doctor");
     if let Some(health) = &report.workspace_health {
         println!("HEALTH workspace: {health}");
+    }
+    if let Some(engine) = current_engine_block() {
+        println!("ENGINE {}", engine.summary_line());
     }
     for check in &report.checks {
         let label = match check.status {
@@ -13004,6 +13034,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             crate::shutdown::exit_process(1);
         }
     };
+    set_engine_block(engine_block(&beads_dir, &paths.db_path));
 
     // Round-3 fresh-eyes finding (`beads_rust-sexc`): every other mutating
     // subcommand (`update`, `delete`, `close`, `dep`, `label`, …) routes its

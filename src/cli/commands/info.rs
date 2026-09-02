@@ -1,6 +1,7 @@
 //! Info command implementation.
 
 use crate::cli::InfoArgs;
+use crate::cli::commands::doctor_subsystems::engine::{EngineBlock, engine_block};
 use crate::config;
 use crate::error::Result;
 use crate::format::sanitize_terminal_inline;
@@ -68,6 +69,9 @@ struct ProjectionInfo {
 struct InfoOutput {
     database_path: String,
     beads_dir: String,
+    /// Storage engine name/version plus sidecars, opener lease, and
+    /// recovery artifacts (beads_rust-dk45.5).
+    engine: EngineBlock,
     mode: String,
     daemon_connected: bool,
     #[serde(skip)]
@@ -166,6 +170,7 @@ fn collect_info_output(args: &InfoArgs, cli: &config::CliOverrides) -> Result<In
     Ok(InfoOutput {
         database_path: db_path.display().to_string(),
         beads_dir: canonicalize_lossy(&beads_dir).display().to_string(),
+        engine: engine_block(&beads_dir, &startup.paths.db_path),
         mode: "direct".to_string(),
         daemon_connected: false,
         resolved_prefix,
@@ -467,6 +472,7 @@ fn print_human(info: &InfoOutput) {
         }
     }
     println!("Mode: {}", info_display_text(&info.mode));
+    println!("Engine: {}", info_display_text(&info.engine.summary_line()));
 
     if info.daemon_connected {
         println!("Daemon: connected");

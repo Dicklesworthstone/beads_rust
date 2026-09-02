@@ -807,6 +807,30 @@ impl IssueValidator {
 
 ---
 
+## Dormant Modules (decision table, 2026-09-02)
+
+Reference counts are `rg` over `src/` excluding the module's own file and its
+`pub use` re-export lines. Removal of any file needs the operator's written
+approval (AGENTS.md rule 1); nothing below has been deleted.
+
+| Module | Lines | Live callers | Decision | Reason / revisit trigger |
+|---|---|---|---|---|
+| `src/write_combining.rs` | 2,911 | none in `src/`; `tests/bench_contention_replay.rs` only | REMOVE (operator) | Design artifact per `docs/WRITE_COMBINING_QUEUE_DESIGN.md`; the classifier it contains is never consulted by a command. Archive the design doc; drop the bench with it. |
+| `src/cache.rs` | 641 | none | REMOVE (operator) | Zero references anywhere. |
+| `src/format/rich.rs` | 543 | none | REMOVE (operator) | Superseded by `src/output/components/*` (the Rich path every command uses). |
+| `src/format/syntax.rs` | 388 | none (re-exported names unused) | REMOVE (operator) | Syntax highlighting was the RICH plan item deferred to a removal decision; `br show` renders Markdown through `rich_rust` without it. |
+| `src/format/theme.rs` | 306 | none (`format::Theme` unused; `output::Theme` has 103 uses) | REMOVE (operator) | Duplicate of `src/output/theme.rs`. |
+| `src/output/components/dep_tree.rs` | 176 | none (`DependencyTree` unused) | REMOVE (operator) | `br dep tree` renders through `commands/dep.rs`. |
+| `src/output/components/stats.rs` | 50 | none (`StatsPanel` unused) | REMOVE (operator) | `br stats` renders in `commands/stats.rs`. |
+| `src/format/markdown.rs` | 546 | `contains_markdown` (2) | KEEP | `br show` gates Rich Markdown rendering on it; `render_markdown`/`escape_markdown` are unused and can go when the file is next touched. |
+| `src/output/components/progress.rs` | 171 | `ProgressTracker` (4) | KEEP | In use. |
+| `OutputContext::error_panel` | fn | none | REMOVE (code cleanup, no approval needed) | Dead method; delete when `output/context.rs` is next edited. |
+
+The stale `#[allow(dead_code)] // WP1 scaffold` markers on
+`DoctorRepairSession` were removed on 2026-09-02 (every method has callers).
+A linter that enforces this table was considered and parked: the table is
+the decision record, and the compiler already flags unused private items.
+
 ## See Also
 
 - [CLI_REFERENCE.md](CLI_REFERENCE.md) - Command reference

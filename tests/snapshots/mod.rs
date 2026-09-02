@@ -71,6 +71,11 @@ static OWNER_RE: LazyLock<Regex> =
 static VERSION_NUM_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b(version|br) \d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?").expect("version number regex")
 });
+/// The `ENGINE ...` summary line `br doctor` prints: engine version, the
+/// sidecars present, and the opener-lease state all depend on the engine
+/// build and the host, so the whole line is masked.
+static ENGINE_LINE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^ENGINE .*$").expect("engine line regex"));
 static LINE_NUM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\.rs:\d+:").expect("line number regex"));
 /// `tracing` source-location annotation that appears in dev builds after the
@@ -535,6 +540,14 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
             .replace_all(&normalized, "$1 X.Y.Z")
             .to_string();
         log.push("version_numbers".to_string());
+    }
+
+    // 13a. Mask the doctor engine summary line (engine version + host state).
+    if config.mask_version_numbers && ENGINE_LINE_RE.is_match(&normalized) {
+        normalized = ENGINE_LINE_RE
+            .replace_all(&normalized, "ENGINE ENGINE-REDACTED")
+            .to_string();
+        log.push("engine_line".to_string());
     }
 
     // 13b. Mask check results determined by the host rather than by br.

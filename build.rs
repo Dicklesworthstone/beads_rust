@@ -19,6 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     emitter.emit()?;
     emit_git_metadata();
+    emit_engine_version();
 
     Ok(())
 }
@@ -69,6 +70,28 @@ fn emit_git_metadata() {
 
 fn emit_env(key: &str, value: &str) {
     println!("cargo:rustc-env={key}={value}");
+}
+
+/// Expose the locked `fsqlite` version as `BR_FSQLITE_VERSION` so `br info`
+/// and `br doctor` can name the engine they were built against.
+fn emit_engine_version() {
+    println!("cargo:rerun-if-changed=Cargo.lock");
+    let Ok(lock) = std::fs::read_to_string("Cargo.lock") else {
+        return;
+    };
+    let mut lines = lock.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() == "name = \"fsqlite\""
+            && let Some(version_line) = lines.next()
+            && let Some(version) = version_line
+                .trim()
+                .strip_prefix("version = \"")
+                .and_then(|rest| rest.strip_suffix('"'))
+        {
+            emit_env("BR_FSQLITE_VERSION", version);
+            return;
+        }
+    }
 }
 
 fn git_output(args: &[&str]) -> Option<String> {

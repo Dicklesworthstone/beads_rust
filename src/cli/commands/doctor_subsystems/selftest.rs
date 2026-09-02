@@ -37,7 +37,15 @@ pub struct SelftestReceipt {
     pub kept: bool,
     pub platform: PlatformFacts,
     pub fs: FilesystemFacts,
+    pub engine: EngineFacts,
     pub steps: Vec<StepReceipt>,
+}
+
+/// The storage engine this binary was built against.
+#[derive(Debug, Serialize)]
+pub struct EngineFacts {
+    pub name: &'static str,
+    pub version: &'static str,
 }
 
 /// Host facts that platform bugs have depended on.
@@ -645,6 +653,10 @@ pub fn execute(args: &DoctorArgs, ctx: &OutputContext) -> Result<()> {
             executable: exe.display().to_string(),
         },
         fs,
+        engine: EngineFacts {
+            name: "frankensqlite",
+            version: crate::cli::commands::doctor_subsystems::engine::engine_version(),
+        },
         steps: runner.steps,
     };
 

@@ -1614,3 +1614,91 @@ fn e2e_workspace_paths_consistent() {
         );
     }
 }
+
+/// The `fsqlite` version pinned in this repository's Cargo.lock.
+fn locked_fsqlite_version() -> String {
+    let lock = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.lock"))
+        .expect("read Cargo.lock");
+    let mut lines = lock.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() == "name = \"fsqlite\"" {
+            return lines
+                .next()
+                .and_then(|line| line.trim().strip_prefix("version = \""))
+                .and_then(|rest| rest.strip_suffix('"'))
+                .expect("fsqlite version line")
+                .to_string();
+        }
+    }
+    panic!("fsqlite is not pinned in Cargo.lock");
+}
+
+/// `br info --json` and `br doctor --json` carry the same `engine` block:
+/// the FrankenSQLite version this binary was built with (checked against
+/// Cargo.lock), the sidecar inventory, the opener lease, and recovery
+/// artifacts; the text renderers print a one-line summary.
+#[test]
+fn e2e_info_and_doctor_report_engine_block() {
+    let _log = common::test_log("e2e_info_and_doctor_report_engine_block");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let create = run_br(&workspace, ["create", "Engine block"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let locked_version = locked_fsqlite_version();
+
+    let info = run_br(&workspace, ["info", "--json"], "info_json");
+    assert!(info.status.success(), "info failed: {}", info.stderr);
+    let info: Value = serde_json::from_str(&extract_json_payload(&info.stdout)).expect("info json");
+    let engine = &info["engine"];
+    assert_eq!(engine["name"], "frankensqlite", "engine: {engine}");
+    assert_eq!(engine["crate"], "fsqlite", "engine: {engine}");
+    assert_eq!(
+        engine["version"],
+        locked_version.as_str(),
+        "engine: {engine}"
+    );
+    assert!(
+        engine["sidecars"].is_array() && engine["recovery_artifacts"].is_array(),
+        "engine: {engine}"
+    );
+    assert_eq!(engine["recovery_artifacts_truncated"], false);
+    assert!(
+        engine["database"]
+            .as_str()
+            .is_some_and(|db| db.ends_with("beads.db")),
+        "engine: {engine}"
+    );
+
+    // Doctor exits 0 or 1 depending on findings; both carry the block.
+    let doctor = run_br(&workspace, ["doctor", "--json"], "doctor_json");
+    let doctor: Value =
+        serde_json::from_str(&extract_json_payload(&doctor.stdout)).expect("doctor json");
+    assert_eq!(
+        doctor["engine"]["name"], "frankensqlite",
+        "doctor: {doctor}"
+    );
+    assert_eq!(
+        doctor["engine"]["version"],
+        locked_version.as_str(),
+        "doctor engine: {}",
+        doctor["engine"]
+    );
+
+    let info_text = run_br(&workspace, ["info"], "info_text");
+    assert!(
+        info_text
+            .stdout
+            .contains(&format!("Engine: frankensqlite {locked_version}")),
+        "info text: {}",
+        info_text.stdout
+    );
+    let doctor_text = run_br(&workspace, ["doctor"], "doctor_text");
+    assert!(
+        doctor_text
+            .stdout
+            .contains(&format!("ENGINE frankensqlite {locked_version}")),
+        "doctor text: {}",
+        doctor_text.stdout
+    );
+}

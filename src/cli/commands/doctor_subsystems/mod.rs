@@ -27,6 +27,7 @@
 //! of invariants.
 
 pub mod capabilities_doctor;
+pub mod engine;
 pub mod exit_codes;
 pub mod mutate;
 pub mod refuse_gates;
