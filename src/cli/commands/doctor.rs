@@ -11974,6 +11974,57 @@ fn collect_doctor_report_for_cli(
     )
 }
 
+/// What `br doctor explain` observed for one check when it ran the flat
+/// doctor checks against the discovered workspace.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExplainObservation {
+    /// No `.beads/` workspace was discovered, so nothing could be observed.
+    NoWorkspace,
+    /// The checks ran but none carried this name or finding id.
+    NotObserved,
+    /// The check ran; this is its result exactly as `br doctor --json` reports it.
+    Check(serde_json::Value),
+}
+
+/// Run the flat doctor checks (never `--repair`) and return the check whose
+/// name is `check_name` or whose details carry `finding_id`.
+///
+/// Used by `br doctor explain`, which must describe the workspace as it is
+/// now: ordinary doctor runs do not persist a report (only `--repair` runs
+/// create a run directory), so the checks are re-executed rather than read
+/// from disk.
+///
+/// # Errors
+///
+/// Propagates path resolution and check execution failures.
+pub(crate) fn observe_check_for_explain(
+    cli: &config::CliOverrides,
+    check_name: &str,
+    finding_id: &str,
+) -> Result<ExplainObservation> {
+    let Some(beads_dir) = config::discover_optional_beads_dir_with_cli(cli)? else {
+        return Ok(ExplainObservation::NoWorkspace);
+    };
+    let paths = config::resolve_paths(&beads_dir, cli.db.as_ref())?;
+    let run = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+    let observed = run.report.checks.iter().find(|check| {
+        check.name == check_name
+            || check
+                .details
+                .as_ref()
+                .and_then(|details| details.get("finding_id"))
+                .and_then(serde_json::Value::as_str)
+                == Some(finding_id)
+    });
+    match observed {
+        Some(check) => Ok(ExplainObservation::Check(
+            serde_json::to_value(check).map_err(BeadsError::Json)?,
+        )),
+        None => Ok(ExplainObservation::NotObserved),
+    }
+}
+
 fn collect_doctor_report_with_mode_and_db_override(
     beads_dir: &Path,
     paths: &config::ConfigPaths,

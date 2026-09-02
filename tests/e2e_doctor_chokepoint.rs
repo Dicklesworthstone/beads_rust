@@ -2013,3 +2013,183 @@ fn e2e_reviewed_schema_migration_plan_apply_barrier_and_non_deleting_undo() {
         "undo must retain exactly one displaced applied-state directory"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `br doctor explain` is a real command (beads_rust-v7o2.3): it resolves a
+// finding id or check name through the registry, re-runs the flat checks
+// against the workspace, and names the fixer that addresses the finding.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn doctor_explain_reports_live_observation_and_fixers() {
+    let tmp = isolated_tempdir();
+    let root = tmp.path().to_path_buf();
+    let init = br_cmd(&root).args(["init"]).output().expect("init spawned");
+    assert!(
+        init.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    // A finding id with a registered fixer (gitignore repair).
+    let out = br_cmd(&root)
+        .args([
+            "doctor",
+            "explain",
+            "fm-configs-gitignore-leaking-beads",
+            "--json",
+        ])
+        .output()
+        .expect("explain spawned");
+    assert!(
+        out.status.success(),
+        "explain should exit 0; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let env = parse_trailing_json(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(env["schema_version"], "br.doctor.explain.v1");
+    assert_eq!(env["finding_id"], "fm-configs-gitignore-leaking-beads");
+    assert!(env["check_name"].is_string(), "check_name missing: {env}");
+    let status = env["observed_status"].as_str().expect("observed_status");
+    assert!(
+        ["ok", "warn", "error", "not_observed"].contains(&status),
+        "unexpected observed_status {status}: {env}"
+    );
+    assert!(env["observed_at"].is_string());
+    let fixers = env["fixers"].as_array().expect("fixers array");
+    assert!(
+        fixers.iter().any(|f| f["id"] == "doctor.gitignore_repair"),
+        "gitignore fixer must be listed: {env}"
+    );
+    assert!(
+        fixers[0]["dry_run_command"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("br doctor --repair --dry-run --only ")),
+        "dry-run command shape: {env}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("stub"),
+        "explain must no longer be a stub"
+    );
+
+    // A check name resolves the same way, and text mode renders the same fields.
+    let by_name = br_cmd(&root)
+        .args(["doctor", "explain", "base_jsonl"])
+        .output()
+        .expect("explain by name spawned");
+    assert!(by_name.status.success());
+    let text = String::from_utf8_lossy(&by_name.stdout);
+    assert!(
+        text.contains("fm-state_files-base-jsonl-missing-or-stale (base_jsonl)"),
+        "{text}"
+    );
+    assert!(text.contains("observed  :"), "{text}");
+}
+
+#[test]
+fn doctor_explain_unknown_id_exits_4_with_suggestions_and_list_enumerates() {
+    let tmp = isolated_tempdir();
+    let root = tmp.path().to_path_buf();
+    br_cmd(&root).args(["init"]).output().expect("init spawned");
+
+    let out = br_cmd(&root)
+        .args(["doctor", "explain", "fm-state-files-base-jsonl"])
+        .output()
+        .expect("explain spawned");
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "unknown ids are a validation error"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("nearest:"),
+        "must suggest nearest ids: {stderr}"
+    );
+    assert!(
+        stderr.contains("fm-state_files-base-jsonl-missing-or-stale"),
+        "suggestion must include the closest id: {stderr}"
+    );
+
+    let list = br_cmd(&root)
+        .args(["doctor", "explain", "--list", "--json"])
+        .output()
+        .expect("explain --list spawned");
+    assert!(list.status.success());
+    let env = parse_trailing_json(&String::from_utf8_lossy(&list.stdout));
+    let findings = env["findings"].as_array().expect("findings array");
+    assert!(
+        findings.len() >= 40,
+        "registry should be large: {}",
+        findings.len()
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["finding_id"] == "fm-state_files-base-jsonl-missing-or-stale")
+    );
+}
+
+#[test]
+fn doctor_capabilities_command_filter_narrows_the_envelope() {
+    let tmp = isolated_tempdir();
+    let root = tmp.path().to_path_buf();
+
+    let out = br_cmd(&root)
+        .args([
+            "doctor",
+            "capabilities",
+            "--format",
+            "json",
+            "--command",
+            "gitignore",
+        ])
+        .output()
+        .expect("capabilities spawned");
+    assert!(out.status.success());
+    let env = parse_trailing_json(&String::from_utf8_lossy(&out.stdout));
+    let fixers = env["fixers"].as_array().expect("fixers");
+    let detectors = env["detectors"].as_array().expect("detectors");
+    assert!(
+        !fixers.is_empty() && !detectors.is_empty(),
+        "filter must keep gitignore rows: {env}"
+    );
+    for fixer in fixers {
+        let id = fixer["id"].as_str().unwrap_or_default();
+        let mentions = fixer["addressed_findings"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .any(|i| i.as_str().unwrap_or_default().contains("gitignore"))
+            })
+            .unwrap_or(false)
+            || fixer["filter_ids"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .any(|i| i.as_str().unwrap_or_default().contains("gitignore"))
+                })
+                .unwrap_or(false);
+        assert!(
+            id.contains("gitignore") || mentions,
+            "unfiltered fixer leaked: {fixer}"
+        );
+    }
+    for detector in detectors {
+        assert!(
+            detector["id"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("gitignore"),
+            "unfiltered detector leaked: {detector}"
+        );
+    }
+    // Exit codes and write scopes are contract, not filtered rows.
+    assert!(
+        env["exit_codes"]
+            .as_array()
+            .is_some_and(|codes| codes.len() >= 11)
+    );
+}

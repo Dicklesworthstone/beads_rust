@@ -96,7 +96,7 @@ pub fn dispatch_subcommand(
         DoctorSubcommand::Ls(a) => execute_ls(a, &repo_root),
         DoctorSubcommand::Undo(a) => execute_undo(a, &repo_root),
         DoctorSubcommand::MigrateSchema(a) => super::schema_migration::execute(a, cli, ctx),
-        DoctorSubcommand::Explain(a) => execute_explain(a, &repo_root),
+        DoctorSubcommand::Explain(a) => execute_explain(a, cli),
     }
 }
 
@@ -134,16 +134,19 @@ pub struct CapabilitiesEnvelope<'a> {
 /// never with the data shapes used here).
 pub fn execute_capabilities(args: &DoctorCapabilitiesArgs, _ctx: &OutputContext) -> Result<()> {
     let caps = DoctorCapabilities::build();
+
+    // `--command <id>` narrows the envelope to the fixers, detectors, and
+    // finding-id rows whose ids contain the filter (case-insensitive), so an
+    // agent can ask "what does the doctor know about gitignore?" without
+    // paging through the full contract.
+    let caps = match args.command.as_deref().map(str::trim) {
+        Some(filter) if !filter.is_empty() => filter_capabilities(&caps, filter),
+        _ => caps,
+    };
     let envelope = CapabilitiesEnvelope {
         schema_version: CAPABILITIES_SCHEMA,
         inner: &caps,
     };
-
-    // The optional --command filter is reserved for future fixer/detector
-    // expansion (capabilities currently has empty fixers/detectors lists,
-    // so filtering is a no-op for now). We honor the flag silently to
-    // avoid breaking pinned agent invocations later.
-    let _filter = args.command.as_deref();
 
     match args.format {
         OutputFormatBasic::Json | OutputFormatBasic::Toon => {
@@ -1942,49 +1945,254 @@ fn now_ns() -> u128 {
 // explain (stub)
 // =============================================================================
 
-/// Execute `br doctor explain <finding-id>`. WP6 ships a stub envelope;
-/// the full evidence-expansion path lands in a later pass.
+/// Narrow a capabilities document to the rows whose ids mention `filter`.
+fn filter_capabilities(caps: &DoctorCapabilities, filter: &str) -> DoctorCapabilities {
+    let needle = filter.to_ascii_lowercase();
+    let matches = |value: &str| value.to_ascii_lowercase().contains(&needle);
+    let mut filtered = caps.clone();
+    filtered.fixers.retain(|fixer| {
+        matches(&fixer.id)
+            || fixer.addressed_findings.iter().any(|item| matches(item))
+            || fixer.filter_ids.iter().any(|item| matches(item))
+    });
+    filtered.detectors.retain(|detector| matches(&detector.id));
+    filtered
+        .finding_id_map
+        .retain(|entry| matches(entry.check_name) || matches(entry.finding_id));
+    filtered
+}
+
+/// One remediation the doctor can apply for a finding.
+#[derive(Debug, Clone, Serialize)]
+struct ExplainFixer {
+    id: String,
+    subsystem: String,
+    auto_fixable: bool,
+    mutates: bool,
+    dry_run_command: String,
+    command: String,
+}
+
+/// `br.doctor.explain.v1` envelope.
+#[derive(Debug, Clone, Serialize)]
+struct ExplainEnvelope {
+    schema_version: &'static str,
+    finding_id: String,
+    check_name: String,
+    subsystem: Option<String>,
+    severity_default: Option<String>,
+    fast_path: Option<bool>,
+    /// `no_workspace`, `not_observed`, or the check's current status.
+    observed_status: String,
+    observed_at: String,
+    message: Option<String>,
+    details: Option<serde_json::Value>,
+    fixers: Vec<ExplainFixer>,
+    next_commands: Vec<String>,
+}
+
+/// Finding ids and check names closest to an unknown query, for the error hint.
+fn nearest_finding_ids(caps: &DoctorCapabilities, query: &str) -> Vec<String> {
+    let needle = query.trim().to_ascii_lowercase();
+    let tokens: Vec<&str> = needle
+        .split(|c: char| c == '-' || c == '_' || c == '.' || c == ' ')
+        .filter(|token| token.len() >= 3 && *token != "fm")
+        .collect();
+    let mut scored: Vec<(usize, &str)> = caps
+        .finding_id_map
+        .iter()
+        .flat_map(|entry| [entry.finding_id, entry.check_name])
+        .map(|candidate| {
+            let lower = candidate.to_ascii_lowercase();
+            let score = tokens.iter().filter(|token| lower.contains(*token)).count();
+            (score, candidate)
+        })
+        .filter(|(score, _)| *score > 0)
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    scored.dedup_by(|a, b| a.1 == b.1);
+    scored
+        .into_iter()
+        .take(5)
+        .map(|(_, id)| id.to_string())
+        .collect()
+}
+
+/// Execute `br doctor explain <finding-id|check-name>` and `--list`.
+///
+/// The finding registry (`CHECK_NAME_TO_FINDING_ID`) resolves the query to a
+/// check; the flat doctor checks are then run against the discovered
+/// workspace so the envelope reports what the check sees right now, and the
+/// fixer registry names the `--repair` invocation that addresses it.
 ///
 /// # Errors
 ///
-/// Returns [`BeadsError`] only on serialization fault.
-pub fn execute_explain(args: &DoctorExplainArgs, _repo_root: &Path) -> Result<()> {
-    #[derive(Serialize)]
-    struct Envelope<'a> {
-        schema_version: &'static str,
-        finding_id: &'a str,
-        title: &'a str,
-        evidence: &'static str,
-        remediation: Remediation,
-        note: &'static str,
-    }
-    #[derive(Serialize)]
-    struct Remediation {
-        command: String,
-        explain_command: String,
-        capabilities_url: &'static str,
-    }
-    let env = Envelope {
-        schema_version: EXPLAIN_SCHEMA,
-        finding_id: &args.finding_id,
-        title: "doctor explain — WP6 stub",
-        evidence: "The full evidence-expansion path is implemented in a later pass; \
-             this envelope pins the contract surface so agents can rely on it.",
-        remediation: Remediation {
-            command: "br doctor --repair --dry-run".to_string(),
-            explain_command: format!("br doctor explain {}", args.finding_id),
-            capabilities_url: "br doctor capabilities --format json",
-        },
-        note: "WP6 stub; consult the full diagnostic via `br doctor`.",
-    };
-    if args.json {
-        if let Ok(json) = serde_json::to_string_pretty(&env) {
-            println!("{json}");
+/// Unknown ids are a validation error (exit 4) whose message lists the
+/// nearest known ids; workspace resolution and check failures propagate.
+pub fn execute_explain(args: &DoctorExplainArgs, cli: &config::CliOverrides) -> Result<()> {
+    let caps = DoctorCapabilities::build();
+
+    if args.list {
+        #[derive(Serialize)]
+        struct ListEnvelope<'a> {
+            schema_version: &'static str,
+            findings: &'a [crate::cli::commands::doctor_subsystems::capabilities_doctor::FindingIdEntry],
         }
+        if args.json {
+            let json = serde_json::to_string_pretty(&ListEnvelope {
+                schema_version: EXPLAIN_SCHEMA,
+                findings: &caps.finding_id_map,
+            })
+            .map_err(BeadsError::Json)?;
+            println!("{json}");
+        } else {
+            for entry in &caps.finding_id_map {
+                println!("{:<56} {}", entry.finding_id, entry.check_name);
+            }
+        }
+        return Ok(());
+    }
+
+    let query = args
+        .finding_id
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    let Some(entry) = caps
+        .finding_id_map
+        .iter()
+        .find(|entry| entry.finding_id == query || entry.check_name == query)
+    else {
+        let nearest = nearest_finding_ids(&caps, query);
+        let hint = if nearest.is_empty() {
+            "run `br doctor explain --list` to see every finding id".to_string()
+        } else {
+            format!("nearest: {}", nearest.join(", "))
+        };
+        return Err(BeadsError::validation(
+            "finding_id",
+            format!("unknown finding id or check name '{query}'; {hint}"),
+        ));
+    };
+    let finding_id = entry.finding_id.to_string();
+    let check_name = entry.check_name.to_string();
+
+    let detector = caps
+        .detectors
+        .iter()
+        .find(|detector| detector.id == check_name);
+    let fixers: Vec<ExplainFixer> = caps
+        .fixers
+        .iter()
+        .filter(|fixer| {
+            fixer.filter_ids.iter().any(|id| *id == finding_id)
+                || fixer
+                    .addressed_findings
+                    .iter()
+                    .any(|name| *name == check_name)
+        })
+        .map(|fixer| {
+            let only = fixer
+                .filter_ids
+                .first()
+                .map_or_else(|| fixer.id.clone(), ToString::to_string);
+            ExplainFixer {
+                id: fixer.id.clone(),
+                subsystem: fixer.subsystem.clone(),
+                auto_fixable: fixer.auto_fixable,
+                mutates: fixer.mutates,
+                dry_run_command: format!("br doctor --repair --dry-run --only {only}"),
+                command: format!("br doctor --repair --only {only}"),
+            }
+        })
+        .collect();
+
+    let observation =
+        crate::cli::commands::doctor::observe_check_for_explain(cli, &check_name, &finding_id)?;
+    let (observed_status, message, details) = match observation {
+        crate::cli::commands::doctor::ExplainObservation::NoWorkspace => (
+            "no_workspace".to_string(),
+            Some("No .beads workspace found; run `br init` or `cd` into one".to_string()),
+            None,
+        ),
+        crate::cli::commands::doctor::ExplainObservation::NotObserved => (
+            "not_observed".to_string(),
+            Some(format!(
+                "The flat doctor run did not emit `{check_name}` for this workspace (the check may only run in --repair or in a mode this workspace does not trigger)"
+            )),
+            None,
+        ),
+        crate::cli::commands::doctor::ExplainObservation::Check(check) => (
+            check
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            check
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string),
+            check.get("details").cloned(),
+        ),
+    };
+
+    let mut next_commands = vec!["br doctor --json".to_string()];
+    next_commands.extend(fixers.iter().map(|fixer| fixer.dry_run_command.clone()));
+    next_commands.push(format!(
+        "br doctor capabilities --format json --command {check_name}"
+    ));
+
+    let envelope = ExplainEnvelope {
+        schema_version: EXPLAIN_SCHEMA,
+        finding_id,
+        check_name,
+        subsystem: detector.map(|d| d.subsystem.clone()),
+        severity_default: detector.map(|d| d.severity_default.clone()),
+        fast_path: detector.map(|d| d.fast_path),
+        observed_status,
+        observed_at: chrono::Utc::now().to_rfc3339(),
+        message,
+        details,
+        fixers,
+        next_commands,
+    };
+
+    if args.json {
+        let json = serde_json::to_string_pretty(&envelope).map_err(BeadsError::Json)?;
+        println!("{json}");
     } else {
-        println!("doctor explain {} (stub)", args.finding_id);
-        println!("  See: br doctor --repair --dry-run");
-        println!("  See: br doctor capabilities --format json");
+        println!("{} ({})", envelope.finding_id, envelope.check_name);
+        if let Some(subsystem) = &envelope.subsystem {
+            println!(
+                "  subsystem : {subsystem}  severity: {}  fast-path: {}",
+                envelope.severity_default.as_deref().unwrap_or("-"),
+                envelope
+                    .fast_path
+                    .map_or("-", |fast| if fast { "yes" } else { "no" })
+            );
+        }
+        println!("  observed  : {}", envelope.observed_status);
+        if let Some(message) = &envelope.message {
+            println!("  message   : {message}");
+        }
+        if let Some(details) = &envelope.details {
+            println!("  details   : {details}");
+        }
+        if envelope.fixers.is_empty() {
+            println!(
+                "  fixers    : none (advisory finding; resolve by hand or rerun after a repair)"
+            );
+        } else {
+            for fixer in &envelope.fixers {
+                println!(
+                    "  fixer     : {} (auto: {}, mutates: {}) -> {}",
+                    fixer.id, fixer.auto_fixable, fixer.mutates, fixer.dry_run_command
+                );
+            }
+        }
+        for command in &envelope.next_commands {
+            println!("  next      : {command}");
+        }
     }
     Ok(())
 }

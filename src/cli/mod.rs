@@ -3505,8 +3505,14 @@ pub struct DoctorMigrateSchemaUndoArgs {
 /// Arguments for `br doctor explain`.
 #[derive(Args, Debug, Clone)]
 pub struct DoctorExplainArgs {
-    /// Finding id (e.g. `fm-jsonl-tombstone-drift`).
-    pub finding_id: String,
+    /// Finding id (e.g. `fm-state_files-base-jsonl-missing-or-stale`) or the
+    /// check name it maps to (e.g. `base_jsonl`).
+    #[arg(required_unless_present = "list")]
+    pub finding_id: Option<String>,
+
+    /// List every known finding id with its check name and exit.
+    #[arg(long)]
+    pub list: bool,
 
     /// Emit JSON instead of text.
     #[arg(long)]

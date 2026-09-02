@@ -14,7 +14,7 @@ use crate::format::{
     IssueWithCounts, ListPage, TextFormatOptions, format_issue_line_with, format_issue_long_with,
     format_issue_pretty_with, terminal_width,
 };
-use crate::model::{IssueType, Priority, Status};
+use crate::model::{IssueType, Status};
 use crate::output::{IssueTable, IssueTableColumns, JsonArrayPageMeta, OutputContext, OutputMode};
 use crate::storage::ListFilters;
 use crate::storage::sqlite::ListRelationMetadata;
@@ -875,6 +875,7 @@ mod tests {
     use super::*;
     use crate::cli;
     use crate::model::Issue;
+    use crate::model::Priority;
     use chrono::Duration;
     use tracing::info;
 
