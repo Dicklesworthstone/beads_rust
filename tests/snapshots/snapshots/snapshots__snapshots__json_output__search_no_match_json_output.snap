@@ -4,5 +4,8 @@ expression: SnapshotJson(&normalize_json(&json))
 ---
 {
   "issues": [],
-  "hidden_closed_count": 0
+  "hidden_closed_count": 0,
+  "limit": 50,
+  "offset": 0,
+  "has_more": false
 }

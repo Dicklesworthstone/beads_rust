@@ -27,6 +27,7 @@ const EXPECTED_SCHEMA_NAMES: &[&str] = &[
     "IssueDetails",
     "IssueWithCounts",
     "ReadyIssue",
+    "SourceRepoPathMigrationReceipt",
     "StaleIssue",
     "Statistics",
     "SyncReconcileReceipt",
