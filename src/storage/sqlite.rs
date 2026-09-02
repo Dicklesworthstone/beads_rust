@@ -17269,8 +17269,8 @@ pub(crate) fn database_family_read_only_diffs(
         } else {
             suffix.clone()
         };
-        let before_bytes = before.get(suffix).and_then(|bytes| bytes.as_deref());
-        let after_bytes = after.get(suffix).and_then(|bytes| bytes.as_deref());
+        let before_bytes = before.get(suffix).and_then(Option::as_deref);
+        let after_bytes = after.get(suffix).and_then(Option::as_deref);
         match (before_bytes, after_bytes) {
             (None, None) => {}
             (Some(_), None) => diffs.push(FamilyByteDiff {
@@ -31293,9 +31293,7 @@ mod tests {
         }
         let wal = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
         assert!(
-            fs::metadata(&wal)
-                .map(|meta| meta.len() > 0)
-                .unwrap_or(false),
+            fs::metadata(&wal).is_ok_and(|meta| meta.len() > 0),
             "fixture must leave an uncheckpointed WAL"
         );
 
@@ -31376,7 +31374,11 @@ mod tests {
         drop(SqliteStorage::open(&db_path).unwrap());
 
         let probe = probe_read_only_open_is_observational(&db_path).unwrap();
-        assert_eq!(probe.skipped, None);
+        assert!(
+            probe.skipped.is_none(),
+            "probe was skipped: {:?}",
+            probe.skipped
+        );
         assert!(
             probe.opened,
             "a current-schema database must open read-only on the copy"

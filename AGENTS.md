@@ -377,6 +377,7 @@ self_update = ["dep:self_update"]   # Self-update from GitHub releases (rustls T
 
 - **Non-invasive by design** — `br` NEVER executes git commands automatically; all git operations are explicit user actions
 - **SQLite + JSONL hybrid** — Primary storage is SQLite for speed; JSONL export for git-based sync and human readability
+- **FrankenSQLite only, no C SQLite** — the engine decision, the August 2026 incident, the sole-opener checkpoint containment, the sidecar inventory, and the engine-bump checklist live in [docs/reliability/ENGINE_OPERATING_MODEL.md](docs/reliability/ENGINE_OPERATING_MODEL.md); read it before touching `fsqlite*` in `Cargo.toml`
 - **Content-addressed deduplication** — SHA-256 content hashes prevent duplicate issues across sync boundaries
 - **Hash-based short IDs** — e.g., `proj-abc12` (not auto-increment integers) for stable cross-repo references
 - **Go parity** — Rust `br` produces identical output to Go `bd` for equivalent inputs; conformance tests validate this
