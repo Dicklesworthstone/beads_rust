@@ -397,10 +397,7 @@ fn show_config_schema(format: OutputFormatBasic, json_mode: bool, ctx: &OutputCo
         }
         return;
     }
-    println!(
-        "{:<28} {:<10} {:<8} {}",
-        "KEY", "TYPE", "DEFAULT", "DESCRIPTION"
-    );
+    println!("{:<28} {:<10} {:<8} DESCRIPTION", "KEY", "TYPE", "DEFAULT");
     for spec in keys {
         println!(
             "{:<28} {:<10} {:<8} {}",
@@ -850,6 +847,23 @@ fn get_config_value(
 }
 
 /// Set a config value in project config (if available) or user config.
+/// The warning `br config set` prints for a key br does not read, naming
+/// the nearest known keys (or the schema command when nothing is close).
+fn unknown_config_key_warning(key: &str) -> Option<String> {
+    if crate::config::is_known_config_key(key) {
+        return None;
+    }
+    let nearest = crate::config::nearest_config_keys(key, 3);
+    let hint = if nearest.is_empty() {
+        "run `br config schema` to list the keys br reads".to_string()
+    } else {
+        format!("nearest known keys: {}", nearest.join(", "))
+    };
+    Some(format!(
+        "unknown config key '{key}': br does not read it; {hint}"
+    ))
+}
+
 fn set_config_value(
     args: &[String],
     _json_mode: bool,
@@ -879,19 +893,7 @@ fn set_config_value(
     // as `id.prefix`) used to succeed silently and change nothing. Warn on
     // stderr and name the nearest keys br actually reads; the write still
     // happens so ad-hoc tooling can stash its own keys.
-    let unknown_key_warning = if crate::config::is_known_config_key(key) {
-        None
-    } else {
-        let nearest = crate::config::nearest_config_keys(key, 3);
-        let hint = if nearest.is_empty() {
-            "run `br config schema` to list the keys br reads".to_string()
-        } else {
-            format!("nearest known keys: {}", nearest.join(", "))
-        };
-        Some(format!(
-            "unknown config key '{key}': br does not read it; {hint}"
-        ))
-    };
+    let unknown_key_warning = unknown_config_key_warning(key);
     if let Some(warning) = &unknown_key_warning {
         eprintln!("warning: {warning}");
     }

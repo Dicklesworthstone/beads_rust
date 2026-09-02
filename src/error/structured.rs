@@ -1241,7 +1241,7 @@ fn detect_priority_intent(input: &str) -> Option<&'static str> {
 /// Calculate the Levenshtein distance between two strings.
 ///
 /// This is used to find similar IDs when an issue is not found.
-pub(crate) fn levenshtein_distance(a: &str, b: &str) -> usize {
+pub fn levenshtein_distance(a: &str, b: &str) -> usize {
     let a_len = a.chars().count();
     let b_len = b.chars().count();
 

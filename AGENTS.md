@@ -74,26 +74,33 @@ We only use **Cargo** in this project, NEVER any other package manager.
 - **Edition:** Rust 2024 (nightly required — see `rust-toolchain.toml`)
 - **Dependency versions:** Explicit versions for stability
 - **Configuration:** Cargo.toml only (single crate, not a workspace)
-- **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]` via crate lints)
+- **Unsafe code:** Denied (`#![deny(unsafe_code)]` in `src/lib.rs` and `unsafe_code = "deny"` in Cargo.toml). Three sanctioned `#[allow(unsafe_code)]` carve-outs exist and are listed in the Cargo.toml lints comment; add none.
 
 ### Key Dependencies
 
+Every crate named here is a real `[dependencies]` entry (`tests/agents_md_contract.rs` checks).
+
 | Crate | Purpose |
 |-------|---------|
-| `clap` | CLI parsing with derive macros + shell completions |
-| `fsqlite` + `fsqlite-types` + `fsqlite-error` | SQLite engine facade plus shared storage types/errors (path dependencies) |
-| `serde` + `serde_json` | Issue serialization and JSONL export |
+| `clap` + `clap_complete` | CLI parsing with derive macros + shell completions |
+| `fsqlite` + `fsqlite-types` + `fsqlite-error` | FrankenSQLite engine facade plus shared storage types/errors (the whole `fsqlite-*` family is pinned to one version; see `docs/reliability/ENGINE_OPERATING_MODEL.md`) |
+| `serde` + `serde_json` + `serde_yml` | Issue serialization, JSONL export, YAML config |
 | `schemars` | JSON Schema generation for robot output |
 | `chrono` | Timestamp parsing and RFC3339 formatting |
-| `rich_rust` | Rich terminal output (panels, tables, colors) |
-| `toon_rust` | TOON format support for token-efficient schema viewing |
+| `rich_rust` | Rich terminal output (panels, tables, Markdown, colors) |
+| `toon_rust` | TOON format support for token-efficient output |
 | `crossterm` + `indicatif` | Terminal control and progress spinners |
 | `anyhow` + `thiserror` | Error handling (anyhow for CLI, thiserror for typed errors) |
-| `sha2` | Content hashing for deduplication |
+| `sha1` + `sha2` | Content hashing for deduplication and witnesses |
 | `regex` | Pattern matching for search and validation |
 | `semver` | Semantic version parsing |
-| `tracing` | Structured logging and diagnostics |
-| `self_update` | Self-update from GitHub releases (optional, feature-gated) |
+| `tracing` + `tracing-subscriber` | Structured logging and diagnostics |
+| `rustix` + `libc` + `signal-hook` | Flagged renames (`renameat2`), opener-lease locks, SIGPIPE handling |
+| `tempfile` | Throwaway workspaces (`br doctor --selftest`) and atomic temp files |
+| `shell-words` + `similar` + `unicode-width` | Argument splitting, diffs, terminal width |
+| `fastmcp-rust` | MCP stdio server (`br serve`; optional, `mcp` feature) |
+| `self_update` + `self-replace` | Self-update from GitHub releases (optional, `self_update` feature) |
+| `vergen-gix` (build) | Build metadata in `br --version`; `build.rs` also emits `BR_FSQLITE_VERSION` from Cargo.lock |
 
 ### Release Profile
 
@@ -235,99 +242,117 @@ Provides lightweight issue tracking with dependency graphs, priority-based triag
 ### Architecture
 
 ```
-CLI (clap derive)
+CLI (clap derive; src/cli/mod.rs + src/main.rs startup/dispatch)
     │
-    ├── Commands ────── 35+ subcommands (create, list, show, close, dep, sync, ...)
+    ├── Commands ────── 47 top-level subcommands (create, list, show, close, dep, sync, doctor, ...)
     │                       │
     │                       ▼
-    ├── Storage ─────── SQLite (fsqlite stack)
+    ├── Storage ─────── FrankenSQLite (fsqlite stack), src/storage/sqlite.rs
     │                       │
-    │                       ├── Schema (migrations, JSONL ↔ SQLite sync)
-    │                       ├── Events (append-only audit log)
-    │                       └── Queries (filtered list, ready, search, graph)
+    │                       ├── Schema (migrations; src/storage/schema.rs)
+    │                       └── Events (append-only audit log; src/storage/events.rs)
     │
     ├── Sync ───────── JSONL import/export (git-friendly, no auto-git)
     │                       │
     │                       ├── Path resolution (.beads/ discovery)
-    │                       └── History (snapshot restore, prune)
+    │                       ├── History (snapshot restore, prune)
+    │                       ├── Witness (read-only JSONL witness)
+    │                       └── DB inode lock (shared opener lease)
     │
-    ├── Model ──────── Issue, Dependency, Comment, Event, Label
-    │                       │
-    │                       └── Content hashing (SHA-256 dedup)
+    ├── Model ──────── Issue, Dependency, Comment, Event, Label, acceptance items
     │
-    ├── Config ─────── Layered config (file + env + CLI flags)
-    │                       │
-    │                       └── Routing (project-aware config resolution)
+    ├── Config ─────── Layered config (file + env + CLI flags) + routing
     │
-    ├── Format ─────── Rich (panels, tables, colors), Plain, CSV, Markdown, Syntax
+    ├── Policy ─────── close_policy.rs, policy.rs (workflow gates, capacity), coordination.rs
     │
-    ├── Output ─────── Mode detection (TTY → Rich, pipe → Plain, --json → JSON)
-    │                       │
-    │                       └── Components (reusable output widgets)
+    ├── Format/Output ─ Rich (panels, tables, Markdown), Plain, JSON, TOON, CSV
+    │
+    ├── MCP ────────── src/mcp/ (br serve; optional `mcp` feature)
     │
     ├── Validation ─── Input validation (titles, IDs, priorities, dates)
     │
-    └── Error ──────── Structured errors with exit codes (BeadsError + ErrorCode)
+    └── Error ──────── Structured errors with exit codes (BeadsError + ErrorCode + hints)
 ```
 
 ### Project Structure
 
+Every `src/*.rs` file and `src/*/` directory is listed here; `tests/agents_md_contract.rs`
+fails when a module is added without a row (or a listed path disappears).
+
 ```
 beads_rust/
 ├── Cargo.toml                     # Single crate (not a workspace)
+├── build.rs                       # vergen build metadata + BR_FSQLITE_VERSION from Cargo.lock
 ├── src/
-│   ├── main.rs                    # CLI entry point, clap dispatch
-│   ├── lib.rs                     # Library root, module declarations
+│   ├── main.rs                    # CLI entry point: startup, write lock, dispatch
+│   ├── lib.rs                     # Library root, module declarations, crate lints
 │   ├── cli/
-│   │   ├── mod.rs                 # CLI argument parsing, output mode detection
-│   │   └── commands/              # 35+ subcommand implementations
+│   │   ├── mod.rs                 # Clap argument structs, output mode detection
+│   │   └── commands/              # One file per subcommand + doctor_subsystems/
 │   ├── model/
-│   │   └── mod.rs                 # Issue, Dependency, Comment, Event, Label types
+│   │   ├── mod.rs                 # Issue, Dependency, Comment, Event, Label types
+│   │   └── acceptance.rs          # Acceptance-criteria item parsing (check/uncheck/add)
 │   ├── storage/
 │   │   ├── mod.rs                 # Storage trait
-│   │   ├── sqlite.rs              # SQLite backend (181KB — the core engine)
+│   │   ├── sqlite.rs              # FrankenSQLite backend (the core engine)
 │   │   ├── schema.rs              # DDL migrations
-│   │   ├── events.rs              # Append-only audit log
-│   │   └── queries/               # Reusable query fragments
+│   │   └── events.rs              # Append-only audit log
 │   ├── sync/
-│   │   ├── mod.rs                 # JSONL import/export (176KB)
+│   │   ├── mod.rs                 # JSONL import/export, publication, reconcile
 │   │   ├── path.rs                # .beads/ directory discovery
-│   │   └── history.rs             # Snapshot restore and prune
+│   │   ├── history.rs             # Snapshot restore and prune
+│   │   ├── witness.rs             # Read-only JSONL witness
+│   │   └── db_inode_lock.rs       # Shared opener lease / database-family authority
 │   ├── config/
-│   │   ├── mod.rs                 # Layered configuration
+│   │   ├── mod.rs                 # Layered configuration + known-key registry
 │   │   └── routing.rs             # Project-aware config resolution
 │   ├── error/
 │   │   ├── mod.rs                 # BeadsError enum
-│   │   ├── structured.rs          # StructuredError with ErrorCode + exit codes
+│   │   ├── structured.rs          # StructuredError with ErrorCode, exit codes, hints
 │   │   └── context.rs             # Error context helpers
 │   ├── format/
 │   │   ├── mod.rs                 # Format module root
-│   │   ├── rich.rs                # Rich terminal output (panels, tables)
 │   │   ├── text.rs                # Plain text formatting
 │   │   ├── csv.rs                 # CSV export
-│   │   ├── markdown.rs            # Markdown formatting
-│   │   ├── syntax.rs              # Syntax highlighting
-│   │   ├── theme.rs               # Color themes
-│   │   ├── context.rs             # Format context (width, mode)
-│   │   └── output.rs              # Output helpers
+│   │   ├── markdown.rs            # Markdown detection/escaping (contains_markdown is live)
+│   │   ├── output.rs              # Output helpers
+│   │   ├── rich.rs                # DORMANT (see docs/ARCHITECTURE.md decision table)
+│   │   ├── syntax.rs              # DORMANT
+│   │   └── theme.rs               # DORMANT (output/theme.rs is the live theme)
 │   ├── output/
-│   │   ├── mod.rs                 # Output mode detection (Rich/Plain/JSON/Quiet)
+│   │   ├── mod.rs                 # Output mode detection (Rich/Plain/JSON/TOON/Quiet)
 │   │   ├── context.rs             # Output context
 │   │   ├── theme.rs               # Output theming
-│   │   └── components/            # Reusable output widgets
+│   │   └── components/            # Issue panel, issue table, dep tree, progress, stats
+│   ├── mcp/
+│   │   ├── mod.rs                 # br serve (stdio MCP server; `mcp` feature)
+│   │   ├── tools.rs               # 7 tools
+│   │   ├── resources.rs           # beads:// resources
+│   │   └── prompts.rs             # Guided prompts
 │   ├── validation/
-│   │   └── mod.rs                 # Input validation rules
+│   │   └── mod.rs                 # Input validation rules, priority filter parser
 │   ├── util/
 │   │   ├── mod.rs                 # Utility module root
-│   │   ├── id.rs                  # Hash-based short ID generation
+│   │   ├── id.rs                  # Hash-based short ID generation and resolution
 │   │   ├── hash.rs                # SHA-256 content hashing
 │   │   ├── time.rs                # Timestamp parsing/formatting
 │   │   ├── progress.rs            # Progress spinners
 │   │   └── markdown_import.rs     # Markdown file import
-│   └── logging.rs                 # tracing-subscriber setup
-├── tests/                         # Integration, conformance, property, regression tests
+│   ├── close_policy.rs            # Close-time policy gates (policy.yaml)
+│   ├── policy.rs                  # Workflow policy model (gates, capacity)
+│   ├── coordination.rs            # br coordination status (stale-claim diagnosis)
+│   ├── health.rs                  # Workspace health vocabulary
+│   ├── inheritance.rs             # Inherited context (BR_INHERITED_CONTEXT)
+│   ├── franken_sync.rs            # Sync helpers over the fsqlite connection
+│   ├── shutdown.rs                # Cooperative shutdown and exit_process
+│   ├── logging.rs                 # tracing-subscriber setup
+│   ├── cache.rs                   # DORMANT (zero references)
+│   ├── write_combining.rs         # DORMANT (design artifact; bench-only)
+│   └── release_public_key.bin     # Minisign public key for self-update verification
+├── tests/                         # Integration, conformance, property, regression, e2e_scripts/
 ├── benches/                       # Criterion benchmarks
-├── docs/                          # Architecture, CLI reference, troubleshooting
+├── scripts/                       # test-shard.sh, bump-version.sh, stress, release helpers
+├── docs/                          # Architecture, CLI reference, reliability, plans
 └── .beads/                        # Self-tracked issues (beads tracking beads)
 ```
 

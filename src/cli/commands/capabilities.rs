@@ -15,6 +15,9 @@ struct CapabilitiesOutput {
     tool: &'static str,
     version: &'static str,
     contract_version: &'static str,
+    /// Compile-time Cargo features of this binary, so an agent can tell
+    /// whether `br serve` or `br upgrade` exist before trying them.
+    build_features: BuildFeatures,
     features: &'static [FeatureCapability],
     commands: Vec<CommandCapability>,
     global_flags: &'static [FlagCapability],
@@ -32,6 +35,20 @@ struct FeatureCapability {
     name: &'static str,
     description: &'static str,
 }
+
+/// Cargo features compiled into this binary.
+#[derive(Debug, Serialize)]
+struct BuildFeatures {
+    /// `br serve` (stdio MCP server) is available.
+    mcp: bool,
+    /// `br upgrade` can download releases.
+    self_update: bool,
+}
+
+const BUILD_FEATURES: BuildFeatures = BuildFeatures {
+    mcp: cfg!(feature = "mcp"),
+    self_update: cfg!(feature = "self_update"),
+};
 
 #[derive(Debug, Serialize)]
 struct CommandCapability {
@@ -291,6 +308,7 @@ pub fn execute(args: &CapabilitiesArgs, outer_ctx: &OutputContext) -> Result<()>
         tool: "br",
         version: env!("CARGO_PKG_VERSION"),
         contract_version: CONTRACT_VERSION,
+        build_features: BUILD_FEATURES,
         features: FEATURES,
         commands: command_capabilities(),
         global_flags: GLOBAL_FLAGS,

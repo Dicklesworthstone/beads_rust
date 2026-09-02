@@ -8977,24 +8977,6 @@ fn check_permissions_beads_dir(beads_dir: &Path, checks: &mut Vec<CheckResult>) 
     }
 }
 
-/// Detector: `.beads/config.yaml` parses cleanly as YAML. Pass-1
-/// archaeology filed `fm-configs-yaml-malformed` (P1): a malformed
-/// project config short-circuits every `br` invocation at startup
-/// with an opaque error and no localization. The doctor surfaces the
-/// parse error with line/column context so the operator can fix it
-/// without grepping unfamiliar code paths.
-///
-/// Detect-only. The doctor never auto-rewrites `config.yaml`: there's
-/// no algorithmic way to know what the operator INTENDED to write, so
-/// the safe action is to report + advise.
-///
-/// Status mapping:
-/// - `ok` — `config.yaml` missing (project config is optional) OR
-///   parses cleanly as YAML.
-/// - `warn` — file exists but `serde_yml::from_str` returns a parse
-///   error. Surfaces the error message + the offending file path so
-///   the operator can open the file and fix the line `serde_yml`
-///   names.
 /// Collect the dotted leaf keys of a YAML mapping (`sync.auto_flush`, ...).
 fn flatten_yaml_keys(value: &serde_yml::Value, prefix: &str, out: &mut Vec<String>) {
     let Some(mapping) = value.as_mapping() else {
@@ -9069,6 +9051,24 @@ fn check_config_unknown_keys(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     );
 }
 
+/// Detector: `.beads/config.yaml` parses cleanly as YAML. Pass-1
+/// archaeology filed `fm-configs-yaml-malformed` (P1): a malformed
+/// project config short-circuits every `br` invocation at startup
+/// with an opaque error and no localization. The doctor surfaces the
+/// parse error with line/column context so the operator can fix it
+/// without grepping unfamiliar code paths.
+///
+/// Detect-only. The doctor never auto-rewrites `config.yaml`: there's
+/// no algorithmic way to know what the operator INTENDED to write, so
+/// the safe action is to report + advise.
+///
+/// Status mapping:
+/// - `ok` — `config.yaml` missing (project config is optional) OR
+///   parses cleanly as YAML.
+/// - `warn` — file exists but `serde_yml::from_str` returns a parse
+///   error. Surfaces the error message + the offending file path so
+///   the operator can open the file and fix the line `serde_yml`
+///   names.
 fn check_config_yaml(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     let config_path = beads_dir.join("config.yaml");
 

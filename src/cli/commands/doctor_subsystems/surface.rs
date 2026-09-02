@@ -1995,7 +1995,7 @@ struct ExplainEnvelope {
 fn nearest_finding_ids(caps: &DoctorCapabilities, query: &str) -> Vec<String> {
     let needle = query.trim().to_ascii_lowercase();
     let tokens: Vec<&str> = needle
-        .split(|c: char| c == '-' || c == '_' || c == '.' || c == ' ')
+        .split(['-', '_', '.', ' '])
         .filter(|token| token.len() >= 3 && *token != "fm")
         .collect();
     let mut scored: Vec<(usize, &str)> = caps
@@ -2033,24 +2033,7 @@ pub fn execute_explain(args: &DoctorExplainArgs, cli: &config::CliOverrides) -> 
     let caps = DoctorCapabilities::build();
 
     if args.list {
-        #[derive(Serialize)]
-        struct ListEnvelope<'a> {
-            schema_version: &'static str,
-            findings: &'a [crate::cli::commands::doctor_subsystems::capabilities_doctor::FindingIdEntry],
-        }
-        if args.json {
-            let json = serde_json::to_string_pretty(&ListEnvelope {
-                schema_version: EXPLAIN_SCHEMA,
-                findings: &caps.finding_id_map,
-            })
-            .map_err(BeadsError::Json)?;
-            println!("{json}");
-        } else {
-            for entry in &caps.finding_id_map {
-                println!("{:<56} {}", entry.finding_id, entry.check_name);
-            }
-        }
-        return Ok(());
+        return print_explain_list(&caps, args.json);
     }
 
     let query = args
@@ -2081,31 +2064,7 @@ pub fn execute_explain(args: &DoctorExplainArgs, cli: &config::CliOverrides) -> 
         .detectors
         .iter()
         .find(|detector| detector.id == check_name);
-    let fixers: Vec<ExplainFixer> = caps
-        .fixers
-        .iter()
-        .filter(|fixer| {
-            fixer.filter_ids.iter().any(|id| *id == finding_id)
-                || fixer
-                    .addressed_findings
-                    .iter()
-                    .any(|name| *name == check_name)
-        })
-        .map(|fixer| {
-            let only = fixer
-                .filter_ids
-                .first()
-                .map_or_else(|| fixer.id.clone(), ToString::to_string);
-            ExplainFixer {
-                id: fixer.id.clone(),
-                subsystem: fixer.subsystem.clone(),
-                auto_fixable: fixer.auto_fixable,
-                mutates: fixer.mutates,
-                dry_run_command: format!("br doctor --repair --dry-run --only {only}"),
-                command: format!("br doctor --repair --only {only}"),
-            }
-        })
-        .collect();
+    let fixers = explain_fixers(&caps, &finding_id, &check_name);
 
     let observation =
         crate::cli::commands::doctor::observe_check_for_explain(cli, &check_name, &finding_id)?;
@@ -2161,40 +2120,98 @@ pub fn execute_explain(args: &DoctorExplainArgs, cli: &config::CliOverrides) -> 
         let json = serde_json::to_string_pretty(&envelope).map_err(BeadsError::Json)?;
         println!("{json}");
     } else {
-        println!("{} ({})", envelope.finding_id, envelope.check_name);
-        if let Some(subsystem) = &envelope.subsystem {
-            println!(
-                "  subsystem : {subsystem}  severity: {}  fast-path: {}",
-                envelope.severity_default.as_deref().unwrap_or("-"),
-                envelope
-                    .fast_path
-                    .map_or("-", |fast| if fast { "yes" } else { "no" })
-            );
-        }
-        println!("  observed  : {}", envelope.observed_status);
-        if let Some(message) = &envelope.message {
-            println!("  message   : {message}");
-        }
-        if let Some(details) = &envelope.details {
-            println!("  details   : {details}");
-        }
-        if envelope.fixers.is_empty() {
-            println!(
-                "  fixers    : none (advisory finding; resolve by hand or rerun after a repair)"
-            );
-        } else {
-            for fixer in &envelope.fixers {
-                println!(
-                    "  fixer     : {} (auto: {}, mutates: {}) -> {}",
-                    fixer.id, fixer.auto_fixable, fixer.mutates, fixer.dry_run_command
-                );
-            }
-        }
-        for command in &envelope.next_commands {
-            println!("  next      : {command}");
+        print_explain_text(&envelope);
+    }
+    Ok(())
+}
+
+/// `br doctor explain --list`: every finding id with its check name.
+fn print_explain_list(caps: &DoctorCapabilities, json: bool) -> Result<()> {
+    #[derive(Serialize)]
+    struct ListEnvelope<'a> {
+        schema_version: &'static str,
+        findings:
+            &'a [crate::cli::commands::doctor_subsystems::capabilities_doctor::FindingIdEntry],
+    }
+    if json {
+        let json = serde_json::to_string_pretty(&ListEnvelope {
+            schema_version: EXPLAIN_SCHEMA,
+            findings: &caps.finding_id_map,
+        })
+        .map_err(BeadsError::Json)?;
+        println!("{json}");
+    } else {
+        for entry in &caps.finding_id_map {
+            println!("{:<56} {}", entry.finding_id, entry.check_name);
         }
     }
     Ok(())
+}
+
+/// The fixers that can act on a finding, with the exact repair commands.
+fn explain_fixers(
+    caps: &DoctorCapabilities,
+    finding_id: &str,
+    check_name: &str,
+) -> Vec<ExplainFixer> {
+    caps.fixers
+        .iter()
+        .filter(|fixer| {
+            fixer.filter_ids.iter().any(|id| id == finding_id)
+                || fixer
+                    .addressed_findings
+                    .iter()
+                    .any(|name| name == check_name)
+        })
+        .map(|fixer| {
+            let only = fixer
+                .filter_ids
+                .first()
+                .map_or_else(|| fixer.id.clone(), ToString::to_string);
+            ExplainFixer {
+                id: fixer.id.clone(),
+                subsystem: fixer.subsystem.clone(),
+                auto_fixable: fixer.auto_fixable,
+                mutates: fixer.mutates,
+                dry_run_command: format!("br doctor --repair --dry-run --only {only}"),
+                command: format!("br doctor --repair --only {only}"),
+            }
+        })
+        .collect()
+}
+
+/// Human rendering of the explain envelope.
+fn print_explain_text(envelope: &ExplainEnvelope) {
+    println!("{} ({})", envelope.finding_id, envelope.check_name);
+    if let Some(subsystem) = &envelope.subsystem {
+        println!(
+            "  subsystem : {subsystem}  severity: {}  fast-path: {}",
+            envelope.severity_default.as_deref().unwrap_or("-"),
+            envelope
+                .fast_path
+                .map_or("-", |fast| if fast { "yes" } else { "no" })
+        );
+    }
+    println!("  observed  : {}", envelope.observed_status);
+    if let Some(message) = &envelope.message {
+        println!("  message   : {message}");
+    }
+    if let Some(details) = &envelope.details {
+        println!("  details   : {details}");
+    }
+    if envelope.fixers.is_empty() {
+        println!("  fixers    : none (advisory finding; resolve by hand or rerun after a repair)");
+    } else {
+        for fixer in &envelope.fixers {
+            println!(
+                "  fixer     : {} (auto: {}, mutates: {}) -> {}",
+                fixer.id, fixer.auto_fixable, fixer.mutates, fixer.dry_run_command
+            );
+        }
+    }
+    for command in &envelope.next_commands {
+        println!("  next      : {command}");
+    }
 }
 
 // =============================================================================

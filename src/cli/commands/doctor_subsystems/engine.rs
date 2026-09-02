@@ -112,9 +112,12 @@ fn opener_lease(db_path: &Path) -> Option<OpenerLease> {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(".br-db-openers-") && name.ends_with(".lock"))
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("lock"))
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".br-db-openers-"))
         })
         .collect();
     leases.sort();
