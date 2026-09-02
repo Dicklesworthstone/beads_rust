@@ -148,6 +148,33 @@ publishes from the tag.
   through the CLI and `issues.jsonl` -- 06d738e5. `br capabilities`
   reports `build_features` (`mcp`, `self_update`).
 
+### Sync: history knobs, per-mutation I/O, comment identity (#484, #485, #486)
+
+- The per-mutation auto-flush (CLI and `br serve`) honors
+  `sync.history_enabled: false` and `BR_HISTORY_MIN_INTERVAL_SECS` again;
+  since bff86a41 it had snapshotted `.br_history` with the compiled-in
+  defaults on every mutation, and only `br sync --flush-only` respected the
+  knobs. One resolver, `config::resolved_history_config_from_layer`, feeds
+  every exporter (#484) -- d03b2230.
+- A one-line `br update` on an existing `issues.jsonl` reads the file once
+  (one immutable snapshot feeds the conflict scan, the change scan, the
+  replacement writer, and the history backup), verifies the staged output
+  by digest instead of re-parsing every issue, proves the rename by inode
+  instead of re-hashing, and deduplicates history from the digest stored in
+  the snapshot's `.meta.json`; previously 11 full reads and 2 fsync'd
+  writes. Read commands prove freshness with a `stat` against the new
+  `jsonl_fast_witness` metadata (content hash bound to size, mtime, ctime,
+  device, inode) instead of hashing the whole JSONL on every start; a
+  same-size rewrite with a restored mtime is still detected because the
+  ctime moves (#485) -- 07e60d95, 58d70456.
+- Comment identity for sync is the payload `(issue, created_at, author,
+  text)`, not the per-database rowid: two clones that each add a comment
+  both mint id 1, and the merged JSONL now imports on both sides (the id
+  that collides is reassigned locally) instead of refusing (`main`) or
+  rolling back every command (v0.5.7). The 34ca862b cross-issue
+  duplicate-id guard is removed; same-issue duplicates are still rejected
+  (#486) -- 07e60d95.
+
 ### Engine: FrankenSQLite 0.3.13 -> 0.3.15
 
 - 0.3.14 (ebc34bd7): generation-tagged checkpoint backfill watermark (the

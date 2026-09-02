@@ -669,7 +669,7 @@ fn jsonl_line_for(path: &std::path::Path, id: &str) -> String {
         .expect("read issues.jsonl")
         .lines()
         .find(|line| line.contains(&needle))
-        .unwrap_or_else(|| panic!("no JSONL line for {id}"))
+        .expect("issues.jsonl must contain a line for the requested issue id")
         .to_string()
 }
 
@@ -679,6 +679,7 @@ fn jsonl_line_for(path: &std::path::Path, id: &str) -> String {
 /// it must succeed on both clones (never refuse, never roll back), and the
 /// documented "renumber one side" remedy must not break the other clone.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_comments_colliding_ids_from_two_clones_import_on_both_sides() {
     let _log = common::test_log("e2e_comments_colliding_ids_from_two_clones_import_on_both_sides");
     let clone_a = BrWorkspace::new();
