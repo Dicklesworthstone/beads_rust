@@ -88,9 +88,22 @@ publishes from the tag.
   identical value stay silent (#467) -- d461a399. `--check-acceptance`,
   `--uncheck-acceptance`, and `--add-acceptance` tick, untick, and append
   acceptance items in place without `--force` (#477) -- c96c6623.
+  `--append-notes <TEXT>` appends a line to `notes` without rewriting the
+  field (repeatable, idempotent on re-run, conflicts with `--notes`, never
+  needs `--force`); `--json` reports the resulting field (#480).
+- The #467 guard is proportional to what a write would lose (#481): a
+  whole-field write that keeps at least half the current length passes
+  (with a warning when it also keeps fewer than half the current words);
+  clearing the field or shrinking it below half its length still needs
+  `--force`, and the refusal states the ratio.
 - `br sync --reconcile-additive --dry-run` is reachable and plan mode no
   longer hangs; the reviewed sync modes accept `--dry-run` (#473) --
   d461a399.
+- JSONL import into an empty database (every `--no-db` invocation, first
+  imports, rebuilds) proves the relation tables empty once and skips the
+  per-record relation probe; import phases log elapsed times at `-vv`, and
+  the `--no-db` rebuild shows progress on an interactive stderr instead of
+  waiting silently (#483).
 - `br list --tree` groups children under their parents with tree connectors
   in text output (#475) -- d461a399.
 - Sync preserves authoritative cross-issue comment IDs (d2393c99) and rejects

@@ -46,6 +46,24 @@ These are explicit design non-goals for the sync command. `br sync` will never:
 5. **Auto-commit changes** - Every git operation requires explicit user action
 6. **Connect to external services** - Offline-first, no network calls
 
+### Writing your own pre-commit hook
+
+If you add a hook that flushes and stages `.beads/issues.jsonl`, make it
+respect path-limited commits. `git commit --only <path>` and
+`git commit <path>` build the commit from a temporary index
+(`$GIT_INDEX_FILE` is `.git/next-index-<pid>.lock`), and a `git add` inside
+the hook widens that commit beyond the paths the caller named. Skip the
+staging step in that mode; the flush itself is still safe:
+
+```sh
+#!/bin/sh
+br sync --flush-only --quiet || exit 1
+case "$(basename "${GIT_INDEX_FILE:-index}")" in
+  next-index-*) exit 0 ;;   # path-limited commit: do not widen it
+esac
+git add .beads/issues.jsonl
+```
+
 Other explicitly requested br commands have their own scope: for example,
 `br changelog`, `br orphans`, and commit-activity `br stats` inspect git
 history, while `br agents`, `br doctor --repair`, `br config`, and `br

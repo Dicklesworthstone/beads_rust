@@ -78,7 +78,7 @@ These options apply to all commands:
 | `--no-auto-import` | Skip automatic import check |
 | `--allow-stale` | Allow stale DB (bypass freshness check warning) |
 | `--lock-timeout <LOCK_TIMEOUT>` | SQLite busy/write-lock timeout in milliseconds |
-| `--no-db` | JSONL-only mode (no DB connection) |
+| `--no-db` | JSONL-only mode (no DB connection). Every invocation rebuilds a private in-memory database from the whole JSONL, so the cost grows with the workspace (a few seconds per few thousand records; progress is shown on an interactive stderr). For large workspaces prefer the default database-backed mode, which imports once and answers from SQLite |
 | `-v, --verbose` | Increase logging verbosity (-v, -vv) |
 | `-q, --quiet` | Quiet mode (errors only) |
 | `--no-color` | Disable colored output |
@@ -384,7 +384,8 @@ br update [OPTIONS] [IDS]...
 | `--check-acceptance <ITEMS>` | Tick acceptance checklist items in place: 1-based numbers (`1,4,5`) or a text selector matching exactly one item; repeatable; atomic; never needs `--force` |
 | `--uncheck-acceptance <ITEMS>` | Untick acceptance checklist items in place (same selectors) |
 | `--add-acceptance <TEXT>` | Append an unchecked `- [ ] TEXT` criterion without rewriting the field; repeatable |
-| `--notes <TEXT>` | Update additional notes |
+| `--notes <TEXT>` | Update additional notes (whole field) |
+| `--append-notes <TEXT>` | Append a line to notes without rewriting the field: existing bytes are kept, the text starts on a new line (the field is created when empty); repeatable; re-running the same append is a no-op; conflicts with `--notes`; never needs `--force` |
 | `--transition-comment <TEXT>` | Add a fresh comment atomically with a status transition |
 | `-s, --status <STATUS>` | Change status |
 | `-p, --priority <N>` | Change priority |
@@ -392,7 +393,7 @@ br update [OPTIONS] [IDS]...
 | `--assignee <NAME>` | Assign (empty string clears) |
 | `--owner <EMAIL>` | Set owner (empty string clears) |
 | `--claim` | Atomic claim (assignee=actor + status=in_progress) |
-| `--force` | Force update even if issue is blocked; also required to replace a non-empty description/design/acceptance-criteria/notes/agent-context value with different content |
+| `--force` | Force update even if issue is blocked; also required for a destructive rewrite of a non-empty description/design/acceptance-criteria/notes/agent-context value (see the overwrite guard below) |
 | `--due <DATE>` | Set due date (empty string clears) |
 | `--defer <DATE>` | Set defer date (empty string clears) |
 | `--estimate <MINUTES>` | Set time estimate |
@@ -416,7 +417,31 @@ br update bd-abc123 bd-def456 -p 1
 
 # Add labels
 br update bd-abc123 --add-label "urgent,reviewed"
+
+# Append to notes without rewriting the field (never needs --force)
+br update bd-abc123 --append-notes "decision: keep the WAL until the migration is verified"
 ```
+
+**Overwrite guard for accumulating text fields (#467, #481).** `description`,
+`design`, `acceptance_criteria`, `notes`, and `agent_context` build up over an
+issue's life and are often supplied from shell variables, where an unset
+variable or a truncated heredoc silently destroys the field. A whole-field
+write (`--description`, `--design`, `--acceptance-criteria`, `--notes`,
+`--agent-context`) is therefore classified by what it would lose, per field
+and per issue, using only the current and incoming values:
+
+| Incoming value | Outcome |
+|---|---|
+| Field is empty, or the value is identical | Written silently |
+| Keeps at least half the current length (in characters) and at least half the current words | Written silently (a revision) |
+| Keeps at least half the length but fewer than half the words | Written, with a warning naming both lengths (a rewrite of comparable size) |
+| Empty, or shorter than half the current length | Refused without `--force` (a destructive shrink) |
+
+The refusal names the issue, the field, both lengths, and the percentage of
+the current length the incoming value keeps; in `--json` mode the `hint`
+field carries the fix. `--force` unlocks every guarded field for that call, so
+prefer the in-place flags that never need it: `--append-notes`,
+`--add-acceptance`, `--check-acceptance`, `--uncheck-acceptance`.
 
 ---
 

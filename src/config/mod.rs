@@ -5309,7 +5309,21 @@ fn open_storage_with_startup_config_impl(
                 allow_external_jsonl,
             );
             import_config.skip_prefix_validation = true;
-            import_from_jsonl_snapshot(&mut storage, source, &import_config, Some(&prefix))?;
+            // JSONL-only mode rebuilds this private database from the whole
+            // JSONL on every invocation, which is seconds for a few thousand
+            // records. Show the import progress on an interactive stderr so
+            // the wait is never silent (GitHub #483); machine callers with a
+            // redirected stderr, and `--quiet`, see nothing.
+            import_config.show_progress =
+                !cli.quiet.unwrap_or(false) && std::io::stderr().is_terminal();
+            let import_started = std::time::Instant::now();
+            let import_result =
+                import_from_jsonl_snapshot(&mut storage, source, &import_config, Some(&prefix))?;
+            tracing::debug!(
+                imported = import_result.imported_count,
+                elapsed_ms = import_started.elapsed().as_millis(),
+                "Built the private JSONL-only database"
+            );
         }
         if let Some(authority) = jsonl_write_authority.as_ref() {
             authority.verify_jsonl_authority()?;

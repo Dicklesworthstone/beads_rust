@@ -13553,13 +13553,14 @@ fn stream_import_actions_in_tx(
     metadata: &ImportMetadataMaps,
     base_result: &ImportResult,
     progress: &indicatif::ProgressBar,
-    fresh_relation_tables_proven_empty: bool,
+    relation_tables_proven_empty: bool,
 ) -> Result<ImportResult> {
     let mut tx_result = base_result.clone();
     let mut seen_external_refs = HashSet::new();
     let mut export_hash_batch = Vec::with_capacity(IMPORT_EXPORT_HASH_BATCH_SIZE);
     let mut export_hash_ids = HashSet::new();
     let mut uncertified_local_wins = 0usize;
+    let stream_started = Instant::now();
 
     progress.set_position(0);
     storage.clear_all_export_hashes_in_tx()?;
@@ -13609,7 +13610,7 @@ fn stream_import_actions_in_tx(
                 &action,
                 &issue,
                 &mut tx_result,
-                fresh_relation_tables_proven_empty,
+                relation_tables_proven_empty,
             )?;
 
             if let Some((export_id, export_hash)) = export_hash_entry_for_import_action(
@@ -13645,6 +13646,11 @@ fn stream_import_actions_in_tx(
         );
         storage.set_metadata_in_tx("needs_flush", "true")?;
     }
+    tracing::debug!(
+        elapsed_ms = stream_started.elapsed().as_millis(),
+        insert_only_relations = relation_tables_proven_empty,
+        "Import phase: issue rows, relations, and export hashes written"
+    );
 
     let orphans_cleaned = cleanup_import_orphans_in_tx(storage)?;
     if orphans_cleaned > 0 {
@@ -13654,10 +13660,26 @@ fn stream_import_actions_in_tx(
         );
         tx_result.orphan_cleaned_count = orphans_cleaned;
     }
+    tracing::debug!(
+        elapsed_ms = stream_started.elapsed().as_millis(),
+        "Import phase: orphan cleanup done"
+    );
 
     tx_result.blocked_cache_entries = storage.rebuild_blocked_cache_in_tx()?;
+    tracing::debug!(
+        elapsed_ms = stream_started.elapsed().as_millis(),
+        "Import phase: blocked cache rebuilt"
+    );
     tx_result.child_counter_entries = storage.rebuild_child_counters_in_tx()?;
+    tracing::debug!(
+        elapsed_ms = stream_started.elapsed().as_millis(),
+        "Import phase: child counters rebuilt"
+    );
     verify_applied_import_issue_semantics(storage, &tx_result.applied_issues)?;
+    tracing::debug!(
+        elapsed_ms = stream_started.elapsed().as_millis(),
+        "Import phase: applied rows re-read and verified"
+    );
 
     Ok(tx_result)
 }
@@ -13835,9 +13857,15 @@ fn import_from_jsonl_snapshot_impl(
     ensure_no_conflict_markers_snapshot(source)?;
 
     // Step 2: Parse, Normalize, Validate, and collect minimal rename state.
+    let import_started = Instant::now();
     let spinner = create_spinner("Parsing and validating issues", config.show_progress);
     let validation_plan = collect_import_validation_plan(source, config, expected_prefix)?;
     spinner.finish_with_message("Parsed and validated issues");
+    tracing::debug!(
+        records = validation_plan.record_count,
+        elapsed_ms = import_started.elapsed().as_millis(),
+        "Import phase: parsed and validated JSONL"
+    );
 
     let mut result = ImportResult::default();
 
@@ -13883,9 +13911,22 @@ fn import_from_jsonl_snapshot_impl(
         "Importing issues",
         config.show_progress,
     );
+    tracing::debug!(
+        elapsed_ms = import_started.elapsed().as_millis(),
+        "Import phase: collision plan ready; applying rows"
+    );
 
     let apply_result = storage.with_write_transaction(|storage| -> Result<ImportResult> {
-        let fresh_relation_tables_proven_empty = if let Some(witness) = fresh_witness.as_ref() {
+        // One query proves that no owned relation rows (labels, dependencies,
+        // comments) exist anywhere yet. When it holds, every inserted issue
+        // can take the insert-only relation path instead of probing its own
+        // relation rows first: for a fresh replacement that is the reviewed
+        // contract, and for a JSONL-only (`--no-db`) open, which imports the
+        // whole JSONL into a private empty database on every invocation, it
+        // removes one round trip per record (GitHub #483). The proof is made
+        // inside this write transaction, so nothing can add relation rows
+        // between it and the inserts.
+        let relation_tables_proven_empty = if let Some(witness) = fresh_witness.as_ref() {
             storage.verify_fresh_database_replacement_witness(witness)?;
             if !storage.import_relation_tables_are_globally_empty_in_tx()? {
                 return Err(BeadsError::SyncConflict {
@@ -13895,7 +13936,7 @@ fn import_from_jsonl_snapshot_impl(
             }
             true
         } else {
-            false
+            storage.import_relation_tables_are_globally_empty_in_tx()?
         };
         let tx_result = stream_import_actions_in_tx(
             storage,
@@ -13907,7 +13948,7 @@ fn import_from_jsonl_snapshot_impl(
             &metadata,
             &result,
             &progress,
-            fresh_relation_tables_proven_empty,
+            relation_tables_proven_empty,
         )?;
 
         storage.set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
@@ -13916,9 +13957,18 @@ fn import_from_jsonl_snapshot_impl(
 
         Ok(tx_result)
     });
+    tracing::debug!(
+        elapsed_ms = import_started.elapsed().as_millis(),
+        committed = apply_result.is_ok(),
+        "Import phase: write transaction finished"
+    );
 
     let validate_foreign_keys = apply_result.is_ok();
     let fk_restore_result = restore_foreign_keys_after_import(storage, validate_foreign_keys);
+    tracing::debug!(
+        elapsed_ms = import_started.elapsed().as_millis(),
+        "Import phase: foreign keys restored and verified"
+    );
 
     match finish_import_after_foreign_key_restore(apply_result, fk_restore_result) {
         Ok(import_result) => {
@@ -13956,13 +14006,13 @@ fn process_import_action(
     action: &CollisionAction,
     issue: &Issue,
     result: &mut ImportResult,
-    fresh_relation_tables_proven_empty: bool,
+    relation_tables_proven_empty: bool,
 ) -> Result<()> {
     match action {
         CollisionAction::Insert => {
             let inserted = insert_new_import_issue(storage, issue)?;
             if inserted
-                && (fresh_relation_tables_proven_empty
+                && (relation_tables_proven_empty
                     || !storage.has_owned_relation_rows_for_import(&issue.id)?)
             {
                 storage.insert_new_issue_relations_for_import_in_tx(issue)?;
@@ -21403,6 +21453,147 @@ mod tests {
             storage.get_labels("bd-fresh").unwrap(),
             vec!["fresh".to_string()]
         );
+    }
+
+    /// Build a JSONL workspace of `count` issues shaped like a real task
+    /// queue: every third issue closed, each with one label and up to three
+    /// `blocks` dependencies on earlier issues (GitHub #483).
+    fn write_scale_jsonl(jsonl_path: &Path, count: usize) {
+        let mut body = String::new();
+        for index in 0..count {
+            let id = format!("bd-{index:05x}");
+            let mut issue = make_test_issue(&id, &format!("Task {index}"));
+            issue.status = if index % 3 == 0 {
+                Status::Closed
+            } else {
+                Status::Open
+            };
+            issue.labels = vec![format!("l{}", index % 7)];
+            issue.dependencies = (1..=(index % 4).min(index))
+                .map(|offset| Dependency {
+                    issue_id: id.clone(),
+                    depends_on_id: format!("bd-{:05x}", index - offset),
+                    dep_type: DependencyType::Blocks,
+                    created_at: issue.created_at,
+                    created_by: Some("gen".to_string()),
+                    metadata: None,
+                    thread_id: None,
+                })
+                .collect();
+            body.push_str(&serde_json::to_string(&issue).unwrap());
+            body.push('\n');
+        }
+        fs::write(jsonl_path, body).unwrap();
+    }
+
+    /// GitHub #483: an import into a database whose relation tables are
+    /// empty (the `--no-db` private database, or any first import) takes
+    /// the insert-only relation path without a fresh-replacement witness,
+    /// and a later import into the now-populated database still syncs
+    /// relations (replace, not duplicate).
+    #[test]
+    fn import_into_empty_relation_tables_is_insert_only_and_reimport_syncs() {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join("issues.jsonl");
+        write_scale_jsonl(&jsonl_path, 12);
+        let source = capture_jsonl_source_snapshot(&jsonl_path).unwrap();
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let config = ImportConfig {
+            skip_prefix_validation: true,
+            ..ImportConfig::default()
+        };
+
+        let result = import_from_jsonl_snapshot(&mut storage, &source, &config, None).unwrap();
+        assert_eq!(result.created_count, 12);
+        assert_eq!(result.labels_imported, 12);
+        assert_eq!(
+            result.dependencies_imported,
+            1 + 2 + 3 + 0 + 1 + 2 + 3 + 0 + 1 + 2 + 3
+        );
+        assert_eq!(
+            storage.get_labels("bd-00007").unwrap(),
+            vec!["l0".to_string()]
+        );
+        let mut deps = storage.get_dependencies("bd-00007").unwrap();
+        deps.sort();
+        assert_eq!(deps, vec!["bd-00004", "bd-00005", "bd-00006"]);
+        // Blocked cache reflects the imported graph: bd-00007 is blocked by
+        // its open predecessors (00004 and 00005; 00006 is closed).
+        assert!(result.blocked_cache_entries > 0);
+
+        // Second import of a changed JSONL into the populated database: the
+        // relation tables are no longer empty, so the sync path runs and
+        // replaces rather than appends.
+        let mut changed = make_test_issue("bd-00007", "Task 7 revised");
+        changed.labels = vec!["renamed".to_string()];
+        changed.updated_at = changed.updated_at + chrono::Duration::seconds(60);
+        changed.dependencies = vec![Dependency {
+            issue_id: "bd-00007".to_string(),
+            depends_on_id: "bd-00001".to_string(),
+            dep_type: DependencyType::Blocks,
+            created_at: changed.created_at,
+            created_by: Some("gen".to_string()),
+            metadata: None,
+            thread_id: None,
+        }];
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&changed).unwrap()),
+        )
+        .unwrap();
+        let source = capture_jsonl_source_snapshot(&jsonl_path).unwrap();
+        let result = import_from_jsonl_snapshot(&mut storage, &source, &config, None).unwrap();
+        assert_eq!(result.updated_count, 1);
+        assert_eq!(
+            storage.get_labels("bd-00007").unwrap(),
+            vec!["renamed".to_string()]
+        );
+        assert_eq!(
+            storage.get_dependencies("bd-00007").unwrap(),
+            vec!["bd-00001".to_string()]
+        );
+        assert_eq!(
+            storage.get_labels("bd-00006").unwrap(),
+            vec!["l6".to_string()]
+        );
+    }
+
+    /// GitHub #483 scale check for the JSONL-only path: a 3k-record
+    /// dependency graph imports into a private empty database, and the
+    /// phase timings are logged at debug level. Run explicitly with
+    /// `cargo test --lib no_db_scale_import -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "scale timing probe; run explicitly"]
+    fn no_db_scale_import_phase_timing() {
+        crate::logging::init_test_logging();
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join("issues.jsonl");
+        write_scale_jsonl(&jsonl_path, 3031);
+        let source = capture_jsonl_source_snapshot(&jsonl_path).unwrap();
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let config = ImportConfig {
+            skip_prefix_validation: true,
+            ..ImportConfig::default()
+        };
+        let started = Instant::now();
+        let result = import_from_jsonl_snapshot(&mut storage, &source, &config, None).unwrap();
+        let elapsed = started.elapsed();
+        println!(
+            "no-db scale import: {} issues, {} deps, {} blocked, {:?}",
+            result.created_count,
+            result.dependencies_imported,
+            result.blocked_cache_entries,
+            elapsed
+        );
+        assert_eq!(result.created_count, 3031);
+        let ready = storage
+            .get_ready_issues(
+                &crate::storage::ReadyFilters::default(),
+                crate::storage::ReadySortPolicy::default(),
+            )
+            .unwrap();
+        println!("ready issues: {} in {:?}", ready.len(), started.elapsed());
+        assert!(!ready.is_empty());
     }
 
     #[test]

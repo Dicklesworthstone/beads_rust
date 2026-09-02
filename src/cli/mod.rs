@@ -1268,6 +1268,21 @@ pub struct UpdateArgs {
     #[arg(long, allow_hyphen_values = true)]
     pub notes: Option<String>,
 
+    /// Append TEXT to notes without rewriting the field (GitHub #480).
+    ///
+    /// Existing notes are kept byte-for-byte; TEXT goes on a new line after
+    /// them (creating the field when empty). Repeatable, like `--add-label`;
+    /// several values are appended as consecutive lines. Re-running the
+    /// same append is a no-op when the field already ends with that text.
+    /// Append-only, so this never needs `--force`.
+    #[arg(
+        long,
+        value_name = "TEXT",
+        conflicts_with = "notes",
+        allow_hyphen_values = true
+    )]
+    pub append_notes: Vec<String>,
+
     /// New comment bound atomically to the requested status transition.
     /// Required when policy lists `transition_comment` for the transition.
     #[arg(long, value_name = "COMMENT", allow_hyphen_values = true)]
@@ -1299,9 +1314,11 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub claim: bool,
 
-    /// Force update even if issue is blocked, and allow replacing a
-    /// non-empty description/design/acceptance-criteria/notes/agent-context
-    /// value with different content (GitHub #467)
+    /// Force update even if issue is blocked, and allow a destructive
+    /// rewrite of a non-empty description/design/acceptance-criteria/
+    /// notes/agent-context value: clearing it, or replacing it with content
+    /// shorter than half its current length (GitHub #467, #481). Revisions
+    /// that keep at least half the length pass without this flag.
     #[arg(long)]
     pub force: bool,
 

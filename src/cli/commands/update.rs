@@ -50,6 +50,11 @@ struct UpdatedIssueOutput {
     /// remaining count without a follow-up `br show`.
     #[serde(skip_serializing_if = "Option::is_none")]
     acceptance_criteria: Option<AcceptanceCriteriaOutput>,
+    /// Resulting notes field, present only when the call used
+    /// `--append-notes` (GitHub #480), so the caller can confirm what was
+    /// appended without a follow-up `br show`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notes: Option<NotesAppendOutput>,
 }
 
 impl From<&Issue> for UpdatedIssueOutput {
@@ -63,8 +68,95 @@ impl From<&Issue> for UpdatedIssueOutput {
             owner: issue.owner.clone(),
             updated_at: issue.updated_at,
             acceptance_criteria: None,
+            notes: None,
         }
     }
+}
+
+/// Structured notes state after `--append-notes` (GitHub #480).
+#[derive(Debug, Clone, Serialize)]
+struct NotesAppendOutput {
+    /// The block this call asked to append (several values joined by `\n`).
+    appended: String,
+    /// False when the field already ended with `appended`, in which case
+    /// nothing was written (idempotent re-run).
+    applied: bool,
+    chars_before: usize,
+    chars_after: usize,
+    /// The complete resulting notes field.
+    text: String,
+}
+
+/// Per-issue plan for `--append-notes`, computed from the issue's current
+/// field before anything is written (GitHub #480).
+#[derive(Debug, Clone)]
+struct NotesAppendPlan {
+    id: String,
+    output: NotesAppendOutput,
+}
+
+/// Join the current notes and an appended block: the current bytes are kept
+/// verbatim, the block starts on its own line, and no separator is invented
+/// when the field is empty or already ends with a newline.
+fn append_notes_body(current: &str, appended: &str) -> String {
+    if current.is_empty() || current.ends_with('\n') {
+        format!("{current}{appended}")
+    } else {
+        format!("{current}\n{appended}")
+    }
+}
+
+/// True when `current` already ends with `appended` as a whole block (the
+/// entire field, or preceded by a line break), so appending it again would
+/// only duplicate the last append.
+fn notes_already_end_with(current: &str, appended: &str) -> bool {
+    current
+        .strip_suffix(appended)
+        .is_some_and(|head| head.is_empty() || head.ends_with('\n'))
+}
+
+fn plan_notes_appends(
+    storage: &SqliteStorage,
+    ids: &[String],
+    args: &UpdateArgs,
+) -> Result<Vec<NotesAppendPlan>> {
+    if args.append_notes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if args.append_notes.iter().any(|text| text.trim().is_empty()) {
+        return Err(BeadsError::validation(
+            "append-notes",
+            "text to append must not be empty",
+        ));
+    }
+    let appended = args.append_notes.join("\n");
+
+    let mut plans = Vec::with_capacity(ids.len());
+    for id in ids {
+        let Some(issue) = storage.get_issue(id)? else {
+            // Missing targets are reported by validate_mutable_target_issues.
+            continue;
+        };
+        let current = issue.notes.unwrap_or_default();
+        let chars_before = current.chars().count();
+        let (applied, text) = if notes_already_end_with(&current, &appended) {
+            (false, current)
+        } else {
+            (true, append_notes_body(&current, &appended))
+        };
+        let chars_after = text.chars().count();
+        plans.push(NotesAppendPlan {
+            id: id.clone(),
+            output: NotesAppendOutput {
+                appended: appended.clone(),
+                applied,
+                chars_before,
+                chars_after,
+                text,
+            },
+        });
+    }
+    Ok(plans)
 }
 
 /// Structured acceptance-checklist state after an in-place edit (GitHub #477).
@@ -252,6 +344,9 @@ enum UpdateRenderItem {
         /// Acceptance checklist state to print after the field diff when the
         /// call used the in-place acceptance flags (GitHub #477).
         acceptance: Option<Box<AcceptanceCriteriaOutput>>,
+        /// Notes append result to print when the call used `--append-notes`
+        /// (GitHub #480).
+        notes: Option<Box<NotesAppendOutput>>,
     },
     NoUpdates {
         id: String,
@@ -291,6 +386,11 @@ struct PreparedUpdateRoute {
     resolved_parent: ParentUpdatePlan,
     /// In-place acceptance-checklist edits, one per target issue (GitHub #477).
     acceptance_edits: Vec<AcceptanceEditPlan>,
+    /// `--append-notes` plans, one per target issue (GitHub #480).
+    notes_appends: Vec<NotesAppendPlan>,
+    /// Non-fatal notes from the #467/#481 overwrite guard: whole-field
+    /// rewrites that keep the field's size but little of its content.
+    overwrite_advisories: Vec<String>,
     auto_flush_external: bool,
     /// Tier 1 attribution (issue #312, Layer 3 capture-only) staged onto each
     /// mutation's audit events. Recorded only — never gated or enforced on.
@@ -593,14 +693,22 @@ fn prepare_single_route(
         || args.parent.is_some()
         || !args.check_acceptance.is_empty()
         || !args.uncheck_acceptance.is_empty()
-        || !args.add_acceptance.is_empty();
+        || !args.add_acceptance.is_empty()
+        || !args.append_notes.is_empty();
 
     validate_mutable_target_issues(&storage_ctx.storage, &resolved_ids, has_updates)?;
-    validate_text_field_overwrite_guard(&storage_ctx.storage, &resolved_ids, &update, args.force)?;
-    // In-place checklist edits are planned from the current field value and
-    // deliberately sit outside the #467 overwrite guard: they cannot destroy
-    // content, so they must never need `--force` (GitHub #477).
+    let overwrite_advisories = validate_text_field_overwrite_guard(
+        &storage_ctx.storage,
+        &resolved_ids,
+        &update,
+        args.force,
+    )?;
+    // In-place checklist edits and notes appends are planned from the
+    // current field value and deliberately sit outside the #467 overwrite
+    // guard: they cannot destroy content, so they must never need `--force`
+    // (GitHub #477, #480).
     let acceptance_edits = plan_acceptance_edits(&storage_ctx.storage, &resolved_ids, args)?;
+    let notes_appends = plan_notes_appends(&storage_ctx.storage, &resolved_ids, args)?;
 
     // Validate labels before making any database changes
     for label in &args.add_label {
@@ -642,6 +750,8 @@ fn prepare_single_route(
         valid_set_labels,
         resolved_parent,
         acceptance_edits,
+        notes_appends,
+        overwrite_advisories,
         auto_flush_external,
         attribution: EventAttribution::new(
             args.agent_name.as_deref(),
@@ -660,6 +770,10 @@ fn execute_prepared_route(
 ) -> Result<UpdateRouteOutput> {
     if can_use_bulk_label_only_route(&prepared) {
         return execute_bulk_label_only_route(prepared, ctx);
+    }
+
+    for advisory in &prepared.overwrite_advisories {
+        ctx.warning(advisory);
     }
 
     let mut updated_issues: Vec<UpdatedIssueOutput> = Vec::new();
@@ -698,9 +812,17 @@ fn execute_prepared_route(
             .map(|plan| (plan.id.clone(), plan))
             .collect();
     let has_acceptance_writes = acceptance_edits.values().any(|plan| plan.changed);
+    // Notes appends are likewise per issue: each was joined onto that
+    // issue's own current field (GitHub #480).
+    let notes_appends: HashMap<String, NotesAppendPlan> =
+        std::mem::take(&mut prepared.notes_appends)
+            .into_iter()
+            .map(|plan| (plan.id.clone(), plan))
+            .collect();
+    let has_notes_writes = notes_appends.values().any(|plan| plan.output.applied);
 
     let mut capacity_warnings = Vec::new();
-    if !prepared.update.is_empty() || has_acceptance_writes {
+    if !prepared.update.is_empty() || has_acceptance_writes || has_notes_writes {
         let mut issue_update = prepared.update.clone();
         issue_update.skip_cache_rebuild = defer_blocked_cache_rebuild;
         let atomic_updates = prepared
@@ -710,6 +832,9 @@ fn execute_prepared_route(
                 let mut per_issue = issue_update.clone();
                 if let Some(plan) = acceptance_edits.get(id).filter(|plan| plan.changed) {
                     per_issue.acceptance_criteria = Some(Some(plan.edit.body.clone()));
+                }
+                if let Some(plan) = notes_appends.get(id).filter(|plan| plan.output.applied) {
+                    per_issue.notes = Some(Some(plan.output.text.clone()));
                 }
                 (!per_issue.is_empty()).then(|| (id.clone(), per_issue))
             })
@@ -830,11 +955,13 @@ fn execute_prepared_route(
         let acceptance_state = acceptance_edits
             .get(id)
             .map(|plan| AcceptanceCriteriaOutput::from_edit(&plan.edit));
+        let notes_state = notes_appends.get(id).map(|plan| plan.output.clone());
 
         if use_machine_output {
             if let Some(ref issue) = issue_after {
                 let mut output = UpdatedIssueOutput::from(issue);
                 output.acceptance_criteria = acceptance_state;
+                output.notes = notes_state;
                 updated_issues.push(output);
             }
         } else if use_human_output && prepared.has_updates {
@@ -863,6 +990,7 @@ fn execute_prepared_route(
                 title,
                 diff: Box::new(diff),
                 acceptance: acceptance_state.map(Box::new),
+                notes: notes_state.map(Box::new),
             });
         } else if use_human_output {
             render_items.push(UpdateRenderItem::NoUpdates { id: id.clone() });
@@ -904,6 +1032,7 @@ fn can_use_bulk_label_only_route(prepared: &PreparedUpdateRoute) -> bool {
     (add_only || remove_only)
         && prepared.update.is_empty()
         && prepared.acceptance_edits.is_empty()
+        && prepared.notes_appends.is_empty()
         && !prepared.set_labels
         && matches!(prepared.resolved_parent, ParentUpdatePlan::Unchanged)
 }
@@ -978,6 +1107,7 @@ fn execute_bulk_label_only_route(
                 title: issue.map_or_else(String::new, |issue| issue.title.clone()),
                 diff: Box::new(UpdateDiff::default()),
                 acceptance: None,
+                notes: None,
             });
         } else if use_human_output {
             render_items.push(UpdateRenderItem::NoUpdates { id: id.clone() });
@@ -1233,6 +1363,26 @@ fn print_acceptance_state(id: &str, state: &AcceptanceCriteriaOutput) {
     println!("{}", parts.join(" · "));
 }
 
+/// Render the result of `--append-notes` (GitHub #480): what was appended and
+/// the field's size afterwards, or that the append was skipped because the
+/// field already ended with that text.
+fn print_notes_append_state(state: &NotesAppendOutput) {
+    let lines = state.text.lines().count();
+    let plural = if lines == 1 { "" } else { "s" };
+    if state.applied {
+        println!(
+            "  notes: appended {} chars (now {lines} line{plural}, {} chars)",
+            state.appended.chars().count(),
+            state.chars_after
+        );
+    } else {
+        println!(
+            "  notes: already ends with the requested text; nothing appended ({lines} line{plural}, {} chars)",
+            state.chars_after
+        );
+    }
+}
+
 fn print_render_items(render_items: &[UpdateRenderItem]) {
     for item in render_items {
         match item {
@@ -1241,10 +1391,14 @@ fn print_render_items(render_items: &[UpdateRenderItem]) {
                 title,
                 diff,
                 acceptance,
+                notes,
             } => {
                 print_update_summary(id, title, diff.as_ref());
                 if let Some(state) = acceptance {
                     print_acceptance_state(id, state);
+                }
+                if let Some(state) = notes {
+                    print_notes_append_state(state);
                 }
             }
             UpdateRenderItem::NoUpdates { id } => println!("{}", no_updates_human_line(id)),
@@ -1359,24 +1513,116 @@ fn validate_mutable_target_issues(
     Ok(())
 }
 
-/// Refuse to silently overwrite a non-empty accumulating text field
-/// (GitHub #467).
+/// Below this share of the current length, a replacement is treated as
+/// destructive and refused without `--force` (GitHub #481). Expressed in
+/// percent so the comparison stays in integer arithmetic.
+const OVERWRITE_GUARD_MIN_LENGTH_PERCENT: usize = 50;
+
+/// A replacement that passes the length tier but keeps fewer than this share
+/// of the current field's words is allowed with an advisory naming both
+/// lengths, so a wrong-variable rewrite of comparable size is still visible.
+const OVERWRITE_GUARD_ADVISORY_RETENTION_PERCENT: usize = 50;
+
+/// How the #467 overwrite guard classifies replacing a text field's current
+/// value with an incoming one (GitHub #481).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverwriteTier {
+    /// Empty field, or identical content: nothing can be lost.
+    Safe,
+    /// Keeps at least half the length and at least half the words.
+    Revision,
+    /// Keeps at least half the length but fewer than half the words: allowed,
+    /// but reported.
+    Rewrite {
+        current_chars: usize,
+        incoming_chars: usize,
+        retained_words: usize,
+        total_words: usize,
+    },
+    /// Clears the field or shrinks it below half its current length: refused
+    /// without `--force`.
+    Destructive {
+        current_chars: usize,
+        incoming_chars: usize,
+    },
+}
+
+/// Count how many of `current`'s whitespace-separated words survive in
+/// `incoming` (multiset intersection), returning `(retained, total)`.
+/// Deterministic and linear, so it is safe on fields of any size.
+fn retained_word_count(current: &str, incoming: &str) -> (usize, usize) {
+    let mut available: HashMap<&str, usize> = HashMap::new();
+    for word in incoming.split_whitespace() {
+        *available.entry(word).or_insert(0) += 1;
+    }
+    let mut total = 0usize;
+    let mut retained = 0usize;
+    for word in current.split_whitespace() {
+        total += 1;
+        if let Some(count) = available.get_mut(word)
+            && *count > 0
+        {
+            *count -= 1;
+            retained += 1;
+        }
+    }
+    (retained, total)
+}
+
+/// Classify one field replacement. The rule is deterministic and depends
+/// only on the two values:
+///
+/// 1. empty current, or identical incoming: [`OverwriteTier::Safe`];
+/// 2. incoming empty, or shorter than half the current length (in chars):
+///    [`OverwriteTier::Destructive`];
+/// 3. otherwise, fewer than half of the current words kept:
+///    [`OverwriteTier::Rewrite`]; else [`OverwriteTier::Revision`].
+fn classify_text_field_overwrite(current: &str, incoming: &str) -> OverwriteTier {
+    if current.is_empty() || incoming == current {
+        return OverwriteTier::Safe;
+    }
+    let current_chars = current.chars().count();
+    let incoming_chars = incoming.chars().count();
+    if incoming_chars * 100 < current_chars * OVERWRITE_GUARD_MIN_LENGTH_PERCENT {
+        return OverwriteTier::Destructive {
+            current_chars,
+            incoming_chars,
+        };
+    }
+    let (retained_words, total_words) = retained_word_count(current, incoming);
+    if retained_words * 100 < total_words * OVERWRITE_GUARD_ADVISORY_RETENTION_PERCENT {
+        return OverwriteTier::Rewrite {
+            current_chars,
+            incoming_chars,
+            retained_words,
+            total_words,
+        };
+    }
+    OverwriteTier::Revision
+}
+
+/// Refuse to silently destroy a non-empty accumulating text field
+/// (GitHub #467), proportionally to what the write would lose (GitHub #481).
 ///
 /// `description`, `design`, `acceptance_criteria`, `notes`, and
 /// `agent_context` build up over an issue's life and are frequently supplied
 /// from shell variables in scripted/agent flows, where a typo, truncated
-/// heredoc, or unset variable silently destroys the whole field. Replacing a
-/// non-empty value with *different* content (including clearing it) now
-/// requires `--force`; writing into an empty field and re-writing the
-/// identical value stay silent so legitimate idempotent scripts keep working.
+/// heredoc, or unset variable silently destroys the whole field. Those
+/// failures all shrink the field severely, so that is the case that requires
+/// `--force`: clearing it, or replacing it with content shorter than half its
+/// current length. A revision that keeps at least half the length passes;
+/// when it also keeps fewer than half the current words it is reported as an
+/// advisory (returned here, printed by the caller) rather than refused.
+/// Writing into an empty field and re-writing the identical value stay
+/// silent so legitimate idempotent scripts keep working.
 fn validate_text_field_overwrite_guard(
     storage: &SqliteStorage,
     ids: &[String],
     update: &IssueUpdate,
     force: bool,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     if force {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let requested: [(&str, Option<&Option<String>>); 5] = [
         ("description", update.description.as_ref()),
@@ -1386,9 +1632,10 @@ fn validate_text_field_overwrite_guard(
         ("agent_context", update.agent_context.as_ref()),
     ];
     if requested.iter().all(|(_, value)| value.is_none()) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut violations = Vec::new();
+    let mut advisories = Vec::new();
     for id in ids {
         let Some(issue) = storage.get_issue(id)? else {
             continue;
@@ -1406,31 +1653,43 @@ fn validate_text_field_overwrite_guard(
                 _ => unreachable!(),
             }
             .unwrap_or("");
-            if current.is_empty() {
-                continue; // empty -> value is always safe
-            }
             let incoming = new_value.as_deref().unwrap_or("");
-            if incoming == current {
-                continue; // value -> same value is a no-op
+            match classify_text_field_overwrite(current, incoming) {
+                OverwriteTier::Safe | OverwriteTier::Revision => {}
+                OverwriteTier::Rewrite {
+                    current_chars,
+                    incoming_chars,
+                    retained_words,
+                    total_words,
+                } => advisories.push(format!(
+                    "{id}: replacing '{field}' ({current_chars} chars) with different content \
+                     ({incoming_chars} chars) that keeps {retained_words} of {total_words} words; \
+                     run `br show {id}` if that was not intended"
+                )),
+                OverwriteTier::Destructive {
+                    current_chars,
+                    incoming_chars,
+                } => violations.push(format!(
+                    "{id}: refusing to overwrite non-empty '{field}' ({current_chars} chars) with {} without --force",
+                    if incoming_chars == 0 {
+                        "an empty value".to_string()
+                    } else {
+                        format!(
+                            "different content ({incoming_chars} chars, {}% of the current length)",
+                            incoming_chars * 100 / current_chars
+                        )
+                    },
+                )),
             }
-            violations.push(format!(
-                "{id}: refusing to overwrite non-empty '{field}' ({} chars) with {} without --force",
-                current.chars().count(),
-                if incoming.is_empty() {
-                    "an empty value".to_string()
-                } else {
-                    format!("different content ({} chars)", incoming.chars().count())
-                },
-            ));
         }
     }
     if violations.is_empty() {
-        return Ok(());
+        return Ok(advisories);
     }
     Err(BeadsError::validation_with_hint(
         "update",
         violations.join("\n"),
-        "These fields accumulate context: pass --force to replace the value, or run `br show <id>` first to read what is there.",
+        "These fields accumulate context: a write that clears the field or keeps less than half its length needs --force; run `br show <id>` first to read what is there, or use --append-notes / --add-acceptance to extend instead of replace.",
     ))
 }
 
@@ -2114,6 +2373,331 @@ mod tests {
         validate_text_field_overwrite_guard(&storage, &ids, &status_only, false).unwrap();
     }
 
+    // === Magnitude-tiered overwrite guard (GitHub #481) ===
+
+    const GUARD_PROSE: &str = "The importer must keep every comment id stable across a merge, \
+because downstream tooling links to them.\n\n- [ ] schema migration applied\n\
+- [ ] rollback path exercised\n- [ ] telemetry counter emitted\n";
+
+    #[test]
+    fn overwrite_tiers_are_proportional_to_what_is_lost() {
+        init_test_logging();
+        // Identical / empty current: safe.
+        assert_eq!(
+            classify_text_field_overwrite(GUARD_PROSE, GUARD_PROSE),
+            OverwriteTier::Safe
+        );
+        assert_eq!(
+            classify_text_field_overwrite("", "anything"),
+            OverwriteTier::Safe
+        );
+
+        // Ticking four boxes in place (the #481 worked example): a revision.
+        let ticked = GUARD_PROSE.replace("- [ ]", "- [x]");
+        assert_eq!(
+            classify_text_field_overwrite(GUARD_PROSE, &ticked),
+            OverwriteTier::Revision
+        );
+        // Appending a paragraph: growth is a revision too.
+        let grown = format!("{GUARD_PROSE}\nAlso verify the WAL is truncated afterwards.\n");
+        assert_eq!(
+            classify_text_field_overwrite(GUARD_PROSE, &grown),
+            OverwriteTier::Revision
+        );
+
+        // Truncation to a fragment (bad heredoc / truncated read): destructive.
+        let current_chars = GUARD_PROSE.chars().count();
+        match classify_text_field_overwrite(GUARD_PROSE, "The importer must") {
+            OverwriteTier::Destructive {
+                current_chars: reported,
+                incoming_chars,
+            } => {
+                assert_eq!(reported, current_chars);
+                assert_eq!(incoming_chars, 17);
+            }
+            other => panic!("expected destructive tier, got {other:?}"),
+        }
+        // Clearing: destructive.
+        assert!(matches!(
+            classify_text_field_overwrite(GUARD_PROSE, ""),
+            OverwriteTier::Destructive {
+                incoming_chars: 0,
+                ..
+            }
+        ));
+
+        // Comparable size but almost none of the words kept (wrong variable):
+        // allowed with an advisory.
+        let unrelated: String = "lorem ipsum dolor sit amet consectetur adipiscing elit "
+            .repeat(4)
+            .chars()
+            .take(current_chars)
+            .collect();
+        match classify_text_field_overwrite(GUARD_PROSE, &unrelated) {
+            OverwriteTier::Rewrite {
+                retained_words,
+                total_words,
+                ..
+            } => {
+                assert_eq!(retained_words, 0);
+                assert!(total_words > 10);
+            }
+            other => panic!("expected rewrite tier, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overwrite_length_boundary_is_exactly_half() {
+        init_test_logging();
+        // 20-char field; both halves are unrelated words so only length decides
+        // between destructive and the (advisory) rewrite tier.
+        let current = "aaaa bbbb cccc dddd ";
+        assert_eq!(current.chars().count(), 20);
+        assert!(matches!(
+            classify_text_field_overwrite(current, "xxxx yyyy "), // 10 chars: exactly half
+            OverwriteTier::Rewrite { .. }
+        ));
+        assert!(matches!(
+            classify_text_field_overwrite(current, "xxxx yyyy"), // 9 chars: below half
+            OverwriteTier::Destructive { .. }
+        ));
+        // Retention boundary: exactly half the words kept is a revision.
+        assert_eq!(
+            classify_text_field_overwrite(current, "aaaa bbbb xxxx yyyy "),
+            OverwriteTier::Revision
+        );
+        assert!(matches!(
+            classify_text_field_overwrite(current, "aaaa xxxx yyyy zzzz "),
+            OverwriteTier::Rewrite { .. }
+        ));
+        // Multiset semantics: a repeated word only counts as retained as many
+        // times as the incoming text contains it.
+        assert_eq!(retained_word_count("a a a b", "a b c"), (2, 4));
+        // Chars, not bytes: multibyte content is measured the same way.
+        assert_eq!(
+            classify_text_field_overwrite("ééééééééé", "éééé"),
+            OverwriteTier::Destructive {
+                current_chars: 9,
+                incoming_chars: 4
+            }
+        );
+    }
+
+    #[test]
+    fn overwrite_guard_passes_revisions_and_reports_rewrites() {
+        init_test_logging();
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = Issue {
+            id: "bd-tier".to_string(),
+            title: "tier test".to_string(),
+            issue_type: IssueType::Task,
+            priority: Priority::MEDIUM,
+            description: Some(GUARD_PROSE.to_string()),
+            ..Default::default()
+        };
+        storage.create_issue(&issue, "tester").unwrap();
+        let ids = vec!["bd-tier".to_string()];
+
+        // Revision: no --force, no advisory.
+        let revision = IssueUpdate {
+            description: Some(Some(GUARD_PROSE.replace("- [ ]", "- [x]"))),
+            ..Default::default()
+        };
+        assert!(
+            validate_text_field_overwrite_guard(&storage, &ids, &revision, false)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Rewrite of comparable size: passes with one advisory naming lengths.
+        let rewrite = IssueUpdate {
+            description: Some(Some(
+                "completely different prose of roughly the same overall length as before, \
+                 written from scratch so that hardly any of the original words remain here \
+                 at all, which is exactly the shape a wrong shell variable produces"
+                    .to_string(),
+            )),
+            ..Default::default()
+        };
+        let advisories =
+            validate_text_field_overwrite_guard(&storage, &ids, &rewrite, false).unwrap();
+        assert_eq!(advisories.len(), 1, "{advisories:?}");
+        assert!(advisories[0].contains("bd-tier: replacing 'description'"));
+        assert!(advisories[0].contains("words"), "{}", advisories[0]);
+
+        // Severe shrink: refused, and the message states the ratio.
+        let truncated = IssueUpdate {
+            description: Some(Some("The importer must keep every".to_string())),
+            ..Default::default()
+        };
+        let err =
+            validate_text_field_overwrite_guard(&storage, &ids, &truncated, false).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("% of the current length"), "{message}");
+        assert!(message.contains("--force"), "{message}");
+        // --force still overrides.
+        validate_text_field_overwrite_guard(&storage, &ids, &truncated, true).unwrap();
+    }
+
+    // === --append-notes (GitHub #480) ===
+
+    #[test]
+    fn append_notes_join_preserves_existing_bytes() {
+        init_test_logging();
+        assert_eq!(append_notes_body("", "first"), "first");
+        assert_eq!(append_notes_body("one", "two"), "one\ntwo");
+        assert_eq!(append_notes_body("one\n", "two"), "one\ntwo");
+        assert_eq!(append_notes_body("one\n\n", "two"), "one\n\ntwo");
+        assert_eq!(
+            append_notes_body("  padded  \r\n", "two"),
+            "  padded  \r\ntwo"
+        );
+
+        assert!(notes_already_end_with("two", "two"));
+        assert!(notes_already_end_with("one\ntwo", "two"));
+        assert!(notes_already_end_with("one\ntwo\nthree", "two\nthree"));
+        assert!(!notes_already_end_with("onetwo", "two"));
+        assert!(!notes_already_end_with("one\ntwo\n", "two"));
+        assert!(!notes_already_end_with("", "two"));
+    }
+
+    fn notes_field(beads_dir: &Path) -> Option<String> {
+        acceptance_field(beads_dir).notes
+    }
+
+    #[test]
+    fn append_notes_creates_and_extends_the_field_without_force() {
+        init_test_logging();
+        let (_temp, beads_dir) = acceptance_workspace(None);
+        // Empty field: created from the appended text.
+        let args = UpdateArgs {
+            ids: vec!["bd-ac".to_string()],
+            append_notes: vec!["constraint: must run under 5s".to_string()],
+            ..Default::default()
+        };
+        let output = run_acceptance_update(&beads_dir, &args).expect("append into empty field");
+        assert_eq!(
+            notes_field(&beads_dir).as_deref(),
+            Some("constraint: must run under 5s")
+        );
+        let state = output.updated_issues[0]
+            .notes
+            .as_ref()
+            .expect("notes state in machine output");
+        assert!(state.applied);
+        assert_eq!(state.chars_before, 0);
+        assert_eq!(state.chars_after, 29);
+        assert_eq!(state.text, "constraint: must run under 5s");
+
+        // Populated field: two values land as two lines after the existing
+        // content, which is untouched; description survives; no --force.
+        let args = UpdateArgs {
+            ids: vec!["bd-ac".to_string()],
+            append_notes: vec![
+                "decision: keep the WAL".to_string(),
+                "-starts with a dash".to_string(),
+            ],
+            priority: Some("1".to_string()),
+            ..Default::default()
+        };
+        let output = run_acceptance_update(&beads_dir, &args).expect("append twice");
+        assert_eq!(
+            notes_field(&beads_dir).as_deref(),
+            Some("constraint: must run under 5s\ndecision: keep the WAL\n-starts with a dash")
+        );
+        let after = acceptance_field(&beads_dir);
+        assert_eq!(after.priority, Priority::HIGH);
+        assert_eq!(
+            after.description.as_deref(),
+            Some("context that must survive")
+        );
+        let json = serde_json::to_value(&output.updated_issues[0]).unwrap();
+        assert_eq!(json["notes"]["applied"], true);
+        assert_eq!(
+            json["notes"]["appended"],
+            "decision: keep the WAL\n-starts with a dash"
+        );
+        assert_eq!(json["notes"]["chars_before"], 29);
+        assert_eq!(
+            json["notes"]["text"],
+            "constraint: must run under 5s\ndecision: keep the WAL\n-starts with a dash"
+        );
+        assert!(
+            json.get("acceptance_criteria").is_none(),
+            "acceptance state must not appear without acceptance flags"
+        );
+    }
+
+    #[test]
+    fn append_notes_rerun_is_a_no_op_and_empty_text_is_rejected() {
+        init_test_logging();
+        let (_temp, beads_dir) = acceptance_workspace(None);
+        let args = UpdateArgs {
+            ids: vec!["bd-ac".to_string()],
+            append_notes: vec!["decision: keep the WAL".to_string()],
+            ..Default::default()
+        };
+        run_acceptance_update(&beads_dir, &args).expect("first append");
+        let before = acceptance_field(&beads_dir);
+
+        let output = run_acceptance_update(&beads_dir, &args).expect("idempotent re-run");
+        let after = acceptance_field(&beads_dir);
+        assert_eq!(after.notes, before.notes);
+        assert_eq!(
+            after.updated_at, before.updated_at,
+            "a skipped append must not rewrite the row"
+        );
+        let state = output.updated_issues[0].notes.as_ref().unwrap();
+        assert!(!state.applied);
+        assert_eq!(state.chars_before, state.chars_after);
+
+        // A same-length identical value combined with the whole-field flag
+        // is refused at the parser; here, blank text is refused before any
+        // write.
+        let blank = UpdateArgs {
+            ids: vec!["bd-ac".to_string()],
+            append_notes: vec!["   ".to_string()],
+            ..Default::default()
+        };
+        let err = run_acceptance_update(&beads_dir, &blank).unwrap_err();
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+        assert_eq!(acceptance_field(&beads_dir).notes, before.notes);
+    }
+
+    #[test]
+    fn append_notes_never_trips_the_overwrite_guard() {
+        init_test_logging();
+        let (_temp, beads_dir) = acceptance_workspace(None);
+        let seed = UpdateArgs {
+            ids: vec!["bd-ac".to_string()],
+            notes: Some(GUARD_PROSE.to_string()),
+            ..Default::default()
+        };
+        run_acceptance_update(&beads_dir, &seed).expect("fill empty notes");
+
+        // Appending a short line to a long field is exactly the shape the
+        // whole-field guard refuses; the append path must not consult it.
+        let args = UpdateArgs {
+            ids: vec!["bd-ac".to_string()],
+            append_notes: vec!["ok".to_string()],
+            ..Default::default()
+        };
+        run_acceptance_update(&beads_dir, &args).expect("append without --force");
+        assert_eq!(notes_field(&beads_dir), Some(format!("{GUARD_PROSE}ok")));
+
+        // Bulk label route stays disabled when an append rides along.
+        let args = UpdateArgs {
+            ids: vec!["bd-ac".to_string()],
+            append_notes: vec!["tagged".to_string()],
+            add_label: vec!["backend".to_string()],
+            ..Default::default()
+        };
+        run_acceptance_update(&beads_dir, &args).expect("append with label");
+        let after = acceptance_field(&beads_dir);
+        assert_eq!(after.notes, Some(format!("{GUARD_PROSE}ok\ntagged")));
+        assert_eq!(after.labels, vec!["backend".to_string()]);
+    }
+
     #[test]
     fn test_optional_string_field_with_value() {
         init_test_logging();
@@ -2691,6 +3275,8 @@ mod tests {
             valid_set_labels: Vec::new(),
             resolved_parent: ParentUpdatePlan::Unchanged,
             acceptance_edits: Vec::new(),
+            notes_appends: Vec::new(),
+            overwrite_advisories: Vec::new(),
             auto_flush_external: false,
             attribution: EventAttribution::default(),
             _routed_write_lock: RoutedWorkspaceWriteLock::local(),
@@ -2775,6 +3361,8 @@ mod tests {
             valid_set_labels: Vec::new(),
             resolved_parent: ParentUpdatePlan::Unchanged,
             acceptance_edits: Vec::new(),
+            notes_appends: Vec::new(),
+            overwrite_advisories: Vec::new(),
             auto_flush_external: false,
             attribution: EventAttribution::default(),
             _routed_write_lock: RoutedWorkspaceWriteLock::local(),
@@ -2898,6 +3486,8 @@ mod tests {
             valid_set_labels: Vec::new(),
             resolved_parent: ParentUpdatePlan::Unchanged,
             acceptance_edits: Vec::new(),
+            notes_appends: Vec::new(),
+            overwrite_advisories: Vec::new(),
             auto_flush_external: false,
             attribution: EventAttribution::default(),
             _routed_write_lock: RoutedWorkspaceWriteLock::local(),
