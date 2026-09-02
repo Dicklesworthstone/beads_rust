@@ -506,6 +506,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | Command | Description | Example |
 |---------|-------------|---------|
 | `list` | List issues | `br list --status open --priority 0-1` |
+| `list --tree` | Group children under their parents with tree connectors | `br list --tree` |
 | `ready` | Actionable work | `br ready` |
 | `blocked` | Blocked issues | `br blocked --json \| jq '.issues[]'` |
 | `search` | Full-text search | `br search "authentication"` |

@@ -63,6 +63,93 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
+## Unreleased -- on `main` after v0.5.7 (targeting v0.5.8)
+
+Every v0.5.7 user has the bugs below; the fixes are on `main` and ship with
+the next tag. Cutting it (`scripts/bump-version.sh 0.5.8`, then tag `v0.5.8`
+and push) is an operator action; the release workflow builds, signs, and
+publishes from the tag.
+
+### Silent-loss fixes (#466, #467, #471, #473, #474, #475, #476, #477)
+
+- `br gate report` writes `gate_results` as well as `gate_result_history`
+  (#466) -- 70e7fed9.
+- `br doctor --repair` no longer discards the append-only tables `events`,
+  `gate_results`, `gate_result_history`, `close_metadata`,
+  `capacity_occupancy`, `capacity_exemptions`, and
+  `capacity_exemption_history`: the rebuild snapshots and restores them
+  (#471) -- 70e7fed9.
+- `--bypass-policy` closes are exported to JSONL, so a bypassed close is
+  visible on every clone, not only on the machine that made it (#474) --
+  70e7fed9.
+- `br update` refuses to replace a non-empty `description`, `design`,
+  `acceptance_criteria`, `notes`, or `agent_context` with different content
+  unless `--force` is given; writing into an empty field and re-writing the
+  identical value stay silent (#467) -- d461a399. `--check-acceptance`,
+  `--uncheck-acceptance`, and `--add-acceptance` tick, untick, and append
+  acceptance items in place without `--force` (#477) -- c96c6623.
+- `br sync --reconcile-additive --dry-run` is reachable and plan mode no
+  longer hangs; the reviewed sync modes accept `--dry-run` (#473) --
+  d461a399.
+- `br list --tree` groups children under their parents with tree connectors
+  in text output (#475) -- d461a399.
+- Sync preserves authoritative cross-issue comment IDs (d2393c99) and rejects
+  cross-issue comment ID collisions on import (34ca862b).
+- Read-only database opens are strictly observational: the main file, WAL,
+  and journal stay byte-identical and only the WAL reader-mark bytes of the
+  `-shm` index may change; new doctor check `db.read_only_open_observational`
+  (#476) -- 8e3300bc, 3d4fdc0f.
+
+### Agent ergonomics
+
+- `br label add/remove` take several labels per call, positionally
+  (`br label add br-abc backend urgent`) or with repeated or comma-separated
+  `-l`; a label placed before the issue id gets a hint instead of
+  "Issue not found" -- 6bda0a41, ccaf0580.
+- Priority filters accept ranges and lists (`0-1`, `P0-P2`, `0,2`) in
+  `list`, `ready`, `blocked`, and `count`; a backwards range says so --
+  6bda0a41, ccaf0580.
+- Config key registry: `br config schema` lists every key br reads with
+  aliases, types, and defaults; `br config set` warns on keys br does not
+  read and names the nearest known ones; doctor check `config.unknown_keys`
+  -- 95b0f620, 611d05af.
+- `br doctor explain <finding-id|check-name>` shows the registry entry, a
+  live observation, the fixers that can act on it, and next commands;
+  `--list` enumerates; unknown ids exit 4 with suggestions -- ea7563d3.
+- `br doctor --selftest [--selftest-dir DIR] [--keep]` drives the installed
+  binary through a full issue lifecycle in a throwaway workspace and prints a
+  `br.doctor.selftest.v1` receipt with platform and filesystem facts (case
+  sensitivity, `renameat2` NOREPLACE support) -- a31e4e91.
+- Dependency-type typos in `dep add --type` suggest the intended type; the
+  #467 overwrite guard and priority errors carry their fix in the `hint`
+  field of `--json` output as well as the text `Hint:` line -- ccaf0580.
+- `br show` renders Markdown descriptions in Rich mode; `TERM=dumb` selects
+  plain output on every detection path -- 5236351f, 950db95f.
+
+### Engine: FrankenSQLite 0.3.13 -> 0.3.15
+
+- 0.3.14 (ebc34bd7): generation-tagged checkpoint backfill watermark (the
+  8 ms -> 320 ms per-statement schema-size cliff br trackers hit, engine
+  GH#402), FTS5 stock-compat writer fix (GH#404), `PRAGMA wal_checkpoint`
+  cumulative-nBackfill parity, FTS5 legacy-automerge origin-poisoning fix.
+- 0.3.15 (52e66763): FTS5 `optimize` in-place migration, contentless
+  empty-re-encode guard, legacy origin-poison self-heal.
+
+### Release, CI, and docs plumbing
+
+- One signed release asset family `br-<version>-<platform>` with `.sha256`
+  and `.minisig`; the crates.io publish step is idempotent -- da7593b2.
+- `ci.yml` leaned out: tracker and docs-only pushes skip CI, a six-hourly
+  schedule covers drift, clippy runs with `-D warnings`, tests run as five
+  file-name-derived shards via `scripts/test-shard.sh`, and the five-platform
+  build, benchmarks, and reliability gates run on PRs, schedule, and manual
+  dispatch instead of every push -- fc000cfe. The workflows themselves were
+  still disabled when this section was written.
+- README corrected against the binary (config keys, install flags, global
+  flags, environment variables, `--robot` scope, command tables) and guarded
+  by a test that checks every table example against `--help` -- fc000cfe;
+  ARCHITECTURE and agent docs refreshed -- 5a1c3d55.
+
 ## v0.5.7 -- 2026-08-29 (Release)
 
 A doctor-consistency fix for agents plus the FrankenSQLite **0.3.13** engine
