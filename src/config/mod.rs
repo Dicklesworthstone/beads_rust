@@ -12561,3 +12561,82 @@ routing:
         );
     }
 }
+
+#[cfg(test)]
+mod config_key_registry_tests {
+    use super::{KNOWN_CONFIG_KEYS, is_known_config_key, nearest_config_keys};
+
+    #[test]
+    fn canonical_keys_and_aliases_are_known_in_every_spelling() {
+        for spec in KNOWN_CONFIG_KEYS {
+            if spec.key.contains('<') {
+                continue;
+            }
+            assert!(is_known_config_key(spec.key), "{} must be known", spec.key);
+            assert!(
+                is_known_config_key(&spec.key.replace('_', "-")),
+                "{} hyphen spelling must be known",
+                spec.key
+            );
+            assert!(
+                is_known_config_key(&spec.key.to_uppercase()),
+                "{} is case-insensitive",
+                spec.key
+            );
+            for alias in spec.aliases {
+                assert!(is_known_config_key(alias), "alias {alias} of {} must be known", spec.key);
+            }
+        }
+    }
+
+    #[test]
+    fn table_prefixes_legacy_startup_keys_and_unknowns() {
+        assert!(is_known_config_key("external_projects.api"));
+        assert!(is_known_config_key("external-projects.ops"));
+        // Classic bd startup keys are tolerated for compatibility.
+        assert!(is_known_config_key("no-git-ops"));
+        assert!(is_known_config_key("sync-branch"));
+        // The README's old example keys are not read by anything.
+        for unknown in ["id.prefix", "defaults.priority", "output.color", "output.date_format", ""] {
+            assert!(!is_known_config_key(unknown), "{unknown:?} must be unknown");
+        }
+    }
+
+    #[test]
+    fn nearest_keys_point_at_what_the_user_meant() {
+        assert_eq!(nearest_config_keys("id.prefix", 3).first(), Some(&"issue_prefix"));
+        assert_eq!(
+            nearest_config_keys("defaults.priority", 3).first(),
+            Some(&"default_priority")
+        );
+        assert_eq!(nearest_config_keys("auto-flush", 3).first(), Some(&"sync.auto_flush"));
+        assert!(nearest_config_keys("zzzz", 3).is_empty());
+    }
+
+    /// Every `get_value`/`get_startup_value` key literal in this module must
+    /// be a known key or alias, so a new getter cannot land without a row.
+    #[test]
+    fn every_getter_key_literal_is_registered() {
+        let source = include_str!("mod.rs");
+        let mut missing = Vec::new();
+        for line in source.lines() {
+            if !(line.contains("get_value(") || line.contains("get_startup_value("))
+                || !line.contains("&[")
+            {
+                continue;
+            }
+            let Some(start) = line.find("&[") else { continue };
+            let Some(end) = line[start..].find(']') else { continue };
+            for literal in line[start + 2..start + end].split(',') {
+                let key = literal.trim().trim_matches('"');
+                if key.is_empty() || key.contains(|c: char| !(c.is_ascii_alphanumeric() || "._-".contains(c))) {
+                    continue;
+                }
+                if !is_known_config_key(key) {
+                    missing.push(key.to_string());
+                }
+            }
+        }
+        assert!(missing.is_empty(), "getter keys missing from KNOWN_CONFIG_KEYS: {missing:?}");
+    }
+}

@@ -478,3 +478,90 @@ fn e2e_create_normalizes_runtime_issue_prefix_from_project_config() {
         create.stderr
     );
 }
+
+// =============================================================================
+// Config key registry (beads_rust-iw7k.3): unknown keys warn instead of
+// silently doing nothing, `br config schema` lists what br reads, and the
+// doctor flags unknown keys already sitting in config.yaml.
+// =============================================================================
+
+#[test]
+fn e2e_config_set_unknown_key_warns_with_nearest_known_key() {
+    let _log = common::test_log("e2e_config_set_unknown_key_warns_with_nearest_known_key");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    // The README used to document `id.prefix`; br reads `issue_prefix`.
+    let set = run_br(&workspace, ["config", "set", "id.prefix=zzz"], "set unknown");
+    assert!(set.status.success(), "set still writes the key: {}", set.stderr);
+    assert!(
+        set.stderr.contains("unknown config key 'id.prefix'"),
+        "stderr must warn about the unknown key:\n{}",
+        set.stderr
+    );
+    assert!(
+        set.stderr.contains("issue_prefix"),
+        "warning must name the nearest known key:\n{}",
+        set.stderr
+    );
+
+    let json = run_br(&workspace, ["config", "set", "output.color=true", "--json"], "set unknown json");
+    assert!(json.status.success(), "{}", json.stderr);
+    let payload: serde_json::Value =
+        serde_json::from_str(common::cli::extract_json_payload(&json.stdout)).expect("json");
+    assert!(
+        payload["warning"].as_str().is_some_and(|w| w.contains("output.color")),
+        "JSON output carries the warning: {payload}"
+    );
+
+    let known = run_br(&workspace, ["config", "set", "default_priority=1"], "set known");
+    assert!(known.status.success());
+    assert!(!known.stderr.contains("unknown config key"), "{}", known.stderr);
+
+    // The doctor now reports the two unknown keys that landed in config.yaml.
+    let doctor = run_br(&workspace, ["doctor", "--json"], "doctor");
+    let report: serde_json::Value =
+        serde_json::from_str(common::cli::extract_json_payload(&doctor.stdout)).expect("doctor json");
+    let check = report["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["name"] == "config.unknown_keys")
+        .expect("config.unknown_keys check present");
+    assert_eq!(check["status"], "warn", "{check}");
+    let unknown: Vec<&str> = check["details"]["unknown_keys"]
+        .as_array()
+        .expect("unknown_keys")
+        .iter()
+        .filter_map(|e| e["key"].as_str())
+        .collect();
+    assert!(unknown.contains(&"id.prefix") && unknown.contains(&"output.color"), "{check}");
+}
+
+#[test]
+fn e2e_config_schema_lists_the_keys_br_reads() {
+    let _log = common::test_log("e2e_config_schema_lists_the_keys_br_reads");
+    let workspace = BrWorkspace::new();
+
+    let text = run_br(&workspace, ["config", "schema"], "schema text");
+    assert!(text.status.success(), "{}", text.stderr);
+    assert!(text.stdout.contains("issue_prefix"), "{}", text.stdout);
+    assert!(text.stdout.contains("sync.auto_flush"), "{}", text.stdout);
+
+    let json = run_br(&workspace, ["config", "schema", "--format", "json"], "schema json");
+    assert!(json.status.success(), "{}", json.stderr);
+    let payload: serde_json::Value =
+        serde_json::from_str(common::cli::extract_json_payload(&json.stdout)).expect("json");
+    assert_eq!(payload["schema_version"], "br.config.schema.v1");
+    let keys: Vec<&str> = payload["keys"]
+        .as_array()
+        .expect("keys")
+        .iter()
+        .filter_map(|k| k["key"].as_str())
+        .collect();
+    for expected in ["issue_prefix", "default_priority", "default_type", "sync.auto_flush", "lock_timeout"] {
+        assert!(keys.contains(&expected), "missing {expected}: {keys:?}");
+    }
+    assert!(!keys.contains(&"id.prefix"));
+}
