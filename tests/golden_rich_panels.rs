@@ -327,3 +327,28 @@ fn golden_stats_rich_widths() {
     assert_rich_frame(&width_120, "stats", 120);
     assert_snapshot!("stats_width_120", width_120);
 }
+
+/// Rich-mode `show` renders a markdown description (headings, emphasis,
+/// inline code, lists) inside the panel instead of printing the raw markup.
+/// The other goldens use prose descriptions and stay byte-identical.
+#[test]
+fn golden_show_rich_markdown_description() {
+    let fixture = init_fixture();
+    let md_id = create_issue(
+        &fixture.root,
+        "Delta issue with a markdown body",
+        "task",
+        "2",
+        "# Plan\n\nUse **bold** and `inline code` in the body.\n\n- first item\n- second item\n\n> a quoted note",
+        "docs",
+    );
+
+    let width_80 = run_rich_br(&fixture.root, 80, &["show", &md_id]);
+    assert_rich_frame(&width_80, "show", 80);
+    assert!(
+        !width_80.contains("**bold**") && !width_80.contains("# Plan"),
+        "markdown markup must be rendered, not printed raw:\n{width_80}"
+    );
+    assert!(width_80.contains("Plan") && width_80.contains("bold"), "content must survive rendering:\n{width_80}");
+    assert_snapshot!("show_markdown_width_80", width_80);
+}

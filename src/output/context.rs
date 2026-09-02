@@ -864,6 +864,11 @@ impl OutputContext {
         if args.no_color || std::env::var("NO_COLOR").is_ok() {
             return OutputMode::Plain;
         }
+        // `TERM=dumb` terminals (basic consoles, some editor embeds, screen
+        // readers) cannot render box-drawing or ANSI styling.
+        if std::env::var("TERM").is_ok_and(|term| term.eq_ignore_ascii_case("dumb")) {
+            return OutputMode::Plain;
+        }
         if !std::io::stdout().is_terminal() {
             return OutputMode::Plain;
         }

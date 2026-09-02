@@ -1,10 +1,12 @@
+use crate::format::contains_markdown;
 use crate::format::{
     IssueDetails, IssueWithDependencyMetadata, format_status_label, format_type_label,
     sanitize_terminal_inline, sanitize_terminal_text,
 };
 use crate::model::{Comment, Dependency, Issue};
-use crate::output::{OutputContext, Theme};
+use crate::output::{OutputContext, OutputMode, Theme};
 use rich_rust::prelude::*;
+use rich_rust::renderables::markdown::Markdown;
 
 /// Renders a single issue with full details in a styled panel.
 pub struct IssuePanel<'a> {
@@ -88,13 +90,24 @@ impl<'a> IssuePanel<'a> {
         );
         content.append("\n");
 
-        // Description
+        // Description. In Rich mode a description that uses markdown is
+        // rendered (headings, emphasis, code, lists, links) at the panel's
+        // inner width; plain prose and every non-Rich mode keep the verbatim
+        // text so Plain/JSON output is unchanged.
         if let Some(ref desc) = self.issue.description {
             content.append("\n");
-            content.append_styled(
-                sanitize_terminal_text(desc).as_ref(),
-                self.theme.issue_description.clone(),
-            );
+            let sanitized = sanitize_terminal_text(desc);
+            if ctx.mode() == OutputMode::Rich && contains_markdown(&sanitized) {
+                let inner_width = ctx.width().saturating_sub(4).max(1);
+                for segment in Markdown::new(sanitized.as_ref()).render(inner_width) {
+                    match segment.style {
+                        Some(style) => content.append_styled(&segment.text, style),
+                        None => content.append(&segment.text),
+                    }
+                }
+            } else {
+                content.append_styled(sanitized.as_ref(), self.theme.issue_description.clone());
+            }
             content.append("\n");
         }
 

@@ -11,7 +11,7 @@
 //! 2. `--quiet` flag → **Quiet mode** (minimal output)
 //! 3. `BR_OUTPUT_FORMAT` (or the `TOON_DEFAULT_FORMAT` fallback) → **JSON** or
 //!    **Toon mode** when set to `json`/`toon`
-//! 4. `NO_COLOR` env or `--no-color` → **Plain mode** (no ANSI codes)
+//! 4. `NO_COLOR` env, `--no-color`, or `TERM=dumb` → **Plain mode** (no ANSI codes)
 //! 5. Non-TTY stdout → **Plain mode** (piped output)
 //! 6. Otherwise → **Rich mode** (colors, tables, panels)
 //!
