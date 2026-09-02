@@ -349,6 +349,9 @@ fn golden_show_rich_markdown_description() {
         !width_80.contains("**bold**") && !width_80.contains("# Plan"),
         "markdown markup must be rendered, not printed raw:\n{width_80}"
     );
-    assert!(width_80.contains("Plan") && width_80.contains("bold"), "content must survive rendering:\n{width_80}");
+    assert!(
+        width_80.contains("Plan") && width_80.contains("bold"),
+        "content must survive rendering:\n{width_80}"
+    );
     assert_snapshot!("show_markdown_width_80", width_80);
 }
