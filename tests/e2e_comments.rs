@@ -642,3 +642,211 @@ fn e2e_comments_sync_roundtrip() {
     assert!(texts.contains(&"First sync comment"));
     assert!(texts.contains(&"Second sync comment"));
 }
+
+fn comment_texts(workspace: &BrWorkspace, id: &str, label: &str) -> Vec<(String, String)> {
+    let list = run_br(workspace, ["comments", "list", id, "--json"], label);
+    assert!(
+        list.status.success(),
+        "{label}: comments list failed: {}",
+        list.stderr
+    );
+    let payload = extract_json_payload(&list.stdout);
+    let comments: Vec<Value> = serde_json::from_str(&payload).expect("parse comments json");
+    comments
+        .iter()
+        .map(|comment| {
+            (
+                comment["author"].as_str().unwrap_or_default().to_string(),
+                comment["text"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+fn jsonl_line_for(path: &std::path::Path, id: &str) -> String {
+    let needle = format!("\"id\":\"{id}\"");
+    std::fs::read_to_string(path)
+        .expect("read issues.jsonl")
+        .lines()
+        .find(|line| line.contains(&needle))
+        .unwrap_or_else(|| panic!("no JSONL line for {id}"))
+        .to_string()
+}
+
+/// GitHub #486: two clones of one workspace each add one comment. Every
+/// clone's AUTOINCREMENT hands out comment id 1, so the git-merged JSONL
+/// carries the same positive comment id for two different issues. Importing
+/// it must succeed on both clones (never refuse, never roll back), and the
+/// documented "renumber one side" remedy must not break the other clone.
+#[test]
+fn e2e_comments_colliding_ids_from_two_clones_import_on_both_sides() {
+    let _log = common::test_log("e2e_comments_colliding_ids_from_two_clones_import_on_both_sides");
+    let clone_a = BrWorkspace::new();
+    let clone_b = BrWorkspace::new();
+
+    // 1. Clone A creates the shared workspace with one issue.
+    let init = run_br(&clone_a, ["init", "--prefix", "demo"], "init_a");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let create_a = run_br(
+        &clone_a,
+        ["create", "Issue from clone A", "--actor", "alice"],
+        "create_a",
+    );
+    assert!(
+        create_a.status.success(),
+        "create failed: {}",
+        create_a.stderr
+    );
+    let a_id = parse_created_id(&create_a.stdout);
+    assert!(!a_id.is_empty(), "missing created id: {}", create_a.stdout);
+    let flush_a = run_br(&clone_a, ["sync", "--flush-only"], "flush_a_initial");
+    assert!(flush_a.status.success(), "flush failed: {}", flush_a.stderr);
+
+    // 2. Clone B = git clone of A: tracked .beads files only, no database.
+    let beads_a = clone_a.root.join(".beads");
+    let beads_b = clone_b.root.join(".beads");
+    std::fs::create_dir_all(&beads_b).expect("create clone B .beads");
+    for name in ["issues.jsonl", "config.yaml", "metadata.json", ".gitignore"] {
+        let src = beads_a.join(name);
+        if src.exists() {
+            std::fs::copy(&src, beads_b.join(name)).expect("copy tracked beads file");
+        }
+    }
+    let warm_b = run_br(&clone_b, ["list"], "list_b_rebuild");
+    assert!(
+        warm_b.status.success(),
+        "clone B rebuild failed: {}",
+        warm_b.stderr
+    );
+
+    // 3. Each clone adds ONE comment to a different issue; both mint comment id 1.
+    let comment_a = run_br(
+        &clone_a,
+        [
+            "comments",
+            "add",
+            &a_id,
+            "comment from clone A",
+            "--actor",
+            "alice",
+        ],
+        "comment_a",
+    );
+    assert!(
+        comment_a.status.success(),
+        "comment failed: {}",
+        comment_a.stderr
+    );
+    let flush_a = run_br(&clone_a, ["sync", "--flush-only"], "flush_a_comment");
+    assert!(flush_a.status.success(), "flush failed: {}", flush_a.stderr);
+
+    let create_b = run_br(
+        &clone_b,
+        ["create", "Issue from clone B", "--actor", "bob"],
+        "create_b",
+    );
+    assert!(
+        create_b.status.success(),
+        "create failed: {}",
+        create_b.stderr
+    );
+    let b_id = parse_created_id(&create_b.stdout);
+    assert!(!b_id.is_empty(), "missing created id: {}", create_b.stdout);
+    let comment_b = run_br(
+        &clone_b,
+        [
+            "comments",
+            "add",
+            &b_id,
+            "comment from clone B",
+            "--actor",
+            "bob",
+        ],
+        "comment_b",
+    );
+    assert!(
+        comment_b.status.success(),
+        "comment failed: {}",
+        comment_b.stderr
+    );
+    let flush_b = run_br(&clone_b, ["sync", "--flush-only"], "flush_b_comment");
+    assert!(flush_b.status.success(), "flush failed: {}", flush_b.stderr);
+
+    let jsonl_a = beads_a.join("issues.jsonl");
+    let jsonl_b = beads_b.join("issues.jsonl");
+    let line_a = jsonl_line_for(&jsonl_a, &a_id);
+    let line_b = jsonl_line_for(&jsonl_b, &b_id);
+    assert!(
+        line_a.contains("\"id\":1,") && line_b.contains("\"id\":1,"),
+        "both clones must have minted comment id 1: A={line_a} B={line_b}"
+    );
+
+    // 4. git merge: A keeps its own line and gains B's new line.
+    let mut merged = std::fs::read_to_string(&jsonl_a).expect("read A jsonl");
+    if !merged.ends_with('\n') {
+        merged.push('\n');
+    }
+    merged.push_str(&line_b);
+    merged.push('\n');
+    std::fs::write(&jsonl_a, merged).expect("write merged jsonl");
+
+    // 5. Clone A imports the merged JSONL (auto-import runs this on every command).
+    let import_a = run_br(&clone_a, ["sync", "--import-only"], "import_a_merged");
+    assert!(
+        import_a.status.success(),
+        "clone A must import colliding comment ids: {}",
+        import_a.stderr
+    );
+    let list_a = run_br(&clone_a, ["list"], "list_a_after_merge");
+    assert!(list_a.status.success(), "list failed: {}", list_a.stderr);
+    let show_a = run_br(&clone_a, ["show", &a_id], "show_a_after_merge");
+    assert!(show_a.status.success(), "show failed: {}", show_a.stderr);
+    assert_eq!(
+        comment_texts(&clone_a, &a_id, "a_comments_on_a"),
+        vec![("alice".to_string(), "comment from clone A".to_string())]
+    );
+    assert_eq!(
+        comment_texts(&clone_a, &b_id, "a_comments_on_b"),
+        vec![("bob".to_string(), "comment from clone B".to_string())]
+    );
+
+    // 6. Clone A republishes (its local rowid for B's comment may differ) and
+    //    clone B pulls that JSONL while its own DB still holds its comment as id 1.
+    let flush_a = run_br(&clone_a, ["sync", "--flush-only"], "flush_a_after_merge");
+    assert!(flush_a.status.success(), "flush failed: {}", flush_a.stderr);
+    std::fs::copy(&jsonl_a, &jsonl_b).expect("pull merged jsonl into clone B");
+
+    // 7. Clone B imports: its skipped local issue keeps comment id 1 while the
+    //    peer's comment also claims id 1. This used to roll back every command.
+    let import_b = run_br(&clone_b, ["sync", "--import-only"], "import_b_merged");
+    assert!(
+        import_b.status.success(),
+        "clone B must import the peer's colliding comment id: {}",
+        import_b.stderr
+    );
+    let list_b = run_br(&clone_b, ["list"], "list_b_after_merge");
+    assert!(list_b.status.success(), "list failed: {}", list_b.stderr);
+    assert_eq!(
+        comment_texts(&clone_b, &a_id, "b_comments_on_a"),
+        vec![("alice".to_string(), "comment from clone A".to_string())]
+    );
+    assert_eq!(
+        comment_texts(&clone_b, &b_id, "b_comments_on_b"),
+        vec![("bob".to_string(), "comment from clone B".to_string())]
+    );
+
+    // Both clones converge: a further round trip is a no-op on each side.
+    let flush_b = run_br(&clone_b, ["sync", "--flush-only"], "flush_b_after_merge");
+    assert!(flush_b.status.success(), "flush failed: {}", flush_b.stderr);
+    std::fs::copy(&jsonl_b, &jsonl_a).expect("pull clone B jsonl into clone A");
+    let import_a = run_br(&clone_a, ["sync", "--import-only"], "import_a_roundtrip");
+    assert!(
+        import_a.status.success(),
+        "round-trip import must succeed: {}",
+        import_a.stderr
+    );
+    assert_eq!(
+        comment_texts(&clone_a, &b_id, "a_comments_on_b_roundtrip"),
+        vec![("bob".to_string(), "comment from clone B".to_string())]
+    );
+}

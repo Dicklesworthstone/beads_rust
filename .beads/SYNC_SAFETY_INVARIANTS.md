@@ -64,7 +64,7 @@ These are explicit design exclusions. br sync is intentionally less invasive tha
 | IV-2 | MEDIUM | Import validates JSON schema before inserting | Unit test: malformed JSON, verify rejection |
 | IV-3 | LOW | Import validates issue ID prefix matches project prefix | Unit test: wrong prefix, verify collision handling |
 | IV-4 | MEDIUM | Import uses 4-phase collision detection: external_ref → content_hash → id → new | Unit test: each phase |
-| IV-5 | HIGH | Import rejects a positive comment ID claimed by more than one issue before database mutation | Unit test: payload-equal and payload-different cross-issue duplicates in either line order |
+| IV-5 | HIGH | Import never refuses a positive comment ID claimed by more than one issue (per-database rowids collide across clones); it reassigns the local rowid and verifies comments by payload `(issue_id, created_at, author, text)` | Unit test: payload-equal and payload-different cross-issue duplicates in either line order import, re-import is a no-op; skipped local owner keeps its rowid |
 
 ### 2.5 No Git Operations Invariants
 
@@ -218,7 +218,7 @@ The following dangerous operations require explicit user intent:
 | AW-2 | Atomic Write | Flush and sync before rename |
 | DL-3 | Data Loss | Never resurrect tombstones |
 | IV-1 | Input Validation | Reject conflict markers |
-| IV-5 | Input Validation | Reject cross-issue duplicate positive comment IDs before mutation |
+| IV-5 | Input Validation | Tolerate cross-issue duplicate comment IDs by reassigning the local rowid; identity is the comment payload |
 
 ### MEDIUM (Schedule Appropriately)
 | ID | Category | Invariant |

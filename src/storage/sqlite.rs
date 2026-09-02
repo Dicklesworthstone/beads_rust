@@ -19462,9 +19462,12 @@ impl SqliteStorage {
     /// Delete comments owned by issues that an outer import transaction will
     /// replace.
     ///
-    /// Imported comment IDs are globally unique and may move between issues in
-    /// authoritative JSONL. Clearing the complete applied-owner set before any
-    /// issue is replayed makes that transfer independent of JSONL line order.
+    /// Comment ids are database-local rowids that JSONL merely carries along;
+    /// a merged JSONL can move an id between issues or (two clones each adding
+    /// a comment, GitHub #486) publish the same id for two issues. Clearing
+    /// the complete applied-owner set before any issue is replayed lets ids
+    /// that do line up land unchanged regardless of JSONL line order, while
+    /// `insert_comment_for_import` reassigns any id that still collides.
     /// Callers must invoke this inside the same transaction that restores the
     /// replacement rows.
     ///
@@ -20249,10 +20252,12 @@ impl SqliteStorage {
                     // another issue OR an earlier comment of *this* issue whose
                     // id was AUTO-reallocated to the same value during this
                     // import — reinsert without an explicit id so AUTOINCREMENT
-                    // assigns a fresh one. True same-issue JSONL duplicates are
-                    // rejected earlier by `validate_import_comments_for_issue`,
-                    // so this cannot silently swallow a genuine duplicate
-                    // (issue #374).
+                    // assigns a fresh one. Comment identity for sync is the
+                    // payload (`Comment::sync_key`), never the rowid, so the
+                    // semantic verifier accepts the reassigned id (GitHub
+                    // #486). True same-issue JSONL duplicates are rejected
+                    // earlier by `validate_import_comments_for_issue`, so this
+                    // cannot silently swallow a genuine duplicate (issue #374).
                     Some(_) => {
                         self.insert_import_comment_without_id(issue_id, comment, &created_at)
                     }

@@ -810,25 +810,18 @@ impl Issue {
             return false;
         }
 
-        // Compare comments (order independent)
-        let mut self_comments = self.comments.clone();
-        self_comments.sort_by(|left, right| {
-            left.issue_id
-                .cmp(&right.issue_id)
-                .then_with(|| left.created_at.cmp(&right.created_at))
-                .then_with(|| left.author.cmp(&right.author))
-                .then_with(|| left.body.cmp(&right.body))
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        let mut other_comments = other.comments.clone();
-        other_comments.sort_by(|left, right| {
-            left.issue_id
-                .cmp(&right.issue_id)
-                .then_with(|| left.created_at.cmp(&right.created_at))
-                .then_with(|| left.author.cmp(&right.author))
-                .then_with(|| left.body.cmp(&right.body))
-                .then_with(|| left.id.cmp(&right.id))
-        });
+        // Compare comments (order independent) by their sync identity.
+        //
+        // `Comment::id` is a per-database AUTOINCREMENT rowid: two clones of
+        // one workspace both hand out `1` to their first comment, so the id
+        // published in JSONL is only meaningful to the database that minted
+        // it and import may reassign it on collision. The identity that
+        // survives sync is `(issue_id, created_at, author, body)`
+        // (GitHub #486).
+        let mut self_comments: Vec<_> = self.comments.iter().map(Comment::sync_key).collect();
+        self_comments.sort_unstable();
+        let mut other_comments: Vec<_> = other.comments.iter().map(Comment::sync_key).collect();
+        other_comments.sort_unstable();
         self_comments == other_comments
     }
 
@@ -931,12 +924,30 @@ pub struct Dependency {
 /// A comment on an issue.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct Comment {
+    /// Database-local rowid. It is exported to JSONL for reference only:
+    /// every clone mints its own sequence, so two clones' comments routinely
+    /// share an id and import reassigns the local rowid when that happens.
+    /// Sync compares comments by [`Comment::sync_key`], never by `id`.
     pub id: i64,
     pub issue_id: String,
     pub author: String,
     #[serde(rename = "text")]
     pub body: String,
     pub created_at: DateTime<Utc>,
+}
+
+impl Comment {
+    /// The identity a comment keeps across clones: everything except the
+    /// database-local rowid (GitHub #486).
+    #[must_use]
+    pub fn sync_key(&self) -> (&str, DateTime<Utc>, &str, &str) {
+        (
+            self.issue_id.as_str(),
+            self.created_at,
+            self.author.as_str(),
+            self.body.as_str(),
+        )
+    }
 }
 
 /// An event in the issue's history (audit log).
@@ -1689,6 +1700,41 @@ mod tests {
 
         assert!(issue1.sync_equals(&issue2));
         assert!(issue2.sync_equals(&issue1));
+    }
+
+    #[test]
+    fn test_issue_sync_equals_ignores_database_local_comment_ids() {
+        // GitHub #486: the comment id is a per-database rowid; two clones can
+        // publish the same comment under different ids (or different comments
+        // under the same id) and sync must judge them by payload.
+        let mut issue1 = create_test_issue();
+        issue1.comments = vec![Comment {
+            id: 1,
+            issue_id: issue1.id.clone(),
+            author: "alice".to_string(),
+            body: "same payload".to_string(),
+            created_at: Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        }];
+        let mut issue2 = issue1.clone();
+        issue2.comments[0].id = 7;
+        assert!(issue1.sync_equals(&issue2));
+        assert!(issue2.sync_equals(&issue1));
+
+        let mut issue3 = issue1.clone();
+        issue3.comments[0].body = "different payload".to_string();
+        assert!(!issue1.sync_equals(&issue3));
+
+        let mut issue4 = issue1.clone();
+        issue4.comments[0].author = "bob".to_string();
+        assert!(!issue1.sync_equals(&issue4));
+
+        let mut issue5 = issue1.clone();
+        issue5.comments[0].created_at = Utc.timestamp_opt(1_700_000_101, 0).unwrap();
+        assert!(!issue1.sync_equals(&issue5));
+
+        let mut issue6 = issue1.clone();
+        issue6.comments.push(issue1.comments[0].clone());
+        assert!(!issue1.sync_equals(&issue6), "multiplicity still matters");
     }
 
     #[test]

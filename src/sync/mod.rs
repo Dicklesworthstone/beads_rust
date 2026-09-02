@@ -12,6 +12,50 @@ pub mod history;
 pub mod path;
 pub mod witness;
 
+/// Per-thread counters for whole-file JSONL traffic.
+///
+/// Every routine that opens the live JSONL for a full read (immutable
+/// snapshot capture, canonical hashing, conflict scans, line readers) and
+/// every routine that writes a full-size JSONL artifact (temp export, history
+/// snapshot) records itself here. The counters are thread-local so tests can
+/// assert how many passes one command makes without cross-talk from parallel
+/// tests. They exist because a single-line `br update` on a 40 MB tracker once
+/// read `issues.jsonl` eleven times and wrote it twice (GitHub #485).
+pub mod io_stats {
+    use std::cell::Cell;
+
+    thread_local! {
+        static JSONL_SOURCE_OPENS: Cell<u64> = const { Cell::new(0) };
+        static JSONL_FULL_WRITES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn record_source_open() {
+        JSONL_SOURCE_OPENS.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(crate) fn record_full_write() {
+        JSONL_FULL_WRITES.with(|count| count.set(count.get() + 1));
+    }
+
+    /// Number of whole-file JSONL reads recorded on this thread since `reset`.
+    #[must_use]
+    pub fn source_opens() -> u64 {
+        JSONL_SOURCE_OPENS.with(Cell::get)
+    }
+
+    /// Number of full-size JSONL artifact writes recorded on this thread since `reset`.
+    #[must_use]
+    pub fn full_writes() -> u64 {
+        JSONL_FULL_WRITES.with(Cell::get)
+    }
+
+    /// Zero both counters for the calling thread.
+    pub fn reset() {
+        JSONL_SOURCE_OPENS.with(|count| count.set(0));
+        JSONL_FULL_WRITES.with(|count| count.set(0));
+    }
+}
+
 pub use path::{
     ALLOWED_EXACT_NAMES, ALLOWED_EXTENSIONS, PathValidation, canonical_source_repo_path,
     is_sync_path_allowed, require_safe_sync_overwrite_path, require_valid_sync_path,
@@ -2650,6 +2694,7 @@ fn export_temp_path_for_attempt(output_path: &Path, attempt: u32) -> PathBuf {
 }
 
 fn create_jsonl_temp_file(output_path: &Path, config: &ExportConfig) -> Result<(PathBuf, File)> {
+    io_stats::record_full_write();
     for attempt in 0..MAX_JSONL_TEMP_PATH_ATTEMPTS {
         let temp_path = export_temp_path_for_attempt(output_path, attempt);
 
@@ -2706,6 +2751,7 @@ where
     Validate: FnMut(&Path) -> Result<()>,
     Hook: FnMut(ConditionalPublicationHookPhase) -> Result<()>,
 {
+    io_stats::record_full_write();
     jsonl_authority.verify_jsonl_authority()?;
     let _ = jsonl_authority.pinned_name_for_target(output_path)?;
     hook(ConditionalPublicationHookPhase::PreCreate)?;
@@ -6217,6 +6263,7 @@ fn is_sync_merge_mutable_metadata_key(key: &str) -> bool {
             | METADATA_JSONL_CONTENT_HASH
             | METADATA_JSONL_MTIME
             | METADATA_JSONL_SIZE
+            | METADATA_JSONL_FAST_WITNESS
             | METADATA_LAST_EXPORT_TIME
             | "needs_flush"
             | "purged_ids_pending_export"
@@ -8622,6 +8669,11 @@ pub(crate) fn apply_additive_reconcile(
                 .mtime,
                 mtime_witness: plan.receipt.source_mtime.clone(),
                 size: plan.receipt.source_size,
+                // The reviewed plan pins the exact metadata table it leaves
+                // behind; leave the fast witness untouched so it self-invalidates
+                // against the new content hash instead of adding a row the plan
+                // could not have predicted.
+                fast: None,
             },
         )?;
         let needs_flush = plan.receipt.db_only_preserved != 0;
@@ -9988,6 +10040,7 @@ fn scan_conflict_markers_from_reader(
 }
 
 pub fn scan_conflict_markers(path: &Path) -> Result<Vec<ConflictMarker>> {
+    io_stats::record_source_open();
     let file = File::open(path)?;
     path::validate_jsonl_fd_metadata(&file, path)?;
     scan_conflict_markers_from_reader(path, BufReader::with_capacity(2 * 1024 * 1024, file))
@@ -10131,6 +10184,7 @@ pub fn count_issues_in_jsonl(path: &Path) -> Result<usize> {
     Ok(analyze_jsonl(path)?.0)
 }
 
+#[cfg(test)]
 fn verify_exported_jsonl_integrity(path: &Path, expected_ids: &[String]) -> Result<()> {
     let source = capture_jsonl_source_snapshot(path)?;
     verify_exported_jsonl_snapshot_integrity(&source, expected_ids)
@@ -10238,9 +10292,9 @@ pub(crate) fn get_issue_ids_from_jsonl_snapshot(
     Ok(analyze_jsonl_snapshot(source)?.1)
 }
 
-fn read_jsonl_lines_by_id(path: &Path) -> Result<BTreeMap<String, String>> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+fn read_jsonl_lines_by_id(source: &JsonlSourceSnapshot) -> Result<BTreeMap<String, String>> {
+    let path = source.display_path();
+    let mut reader = source.reader();
     let mut lines_by_id = BTreeMap::new();
     let mut line_buf = String::new();
     let mut line_num = 0;
@@ -11308,11 +11362,56 @@ pub const METADATA_LAST_EXPORT_TIME: &str = "last_export_time";
 /// Metadata key for the last import time.
 pub const METADATA_LAST_IMPORT_TIME: &str = "last_import_time";
 
+/// Metadata key for the read-path freshness witness (GitHub #485).
+///
+/// Value format: `v1;<content_hash>;<size>;<mtime>;<ctime_secs>.<ctime_nsecs>;<device>;<inode>`.
+/// The embedded content hash binds the witness to the generation it was
+/// verified for, so any writer that updates [`METADATA_JSONL_CONTENT_HASH`]
+/// without refreshing this key automatically invalidates it.
+pub const METADATA_JSONL_FAST_WITNESS: &str = "jsonl_fast_witness";
+
+/// Kernel-maintained file identity that userland cannot restore.
+///
+/// A same-size rewrite can put the previous `mtime` back, which is why
+/// `(mtime, size)` alone never proved freshness. Rewriting a file in place
+/// advances its inode change time, and replacing it via rename changes its
+/// inode, so `(ctime, device, inode)` together with `(mtime, size)` identify
+/// one exact generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JsonlFastWitness {
+    ctime_secs: i64,
+    ctime_nsecs: i64,
+    device_id: u64,
+    inode: u64,
+}
+
 #[derive(Debug, Clone)]
 struct JsonlWitness {
     mtime: std::time::SystemTime,
     mtime_witness: String,
     size: u64,
+    /// `None` where the platform cannot supply a kernel identity; the probe
+    /// then always falls back to hashing.
+    fast: Option<JsonlFastWitness>,
+}
+
+fn encode_jsonl_fast_witness(observed: &JsonlWitness, content_hash: &str) -> Option<String> {
+    let fast = observed.fast.as_ref()?;
+    Some(format!(
+        "v1;{content_hash};{};{};{}.{};{};{}",
+        observed.size,
+        observed.mtime_witness,
+        fast.ctime_secs,
+        fast.ctime_nsecs,
+        fast.device_id,
+        fast.inode
+    ))
+}
+
+/// True when a stored fast witness describes exactly the observed generation
+/// and was recorded for `content_hash`.
+fn jsonl_fast_witness_matches(stored: &str, observed: &JsonlWitness, content_hash: &str) -> bool {
+    encode_jsonl_fast_witness(observed, content_hash).is_some_and(|expected| expected == stored)
 }
 
 /// Result of a staleness check between JSONL and DB.
@@ -11341,9 +11440,11 @@ fn pending_export_state(
 
 /// Compute staleness based on the JSONL content hash and DB dirty state.
 ///
-/// Mtime and size are retained as diagnostic witnesses, but they are not
-/// trusted as proof of unchanged content: a same-size rewrite can restore the
-/// previous mtime.
+/// Mtime and size alone are never trusted as proof of unchanged content: a
+/// same-size rewrite can restore the previous mtime. The probe hashes the file
+/// unless the stored [`METADATA_JSONL_FAST_WITNESS`] — which also binds the
+/// kernel-maintained ctime and inode to the stored content hash — describes
+/// exactly the observed generation (GitHub #485).
 ///
 /// # Errors
 ///
@@ -11368,8 +11469,8 @@ pub fn compute_staleness_refreshing_witnesses(
     jsonl_path: &Path,
 ) -> Result<StalenessCheck> {
     let (staleness, refresh_witness) = compute_staleness_impl(storage, jsonl_path)?;
-    if let Some(observed) = refresh_witness {
-        refresh_jsonl_witness_best_effort(storage, jsonl_path, &observed);
+    if let Some(refresh) = refresh_witness {
+        refresh_jsonl_witness_best_effort(storage, jsonl_path, &refresh);
     }
     Ok(staleness)
 }
@@ -11395,8 +11496,8 @@ pub fn auto_import_probe_refreshing_witnesses(
         validate_sync_path_with_external(jsonl_path, beads_dir, allow_external_jsonl)?;
     }
     let probe = compute_jsonl_newer_impl(storage, jsonl_path)?;
-    if let Some(observed) = probe.refresh_witness {
-        refresh_jsonl_witness_best_effort(storage, jsonl_path, &observed);
+    if let Some(refresh) = probe.refresh_witness {
+        refresh_jsonl_witness_best_effort(storage, jsonl_path, &refresh);
     }
     Ok(probe.jsonl_newer)
 }
@@ -11428,7 +11529,7 @@ pub fn auto_import_probe(
 fn compute_staleness_impl(
     storage: &SqliteStorage,
     jsonl_path: &Path,
-) -> Result<(StalenessCheck, Option<JsonlWitness>)> {
+) -> Result<(StalenessCheck, Option<JsonlWitnessRefresh>)> {
     let jsonl_exists = jsonl_path.exists();
     let (dirty_count, _needs_flush, db_newer) = pending_export_state(storage, jsonl_exists)?;
     let probe = compute_jsonl_newer_impl(storage, jsonl_path)?;
@@ -11445,11 +11546,18 @@ fn compute_staleness_impl(
     ))
 }
 
+/// A verified `(witness, content hash)` pair the probe would like persisted so
+/// the next probe of the same generation can skip hashing.
+struct JsonlWitnessRefresh {
+    observed: JsonlWitness,
+    content_hash: String,
+}
+
 struct JsonlNewerProbe {
     jsonl_exists: bool,
     jsonl_mtime: Option<std::time::SystemTime>,
     jsonl_newer: bool,
-    refresh_witness: Option<JsonlWitness>,
+    refresh_witness: Option<JsonlWitnessRefresh>,
 }
 
 fn compute_jsonl_newer_impl(storage: &SqliteStorage, jsonl_path: &Path) -> Result<JsonlNewerProbe> {
@@ -11466,19 +11574,43 @@ fn compute_jsonl_newer_impl(storage: &SqliteStorage, jsonl_path: &Path) -> Resul
     let stored_mtime = storage.get_metadata(METADATA_JSONL_MTIME)?;
     let stored_size = storage.get_metadata(METADATA_JSONL_SIZE)?;
     let stored_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
+    let stored_fast = storage.get_metadata(METADATA_JSONL_FAST_WITNESS)?;
     // Mtime and size are mutable filesystem metadata, not a content identity.
     // In particular, external tooling can rewrite a file with the same length
     // and restore its prior mtime. Only the canonical content hash proves that
-    // the JSONL still represents the state recorded by the database.
-    let jsonl_newer = match stored_hash {
-        Some(stored_hash) => compute_jsonl_hash(jsonl_path)? != stored_hash,
-        None => true,
+    // the JSONL still represents the state recorded by the database — unless
+    // the stored fast witness binds that hash to the kernel identity (ctime +
+    // inode) of exactly this generation, which userland cannot forge. Read
+    // commands on a 40 MB tracker were paying a full SHA-256 on every start
+    // (GitHub #485); the fast witness turns that into one `stat`.
+    let fast_witness_current = match (stored_hash.as_deref(), stored_fast.as_deref()) {
+        (Some(hash), Some(stored)) => jsonl_fast_witness_matches(stored, &observed, hash),
+        _ => false,
+    };
+    let jsonl_newer = if fast_witness_current {
+        false
+    } else {
+        match stored_hash.as_deref() {
+            Some(stored_hash) => compute_jsonl_hash(jsonl_path)? != stored_hash,
+            None => true,
+        }
     };
     let stored_size_matches =
         stored_size.as_deref().and_then(parse_jsonl_size_witness) == Some(observed.size);
     let stored_mtime_matches = stored_mtime.as_deref() == Some(observed.mtime_witness.as_str());
-    let refresh_witness =
-        (!jsonl_newer && (!stored_mtime_matches || !stored_size_matches)).then(|| observed.clone());
+    let fast_witness_stale = !fast_witness_current && observed.fast.is_some();
+    let refresh_witness = match stored_hash {
+        Some(content_hash)
+            if !jsonl_newer
+                && (!stored_mtime_matches || !stored_size_matches || fast_witness_stale) =>
+        {
+            Some(JsonlWitnessRefresh {
+                observed: observed.clone(),
+                content_hash,
+            })
+        }
+        _ => None,
+    };
 
     Ok(JsonlNewerProbe {
         jsonl_exists: true,
@@ -11497,19 +11629,46 @@ fn observed_jsonl_mtime(jsonl_path: &Path) -> Result<(std::time::SystemTime, Str
 fn observed_jsonl_witness(jsonl_path: &Path) -> Result<JsonlWitness> {
     let metadata = fs::symlink_metadata(jsonl_path)?;
     let jsonl_mtime = metadata.modified()?;
+    #[cfg(unix)]
+    let fast = {
+        use std::os::unix::fs::MetadataExt;
+        Some(JsonlFastWitness {
+            ctime_secs: metadata.ctime(),
+            ctime_nsecs: metadata.ctime_nsec(),
+            device_id: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    };
+    #[cfg(not(unix))]
+    let fast = None;
     Ok(JsonlWitness {
         mtime: jsonl_mtime,
         mtime_witness: chrono::DateTime::<Utc>::from(jsonl_mtime).to_rfc3339(),
         size: metadata.len(),
+        fast,
     })
 }
 
 fn observed_jsonl_snapshot_witness(source: &JsonlSourceSnapshot) -> JsonlWitness {
     let modified = source.modified();
+    #[cfg(unix)]
+    let fast = {
+        let (ctime_secs, ctime_nsecs) = source.ctime();
+        let identity = source.identity();
+        Some(JsonlFastWitness {
+            ctime_secs,
+            ctime_nsecs,
+            device_id: identity.device_id(),
+            inode: identity.inode(),
+        })
+    };
+    #[cfg(not(unix))]
+    let fast = None;
     JsonlWitness {
         mtime: modified,
         mtime_witness: chrono::DateTime::<Utc>::from(modified).to_rfc3339(),
         size: source.size(),
+        fast,
     }
 }
 
@@ -11525,23 +11684,52 @@ fn record_observed_jsonl_witness_in_tx(
     storage.set_metadata_in_tx(METADATA_JSONL_SIZE, &observed.size.to_string())
 }
 
+/// Record the content hash the database now agrees with, plus every witness of
+/// the generation that carries it. When the platform supplied a kernel identity
+/// this also arms the read-path fast witness (GitHub #485).
+fn record_verified_jsonl_witness_in_tx(
+    storage: &SqliteStorage,
+    observed: &JsonlWitness,
+    content_hash: &str,
+) -> Result<()> {
+    storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, content_hash)?;
+    record_observed_jsonl_witness_in_tx(storage, observed)?;
+    if let Some(fast) = encode_jsonl_fast_witness(observed, content_hash) {
+        storage.set_metadata_in_tx(METADATA_JSONL_FAST_WITNESS, &fast)?;
+    }
+    Ok(())
+}
+
 fn maybe_refresh_jsonl_witness(
     storage: &mut SqliteStorage,
     jsonl_path: &Path,
-    observed: &JsonlWitness,
+    refresh: &JsonlWitnessRefresh,
 ) -> Result<()> {
+    // Re-observe after the hash and require the full witness — including the
+    // kernel identity — to be unchanged, so a rewrite that raced the hash can
+    // never have its ctime/inode recorded against the previous content hash.
     let current = observed_jsonl_witness(jsonl_path)?;
-    if current.mtime != observed.mtime || current.size != observed.size {
+    let observed = &refresh.observed;
+    if current.mtime != observed.mtime
+        || current.size != observed.size
+        || current.fast != observed.fast
+    {
         return Ok(());
     }
 
-    storage.with_write_transaction(|storage| record_observed_jsonl_witness_in_tx(storage, &current))
+    storage.with_write_transaction(|storage| {
+        record_observed_jsonl_witness_in_tx(storage, &current)?;
+        if let Some(fast) = encode_jsonl_fast_witness(&current, &refresh.content_hash) {
+            storage.set_metadata_in_tx(METADATA_JSONL_FAST_WITNESS, &fast)?;
+        }
+        Ok(())
+    })
 }
 
 fn refresh_jsonl_witness_best_effort(
     storage: &mut SqliteStorage,
     jsonl_path: &Path,
-    observed: &JsonlWitness,
+    observed: &JsonlWitnessRefresh,
 ) {
     if let Err(error) = maybe_refresh_jsonl_witness(storage, jsonl_path, observed) {
         tracing::debug!(
@@ -11753,9 +11941,8 @@ pub(crate) fn finalize_export_under_authority(
         }
 
         // Update metadata
-        storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &result.content_hash)?;
         storage.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
-        record_observed_jsonl_witness_in_tx(storage, &observed_jsonl)?;
+        record_verified_jsonl_witness_in_tx(storage, &observed_jsonl, &result.content_hash)?;
 
         // Keep the row stable and clear the flag in place so ordinary export
         // cycles avoid delete+insert churn on the metadata B-tree.
@@ -12034,9 +12221,8 @@ fn finalize_incremental_auto_flush(
             storage.set_changed_export_hashes_in_tx(issue_hashes)?;
         }
         if let Some((content_hash, observed_jsonl)) = &export_metadata {
-            storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, content_hash)?;
             storage.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
-            record_observed_jsonl_witness_in_tx(storage, observed_jsonl)?;
+            record_verified_jsonl_witness_in_tx(storage, observed_jsonl, content_hash)?;
         }
         storage.set_metadata_in_tx("needs_flush", "false")?;
         // The published snapshot no longer contains purged issues (#405).
@@ -12077,11 +12263,11 @@ struct JsonlTempOutput {
 }
 
 fn scan_existing_jsonl_replacements(
-    path: &Path,
+    source: &JsonlSourceSnapshot,
     replacement_lines: &HashMap<String, String>,
 ) -> Result<ExistingJsonlReplacementScan> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+    let path = source.display_path();
+    let mut reader = source.reader();
     let mut seen_ids = HashSet::new();
     let mut seen_replacements = HashSet::with_capacity(replacement_lines.len());
     let mut line_buf = String::new();
@@ -12129,11 +12315,26 @@ fn scan_existing_jsonl_replacements(
     })
 }
 
-fn prepare_jsonl_temp_output(output_path: &Path, config: &ExportConfig) -> Result<JsonlTempOutput> {
+/// Stage a temp output beside `output_path`, snapshotting the previous
+/// generation into `.br_history` first.
+///
+/// `previous_source` is the already-captured snapshot of the file being
+/// replaced; the history backup copies from it instead of re-reading (and
+/// re-hashing) the live path.
+fn prepare_jsonl_temp_output(
+    output_path: &Path,
+    config: &ExportConfig,
+    previous_source: &JsonlSourceSnapshot,
+) -> Result<JsonlTempOutput> {
     if let Some(ref beads_dir) = config.beads_dir {
         validate_sync_path_with_external(output_path, beads_dir, config.allow_external_jsonl)?;
         let output_abs = absolute_or_current_dir_join(output_path);
-        history::backup_before_export(beads_dir, &config.history, &output_abs)?;
+        history::backup_before_export_snapshot(
+            beads_dir,
+            &config.history,
+            &output_abs,
+            previous_source,
+        )?;
     }
 
     let parent_dir = output_path.parent().ok_or_else(|| {
@@ -12188,21 +12389,159 @@ fn rename_jsonl_temp_output(
     Ok(())
 }
 
-fn sync_jsonl_writer(mut writer: BufWriter<File>) -> Result<()> {
+/// Flush, fsync, and return the durable temp file together with its
+/// filesystem identity so the caller can prove the rename published it.
+fn sync_jsonl_writer(mut writer: BufWriter<File>) -> Result<StagedJsonlIdentity> {
     writer.flush()?;
-    writer
+    let file = writer
         .into_inner()
-        .map_err(|e| BeadsError::Io(e.into_error()))?
-        .sync_all()?;
+        .map_err(|e| BeadsError::Io(e.into_error()))?;
+    file.sync_all()?;
+    staged_jsonl_identity(&file.metadata()?)
+}
+
+/// Filesystem identity of a staged temp file, compared against the published
+/// path after `durable_rename` so the incremental exporter never has to
+/// re-hash the file it just verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StagedJsonlIdentity {
+    size: u64,
+    #[cfg(unix)]
+    device_id: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn staged_jsonl_identity(metadata: &fs::Metadata) -> Result<StagedJsonlIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(StagedJsonlIdentity {
+        size: metadata.len(),
+        device_id: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+fn staged_jsonl_identity(metadata: &fs::Metadata) -> Result<StagedJsonlIdentity> {
+    Ok(StagedJsonlIdentity {
+        size: metadata.len(),
+    })
+}
+
+/// Verify that `published_path` now names exactly the staged temp file that
+/// was verified before the rename.
+///
+/// On Unix the device/inode pair proves identity without reading a byte; other
+/// platforms fall back to re-hashing the published bytes.
+fn verify_published_jsonl_matches_staged(
+    published_path: &Path,
+    staged: StagedJsonlIdentity,
+    expected_content_hash: &str,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(published_path)?;
+    let published = staged_jsonl_identity(&metadata)?;
+    #[cfg(unix)]
+    let identical = published == staged;
+    #[cfg(not(unix))]
+    let identical =
+        published == staged && compute_jsonl_hash(published_path)? == expected_content_hash;
+    #[cfg(unix)]
+    let _ = expected_content_hash;
+    if identical {
+        Ok(())
+    } else {
+        Err(BeadsError::SyncConflict {
+            message: "Persisted JSONL bytes do not match the incremental auto-flush hash"
+                .to_string(),
+        })
+    }
+}
+
+/// Verify a freshly synced temp export before it is renamed over the live JSONL.
+///
+/// The writer already hashed every byte it emitted and parsed every issue id,
+/// so this re-reads the temp file exactly once to prove the bytes that reached
+/// the disk hash to the same canonical digest and carry the expected number of
+/// records. It replaces a full `Issue` re-parse of the staged file plus a
+/// second hash of the published file (GitHub #485).
+fn verify_staged_jsonl_temp(
+    temp_path: &Path,
+    expected_content_hash: &str,
+    expected_ids: &[String],
+) -> Result<()> {
+    let mut unique_ids = HashSet::with_capacity(expected_ids.len());
+    for issue_id in expected_ids {
+        if !unique_ids.insert(issue_id.as_str()) {
+            return Err(BeadsError::Config(format!(
+                "Export verification failed: duplicate issue id '{issue_id}' in staged output"
+            )));
+        }
+    }
+
+    let file = File::open(temp_path)?;
+    let mut reader = BufReader::with_capacity(2 * 1024 * 1024, file);
+    let mut hasher = Sha256::new();
+    let mut line_buf = Vec::with_capacity(4096);
+    let mut record_count = 0usize;
+    loop {
+        line_buf.clear();
+        if reader.read_until(b'\n', &mut line_buf)? == 0 {
+            break;
+        }
+        let trimmed = line_buf.trim_ascii();
+        if trimmed.is_empty() {
+            continue;
+        }
+        hasher.update(trimmed);
+        hasher.update(b"\n");
+        record_count += 1;
+    }
+
+    if record_count != expected_ids.len() {
+        return Err(BeadsError::Config(format!(
+            "Export verification failed: expected {} issues, staged JSONL has {record_count} record lines",
+            expected_ids.len()
+        )));
+    }
+    if hex_encode(&hasher.finalize()) != expected_content_hash {
+        return Err(BeadsError::SyncConflict {
+            message: "Staged JSONL bytes do not match the incremental auto-flush hash".to_string(),
+        });
+    }
     Ok(())
+}
+
+/// True when the live path still names exactly the captured snapshot
+/// generation (size, mtime and — on Unix — device/inode all agree).
+fn jsonl_path_matches_snapshot(path: &Path, source: &JsonlSourceSnapshot) -> Result<bool> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file()
+        || metadata.len() != source.size()
+        || metadata.modified()? != source.modified()
+    {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let identity = source.identity();
+        Ok(metadata.dev() == identity.device_id() && metadata.ino() == identity.inode())
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(true)
+    }
 }
 
 fn try_write_existing_jsonl_replacements_atomically(
     replacement_lines: &HashMap<String, String>,
     output_path: &Path,
     config: &ExportConfig,
+    source: &JsonlSourceSnapshot,
 ) -> Result<ExistingJsonlReplacementWrite> {
-    let scan = scan_existing_jsonl_replacements(output_path, replacement_lines)?;
+    let scan = scan_existing_jsonl_replacements(source, replacement_lines)?;
 
     if !scan.all_replacements_seen {
         // GitHub #404: a replacement id the file does not already contain is a
@@ -12220,8 +12559,12 @@ fn try_write_existing_jsonl_replacements_atomically(
         });
     }
 
-    let (content_hash, exported_count) =
-        write_existing_jsonl_replacements_atomically(replacement_lines, output_path, config)?;
+    let (content_hash, exported_count) = write_existing_jsonl_replacements_atomically(
+        replacement_lines,
+        output_path,
+        config,
+        source,
+    )?;
     Ok(ExistingJsonlReplacementWrite::Written {
         content_hash,
         exported_count,
@@ -12232,10 +12575,10 @@ fn write_existing_jsonl_replacements_atomically(
     replacement_lines: &HashMap<String, String>,
     output_path: &Path,
     config: &ExportConfig,
+    source: &JsonlSourceSnapshot,
 ) -> Result<(String, usize)> {
-    let input_file = File::open(output_path)?;
-    let mut reader = BufReader::new(input_file);
-    let mut temp_output = prepare_jsonl_temp_output(output_path, config)?;
+    let mut reader = source.reader();
+    let mut temp_output = prepare_jsonl_temp_output(output_path, config, source)?;
     let mut hasher = Sha256::new();
     let mut seen_ids = HashSet::new();
     let mut replaced_ids = HashSet::with_capacity(replacement_lines.len());
@@ -12277,7 +12620,9 @@ fn write_existing_jsonl_replacements_atomically(
         };
 
         writeln!(temp_output.writer, "{output_line}")?;
-        hasher.update(output_line.as_bytes());
+        // Hash the canonical (ASCII-trimmed) line so the digest equals what
+        // `compute_jsonl_hash` derives from the published file.
+        hasher.update(output_line.as_bytes().trim_ascii());
         hasher.update(b"\n");
         expected_ids.push(
             serde_json::from_str::<PartialId>(output_line)
@@ -12304,7 +12649,9 @@ fn write_existing_jsonl_replacements_atomically(
             ))
         })?;
         writeln!(temp_output.writer, "{output_line}")?;
-        hasher.update(output_line.as_bytes());
+        // Hash the canonical (ASCII-trimmed) line so the digest equals what
+        // `compute_jsonl_hash` derives from the published file.
+        hasher.update(output_line.as_bytes().trim_ascii());
         hasher.update(b"\n");
         expected_ids.push(issue_id.clone());
         exported_count += 1;
@@ -12316,24 +12663,27 @@ fn write_existing_jsonl_replacements_atomically(
         writer,
     } = temp_output;
 
-    sync_jsonl_writer(writer)?;
-    verify_exported_jsonl_integrity(&temp_path, &expected_ids)?;
+    let content_hash = hex_encode(&hasher.finalize());
+    let staged = sync_jsonl_writer(writer)?;
+    verify_staged_jsonl_temp(&temp_path, &content_hash, &expected_ids)?;
     rename_jsonl_temp_output(&temp_path, temp_guard, output_path, config)?;
+    verify_published_jsonl_matches_staged(output_path, staged, &content_hash)?;
 
-    Ok((hex_encode(&hasher.finalize()), exported_count))
+    Ok((content_hash, exported_count))
 }
 
 fn write_jsonl_lines_atomically(
     lines_by_id: &BTreeMap<String, String>,
     output_path: &Path,
     config: &ExportConfig,
+    source: &JsonlSourceSnapshot,
 ) -> Result<String> {
-    let mut temp_output = prepare_jsonl_temp_output(output_path, config)?;
+    let mut temp_output = prepare_jsonl_temp_output(output_path, config, source)?;
     let mut hasher = Sha256::new();
 
     for line in lines_by_id.values() {
         writeln!(temp_output.writer, "{line}")?;
-        hasher.update(line.as_bytes());
+        hasher.update(line.as_bytes().trim_ascii());
         hasher.update(b"\n");
     }
 
@@ -12343,13 +12693,15 @@ fn write_jsonl_lines_atomically(
         writer,
     } = temp_output;
 
-    sync_jsonl_writer(writer)?;
+    let content_hash = hex_encode(&hasher.finalize());
+    let staged = sync_jsonl_writer(writer)?;
     let expected_ids = lines_by_id.keys().cloned().collect::<Vec<_>>();
-    verify_exported_jsonl_integrity(&temp_path, &expected_ids)?;
+    verify_staged_jsonl_temp(&temp_path, &content_hash, &expected_ids)?;
 
     rename_jsonl_temp_output(&temp_path, temp_guard, output_path, config)?;
+    verify_published_jsonl_matches_staged(output_path, staged, &content_hash)?;
 
-    Ok(hex_encode(&hasher.finalize()))
+    Ok(content_hash)
 }
 
 struct IncrementalAutoFlushChanges {
@@ -12414,7 +12766,7 @@ fn try_existing_line_auto_flush(
     export_config: &ExportConfig,
     changes: &IncrementalAutoFlushChanges,
     jsonl_authority: &JsonlFamilyWriteLock,
-    source_content_hash: &str,
+    source: &JsonlSourceSnapshot,
 ) -> Result<Option<AutoFlushResult>> {
     if !changes.removed_hash_ids.is_empty() || changes.replacement_lines.is_empty() {
         return Ok(None);
@@ -12424,6 +12776,7 @@ fn try_existing_line_auto_flush(
         &changes.replacement_lines,
         jsonl_path,
         export_config,
+        source,
     )?;
 
     match result {
@@ -12434,7 +12787,7 @@ fn try_existing_line_auto_flush(
         ExistingJsonlReplacementWrite::Declined => Ok(None),
         ExistingJsonlReplacementWrite::Unchanged { .. } => {
             jsonl_authority.verify_jsonl_authority()?;
-            if compute_jsonl_hash(jsonl_path)? != source_content_hash {
+            if !jsonl_path_matches_snapshot(jsonl_path, source)? {
                 return Err(BeadsError::SyncConflict {
                     message: "JSONL changed during an unchanged incremental auto-flush scan"
                         .to_string(),
@@ -12454,13 +12807,9 @@ fn try_existing_line_auto_flush(
             content_hash,
             exported_count,
         } => {
+            // The writer verified the staged bytes against `content_hash` and
+            // proved the rename published that exact file.
             jsonl_authority.verify_jsonl_authority()?;
-            if compute_jsonl_hash(jsonl_path)? != content_hash {
-                return Err(BeadsError::SyncConflict {
-                    message: "Persisted JSONL bytes do not match the incremental auto-flush hash"
-                        .to_string(),
-                });
-            }
             finalize_incremental_auto_flush(
                 storage,
                 &changes.dirty_metadata,
@@ -12495,13 +12844,24 @@ fn apply_incremental_auto_flush_changes(
     changed
 }
 
+/// Export dirty issues into an existing JSONL by rewriting only their lines.
+///
+/// The live file is read exactly once: one immutable [`JsonlSourceSnapshot`]
+/// (captured under the JSONL-family write authority) feeds the conflict-marker
+/// scan, the "did anything change" scan, the replacement writer, and the
+/// `.br_history` backup. The staged temp file is read back once to verify its
+/// digest, and the rename is proven by file identity rather than a second hash
+/// of the published bytes (GitHub #485).
 fn try_incremental_auto_flush(
     storage: &mut SqliteStorage,
     beads_dir: &Path,
     jsonl_path: &Path,
     allow_external_jsonl: bool,
+    history: &HistoryConfig,
 ) -> Result<Option<AutoFlushResult>> {
-    if !jsonl_path.exists() {
+    // Missing or non-regular targets take the full-export path, which reports
+    // the precise reason (fresh export, or the conflict scan's I/O error).
+    if !jsonl_path.is_file() {
         return Ok(None);
     }
 
@@ -12513,13 +12873,13 @@ fn try_incremental_auto_flush(
                 .to_string(),
         });
     }
-    let source_content_hash = compute_jsonl_hash(jsonl_path)?;
-    let conflict_markers = scan_conflict_markers(jsonl_path)?;
+    let source = capture_jsonl_source_snapshot(jsonl_path)?;
+    let conflict_markers = scan_conflict_markers_snapshot(&source)?;
     if !conflict_markers.is_empty() {
         tracing::warn!(
             jsonl_path = %jsonl_path.display(),
             marker_count = conflict_markers.len(),
-            "Skipping incremental auto-flush: JSONL contains merge-conflict markers",
+            "Skipping incremental auto-flush: JSONL contains merge-conflict markers. Resolve them (or run `br sync --flush-only --force` to override) before the next write.",
         );
         return Ok(Some(AutoFlushResult::default()));
     }
@@ -12534,6 +12894,7 @@ fn try_incremental_auto_flush(
         force: false,
         beads_dir: Some(beads_dir.to_path_buf()),
         allow_external_jsonl,
+        history: history.clone(),
         ..Default::default()
     };
 
@@ -12543,17 +12904,17 @@ fn try_incremental_auto_flush(
         &export_config,
         &changes,
         &jsonl_authority,
-        &source_content_hash,
+        &source,
     )? {
         return Ok(Some(result));
     }
 
-    let mut lines_by_id = read_jsonl_lines_by_id(jsonl_path)?;
+    let mut lines_by_id = read_jsonl_lines_by_id(&source)?;
     let changed = apply_incremental_auto_flush_changes(&mut lines_by_id, &changes);
 
     if !changed {
         jsonl_authority.verify_jsonl_authority()?;
-        if compute_jsonl_hash(jsonl_path)? != source_content_hash {
+        if !jsonl_path_matches_snapshot(jsonl_path, &source)? {
             return Err(BeadsError::SyncConflict {
                 message: "JSONL changed during incremental auto-flush reconciliation".to_string(),
             });
@@ -12569,14 +12930,9 @@ fn try_incremental_auto_flush(
         return Ok(Some(AutoFlushResult::default()));
     }
 
-    let content_hash = write_jsonl_lines_atomically(&lines_by_id, jsonl_path, &export_config)?;
+    let content_hash =
+        write_jsonl_lines_atomically(&lines_by_id, jsonl_path, &export_config, &source)?;
     jsonl_authority.verify_jsonl_authority()?;
-    if compute_jsonl_hash(jsonl_path)? != content_hash {
-        return Err(BeadsError::SyncConflict {
-            message: "Persisted JSONL bytes do not match the incremental auto-flush hash"
-                .to_string(),
-        });
-    }
     finalize_incremental_auto_flush(
         storage,
         &changes.dirty_metadata,
@@ -12619,6 +12975,10 @@ pub struct AutoFlushResult {
 /// * `storage` - Mutable reference to the `SQLite` storage
 /// * `beads_dir` - Path to the .beads directory
 /// * `jsonl_path` - Resolved JSONL export target for this workspace
+/// * `history` - The `.br_history` policy resolved by
+///   [`crate::config::resolved_history_config_from_layer`]; callers must never
+///   substitute `HistoryConfig::default()`, which ignores
+///   `sync.history_enabled` and `BR_HISTORY_MIN_INTERVAL_SECS` (GitHub #484)
 ///
 /// # Errors
 ///
@@ -12628,6 +12988,7 @@ pub fn auto_flush(
     beads_dir: &Path,
     jsonl_path: &Path,
     allow_external_jsonl: bool,
+    history: HistoryConfig,
 ) -> Result<AutoFlushResult> {
     // This guard is intentionally independent of CLI/MCP startup policy and
     // precedes the dirty/no-op probe. A clean database with a durable pending
@@ -12655,6 +13016,38 @@ pub fn auto_flush(
 
     validate_sync_path_with_external(jsonl_path, beads_dir, allow_external_jsonl)?;
 
+    tracing::debug!(
+        dirty_count,
+        needs_flush,
+        "Auto-flush: exporting dirty issues"
+    );
+
+    if !needs_flush {
+        // The incremental path performs the merge-conflict-marker refusal on
+        // the single snapshot it captures, so the scan below only runs when
+        // the flush falls through to a full export.
+        match try_incremental_auto_flush(
+            storage,
+            beads_dir,
+            jsonl_path,
+            allow_external_jsonl,
+            &history,
+        ) {
+            Ok(Some(result)) => {
+                tracing::info!(
+                    flushed = result.flushed,
+                    exported = result.exported_count,
+                    "Auto-flush complete"
+                );
+                return Ok(result);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                return Err(err);
+            }
+        }
+    }
+
     // Refuse to auto-flush over a JSONL that still holds unresolved
     // merge-conflict markers. The downstream export path would otherwise
     // silently overwrite the `<<<<<<<` / `=======` / `>>>>>>>` regions
@@ -12675,29 +13068,6 @@ pub fn auto_flush(
         }
     }
 
-    tracing::debug!(
-        dirty_count,
-        needs_flush,
-        "Auto-flush: exporting dirty issues"
-    );
-
-    if !needs_flush {
-        match try_incremental_auto_flush(storage, beads_dir, jsonl_path, allow_external_jsonl) {
-            Ok(Some(result)) => {
-                tracing::info!(
-                    flushed = result.flushed,
-                    exported = result.exported_count,
-                    "Auto-flush complete"
-                );
-                return Ok(result);
-            }
-            Ok(None) => {}
-            Err(err) => {
-                return Err(err);
-            }
-        }
-    }
-
     // Configure export with defaults, including beads_dir for path validation.
     // `needs_flush` is deliberately NOT passed as `force` (#405): doing so
     // disabled the exporter's data-loss guards, and the import path also arms
@@ -12710,6 +13080,7 @@ pub fn auto_flush(
         force: false,
         beads_dir: Some(beads_dir.to_path_buf()),
         allow_external_jsonl,
+        history,
         ..Default::default()
     };
 
@@ -12748,6 +13119,7 @@ pub fn auto_flush(
 ///
 /// Returns an error if the file cannot be read or contains invalid JSON.
 pub fn read_issues_from_jsonl(path: &Path) -> Result<Vec<Issue>> {
+    io_stats::record_source_open();
     let file = File::open(path)?;
     path::validate_jsonl_fd_metadata(&file, path)?;
     let file_size = file.metadata().map_or(0, |m| m.len());
@@ -13132,7 +13504,6 @@ fn collect_import_validation_plan(
 ) -> Result<ImportValidationPlan> {
     let mut plan = ImportValidationPlan::default();
     let mut seen_ids = HashSet::new();
-    let mut positive_comment_owners = HashMap::<i64, (String, usize)>::new();
 
     for_each_jsonl_import_issue(source, |line_num, issue, _| {
         let prefix_mismatch = !config.skip_prefix_validation
@@ -13159,24 +13530,15 @@ fn collect_import_validation_plan(
             )));
         }
 
-        for comment in &issue.comments {
-            if comment.id <= 0 {
-                continue;
-            }
-            if let Some((first_issue_id, first_line_num)) =
-                positive_comment_owners.insert(comment.id, (issue.id.clone(), line_num))
-            {
-                return Err(BeadsError::Config(format!(
-                    "Duplicate positive comment id '{}' in {}: issue '{}' at line {} conflicts with issue '{}' at line {}",
-                    comment.id,
-                    source.display_path().display(),
-                    first_issue_id,
-                    first_line_num,
-                    issue.id,
-                    line_num
-                )));
-            }
-        }
+        // Comment ids are deliberately NOT checked for cross-issue uniqueness
+        // here. They are per-database AUTOINCREMENT rowids, so two clones that
+        // each added one comment legitimately publish the same id for
+        // different issues; refusing that file made every `br` command in the
+        // importing clone fail until the JSONL was hand-edited (GitHub #486).
+        // Import reassigns the local rowid on collision and the semantic
+        // verifier compares comments by payload, so no refusal is needed.
+        // Same-issue duplicates are still rejected by
+        // `validate_import_comments_for_issue`.
 
         if prefix_mismatch {
             plan.prefix_mismatches.push(PrefixRenameSeed {
@@ -13952,8 +14314,7 @@ fn import_from_jsonl_snapshot_impl(
         )?;
 
         storage.set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
-        storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &jsonl_hash)?;
-        record_observed_jsonl_witness_in_tx(storage, &observed_jsonl)?;
+        record_verified_jsonl_witness_in_tx(storage, &observed_jsonl, &jsonl_hash)?;
 
         Ok(tx_result)
     });
@@ -14133,6 +14494,7 @@ pub(crate) fn compute_jsonl_snapshot_content_hash(source: &JsonlSourceSnapshot) 
 ///
 /// Returns an error if the file cannot be read.
 pub fn compute_jsonl_hash(path: &Path) -> Result<String> {
+    io_stats::record_source_open();
     let file = std::fs::File::open(path)?;
     self::path::validate_jsonl_fd_metadata(&file, path)?;
     compute_jsonl_hash_from_reader(std::io::BufReader::new(file))
@@ -14740,11 +15102,7 @@ fn run_reconcile_apply_tx(
         )));
     }
     storage.set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
-    storage.set_metadata_in_tx(
-        METADATA_JSONL_CONTENT_HASH,
-        &plan.witness.jsonl_content_hash,
-    )?;
-    record_observed_jsonl_witness_in_tx(storage, &observed)?;
+    record_verified_jsonl_witness_in_tx(storage, &observed, &plan.witness.jsonl_content_hash)?;
     outcome.metadata_repaired = true;
 
     if outcome.uncertified_local_wins > 0 || !plan.db_only_ids.is_empty() {
@@ -20099,10 +20457,18 @@ mod tests {
         let observed = observed_jsonl_witness(&jsonl_path).unwrap();
         fs::remove_file(&jsonl_path).unwrap();
 
-        refresh_jsonl_witness_best_effort(&mut storage, &jsonl_path, &observed);
+        let refresh = JsonlWitnessRefresh {
+            observed,
+            content_hash: "0".repeat(64),
+        };
+        refresh_jsonl_witness_best_effort(&mut storage, &jsonl_path, &refresh);
 
         assert_eq!(storage.get_metadata(METADATA_JSONL_MTIME).unwrap(), None);
         assert_eq!(storage.get_metadata(METADATA_JSONL_SIZE).unwrap(), None);
+        assert_eq!(
+            storage.get_metadata(METADATA_JSONL_FAST_WITNESS).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -20131,6 +20497,170 @@ mod tests {
         assert!(!staleness.jsonl_exists);
     }
 
+    fn counted_workspace() -> (TempDir, PathBuf, PathBuf) {
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        (temp_dir, beads_dir, jsonl_path)
+    }
+
+    fn retitle(storage: &mut SqliteStorage, id: &str, title: &str) {
+        storage
+            .update_issue(
+                id,
+                &crate::storage::IssueUpdate {
+                    title: Some(title.to_string()),
+                    ..Default::default()
+                },
+                "tester",
+            )
+            .unwrap();
+    }
+
+    /// GitHub #485: a one-line mutation used to read `issues.jsonl` eleven
+    /// times and write two fsync'd copies of it. The incremental exporter now
+    /// reads the live file exactly once and writes each artifact once.
+    #[test]
+    fn test_incremental_auto_flush_reads_source_once_and_writes_once_per_artifact() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+        for index in 0..3 {
+            let issue = make_test_issue(&format!("bd-io-{index}"), "Counted issue");
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        let history = HistoryConfig {
+            min_interval_secs: 0,
+            ..HistoryConfig::default()
+        };
+        let first = auto_flush(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            false,
+            history.clone(),
+        )
+        .unwrap();
+        assert!(first.flushed, "initial full export publishes issues.jsonl");
+
+        retitle(&mut storage, "bd-io-1", "Changed once");
+        io_stats::reset();
+        let second = auto_flush(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            false,
+            history.clone(),
+        )
+        .unwrap();
+        assert!(second.flushed);
+        assert_eq!(
+            io_stats::source_opens(),
+            1,
+            "a one-line update must read issues.jsonl exactly once"
+        );
+        assert_eq!(
+            io_stats::full_writes(),
+            2,
+            "one temp export plus one history snapshot"
+        );
+
+        retitle(&mut storage, "bd-io-2", "Changed twice");
+        io_stats::reset();
+        let third = auto_flush(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            false,
+            HistoryConfig {
+                enabled: false,
+                ..HistoryConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(third.flushed);
+        assert_eq!(io_stats::source_opens(), 1);
+        assert_eq!(
+            io_stats::full_writes(),
+            1,
+            "history disabled: only the temp export is written"
+        );
+
+        let issues = read_issues_from_jsonl(&jsonl_path).unwrap();
+        assert_eq!(issues.len(), 3);
+        assert!(issues.iter().any(|issue| issue.title == "Changed once"));
+        assert!(issues.iter().any(|issue| issue.title == "Changed twice"));
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+    }
+
+    /// GitHub #485: read commands used to SHA-256 the whole JSONL on every
+    /// start. After an export the probe proves freshness with one `stat`,
+    /// while a same-size rewrite that restores the old mtime is still caught.
+    #[test]
+    fn test_auto_import_probe_trusts_fast_witness_and_detects_restored_mtime_rewrite() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+        let issue = make_test_issue("bd-fast-1", "Fast witness");
+        storage.create_issue(&issue, "tester").unwrap();
+        let history = HistoryConfig {
+            min_interval_secs: 0,
+            ..HistoryConfig::default()
+        };
+        auto_flush(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            false,
+            history.clone(),
+        )
+        .unwrap();
+
+        io_stats::reset();
+        assert!(
+            !auto_import_probe(&storage, &beads_dir, &jsonl_path, false).unwrap(),
+            "the just-exported generation is current"
+        );
+        assert_eq!(
+            io_stats::source_opens(),
+            0,
+            "a full export arms the fast witness; the probe must not hash"
+        );
+
+        retitle(&mut storage, "bd-fast-1", "Changed title");
+        auto_flush(&mut storage, &beads_dir, &jsonl_path, false, history).unwrap();
+        io_stats::reset();
+        assert!(!auto_import_probe(&storage, &beads_dir, &jsonl_path, false).unwrap());
+        assert_eq!(
+            io_stats::source_opens(),
+            0,
+            "an incremental export arms the fast witness as well"
+        );
+
+        // Same-size in-place rewrite with the previous mtime restored: the
+        // ctime still moves, so the witness is rejected and the hash decides.
+        let modified = fs::metadata(&jsonl_path).unwrap().modified().unwrap();
+        let original = fs::read_to_string(&jsonl_path).unwrap();
+        let altered = original.replacen("Changed title", "CHANGED TITLE", 1);
+        assert_ne!(original, altered);
+        assert_eq!(original.len(), altered.len());
+        fs::write(&jsonl_path, altered).unwrap();
+        File::options()
+            .write(true)
+            .open(&jsonl_path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        io_stats::reset();
+        assert!(
+            auto_import_probe(&storage, &beads_dir, &jsonl_path, false).unwrap(),
+            "a restored mtime must never hide a content change"
+        );
+        assert!(
+            io_stats::source_opens() >= 1,
+            "a rejected witness falls back to hashing"
+        );
+    }
+
     #[test]
     fn test_auto_flush_propagates_jsonl_scan_io_errors() {
         let mut storage = SqliteStorage::open_memory().unwrap();
@@ -20142,7 +20672,14 @@ mod tests {
         let issue = make_test_issue("bd-scan-error", "Dirty issue");
         storage.create_issue(&issue, "tester").unwrap();
 
-        let err = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap_err();
+        let err = auto_flush(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            false,
+            HistoryConfig::default(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("directory")
                 || err.to_string().contains("Is a directory")
@@ -20169,7 +20706,14 @@ mod tests {
         let issue = make_test_issue("bd-auto-flush-path", "Dirty issue");
         storage.create_issue(&issue, "tester").unwrap();
 
-        let err = auto_flush(&mut storage, &beads_dir, &outside_jsonl_path, false).unwrap_err();
+        let err = auto_flush(
+            &mut storage,
+            &beads_dir,
+            &outside_jsonl_path,
+            false,
+            HistoryConfig::default(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("is outside .beads")
                 || err.to_string().contains("outside the beads directory"),
@@ -20192,7 +20736,14 @@ mod tests {
             .set_metadata(METADATA_SYNC_MERGE_PENDING_LEGACY, "legacy-receipt")
             .unwrap();
 
-        let err = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap_err();
+        let err = auto_flush(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            false,
+            HistoryConfig::default(),
+        )
+        .unwrap_err();
 
         assert!(matches!(&err, BeadsError::SyncConflict { .. }));
         assert!(
@@ -20233,7 +20784,14 @@ mod tests {
             .unwrap();
         let dirty_before = storage.get_dirty_issue_metadata().unwrap();
 
-        let err = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap_err();
+        let err = auto_flush(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            false,
+            HistoryConfig::default(),
+        )
+        .unwrap_err();
 
         assert!(matches!(err, BeadsError::SyncConflict { .. }));
         assert_eq!(
@@ -20437,8 +20995,12 @@ mod tests {
     }
 
     #[test]
-    fn test_import_rejects_cross_issue_duplicate_positive_comment_ids_before_mutation() {
-        fn assert_rejected(second_body: &str, reverse_lines: bool) {
+    fn test_import_tolerates_cross_issue_duplicate_positive_comment_ids() {
+        // GitHub #486: two clones each add one comment, both AUTOINCREMENT
+        // sequences hand out the same id, and the merged JSONL publishes it
+        // for two different issues. Import must reassign the local rowid
+        // instead of refusing the file (or rolling back on the verifier).
+        fn assert_imported(second_body: &str, reverse_lines: bool) {
             let mut storage = SqliteStorage::open_memory().unwrap();
             let sentinel = make_test_issue("bd-comment-sentinel", "Existing state");
             storage.create_issue(&sentinel, "tester").unwrap();
@@ -20479,43 +21041,119 @@ mod tests {
             )
             .unwrap();
 
-            let err = import_from_jsonl(
+            let result = import_from_jsonl(
                 &mut storage,
                 &jsonl_path,
                 &ImportConfig::default(),
                 Some("bd-"),
             )
-            .expect_err("cross-issue positive comment identities must be globally unique");
-            let message = err.to_string();
-            assert!(message.contains("Duplicate positive comment id '3560'"));
-            assert!(message.contains("bd-comment-duplicate-a"));
-            assert!(message.contains("bd-comment-duplicate-b"));
-            assert!(message.contains("line 1"));
-            assert!(message.contains("line 2"));
+            .expect("cross-issue comment id collisions must import, not refuse");
+            assert_eq!(result.created_count, 2);
 
-            assert!(
-                storage
-                    .get_issue("bd-comment-duplicate-a")
-                    .unwrap()
-                    .is_none()
+            let comments_a = storage.get_comments(&first.id).unwrap();
+            let comments_b = storage.get_comments(&second.id).unwrap();
+            assert_eq!(comments_a.len(), 1);
+            assert_eq!(comments_b.len(), 1);
+            assert_eq!(comments_a[0].body, "shared identity");
+            assert_eq!(comments_b[0].body, second_body);
+            assert_eq!(comments_a[0].author, "alice");
+            assert_eq!(comments_b[0].author, "alice");
+            assert_eq!(comments_a[0].created_at, first.created_at);
+            assert_eq!(comments_b[0].created_at, first.created_at);
+            assert_ne!(
+                comments_a[0].id, comments_b[0].id,
+                "the colliding id must be reassigned locally for one of the two issues"
             );
             assert!(
-                storage
-                    .get_issue("bd-comment-duplicate-b")
-                    .unwrap()
-                    .is_none()
+                comments_a[0].id == 3_560 || comments_b[0].id == 3_560,
+                "the first claimant keeps the published id"
             );
             assert_eq!(
                 storage.get_comments(&sentinel.id).unwrap(),
                 vec![sentinel_comment],
-                "preflight rejection must not mutate existing comments"
+                "unrelated existing comments must survive untouched"
             );
+
+            // Re-importing the same file is a true no-op: the reassigned rowid
+            // is a local detail, not a semantic difference.
+            let second_import = import_from_jsonl(
+                &mut storage,
+                &jsonl_path,
+                &ImportConfig::default(),
+                Some("bd-"),
+            )
+            .expect("re-import after rowid reassignment must succeed");
+            assert_eq!(second_import.created_count, 0);
+            assert_eq!(second_import.updated_count, 0);
+            assert_eq!(storage.get_comments(&first.id).unwrap(), comments_a);
+            assert_eq!(storage.get_comments(&second.id).unwrap(), comments_b);
         }
 
         for reverse_lines in [false, true] {
-            assert_rejected("different payload", reverse_lines);
-            assert_rejected("shared identity", reverse_lines);
+            assert_imported("different payload", reverse_lines);
+            assert_imported("shared identity", reverse_lines);
         }
+    }
+
+    #[test]
+    fn test_import_verifier_accepts_reassigned_comment_id_for_skipped_local_owner() {
+        // GitHub #486 step 7: this clone's own issue already holds comment id
+        // 1 (its AUTOINCREMENT minted it). The merged JSONL keeps that issue
+        // unchanged but brings a peer's new issue whose comment also claims
+        // id 1. The peer's comment must be inserted under a fresh rowid and
+        // the semantic verifier must accept the payload-equal result.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+
+        let local = make_test_issue("bd-comment-local", "Local owner");
+        storage.create_issue(&local, "tester").unwrap();
+        let local_comment = storage
+            .add_comment(&local.id, "bob", "comment from clone B")
+            .unwrap();
+        let local_exported = storage
+            .get_issues_for_export(std::slice::from_ref(&local.id))
+            .unwrap()
+            .remove(0);
+
+        let mut peer = make_test_issue("bd-comment-peer", "Peer issue");
+        peer.comments.push(crate::model::Comment {
+            id: local_comment.id,
+            issue_id: peer.id.clone(),
+            author: "alice".to_string(),
+            body: "comment from clone A".to_string(),
+            created_at: peer.created_at,
+        });
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&local_exported).unwrap(),
+                serde_json::to_string(&peer).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let result = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .expect("peer comment colliding with a skipped local owner must import");
+        assert_eq!(result.created_count, 1);
+        assert_eq!(result.updated_count, 0);
+
+        assert_eq!(
+            storage.get_comments(&local.id).unwrap(),
+            vec![local_comment.clone()],
+            "the skipped local owner keeps its comment and rowid"
+        );
+        let peer_comments = storage.get_comments(&peer.id).unwrap();
+        assert_eq!(peer_comments.len(), 1);
+        assert_ne!(peer_comments[0].id, local_comment.id);
+        assert_eq!(peer_comments[0].author, "alice");
+        assert_eq!(peer_comments[0].body, "comment from clone A");
     }
 
     #[test]
@@ -22414,7 +23052,14 @@ mod tests {
         let issue = make_test_issue("bd-noop", "No-op dirty marker");
         storage.create_issue(&issue, "test").unwrap();
 
-        let first = auto_flush(&mut storage, &beads_dir, &output_path, false).unwrap();
+        let first = auto_flush(
+            &mut storage,
+            &beads_dir,
+            &output_path,
+            false,
+            HistoryConfig::default(),
+        )
+        .unwrap();
         assert!(first.flushed);
         let before = fs::read_to_string(&output_path).unwrap();
 
@@ -22422,7 +23067,14 @@ mod tests {
             .replace_dirty_issue_marker("bd-noop", "manual-dirty-marker")
             .unwrap();
 
-        let second = auto_flush(&mut storage, &beads_dir, &output_path, false).unwrap();
+        let second = auto_flush(
+            &mut storage,
+            &beads_dir,
+            &output_path,
+            false,
+            HistoryConfig::default(),
+        )
+        .unwrap();
         assert!(
             !second.flushed,
             "byte-identical dirty markers should not rewrite JSONL"

@@ -2440,6 +2440,11 @@ pub(crate) struct JsonlSourceSnapshot {
     content_sha256: String,
     modified: SystemTime,
     size: u64,
+    /// Inode change time `(secs, nsecs)` of the captured generation. Unlike
+    /// `mtime`, userland cannot restore it, so it anchors the read-path
+    /// freshness witness (GitHub #485).
+    #[cfg(unix)]
+    ctime: (i64, i64),
     #[cfg(any(unix, windows))]
     // The Windows receipt integration consumes this once sync/mod.rs enables
     // native publication; keep the capability witness without a broad allow.
@@ -2484,6 +2489,13 @@ impl JsonlSourceSnapshot {
     #[must_use]
     pub(crate) const fn size(&self) -> u64 {
         self.size
+    }
+
+    /// Inode change time `(secs, nsecs)` observed on the captured generation.
+    #[cfg(unix)]
+    #[must_use]
+    pub(crate) const fn ctime(&self) -> (i64, i64) {
+        self.ctime
     }
 
     #[cfg(any(unix, windows))]
@@ -2679,6 +2691,7 @@ where
 {
     use std::io::{Read, Write};
 
+    super::io_stats::record_source_open();
     ensure_jsonl_capture_deadline(deadline)?;
     let identity = opened.identity();
     let before_metadata = regular_jsonl_fd_metadata(opened.as_file(), path)?;
@@ -2744,6 +2757,8 @@ where
         content_sha256,
         modified: before_witness.1,
         size: before_witness.0,
+        #[cfg(unix)]
+        ctime: (before_witness.2, before_witness.3),
         identity,
     })
 }

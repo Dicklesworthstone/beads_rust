@@ -123,7 +123,7 @@ arbitrary daemonized descendants. No sync mode calls or delegates to it.
 |-------|-----------------|----------|
 | **Conflict marker scan** | Importing unresolved merge conflicts | **None** - must resolve conflicts |
 | **Schema validation** | Importing malformed JSON | **None** - must fix JSONL |
-| **Global positive comment-ID uniqueness** | Silently reallocating one of two cross-issue comments that claim the same persisted identity | **None** - renumber one source comment explicitly |
+| **Payload comment identity** | Treating a database-local comment rowid as global identity: two clones both mint comment id `1`, so a merged JSONL routinely carries one id for two issues; import reassigns the local rowid and verifies comments by `(issue, created_at, author, text)` instead of refusing the file | n/a - never refuses; same-issue duplicate payloads are still rejected |
 | **Tombstone protection** | Resurrecting deleted issues | **None** - by design |
 
 ### Merge Guards
