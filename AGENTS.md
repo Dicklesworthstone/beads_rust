@@ -160,6 +160,10 @@ cargo fmt --check
 
 If you see errors, **carefully understand and resolve each issue**. Read sufficient context to fix them the RIGHT way.
 
+Under RCH the all-targets clippy form can exceed the remote time cap; see
+"Time caps and how to run the suite under RCH" below for the split form and
+for which test commands fit.
+
 ---
 
 ## Testing
@@ -782,6 +786,42 @@ rch queue                     # See active/waiting builds
 
 If rch or its workers are unavailable, it fails open — builds run locally as normal.
 
+### Time caps and how to run the suite under RCH
+
+RCH wraps every remote command in a wall-clock cap and kills it with SIGKILL
+(exit 137) when the cap is hit. The hook then reports "likely resource
+exhaustion" and retries on another worker, which usually starts a cold compile
+and hits the same cap again. Observed caps (2026-09-01):
+
+| Command kind | Cap | Consequence for this crate |
+|---|---|---|
+| `cargo clippy --all-targets` | ~5 minutes | Checking all 162 test binaries from cold does not fit; split by target group |
+| `cargo test` / `cargo build` | ~30 minutes | A cold `cargo test --all-features` (162 integration binaries) does not fit |
+
+What fits:
+
+```bash
+# Unit tests only (one binary; ~20 min cold, ~1 min warm)
+rch exec -- cargo test --lib
+
+# One targeted unit test or module (seconds on a warm worker)
+rch exec -- cargo test --lib pending_sync_merge_authority_inspector_is_coherent
+rch exec -- cargo test --lib storage::
+
+# One integration binary at a time
+rch exec -- cargo test --test e2e_basic_lifecycle
+
+# Clippy in parts when the all-targets form is killed
+rch exec -- cargo clippy --lib --bins -- -D warnings
+rch exec -- cargo clippy --tests -- -D warnings
+```
+
+A worker that compiled this crate recently keeps its target directory, so
+re-running a targeted command on the same worker is fast; `rch queue` shows
+which worker a job landed on. Never chain a full-suite run behind a cold
+worker; use the shard list in `docs/TEST_HARNESS.md` (and `scripts/gate.sh
+<shard>` once the gate manifest from bead `beads_rust-uze9.2` lands).
+
 **Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
 
 ---
@@ -913,6 +953,17 @@ git commit -m "..."     # Commit everything together
 git push                # Push to remote
 ```
 
+### GitHub issues must cite a bead
+
+A GitHub issue closed as fixed must cite a bead ID in its closing comment.
+If no bead exists, create one first (`br create "..." --external-ref gh-NNN`)
+and close it with the landing commit in the reason. This keeps `br list` able
+to answer "what shipped" — in August 2026, six user-reported fixes and a full
+engine emergency landed with no bead, and the tracker stopped reflecting the
+work. `scripts/stale-claims.sh` (run on a schedule by the Doctor workflow)
+prints every in-progress claim that `br coordination status` classifies as
+stale or abandoned and exits non-zero so hidden work is surfaced.
+
 ### Best Practices
 
 - Check `br ready` at session start to find available work
@@ -929,7 +980,7 @@ git push                # Push to remote
 
 **MANDATORY WORKFLOW:**
 
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
+1. **File issues for remaining work** - Create issues for anything that needs follow-up; any GitHub issue you closed as fixed must cite a bead ID
 2. **Run quality gates** (if code changed) - Tests, linters, builds
 3. **Update issue status** - Close finished work, update in-progress items
 4. **Sync beads** - `br sync --flush-only` to export to JSONL

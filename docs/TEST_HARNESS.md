@@ -27,6 +27,30 @@ scripts/conformance.sh            # br vs bd parity checks
 scripts/bench.sh --quick          # Quick performance comparison
 ```
 
+## Running under RCH time caps
+
+Agent sessions offload cargo through RCH, which caps `cargo clippy
+--all-targets` at about 5 minutes and `cargo test`/`cargo build` at about 30
+minutes and kills the job (exit 137, reported as "likely resource exhaustion")
+when the cap is hit. This crate has 162 integration test binaries under
+`tests/`; a cold `cargo test --all-features` does not fit in the cap, and the
+automatic retry lands on a cold worker and fails the same way.
+
+Run one of these instead:
+
+| Goal | Command | Cold / warm |
+|---|---|---|
+| Unit suite (2,894 tests) | `rch exec -- cargo test --lib` | ~20 min / ~1 min |
+| One unit test or module | `rch exec -- cargo test --lib <filter>` | ~20 min / seconds |
+| One integration binary | `rch exec -- cargo test --test <name>` | 5-15 min / ~1 min |
+| Clippy when all-targets is killed | `rch exec -- cargo clippy --lib --bins -- -D warnings` then `--tests` | — |
+
+A shard manifest (`gates.toml` + `scripts/gate.sh <shard>`) that partitions the
+integration binaries into cap-sized groups is tracked in bead
+`beads_rust-uze9.2`; until it lands, run binaries individually or in small
+groups on a worker that already has the crate compiled (`rch queue` shows the
+worker a job landed on).
+
 ## Script Reference
 
 | Script | Purpose | Duration | When to Use |
