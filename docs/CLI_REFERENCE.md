@@ -1861,6 +1861,16 @@ Checks database integrity, schema compatibility, and configuration.
 |--------|-------------|
 | `--repair` | Attempt to repair detected issues by rebuilding DB from JSONL |
 | `--allow-repeated-repair` | Allow another JSONL rebuild after prior failed recovery evidence |
+| `--selftest` | Run this binary through a full issue lifecycle in a throwaway workspace and print a `br.doctor.selftest.v1` receipt (platform, filesystem probe, engine, per-step timings). Never touches the current workspace; exit 0 when every step passed, 1 otherwise |
+| `--selftest-dir <DIR>` | With `--selftest`, create the throwaway workspace under `DIR` (probe a specific filesystem such as a WSL2 DrvFS mount) |
+| `--keep` | With `--selftest`, keep the throwaway workspace for inspection |
+
+`br doctor --json` and `br info --json` both carry an `engine` block: engine
+name and version (from `Cargo.lock` at build time), the sidecars present
+beside `beads.db`, the shared opener lease and whether it is held, and any
+`.br_recovery/` artifacts. `br doctor explain <finding-id|check-name>` expands
+one finding with its registry entry, a live observation, fixers, and next
+commands; `br doctor explain --list` enumerates the finding ids.
 
 #### Reviewed schema migration
 

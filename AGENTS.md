@@ -820,8 +820,9 @@ rch exec -- cargo clippy --tests -- -D warnings
 A worker that compiled this crate recently keeps its target directory, so
 re-running a targeted command on the same worker is fast; `rch queue` shows
 which worker a job landed on. Never chain a full-suite run behind a cold
-worker; use the shard list in `docs/TEST_HARNESS.md` (and `scripts/gate.sh
-<shard>` once the gate manifest from bead `beads_rust-uze9.2` lands).
+worker; run one shard at a time with `scripts/test-shard.sh <shard>`
+(`lib`, `e2e-a-l`, `e2e-m-z`, `storage`, `misc`; `list`/`show` print the
+membership), which is also what `.github/workflows/ci.yml` runs.
 
 **Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
 
