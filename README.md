@@ -25,7 +25,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/
 
 <p><em>Works on Linux, macOS, and Windows (WSL). Auto-detects your platform and downloads the right binary.</em></p>
 
-<p><em>Useful install flags: <code>--skip-skills</code> to skip all Claude Code / Codex skills, or <code>--no-migration-skill</code> to skip just the bd-to-br-migration skill (handy for clean agent sandboxes where you're only using <code>br</code>).</em></p>
+<p><em>Useful install flags: <code>--skip-skills</code> to skip all Claude Code / Codex skills, or <code>--with-migration-skill</code> to also install the bd-to-br-migration skill (skipped by default; only needed when moving off classic <code>bd</code>).</em></p>
 </div>
 
 ---
@@ -225,14 +225,18 @@ br show br-abc    # Styled panels with metadata
 # Plain mode (piped or --no-color)
 br list | cat     # Clean text, no ANSI codes
 
-# JSON mode (--json or --robot)
+# JSON mode (--json on every command; some also offer --robot for automation-oriented envelopes)
 br list --json    # Structured output for tools ({issues, total, limit, offset, has_more})
+br ready --robot  # --robot exists on: close, reopen, defer, undefer, ready, blocked, orphans,
+                  # changelog, stats/status, vcs-status, sync, scheduler, dep import,
+                  # gate report/list, capacity *, coordination status
 ```
 
 Output mode is auto-detected:
 - **Rich**: Interactive TTY with color support
-- **Plain**: Piped output or `NO_COLOR` environment
-- **JSON**: Machine-readable (`--json` flag)
+- **Plain**: Piped output, `NO_COLOR`, or `TERM=dumb`
+- **JSON**: Machine-readable (`--json` flag, or `BR_OUTPUT_FORMAT=json`)
+- **TOON**: Token-efficient structured output (`BR_OUTPUT_FORMAT=toon`, or `--format toon` where a command offers it)
 - **Quiet**: Minimal output (`--quiet` flag)
 
 ### 6. Focused Local Scope
@@ -266,7 +270,7 @@ Agent Mail, MCP clients, or fixture update modes.
 | Storage | SQLite + JSONL | Dolt/SQLite |
 | Background daemon | **No** | Yes |
 | Hook installation | **Manual** | Automatic |
-| Binary size | ~5-8 MB | ~30+ MB |
+| Binary size | ~26 MB stripped static binary (v0.5.7, x86_64 Linux; ~11 MB compressed download) | ~30+ MB |
 | Scope | Local CLI, sync, recovery, and agent workflows | Feature-rich ecosystem |
 
 **When to use br:** You want a stable, local-first issue tracker with explicit sync, dependency-aware planning, and machine-readable output.
@@ -508,7 +512,9 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `stale` | Stale issues | `br stale --days 30` |
 | `coordination status` | Hidden in-progress claim diagnosis | `br coordination status --json` |
 | `count` | Count with grouping | `br count --by status` |
-| `query` | Manage saved queries | `br query save mine --status open --assignee alice` |
+| `query save` | Save the current filter set under a name | `br query save mine --status open --assignee alice` |
+| `query run` | Run a saved query (extra filters override the saved ones) | `br query run mine --priority 0-1` |
+| `query list` / `query delete` | List or delete saved queries | `br query delete mine` |
 
 ### Dependencies
 
@@ -529,6 +535,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `label remove` | Remove label | `br label remove br-abc123 urgent` |
 | `label list` | List issue labels | `br label list br-abc123` |
 | `label list-all` | All labels in project | `br label list-all` |
+| `label rename` | Rename a label on every issue that carries it | `br label rename backend platform` |
 
 ### Comments
 
@@ -547,7 +554,10 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `lint` | Check issues for missing template sections | `br lint --status all` |
 | `orphans` | List open issues referenced in commits | `br orphans` |
 | `changelog` | Generate changelog from closed issues | `br changelog --since-tag v0.1.44` |
-| `history` | Manage bounded local history backups | `br history prune --max-bytes 1073741824` |
+| `history list` | List bounded local JSONL history backups | `br history list` |
+| `history diff` | Diff a backup against the current JSONL | `br history diff issues.2026-09-01T12-00-00.jsonl` |
+| `history restore` | Restore a backup (`--force` when issues.jsonl exists) | `br history restore issues.2026-09-01T12-00-00.jsonl --force` |
+| `history prune` | Prune old backups | `br history prune --max-bytes 1073741824` |
 | `status` | Alias for project statistics | `br status` |
 
 ### Agents & Tooling
@@ -557,6 +567,11 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `agents` | Manage AGENTS.md workflow instructions | `br agents --add --force` |
 | `audit` | Record and label agent interactions | `br audit record --kind note` |
 | `capabilities` | Describe machine-readable contracts and safety guarantees | `br capabilities --format json` |
+| `gate report` | Record a workflow gate verdict for an issue | `br gate report br-abc123 --gate ci_green --provider ci --status pass` |
+| `gate list` | Show an issue's recorded gate results | `br gate list br-abc123 --robot` |
+| `capacity exempt` | Grant an audited exemption from a status capacity | `br capacity exempt br-abc123 --status blocked --provider lead --reason "hotfix"` |
+| `scheduler` | Rank ready work for agent swarms with explainable evidence | `br scheduler --limit 5 --robot` |
+| `serve` | Run the MCP server over stdio (binaries built with `--features mcp`) | `br serve --actor mcp` |
 | `completions` | Generate shell completions | `br completions zsh` |
 | `info` | Show workspace diagnostics | `br info` |
 | `robot-docs` | Print concise docs for automation agents | `br robot-docs guide` |
@@ -574,8 +589,12 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `sync --migrate-source-repo-path` | Reconcile rows and normalize machine-specific source paths | `br sync --migrate-source-repo-path --robot` |
 | `doctor` | Run diagnostics | `br doctor` |
 | `doctor migrate-schema` | Plan/apply/undo an explicit receipt-bound schema upgrade | `br doctor migrate-schema plan --json` |
+| `doctor health` | Cheap one-line liveness summary; exit code is the verdict | `br doctor health` |
+| `doctor explain` | Expand one finding: registry entry, live observation, fixers, next commands | `br doctor explain fm-configs-unknown-keys` |
+| `doctor ls` / `doctor undo` | List repair runs; restore a run's backups | `br doctor undo latest --dry-run` |
+| `doctor capabilities` | Machine-readable doctor contract (detectors, fixers, exit codes) | `br doctor capabilities --format json` |
 | `stats` | Project statistics | `br stats` |
-| `config` | Manage config | `br config list` |
+| `config` | Manage config (`list`, `get`, `set`, `schema`, `delete`, `path`, `edit`) | `br config schema` |
 | `upgrade` | Self-update | `br upgrade` |
 | `version` | Show version | `br version` |
 
@@ -588,6 +607,13 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `--verbose` / `-v` | Increase verbosity (-vv for debug) |
 | `--no-color` | Disable colored output |
 | `--db <path>` | Override database path |
+| `--actor <name>` | Actor name recorded in the audit trail |
+| `--no-auto-flush` | Skip the automatic JSONL export after a mutation |
+| `--no-auto-import` | Skip the automatic import check for a newer JSONL |
+| `--allow-stale` | Bypass the stale-database freshness warning |
+| `--lock-timeout <ms>` | SQLite busy / write-lock wait in milliseconds |
+| `--no-db` | JSONL-only mode: never open the SQLite database |
+| `--no-daemon` | Accepted for classic `bd` compatibility; br never runs a daemon |
 
 ---
 
@@ -604,27 +630,30 @@ br uses layered configuration:
 ### Example Config
 
 ```yaml
-# .beads/config.yaml
+# .beads/config.yaml — the keys br reads; `br config schema` prints the live list
+# with types and defaults, and `br config set` warns about keys br does not read.
 
-# Default issue ID prefix for newly created issues
-id:
-  prefix: "proj"
+# Prefix for newly created issue ids (existing ids keep theirs)
+issue_prefix: "proj"
 
-# Default values for new issues
-defaults:
-  priority: 2
-  type: "task"
-  assignee: "team@example.com"
+# Defaults for `br create` when --priority / --type are not given
+default_priority: 2        # 0-4 or P0-P4
+default_type: "task"
 
-# Output formatting
-output:
-  color: true
-  date_format: "%Y-%m-%d"
+# Force colored (true) or plain (false) output; unset means auto-detect
+# display:
+#   color: true
 
-# Sync behavior
+# Sync behavior (these are the defaults; set to false to opt out)
 sync:
-  auto_import: false
-  auto_flush: false
+  auto_flush: true         # export issues.jsonl after each successful mutation
+  auto_import: true        # import a newer issues.jsonl before commands run
+  history_enabled: true    # keep bounded JSONL snapshots under .beads/.br_history
+
+# Optional
+# actor: "alice"           # audit actor when --actor is not given
+# claim_exclusive: true    # refuse `br update --claim` on an issue another actor holds
+# lock_timeout: 5000       # write-lock wait in milliseconds
 ```
 
 ### Config Commands
@@ -633,13 +662,18 @@ sync:
 # Show all config
 br config list
 
-# Get specific value
-br config get id.prefix
+# Every key br honors, with aliases, types, defaults, and descriptions
+br config schema
 
-# Set value
-br config set defaults.priority=1
+# Get a specific value
+br config get issue_prefix
 
-# Open in editor
+# Set a value (key=value or key value); unknown keys are written but warned about
+br config set default_priority=1
+
+# Remove a key, print the config file path, or open it in $EDITOR
+br config delete default_priority
+br config path
 br config edit
 ```
 
@@ -831,8 +865,24 @@ GitHub #384 acceptance matrix.
 
 | Variable | Description |
 |----------|-------------|
+| `BEADS_DIR` | Use this `.beads` directory instead of discovering one from the working directory |
 | `BD_DB` / `BD_DATABASE` | Override database path |
 | `BEADS_JSONL` | Override JSONL path (requires `--allow-external-jsonl`) |
+| `BR_OUTPUT_FORMAT` | Force `json` or `toon` output for every command |
+| `TOON_DEFAULT_FORMAT` | Fallback for `BR_OUTPUT_FORMAT` |
+| `TOON_STATS` | Show TOON token-savings stats |
+| `NO_COLOR`, `TERM=dumb` | Plain output without ANSI codes |
+| `COLUMNS` | Width used for text wrapping when the terminal size is unavailable |
+| `BR_AGENT_NAME`, `BR_HARNESS`, `BR_MODEL` | Default agent attribution (`--agent-name`, `--harness`, `--model`) recorded on close |
+| `BR_SESSION` | Harness session identity recorded with audit attribution |
+| `BR_INHERITED_CONTEXT` | Override `inherited_context.enabled` from config |
+| `BR_HISTORY_MAX_BYTES`, `BR_HISTORY_MIN_INTERVAL_SECS` | Size budget and minimum spacing of JSONL history snapshots |
+| `BR_DISABLE_PARALLEL_JSONL_EXPORT` | Force the single-threaded JSONL export path |
+| `BR_DOCTOR_STALE_LOCK_THRESHOLD_SECS` | Age after which `br doctor` reports `.write.lock` as stale (default 300) |
+| `EDITOR` / `VISUAL` | Editor for `br config edit` |
+| `GITHUB_TOKEN` / `GH_TOKEN` | Authenticate the GitHub API calls made by `br upgrade` |
+| `XDG_CACHE_HOME` | Base directory for br's cache (default `~/.cache`) |
+| `BEADS_IDENTITY`, `BEADS_FLUSH_DEBOUNCE`, `BEADS_REMOTE_SYNC_INTERVAL`, `BEADS_AUTO_START_DAEMON` | Classic `bd` startup keys, read for compatibility and shown by `br config list` |
 | `RUST_LOG` | Logging level (debug, info, warn, error) |
 
 Recommended default for normal CLI use:
@@ -949,7 +999,7 @@ prefixes during import. Mixed prefixes in a project are supported by default.
 
 ```bash
 # Check your default creation prefix
-br config get id.prefix
+br config get issue_prefix
 
 # Import while rewriting IDs into your configured default prefix
 br sync --import-only --rename-prefix
@@ -1137,7 +1187,7 @@ br sync --import-only
 
 ### Q: Why Rust instead of Go?
 
-- **Smaller binary:** ~5-8 MB vs ~30+ MB
+- **Single static binary:** one ~26 MB executable (v0.5.7, x86_64 Linux) with no runtime, daemon, or Dolt dependency
 - **Memory safety:** No runtime garbage collection
 - **Operational fit:** The CLI, release pipeline, and agent tooling are already Rust-based
 - **Personal preference:** The author's flywheel tooling is Rust-based
@@ -1191,7 +1241,7 @@ br sync --merge --force        # keep the newer timestamp
 Yes:
 
 ```bash
-br config set id.prefix=myproj
+br config set issue_prefix=myproj
 # New issues: myproj-abc123
 ```
 

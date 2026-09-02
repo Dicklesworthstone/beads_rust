@@ -3,8 +3,16 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '.beads/**'
+      - 'docs/**'
+      - '**.md'
   pull_request:
     branches: [main]
+  schedule:
+    # Every six hours: catches drift that a paths-ignored push or a cancelled
+    # in-progress run missed, and runs the jobs that are too slow per push.
+    - cron: '17 */6 * * *'
   workflow_dispatch:
 
 # Cancel in-progress runs for the same branch
@@ -41,10 +49,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (all features)
-        run: cargo clippy --all-targets --all-features
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Clippy (no default features)
-        run: cargo clippy --all-targets --no-default-features
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
 
       - name: Check (all targets)
         run: cargo check --all-targets --all-features
@@ -69,10 +77,16 @@ jobs:
         run: cargo audit --deny yanked
 
   test:
-    name: Test Suite
+    name: Test (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        # Shard membership is derived from tests/*.rs file names by
+        # scripts/test-shard.sh, so every test file runs in exactly one job.
+        shard: [lib, e2e-a-l, e2e-m-z, storage, misc]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -84,22 +98,19 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2.9.1
 
-      - name: Run all tests (all features)
-        run: cargo test --all-features -- --nocapture
+      - name: Run shard
+        run: scripts/test-shard.sh ${{ matrix.shard }}
         env:
-          RUST_LOG: beads_rust=debug
-
-      - name: Run tests (no default features)
-        run: cargo test --no-default-features
-
-      - name: Run doc tests
-        run: cargo test --doc
+          NO_COLOR: 1
+          RUST_LOG: error
 
   reliability-gates:
     name: Reliability Gates
     runs-on: ubuntu-latest
     timeout-minutes: 60
     needs: check
+    # Too slow for every push; release.yml runs the same four gates on tags.
+    if: github.event_name != 'push'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -209,45 +220,14 @@ jobs:
             /tmp/forced_cycle_close_audit_*.summary.txt
           if-no-files-found: ignore
 
-  coverage:
-    name: Code Coverage
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    needs: test
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
-        with:
-          toolchain: nightly
-          components: llvm-tools-preview
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2.9.1
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d  # v2.87.0
-        with:
-          tool: cargo-llvm-cov
-
-      - name: Generate coverage report
-        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
-        continue-on-error: true
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
-        with:
-          files: lcov.info
-          fail_ci_if_error: false
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-
   build:
     name: Build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     needs: check
+    # Five-platform release builds on every push burn minutes without
+    # changing a decision; PRs, the schedule, and manual runs still get them.
+    if: github.event_name != 'push'
     strategy:
       fail-fast: false
       matrix:
@@ -316,7 +296,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: check
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    if: github.event_name != 'push'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 

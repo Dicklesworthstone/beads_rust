@@ -14,6 +14,10 @@
 //! order) of the live output equals the documented block. Values are not
 //! compared, so ids, timestamps, and messages may differ; renaming or dropping
 //! a key fails. Add a marker whenever you paste command output into a doc.
+//!
+//! A second test checks that every `br ...` example in the README command
+//! tables, and every flag in its Global Flags table, names a subcommand and
+//! flags the built binary's `--help` actually lists.
 #![allow(clippy::pedantic, clippy::nursery)]
 
 use assert_cmd::Command;
@@ -176,6 +180,182 @@ fn documented_json_examples_match_live_key_structure() {
     assert!(
         failures.is_empty(),
         "documented examples drifted:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// Subcommands that only exist in feature-gated builds; their README rows are
+/// checked only when the built binary has them.
+const FEATURE_GATED_SUBCOMMANDS: &[&str] = &["serve"];
+
+fn br_help(args: &[&str]) -> Option<String> {
+    let output = Command::cargo_bin("br")
+        .expect("br binary")
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", "error")
+        .args(args)
+        .arg("--help")
+        .output()
+        .expect("run br --help");
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Every `br ...` example in the README command tables, as (line, command).
+fn readme_table_examples(readme: &str) -> Vec<(usize, String)> {
+    let mut examples = Vec::new();
+    for (index, line) in readme.lines().enumerate() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('|') {
+            continue;
+        }
+        let unescaped = trimmed.replace("\\|", "\u{1}");
+        let Some(cell) = unescaped
+            .trim_matches('|')
+            .split('|')
+            .map(str::trim)
+            .filter(|cell| !cell.is_empty())
+            .last()
+        else {
+            continue;
+        };
+        let Some(code) = cell
+            .strip_prefix('`')
+            .and_then(|rest| rest.strip_suffix('`'))
+        else {
+            continue;
+        };
+        if !code.starts_with("br ") && code != "br" {
+            continue;
+        }
+        // Keep only the br invocation in front of a shell pipe.
+        let command = code.split(['\u{1}', '|']).next().unwrap_or("").trim();
+        examples.push((index + 1, command.to_string()));
+    }
+    examples
+}
+
+/// `--flag` names mentioned in a README table's first column, e.g. the
+/// Global Flags table, between `heading` and the next heading.
+fn readme_flag_table(readme: &str, heading: &str) -> Vec<(usize, String)> {
+    let mut flags = Vec::new();
+    let mut inside = false;
+    for (index, line) in readme.lines().enumerate() {
+        if line.trim() == heading {
+            inside = true;
+            continue;
+        }
+        if inside && line.starts_with('#') {
+            break;
+        }
+        if !inside || !line.trim().starts_with('|') {
+            continue;
+        }
+        let first_cell = line.trim().trim_matches('|').split('|').next().unwrap_or("");
+        for token in first_cell.split_whitespace() {
+            let token = token.trim_matches('`');
+            if let Some(flag) = token.strip_prefix("--") {
+                let name: String = flag
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                    .collect();
+                // A table separator row (`|------|`) is not a flag.
+                if name.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+                    flags.push((index + 1, format!("--{name}")));
+                }
+            }
+        }
+    }
+    flags
+}
+
+/// Every command and `--flag` the README tables show must exist in the built
+/// binary's `--help`: the drift class this catches is a renamed or removed
+/// subcommand or flag that a README row still advertises (the 2026-09-01
+/// reality check found several).
+#[test]
+fn readme_table_examples_name_real_subcommands_and_flags() {
+    let readme = fs::read_to_string("README.md").expect("read README.md");
+    let examples = readme_table_examples(&readme);
+    assert!(
+        examples.len() > 40,
+        "expected the README command tables to hold dozens of `br` examples, found {}",
+        examples.len()
+    );
+
+    let mut failures = Vec::new();
+    for (line, command) in &examples {
+        let words = match shell_words::split(command) {
+            Ok(words) => words,
+            Err(err) => {
+                failures.push(format!("README.md:{line} `{command}`: cannot split: {err}"));
+                continue;
+            }
+        };
+        let path: Vec<&str> = words
+            .iter()
+            .skip(1)
+            .take_while(|word| !word.starts_with('-'))
+            .take(3)
+            .map(String::as_str)
+            .collect();
+        if path
+            .first()
+            .is_some_and(|first| FEATURE_GATED_SUBCOMMANDS.contains(first))
+            && br_help(&path[..1]).is_none()
+        {
+            eprintln!("[readme_examples] README.md:{line} `{command}` skipped: feature-gated subcommand not built");
+            continue;
+        }
+        // Longest subcommand prefix whose --help succeeds wins; positionals
+        // such as issue ids are tolerated by clap when --help is present.
+        let help = (1..=path.len())
+            .rev()
+            .find_map(|depth| br_help(&path[..depth]).map(|help| (depth, help)));
+        let Some((depth, help)) = help else {
+            failures.push(format!(
+                "README.md:{line} `{command}`: no subcommand `{}` in the built binary",
+                path.first().copied().unwrap_or("")
+            ));
+            continue;
+        };
+        for word in words.iter().skip(1) {
+            let Some(flag) = word.strip_prefix("--") else {
+                continue;
+            };
+            let name = flag.split('=').next().unwrap_or(flag);
+            if !help.contains(&format!("--{name}")) {
+                failures.push(format!(
+                    "README.md:{line} `{command}`: `br {} --help` does not list --{name}",
+                    path[..depth].join(" ")
+                ));
+            }
+        }
+        eprintln!(
+            "[readme_examples] README.md:{line} `{command}` -> br {} --help ok",
+            path[..depth].join(" ")
+        );
+    }
+
+    let global_help = br_help(&[]).expect("br --help");
+    let global_flags = readme_flag_table(&readme, "### Global Flags");
+    assert!(
+        global_flags.len() >= 5,
+        "Global Flags table not found or empty in README.md"
+    );
+    for (line, flag) in &global_flags {
+        if !global_help.contains(flag.as_str()) {
+            failures.push(format!(
+                "README.md:{line}: Global Flags table lists {flag}, which `br --help` does not"
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "README command tables drifted from the binary:\n{}",
         failures.join("\n")
     );
 }

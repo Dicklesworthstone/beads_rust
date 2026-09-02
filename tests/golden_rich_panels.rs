@@ -396,7 +396,7 @@ fn term_dumb_pty_selects_plain_mode() {
         "TERM=dumb output must not contain box drawing:\n{dumb}"
     );
     assert!(
-        dumb.contains(&fixture.show_id) || dumb.contains("ID-REDACTED"),
+        dumb.contains("Alpha layout regression"),
         "plain output must still show the issue:\n{dumb}"
     );
 }

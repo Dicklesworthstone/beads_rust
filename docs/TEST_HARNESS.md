@@ -45,11 +45,14 @@ Run one of these instead:
 | One integration binary | `rch exec -- cargo test --test <name>` | 5-15 min / ~1 min |
 | Clippy when all-targets is killed | `rch exec -- cargo clippy --lib --bins -- -D warnings` then `--tests` | — |
 
-A shard manifest (`gates.toml` + `scripts/gate.sh <shard>`) that partitions the
-integration binaries into cap-sized groups is tracked in bead
-`beads_rust-uze9.2`; until it lands, run binaries individually or in small
-groups on a worker that already has the crate compiled (`rch queue` shows the
-worker a job landed on).
+`scripts/test-shard.sh <shard>` partitions the suite into cap-sized groups by
+file name (no manifest to maintain): `lib`, `e2e-a-l`, `e2e-m-z`, `storage`
+(storage/proptest/repro/workflow binaries), `misc` (conformance, snapshots,
+goldens, docs, manifests), and `bench`. `scripts/test-shard.sh list` and
+`show <shard>` print the membership; `.github/workflows/ci.yml` runs the first
+five as a matrix. Under RCH, `rch exec -- scripts/test-shard.sh e2e-a-l` fits
+the 30-minute cap on a warm worker; on a cold worker run binaries individually
+or in small groups (`rch queue` shows the worker a job landed on).
 
 ## Script Reference
 

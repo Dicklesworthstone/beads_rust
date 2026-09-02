@@ -54,14 +54,8 @@ main() {
     log "Check (all targets)"
     cargo check --all-targets --all-features
 
-    log "Tests (all features)"
-    cargo test --all-features -- --nocapture
-
-    log "Tests (no default features)"
-    cargo test --no-default-features
-
-    log "Doc tests"
-    cargo test --doc
+    log "Tests (all features, sharded like ci.yml)"
+    scripts/test-shard.sh all
 
     run_reliability_gates
 
