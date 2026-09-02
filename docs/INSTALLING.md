@@ -136,7 +136,19 @@ cargo test && cargo build --release
 
 ### Pre-built Binaries
 
-Pre-built binaries are available from GitHub Releases:
+Pre-built binaries are available from GitHub Releases.
+
+**Canonical asset names.** The release workflow publishes exactly one asset
+family per release: `br-<version>-<platform>.tar.gz` (Linux and macOS) or
+`br-<version>-<platform>.zip` (Windows), each with a `.sha256` checksum
+sidecar and a `.minisig` signature (see README "Verify Release Signatures").
+`<platform>` is one of `linux_amd64`, `linux_arm64`, `linux_musl_amd64`,
+`linux_musl_arm64`, `darwin_amd64`, `darwin_arm64`, `windows_amd64`. The
+installer, the Homebrew/Scoop/AUR manifests, and `br upgrade` all use these
+names. Assets with any other prefix (for example `beads_rust-<version>-…`
+with Rust target aliases such as `darwin_aarch64`) are not produced by the
+release workflow, carry no signature, and are unsupported; if you see them on
+a release they came from an out-of-band uploader and should be ignored.
 
 ```bash
 # Example for Linux x86_64

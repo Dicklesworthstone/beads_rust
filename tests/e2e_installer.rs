@@ -931,3 +931,49 @@ fn plugin_marketplace_publishes_only_the_br_skill() {
         );
     }
 }
+
+/// The installer, the release workflow, and the packaging manifests must agree
+/// on one asset family. v0.5.7 shipped a second, unsigned `beads_rust-<ver>-*`
+/// family from an out-of-band uploader; the workflow itself must never produce
+/// or reference it, and the installer's archive pattern must match the
+/// workflow's archive pattern (asset version without the `v`, platform name
+/// from the build matrix).
+#[test]
+fn release_workflow_and_installer_agree_on_asset_names() {
+    let workflow = std::fs::read_to_string(".github/workflows/release.yml")
+        .expect("read .github/workflows/release.yml");
+    assert!(
+        workflow.contains(
+            "br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }}"
+        ),
+        "release.yml must build br-<asset_version>-<platform>.<archive> assets"
+    );
+    assert!(
+        !workflow.contains("beads_rust-${{"),
+        "release.yml must not produce a beads_rust-* asset family"
+    );
+
+    let script = install_script_contents();
+    let download_release = shell_function_section(&script, "download_release");
+    assert!(
+        download_release
+            .contains(r#"archive_name="br-${asset_version}-${platform}.${archive_ext}""#),
+        "install.sh must download the br-<asset_version>-<platform> family"
+    );
+    assert!(
+        !script.contains("beads_rust-${"),
+        "install.sh must not reference a beads_rust-* asset family"
+    );
+
+    for manifest in [
+        "packaging/homebrew/br.rb",
+        "packaging/scoop/br.json",
+        "packaging/aur/PKGBUILD",
+    ] {
+        let content = std::fs::read_to_string(manifest).expect("read package manifest");
+        assert!(
+            !content.contains("beads_rust-"),
+            "{manifest} must use the br-<version>-<platform> asset family"
+        );
+    }
+}

@@ -739,4 +739,19 @@ jobs:
         # committed into git" (seen on v0.1.43).  `--no-verify` skips the
         # rebuild-and-test pass that CI already ran, keeping the publish
         # under the 15-minute timeout and avoiding a second resolution.
-        run: cargo publish --locked --no-verify --token ${{ secrets.CRATES_IO_TOKEN }}
+        #
+        # Idempotent on re-runs: the second v0.5.7 workflow run (2026-08-29)
+        # succeeded on every build job and failed only here because the first
+        # run had already published 0.5.7. A version that crates.io already
+        # serves is treated as done, not as a failure.
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          if curl -fsSL -A "beads_rust-release-workflow" \
+               "https://crates.io/api/v1/crates/beads_rust/${version}" >/dev/null 2>&1; then
+            echo "beads_rust ${version} is already on crates.io; nothing to publish."
+            exit 0
+          fi
+          cargo publish --locked --no-verify --token "${CRATES_IO_TOKEN}"
+        env:
+          CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
