@@ -1055,7 +1055,7 @@ mod tests {
     fn test_label_remove_rejects_invalid_label_before_route_preparation() {
         let args = LabelRemoveArgs {
             issues: vec!["bd-abc".to_string(), "has space".to_string()],
-            label: None,
+            label: Vec::new(),
         };
         let ctx = OutputContext::from_flags(false, false, true);
         let err = execute_routed_label_remove(
