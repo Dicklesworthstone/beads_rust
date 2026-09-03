@@ -17336,8 +17336,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "carried red from the stranded sync-safety workstream (failed identically on its own \
-                pre-merge snapshot); tracked for completion by the owning workstream"]
     fn reviewed_apply_reports_composable_postcommit_source_drift_and_allows_replan() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
@@ -17393,10 +17391,17 @@ mod tests {
         assert!(storage.get_issue(&incoming.id).unwrap().is_some());
         drop(storage);
 
+        // The issues converged, so the replan mutates nothing; it still has
+        // bookkeeping to do because the source witness recorded at commit
+        // time is the pre-drift one. That is MetadataOnlyReady by design,
+        // not NoChanges: applying it re-anchors the authority without
+        // touching issues.
         let retry = plan_reviewed_additive_reconcile(&plan_request).unwrap();
+        assert_eq!(retry.receipt().created, 0, "{:?}", retry.receipt());
+        assert_eq!(retry.receipt().updated, 0, "{:?}", retry.receipt());
         assert_eq!(
             retry.receipt().status,
-            AdditiveReconcileStatus::NoChanges,
+            AdditiveReconcileStatus::MetadataOnlyReady,
             "replanning after the reported postcommit drift must converge safely"
         );
     }
