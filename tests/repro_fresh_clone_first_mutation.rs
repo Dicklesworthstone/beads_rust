@@ -28,7 +28,8 @@ const FLUSH_TIMEOUT_HEADROOM: Duration = Duration::from_secs(15);
 /// The files `git` actually tracks in a beads workspace. A real `git clone`
 /// hands a teammate exactly these — notably *not* `beads.db`, which
 /// `.beads/.gitignore` excludes.
-const TRACKED_BEADS_FILES: &[&str] = &["issues.jsonl", "config.yaml", "metadata.json", ".gitignore"];
+const TRACKED_BEADS_FILES: &[&str] =
+    &["issues.jsonl", "config.yaml", "metadata.json", ".gitignore"];
 
 /// Build a donor workspace with `seed_titles` issues and return it.
 fn donor_workspace(prefix: &str, seed_titles: &[&str]) -> BrWorkspace {
