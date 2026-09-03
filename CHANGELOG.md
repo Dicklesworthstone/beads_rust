@@ -64,6 +64,15 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
+## Unreleased -- on `main` after v0.5.8
+
+- Ordinary database opens trust the recorded runtime-schema witness: when the
+  metadata witness names the connection's exact SQLite schema cookie, the
+  open skips the eleven-table PRAGMA walk (about 24 ms, run twice per
+  mutating command) and the witness re-write, as the read-only fast open
+  already did. Any DDL moves the cookie, so a tampered schema still takes
+  the full check and is healed (bead naul5; measured profile on that bead).
+
 ## v0.5.8 -- 2026-09-03 (Release)
 
 Every v0.5.7 user has the bugs below. This cut carries the six user-reported
