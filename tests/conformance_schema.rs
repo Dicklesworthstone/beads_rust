@@ -10,6 +10,7 @@
 
 mod common;
 
+use beads_rust::franken_sync::{Connection, SqliteValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -38,7 +39,7 @@ pub struct SchemaWorkspace {
 
 impl SchemaWorkspace {
     pub fn new() -> Self {
-        let temp_dir = TempDir::new().expect("create temp dir");
+        let temp_dir = TempDir::new_in(common::cli::isolated_temp_root()).expect("create temp dir");
         let root = temp_dir.path().to_path_buf();
         let br_root = root.join("br_workspace");
         let bd_root = root.join("bd_workspace");
@@ -69,7 +70,7 @@ impl SchemaWorkspace {
 
     /// Run bd command
     pub fn run_bd(&self, args: &[&str]) -> CmdOutput {
-        run_binary("bd", &self.bd_root, args)
+        run_binary(&common::bd_binary_name(), &self.bd_root, args)
     }
 
     /// Get path to br database
@@ -102,13 +103,40 @@ impl SchemaWorkspace {
         self.bd_root.join(".beads").join("issues.jsonl")
     }
 
-    /// Run SQLite PRAGMA command and return results
+    /// Run one introspection statement (a `PRAGMA ...` or a `SELECT` over
+    /// `sqlite_master`) in-process and render the rows the way the sqlite3
+    /// CLI's list mode does: one row per line, cells joined by `|`.
+    ///
+    /// Both databases are plain SQLite files (bd's from the Go toolchain,
+    /// br's from FrankenSQLite), so the crate's own engine reads either and
+    /// the host needs no `sqlite3` binary.
     pub fn run_sqlite_pragma(&self, db_path: &PathBuf, pragma: &str) -> String {
-        let output = Command::new("sqlite3")
-            .args([db_path.to_str().unwrap(), pragma])
-            .output()
-            .expect("run sqlite3");
-        String::from_utf8_lossy(&output.stdout).to_string()
+        let conn = Connection::open(db_path.to_string_lossy().into_owned())
+            .unwrap_or_else(|error| panic!("open {}: {error}", db_path.display()));
+        let rows = conn
+            .query(pragma.trim().trim_end_matches(';'))
+            .unwrap_or_else(|error| panic!("run {pragma}: {error}"));
+        let mut rendered = String::new();
+        for row in &rows {
+            let cells: Vec<String> = row.values().iter().map(render_cell).collect();
+            rendered.push_str(&cells.join("|"));
+            rendered.push('\n');
+        }
+        conn.close().expect("close sqlite database");
+        rendered
+    }
+}
+
+/// One cell as the sqlite3 CLI would print it in list mode.
+fn render_cell(value: &SqliteValue) -> String {
+    match value {
+        SqliteValue::Null => String::new(),
+        SqliteValue::Integer(integer) => integer.to_string(),
+        SqliteValue::Float(float) => float.to_string(),
+        other => other
+            .as_text()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{other:?}")),
     }
 }
 

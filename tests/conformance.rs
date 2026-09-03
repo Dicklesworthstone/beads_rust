@@ -87,7 +87,10 @@ impl ConformanceWorkspace {
     const INIT_ARGS: [&'static str; 3] = ["init", "--prefix", CONFORMANCE_PREFIX];
 
     pub fn new() -> Self {
-        let temp_dir = TempDir::new().expect("create temp dir");
+        // Never under `$TMPDIR` blindly: on RCH workers it points inside this
+        // repository, and `br` would then discover the repository's own
+        // `.beads` workspace instead of the scratch one.
+        let temp_dir = TempDir::new_in(common::cli::isolated_temp_root()).expect("create temp dir");
         let root = temp_dir.path().to_path_buf();
         let br_root = root.join("br_workspace");
         let bd_root = root.join("bd_workspace");
