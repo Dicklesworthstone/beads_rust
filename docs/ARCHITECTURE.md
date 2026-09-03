@@ -807,6 +807,54 @@ impl IssueValidator {
 
 ---
 
+## As built (2026-09-03)
+
+The sections above describe the design; this one records what the tree
+actually is, so nobody has to re-derive it from the planning documents under
+`docs/porting/` and `docs/plans/` (those are historical; their banners point
+here). Line counts are `wc -l` over `*.rs` on 2026-09-03 at commit
+`b4430d11` (`tokei` is not installed on the build hosts).
+
+| Area | Files | Lines | What lives there |
+|---|---|---|---|
+| `src/cli/commands/` | 45 + `doctor_subsystems/` (11) | 102,932 | One file per subcommand (47 top-level subcommands). `doctor.rs` alone is 25,690 lines; `doctor_subsystems/` (15,376) holds the chokepoint, capabilities, explain, engine block, selftest, schema migration, and the incident bundle. `sync.rs` is 7,535. |
+| `src/storage/` | 4 | 47,677 | `sqlite.rs` (38,571) is the whole engine facade: CRUD, filtered queries, dependency graph, labels, comments, events, integrity probes, database-family snapshots. `schema.rs` carries DDL migrations. |
+| `src/sync/` | 5 | 33,827 | `mod.rs` (25,032): JSONL export/import, merge with pending-merge receipts, additive reconcile, source witnesses, write authority. `db_inode_lock.rs` is the sole-opener lease. |
+| `src/config/` | 2 | 13,741 | Layered config, known-key registry, startup/open/recovery orchestration (`open_sqlite_storage_with_recovery_strategy`, sidecar quarantines). |
+| `src/mcp/` | 4 | 9,520 | `br serve`: 7 tools, resources, prompts (`mcp` feature). |
+| `src/close_policy.rs`, `policy.rs`, `coordination.rs`, `health.rs`, `inheritance.rs` | 5 | 9,200 | Workflow gates and capacity, policy documents, stale-claim diagnosis, health vocabulary, inherited context. |
+| `src/model/`, `error/`, `format/`, `output/`, `util/`, `validation/` | 29 | 18,582 | Types, structured errors, plain/JSON/TOON/CSV formatting, Rich components, ids/hashes/time, input validation. |
+| `src/main.rs`, `cli/mod.rs`, `lib.rs`, `franken_sync.rs`, `shutdown.rs`, `logging.rs` | 6 | 9,247 | Startup, write-lock acquisition and dispatch; clap definitions; the synchronous facade over the async FrankenSQLite API; cooperative shutdown. |
+| dormant (`cache.rs`, `write_combining.rs`, `format/{rich,syntax,theme}.rs`, two output components) | 7 | 5,015 | Counted inside the rows above. See the decision table below; deletion is an operator decision. |
+| `src/` total | 113 | 248,278 | |
+| `tests/` | 154 integration files + `common/` | 142,914 | Sharded by `scripts/test-shard.sh` (`lib`, `e2e-a-l`, `e2e-m-z`, `storage`, `misc`, `bench`). |
+
+**Why there is no `Storage` trait.** The porting plan specified a ~45-method
+`pub trait Storage`. The tree has one engine by design (FrankenSQLite, no C
+SQLite, no FFI; see `docs/reliability/ENGINE_OPERATING_MODEL.md`), so the trait
+would have exactly one implementation and every test would still run against
+that engine. The engine-independent check that a trait was meant to enable is
+done differently: `tests/model_based_storage.rs` compares `SqliteStorage`
+against a `BTreeMap` reference model after every operation.
+
+**Why the monoliths exist.** `sqlite.rs`, `sync/mod.rs`, and `doctor.rs` grew
+around the 2026-08 corruption incidents, where the fix surface (write
+authority, receipts, witnesses, quarantines, migrations) had to move together.
+Splitting them along the planned `storage/{issues,deps,labels,queries}` lines
+is mechanical but touches thousands of lines of `pub(crate)` plumbing and
+every unit-test module inside them; it buys navigability, not behavior. It is
+listed as an optional Track G bead and has not been scheduled.
+
+**What guards the boundaries today.** `tests/agents_md_contract.rs` fails when
+a module is added without an `AGENTS.md` row; the doctor's read-only contract
+(`storage::sqlite::database_family_read_only_diffs`, GitHub #476) is the one
+place that defines which bytes a read-only open may touch; the release and
+CI reliability jobs run the failure-injection matrix and the multi-process
+stress script.
+
+**Operator decision outstanding (bead wqmw.6 / bridge plan §8.4):** keep the
+as-built layout, or schedule the isomorphic split as a Track G bead.
+
 ## Dormant Modules (decision table, 2026-09-02)
 
 Reference counts are `rg` over `src/` excluding the module's own file and its

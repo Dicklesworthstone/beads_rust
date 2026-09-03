@@ -1,3 +1,8 @@
+> **Historical planning document (2026-01).** It describes the Go `bd` code
+> base the port started from, not `br` as it exists now. For the current
+> architecture see [docs/ARCHITECTURE.md](../ARCHITECTURE.md), section
+> "As built".
+
 # Existing Beads Structure and Architecture
 
 > Comprehensive specification of the Go beads codebase for porting to Rust.

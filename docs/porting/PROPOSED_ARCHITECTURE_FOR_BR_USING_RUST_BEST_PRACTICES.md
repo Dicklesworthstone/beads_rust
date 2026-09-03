@@ -1,3 +1,8 @@
+> **Historical planning document (2026-01).** The `Storage` trait and the
+> `storage/{issues,deps,labels,queries}` split proposed here were not built;
+> [docs/ARCHITECTURE.md](../ARCHITECTURE.md) section "As built" records what
+> exists and why.
+
 # Proposed Architecture for `br` (beads_rust)
 
 ## Using Rust Best Practices from xf & cass

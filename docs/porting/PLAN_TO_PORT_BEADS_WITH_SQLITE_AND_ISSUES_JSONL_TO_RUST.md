@@ -1,3 +1,8 @@
+> **Historical planning document (2026-01).** The port shipped; module names,
+> traits, and milestones below are the plan, not the tree. For the current
+> architecture see [docs/ARCHITECTURE.md](../ARCHITECTURE.md), section
+> "As built".
+
 # Plan: Port Beads (Classic SQLite + JSONL) to Rust
 
 > **Project:** beads_rust

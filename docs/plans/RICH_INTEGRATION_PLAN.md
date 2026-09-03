@@ -1,3 +1,8 @@
+> **Historical planning document (2026-01).** Rich output lives in
+> `src/output/components/` today; `src/format/{rich,syntax,theme}.rs` from this
+> plan are dormant (see the decision table in
+> [docs/ARCHITECTURE.md](../ARCHITECTURE.md)).
+
 # Rich Rust Integration Plan for beads_rust
 
 > A comprehensive, granular plan to integrate rich_rust throughout beads_rust for premium, stylish console output that delights humans without interfering with AI agent workflows.
