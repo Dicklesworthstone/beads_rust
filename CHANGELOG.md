@@ -74,6 +74,13 @@ publishes from the tag.
 
 - `br gate report` writes `gate_results` as well as `gate_result_history`
   (#466) -- 70e7fed9.
+- `br sync --import` no longer refuses a JSONL record that spells an absent
+  text field as `""` (`acceptance_criteria`, `design`, `notes`, `assignee`,
+  and the other optional text columns): the storage re-reads those as NULL,
+  and strict import verification compared the record against its own
+  literal form, rolling back the whole import with "does not match its
+  normalized JSONL payload". The refusal now also names the differing
+  fields. Found by the `db_bloat` doctor fixture (bead hrhx).
 - `br doctor --repair` no longer discards the append-only tables `events`,
   `gate_results`, `gate_result_history`, `close_metadata`,
   `capacity_occupancy`, `capacity_exemptions`, and

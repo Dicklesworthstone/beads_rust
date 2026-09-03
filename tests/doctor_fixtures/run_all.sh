@@ -29,6 +29,12 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FIXTURES_ROOT="${FIXTURES_ROOT:-$SCRIPT_DIR}"
+# Many fixtures drive the sqlite3 CLI. Hosts without one (RCH workers, slim
+# CI images) get the python-backed stand-in in _bin/, which any real sqlite3
+# already on PATH shadows.
+if ! command -v sqlite3 >/dev/null 2>&1; then
+    export PATH="$SCRIPT_DIR/_bin:${PATH:-}"
+fi
 FAIL_FAST="${FAIL_FAST:-1}"
 
 if [ -z "${TOOL_BIN:-}" ]; then
@@ -55,6 +61,11 @@ fi
 
 declare -a fixtures=()
 while IFS= read -r dir; do
+    # `_bin/` and any other underscore-prefixed directory is tooling, not a
+    # fixture; a fixture directory missing its scripts still fails loudly.
+    case "$(basename "$dir")" in
+        _*) continue ;;
+    esac
     fixtures+=("$dir")
 done < <(find "$FIXTURES_ROOT" -mindepth 1 -maxdepth 1 -type d | sort)
 

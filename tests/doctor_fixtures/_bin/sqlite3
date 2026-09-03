@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Minimal stand-in for the sqlite3 CLI, used by tests/doctor_fixtures/run_all.sh
+only when no real `sqlite3` is on PATH (RCH workers, slim CI images).
+
+Covers exactly what the fixtures use: `sqlite3 DB 'SQL'` and `... | sqlite3 DB`
+(SQL on stdin), several `;`-separated statements per call, list-mode output
+(cells joined by `|`, one row per line, NULL as an empty cell). Nothing else
+(dot-commands, output modes, flags) is supported; unknown arguments fail loudly
+so a fixture never passes on a silently ignored corruption step.
+"""
+import sqlite3
+import sys
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1].startswith("-"):
+        sys.stderr.write("fixture sqlite3 shim: usage: sqlite3 DB [SQL]\n")
+        return 2
+    if len(argv) > 3:
+        sys.stderr.write("fixture sqlite3 shim: unsupported extra arguments\n")
+        return 2
+    db_path = argv[1]
+    script = argv[2] if len(argv) == 3 else sys.stdin.read()
+
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        for statement in split_statements(script):
+            cursor = conn.execute(statement)
+            if cursor.description is None:
+                continue
+            for row in cursor.fetchall():
+                sys.stdout.write("|".join(render(cell) for cell in row) + "\n")
+    except sqlite3.Error as error:
+        sys.stderr.write(f"fixture sqlite3 shim: {error}\n")
+        return 1
+    finally:
+        conn.close()
+    return 0
+
+
+def split_statements(script):
+    """Yield complete statements, honouring quotes the way the CLI does."""
+    buffer = ""
+    for line in script.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            statement = buffer.strip()
+            if statement.rstrip(";").strip():
+                yield statement
+            buffer = ""
+    tail = buffer.strip()
+    if tail.rstrip(";").strip():
+        yield tail
+
+
+def render(cell):
+    if cell is None:
+        return ""
+    if isinstance(cell, bytes):
+        return cell.decode("utf-8", "replace")
+    return str(cell)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
