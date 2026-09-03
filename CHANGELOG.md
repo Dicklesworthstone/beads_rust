@@ -150,6 +150,24 @@ publishes from the tag.
   order and a sequential model; the published JSONL must then equal the
   linearized final state, `integrity_check` must be ok, and issue rowids must
   be dense. It runs in the CI and release reliability jobs (bead dk45.8).
+- The Go-bd conformance suite runs again, against bd v0.46.0 built from the
+  workflow's pinned commit: the harnesses now create their paired
+  workspaces under an isolated temp root (with `TMPDIR` inside the
+  repository, `br` had been walking up into the repository's own `.beads`
+  and waiting on its write lock), honor `BD_BINARY` everywhere, introspect
+  schemas in-process instead of through the `sqlite3` CLI, run `br` at
+  `RUST_LOG=error`, and read br's paginated `list`/`blocked` payloads.
+  Remaining differences are recorded in docs/TEST_HARNESS.md ("Known
+  divergences from bd 0.46.0") and encoded as allowlist entries or ignore
+  reasons: plain-text formats, `dep cycles` now agreeing under #391,
+  pagination, dependency provenance fields, schema drift, and bd's silent
+  `show` of an unknown id (bead zxfz.3).
+- The doctor fixture suite runs on hosts without the `sqlite3` CLI
+  (`db_bloat` uses python's sqlite3 module), the WAL-without-SHM fixture
+  accepts the `-shm` that fsqlite 0.3.15 recreates on every open, and a new
+  `config_unknown_keys` fixture plus a manifest exception row close the
+  coverage-manifest gap for the two doctor checks added after v0.5.7
+  (bead hrhx).
 - Reviewed additive reconciliation has unit coverage for the three witness
   cases that were only asserted in prose: a byte-identical source replaced
   under a new inode with its mtime restored, a same-size rewrite with the
