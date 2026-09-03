@@ -2210,8 +2210,17 @@ mod tests {
 
     #[test]
     fn test_normalize_dep_type_filter_rejects_unknown_types() {
+        // Unknown spellings are refused with the actionable hint variant
+        // (docs-shaped mistakes name the nearest real type).
         let err = normalize_dep_type_filter("parent_child").unwrap_err();
-        assert!(matches!(err, BeadsError::Validation { field, .. } if field == "type"));
+        assert!(
+            matches!(
+                &err,
+                BeadsError::ValidationWithHint { field, hint, .. }
+                    if field == "type" && hint.contains("parent-child")
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
