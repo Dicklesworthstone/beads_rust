@@ -114,8 +114,14 @@ or manual):
    stderr signatures). Attach both receipts to the PR.
 4. `br doctor --json` on the stressed copy: `db.read_only_open_observational`
    and `db.sidecars` ok.
-5. Once `beads_rust-dk45.7` and `dk45.8` land: the model-based differential
-   test and the multi-process linearizability checker green.
+5. `cargo test --test model_based_storage` (random operation sequences against
+   the engine-free reference model) and
+   `cargo test --test linearizability_multiprocess -- --nocapture` (eight
+   concurrent `br` process streams for 30 s; every per-issue history must
+   linearize against the sequential model and the published JSONL must equal
+   the linearized final state) green. Both run in the CI and release
+   reliability jobs; a violation writes the merged history and the failing
+   partition under `target/test-artifacts/linearizability/`.
 6. Re-run the repro tests for the open engine escalations (§7); record which
    ones now pass and remove the matching workarounds in the same PR.
 

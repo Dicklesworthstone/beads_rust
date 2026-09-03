@@ -176,6 +176,16 @@ jobs:
         env:
           NO_COLOR: 1
 
+      # Eight concurrent br process streams for 30 s; every per-issue history
+      # must linearize against the sequential model and the published JSONL
+      # must equal the linearized final state (bead dk45.8).
+      - name: Multi-process linearizability check
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
+        run: cargo test --locked --test linearizability_multiprocess -- --nocapture
+        env:
+          NO_COLOR: 1
+          BR_LINEARIZABILITY_ARTIFACT_DIR: target/test-artifacts/linearizability
+
       - name: Record reliability gate outcome
         if: ${{ always() && (github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates) }}
         run: |

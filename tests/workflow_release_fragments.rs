@@ -381,6 +381,7 @@ fn release_workflow_uses_the_pinned_toolchain_and_lockfile() -> Result<(), Strin
         "Crash-injection sync matrix",
         "Long-lived single-workspace stress",
         "Concurrent command-family integrity stress",
+        "Multi-process linearizability check",
         "Build release binary",
     ] {
         let script = release_step_script(step_name)?;

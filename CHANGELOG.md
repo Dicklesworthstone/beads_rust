@@ -142,6 +142,14 @@ publishes from the tag.
   bv 0.22.0 and skip loudly on any other release; the reconcile dry-run
   byte-identity tests apply the GitHub #476 read-mark contract (beads
   zxfz.5, 3r45.3).
+- A multi-process linearizability check (`tests/linearizability_multiprocess.rs`)
+  drives eight concurrent `br` process streams (create, close, reopen,
+  priority, labels, comments, dependency edges, `show --json`) against one
+  workspace for 30 s, records every call with its invoke/return times, and
+  searches each issue's history for a linearization consistent with real-time
+  order and a sequential model; the published JSONL must then equal the
+  linearized final state, `integrity_check` must be ok, and issue rowids must
+  be dense. It runs in the CI and release reliability jobs (bead dk45.8).
 - Reviewed additive reconciliation has unit coverage for the three witness
   cases that were only asserted in prose: a byte-identical source replaced
   under a new inode with its mtime restored, a same-size rewrite with the
