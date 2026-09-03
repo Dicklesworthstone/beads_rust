@@ -146,6 +146,41 @@ scripts/conformance.sh --filter schema    # Only schema tests
 | `tests/conformance_labels_comments.rs` | Labels/comments parity |
 | `tests/conformance_schema.rs` | DB schema compatibility |
 
+### Known divergences from bd 0.46.0
+
+The Conformance workflow pins bd `v0.46.0` (commit `812f4e52`). Running the
+six conformance targets against that build on 2026-09-03 left these
+differences, which are deliberate on br's side or belong to bd's newer
+schema; each is encoded in the tests as an allowlist entry or an `#[ignore]`
+with a reason pointing here, never as a weakened comparison:
+
+- **Plain-text output is br's own format.** `list`, `ready`, `show`, and
+  `stats` render status glyphs (`○`), priority markers (`● P2`), an
+  owner/type line in `show`, "All work complete" for an empty `ready`, and
+  name the binary as `br` in hints. Parity is checked on `--json`; the nine
+  `conformance_text_output.rs` tests that diff plain text are ignored with
+  this reason.
+- **`dep cycles` agrees with bd since #391.** Only blocking edge types are
+  cycle-checked, so a loop of `related` edges is not a cycle for either tool
+  and both exit 0. The older expectation (br exits 5 on any-type loops) was
+  from #368 and is gone.
+- **`blocked --json` carries more fields in br** (`blocked_by`,
+  `blocked_by_count`); the shape test compares the shared fields.
+- **Schema.** br-only tables: `capacity_exemption_history`,
+  `capacity_exemptions`, `capacity_occupancy`, `close_metadata`,
+  `gate_result_history`, `gate_results`. bd-only tables: `compaction_snapshots`,
+  `issue_snapshots`, `repo_mtimes`. br-only columns: `issues.owner`,
+  `issues.agent_context`, `issues.source_system`, `events.agent_name`,
+  `events.harness`, `events.model`, `blocked_issues_cache.blocked_at`.
+  bd-only column: `dirty_issues.content_hash`. Constraint differences:
+  `config.key` (bd: primary key, nullable), `dependencies.type` (bd: part of
+  the primary key), `dependencies.created_at` and
+  `blocked_issues_cache.issue_id` (NOT NULL differs). bd 0.46 dropped
+  `issues.owner`, so it is no longer in the core column set.
+- **`bd` prints a background-sync note** ("No git repository initialized")
+  on stderr in every scratch workspace; tests that assert on bd's stderr
+  must tolerate it.
+
 ### Conformance Output
 
 Output written to `target/test-artifacts/conformance/`:

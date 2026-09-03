@@ -8848,15 +8848,15 @@ fn conformance_dep_cycles_simple() {
     let br_cycles = workspace.run_br(["dep", "cycles", "--json"], "cycles");
     let bd_cycles = workspace.run_bd(["dep", "cycles", "--json"], "cycles");
 
-    // #368: `br dep cycles` exits 5 (CycleDetected) when an active cycle is
-    // present so scripted callers can gate on the exit code. This diverges from
-    // bd, which exits 0; the cycle here is a `related` edge that bd's
-    // blocking-only detector ignores, so bd still exits 0. The cycle *data* is
-    // emitted on stdout regardless and is compared below.
+    // #391: only blocking edge types are cycle-checked, and `br dep cycles`
+    // uses the same blocking set, so a `related` loop is not a cycle for br
+    // either. Both tools exit 0 and report zero cycles; an exit of 5 here
+    // would mean br started treating non-blocking edges as cycles again.
     assert_eq!(
         br_cycles.status.code(),
-        Some(5),
-        "br dep cycles should exit 5 when an active cycle is present"
+        Some(0),
+        "br dep cycles must exit 0 when the only loop is over `related` edges: {}",
+        br_cycles.stderr
     );
     assert!(bd_cycles.status.success(), "bd dep cycles failed");
 
@@ -8866,7 +8866,7 @@ fn conformance_dep_cycles_simple() {
     let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Null);
     let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Null);
 
-    // br detects cycles in all types, bd only in blocking types
+    // Both tools only count blocking-type loops (#391).
     let br_count = br_val["count"].as_u64().unwrap_or(0);
     let bd_count = bd_val["count"].as_u64().unwrap_or(0);
 
@@ -8875,10 +8875,13 @@ fn conformance_dep_cycles_simple() {
         br_count, bd_count
     );
 
-    // Verify br properly detects cycles in all dependency types
-    assert!(
-        br_count >= 1,
-        "br should detect cycle in 'related' dependencies"
+    assert_eq!(
+        br_count, 0,
+        "a `related` loop is not a cycle under the #391 blocking-only contract"
+    );
+    assert_eq!(
+        br_count, bd_count,
+        "br and bd agree on blocking-only cycle detection"
     );
 
     info!("conformance_dep_cycles_simple passed");
@@ -8942,13 +8945,15 @@ fn conformance_dep_cycles_complex() {
     let br_cycles = workspace.run_br(["dep", "cycles", "--json"], "cycles");
     let bd_cycles = workspace.run_bd(["dep", "cycles", "--json"], "cycles");
 
-    // #368: active cycle present -> `br dep cycles` exits 5. The `related`
-    // triangular cycle is invisible to bd's blocking-only detector, so bd
-    // exits 0. Cycle data still lands on stdout and is compared below.
+    // #391: only blocking edge types are cycle-checked, and `br dep cycles`
+    // uses the same blocking set, so a `related` loop is not a cycle for br
+    // either. Both tools exit 0 and report zero cycles; an exit of 5 here
+    // would mean br started treating non-blocking edges as cycles again.
     assert_eq!(
         br_cycles.status.code(),
-        Some(5),
-        "br dep cycles should exit 5 when an active cycle is present"
+        Some(0),
+        "br dep cycles must exit 0 when the only loop is over `related` edges: {}",
+        br_cycles.stderr
     );
     assert!(bd_cycles.status.success(), "bd dep cycles failed");
 
@@ -8966,10 +8971,13 @@ fn conformance_dep_cycles_complex() {
         br_count, bd_count
     );
 
-    // Verify br properly detects cycles in all dependency types
-    assert!(
-        br_count >= 1,
-        "br should detect cycle in 'related' dependencies"
+    assert_eq!(
+        br_count, 0,
+        "a `related` loop is not a cycle under the #391 blocking-only contract"
+    );
+    assert_eq!(
+        br_count, bd_count,
+        "br and bd agree on blocking-only cycle detection"
     );
 
     info!("conformance_dep_cycles_complex passed");

@@ -1226,7 +1226,9 @@ fn conformance_schema_version() {
     // Both should pass doctor (schema should be valid)
     assert!(
         br_doctor.status.success(),
-        "br doctor failed: {}",
+        "br doctor failed (exit {:?}); stdout:\n{}\nstderr:\n{}",
+        br_doctor.status.code(),
+        br_doctor.stdout,
         br_doctor.stderr
     );
     if !bd_doctor.status.success() {
