@@ -814,7 +814,11 @@ external blocker that legitimately stays in a limited status:
 
 ```yaml
 workflow:
+  statuses: [open, in_progress, blocked, closed]
   capacity:
+    statuses:
+      blocked:
+        hard: 2                 # the limit a granted exemption lifts for one issue
     exemptions:
       providers: [operator]     # who may grant; empty disables granting
       require_expiry: true      # optional: every grant must carry an expiry
@@ -824,7 +828,7 @@ workflow:
 br capacity exempt br-abc --status blocked \
   --provider operator \
   --reason "Awaiting an external regulatory decision" \
-  --expires 2026-08-15
+  --expires +30d
 ```
 
 Grants, renewals, revocations, and observed expirations are all recorded in an

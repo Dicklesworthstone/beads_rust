@@ -11,8 +11,13 @@
 //! command, and its output. It also asserts that the README's `config.yaml`
 //! example changes behavior the way the prose claims.
 //!
-//! Not executed: `br serve` (long-running), lines where `br` is inside a
-//! `$(...)` substitution or an assignment, and anything after a `|`.
+//! Recipe lines of the form `plan="$(br ... --robot)"` and
+//! `plan_sha256="$(printf '%s\n' "$plan" | jq -r .plan_sha256)"` are
+//! replayed (the br command runs, the jq step is evaluated in-process) so
+//! the `--apply --expect-plan-sha256 "$plan_sha256"` examples run for real.
+//! A block that uses `br capacity exempt` gets the README's own exemption
+//! policy example installed first. Not executed: `br serve` (long-running)
+//! and anything after a `|`.
 mod common;
 
 use common::cli::{BrRun, BrWorkspace, parse_created_id, run_br_with_env};
@@ -31,12 +36,42 @@ const POOL_TITLES: [&str; 4] = [
 
 static PLACEHOLDER_ID: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\bbr-[A-Za-z0-9]{1,8}\b").expect("placeholder id regex"));
+/// `$name` references to recipe variables.
+static SHELL_VARIABLE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\$(\w+)\b").expect("shell variable regex"));
+/// `name="$(br ...)"`: capture a br command's stdout into a shell variable.
+static ASSIGN_FROM_BR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^(\w+)="\$\((br [^)]*)\)"$"#).expect("assignment regex"));
+/// `name="$(printf '%s\n' "$other" | jq -r .field)"`: pull one JSON field out
+/// of a captured variable.
+static EXTRACT_FIELD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^(\w+)="\$\(printf '%s\\n' "\$(\w+)" \| jq -r \.(\w+)\)"$"#)
+        .expect("extract regex")
+});
 
 /// One README command with the line it starts on.
 #[derive(Debug, Clone)]
 struct Example {
     line: usize,
     text: String,
+    kind: ExampleKind,
+}
+
+/// README recipes assign a plan to a variable, pull its hash with jq, and
+/// pass the hash to `--apply`; the test replays those steps.
+#[derive(Debug, Clone)]
+enum ExampleKind {
+    Command,
+    /// `var = stdout of the br command in `text``
+    Assign {
+        var: String,
+    },
+    /// `var = JSON field of another variable`
+    Extract {
+        var: String,
+        from: String,
+        field: String,
+    },
 }
 
 /// Commands the README documents as non-zero, or that cannot run here.
@@ -81,11 +116,30 @@ fn readme_bash_blocks() -> Vec<(usize, Vec<Example>)> {
                 }
                 continue;
             }
-            if is_br_command(trimmed) {
+            if let Some(captures) = ASSIGN_FROM_BR.captures(trimmed) {
+                commands.push(Example {
+                    line: line_no,
+                    text: captures[2].to_string(),
+                    kind: ExampleKind::Assign {
+                        var: captures[1].to_string(),
+                    },
+                });
+            } else if let Some(captures) = EXTRACT_FIELD.captures(trimmed) {
+                commands.push(Example {
+                    line: line_no,
+                    text: trimmed.to_string(),
+                    kind: ExampleKind::Extract {
+                        var: captures[1].to_string(),
+                        from: captures[2].to_string(),
+                        field: captures[3].to_string(),
+                    },
+                });
+            } else if is_br_command(trimmed) {
                 let piece = trimmed.trim_end_matches('\\').trim().to_string();
                 let example = Example {
                     line: line_no,
                     text: piece,
+                    kind: ExampleKind::Command,
                 };
                 if trimmed.ends_with('\\') {
                     pending = Some(example);
@@ -106,7 +160,9 @@ fn is_br_command(line: &str) -> bool {
     let mut words = line.split_whitespace();
     loop {
         match words.next() {
-            Some(word) if word.contains('=') && !word.starts_with('-') && !word.starts_with('"') => {
+            Some(word)
+                if word.contains('=') && !word.starts_with('-') && !word.starts_with('"') =>
+            {
                 if word.starts_with("br") {
                     return false;
                 }
@@ -126,11 +182,10 @@ fn executable_part(text: &str) -> String {
     for ch in text.chars() {
         match quote {
             Some(q) if ch == q => quote = None,
-            Some(_) => {}
             None if ch == '"' || ch == '\'' => quote = Some(ch),
             None if ch == '|' => break,
             None if ch == '#' && previous.is_whitespace() => break,
-            None => {}
+            _ => {}
         }
         out.push(ch);
         previous = ch;
@@ -143,6 +198,8 @@ struct BlockRunner {
     initialized: bool,
     pool: Vec<String>,
     placeholders: BTreeMap<String, String>,
+    /// Shell variables set by README recipe lines (`plan`, `plan_sha256`).
+    vars: BTreeMap<String, String>,
 }
 
 impl BlockRunner {
@@ -153,6 +210,7 @@ impl BlockRunner {
             initialized: false,
             pool: Vec::new(),
             placeholders: BTreeMap::new(),
+            vars: BTreeMap::new(),
         };
         if needs_init {
             let init = runner.run(&["init", "--prefix", "br"], &[], &format!("{label}_init"));
@@ -160,6 +218,22 @@ impl BlockRunner {
             runner.initialized = true;
         }
         runner
+    }
+
+    /// Install the README's own capacity-exemption policy so its
+    /// `br capacity exempt` example runs in the context the prose gives it.
+    fn install_exemption_policy(&self) {
+        let policy = README
+            .split("```yaml\n")
+            .skip(1)
+            .filter_map(|rest| rest.split("```").next())
+            .find(|block| block.contains("exemptions:") && block.contains("providers:"))
+            .expect("README has a capacity exemptions policy example");
+        fs::write(
+            self.workspace.root.join(".beads").join("policy.yaml"),
+            policy,
+        )
+        .expect("write README policy example");
     }
 
     fn run(&self, args: &[&str], env: &[(String, String)], label: &str) -> BrRun {
@@ -180,20 +254,39 @@ impl BlockRunner {
         if self.pool.is_empty() {
             for (index, title) in POOL_TITLES.iter().enumerate() {
                 let created = self.run(&["create", title], &[], &format!("{label}_pool{index}"));
-                assert!(created.status.success(), "pool create failed: {}", created.stderr);
+                assert!(
+                    created.status.success(),
+                    "pool create failed: {}",
+                    created.stderr
+                );
                 let id = parse_created_id(&created.stdout);
-                assert!(!id.is_empty(), "pool create printed no id: {}", created.stdout);
+                assert!(
+                    !id.is_empty(),
+                    "pool create printed no id: {}",
+                    created.stdout
+                );
                 self.pool.push(id);
             }
         }
         let next = self.placeholders.len() % self.pool.len();
         let id = self.pool[next].clone();
-        self.placeholders.insert(placeholder.to_string(), id.clone());
+        self.placeholders
+            .insert(placeholder.to_string(), id.clone());
         id
     }
 
     fn substitute(&mut self, text: &str, label: &str) -> String {
         let with_email = text.replace("$(git config user.email)", "alice@example.com");
+        // Whole-name variable references only, so `$plan` never eats the
+        // prefix of `$plan_sha256`.
+        let with_email = SHELL_VARIABLE
+            .replace_all(&with_email, |captures: &regex::Captures<'_>| {
+                self.vars
+                    .get(&captures[1])
+                    .cloned()
+                    .unwrap_or_else(|| captures[0].to_string())
+            })
+            .into_owned();
         let mut out = String::new();
         let mut last = 0;
         for found in PLACEHOLDER_ID.find_iter(&with_email) {
@@ -225,7 +318,30 @@ fn readme_bash_examples_exit_as_documented() {
         let block_has_init = commands.iter().any(|c| c.text.starts_with("br init"));
         let label = format!("readme_block_{block_line}");
         let mut runner = BlockRunner::new(!block_has_init, &label);
+        if commands
+            .iter()
+            .any(|c| c.text.starts_with("br capacity exempt"))
+        {
+            runner.install_exemption_policy();
+        }
         for example in commands {
+            if let ExampleKind::Extract { var, from, field } = &example.kind {
+                let source = runner.vars.get(from).cloned().unwrap_or_default();
+                let start = source.find(['{', '[']).unwrap_or(source.len());
+                let parsed: serde_json::Value = serde_json::from_str(source[start..].trim())
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "README.md:{}: `${from}` is not JSON ({err}):\n{source}",
+                            example.line
+                        )
+                    });
+                let value = parsed[field.as_str()]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| parsed[field.as_str()].to_string());
+                runner.vars.insert(var.clone(), value);
+                continue;
+            }
             let text = executable_part(&example.text);
             let expectation = expectation(&text);
             if let Expectation::Skip(reason) = expectation {
@@ -233,8 +349,9 @@ fn readme_bash_examples_exit_as_documented() {
                 continue;
             }
             let substituted = runner.substitute(&text, &label);
-            let words = shell_words::split(&substituted)
-                .unwrap_or_else(|err| panic!("README.md:{}: cannot parse `{text}`: {err}", example.line));
+            let words = shell_words::split(&substituted).unwrap_or_else(|err| {
+                panic!("README.md:{}: cannot parse `{text}`: {err}", example.line)
+            });
             let mut env: Vec<(String, String)> = vec![("EDITOR".to_string(), "true".to_string())];
             let mut argv: Vec<&str> = Vec::new();
             let mut seen_br = false;
@@ -249,10 +366,19 @@ fn readme_bash_examples_exit_as_documented() {
                 }
                 argv.push(word.as_str());
             }
-            assert!(seen_br, "README.md:{}: no br command in `{text}`", example.line);
+            assert!(
+                seen_br,
+                "README.md:{}: no br command in `{text}`",
+                example.line
+            );
             let run = runner.run(&argv, &env, &format!("{label}_l{}", example.line));
             if argv.first() == Some(&"init") {
                 runner.initialized = runner.initialized || run.status.success();
+            }
+            if let ExampleKind::Assign { var } = &example.kind {
+                runner
+                    .vars
+                    .insert(var.clone(), run.stdout.trim().to_string());
             }
             executed += 1;
             let Expectation::Exit(expected) = expectation else {
@@ -270,7 +396,10 @@ fn readme_bash_examples_exit_as_documented() {
             }
         }
     }
-    eprintln!("[readme] executed {executed} commands; skipped {}", skipped.len());
+    eprintln!(
+        "[readme] executed {executed} commands; skipped {}",
+        skipped.len()
+    );
     for skip in &skipped {
         eprintln!("[readme] skipped {skip}");
     }
@@ -326,7 +455,11 @@ fn readme_config_example_changes_prefix_and_default_priority() {
         env,
         "readme_config_create",
     );
-    assert!(created.status.success(), "create failed: {}", created.stderr);
+    assert!(
+        created.status.success(),
+        "create failed: {}",
+        created.stderr
+    );
     let payload = created.stdout.trim();
     let start = payload.find('{').expect("json object in create output");
     let value: serde_json::Value = serde_json::from_str(&payload[start..]).expect("create json");
