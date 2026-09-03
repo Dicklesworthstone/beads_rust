@@ -84,8 +84,10 @@ tests. The test was fixed and the release re-cut.
   open skips the eleven-table PRAGMA walk (about 24 ms, run twice per
   mutating command) and the witness re-write, as the read-only fast open
   already did. Any DDL moves the cookie, so a tampered schema still takes
-  the full check and is healed (bead naul5; the measured per-step profile of
-  a mutation is on that bead).
+  the full check and is healed. Measured with the eight-stream
+  linearizability workload on the same worker class: 334 operations in 30 s
+  after the change versus 224–235 before (bead naul5 carries the per-step
+  profile of a mutation).
 
 ### Silent-loss fixes (#466, #467, #471, #473, #474, #475, #476, #477)
 
