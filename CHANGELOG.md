@@ -128,6 +128,20 @@ publishes from the tag.
   statement counts correctly on fsqlite 0.3.15, the same statement with bound
   parameters counts 0. The detour stays; the ignored bound-parameter probe
   flips green on a fixed engine and names the detour to remove.
+- Every `br` example in README.md's bash blocks now runs against the binary
+  (`tests/e2e_readme_examples.rs`: 100 commands, placeholder ids, recipe
+  variables, the README's own policy for the capacity example), and the
+  README `config.yaml` example is checked for the prefix and default
+  priority it promises. The capacity-exemption example was corrected (it
+  limited no status and used a past expiry) (bead wqmw.2).
+- A model-based differential test (`tests/model_based_storage.rs`) replays
+  random operation sequences against `SqliteStorage` and an engine-free
+  reference model, with fixed seeds for the GitHub #426 dependency-removal
+  chain and GitHub #461 comment retention (bead dk45.7).
+- The snapshot suite is green on main again: bv robot goldens are pinned to
+  bv 0.22.0 and skip loudly on any other release; the reconcile dry-run
+  byte-identity tests apply the GitHub #476 read-mark contract (beads
+  zxfz.5, 3r45.3).
 - The #467 guard is proportional to what a write would lose (#481): a
   whole-field write that keeps at least half the current length passes
   (with a warning when it also keeps fewer than half the current words);
