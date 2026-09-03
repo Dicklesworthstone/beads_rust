@@ -93,6 +93,13 @@ tests. The test was fixed and the release re-cut.
 
 - `br gate report` writes `gate_results` as well as `gate_result_history`
   (#466) -- 70e7fed9.
+- The first mutation in a fresh clone (tracked `.beads/*`, no `beads.db`) no
+  longer stalls its auto-flush for the 30 s write-lock timeout and then exits
+  0 with a stale `issues.jsonl`: the JSONL rebuild kept the JSONL-family
+  flock for the rest of the command and the flush re-acquired the same
+  sidecar through a second descriptor, blocking on itself. The flush now
+  reuses the held authority (#487) -- 26f57a8e, with
+  `tests/repro_fresh_clone_first_mutation.rs`.
 - `br sync --import` no longer refuses a JSONL record that spells an absent
   text field as `""` (`acceptance_criteria`, `design`, `notes`, `assignee`,
   and the other optional text columns): the storage re-reads those as NULL,
