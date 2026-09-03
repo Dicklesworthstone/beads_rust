@@ -2437,7 +2437,13 @@ impl SqliteStorage {
         }
         let schema_current = effective_schema_version == Some(current_schema_version);
         let schema_cookie_before = crate::storage::schema::runtime_schema_cookie(&conn)?;
-        let runtime_compatible = runtime_schema_compatible(&conn);
+        // Steady state: the recorded witness names this exact SQLite schema
+        // cookie as already attested against the complete runtime contract,
+        // and any DDL since would have changed the cookie. Trusting it here
+        // (as the read-only fast open already does) skips the 11-table PRAGMA
+        // walk that cost ~24 ms per open, twice per mutating command.
+        let witness_matches = schema_current && runtime_schema_witness_matches(&conn);
+        let runtime_compatible = witness_matches || runtime_schema_compatible(&conn);
         #[cfg(test)]
         Self::maybe_change_user_version_after_runtime_compatibility(&conn)?;
         let schema_cookie_after = crate::storage::schema::runtime_schema_cookie(&conn)?;
@@ -2462,7 +2468,11 @@ impl SqliteStorage {
             attest_runtime_schema_cookie(&conn)?
         };
         Self::ensure_known_metadata_defaults(&conn)?;
-        if let Err(error) = record_runtime_schema_witness(&conn, attested_cookie) {
+        // A matching witness is already on disk for this cookie; re-writing
+        // it would only add a write transaction to every steady-state open.
+        if !(witness_matches && attested_cookie == schema_cookie_before)
+            && let Err(error) = record_runtime_schema_witness(&conn, attested_cookie)
+        {
             tracing::debug!(
                 %error,
                 "runtime schema witness could not be recorded; future fast opens will revalidate"
@@ -25821,6 +25831,46 @@ mod tests {
     }
 
     /// Three issues, two labels: only `bd-both` carries both.
+    /// The ordinary open trusts the recorded schema witness instead of
+    /// walking every table, and DDL behind br's back (which moves SQLite's
+    /// schema cookie) still forces the full check, which heals the schema.
+    #[test]
+    fn ordinary_open_trusts_recorded_witness_and_revalidates_after_ddl() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        assert!(
+            crate::storage::schema::runtime_schema_witness_matches(&storage.conn),
+            "a healthy open must leave a witness for its exact schema cookie"
+        );
+        drop(storage);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("DROP INDEX idx_issues_status").unwrap();
+        assert!(
+            !crate::storage::schema::runtime_schema_witness_matches(&conn),
+            "DDL moves the schema cookie, so the stale witness must stop matching"
+        );
+        conn.close().unwrap();
+
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let healed = storage
+            .conn
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_issues_status'",
+            )
+            .unwrap();
+        assert_eq!(
+            healed.len(),
+            1,
+            "the full compatibility check must recreate the dropped index"
+        );
+        assert!(
+            crate::storage::schema::runtime_schema_witness_matches(&storage.conn),
+            "the healed schema must be attested and witnessed again"
+        );
+    }
+
     fn storage_with_multi_label_fixture() -> SqliteStorage {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 4, 1, 0, 0, 0).unwrap();
