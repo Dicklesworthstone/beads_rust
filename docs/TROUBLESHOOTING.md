@@ -27,6 +27,11 @@ Common issues and solutions when using `br` (beads_rust).
 Run these commands to diagnose common problems:
 
 ```bash
+# Run the selftest first: it drives this binary through a full issue lifecycle
+# in a throwaway directory on your filesystem (never your workspace) and prints
+# a br.doctor.selftest.v1 receipt; a platform or filesystem problem shows up here
+RUST_LOG=error br doctor --selftest --json
+
 # Check workspace health
 br doctor
 
