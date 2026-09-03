@@ -23,6 +23,7 @@ Recent line (0.5.x — storage-safety and the multi-process corruption program):
 
 | Version | Date | Kind | Headline |
 |---|---|---|---|
+| [v0.5.8](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.8) | 2026-09-03 | Release | Six silent-loss fixes (#466–#477); acceptance checklist edits; `doctor --bundle`; FrankenSQLite 0.3.15; linearizability, model-based, README, and Go-bd proof suites |
 | [v0.5.7](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.7) | 2026-08-29 | Release | `doctor health` schema-incompatibility tripwire (#464); FrankenSQLite 0.3.13 reader-slot follow-up |
 | [v0.5.6](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.6) | 2026-08-29 | Release | Review-round correctness/hygiene fixes (agent_context merge, blocked-cache, temp-sidecar leak) |
 | [v0.5.5](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.5) | 2026-08-29 | Release | FrankenSQLite 0.3.12 engine fix (cross-process WAL reader registration) for the page-aliasing corruption |
@@ -63,12 +64,12 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
-## Unreleased -- on `main` after v0.5.7 (targeting v0.5.8)
+## v0.5.8 -- 2026-09-03 (Release)
 
-Every v0.5.7 user has the bugs below; the fixes are on `main` and ship with
-the next tag. Cutting it (`scripts/bump-version.sh 0.5.8`, then tag `v0.5.8`
-and push) is an operator action; the release workflow builds, signs, and
-publishes from the tag.
+Every v0.5.7 user has the bugs below. This cut carries the six user-reported
+silent-loss fixes, the acceptance-checklist and incident-bundle features, the
+FrankenSQLite 0.3.15 engine, and the proof suites (linearizability, model-based
+storage, README examples, Go-bd conformance) that now gate the release.
 
 ### Silent-loss fixes (#466, #467, #471, #473, #474, #475, #476, #477)
 

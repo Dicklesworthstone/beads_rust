@@ -25904,9 +25904,9 @@ mod tests {
     /// variant counts 1, drop the `multi_label_and` detour in
     /// `count_issues_with_filters` and un-ignore this test.
     #[test]
-    #[ignore = "beads_rust-ro3m: fsqlite 0.3.15 returns NULL for the grouped/HAVING IN-subquery \
-                count when further predicates follow the subquery (minimal statement counts 1); \
-                rerun after an engine bump"]
+    #[ignore = "beads_rust-ro3m / upstream frankensqlite#407: fsqlite 0.3.15 returns NULL for the \
+                grouped/HAVING IN-subquery count when further predicates follow the subquery \
+                (minimal statement counts 1); rerun after an engine bump"]
     fn grouped_having_in_subquery_count_with_bound_params() {
         let storage = storage_with_multi_label_fixture();
         let params = [

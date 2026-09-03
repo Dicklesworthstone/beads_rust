@@ -456,12 +456,20 @@ All summary files follow this structure:
 
 The existing `.github/workflows/ci.yml` runs:
 
-1. **check** - Formatting, clippy, cargo check
+1. **check** - Formatting, clippy (`-D warnings`), cargo check
 2. **security** - cargo-audit
-3. **test** - Full test suite (`cargo test`)
-4. **coverage** - llvm-cov with Codecov upload
-5. **build** - Multi-platform binaries
-6. **bench** - Criterion benchmarks with regression detection
+3. **test** - The suite as five file-name-derived shards (`scripts/test-shard.sh`)
+4. **reliability-gates** - Failure-corpus replay, crash-injection sync matrix,
+   multi-process stress, the linearizability check (PRs, schedule, dispatch)
+5. **audit-gates** - Forced-cycle-close audit, sync-safety and concurrency
+   witnesses
+6. **build** - Multi-platform binaries
+7. **bench** - Criterion benchmarks with regression detection
+8. **version-audit** - Version metadata consistency
+
+There is no coverage job: the earlier `llvm-cov` + Codecov upload ran with
+`continue-on-error` and could not fail anything, so it was removed with the
+lean CI rewrite (decision recorded in `docs/TESTING_GUIDELINES.md`).
 
 ### Adding E2E to PR Checks
 
