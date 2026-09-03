@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "beads",
   "displayName": "Beads (br)",
-  "version": "0.5.8",
+  "version": "0.5.9",
   "description": "Official br (beads_rust) skill: a local-first, dependency-aware issue tracker for AI agents. Ships agent instructions only — install the br binary separately.",
   "author": {
     "name": "Dicklesworthstone",
