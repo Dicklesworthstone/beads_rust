@@ -14048,6 +14048,33 @@ fn stream_import_actions_in_tx(
 /// Materialize legacy schema defaults that are written even when older JSONL
 /// records omit the corresponding optional fields.
 pub(crate) fn canonicalize_persisted_issue_defaults(issue: &mut Issue) {
+    // Every optional text column comes back through `get_non_empty_str`, so a
+    // JSONL record that spells "no value" as `""` (older bd exports, hand-
+    // written fixtures, scripts) is persisted and re-read as `None`. Strict
+    // verification compares against that persisted form; without this the
+    // whole import was refused over an empty string (doctor fixture
+    // `db_bloat` plants `"acceptance_criteria": ""`).
+    for field in [
+        &mut issue.description,
+        &mut issue.design,
+        &mut issue.acceptance_criteria,
+        &mut issue.notes,
+        &mut issue.assignee,
+        &mut issue.owner,
+        &mut issue.created_by,
+        &mut issue.close_reason,
+        &mut issue.closed_by_session,
+        &mut issue.source_system,
+        &mut issue.source_repo,
+        &mut issue.deleted_by,
+        &mut issue.delete_reason,
+        &mut issue.original_type,
+        &mut issue.sender,
+    ] {
+        if field.as_deref() == Some("") {
+            *field = None;
+        }
+    }
     issue.source_repo.get_or_insert_with(|| ".".to_string());
     issue.original_size.get_or_insert(0);
     // GitHub #468: legacy JSONL may omit dependency `created_by`, `metadata`,
@@ -21012,6 +21039,59 @@ mod tests {
             Some("legacy-receipt"),
             "dirty refusal must preserve pending metadata exactly"
         );
+    }
+
+    /// A JSONL record that spells "no value" as `""` (older bd exports,
+    /// hand-written fixtures) must import: the storage re-reads those
+    /// columns as `None`, and strict verification compares against that
+    /// persisted form instead of refusing the whole import.
+    #[test]
+    fn import_accepts_empty_string_text_fields_as_absent() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+
+        let issue = make_test_issue("bd-empty", "Empty text fields");
+        let mut record: serde_json::Value = serde_json::to_value(&issue).unwrap();
+        for field in [
+            "description",
+            "design",
+            "acceptance_criteria",
+            "notes",
+            "assignee",
+            "close_reason",
+            "source_system",
+        ] {
+            record[field] = serde_json::Value::String(String::new());
+        }
+        fs::write(&jsonl_path, format!("{record}\n")).unwrap();
+
+        let result = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .expect("empty-string text fields must not fail import semantic verification");
+        assert_eq!(result.created_count, 1);
+
+        let stored = storage.get_issue("bd-empty").unwrap().unwrap();
+        assert_eq!(stored.title, "Empty text fields");
+        assert_eq!(stored.description, None);
+        assert_eq!(stored.design, None);
+        assert_eq!(stored.acceptance_criteria, None);
+        assert_eq!(stored.notes, None);
+        assert_eq!(stored.assignee, None);
+        assert_eq!(stored.close_reason, None);
+        assert_eq!(stored.source_system, None);
+
+        let mut canonical = issue.clone();
+        canonical.acceptance_criteria = Some(String::new());
+        canonical.owner = Some(String::new());
+        canonicalize_persisted_issue_defaults(&mut canonical);
+        assert_eq!(canonical.acceptance_criteria, None);
+        assert_eq!(canonical.owner, None);
+        assert_eq!(canonical.source_repo.as_deref(), Some("."));
     }
 
     #[test]
