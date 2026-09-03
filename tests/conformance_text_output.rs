@@ -733,19 +733,21 @@ fn conformance_text_show_not_found() {
         "br should print not-found error, got: {}",
         br_show.stderr
     );
-    // bd 0.46 signals the miss through its exit status; its stderr may hold
-    // only the "No git repository initialized" note, and older bd printed a
-    // not-found line instead. Either form counts as the diagnostic.
+    // bd 0.46.0 is silent here: `bd show <unknown id>` exits 0 with empty
+    // stdout and only the "No git repository initialized" note on stderr
+    // (observed 2026-09-03; older bd printed a not-found line). br's exit 3
+    // plus diagnostic is the documented divergence (docs/TEST_HARNESS.md,
+    // "Known divergences"), so bd's behavior is recorded, not asserted.
     let bd_diagnostic = format!("{}\n{}", bd_show.stdout, bd_show.stderr).to_lowercase();
-    assert!(
-        !bd_show.success
-            || bd_diagnostic.contains("not found")
-            || bd_diagnostic.contains("no such")
-            || bd_diagnostic.contains("not exist"),
-        "bd should signal a not-found issue, got exit {}, stdout: {}, stderr: {}",
+    let bd_signals_miss = !bd_show.success
+        || bd_diagnostic.contains("not found")
+        || bd_diagnostic.contains("no such")
+        || bd_diagnostic.contains("not exist");
+    info!(
+        "bd show <unknown id>: exit {}, signals_miss={bd_signals_miss}, stdout={:?}, stderr={:?}",
         bd_show.exit_code,
-        bd_show.stdout,
-        bd_show.stderr
+        bd_show.stdout.trim(),
+        bd_show.stderr.trim()
     );
 
     workspace.finish(true);

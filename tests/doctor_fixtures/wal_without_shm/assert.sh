@@ -11,9 +11,14 @@ case "$stage" in
     out=$("$tool_bin" doctor --json 2>/dev/null) || true
     # db.sidecars must be healthy since FrankenSQLite intentionally keeps its
     # WAL index in process-local memory rather than a sibling SHM file.
+    # fsqlite 0.3.15 recreates `-shm` on every open, including the doctor's
+    # own read-only inspection (verified 2026-09-03 with main's binary), so
+    # the check reports either the WAL-only wording or "SHM sidecar ... is
+    # inert beside the WAL". Both describe a healthy family; the contract is
+    # status ok and a message that names the WAL.
     echo "$out" | jq -e '
       .checks[] | select(.name == "db.sidecars") | select(.status == "ok")
-      | select(.message | test("WAL sidecar"; "i"))
+      | select(.message | test("WAL sidecar|inert beside the WAL"; "i"))
     ' >/dev/null || {
       echo "ASSERT FAIL[$stage]: db.sidecars not healthy for valid WAL-without-SHM" >&2
       echo "$out" | jq '.checks[] | select(.name == "db.sidecars")' >&2

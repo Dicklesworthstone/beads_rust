@@ -185,6 +185,9 @@ with a reason pointing here, never as a weakened comparison:
 - **`bd` prints a background-sync note** ("No git repository initialized")
   on stderr in every scratch workspace; tests that assert on bd's stderr
   must tolerate it.
+- **`bd show <unknown id>` is silent**: exit 0, empty stdout, only the note
+  above on stderr. br exits 3 with an ISSUE_NOT_FOUND diagnostic; the
+  not-found text test asserts br and only records what bd did.
 
 ### Conformance Output
 
