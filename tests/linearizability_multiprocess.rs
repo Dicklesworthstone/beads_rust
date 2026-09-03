@@ -40,9 +40,11 @@ const DEFAULT_SECONDS: u64 = 30;
 const SOURCE_ISSUES: usize = 8;
 const SINK_ISSUES: usize = 8;
 const LABELS: [&str; 4] = ["alpha", "beta", "gamma", "delta"];
-/// Under eight-way contention every mutation holds the workspace write lock
-/// through its JSONL auto-flush, so the fleet completes only a few hundred
-/// operations in 30 s; the floor only rules out a run that barely started.
+/// Mutations serialize on the workspace write lock and each one costs
+/// 100–200 ms of process start, open, commit, and flush (profile on bead
+/// naul5), so eight streams complete only a few hundred operations in 30 s
+/// (about 230 before the schema-witness fast open, about 330 after); the
+/// floor only rules out a run that barely started.
 const MIN_OPERATIONS: usize = 100;
 
 // ---------------------------------------------------------------------------
