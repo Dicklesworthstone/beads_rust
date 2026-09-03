@@ -126,6 +126,16 @@ Once `beads_rust-6jmq` lands, the CI pipeline runs:
 
 Pass-or-fail of those gates blocks merge. Document new gates here when adding them.
 
+## Coverage (decision 2026-09-03)
+
+There is no coverage gate. The `cargo llvm-cov` job with a Codecov upload ran
+under `continue-on-error: true` and `fail_ci_if_error: false`, so it could
+not fail a build and cost about thirty minutes per run; it was dropped with
+the lean `ci.yml`. Coverage is measured on demand
+(`cargo llvm-cov --all-features --lcov`) when a change to test scope needs the
+number, and the number goes in the PR, not in a gate. Reintroduce a gate only
+with a committed baseline and a threshold that can fail (bead `beads_rust-uze9.8`).
+
 ## Audit-driven test additions (2026-05-09)
 
 | Bead | What it added |
