@@ -29,13 +29,28 @@ head -c 1200000 /dev/zero | tr '\0' 'x' > "$payload_file"
 "$tool_bin" sync --import-only --rebuild >/dev/null 2>&1
 "$tool_bin" sync --flush-only >/dev/null 2>&1
 
-sqlite3 .beads/beads.db 'PRAGMA wal_checkpoint(TRUNCATE); PRAGMA integrity_check;' \
-  | grep -Fxq ok
+# python3's sqlite3 module instead of the sqlite3 CLI: CI runners and the RCH
+# workers all have the former, not always the latter.
+integrity_ok() {
+  python3 - "$1" "$2" <<'PY'
+import sqlite3
+import sys
+
+conn = sqlite3.connect(sys.argv[1])
+if sys.argv[2] == "checkpoint":
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+row = conn.execute("PRAGMA integrity_check").fetchone()
+conn.close()
+sys.exit(0 if row and row[0] == "ok" else 1)
+PY
+}
+
+integrity_ok .beads/beads.db checkpoint
 
 # Add 18 MiB of trailing zero pages. SQLite still reports integrity_check=ok,
 # and VACUUM compacts the database back to its logical page set.
 dd if=/dev/zero bs=1048576 count=18 status=none >> .beads/beads.db
-sqlite3 .beads/beads.db 'PRAGMA integrity_check;' | grep -Fxq ok
+integrity_ok .beads/beads.db no-checkpoint
 
 wc -c < .beads/beads.db > .fixture_db_bloat_pre_bytes
 wc -c < .beads/issues.jsonl > .fixture_jsonl_bytes

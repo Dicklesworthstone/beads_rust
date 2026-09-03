@@ -368,7 +368,9 @@ where
     cmd.current_dir(cwd);
     cmd.args(args);
     cmd.env("NO_COLOR", "1");
-    cmd.env("RUST_LOG", "beads_rust=debug");
+    // `error`, not `debug`: `br doctor` warns (and exits 1) under verbose
+    // RUST_LOG, and debug output buries failure messages under log lines.
+    cmd.env("RUST_LOG", "error");
     cmd.env("RUST_BACKTRACE", "1");
     cmd.env("HOME", cwd);
 

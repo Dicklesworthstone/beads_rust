@@ -34,6 +34,7 @@ invocation (env override or flag) to pin the finding/check contract;
 | fm-configs-gitignore-leaking-beads | gitignore_leaking_beads, gitignore_bare_pattern, inner_gitignore_append | detect |
 | fm-configs-metadata-json-stale | metadata_json_drift, metadata_json_malformed | detect |
 | fm-configs-startup-cache-poisoned | startup_cache_poisoned | detect |
+| fm-configs-unknown-keys | config_unknown_keys | detect |
 | fm-configs-yaml-malformed | config_yaml_malformed | detect |
 | fm-dependencies-dead-closed-blocking-edges | dep_dead_closed_blocking_edges | detect |
 | fm-dependencies-fully-unblocked-open-issues | dep_dead_closed_blocking_edges | detect |
@@ -71,6 +72,7 @@ invocation (env override or flag) to pin the finding/check contract;
 | fm-state_files-orphaned-write-lock | permissions_write_lock_unwritable | detect: env-skip protocol (exit 3) on hosts where permission bits do not bind (root / CAP_DAC_OVERRIDE) |
 | fm-state_files-recovery-artifacts-orphaned | recovery_artifacts_orphaned, recovery_artifacts_aged | detect |
 | fm-state_files-sqlite-page-malformed | sqlite_page_malformed, doctor_mutates_without_fix | detect |
+| fm-state_files-read-only-open-not-observational | — | exception: `db.read_only_open_observational` fires only when a read-only inspection changes database-family bytes outside the `-shm` read-mark window (GitHub #476), which a healthy engine never does and no planted file state can force; the contract is pinned by `tests/e2e_sync_reconcile.rs` (byte-identity of every family file across dry-run inspection) and `cli::commands::doctor::tests::pending_sync_merge_authority_inspector_is_coherent_and_byte_identical` |
 | fm-state_files-sync-merge-pending | — | exception: the id is emitted by the `sync.merge_pending` refuse gate, which fires only while a committed `br sync --merge` saga is still unreconciled. Planting one means writing the pending-merge metadata row by hand, and any repair stage then refuses every mutation by design, so a fixture round-trip would assert nothing beyond the refusal already covered by `cli::commands::doctor::tests::pending_sync_merge_read_only_inspector_rejects_duplicate_and_empty_rows` |
 | fm-state_files-wal-oversized | wal_oversized_checkpoint | detect |
 | fm-state_files-wal-shm-sidecar-orphan | orphan_shm_sidecar, wal_without_shm | detect: orphan_shm_sidecar fires the error; wal_without_shm pins the tolerated ok-path (WAL without SHM is legal after a clean close) |

@@ -771,6 +771,11 @@ const KNOWN_NOTNULL_DIFFERENCES: &[&str] = &[
     "owner",
     "sender",
     "source_system",
+    // bd 0.46.0 relaxed these to nullable; br keeps NOT NULL with defaults.
+    "ephemeral",
+    "is_template",
+    "pinned",
+    "source_repo",
 ];
 
 #[test]
@@ -1156,6 +1161,8 @@ const KNOWN_OTHER_TABLE_DIFFS: &[(&str, &str, &str)] = &[
     ("blocked_issues_cache", "issue_id", "notnull_mismatch"),
     ("config", "key", "notnull_mismatch"),
     ("config", "key", "pk_mismatch"),
+    ("metadata", "key", "notnull_mismatch"),
+    ("metadata", "key", "pk_mismatch"),
     ("dependencies", "created_at", "notnull_mismatch"),
     ("dependencies", "type", "pk_mismatch"),
     // NOT NULL differences: br is stricter than bd
