@@ -380,7 +380,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    run_cmd_system("bd", cwd, log_dir, args, label)
+    run_cmd_system(&common::bd_binary_name(), cwd, log_dir, args, label)
 }
 
 fn run_cmd_system<I, S>(

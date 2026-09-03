@@ -153,6 +153,20 @@ impl DiffResult {
     }
 }
 
+/// Number of issues in a `list`/`ready`/`blocked --json` payload: br paginates
+/// (`{"issues": [...], ...}`) while bd prints a bare array.
+fn issue_count(value: &Value) -> usize {
+    value.as_array().map_or_else(
+        || {
+            value
+                .get("issues")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len)
+        },
+        Vec::len,
+    )
+}
+
 /// Normalize a JSON value by masking timestamps and normalizing IDs.
 fn normalize_json(value: &mut Value, path: &str, log: &mut Vec<String>) {
     match value {
@@ -626,8 +640,8 @@ fn conformance_workflow_create_update_lifecycle() {
     normalize_json(&mut bd_val, "", &mut log);
 
     // Count issues
-    let br_count = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_count = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_count = issue_count(&br_val);
+    let bd_count = issue_count(&bd_val);
     assert_eq!(
         br_count, bd_count,
         "Issue counts differ: br={}, bd={}",
@@ -707,8 +721,8 @@ fn conformance_workflow_dependency_chain() {
     let bd_blocked_val: Value =
         serde_json::from_str(&bd_blocked_json).unwrap_or(Value::Array(vec![]));
 
-    let br_blocked_count = br_blocked_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_blocked_count = bd_blocked_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_blocked_count = issue_count(&br_blocked_val);
+    let bd_blocked_count = issue_count(&bd_blocked_val);
 
     assert_eq!(
         br_blocked_count, bd_blocked_count,
@@ -728,8 +742,8 @@ fn conformance_workflow_dependency_chain() {
     let br_ready_val: Value = serde_json::from_str(&br_ready_json).unwrap_or(Value::Array(vec![]));
     let bd_ready_val: Value = serde_json::from_str(&bd_ready_json).unwrap_or(Value::Array(vec![]));
 
-    let br_ready_count = br_ready_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_ready_count = bd_ready_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_ready_count = issue_count(&br_ready_val);
+    let bd_ready_count = issue_count(&bd_ready_val);
 
     assert_eq!(
         br_ready_count, bd_ready_count,
@@ -880,8 +894,8 @@ fn conformance_workflow_delete_lifecycle() {
     let br_list_val: Value = serde_json::from_str(&br_list_json).unwrap_or(Value::Array(vec![]));
     let bd_list_val: Value = serde_json::from_str(&bd_list_json).unwrap_or(Value::Array(vec![]));
 
-    let br_count = br_list_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_count = bd_list_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_count = issue_count(&br_list_val);
+    let bd_count = issue_count(&bd_list_val);
 
     assert_eq!(
         br_count, bd_count,
@@ -1019,8 +1033,8 @@ fn conformance_workflow_full_lifecycle() {
     let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Array(vec![]));
     let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Array(vec![]));
 
-    let br_count = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_count = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_count = issue_count(&br_val);
+    let bd_count = issue_count(&bd_val);
 
     assert_eq!(
         br_count, bd_count,
@@ -1078,8 +1092,8 @@ fn conformance_workflow_dep_removal() {
     let bd_blocked1_val: Value = serde_json::from_str(&extract_json_payload(&bd_blocked1.stdout))
         .unwrap_or(Value::Array(vec![]));
 
-    let br_blocked1_count = br_blocked1_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_blocked1_count = bd_blocked1_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_blocked1_count = issue_count(&br_blocked1_val);
+    let bd_blocked1_count = issue_count(&bd_blocked1_val);
     assert_eq!(br_blocked1_count, bd_blocked1_count);
     assert_eq!(
         br_blocked1_count, 1,
@@ -1099,8 +1113,8 @@ fn conformance_workflow_dep_removal() {
     let bd_blocked2_val: Value = serde_json::from_str(&extract_json_payload(&bd_blocked2.stdout))
         .unwrap_or(Value::Array(vec![]));
 
-    let br_blocked2_count = br_blocked2_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_blocked2_count = bd_blocked2_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_blocked2_count = issue_count(&br_blocked2_val);
+    let bd_blocked2_count = issue_count(&bd_blocked2_val);
     assert_eq!(br_blocked2_count, bd_blocked2_count);
     assert_eq!(
         br_blocked2_count, 0,

@@ -14,6 +14,20 @@
 mod common;
 
 use common::cli::extract_json_payload;
+
+/// Number of issues in a `list --json` payload: br paginates
+/// (`{"issues": [...], ...}`) while bd prints a bare array.
+fn issue_count(value: &serde_json::Value) -> usize {
+    value.as_array().map_or_else(
+        || {
+            value
+                .get("issues")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len)
+        },
+        Vec::len,
+    )
+}
 use serde_json::Value;
 use std::fs;
 use std::time::Instant;
@@ -545,8 +559,8 @@ fn conformance_rapid_creates_50() {
     let bd_json: Value =
         serde_json::from_str(&extract_json_payload(&bd_list.stdout)).expect("parse bd list");
 
-    let br_count = br_json.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_count = bd_json.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_count = issue_count(&br_json);
+    let bd_count = issue_count(&bd_json);
 
     assert_eq!(br_count, count, "br should have {} issues", count);
     assert_eq!(bd_count, count, "bd should have {} issues", count);
@@ -703,8 +717,8 @@ fn conformance_large_dep_graph_100() {
     let bd_json: Value = serde_json::from_str(&extract_json_payload(&bd_ready.stdout))
         .unwrap_or(Value::Array(vec![]));
 
-    let br_count = br_json.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_count = bd_json.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_count = issue_count(&br_json);
+    let bd_count = issue_count(&bd_json);
 
     assert_eq!(
         br_count, bd_count,
@@ -946,8 +960,8 @@ fn conformance_many_comments_20() {
     let bd_json: Value = serde_json::from_str(&extract_json_payload(&bd_comments.stdout))
         .unwrap_or(Value::Array(vec![]));
 
-    let br_count = br_json.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_count = bd_json.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_count = issue_count(&br_json);
+    let bd_count = issue_count(&bd_json);
 
     assert_eq!(
         br_count, comment_count,
