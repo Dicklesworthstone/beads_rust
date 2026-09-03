@@ -87,7 +87,16 @@ fn hash_files_under(dir: &Path) -> BTreeMap<String, String> {
                     .to_string_lossy()
                     .to_string();
                 if path.is_file() {
-                    if let Ok(contents) = fs::read(&path) {
+                    if let Ok(mut contents) = fs::read(&path) {
+                        // A WAL reader registers its snapshot in the -shm
+                        // read-mark array (bytes 100..120) as part of the
+                        // read-lock protocol, so a read-only open cannot
+                        // leave those 20 bytes alone (GitHub #476,
+                        // `storage::sqlite::SHM_READ_MARK_RANGE`). Every
+                        // other byte of every file is under the contract.
+                        if rel.ends_with("-shm") && contents.len() >= 120 {
+                            contents[100..120].fill(0);
+                        }
                         let mut digest = Sha256::new();
                         digest.update(&contents);
                         map.insert(rel, beads_rust::util::hex_encode(&digest.finalize()));
@@ -118,11 +127,19 @@ fn stat_files_under(dir: &Path) -> BTreeMap<String, (u128, u64)> {
                     .to_string();
                 if path.is_file() {
                     if let Ok(meta) = fs::metadata(&path) {
-                        let mtime = meta
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                            .map_or(0, |d| d.as_nanos());
+                        // The -shm read-mark write of a read-only open
+                        // (GitHub #476) refreshes that file's mtime; its
+                        // size and every other byte stay under the contract.
+                        let mtime = if rel.ends_with("-shm") {
+                            0
+                        } else {
+                            meta.modified()
+                                .ok()
+                                .and_then(|t| {
+                                    t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok()
+                                })
+                                .map_or(0, |d| d.as_nanos())
+                        };
                         map.insert(rel, (mtime, meta.len()));
                     }
                 } else if path.is_dir() {
