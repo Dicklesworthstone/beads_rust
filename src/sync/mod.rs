@@ -12857,6 +12857,7 @@ fn try_incremental_auto_flush(
     jsonl_path: &Path,
     allow_external_jsonl: bool,
     history: &HistoryConfig,
+    provided_jsonl_authority: Option<&JsonlFamilyWriteLock>,
 ) -> Result<Option<AutoFlushResult>> {
     // Missing or non-regular targets take the full-export path, which reports
     // the precise reason (fresh export, or the conflict scan's I/O error).
@@ -12864,7 +12865,22 @@ fn try_incremental_auto_flush(
         return Ok(None);
     }
 
-    let jsonl_authority = blocking_jsonl_family_write_lock_with_timeout(jsonl_path, None)?;
+    // A caller that already holds the JSONL-family authority (the missing-DB
+    // rebuild retains one for the whole command) MUST hand it in: `flock`
+    // treats a second descriptor on the same file as an independent holder, so
+    // acquiring here would block on this very process until the write-lock
+    // timeout expired (GitHub #487).
+    let owned_jsonl_authority = match provided_jsonl_authority {
+        Some(_) => None,
+        None => Some(blocking_jsonl_family_write_lock_with_timeout(
+            jsonl_path, None,
+        )?),
+    };
+    let jsonl_authority = provided_jsonl_authority
+        .or(owned_jsonl_authority.as_ref())
+        .ok_or_else(|| BeadsError::SyncConflict {
+            message: "Incremental auto-flush has no JSONL-family write authority".to_string(),
+        })?;
     jsonl_authority.verify_jsonl_authority()?;
     if !jsonl_path.is_file() {
         return Err(BeadsError::SyncConflict {
@@ -12902,7 +12918,7 @@ fn try_incremental_auto_flush(
         jsonl_path,
         &export_config,
         &changes,
-        &jsonl_authority,
+        jsonl_authority,
         &source,
     )? {
         return Ok(Some(result));
@@ -12989,6 +13005,41 @@ pub fn auto_flush(
     allow_external_jsonl: bool,
     history: HistoryConfig,
 ) -> Result<AutoFlushResult> {
+    auto_flush_with_authority(
+        storage,
+        beads_dir,
+        jsonl_path,
+        allow_external_jsonl,
+        history,
+        None,
+    )
+}
+
+/// [`auto_flush`] for a caller that already owns the JSONL-family write
+/// authority for `jsonl_path`.
+///
+/// A mutating command that opened storage in a workspace with no `beads.db`
+/// rebuilt the database from the JSONL under that authority and keeps it for
+/// the rest of the command, so the post-mutation flush must export *under* it.
+/// Re-acquiring would deadlock the command against itself: `flock` locks are
+/// per open file description, so the flush's fresh descriptor blocks on the
+/// rebuild's until the write-lock timeout expires — a 30 s stall that ends in
+/// `AUTO_FLUSH_FAILED` with the mutation still exiting 0 and the tracked JSONL
+/// left stale (GitHub #487).
+///
+/// Passing `None` is the ordinary case and acquires the authority internally.
+///
+/// # Errors
+///
+/// Returns an error if the export fails.
+pub fn auto_flush_with_authority(
+    storage: &mut SqliteStorage,
+    beads_dir: &Path,
+    jsonl_path: &Path,
+    allow_external_jsonl: bool,
+    history: HistoryConfig,
+    provided_jsonl_authority: Option<&JsonlFamilyWriteLock>,
+) -> Result<AutoFlushResult> {
     // This guard is intentionally independent of CLI/MCP startup policy and
     // precedes the dirty/no-op probe. A clean database with a durable pending
     // saga is still not safe for an unrelated automatic exporter: even a
@@ -13031,6 +13082,7 @@ pub fn auto_flush(
             jsonl_path,
             allow_external_jsonl,
             &history,
+            provided_jsonl_authority,
         ) {
             Ok(Some(result)) => {
                 tracing::info!(
@@ -13085,20 +13137,33 @@ pub fn auto_flush(
 
     // Perform export
     let expected_missing_jsonl = (!jsonl_exists).then_some(None);
-    let (export_result, _report) = export_to_jsonl_with_policy_expected(
+    let (export_result, _report) = export_to_jsonl_with_policy_expected_authority(
         storage,
         jsonl_path,
         &export_config,
         expected_missing_jsonl.as_ref(),
+        None,
+        provided_jsonl_authority,
+        None,
     )?;
 
-    // Finalize export (clear dirty flags, update metadata)
-    finalize_export(
-        storage,
-        &export_result,
-        Some(&export_result.issue_hashes),
-        jsonl_path,
-    )?;
+    // Finalize export (clear dirty flags, update metadata) under the same
+    // authority the export ran under, for the same reason (GitHub #487).
+    match provided_jsonl_authority {
+        Some(authority) => finalize_export_under_authority(
+            storage,
+            &export_result,
+            Some(&export_result.issue_hashes),
+            jsonl_path,
+            authority,
+        )?,
+        None => finalize_export(
+            storage,
+            &export_result,
+            Some(&export_result.issue_hashes),
+            jsonl_path,
+        )?,
+    }
 
     tracing::info!(
         exported = export_result.exported_count,
