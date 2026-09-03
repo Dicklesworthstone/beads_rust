@@ -18,7 +18,7 @@ use crate::sync::path::validate_sync_path_with_external;
 use crate::sync::{
     ExpectedJsonlSourceRef, ExportConfig, FreshDatabaseReplacementWitness, ImportConfig,
     ImportResult, JsonlSourceSnapshot, JsonlSourceStateWitness, JsonlTombstoneFilter,
-    PreservedIssue, auto_flush, blocking_database_family_write_lock_with_timeout,
+    PreservedIssue, blocking_database_family_write_lock_with_timeout,
     capture_optional_jsonl_source, dirty_issues_missing_from_jsonl,
     export_to_jsonl_with_policy_expected_under_authority, finalize_export_under_authority,
     import_from_jsonl_snapshot, import_from_jsonl_snapshot_into_fresh_replacement,
@@ -5012,14 +5012,54 @@ impl OpenStorageResult {
         }
 
         let history = self.resolved_history_config();
-        auto_flush(
-            &mut self.storage,
-            &self.paths.beads_dir,
-            &self.paths.jsonl_path,
-            self.allow_external_jsonl,
+        let beads_dir = self.paths.beads_dir.clone();
+        let jsonl_path = self.paths.jsonl_path.clone();
+        let allow_external_jsonl = self.allow_external_jsonl;
+        self.auto_flush_under_retained_authority(
+            &beads_dir,
+            &jsonl_path,
+            allow_external_jsonl,
             history,
         )?;
         Ok(())
+    }
+
+    /// Auto-flush this open storage, exporting under the JSONL-family write
+    /// authority the open retained (if any).
+    ///
+    /// A mutating command in a workspace with no `beads.db` rebuilds the
+    /// database from the JSONL under that authority and holds it for the rest
+    /// of the command. The flush must therefore export *under* it: acquiring a
+    /// second `flock` descriptor for the same sidecar blocks the process on
+    /// itself until the write-lock timeout expires (GitHub #487).
+    ///
+    /// `beads_dir` / `jsonl_path` / `allow_external_jsonl` are parameters
+    /// rather than `self.paths` because the CLI's post-command flush resolves
+    /// them from its own startup context.
+    ///
+    /// # Errors
+    ///
+    /// Returns any export error encountered while auto-flush is enabled.
+    pub fn auto_flush_under_retained_authority(
+        &mut self,
+        beads_dir: &Path,
+        jsonl_path: &Path,
+        allow_external_jsonl: bool,
+        history: crate::sync::history::HistoryConfig,
+    ) -> Result<crate::sync::AutoFlushResult> {
+        let Self {
+            storage,
+            jsonl_write_authority,
+            ..
+        } = self;
+        crate::sync::auto_flush_with_authority(
+            storage,
+            beads_dir,
+            jsonl_path,
+            allow_external_jsonl,
+            history,
+            jsonl_write_authority.as_deref(),
+        )
     }
 
     /// Resolve a [`HistoryConfig`] honoring the merged config layer.
