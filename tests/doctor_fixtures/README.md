@@ -53,6 +53,12 @@ Per AGENTS.md: no `Command::new("git")` from runtime `br` code; the fixture
 recipes themselves may call `git init` for setup (e.g. to materialise a real
 `.git/info/exclude`).
 
+Recipes and assertions may drive the `sqlite3` CLI (`sqlite3 DB 'SQL'` or
+SQL on stdin, list-mode output). When no `sqlite3` is on PATH the driver
+prepends `_bin/`, whose `sqlite3` is a python stand-in covering exactly that
+usage; a real CLI always wins. Underscore-prefixed directories are tooling,
+never fixtures.
+
 ## Idempotence replay gate (pass-3, opt-in)
 
 `run_all.sh` supports an OPT-IN idempotence-replay gate between Stage 3
