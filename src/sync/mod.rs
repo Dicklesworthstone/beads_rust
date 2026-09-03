@@ -14066,6 +14066,34 @@ pub(crate) fn canonicalize_persisted_issue_defaults(issue: &mut Issue) {
     }
 }
 
+/// Names of the serialized issue fields on which `actual` and `expected`
+/// differ (plus `content_hash`), so a semantic-verification refusal says
+/// what did not round-trip instead of only that something did not.
+pub(crate) fn sync_mismatch_field_names(actual: &Issue, expected: &Issue) -> Vec<String> {
+    let content_hash_differs = actual.content_hash != expected.content_hash;
+    let Ok(serde_json::Value::Object(actual_fields)) = serde_json::to_value(actual) else {
+        return vec!["unknown".to_string()];
+    };
+    let Ok(serde_json::Value::Object(expected_fields)) = serde_json::to_value(expected) else {
+        return vec!["unknown".to_string()];
+    };
+    let mut fields = actual_fields
+        .keys()
+        .chain(expected_fields.keys())
+        .filter(|field| actual_fields.get(*field) != expected_fields.get(*field))
+        .cloned()
+        .collect::<Vec<_>>();
+    if content_hash_differs {
+        fields.push("content_hash".to_string());
+    }
+    fields.sort_unstable();
+    fields.dedup();
+    if fields.is_empty() {
+        fields.push("unknown".to_string());
+    }
+    fields
+}
+
 /// Compare every persisted import field while retaining the order-independent
 /// relation semantics used by normal sync comparisons.
 pub(crate) fn persisted_import_issue_equals(actual: &Issue, expected: &Issue) -> bool {
@@ -14106,10 +14134,12 @@ fn verify_applied_import_issue_semantics(
         let mut persisted_expected = expected.clone();
         canonicalize_persisted_issue_defaults(&mut persisted_expected);
         if !persisted_import_issue_equals(actual, &persisted_expected) {
+            let differing_fields = sync_mismatch_field_names(actual, &persisted_expected);
             return Err(BeadsError::SyncConflict {
                 message: format!(
-                    "Import semantic verification failed: issue {} does not match its normalized JSONL payload; rolling back the import",
-                    expected.id
+                    "Import semantic verification failed: issue {} does not match its normalized JSONL payload (differing fields: {}); rolling back the import",
+                    expected.id,
+                    differing_fields.join(", ")
                 ),
             });
         }

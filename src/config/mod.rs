@@ -2816,7 +2816,8 @@ fn verify_rebuilt_issue_semantics(
                 ))
             })?;
         if !crate::sync::persisted_import_issue_equals(actual, &persisted_expected) {
-            let differing_fields = sync_mismatch_field_names(actual, &persisted_expected);
+            let differing_fields =
+                crate::sync::sync_mismatch_field_names(actual, &persisted_expected);
             return Err(BeadsError::Config(format!(
                 "post-recovery semantic validation failed: imported issue {} does not match its normalized JSONL payload (differing fields: {})",
                 expected.id,
@@ -2825,34 +2826,6 @@ fn verify_rebuilt_issue_semantics(
         }
     }
     Ok(())
-}
-
-fn sync_mismatch_field_names(
-    actual: &crate::model::Issue,
-    expected: &crate::model::Issue,
-) -> Vec<String> {
-    let content_hash_differs = actual.content_hash != expected.content_hash;
-    let Ok(serde_json::Value::Object(actual_fields)) = serde_json::to_value(actual) else {
-        return vec!["unknown".to_string()];
-    };
-    let Ok(serde_json::Value::Object(expected_fields)) = serde_json::to_value(expected) else {
-        return vec!["unknown".to_string()];
-    };
-    let mut fields = actual_fields
-        .keys()
-        .chain(expected_fields.keys())
-        .filter(|field| actual_fields.get(*field) != expected_fields.get(*field))
-        .cloned()
-        .collect::<Vec<_>>();
-    if content_hash_differs {
-        fields.push("content_hash".to_string());
-    }
-    fields.sort_unstable();
-    fields.dedup();
-    if fields.is_empty() {
-        fields.push("unknown".to_string());
-    }
-    fields
 }
 
 fn verify_rebuilt_table_count(
