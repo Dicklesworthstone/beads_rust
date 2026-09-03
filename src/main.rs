@@ -3244,7 +3244,23 @@ mod tests {
                 .expect("open original database read-only"),
         );
 
+        // Displace the whole database family, not just the main file: since
+        // fsqlite 0.3.15 every open leaves `-shm` (and `-wal`, `-wal-cert`)
+        // beside the database, and a fresh database cannot be created next to
+        // sidecars that belong to the displaced inode. Production replacement
+        // paths (JSONL rebuild, doctor repair) move the family as a unit too.
         let displaced_path = beads_dir.join("beads.displaced.db");
+        for entry in fs::read_dir(&beads_dir).expect("list beads dir") {
+            let entry = entry.expect("dir entry");
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(suffix) = name.strip_prefix("beads.db-") {
+                fs::rename(
+                    entry.path(),
+                    beads_dir.join(format!("beads.displaced.db-{suffix}")),
+                )
+                .expect("displace database sidecar");
+            }
+        }
         fs::rename(&paths.db_path, &displaced_path).expect("displace original database");
         let mut replacement = beads_rust::storage::SqliteStorage::open(&paths.db_path)
             .expect("create canonical replacement");
