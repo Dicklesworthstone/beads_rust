@@ -733,12 +733,17 @@ fn conformance_text_show_not_found() {
         "br should print not-found error, got: {}",
         br_show.stderr
     );
+    // bd 0.46 signals the miss through its exit status; its stderr may hold
+    // only the "No git repository initialized" note, and older bd printed a
+    // not-found line instead. Either form counts as the diagnostic.
     let bd_diagnostic = format!("{}\n{}", bd_show.stdout, bd_show.stderr).to_lowercase();
     assert!(
-        bd_diagnostic.contains("not found")
+        !bd_show.status.success()
+            || bd_diagnostic.contains("not found")
             || bd_diagnostic.contains("no such")
             || bd_diagnostic.contains("not exist"),
-        "bd should print not-found error, got stdout: {}, stderr: {}",
+        "bd should signal a not-found issue, got exit {:?}, stdout: {}, stderr: {}",
+        bd_show.status.code(),
         bd_show.stdout,
         bd_show.stderr
     );

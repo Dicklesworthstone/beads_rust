@@ -739,6 +739,11 @@ const KNOWN_BR_ONLY_COLUMNS: &[&str] = &[
     "source_repo",
     // source_repo_path: br tracks the absolute canonical workspace path
     "source_repo_path",
+    // Dropped by bd 0.46 (compared 2026-09-03 against v0.46.0); br keeps them
+    // for JSONL compatibility with older bd exports and for inherited context.
+    "owner",
+    "source_system",
+    "agent_context",
 ];
 
 /// Known type differences between br and bd that are acceptable.
@@ -852,7 +857,7 @@ fn conformance_schema_issues_columns() {
         "priority",
         "issue_type",
         "assignee",
-        "owner",
+        // `owner` is br-only since bd 0.46 dropped it (KNOWN_BR_ONLY_COLUMNS).
         "created_at",
         "updated_at",
         "closed_at",
@@ -1141,6 +1146,18 @@ const KNOWN_OTHER_TABLE_DIFFS: &[(&str, &str, &str)] = &[
     ("dirty_issues", "marked_at", "type_mismatch"),
     ("events", "created_at", "type_mismatch"),
     ("export_hashes", "exported_at", "type_mismatch"),
+    // bd 0.46.0 (compared 2026-09-03): audit columns only br records, the
+    // dirty-marker content hash only bd records, and constraint drift on the
+    // shared tables. See docs/TEST_HARNESS.md, "Known divergences".
+    ("events", "agent_name", "missing_in_bd"),
+    ("events", "harness", "missing_in_bd"),
+    ("events", "model", "missing_in_bd"),
+    ("dirty_issues", "content_hash", "missing_in_br"),
+    ("blocked_issues_cache", "issue_id", "notnull_mismatch"),
+    ("config", "key", "notnull_mismatch"),
+    ("config", "key", "pk_mismatch"),
+    ("dependencies", "created_at", "notnull_mismatch"),
+    ("dependencies", "type", "pk_mismatch"),
     // NOT NULL differences: br is stricter than bd
     ("dependencies", "created_by", "notnull_mismatch"),
 ];

@@ -164,8 +164,10 @@ with a reason pointing here, never as a weakened comparison:
   cycle-checked, so a loop of `related` edges is not a cycle for either tool
   and both exit 0. The older expectation (br exits 5 on any-type loops) was
   from #368 and is gone.
-- **`blocked --json` carries more fields in br** (`blocked_by`,
-  `blocked_by_count`); the shape test compares the shared fields.
+- **br paginates list-shaped JSON.** `list --json` and `blocked --json`
+  return `{"issues": [...], "total", "limit", "offset", "has_more"}`; bd
+  prints a bare array with the same per-issue fields. Count and shape tests
+  unwrap `issues` (`common::cli::extract_issues_array`) before comparing.
 - **Schema.** br-only tables: `capacity_exemption_history`,
   `capacity_exemptions`, `capacity_occupancy`, `close_metadata`,
   `gate_result_history`, `gate_results`. bd-only tables: `compaction_snapshots`,

@@ -2643,8 +2643,18 @@ fn conformance_blocked_json_shape() {
         bd_blocked_out.stderr
     );
 
-    let br_json = extract_json_payload(&br_blocked_out.stdout);
-    let bd_json = extract_json_payload(&bd_blocked_out.stdout);
+    // br paginates `blocked --json` (`{"issues": [...], "total", "limit",
+    // "offset", "has_more"}`) while bd prints a bare array; both carry the
+    // same per-issue fields (`blocked_by`, `blocked_by_count`, ...), so the
+    // shape comparison is over the unwrapped issue arrays.
+    let br_json = serde_json::to_string(&Value::Array(common::cli::extract_issues_array(
+        &br_blocked_out.stdout,
+    )))
+    .expect("serialize br blocked issues");
+    let bd_json = serde_json::to_string(&Value::Array(common::cli::extract_issues_array(
+        &bd_blocked_out.stdout,
+    )))
+    .expect("serialize bd blocked issues");
 
     compare_json(&br_json, &bd_json, &CompareMode::StructureOnly).expect("JSON mismatch");
 
