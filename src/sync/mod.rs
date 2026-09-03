@@ -18556,6 +18556,172 @@ mod tests {
         assert!(storage.get_issue("bd-new").unwrap().is_none());
     }
 
+    fn assert_additive_prestate_untouched(
+        storage: &SqliteStorage,
+        plan: &AdditiveReconcilePlan,
+        issue_id: &str,
+    ) {
+        assert!(storage.get_issue(issue_id).unwrap().is_none());
+        let issues = hydrate_additive_database_issues(storage).unwrap();
+        assert_eq!(
+            additive_database_witness(storage, &issues).unwrap(),
+            plan.receipt().target_before,
+            "a refused apply must leave the complete typed database prestate"
+        );
+    }
+
+    /// A-B-A on the source path: the reviewed bytes come back under a fresh
+    /// inode with the original mtime restored (what `git checkout` and
+    /// write-then-rename editors do). Size, mtime, and content all match the
+    /// receipt; only the file identity moved, and that alone must refuse the
+    /// reviewed plan until it is regenerated against the new identity.
+    #[cfg(unix)]
+    #[test]
+    fn additive_reconcile_refuses_byte_identical_source_replaced_at_a_new_inode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let incoming = make_issue_at("bd-aba", "Replaced in place", fixed_time(100));
+        write_additive_issues(&jsonl_path, std::slice::from_ref(&incoming));
+        let bytes_before = fs::read(&jsonl_path).unwrap();
+        let metadata_before = fs::metadata(&jsonl_path).unwrap();
+        let plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        assert_eq!(plan.receipt().status, AdditiveReconcileStatus::Ready);
+
+        let replacement = temp.path().join("replacement.jsonl");
+        fs::write(&replacement, &bytes_before).unwrap();
+        fs::rename(&replacement, &jsonl_path).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&jsonl_path)
+            .unwrap()
+            .set_modified(metadata_before.modified().unwrap())
+            .unwrap();
+        let metadata_after = fs::metadata(&jsonl_path).unwrap();
+        assert_ne!(metadata_after.ino(), metadata_before.ino());
+        assert_eq!(metadata_after.len(), metadata_before.len());
+        assert_eq!(
+            metadata_after.modified().unwrap(),
+            metadata_before.modified().unwrap()
+        );
+        assert_eq!(fs::read(&jsonl_path).unwrap(), bytes_before);
+
+        let error = apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &plan)
+            .expect_err("a byte-identical source under a new inode must refuse the reviewed plan");
+        let message = error.to_string();
+        assert!(
+            message.contains("stale") || message.contains("JSONL witness changed"),
+            "unexpected A-B-A refusal: {message}"
+        );
+        assert_additive_prestate_untouched(&storage, &plan, "bd-aba");
+
+        let replan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        let receipt =
+            apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &replan).unwrap();
+        assert_eq!(receipt.status, AdditiveReconcileStatus::Applied);
+        assert!(storage.get_issue("bd-aba").unwrap().is_some());
+    }
+
+    /// The source is rewritten in place with different bytes of the same
+    /// length and the mtime is put back: identity, size, and mtime all still
+    /// match the receipt, so only the raw content hash can catch the swap.
+    #[test]
+    fn additive_reconcile_refuses_same_size_source_rewrite_with_restored_mtime() {
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let incoming = make_issue_at("bd-swap", "Reviewed title", fixed_time(100));
+        write_additive_issues(&jsonl_path, std::slice::from_ref(&incoming));
+        let metadata_before = fs::metadata(&jsonl_path).unwrap();
+        let plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        assert_eq!(plan.receipt().status, AdditiveReconcileStatus::Ready);
+
+        let swapped = make_issue_at("bd-swap", "Reviewed titlf", fixed_time(100));
+        write_additive_issues(&jsonl_path, std::slice::from_ref(&swapped));
+        std::fs::File::options()
+            .write(true)
+            .open(&jsonl_path)
+            .unwrap()
+            .set_modified(metadata_before.modified().unwrap())
+            .unwrap();
+        let metadata_after = fs::metadata(&jsonl_path).unwrap();
+        assert_eq!(
+            metadata_after.len(),
+            metadata_before.len(),
+            "the swap must keep the exact byte length so only the content hash differs"
+        );
+        assert_eq!(
+            metadata_after.modified().unwrap(),
+            metadata_before.modified().unwrap()
+        );
+
+        let error = apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &plan)
+            .expect_err(
+                "a same-size rewrite with the mtime restored must refuse the reviewed plan",
+            );
+        let message = error.to_string();
+        assert!(
+            message.contains("stale") || message.contains("JSONL witness changed"),
+            "unexpected same-size swap refusal: {message}"
+        );
+        assert_additive_prestate_untouched(&storage, &plan, "bd-swap");
+    }
+
+    /// The operator reviewed one receipt, the source moved on, and the apply
+    /// arrives carrying the superseded token: the token check refuses before
+    /// any transaction opens, the superseded plan is refused under its own
+    /// token as well, and only the current plan under its current token lands.
+    #[test]
+    fn additive_reconcile_rejects_a_superseded_review_token_before_touching_the_database() {
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let first = make_issue_at("bd-token", "First review", fixed_time(100));
+        write_additive_issues(&jsonl_path, std::slice::from_ref(&first));
+        let first_plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        let second = make_issue_at("bd-token", "Second review", fixed_time(200));
+        write_additive_issues(&jsonl_path, std::slice::from_ref(&second));
+        let second_plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        assert_ne!(
+            first_plan.receipt().plan_sha256,
+            second_plan.receipt().plan_sha256
+        );
+        let events_before = storage.get_all_events(0).unwrap();
+
+        let error = apply_additive_reconcile(
+            &mut storage,
+            &jsonl_path,
+            &config,
+            &second_plan,
+            &first_plan.receipt().plan_sha256,
+        )
+        .expect_err("a superseded review token must be refused");
+        assert!(
+            error.to_string().contains("stale or mismatched"),
+            "unexpected token refusal: {error}"
+        );
+        assert_additive_prestate_untouched(&storage, &second_plan, "bd-token");
+        assert_eq!(storage.get_all_events(0).unwrap(), events_before);
+
+        let error = apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &first_plan)
+            .expect_err("the superseded plan must be refused even under its own token");
+        assert!(
+            error.to_string().contains("stale"),
+            "unexpected superseded-plan refusal: {error}"
+        );
+        assert_additive_prestate_untouched(&storage, &second_plan, "bd-token");
+
+        let receipt =
+            apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &second_plan).unwrap();
+        assert_eq!(receipt.status, AdditiveReconcileStatus::Applied);
+        assert_eq!(
+            storage.get_issue("bd-token").unwrap().unwrap().title,
+            "Second review"
+        );
+    }
+
     fn build_collision_maps(
         storage: &SqliteStorage,
     ) -> (

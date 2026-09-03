@@ -142,6 +142,12 @@ publishes from the tag.
   bv 0.22.0 and skip loudly on any other release; the reconcile dry-run
   byte-identity tests apply the GitHub #476 read-mark contract (beads
   zxfz.5, 3r45.3).
+- Reviewed additive reconciliation has unit coverage for the three witness
+  cases that were only asserted in prose: a byte-identical source replaced
+  under a new inode with its mtime restored, a same-size rewrite with the
+  mtime restored (only the raw content hash differs), and a superseded review
+  token; each refuses before any row changes and the regenerated plan applies
+  (bead 3r45.1).
 - The #467 guard is proportional to what a write would lose (#481): a
   whole-field write that keeps at least half the current length passes
   (with a warning when it also keeps fewer than half the current words);
