@@ -605,7 +605,10 @@ fn e2e_update_description_file_preserves_exact_content() {
 
     let empty_path = workspace.root.join("empty-description.md");
     fs::write(&empty_path, "").expect("write empty description file");
-    let clear_to_empty = run_br(
+    // GitHub #467/#481: clearing a non-empty context field is a loss-shaped
+    // write, so an empty file is refused with a hint unless the caller
+    // passes --force. The refusal must name the field and the way out.
+    let refused = run_br(
         &workspace,
         vec![
             "update".to_string(),
@@ -613,11 +616,35 @@ fn e2e_update_description_file_preserves_exact_content() {
             "--description-file".to_string(),
             empty_path.display().to_string(),
         ],
+        "update_description_from_empty_file_refused",
+    );
+    assert!(
+        !refused.status.success(),
+        "clearing a non-empty description without --force must be refused: stdout={} stderr={}",
+        refused.stdout,
+        refused.stderr
+    );
+    assert!(
+        refused.stderr.contains("'description'") && refused.stderr.contains("--force"),
+        "the refusal must name the field and --force: {}",
+        refused.stderr
+    );
+    assert_issue_description(&workspace, &issue_id, exact_description);
+
+    let clear_to_empty = run_br(
+        &workspace,
+        vec![
+            "update".to_string(),
+            issue_id.clone(),
+            "--description-file".to_string(),
+            empty_path.display().to_string(),
+            "--force".to_string(),
+        ],
         "update_description_from_empty_file",
     );
     assert!(
         clear_to_empty.status.success(),
-        "empty description-file update failed: stdout={} stderr={}",
+        "forced empty description-file update failed: stdout={} stderr={}",
         clear_to_empty.stdout,
         clear_to_empty.stderr
     );
