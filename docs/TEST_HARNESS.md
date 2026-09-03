@@ -131,6 +131,21 @@ scripts/conformance.sh --json             # JSON summary
 scripts/conformance.sh --filter schema    # Only schema tests
 ```
 
+**On an RCH worker (no local bd):** the workers have Go, so build the
+workflow's pinned bd on one and point the tests at it. The job lane and the
+compile lane choose workers independently; build on the worker the compile
+lane keeps selecting (check `Selected worker:` in the rch output):
+
+```bash
+rch exec --job -- bash -c 'git clone -q --depth 1 --branch v0.46.0 \
+  https://github.com/steveyegge/beads.git /tmp/beads-go && \
+  cd /tmp/beads-go && go build -o /tmp/bd ./cmd/bd && /tmp/bd version'
+rch exec -- env BD_BINARY=/tmp/bd NO_COLOR=1 cargo test --test conformance_schema
+```
+
+A worker without `/tmp/bd` skips the bd-dependent tests with one actionable
+message rather than failing.
+
 **Environment variables:**
 - `BD_BINARY=/path/to/bd` - Override bd location
 - `BR_BINARY=/path/to/br` - Override br location

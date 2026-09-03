@@ -743,7 +743,7 @@ fn conformance_text_show_not_found() {
         || bd_diagnostic.contains("not found")
         || bd_diagnostic.contains("no such")
         || bd_diagnostic.contains("not exist");
-    info!(
+    eprintln!(
         "bd show <unknown id>: exit {}, signals_miss={bd_signals_miss}, stdout={:?}, stderr={:?}",
         bd_show.exit_code,
         bd_show.stdout.trim(),
