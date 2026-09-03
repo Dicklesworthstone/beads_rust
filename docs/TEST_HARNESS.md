@@ -179,6 +179,9 @@ with a reason pointing here, never as a weakened comparison:
   the primary key), `dependencies.created_at` and
   `blocked_issues_cache.issue_id` (NOT NULL differs). bd 0.46 dropped
   `issues.owner`, so it is no longer in the core column set.
+- **br's JSONL dependency records carry `thread_id` and `metadata`**
+  (per-edge provenance, #484–#486); bd's do not. The workflow JSONL
+  comparison ignores those two br-only leaf fields.
 - **`bd` prints a background-sync note** ("No git repository initialized")
   on stderr in every scratch workspace; tests that assert on bd's stderr
   must tolerate it.

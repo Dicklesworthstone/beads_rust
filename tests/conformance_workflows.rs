@@ -81,6 +81,10 @@ const IGNORABLE_BR_ONLY_FIELDS: &[&str] = &[
     "original_size",
     "source_repo",
     "source_repo_path",
+    // Per-edge provenance on br's dependency records (#484–#486); bd 0.46
+    // exports neither. See docs/TEST_HARNESS.md, "Known divergences".
+    "thread_id",
+    "metadata",
 ];
 
 /// Fields where br and bd have different implementation-specific defaults.
