@@ -23,7 +23,8 @@ Recent line (0.5.x — storage-safety and the multi-process corruption program):
 
 | Version | Date | Kind | Headline |
 |---|---|---|---|
-| [v0.5.8](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.8) | 2026-09-03 | Release | Six silent-loss fixes (#466–#477); acceptance checklist edits; `doctor --bundle`; FrankenSQLite 0.3.15; linearizability, model-based, README, and Go-bd proof suites |
+| [v0.5.9](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.9) | 2026-09-03 | Release | Six silent-loss fixes (#466–#477); acceptance checklist edits; `doctor --bundle`; FrankenSQLite 0.3.15; linearizability, model-based, README, and Go-bd proof suites; schema-witness fast open |
+| v0.5.8 | 2026-09-03 | Tag | Tagged, no binaries: the first hosted run of the release gates caught a binary unit test broken by the fsqlite 0.3.15 sidecar behavior; fixed and re-cut as v0.5.9 |
 | [v0.5.7](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.7) | 2026-08-29 | Release | `doctor health` schema-incompatibility tripwire (#464); FrankenSQLite 0.3.13 reader-slot follow-up |
 | [v0.5.6](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.6) | 2026-08-29 | Release | Review-round correctness/hygiene fixes (agent_context merge, blocked-cache, temp-sidecar leak) |
 | [v0.5.5](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.5) | 2026-08-29 | Release | FrankenSQLite 0.3.12 engine fix (cross-process WAL reader registration) for the page-aliasing corruption |
@@ -64,21 +65,27 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
-## Unreleased -- on `main` after v0.5.8
+## v0.5.9 -- 2026-09-03 (Release)
+
+Every v0.5.7 user has the bugs below. This cut carries the six user-reported
+silent-loss fixes, the acceptance-checklist and incident-bundle features, the
+FrankenSQLite 0.3.15 engine, and the proof suites (linearizability, model-based
+storage, README examples, Go-bd conformance) that now gate the release.
+v0.5.8 was tagged the same day and produced no binaries: the first hosted run
+of the release gates failed on a binary unit test that the fsqlite 0.3.15
+sidecar behavior had broken (`-shm` now outlives every open), which the RCH
+gates had never exercised because `cargo test --lib` skips `src/main.rs`
+tests. The test was fixed and the release re-cut.
+
+### Performance
 
 - Ordinary database opens trust the recorded runtime-schema witness: when the
   metadata witness names the connection's exact SQLite schema cookie, the
   open skips the eleven-table PRAGMA walk (about 24 ms, run twice per
   mutating command) and the witness re-write, as the read-only fast open
   already did. Any DDL moves the cookie, so a tampered schema still takes
-  the full check and is healed (bead naul5; measured profile on that bead).
-
-## v0.5.8 -- 2026-09-03 (Release)
-
-Every v0.5.7 user has the bugs below. This cut carries the six user-reported
-silent-loss fixes, the acceptance-checklist and incident-bundle features, the
-FrankenSQLite 0.3.15 engine, and the proof suites (linearizability, model-based
-storage, README examples, Go-bd conformance) that now gate the release.
+  the full check and is healed (bead naul5; the measured per-step profile of
+  a mutation is on that bead).
 
 ### Silent-loss fixes (#466, #467, #471, #473, #474, #475, #476, #477)
 
