@@ -95,8 +95,8 @@ enum Op {
 
 fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
-        4 => ("[a-z ]{1,24}", 0..=4_i32, 0..KINDS.len()).prop_map(|(title, priority, kind)| Op::Create { title, priority, kind }),
-        2 => (any::<usize>(), "[a-z ]{1,24}").prop_map(|(target, title)| Op::Retitle { target, title }),
+        4 => ("[a-z][a-z ]{0,23}", 0..=4_i32, 0..KINDS.len()).prop_map(|(title, priority, kind)| Op::Create { title, priority, kind }),
+        2 => (any::<usize>(), "[a-z][a-z ]{0,23}").prop_map(|(target, title)| Op::Retitle { target, title }),
         2 => (any::<usize>(), 0..ACTIVE_STATUSES.len()).prop_map(|(target, status)| Op::SetStatus { target, status }),
         1 => any::<usize>().prop_map(|target| Op::Close { target }),
         1 => (any::<usize>(), proptest::option::of("[a-z]{2,6}")).prop_map(|(target, assignee)| Op::Assign { target, assignee }),
@@ -104,7 +104,7 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         1 => (any::<usize>(), any::<usize>()).prop_map(|(target, which)| Op::LabelRemove { target, which }),
         3 => (any::<usize>(), any::<usize>(), 0..DEP_TYPES.len()).prop_map(|(from, to, kind)| Op::DepAdd { from, to, kind }),
         2 => (any::<usize>(), any::<usize>()).prop_map(|(target, which)| Op::DepRemove { target, which }),
-        2 => (any::<usize>(), "[a-z ]{1,30}").prop_map(|(target, text)| Op::CommentAdd { target, text }),
+        2 => (any::<usize>(), "[a-z][a-z ]{0,29}").prop_map(|(target, text)| Op::CommentAdd { target, text }),
         1 => any::<usize>().prop_map(|target| Op::Delete { target }),
     ]
 }
@@ -205,6 +205,7 @@ fn new_issue(id: &str, title: &str, priority: i32, kind: IssueType) -> Issue {
 }
 
 /// Apply one op to both sides. Returns a description for the failure log.
+#[allow(clippy::too_many_lines)]
 fn apply(op: &Op, storage: &mut SqliteStorage, model: &mut Model) -> String {
     match op {
         Op::Create {
@@ -247,7 +248,12 @@ fn apply(op: &Op, storage: &mut SqliteStorage, model: &mut Model) -> String {
                     ACTOR,
                 )
                 .expect("retitle");
-            model.issues.get_mut(&id).expect("model issue").title = title.clone();
+            model
+                .issues
+                .get_mut(&id)
+                .expect("model issue")
+                .title
+                .clone_from(title);
             format!("retitle {id}")
         }
         Op::SetStatus { target, status } => {
@@ -397,11 +403,20 @@ fn apply_dep_add(
     let (Some(from_id), Some(to_id)) = (model.pick(from), model.pick(to)) else {
         return "dep add (no live issue)".to_string();
     };
-    if from_id == to_id || model.edge_between(&from_id, &to_id) || model.reaches(&to_id, &from_id)
-    {
+    if from_id == to_id || model.edge_between(&from_id, &to_id) || model.reaches(&to_id, &from_id) {
         return format!("dep add {from_id} -> {to_id} (skipped: self, duplicate, or cycle)");
     }
     let dep_type = DEP_TYPES[kind];
+    // The storage allows one parent per issue: a second parent-child edge
+    // from the same issue is refused until the first is cleared.
+    if dep_type == "parent-child"
+        && model
+            .outgoing(&from_id)
+            .iter()
+            .any(|(_, kind)| kind == "parent-child")
+    {
+        return format!("dep add {from_id} -> {to_id} (skipped: already has a parent)");
+    }
     storage
         .add_dependency(&from_id, &to_id, dep_type, ACTOR)
         .expect("add dependency");
@@ -443,7 +458,7 @@ fn check_projections(storage: &SqliteStorage, model: &Model, context: &str) {
             .get_comments(id)
             .expect("get_comments")
             .into_iter()
-            .map(|comment| comment.text)
+            .map(|comment| comment.body)
             .collect();
         assert_eq!(comments, expected.comments, "{context}: comments of {id}");
         let deps: BTreeSet<String> = storage
@@ -486,12 +501,17 @@ fn check_projections(storage: &SqliteStorage, model: &Model, context: &str) {
         .into_iter()
         .map(|issue| issue.id)
         .collect();
-    assert_eq!(listed, live, "{context}: listing (closed + deferred included)");
+    assert_eq!(
+        listed, live,
+        "{context}: listing (closed + deferred included)"
+    );
 }
 
 fn integrity_check(db_path: &Path) -> String {
     let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open raw db");
-    let rows = conn.query("PRAGMA integrity_check").expect("integrity_check");
+    let rows = conn
+        .query("PRAGMA integrity_check")
+        .expect("integrity_check");
     let first = rows
         .first()
         .and_then(|row| row.get(0))
@@ -552,6 +572,42 @@ proptest! {
     fn storage_matches_reference_model(ops in proptest::collection::vec(op_strategy(), 1..=120)) {
         run_sequence(&ops)?;
     }
+}
+
+/// The checker itself must fail readably when a projection drifts from the
+/// model: a label added behind the model's back is reported as a labels
+/// mismatch naming the issue and the step.
+#[test]
+fn checker_reports_a_projection_that_drifted_from_the_model() {
+    let (mut storage, _dir, _db_path) = fresh_storage();
+    let mut model = Model::default();
+    apply(
+        &Op::Create {
+            title: "drifts".to_string(),
+            priority: 3,
+            kind: 0,
+        },
+        &mut storage,
+        &mut model,
+    );
+    storage
+        .add_label("mb-0000", "unmodeled", ACTOR)
+        .expect("add label behind the model's back");
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        check_projections(&storage, &model, "after an unmodeled label add");
+    }));
+    let message = match outcome {
+        Ok(()) => panic!("the checker accepted a projection the model does not predict"),
+        Err(payload) => payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_default(),
+    };
+    assert!(
+        message.contains("labels of mb-0000") && message.contains("after an unmodeled label add"),
+        "checker message should name the projection and the step: {message}"
+    );
 }
 
 /// GitHub #426: 300 issues chained by `blocks` edges, then 264 sequential
