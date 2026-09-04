@@ -68,6 +68,13 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ## Unreleased -- on `main` after v0.5.10
 
+- CI runs again: every workflow pins the manifest's toolchain
+  (`nightly-2026-08-31`) instead of floating `nightly` (release.yml still
+  said 2026-08-25 after the manifest moved), the audit gate installs
+  `cargo-insta` as a prebuilt binary (source builds failed on a newer
+  nightly's `rustix`), and the runtime index diagnostics are rustfmt-clean
+  (the formatting check had failed on every push since they landed).
+
 - `br upgrade --version 0.5.10` no longer 404s: a bare version is looked up
   as the `v`-prefixed release tag GitHub actually carries (found while
   installing v0.5.10 through the shipped 0.5.7 binary; the no-version path

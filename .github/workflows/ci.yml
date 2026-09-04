@@ -39,7 +39,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-08-31
           components: rustfmt, clippy
 
       - name: Cache cargo
@@ -93,7 +93,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-08-31
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2.9.1
@@ -117,7 +117,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-08-31
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2.9.1
@@ -191,13 +191,17 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-08-31
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2.9.1
 
+      # Prebuilt binary: compiling cargo-insta from source on the runner
+      # failed when a newer nightly rejected its rustix dependency.
       - name: Install cargo-insta
-        run: cargo install cargo-insta --locked --version 1.46.1
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf  # v2.87.2
+        with:
+          tool: cargo-insta@1.46.1
 
       - name: Build release br binary (used by shell harnesses)
         run: cargo build --release
@@ -276,7 +280,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-08-31
           targets: ${{ matrix.target }}
 
       - name: Cache cargo
@@ -321,7 +325,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-08-31
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2.9.1
@@ -455,7 +459,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-08-31
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2.9.1
