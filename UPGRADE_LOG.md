@@ -7,7 +7,7 @@
 - **Inventory:** 56 direct dependency entries (41 `[dependencies]`, 1 build, 14 dev); 20 entries behind crates.io's latest stable at start: the `fsqlite*` family (15 crates, 0.3.15 → 0.3.16, published 2026-09-04), `asupersync` (=0.4.9 → 0.4.10, two entries), `fastmcp-rust` (=0.7.1 → 0.8.1), `toon_rust`/`tru` (0.2.3 → 0.2.4), `toml` (dev, =1.1.4 → 1.1.5). Everything else already at latest stable (vergen-gix 10.0.3, rand 0.10.2, clap 4.6.6, serde 1.0.229, chrono 0.4.45, regex 1.13.1, thiserror 2.0.20, insta 1.48.0, proptest 1.11.0, criterion 0.8.2, ...).
 - **Method:** one dependency at a time; research from crates.io metadata and the upstream changelog/compare; manifest + lockfile update; the relevant test targets through RCH (`rch exec -- cargo ...`; RCH caps one command at 5 min for builds and 30 min for tests, so each entry names the exact targets run); log here before moving on.
 - **Order:** tru → toml → fastmcp-rust → fsqlite family (engine-bump checklist, `docs/reliability/ENGINE_OPERATING_MODEL.md` §6). asupersync stays at =0.4.9: fastmcp-rust 0.8.1 still pins `=0.4.9` exactly and the `mcp` build must carry one asupersync (bead beads_rust-fiop); fsqlite 0.3.16 accepts `>=0.4.3,<0.5`.
-- **Status:** in progress (entries below are appended as each dependency lands).
+- **Result:** updated 3 lines (fsqlite family ×15 manifest entries / 20 crates, fastmcp-rust ×8 crates plus its `log` pin, tru), skipped 2 (asupersync, toml — both held by fastmcp's exact pins), failed 0, rolled back 0. Landed as one commit (5e81e796) after every dependency had passed its own RCH gates; the hosted CI push run and a dispatched `Reliability Gates` run are the receipts for the whole tree (ids below).
 
 ## Updates (2026-09-04)
 
