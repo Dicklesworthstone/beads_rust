@@ -1,9 +1,9 @@
 {
-  "version": "0.5.2",
+  "version": "0.5.10",
   "build": "<build>",
+  "rust_version": "<rust_version>",
   "target": "<target>",
   "features": [
     "self_update"
-  ],
-  "rust_version": "<rust_version>"
+  ]
 }

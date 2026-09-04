@@ -25,7 +25,7 @@ Options:
           Filter by label (OR logic, can be repeated)
 
   -p, --priority <PRIORITY>
-          Filter by priority (can be repeated)
+          Filter by priority: 0-4 or P0-P4, ranges like 0-1, comma lists; repeatable
 
       --priority-min <PRIORITY_MIN>
           Filter by minimum priority (0=critical, 4=backlog)
@@ -68,6 +68,9 @@ Options:
 
       --pretty
           Use tree/pretty output format
+
+      --tree
+          Group children under their parents with tree connectors (text output). Hierarchy follows dotted child IDs (`bd-abc.2` under `bd-abc`); a child whose parent is filtered out of the result set is shown at the top level (GitHub #475)
 
       --wrap
           Wrap long lines instead of truncating in text output
