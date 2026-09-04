@@ -20,6 +20,11 @@
 
 set -euo pipefail
 
+# `sort` feeds `comm`; under a locale that collates punctuation loosely the
+# digest-named lock files can make comm reject sort's order ("file 1 is not
+# in sorted order") and abort the witness. Byte order for both.
+export LC_ALL=C
+
 LOG_TS=$(date -u +%Y%m%dT%H%M%SZ)
 EVENT_LOG="/tmp/sync_safety_witness_${LOG_TS}.jsonl"
 PASS_FAIL_LOG="/tmp/sync_safety_witness_${LOG_TS}.summary.txt"
@@ -50,6 +55,14 @@ is_allowed_path() {
             local pid="${rel##*.jsonl.}"
             pid="${pid%.tmp}"
             [[ "$pid" =~ ^[0-9]+$ ]] && return 0
+            ;;
+        # Database-family and JSONL-family write-authority locks (251b501b):
+        # a 24-hex-digit digest of the guarded path, created beside it by
+        # `br sync`. Same rule as the Rust allowlist.
+        .beads/.br-db-write-*.lock|.beads/.br-jsonl-write-*.lock)
+            local digest="${rel##*-write-}"
+            digest="${digest%.lock}"
+            [[ "$digest" =~ ^[0-9a-f]{24}$ ]] && return 0
             ;;
     esac
     return 1

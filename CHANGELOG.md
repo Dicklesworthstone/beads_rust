@@ -94,7 +94,14 @@ this repo): commits `55c186682` + `5946b3b7c` in
   (`audit.suspect_close_reasons`); its greedy `forced.*close.*cycle` regex
   flagged the audit's own policy bead (30ci) for naming
   `forced_cycle_close_audit.sh` in its close reason, so the job had failed
-  on every hosted run.
+  on every hosted run. The sync-safety filesystem witness
+  (`sync_safety_witness.sh`) accepts the digest-named write-authority locks
+  (`.br-db-write-<hash>.lock`, `.br-jsonl-write-<hash>.lock`) that `br sync`
+  has created since the July write-authority work, matching the Rust
+  allowlist in `e2e_sync_git_safety.rs` it mirrors; it had flagged them as
+  out-of-allowlist writes. The witness also pins `LC_ALL=C` so its
+  `sort`/`comm` file diff cannot abort on locale collation of the
+  digest-named files.
 
 - `br upgrade --version 0.5.10` no longer 404s: a bare version is looked up
   as the `v`-prefixed release tag GitHub actually carries (found while
