@@ -541,9 +541,19 @@ fn e2e_history_restore_with_real_dataset() {
     // Create isolated workspace from real dataset
     let isolated = IsolatedDataset::from_dataset(KnownDataset::BeadsRust)
         .expect("should copy beads_rust dataset");
-    isolated
-        .migrate_to_current_schema()
-        .expect("migrate isolated beads_rust dataset");
+    if let Err(error) = isolated.migrate_to_current_schema() {
+        // The reviewed migration covers schemas 13 and later; a checkout
+        // whose live `.beads` predates that (RCH workers carry old copies)
+        // cannot host this scenario, and the helper says so with
+        // `Unsupported` rather than a failure of the code under test.
+        if error.kind() == std::io::ErrorKind::Unsupported {
+            eprintln!(
+                "Skipping e2e_history_restore_with_real_dataset: dataset schema is below the reviewed-migration floor: {error}"
+            );
+            return;
+        }
+        panic!("migrate isolated beads_rust dataset: {error}");
+    }
 
     // Write test summary for debugging
     let _summary_path = isolated.write_summary().expect("write summary");
@@ -621,9 +631,17 @@ fn e2e_history_prune_with_real_dataset() {
     // Create isolated workspace from real dataset
     let isolated = IsolatedDataset::from_dataset(KnownDataset::BeadsRust)
         .expect("should copy beads_rust dataset");
-    isolated
-        .migrate_to_current_schema()
-        .expect("migrate isolated beads_rust dataset");
+    if let Err(error) = isolated.migrate_to_current_schema() {
+        // See e2e_history_restore_with_real_dataset: a pre-floor dataset is
+        // an environment gap, reported by the helper as `Unsupported`.
+        if error.kind() == std::io::ErrorKind::Unsupported {
+            eprintln!(
+                "Skipping e2e_history_prune_with_real_dataset: dataset schema is below the reviewed-migration floor: {error}"
+            );
+            return;
+        }
+        panic!("migrate isolated beads_rust dataset: {error}");
+    }
 
     let workspace = BrWorkspace {
         temp_dir: isolated.temp_dir,
