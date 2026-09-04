@@ -104,6 +104,12 @@ impl Runner {
                 cmd.env_remove(&key);
             }
         }
+        // Pin discovery to the throwaway workspace. The temp root can sit
+        // inside a real workspace (a TMPDIR under a checkout), and without
+        // this the child `br init` would walk up to that tracker and refuse
+        // to touch it, failing the selftest for a reason that has nothing to
+        // do with this binary or filesystem.
+        cmd.env("BEADS_DIR", self.root.join(".beads"));
         cmd.output()
     }
 

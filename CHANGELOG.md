@@ -65,6 +65,14 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
+## Unreleased -- on `main` after v0.5.9
+
+- `br doctor --selftest` pins its child commands to the throwaway workspace
+  (`BEADS_DIR`), so a temp root that sits inside a real checkout no longer
+  makes the selftest's `br init` discover that tracker and refuse; found
+  when the selftest e2e ran on an RCH worker whose `TMPDIR` is inside the
+  repository.
+
 ## v0.5.9 -- 2026-09-03 (Release)
 
 Every v0.5.7 user has the bugs below. This cut carries the six user-reported
