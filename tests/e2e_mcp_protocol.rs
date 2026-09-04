@@ -65,6 +65,10 @@ fn br_command(root: &Path) -> Command {
     command.env("HOME", root);
     command.env("NO_COLOR", "1");
     command.env("RUST_LOG", "error");
+    // Pin discovery to this workspace: on hosts whose TMPDIR sits inside a
+    // checkout (RCH workers), `br init` would otherwise walk up to that
+    // repository's own tracker and refuse.
+    command.env("BEADS_DIR", root.join(".beads"));
     command
 }
 

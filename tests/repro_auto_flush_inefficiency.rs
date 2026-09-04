@@ -30,7 +30,7 @@ fn make_issue(id: &str) -> Issue {
 #[test]
 #[ignore = "integration test cannot mark an issue dirty without changing JSONL bytes"]
 fn test_auto_flush_optimizes_no_content_change() {
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new_in(common::cli::isolated_temp_root()).unwrap();
     let beads_dir = temp_dir.path().join(".beads");
     fs::create_dir(&beads_dir).unwrap();
     let db_path = beads_dir.join("beads.db");
@@ -103,7 +103,7 @@ fn test_auto_flush_optimizes_no_content_change() {
 
 #[test]
 fn test_auto_flush_flush_on_label_change() {
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new_in(common::cli::isolated_temp_root()).unwrap();
     let beads_dir = temp_dir.path().join(".beads");
     fs::create_dir(&beads_dir).unwrap();
     let db_path = beads_dir.join("beads.db");
@@ -149,7 +149,7 @@ fn test_auto_flush_flush_on_label_change() {
 
 #[test]
 fn test_auto_flush_uses_resolved_jsonl_path() {
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new_in(common::cli::isolated_temp_root()).unwrap();
     let beads_dir = temp_dir.path().join(".beads");
     fs::create_dir(&beads_dir).unwrap();
     let db_path = beads_dir.join("beads.db");
@@ -177,7 +177,7 @@ fn test_auto_flush_uses_resolved_jsonl_path() {
 
 #[test]
 fn test_auto_flush_preserves_unrelated_existing_jsonl_lines() {
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new_in(common::cli::isolated_temp_root()).unwrap();
     let beads_dir = temp_dir.path().join(".beads");
     fs::create_dir(&beads_dir).unwrap();
     let db_path = beads_dir.join("beads.db");
@@ -247,7 +247,7 @@ fn test_auto_flush_preserves_unrelated_existing_jsonl_lines() {
 /// id order; updates keep the cheap in-place write.
 #[test]
 fn test_auto_flush_keeps_jsonl_id_sorted_after_creates() {
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new_in(common::cli::isolated_temp_root()).unwrap();
     let beads_dir = temp_dir.path().join(".beads");
     fs::create_dir(&beads_dir).unwrap();
     let db_path = beads_dir.join("beads.db");
