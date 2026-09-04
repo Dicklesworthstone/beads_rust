@@ -23,8 +23,9 @@ Recent line (0.5.x — storage-safety and the multi-process corruption program):
 
 | Version | Date | Kind | Headline |
 |---|---|---|---|
-| [v0.5.9](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.9) | 2026-09-03 | Release | Six silent-loss fixes (#466–#477); acceptance checklist edits; `doctor --bundle`; FrankenSQLite 0.3.15; linearizability, model-based, README, and Go-bd proof suites; schema-witness fast open |
-| v0.5.8 | 2026-09-03 | Tag | Tagged, no binaries: the first hosted run of the release gates caught a binary unit test broken by the fsqlite 0.3.15 sidecar behavior; fixed and re-cut as v0.5.9 |
+| [v0.5.10](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.10) | 2026-09-04 | Release | Six silent-loss fixes (#466–#477, #487); acceptance checklist edits; `doctor --bundle`; FrankenSQLite 0.3.15; linearizability, model-based, README, and Go-bd proof suites; schema-witness fast open |
+| v0.5.9 | 2026-09-03 | Tag | Tagged, no binaries: the hosted lib shard passed, then the new multi-process stress gate ran its script with relative paths that its own `cd` broke; fixed and re-cut as v0.5.10 |
+| v0.5.8 | 2026-09-03 | Tag | Tagged, no binaries: the first hosted run of the release gates caught a binary unit test broken by the fsqlite 0.3.15 sidecar behavior; fixed and re-cut |
 | [v0.5.7](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.7) | 2026-08-29 | Release | `doctor health` schema-incompatibility tripwire (#464); FrankenSQLite 0.3.13 reader-slot follow-up |
 | [v0.5.6](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.6) | 2026-08-29 | Release | Review-round correctness/hygiene fixes (agent_context merge, blocked-cache, temp-sidecar leak) |
 | [v0.5.5](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.5) | 2026-08-29 | Release | FrankenSQLite 0.3.12 engine fix (cross-process WAL reader registration) for the page-aliasing corruption |
@@ -65,25 +66,25 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
-## Unreleased -- on `main` after v0.5.9
+## v0.5.10 -- 2026-09-04 (Release)
+
+Every v0.5.7 user has the bugs below. This cut carries the six user-reported
+silent-loss fixes, the acceptance-checklist and incident-bundle features, the
+FrankenSQLite 0.3.15 engine, and the proof suites (linearizability, model-based
+storage, README examples, Go-bd conformance) that now gate the release.
+Two tags preceded it without binaries. v0.5.8 failed the first hosted run of
+the release gates on a binary unit test that the fsqlite 0.3.15 sidecar
+behavior had broken (`-shm` now outlives every open), which the RCH gates had
+never exercised because `cargo test --lib` skips `src/main.rs` tests. v0.5.9
+passed that shard and then failed the new multi-process stress gate, whose
+script changes into a throwaway directory before running the binary it was
+handed as a relative path. Both were fixed and the release re-cut.
 
 - `br doctor --selftest` pins its child commands to the throwaway workspace
   (`BEADS_DIR`), so a temp root that sits inside a real checkout no longer
   makes the selftest's `br init` discover that tracker and refuse; found
   when the selftest e2e ran on an RCH worker whose `TMPDIR` is inside the
   repository.
-
-## v0.5.9 -- 2026-09-03 (Release)
-
-Every v0.5.7 user has the bugs below. This cut carries the six user-reported
-silent-loss fixes, the acceptance-checklist and incident-bundle features, the
-FrankenSQLite 0.3.15 engine, and the proof suites (linearizability, model-based
-storage, README examples, Go-bd conformance) that now gate the release.
-v0.5.8 was tagged the same day and produced no binaries: the first hosted run
-of the release gates failed on a binary unit test that the fsqlite 0.3.15
-sidecar behavior had broken (`-shm` now outlives every open), which the RCH
-gates had never exercised because `cargo test --lib` skips `src/main.rs`
-tests. The test was fixed and the release re-cut.
 
 ### Performance
 

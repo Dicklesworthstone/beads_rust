@@ -402,7 +402,7 @@ The resource surface is `beads://project/info`, `beads://issues/{id}`,
 
 ```bash
 br --version
-# br 0.5.9
+# br 0.5.10
 ```
 
 ### Verify Release Signatures

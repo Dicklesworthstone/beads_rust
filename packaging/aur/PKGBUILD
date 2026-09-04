@@ -5,7 +5,7 @@
 # To install from AUR: yay -S br-bin
 
 pkgname=br-bin
-pkgver=0.5.9
+pkgver=0.5.10
 pkgrel=1
 pkgdesc="Agent-first issue tracker (SQLite + JSONL)"
 arch=('x86_64' 'aarch64')
