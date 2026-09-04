@@ -47,7 +47,7 @@ clap_complete = { version = "4.6.9", features = ["unstable-dynamic"] }
 # depends on fsqlite-ext-json internally, but the 0.3.9+ extension enables
 # only serde_json's `preserve_order`; the old viral `arbitrary_precision`
 # feature no longer affects br's JSON/TOON serializers.
-fsqlite = { version = "0.3.15", default-features = false, features = [
+fsqlite = { version = "0.3.16", default-features = false, features = [
     "native",
     "linux-asupersync-uring",
     "fts5",
@@ -55,25 +55,25 @@ fsqlite = { version = "0.3.15", default-features = false, features = [
     "icu",
     "misc",
 ] }
-fsqlite-types = "0.3.15"
-fsqlite-error = "0.3.15"
-fsqlite-core = "0.3.15"
-fsqlite-func = "0.3.15"
-fsqlite-vdbe = "0.3.15"
-fsqlite-vfs = "0.3.15"
-fsqlite-pager = "0.3.15"
-fsqlite-parser = "0.3.15"
-fsqlite-planner = "0.3.15"
-fsqlite-wal = "0.3.15"
-fsqlite-btree = "0.3.15"
-fsqlite-ast = "0.3.15"
-fsqlite-mvcc = "0.3.15"
-fsqlite-observability = "0.3.15"
+fsqlite-types = "0.3.16"
+fsqlite-error = "0.3.16"
+fsqlite-core = "0.3.16"
+fsqlite-func = "0.3.16"
+fsqlite-vdbe = "0.3.16"
+fsqlite-vfs = "0.3.16"
+fsqlite-pager = "0.3.16"
+fsqlite-parser = "0.3.16"
+fsqlite-planner = "0.3.16"
+fsqlite-wal = "0.3.16"
+fsqlite-btree = "0.3.16"
+fsqlite-ast = "0.3.16"
+fsqlite-mvcc = "0.3.16"
+fsqlite-observability = "0.3.16"
 
 # Current-thread runtime that drives fsqlite 0.3's async (!Send) futures to
 # completion behind the synchronous `franken_sync::Connection` bridge.
 # Pinned =0.4.9 to match both the fsqlite family's requirement
-# (>=0.4.3,<0.5) and fastmcp-rust 0.7.0's exact =0.4.9 pin, so `--features
+# (>=0.4.3,<0.5) and fastmcp-rust 0.8.1's exact =0.4.9 pin, so `--features
 # mcp` builds carry a single asupersync version (beads_rust-fiop).
 # default-features = false mirrors fsqlite's own spec.
 asupersync = { version = "=0.4.9", default-features = false }
@@ -109,7 +109,7 @@ crossterm = "0.29"
 rich_rust = { version = "0.2.3", features = ["markdown", "json", "backtrace"] }
 
 # TOON format support (sibling project)
-toon_rust = { version = "0.2.3", package = "tru" }
+toon_rust = { version = "0.2.4", package = "tru" }
 
 # Path normalization (strips \\?\ prefix on Windows)
 dunce = "1.0.5"
@@ -126,7 +126,7 @@ unicode-width = "0.2.2"
 semver = "1.0.28"
 
 # MCP server (optional; gated behind the `mcp` feature)
-fastmcp-rust = { version = "=0.7.1", optional = true }
+fastmcp-rust = { version = "=0.8.1", optional = true }
 
 # Self-update (optional; gated behind the `self_update` feature)
 self_update = { version = "1.3.0", features = ["reqwest", "rustls", "github", "progress-bar", "archive-tar", "compression-tar-gz"], default-features = false, optional = true }
@@ -218,8 +218,8 @@ self_update = [
 
 # NOTE: no `[patch.crates-io]` here.
 #
-# All dependencies — fsqlite 0.3.13, its fsqlite-* transitive crates, and
-# fastmcp-rust 0.7.0 — are published on crates.io, so this crate
+# All dependencies — fsqlite 0.3.16, its fsqlite-* transitive crates, and
+# fastmcp-rust 0.8.1 — are published on crates.io, so this crate
 # resolves everything from the registry out of the box.  That makes
 # `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked`
 # work without requiring sibling `frankensqlite` or `fastmcp_rust`

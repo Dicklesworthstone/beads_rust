@@ -111,6 +111,16 @@ this repo): commits `55c186682` + `5946b3b7c` in
   fast open (20 sequential operations each, installed release binaries):
   `create` 144 → 112 ms, `update --priority` 238 → 188 ms, `show --json`
   53 → 45 ms per operation from v0.5.7 to v0.5.10 (bead naul5).
+- Dependencies (`/library-updater`, one at a time, each gated on RCH; see
+  `UPGRADE_LOG.md`): the FrankenSQLite family 0.3.15 → 0.3.16 (page-allocator
+  EOF-growth double-grant closed under the reserved append lock, bd-9inpb;
+  WAL appended-tail reads no longer rescan the whole WAL per page on
+  writable open and checkpoint, GH#382; FTS5 work br does not use;
+  frankensqlite#407 is fixed upstream but after the 0.3.16 tag, so the
+  multi-label counting workaround and its ignored probe stay), fastmcp-rust
+  =0.7.1 → =0.8.1 (caller-owned runtime contexts, which `br serve` already
+  provided; `log` 0.4.34 by its pin), toon_rust/`tru` 0.2.3 → 0.2.4. Held:
+  asupersync =0.4.9 and toml =1.1.4, both exact pins of fastmcp 0.8.1.
 - `br update` and `br close` reuse the connection `main` already opened at
   startup for the auto-import probe and the auto-flush instead of opening a
   second one for the write (the remaining fixed cost measured on the update

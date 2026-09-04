@@ -8883,7 +8883,8 @@ impl SqliteStorage {
 
         let labels_and = filters.labels.as_deref().unwrap_or(&[]);
         let labels_or = filters.labels_or.as_deref().unwrap_or(&[]);
-        // fsqlite regression (seen on 0.3.6, still present on 0.3.15):
+        // fsqlite regression (seen on 0.3.6, still present on 0.3.16; fixed
+        // upstream in frankensqlite#407 after the 0.3.16 tag):
         // `SELECT COUNT(*) ... WHERE id IN (SELECT ... GROUP BY ... HAVING
         // COUNT(DISTINCT label) = ?)` evaluates to NULL (read as 0 below) as
         // soon as further predicates follow the IN-subquery, which the
@@ -25947,16 +25948,18 @@ mod tests {
 
     /// beads_rust-ro3m engine probe: every parametrized way of asking the
     /// engine the multi-label AND count, so the failing variant is named.
-    /// On fsqlite 0.3.15 the two production-shaped variants return NULL
-    /// (`Ok(None)`) while the minimal statement counts 1 through both query
-    /// APIs: the grouped/HAVING IN-subquery breaks once further predicates
-    /// follow it. Run with `--ignored` after an engine bump; when every
-    /// variant counts 1, drop the `multi_label_and` detour in
-    /// `count_issues_with_filters` and un-ignore this test.
+    /// On fsqlite 0.3.15 and 0.3.16 the two production-shaped variants return
+    /// NULL (`Ok(None)`) while the minimal statement counts 1 through both
+    /// query APIs: the grouped/HAVING IN-subquery breaks once further
+    /// predicates follow it (fixed upstream after the 0.3.16 tag). Run with
+    /// `--ignored` after an engine bump; when every variant counts 1, drop
+    /// the `multi_label_and` detour in `count_issues_with_filters` and
+    /// un-ignore this test.
     #[test]
-    #[ignore = "beads_rust-ro3m / upstream frankensqlite#407: fsqlite 0.3.15 returns NULL for the \
-                grouped/HAVING IN-subquery count when further predicates follow the subquery \
-                (minimal statement counts 1); rerun after an engine bump"]
+    #[ignore = "beads_rust-ro3m / upstream frankensqlite#407: fsqlite 0.3.15 and 0.3.16 return NULL for \
+                the grouped/HAVING IN-subquery count when further predicates follow the subquery \
+                (minimal statement counts 1); fixed upstream after the 0.3.16 tag, rerun after the \
+                next engine bump"]
     fn grouped_having_in_subquery_count_with_bound_params() {
         let storage = storage_with_multi_label_fixture();
         let params = [
