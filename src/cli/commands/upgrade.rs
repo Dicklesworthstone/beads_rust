@@ -600,7 +600,7 @@ fn build_updater_with_target(
         .show_download_progress(show_progress)
         .no_confirm(true)
         .current_version(current_version)
-        .release_tag(&release_tag_for(target_version));
+        .release_tag(release_tag_for(target_version));
 
     if let Some(token) = resolve_auth_token() {
         tracing::debug!("Using GitHub auth token from environment");
