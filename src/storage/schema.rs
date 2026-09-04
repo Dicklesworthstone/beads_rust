@@ -4417,7 +4417,9 @@ pub fn runtime_index_diagnostics(conn: &Connection) -> String {
         ("dependencies", DEPENDENCIES_RUNTIME_INDEXES),
         ("events", EVENTS_RUNTIME_INDEXES),
     ];
-    let mut out = String::from("table|index|present|unique_ok|origin|partial_ok|key_ok|predicate_ok|actual_predicate\n");
+    let mut out = String::from(
+        "table|index|present|unique_ok|origin|partial_ok|key_ok|predicate_ok|actual_predicate\n",
+    );
     for (table, indexes) in tables {
         let escaped_table = table.replace('\'', "''");
         let index_rows = match conn.query(&format!("PRAGMA index_list('{escaped_table}')")) {
@@ -4451,11 +4453,7 @@ pub fn runtime_index_diagnostics(conn: &Connection) -> String {
             let (predicate_ok, actual_predicate) = predicate_diagnostic(conn, expected.name);
             out.push_str(&format!(
                 "{table}|{}|{}|{}|{}|{}|{key_ok}|{predicate_ok}|{actual_predicate}\n",
-                expected.name,
-                true,
-                unique_ok,
-                origin,
-                partial_ok,
+                expected.name, true, unique_ok, origin, partial_ok,
             ));
         }
     }
@@ -4492,8 +4490,8 @@ fn predicate_diagnostic(conn: &Connection, index: &str) -> (bool, String) {
     let Some(actual) = tokens.get(where_position + 1..) else {
         return (false, "<empty predicate>".to_string());
     };
-    let actual_canonical = canonical_predicate_text(actual)
-        .unwrap_or_else(|| "<canonicalize failed>".to_string());
+    let actual_canonical =
+        canonical_predicate_text(actual).unwrap_or_else(|| "<canonicalize failed>".to_string());
     let ok = canonical_predicate_text(actual).is_some_and(|actual| {
         canonical_predicate_text(&sql_evidence_tokens(predicate))
             .is_some_and(|expected| actual == expected)
