@@ -66,6 +66,17 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
+## Unreleased -- on `main` after v0.5.10
+
+- `br upgrade --version 0.5.10` no longer 404s: a bare version is looked up
+  as the `v`-prefixed release tag GitHub actually carries (found while
+  installing v0.5.10 through the shipped 0.5.7 binary; the no-version path
+  was unaffected).
+- Measured on the same host with the same loops as before the schema-witness
+  fast open (20 sequential operations each, installed release binaries):
+  `create` 144 → 112 ms, `update --priority` 238 → 188 ms, `show --json`
+  53 → 45 ms per operation from v0.5.7 to v0.5.10 (bead naul5).
+
 ## v0.5.10 -- 2026-09-04 (Release)
 
 Every v0.5.7 user has the bugs below. This cut carries the six user-reported

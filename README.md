@@ -270,7 +270,7 @@ Agent Mail, MCP clients, or fixture update modes.
 | Storage | SQLite + JSONL | Dolt/SQLite |
 | Background daemon | **No** | Yes |
 | Hook installation | **Manual** | Automatic |
-| Binary size | ~26 MB stripped static binary (v0.5.7, x86_64 Linux; ~11 MB compressed download) | ~30+ MB |
+| Binary size | ~26 MB stripped static binary (v0.5.10, x86_64 Linux; ~12 MB compressed download) | ~30+ MB |
 | Scope | Local CLI, sync, recovery, and agent workflows | Feature-rich ecosystem |
 
 **When to use br:** You want a stable, local-first issue tracker with explicit sync, dependency-aware planning, and machine-readable output.
@@ -1194,7 +1194,7 @@ br sync --import-only
 
 ### Q: Why Rust instead of Go?
 
-- **Single static binary:** one ~26 MB executable (v0.5.7, x86_64 Linux) with no runtime, daemon, or Dolt dependency
+- **Single static binary:** one ~26 MB executable (v0.5.10, x86_64 Linux) with no runtime, daemon, or Dolt dependency
 - **Memory safety:** No runtime garbage collection
 - **Operational fit:** The CLI, release pipeline, and agent tooling are already Rust-based
 - **Personal preference:** The author's flywheel tooling is Rust-based
