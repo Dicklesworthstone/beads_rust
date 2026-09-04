@@ -101,7 +101,7 @@ Options:
           [env: BR_MODEL=]
 
       --db <DB>
-          Database path (ID-REDACTED .beads/*.db if not set)
+          Database path (ID-REDACTED .beads/*.db if not set; env: BEADS_DB)
 
       --actor <ACTOR>
           Actor name for audit trail
