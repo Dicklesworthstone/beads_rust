@@ -17,7 +17,11 @@ on:
 
 # Cancel in-progress runs for the same branch
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Keyed by event too: a scheduled run used to land in the push run's group
+  # and cancel its shards mid-flight (2026-09-04, run 33859727294), so with
+  # runners scarce no push run ever finished. Pushes still supersede older
+  # pushes; scheduled runs supersede only older scheduled runs.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
@@ -451,7 +455,9 @@ jobs:
   e2e-quick:
     name: Quick E2E
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # A cold runner spends ~10 min compiling before the script runs; the old
+    # 10-minute limit cancelled the step at 9:57 (run 33867897062).
+    timeout-minutes: 30
     needs: check
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

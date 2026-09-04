@@ -72,8 +72,11 @@ this repo): commits `55c186682` + `5946b3b7c` in
   (`nightly-2026-08-31`) instead of floating `nightly` (release.yml still
   said 2026-08-25 after the manifest moved), the audit gate installs
   `cargo-insta` as a prebuilt binary (source builds failed on a newer
-  nightly's `rustix`), and the runtime index diagnostics are rustfmt-clean
-  (the formatting check had failed on every push since they landed).
+  nightly's `rustix`), the runtime index diagnostics are rustfmt-clean
+  (the formatting check had failed on every push since they landed), and
+  the CI concurrency group is keyed by event so the six-hourly scheduled
+  run no longer cancels a push run's shards mid-flight, and the Quick E2E
+  job's timeout covers a cold compile (it was cancelled at 9:57 of 10).
 
 - `br upgrade --version 0.5.10` no longer 404s: a bare version is looked up
   as the `v`-prefixed release tag GitHub actually carries (found while
