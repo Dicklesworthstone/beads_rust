@@ -151,7 +151,7 @@ jobs:
       - name: Multi-process mixed-workload stress
         run: |
           cargo build --bin br
-          scripts/br-stress.sh target/debug/br .beads 8 60
+          scripts/br-stress.sh "$(pwd)/target/debug/br" .beads 8 60
         env:
           NO_COLOR: 1
 

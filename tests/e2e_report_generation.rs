@@ -76,7 +76,7 @@ fn create_sample_artifacts(base_dir: &std::path::Path) -> std::io::Result<()> {
 
 #[test]
 fn test_report_indexer_basic() {
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new_in(common::cli::isolated_temp_root()).unwrap();
     create_sample_artifacts(temp_dir.path()).unwrap();
 
     let indexer = ArtifactIndexer::new(temp_dir.path());
@@ -111,7 +111,7 @@ fn test_report_indexer_basic() {
 
 #[test]
 fn test_markdown_report() {
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new_in(common::cli::isolated_temp_root()).unwrap();
     create_sample_artifacts(temp_dir.path()).unwrap();
 
     let indexer = ArtifactIndexer::new(temp_dir.path());
@@ -144,7 +144,7 @@ fn test_markdown_report() {
 
 #[test]
 fn test_html_report() {
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new_in(common::cli::isolated_temp_root()).unwrap();
     create_sample_artifacts(temp_dir.path()).unwrap();
 
     let indexer = ArtifactIndexer::new(temp_dir.path());
@@ -173,7 +173,7 @@ fn test_html_report() {
 
 #[test]
 fn test_write_reports() {
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new_in(common::cli::isolated_temp_root()).unwrap();
     let artifacts_dir = temp_dir.path().join("artifacts");
     let output_dir = temp_dir.path().join("output");
 
@@ -198,7 +198,7 @@ fn test_write_reports() {
 
 #[test]
 fn test_failures_only_filter() {
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new_in(common::cli::isolated_temp_root()).unwrap();
     create_sample_artifacts(temp_dir.path()).unwrap();
 
     let config = IndexerConfig {

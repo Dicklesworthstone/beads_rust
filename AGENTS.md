@@ -849,7 +849,17 @@ rch exec -- cargo clippy --tests -- -D warnings
 
 A worker that compiled this crate recently keeps its target directory, so
 re-running a targeted command on the same worker is fast; `rch queue` shows
-which worker a job landed on. Never chain a full-suite run behind a cold
+which worker a job landed on.
+
+On a worker `TMPDIR` points inside this checkout (`.rch-tmp/`), and the
+checkout carries this repository's own `.beads/`. A test that runs `br init`
+in a raw `TempDir::new()` therefore walks up to that tracker and fails with a
+schema or lock refusal that never happens on a hosted runner. Create test
+workspaces through `common::cli::BrWorkspace` /
+`common::cli::isolated_temp_root()`, or pin the child's `BEADS_DIR` to the
+throwaway workspace (what `br doctor --selftest` does). Worker checkouts are
+shared between agents: a compile error naming code you do not have is another
+agent's uncommitted tree that synced in between; re-run. Never chain a full-suite run behind a cold
 worker; run one shard at a time with `scripts/test-shard.sh <shard>`
 (`lib`, `e2e-a-l`, `e2e-m-z`, `storage`, `misc`; `list`/`show` print the
 membership), which is also what `.github/workflows/ci.yml` runs.

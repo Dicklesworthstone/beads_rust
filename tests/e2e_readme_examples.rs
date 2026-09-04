@@ -76,7 +76,14 @@ enum ExampleKind {
 
 /// Commands the README documents as non-zero, or that cannot run here.
 fn expectation(command: &str) -> Expectation {
-    if command.starts_with("br serve") {
+    // README examples may carry env assignments first (`RUST_LOG=error br
+    // serve ...`); look at the command after them.
+    let program = command
+        .split_whitespace()
+        .skip_while(|token| token.contains('=') && !token.starts_with('-'))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if program.starts_with("br serve") {
         return Expectation::Skip("br serve runs until stdin closes");
     }
     Expectation::Exit(0)
