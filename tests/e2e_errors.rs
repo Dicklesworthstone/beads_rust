@@ -4597,9 +4597,17 @@ fn e2e_docs_shaped_mistakes_have_actionable_hints() {
     assert!(dep_ok.status.success(), "stderr: {}", dep_ok.stderr);
 
     // 5. The overwrite guard names the field and the --force escape hatch.
+    // The guard is proportional (#481): only a write that keeps less than
+    // half of the existing text is refused, so the seed must be long enough
+    // that "rewritten" is a real loss.
     let seed = run_br(
         &workspace,
-        ["update", &first, "--description", "first draft"],
+        [
+            "update",
+            &first,
+            "--description",
+            "first draft of the design: goals, constraints, and the open questions we still owe answers to",
+        ],
         "update_seed_description",
     );
     assert!(seed.status.success(), "stderr: {}", seed.stderr);
