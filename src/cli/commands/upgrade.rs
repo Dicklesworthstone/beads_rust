@@ -572,6 +572,19 @@ fn build_updater(current_version: &str) -> Result<Box<dyn ReleaseUpdate>> {
         .map_err(map_update_error)
 }
 
+/// The GitHub release tag for a requested version.
+///
+/// Releases are tagged `v<version>`; operators naturally type the bare
+/// version (`br upgrade --version 0.5.10`), which used to be looked up as the
+/// tag `0.5.10` and fail with a 404 on a release that exists.
+fn release_tag_for(version: &str) -> String {
+    if version.starts_with('v') {
+        version.to_string()
+    } else {
+        format!("v{version}")
+    }
+}
+
 /// Build updater with a specific target version.
 fn build_updater_with_target(
     target_version: &str,
@@ -587,7 +600,7 @@ fn build_updater_with_target(
         .show_download_progress(show_progress)
         .no_confirm(true)
         .current_version(current_version)
-        .release_tag(target_version);
+        .release_tag(&release_tag_for(target_version));
 
     if let Some(token) = resolve_auth_token() {
         tracing::debug!("Using GitHub auth token from environment");
@@ -804,6 +817,12 @@ mod tests {
     fn test_version_comparison_older() {
         assert!(!version_newer("0.1.0", "0.2.0"));
         assert!(!version_newer("0.9.0", "1.0.0"));
+    }
+
+    #[test]
+    fn pinned_versions_resolve_to_v_prefixed_release_tags() {
+        assert_eq!(release_tag_for("0.5.10"), "v0.5.10");
+        assert_eq!(release_tag_for("v0.5.10"), "v0.5.10");
     }
 
     #[test]
