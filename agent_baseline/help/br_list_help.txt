@@ -95,7 +95,7 @@ Options:
           Default: id, title, status, priority, `issue_type`, assignee, `created_at`, `updated_at`
 
       --db <DB>
-          Database path (auto-discover .beads/*.db if not set)
+          Database path (auto-discover .beads/*.db if not set; env: BEADS_DB)
 
       --actor <ACTOR>
           Actor name for audit trail

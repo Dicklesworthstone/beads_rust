@@ -43,8 +43,9 @@ sync:
 
 | Variable | Description |
 |----------|-------------|
-| `BR_ACTOR` | Default actor identity for audit trail |
-| `BEADS_DB` | Override database path |
+| `USER` | Fallback actor identity for the audit trail, used when neither `--actor` nor the `actor` config key is set. `BR_ACTOR` is only a shell convention in this skill's snippets, which pass it through as `--actor`; `br` itself does not read it. |
+| `BEADS_DIR` | Use this `.beads` directory instead of discovering one from the working directory |
+| `BEADS_DB` (aliases: `BD_DB`, `BD_DATABASE`) | Override database path |
 | `BEADS_JSONL` | Override JSONL path (requires `--allow-external-jsonl`) |
 | `RUST_LOG` | Logging level (debug, info, warn, error) |
 

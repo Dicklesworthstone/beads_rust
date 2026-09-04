@@ -873,7 +873,7 @@ GitHub #384 acceptance matrix.
 | Variable | Description |
 |----------|-------------|
 | `BEADS_DIR` | Use this `.beads` directory instead of discovering one from the working directory |
-| `BD_DB` / `BD_DATABASE` | Override database path |
+| `BD_DB` / `BD_DATABASE` / `BEADS_DB` | Override database path (checked in that order) |
 | `BEADS_JSONL` | Override JSONL path (requires `--allow-external-jsonl`) |
 | `BR_OUTPUT_FORMAT` | Force `json` or `toon` output for every command |
 | `TOON_DEFAULT_FORMAT` | Fallback for `BR_OUTPUT_FORMAT` |

@@ -39,7 +39,7 @@ Options:
           Show token savings stats when using TOON output
 
       --db <DB>
-          Database path (auto-discover .beads/*.db if not set)
+          Database path (auto-discover .beads/*.db if not set; env: BEADS_DB)
 
       --actor <ACTOR>
           Actor name for audit trail

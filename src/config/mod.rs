@@ -671,8 +671,15 @@ fn discover_beads_dir_candidate_with_cli_from(
     )
 }
 
+/// Environment variables that select the database, in precedence order.
+///
+/// `BD_DB` / `BD_DATABASE` are the historical names carried over from the Go
+/// implementation; `BEADS_DB` is the name the `br` documentation uses and is
+/// accepted as an alias so the documented variable is not inert.
+pub(crate) const DB_OVERRIDE_ENV_KEYS: [&str; 3] = ["BD_DB", "BD_DATABASE", "BEADS_DB"];
+
 fn startup_db_override_from_env() -> Option<PathBuf> {
-    for key in ["BD_DB", "BD_DATABASE"] {
+    for key in DB_OVERRIDE_ENV_KEYS {
         if let Some(value) = env::var_os(key).filter(|value| !value.is_empty()) {
             return Some(PathBuf::from(value));
         }

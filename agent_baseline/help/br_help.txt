@@ -52,7 +52,7 @@ Commands:
   help          Print this message or the help of the given subcommand(s)
 
 Options:
-      --db <DB>                      Database path (auto-discover .beads/*.db if not set)
+      --db <DB>                      Database path (auto-discover .beads/*.db if not set; env: BEADS_DB)
       --actor <ACTOR>                Actor name for audit trail
       --json                         Output as JSON
       --no-daemon                    Force direct mode (no daemon) - effectively no-op in br v1

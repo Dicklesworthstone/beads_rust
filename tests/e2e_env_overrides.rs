@@ -226,6 +226,99 @@ fn e2e_bd_db_env_override_allows_access_outside_workspace() {
     );
 }
 
+/// GH#488: `BEADS_DB` is documented in the `br` skill reference as the database
+/// override, but only the legacy `BD_DB` / `BD_DATABASE` names were consulted,
+/// so the documented variable was inert in both directions.
+#[test]
+fn e2e_beads_db_env_override_allows_access_outside_workspace() {
+    let _log = common::test_log("e2e_beads_db_env_override_allows_access_outside_workspace");
+
+    let actual_workspace = BrWorkspace::new();
+    let cwd_workspace = BrWorkspace::new();
+
+    let init = run_br(&actual_workspace, ["init"], "init_actual");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&actual_workspace, ["create", "BEADS_DB env test"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let db_path = actual_workspace.root.join(".beads").join("beads.db");
+    let env_vars = vec![("BEADS_DB", db_path.to_str().expect("db path"))];
+
+    let list = run_br_with_env(
+        &cwd_workspace,
+        ["list", "--json"],
+        env_vars,
+        "list_via_beads_db",
+    );
+    assert!(
+        list.status.success(),
+        "list via BEADS_DB failed: {}",
+        list.stderr
+    );
+
+    let list_json = parse_list_issues(&list.stdout);
+    assert!(
+        list_json
+            .iter()
+            .any(|item| item["title"] == "BEADS_DB env test"),
+        "issue not found via BEADS_DB override"
+    );
+}
+
+/// GH#488 case A: the override must also win over a `.beads` that *is*
+/// discoverable from the current directory, matching `--db`.
+#[test]
+fn e2e_beads_db_env_override_wins_over_discovered_workspace() {
+    let _log = common::test_log("e2e_beads_db_env_override_wins_over_discovered_workspace");
+
+    let workspace_a = BrWorkspace::new();
+    let workspace_b = BrWorkspace::new();
+
+    let init_a = run_br(&workspace_a, ["init"], "init_a");
+    assert!(init_a.status.success(), "init_a failed: {}", init_a.stderr);
+    let init_b = run_br(&workspace_b, ["init"], "init_b");
+    assert!(init_b.status.success(), "init_b failed: {}", init_b.stderr);
+
+    let create_a = run_br(&workspace_a, ["create", "Issue in A"], "create_a");
+    assert!(
+        create_a.status.success(),
+        "create_a failed: {}",
+        create_a.stderr
+    );
+    let create_b = run_br(&workspace_b, ["create", "Issue in B"], "create_b");
+    assert!(
+        create_b.status.success(),
+        "create_b failed: {}",
+        create_b.stderr
+    );
+
+    let db_path_b = workspace_b.root.join(".beads").join("beads.db");
+    let env_vars = vec![("BEADS_DB", db_path_b.to_str().expect("db path"))];
+
+    let list = run_br_with_env(
+        &workspace_a,
+        ["list", "--json"],
+        env_vars,
+        "list_beads_db_override",
+    );
+    assert!(
+        list.status.success(),
+        "list via BEADS_DB failed: {}",
+        list.stderr
+    );
+
+    let list_json = parse_list_issues(&list.stdout);
+    assert!(
+        list_json.iter().any(|item| item["title"] == "Issue in B"),
+        "should see workspace B's issue"
+    );
+    assert!(
+        !list_json.iter().any(|item| item["title"] == "Issue in A"),
+        "should NOT see workspace A's issue"
+    );
+}
+
 // ============================================================================
 // BEADS_JSONL tests
 // ============================================================================

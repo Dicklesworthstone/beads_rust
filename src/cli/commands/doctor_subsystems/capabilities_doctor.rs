@@ -153,6 +153,8 @@ impl DoctorCapabilities {
                 "BD_NO_AUTOFLUSH",
                 "RUST_LOG",
                 "BD_DB",
+                "BD_DATABASE",
+                "BEADS_DB",
                 "BEADS_JSONL",
             ],
             fixers: build_fixer_registry(),

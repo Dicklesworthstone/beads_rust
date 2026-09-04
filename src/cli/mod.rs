@@ -695,7 +695,7 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 
-    /// Database path (auto-discover .beads/*.db if not set)
+    /// Database path (auto-discover .beads/*.db if not set; env: BEADS_DB)
     #[arg(long, global = true)]
     pub db: Option<PathBuf>,
 

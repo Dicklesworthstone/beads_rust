@@ -229,7 +229,7 @@ const EXIT_CODES: &[ExitCodeCapability] = &[
 
 const ENV_VARS: &[EnvVarCapability] = &[
     EnvVarCapability {
-        name: "BD_DB / BD_DATABASE",
+        name: "BD_DB / BD_DATABASE / BEADS_DB",
         description: "Override the SQLite database path.",
     },
     EnvVarCapability {
