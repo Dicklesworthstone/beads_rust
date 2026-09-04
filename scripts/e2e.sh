@@ -94,6 +94,18 @@ log "Building br binary..."
 cd "$PROJECT_ROOT"
 cargo build --release --quiet 2>/dev/null || cargo build --release
 
+# Compile the quick test binaries once, outside the per-test timeout. A cold
+# release compile of the test crate and its dev-dependencies takes longer than
+# the 180 s budget on a hosted runner, and it used to be charged to the first
+# test in the list, which was then reported as a failure without ever running.
+log "Compiling quick E2E test binaries..."
+QUICK_TEST_TARGETS=()
+for test in "${QUICK_TESTS[@]}"; do
+    QUICK_TEST_TARGETS+=(--test "$test")
+done
+cargo test --release --no-run --quiet "${QUICK_TEST_TARGETS[@]}" 2>/dev/null \
+    || cargo test --release --no-run "${QUICK_TEST_TARGETS[@]}"
+
 # Create artifacts directory
 mkdir -p "$ARTIFACTS_DIR"
 

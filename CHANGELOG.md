@@ -82,6 +82,10 @@ this repo): commits `55c186682` + `5946b3b7c` in
   WAL sidecars; they had been red since that lease landed on 2026-08-28.
   The audit gate's snapshot-freshness step runs only the four insta-using
   targets instead of `--workspace` (162 binaries from cold overran the job).
+  The Quick E2E harness (`scripts/e2e.sh`) compiles its six test binaries
+  before the per-test 180 s timeout starts; a cold release compile inside
+  that budget had been reported as the first test's failure without the
+  test ever running.
 
 - `br upgrade --version 0.5.10` no longer 404s: a bare version is looked up
   as the `v`-prefixed release tag GitHub actually carries (found while
@@ -91,6 +95,23 @@ this repo): commits `55c186682` + `5946b3b7c` in
   fast open (20 sequential operations each, installed release binaries):
   `create` 144 → 112 ms, `update --priority` 238 → 188 ms, `show --json`
   53 → 45 ms per operation from v0.5.7 to v0.5.10 (bead naul5).
+- `br update` reuses the connection `main` already opened at startup for
+  the auto-import probe and the auto-flush instead of opening a second one
+  for the write (the remaining fixed cost measured on the update path, bead
+  naul5). The connection goes back to `main` after the write so the
+  auto-flush still runs through the connection that performed it; a
+  pre-opened connection for a different workspace is left alone, and routed
+  external batches keep opening their own. `br create` already worked this
+  way.
+- Import no longer rolls back with `Import semantic verification failed ...
+  (differing fields: content_hash, created_at, external_ref, title,
+  updated_at)` when two records of one JSONL file collapse onto the same
+  issue (an external-ref collision remapped onto an existing id, then an
+  explicit record for that id). The verifier added on 2026-08-27 compared
+  the persisted row against every record applied to the issue, including
+  the superseded first one; it now checks the last record applied. The
+  `misc` CI shard's `jsonl_import_export` binary had been red on this since
+  that verifier landed (bead 72j0i).
 
 ## v0.5.10 -- 2026-09-04 (Release)
 

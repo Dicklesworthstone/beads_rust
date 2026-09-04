@@ -149,6 +149,18 @@ else
     CARGO_ARGS="--jobs 1"
 fi
 
+# Compile every discovered test binary once, outside the per-test timeout.
+# A cold compile of the test crate and its dev-dependencies takes longer than
+# the per-test budget and used to be charged to the first test in the list,
+# which was then reported as a failure without ever running.
+log "Compiling ${#ALL_TESTS[@]} E2E test binaries..."
+ALL_TEST_TARGETS=()
+for test in "${ALL_TESTS[@]}"; do
+    ALL_TEST_TARGETS+=(--test "$test")
+done
+cargo test --no-run --quiet $CARGO_ARGS "${ALL_TEST_TARGETS[@]}" 2>/dev/null \
+    || cargo test --no-run $CARGO_ARGS "${ALL_TEST_TARGETS[@]}"
+
 for test in "${ALL_TESTS[@]}"; do
     log "  Running: $test"
 

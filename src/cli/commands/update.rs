@@ -294,6 +294,15 @@ struct UpdateRouteOutput {
     capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
 }
 
+/// What a route leaves behind after its writes: the connection that performed
+/// them and the routed workspace's write lock. The storage is declared first
+/// so it (and the WAL checkpoint its drop performs, #270) is released before
+/// the family write lock, exactly as inside `PreparedUpdateRoute`.
+struct RouteResources {
+    storage_ctx: config::OpenStorageResult,
+    _routed_write_lock: RoutedWorkspaceWriteLock,
+}
+
 #[derive(Debug, Serialize)]
 struct UpdateWithCapacityWarnings {
     updated: Vec<UpdatedIssueOutput>,
@@ -328,7 +337,7 @@ struct PreparedUpdateRoute {
     /// Tier 1 attribution (issue #312, Layer 3 capture-only) staged onto each
     /// mutation's audit events. Recorded only — never gated or enforced on.
     attribution: EventAttribution,
-    _routed_write_lock: RoutedWorkspaceWriteLock,
+    routed_write_lock: RoutedWorkspaceWriteLock,
 }
 
 /// Execute the update command.
@@ -336,8 +345,39 @@ struct PreparedUpdateRoute {
 /// # Errors
 ///
 /// Returns an error if database operations fail or validation errors occur.
-#[allow(clippy::too_many_lines)]
 pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
+    execute_with_storage(args, cli, ctx, &mut None)
+}
+
+/// Whether two `.beads` directories name the same workspace, tolerating
+/// symlinked or relative spellings of one path.
+fn same_workspace(left: &Path, right: &Path) -> bool {
+    let canonical = |path: &Path| dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical(left) == canonical(right)
+}
+
+/// Execute the update command, reusing the caller's pre-opened storage for
+/// the local route when it belongs to the same workspace.
+///
+/// `main` opens storage once at startup (auto-import probe, auto-flush) and
+/// keeps that connection alive across dispatch; opening a second one here was
+/// the largest fixed cost left on a single-issue update after the
+/// schema-witness fast open (beads_rust-naul5). The borrowed connection is
+/// handed back through `pre_opened` after the write, so the startup
+/// auto-flush still runs through the connection that performed it. A
+/// pre-opened context for a different workspace is left untouched, and routed
+/// external batches always open their own.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail or validation errors occur.
+#[allow(clippy::too_many_lines)]
+pub fn execute_with_storage(
+    args: &UpdateArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    pre_opened: &mut Option<config::OpenStorageResult>,
+) -> Result<()> {
     // Refuse terminal-state transitions before doing any I/O. `br update`
     // is a data-only field mutator; terminal-state transitions
     // (closed, tombstone) must go through their dedicated commands so the
@@ -455,8 +495,21 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 routed_capacity_warnings,
             )
         } else {
-            let route_output =
-                execute_prepared_route(prepare_single_route(args, cli, &beads_dir, false)?, ctx)?;
+            let reuse_pre_opened = pre_opened.as_ref().is_some_and(|storage_ctx| {
+                same_workspace(&storage_ctx.paths.beads_dir, &beads_dir)
+            });
+            let borrowed = if reuse_pre_opened {
+                pre_opened.take()
+            } else {
+                None
+            };
+            let (route_output, resources) = execute_prepared_route_with_resources(
+                prepare_single_route_with_storage(args, cli, &beads_dir, false, borrowed)?,
+                ctx,
+            )?;
+            if reuse_pre_opened {
+                *pre_opened = Some(resources.storage_ctx);
+            }
             (
                 route_output.updated_issues,
                 route_output.render_items,
@@ -564,12 +617,22 @@ fn emit_inherited_context_for_in_progress_transitions(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn prepare_single_route(
     args: &UpdateArgs,
     cli: &config::CliOverrides,
     beads_dir: &Path,
     auto_flush_external: bool,
+) -> Result<PreparedUpdateRoute> {
+    prepare_single_route_with_storage(args, cli, beads_dir, auto_flush_external, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn prepare_single_route_with_storage(
+    args: &UpdateArgs,
+    cli: &config::CliOverrides,
+    beads_dir: &Path,
+    auto_flush_external: bool,
+    pre_opened: Option<config::OpenStorageResult>,
 ) -> Result<PreparedUpdateRoute> {
     let routed_write_lock =
         acquire_routed_workspace_write_lock(beads_dir, auto_flush_external, cli.lock_timeout)?;
@@ -579,7 +642,11 @@ fn prepare_single_route(
     let mut route_cli = cli.clone();
     routed_write_lock.mark_cli_write_lock_held(&mut route_cli);
     let cli = &route_cli;
-    let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+    let mut storage_ctx = if let Some(storage_ctx) = pre_opened {
+        storage_ctx
+    } else {
+        config::open_storage_with_cli(beads_dir, cli)?
+    };
     auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
 
     let config_layer = storage_ctx.load_config(cli)?;
@@ -692,15 +759,25 @@ fn prepare_single_route(
             args.model.as_deref(),
             super::session_attribution_from_env().as_deref(),
         ),
-        _routed_write_lock: routed_write_lock,
+        routed_write_lock,
     })
 }
 
-#[allow(clippy::too_many_lines)]
 fn execute_prepared_route(
-    mut prepared: PreparedUpdateRoute,
+    prepared: PreparedUpdateRoute,
     ctx: &OutputContext,
 ) -> Result<UpdateRouteOutput> {
+    execute_prepared_route_with_resources(prepared, ctx).map(|(output, _resources)| output)
+}
+
+/// Execute a prepared route and hand its connection and lock back to the
+/// caller instead of dropping them, so a borrowed startup connection can be
+/// returned to `main` for the auto-flush.
+#[allow(clippy::too_many_lines)]
+fn execute_prepared_route_with_resources(
+    mut prepared: PreparedUpdateRoute,
+    ctx: &OutputContext,
+) -> Result<(UpdateRouteOutput, RouteResources)> {
     if can_use_bulk_label_only_route(&prepared) {
         return execute_bulk_label_only_route(prepared, ctx);
     }
@@ -950,12 +1027,18 @@ fn execute_prepared_route(
         );
     }
 
-    Ok(UpdateRouteOutput {
-        updated_issues,
-        render_items,
-        resolved_ids,
-        capacity_warnings,
-    })
+    Ok((
+        UpdateRouteOutput {
+            updated_issues,
+            render_items,
+            resolved_ids,
+            capacity_warnings,
+        },
+        RouteResources {
+            storage_ctx: prepared.storage_ctx,
+            _routed_write_lock: prepared.routed_write_lock,
+        },
+    ))
 }
 
 fn can_use_bulk_label_only_route(prepared: &PreparedUpdateRoute) -> bool {
@@ -973,7 +1056,7 @@ fn can_use_bulk_label_only_route(prepared: &PreparedUpdateRoute) -> bool {
 fn execute_bulk_label_only_route(
     mut prepared: PreparedUpdateRoute,
     ctx: &OutputContext,
-) -> Result<UpdateRouteOutput> {
+) -> Result<(UpdateRouteOutput, RouteResources)> {
     let resolved_ids = prepared.resolved_ids.clone();
     let actor = prepared.actor.clone();
     let add_labels = prepared.add_labels.clone();
@@ -1059,12 +1142,18 @@ fn execute_bulk_label_only_route(
         );
     }
 
-    Ok(UpdateRouteOutput {
-        updated_issues,
-        render_items,
-        resolved_ids,
-        capacity_warnings: Vec::new(),
-    })
+    Ok((
+        UpdateRouteOutput {
+            updated_issues,
+            render_items,
+            resolved_ids,
+            capacity_warnings: Vec::new(),
+        },
+        RouteResources {
+            storage_ctx: prepared.storage_ctx,
+            _routed_write_lock: prepared.routed_write_lock,
+        },
+    ))
 }
 
 fn update_uses_machine_output(ctx: &OutputContext) -> bool {
@@ -2007,6 +2096,99 @@ mod tests {
     fn run_acceptance_update(beads_dir: &Path, args: &UpdateArgs) -> Result<UpdateRouteOutput> {
         let prepared = prepare_single_route(args, &CliOverrides::default(), beads_dir, false)?;
         execute_prepared_route(prepared, &OutputContext::from_flags(true, false, true))
+    }
+
+    // === Startup connection reuse (beads_rust-naul5) ===
+
+    #[test]
+    fn execute_with_storage_reuses_the_pre_opened_connection_and_hands_it_back() {
+        init_test_logging();
+        let (_temp, beads_dir) = acceptance_workspace(None);
+        let cli = CliOverrides {
+            db: Some(beads_dir.join("beads.db")),
+            ..CliOverrides::default()
+        };
+        let mut pre_opened =
+            Some(config::open_storage_with_cli(&beads_dir, &cli).expect("pre-open storage"));
+        let args = UpdateArgs {
+            ids: vec!["bd-ac".to_string()],
+            append_notes: vec!["written through the borrowed connection".to_string()],
+            ..Default::default()
+        };
+
+        execute_with_storage(
+            &args,
+            &cli,
+            &OutputContext::from_flags(true, false, true),
+            &mut pre_opened,
+        )
+        .expect("update through the pre-opened storage");
+
+        let storage_ctx = pre_opened.expect("the borrowed connection is handed back");
+        let issue = storage_ctx
+            .storage
+            .get_issue("bd-ac")
+            .expect("read issue")
+            .expect("issue exists");
+        assert!(
+            issue
+                .notes
+                .as_deref()
+                .is_some_and(|notes| notes.contains("borrowed connection")),
+            "the write is visible through the connection that was handed back: {:?}",
+            issue.notes
+        );
+    }
+
+    #[test]
+    fn execute_with_storage_leaves_a_foreign_pre_opened_connection_alone() {
+        init_test_logging();
+        let (_temp_a, beads_dir_a) = acceptance_workspace(None);
+        let (_temp_b, beads_dir_b) = acceptance_workspace(None);
+        let cli_b = CliOverrides {
+            db: Some(beads_dir_b.join("beads.db")),
+            ..CliOverrides::default()
+        };
+        let mut pre_opened = Some(
+            config::open_storage_with_cli(&beads_dir_a, &CliOverrides::default())
+                .expect("pre-open workspace A"),
+        );
+        let args = UpdateArgs {
+            ids: vec!["bd-ac".to_string()],
+            append_notes: vec!["only workspace B".to_string()],
+            ..Default::default()
+        };
+
+        execute_with_storage(
+            &args,
+            &cli_b,
+            &OutputContext::from_flags(true, false, true),
+            &mut pre_opened,
+        )
+        .expect("update workspace B");
+
+        let kept = pre_opened.expect("a foreign connection stays with the caller");
+        assert!(
+            same_workspace(&kept.paths.beads_dir, &beads_dir_a),
+            "the caller's connection still belongs to workspace A"
+        );
+        let untouched = kept
+            .storage
+            .get_issue("bd-ac")
+            .expect("read workspace A")
+            .expect("A's issue exists");
+        assert!(
+            untouched.notes.is_none(),
+            "workspace A was not written: {:?}",
+            untouched.notes
+        );
+        assert!(
+            acceptance_field(&beads_dir_b)
+                .notes
+                .as_deref()
+                .is_some_and(|notes| notes.contains("only workspace B")),
+            "workspace B received the update through its own connection"
+        );
     }
 
     #[test]
@@ -3217,7 +3399,7 @@ because downstream tooling links to them.\n\n- [ ] schema migration applied\n\
             overwrite_advisories: Vec::new(),
             auto_flush_external: false,
             attribution: EventAttribution::default(),
-            _routed_write_lock: RoutedWorkspaceWriteLock::local(),
+            routed_write_lock: RoutedWorkspaceWriteLock::local(),
         };
 
         let ctx = OutputContext::from_flags(true, false, true);
@@ -3303,7 +3485,7 @@ because downstream tooling links to them.\n\n- [ ] schema migration applied\n\
             overwrite_advisories: Vec::new(),
             auto_flush_external: false,
             attribution: EventAttribution::default(),
-            _routed_write_lock: RoutedWorkspaceWriteLock::local(),
+            routed_write_lock: RoutedWorkspaceWriteLock::local(),
         };
 
         let ctx = OutputContext::from_flags(true, false, true);
@@ -3428,7 +3610,7 @@ because downstream tooling links to them.\n\n- [ ] schema migration applied\n\
             overwrite_advisories: Vec::new(),
             auto_flush_external: false,
             attribution: EventAttribution::default(),
-            _routed_write_lock: RoutedWorkspaceWriteLock::local(),
+            routed_write_lock: RoutedWorkspaceWriteLock::local(),
         };
 
         let ctx = OutputContext::from_flags(false, false, true);

@@ -14204,9 +14204,18 @@ fn verify_applied_import_issue_semantics(
         return Ok(());
     }
 
-    let ids = expected_issues
-        .iter()
-        .map(|issue| issue.id.clone())
+    // Several JSONL records can collapse onto one issue within a single
+    // import (an external-ref collision remapped onto an existing id, then an
+    // explicit record for that id). They are applied in file order and the
+    // last one wins, so that is the record the persisted row must match;
+    // earlier records for the same id are superseded, not violated.
+    let mut expected_by_id: HashMap<&str, &Issue> = HashMap::new();
+    for expected in expected_issues {
+        expected_by_id.insert(expected.id.as_str(), expected);
+    }
+    let ids = expected_by_id
+        .keys()
+        .map(|id| (*id).to_string())
         .collect::<Vec<_>>();
     let actual_by_id = storage
         .get_issues_for_export(&ids)?
@@ -14214,7 +14223,7 @@ fn verify_applied_import_issue_semantics(
         .map(|issue| (issue.id.clone(), issue))
         .collect::<HashMap<_, _>>();
 
-    for expected in expected_issues {
+    for expected in expected_by_id.into_values() {
         let actual = actual_by_id.get(&expected.id).ok_or_else(|| {
             BeadsError::SyncConflict {
                 message: format!(
@@ -21761,6 +21770,32 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("does not match its normalized JSONL payload"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_applied_import_semantics_checks_the_last_record_applied_to_an_issue() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut superseded = make_test_issue("bd-dup", "Intermediate update");
+        normalize_issue(&mut superseded);
+        let mut final_record = make_test_issue("bd-dup", "Final update");
+        normalize_issue(&mut final_record);
+        storage.create_issue(&final_record, "tester").unwrap();
+
+        // Two JSONL records collapsed onto one issue (an external-ref
+        // collision, then an explicit id): the later record is the one that
+        // was applied, so the earlier one is superseded rather than violated.
+        verify_applied_import_issue_semantics(
+            &storage,
+            &[superseded.clone(), final_record.clone()],
+        )
+        .expect("the last record applied for an issue is the one to verify");
+
+        let err = verify_applied_import_issue_semantics(&storage, &[final_record, superseded])
+            .expect_err("a stale last record must still be caught");
+        assert!(
+            err.to_string().contains("differing fields: "),
             "unexpected error: {err}"
         );
     }

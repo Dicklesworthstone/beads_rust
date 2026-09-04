@@ -591,7 +591,12 @@ fn main() {
         Commands::Create(args) => {
             execute_create_command(&args, &overrides, &output_ctx, &mut storage_result)
         }
-        Commands::Update(args) => commands::update::execute(&args, &overrides, &output_ctx),
+        Commands::Update(args) => commands::update::execute_with_storage(
+            &args,
+            &overrides,
+            &output_ctx,
+            &mut storage_result,
+        ),
         Commands::Delete(args) => {
             commands::delete::execute(&args, cli.json, &overrides, &output_ctx)
         }
