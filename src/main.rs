@@ -649,9 +649,13 @@ fn main() {
                 commands::show::execute(&args, cli.json, &overrides, &output_ctx)
             }
         }
-        Commands::Close(args) => {
-            commands::close::execute_cli(&args, cli.json || args.robot, &overrides, &output_ctx)
-        }
+        Commands::Close(args) => commands::close::execute_cli_with_storage(
+            &args,
+            cli.json || args.robot,
+            &overrides,
+            &output_ctx,
+            &mut storage_result,
+        ),
         Commands::Reopen(args) => {
             commands::reopen::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
         }

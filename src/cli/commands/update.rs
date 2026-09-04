@@ -2,10 +2,11 @@
 
 use super::create::read_description_file;
 use super::{
-    RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
+    RouteResources, RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
     auto_import_storage_ctx_if_stale, finalize_batched_blocked_cache_refresh,
     preserve_blocked_cache_on_error, report_auto_flush_failure, resolve_issue_id,
-    resolve_issue_ids, retry_mutation_with_jsonl_recovery, update_issues_atomically_with_recovery,
+    resolve_issue_ids, retry_mutation_with_jsonl_recovery, same_workspace,
+    update_issues_atomically_with_recovery,
 };
 use crate::cli::UpdateArgs;
 use crate::config;
@@ -294,15 +295,6 @@ struct UpdateRouteOutput {
     capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
 }
 
-/// What a route leaves behind after its writes: the connection that performed
-/// them and the routed workspace's write lock. The storage is declared first
-/// so it (and the WAL checkpoint its drop performs, #270) is released before
-/// the family write lock, exactly as inside `PreparedUpdateRoute`.
-struct RouteResources {
-    storage_ctx: config::OpenStorageResult,
-    _routed_write_lock: RoutedWorkspaceWriteLock,
-}
-
 #[derive(Debug, Serialize)]
 struct UpdateWithCapacityWarnings {
     updated: Vec<UpdatedIssueOutput>,
@@ -347,13 +339,6 @@ struct PreparedUpdateRoute {
 /// Returns an error if database operations fail or validation errors occur.
 pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     execute_with_storage(args, cli, ctx, &mut None)
-}
-
-/// Whether two `.beads` directories name the same workspace, tolerating
-/// symlinked or relative spellings of one path.
-fn same_workspace(left: &Path, right: &Path) -> bool {
-    let canonical = |path: &Path| dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    canonical(left) == canonical(right)
 }
 
 /// Execute the update command, reusing the caller's pre-opened storage for

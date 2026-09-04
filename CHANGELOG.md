@@ -111,11 +111,11 @@ this repo): commits `55c186682` + `5946b3b7c` in
   fast open (20 sequential operations each, installed release binaries):
   `create` 144 → 112 ms, `update --priority` 238 → 188 ms, `show --json`
   53 → 45 ms per operation from v0.5.7 to v0.5.10 (bead naul5).
-- `br update` reuses the connection `main` already opened at startup for
-  the auto-import probe and the auto-flush instead of opening a second one
-  for the write (the remaining fixed cost measured on the update path, bead
-  naul5). The connection goes back to `main` after the write so the
-  auto-flush still runs through the connection that performed it; a
+- `br update` and `br close` reuse the connection `main` already opened at
+  startup for the auto-import probe and the auto-flush instead of opening a
+  second one for the write (the remaining fixed cost measured on the update
+  path, bead naul5). The connection goes back to `main` after the write so
+  the auto-flush still runs through the connection that performed it; a
   pre-opened connection for a different workspace is left alone, and routed
   external batches keep opening their own. `br create` already worked this
   way.

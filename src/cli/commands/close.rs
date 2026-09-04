@@ -2,9 +2,10 @@
 
 use crate::cli::CloseArgs as CliCloseArgs;
 use crate::cli::commands::{
-    acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
+    RouteResources, acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
     finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
-    report_auto_flush_failure, resolve_issue_ids, update_issues_atomically_with_recovery,
+    report_auto_flush_failure, resolve_issue_ids, same_workspace,
+    update_issues_atomically_with_recovery,
 };
 use crate::close_policy::{
     self, AttributionTier, AttributionValues, CloseEvidence, ClosePolicy, PolicyDocument,
@@ -257,8 +258,25 @@ pub fn execute_cli(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
+    execute_cli_with_storage(cli_args, json, cli, ctx, &mut None)
+}
+
+/// Execute the close command from CLI arguments, reusing the caller's
+/// pre-opened storage for the local route when it belongs to the same
+/// workspace (see [`execute_with_args_and_storage`]).
+///
+/// # Errors
+///
+/// Returns an error if database operations fail or IDs cannot be resolved.
+pub fn execute_cli_with_storage(
+    cli_args: &CliCloseArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    pre_opened: &mut Option<config::OpenStorageResult>,
+) -> Result<()> {
     let args = CloseArgs::from(cli_args);
-    execute_with_args(&args, json, cli, ctx)
+    execute_with_args_and_storage(&args, json, cli, ctx, pre_opened)
 }
 
 /// Result of a close operation for JSON output.
@@ -580,12 +598,37 @@ pub fn execute(
 /// # Errors
 ///
 /// Returns an error if database operations fail or IDs cannot be resolved.
-#[allow(clippy::too_many_lines)]
 pub fn execute_with_args(
     args: &CloseArgs,
     use_json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
+) -> Result<()> {
+    execute_with_args_and_storage(args, use_json, cli, ctx, &mut None)
+}
+
+/// Execute the close command with full arguments, reusing the caller's
+/// pre-opened storage for the local route when it belongs to the same
+/// workspace.
+///
+/// `main` opens storage once at startup (auto-import probe, auto-flush) and
+/// keeps that connection alive across dispatch; opening a second one here was
+/// a fixed cost on every close (bead naul5). The borrowed connection is handed
+/// back through `pre_opened` after the write, so the startup auto-flush still
+/// runs through the connection that performed it. A pre-opened context for a
+/// different workspace is left untouched, and routed external batches always
+/// open their own.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail or IDs cannot be resolved.
+#[allow(clippy::too_many_lines)]
+pub fn execute_with_args_and_storage(
+    args: &CloseArgs,
+    use_json: bool,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    pre_opened: &mut Option<config::OpenStorageResult>,
 ) -> Result<()> {
     tracing::info!("Executing close command");
     let use_structured_output = use_json || ctx.is_json() || ctx.is_toon();
@@ -670,7 +713,19 @@ pub fn execute_with_args(
     } else {
         let mut local_args = args.clone();
         local_args.ids = target_inputs;
-        let execution = execute_route(&local_args, cli, ctx, &beads_dir, false)?;
+        let reuse_pre_opened = pre_opened
+            .as_ref()
+            .is_some_and(|storage_ctx| same_workspace(&storage_ctx.paths.beads_dir, &beads_dir));
+        let borrowed = if reuse_pre_opened {
+            pre_opened.take()
+        } else {
+            None
+        };
+        let (execution, resources) =
+            execute_route_with_storage(&local_args, cli, ctx, &beads_dir, false, borrowed)?;
+        if reuse_pre_opened {
+            *pre_opened = Some(resources.storage_ctx);
+        }
         closed_issues = execution.closed;
         skipped_issues = execution.skipped;
         unblocked_issues = execution.unblocked;
@@ -772,7 +827,6 @@ fn summarize_skip_reasons(skipped: &[SkippedIssue]) -> String {
     parts.join("; ")
 }
 
-#[allow(clippy::too_many_lines)]
 fn execute_route(
     args: &CloseArgs,
     cli: &config::CliOverrides,
@@ -780,6 +834,22 @@ fn execute_route(
     beads_dir: &Path,
     auto_flush_external: bool,
 ) -> Result<CloseExecution> {
+    execute_route_with_storage(args, cli, ctx, beads_dir, auto_flush_external, None)
+        .map(|(execution, _resources)| execution)
+}
+
+/// Execute one route and hand its connection and lock back to the caller
+/// instead of dropping them, so a borrowed startup connection can be returned
+/// to `main` for the auto-flush.
+#[allow(clippy::too_many_lines)]
+fn execute_route_with_storage(
+    args: &CloseArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    beads_dir: &Path,
+    auto_flush_external: bool,
+    pre_opened: Option<config::OpenStorageResult>,
+) -> Result<(CloseExecution, RouteResources)> {
     let routed_write_lock =
         acquire_routed_workspace_write_lock(beads_dir, auto_flush_external, cli.lock_timeout)?;
     // Reuse the routed authority for the storage open below; acquiring the
@@ -788,7 +858,11 @@ fn execute_route(
     let mut route_cli = cli.clone();
     routed_write_lock.mark_cli_write_lock_held(&mut route_cli);
     let cli = &route_cli;
-    let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+    let mut storage_ctx = if let Some(storage_ctx) = pre_opened {
+        storage_ctx
+    } else {
+        config::open_storage_with_cli(beads_dir, cli)?
+    };
     auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
 
     let config_layer = storage_ctx.load_config(cli)?;
@@ -1187,13 +1261,19 @@ fn execute_route(
 
         let Some(blocked_after) = blocked_after else {
             storage_ctx.flush_no_db_if_dirty()?;
-            return Ok(CloseExecution {
-                closed: closed_issues,
-                skipped: skipped_issues,
-                unblocked: Vec::new(),
-                ordered_outcomes,
-                capacity_warnings,
-            });
+            return Ok((
+                CloseExecution {
+                    closed: closed_issues,
+                    skipped: skipped_issues,
+                    unblocked: Vec::new(),
+                    ordered_outcomes,
+                    capacity_warnings,
+                },
+                RouteResources {
+                    storage_ctx,
+                    _routed_write_lock: routed_write_lock,
+                },
+            ));
         };
 
         let newly_unblocked: Vec<String> = blocked_before
@@ -1244,13 +1324,19 @@ fn execute_route(
         );
     }
 
-    Ok(CloseExecution {
-        closed: closed_issues,
-        skipped: skipped_issues,
-        unblocked: unblocked_issues,
-        ordered_outcomes,
-        capacity_warnings,
-    })
+    Ok((
+        CloseExecution {
+            closed: closed_issues,
+            skipped: skipped_issues,
+            unblocked: unblocked_issues,
+            ordered_outcomes,
+            capacity_warnings,
+        },
+        RouteResources {
+            storage_ctx,
+            _routed_write_lock: routed_write_lock,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -1310,6 +1396,111 @@ mod tests {
     // =========================================================================
     // CloseArgs tests
     // =========================================================================
+
+    // === Startup connection reuse (beads_rust-naul5) ===
+
+    fn reuse_workspace() -> (TempDir, PathBuf) {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let mut storage_ctx =
+            config::open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
+        storage_ctx
+            .storage
+            .create_issue(&make_issue("bd-cl", "Close target"), "tester")
+            .expect("create issue");
+        (temp, beads_dir)
+    }
+
+    #[test]
+    fn execute_with_args_and_storage_reuses_the_pre_opened_connection_and_hands_it_back() {
+        let (_temp, beads_dir) = reuse_workspace();
+        let cli = CliOverrides {
+            db: Some(beads_dir.join("beads.db")),
+            ..CliOverrides::default()
+        };
+        let mut pre_opened =
+            Some(config::open_storage_with_cli(&beads_dir, &cli).expect("pre-open storage"));
+        let args = CloseArgs {
+            ids: vec!["bd-cl".to_string()],
+            ..CloseArgs::default()
+        };
+
+        execute_with_args_and_storage(
+            &args,
+            true,
+            &cli,
+            &OutputContext::from_flags(true, false, true),
+            &mut pre_opened,
+        )
+        .expect("close through the pre-opened storage");
+
+        let storage_ctx = pre_opened.expect("the borrowed connection is handed back");
+        let issue = storage_ctx
+            .storage
+            .get_issue("bd-cl")
+            .expect("read issue")
+            .expect("issue exists");
+        assert_eq!(
+            issue.status,
+            Status::Closed,
+            "the close is visible through the connection that was handed back"
+        );
+    }
+
+    #[test]
+    fn execute_with_args_and_storage_leaves_a_foreign_pre_opened_connection_alone() {
+        let (_temp_a, beads_dir_a) = reuse_workspace();
+        let (_temp_b, beads_dir_b) = reuse_workspace();
+        let cli_b = CliOverrides {
+            db: Some(beads_dir_b.join("beads.db")),
+            ..CliOverrides::default()
+        };
+        let mut pre_opened = Some(
+            config::open_storage_with_cli(&beads_dir_a, &CliOverrides::default())
+                .expect("pre-open workspace A"),
+        );
+        let args = CloseArgs {
+            ids: vec!["bd-cl".to_string()],
+            ..CloseArgs::default()
+        };
+
+        execute_with_args_and_storage(
+            &args,
+            true,
+            &cli_b,
+            &OutputContext::from_flags(true, false, true),
+            &mut pre_opened,
+        )
+        .expect("close in workspace B");
+
+        let kept = pre_opened.expect("a foreign connection stays with the caller");
+        assert!(
+            crate::cli::commands::same_workspace(&kept.paths.beads_dir, &beads_dir_a),
+            "the caller's connection still belongs to workspace A"
+        );
+        assert_eq!(
+            kept.storage
+                .get_issue("bd-cl")
+                .expect("read workspace A")
+                .expect("A's issue exists")
+                .status,
+            Status::Open,
+            "workspace A was not written"
+        );
+        let reopened_b = config::open_storage_with_cli(&beads_dir_b, &CliOverrides::default())
+            .expect("reopen workspace B");
+        assert_eq!(
+            reopened_b
+                .storage
+                .get_issue("bd-cl")
+                .expect("read workspace B")
+                .expect("B's issue exists")
+                .status,
+            Status::Closed,
+            "workspace B received the close through its own connection"
+        );
+    }
 
     #[test]
     fn test_close_args_default() {

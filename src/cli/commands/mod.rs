@@ -474,6 +474,25 @@ pub(super) struct RoutedWorkspaceWriteLock {
     beads_dir: Option<PathBuf>,
 }
 
+/// What a routed mutation leaves behind after its writes: the connection that
+/// performed them and the routed workspace's write lock. The storage is
+/// declared first so it (and the WAL checkpoint its drop performs, #270) is
+/// released before the family write lock, exactly as when both were locals of
+/// the route function. A command that borrowed `main`'s startup connection
+/// hands `storage_ctx` back through this so the startup auto-flush runs
+/// through the connection that performed the write (bead naul5).
+pub(super) struct RouteResources {
+    pub(super) storage_ctx: OpenStorageResult,
+    pub(super) _routed_write_lock: RoutedWorkspaceWriteLock,
+}
+
+/// Whether two `.beads` directories name the same workspace, tolerating
+/// symlinked or relative spellings of one path.
+pub(super) fn same_workspace(left: &Path, right: &Path) -> bool {
+    let canonical = |path: &Path| dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical(left) == canonical(right)
+}
+
 impl RoutedWorkspaceWriteLock {
     #[must_use]
     pub(super) const fn local() -> Self {
