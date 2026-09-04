@@ -13,6 +13,9 @@
 #   HARNESS_PRESERVE_SUCCESS=1  Keep artifacts even on success
 #   BR_BINARY=/path/to/br     Override br binary location
 #   E2E_TIMEOUT=300           Per-test timeout in seconds (default: 180)
+#   E2E_PROFILE=dev           Cargo profile: release (default) or dev. CI uses
+#                             dev: linking six test binaries with the release
+#                             profile's fat LTO exhausts a hosted runner.
 #
 # Output:
 #   - Exit code 0 on success, 1 on failure
@@ -40,6 +43,15 @@ JSON_OUTPUT=0
 VERBOSE=0
 FILTER=""
 TIMEOUT="${E2E_TIMEOUT:-180}"
+PROFILE="${E2E_PROFILE:-release}"
+case "$PROFILE" in
+    release) PROFILE_ARGS=(--release) ;;
+    dev) PROFILE_ARGS=() ;;
+    *)
+        echo "[e2e] ERROR: E2E_PROFILE must be release or dev, got: $PROFILE" >&2
+        exit 2
+        ;;
+esac
 
 log() {
     if [[ "$JSON_OUTPUT" -eq 0 ]]; then
@@ -90,9 +102,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Ensure build is up to date
-log "Building br binary..."
+log "Building br binary ($PROFILE profile)..."
 cd "$PROJECT_ROOT"
-cargo build --release --quiet 2>/dev/null || cargo build --release
+cargo build "${PROFILE_ARGS[@]}" --quiet 2>/dev/null || cargo build "${PROFILE_ARGS[@]}"
 
 # Compile the quick test binaries once, outside the per-test timeout. A cold
 # release compile of the test crate and its dev-dependencies takes longer than
@@ -103,8 +115,8 @@ QUICK_TEST_TARGETS=()
 for test in "${QUICK_TESTS[@]}"; do
     QUICK_TEST_TARGETS+=(--test "$test")
 done
-cargo test --release --no-run --quiet "${QUICK_TEST_TARGETS[@]}" 2>/dev/null \
-    || cargo test --release --no-run "${QUICK_TEST_TARGETS[@]}"
+cargo test "${PROFILE_ARGS[@]}" --no-run --quiet "${QUICK_TEST_TARGETS[@]}" 2>/dev/null \
+    || cargo test "${PROFILE_ARGS[@]}" --no-run "${QUICK_TEST_TARGETS[@]}"
 
 # Create artifacts directory
 mkdir -p "$ARTIFACTS_DIR"
@@ -131,7 +143,7 @@ for test in "${QUICK_TESTS[@]}"; do
     TEST_START=$(date +%s.%N)
 
     if [[ "$VERBOSE" -eq 1 ]]; then
-        if timeout "$TIMEOUT" cargo test --release --test "$test" -- --nocapture 2>&1; then
+        if timeout "$TIMEOUT" cargo test "${PROFILE_ARGS[@]}" --test "$test" -- --nocapture 2>&1; then
             RESULT="pass"
             PASSED=$((PASSED + 1))
         else
@@ -139,7 +151,7 @@ for test in "${QUICK_TESTS[@]}"; do
             FAILED=$((FAILED + 1))
         fi
     else
-        if timeout "$TIMEOUT" cargo test --release --test "$test" -- --nocapture >/dev/null 2>&1; then
+        if timeout "$TIMEOUT" cargo test "${PROFILE_ARGS[@]}" --test "$test" -- --nocapture >/dev/null 2>&1; then
             RESULT="pass"
             PASSED=$((PASSED + 1))
         else

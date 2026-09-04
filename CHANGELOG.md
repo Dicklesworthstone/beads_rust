@@ -85,7 +85,16 @@ this repo): commits `55c186682` + `5946b3b7c` in
   The Quick E2E harness (`scripts/e2e.sh`) compiles its six test binaries
   before the per-test 180 s timeout starts; a cold release compile inside
   that budget had been reported as the first test's failure without the
-  test ever running.
+  test ever running. The job also runs the harness in the dev profile
+  (`E2E_PROFILE=dev`; release stays the local default): linking six test
+  binaries with the release profile's fat LTO killed the hosted runner
+  ("runner has received a shutdown signal") on two consecutive runs before
+  any test ran. The audit gate's suspect-close-reason script matches
+  the same literal hedge phrases as the doctor rule it mirrors
+  (`audit.suspect_close_reasons`); its greedy `forced.*close.*cycle` regex
+  flagged the audit's own policy bead (30ci) for naming
+  `forced_cycle_close_audit.sh` in its close reason, so the job had failed
+  on every hosted run.
 
 - `br upgrade --version 0.5.10` no longer 404s: a bare version is looked up
   as the `v`-prefixed release tag GitHub actually carries (found while
@@ -112,6 +121,15 @@ this repo): commits `55c186682` + `5946b3b7c` in
   the superseded first one; it now checks the last record applied. The
   `misc` CI shard's `jsonl_import_export` binary had been red on this since
   that verifier landed (bead 72j0i).
+- The model-based storage property test (`tests/model_based_storage.rs`)
+  predicts dependency cycles the way the storage detects them: parent-child
+  edges run parent → child in the blocker graph and `related` edges are
+  never cycle-checked. Its reference model walked every edge as
+  issue → dependency, so a `blocks` chain plus a reversed parent-child edge
+  (a real deadlock the storage refuses) made the test expect success; the
+  hosted `misc` shard hit that case once the import verifier fix let the
+  binary run. A deterministic regression case covers both orientations and
+  the non-blocking edge.
 
 ## v0.5.10 -- 2026-09-04 (Release)
 

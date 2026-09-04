@@ -484,6 +484,11 @@ jobs:
         env:
           NO_COLOR: 1
           HARNESS_ARTIFACTS: 1
+          # Dev profile: linking the six quick test binaries with the release
+          # profile's fat LTO killed the hosted runner ("runner has received a
+          # shutdown signal") on runs 33872723832 and 33875242391 before any
+          # test ran. The release binary is exercised by the Release workflow.
+          E2E_PROFILE: dev
 
       - name: Upload E2E summary
         if: always()

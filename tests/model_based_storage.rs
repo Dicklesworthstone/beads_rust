@@ -164,9 +164,27 @@ impl Model {
             .collect()
     }
 
-    /// True when `to` can already reach `from` through any edge type, so an
-    /// edge `from -> to` would close a cycle.
-    fn reaches(&self, start: &str, goal: &str) -> bool {
+    /// The storage's blocker graph, mirrored from `check_cycle` in
+    /// `src/storage/sqlite.rs`: a blocking dependency runs from the issue to
+    /// what it depends on, and a parent-child edge runs from the parent to
+    /// the child because a parent waits for its children. `related` edges
+    /// are not blocking and are never followed.
+    fn blocker_neighbors(&self, node: &str) -> Vec<String> {
+        let mut next = Vec::new();
+        for (from, to, kind) in &self.deps {
+            if from == node
+                && matches!(kind.as_str(), "blocks" | "conditional-blocks" | "waits-for")
+            {
+                next.push(to.clone());
+            }
+            if to == node && kind == "parent-child" {
+                next.push(from.clone());
+            }
+        }
+        next
+    }
+
+    fn reaches_in_blocker_graph(&self, start: &str, goal: &str) -> bool {
         let mut stack = vec![start.to_string()];
         let mut seen = BTreeSet::new();
         while let Some(node) = stack.pop() {
@@ -174,12 +192,24 @@ impl Model {
                 return true;
             }
             if seen.insert(node.clone()) {
-                for (to, _) in self.outgoing(&node) {
-                    stack.push(to);
-                }
+                stack.extend(self.blocker_neighbors(&node));
             }
         }
         false
+    }
+
+    /// Whether the storage will refuse `from -> to` of `dep_type` as a
+    /// cycle. A non-blocking edge is never cycle-checked. A parent-child
+    /// edge (`from` is the child, `to` the parent) adds the blocker edge
+    /// parent -> child, so it closes a cycle when the child already reaches
+    /// the parent; any other blocking edge closes one when `to` already
+    /// reaches `from`.
+    fn would_close_blocker_cycle(&self, from: &str, to: &str, dep_type: &str) -> bool {
+        match dep_type {
+            "related" => false,
+            "parent-child" => self.reaches_in_blocker_graph(from, to),
+            _ => self.reaches_in_blocker_graph(to, from),
+        }
     }
 
     fn edge_between(&self, a: &str, b: &str) -> bool {
@@ -403,10 +433,13 @@ fn apply_dep_add(
     let (Some(from_id), Some(to_id)) = (model.pick(from), model.pick(to)) else {
         return "dep add (no live issue)".to_string();
     };
-    if from_id == to_id || model.edge_between(&from_id, &to_id) || model.reaches(&to_id, &from_id) {
-        return format!("dep add {from_id} -> {to_id} (skipped: self, duplicate, or cycle)");
+    if from_id == to_id || model.edge_between(&from_id, &to_id) {
+        return format!("dep add {from_id} -> {to_id} (skipped: self or duplicate)");
     }
     let dep_type = DEP_TYPES[kind];
+    if model.would_close_blocker_cycle(&from_id, &to_id, dep_type) {
+        return format!("dep add {from_id} -> {to_id} ({dep_type}, skipped: cycle)");
+    }
     // The storage allows one parent per issue: a second parent-child edge
     // from the same issue is refused until the first is cleared.
     if dep_type == "parent-child"
@@ -572,6 +605,124 @@ proptest! {
     fn storage_matches_reference_model(ops in proptest::collection::vec(op_strategy(), 1..=120)) {
         run_sequence(&ops)?;
     }
+}
+
+/// The model must predict cycles the way the storage detects them. A
+/// parent-child edge runs parent -> child in the blocker graph (a parent
+/// waits for its children), so a child that already reaches its would-be
+/// parent through `blocks` edges is a deadlock the storage refuses, while
+/// the opposite orientation and a non-blocking `related` edge are accepted.
+/// The property test found the first case on the hosted misc shard (CI run
+/// 33875242391) when the model still walked every edge as issue -> dependency.
+#[test]
+fn model_predicts_the_parent_child_blocker_direction() {
+    let (mut storage, _dir, _db_path) = fresh_storage();
+    let mut model = Model::default();
+    for title in ["first", "second", "third"] {
+        apply(
+            &Op::Create {
+                title: title.to_string(),
+                priority: 2,
+                kind: 0,
+            },
+            &mut storage,
+            &mut model,
+        );
+    }
+    // mb-0000 is blocked by mb-0001, which is blocked by mb-0002.
+    assert_eq!(
+        apply(
+            &Op::DepAdd {
+                from: 0,
+                to: 1,
+                kind: 0
+            },
+            &mut storage,
+            &mut model
+        ),
+        "dep add mb-0000 -> mb-0001 (blocks)"
+    );
+    assert_eq!(
+        apply(
+            &Op::DepAdd {
+                from: 1,
+                to: 2,
+                kind: 0
+            },
+            &mut storage,
+            &mut model
+        ),
+        "dep add mb-0001 -> mb-0002 (blocks)"
+    );
+    check_projections(&storage, &model, "after the blocks chain");
+
+    // mb-0000 as a child of mb-0002: the parent would wait for a child that
+    // (transitively) waits for the parent. The model predicts the refusal
+    // instead of calling the storage and panicking on DependencyCycle.
+    assert_eq!(
+        apply(
+            &Op::DepAdd {
+                from: 0,
+                to: 2,
+                kind: 2
+            },
+            &mut storage,
+            &mut model
+        ),
+        "dep add mb-0000 -> mb-0002 (parent-child, skipped: cycle)"
+    );
+    let refused = storage.add_dependency("mb-0000", "mb-0002", "parent-child", ACTOR);
+    assert!(
+        matches!(
+            refused,
+            Err(beads_rust::error::BeadsError::DependencyCycle { .. })
+        ),
+        "the storage refuses the same edge as a cycle: {refused:?}"
+    );
+    check_projections(&storage, &model, "after the refused parent-child edge");
+
+    // A non-blocking edge is never cycle-checked: `related` from mb-0002
+    // back to mb-0000 closes a loop in the plain edge graph, and both the
+    // storage and the model accept it.
+    assert_eq!(
+        apply(
+            &Op::DepAdd {
+                from: 2,
+                to: 0,
+                kind: 1
+            },
+            &mut storage,
+            &mut model
+        ),
+        "dep add mb-0002 -> mb-0000 (related)"
+    );
+    check_projections(&storage, &model, "after the related edge");
+
+    // A parent-child edge in the safe orientation: mb-0003 as the child of
+    // mb-0000 adds the blocker edge mb-0000 -> mb-0003, which mb-0003 does
+    // not reach back.
+    apply(
+        &Op::Create {
+            title: "fourth".to_string(),
+            priority: 2,
+            kind: 0,
+        },
+        &mut storage,
+        &mut model,
+    );
+    assert_eq!(
+        apply(
+            &Op::DepAdd {
+                from: 3,
+                to: 0,
+                kind: 2
+            },
+            &mut storage,
+            &mut model
+        ),
+        "dep add mb-0003 -> mb-0000 (parent-child)"
+    );
+    check_projections(&storage, &model, "after the accepted parent-child edge");
 }
 
 /// The checker itself must fail readably when a projection drifts from the

@@ -26,8 +26,13 @@ JSONL="${BEADS_JSONL:-.beads/issues.jsonl}"
 [[ -f "$JSONL" ]] || fail "JSONL not found: $JSONL"
 command -v jq >/dev/null 2>&1 || fail "jq missing"
 
-# Patterns from m3mi (sibling bead)
-PATTERN='[Ff]orced.*close.*cycle|due to.*dep.*cycle|temporarily closed|wip close'
+# The same literal hedge phrases as the doctor rule this script mirrors
+# (`audit.suspect_close_reasons`, beads_rust-m3mi, src/cli/commands/doctor.rs
+# check_suspect_close_reasons), matched case-insensitively. The earlier
+# greedy `forced.*close.*cycle` regex also matched prose that merely named
+# this script or the audit document in a close reason, which flagged the
+# audit's own policy bead (30ci) and failed the gate on every hosted run.
+PATTERN='forced close due to cycle|due to dep cycle|due to dependency cycle|temporarily closed|wip close'
 
 OFFENDER_COUNT=0
 OFFENDER_IDS=""
