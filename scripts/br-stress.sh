@@ -34,6 +34,10 @@ if [[ ! -f "$SRC/issues.jsonl" ]]; then
     echo "source family has no issues.jsonl: $SRC" >&2
     exit 2
 fi
+# Both arguments are used after `cd "$WORK"`, so relative paths (the CI
+# steps pass `target/debug/br` and `.beads`) must be made absolute first.
+BR="$(cd "$(dirname "$BR")" && pwd -P)/$(basename "$BR")"
+SRC="$(cd "$SRC" && pwd -P)"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/br-stress-XXXXXX")"
 cd "$WORK" || exit 2
