@@ -211,8 +211,17 @@ jobs:
         run: cargo build --release
 
       # l6xl: snapshot freshness — fails CI on any *.snap.new alongside *.snap
+      # Only the targets that use insta: `--workspace` compiled and ran all
+      # 162 test binaries from cold and blew the job's 30-minute budget
+      # (run 33867897062). The freshness contract (no *.snap.new beside a
+      # *.snap) only concerns these four.
       - name: Snapshot freshness gate (beads_rust-l6xl)
-        run: cargo insta test --check --workspace
+        run: >-
+          cargo insta test --check
+          --test snapshots
+          --test golden_beads_init
+          --test golden_rich_panels
+          --test storage_golden_snapshot
         env:
           RUST_LOG: error
 

@@ -80,6 +80,8 @@ this repo): commits `55c186682` + `5946b3b7c` in
   The `misc` shard's golden `init` file-set tests now treat the sole-opener
   lease file (`.br-db-openers-<hash>.lock`, #457) as engine state like the
   WAL sidecars; they had been red since that lease landed on 2026-08-28.
+  The audit gate's snapshot-freshness step runs only the four insta-using
+  targets instead of `--workspace` (162 binaries from cold overran the job).
 
 - `br upgrade --version 0.5.10` no longer 404s: a bare version is looked up
   as the `v`-prefixed release tag GitHub actually carries (found while
