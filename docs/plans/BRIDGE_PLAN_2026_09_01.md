@@ -1,5 +1,372 @@
 # Bridge Plan: beads_rust (`br`)
 
+## Current assessment — 2026-09-04
+
+This dated assessment supersedes the September 1 status and execution plan below.
+The older material remains an audit trail, not a list of still-missing features.
+This revision applies all phases of `reality-check-for-project`: vision extraction,
+code and runtime investigation, gap mapping, a bridge plan, bead generation,
+ambition rounds, refinement, and graph validation. Implementation belongs to the
+resulting work queue; this assessment does not claim to have fixed its findings.
+
+### Verdict and evidence boundary
+
+**The core issue tracker works and has substantial independent release evidence.
+It is not finished against its agent-facing contracts.** The largest newly found
+gap is that MCP operations bypass the CLI's workflow policy. Direct probing also
+found the ready resource dispatched as an issue lookup. Another concrete gap is
+`init --json` returning prose. Performance targets remain unestablished,
+and the green release must not be confused with the newer dependency tree.
+
+The reviewed source started at `5e81e7961e43f4bf79d997b6d5d8beb425c90a70`
+(fsqlite 0.3.16, fastmcp-rust 0.8.1, tru 0.2.4). During the audit another agent
+committed the existing `UPGRADE_LOG.md` edit as `2334b42d`; no production code
+changed with that commit. The installed v0.5.10 binary is commit
+`6c8283c43773212ad1509c2caa4f400674674a50`, with fsqlite 0.3.15 and default
+`self_update` features. Its SHA-256 is
+`bf8e0c9c42fc966d8e1134206de7201cfe07a14e6b3c8527df650b87ae48f797`.
+
+Evidence collected:
+
+- Read all of AGENTS.md, README.md, the three historical porting documents, the
+  Rich plan, the previous bridge plan, architecture and write-combining design;
+  also read current engine, health, coordination, CI, and scaling contracts.
+  Historical banners and later explicit decisions take precedence over abandoned
+  designs: no new Storage trait, daemon, alternate engine, or dormant-code removal
+  is needed to finish the current product.
+- Inspected the exhaustive CLI dispatch, real command handlers, storage mutation
+  and capacity paths, startup import/locking, sync publication/reconciliation,
+  live Rich rendering, MCP handlers, and the assertions in proof harnesses.
+  Keyword and Rust AST scans found no `todo!` or `unimplemented!` dispatch stubs.
+  Dormant syntax/cache modules are documented decisions, not live CLI stubs.
+- [Release run 33827552018](https://github.com/Dicklesworthstone/beads_rust/actions/runs/33827552018)
+  succeeded at the v0.5.10 commit: reliability gates, seven builds, publication,
+  crates.io, and downloaded-archive selftests on Linux amd64/arm64, macOS arm64,
+  and Windows amd64. Canary receipts exist as workflow artifacts. They are not
+  release assets and have the workflow artifact retention lifetime.
+- Local `br doctor --selftest --keep --json`: **45/45 steps passed**, 4,715 ms,
+  Linux x86_64, case-sensitive filesystem, supported no-replace rename. Retained
+  workspace: `/data/tmp/br-selftest-rxUVp5`. This proves the exercised lifecycle,
+  not every output contract, failure mode, platform, or performance target.
+- Independent strict-parser smoke exercised dependency blocking/unblocking,
+  cycle rejection, multi-label AND counts, JSON/TOON/plain output, and structured
+  not-found errors. Receipt: `/tmp/br-reality-_azdbf9m/reality-receipt.json`.
+  `init --json` failed the JSON contract; the other exercised forms passed.
+  Structured errors intentionally use stdout, and partial-batch failures may
+  emit two JSON documents, as documented in `docs/agent/ERRORS.md`.
+- A current-source MCP binary on RCH worker `ovh-a` reproduced a hard-capacity
+  bypass: the CLI refused the second `in_progress` issue with
+  `WORKFLOW_CAPACITY_EXCEEDED`, while MCP accepted it and the CLI subsequently
+  listed two issues against a hard limit of one. `resources/read` for
+  `beads://issues/ready` returned `ISSUE_NOT_FOUND: ready`. Full policy, requests,
+  responses and final state are retained on that worker in
+  `/tmp/br-reality-policy-fi3phoje/reality-policy-receipt.json`.
+- [CI run 33910709080](https://github.com/Dicklesworthstone/beads_rust/actions/runs/33910709080)
+  at `829a8357` failed the misc and snapshot-freshness jobs. The exact difference
+  is `env: BEADS_DB` newly appearing in root/create help. Snapshot suite: 258
+  passed, 2 failed in the all-feature job. Functional shards and Check passed.
+  This is a snapshot regression, not evidence that the new database alias fails.
+- Fresh current-source tests completed through RCH: **2,969 lib tests passed,
+  four ignored; one MCP protocol E2E passed**. The initial cold lib invocation
+  hit the remote cap; successful re-execution used the already compiled test
+  binaries. Source-content receipt barriers rejected concurrent plan edits, so
+  the exact scope of the independent source comparison is recorded below.
+  `UPGRADE_LOG.md` supplies separately attributed earlier
+  lib/model/linearizability/MCP results; its migrated-family stress and doctor
+  evidence for the engine bump was still pending when written.
+
+### Current vision checklist
+
+`WORKING` means implemented and supported by the named release/runtime evidence
+for its tested scope. `PARTIAL` identifies a specific gap. `UNPROVEN` does not
+mean broken. Historical goals explicitly retired in the as-built decision record
+are `SUPERSEDED`, rather than new implementation obligations.
+
+| Goal | Current status and evidence | Remaining work |
+|---|---|---|
+| V1 Classic CRUD, dependencies, labels, comments, queries | WORKING: dispatch, storage, release and local lifecycle | R1/R2 for alternate entry points |
+| V2 SQLite + JSONL, no Dolt | WORKING: fsqlite facade and explicit sync | Engine proof R7 |
+| V3 Non-invasive collaboration | WORKING: no automatic git/hook/daemon; explicit VCS reporting is allowed | Prose qualification R4 |
+| V4 Go schema compatibility | WORKING within documented interchange scope; identical schemas SUPERSEDED by v17 and conformance decisions | R4: describe the narrower supported contract |
+| V5 IDs and deduplication | WORKING: adaptive IDs and length-prefixed SHA-256; hashes intentionally differ from bd | R4 wording |
+| V6 Go conformance | WORKING within pinned classic bd 0.46.0 comparison; text/schema exceptions documented | Retain divergence ledger and real-bd gate |
+| V7 Machine-readable command results/errors | PARTIAL: `init --json` returns prose; error-stream contract otherwise deliberate | R2 |
+| V8 TOON and precedence | WORKING on exercised forms; init inherits the same missing branch | R2/R5 |
+| V9 Rich/plain mode behavior | WORKING: live output layer, goldens, runtime plain/TOON checks | Preserve mode matrix |
+| V10 Markdown/syntax presentation | Markdown WORKING in IssuePanel; old separate syntax renderer SUPERSEDED/dormant | No new renderer project |
+| V11 Sync paths, publication and conflict refusal | WORKING on release reliability suite; exact allowlist has documented external-path exceptions | R7/R8 evidence |
+| V12 Preserve acknowledged data | PARTIAL proof, not a universal theorem: corruption containment, witnesses, crash tests exist | R7/R8 |
+| V13 Merge/reconcile/salvage/reviewed plans | WORKING on synthetic and release tests | Exact CASS rehearsal remains operator-dependent |
+| V14 Local history | WORKING on lifecycle and history tests | Keep explicit restore/prune semantics |
+| V15 Workflow policy/capacity/gates | CLI WORKING; MCP PARTIAL because policy is not installed/evaluated | R1 |
+| V16 Stale-claim diagnosis | WORKING as advisory caller-provided evidence | R9 tracker hygiene, no automatic stealing |
+| V17 Routing and external dependencies | WORKING in CLI tests; no distributed transaction promised | MCP policy/read parity R1 |
+| V18 Doctor explain/repair/bundle/migration | WORKING on release/fixture evidence; foreign sidecar diagnosis incomplete | R7 |
+| V19 Seven MCP tools/resources/prompts | Real protocol and persistence WORKING; policy and resource routing PARTIAL | R1/R5/R10 |
+| V20 <100 ms cold/<50 ms warm and faster than bd | UNPROVEN as a workload-qualified promise | R6 |
+| V21 Useful regression budgets | PARTIAL: benchmark mechanism exists, command SLO/size contract parked | R6 |
+| V22 Storage abstraction and decomposition | SUPERSEDED by explicit single-backend as-built decision | No mandatory trait or split |
+| V23 Write-combining/cache | SUPERSEDED as shipping requirements; dormant opt-in research | Only reconsider with measured benefit |
+| V24 Cross-platform distributions | WORKING: seven archives, checksums/signatures and four native canaries | R4 static-binary wording; durable receipts R7 |
+| V25 Cargo installation | WORKING: crates.io publication and release manifest evidence | Source HEAD is newer than release |
+| V26 Explicit self-update | WORKING with mandatory checksum sidecar verification | Preserve existing failure tests |
+| V27 Meaningful tests and fault proof | PARTIAL: substantial real tests; model lacks ready/blocked oracle | R3/R5/R8 |
+| V28 Unsafe discipline | WORKING as deny-by-default with three sanctioned carve-outs | R4 conflicting older count |
+| V29 Accurate actionable documentation | PARTIAL: auto-import, schema/parity, static linkage and safety prose drift | R4 |
+| V30 Tracker reflects work | PARTIAL: old parked tasks look ready; outdated epic descriptions | R9 |
+| V31 Windows | WORKING within published Windows selftest; not proof of every filesystem | R7 platform evidence matrix |
+| V32 Broken pipes | WORKING in existing E2E and release suite | Preserve text/structured distinction |
+| V33 Structured acceptance items | WORKING in CLI/MCP parser and tests | Enforcement on MCP close R1 |
+| V34 Actionable agent hints | WORKING on tested errors; init format failure escapes this surface | R2/R5 |
+| V35 One-command binary selftest | WORKING, locally rerun and four published native canaries | Extend output proof R5 |
+
+### Bridge work and initial bead coverage
+
+**Completing the old open queue would not close the gap.** It omits R1, R2, R3,
+R10 and the specific oracle gaps in R8. Generic closed MCP/JSON test beads do not
+cover these counterexamples. Conversely, implementing every parked generator or
+gate manifest would add work without repairing those counterexamples.
+
+| Gap | Concrete change and acceptance | Ownership before this audit |
+|---|---|---|
+| R1 MCP policy parity (P1) | Load current workspace policy under request authority; apply ready groups, strict statuses/transitions, capacity, required fields, close gates/acceptance and audit attribution. Refusals must preserve all state; CLI and MCP must agree on the same fixture. | NO_BEAD |
+| R2 Init structured output (P1) | Add a typed JSON/TOON init result through OutputContext, expose its schema/metadata, preserve plain/Rich/quiet behavior. Parse whole successful stdout with no prefix stripping. | NO_BEAD; closed `0a5` promised a JSON object but init.rs:272–293 has only quiet/Rich/plain branches |
+| R3 Current help snapshots (P1) | Review and update only the root/create help snapshots changed by the BEADS_DB help addition; prove default and MCP feature modes and snapshot freshness. | NO_BEAD; older `zxfz.5` addressed different snapshots |
+| R4 Semantic documentation drift (P2) | Correct README's explicit-only import claim against main.rs auto-import; qualify schema/text/hash parity, GNU versus musl static linkage, and recovery/unsafe counts. Add behavioral checks where appropriate; no wholesale generator requirement. | `wqmw` broadly; its only open child is a parked generator |
+| R5 Contract test blind spots (P1) | Extend existing executable tests with strict success parsing and documented error-stream parsing; cross CLI/MCP policy fixtures, not just method discovery or text containment. Include disabled-feature behavior and mode precedence. | NO_BEAD for these cases |
+| R6 Latency and size (P1/P2) | Establish reproducible workload-qualified budgets and benchmark update/close reuse on the same host; profile measured costs. Preserve correctness and persistence acknowledgment. | `zxfz.1`, active `naul5` |
+| R7 Engine and release proof (P1/P2) | Finish current dependency-tree migrated-family stress/doctor receipts; retain the grouped-count workaround until the pinned engine includes and passes the upstream fix. Diagnose present-DB foreign sidecars conservatively. | `ro3m`, `w4rmw`, `uze9`, `0wb0w` |
+| R8 Independent oracle scope (P2) | Extend the BTreeMap model to ready/blocked/dependency types and rejection postconditions; add bounded cross-issue concurrent histories for capacity/graphs. Keep the valid existing per-issue checker. | NO_BEAD for omitted projections/coupled histories; `dk45.7/.8` correctly cover narrower implemented scopes |
+| R9 Tracker/decision hygiene (P2/P3) | Refresh epic closure criteria, record shipped evidence, keep active ownership, separate parked design ideas and operator-only actions from executable shipping blockers. | `di3tb`, `0wb0w`; cleanup/CASS decisions remain explicit |
+| R10 Literal MCP resource dispatch (P1) | Ensure fixed issue resources resolve before the generic issue-ID template. Read every advertised fixed URI over actual stdio; preserve real/missing ID behavior. | NO_BEAD; discovered during refinement by direct runtime probe |
+
+R1 code evidence: `src/mcp/mod.rs::mcp_ready_issues` uses
+`ReadyFilters::default()` instead of the configured ready group. MCP writable
+open calls `SqliteStorage::open` and attaches authority, but never installs the
+capacity policy. `src/mcp/tools.rs::close_issue_json` calls `update_issue` before
+looking up blockers and only warns afterward; it does not evaluate close policy.
+`apply_update_issue_json` likewise uses the low-level mutation directly. CLI
+`ready.rs`, `close.rs`, and `update.rs` contain the missing policy integration.
+Capacity bypass is now reproduced over actual stdio. The broader policy cases
+remain code-confirmed or specified companion-test coverage; the basic MCP smoke
+does not establish them. The ready URI's routing failure masks its separate
+configured-status mismatch until R10 is fixed. `IssueResource` is registered
+before literal issue resources; confirm dispatch precedence in the pinned
+fastmcp implementation before choosing the smallest routing fix.
+
+R8 code evidence: `tests/model_based_storage.rs::check_projections` compares
+issue fields, labels, comments, edge endpoints and list membership, but never
+calls ready/blocked or compares edge types. Invalid operations are not generated.
+`tests/linearizability_multiprocess.rs` deliberately constrains dependencies to
+fixed sinks, making per-issue decomposition valid; that cannot establish atomic
+capacity admission or multi-issue graph invariants.
+
+Local performance observations (20 timed fresh processes after one warm-up,
+warm filesystem cache, shared host, 2–23 issues): version median/p95 5.05/5.77 ms;
+list 53.39/62.48 ms; ready 54.45/63.94 ms; create 104.10/133.53 ms. These are
+diagnostic measurements, not calibrated 1k/10k budgets or a cold-cache benchmark.
+The active performance bead already disproved the original flush-lock hypothesis
+and landed schema-witness and update/close connection reuse improvements. Preserve
+that evidence; do not resurrect lock-scope changes without a new profile.
+
+### Execution and closure
+
+#### Ambition revision 1: shared semantics and attributable proof
+
+The first revision replaces isolated MCP checks with one request-scoped policy
+context, built from the policy bytes actually loaded after authority acquisition.
+Share the smallest existing semantic operations between CLI and MCP. Validate
+before mutation; do not maintain two subtly different implementations. A long-lived
+MCP process must observe policy edits on its next request, and its ready resource,
+overview and prompts must agree with the CLI. Tests should retain the policy
+digest, actor, requested transition and before/after state so disagreements can
+be diagnosed without private workspace data.
+
+Separate policy refusal from failures after a successful database mutation.
+Refusals must leave issues, events, gates, dirty state and JSONL unchanged. A
+publication error after commit must report the actual committed state and existing
+pending-sync outcome, not claim rollback or invite a blind retry. Within each
+issue operation, validate labels/parent/required fields before mutation wherever
+their failure would otherwise leave misleading partial state. Preserve deliberate
+per-item batch results; a batch-wide transaction is not an implied requirement.
+
+The output proof uses a bounded table of real command families and explicit
+contracts. Successful structured results consume the whole stream; failures use
+the documented one- or two-document error contract. Help, completions and raw
+exports are checked under their own contracts. Schema shape alone cannot prove
+semantic parity. Default-feature builds must prove MCP is absent; feature-enabled
+builds must report nonzero executed protocol tests.
+
+Final closure records one coherent source/lockfile/feature/platform tuple, exact
+commands and test counts, then identifies the release archives by digest. Older
+release successes remain valid for that release, but cannot satisfy new engine
+acceptance. Retain native canary summaries with durable release evidence before
+workflow artifacts expire; extend existing release evidence machinery only if
+needed. No new gates manifest or document generator is required.
+
+#### Ambition revision 2: independent models and meaningful budgets
+
+Keep the existing per-issue concurrent checker for its valid fixed-sink workload.
+Add bounded histories whose conflict domains include all issues sharing a capacity
+limit or connected by a graph mutation. Search legal sequential histories while
+respecting invocation/response precedence. Decompose only where the operations
+really commute; a shared capacity pool cannot be split by issue ID. Start with
+two to four writers and short histories, memoize equivalent model states, and
+classify exhausted search budgets as inconclusive. Preserve unknown commit
+outcomes explicitly instead of discarding failed operations from the history.
+
+An independent checker also needs evidence that it detects errors. Feed it small
+hand-verified legal and illegal histories: oversubscribed capacity, a hidden cycle,
+a stale blocker projection, and an acknowledged write absent after reopen. Each
+illegal case must be rejected for its intended invariant; timeout is not rejection.
+Use test-only trace/projection inputs, not production fault toggles. Record seed,
+clock/barrier events, minimized history and model counterexample. The sequential
+readiness model and coupled checker share a documented semantic specification,
+but neither calls production cache/query logic as its oracle.
+
+Rework `zxfz.1` around a release binary on a quiet, identified runner. Extend the
+existing benchmark harness rather than create a debug-build latency integration
+test. Measure representative 1k/10k fixtures with controlled graph/label density,
+paired baseline/candidate runs in alternating order, warmups and repeated samples.
+Publish distributions and uncertainty alongside ratios; establish command-specific
+budgets from calibrated evidence. A copied database is not cold filesystem cache.
+Retain the historical <100 ms cold/<50 ms warm startup objectives under a defined
+startup workload; calibration cannot silently weaken them to obtain a green gate.
+Record a measured miss as a gap, and report both wins and losses against real bd.
+Label fresh-process/warm-cache measurements accurately, and keep real cold-cache
+claims out of the gate unless that condition is controlled. Separate default
+auto-flush from diagnostic no-auto-flush runs. Size evidence names target,
+features, stripping and compressed/uncompressed bytes. Include a deliberately
+degraded fixture/result to prove the regression gate fails. Existing `naul5`
+remains owned; new measurements must not revive its disproven flush hypothesis.
+
+First restore reviewed snapshot freshness and implement MCP/initialization
+contracts, with their companion proof tasks. Documentation correction can proceed
+independently. Then expand independent correctness oracles and establish stable
+performance budgets. Engine-bump proof and upstream repros remain prerequisites
+for claims about the newer engine. Final integration verifies one pinned source
+and its published artifacts, rather than assembling unrelated green runs.
+
+Every implementation task names existing source/test files, positive and negative
+cases, exact reproduction commands, and retained failure evidence. Do not remove
+files or change the engine, git behavior, partial-batch contract, or active owner
+as a side effect of this plan. Parked architecture/generator ideas are decisions,
+not prerequisites to finish these fixes. Exact CASS data and repository-index
+cleanup require the separate operator actions already described in their beads.
+
+### Workflow rounds and validation
+
+The final campaign is `beads_rust-azxef`; its twelve children are self-contained
+and include background, source locations, changes, tests, negative cases and
+receipt requirements. All bead changes were made with `br`.
+
+| Gap | Implementation owner | Companion proof / integration |
+|---|---|---|
+| R1 MCP policy | `azxef.1` | `azxef.7` |
+| R2 Init structured output | `azxef.2` | `azxef.6` |
+| R3 Help snapshot regression | `azxef.3` | Existing snapshots plus `azxef.6` |
+| R4 Semantic docs | `azxef.4`, track `wqmw` | `azxef.6` and existing docs examples |
+| R5 Entry-point/stream proof | `azxef.6`, `azxef.7` | Existing output/stdio harnesses |
+| R6 Performance/size | `zxfz.1`; active optimization `naul5` | `azxef.10` |
+| R7 Engine/sidecar/release evidence | `w4rmw`, track `uze9` | `azxef.11`, final `0wb0w` |
+| R8 Independent models | `azxef.5`, `azxef.8` | `azxef.9` |
+| R9 Queue/decision truth | Audit `ua6dh`; revised existing epics | `br ready`, `br dep cycles`, `bv --robot-*` |
+| R10 Literal MCP resources | `azxef.12` | `azxef.7` |
+
+Execution order: start concrete P1 fixes `.1`, `.2`, `.3`, `.12`; semantic docs,
+independent models and calibrated performance preparation can proceed on their
+named file scopes. `.6` waits for init/snapshots/docs, `.7` for policy/routing,
+`.9` for both model tasks, `.10` for `zxfz.1`, `.11` for `w4rmw`. Updated tracks
+feed `0wb0w`, which also depends on the campaign. Parent epics are organizational;
+their high graph ranking is not a reason to claim an aggregate instead of a leaf.
+
+Seven existing entries are explicitly deferred with preserved evidence and
+revisit conditions: `uze9.2`, `wqmw.5`, `di3tb`, `di3tb.4`, `3r45.4`, `mwxp`,
+and `ro3m`. The first two are parked designs, Track H and CASS require operator
+inputs, `mwxp` needs a current reproduction, and upstream workaround removal
+awaits a released/pinned fix. Track H is related to final integration rather
+than a blocker. The active `naul5` claim was preserved. The old invalid test
+issue `yh98` was observed and left intact; it is not executable ready work.
+
+Initial bridge draft was converted into campaign `beads_rust-azxef` and seven
+implementation/proof children before ambition work. Audit execution is tracked
+separately in `beads_rust-ua6dh`; closing that audit does not close product fixes.
+
+Ambition round 1 used the skill's prompt verbatim:
+
+> That's a decent start but it barely scratches the surface and is light years away from being
+> OPTIMAL. Please try again and revise your existing plan document in-place to make it MUCH, MUCH,
+> MUCH better in EVERY WAY.
+
+Result: shared request policy, preflight/post-commit outcome separation, bounded
+strict-output contracts and source-bound durable release evidence were added
+above, then carried into the corresponding beads.
+
+Ambition round 2 used the skill's prompt verbatim:
+
+> That's a lot better than before but STILL is a far cry from being OPTIMAL. Please try yet again
+> and revise your existing plan document in-place to make it MUCH, MUCH, MUCH better in EVERY WAY.
+> I believe in you, you can do this!!! Show me how brilliant you really are.
+
+Result: bounded coupled-history verification, independently checked negative
+controls and calibrated paired performance budgets were added in place and
+converted into new proof beads or revisions of existing owners.
+
+Refinement used the skill's frozen Phase 5 prompt verbatim, recorded in audit
+comment 997 after rereading AGENTS.md. Five passes were insufficient because the
+fifth found a scheduling defect; a sixth established convergence.
+
+| Pass | Review result and actual revision |
+|---|---|
+| 1 | Replaced obsolete release/generator prerequisites; represented already parked designs and operator tasks as deferred, preserving their evidence. |
+| 2 | Direct MCP probing confirmed capacity bypass and discovered literal-resource shadowing; added routing work, transport coverage and engine proof; corrected due versus defer semantics in the model. |
+| 3 | Added behavioral automatic-import proof to semantic documentation; separated preflight, commit, publication and remote-transfer outcomes. |
+| 4 | Refreshed Track F, preserved original startup objectives, made workload/baseline and failure evidence explicit, and deferred old unmeasured/upstream work with concrete triggers. |
+| 5 | `br ready` exposed parent-inherited starvation that cycle metrics missed: Track F depended on proof `.10`, which depended on its own child `zxfz.1`. Changed cross-track links to `related`; final integration still requires the campaign. |
+| 6 | Reread all twelve final children and revised epic dependencies; checked expected ready leaves, proof dependencies, preserved requirements, failure semantics, ownership and graph results. No further plan or bead changes were needed. |
+
+Final validation evidence:
+
+- Lib binary produced by `RCH_REQUIRE_REMOTE=1 rch exec
+  --source-content-receipt -- cargo test --lib --locked` was re-executed through
+  `rch exec --job -- <retained-lib-binary> --quiet` on `hz4`: **2,969 passed,
+  0 failed, 4 ignored**, 240.92 seconds, remote exit 0. The initial compile took
+  23m39s and its combined compile/test invocation exceeded the 30-minute cap.
+- MCP binary produced by the analogous `cargo test --test e2e_mcp_protocol
+  --features mcp --locked` invocation was re-executed through RCH job mode on
+  `ovh-a`: **1 passed, 0 failed**, 1.58 seconds, remote exit 0. This is transport
+  smoke proof; the separately reproduced policy/routing failures remain open.
+- The initial source-content receipt attempts failed their post-command barrier
+  because this plan was changing. Two clean-overlay retries began fresh caches
+  and were explicitly cancelled in favor of the retained compiled binaries.
+  Independent post-run comparison of all Rust files under src/tests/benches
+  together with Cargo.toml/Cargo.lock/build.rs/rust-toolchain.toml (297 files
+  total) matched locally and in
+  both retained source roots: digest
+  `66903719adcdd7473c11f7804eb7f38af94d99308e39e260c6f8f1b542aacd80`.
+  This is a scoped source comparison, not a successful whole-tree RCH receipt.
+- The MCP failure receipt was copied locally to
+  `/tmp/br-reality-evidence-7g7ftwr6/mcp-policy-receipt.json`; its original worker
+  workspace and the released-binary smoke/selftest workspaces were retained.
+- Current-source [CI run 33920447209](https://github.com/Dicklesworthstone/beads_rust/actions/runs/33920447209)
+  had Check and Security Audit green at the last inspection; remaining test
+  shards were queued/running. Push-skipped reliability/build/version/benchmark
+  jobs are not passes. The prior help-snapshot failure remains separately tracked.
+- `br dep cycles --json`: zero cycles. `bv --robot-insights`: computed empty
+  Cycles; `bv --robot-triage`: phase 2 ready, graph has no cycles. Actual
+  `br ready` includes all nine intended implementation leaves, including restored
+  `zxfz.1`, and excludes their dependent proof work. Graph rankings are advisory;
+  the old forecast's low-confidence ETA is not a delivery commitment.
+- `git diff --check` and `cargo fmt --check` passed. UBS was invoked on both changed files and exited 3
+  because Markdown/JSONL are unsupported; **nothing was scanned**, not a pass.
+  No Rust or workflow implementation changed in this audit. Product compilation
+  and workflow gates remain mandatory in the implementation beads.
+
+This audit creates one campaign, twelve implementation/proof children and one
+completed-audit record. It does not close the campaign or claim its fixes shipped.
+
+## Historical baseline — 2026-09-01
+
 **Reality check date:** 2026-09-01
 **Plan revision:** 3 (two ambition rounds applied in place; see §9)
 **Baseline:** installed `br 0.5.7` = Cargo.toml 0.5.7 = latest GitHub release (2026-08-29); `main` at `ebc34bd7` (fsqlite 0.3.14)
