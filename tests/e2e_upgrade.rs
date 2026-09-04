@@ -110,14 +110,19 @@ fn e2e_upgrade_check_attempts_api_call() {
     let workspace = BrWorkspace::new();
 
     let upgrade = run_br(&workspace, ["upgrade", "--check"], "upgrade_check");
-    // May succeed or fail depending on network, but should handle gracefully
-    // Either outputs version info (success) or error JSON (failure)
+    // May succeed or fail depending on network (hosted runners often sit at
+    // the unauthenticated GitHub API rate limit); either version info or a
+    // reported failure is acceptable, a silent exit is not.
+    let reported_failure = !upgrade.status.success() && !upgrade.stderr.trim().is_empty();
     assert!(
         upgrade.stdout.contains("version")
             || upgrade.stdout.contains("error")
             || upgrade.stderr.contains("error")
-            || upgrade.stderr.contains("NetworkError"),
-        "upgrade --check should output version or error info"
+            || reported_failure,
+        "upgrade --check should output version info or report the lookup failure\nexit: {:?}\nstdout: {}\nstderr: {}",
+        upgrade.status,
+        upgrade.stdout,
+        upgrade.stderr
     );
 }
 
@@ -244,7 +249,12 @@ fn e2e_upgrade_dry_run_quiet_suppresses_output() {
 #[cfg(feature = "self_update")]
 #[test]
 fn e2e_upgrade_with_version_flag() {
-    // Upgrade --version <ver> should accept version argument
+    // `--version <ver>` must be accepted by the parser. What follows is a
+    // GitHub releases lookup: with network access the dry run names the
+    // target version; without it, or under the unauthenticated API rate
+    // limit hosted runners often hit, the command fails with a reported
+    // error (`Error: Upgrade failed: ...`). Either outcome is fine; a parse
+    // failure or a silent exit is not.
     let workspace = BrWorkspace::new();
 
     let upgrade = run_br(
@@ -252,14 +262,21 @@ fn e2e_upgrade_with_version_flag() {
         ["upgrade", "--version", "0.1.0", "--dry-run"],
         "upgrade_specific_version",
     );
-    // Should process the version argument (may fail on network, but should parse args)
-    // Not checking exit code since network may fail
     assert!(
-        upgrade.stdout.contains("0.1.0")
-            || upgrade.stderr.contains("0.1.0")
-            || upgrade.stderr.contains("NetworkError")
-            || upgrade.stdout.contains("error"),
-        "should reference version or show network error"
+        !upgrade.stderr.contains("unknown argument")
+            && !upgrade.stderr.contains("unrecognized")
+            && !upgrade.stderr.contains("invalid value"),
+        "--version 0.1.0 should be accepted by the parser: {}",
+        upgrade.stderr
+    );
+    let references_version = upgrade.stdout.contains("0.1.0") || upgrade.stderr.contains("0.1.0");
+    let reported_failure = !upgrade.status.success() && !upgrade.stderr.trim().is_empty();
+    assert!(
+        references_version || reported_failure,
+        "should name the target version or report the lookup failure\nexit: {:?}\nstdout: {}\nstderr: {}",
+        upgrade.status,
+        upgrade.stdout,
+        upgrade.stderr
     );
 }
 

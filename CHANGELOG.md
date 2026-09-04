@@ -137,6 +137,21 @@ this repo): commits `55c186682` + `5946b3b7c` in
   hosted `misc` shard hit that case once the import verifier fix let the
   binary run. A deterministic regression case covers both orientations and
   the non-blocking edge.
+- The multi-process linearizability check (`tests/linearizability_multiprocess.rs`)
+  ends its workload with a quiescent read pass (one `show --json` per issue,
+  appended to the history) so a linearization has to end in the state the
+  database actually reached. Two overlapping writes on one issue with no
+  later read admit two valid end states, and the check compared the
+  published JSONL against whichever the search found first; on the hosted
+  `misc` shard (run 33881198051) that produced a false "published JSONL
+  diverges from the linearized final state" for one issue's priority.
+- `tests/e2e_upgrade.rs`'s pinned-version dry run accepts a reported lookup
+  failure (non-zero exit with a message) as well as the named target
+  version. It required the output to contain the version, `NetworkError`,
+  or a lowercase `error`, and the unauthenticated GitHub API rate limit
+  hosted runners hit yields `Error: Upgrade failed: ...`, none of those; the
+  e2e m–z shard failed on it in the same run. The parse-acceptance check
+  stays, and the failure message now carries the outputs.
 
 ## v0.5.10 -- 2026-09-04 (Release)
 

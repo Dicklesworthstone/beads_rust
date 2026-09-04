@@ -12,9 +12,12 @@
 //! `show --json` observations are compared field by field with the model;
 //! mutations that exited non-zero may have taken effect or not.
 //!
-//! After the run the database must pass `PRAGMA integrity_check`, its rowids
-//! must be dense, and the JSONL published by `br sync --flush-only` must match
-//! the linearized final state of every issue.
+//! After the workers stop, a quiescent read pass appends one `show --json`
+//! observation per issue to the history, so a linearization must end in the
+//! state the database actually reached (two overlapping writes with no later
+//! read would otherwise leave more than one valid end state). The database
+//! must then pass `PRAGMA integrity_check`, its rowids must be dense, and the
+//! JSONL published by `br sync --flush-only` must match that final state.
 //!
 //! Knobs: `BR_LINEARIZABILITY_PROCESSES` (default 8),
 //! `BR_LINEARIZABILITY_SECONDS` (default 30), and
@@ -1011,6 +1014,32 @@ fn concurrent_br_histories_are_linearizable_and_match_the_published_jsonl() {
             .map(|entry| describe(entry))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+
+    // Quiescent read pass: one `show` per issue after every worker has
+    // returned, appended to the history under a pid of its own. Two
+    // overlapping writes on a key with no later read admit more than one
+    // valid end state; these reads pin the one the database reached, so the
+    // checker's final states are observations rather than one of several
+    // admissible orders (the JSONL comparison below relies on that).
+    let final_keys: Vec<String> = keys.iter().map(|key| (*key).to_string()).collect();
+    let quiescent_pid = processes;
+    let mut unobserved = Vec::new();
+    for (seq, key) in final_keys.iter().enumerate() {
+        let entry = harness.execute(quiescent_pid, seq, key, Op::Show);
+        if !matches!(entry.outcome, Outcome::Observed(_)) {
+            unobserved.push(describe(&entry));
+        }
+        entries.push(entry);
+    }
+    eprintln!(
+        "[linearizability] quiescent read pass: {} issues observed",
+        final_keys.len()
+    );
+    assert!(
+        unobserved.is_empty(),
+        "every issue in the history must be observable once the workers have stopped:\n{}",
+        unobserved.join("\n")
     );
 
     let seeded: BTreeMap<String, KeyState> = {
