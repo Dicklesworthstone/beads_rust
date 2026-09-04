@@ -59,7 +59,11 @@ fn is_binary(path: &std::path::Path) -> bool {
 }
 
 fn is_transient_sqlite(name: &str) -> bool {
-    name.ends_with("-wal")
+    // The sole-opener lease (`.br-db-openers-<hash>.lock`, #457) is a flock
+    // target that persists beside the database by design; init's .gitignore
+    // covers it (`*.lock`) and `br doctor`'s engine block accounts for it.
+    (name.starts_with(".br-db-openers-") && name.ends_with(".lock"))
+        || name.ends_with("-wal")
         || name.ends_with("-wal-cert")
         || name.ends_with("-wal-cert-head")
         || name.ends_with("-shm")
