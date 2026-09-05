@@ -14,15 +14,15 @@
 mod common;
 
 use common::cli::parse_list_issues;
-use common::harness::{TestWorkspace, extract_json_payload};
+use common::harness::TestWorkspace;
 use common::scenarios::{WorkspaceEvolutionEventKind, catalog};
 use serde_json::Value;
 use tempfile::TempDir;
 
 fn parse_json_stdout(stdout: &str, context: &str) -> Value {
-    let payload = extract_json_payload(stdout);
-    let message = format!("parse {context} json payload: {payload}");
-    serde_json::from_str(&payload).expect(&message)
+    serde_json::from_str(stdout).unwrap_or_else(|error| {
+        panic!("whole {context} stdout must be one JSON value: {error}\n{stdout}")
+    })
 }
 
 fn assert_doctor_json_has_healthy_checks(json: &Value) {
@@ -116,18 +116,54 @@ fn scenario_init_reinit_rejected_without_force() {
 fn scenario_init_json_output() {
     let mut ws = TestWorkspace::new("e2e_workspace", "init_json");
 
-    // Init with JSON output
-    let init = ws.run_br(["init", "--json"], "init_json");
+    let init = ws.run_br(["init", "--prefix", "scenario", "--json"], "init_json");
     init.assert_success();
 
-    let payload = extract_json_payload(&init.stdout);
-    if !payload.is_empty() && (payload.starts_with('{') || payload.starts_with('[')) {
-        let json: Value = serde_json::from_str(&payload).expect("parse init json");
+    let receipt = parse_json_stdout(&init.stdout, "init");
+    let beads_dir = dunce::canonicalize(&ws.beads_dir).expect("initialized beads directory");
+    assert_eq!(
+        receipt,
+        serde_json::json!({
+            "initialized": true,
+            "beads_dir": beads_dir,
+            "database_path": beads_dir.join("beads.db"),
+            "prefix": "scenario",
+            "files": {
+                "directory": "created",
+                "database": "created",
+                "metadata": "created",
+                "config": "created",
+                "gitignore": "created",
+                "jsonl": "created"
+            }
+        })
+    );
+    for name in [
+        "beads.db",
+        "metadata.json",
+        "config.yaml",
+        ".gitignore",
+        "issues.jsonl",
+    ] {
         assert!(
-            json.get("path").is_some() || json.get("workspace").is_some(),
-            "init JSON should contain path or workspace field"
+            beads_dir.join(name).is_file(),
+            "init receipt claims a missing file: {name}"
         );
     }
+
+    let title = "Initialized workspace witness";
+    let create = ws.run_br(["create", title, "--json"], "create_after_init");
+    create.assert_success();
+    let created = parse_json_stdout(&create.stdout, "create after init");
+    let id = created["id"].as_str().expect("created issue ID");
+    assert!(id.starts_with("scenario-"), "stored prefix differs: {id}");
+
+    let show = ws.run_br(["show", id, "--json"], "show_after_init");
+    show.assert_success();
+    let shown = parse_json_stdout(&show.stdout, "show after init");
+    assert_eq!(shown.as_array().expect("shown issue array").len(), 1);
+    assert_eq!(shown[0]["id"], id);
+    assert_eq!(shown[0]["title"], title);
 
     ws.finish(true);
 }
@@ -164,8 +200,7 @@ fn scenario_config_list_json() {
     let list = ws.run_br(["config", "list", "--json"], "config_list_json");
     list.assert_success();
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Value = serde_json::from_str(&payload).expect("parse config list json");
+    let json = parse_json_stdout(&list.stdout, "config list");
     assert!(json.is_object(), "config list --json should return object");
 
     ws.finish(true);
@@ -323,8 +358,7 @@ fn scenario_info_json_output() {
     let info = ws.run_br(["info", "--json"], "info_json");
     info.assert_success();
 
-    let payload = extract_json_payload(&info.stdout);
-    let json: Value = serde_json::from_str(&payload).expect("parse info json");
+    let json = parse_json_stdout(&info.stdout, "info");
     assert!(json.is_object(), "info --json should return object");
 
     ws.finish(true);
@@ -398,8 +432,7 @@ fn scenario_version_json() {
     let version = ws.run_br(["version", "--json"], "version_json");
     version.assert_success();
 
-    let payload = extract_json_payload(&version.stdout);
-    let json: Value = serde_json::from_str(&payload).expect("parse version json");
+    let json = parse_json_stdout(&version.stdout, "version");
 
     // Check expected fields
     assert!(
