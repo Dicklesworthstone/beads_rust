@@ -1252,11 +1252,14 @@ Semantics of a future `defer_until` on an issue that is **not** `deferred`:
   2026-09-11 (ready in 7 days)`).
 - **`br ready --include-deferred` surfaces it anyway** when a caller wants the
   gated backlog too.
-- **JSONL export carries `defer_until`**, so the schedule syncs through git and
-  older readers that do not know the field ignore it.
+- **`defer_until` is a first-class field** in `--json`/`--format toon` output
+  and in the JSONL export, so the schedule travels with the repo and agents can
+  read it directly.
 - **No transition is needed when the date arrives.** The gate is compared at
   query time, so the bead becomes ready on its own; nothing has to run
   `br undefer` (that is only for issues whose *status* is `deferred`).
+- **Date parsing** accepts RFC3339 (`2026-09-11T09:00:00Z`), a bare
+  `YYYY-MM-DD` (09:00 local time), and relative forms (`+1w`, `tomorrow`).
 
 A recurring task is therefore one epic holding a batch of children, each with
 its own `--defer` a week apart. `br defer <id> --until <date>` remains the

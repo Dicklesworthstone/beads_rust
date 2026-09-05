@@ -747,15 +747,15 @@ fn ready_ids(workspace: &BrWorkspace, args: &[&str], label: &str) -> Vec<String>
         .collect()
 }
 
-#[test]
-fn scheduled_open_issue_is_hidden_from_ready_until_its_date() {
-    common::init_test_logging();
-    info!("scheduled_open_issue_is_hidden_from_ready_until_its_date: starting");
+/// A workspace holding one ungated control issue (so an empty `br ready` can
+/// never make a gating assertion pass by accident) and one `open` bead whose
+/// `defer_until` sits far in the future. Returns
+/// `(workspace, scheduled_id, control_id)`.
+fn setup_scheduled_workspace() -> (BrWorkspace, String, String) {
     let workspace = BrWorkspace::new();
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    // A control issue with no gate, so an empty ready list cannot pass by accident.
     let control = run_br(
         &workspace,
         ["create", "Ungated work", "-p", "2", "-t", "task"],
@@ -768,7 +768,6 @@ fn scheduled_open_issue_is_hidden_from_ready_until_its_date() {
     );
     let control_id = parse_created_id(&control.stdout);
 
-    // The scheduled bead: created `open`, gated by a future date.
     let create = run_br(
         &workspace,
         [
@@ -779,12 +778,26 @@ fn scheduled_open_issue_is_hidden_from_ready_until_its_date() {
             "-t",
             "task",
             "--defer",
-            "2099-12-31T09:00:00Z",
+            SCHEDULED_GATE,
         ],
         "create_scheduled",
     );
     assert!(create.status.success(), "create failed: {}", create.stderr);
     let id = parse_created_id(&create.stdout);
+
+    (workspace, id, control_id)
+}
+
+/// Explicit RFC3339 so the stored instant does not depend on the host's zone
+/// (a bare `YYYY-MM-DD` is parsed as 09:00 *local* time).
+const SCHEDULED_GATE: &str = "2099-12-31T09:00:00Z";
+const SCHEDULED_GATE_DATE: &str = "2099-12-31";
+
+#[test]
+fn scheduled_open_issue_is_hidden_from_ready_until_its_date() {
+    common::init_test_logging();
+    info!("scheduled_open_issue_is_hidden_from_ready_until_its_date: starting");
+    let (workspace, id, control_id) = setup_scheduled_workspace();
 
     // `--defer` must NOT flip the status: the bead is real, open work whose
     // start date has not arrived.
@@ -800,7 +813,7 @@ fn scheduled_open_issue_is_hidden_from_ready_until_its_date() {
     assert!(
         shown[0]["defer_until"]
             .as_str()
-            .is_some_and(|d| d.contains("2099-12-31")),
+            .is_some_and(|d| d.contains(SCHEDULED_GATE_DATE)),
         "defer_until must round-trip: {}",
         shown[0]
     );
@@ -813,9 +826,11 @@ fn scheduled_open_issue_is_hidden_from_ready_until_its_date() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
     let listed = parse_list_issues(&list.stdout);
-    let listed_ids: Vec<&str> = listed.iter().filter_map(|i| i["id"].as_str()).collect();
     assert!(
-        listed_ids.contains(&id.as_str()),
+        listed
+            .iter()
+            .filter_map(|i| i["id"].as_str())
+            .any(|listed_id| listed_id == id),
         "a scheduled bead is still open work and must appear in `br list --status open`"
     );
 
@@ -845,20 +860,32 @@ fn scheduled_open_issue_is_hidden_from_ready_until_its_date() {
         show_text.stderr
     );
     assert!(
-        show_text.stdout.contains("Deferred until: 2099-12-31")
+        show_text
+            .stdout
+            .contains(&format!("Deferred until: {SCHEDULED_GATE_DATE}"))
             && show_text.stdout.contains("(ready in "),
         "show should annotate the gate countdown: {}",
         show_text.stdout
     );
+    info!("scheduled_open_issue_is_hidden_from_ready_until_its_date: assertions passed");
+}
 
-    // The gate elapses (simulated by moving it into the past) and the bead
-    // becomes ready with no status transition and no undefer.
+#[test]
+fn an_elapsed_defer_gate_releases_the_issue_without_a_status_change() {
+    common::init_test_logging();
+    info!("an_elapsed_defer_gate_releases_the_issue_without_a_status_change: starting");
+    let (workspace, id, _control_id) = setup_scheduled_workspace();
+    assert!(!ready_ids(&workspace, &[], "ready_gated").contains(&id));
+
+    // The gate elapsing is simulated by moving it into the past; the point is
+    // that nothing else changes — no transition, no `br undefer`.
     let update = run_br(
         &workspace,
         ["update", &id, "--defer", "2000-01-01T09:00:00Z"],
         "update_past_gate",
     );
     assert!(update.status.success(), "update failed: {}", update.stderr);
+
     let elapsed = ready_ids(&workspace, &[], "ready_elapsed");
     assert!(
         elapsed.contains(&id),
@@ -866,40 +893,34 @@ fn scheduled_open_issue_is_hidden_from_ready_until_its_date() {
     );
 
     let show_after = run_br(&workspace, ["show", &id, "--json"], "show_after");
+    assert!(
+        show_after.status.success(),
+        "show failed: {}",
+        show_after.stderr
+    );
+    let shown: Value =
+        serde_json::from_str(&extract_json_payload(&show_after.stdout)).expect("valid show json");
     assert_eq!(
-        serde_json::from_str::<Value>(&extract_json_payload(&show_after.stdout)).unwrap()[0]
-            ["status"]
-            .as_str(),
+        shown[0]["status"].as_str(),
         Some("open"),
         "the gate must never have changed the status"
     );
-    info!("scheduled_open_issue_is_hidden_from_ready_until_its_date: assertions passed");
+    // An elapsed gate no longer constrains anything, so `br show` must not
+    // annotate it with a countdown.
+    let show_text = run_br(&workspace, ["show", &id], "show_text_after");
+    assert!(
+        !show_text.stdout.contains("(ready in "),
+        "an elapsed gate must not be annotated: {}",
+        show_text.stdout
+    );
+    info!("an_elapsed_defer_gate_releases_the_issue_without_a_status_change: assertions passed");
 }
 
 #[test]
 fn scheduled_gate_round_trips_through_jsonl() {
     common::init_test_logging();
     info!("scheduled_gate_round_trips_through_jsonl: starting");
-    let workspace = BrWorkspace::new();
-    let init = run_br(&workspace, ["init"], "init");
-    assert!(init.status.success(), "init failed: {}", init.stderr);
-
-    let create = run_br(
-        &workspace,
-        [
-            "create",
-            "Quarterly license sweep",
-            "-p",
-            "2",
-            "-t",
-            "task",
-            "--defer",
-            "2099-12-31T09:00:00Z",
-        ],
-        "create_scheduled",
-    );
-    assert!(create.status.success(), "create failed: {}", create.stderr);
-    let id = parse_created_id(&create.stdout);
+    let (workspace, id, _control_id) = setup_scheduled_workspace();
 
     let flush = run_br(&workspace, ["sync", "--flush-only"], "flush");
     assert!(flush.status.success(), "flush failed: {}", flush.stderr);
@@ -925,7 +946,7 @@ fn scheduled_gate_round_trips_through_jsonl() {
     assert!(
         record["defer_until"]
             .as_str()
-            .is_some_and(|d| d.contains("2099-12-31")),
+            .is_some_and(|d| d.contains(SCHEDULED_GATE_DATE)),
         "JSONL export must carry the gate: {record}"
     );
     info!("scheduled_gate_round_trips_through_jsonl: assertions passed");
@@ -936,26 +957,7 @@ fn scheduled_gate_round_trips_through_jsonl() {
 fn clearing_the_defer_gate_releases_an_open_issue_into_ready() {
     common::init_test_logging();
     info!("clearing_the_defer_gate_releases_an_open_issue_into_ready: starting");
-    let workspace = BrWorkspace::new();
-    let init = run_br(&workspace, ["init"], "init");
-    assert!(init.status.success(), "init failed: {}", init.stderr);
-
-    let create = run_br(
-        &workspace,
-        [
-            "create",
-            "Revisit after the release freeze",
-            "-p",
-            "1",
-            "-t",
-            "task",
-            "--defer",
-            "2099-12-31T09:00:00Z",
-        ],
-        "create_scheduled",
-    );
-    assert!(create.status.success(), "create failed: {}", create.stderr);
-    let id = parse_created_id(&create.stdout);
+    let (workspace, id, _control_id) = setup_scheduled_workspace();
     assert!(!ready_ids(&workspace, &[], "ready_gated").contains(&id));
 
     let clear = run_br(&workspace, ["update", &id, "--defer", ""], "clear_gate");
