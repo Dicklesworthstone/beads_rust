@@ -720,3 +720,299 @@ fn undefer_appears_in_ready() {
     );
     info!("undefer_appears_in_ready: assertions passed");
 }
+
+// =============================================================================
+// Scheduled ("not before this date") beads — GitHub #489
+//
+// `defer_until` is a time gate, not merely a companion to the `deferred`
+// status: `br ready` excludes ANY issue whose `defer_until` is in the future,
+// including a plain `open` one. That is what makes a recurring or time-gated
+// bead expressible without a daemon — the bead stays `open` and visible in
+// `br list`, but no agent picks it up before its date. These tests pin that
+// contract end to end so it cannot regress into a status-only feature.
+// =============================================================================
+
+/// Helper: ids present in a `br ready --json` payload.
+fn ready_ids(workspace: &BrWorkspace, args: &[&str], label: &str) -> Vec<String> {
+    let mut argv = vec!["ready", "--json"];
+    argv.extend_from_slice(args);
+    let ready = run_br(workspace, argv, label);
+    assert!(ready.status.success(), "ready failed: {}", ready.stderr);
+    let issues: Vec<Value> = serde_json::from_str(&ready.stdout).expect("valid ready json");
+    issues
+        .iter()
+        .map(|i| i["id"].as_str().expect("ready issue has an id"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// A workspace holding one ungated control issue (so an empty `br ready` can
+/// never make a gating assertion pass by accident) and one `open` bead whose
+/// `defer_until` sits far in the future. Returns
+/// `(workspace, scheduled_id, control_id)`.
+fn setup_scheduled_workspace() -> (BrWorkspace, String, String) {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let control = run_br(
+        &workspace,
+        ["create", "Ungated work", "-p", "2", "-t", "task"],
+        "create_control",
+    );
+    assert!(
+        control.status.success(),
+        "create failed: {}",
+        control.stderr
+    );
+    let control_id = parse_created_id(&control.stdout);
+
+    let create = run_br(
+        &workspace,
+        [
+            "create",
+            "Weekly dependency audit",
+            "-p",
+            "2",
+            "-t",
+            "task",
+            "--defer",
+            SCHEDULED_GATE,
+        ],
+        "create_scheduled",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let id = parse_created_id(&create.stdout);
+
+    (workspace, id, control_id)
+}
+
+/// Explicit RFC3339 so the stored instant does not depend on the host's zone
+/// (a bare `YYYY-MM-DD` is parsed as 09:00 *local* time).
+const SCHEDULED_GATE: &str = "2099-12-31T09:00:00Z";
+const SCHEDULED_GATE_DATE: &str = "2099-12-31";
+
+#[test]
+fn scheduled_open_issue_is_hidden_from_ready_until_its_date() {
+    common::init_test_logging();
+    info!("scheduled_open_issue_is_hidden_from_ready_until_its_date: starting");
+    let (workspace, id, control_id) = setup_scheduled_workspace();
+
+    // `--defer` must NOT flip the status: the bead is real, open work whose
+    // start date has not arrived.
+    let show = run_br(&workspace, ["show", &id, "--json"], "show_scheduled");
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let shown: Value = serde_json::from_str(&show.stdout).expect("valid show json");
+    assert_eq!(
+        shown[0]["status"].as_str(),
+        Some("open"),
+        "--defer must not change status"
+    );
+    assert_eq!(shown[0]["defer_until"].as_str(), Some(SCHEDULED_GATE));
+
+    // It stays visible as open work.
+    let list = run_br(
+        &workspace,
+        ["list", "--status", "open", "--json"],
+        "list_open",
+    );
+    assert!(list.status.success(), "list failed: {}", list.stderr);
+    let listed: Value = serde_json::from_str(&list.stdout).expect("valid list json");
+    let listed = listed["issues"].as_array().expect("list issues array");
+    assert!(
+        listed
+            .iter()
+            .filter_map(|i| i["id"].as_str())
+            .any(|listed_id| listed_id == id),
+        "a scheduled bead is still open work and must appear in `br list --status open`"
+    );
+
+    // But no agent picks it up.
+    let gated = ready_ids(&workspace, &[], "ready_gated");
+    assert!(
+        !gated.contains(&id),
+        "a future defer_until must gate an open issue out of ready: {gated:?}"
+    );
+    assert!(
+        gated.contains(&control_id),
+        "the ungated control issue must still be ready: {gated:?}"
+    );
+
+    // ...unless the caller explicitly asks for gated work.
+    let including = ready_ids(&workspace, &["--include-deferred"], "ready_including");
+    assert!(
+        including.contains(&id),
+        "--include-deferred must surface a time-gated open issue: {including:?}"
+    );
+
+    // `br show` text mode states how long the gate still has to run.
+    let show_text = run_br(&workspace, ["show", &id], "show_text");
+    assert!(
+        show_text.status.success(),
+        "show failed: {}",
+        show_text.stderr
+    );
+    assert!(
+        show_text
+            .stdout
+            .contains(&format!("Deferred until: {SCHEDULED_GATE_DATE}"))
+            && show_text.stdout.contains("(gate opens in ")
+            && !show_text.stdout.contains("(ready in "),
+        "show should annotate the gate countdown: {}",
+        show_text.stdout
+    );
+    info!("scheduled_open_issue_is_hidden_from_ready_until_its_date: assertions passed");
+}
+
+#[test]
+fn an_elapsed_defer_gate_releases_the_issue_without_a_status_change() {
+    common::init_test_logging();
+    info!("an_elapsed_defer_gate_releases_the_issue_without_a_status_change: starting");
+    let (workspace, id, _control_id) = setup_scheduled_workspace();
+    assert!(!ready_ids(&workspace, &[], "ready_gated").contains(&id));
+
+    // The gate elapsing is simulated by moving it into the past; the point is
+    // that nothing else changes — no transition, no `br undefer`.
+    let update = run_br(
+        &workspace,
+        ["update", &id, "--defer", "2000-01-01T09:00:00Z"],
+        "update_past_gate",
+    );
+    assert!(update.status.success(), "update failed: {}", update.stderr);
+
+    let elapsed = ready_ids(&workspace, &[], "ready_elapsed");
+    assert!(
+        elapsed.contains(&id),
+        "an elapsed defer_until must release the issue into ready: {elapsed:?}"
+    );
+
+    let show_after = run_br(&workspace, ["show", &id, "--json"], "show_after");
+    assert!(
+        show_after.status.success(),
+        "show failed: {}",
+        show_after.stderr
+    );
+    let shown: Value = serde_json::from_str(&show_after.stdout).expect("valid show json");
+    assert_eq!(
+        shown[0]["status"].as_str(),
+        Some("open"),
+        "the gate must never have changed the status"
+    );
+    // An elapsed gate no longer constrains anything, so `br show` must not
+    // annotate it with a countdown.
+    let show_text = run_br(&workspace, ["show", &id], "show_text_after");
+    assert!(
+        show_text.status.success(),
+        "show failed: {}",
+        show_text.stderr
+    );
+    assert!(
+        show_text.stdout.contains("Deferred until: 2000-01-01")
+            && !show_text.stdout.contains("(gate opens in ")
+            && !show_text.stdout.contains("(ready in "),
+        "an elapsed gate must not be annotated: {}",
+        show_text.stdout
+    );
+    info!("an_elapsed_defer_gate_releases_the_issue_without_a_status_change: assertions passed");
+}
+
+#[test]
+fn elapsed_defer_gate_does_not_release_an_open_issue_with_a_blocker() {
+    let (workspace, id, blocker_id) = setup_scheduled_workspace();
+    let dep = run_br(&workspace, ["dep", "add", &id, &blocker_id], "add_blocker");
+    assert!(dep.status.success(), "dep add failed: {}", dep.stderr);
+
+    let future = run_br(&workspace, ["show", &id], "show_blocked_future");
+    assert!(future.status.success(), "show failed: {}", future.stderr);
+    assert!(
+        future.stdout.contains(&id)
+            && future.stdout.contains(&blocker_id)
+            && future.stdout.contains("(gate opens in ")
+            && !future.stdout.contains("(ready in "),
+        "blocked open issue must show only its time gate: {}",
+        future.stdout
+    );
+
+    let update = run_br(
+        &workspace,
+        ["update", &id, "--defer", "2000-01-01T09:00:00Z"],
+        "elapsed_blocked_gate",
+    );
+    assert!(update.status.success(), "update failed: {}", update.stderr);
+    let shown = run_br(&workspace, ["show", &id, "--json"], "show_blocked_open");
+    assert!(shown.status.success(), "show failed: {}", shown.stderr);
+    let issues: Vec<Value> = serde_json::from_str(&shown.stdout).expect("valid show json");
+    assert_eq!(issues[0]["status"].as_str(), Some("open"));
+
+    let ready = ready_ids(&workspace, &[], "ready_still_blocked");
+    assert!(
+        ready.contains(&blocker_id),
+        "control must be ready: {ready:?}"
+    );
+    assert!(
+        !ready.contains(&id),
+        "dependency still blocks issue: {ready:?}"
+    );
+    let elapsed = run_br(&workspace, ["show", &id], "show_blocked_elapsed");
+    assert!(elapsed.status.success(), "show failed: {}", elapsed.stderr);
+    assert!(
+        elapsed.stdout.contains("Deferred until: 2000-01-01")
+            && elapsed.stdout.contains(&blocker_id)
+            && !elapsed.stdout.contains("(gate opens in ")
+            && !elapsed.stdout.contains("(ready in "),
+        "elapsed gate must not promise readiness: {}",
+        elapsed.stdout
+    );
+
+    let close = run_br(&workspace, ["close", &blocker_id], "close_blocker");
+    assert!(close.status.success(), "close failed: {}", close.stderr);
+    assert!(
+        ready_ids(&workspace, &[], "ready_after_blocker_closed").contains(&id),
+        "elapsed open issue becomes ready once its remaining blocker closes"
+    );
+}
+
+#[test]
+fn scheduled_gate_is_preserved_in_jsonl_export() {
+    common::init_test_logging();
+    info!("scheduled_gate_is_preserved_in_jsonl_export: starting");
+    let (workspace, id, _control_id) = setup_scheduled_workspace();
+
+    let flush = run_br(&workspace, ["sync", "--flush-only"], "flush");
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+
+    let jsonl_path = workspace.root.join(".beads/issues.jsonl");
+    let jsonl = std::fs::read_to_string(&jsonl_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", jsonl_path.display()));
+    let records: Vec<Value> = jsonl
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid JSONL record"))
+        .collect();
+    let record = records
+        .iter()
+        .find(|v| v["id"].as_str() == Some(id.as_str()))
+        .unwrap_or_else(|| panic!("no JSONL record for {id} in {jsonl}"));
+
+    assert_eq!(record["status"].as_str(), Some("open"));
+    assert_eq!(record["defer_until"].as_str(), Some(SCHEDULED_GATE));
+    info!("scheduled_gate_is_preserved_in_jsonl_export: assertions passed");
+}
+
+/// Clearing the gate (`--defer ''`) releases the bead immediately.
+#[test]
+fn clearing_the_defer_gate_releases_an_open_issue_into_ready() {
+    common::init_test_logging();
+    info!("clearing_the_defer_gate_releases_an_open_issue_into_ready: starting");
+    let (workspace, id, _control_id) = setup_scheduled_workspace();
+    assert!(!ready_ids(&workspace, &[], "ready_gated").contains(&id));
+
+    let clear = run_br(&workspace, ["update", &id, "--defer", ""], "clear_gate");
+    assert!(clear.status.success(), "update failed: {}", clear.stderr);
+
+    let released = ready_ids(&workspace, &[], "ready_released");
+    assert!(
+        released.contains(&id),
+        "clearing defer_until must release the issue: {released:?}"
+    );
+    info!("clearing_the_defer_gate_releases_an_open_issue_into_ready: assertions passed");
+}

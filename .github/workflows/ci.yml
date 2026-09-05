@@ -369,6 +369,7 @@ jobs:
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2.9.1
 
       - name: Build pinned release artifacts before measurement
+        id: benchmark_build
         run: |
           set -euo pipefail
           mkdir -p "$BR_PERF_EVIDENCE"
@@ -403,8 +404,92 @@ jobs:
               env.write('BR_PERF_HARNESS=' + executables.pop() + '\n')
           PY
 
+      - name: Measure planted ready slowdown control
+        run: |
+          set -euo pipefail
+          directory="$BR_PERF_EVIDENCE/planted-ready"
+          mkdir -p "$directory"
+          # This 100% threshold tests sensitivity to 20 real ready invocations;
+          # it is a diagnostic control, never an accepted workload SLO.
+          set +e
+          (
+            set -e
+            unset BR_PERF_BUDGETS_JSON
+            export BR_PERF_OUTPUT="$directory"
+            export BR_PERF_WORKLOAD=1000-ready-default-auto-flush
+            export BR_PERF_NEGATIVE_EXTRA_WORK=20 BR_PERF_BUDGET_PCT=100
+            export BR_PERF_ABBA_BLOCKS=10 BR_PERF_QUIET_RUNNER=1
+            export BR_PERF_BASELINE_BINARY="$BR_PERF_CANDIDATE_BINARY"
+            export BR_PERF_BASELINE_SHA256="$BR_PERF_CANDIDATE_SHA256"
+            export BR_PERF_BASELINE_LOCKFILE="$BR_PERF_CANDIDATE_LOCKFILE"
+            export BR_PERF_BASELINE_LOCK_SHA256="$BR_PERF_CANDIDATE_LOCK_SHA256"
+            export BR_PERF_BASELINE_SOURCE="$BR_PERF_CANDIDATE_SOURCE"
+            timeout --signal=TERM --kill-after=10s 1800s "$BR_PERF_HARNESS" --exact release_abba::release_cli_abba_1k_10k --ignored --nocapture
+          ) 2>&1 | tee "$directory/collector.log"
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          printf '%s\n' "${pipeline_status[0]}" > "$directory/collector.exit"
+          printf '%s\n' "${pipeline_status[1]}" > "$directory/log-capture.exit"
+          if (( pipeline_status[0] != 0 )); then exit "${pipeline_status[0]}"; fi
+          if (( pipeline_status[1] != 0 )); then exit "${pipeline_status[1]}"; fi
+          python3 - <<'PY'
+          import json, math, os, pathlib
+          directory = pathlib.Path(os.environ['BR_PERF_EVIDENCE'], 'planted-ready')
+          name = '1000-ready-default-auto-flush'
+          try:
+              run = json.loads((directory / 'run.json').read_text())
+              if type(run['completed_workloads']) is not int or not isinstance(run['latency_gate_exits'], list) or any(type(code) is not int for code in run['latency_gate_exits']):
+                  raise ValueError('invalid integer control completion fields')
+              if (run['state'], run['scope'], run['selected_workload'], run['completed_workloads'], run['latency_gate_exits']) != ('measurements_completed', 'separate_exact_workload', name, 1, [1]):
+                  raise ValueError('expected one completed selected Regression control')
+              summary = json.loads((directory / f'{name}-summary.json').read_text())
+              budget = summary['comparison']['budget_pct']
+              if type(summary['gate_exit']) is not int or type(summary['negative_control_ready_invocations']) is not int or type(budget) not in (int, float) or not math.isfinite(budget):
+                  raise ValueError('invalid numeric control decision fields')
+              if (summary['gate_exit'], summary['comparison']['state'], summary['comparison']['budget_pct'], summary['negative_control_ready_invocations'], summary['budget_origin']) != (1, 'regression', 100, 20, 'global diagnostic control; not an accepted SLO'):
+                  raise ValueError('20x control did not establish Regression at the diagnostic 100% threshold')
+              receipts = [json.loads((directory / f'{name}-{side}.json').read_text()) for side in (0, 1)]
+              for receipt in receipts:
+                  metadata = receipt['metadata']
+                  if (metadata['command'], metadata['issue_count'], metadata['flush_mode'], metadata['build_profile']) != ('ready', '1000', 'default-auto-flush', 'release'):
+                      raise ValueError('control workload identity mismatch')
+                  for key, suffix in (('binary_sha256', 'SHA256'), ('lockfile_sha256', 'LOCK_SHA256'), ('source_revision', 'SOURCE')):
+                      if metadata[key] != os.environ[f'BR_PERF_CANDIDATE_{suffix}']:
+                          raise ValueError(f'control {key} differs from candidate artifact pin')
+                  samples, exits = receipt['samples_ms'], receipt['exit_codes']
+                  if not isinstance(samples, list) or len(samples) != 20 or any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0 for value in samples):
+                      raise ValueError('invalid retained control samples')
+                  if not isinstance(exits, list) or len(exits) != 20 or any(type(code) is not int or code != 0 for code in exits):
+                      raise ValueError('expected twenty successful retained samples per side')
+              if receipts[0]['metadata'] != receipts[1]['metadata']:
+                  raise ValueError('same-candidate control metadata differs')
+              raw = json.loads((directory / f'{name}-raw.json').read_text())
+              if len(raw) != 48:
+                  raise ValueError('incomplete control raw ABBA log')
+              retained = [[], []]
+              for index, sample in enumerate(raw):
+                  block, position = divmod(index, 4)
+                  side = (0, 1, 1, 0)[position]
+                  if any(type(sample[key]) is not int or sample[key] != expected for key, expected in (('block', block), ('position', position), ('side', side), ('exit_code', 0), ('invocations', 1 if side == 0 else 20))) or sample['warmup'] is not (block < 2):
+                      raise ValueError('invalid control ABBA order or invocation count')
+                  elapsed = sample['elapsed_ms']
+                  if type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed <= 0:
+                      raise ValueError('invalid control elapsed time')
+                  if not sample['warmup']:
+                      retained[side].append(elapsed)
+              if retained != [receipt['samples_ms'] for receipt in receipts]:
+                  raise ValueError('control raw observations differ from retained samples')
+          except (OSError, ValueError, KeyError, TypeError) as error:
+              print(f'benchmark_sensitivity: inconclusive: {error}')
+              raise SystemExit(2)
+          print('benchmark_sensitivity: Regression observed for 20x ready work; diagnostic 100% threshold, not an accepted SLO')
+          PY
+
       - name: Measure release A-A control and A-B comparison
         id: measure
+        # Preserve full cohorts after a failed sensitivity control. That earlier
+        # step remains failed even if these collectors or the later gate pass.
+        if: ${{ !cancelled() && steps.benchmark_build.outcome == 'success' }}
         run: |
           set -euo pipefail
           # Allow build load to decay before the collector's per-sample checks.

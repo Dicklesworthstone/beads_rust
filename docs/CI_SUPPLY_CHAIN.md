@@ -117,6 +117,17 @@ benchmark shell controls live in `tests/workflow_action_pins.rs`. Calibrated
 budgets belong in `BR_PERF_BUDGETS_JSON`; changing them requires reviewing the
 retained measurements, rather than accepting a failed run as the next baseline.
 
+The same job separately selects `1000-ready-default-auto-flush` and measures the
+candidate against itself, with 20 real ready invocations on the second side.
+This sensitivity control must retain all 48 ABBA observations and report
+`Regression` at a fixed 100% diagnostic threshold; that threshold is not an
+accepted SLO. Its actual collector exit and combined stdout/stderr log are
+uploaded under `planted-ready`, including on failure. A failed control remains
+a failed job step while the full A/A and A/B cohorts still run after a successful
+build. The fragment tests use an explicitly labeled mock collector to check
+argument, environment, artifact-pin and exit propagation; those fixtures are
+shell controls, not live sensitivity evidence.
+
 The ACFS installer notification workflow also has a focused local harness:
 
 ```bash

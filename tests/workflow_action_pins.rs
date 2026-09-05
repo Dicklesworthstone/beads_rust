@@ -947,6 +947,8 @@ mod scheduled_benchmarks {
 
     const GATE: &str = "Enforce complete matched benchmark receipts";
     const FIRST: &str = "1000-version-default-auto-flush";
+    const PLANTED: &str = "Measure planted ready slowdown control";
+    const READY: &str = "1000-ready-default-auto-flush";
 
     fn workflow() -> Value {
         serde_yml::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap()
@@ -1131,6 +1133,236 @@ mod scheduled_benchmarks {
         }
     }
 
+    #[cfg(unix)]
+    fn planted_control() -> ReceiptControl {
+        use std::os::unix::fs::PermissionsExt;
+
+        let control = ReceiptControl {
+            root: tempfile::TempDir::new().unwrap(),
+            budgets: json!({}),
+        };
+        fs::create_dir(control.root.path().join("planted-ready")).unwrap();
+        control.write(
+            "planted-ready/run.json",
+            &json!({"state": "measurements_completed", "scope": "separate_exact_workload",
+                "selected_workload": READY, "completed_workloads": 1, "latency_gate_exits": [1]}),
+        );
+        let mut summary = summary_control(READY, 1);
+        summary["comparison"]["budget_pct"] = json!(100);
+        summary["negative_control_ready_invocations"] = json!(20);
+        summary["budget_origin"] = json!("global diagnostic control; not an accepted SLO");
+        control.write(&format!("planted-ready/{READY}-summary.json"), &summary);
+        let mut raw = abba_control();
+        for sample in raw.as_array_mut().unwrap() {
+            let invocations = if sample["side"] == 0 { 1 } else { 20 };
+            sample["invocations"] = json!(invocations);
+            sample["elapsed_ms"] = json!(10 * invocations);
+            sample["args"] = json!(["ready", "--json"]);
+            sample["stdout"] = json!("[]\n".repeat(invocations));
+        }
+        control.write(&format!("planted-ready/{READY}-raw.json"), &raw);
+        for side in 0..2 {
+            let mut receipt = raw_control(READY);
+            receipt["samples_ms"] = json!(vec![if side == 0 { 10 } else { 200 }; 20]);
+            control.write(&format!("planted-ready/{READY}-{side}.json"), &receipt);
+        }
+        // This mock collector records the real shell boundary. Its prewritten
+        // receipts exercise transport/refusal only, never live performance.
+        let harness = control.root.path().join("mock-collector");
+        fs::write(
+            &harness,
+            r"#!/usr/bin/env python3
+import json, os, pathlib, sys
+keys = ('OUTPUT', 'WORKLOAD', 'NEGATIVE_EXTRA_WORK', 'BUDGET_PCT', 'BUDGETS_JSON',
+        'ABBA_BLOCKS', 'QUIET_RUNNER', 'BASELINE_BINARY', 'CANDIDATE_BINARY',
+        'BASELINE_SHA256', 'CANDIDATE_SHA256', 'BASELINE_LOCKFILE', 'CANDIDATE_LOCKFILE',
+        'BASELINE_LOCK_SHA256', 'CANDIDATE_LOCK_SHA256', 'BASELINE_SOURCE', 'CANDIDATE_SOURCE')
+pathlib.Path(os.environ['BR_PERF_EVIDENCE'], 'invocation.json').write_text(json.dumps({
+    'args': sys.argv[1:], 'env': {key: os.environ.get('BR_PERF_' + key) for key in keys}}))
+print('mock collector transport control: stdout')
+print('mock collector transport control: stderr', file=sys.stderr)
+raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
+",
+        )
+        .unwrap();
+        fs::set_permissions(harness, fs::Permissions::from_mode(0o755)).unwrap();
+        control
+    }
+
+    #[cfg(unix)]
+    fn run_planted(control: &ReceiptControl, collector_exit: i32) -> Output {
+        let root = control.root.path();
+        let mut variables = [
+            ("BR_PERF_EVIDENCE", root.display().to_string()),
+            (
+                "BR_PERF_HARNESS",
+                root.join("mock-collector").display().to_string(),
+            ),
+            ("BR_PERF_FIXTURE_EXIT", collector_exit.to_string()),
+            ("BR_PERF_BUDGETS_JSON", json!({READY: 7}).to_string()),
+            ("BR_PERF_WORKLOAD", "wrong-inherited-selector".into()),
+        ]
+        .map(|(key, value)| (key.to_string(), value))
+        .to_vec();
+        for (suffix, candidate) in [
+            ("BINARY", "candidate-release-br".into()),
+            ("SHA256", "2".repeat(64)),
+            ("LOCKFILE", "candidate-Cargo.lock".into()),
+            ("LOCK_SHA256", "3".repeat(64)),
+            ("SOURCE", "arithmetic-control-source".into()),
+        ] {
+            variables.push((
+                format!("BR_PERF_BASELINE_{suffix}"),
+                "wrong-baseline-pin".into(),
+            ));
+            variables.push((format!("BR_PERF_CANDIDATE_{suffix}"), candidate));
+        }
+        let borrowed = variables
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.clone()))
+            .collect::<Vec<_>>();
+        run_fragment(PLANTED, root, &borrowed)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scheduled_planted_fragment_selects_same_candidate_and_preserves_collector_failure() {
+        let control = planted_control();
+        expect_exit(&run_planted(&control, 0), 0, "Regression observed");
+        let invocation: Value =
+            serde_json::from_slice(&fs::read(control.root.path().join("invocation.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            invocation["args"],
+            json!([
+                "--exact",
+                "release_abba::release_cli_abba_1k_10k",
+                "--ignored",
+                "--nocapture"
+            ])
+        );
+        let env = &invocation["env"];
+        for (key, expected) in [
+            ("WORKLOAD", READY),
+            ("NEGATIVE_EXTRA_WORK", "20"),
+            ("BUDGET_PCT", "100"),
+            ("ABBA_BLOCKS", "10"),
+            ("QUIET_RUNNER", "1"),
+        ] {
+            assert_eq!(env[key], expected, "{key}: {invocation}");
+        }
+        assert_eq!(env["BUDGETS_JSON"], Value::Null);
+        assert_eq!(
+            env["OUTPUT"],
+            control
+                .root
+                .path()
+                .join("planted-ready")
+                .display()
+                .to_string()
+        );
+        for suffix in ["BINARY", "SHA256", "LOCKFILE", "LOCK_SHA256", "SOURCE"] {
+            assert_eq!(
+                env[format!("BASELINE_{suffix}")],
+                env[format!("CANDIDATE_{suffix}")]
+            );
+            assert_ne!(env[format!("BASELINE_{suffix}")], "wrong-baseline-pin");
+        }
+        expect_exit(
+            &run_planted(&control, 37),
+            37,
+            "mock collector transport control",
+        );
+        let directory = control.root.path().join("planted-ready");
+        assert_eq!(
+            fs::read_to_string(directory.join("collector.exit")).unwrap(),
+            "37\n"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.join("log-capture.exit")).unwrap(),
+            "0\n"
+        );
+        let log = fs::read_to_string(directory.join("collector.log")).unwrap();
+        assert!(log.contains("transport control: stdout"));
+        assert!(log.contains("transport control: stderr"));
+        assert!(directory.join(format!("{READY}-raw.json")).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scheduled_planted_fragment_refuses_incomplete_or_wrong_control_receipts() {
+        for (file, key, value, diagnostic) in [
+            (
+                "run",
+                "selected_workload",
+                json!(FIRST),
+                "one completed selected Regression",
+            ),
+            (
+                "summary",
+                "gate_exit",
+                json!(0),
+                "did not establish Regression",
+            ),
+            (
+                "summary",
+                "negative_control_ready_invocations",
+                json!(1),
+                "did not establish Regression",
+            ),
+            (
+                "run",
+                "completed_workloads",
+                json!(true),
+                "invalid integer control completion",
+            ),
+            (
+                "summary",
+                "gate_exit",
+                json!(true),
+                "invalid numeric control decision",
+            ),
+        ] {
+            let control = planted_control();
+            let path = if file == "run" {
+                "planted-ready/run.json".into()
+            } else {
+                format!("planted-ready/{READY}-summary.json")
+            };
+            let mut value_in_file: Value =
+                serde_json::from_slice(&fs::read(control.root.path().join(&path)).unwrap())
+                    .unwrap();
+            value_in_file[key] = value;
+            control.write(&path, &value_in_file);
+            expect_exit(&run_planted(&control, 0), 2, diagnostic);
+        }
+        let control = planted_control();
+        control.write(&format!("planted-ready/{READY}-raw.json"), &json!([]));
+        expect_exit(
+            &run_planted(&control, 0),
+            2,
+            "incomplete control raw ABBA log",
+        );
+        let control = planted_control();
+        let mut receipt = raw_control(READY);
+        receipt["exit_codes"] = json!(vec![false; 20]);
+        control.write(&format!("planted-ready/{READY}-0.json"), &receipt);
+        expect_exit(
+            &run_planted(&control, 0),
+            2,
+            "expected twenty successful retained samples per side",
+        );
+        let control = planted_control();
+        let mut receipt = raw_control(READY);
+        receipt["metadata"]["binary_sha256"] = json!("4".repeat(64));
+        control.write(&format!("planted-ready/{READY}-0.json"), &receipt);
+        expect_exit(
+            &run_planted(&control, 0),
+            2,
+            "differs from candidate artifact pin",
+        );
+    }
+
     #[test]
     fn scheduled_receipt_fragment_has_actual_pass_regression_and_unknown_exits() {
         let control = ReceiptControl::new(None);
@@ -1277,11 +1509,20 @@ mod scheduled_benchmarks {
         assert_eq!(upload["if"], "always()");
         assert_eq!(upload["with"]["if-no-files-found"], "error");
         let build = step("Build pinned release artifacts before measurement");
+        assert_eq!(build["id"], "benchmark_build");
         let script = build["run"].as_str().unwrap();
         assert!(script.contains("--release --locked --bin br"));
         assert!(script.contains("--test bench_synthetic_scale --no-run"));
         assert!(!script.contains("cargo test --release"));
         let measure = step("Measure release A-A control and A-B comparison");
+        assert_eq!(
+            measure["if"],
+            "${{ !cancelled() && steps.benchmark_build.outcome == 'success' }}"
+        );
+        let planted = step(PLANTED);
+        let script = planted["run"].as_str().unwrap();
+        assert!(script.contains("timeout --signal=TERM --kill-after=10s 1800s"));
+        assert!(!script.contains("cargo "));
         let script = measure["run"].as_str().unwrap();
         assert!(script.contains("for cohort in aa ab"));
         assert!(script.contains("--exact release_abba::release_cli_abba_1k_10k --ignored"));
