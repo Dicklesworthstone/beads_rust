@@ -69,8 +69,8 @@ impl From<&CliCloseArgs> for CloseArgs {
 }
 
 /// Aggregate of policy gates that fired for a single candidate close.
-struct EvaluatedGates {
-    violations: Vec<PolicyViolation>,
+pub(crate) struct EvaluatedGates {
+    pub(crate) violations: Vec<PolicyViolation>,
 }
 
 /// Validate the `--bypass-policy` / `--bypass-reason` flag pair before
@@ -106,7 +106,7 @@ fn validate_bypass_args(args: &CloseArgs) -> Result<()> {
 /// Resolve attribution values for the close. CLI flags take precedence over
 /// env vars; both are ignored when the policy.yaml `attribution.tier` is
 /// `off`. Tier 2/3 ("require"/"allowlist") are out of scope for Phase 1.
-fn resolve_attribution_for_close(
+pub(crate) fn resolve_attribution_for_close(
     args: &CloseArgs,
     policy_doc: &PolicyDocument,
 ) -> AttributionValues {
@@ -125,7 +125,7 @@ fn resolve_attribution_for_close(
 /// workflow gate engine (issue #312, layer 2): closing an issue is a transition
 /// into the `closed` state, so any `workflow.gates` rule guarding
 /// `"<current> -> closed"` is enforced here too.
-fn evaluate_close_policy(
+pub(crate) fn evaluate_close_policy(
     policy: &ClosePolicy,
     workflow: &crate::close_policy::Workflow,
     storage: &SqliteStorage,

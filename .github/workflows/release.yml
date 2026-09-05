@@ -385,6 +385,79 @@ jobs:
           zip -j ../../../br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.zip br.exe LICENSE
           cd ../../..
 
+      - name: Check release artifact size budgets
+        env:
+          SIZE_TARGET: ${{ matrix.target }}
+          SIZE_PLATFORM: ${{ matrix.name }}
+          SIZE_ARCHIVE: br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, sys, tomllib
+
+          # Measured from digest-verified v0.5.10 published archives, 2026-09-05.
+          # These are product growth budgets, not statistical confidence bounds:
+          # allow 1 MiB binary / 512 KiB archive growth from each pinned target.
+          # Updating a baseline or allowance requires reviewing the size change.
+          baselines = {
+              "linux_amd64": ("x86_64-unknown-linux-gnu", 27307752, 11613648, "1956c808601588a7ab7ee807f1f54a4453387b02eddfbf4469a86abdc7ecf366"),
+              "linux_musl_amd64": ("x86_64-unknown-linux-musl", 27443960, 11730696, "ca3351a15b9961a7f46fba2d365701506368764bc992a6def2a84b99e3abe282"),
+              "linux_arm64": ("aarch64-unknown-linux-gnu", 20963480, 10952270, "9e9ea38667c53d7ab515c6accec97b9a4b3dfd26f4344c99428c6525e5e250a9"),
+              "linux_musl_arm64": ("aarch64-unknown-linux-musl", 19849304, 10839706, "a9e06c203fba0a13f7dcac058bad45d3d3546b19f2fcc5a4b010c6c720603e9e"),
+              "darwin_amd64": ("x86_64-apple-darwin", 22071840, 10272898, "6e099d2ac08fe23fe79fe8a71ea51d8c1816e47e156eff7ae178352f3f435362"),
+              "darwin_arm64": ("aarch64-apple-darwin", 15856032, 9435650, "face0ebc867f11cd531e9fbcb4eedcf210de6b061d114cad15f79dc46ce65c03"),
+              "windows_amd64": ("x86_64-pc-windows-gnu", 23221760, 10240118, "b50ea39789f6a8b1ecc724e71bc023e98fbddd1a4a5a61505660d845d1d2c035"),
+          }
+          platform = os.environ.get("SIZE_PLATFORM", "")
+          receipt = {"platform": platform, "target": os.environ.get("SIZE_TARGET", ""),
+                     "source_commit": os.environ.get("GITHUB_SHA", ""), "baseline_release": "v0.5.10",
+                     "features": ["self_update"], "state": "inconclusive", "gate_exit": 2}
+          try:
+              target, binary_base, archive_base, baseline_digest = baselines[platform]
+              source = receipt["source_commit"]
+              if len(source) != 40 or any(c not in "0123456789abcdef" for c in source):
+                  raise ValueError("source commit must be an exact 40-character SHA")
+              if target != receipt["target"]:
+                  raise ValueError("platform and target do not match the pinned baseline")
+              manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+              if manifest["profile"]["release"]["strip"] is not True:
+                  raise ValueError("release profile must strip the distributed binary")
+              binary = pathlib.Path("target") / target / "release" / ("br.exe" if platform == "windows_amd64" else "br")
+              archive = pathlib.Path(os.environ["SIZE_ARCHIVE"])
+              for path in (binary, archive):
+                  if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
+                      raise ValueError(f"missing, empty, or non-regular artifact: {path}")
+              binary_size, archive_size = binary.stat().st_size, archive.stat().st_size
+              binary_limit, archive_limit = binary_base + 1048576, archive_base + 524288
+              passed = binary_size <= binary_limit and archive_size <= archive_limit
+              receipt.update(state="pass" if passed else "regression", gate_exit=0 if passed else 1,
+                  baseline_archive_sha256=baseline_digest, release_profile_strip=True,
+                  binary_bytes=binary_size, archive_bytes=archive_size,
+                  baseline_binary_bytes=binary_base, baseline_archive_bytes=archive_base,
+                  binary_limit_bytes=binary_limit, archive_limit_bytes=archive_limit,
+                  binary_delta_bytes=binary_size-binary_base, archive_delta_bytes=archive_size-archive_base,
+                  binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+                  archive_sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
+                  lockfile_sha256=hashlib.sha256(pathlib.Path("Cargo.lock").read_bytes()).hexdigest())
+          except (KeyError, OSError, ValueError, TypeError) as error:
+              receipt.update(state="inconclusive", gate_exit=2, reason=str(error))
+          text = json.dumps(receipt, sort_keys=True)
+          receipt_platform = platform if platform in baselines else "unknown"
+          pathlib.Path(f"release-size-{receipt_platform}.json").write_text(text + "\n")
+          print(text)
+          if os.environ.get("GITHUB_STEP_SUMMARY"):
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+                  summary.write(f"Release size {platform}: `{text}`\n\n")
+          sys.exit(receipt["gate_exit"])
+          PY
+
+      - name: Upload release size receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: release-size-${{ matrix.name }}
+          path: release-size-*.json
+          if-no-files-found: warn
+
       - name: Install minisign (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -443,6 +516,7 @@ jobs:
             br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }}
             br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
             br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }}.minisig
+            release-size-${{ matrix.name }}.json
           retention-days: 7
 
       - name: Upload artifacts (act)
@@ -454,6 +528,7 @@ jobs:
             br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }}
             br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
             br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }}.minisig
+            release-size-${{ matrix.name }}.json
           retention-days: 7
 
   create-release:

@@ -2468,6 +2468,147 @@ fn check_database_sidecars(db_path: &Path, checks: &mut Vec<CheckResult>) -> Res
     Ok(())
 }
 
+#[cfg(any(unix, windows))]
+fn namespace_database_identity(db_path: &Path) -> Result<fsqlite_vfs::FileIdentity> {
+    if !fs::symlink_metadata(db_path)?.is_file() {
+        return Err(BeadsError::Config(
+            "Database pathname is not a regular, non-symlink file".to_string(),
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(db_path)?;
+    if !file.metadata()?.is_file() || !fs::symlink_metadata(db_path)?.is_file() {
+        return Err(BeadsError::Config(
+            "Database pathname changed during identity inspection".to_string(),
+        ));
+    }
+    fsqlite_vfs::FileIdentity::from_file(&file)?.ok_or_else(|| {
+        BeadsError::Config("Database descriptor identity is unavailable".to_string())
+    })
+}
+
+/// Compare the live main file with the engine's complete namespace ledger.
+/// ReadOnlyExisting never creates sidecars or publishes a new identity. The
+/// engine holds shared gate/use locks while these descriptor identities are
+/// compared; a pathname replacement observed during the probe is inconclusive.
+#[cfg(any(unix, windows))]
+struct NamespaceIdentityObservation {
+    recorded: fsqlite_vfs::FileIdentity,
+    current: fsqlite_vfs::FileIdentity,
+}
+
+#[cfg(any(unix, windows))]
+fn inspect_namespace_identity(db_path: &Path) -> Result<Option<NamespaceIdentityObservation>> {
+    use fsqlite_vfs::{NamespaceOpenIntent, PendingNamespaceOpen};
+
+    let paths = fsqlite_namespace_sidecar_paths(db_path);
+    let mut present = 0;
+    for path in &paths {
+        match fs::symlink_metadata(path) {
+            Ok(_) => present += 1,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if present == 0 {
+        return Ok(None);
+    }
+    if present != paths.len() {
+        return Err(BeadsError::Config(
+            "Namespace sidecar pair is incomplete; identity cannot be established".to_string(),
+        ));
+    }
+    let admission = PendingNamespaceOpen::begin(db_path, NamespaceOpenIntent::ReadOnlyExisting)?;
+    let expected = admission.expected_identity().ok_or_else(|| {
+        BeadsError::Config("Namespace record has no established identity".to_string())
+    })?;
+    let current = namespace_database_identity(db_path)?;
+    if namespace_database_identity(db_path)? != current {
+        return Err(BeadsError::Config(
+            "Database pathname changed during identity inspection; retry after writers stop"
+                .to_string(),
+        ));
+    }
+    Ok(Some(NamespaceIdentityObservation {
+        recorded: expected,
+        current,
+    }))
+}
+
+/// Inspect before any engine open: even a read-only engine open can rebind a
+/// quiescent namespace record in FrankenSQLite 0.3.16. A false result forbids
+/// live probes so the evidence this check reports remains intact.
+fn check_namespace_identity(db_path: &Path, checks: &mut Vec<CheckResult>) -> bool {
+    const NAME: &str = "db.namespace_identity";
+    #[cfg(any(unix, windows))]
+    {
+        let sidecars = fsqlite_namespace_sidecar_paths(db_path);
+        match inspect_namespace_identity(db_path) {
+            Ok(Some(identity)) => {
+                let matched = identity.recorded == identity.current;
+                push_check(
+                    checks,
+                    NAME,
+                    if matched { CheckStatus::Ok } else { CheckStatus::Error },
+                    (!matched).then(|| "Database identity differs from its persistent namespace sidecars (foreign sidecar family). Preserve the main database and every sidecar, including WAL and journal files: they may contain committed data for the displaced database. Stop all writers, capture `br doctor --bundle <path> --include-db`, and validate the authoritative family before operator-directed recovery. No automatic repair is offered.".to_string()),
+                    Some(serde_json::json!({
+                        "state": if matched { "matched" } else { "mismatch" },
+                        "database": db_path, "sidecars": sidecars,
+                        "identities_match": matched,
+                        "automatic_repair": false,
+                    })),
+                );
+                matched
+            }
+            Ok(None) => {
+                push_check(
+                    checks,
+                    NAME,
+                    CheckStatus::Ok,
+                    Some(
+                        "No persistent namespace sidecars; identity comparison is not applicable"
+                            .to_string(),
+                    ),
+                    Some(serde_json::json!({ "state": "not_applicable", "database": db_path })),
+                );
+                true
+            }
+            Err(error) => {
+                push_check(
+                    checks,
+                    NAME,
+                    CheckStatus::Warn,
+                    Some(format!(
+                        "Namespace identity evidence is unavailable: {error}. This does not establish a foreign sidecar family; preserve all database-family files."
+                    )),
+                    Some(serde_json::json!({
+                        "state": "unavailable", "database": db_path, "sidecars": sidecars,
+                        "reason": error.to_string(), "automatic_repair": false,
+                    })),
+                );
+                false
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        push_check(
+            checks,
+            NAME,
+            CheckStatus::Warn,
+            Some("Namespace identity inspection is unavailable on this platform".to_string()),
+            Some(serde_json::json!({ "state": "unavailable", "database": db_path })),
+        );
+        false
+    }
+}
+
 fn check_recovery_artifacts(
     beads_dir: &Path,
     db_path: &Path,
@@ -6687,8 +6828,8 @@ fn check_recovery_dir_writable(db_path: &Path, beads_dir: &Path, checks: &mut Ve
 ///
 /// Detect-only — auto-chmoding might collide with operator intent
 /// (e.g. immutable lock files used by some hardened CI runners).
-/// Remediation: `chmod u+w .beads/.write.lock` or remove and let
-/// the next `br` invocation recreate it cleanly.
+/// Remediation: `chmod u+w .beads/.write.lock`, preserving the
+/// existing lock inode so live holders retain the same authority.
 ///
 /// Unix-only — non-Unix uses different lock semantics so the check
 /// is silenced there.
@@ -6739,7 +6880,7 @@ fn check_write_lock_writable(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
                 Some(serde_json::json!({
                     "path": lock_path.display().to_string(),
                     "mode_octal": format!("{:o}", mode & 0o777),
-                    "remediation": format!("`chmod u+w {}` or remove the file (the next br call recreates it)", lock_path.display()),
+                    "remediation": format!("`chmod u+w {}` (preserve the existing lock file)", lock_path.display()),
                 })),
             );
             return;
@@ -12138,6 +12279,10 @@ fn collect_doctor_report_with_mode_and_db_override(
     no_db: bool,
 ) -> Result<DoctorRun> {
     let mut checks = Vec::new();
+    // Even --no-db inspects pending merge state below. Check namespace
+    // evidence before that read-only open can rebind a quiescent generation.
+    let live_database_inspectable =
+        !paths.db_path.exists() || check_namespace_identity(&paths.db_path, &mut checks);
     check_merge_artifacts(beads_dir, &paths.jsonl_path, &mut checks)?;
     check_base_jsonl(beads_dir, &mut checks);
     // Pass-5 cycle 10: doctor's own runs dir size (operator-prunable).
@@ -12150,8 +12295,8 @@ fn collect_doctor_report_with_mode_and_db_override(
     // next --repair won't crash mid-backup.
     //
     // #329: this is a DB-backed check (it probes the database's recovery
-    // sidecar dir). Under `--no-db` (the JSONL-only contract) we never open
-    // or recover the DB, so skip it and report it in `db.no_db_mode` below.
+    // sidecar dir). Under `--no-db` we do not recover the DB, so skip this
+    // recovery-readiness check and report it in `db.no_db_mode` below.
     if !no_db {
         check_recovery_dir_writable(&paths.db_path, beads_dir, &mut checks);
     }
@@ -12192,15 +12337,25 @@ fn collect_doctor_report_with_mode_and_db_override(
     // operators know that only `br sync --merge` may advance the state.
     // This check still runs in `--no-db` mode because a JSONL-only rewrite
     // could otherwise overwrite the pending merge's expected artifact.
-    check_pending_sync_merge(&paths.db_path, &mut checks);
+    if live_database_inspectable {
+        check_pending_sync_merge(&paths.db_path, &mut checks);
+    } else {
+        push_check(
+            &mut checks,
+            "sync.merge_pending",
+            CheckStatus::Error,
+            Some("Pending sync-merge state is unknown: live database inspection was skipped to preserve the namespace identity evidence".to_string()),
+            Some(serde_json::json!({ "inspected": false, "blocked_by": "db.namespace_identity" })),
+        );
+    }
 
     // The JSONL-side audit always runs — it is the source of truth under the
     // `--no-db` (JSONL-only) contract.
     let (jsonl_path, jsonl_count) = inspect_doctor_jsonl(beads_dir, paths, mode, &mut checks);
     if no_db {
-        // #329: under `--no-db`, `br` never opens or recovers the SQLite DB,
-        // so the DB-backed checks below would either be meaningless or would
-        // violate the JSONL-only contract by touching the database file.
+        // #329: under `--no-db`, skip database consistency and recovery
+        // checks. Namespace admission and pending-merge evidence still run
+        // above to protect the JSONL artifact from an unsafe rewrite.
         // Skip them and emit a single Ok check that enumerates exactly which
         // checks were skipped, so robot callers can see the scope of the
         // reduced run rather than silently missing findings.
@@ -12231,6 +12386,7 @@ fn collect_doctor_report_with_mode_and_db_override(
             jsonl_path.as_deref(),
             jsonl_count,
             mode,
+            live_database_inspectable,
             &mut checks,
         );
     }
@@ -12773,6 +12929,7 @@ fn inspect_doctor_database(
     jsonl_path: Option<&Path>,
     jsonl_count: JsonlCountState,
     mode: DoctorInspectionMode,
+    live_database_inspectable: bool,
     checks: &mut Vec<CheckResult>,
 ) {
     if let Err(err) = check_recovery_artifacts(beads_dir, db_path, checks) {
@@ -12809,7 +12966,18 @@ fn inspect_doctor_database(
     }
 
     if db_path.exists() {
-        if let Err(err) = check_read_only_open_observational(db_path, checks) {
+        if !live_database_inspectable {
+            push_check(
+                checks,
+                "db.read_only_open_observational",
+                CheckStatus::Warn,
+                Some(
+                    "Live open probe skipped to preserve the namespace identity evidence"
+                        .to_string(),
+                ),
+                Some(serde_json::json!({ "opened": false, "blocked_by": "db.namespace_identity" })),
+            );
+        } else if let Err(err) = check_read_only_open_observational(db_path, checks) {
             push_inspection_error(
                 checks,
                 "db.read_only_open_observational",
@@ -15940,9 +16108,9 @@ mod tests {
 
     #[test]
     fn test_doctor_no_db_skips_db_backed_checks_and_reports_no_db_mode() {
-        // #329: under `--no-db` (JSONL-only), doctor must NOT run the
-        // DB-backed checks and must emit `db.no_db_mode` listing the skipped
-        // checks. The JSONL-side audit still runs.
+        // #329: under `--no-db`, doctor skips database consistency/recovery
+        // checks and emits `db.no_db_mode` listing them. The JSONL audit and
+        // namespace/pending-merge safety checks still run.
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();

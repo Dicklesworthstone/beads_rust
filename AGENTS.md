@@ -295,7 +295,7 @@ beads_rust/
 │   │   ├── mod.rs                 # Issue, Dependency, Comment, Event, Label types
 │   │   └── acceptance.rs          # Acceptance-criteria item parsing (check/uncheck/add)
 │   ├── storage/
-│   │   ├── mod.rs                 # Storage trait
+│   │   ├── mod.rs                 # Concrete SqliteStorage and storage-type exports
 │   │   ├── sqlite.rs              # FrankenSQLite backend (the core engine)
 │   │   ├── schema.rs              # DDL migrations
 │   │   └── events.rs              # Append-only audit log
@@ -410,8 +410,8 @@ self_update = ["dep:self_update", "dep:self-replace", ...]   # Self-update from 
 - **FrankenSQLite only, no C SQLite** — the engine decision, the August 2026 incident, the sole-opener checkpoint containment, the sidecar inventory, and the engine-bump checklist live in [docs/reliability/ENGINE_OPERATING_MODEL.md](docs/reliability/ENGINE_OPERATING_MODEL.md); read it before touching `fsqlite*` in `Cargo.toml`
 - **Content-addressed deduplication** — SHA-256 content hashes prevent duplicate issues across sync boundaries
 - **Hash-based short IDs** — e.g., `proj-abc12` (not auto-increment integers) for stable cross-repo references
-- **Go parity** — Rust `br` produces identical output to Go `bd` for equivalent inputs; conformance tests validate this
-- **Schema compatibility** — Database schema matches Go beads for potential cross-tool usage
+- **Classic bd interchange** — Conformance tests compare core issue behavior and JSONL interchange with pinned Go `bd` v0.46.0; plain text, paginated JSON envelopes, and some fields intentionally differ (see `docs/TEST_HARNESS.md`)
+- **Related schemas, separate databases** — br adds workflow tables and fields; its length-prefixed content hash deliberately differs from classic bd. Use JSONL interchange, not an assumption of identical live schemas
 - **Multiple output modes** — Rich (TTY), Plain (pipe/NO_COLOR), JSON (--json/--robot), Quiet (--quiet) — auto-detected
 - **Append-only audit log** — Every mutation recorded in events table for full traceability
 - **Layered configuration** — File + env vars + CLI flags with project-aware routing
@@ -482,7 +482,7 @@ br list | head -1
 JSON mode guarantees:
 - Stable schema (changes are versioned and documented)
 - No ANSI escape codes
-- Clean stdout (diagnostics go to stderr)
+- Structured results on stdout, including error envelopes on failure; diagnostics go to stderr. Partial-batch failures may emit a result followed by an error document (see `docs/agent/ERRORS.md`)
 - Exit codes for success/failure
 
 Schema discovery:
@@ -505,7 +505,7 @@ Transport is stdio. Configure the MCP client to launch `br serve`; do not expect
 a TCP port or background daemon. Available tools are `list_issues`, `show_issue`,
 `create_issue`, `update_issue`, `close_issue`, `manage_dependencies`, and
 `project_overview`. Resources include `beads://project/info`,
-`beads://issues/{id}`, `beads://schema`, `beads://labels`,
+`beads://issue/{id}`, `beads://schema`, `beads://labels`,
 `beads://issues/ready`, `beads://issues/blocked`,
 `beads://issues/in_progress`, `beads://issues/deferred`,
 `beads://issues/bottlenecks`, `beads://graph/health`, and

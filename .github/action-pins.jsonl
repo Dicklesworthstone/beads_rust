@@ -1,8 +1,6 @@
 {"workflow":".github/workflows/audit.yml","action":"actions/checkout","sha":"3d3c42e5aac5ba805825da76410c181273ba90b1","tag":"v7.0.1","source":"verified upstream tag refs/tags/v7.0.1"}
 {"workflow":".github/workflows/audit.yml","action":"dtolnay/rust-toolchain","sha":"6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772","tag":"default-branch-head-2026-08-05","source":"verified upstream commit snapshot dated 2026-08-05; compare master...6c977a6 identical"}
 {"workflow":".github/workflows/audit.yml","action":"taiki-e/install-action","sha":"1ed6d7be6168f6c9046541087ff549b6bc581fdf","tag":"v2.87.2","source":"verified upstream tag refs/tags/v2.87.2 (git ls-remote 2026-09-02)"}
-{"workflow":".github/workflows/ci.yml","action":"actions/cache/restore","sha":"55cc8345863c7cc4c66a329aec7e433d2d1c52a9","tag":"v6.1.0","source":"verified upstream tag refs/tags/v6.1.0"}
-{"workflow":".github/workflows/ci.yml","action":"actions/cache/save","sha":"55cc8345863c7cc4c66a329aec7e433d2d1c52a9","tag":"v6.1.0","source":"verified upstream tag refs/tags/v6.1.0"}
 {"workflow":".github/workflows/ci.yml","action":"actions/checkout","sha":"3d3c42e5aac5ba805825da76410c181273ba90b1","tag":"v7.0.1","source":"verified upstream tag refs/tags/v7.0.1"}
 {"workflow":".github/workflows/ci.yml","action":"actions/download-artifact","sha":"3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c","tag":"v8.0.1","source":"current workflow ref; inline tag comment"}
 {"workflow":".github/workflows/ci.yml","action":"actions/upload-artifact","sha":"043fb46d1a93c77aae656e7c1c64a875d1fc6a0a","tag":"v7.0.1","source":"current workflow ref; inline tag comment"}

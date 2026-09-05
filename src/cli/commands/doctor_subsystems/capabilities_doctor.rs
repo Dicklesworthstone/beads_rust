@@ -308,6 +308,7 @@ const DETECTOR_ROWS: &[DetectorRow] = &[
     ("db.exists", "state_files", "error", true),
     ("db.open", "state_files", "error", true),
     ("db.sidecars", "state_files", "error", true),
+    ("db.namespace_identity", "state_files", "error", true),
     (
         "db.read_only_open_observational",
         "state_files",

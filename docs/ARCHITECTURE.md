@@ -29,7 +29,7 @@ This document describes the internal architecture of `beads_rust` (br), a Rust p
 2. **Local-First**: SQLite is the source of truth; JSONL enables collaboration
 3. **Agent-Friendly**: Machine-readable output (JSON) for AI coding agents
 4. **Deterministic**: Same input produces same output
-5. **Safe**: No operations outside `.beads/` directory
+5. **Safe**: Normal issue state stays in `.beads/`; explicit external database/JSONL routing and commands such as `br agents`, `config edit`, and `completions -o` have their own validated write targets
 
 ### Comparison with Go beads (bd)
 
@@ -572,25 +572,22 @@ pub struct IdConfig {
 
 ### Content Hashing
 
-Deterministic hash for deduplication:
-
-```rust
-impl Issue {
-    pub fn compute_content_hash(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.title.as_bytes());
-        hasher.update(self.description.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.status.as_str().as_bytes());
-        // ... other fields
-        format!("{:x}", hasher.finalize())
-    }
-}
-```
+`Issue::compute_content_hash` delegates to `src/util/hash.rs`. It hashes stable,
+ordered issue fields with SHA-256, encoding each UTF-8 field as its unsigned
+64-bit little-endian byte length followed by the field bytes. Length prefixes
+prevent embedded NULs from moving field boundaries; this deliberately differs
+from classic bd's NUL-separated hash format. Schema v14 rebuilt stored hashes.
+`tests/proptest_hash.rs` checks an independent length-prefixed reference writer,
+including the embedded-NUL collision regression.
 
 **Excluded from hash:**
 - `id` (generated)
 - `created_at`, `updated_at` (timestamps)
 - `labels`, `dependencies`, `comments` (relations)
+
+The complete included/excluded field lists live beside the implementation in
+`src/util/hash.rs`; a content hash is not a digest of every issue field or a
+substitute for the JSONL publication witness.
 
 ### Atomic JSONL Export Writes
 

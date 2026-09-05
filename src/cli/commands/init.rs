@@ -3,9 +3,35 @@ use crate::output::{OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
 use crate::util::db_path;
 use rich_rust::prelude::*;
+use schemars::JsonSchema;
+use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+/// Successful initialization receipt emitted by JSON and TOON output modes.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct InitResult {
+    initialized: bool,
+    /// Absolute, resolved workspace directory, including a `BEADS_DIR` override.
+    beads_dir: PathBuf,
+    /// Absolute, resolved database path, including a `BEADS_CACHE_DIR` override.
+    database_path: PathBuf,
+    /// The normalized prefix actually stored in the database.
+    prefix: String,
+    files: InitFiles,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct InitFiles {
+    directory: InitStepStatus,
+    /// Existing means the database was reused; its prefix is still set by init.
+    database: InitStepStatus,
+    metadata: InitStepStatus,
+    config: InitStepStatus,
+    gitignore: InitStepStatus,
+    jsonl: InitStepStatus,
+}
 
 /// Resolve the beads directory for init.
 ///
@@ -177,16 +203,26 @@ pub fn execute(
   "database": "beads.db",
   "jsonl_export": "issues.jsonl"
 }"#;
-    if force {
+    let metadata_status = if force {
         write_init_file_atomically(&metadata_path, metadata.as_bytes())?;
-    } else if !metadata_existed {
-        write_init_file_if_missing(&metadata_path, metadata.as_bytes())?;
-    }
+        if metadata_existed {
+            InitStepStatus::Updated
+        } else {
+            InitStepStatus::Created
+        }
+    } else {
+        InitStepStatus::from_created(write_init_file_if_missing(
+            &metadata_path,
+            metadata.as_bytes(),
+        )?)
+    };
 
     // Write config.yaml template
     let config_path = beads_dir.join("config.yaml");
     let config_existed = path_entry_exists(&config_path)?;
-    if !config_existed {
+    let config_created = if config_existed {
+        false
+    } else {
         let config = format!(
             "# Beads Project Configuration
 # issue_prefix: {normalized}
@@ -194,13 +230,15 @@ pub fn execute(
 # default_type: task
 "
         );
-        write_init_file_if_missing(&config_path, config.as_bytes())?;
-    }
+        write_init_file_if_missing(&config_path, config.as_bytes())?
+    };
 
     // Write .gitignore
     let gitignore_path = beads_dir.join(".gitignore");
     let gitignore_existed = path_entry_exists(&gitignore_path)?;
-    if !gitignore_existed {
+    let gitignore_created = if gitignore_existed {
+        false
+    } else {
         let gitignore = r"# Database
 *.db
 *.db-journal
@@ -258,22 +296,40 @@ redirect
 # bv (beads viewer) lock file
 .bv.lock
 ";
-        write_init_file_if_missing(&gitignore_path, gitignore.as_bytes())?;
-    }
+        write_init_file_if_missing(&gitignore_path, gitignore.as_bytes())?
+    };
 
     // Write empty issues.jsonl for compatibility with bv (beads_viewer)
     // bv expects this file to exist even if there are no issues yet
     let jsonl_path = beads_dir.join("issues.jsonl");
     let jsonl_existed = path_entry_exists(&jsonl_path)?;
-    if !jsonl_existed {
-        write_init_file_if_missing(&jsonl_path, b"")?;
-    }
+    let jsonl_created = !jsonl_existed && write_init_file_if_missing(&jsonl_path, b"")?;
 
     if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     }
 
-    if matches!(ctx.mode(), OutputMode::Rich) {
+    if matches!(ctx.mode(), OutputMode::Json | OutputMode::Toon) {
+        let result = InitResult {
+            initialized: true,
+            beads_dir: dunce::canonicalize(&beads_dir)?,
+            database_path: dunce::canonicalize(&effective_db_path)?,
+            prefix: normalized,
+            files: InitFiles {
+                directory: InitStepStatus::from_created(created_dir),
+                database: InitStepStatus::from_created(!db_existed),
+                metadata: metadata_status,
+                config: InitStepStatus::from_created(config_created),
+                gitignore: InitStepStatus::from_created(gitignore_created),
+                jsonl: InitStepStatus::from_created(jsonl_created),
+            },
+        };
+        if ctx.is_json() {
+            ctx.json(&result);
+        } else {
+            ctx.toon(&result);
+        }
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
         let steps = build_init_steps(
             created_dir,
             db_existed,
@@ -295,11 +351,22 @@ redirect
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 enum InitStepStatus {
     Created,
     Updated,
     Existing,
+}
+
+impl InitStepStatus {
+    const fn from_created(created: bool) -> Self {
+        if created {
+            Self::Created
+        } else {
+            Self::Existing
+        }
+    }
 }
 
 struct InitStep {

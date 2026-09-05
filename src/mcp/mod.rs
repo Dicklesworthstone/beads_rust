@@ -75,8 +75,14 @@ pub(super) fn mcp_ready_issues(
     state: &BeadsState,
     storage: &SqliteStorage,
 ) -> fastmcp_rust::McpResult<Vec<Issue>> {
+    let workflow = storage.workflow_policy();
+    workflow.validate_ready_status_group().map_err(to_mcp)?;
+    let filters = ReadyFilters {
+        ready_statuses: workflow.ready_status_group(),
+        ..ReadyFilters::default()
+    };
     let mut ready = storage
-        .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Hybrid)
+        .get_ready_issues(&filters, ReadySortPolicy::Hybrid)
         .map_err(to_mcp)?;
     if ready.is_empty() || !storage.has_external_dependencies(true).map_err(to_mcp)? {
         return Ok(ready);
@@ -106,13 +112,15 @@ fn auto_flush_mcp_error(
     jsonl_path: &Path,
     err: impl std::fmt::Display,
 ) -> McpError {
-    let message = "Mutation succeeded, but automatic JSONL export failed";
+    let message = "Automatic JSONL export failed";
     McpError::with_data(
         McpErrorCode::ToolExecutionError,
         message,
         json!({
             "error_type": "AUTO_FLUSH_FAILED",
             "recoverable": true,
+            "sync_pending": true,
+            "retry_mutation": false,
             "message": message,
             "beads_dir": beads_dir.display().to_string(),
             "jsonl_path": jsonl_path.display().to_string(),
@@ -214,9 +222,9 @@ fn pending_sync_merge_read_fallback_unknown(err: impl std::fmt::Display) -> Bead
     }
 }
 
-fn dirty_auto_flush_incomplete_error(remaining_dirty: usize) -> BeadsError {
+fn dirty_auto_flush_incomplete_error(remaining_dirty: usize, needs_flush: bool) -> BeadsError {
     BeadsError::Config(format!(
-        "Automatic JSONL export did not flush {remaining_dirty} dirty issue(s)"
+        "Automatic JSONL export remains pending: {remaining_dirty} dirty issue(s), forced flush: {needs_flush}"
     ))
 }
 
@@ -387,6 +395,7 @@ impl BeadsState {
             snapshot_sidecar_path(&self.db_path, "-wal"),
             snapshot_sidecar_path(&self.db_path, "-shm"),
             self.jsonl_path.clone(),
+            self.beads_dir.join("policy.yaml"),
         ];
 
         paths
@@ -494,7 +503,8 @@ impl BeadsState {
     ///
     /// Returns an error if storage cannot be opened.
     pub fn open_read_storage(&self) -> crate::Result<SqliteStorage> {
-        match SqliteStorage::open_current_read_only(&self.db_path) {
+        let policy = crate::close_policy::load_for_beads_dir(&self.beads_dir)?;
+        let mut storage = match SqliteStorage::open_current_read_only(&self.db_path) {
             Ok(Some(storage)) => Ok(storage),
             Ok(None) => self.open_storage_with_fresh_write_authority(),
             Err(err) => {
@@ -505,14 +515,20 @@ impl BeadsState {
                 );
                 self.open_storage_with_fresh_write_authority()
             }
-        }
+        }?;
+        storage.set_workflow_policy(policy.workflow);
+        Ok(storage)
     }
 
     /// Execute a mutating closure against the storage, acquiring the cross-process
     /// write lock and triggering an auto-flush upon success.
     pub fn with_mutation<F, R>(&self, mut f: F) -> fastmcp_rust::McpResult<R>
     where
-        F: FnMut(&mut SqliteStorage) -> fastmcp_rust::McpResult<R>,
+        R: serde::Serialize,
+        F: FnMut(
+            &mut SqliteStorage,
+            &crate::close_policy::PolicyDocument,
+        ) -> fastmcp_rust::McpResult<R>,
     {
         // 1. Acquire the cross-process write lock.
         let write_authority = Arc::new(
@@ -556,37 +572,90 @@ impl BeadsState {
 
         self.clear_read_snapshot_cache();
 
+        // Refresh policy once per request under write authority. The same
+        // document drives storage admission and close-time policy evaluation.
+        let policy = crate::close_policy::load_for_beads_dir(&self.beads_dir).map_err(to_mcp)?;
         // 3. Open storage.
         let mut storage = self
             .open_storage_under_write_authority(&write_authority)
             .map_err(to_mcp)?;
+        storage.set_workflow_policy(policy.workflow.clone());
         match storage.inspect_pending_sync_merge() {
             Ok(PendingSyncMergeInspection::Absent) => {}
             Ok(inspection) => return Err(pending_sync_merge_mcp_error(&inspection)),
             Err(err) => return Err(pending_sync_merge_unknown_mcp_error(err)),
         }
         let dirty_before_mutation = storage.get_dirty_issue_metadata().map_err(to_mcp)?;
+        let (_, _, previous_sync_pending) =
+            crate::sync::pending_export_state(&storage, self.jsonl_path.exists())
+                .map_err(to_mcp)?;
 
-        // 4. Execute the mutation.
-        let result = match f(&mut storage) {
-            Ok(result) => result,
-            Err(err) => {
-                let dirty_after_error = storage.get_dirty_issue_metadata().map_err(to_mcp)?;
-                if dirty_after_error != dirty_before_mutation {
-                    self.flush_dirty_storage(&mut storage)?;
-                }
-                return Err(err);
+        let result = f(&mut storage, &policy);
+        self.finish_mutation(
+            &mut storage,
+            &dirty_before_mutation,
+            previous_sync_pending,
+            result,
+        )
+    }
+
+    fn finish_mutation<R: serde::Serialize>(
+        &self,
+        storage: &mut SqliteStorage,
+        before: &[(String, String)],
+        previous_sync_pending: bool,
+        result: McpResult<R>,
+    ) -> McpResult<R> {
+        let changed = match storage.get_dirty_issue_metadata() {
+            Ok(after) => after != before,
+            Err(witness_error) => {
+                let mut error = match result {
+                    Ok(value) => {
+                        let mut error = to_mcp(&witness_error);
+                        retain_request_result(&mut error, &value);
+                        error
+                    }
+                    Err(error) => error,
+                };
+                mark_unknown_outcome(&mut error, &witness_error);
+                return Err(error);
             }
         };
-
-        // 5. Auto-flush.
-        self.flush_dirty_storage(&mut storage)?;
-
-        Ok(result)
+        match result {
+            Ok(value) => {
+                if let Err(mut error) = self.flush_dirty_storage(storage) {
+                    let data = error_data(&mut error);
+                    data["mutation_committed"] = json!(changed);
+                    data["previous_sync_pending"] = json!(previous_sync_pending);
+                    data["sync_pending"] = json!(true);
+                    data["retry_mutation"] = json!(false);
+                    retain_request_result(&mut error, &value);
+                    return Err(error);
+                }
+                Ok(value)
+            }
+            Err(mut error) => {
+                if changed {
+                    mark_committed_error(&mut error);
+                    if let Err(mut flush_error) = self.flush_dirty_storage(storage) {
+                        let data = error_data(&mut flush_error);
+                        data["mutation_committed"] = json!(true);
+                        data["previous_sync_pending"] = json!(previous_sync_pending);
+                        data["sync_pending"] = json!(true);
+                        data["retry_mutation"] = json!(false);
+                        data["mutation_error"] = json!({
+                            "code": i32::from(error.code), "message": error.message, "data": error.data,
+                        });
+                        return Err(flush_error);
+                    }
+                    error_data(&mut error)["sync_pending"] = json!(false);
+                }
+                Err(error)
+            }
+        }
     }
 
     fn flush_dirty_storage(&self, storage: &mut SqliteStorage) -> fastmcp_rust::McpResult<()> {
-        let dirty_before_flush = storage.get_dirty_issue_count().map_err(to_mcp)?;
         let flush_result = crate::sync::auto_flush(
             storage,
             &self.beads_dir,
@@ -596,19 +665,74 @@ impl BeadsState {
         )
         .map_err(|err| auto_flush_mcp_error(&self.beads_dir, &self.jsonl_path, err))?;
 
-        if dirty_before_flush > 0 && !flush_result.flushed {
-            let remaining_dirty = storage.get_dirty_issue_count().map_err(to_mcp)?;
-            if remaining_dirty > 0 {
+        if !flush_result.flushed {
+            let (remaining_dirty, needs_flush, pending) =
+                crate::sync::pending_export_state(storage, self.jsonl_path.exists())
+                    .map_err(|err| auto_flush_mcp_error(&self.beads_dir, &self.jsonl_path, err))?;
+            if pending {
                 return Err(auto_flush_mcp_error(
                     &self.beads_dir,
                     &self.jsonl_path,
-                    dirty_auto_flush_incomplete_error(remaining_dirty),
+                    dirty_auto_flush_incomplete_error(remaining_dirty, needs_flush),
                 ));
             }
         }
 
         Ok(())
     }
+}
+
+/// Preserve the distinction between an unchanged refusal and an operation that
+/// committed before a later step failed, including individual batch items.
+fn with_item_outcome<T>(
+    storage: &mut SqliteStorage,
+    operation: impl FnOnce(&mut SqliteStorage) -> McpResult<T>,
+) -> McpResult<T> {
+    let before = storage.get_dirty_issue_metadata().map_err(to_mcp)?;
+    operation(storage).map_err(|mut error| {
+        match storage.get_dirty_issue_metadata() {
+            Ok(after) if after != before => mark_committed_error(&mut error),
+            Ok(_) => {}
+            Err(witness_error) => mark_unknown_outcome(&mut error, &witness_error),
+        }
+        error
+    })
+}
+
+fn error_data(error: &mut McpError) -> &mut Value {
+    let data = error.data.get_or_insert_with(|| json!({}));
+    if !data.is_object() {
+        *data = json!({"original_error": data.clone()});
+    }
+    data
+}
+
+fn retain_request_result(error: &mut McpError, value: &impl serde::Serialize) {
+    let data = error_data(error);
+    match serde_json::to_value(value) {
+        Ok(result) => data["request_result"] = result,
+        Err(error) => data["request_result_error"] = json!(error.to_string()),
+    }
+}
+
+fn mark_unknown_outcome(error: &mut McpError, witness_error: &impl std::fmt::Display) {
+    let data = error_data(error);
+    data["mutation_committed"] = Value::Null;
+    data["retry_mutation"] = json!(false);
+    data["outcome_error"] = json!(witness_error.to_string());
+    data["recovery"] = json!(
+        "Inspect the issue and audit events before retrying; mutation outcome could not be determined."
+    );
+}
+
+fn mark_committed_error(error: &mut McpError) {
+    let data = error_data(error);
+    data["mutation_committed"] = json!(true);
+    data["retry_mutation"] = json!(false);
+    data["publication"] = json!("see_request_outcome");
+    data["recovery"] = json!(
+        "Inspect the committed issue and audit events; retry only the unfinished operation, not the whole mutation."
+    );
 }
 
 #[cfg(test)]
@@ -663,6 +787,83 @@ mod tests {
         let mut state = test_state(temp, jsonl_path);
         state.read_snapshot_cache = Some(Mutex::new(McpReadSnapshotCache::default()));
         state
+    }
+
+    #[test]
+    fn policy_refresh_invalidates_read_cache_and_refuses_before_mutation() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state_with_read_snapshot(&temp, temp.path().join(".beads/issues.jsonl"));
+        let policy_path = state.beads_dir.join("policy.yaml");
+        fs::write(
+            &policy_path,
+            "workflow:\n  status_groups:\n    ready: [open]\n",
+        )
+        .unwrap();
+        let witness = state.capture_read_snapshot_witness();
+        state.store_read_json_snapshot("policy-read".to_string(), witness, &json!({"ready": 0}));
+        assert!(state.cached_read_json("policy-read").is_some());
+        fs::write(&policy_path, "workflow: [malformed").unwrap();
+        assert!(state.cached_read_json("policy-read").is_none());
+        let before = fs::read(&state.db_path).unwrap();
+        let called = Cell::new(false);
+        let error = state
+            .with_mutation(|_, _| {
+                called.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(!called.get());
+        assert!(error.message.contains("policy"), "{error}");
+        assert_eq!(fs::read(&state.db_path).unwrap(), before);
+    }
+
+    #[test]
+    fn request_policy_installs_capacity_before_create() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp, temp.path().join(".beads/issues.jsonl"));
+        let path = state.beads_dir.join("policy.yaml");
+        fs::write(
+            &path,
+            "workflow:\n  statuses: [open]\n  capacity:\n    statuses:\n      open:\n        hard: 1\n",
+        )
+        .unwrap();
+        state
+            .with_mutation(|storage, _| {
+                storage
+                    .create_issue(&test_issue("br-policy-a", "first"), &state.actor)
+                    .map_err(to_mcp)
+            })
+            .unwrap();
+        let before = fs::read(&state.jsonl_path).unwrap();
+        let error = state
+            .with_mutation(|storage, _| {
+                storage
+                    .create_issue(&test_issue("br-policy-b", "second"), &state.actor)
+                    .map_err(to_mcp)
+            })
+            .unwrap_err();
+        assert!(error.message.contains("capacity"), "{error}");
+        assert_eq!(fs::read(&state.jsonl_path).unwrap(), before);
+        let storage = state.open_read_storage().unwrap();
+        assert_eq!(storage.count_issues().unwrap(), 1);
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+        drop(storage);
+        fs::write(
+            &path,
+            "workflow:\n  statuses: [open]\n  capacity:\n    statuses:\n      open:\n        hard: 2\n",
+        )
+        .unwrap();
+        state
+            .with_mutation(|storage, _| {
+                storage
+                    .create_issue(&test_issue("br-policy-b", "second"), &state.actor)
+                    .map_err(to_mcp)
+            })
+            .unwrap();
+        assert_eq!(
+            state.open_read_storage().unwrap().count_issues().unwrap(),
+            2
+        );
     }
 
     fn install_valid_pending_merge_receipt(
@@ -795,7 +996,7 @@ mod tests {
         let called = Rc::new(Cell::new(false));
         let called_for_closure = Rc::clone(&called);
         let mutation_err = state
-            .with_mutation(|_| {
+            .with_mutation(|_, _| {
                 called_for_closure.set(true);
                 Ok(())
             })
@@ -856,7 +1057,7 @@ mod tests {
         state.store_read_json_snapshot("test".to_string(), witness, &cached);
 
         state
-            .with_mutation(|storage| {
+            .with_mutation(|storage, _| {
                 assert!(
                     storage.attached_write_authority().is_some(),
                     "MCP mutation storage must retain database-family authority"
@@ -886,7 +1087,7 @@ mod tests {
 
             // First flush publishes issues.jsonl (nothing to back up yet).
             state
-                .with_mutation(|storage| {
+                .with_mutation(|storage, _| {
                     storage
                         .create_issue(&test_issue("br-mcp-hist", "history knob"), "mcp-test")
                         .map_err(to_mcp)?;
@@ -898,7 +1099,7 @@ mod tests {
             // Second flush replaces an existing JSONL: the only point where a
             // `.br_history` snapshot can be taken.
             state
-                .with_mutation(|storage| {
+                .with_mutation(|storage, _| {
                     storage
                         .update_issue(
                             "br-mcp-hist",
@@ -957,7 +1158,7 @@ mod tests {
         let called_for_closure = Rc::clone(&called);
 
         let err = state
-            .with_mutation(|storage| {
+            .with_mutation(|storage, _| {
                 called_for_closure.set(true);
                 storage
                     .create_issue(
@@ -1005,7 +1206,7 @@ mod tests {
         let called_for_closure = Rc::clone(&called);
 
         let err = state
-            .with_mutation(|_| {
+            .with_mutation(|_, _| {
                 called_for_closure.set(true);
                 Ok(())
             })
@@ -1067,7 +1268,7 @@ mod tests {
         let called_for_closure = Rc::clone(&called);
 
         let err = state
-            .with_mutation(|_| {
+            .with_mutation(|_, _| {
                 called_for_closure.set(true);
                 Ok(())
             })
@@ -1120,7 +1321,7 @@ mod tests {
         let called_for_closure = Rc::clone(&called);
 
         let err = state
-            .with_mutation(|_| {
+            .with_mutation(|_, _| {
                 called_for_closure.set(true);
                 Ok(())
             })
@@ -1177,7 +1378,7 @@ mod tests {
         .unwrap();
 
         let err = state
-            .with_mutation(|storage| {
+            .with_mutation(|storage, _| {
                 storage
                     .create_issue(&test_issue("br-mcp-dirty", "dirty issue"), "mcp-test")
                     .map_err(to_mcp)?;
@@ -1202,6 +1403,98 @@ mod tests {
     }
 
     #[test]
+    fn no_op_reports_forced_export_pending_after_a_real_purge() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp, temp.path().join(".beads/issues.jsonl"));
+        state
+            .with_mutation(|storage, _| {
+                storage
+                    .create_issue(&test_issue("br-purge", "Pending purge"), &state.actor)
+                    .map_err(to_mcp)
+            })
+            .unwrap();
+        {
+            let mut storage = state.open_storage_with_fresh_write_authority().unwrap();
+            storage.purge_issue("br-purge", &state.actor).unwrap();
+            assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+            assert_eq!(storage.count_issues().unwrap(), 0);
+            assert_eq!(
+                storage.get_metadata("needs_flush").unwrap().as_deref(),
+                Some("true")
+            );
+        }
+        let conflict = "<<<<<<< ours\n{}\n=======\n{}\n>>>>>>> theirs\n";
+        fs::write(&state.jsonl_path, conflict).unwrap();
+        let expected = json!({"count": 0, "ok_count": 0, "error_count": 0});
+        let error = state
+            .with_mutation(|_, _| Ok(expected.clone()))
+            .unwrap_err();
+        let data = error.data.unwrap();
+        assert_eq!(data["error_type"], "AUTO_FLUSH_FAILED");
+        assert_eq!(data["mutation_committed"], false);
+        assert_eq!(data["previous_sync_pending"], true);
+        assert_eq!(data["sync_pending"], true);
+        assert_eq!(data["retry_mutation"], false);
+        assert_eq!(data["request_result"], expected);
+        assert_eq!(fs::read_to_string(&state.jsonl_path).unwrap(), conflict);
+
+        fs::rename(
+            &state.jsonl_path,
+            state.beads_dir.join("preserved-conflict.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(
+            state.with_mutation(|_, _| Ok(expected.clone())).unwrap(),
+            expected
+        );
+        assert!(fs::read(&state.jsonl_path).unwrap().is_empty());
+        let storage = state.open_read_storage().unwrap();
+        assert_eq!(
+            crate::sync::pending_export_state(&storage, true).unwrap(),
+            (0, false, false)
+        );
+    }
+
+    #[test]
+    fn with_mutation_preserves_original_error_when_commit_witness_is_unreadable() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp, temp.path().join(".beads/issues.jsonl"));
+        let error = state
+            .with_mutation(|storage, _| -> McpResult<()> {
+                storage
+                    .create_issue(
+                        &test_issue("br-unreadable-witness", "Committed issue"),
+                        &state.actor,
+                    )
+                    .map_err(to_mcp)?;
+                // A deliberately malformed witness exercises the unavailable
+                // outcome path using the real database, without a production hook.
+                storage
+                    .execute_test_sql("UPDATE dirty_issues SET marked_at = X'FF'")
+                    .map_err(to_mcp)?;
+                Err(McpError::with_data(
+                    McpErrorCode::InvalidParams,
+                    "Original late failure",
+                    json!({"error_type": "ORIGINAL_FAILURE", "operation": "append_comment"}),
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(error.message, "Original late failure");
+        let data = error.data.expect("outcome context");
+        assert_eq!(data["error_type"], "ORIGINAL_FAILURE");
+        assert_eq!(data["operation"], "append_comment");
+        assert!(data["mutation_committed"].is_null());
+        assert_eq!(data["retry_mutation"], false);
+        assert!(
+            data["outcome_error"]
+                .as_str()
+                .unwrap()
+                .contains("marked_at was not text")
+        );
+    }
+
+    #[test]
     fn with_mutation_flushes_committed_changes_before_returning_late_error() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
@@ -1209,7 +1502,7 @@ mod tests {
         let state = test_state(&temp, jsonl_path.clone());
 
         let err = state
-            .with_mutation(|storage| -> fastmcp_rust::McpResult<()> {
+            .with_mutation(|storage, _| -> fastmcp_rust::McpResult<()> {
                 storage
                     .create_issue(
                         &test_issue("br-mcp-partial", "partial mutation"),
@@ -1223,6 +1516,10 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.code, McpErrorCode::InvalidParams);
+        let detail = err.data.as_ref().expect("partial mutation detail");
+        assert_eq!(detail["mutation_committed"], true);
+        assert_eq!(detail["retry_mutation"], false);
+        assert_eq!(detail["sync_pending"], false);
 
         let storage = SqliteStorage::open(&state.db_path).unwrap();
         assert!(storage.id_exists("br-mcp-partial").unwrap());
@@ -1369,7 +1666,6 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         .tool(tools::ProjectOverviewTool::new(state.clone()))
         // Resources (12)
         .resource(resources::ProjectInfoResource::new(state.clone()))
-        .resource(resources::IssueResource::new(state.clone()))
         .resource(resources::SchemaResource)
         .resource(resources::LabelsResource::new(state.clone()))
         .resource(resources::ReadyIssuesResource::new(state.clone()))
@@ -1380,6 +1676,9 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         .resource(resources::DeferredIssuesResource::new(state.clone()))
         .resource(resources::GraphHealthResource::new(state.clone()))
         .resource(resources::BottlenecksResource::new(state.clone()))
+        // fastmcp rejects overlapping exact/template registrations. Individual
+        // issues use the singular namespace; collections retain issues/.
+        .resource(resources::IssueResource::new(state.clone()))
         // Prompts (4)
         .prompt(prompts::TriagePrompt::new(state.clone()))
         .prompt(prompts::StatusReportPrompt::new(state.clone()))

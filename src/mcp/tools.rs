@@ -11,7 +11,8 @@
 use std::sync::Arc;
 
 use fastmcp_rust::{
-    Content, McpContext, McpError, McpErrorCode, McpResult, Tool, ToolAnnotations, ToolHandler,
+    CompleteResult, Content, ContentBlock, FinalCallToolResult, McpContext, McpError, McpErrorCode,
+    McpResult, ResultMeta, Tool, ToolAnnotations, ToolHandler,
 };
 use serde_json::{Value, json};
 
@@ -41,6 +42,7 @@ const UPDATE_FIELD_KEYS: &[&str] = &[
     "defer_until",
     "estimated_minutes",
     "external_ref",
+    "transition_comment",
 ];
 
 /// Known placeholder strings agents hallucinate instead of real IDs.
@@ -287,7 +289,9 @@ fn beads_to_mcp(err: impl Into<crate::BeadsError>) -> McpError {
         | ErrorCode::HasDependents
         | ErrorCode::SelfDependency
         | ErrorCode::DuplicateDependency
-        | ErrorCode::IdCollision => McpErrorCode::ToolExecutionError,
+        | ErrorCode::IdCollision
+        | ErrorCode::PolicyViolation
+        | ErrorCode::WorkflowCapacityExceeded => McpErrorCode::ToolExecutionError,
         // Database / config / IO → internal
         _ => McpErrorCode::InternalError,
     };
@@ -301,10 +305,11 @@ fn beads_to_mcp(err: impl Into<crate::BeadsError>) -> McpError {
     if let Some(hint) = &structured.hint {
         data["hint"] = json!(hint);
     }
-    if let Some(ctx) = &structured.context
-        && let Some(similar) = ctx.get("similar_ids")
-    {
-        data["suggestions"] = similar.clone();
+    if let Some(ctx) = &structured.context {
+        data["context"] = ctx.clone();
+        if let Some(similar) = ctx.get("similar_ids") {
+            data["suggestions"] = similar.clone();
+        }
     }
 
     // Add contextual suggested_tool_calls based on error type
@@ -445,7 +450,20 @@ where
 
 /// Parse a status string with coercion. Returns the status and an optional
 /// warning if the input was auto-corrected (e.g. "wip" → "in_progress").
-fn parse_status(s: &str) -> McpResult<(Status, Option<String>)> {
+fn parse_status(
+    s: &str,
+    workflow: &crate::close_policy::Workflow,
+) -> McpResult<(Status, Option<String>)> {
+    if workflow
+        .statuses
+        .iter()
+        .any(|status| status.eq_ignore_ascii_case(s))
+    {
+        return s
+            .parse::<Status>()
+            .map(|status| (status, None))
+            .map_err(beads_to_mcp);
+    }
     let lower = s.to_lowercase();
     let (status, canonical) = match lower.as_str() {
         "open" | "new" | "todo" => (Status::Open, "open"),
@@ -459,26 +477,13 @@ fn parse_status(s: &str) -> McpResult<(Status, Option<String>)> {
             (Status::Closed, "closed")
         }
         "pinned" | "sticky" | "hold" | "on_hold" | "on-hold" => (Status::Pinned, "pinned"),
+        // Custom workflow states use the same parser as CLI status values.
+        // Strict vocabulary admission happens in the storage transaction.
         _ => {
-            return Err(McpError::with_data(
-                McpErrorCode::InvalidParams,
-                format!("Unknown status '{s}'"),
-                json!({
-                    "error_type": "INVALID_STATUS",
-                    "provided": s,
-                    "recoverable": true,
-                    "available_options": ["open", "in_progress", "blocked", "deferred", "draft", "closed", "pinned"],
-                    "aliases": {
-                        "open": ["new", "todo"],
-                        "in_progress": ["wip", "working", "active", "started"],
-                        "blocked": ["stuck", "waiting"],
-                        "deferred": ["later", "postponed"],
-                        "closed": ["done", "completed", "resolved", "fixed"],
-                        "pinned": ["hold", "sticky", "on_hold"]
-                    },
-                    "fix_hint": "Use one of the available options or their aliases"
-                }),
-            ));
+            return s
+                .parse::<Status>()
+                .map(|status| (status, None))
+                .map_err(beads_to_mcp);
         }
     };
 
@@ -843,6 +848,7 @@ fn validate_mcp_comment(issue_id: &str, author: &str, body: &str) -> McpResult<(
 fn parse_update_fields(
     id: &str,
     args: &serde_json::Value,
+    workflow: &crate::close_policy::Workflow,
 ) -> McpResult<(IssueUpdate, Vec<String>)> {
     let mut coercions: Vec<String> = Vec::new();
     let mut updates = IssueUpdate::default();
@@ -852,8 +858,9 @@ fn parse_update_fields(
         updates.title = Some(title);
     }
     updates.description = nullable_str(args, "description")?;
+    updates.transition_comment = optional_str_arg(args, "transition_comment")?;
     if let Some(s) = optional_str_arg(args, "status")? {
-        let (status, warning) = parse_status(&s)?;
+        let (status, warning) = parse_status(&s, workflow)?;
 
         // Intercept status→closed: redirect to close_issue
         if status == Status::Closed {
@@ -870,6 +877,12 @@ fn parse_update_fields(
                     }]
                 }),
             ));
+        }
+        if status == Status::Tombstone {
+            return Err(beads_to_mcp(BeadsError::validation(
+                "status",
+                "Use br delete to apply tombstone metadata and dependency rewiring",
+            )));
         }
 
         if let Some(w) = warning {
@@ -965,12 +978,13 @@ fn issue_json(issue: &Issue) -> serde_json::Value {
 fn build_list_filters(
     args: &serde_json::Value,
     coercions: &mut Vec<String>,
+    workflow: &crate::close_policy::Workflow,
 ) -> McpResult<ListFilters> {
     let statuses = optional_str_arg(args, "status")?
         .map(|s| {
             s.split(',')
                 .map(|p| {
-                    let (status, warning) = parse_status(p.trim())?;
+                    let (status, warning) = parse_status(p.trim(), workflow)?;
                     if let Some(w) = warning {
                         coercions.push(w);
                     }
@@ -1050,7 +1064,7 @@ fn build_list_filters(
 
 fn list_issues_json(storage: &SqliteStorage, args: &Value) -> McpResult<Value> {
     let mut coercions: Vec<String> = Vec::new();
-    let filters = build_list_filters(args, &mut coercions)?;
+    let filters = build_list_filters(args, &mut coercions, &storage.workflow_policy())?;
 
     let search_query = optional_str_arg(args, "search")?;
 
@@ -1183,6 +1197,14 @@ impl ListIssuesTool {
 }
 
 impl ToolHandler for ListIssuesTool {
+    fn call_final(
+        &self,
+        ctx: &McpContext,
+        args: Value,
+    ) -> McpResult<CompleteResult<FinalCallToolResult>> {
+        final_tool_result(self.call(ctx, args))
+    }
+
     fn definition(&self) -> Tool {
         Tool {
             name: "list_issues".into(),
@@ -1426,6 +1448,40 @@ fn mcp_error_json(err: McpError) -> Value {
     })
 }
 
+/// Tool refusals belong in the MCP tool result, where clients can inspect their
+/// typed cause and recovery context. JSON-RPC errors are reserved for protocol
+/// failures; the framework deliberately sanitizes internal protocol errors.
+fn final_tool_result(
+    result: McpResult<Vec<Content>>,
+) -> McpResult<CompleteResult<FinalCallToolResult>> {
+    let payload = match result {
+        Ok(content) => FinalCallToolResult {
+            content: content
+                .into_iter()
+                .map(|item| {
+                    serde_json::to_value(item)
+                        .and_then(serde_json::from_value::<ContentBlock>)
+                        .map_err(|err| {
+                            McpError::internal_error(format!("Invalid tool content: {err}"))
+                        })
+                })
+                .collect::<McpResult<Vec<_>>>()?,
+            is_error: false,
+            structured_content: None,
+        },
+        Err(err) if err.code == McpErrorCode::RequestCancelled => return Err(err),
+        Err(err) => {
+            let error = mcp_error_json(err);
+            FinalCallToolResult {
+                content: vec![ContentBlock::text(error.to_string())],
+                is_error: true,
+                structured_content: Some(error),
+            }
+        }
+    };
+    Ok(CompleteResult::new(payload, ResultMeta::empty()))
+}
+
 fn show_issue_batch_json(storage: &SqliteStorage, ids: &[String]) -> Value {
     let mut ok_count = 0_u64;
     let items: Vec<Value> = ids
@@ -1469,6 +1525,14 @@ fn show_issue_batch_ids(args: &Value) -> McpResult<Option<Vec<String>>> {
 }
 
 impl ToolHandler for ShowIssueTool {
+    fn call_final(
+        &self,
+        ctx: &McpContext,
+        args: Value,
+    ) -> McpResult<CompleteResult<FinalCallToolResult>> {
+        final_tool_result(self.call(ctx, args))
+    }
+
     fn definition(&self) -> Tool {
         Tool {
             name: "show_issue".into(),
@@ -1649,6 +1713,19 @@ fn create_issue_json(
         created_by: Some(state.actor.clone()),
         created_at: now,
         updated_at: now,
+        labels: labels_to_add,
+        dependencies: parent_id
+            .iter()
+            .map(|pid| crate::model::Dependency {
+                issue_id: id.clone(),
+                depends_on_id: pid.clone(),
+                dep_type: crate::model::DependencyType::ParentChild,
+                created_at: now,
+                created_by: Some(state.actor.clone()),
+                metadata: None,
+                thread_id: None,
+            })
+            .collect(),
         ..Issue::default()
     };
 
@@ -1656,21 +1733,17 @@ fn create_issue_json(
         .map_err(BeadsError::from_validation_errors)
         .map_err(beads_to_mcp)?;
 
+    let workflow = storage.workflow_policy();
+    workflow
+        .validate_status(issue.status.as_str())
+        .map_err(beads_to_mcp)?;
+    workflow
+        .validate_transition(None, issue.status.as_str())
+        .map_err(beads_to_mcp)?;
+    storage.set_pending_event_attribution(mcp_event_attribution(args)?);
     storage
         .create_issue(&issue, &state.actor)
         .map_err(beads_to_mcp)?;
-
-    for label in &labels_to_add {
-        storage
-            .add_label(&id, label, &state.actor)
-            .map_err(beads_to_mcp)?;
-    }
-
-    if let Some(ref pid) = parent_id {
-        storage
-            .add_dependency(&id, pid, "parent-child", &state.actor)
-            .map_err(beads_to_mcp)?;
-    }
 
     Ok(create_issue_result_json(
         &id,
@@ -1695,6 +1768,9 @@ fn create_issue_batch_items(args: &Value) -> McpResult<Option<Vec<Value>>> {
         "assignee",
         "labels",
         "parent",
+        "agent_name",
+        "harness",
+        "model",
     ]
     .iter()
     .any(|key| args.get(*key).is_some())
@@ -1751,8 +1827,10 @@ fn create_issue_batch_json(
     let results = items
         .iter()
         .enumerate()
-        .map(
-            |(index, item)| match create_issue_json(storage, state, item) {
+        .map(|(index, item)| {
+            match super::with_item_outcome(storage, |storage| {
+                create_issue_json(storage, state, item)
+            }) {
                 Ok(result) => {
                     ok_count += 1;
                     json!({
@@ -1764,8 +1842,8 @@ fn create_issue_batch_json(
                     })
                 }
                 Err(err) => create_issue_batch_error_item(index, item, err),
-            },
-        )
+            }
+        })
         .collect::<Vec<_>>();
     let count = u64::try_from(items.len()).unwrap_or(u64::MAX);
 
@@ -1778,6 +1856,14 @@ fn create_issue_batch_json(
 }
 
 impl ToolHandler for CreateIssueTool {
+    fn call_final(
+        &self,
+        ctx: &McpContext,
+        args: Value,
+    ) -> McpResult<CompleteResult<FinalCallToolResult>> {
+        final_tool_result(self.call(ctx, args))
+    }
+
     #[allow(clippy::too_many_lines)]
     fn definition(&self) -> Tool {
         Tool {
@@ -1826,6 +1912,9 @@ impl ToolHandler for CreateIssueTool {
                         "type": "string",
                         "description": "Parent issue ID to create as sub-issue. Creates a parent-child dependency automatically."
                     },
+                    "agent_name": {"type": "string", "description": "Agent attribution for the create event"},
+                    "harness": {"type": "string", "description": "Harness attribution used by scoped capacity admission"},
+                    "model": {"type": "string", "description": "Model attribution for the create event"},
                     "issues": {
                         "type": "array",
                         "minItems": 1,
@@ -1861,15 +1950,15 @@ impl ToolHandler for CreateIssueTool {
         ensure_not_shutting_down()?;
 
         if let Some(items) = create_issue_batch_items(&args)? {
-            let result = self
-                .0
-                .with_mutation(|storage| Ok(create_issue_batch_json(storage, &self.0, &items)))?;
+            let result = self.0.with_mutation(|storage, _| {
+                Ok(create_issue_batch_json(storage, &self.0, &items))
+            })?;
             return Ok(vec![Content::text(result.to_string())]);
         }
 
         let result = self
             .0
-            .with_mutation(|storage| create_issue_json(storage, &self.0, &args))?;
+            .with_mutation(|storage, _| create_issue_json(storage, &self.0, &args))?;
 
         Ok(vec![Content::text(result.to_string())])
     }
@@ -1947,6 +2036,20 @@ fn plan_mcp_acceptance_edit(
     Ok(Some(McpAcceptancePlan { edit, changed }))
 }
 
+fn mcp_event_attribution(args: &Value) -> McpResult<crate::storage::EventAttribution> {
+    let attribution = crate::close_policy::AttributionValues::resolve_from_env(
+        optional_str_arg(args, "agent_name")?.as_deref(),
+        optional_str_arg(args, "harness")?.as_deref(),
+        optional_str_arg(args, "model")?.as_deref(),
+    );
+    Ok(crate::storage::EventAttribution::new(
+        attribution.agent_name.as_deref(),
+        attribution.harness.as_deref(),
+        attribution.model.as_deref(),
+        crate::cli::commands::session_attribution_from_env().as_deref(),
+    ))
+}
+
 fn apply_update_issue_json(
     storage: &mut SqliteStorage,
     state: &BeadsState,
@@ -1954,10 +2057,11 @@ fn apply_update_issue_json(
 ) -> McpResult<Value> {
     let id = required_str_arg(args, "id")?;
 
-    let (mut updates, coercions) = parse_update_fields(&id, args)?;
+    let (mut updates, coercions) = parse_update_fields(&id, args, &storage.workflow_policy())?;
     let labels_to_add = optional_label_array_arg(args, "labels_add")?;
     let labels_to_remove = optional_label_array_arg(args, "labels_remove")?;
     let comment = optional_str_arg(args, "comment")?;
+    let attribution = mcp_event_attribution(args)?;
 
     if let Some(comment) = comment.as_deref()
         && !comment.is_empty()
@@ -1967,6 +2071,22 @@ fn apply_update_issue_json(
 
     // Validate ID exists before attempting update (placeholder + existence check).
     require_valid_issue(storage, &id)?;
+    if let Some(status) = &updates.status {
+        storage
+            .workflow_policy()
+            .validate_status(status.as_str())
+            .map_err(beads_to_mcp)?;
+    }
+
+    if updates.status == Some(Status::InProgress) {
+        let blockers = storage.get_start_blockers(&id).map_err(beads_to_mcp)?;
+        if !blockers.is_empty() {
+            return Err(beads_to_mcp(BeadsError::validation(
+                "claim",
+                format!("cannot claim blocked issue: {}", blockers.join(", ")),
+            )));
+        }
+    }
 
     let acceptance = plan_mcp_acceptance_edit(storage, &id, args)?;
     let acceptance_rewrite = acceptance.as_ref().is_some_and(|plan| plan.changed);
@@ -1980,6 +2100,7 @@ fn apply_update_issue_json(
         || !labels_to_remove.is_empty()
         || comment.as_deref().is_some_and(|s| !s.is_empty());
 
+    storage.set_pending_event_attribution(attribution);
     let issue = if has_field_updates {
         storage
             .update_issue(&id, &updates, &state.actor)
@@ -2100,8 +2221,10 @@ fn update_issue_batch_json(
     let results = items
         .iter()
         .enumerate()
-        .map(
-            |(index, item)| match apply_update_issue_json(storage, state, item) {
+        .map(|(index, item)| {
+            match super::with_item_outcome(storage, |storage| {
+                apply_update_issue_json(storage, state, item)
+            }) {
                 Ok(result) => {
                     ok_count += 1;
                     json!({
@@ -2112,8 +2235,8 @@ fn update_issue_batch_json(
                     })
                 }
                 Err(err) => update_issue_batch_error_item(index, item, err),
-            },
-        )
+            }
+        })
         .collect::<Vec<_>>();
     let count = u64::try_from(items.len()).unwrap_or(u64::MAX);
 
@@ -2126,6 +2249,14 @@ fn update_issue_batch_json(
 }
 
 impl ToolHandler for UpdateIssueTool {
+    fn call_final(
+        &self,
+        ctx: &McpContext,
+        args: Value,
+    ) -> McpResult<CompleteResult<FinalCallToolResult>> {
+        final_tool_result(self.call(ctx, args))
+    }
+
     #[allow(clippy::too_many_lines)]
     fn definition(&self) -> Tool {
         Tool {
@@ -2139,7 +2270,7 @@ impl ToolHandler for UpdateIssueTool {
                  Don't: Set status to 'closed' — you'll be redirected to close_issue.\n\
                  Inputs auto-corrected: 'wip' → in_progress, 'urgent' → critical, etc.\n\
                  Batch semantics: updates[] uses one write lock/storage open/auto-flush and returns {items,count,ok_count,error_count}; each item has ok:true with the legacy result or ok:false with a structured error.\n\
-                 Idempotency: Safe to retry with the same values."
+                 Idempotency: Comments and appended acceptance items can repeat on retry. Inspect mutation_committed, retry_mutation, and request_result in errors before retrying."
                     .into(),
             ),
             input_schema: json!({
@@ -2159,7 +2290,11 @@ impl ToolHandler for UpdateIssueTool {
                     },
                     "status": {
                         "type": "string",
-                        "description": "New status: open, in_progress, blocked, deferred, draft, pinned. NOT 'closed' — use close_issue instead. Aliases accepted."
+                        "description": "New status: open, in_progress, blocked, deferred, draft, pinned, or a configured custom workflow state. NOT closed or tombstone. Aliases accepted."
+                    },
+                    "transition_comment": {
+                        "type": "string",
+                        "description": "Comment committed atomically with the status transition; satisfies configured workflow comment requirements"
                     },
                     "priority": {
                         "type": "string",
@@ -2222,6 +2357,9 @@ impl ToolHandler for UpdateIssueTool {
                         "type": "string",
                         "description": "Add a comment to the issue (appended after field updates)"
                     },
+                    "agent_name": {"type": "string", "description": "Agent attribution for the update event"},
+                    "harness": {"type": "string", "description": "Harness attribution used by scoped capacity admission"},
+                    "model": {"type": "string", "description": "Model attribution for the update event"},
                     "updates": {
                         "type": "array",
                         "minItems": 1,
@@ -2247,7 +2385,7 @@ impl ToolHandler for UpdateIssueTool {
             annotations: Some(ToolAnnotations {
                 read_only: None,
                 destructive: Some(false),
-                idempotent: Some(true),
+                idempotent: Some(false),
                 open_world_hint: None,
             }),
         }
@@ -2257,15 +2395,15 @@ impl ToolHandler for UpdateIssueTool {
         ensure_not_shutting_down()?;
 
         if let Some(items) = update_issue_batch_items(&args)? {
-            let result = self
-                .0
-                .with_mutation(|storage| Ok(update_issue_batch_json(storage, &self.0, &items)))?;
+            let result = self.0.with_mutation(|storage, _| {
+                Ok(update_issue_batch_json(storage, &self.0, &items))
+            })?;
             return Ok(vec![Content::text(result.to_string())]);
         }
 
         let result = self
             .0
-            .with_mutation(|storage| apply_update_issue_json(storage, &self.0, &args))?;
+            .with_mutation(|storage, _| apply_update_issue_json(storage, &self.0, &args))?;
         Ok(vec![Content::text(result.to_string())])
     }
 }
@@ -2281,13 +2419,66 @@ impl CloseIssueTool {
     }
 }
 
+fn validate_mcp_close(
+    storage: &SqliteStorage,
+    state: &BeadsState,
+    id: &str,
+    args: &crate::cli::commands::close::CloseArgs,
+    policy: &crate::close_policy::PolicyDocument,
+) -> McpResult<()> {
+    let current = storage
+        .get_issue(id)
+        .map_err(beads_to_mcp)?
+        .ok_or_else(|| beads_to_mcp(BeadsError::IssueNotFound { id: id.to_string() }))?;
+    let mut blockers = storage.get_close_blockers(id).map_err(beads_to_mcp)?;
+    blockers.extend(
+        storage
+            .get_open_dot_notation_children(id)
+            .map_err(beads_to_mcp)?,
+    );
+    blockers.sort();
+    blockers.dedup();
+    if !blockers.is_empty() {
+        return Err(McpError::with_data(
+            McpErrorCode::ToolExecutionError,
+            format!("Issue {id} is blocked by {}", blockers.join(", ")),
+            json!({"error_type": "ISSUE_BLOCKED", "recoverable": true,
+                "issue_id": id, "blocked_by": blockers,
+                "hint": "Close the open prerequisites and children before retrying."}),
+        ));
+    }
+    let evaluated = crate::cli::commands::close::evaluate_close_policy(
+        &policy.close_policy,
+        &policy.workflow,
+        storage,
+        id,
+        &current,
+        args,
+        &state.actor,
+    )
+    .map_err(beads_to_mcp)?;
+    if !evaluated.violations.is_empty() {
+        return Err(beads_to_mcp(BeadsError::PolicyViolation {
+            issue_id: id.to_string(),
+            summary: evaluated
+                .violations
+                .iter()
+                .map(|v| v.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+            violations: evaluated.violations,
+        }));
+    }
+    Ok(())
+}
+
 fn close_issue_json(
     storage: &mut SqliteStorage,
     state: &BeadsState,
     id: &str,
-    reason: Option<&str>,
+    args: &crate::cli::commands::close::CloseArgs,
+    policy: &crate::close_policy::PolicyDocument,
 ) -> McpResult<Value> {
-    // Validate ID exists (with placeholder detection + fuzzy suggestions).
     require_valid_issue(storage, id)?;
 
     // Idempotency: if already closed, return existing state without error.
@@ -2308,11 +2499,21 @@ fn close_issue_json(
         }));
     }
 
+    validate_mcp_close(storage, state, id, args, policy)?;
+    let attribution = crate::cli::commands::close::resolve_attribution_for_close(args, policy);
+    storage.set_pending_event_attribution(crate::storage::EventAttribution::new(
+        attribution.agent_name.as_deref(),
+        attribution.harness.as_deref(),
+        attribution.model.as_deref(),
+        crate::cli::commands::session_attribution_from_env().as_deref(),
+    ));
     let now = chrono::Utc::now();
+    let reason = args.reason.as_deref().unwrap_or("done");
     let close_update = IssueUpdate {
         status: Some(Status::Closed),
         closed_at: Some(Some(now)),
-        close_reason: Some(reason.map(str::to_string)),
+        close_reason: Some(Some(reason.to_string())),
+        transition_comment: args.transition_comment.clone(),
         ..IssueUpdate::default()
     };
 
@@ -2321,15 +2522,17 @@ fn close_issue_json(
         .map_err(beads_to_mcp)?;
 
     let mut warnings = Vec::new();
-
-    // Check for blockers this issue had (warn about closing a blocked issue).
-    let our_blockers = match storage.get_blockers(id) {
-        Ok(blockers) => Some(blockers),
-        Err(err) => {
-            warnings.push(storage_read_warning("get_blockers", &err));
-            None
-        }
-    };
+    if (policy.close_policy.is_active()
+        || policy.workflow.gates_enforced()
+        || !policy.workflow.required_fields.is_empty())
+        && let Err(err) = storage.record_close_metadata(id, &attribution, false, None, &[])
+    {
+        warnings.push(json!({
+            "operation": "record_close_metadata",
+            "message": format!("Issue closed, but close metadata could not be recorded: {err}"),
+            "mutation_committed": true,
+        }));
+    }
 
     // Check what this issue was blocking (now potentially unblocked).
     let dependents = match storage.get_blocked_issue_ids(id) {
@@ -2350,16 +2553,6 @@ fn close_issue_json(
 
     if !warnings.is_empty() {
         result["warnings"] = json!(warnings);
-    }
-
-    if let Some(our_blockers) = our_blockers
-        && !our_blockers.is_empty()
-    {
-        result["warning"] = json!(format!(
-            "This issue was blocked by {} issue(s): {}. Consider whether those blockers are still relevant.",
-            our_blockers.len(),
-            our_blockers.join(", ")
-        ));
     }
 
     if let Some(dependents) = dependents {
@@ -2407,14 +2600,17 @@ fn close_issue_batch_json(
     storage: &mut SqliteStorage,
     state: &BeadsState,
     ids: &[String],
-    reason: Option<&str>,
+    args: &crate::cli::commands::close::CloseArgs,
+    policy: &crate::close_policy::PolicyDocument,
 ) -> Value {
     let mut ok_count = 0_u64;
     let items = ids
         .iter()
         .enumerate()
-        .map(
-            |(index, id)| match close_issue_json(storage, state, id, reason) {
+        .map(|(index, id)| {
+            match super::with_item_outcome(storage, |storage| {
+                close_issue_json(storage, state, id, args, policy)
+            }) {
                 Ok(result) => {
                     ok_count += 1;
                     json!({
@@ -2425,8 +2621,8 @@ fn close_issue_batch_json(
                     })
                 }
                 Err(err) => close_issue_batch_error_item(index, id, err),
-            },
-        )
+            }
+        })
         .collect::<Vec<_>>();
     let count = u64::try_from(ids.len()).unwrap_or(u64::MAX);
 
@@ -2439,6 +2635,14 @@ fn close_issue_batch_json(
 }
 
 impl ToolHandler for CloseIssueTool {
+    fn call_final(
+        &self,
+        ctx: &McpContext,
+        args: Value,
+    ) -> McpResult<CompleteResult<FinalCallToolResult>> {
+        final_tool_result(self.call(ctx, args))
+    }
+
     fn definition(&self) -> Tool {
         Tool {
             name: "close_issue".into(),
@@ -2470,6 +2674,14 @@ impl ToolHandler for CloseIssueTool {
                     "reason": {
                         "type": "string",
                         "description": "Why this issue is being closed (e.g. 'completed', 'wontfix', 'duplicate')"
+                    },
+                    "transition_comment": {
+                        "type": "string",
+                        "description": "Comment committed atomically with the close; satisfies configured transition comment requirements"
+                    },
+                    "agent_name": {"type": "string", "description": "Agent attribution for the close event"},
+                    "harness": {"type": "string", "description": "Harness attribution for the close event"},
+                    "model": {"type": "string", "description": "Model attribution for the close event"
                     }
                 },
                 "oneOf": [
@@ -2494,23 +2706,31 @@ impl ToolHandler for CloseIssueTool {
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
         ensure_not_shutting_down()?;
 
-        let reason = optional_str_arg(&args, "reason")?;
+        let close_args = crate::cli::commands::close::CloseArgs {
+            reason: optional_str_arg(&args, "reason")?,
+            transition_comment: optional_str_arg(&args, "transition_comment")?,
+            agent_name: optional_str_arg(&args, "agent_name")?,
+            harness: optional_str_arg(&args, "harness")?,
+            model: optional_str_arg(&args, "model")?,
+            ..Default::default()
+        };
         if let Some(ids) = close_issue_batch_ids(&args)? {
-            let result = self.0.with_mutation(|storage| {
+            let result = self.0.with_mutation(|storage, policy| {
                 Ok(close_issue_batch_json(
                     storage,
                     &self.0,
                     &ids,
-                    reason.as_deref(),
+                    &close_args,
+                    policy,
                 ))
             })?;
             return Ok(vec![Content::text(result.to_string())]);
         }
 
         let id = required_str_arg(&args, "id")?;
-        let result = self
-            .0
-            .with_mutation(|storage| close_issue_json(storage, &self.0, &id, reason.as_deref()))?;
+        let result = self.0.with_mutation(|storage, policy| {
+            close_issue_json(storage, &self.0, &id, &close_args, policy)
+        })?;
 
         Ok(vec![Content::text(result.to_string())])
     }
@@ -2768,8 +2988,10 @@ fn manage_dependencies_batch_json(
     let results = items
         .iter()
         .enumerate()
-        .map(
-            |(index, item)| match manage_dependencies_operation_json(storage, state, item) {
+        .map(|(index, item)| {
+            match super::with_item_outcome(storage, |storage| {
+                manage_dependencies_operation_json(storage, state, item)
+            }) {
                 Ok(result) => {
                     ok_count += 1;
                     json!({
@@ -2781,8 +3003,8 @@ fn manage_dependencies_batch_json(
                     })
                 }
                 Err(err) => manage_dependencies_batch_error_item(index, item, err),
-            },
-        )
+            }
+        })
         .collect::<Vec<_>>();
     let count = u64::try_from(items.len()).unwrap_or(u64::MAX);
 
@@ -2795,6 +3017,14 @@ fn manage_dependencies_batch_json(
 }
 
 impl ToolHandler for ManageDependenciesTool {
+    fn call_final(
+        &self,
+        ctx: &McpContext,
+        args: Value,
+    ) -> McpResult<CompleteResult<FinalCallToolResult>> {
+        final_tool_result(self.call(ctx, args))
+    }
+
     fn definition(&self) -> Tool {
         Tool {
             name: "manage_dependencies".into(),
@@ -2885,7 +3115,7 @@ impl ToolHandler for ManageDependenciesTool {
                 let mut storage = open(&self.0)?;
                 manage_dependencies_batch_json(&mut storage, &self.0, &items)
             } else {
-                self.0.with_mutation(|storage| {
+                self.0.with_mutation(|storage, _| {
                     Ok(manage_dependencies_batch_json(storage, &self.0, &items))
                 })?
             };
@@ -2904,7 +3134,7 @@ impl ToolHandler for ManageDependenciesTool {
                 let depends_on = required_str_arg(&args, "depends_on")
                     .map_err(|err| McpError::invalid_params(format!("{err} for action 'add'")))?;
                 let dep_type_raw = optional_str_arg(&args, "dep_type")?;
-                let result = self.0.with_mutation(|storage| {
+                let result = self.0.with_mutation(|storage, _| {
                     manage_dependencies_add_json(
                         storage,
                         &self.0,
@@ -2919,7 +3149,7 @@ impl ToolHandler for ManageDependenciesTool {
                 let depends_on = required_str_arg(&args, "depends_on").map_err(|err| {
                     McpError::invalid_params(format!("{err} for action 'remove'"))
                 })?;
-                let removed = self.0.with_mutation(|storage| {
+                let removed = self.0.with_mutation(|storage, _| {
                     manage_dependencies_remove_json(storage, &self.0, &id, &depends_on)
                 })?;
                 Ok(vec![Content::text(removed.to_string())])
@@ -3037,6 +3267,14 @@ impl ProjectOverviewTool {
 }
 
 impl ToolHandler for ProjectOverviewTool {
+    fn call_final(
+        &self,
+        ctx: &McpContext,
+        args: Value,
+    ) -> McpResult<CompleteResult<FinalCallToolResult>> {
+        final_tool_result(self.call(ctx, args))
+    }
+
     fn definition(&self) -> Tool {
         Tool {
             name: "project_overview".into(),
@@ -4859,16 +5097,24 @@ mod tests {
 
     #[test]
     fn parse_update_fields_rejects_non_string_priority() {
-        let err = parse_update_fields("beads_rust-1234", &json!({"priority": 0}))
-            .expect_err("numeric priority must be rejected");
+        let err = parse_update_fields(
+            "beads_rust-1234",
+            &json!({"priority": 0}),
+            &crate::close_policy::Workflow::default(),
+        )
+        .expect_err("numeric priority must be rejected");
 
         assert!(err.to_string().contains("'priority' must be a string"));
     }
 
     #[test]
     fn parse_update_fields_rejects_non_string_title() {
-        let err = parse_update_fields("beads_rust-1234", &json!({"title": ["bad"]}))
-            .expect_err("array title must be rejected");
+        let err = parse_update_fields(
+            "beads_rust-1234",
+            &json!({"title": ["bad"]}),
+            &crate::close_policy::Workflow::default(),
+        )
+        .expect_err("array title must be rejected");
 
         assert!(err.to_string().contains("'title' must be a string"));
     }
@@ -4876,8 +5122,12 @@ mod tests {
     #[test]
     fn parse_update_fields_accepts_500_multibyte_character_title() {
         let title = "é".repeat(500);
-        let (updates, coercions) = parse_update_fields("beads_rust-1234", &json!({"title": title}))
-            .expect("500-character title should be valid even when UTF-8 encoded");
+        let (updates, coercions) = parse_update_fields(
+            "beads_rust-1234",
+            &json!({"title": title}),
+            &crate::close_policy::Workflow::default(),
+        )
+        .expect("500-character title should be valid even when UTF-8 encoded");
 
         assert!(coercions.is_empty());
         let expected = "é".repeat(500);
@@ -4886,8 +5136,12 @@ mod tests {
 
     #[test]
     fn parse_update_fields_rejects_blank_title() {
-        let err = parse_update_fields("beads_rust-1234", &json!({"title": "   \t"}))
-            .expect_err("blank title must be rejected");
+        let err = parse_update_fields(
+            "beads_rust-1234",
+            &json!({"title": "   \t"}),
+            &crate::close_policy::Workflow::default(),
+        )
+        .expect_err("blank title must be rejected");
 
         assert!(err.to_string().contains("Title must be 1-500 characters"));
     }
@@ -5415,8 +5669,12 @@ mod tests {
     #[test]
     fn build_list_filters_rejects_wrong_limit_type() {
         let mut coercions = Vec::new();
-        let err = build_list_filters(&json!({"limit": "10"}), &mut coercions)
-            .expect_err("string limit must be rejected");
+        let err = build_list_filters(
+            &json!({"limit": "10"}),
+            &mut coercions,
+            &crate::close_policy::Workflow::default(),
+        )
+        .expect_err("string limit must be rejected");
 
         assert!(
             err.to_string()

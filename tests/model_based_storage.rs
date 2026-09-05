@@ -10,17 +10,19 @@
 //! produced a projection mismatch here. `PRAGMA integrity_check` must be
 //! `ok` at the end of every case.
 //!
-//! Operations that the storage rejects by design (self-dependencies, edges
-//! that would create a cycle, duplicate edges) are never generated: indices
-//! in an `Op` are resolved against the live issues at execution time, so a
-//! shrunken failing sequence is always a valid sequence. Set
+//! Readiness and annotated blocker witnesses are checked against independent
+//! graph rules, including typed edges and hierarchy. Deliberate invalid
+//! dependencies and predicted cycles must fail without changing issue data,
+//! events, or dirty tracking. Indices resolve against live issues so shrinking
+//! preserves meaningful operations. Set
 //! `BR_MODEL_CASES` to run more cases than the default.
 mod common;
 
+use beads_rust::error::BeadsError;
 use beads_rust::franken_sync::Connection;
 use beads_rust::model::{Issue, IssueType, Priority, Status};
-use beads_rust::storage::{IssueUpdate, ListFilters, SqliteStorage};
-use chrono::Utc;
+use beads_rust::storage::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
+use chrono::{DateTime, Utc};
 use fsqlite_types::SqliteValue;
 use proptest::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,7 +42,13 @@ const ACTIVE_STATUSES: [Status; 4] = [
     Status::Blocked,
     Status::Deferred,
 ];
-const DEP_TYPES: [&str; 3] = ["blocks", "related", "parent-child"];
+const DEP_TYPES: [&str; 5] = [
+    "blocks",
+    "related",
+    "parent-child",
+    "conditional-blocks",
+    "waits-for",
+];
 
 /// One generated operation. Issue references are indices into the sorted
 /// list of live (non-tombstoned) issues at the moment the op runs, taken
@@ -51,6 +59,18 @@ enum Op {
         title: String,
         priority: i32,
         kind: usize,
+    },
+    CreateReadiness {
+        flags: u8,
+        defer: usize,
+    },
+    Schedule {
+        target: usize,
+        defer: usize,
+    },
+    RejectDependency {
+        target: usize,
+        invalid: usize,
     },
     Retitle {
         target: usize,
@@ -96,6 +116,9 @@ enum Op {
 fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
         4 => ("[a-z][a-z ]{0,23}", 0..=4_i32, 0..KINDS.len()).prop_map(|(title, priority, kind)| Op::Create { title, priority, kind }),
+        1 => (0..32_u8, 0..3_usize).prop_map(|(flags, defer)| Op::CreateReadiness { flags, defer }),
+        1 => (any::<usize>(), 0..3_usize).prop_map(|(target, defer)| Op::Schedule { target, defer }),
+        1 => (any::<usize>(), 0..3_usize).prop_map(|(target, invalid)| Op::RejectDependency { target, invalid }),
         2 => (any::<usize>(), "[a-z][a-z ]{0,23}").prop_map(|(target, title)| Op::Retitle { target, title }),
         2 => (any::<usize>(), 0..ACTIVE_STATUSES.len()).prop_map(|(target, status)| Op::SetStatus { target, status }),
         1 => any::<usize>().prop_map(|target| Op::Close { target }),
@@ -118,7 +141,11 @@ struct ModelIssue {
     assignee: Option<String>,
     labels: BTreeSet<String>,
     comments: Vec<String>,
-    deleted: bool,
+    pinned: bool,
+    ephemeral: bool,
+    is_template: bool,
+    defer_until: Option<DateTime<Utc>>,
+    due_at: Option<DateTime<Utc>>,
 }
 
 /// The engine-free reference: what the observable state must be.
@@ -134,7 +161,7 @@ impl Model {
     fn live_ids(&self) -> Vec<String> {
         self.issues
             .iter()
-            .filter(|(_, issue)| !issue.deleted)
+            .filter(|(_, issue)| issue.status != Status::Tombstone)
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -217,6 +244,152 @@ impl Model {
             .iter()
             .any(|(from, to, _)| (from == a && to == b) || (from == b && to == a))
     }
+
+    /// Direct prerequisites are distinct from hierarchy: an unfinished
+    /// prerequisite blocks its dependent, while a completed/template issue
+    /// does not. This specification uses only the model, never storage caches.
+    fn direct_blockers(&self, id: &str) -> BTreeSet<String> {
+        self.outgoing(id)
+            .into_iter()
+            .filter(|(_, kind)| {
+                matches!(kind.as_str(), "blocks" | "conditional-blocks" | "waits-for")
+            })
+            .filter_map(|(target, _)| {
+                let issue = &self.issues[&target];
+                (!matches!(issue.status, Status::Closed | Status::Tombstone) && !issue.is_template)
+                    .then(|| format!("{target}:{}", issue.status.as_str()))
+            })
+            .collect()
+    }
+
+    fn parent(&self, child: &str) -> Option<String> {
+        self.outgoing(child)
+            .into_iter()
+            .find_map(|(parent, kind)| (kind == "parent-child").then_some(parent))
+    }
+
+    /// A child's ancestor must have a real prerequisite to propagate a
+    /// readiness blocker. An epic's open-child rollup never blocks that child
+    /// back. Walking ancestors independently avoids copying the cache's
+    /// propagation algorithm into the oracle.
+    fn blocker_refs(&self, id: &str) -> BTreeSet<String> {
+        let mut blockers = self.direct_blockers(id);
+        if let Some(parent) = self.parent(id) {
+            let mut ancestor = Some(parent.clone());
+            let mut seen = BTreeSet::new();
+            while let Some(current) = ancestor {
+                if !seen.insert(current.clone()) {
+                    break;
+                }
+                if !self.direct_blockers(&current).is_empty() {
+                    blockers.insert(format!("{parent}:parent-blocked"));
+                    break;
+                }
+                ancestor = self.parent(&current);
+            }
+        }
+        if self.issues[id].kind == IssueType::Epic {
+            for (child, parent, kind) in &self.deps {
+                let issue = &self.issues[child];
+                if parent == id
+                    && kind == "parent-child"
+                    && !matches!(issue.status, Status::Closed | Status::Tombstone)
+                    && !issue.is_template
+                {
+                    blockers.insert(format!("{child}:child-open"));
+                }
+            }
+        }
+        blockers
+    }
+
+    fn blocked(&self) -> BTreeMap<String, BTreeSet<String>> {
+        self.issues
+            .iter()
+            .filter_map(|(id, issue)| {
+                let blockers = self.blocker_refs(id);
+                (!matches!(issue.status, Status::Closed | Status::Tombstone)
+                    && !blockers.is_empty())
+                .then(|| (id.clone(), blockers))
+            })
+            .collect()
+    }
+
+    fn ready(
+        &self,
+        now: DateTime<Utc>,
+        statuses: &[&str],
+        include_deferred: bool,
+    ) -> BTreeSet<String> {
+        self.issues
+            .iter()
+            .filter(|(id, issue)| {
+                (statuses.contains(&issue.status.as_str())
+                    || (include_deferred && issue.status == Status::Deferred))
+                    && self.blocker_refs(id).is_empty()
+                    && (include_deferred || issue.defer_until.is_none_or(|until| until <= now))
+                    && !issue.pinned
+                    && !issue.ephemeral
+                    && !issue.is_template
+                    && !id.contains("-wisp-")
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+}
+
+/// Fixed dates stay well outside the test's execution window; equality at the
+/// admission boundary is tested separately against the pure model.
+fn schedule_date(choice: usize) -> Option<DateTime<Utc>> {
+    match choice {
+        0 => None,
+        1 => Some("2000-01-01T00:00:00Z".parse().expect("past date")),
+        _ => Some("2100-01-01T00:00:00Z".parse().expect("future date")),
+    }
+}
+
+fn record_creation(storage: &mut SqliteStorage, model: &mut Model, issue: Issue) -> String {
+    storage.create_issue(&issue, ACTOR).expect("create");
+    let id = issue.id.clone();
+    model.next += 1;
+    model.issues.insert(
+        id.clone(),
+        ModelIssue {
+            title: issue.title,
+            status: issue.status,
+            priority: issue.priority.0,
+            kind: issue.issue_type,
+            assignee: issue.assignee,
+            labels: BTreeSet::new(),
+            comments: Vec::new(),
+            pinned: issue.pinned,
+            ephemeral: issue.ephemeral,
+            is_template: issue.is_template,
+            defer_until: issue.defer_until,
+            due_at: issue.due_at,
+        },
+    );
+    format!("create {id}")
+}
+
+fn refusal_snapshot(storage: &SqliteStorage, model: &Model) -> serde_json::Value {
+    let issues: Vec<_> = model
+        .issues
+        .keys()
+        .map(|id| storage.get_issue(id).expect("refusal issue"))
+        .collect();
+    let deps: Vec<_> = model
+        .issues
+        .keys()
+        .map(|id| storage.get_dependencies_full(id).expect("refusal deps"))
+        .collect();
+    serde_json::json!({
+        "issues": issues,
+        "dependencies": deps,
+        "events": storage.get_all_events(0).expect("refusal events"),
+        "dirty": storage.get_dirty_issue_metadata().expect("refusal dirty metadata"),
+        "needs_flush": storage.get_metadata("needs_flush").expect("refusal flush marker"),
+    })
 }
 
 fn new_issue(id: &str, title: &str, priority: i32, kind: IssueType) -> Issue {
@@ -244,25 +417,79 @@ fn apply(op: &Op, storage: &mut SqliteStorage, model: &mut Model) -> String {
             kind,
         } => {
             let id = format!("mb-{:04}", model.next);
-            model.next += 1;
             let kind = KINDS[*kind].clone();
+            record_creation(storage, model, new_issue(&id, title, *priority, kind))
+        }
+        Op::CreateReadiness { flags, defer } => {
+            let id = if flags & 8 != 0 {
+                format!("mb-wisp-{:04}", model.next)
+            } else {
+                format!("mb-{:04}", model.next)
+            };
+            let mut issue = new_issue(&id, "readiness controls", 2, IssueType::Task);
+            issue.pinned = flags & 1 != 0;
+            issue.ephemeral = flags & 2 != 0;
+            issue.is_template = flags & 4 != 0;
+            if flags & 16 != 0 {
+                issue.status = Status::Custom("review".to_string());
+            }
+            issue.defer_until = schedule_date(*defer);
+            // A future due date is not a readiness admission gate.
+            issue.due_at = schedule_date(2);
+            record_creation(storage, model, issue)
+        }
+        Op::Schedule { target, defer } => {
+            let Some(id) = model.pick(*target) else {
+                return "schedule (no live issue)".to_string();
+            };
+            let until = schedule_date(*defer);
             storage
-                .create_issue(&new_issue(&id, title, *priority, kind.clone()), ACTOR)
-                .expect("create");
-            model.issues.insert(
-                id.clone(),
-                ModelIssue {
-                    title: title.clone(),
-                    status: Status::Open,
-                    priority: *priority,
-                    kind,
-                    assignee: None,
-                    labels: BTreeSet::new(),
-                    comments: Vec::new(),
-                    deleted: false,
-                },
+                .update_issue(
+                    &id,
+                    &IssueUpdate {
+                        defer_until: Some(until),
+                        ..Default::default()
+                    },
+                    ACTOR,
+                )
+                .expect("schedule");
+            model.issues.get_mut(&id).expect("model issue").defer_until = until;
+            format!("schedule {id} {until:?}")
+        }
+        Op::RejectDependency { target, invalid } => {
+            let Some(id) = model.pick(*target) else {
+                return "invalid dependency (no live issue)".to_string();
+            };
+            let before = refusal_snapshot(storage, model);
+            let error = match invalid {
+                0 => storage.add_dependency(&id, &id, "blocks", ACTOR),
+                1 => storage.add_dependency(&id, "mb-missing", "blocks", ACTOR),
+                _ => storage.add_dependency_with_metadata(
+                    &id,
+                    "mb-missing",
+                    "blocks",
+                    ACTOR,
+                    Some("{"),
+                ),
+            }
+            .expect_err("deliberate invalid dependency must be refused");
+            let expected = match invalid {
+                0 => matches!(error, BeadsError::SelfDependency { .. }),
+                1 => matches!(error, BeadsError::IssueNotFound { .. }),
+                _ => {
+                    matches!(error, BeadsError::Validation { ref field, .. } if field == "metadata")
+                }
+            };
+            assert!(
+                expected,
+                "unexpected (possibly uncertain engine) failure: {error:?}"
             );
-            format!("create {id}")
+            assert_eq!(
+                refusal_snapshot(storage, model),
+                before,
+                "refusal mutated state: {error}"
+            );
+            format!("refused dependency {id} {error}")
         }
         Op::Retitle { target, title } => {
             let Some(id) = model.pick(*target) else {
@@ -416,7 +643,6 @@ fn apply(op: &Op, storage: &mut SqliteStorage, model: &mut Model) -> String {
                 .delete_issue(&id, ACTOR, "model", None)
                 .expect("delete");
             let issue = model.issues.get_mut(&id).expect("model issue");
-            issue.deleted = true;
             issue.status = Status::Tombstone;
             format!("delete {id}")
         }
@@ -437,11 +663,7 @@ fn apply_dep_add(
         return format!("dep add {from_id} -> {to_id} (skipped: self or duplicate)");
     }
     let dep_type = DEP_TYPES[kind];
-    if model.would_close_blocker_cycle(&from_id, &to_id, dep_type) {
-        return format!("dep add {from_id} -> {to_id} ({dep_type}, skipped: cycle)");
-    }
-    // The storage allows one parent per issue: a second parent-child edge
-    // from the same issue is refused until the first is cleared.
+    // Parent uniqueness is checked before cycle admission.
     if dep_type == "parent-child"
         && model
             .outgoing(&from_id)
@@ -449,6 +671,20 @@ fn apply_dep_add(
             .any(|(_, kind)| kind == "parent-child")
     {
         return format!("dep add {from_id} -> {to_id} (skipped: already has a parent)");
+    }
+    if model.would_close_blocker_cycle(&from_id, &to_id, dep_type) {
+        let before = refusal_snapshot(storage, model);
+        let refused = storage.add_dependency(&from_id, &to_id, dep_type, ACTOR);
+        assert!(
+            matches!(refused, Err(BeadsError::DependencyCycle { .. })),
+            "expected deterministic cycle refusal, got {refused:?}"
+        );
+        assert_eq!(
+            refusal_snapshot(storage, model),
+            before,
+            "cycle refusal changed semantic state"
+        );
+        return format!("dep add {from_id} -> {to_id} ({dep_type}, refused: cycle)");
     }
     storage
         .add_dependency(&from_id, &to_id, dep_type, ACTOR)
@@ -459,6 +695,34 @@ fn apply_dep_add(
     format!("dep add {from_id} -> {to_id} ({dep_type})")
 }
 
+fn check_issue_fields(actual: &Issue, expected: &ModelIssue, context: &str) {
+    let id = &actual.id;
+    assert_eq!(actual.title, expected.title, "{context}: title of {id}");
+    assert_eq!(actual.status, expected.status, "{context}: status of {id}");
+    assert_eq!(
+        actual.priority.0, expected.priority,
+        "{context}: priority of {id}"
+    );
+    assert_eq!(actual.issue_type, expected.kind, "{context}: type of {id}");
+    assert_eq!(actual.pinned, expected.pinned, "{context}: pinned of {id}");
+    assert_eq!(
+        actual.ephemeral, expected.ephemeral,
+        "{context}: ephemeral of {id}"
+    );
+    assert_eq!(
+        actual.is_template, expected.is_template,
+        "{context}: template of {id}"
+    );
+    assert_eq!(
+        actual.defer_until, expected.defer_until,
+        "{context}: defer time of {id}"
+    );
+    assert_eq!(
+        actual.due_at, expected.due_at,
+        "{context}: due time of {id}"
+    );
+}
+
 /// Compare every projection the model tracks against the storage.
 fn check_projections(storage: &SqliteStorage, model: &Model, context: &str) {
     let live: BTreeSet<String> = model.live_ids().into_iter().collect();
@@ -467,14 +731,8 @@ fn check_projections(storage: &SqliteStorage, model: &Model, context: &str) {
             .get_issue(id)
             .expect("get_issue")
             .unwrap_or_else(|| panic!("{context}: {id} missing from storage"));
-        assert_eq!(actual.title, expected.title, "{context}: title of {id}");
-        assert_eq!(actual.status, expected.status, "{context}: status of {id}");
-        assert_eq!(
-            actual.priority.0, expected.priority,
-            "{context}: priority of {id}"
-        );
-        assert_eq!(actual.issue_type, expected.kind, "{context}: type of {id}");
-        if expected.deleted {
+        check_issue_fields(&actual, expected, context);
+        if expected.status == Status::Tombstone {
             continue;
         }
         assert_eq!(
@@ -494,17 +752,35 @@ fn check_projections(storage: &SqliteStorage, model: &Model, context: &str) {
             .map(|comment| comment.body)
             .collect();
         assert_eq!(comments, expected.comments, "{context}: comments of {id}");
-        let deps: BTreeSet<String> = storage
-            .get_dependencies(id)
-            .expect("get_dependencies")
+        let deps: BTreeSet<(String, String)> = storage
+            .get_dependencies_full(id)
+            .expect("get_dependencies_full")
             .into_iter()
-            .filter(|dep| live.contains(dep))
+            .filter(|dep| live.contains(&dep.depends_on_id))
+            .map(|dep| {
+                assert_eq!(dep.issue_id, *id, "{context}: dependency source");
+                assert_eq!(
+                    dep.created_by.as_deref(),
+                    Some(ACTOR),
+                    "{context}: dependency actor"
+                );
+                assert_eq!(
+                    dep.metadata.as_deref(),
+                    Some("{}"),
+                    "{context}: dependency metadata"
+                );
+                assert_eq!(
+                    dep.thread_id.as_deref(),
+                    Some(""),
+                    "{context}: dependency thread (schema default)"
+                );
+                (dep.depends_on_id, dep.dep_type.as_str().to_string())
+            })
             .collect();
-        let expected_deps: BTreeSet<String> = model
+        let expected_deps: BTreeSet<(String, String)> = model
             .outgoing(id)
             .into_iter()
-            .map(|(to, _)| to)
-            .filter(|to| live.contains(to))
+            .filter(|(to, _)| live.contains(to))
             .collect();
         assert_eq!(deps, expected_deps, "{context}: dependencies of {id}");
         let dependents: BTreeSet<String> = storage
@@ -527,6 +803,7 @@ fn check_projections(storage: &SqliteStorage, model: &Model, context: &str) {
         .list_issues(&ListFilters {
             include_closed: true,
             include_deferred: true,
+            include_templates: true,
             limit: Some(0),
             ..Default::default()
         })
@@ -538,6 +815,57 @@ fn check_projections(storage: &SqliteStorage, model: &Model, context: &str) {
         listed, live,
         "{context}: listing (closed + deferred included)"
     );
+    check_readiness(storage, model, &["open"], false, context);
+}
+
+fn check_readiness(
+    storage: &SqliteStorage,
+    model: &Model,
+    statuses: &[&str],
+    include_deferred: bool,
+    context: &str,
+) {
+    let filters = ReadyFilters {
+        ready_statuses: statuses
+            .iter()
+            .map(|status| (*status).to_string())
+            .collect(),
+        include_deferred,
+        ..Default::default()
+    };
+    let ready = storage
+        .get_ready_issues(&filters, ReadySortPolicy::Priority)
+        .expect("ready query")
+        .into_iter()
+        .map(|issue| issue.id)
+        .collect();
+    let blocked = storage
+        .get_blocked_issues()
+        .expect("blocked query")
+        .into_iter()
+        .map(|(issue, refs)| (issue.id, refs.into_iter().collect()))
+        .collect();
+    assert_readiness_projection(model, &ready, &blocked, statuses, include_deferred, context);
+}
+
+fn assert_readiness_projection(
+    model: &Model,
+    ready: &BTreeSet<String>,
+    blocked: &BTreeMap<String, BTreeSet<String>>,
+    statuses: &[&str],
+    include_deferred: bool,
+    context: &str,
+) {
+    assert_eq!(
+        *blocked,
+        model.blocked(),
+        "{context}: blocked IDs and witnesses"
+    );
+    assert_eq!(
+        *ready,
+        model.ready(Utc::now(), statuses, include_deferred),
+        "{context}: ready IDs"
+    );
 }
 
 fn integrity_check(db_path: &Path) -> String {
@@ -545,14 +873,49 @@ fn integrity_check(db_path: &Path) -> String {
     let rows = conn
         .query("PRAGMA integrity_check")
         .expect("integrity_check");
-    let first = rows
-        .first()
-        .and_then(|row| row.get(0))
-        .and_then(SqliteValue::as_text)
-        .unwrap_or("<no row>")
-        .to_string();
+    let values: Vec<_> = rows.iter().map(|row| row.values().to_vec()).collect();
+    let result = integrity_result(&values);
     conn.close().expect("close raw db");
-    first
+    result
+}
+
+fn integrity_result(rows: &[Vec<SqliteValue>]) -> String {
+    match rows {
+        [row] if row.len() == 1 && row[0].as_text() == Some("ok") => "ok".to_string(),
+        _ => format!("unexpected PRAGMA integrity_check rows: {rows:?}"),
+    }
+}
+
+#[test]
+fn integrity_checker_rejects_trailing_corruption_and_malformed_results() {
+    let (storage, _directory, db_path) = fresh_storage();
+    drop(storage);
+    assert_eq!(integrity_check(&db_path), "ok", "real engine baseline");
+    for rows in [
+        vec![],
+        vec![vec![]],
+        vec![
+            vec![SqliteValue::from("ok")],
+            vec![SqliteValue::from("later corruption")],
+        ],
+        vec![vec![
+            SqliteValue::from("ok"),
+            SqliteValue::from("extra column"),
+        ]],
+        vec![vec![SqliteValue::Null]],
+        vec![vec![SqliteValue::from(0_i64)]],
+        vec![vec![SqliteValue::from("OK")]],
+    ] {
+        let result = integrity_result(&rows);
+        assert!(
+            result.starts_with("unexpected PRAGMA integrity_check rows:"),
+            "unexpected integrity result accepted: {rows:?}"
+        );
+        assert!(
+            result.contains(&format!("{rows:?}")),
+            "rows omitted: {result}"
+        );
+    }
 }
 
 fn fresh_storage() -> (SqliteStorage, TempDir, std::path::PathBuf) {
@@ -561,37 +924,76 @@ fn fresh_storage() -> (SqliteStorage, TempDir, std::path::PathBuf) {
     (storage, dir, db_path)
 }
 
-fn run_sequence(ops: &[Op]) -> Result<(), TestCaseError> {
+fn run_sequence(ops: &[Op]) {
     let (mut storage, dir, db_path) = fresh_storage();
     let mut model = Model::default();
     let mut trace: Vec<String> = Vec::new();
-    for (step, op) in ops.iter().enumerate() {
-        let done = apply(op, &mut storage, &mut model);
-        trace.push(format!("{step}: {done}"));
-        let context = format!("after step {step} ({done})\ntrace:\n{}", trace.join("\n"));
-        check_projections(&storage, &model, &context);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for (step, op) in ops.iter().enumerate() {
+            trace.push(format!("{step}: requested {op:?}"));
+            let done = apply(op, &mut storage, &mut model);
+            trace.push(format!("{step}: {done}"));
+            let context = format!("after step {step} ({done})\ntrace:\n{}", trace.join("\n"));
+            check_projections(&storage, &model, &context);
+        }
+        drop(storage);
+        let reopened = SqliteStorage::open(&db_path).expect("reopen model database");
+        check_projections(
+            &reopened,
+            &model,
+            &format!("after reopen\n{}", trace.join("\n")),
+        );
+        check_readiness(
+            &reopened,
+            &model,
+            &["open", "in_progress", "review"],
+            true,
+            "configured ready group after reopen",
+        );
+        drop(reopened);
+        assert_eq!(
+            integrity_check(&db_path),
+            "ok",
+            "integrity_check after {} ops:\n{}",
+            ops.len(),
+            trace.join("\n")
+        );
+    }));
+    if let Err(payload) = result {
+        let kept = dir.keep();
+        let path = kept.join("model-failure-trace.txt");
+        std::fs::write(
+            &path,
+            format!("operations: {ops:#?}\ntrace:\n{}", trace.join("\n")),
+        )
+        .expect("write model failure trace");
+        eprintln!(
+            "[model] failure workspace and replay trace: {}",
+            path.display()
+        );
+        std::panic::resume_unwind(payload);
     }
-    drop(storage);
-    let integrity = integrity_check(&db_path);
-    prop_assert_eq!(
-        integrity.as_str(),
-        "ok",
-        "integrity_check after {} ops:\n{}",
-        ops.len(),
-        trace.join("\n")
-    );
     if std::env::var_os("BR_KEEP_TEMP").is_some() {
         let kept = dir.keep();
         eprintln!("[model] kept workspace {}", kept.display());
     }
-    Ok(())
 }
 
 fn configured_cases() -> u32 {
-    std::env::var("BR_MODEL_CASES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(120)
+    let cases = std::env::var("BR_MODEL_CASES").map_or(120, |value| {
+        value
+            .parse::<u32>()
+            .expect("BR_MODEL_CASES must be a positive integer")
+    });
+    assert!(cases > 0, "BR_MODEL_CASES=0 would skip the model campaign");
+    eprintln!(
+        "[model] cases={cases} max_ops=120 br={} engine={} source={} seed={:?}",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("BR_FSQLITE_VERSION").unwrap_or("unknown"),
+        option_env!("VERGEN_GIT_SHA").unwrap_or("unknown"),
+        std::env::var("PROPTEST_RNG_SEED").ok()
+    );
+    cases
 }
 
 proptest! {
@@ -603,7 +1005,7 @@ proptest! {
 
     #[test]
     fn storage_matches_reference_model(ops in proptest::collection::vec(op_strategy(), 1..=120)) {
-        run_sequence(&ops)?;
+        run_sequence(&ops);
     }
 }
 
@@ -658,7 +1060,7 @@ fn model_predicts_the_parent_child_blocker_direction() {
 
     // mb-0000 as a child of mb-0002: the parent would wait for a child that
     // (transitively) waits for the parent. The model predicts the refusal
-    // instead of calling the storage and panicking on DependencyCycle.
+    // and verifies the actual refusal leaves every observed value unchanged.
     assert_eq!(
         apply(
             &Op::DepAdd {
@@ -669,7 +1071,7 @@ fn model_predicts_the_parent_child_blocker_direction() {
             &mut storage,
             &mut model
         ),
-        "dep add mb-0000 -> mb-0002 (parent-child, skipped: cycle)"
+        "dep add mb-0000 -> mb-0002 (parent-child, refused: cycle)"
     );
     let refused = storage.add_dependency("mb-0000", "mb-0002", "parent-child", ACTOR);
     assert!(
@@ -759,6 +1161,297 @@ fn checker_reports_a_projection_that_drifted_from_the_model() {
         message.contains("labels of mb-0000") && message.contains("after an unmodeled label add"),
         "checker message should name the projection and the step: {message}"
     );
+}
+
+#[test]
+fn readiness_model_distinguishes_prerequisites_hierarchy_and_epic_rollup() {
+    let (mut storage, _dir, db_path) = fresh_storage();
+    let mut model = Model::default();
+    for (index, title) in ["epic", "child", "grandchild", "prerequisite", "related"]
+        .iter()
+        .enumerate()
+    {
+        apply(
+            &Op::Create {
+                title: (*title).to_string(),
+                priority: 2,
+                kind: usize::from(index == 0) * 3,
+            },
+            &mut storage,
+            &mut model,
+        );
+    }
+    for (from, to, kind) in [(1, 0, 2), (2, 1, 2), (4, 3, 1)] {
+        apply(&Op::DepAdd { from, to, kind }, &mut storage, &mut model);
+    }
+    assert_eq!(
+        model.blocked(),
+        BTreeMap::from([(
+            "mb-0000".to_string(),
+            BTreeSet::from(["mb-0001:child-open".to_string()])
+        )])
+    );
+    assert_eq!(
+        model.ready(Utc::now(), &["open"], false),
+        ["mb-0001", "mb-0002", "mb-0003", "mb-0004"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
+    check_projections(
+        &storage,
+        &model,
+        "unblocked children of an epic with open children",
+    );
+
+    apply(
+        &Op::DepAdd {
+            from: 0,
+            to: 3,
+            kind: 4,
+        },
+        &mut storage,
+        &mut model,
+    );
+    assert_eq!(
+        model.blocked(),
+        BTreeMap::from([
+            (
+                "mb-0000".to_string(),
+                BTreeSet::from(["mb-0003:open".to_string(), "mb-0001:child-open".to_string()])
+            ),
+            (
+                "mb-0001".to_string(),
+                BTreeSet::from(["mb-0000:parent-blocked".to_string()])
+            ),
+            (
+                "mb-0002".to_string(),
+                BTreeSet::from(["mb-0001:parent-blocked".to_string()])
+            ),
+        ])
+    );
+    check_projections(
+        &storage,
+        &model,
+        "blocked grandparent propagates through the immediate parent",
+    );
+    // The informational edge leaves mb-0004 ready while the real prerequisite
+    // blocks the epic and its descendants.
+    assert_eq!(storage.get_blockers("mb-0002").unwrap(), ["mb-0001"]);
+    assert!(storage.get_start_blockers("mb-0002").unwrap().is_empty());
+    assert!(storage.get_close_blockers("mb-0002").unwrap().is_empty());
+    apply(&Op::Close { target: 3 }, &mut storage, &mut model);
+    check_projections(
+        &storage,
+        &model,
+        "close prerequisite clears descendant blockers",
+    );
+    apply(
+        &Op::SetStatus {
+            target: 3,
+            status: 0,
+        },
+        &mut storage,
+        &mut model,
+    );
+    check_projections(
+        &storage,
+        &model,
+        "reopen prerequisite restores descendant blockers",
+    );
+    drop(storage);
+    let reopened = SqliteStorage::open(&db_path).expect("reopen hierarchy database");
+    check_projections(&reopened, &model, "reopened hierarchy projection");
+}
+
+#[test]
+fn readiness_model_checks_flags_custom_statuses_and_fixed_defer_boundaries() {
+    let (mut storage, _dir, _db_path) = fresh_storage();
+    let mut model = Model::default();
+    for flags in [0, 1, 2, 4, 8, 16] {
+        apply(
+            &Op::CreateReadiness { flags, defer: 0 },
+            &mut storage,
+            &mut model,
+        );
+    }
+    for defer in [1, 2] {
+        apply(
+            &Op::CreateReadiness { flags: 0, defer },
+            &mut storage,
+            &mut model,
+        );
+    }
+    let mut deferred = new_issue("mb-deferred", "deferred", 2, IssueType::Task);
+    deferred.status = Status::Deferred;
+    deferred.defer_until = schedule_date(2);
+    record_creation(&mut storage, &mut model, deferred);
+    check_projections(&storage, &model, "each independent readiness exclusion");
+    let expected: BTreeSet<_> = ["mb-0000", "mb-0006"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(model.ready(Utc::now(), &["open"], false), expected);
+    check_readiness(
+        &storage,
+        &model,
+        &["review"],
+        false,
+        "configured custom-only ready status",
+    );
+    assert_eq!(
+        model.ready(Utc::now(), &["review"], false),
+        BTreeSet::from(["mb-0005".to_string()])
+    );
+    check_readiness(
+        &storage,
+        &model,
+        &["open", "review"],
+        true,
+        "include-deferred bypasses the time gate",
+    );
+    assert!(
+        model
+            .ready(Utc::now(), &["open"], true)
+            .contains("mb-deferred")
+    );
+
+    // An injected clock is confined to the engine-free specification. Engine
+    // comparisons above use stable 2000/2100 boundaries rather than sleeps.
+    let boundary: DateTime<Utc> = "2030-01-01T00:00:00Z".parse().unwrap();
+    model.issues.get_mut("mb-0000").unwrap().defer_until = Some(boundary);
+    assert!(
+        !model
+            .ready(boundary - chrono::Duration::seconds(1), &["open"], false)
+            .contains("mb-0000")
+    );
+    assert!(model.ready(boundary, &["open"], false).contains("mb-0000"));
+    assert!(
+        model
+            .ready(boundary + chrono::Duration::seconds(1), &["open"], false)
+            .contains("mb-0000")
+    );
+}
+
+#[test]
+fn invalid_dependencies_preserve_clean_and_dirty_state() {
+    let (mut storage, _dir, _db_path) = fresh_storage();
+    let mut model = Model::default();
+    apply(
+        &Op::Create {
+            title: "unchanged".to_string(),
+            priority: 2,
+            kind: 0,
+        },
+        &mut storage,
+        &mut model,
+    );
+    for clean in [false, true] {
+        if clean {
+            storage
+                .clear_all_dirty_issues()
+                .expect("clear dirty baseline");
+            storage
+                .set_metadata("needs_flush", "false")
+                .expect("clear flush baseline");
+        }
+        for invalid in 0..3 {
+            apply(
+                &Op::RejectDependency { target: 0, invalid },
+                &mut storage,
+                &mut model,
+            );
+            check_projections(
+                &storage,
+                &model,
+                "refused self/missing-target/invalid-metadata dependency",
+            );
+        }
+    }
+}
+
+#[test]
+fn readiness_checker_rejects_missing_blockers_wrong_witnesses_and_stale_ready_rows() {
+    let (mut storage, _dir, _db_path) = fresh_storage();
+    let mut model = Model::default();
+    for title in ["dependent", "prerequisite"] {
+        apply(
+            &Op::Create {
+                title: title.to_string(),
+                priority: 2,
+                kind: 0,
+            },
+            &mut storage,
+            &mut model,
+        );
+    }
+    apply(
+        &Op::DepAdd {
+            from: 0,
+            to: 1,
+            kind: 0,
+        },
+        &mut storage,
+        &mut model,
+    );
+    let ready = BTreeSet::from(["mb-0001".to_string()]);
+    let blocked = BTreeMap::from([(
+        "mb-0000".to_string(),
+        BTreeSet::from(["mb-0001:open".to_string()]),
+    )]);
+    assert_readiness_projection(
+        &model,
+        &ready,
+        &blocked,
+        &["open"],
+        false,
+        "hand-checked baseline",
+    );
+    check_projections(
+        &storage,
+        &model,
+        "live baseline before artificial projection faults",
+    );
+
+    for fault in ["missing blocker", "wrong witness", "stale ready"] {
+        let mut faulty_ready = ready.clone();
+        let mut faulty_blocked = blocked.clone();
+        match fault {
+            "missing blocker" => {
+                faulty_blocked.clear();
+            }
+            "wrong witness" => {
+                faulty_blocked.insert(
+                    "mb-0000".to_string(),
+                    BTreeSet::from(["mb-0001:closed".to_string()]),
+                );
+            }
+            _ => {
+                faulty_ready.insert("mb-0000".to_string());
+            }
+        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_readiness_projection(
+                &model,
+                &faulty_ready,
+                &faulty_blocked,
+                &["open"],
+                false,
+                fault,
+            );
+        }));
+        let payload =
+            outcome.expect_err("checker must reject the deliberately altered observation");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            message.contains(fault) && message.contains("mb-0000"),
+            "missing mismatch context: {message}"
+        );
+    }
 }
 
 /// GitHub #426: 300 issues chained by `blocks` edges, then 264 sequential

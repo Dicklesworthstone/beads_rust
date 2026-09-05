@@ -327,13 +327,38 @@ jobs:
           path: target/${{ matrix.target }}/release/br.exe
 
   bench:
-    name: Benchmarks
+    name: Matched release benchmarks
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 120
     needs: check
-    if: github.event_name != 'push'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    env:
+      BR_PERF_BASELINE_REVISION: ${{ vars.BR_PERF_BASELINE_REVISION || '081100e4e35920f08b8c6faf6daa350da2cb030a' }}
+      # Exact workload names map to calibrated relative budgets. An absent
+      # budget retains measurements and exits inconclusive; it never passes.
+      BR_PERF_BUDGETS_JSON: ${{ vars.BR_PERF_BUDGETS_JSON }}
+      BR_PERF_QUIET_RUNNER: '1'
+      BR_PERF_ABBA_BLOCKS: '10'
+      BR_PERF_NEGATIVE_EXTRA_WORK: '1'
+      BR_PERF_EVIDENCE: ${{ github.workspace }}/target/perf-evidence
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate pinned benchmark source
+        run: |
+          set -euo pipefail
+          if [[ ! "$BR_PERF_BASELINE_REVISION" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ "$BR_PERF_BASELINE_REVISION" == 0000000000000000000000000000000000000000 ]]; then
+            echo 'benchmark_gate: inconclusive: baseline must be a full nonzero commit SHA'
+            exit 2
+          fi
+          if ! git cat-file -e "$BR_PERF_BASELINE_REVISION^{commit}"; then
+            echo 'benchmark_gate: inconclusive: pinned baseline source is unavailable'
+            exit 2
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
@@ -343,92 +368,189 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2.9.1
 
-      - name: Restore criterion baseline cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
-        with:
-          path: target/criterion/
-          key: ${{ runner.os }}-${{ runner.arch }}-criterion-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-criterion-
-
-      - name: Snapshot benchmark baseline (if present)
-        run: |
-          if [ -d target/criterion ]; then
-            mkdir -p target/criterion_prev
-            cp -a target/criterion/. target/criterion_prev/
-          fi
-
-      - name: Run benchmarks
+      - name: Build pinned release artifacts before measurement
         run: |
           set -euo pipefail
-          if find target/criterion -path "*/main/estimates.json" -type f 2>/dev/null | grep -q .; then
-            cargo bench --bench storage_perf -- --baseline main --save-baseline main
-          else
-            cargo bench --bench storage_perf -- --save-baseline main
-          fi
-        continue-on-error: true
+          mkdir -p "$BR_PERF_EVIDENCE"
+          baseline_source="$RUNNER_TEMP/br-perf-baseline"
+          baseline_target="$RUNNER_TEMP/br-perf-baseline-target"
+          git worktree add --detach "$baseline_source" "$BR_PERF_BASELINE_REVISION"
+          cargo build --manifest-path "$baseline_source/Cargo.toml" --target-dir "$baseline_target" --release --locked --bin br
+          cargo build --release --locked --bin br
+          # The debug driver times external release CLIs; building the driver in
+          # debug keeps Cargo's test panic strategy from replacing release/br.
+          cargo test --locked --test bench_synthetic_scale --no-run --message-format=json > "$BR_PERF_EVIDENCE/build-artifacts.jsonl"
+          {
+            printf 'BR_PERF_BASELINE_BINARY=%s/release/br\n' "$baseline_target"
+            printf 'BR_PERF_BASELINE_SHA256=%s\n' "$(sha256sum "$baseline_target/release/br" | cut -d ' ' -f1)"
+            printf 'BR_PERF_BASELINE_LOCKFILE=%s/Cargo.lock\n' "$baseline_source"
+            printf 'BR_PERF_BASELINE_LOCK_SHA256=%s\n' "$(sha256sum "$baseline_source/Cargo.lock" | cut -d ' ' -f1)"
+            printf 'BR_PERF_BASELINE_SOURCE=%s\n' "$BR_PERF_BASELINE_REVISION"
+            printf 'BR_PERF_CANDIDATE_BINARY=%s/target/release/br\n' "$GITHUB_WORKSPACE"
+            printf 'BR_PERF_CANDIDATE_SHA256=%s\n' "$(sha256sum target/release/br | cut -d ' ' -f1)"
+            printf 'BR_PERF_CANDIDATE_LOCKFILE=%s/Cargo.lock\n' "$GITHUB_WORKSPACE"
+            printf 'BR_PERF_CANDIDATE_LOCK_SHA256=%s\n' "$(sha256sum Cargo.lock | cut -d ' ' -f1)"
+            printf 'BR_PERF_CANDIDATE_SOURCE=%s\n' "$(git rev-parse HEAD)"
+          } >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          import json, os, pathlib
+          records = pathlib.Path(os.environ['BR_PERF_EVIDENCE'], 'build-artifacts.jsonl').read_text().splitlines()
+          executables = {row['executable'] for line in records if (row := json.loads(line)).get('reason') == 'compiler-artifact'
+                         and row.get('target', {}).get('name') == 'bench_synthetic_scale' and row.get('executable')}
+          if len(executables) != 1:
+              raise SystemExit('benchmark_gate: inconclusive: expected one compiled measurement driver')
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+              env.write('BR_PERF_HARNESS=' + executables.pop() + '\n')
+          PY
 
-      - name: Check benchmark regressions (10% threshold)
+      - name: Measure release A-A control and A-B comparison
+        id: measure
+        run: |
+          set -euo pipefail
+          # Allow build load to decay before the collector's per-sample checks.
+          # This observes low contention; the A/A cohort tests its stability.
+          python3 - <<'PY'
+          import os, time
+          deadline = time.monotonic() + 300
+          while os.getloadavg()[0] / len(os.sched_getaffinity(0)) > 0.25:
+              if time.monotonic() >= deadline:
+                  print('benchmark_gate: inconclusive: runner load did not settle')
+                  raise SystemExit(2)
+              time.sleep(5)
+          PY
+          if [[ -z "$BR_PERF_BUDGETS_JSON" ]]; then
+            unset BR_PERF_BUDGETS_JSON
+          fi
+          overall=0
+          for cohort in aa ab; do
+            mkdir -p "$BR_PERF_EVIDENCE/$cohort"
+            status=0
+            (
+              export BR_PERF_OUTPUT="$BR_PERF_EVIDENCE/$cohort"
+              if [[ "$cohort" == aa ]]; then
+                export BR_PERF_BASELINE_BINARY="$BR_PERF_CANDIDATE_BINARY"
+                export BR_PERF_BASELINE_SHA256="$BR_PERF_CANDIDATE_SHA256"
+                export BR_PERF_BASELINE_LOCKFILE="$BR_PERF_CANDIDATE_LOCKFILE"
+                export BR_PERF_BASELINE_SOURCE="$BR_PERF_CANDIDATE_SOURCE"
+              fi
+              timeout --signal=TERM --kill-after=10s 1800s "$BR_PERF_HARNESS" --exact release_abba::release_cli_abba_1k_10k --ignored --nocapture
+            ) 2>&1 | tee "$BR_PERF_EVIDENCE/$cohort/collector.log" || status=$?
+            printf '%s\n' "$status" > "$BR_PERF_EVIDENCE/$cohort/collector.exit"
+            if [[ "$status" != 0 ]]; then overall=2; fi
+          done
+          exit "$overall"
+
+      - name: Enforce complete matched benchmark receipts
+        if: always()
         run: |
           python3 - <<'PY'
-          import glob
-          import json
-          import os
-          import sys
-
-          threshold = 1.10
-          prev_root = "target/criterion_prev"
-          curr_root = "target/criterion"
-
-          if not os.path.isdir(prev_root):
-              print("benchmark_regression: no previous baseline; skipping")
-              sys.exit(0)
-
-          prev_files = glob.glob(os.path.join(prev_root, "**", "main", "estimates.json"), recursive=True)
-          if not prev_files:
-              print("benchmark_regression: no baseline estimates; skipping")
-              sys.exit(0)
-
-          regressions = []
-          for prev_path in prev_files:
-              rel = os.path.relpath(prev_path, prev_root)
-              curr_path = os.path.join(curr_root, rel)
-              if not os.path.exists(curr_path):
-                  continue
-              with open(prev_path, "r", encoding="utf-8") as fh:
-                  prev = json.load(fh)
-              with open(curr_path, "r", encoding="utf-8") as fh:
-                  curr = json.load(fh)
-              prev_mean = prev.get("mean", {}).get("point_estimate", 0.0)
-              curr_mean = curr.get("mean", {}).get("point_estimate", 0.0)
-              if prev_mean <= 0:
-                  continue
-              ratio = curr_mean / prev_mean
-              if ratio > threshold:
-                  regressions.append((rel, prev_mean, curr_mean, ratio))
-
-          if regressions:
-              print("benchmark_regression: failures (mean > 10% slower)")
-              for rel, prev_mean, curr_mean, ratio in regressions:
-                  print(f"  {rel}: prev={prev_mean:.2f} curr={curr_mean:.2f} ratio={ratio:.2f}")
-              sys.exit(1)
-
-          print("benchmark_regression: ok")
+          import json, math, os, pathlib, re
+          root = pathlib.Path(os.environ['BR_PERF_EVIDENCE'])
+          names = [f'{count}-{command}-{flush}' for count in (1000, 10000)
+                   for flush in ('default-auto-flush', 'diagnostic-no-auto-flush')
+                   for command in ('version', 'ready', 'list', 'show', 'create', 'update', 'close')]
+          try:
+              budgets = json.loads(os.environ.get('BR_PERF_BUDGETS_JSON') or '{}')
+              if not isinstance(budgets, dict) or set(budgets) != set(names) or any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in budgets.values()):
+                  raise ValueError('missing or invalid calibrated per-workload budgets')
+              decisions = {}
+              for cohort in ('aa', 'ab'):
+                  directory = root / cohort
+                  if (directory / 'collector.exit').read_text().strip() != '0':
+                      raise ValueError(f'{cohort}: collector did not complete successfully')
+                  run = json.loads((directory / 'run.json').read_text())
+                  if run['state'] != 'measurements_completed':
+                      raise ValueError(f'{cohort}: incomplete run')
+                  codes = []
+                  for name in names:
+                      count, command, flush = name.split('-', 2)
+                      summary = json.loads((directory / f'{name}-summary.json').read_text())
+                      comparison = summary['comparison']
+                      code = summary['gate_exit']
+                      if type(code) is not int or code not in (0, 1, 2) or comparison['state'] != ('pass', 'regression', 'inconclusive')[code]:
+                          raise ValueError(f'{cohort}/{name}: inconsistent comparison state')
+                      if comparison['budget_pct'] != budgets[name]:
+                          raise ValueError(f'{cohort}/{name}: comparison used a different budget')
+                      for field, keys in (('median', ('baseline_ms', 'candidate_ms', 'delta_ms', 'delta_pct')),
+                                          ('p95', ('baseline_ms', 'candidate_ms', 'delta_ms', 'delta_pct')),
+                                          ('uncertainty', ('lower_ms', 'upper_ms', 'lower_pct', 'upper_pct'))):
+                          if any(type(comparison[field][key]) not in (int, float) or not math.isfinite(comparison[field][key]) for key in keys):
+                              raise ValueError(f'{cohort}/{name}: missing or invalid descriptive {field}')
+                      receipts = [json.loads((directory / f'{name}-{side}.json').read_text()) for side in (0, 1)]
+                      for side, receipt in enumerate(receipts):
+                          samples = receipt['samples_ms']
+                          if len(samples) < 20 or len(samples) != len(receipt['exit_codes']) or any(type(x) not in (int, float) or not math.isfinite(x) or x <= 0 for x in samples):
+                              raise ValueError(f'{cohort}/{name}: invalid raw samples')
+                          if any(type(code) is not int or code != 0 for code in receipt['exit_codes']):
+                              raise ValueError(f'{cohort}/{name}: failed measured process')
+                          metadata = receipt['metadata']
+                          required = ('command', 'issue_count', 'dataset_sha256', 'flush_mode', 'cache_protocol', 'host', 'cpu', 'os', 'filesystem', 'target', 'features', 'engine', 'source_revision', 'lockfile_sha256', 'binary_sha256', 'build_profile')
+                          if not isinstance(metadata, dict) or any(not isinstance(metadata.get(key), str) or metadata[key].strip().lower() in ('', 'unknown', 'default', 'unavailable', 'n/a', 'placeholder', 'unset') for key in required):
+                              raise ValueError(f'{cohort}/{name}: missing or placeholder provenance')
+                          for key in ('dataset_sha256', 'lockfile_sha256', 'binary_sha256'):
+                              if not re.fullmatch('[0-9a-fA-F]{64}', metadata[key]) or int(metadata[key], 16) == 0:
+                                  raise ValueError(f'{cohort}/{name}: malformed {key}')
+                          if (metadata['command'], metadata['issue_count'], metadata['flush_mode'], metadata['build_profile']) != (command, count, flush, 'release'):
+                              raise ValueError(f'{cohort}/{name}: workload identity mismatch')
+                          artifact = 'CANDIDATE' if cohort == 'aa' or side == 1 else 'BASELINE'
+                          for key, suffix in (('binary_sha256', 'SHA256'), ('lockfile_sha256', 'LOCK_SHA256'), ('source_revision', 'SOURCE')):
+                              if metadata[key] != os.environ[f'BR_PERF_{artifact}_{suffix}']:
+                                  raise ValueError(f'{cohort}/{name}: {key} differs from built artifact pin')
+                      if len(receipts[0]['samples_ms']) != len(receipts[1]['samples_ms']):
+                          raise ValueError(f'{cohort}/{name}: unequal cohort sizes')
+                      provenance = ('source_revision', 'lockfile_sha256', 'binary_sha256')
+                      dimensions = [{key: value for key, value in receipt['metadata'].items() if key not in provenance} for receipt in receipts]
+                      if dimensions[0] != dimensions[1]:
+                          raise ValueError(f'{cohort}/{name}: matched metadata differs')
+                      if cohort == 'aa' and receipts[0]['metadata']['binary_sha256'] != receipts[1]['metadata']['binary_sha256']:
+                          raise ValueError(f'{cohort}/{name}: A/A artifact mismatch')
+                      raw = json.loads((directory / f'{name}-raw.json').read_text())
+                      if len(raw) != 48:
+                          raise ValueError(f'{cohort}/{name}: incomplete raw ABBA log')
+                      retained = [[], []]
+                      for index, sample in enumerate(raw):
+                          block, position = divmod(index, 4)
+                          side = (0, 1, 1, 0)[position]
+                          if any(type(sample[key]) is not int or sample[key] != expected for key, expected in (('block', block), ('position', position), ('side', side), ('exit_code', 0), ('invocations', 1))) or sample['warmup'] is not (block < 2):
+                              raise ValueError(f'{cohort}/{name}: invalid raw ABBA order or process result')
+                          elapsed = sample['elapsed_ms']
+                          if type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed <= 0:
+                              raise ValueError(f'{cohort}/{name}: invalid raw elapsed time')
+                          if not isinstance(sample['stdout'], str) or not isinstance(sample['stderr'], str) or not isinstance(sample['args'], list) or not sample['args']:
+                              raise ValueError(f'{cohort}/{name}: missing raw process output or arguments')
+                          json.loads(sample['stdout'])
+                          load = json.loads(sample['load_before'])
+                          if type(load['normalized_load_one']) not in (int, float) or not 0 <= load['normalized_load_one'] <= 0.25 or type(load['logical_cpus']) is not int or load['logical_cpus'] <= 0 or not isinstance(load['compiler_processes'], list):
+                              raise ValueError(f'{cohort}/{name}: invalid runner-load observation')
+                          if not sample['warmup']:
+                              retained[side].append(elapsed)
+                      if retained != [receipt['samples_ms'] for receipt in receipts]:
+                          raise ValueError(f'{cohort}/{name}: raw observations do not match comparison samples')
+                      print(f'{cohort}/{name}: {comparison["diagnostic"]}')
+                      codes.append(code)
+                  if run['latency_gate_exits'] != codes:
+                      raise ValueError(f'{cohort}: aggregate does not match all workload receipts')
+                  decisions[cohort] = codes
+              if any(code != 0 for code in decisions['aa']):
+                  raise ValueError('A/A control did not establish stable comparisons')
+              if 2 in decisions['ab']:
+                  raise ValueError('one or more candidate comparisons are inconclusive')
+          except (OSError, ValueError, KeyError, TypeError) as error:
+              print(f'benchmark_gate: inconclusive: {error}')
+              raise SystemExit(2)
+          if 1 in decisions['ab']:
+              print('benchmark_gate: regression: inspect workload diagnostics')
+              raise SystemExit(1)
+          print('benchmark_gate: pass: all 28 matched latency workloads and A/A controls passed; release size is gated separately')
           PY
 
       - name: Upload benchmark results
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: benchmark-results
-          path: target/criterion/
-          if-no-files-found: ignore
-
-      - name: Save criterion baseline cache
-        if: always()
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
-        with:
-          path: target/criterion/
-          key: ${{ runner.os }}-${{ runner.arch }}-criterion-${{ github.run_id }}
+          path: target/perf-evidence/
+          if-no-files-found: error
 
   # Verify version auditing info is correctly embedded
   version-audit:

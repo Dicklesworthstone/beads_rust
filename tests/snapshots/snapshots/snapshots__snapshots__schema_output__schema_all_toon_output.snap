@@ -1289,6 +1289,46 @@ schemas:
             type: boolean
           context.description: Additional context for debugging (arbitrary JSON)
         required[5]: code,message,hint,retryable,context
+  InitResult:
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+    title: InitResult
+    description: Successful initialization receipt emitted by JSON and TOON output modes.
+    type: object
+    properties:
+      initialized.type: boolean
+      beads_dir:
+        description: "Absolute, resolved workspace directory, including a `BEADS_DIR` override."
+        type: string
+      database_path:
+        description: "Absolute, resolved database path, including a `BEADS_CACHE_DIR` override."
+        type: string
+      prefix:
+        description: The normalized prefix actually stored in the database.
+        type: string
+      files:
+        "$ref": #/$defs/InitFiles
+    required[5]: initialized,beads_dir,database_path,prefix,files
+    "$defs":
+      InitFiles:
+        type: object
+        properties:
+          directory:
+            "$ref": #/$defs/InitStepStatus
+          database:
+            description: Existing means the database was reused; its prefix is still set by init.
+            "$ref": #/$defs/InitStepStatus
+          metadata:
+            "$ref": #/$defs/InitStepStatus
+          config:
+            "$ref": #/$defs/InitStepStatus
+          gitignore:
+            "$ref": #/$defs/InitStepStatus
+          jsonl:
+            "$ref": #/$defs/InitStepStatus
+        required[6]: directory,database,metadata,config,gitignore,jsonl
+      InitStepStatus:
+        type: string
+        enum[3]: created,updated,existing
   Issue:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
     title: Issue
@@ -2713,8 +2753,8 @@ commands:
     shape: array
     jq_filter: ".[]"
     items_at: .
-    error_envelope_on_stderr: true
-    notes: Empty array if no comments. ErrorEnvelope on stderr if the issue id cannot be resolved.
+    error_envelope_on_stderr: false
+    notes: Empty array if no comments. ErrorEnvelope on stdout if the issue id cannot be resolved.
   "coordination status":
     shape: object
     jq_filter: ".claims[]"
@@ -2738,19 +2778,25 @@ commands:
     shape: array
     jq_filter: ".[]"
     items_at: .
-    error_envelope_on_stderr: true
+    error_envelope_on_stderr: false
   "dep tree":
     shape: array
     jq_filter: ".[]"
     items_at: .
     item_schema: TreeNode
-    error_envelope_on_stderr: true
+    error_envelope_on_stderr: false
     notes: Pre-order traversal; each node carries a `depth` field.
   info:
     shape: object
     jq_filter: .
     error_envelope_on_stderr: false
     notes: "Workspace info object (paths, mode, config snapshot)."
+  init:
+    shape: object
+    jq_filter: .
+    item_schema: InitResult
+    error_envelope_on_stderr: false
+    notes: "Successful initialization receipt with resolved paths, stored prefix, and file outcomes. --force reuses existing issues and rewrites metadata; it does not reset the database. Structured errors are emitted on stdout."
   "label list":
     shape: array
     jq_filter: ".[]"
@@ -2783,11 +2829,11 @@ commands:
     notes: "Stable wrapper object `{\"issues\": [...], \"hidden_closed_count\": N}`; iterate with `.issues[]`. The count is zero when no closed matches were hidden or the selected corpus already includes closed issues. Pagination metadata also reports `limit`, `offset`, and `has_more`; `has_more` discloses truncation."
   show:
     shape: array
-    jq_filter: ".[0]"
+    jq_filter: ".[]"
     items_at: .
     item_schema: IssueDetails
-    error_envelope_on_stderr: true
-    notes: "Always a single-element array on success (wrapped for shape consistency with list-style commands). On a missing id, an ErrorEnvelope is written to stderr and exit code is non-zero."
+    error_envelope_on_stderr: false
+    notes: "Array containing each requested issue; a single requested ID yields one element. On a missing ID, an ErrorEnvelope is written to stdout and exit code is non-zero."
   stale:
     shape: array
     jq_filter: ".[]"

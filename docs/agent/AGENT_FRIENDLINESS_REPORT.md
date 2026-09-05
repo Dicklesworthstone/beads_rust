@@ -65,7 +65,7 @@ The original CLI-only decision predates `br serve`. Today:
   workspace over MCP stdio: 7 tools (`list_issues`, `show_issue`,
   `create_issue`, `update_issue`, `close_issue`, `manage_dependencies`,
   `project_overview`), 12 resources (`beads://project/info`,
-  `beads://issues/{id}`, `beads://schema`, `beads://labels`,
+  `beads://issue/{id}`, `beads://schema`, `beads://labels`,
   `beads://issues/ready`, `beads://issues/blocked`, `beads://issues/in_progress`,
   `beads://coordination/status`, `beads://events/recent`,
   `beads://issues/deferred`, `beads://graph/health`, `beads://issues/bottlenecks`),
@@ -73,9 +73,9 @@ The original CLI-only decision predates `br serve`. Today:
   It never listens on a network port, never runs git, and uses the same
   write lock, audit events, and JSONL auto-flush as the CLI.
 - Use the CLI for scripts; use MCP when an agent benefits from discoverable
-  tools, resources, and prompts. A stdio protocol e2e is tracked in
-  `beads_rust-zxfz.2`; until it lands, MCP behavior is covered by unit tests
-  in `src/mcp/` and the shutdown e2e only.
+  tools, resources, and prompts. Stdio protocol tests live in
+  `tests/e2e_mcp_protocol.rs` and run with `--features mcp`; unit tests live
+  in `src/mcp/`.
 
 ## Gaps / Next Improvements
 

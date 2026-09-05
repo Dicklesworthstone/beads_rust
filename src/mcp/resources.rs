@@ -181,7 +181,7 @@ impl ResourceHandler for ProjectInfoResource {
 }
 
 // ---------------------------------------------------------------------------
-// 2. issues/{id} — individual issue resource template
+// 2. issue/{id} — individual issue resource template
 // ---------------------------------------------------------------------------
 
 pub struct IssueResource(Arc<BeadsState>);
@@ -238,7 +238,7 @@ fn issue_resource_json(storage: &SqliteStorage, id: &str) -> McpResult<Value> {
 impl ResourceHandler for IssueResource {
     fn definition(&self) -> Resource {
         Resource {
-            uri: "beads://issues/{id}".into(),
+            uri: "beads://issue/{id}".into(),
             name: "Issue Details".into(),
             description: Some(
                 "Full issue details by ID. Discovery: use list_issues tool to find IDs. \
@@ -254,7 +254,7 @@ impl ResourceHandler for IssueResource {
 
     fn template(&self) -> Option<ResourceTemplate> {
         Some(ResourceTemplate {
-            uri_template: "beads://issues/{id}".into(),
+            uri_template: "beads://issue/{id}".into(),
             name: "Issue Details".into(),
             description: Some("Full issue details by ID".into()),
             mime_type: Some("application/json".into()),
@@ -268,7 +268,7 @@ impl ResourceHandler for IssueResource {
         ensure_not_shutting_down()?;
 
         Err(McpError::invalid_params(
-            "Provide an issue ID via the URI template: beads://issues/{id}",
+            "Provide an issue ID via the URI template: beads://issue/{id}",
         ))
     }
 
@@ -469,7 +469,7 @@ impl ResourceHandler for ReadyIssuesResource {
             uri: "beads://issues/ready".into(),
             name: "Ready Issues".into(),
             description: Some(
-                "Issues ready for work: open, not blocked, not deferred. \
+                "Issues ready for work in the configured ready status group, not blocked or deferred. \
                  Quick view of actionable items sorted by priority. \
                  Used by: project_overview returns the same data. Use list_issues for \
                  filtered queries."
@@ -1046,9 +1046,8 @@ fn compute_bottlenecks(storage: &SqliteStorage) -> McpResult<serde_json::Value> 
     Ok(json!({
         "count": bottlenecks.len(),
         "issues": bottlenecks,
-        "analysis_hint": "Issues sorted by how many other open issues they block. \
-            High blocks_count = high PageRank equivalent. Resolve these first to \
-            maximize unblocked work.",
+            "analysis_hint": "Issues sorted by how many other open issues they directly block. \
+            Resolve these first to maximize unblocked work.",
     }))
 }
 
@@ -1065,9 +1064,8 @@ impl ResourceHandler for BottlenecksResource {
             uri: "beads://issues/bottlenecks".into(),
             name: "Bottleneck Issues".into(),
             description: Some(
-                "Issues that block the most other work, sorted by impact. \
-                 Equivalent to bv's PageRank-based prioritization. Payload entries \
-                 include blocks_count so agents can rank downstream impact. Resolve these \
+                "Issues that block the most open issues, ranked by direct blocking edges. Payload entries \
+                 include blocks_count so agents can rank downstream impact. \
                  Used by: plan_next_work prompt uses this data for recommendations."
                     .into(),
             ),
@@ -1282,7 +1280,7 @@ mod tests {
             ),
             (
                 IssueResource::new(Arc::clone(&state)).definition(),
-                "beads://issues/{id}",
+                "beads://issue/{id}",
                 &["Full issue details", "list_issues", "show_issue"],
             ),
             (
@@ -1476,7 +1474,7 @@ mod tests {
         let params = HashMap::from([("id".to_string(), "br-resource-issue".to_string())]);
 
         let content = resource
-            .read_with_uri(&ctx, "beads://issues/br-resource-issue", &params)
+            .read_with_uri(&ctx, "beads://issue/br-resource-issue", &params)
             .expect("read issue resource");
         let cached = resource_text_json(&content);
         let direct = {

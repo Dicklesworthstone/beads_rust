@@ -1628,3 +1628,428 @@ fn test_benchmark_comparison_calculations() {
 
     info!("test_benchmark_comparison_calculations: passed");
 }
+
+/// Deterministic arithmetic controls, never measurements of product performance.
+/// The release ABBA runner uses this same comparison implementation.
+mod matched_arithmetic {
+    use super::*;
+    use common::baseline::{
+        BaselineStore, MATCHED_RUN_METADATA, MatchedRun, MatchedState, OperationBaseline,
+        RegressionConfig, RegressionResult, RegressionStatus, RegressionSummary,
+        compare_matched_runs, summarize_matched_samples,
+    };
+
+    fn control(samples_ms: Vec<f64>) -> MatchedRun {
+        let metadata = [
+            ("command", "list --json"),
+            ("issue_count", "1000"),
+            ("flush_mode", "auto-flush-enabled"),
+            ("cache_protocol", "warm-after-one-discarded-warmup"),
+            ("host", "arithmetic-control-host"),
+            ("cpu", "arithmetic-control-cpu"),
+            ("os", "arithmetic-control-os"),
+            ("filesystem", "arithmetic-control-filesystem"),
+            ("target", "x86_64-unknown-linux-gnu"),
+            ("features", "self_update"),
+            ("engine", "arithmetic-control-engine"),
+            ("source_revision", "arithmetic-control-source"),
+            ("build_profile", "release"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .chain([
+            ("dataset_sha256".to_string(), "1".repeat(64)),
+            ("lockfile_sha256".to_string(), "2".repeat(64)),
+            ("binary_sha256".to_string(), "3".repeat(64)),
+        ])
+        .collect();
+        MatchedRun {
+            exit_codes: vec![0; samples_ms.len()],
+            metadata,
+            samples_ms,
+        }
+    }
+
+    fn close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-10,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn equal_positive_zero_variance_passes_without_dividing_by_variance() {
+        let baseline = control(vec![10.0; 20]);
+        let result = compare_matched_runs(Some(&baseline), &baseline, 0.0);
+        assert_eq!(result.state, MatchedState::Pass);
+        assert_eq!(result.exit_code(), 0);
+        close(result.median.unwrap().delta_ms, 0.0);
+        close(result.p95.unwrap().delta_pct, 0.0);
+        let interval = result.uncertainty.unwrap();
+        close(interval.lower_pct, 0.0);
+        close(interval.upper_pct, 0.0);
+        assert_eq!(
+            interval.method,
+            "observed_support_extrema_not_confidence_interval"
+        );
+    }
+
+    #[test]
+    fn inclusive_budget_boundary_and_small_variation_are_not_false_regressions() {
+        let baseline = control(vec![10.0; 20]);
+        let candidate = control(vec![11.0; 20]);
+        assert_eq!(
+            compare_matched_runs(Some(&baseline), &candidate, 10.0).exit_code(),
+            0
+        );
+        assert_eq!(
+            compare_matched_runs(Some(&baseline), &candidate, 9.99).exit_code(),
+            1
+        );
+        let varied = control((0..20).map(|n| 10.0 + f64::from(n) / 100.0).collect());
+        assert_eq!(
+            compare_matched_runs(Some(&baseline), &varied, 10.0).exit_code(),
+            0
+        );
+    }
+
+    #[test]
+    fn quantiles_and_deltas_match_hand_calculation() {
+        let baseline = control((10..30).rev().map(f64::from).collect());
+        let candidate = control((15..35).map(f64::from).collect());
+        let result = compare_matched_runs(Some(&baseline), &candidate, 30.0);
+        let median = result.median.unwrap();
+        close(median.baseline_ms, 19.5);
+        close(median.candidate_ms, 24.5);
+        close(median.delta_ms, 5.0);
+        close(median.delta_pct, 5.0 / 19.5 * 100.0);
+        let p95 = result.p95.unwrap();
+        close(p95.baseline_ms, 28.0); // ceil(0.95 * 20) = 19th ordered sample.
+        close(p95.candidate_ms, 33.0);
+        close(p95.delta_ms, 5.0);
+        close(p95.delta_pct, 5.0 / 28.0 * 100.0);
+        let interval = result.uncertainty.unwrap();
+        close(interval.lower_ms, -14.0); // 15 - 29
+        close(interval.upper_ms, 24.0); // 34 - 10
+        close(interval.lower_pct, (15.0 / 29.0 - 1.0) * 100.0);
+        close(interval.upper_pct, 240.0);
+        assert_eq!(result.state, MatchedState::Inconclusive);
+
+        let odd = summarize_matched_samples(&(1..=21).map(f64::from).collect::<Vec<_>>())
+            .expect("valid arithmetic samples");
+        close(odd.median_ms, 11.0);
+        close(odd.p95_ms, 20.0); // ceil(0.95 * 21) = 20th, not the maximum.
+        close(odd.min_ms, 1.0);
+        close(odd.max_ms, 21.0);
+        assert_eq!(odd.sample_count, 21);
+    }
+
+    #[test]
+    fn degraded_receipt_fails_actual_gate_with_exit_one_and_diagnostic() {
+        let root = TempDir::new().expect("arithmetic control directory");
+        let baseline_path = root.path().join("baseline.json");
+        let candidate_path = root.path().join("degraded.json");
+        let baseline = control(vec![10.0; 20]);
+        let mut candidate = control(vec![15.0; 20]);
+        candidate
+            .metadata
+            .insert("binary_sha256".to_string(), "4".repeat(64));
+        candidate
+            .metadata
+            .insert("lockfile_sha256".to_string(), "5".repeat(64));
+        candidate.metadata.insert(
+            "source_revision".to_string(),
+            "arithmetic-control-candidate".to_string(),
+        );
+        fs::write(&baseline_path, serde_json::to_vec(&baseline).unwrap()).unwrap();
+        fs::write(&candidate_path, serde_json::to_vec(&candidate).unwrap()).unwrap();
+        let loaded_baseline = MatchedRun::load(&baseline_path).unwrap();
+        let loaded_candidate = MatchedRun::load(&candidate_path).unwrap();
+        let result = compare_matched_runs(Some(&loaded_baseline), &loaded_candidate, 20.0);
+        assert_eq!(result.state, MatchedState::Regression);
+        assert_eq!(result.exit_code(), 1);
+        close(result.p95.unwrap().delta_pct, 50.0);
+        assert!(result.diagnostic.contains("list --json"));
+        assert!(result.diagnostic.contains("budget 20.000%"));
+        assert!(
+            result
+                .diagnostic
+                .contains("p95 delta +5.000000 ms (+50.000%)")
+        );
+
+        let missing_path = root.path().join("missing.json");
+        let mismatched_path = root.path().join("mismatched.json");
+        let mut mismatched = baseline.clone();
+        mismatched
+            .metadata
+            .insert("host".to_string(), "another-control-host".to_string());
+        fs::write(&mismatched_path, serde_json::to_vec(&mismatched).unwrap()).unwrap();
+        for (candidate, reference, budget, exit, diagnostic) in [
+            (&baseline_path, &baseline_path, "20", 0, "Pass"),
+            (&candidate_path, &baseline_path, "20", 1, "Regression"),
+            (
+                &candidate_path,
+                &missing_path,
+                "20",
+                2,
+                "missing baseline receipt",
+            ),
+            (
+                &mismatched_path,
+                &baseline_path,
+                "20",
+                2,
+                "mismatched metadata: host",
+            ),
+            (
+                &baseline_path,
+                &baseline_path,
+                "NaN",
+                2,
+                "budget unavailable",
+            ),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "matched_arithmetic::receipt_gate_process_driver",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("BR_ARITHMETIC_GATE_CANDIDATE", candidate)
+                .env("BR_ARITHMETIC_GATE_BASELINE", reference)
+                .env("BR_ARITHMETIC_GATE_BUDGET", budget)
+                .output()
+                .expect("run the arithmetic receipt gate as a real subprocess");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(output.status.code(), Some(exit), "{output:?}");
+            assert!(stdout.contains(diagnostic), "{output:?}");
+            assert!(stdout.contains("list --json"), "{output:?}");
+        }
+    }
+
+    /// Only the parent control above launches this ignored process driver. Its
+    /// process status comes directly from the same comparison used by release
+    /// measurements; the input receipts here remain arithmetic controls.
+    #[test]
+    #[ignore = "subprocess driver; requires BR_ARITHMETIC_GATE_* receipt inputs"]
+    fn receipt_gate_process_driver() {
+        let candidate_path =
+            std::env::var_os("BR_ARITHMETIC_GATE_CANDIDATE").expect("candidate receipt path");
+        let baseline_path =
+            std::env::var_os("BR_ARITHMETIC_GATE_BASELINE").expect("baseline receipt path");
+        let budget = std::env::var("BR_ARITHMETIC_GATE_BUDGET")
+            .expect("explicit diagnostic budget")
+            .parse::<f64>()
+            .expect("numeric diagnostic budget");
+        let candidate = MatchedRun::load(Path::new(&candidate_path)).expect("candidate receipt");
+        let baseline = match MatchedRun::load(Path::new(&baseline_path)) {
+            Ok(run) => Some(run),
+            Err(error) => {
+                eprintln!("Baseline receipt unavailable: {error}");
+                None
+            }
+        };
+        let result = compare_matched_runs(baseline.as_ref(), &candidate, budget);
+        println!("{}", serde_json::to_string(&result).unwrap());
+        std::io::stdout().flush().unwrap();
+        std::process::exit(result.exit_code());
+    }
+
+    #[test]
+    fn missing_or_corrupt_receipts_cannot_pass() {
+        let baseline = control(vec![10.0; 20]);
+        let missing = compare_matched_runs(None, &baseline, 20.0);
+        assert_eq!(missing.state, MatchedState::Inconclusive);
+        assert_eq!(missing.exit_code(), 2);
+        assert!(missing.diagnostic.contains("missing baseline"));
+        let root = TempDir::new().unwrap();
+        let missing_path = root.path().join("missing.json");
+        assert!(MatchedRun::load(&missing_path).is_err());
+        assert!(BaselineStore::load(&missing_path).is_err());
+        for (index, bytes) in ["{", "{}", "{\"metadata\":null}", "null"]
+            .iter()
+            .enumerate()
+        {
+            let path = root.path().join(format!("corrupt-{index}.json"));
+            fs::write(&path, bytes).unwrap();
+            assert!(MatchedRun::load(&path).is_err());
+            assert!(BaselineStore::load(&path).is_err());
+            let empty = BaselineStore::load_or_default(&path);
+            assert!(empty.get_baseline("control", "list").is_none());
+            let config = RegressionConfig {
+                strict_mode: true,
+                ..Default::default()
+            };
+            let summary = RegressionSummary::from_results(
+                vec![RegressionResult::no_baseline("list", "control", 1.0, None)],
+                &config,
+            );
+            assert!(!summary.passed);
+        }
+    }
+
+    #[test]
+    fn malformed_zero_nonfinite_and_insufficient_samples_are_inconclusive() {
+        let baseline = control(vec![10.0; 20]);
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let invalid = control(vec![value; 20]);
+            for result in [
+                compare_matched_runs(Some(&invalid), &baseline, 20.0),
+                compare_matched_runs(Some(&baseline), &invalid, 20.0),
+            ] {
+                assert_eq!(result.state, MatchedState::Inconclusive);
+                assert_eq!(result.exit_code(), 2);
+            }
+        }
+        for count in [0, 1, 19, 21] {
+            let candidate = control(vec![10.0; count]);
+            assert_eq!(
+                compare_matched_runs(Some(&baseline), &candidate, 20.0).exit_code(),
+                2
+            );
+        }
+        for budget in [-1.0, f64::NAN, f64::INFINITY] {
+            let result = compare_matched_runs(Some(&baseline), &baseline, budget);
+            assert_eq!(result.exit_code(), 2);
+            assert!(result.budget_pct.is_none());
+            assert!(result.diagnostic.contains("budget unavailable"));
+            close(result.median.unwrap().delta_ms, 0.0);
+            close(result.p95.unwrap().delta_ms, 0.0);
+            close(result.uncertainty.unwrap().upper_ms, 0.0);
+        }
+        let tiny = control(vec![f64::MIN_POSITIVE; 20]);
+        let huge = control(vec![f64::MAX; 20]);
+        assert_eq!(
+            compare_matched_runs(Some(&tiny), &huge, 20.0).exit_code(),
+            2
+        );
+    }
+
+    #[test]
+    fn noisy_samples_stay_present_and_cannot_claim_a_pass() {
+        let baseline = control(vec![10.0; 20]);
+        let mut candidate = baseline.clone();
+        candidate.samples_ms[19] = 1000.0;
+        let result = compare_matched_runs(Some(&baseline), &candidate, 20.0);
+        assert_eq!(result.state, MatchedState::Inconclusive);
+        assert_eq!(result.exit_code(), 2);
+        // Nearest-rank p95 is unchanged, but the extreme sample is still in the gate.
+        close(result.p95.unwrap().delta_ms, 0.0);
+        close(result.uncertainty.unwrap().upper_ms, 990.0);
+        assert_eq!(candidate.samples_ms.len(), 20);
+        close(
+            summarize_matched_samples(&candidate.samples_ms)
+                .unwrap()
+                .max_ms,
+            1000.0,
+        );
+    }
+
+    #[test]
+    fn missing_placeholder_and_mismatched_metadata_are_inconclusive() {
+        let baseline = control(vec![10.0; 20]);
+        for key in MATCHED_RUN_METADATA {
+            let mut candidate = baseline.clone();
+            candidate.metadata.remove(key);
+            assert_eq!(
+                compare_matched_runs(Some(&baseline), &candidate, 20.0).exit_code(),
+                2,
+                "missing {key}"
+            );
+            candidate
+                .metadata
+                .insert(key.to_string(), "unknown".to_string());
+            assert_eq!(
+                compare_matched_runs(Some(&baseline), &candidate, 20.0).exit_code(),
+                2,
+                "unknown {key}"
+            );
+            if !matches!(key, "source_revision" | "lockfile_sha256" | "binary_sha256") {
+                let replacement = if key == "dataset_sha256" {
+                    "6".repeat(64)
+                } else if key == "issue_count" {
+                    "10000".to_string()
+                } else {
+                    "different-control-value".to_string()
+                };
+                candidate.metadata.insert(key.to_string(), replacement);
+                let result = compare_matched_runs(Some(&baseline), &candidate, 20.0);
+                assert_eq!(result.exit_code(), 2, "mismatch {key}");
+                assert!(result.diagnostic.contains(key));
+            }
+        }
+        for digest in ["0".repeat(64), "a".repeat(63), "g".repeat(64)] {
+            let mut candidate = baseline.clone();
+            candidate
+                .metadata
+                .insert("binary_sha256".to_string(), digest);
+            assert_eq!(
+                compare_matched_runs(Some(&baseline), &candidate, 20.0).exit_code(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn success_metadata_never_overrides_nonzero_or_missing_exit_codes() {
+        let mut baseline = control(vec![10.0; 20]);
+        baseline
+            .metadata
+            .insert("status".to_string(), "success".to_string());
+        let mut candidate = baseline.clone();
+        candidate.exit_codes[5] = 7;
+        let result = compare_matched_runs(Some(&baseline), &candidate, 20.0);
+        assert_eq!(result.exit_code(), 2);
+        assert!(
+            result
+                .diagnostic
+                .contains("sample 5 failed with exit code 7")
+        );
+        candidate.exit_codes.pop();
+        assert_eq!(
+            compare_matched_runs(Some(&baseline), &candidate, 20.0).exit_code(),
+            2
+        );
+    }
+
+    #[test]
+    fn legacy_unknown_and_empty_summary_cannot_pass_in_either_mode() {
+        for strict_mode in [false, true] {
+            let config = RegressionConfig {
+                strict_mode,
+                ..Default::default()
+            };
+            assert!(!RegressionSummary::from_results(Vec::new(), &config).passed);
+            let result = RegressionResult::no_baseline("list", "arithmetic", 1.0, None);
+            assert_eq!(result.status, RegressionStatus::Inconclusive);
+            let summary = RegressionSummary::from_results(vec![result], &config);
+            assert_eq!(summary.ok_count, 0);
+            assert_eq!(summary.inconclusive_count, 1);
+            assert!(!summary.passed);
+        }
+    }
+
+    #[test]
+    fn legacy_invalid_ratios_and_unmatched_rss_are_inconclusive() {
+        let config = RegressionConfig::ci();
+        let mut baseline = OperationBaseline {
+            duration_ratio: 1.0,
+            rss_ratio: None,
+            br_duration_ms: 10,
+            bd_duration_ms: 10,
+            captured_at: "arithmetic-control".to_string(),
+            notes: None,
+        };
+        for ratio in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            baseline.duration_ratio = ratio;
+            let result = RegressionResult::check("list", "control", 1.0, None, &baseline, &config);
+            assert_eq!(result.status, RegressionStatus::Inconclusive);
+            assert!(!RegressionSummary::from_results(vec![result], &config).passed);
+        }
+        baseline.duration_ratio = 1.0;
+        baseline.rss_ratio = Some(1.0);
+        let result = RegressionResult::check("list", "control", 1.0, None, &baseline, &config);
+        assert_eq!(result.status, RegressionStatus::Inconclusive);
+    }
+}

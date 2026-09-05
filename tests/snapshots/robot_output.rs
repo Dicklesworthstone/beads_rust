@@ -1,4 +1,4 @@
-use super::common::cli::{BrWorkspace, run_br};
+use super::common::cli::{BrWorkspace, run_br, run_br_with_env};
 use super::init_workspace;
 use insta::assert_snapshot;
 use regex::Regex;
@@ -278,17 +278,20 @@ fn normalize_bv_robot_output_masks_data_hash() {
 fn robot_golden_ready_output() {
     let workspace = init_robot_golden_workspace();
 
-    let output = run_br(
+    let output = run_br_with_env(
         &workspace,
         [
             "ready",
             "--robot",
+            "--quiet",
+            "--no-color",
             "--include-deferred",
             "--sort",
             "priority",
             "--limit",
             "0",
         ],
+        [("BR_OUTPUT_FORMAT", "toon"), ("TERM", "dumb")],
         "robot_golden_ready",
     );
     assert!(

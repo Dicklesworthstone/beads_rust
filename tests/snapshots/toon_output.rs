@@ -1,9 +1,19 @@
-use super::common::cli::run_br;
+use super::common::cli::{BrRun, run_br};
 use super::init_workspace;
 use insta::assert_snapshot;
 use regex::Regex;
+use serde_json::Value;
 use std::fs;
 use std::sync::LazyLock;
+
+fn strict_toon(run: &BrRun) -> Value {
+    assert!(run.status.success(), "TOON command failed: {run:?}");
+    assert!(!run.stdout.contains('\u{1b}'), "ANSI in TOON: {run:?}");
+    Value::from(
+        toon_rust::try_decode(&run.stdout, None)
+            .unwrap_or_else(|error| panic!("whole TOON stdout must decode: {error}; {run:?}")),
+    )
+}
 
 const TOON_JSONL_FIXTURE: &str = r#"{"id":"bd-blocker","title":"00 Blocking Root","description":"Unblocks dependent work","status":"open","priority":0,"issue_type":"task","created_at":"2026-02-01T00:00:00Z","created_by":"fixture","updated_at":"2026-02-01T00:00:00Z","source_repo":".","labels":["core"],"compaction_level":0,"original_size":0}
 {"id":"bd-ready-p0","title":"01 Ready Critical Unassigned","status":"open","priority":0,"issue_type":"bug","created_at":"2026-02-02T00:00:00Z","created_by":"fixture","updated_at":"2026-02-02T00:00:00Z","source_repo":".","labels":["ops","agent"],"compaction_level":0,"original_size":0}
@@ -56,10 +66,9 @@ fn toon_golden_list_output() {
         "list --format toon failed: {}",
         output.stderr
     );
-    assert!(
-        !output.stdout.trim().is_empty(),
-        "TOON output should not be empty"
-    );
+    let decoded = strict_toon(&output);
+    assert_eq!(decoded["issues"].as_array().expect("list issues").len(), 5);
+    assert_eq!(decoded["issues"][0]["id"], "bd-blocker");
 
     let normalized = normalize_toon_output(&output.stdout);
     assert_snapshot!("toon_list_output", normalized);
@@ -79,10 +88,9 @@ fn toon_golden_show_output() {
         "show --format toon failed: {}",
         output.stderr
     );
-    assert!(
-        !output.stdout.trim().is_empty(),
-        "TOON output should not be empty"
-    );
+    let decoded = strict_toon(&output);
+    assert_eq!(decoded.as_array().expect("show issues").len(), 1);
+    assert_eq!(decoded[0]["id"], "bd-ready-p0");
 
     let normalized = normalize_toon_output(&output.stdout);
     assert_snapshot!("toon_show_output", normalized);
@@ -104,10 +112,14 @@ fn toon_golden_ready_output() {
         "ready --format toon failed: {}",
         output.stderr
     );
-    assert!(
-        !output.stdout.trim().is_empty(),
-        "TOON output should not be empty"
-    );
+    let decoded = strict_toon(&output);
+    let ids: Vec<_> = decoded
+        .as_array()
+        .expect("ready issues")
+        .iter()
+        .map(|issue| issue["id"].as_str().expect("ready id"))
+        .collect();
+    assert_eq!(ids, ["bd-blocker", "bd-ready-p0", "bd-ready-p1-assigned"]);
 
     let normalized = normalize_toon_output(&output.stdout);
     assert_snapshot!("toon_ready_output", normalized);

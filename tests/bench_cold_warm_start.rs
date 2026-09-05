@@ -849,19 +849,19 @@ fn build_perf_evidence_manifest(
         },
         isomorphism_note_path: "proof/isomorphism.md".to_string(),
         policy: PerfEvidencePolicy {
-            mode: "enforcing".to_string(),
-            baseline_manifest_path: Some("baseline/perf-evidence-manifest.json".to_string()),
-            latency_regression_budget_pct: Some(5.0),
-            syscall_regression_budget_pct: Some(10.0),
-            output_hash_must_match: true,
+            mode: "advisory".to_string(),
+            baseline_manifest_path: None,
+            latency_regression_budget_pct: None,
+            syscall_regression_budget_pct: None,
+            output_hash_must_match: false,
         },
         comparison: PerfEvidenceComparison {
-            status: "pass".to_string(),
-            baseline_manifest_path: Some("baseline/perf-evidence-manifest.json".to_string()),
-            p95_delta_pct: Some(0.0),
-            stdout_hash_match: Some(true),
-            syscall_delta_pct: Some(0.0),
-            decision_reason: "self-baseline smoke comparison passed enforcing policy".to_string(),
+            status: "not_compared".to_string(),
+            baseline_manifest_path: None,
+            p95_delta_pct: None,
+            stdout_hash_match: None,
+            syscall_delta_pct: None,
+            decision_reason: "smoke samples have no independent matched release baseline; latency and syscall regressions are unknown".to_string(),
         },
         raw_artifact_paths,
     })
@@ -901,11 +901,6 @@ fn write_perf_evidence_smoke_bundle(
         bundle_dir.join("perf-evidence-manifest.json"),
         &manifest_json,
     )?;
-    fs::write(
-        bundle_dir.join("baseline/perf-evidence-manifest.json"),
-        manifest_json,
-    )?;
-
     Ok(manifest)
 }
 
@@ -1560,9 +1555,16 @@ fn perf_evidence_smoke_bundle_records_list_json_command() -> std::io::Result<()>
     );
     assert_eq!(manifest.schema_version, "br.perf-evidence.v1");
     assert_eq!(manifest.command.args, ["list", "--json"]);
-    assert_eq!(manifest.policy.mode, "enforcing");
-    assert_eq!(manifest.comparison.status, "pass");
-    assert_eq!(manifest.comparison.stdout_hash_match, Some(true));
+    assert_eq!(manifest.policy.mode, "advisory");
+    assert_eq!(manifest.comparison.status, "not_compared");
+    assert_eq!(manifest.comparison.stdout_hash_match, None);
+    assert_eq!(manifest.comparison.p95_delta_pct, None);
+    assert_eq!(manifest.comparison.syscall_delta_pct, None);
+    assert!(
+        !bundle_dir
+            .join("baseline/perf-evidence-manifest.json")
+            .exists()
+    );
     assert_eq!(manifest.timing.sample_count, 3);
     assert!(manifest.timing.p50_ms <= manifest.timing.p95_ms);
     assert!(manifest.timing.p95_ms <= manifest.timing.p99_ms);

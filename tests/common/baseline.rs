@@ -23,7 +23,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::{self, File};
 use std::io::BufWriter;
@@ -167,22 +167,32 @@ impl Default for BaselineStore {
 }
 
 impl BaselineStore {
-    /// Load baselines from file, or return empty store if file doesn't exist.
+    /// Load an existing baseline, preserving missing/corrupt input as an error.
+    pub fn load(path: &Path) -> std::io::Result<Self> {
+        let content = fs::read_to_string(path)?;
+        let store: Self = serde_json::from_str(&content)?;
+        if store.version != "1.0" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported baseline version: {}", store.version),
+            ));
+        }
+        Ok(store)
+    }
+
+    /// Load baselines, retaining an empty, non-passing store on load failure.
+    /// Call `load` when the caller needs the exact I/O or parsing error.
     pub fn load_or_default(path: &Path) -> Self {
-        if path.exists() {
-            match fs::read_to_string(path) {
-                Ok(content) => match serde_json::from_str(&content) {
-                    Ok(store) => return store,
-                    Err(e) => {
-                        eprintln!("Warning: Failed to parse baseline file: {e}");
-                    }
-                },
-                Err(e) => {
-                    eprintln!("Warning: Failed to read baseline file: {e}");
-                }
+        match Self::load(path) {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!(
+                    "Inconclusive: cannot load baseline {}: {error}",
+                    path.display()
+                );
+                Self::default()
             }
         }
-        Self::default()
     }
 
     /// Save baselines to file.
@@ -244,7 +254,7 @@ pub struct RegressionResult {
     /// Whether this is a regression.
     pub is_regression: bool,
 
-    /// Regression status: "ok", "warning", or "regression".
+    /// Regression status, including inconclusive evidence.
     pub status: RegressionStatus,
 
     /// Current duration ratio.
@@ -276,6 +286,33 @@ pub enum RegressionStatus {
     Ok,
     Warning,
     Regression,
+    Inconclusive,
+}
+
+fn comparable_ratios(
+    current: f64,
+    current_rss: Option<f64>,
+    baseline: &OperationBaseline,
+    config: &RegressionConfig,
+) -> bool {
+    positive_finite(current)
+        && positive_finite(baseline.duration_ratio)
+        && positive_finite(current / baseline.duration_ratio)
+        && ((current / baseline.duration_ratio - 1.0) * 100.0).is_finite()
+        && config.duration_threshold.is_finite()
+        && config.duration_threshold >= 1.0
+        && config.rss_threshold.is_finite()
+        && config.rss_threshold >= 1.0
+        && match (current_rss, baseline.rss_ratio) {
+            (None, None) => true,
+            (Some(current), Some(reference)) => {
+                positive_finite(current)
+                    && positive_finite(reference)
+                    && positive_finite(current / reference)
+                    && ((current / reference - 1.0) * 100.0).is_finite()
+            }
+            _ => false,
+        }
 }
 
 impl std::fmt::Display for RegressionStatus {
@@ -284,6 +321,7 @@ impl std::fmt::Display for RegressionStatus {
             Self::Ok => write!(f, "ok"),
             Self::Warning => write!(f, "warning"),
             Self::Regression => write!(f, "REGRESSION"),
+            Self::Inconclusive => write!(f, "INCONCLUSIVE"),
         }
     }
 }
@@ -300,7 +338,7 @@ impl RegressionResult {
             operation: operation.to_string(),
             dataset: dataset.to_string(),
             is_regression: false,
-            status: RegressionStatus::Ok,
+            status: RegressionStatus::Inconclusive,
             current_ratio,
             baseline_ratio: None,
             change_pct: None,
@@ -321,6 +359,15 @@ impl RegressionResult {
         config: &RegressionConfig,
     ) -> Self {
         let baseline_ratio = baseline.duration_ratio;
+        if !comparable_ratios(current_ratio, current_rss_ratio, baseline, config) {
+            let mut result =
+                Self::no_baseline(operation, dataset, current_ratio, current_rss_ratio);
+            result.baseline_ratio = Some(baseline_ratio);
+            result.baseline_rss_ratio = baseline.rss_ratio;
+            result.reason =
+                "Invalid or unmatched metrics/thresholds; comparison is inconclusive".to_string();
+            return result;
+        }
         let ratio_change = current_ratio / baseline_ratio;
         let change_pct = (ratio_change - 1.0) * 100.0;
 
@@ -357,31 +404,25 @@ impl RegressionResult {
         let baseline_rss_ratio = baseline.rss_ratio;
 
         if let (Some(current_rss), Some(baseline_rss)) = (current_rss_ratio, baseline_rss_ratio) {
-            if baseline_rss > 0.0 {
-                let rss_ratio_change = current_rss / baseline_rss;
-                let rss_change = (rss_ratio_change - 1.0) * 100.0;
-                rss_change_pct = Some(rss_change);
+            let rss_ratio_change = current_rss / baseline_rss;
+            let rss_change = (rss_ratio_change - 1.0) * 100.0;
+            rss_change_pct = Some(rss_change);
 
-                if rss_ratio_change <= 1.0 {
-                    let improvement = (1.0 - rss_ratio_change) * 100.0;
-                    rss_reason = Some(format!("{improvement:.1}% lower RSS than baseline"));
-                } else if rss_ratio_change <= config.rss_threshold {
-                    rss_reason = Some(format!(
-                        "{rss_change:.1}% higher RSS (within {:.0}% threshold)",
-                        (config.rss_threshold - 1.0) * 100.0
-                    ));
-                } else {
-                    rss_regression = true;
-                    rss_reason = Some(format!(
-                        "{rss_change:.1}% higher RSS (exceeds {:.0}% threshold)",
-                        (config.rss_threshold - 1.0) * 100.0
-                    ));
-                }
+            if rss_ratio_change <= 1.0 {
+                let improvement = (1.0 - rss_ratio_change) * 100.0;
+                rss_reason = Some(format!("{improvement:.1}% lower RSS than baseline"));
+            } else if rss_ratio_change <= config.rss_threshold {
+                rss_reason = Some(format!(
+                    "{rss_change:.1}% higher RSS (within {:.0}% threshold)",
+                    (config.rss_threshold - 1.0) * 100.0
+                ));
+            } else {
+                rss_regression = true;
+                rss_reason = Some(format!(
+                    "{rss_change:.1}% higher RSS (exceeds {:.0}% threshold)",
+                    (config.rss_threshold - 1.0) * 100.0
+                ));
             }
-        } else if baseline_rss_ratio.is_some() && current_rss_ratio.is_none() {
-            rss_reason = Some("RSS not measured for current run".to_string());
-        } else if baseline_rss_ratio.is_none() && current_rss_ratio.is_some() {
-            rss_reason = Some("RSS baseline missing".to_string());
         }
 
         let status = if duration_status == RegressionStatus::Regression || rss_regression {
@@ -434,10 +475,13 @@ pub struct RegressionSummary {
     /// Operations without baselines.
     pub no_baseline_count: usize,
 
+    /// Operations with unusable or missing comparison evidence.
+    pub inconclusive_count: usize,
+
     /// Individual results.
     pub results: Vec<RegressionResult>,
 
-    /// Whether the overall check passed (no regressions in strict mode).
+    /// Whether every operation has usable evidence and the configured check passed.
     pub passed: bool,
 
     /// Config used for this check.
@@ -478,17 +522,19 @@ impl RegressionSummary {
             .iter()
             .filter(|r| r.baseline_ratio.is_none())
             .count();
+        let inconclusive_count = results
+            .iter()
+            .filter(|r| r.status == RegressionStatus::Inconclusive || r.baseline_ratio.is_none())
+            .count();
         let ok_count = results
             .iter()
             .filter(|r| r.status == RegressionStatus::Ok && r.baseline_ratio.is_some())
             .count();
 
-        // In strict mode, any regression means failure
-        let passed = if config.strict_mode {
-            regression_count == 0
-        } else {
-            true // In non-strict mode, we just warn
-        };
+        // Warning-only mode can tolerate a measured regression, never missing evidence.
+        let passed = total_operations > 0
+            && inconclusive_count == 0
+            && (!config.strict_mode || (regression_count == 0 && warning_count == 0));
 
         Self {
             total_operations,
@@ -496,6 +542,7 @@ impl RegressionSummary {
             warning_count,
             ok_count,
             no_baseline_count,
+            inconclusive_count,
             results,
             passed,
             config_summary: RegressionConfigSummary::from(config),
@@ -518,7 +565,7 @@ impl RegressionSummary {
 
         if self.no_baseline_count == self.total_operations {
             println!(
-                "No baselines established yet. Run with BENCH_UPDATE_BASELINE=1 to create baselines."
+                "INCONCLUSIVE: no usable comparisons. Baseline capture is not a regression pass."
             );
             return;
         }
@@ -552,14 +599,328 @@ impl RegressionSummary {
 
         println!("{}", "-".repeat(95));
         println!(
-            "Total: {} ops | {} ok | {} no baseline | {} regressions | Passed: {}",
+            "Total: {} ops | {} ok | {} no baseline | {} inconclusive | {} regressions | Passed: {}",
             self.total_operations,
             self.ok_count,
             self.no_baseline_count,
+            self.inconclusive_count,
             self.regression_count,
             if self.passed { "YES" } else { "NO" }
         );
     }
+}
+
+/// Required provenance and workload dimensions for raw release measurements.
+pub const MATCHED_RUN_METADATA: [&str; 16] = [
+    "command",
+    "issue_count",
+    "dataset_sha256",
+    "flush_mode",
+    "cache_protocol",
+    "host",
+    "cpu",
+    "os",
+    "filesystem",
+    "target",
+    "features",
+    "engine",
+    "source_revision",
+    "lockfile_sha256",
+    "binary_sha256",
+    "build_profile",
+];
+
+/// A single side of an alternating baseline/candidate release measurement.
+/// Timings include every measured invocation; failed invocations are retained.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatchedRun {
+    pub metadata: BTreeMap<String, String>,
+    pub samples_ms: Vec<f64>,
+    pub exit_codes: Vec<i32>,
+}
+
+impl MatchedRun {
+    /// Read and validate a receipt. Missing/corrupt receipts never become defaults.
+    pub fn load(path: &Path) -> std::io::Result<Self> {
+        let run: Self = serde_json::from_str(&fs::read_to_string(path)?)?;
+        run.validate()
+            .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidData, reason))?;
+        Ok(run)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        for key in MATCHED_RUN_METADATA {
+            let Some(value) = self.metadata.get(key) else {
+                return Err(format!("missing metadata: {key}"));
+            };
+            if value.trim().is_empty()
+                || matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "unknown" | "default" | "unavailable" | "n/a" | "placeholder" | "unset"
+                )
+            {
+                return Err(format!("unusable metadata: {key}"));
+            }
+        }
+        for key in ["dataset_sha256", "lockfile_sha256", "binary_sha256"] {
+            let digest = &self.metadata[key];
+            if digest.len() != 64
+                || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || digest.bytes().all(|byte| byte == b'0')
+            {
+                return Err(format!("invalid SHA-256 provenance: {key}"));
+            }
+        }
+        if self.metadata["issue_count"].parse::<usize>().is_err() {
+            return Err("invalid issue_count metadata".to_string());
+        }
+        if self.metadata["build_profile"] != "release" {
+            return Err("build_profile must be release".to_string());
+        }
+        if self.samples_ms.len() < 20 {
+            return Err(format!(
+                "insufficient samples: {} (at least 20 required)",
+                self.samples_ms.len()
+            ));
+        }
+        if self.samples_ms.len() != self.exit_codes.len() {
+            return Err("each sample must have an exit code".to_string());
+        }
+        if let Some(index) = self.samples_ms.iter().position(|&ms| !positive_finite(ms)) {
+            return Err(format!("sample {index} must be positive and finite"));
+        }
+        if let Some(index) = self.exit_codes.iter().position(|&code| code != 0) {
+            return Err(format!(
+                "sample {index} failed with exit code {}",
+                self.exit_codes[index]
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchedState {
+    Pass,
+    Regression,
+    Inconclusive,
+}
+
+/// Exact empirical quantile change, in milliseconds and percent of baseline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimingDelta {
+    pub baseline_ms: f64,
+    pub candidate_ms: f64,
+    pub delta_ms: f64,
+    pub delta_pct: f64,
+}
+
+impl TimingDelta {
+    fn new(baseline_ms: f64, candidate_ms: f64) -> Self {
+        Self {
+            baseline_ms,
+            candidate_ms,
+            delta_ms: candidate_ms - baseline_ms,
+            delta_pct: (candidate_ms / baseline_ms - 1.0) * 100.0,
+        }
+    }
+}
+
+/// Conservative observed-support bounds: [candidate_min - baseline_max,
+/// candidate_max - baseline_min], with analogous relative bounds. These enclose
+/// all median/p95 changes obtainable by resampling the observed values. They
+/// are NOT a population confidence interval and assume no distribution model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservedSupportInterval {
+    pub method: String,
+    pub lower_ms: f64,
+    pub upper_ms: f64,
+    pub lower_pct: f64,
+    pub upper_pct: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchedComparison {
+    pub state: MatchedState,
+    pub command: String,
+    pub budget_pct: Option<f64>,
+    pub median: Option<TimingDelta>,
+    pub p95: Option<TimingDelta>,
+    pub uncertainty: Option<ObservedSupportInterval>,
+    pub diagnostic: String,
+}
+
+impl MatchedComparison {
+    pub const fn exit_code(&self) -> i32 {
+        match self.state {
+            MatchedState::Pass => 0,
+            MatchedState::Regression => 1,
+            MatchedState::Inconclusive => 2,
+        }
+    }
+}
+
+fn positive_finite(value: f64) -> bool {
+    value.is_finite() && value > 0.0
+}
+
+/// Empirical raw-sample summary; this does not make a budget or gate decision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchedSampleSummary {
+    pub sample_count: usize,
+    pub median_ms: f64,
+    pub p95_ms: f64,
+    pub min_ms: f64,
+    pub max_ms: f64,
+}
+
+/// Summarize every positive finite sample, without filtering. Median averages
+/// the middle two values for even counts; p95 is nearest rank. Fewer than 20
+/// samples can be summarized, but cannot pass `compare_matched_runs`.
+pub fn summarize_matched_samples(samples: &[f64]) -> Result<MatchedSampleSummary, String> {
+    if samples.is_empty() || samples.iter().any(|&sample| !positive_finite(sample)) {
+        return Err("samples must be nonempty, positive and finite".to_string());
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let count = sorted.len();
+    let middle = count / 2;
+    let median_ms = if count.is_multiple_of(2) {
+        sorted[middle - 1] + (sorted[middle] - sorted[middle - 1]) / 2.0
+    } else {
+        sorted[middle]
+    };
+    // ceil(19*n/20)-1, without multiplying the count or casting to floats.
+    let p95_index = count - count / 20 - 1;
+    Ok(MatchedSampleSummary {
+        sample_count: count,
+        median_ms,
+        p95_ms: sorted[p95_index],
+        min_ms: sorted[0],
+        max_ms: sorted[count - 1],
+    })
+}
+
+fn validate_and_summarize_matched_runs(
+    baseline: Option<&MatchedRun>,
+    candidate: &MatchedRun,
+) -> Result<(MatchedSampleSummary, MatchedSampleSummary), String> {
+    candidate
+        .validate()
+        .map_err(|error| format!("candidate: {error}"))?;
+    let baseline = baseline.ok_or_else(|| "missing baseline receipt".to_string())?;
+    baseline
+        .validate()
+        .map_err(|error| format!("baseline: {error}"))?;
+    if baseline.samples_ms.len() != candidate.samples_ms.len() {
+        return Err("baseline/candidate sample counts differ".to_string());
+    }
+    for key in baseline.metadata.keys().chain(candidate.metadata.keys()) {
+        if !matches!(
+            key.as_str(),
+            "source_revision" | "lockfile_sha256" | "binary_sha256"
+        ) && baseline.metadata.get(key) != candidate.metadata.get(key)
+        {
+            return Err(format!("mismatched metadata: {key}"));
+        }
+    }
+    Ok((
+        summarize_matched_samples(&baseline.samples_ms)?,
+        summarize_matched_samples(&candidate.samples_ms)?,
+    ))
+}
+
+/// Compare raw timings without filtering outliers. Median averages the middle
+/// two values for even counts; p95 uses nearest rank (ceil(0.95*n), one-based).
+/// Source/lockfile/binary provenance may differ intentionally; all other metadata
+/// must match. A decision requires the entire observed-support interval to lie
+/// on one side of the relative budget. Overlap is inconclusive, not a pass.
+/// An invalid/absent budget retains descriptive deltas but cannot pass the gate.
+pub fn compare_matched_runs(
+    baseline: Option<&MatchedRun>,
+    candidate: &MatchedRun,
+    budget_pct: f64,
+) -> MatchedComparison {
+    let command = candidate
+        .metadata
+        .get("command")
+        .cloned()
+        .unwrap_or_else(|| "<missing command>".to_string());
+    let valid_budget = budget_pct.is_finite() && budget_pct >= 0.0;
+    let budget_description = if valid_budget {
+        format!("{budget_pct:.3}%")
+    } else {
+        "unavailable (requires a finite nonnegative percentage)".to_string()
+    };
+    let mut comparison = MatchedComparison {
+        state: MatchedState::Inconclusive,
+        diagnostic: format!("{command}: budget {budget_description}; delta unavailable"),
+        command,
+        budget_pct: valid_budget.then_some(budget_pct),
+        median: None,
+        p95: None,
+        uncertainty: None,
+    };
+    let reason = validate_and_summarize_matched_runs(baseline, candidate);
+    let (baseline_summary, candidate_summary) = match reason {
+        Ok(summaries) => summaries,
+        Err(reason) => {
+            comparison
+                .diagnostic
+                .push_str(&format!("; inconclusive: {reason}"));
+            return comparison;
+        }
+    };
+
+    let median = TimingDelta::new(baseline_summary.median_ms, candidate_summary.median_ms);
+    let p95 = TimingDelta::new(baseline_summary.p95_ms, candidate_summary.p95_ms);
+    let lower = TimingDelta::new(baseline_summary.max_ms, candidate_summary.min_ms);
+    let upper = TimingDelta::new(baseline_summary.min_ms, candidate_summary.max_ms);
+    let lower_budget_ms = lower.baseline_ms * (budget_pct / 100.0);
+    let upper_budget_ms = upper.baseline_ms * (budget_pct / 100.0);
+    if [&median, &p95, &lower, &upper]
+        .iter()
+        .any(|delta| !delta.delta_ms.is_finite() || !delta.delta_pct.is_finite())
+    {
+        comparison
+            .diagnostic
+            .push_str("; inconclusive: comparison arithmetic overflow");
+        return comparison;
+    }
+    comparison.state =
+        if !valid_budget || !lower_budget_ms.is_finite() || !upper_budget_ms.is_finite() {
+            MatchedState::Inconclusive
+        } else if lower.delta_ms > lower_budget_ms {
+            MatchedState::Regression
+        } else if upper.delta_ms <= upper_budget_ms {
+            MatchedState::Pass
+        } else {
+            MatchedState::Inconclusive
+        };
+    comparison.diagnostic = format!(
+        "{}: {:?}; budget {}; median delta {:+.6} ms ({:+.3}%); p95 delta {:+.6} ms ({:+.3}%); observed-support range [{:+.3}%, {:+.3}%] (not a confidence interval)",
+        comparison.command,
+        comparison.state,
+        budget_description,
+        median.delta_ms,
+        median.delta_pct,
+        p95.delta_ms,
+        p95.delta_pct,
+        lower.delta_pct,
+        upper.delta_pct,
+    );
+    comparison.median = Some(median);
+    comparison.p95 = Some(p95);
+    comparison.uncertainty = Some(ObservedSupportInterval {
+        method: "observed_support_extrema_not_confidence_interval".to_string(),
+        lower_ms: lower.delta_ms,
+        upper_ms: upper.delta_ms,
+        lower_pct: lower.delta_pct,
+        upper_pct: upper.delta_pct,
+    });
+    comparison
 }
 
 // =============================================================================
@@ -613,7 +974,7 @@ mod tests {
     fn test_regression_check_no_baseline() {
         let result = RegressionResult::no_baseline("list", "beads_rust", 0.5, None);
         assert!(!result.is_regression);
-        assert_eq!(result.status, RegressionStatus::Ok);
+        assert_eq!(result.status, RegressionStatus::Inconclusive);
         assert!(result.baseline_ratio.is_none());
     }
 
@@ -734,7 +1095,8 @@ mod tests {
         assert_eq!(summary.no_baseline_count, 1);
         assert_eq!(summary.ok_count, 1);
         assert_eq!(summary.regression_count, 1);
-        assert!(summary.passed); // Non-strict mode
+        assert_eq!(summary.inconclusive_count, 1);
+        assert!(!summary.passed); // Missing evidence cannot pass even in warning-only mode.
     }
 
     #[test]

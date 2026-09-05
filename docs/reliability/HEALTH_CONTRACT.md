@@ -43,12 +43,21 @@ Executable implementation: `src/health.rs`.
 
 | Anomaly | Severity | Detection | Recovery |
 |---------|----------|-----------|----------|
-| `WalCorrupt` | Recoverable | WAL header validation | Delete WAL, rebuild |
-| `SidecarMismatch` | Degraded | SHM exists without WAL, a sidecar is not a regular file, or sidecars exist without a database | Quarantine the invalid or dangling sidecar |
-| `TruncatedWal` | Recoverable | WAL file < 32 bytes | Delete truncated WAL |
-| `JournalSidecarPresent` | Degraded | File existence check | Delete journal (incomplete txn) |
-| `StaleRecoveryArtifacts` | Degraded | Recovery temp files present | Clean up |
-| `OrphanedLockFile` | Degraded | `.beads.lock` file stat | Remove if no live process |
+| `WalCorrupt` | Recoverable | WAL header validation | Preserve the whole database family; validate JSONL authority before a receipt-bound rebuild |
+| `SidecarMismatch` | Degraded | SHM exists without WAL, a sidecar is not a regular file, or sidecars exist without a database | Inspect the family and active openers; quarantine only through an applicable repair under write authority |
+| `TruncatedWal` | Recoverable | WAL file is 1–31 bytes (zero bytes is a normal checkpoint result) | Preserve the family; use the existing quarantine/rebuild path after validating authority |
+| `JournalSidecarPresent` | Degraded | File existence check | Preserve the journal with its database; inspect before choosing recovery |
+| `StaleRecoveryArtifacts` | Degraded | Recovery temp files present | Retain incident evidence; review aged artifacts through the doctor repair plan |
+| `OrphanedLockFile` | Degraded | `.beads.lock` file stat | Verify liveness and inspect the doctor repair plan; file presence alone does not prove the lock is abandoned |
+
+A WAL or journal can contain committed or recoverable data absent from the main
+database. Do not delete it to clear a diagnostic. Capture `br doctor --bundle`
+with `--include-db` when database bytes are needed, review
+`br doctor --repair --dry-run --json`, and follow the
+[engine operating model](ENGINE_OPERATING_MODEL.md#4-database-family-and-sidecar-inventory).
+Keep the original family and recovery artifacts until the incident is resolved;
+any eventual removal is an operator decision. These recovery choices also apply
+to explicitly configured database families outside `.beads/`.
 
 ### Derived State
 

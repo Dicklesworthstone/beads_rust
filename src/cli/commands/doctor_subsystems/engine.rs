@@ -11,13 +11,15 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// Sidecar suffixes FrankenSQLite may leave beside `beads.db`.
-const SIDECAR_SUFFIXES: [&str; 6] = [
+const SIDECAR_SUFFIXES: [&str; 8] = [
     "-wal",
     "-shm",
     "-wal-cert",
     "-wal-cert-head",
     "-ns",
     "-journal",
+    "-fsqlite-ns-gate",
+    "-fsqlite-ns-use",
 ];
 
 /// Recovery artifacts listed at most this many entries deep.
@@ -236,6 +238,8 @@ mod tests {
         let db = beads_dir.join("beads.db");
         std::fs::write(&db, b"db").unwrap();
         std::fs::write(beads_dir.join("beads.db-wal"), b"wal").unwrap();
+        std::fs::write(beads_dir.join("beads.db-fsqlite-ns-gate"), b"").unwrap();
+        std::fs::write(beads_dir.join("beads.db-fsqlite-ns-use"), b"namespace").unwrap();
         std::fs::create_dir_all(beads_dir.join(".br_recovery").join("run-1")).unwrap();
         std::fs::write(
             beads_dir
@@ -250,9 +254,13 @@ mod tests {
         assert_eq!(block.name, "frankensqlite");
         assert_eq!(block.crate_name, "fsqlite");
         assert!(!block.version.is_empty());
-        assert_eq!(block.sidecars.len(), 1);
+        assert_eq!(block.sidecars.len(), 3);
         assert!(block.sidecars[0].file.ends_with("beads.db-wal"));
         assert_eq!(block.sidecars[0].bytes, 3);
+        assert_eq!(block.sidecars[1].bytes, 0);
+        assert!(block.sidecars[1].file.ends_with("-fsqlite-ns-gate"));
+        assert_eq!(block.sidecars[2].bytes, 9);
+        assert!(block.sidecars[2].file.ends_with("-fsqlite-ns-use"));
         assert_eq!(block.recovery_artifacts.len(), 1);
         assert!(!block.recovery_artifacts_truncated);
         assert!(block.sole_opener_lease.is_none());

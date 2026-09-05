@@ -98,6 +98,25 @@ rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_beads_rust_ci_supply
 
 That harness parses `.github/workflows/release.yml` and executes the high-risk release fragments against fixtures for reliability override validation, required artifact detection, checksum aggregation, checksum verification, and release-note branch coverage.
 
+The release-size fragment measures each distributed binary and archive against
+its platform's digest-verified v0.5.10 archive baseline. The explicit growth
+allowances are 1 MiB for the binary and 512 KiB for the archive. These are product
+budgets, not statistical bounds. A larger allowance requires review of the
+actual size change; a failed build never advances the baseline. Receipts record
+the source commit, lockfile and artifact hashes, measured sizes, limits and
+decision. The receipt upload runs even when the gate fails. The harness executes
+all seven target boundaries, one-byte overruns and missing/incompatible-input
+refusals. Its sparse byte fixtures test the gate and are not release measurements.
+
+Scheduled benchmark CI builds a pinned baseline and the candidate in the same
+job before collecting A/A and A/B samples. It retains raw results even when
+collection or enforcement fails. Missing per-workload budgets, failed samples,
+unmatched provenance and unstable A/A controls are inconclusive, with exit 2;
+regressions exit 1. Only complete, matched passing comparisons exit 0. The
+benchmark shell controls live in `tests/workflow_action_pins.rs`. Calibrated
+budgets belong in `BR_PERF_BUDGETS_JSON`; changing them requires reviewing the
+retained measurements, rather than accepting a failed run as the next baseline.
+
 The ACFS installer notification workflow also has a focused local harness:
 
 ```bash

@@ -7,7 +7,8 @@ mod common;
 
 use beads_rust::franken_sync::Connection;
 use common::cli::{
-    BrWorkspace, extract_json_payload, parse_created_id, parse_list_issues, run_br, run_br_with_env,
+    BrRun, BrWorkspace, extract_json_payload, parse_created_id, parse_list_issues, run_br,
+    run_br_with_env,
 };
 use serde_json::Value;
 use std::fs;
@@ -15,6 +16,191 @@ use std::fs;
 // ============================================================================
 // init command tests
 // ============================================================================
+
+fn init_json(run: &BrRun) -> Value {
+    assert!(run.status.success(), "init failed: {run:?}");
+    assert!(
+        !run.stdout.contains('\u{1b}'),
+        "ANSI in init output: {run:?}"
+    );
+    serde_json::from_str(&run.stdout).unwrap_or_else(|error| {
+        panic!("whole init stdout must be one JSON value: {error}; {run:?}")
+    })
+}
+
+fn assert_fresh_init_receipt(receipt: &Value, workspace: &BrWorkspace) {
+    let beads_dir = dunce::canonicalize(workspace.root.join(".beads")).expect("resolved .beads");
+    assert_eq!(
+        receipt,
+        &serde_json::json!({
+            "initialized": true,
+            "beads_dir": beads_dir,
+            "database_path": beads_dir.join("beads.db"),
+            "prefix": "receipt",
+            "files": {
+                "directory": "created",
+                "database": "created",
+                "metadata": "created",
+                "config": "created",
+                "gitignore": "created",
+                "jsonl": "created"
+            }
+        })
+    );
+}
+
+#[test]
+fn e2e_init_json_modes_emit_one_truthful_receipt() {
+    let _log = common::test_log("e2e_init_json_modes_emit_one_truthful_receipt");
+    let cases = [
+        ("explicit", vec!["--json"], vec![]),
+        ("environment", vec![], vec![("BR_OUTPUT_FORMAT", "json")]),
+        (
+            "explicit_over_quiet_and_toon",
+            vec!["--json", "--quiet", "--no-color"],
+            vec![
+                ("BR_OUTPUT_FORMAT", "toon"),
+                ("TOON_DEFAULT_FORMAT", "toon"),
+            ],
+        ),
+    ];
+    for (label, flags, environment) in cases {
+        let workspace = BrWorkspace::new();
+        let args: Vec<_> = ["init", "--prefix", "RECEIPT"]
+            .into_iter()
+            .chain(flags)
+            .collect();
+        let init = run_br_with_env(&workspace, args, environment, label);
+        let receipt = init_json(&init);
+        assert_fresh_init_receipt(&receipt, &workspace);
+
+        // A successful parse must not hide the original bug by stripping prose.
+        let prefixed = format!("Prefix set to: receipt\n{}", init.stdout);
+        assert!(serde_json::from_str::<Value>(&prefixed).is_err());
+        let suffixed = format!("{}\nInitialized workspace", init.stdout);
+        assert!(serde_json::from_str::<Value>(&suffixed).is_err());
+        let extra_value = format!("{}\n{{}}", init.stdout);
+        assert!(serde_json::from_str::<Value>(&extra_value).is_err());
+        let ansi_prefix = format!("\u{1b}[32m{}", init.stdout);
+        assert!(serde_json::from_str::<Value>(&ansi_prefix).is_err());
+        let truncated = init
+            .stdout
+            .trim_end()
+            .strip_suffix('}')
+            .expect("JSON object");
+        assert!(serde_json::from_str::<Value>(truncated).is_err());
+
+        let create = run_br(
+            &workspace,
+            ["create", "Verify stored prefix", "--json"],
+            "create",
+        );
+        assert!(create.status.success(), "create failed: {create:?}");
+        let issue: Value = serde_json::from_str(&create.stdout).expect("whole create JSON");
+        assert!(issue["id"].as_str().expect("id").starts_with("receipt-"));
+    }
+}
+
+#[test]
+fn e2e_init_toon_matches_json_receipt_and_honors_environment_precedence() {
+    let _log =
+        common::test_log("e2e_init_toon_matches_json_receipt_and_honors_environment_precedence");
+    for (label, environment) in [
+        ("toon_env", vec![("BR_OUTPUT_FORMAT", "toon")]),
+        ("toon_fallback", vec![("TOON_DEFAULT_FORMAT", "toon")]),
+        (
+            "toon_env_over_fallback",
+            vec![
+                ("BR_OUTPUT_FORMAT", "toon"),
+                ("TOON_DEFAULT_FORMAT", "json"),
+            ],
+        ),
+    ] {
+        let workspace = BrWorkspace::new();
+        let init = run_br_with_env(
+            &workspace,
+            ["init", "--prefix", "RECEIPT"],
+            environment,
+            label,
+        );
+        assert!(init.status.success(), "TOON init failed: {init:?}");
+        assert!(!init.stdout.contains('\u{1b}'), "ANSI in TOON: {init:?}");
+        let receipt = Value::from(
+            toon_rust::try_decode(&init.stdout, None)
+                .unwrap_or_else(|error| panic!("whole TOON receipt: {error}; {init:?}")),
+        );
+        assert_fresh_init_receipt(&receipt, &workspace);
+    }
+}
+
+#[test]
+fn e2e_init_quiet_suppresses_success_even_with_environment_format() {
+    let _log = common::test_log("e2e_init_quiet_suppresses_success_even_with_environment_format");
+    let workspace = BrWorkspace::new();
+    let init = run_br_with_env(
+        &workspace,
+        ["init", "--quiet"],
+        [("BR_OUTPUT_FORMAT", "json")],
+        "quiet_init",
+    );
+    assert!(init.status.success(), "quiet init failed: {init:?}");
+    assert!(
+        init.stdout.is_empty(),
+        "quiet init emitted output: {init:?}"
+    );
+    assert!(workspace.root.join(".beads/beads.db").is_file());
+}
+
+#[test]
+fn e2e_init_existing_directory_preserves_unrelated_files_and_reports_paths() {
+    let _log =
+        common::test_log("e2e_init_existing_directory_preserves_unrelated_files_and_reports_paths");
+    let workspace = BrWorkspace::new();
+    let beads_dir = workspace.root.join("tracker");
+    fs::create_dir(&beads_dir).expect("existing workspace directory");
+    let config = b"# Keep my existing configuration\n";
+    fs::write(beads_dir.join("config.yaml"), config).expect("existing config");
+    fs::write(
+        workspace.root.join("unrelated.txt"),
+        b"keep outside content",
+    )
+    .expect("unrelated file");
+    let cache_dir = workspace.root.join("cache");
+    let init = run_br_with_env(
+        &workspace,
+        ["init", "--prefix", "MiXeD", "--json"],
+        [("BEADS_DIR", &beads_dir), ("BEADS_CACHE_DIR", &cache_dir)],
+        "existing_directory",
+    );
+    let receipt = init_json(&init);
+    assert_eq!(receipt["prefix"], "mixed");
+    let resolved_beads_dir = dunce::canonicalize(&beads_dir).expect("resolved tracker directory");
+    assert_eq!(
+        receipt["beads_dir"],
+        resolved_beads_dir.to_string_lossy().as_ref()
+    );
+    let database_path = std::path::Path::new(receipt["database_path"].as_str().expect("db path"));
+    assert!(database_path.is_file(), "reported database must exist");
+    assert!(
+        database_path.starts_with(dunce::canonicalize(&cache_dir).expect("resolved cache")),
+        "cache override must be reflected"
+    );
+    assert_eq!(receipt["files"]["directory"], "existing");
+    assert_eq!(receipt["files"]["database"], "created");
+    assert_eq!(receipt["files"]["config"], "existing");
+    assert_eq!(
+        fs::read(beads_dir.join("config.yaml")).expect("preserved config"),
+        config
+    );
+    assert_eq!(
+        fs::read(workspace.root.join("unrelated.txt")).expect("preserved unrelated"),
+        b"keep outside content"
+    );
+    assert!(
+        !workspace.root.join(".beads").exists(),
+        "BEADS_DIR must select the only tracker"
+    );
+}
 
 #[test]
 fn e2e_init_new_workspace() {
@@ -144,18 +330,13 @@ fn e2e_init_already_initialized() {
         init1.stderr
     );
 
-    // Second init without --force should warn or succeed gracefully
-    let init2 = run_br(&workspace, ["init"], "init2");
-    // Either succeeds with warning or fails gracefully with "already" message
-    // br returns JSON error with code "ALREADY_INITIALIZED"
-    let stderr_lower = init2.stderr.to_lowercase();
+    let init2 = run_br(&workspace, ["init", "--json"], "init2");
+    assert_eq!(init2.status.code(), Some(2), "reinit must fail: {init2:?}");
+    let error: Value = serde_json::from_str(&init2.stdout).expect("whole stdout error envelope");
+    assert_eq!(error["error"]["code"], "ALREADY_INITIALIZED");
     assert!(
-        init2.status.success()
-            || stderr_lower.contains("already")
-            || init2.stderr.contains("ALREADY_INITIALIZED"),
-        "second init should succeed or warn: stdout='{}', stderr='{}'",
-        init2.stdout,
-        init2.stderr
+        error.get("initialized").is_none(),
+        "failure cannot advertise success"
     );
 }
 
@@ -172,23 +353,50 @@ fn e2e_init_force_reinit() {
         init1.stderr
     );
 
-    // Create an issue to verify database is reset
-    let create = run_br(&workspace, ["create", "Test issue before force"], "create");
+    // Force reinitialization preserves existing issues and workspace files.
+    let create = run_br(
+        &workspace,
+        ["create", "Test issue before force", "--json"],
+        "create",
+    );
     assert!(create.status.success(), "create failed: {}", create.stderr);
-
-    // Force reinit (if supported)
-    let init2 = run_br(&workspace, ["init", "--force"], "init2_force");
-    // --force may not be implemented, check either way
-    if init2.status.success() {
-        // After force reinit, the database should be fresh
-        // List should show no issues or only one if --force doesn't clear
-        let list = run_br(&workspace, ["list", "--json"], "list_after_force");
-        assert!(
-            list.status.success(),
-            "list after force init failed: {}",
-            list.stderr
+    let issue: Value = serde_json::from_str(&create.stdout).expect("whole create JSON");
+    let beads_dir = workspace.root.join(".beads");
+    let retained: Vec<_> = ["config.yaml", ".gitignore", "issues.jsonl"]
+        .into_iter()
+        .map(|name| {
+            (
+                name,
+                fs::read(beads_dir.join(name)).expect("existing init file"),
+            )
+        })
+        .collect();
+    let init2 = run_br(
+        &workspace,
+        ["init", "--force", "--prefix", "REINITIALIZED", "--json"],
+        "init2_force",
+    );
+    let receipt = init_json(&init2);
+    assert_eq!(receipt["prefix"], "reinitialized");
+    assert_eq!(
+        receipt["files"],
+        serde_json::json!({
+            "directory": "existing", "database": "existing", "metadata": "updated",
+            "config": "existing", "gitignore": "existing", "jsonl": "existing"
+        })
+    );
+    for (name, contents) in retained {
+        assert_eq!(
+            fs::read(beads_dir.join(name)).expect("retained file"),
+            contents,
+            "changed {name}"
         );
     }
+    let list = run_br(&workspace, ["list", "--json"], "list_after_force");
+    assert!(list.status.success(), "list failed: {list:?}");
+    let list: Value = serde_json::from_str(&list.stdout).expect("whole list JSON");
+    assert_eq!(list["issues"].as_array().expect("issues").len(), 1);
+    assert_eq!(list["issues"][0]["id"], issue["id"]);
 }
 
 #[test]
@@ -354,6 +562,277 @@ fn e2e_config_edit_creates_user_config() {
 // ============================================================================
 // doctor command tests
 // ============================================================================
+
+fn namespace_family_bytes(workspace: &BrWorkspace) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fs::read_dir(workspace.root.join(".beads"))
+        .expect("read database family")
+        .map(|entry| entry.expect("database family entry"))
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("beads.db"))
+        .map(|entry| {
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                fs::read(entry.path()).expect("read database family bytes"),
+            )
+        })
+        .collect()
+}
+
+fn assert_namespace_family_preserved(
+    workspace: &BrWorkspace,
+    before: &std::collections::BTreeMap<String, Vec<u8>>,
+    allow_shm_reader_marks: bool,
+) {
+    let after = namespace_family_bytes(workspace);
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>(),
+        "database-family artifact presence changed"
+    );
+    for (name, expected) in before {
+        let actual = &after[name];
+        assert_eq!(expected.len(), actual.len(), "{name}: length changed");
+        // The existing read-only contract permits exactly the five native
+        // u32 WAL reader marks at offsets 100..120 (GH #476). Suspect families
+        // must not be opened at all and therefore get no such exemption.
+        let differences: Vec<_> = expected
+            .iter()
+            .zip(actual)
+            .enumerate()
+            .filter(|(offset, (a, b))| {
+                a != b
+                    && !(allow_shm_reader_marks
+                        && name == "beads.db-shm"
+                        && (100..120).contains(offset))
+            })
+            .map(|(offset, _)| offset)
+            .take(16)
+            .collect();
+        assert!(
+            differences.is_empty(),
+            "{name}: bytes changed at offsets {differences:?}; workspace {}",
+            workspace.root.display()
+        );
+    }
+}
+
+fn namespace_check(doctor: &BrRun) -> Value {
+    let report: Value = serde_json::from_str(&doctor.stdout)
+        .unwrap_or_else(|error| panic!("whole doctor JSON: {error}; {doctor:?}"));
+    report["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["name"] == "db.namespace_identity")
+        .unwrap_or_else(|| panic!("namespace check missing: {doctor:?}"))
+        .clone()
+}
+
+fn assert_no_db_pending_probe_skipped(doctor: &BrRun) {
+    let report: Value = serde_json::from_str(&doctor.stdout).unwrap();
+    let checks = report["checks"].as_array().unwrap();
+    let skipped = &checks
+        .iter()
+        .find(|check| check["name"] == "db.no_db_mode")
+        .unwrap()["details"]["skipped_checks"];
+    assert!(
+        !skipped
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "db.namespace_identity"),
+        "namespace preflight ran and must not be reported as skipped: {skipped}"
+    );
+    let pending = checks
+        .iter()
+        .find(|check| check["name"] == "sync.merge_pending")
+        .unwrap();
+    assert_eq!(pending["details"]["inspected"], false, "{pending}");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn e2e_doctor_namespace_identity_detects_displaced_main_without_mutating_family() {
+    let _log = common::test_log("e2e_doctor_namespace_identity_displaced_main");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init", "--prefix", "ns"], "init");
+    assert!(init.status.success(), "{init:?}");
+    let create = run_br(&workspace, ["create", "Retained issue", "--json"], "create");
+    assert!(create.status.success(), "{create:?}");
+    let database = workspace.root.join(".beads/beads.db");
+    // Hold a real namespace generation lease, as another live engine opener
+    // would. Current FrankenSQLite can rebind a quiescent copied record, but
+    // it must refuse to join this live generation through a different inode.
+    let pending = fsqlite_vfs::PendingNamespaceOpen::begin(
+        &database,
+        fsqlite_vfs::NamespaceOpenIntent::ReadOnlyExisting,
+    )
+    .unwrap();
+    let recorded_identity = pending.expected_identity().unwrap();
+    let lease = pending.bind(recorded_identity).unwrap();
+    let displaced = workspace.root.join("displaced-beads.db");
+    fs::rename(&database, &displaced).expect("preserve displaced main database");
+    fs::copy(&displaced, &database).expect("copy identical bytes into a different inode");
+    assert_ne!(
+        fsqlite_vfs::FileIdentity::from_file(&fs::File::open(&database).unwrap()).unwrap(),
+        fsqlite_vfs::FileIdentity::from_file(&fs::File::open(&displaced).unwrap()).unwrap()
+    );
+    let before = namespace_family_bytes(&workspace);
+    assert_eq!(before["beads.db"], fs::read(&displaced).unwrap());
+
+    let list = run_br(
+        &workspace,
+        ["list", "--json", "--no-auto-import", "--no-auto-flush"],
+        "foreign_namespace_open",
+    );
+    assert!(
+        !list.status.success(),
+        "foreign namespace must refuse: {list:?}"
+    );
+    assert!(
+        format!("{}{}", list.stdout, list.stderr).contains("unable to open database file"),
+        "expected the engine's CannotOpen refusal: {list:?}"
+    );
+    assert_namespace_family_preserved(&workspace, &before, false);
+
+    for label in ["diagnose_foreign_family", "diagnose_foreign_family_again"] {
+        let doctor = run_br(&workspace, ["doctor", "--json"], label);
+        assert!(
+            !doctor.status.success(),
+            "mismatch must fail diagnosis: {doctor:?}"
+        );
+        let check = namespace_check(&doctor);
+        assert_eq!(check["status"], "error", "{check}");
+        assert_eq!(check["details"]["state"], "mismatch", "{check}");
+        assert_eq!(check["details"]["automatic_repair"], false);
+        assert_eq!(check["details"]["identities_match"], false);
+        assert!(
+            check["message"]
+                .as_str()
+                .unwrap()
+                .contains("Preserve the main database and every sidecar")
+        );
+        assert_namespace_family_preserved(&workspace, &before, false);
+    }
+
+    // Removing the live opener changes the engine's admission decision, not
+    // the diagnosis evidence. Doctor must still report the quiescent mismatch
+    // without rebinding it; an ordinary CLI open may then legitimately rebind.
+    drop(lease);
+    let quiescent = run_br(&workspace, ["doctor", "--json"], "quiescent_mismatch");
+    assert_eq!(namespace_check(&quiescent)["details"]["state"], "mismatch");
+    assert_namespace_family_preserved(&workspace, &before, false);
+    let no_db = run_br(
+        &workspace,
+        ["doctor", "--no-db", "--json"],
+        "quiescent_mismatch_no_db",
+    );
+    assert!(!no_db.status.success(), "{no_db:?}");
+    assert_eq!(namespace_check(&no_db)["details"]["state"], "mismatch");
+    assert_no_db_pending_probe_skipped(&no_db);
+    assert_namespace_family_preserved(&workspace, &before, false);
+    let list = run_br(
+        &workspace,
+        ["list", "--json", "--no-auto-import", "--no-auto-flush"],
+        "quiescent_namespace_open",
+    );
+    assert!(
+        list.status.success(),
+        "current engine rebind failed: {list:?}"
+    );
+    let listed: Value = serde_json::from_str(&list.stdout).unwrap();
+    assert_eq!(listed["issues"][0]["title"], "Retained issue");
+    let rebound = run_br(&workspace, ["doctor", "--json"], "rebound_namespace");
+    assert_eq!(namespace_check(&rebound)["details"]["state"], "matched");
+    assert_eq!(fs::read(&displaced).unwrap(), before["beads.db"]);
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn e2e_doctor_namespace_identity_distinguishes_healthy_and_unavailable_evidence() {
+    let _log = common::test_log("e2e_doctor_namespace_identity_evidence_states");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init", "--prefix", "ns"], "init");
+    assert!(init.status.success(), "{init:?}");
+    let healthy = run_br(&workspace, ["doctor", "--json"], "healthy_namespace");
+    assert!(healthy.status.success(), "{healthy:?}");
+    let check = namespace_check(&healthy);
+    assert_eq!(check["status"], "ok");
+    assert_eq!(check["details"]["state"], "matched");
+    assert_eq!(check["details"]["identities_match"], true);
+
+    // Malformed evidence is not proof of a foreign family. Preserve exactly
+    // the operator's files even when the engine cannot parse its own record.
+    let use_path = workspace.root.join(".beads/beads.db-fsqlite-ns-use");
+    fs::write(&use_path, b"deliberately malformed namespace record").unwrap();
+    let before = namespace_family_bytes(&workspace);
+    for (args, label) in [
+        (vec!["doctor", "--json"], "malformed_namespace"),
+        (
+            vec!["doctor", "--no-db", "--json"],
+            "malformed_namespace_no_db",
+        ),
+    ] {
+        let doctor = run_br(&workspace, args, label);
+        let check = namespace_check(&doctor);
+        assert_eq!(check["status"], "warn", "{check}");
+        assert_eq!(check["details"]["state"], "unavailable", "{check}");
+        assert!(
+            check["details"]["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty())
+        );
+        assert_namespace_family_preserved(&workspace, &before, false);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_doctor_namespace_identity_absence_and_permission_failures_are_not_mismatches() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _log = common::test_log("e2e_doctor_namespace_identity_missing_and_permissions");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init", "--prefix", "ns"], "init");
+    assert!(init.status.success(), "{init:?}");
+    let gate = workspace.root.join(".beads/beads.db-fsqlite-ns-gate");
+    let use_file = workspace.root.join(".beads/beads.db-fsqlite-ns-use");
+    fs::set_permissions(&gate, fs::Permissions::from_mode(0o644)).unwrap();
+    let before = namespace_family_bytes(&workspace);
+    let permissions = run_br(&workspace, ["doctor", "--json"], "namespace_permissions");
+    assert_eq!(
+        namespace_check(&permissions)["details"]["state"],
+        "unavailable"
+    );
+    assert_eq!(
+        fs::metadata(&gate).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    assert_namespace_family_preserved(&workspace, &before, false);
+
+    // Retain each sidecar outside the canonical family; never unlink it.
+    fs::rename(&gate, workspace.root.join("saved-namespace-gate")).unwrap();
+    let incomplete_before = namespace_family_bytes(&workspace);
+    let incomplete = run_br(&workspace, ["doctor", "--json"], "namespace_incomplete");
+    let check = namespace_check(&incomplete);
+    assert_eq!(check["details"]["state"], "unavailable");
+    assert!(
+        check["details"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("incomplete")
+    );
+    assert_namespace_family_preserved(&workspace, &incomplete_before, false);
+
+    fs::rename(&use_file, workspace.root.join("saved-namespace-use")).unwrap();
+    let absent_before = namespace_family_bytes(&workspace);
+    let absent = run_br(&workspace, ["doctor", "--json"], "namespace_absent");
+    let check = namespace_check(&absent);
+    assert_eq!(check["status"], "ok");
+    assert_eq!(check["details"]["state"], "not_applicable");
+    assert_namespace_family_preserved(&workspace, &absent_before, true);
+    assert!(!gate.exists());
+    assert!(!use_file.exists());
+}
 
 #[test]
 fn e2e_doctor_healthy_workspace() {

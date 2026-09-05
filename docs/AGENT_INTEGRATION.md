@@ -46,7 +46,7 @@ This guide covers how AI coding agents can effectively use `br` (beads_rust) for
 
 ```bash
 # Initialize (if needed)
-br init
+br init --json
 
 # Find work
 br ready --json --limit 5
@@ -753,7 +753,7 @@ Tools:
 Resources:
 
 - `beads://project/info`
-- `beads://issues/{id}`
+- `beads://issue/{id}`
 - `beads://schema`
 - `beads://labels`
 - `beads://issues/ready`

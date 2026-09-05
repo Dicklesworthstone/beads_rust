@@ -78,7 +78,7 @@ These options apply to all commands:
 | `--no-auto-import` | Skip automatic import check |
 | `--allow-stale` | Allow stale DB (bypass freshness check warning) |
 | `--lock-timeout <LOCK_TIMEOUT>` | SQLite busy/write-lock timeout in milliseconds |
-| `--no-db` | JSONL-only mode (no DB connection). Every invocation rebuilds a private in-memory database from the whole JSONL, so the cost grows with the workspace (a few seconds per few thousand records; progress is shown on an interactive stderr). For large workspaces prefer the default database-backed mode, which imports once and answers from SQLite |
+| `--no-db` | Run issue operations from JSONL using a private in-memory database rebuilt on each invocation. Startup may still inspect a present database for pending-merge safety; doctor checks namespace evidence before that inspection and reports which consistency/recovery checks it skips. Loading cost grows with the whole JSONL; progress appears on an interactive stderr. For large workspaces prefer the default database-backed mode, which imports once and answers from SQLite |
 | `-v, --verbose` | Increase logging verbosity (-v, -vv) |
 | `-q, --quiet` | Quiet mode (errors only) |
 | `--no-color` | Disable colored output |
@@ -1804,7 +1804,7 @@ network listener.
 **Tools:** `list_issues`, `show_issue`, `create_issue`, `update_issue`,
 `close_issue`, `manage_dependencies`, `project_overview`.
 
-**Resources:** `beads://project/info`, `beads://issues/{id}`,
+**Resources:** `beads://project/info`, `beads://issue/{id}`,
 `beads://schema`, `beads://labels`, `beads://issues/ready`,
 `beads://issues/blocked`, `beads://issues/in_progress`,
 `beads://coordination/status`, `beads://issues/deferred`,

@@ -80,6 +80,7 @@ fn release_workflow_exposes_expected_fragment_steps() -> Result<(), String> {
         "Verify all checksums",
         "Create archive (tar.gz)",
         "Create archive (zip)",
+        "Check release artifact size budgets",
         "Sign release archive with Ed25519",
         "Generate changelog",
         "Install digest-verified Syft",
@@ -678,6 +679,248 @@ fn changelog_fragment_keeps_previous_tag_and_reliability_paths() -> Result<(), S
         &script,
         "Release reliability gates completed before artifacts were built",
     )
+}
+
+#[test]
+fn release_size_gate_accepts_exact_target_budgets() -> Result<(), String> {
+    for (platform, target, binary_base, archive_base) in [
+        (
+            "linux_amd64",
+            "x86_64-unknown-linux-gnu",
+            27_307_752,
+            11_613_648,
+        ),
+        (
+            "linux_musl_amd64",
+            "x86_64-unknown-linux-musl",
+            27_443_960,
+            11_730_696,
+        ),
+        (
+            "linux_arm64",
+            "aarch64-unknown-linux-gnu",
+            20_963_480,
+            10_952_270,
+        ),
+        (
+            "linux_musl_arm64",
+            "aarch64-unknown-linux-musl",
+            19_849_304,
+            10_839_706,
+        ),
+        (
+            "darwin_amd64",
+            "x86_64-apple-darwin",
+            22_071_840,
+            10_272_898,
+        ),
+        (
+            "darwin_arm64",
+            "aarch64-apple-darwin",
+            15_856_032,
+            9_435_650,
+        ),
+        (
+            "windows_amd64",
+            "x86_64-pc-windows-gnu",
+            23_221_760,
+            10_240_118,
+        ),
+    ] {
+        let binary_limit = binary_base + 1_048_576;
+        let archive_limit = archive_base + 524_288;
+        let fixture = size_fixture(platform, target, binary_limit, archive_limit)?;
+        let receipt = run_size_gate(&fixture, platform, target, 0)?;
+        assert_eq!(receipt["state"], "pass", "{platform}: {receipt}");
+        assert_eq!(receipt["binary_bytes"], binary_limit);
+        assert_eq!(receipt["archive_bytes"], archive_limit);
+        assert_eq!(receipt["binary_limit_bytes"], binary_limit);
+        assert_eq!(receipt["archive_limit_bytes"], archive_limit);
+        assert_eq!(receipt["release_profile_strip"], true);
+        assert_eq!(receipt["source_commit"], "a".repeat(40));
+        assert_eq!(
+            receipt["lockfile_sha256"],
+            sha256_hex(b"fixture lockfile\n")
+        );
+        for field in ["binary_sha256", "archive_sha256", "baseline_archive_sha256"] {
+            assert_eq!(receipt[field].as_str().map(str::len), Some(64), "{receipt}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn release_size_gate_rejects_each_artifact_over_budget() -> Result<(), String> {
+    for (binary_size, archive_size) in [(28_356_329, 12_137_936), (28_356_328, 12_137_937)] {
+        let fixture = size_fixture(
+            "linux_amd64",
+            "x86_64-unknown-linux-gnu",
+            binary_size,
+            archive_size,
+        )?;
+        let receipt = run_size_gate(&fixture, "linux_amd64", "x86_64-unknown-linux-gnu", 1)?;
+        assert_eq!(receipt["state"], "regression", "{receipt}");
+        assert_eq!(receipt["binary_bytes"], binary_size);
+        assert_eq!(receipt["archive_bytes"], archive_size);
+    }
+    Ok(())
+}
+
+#[test]
+fn release_size_gate_refuses_missing_and_incompatible_inputs() -> Result<(), String> {
+    for fault in [
+        "unknown_platform",
+        "wrong_target",
+        "empty_binary",
+        "missing_archive",
+        "unstripped",
+        "bad_manifest",
+        "missing_source",
+    ] {
+        let fixture = size_fixture("linux_amd64", "x86_64-unknown-linux-gnu", 1024, 512)?;
+        let platform = if fault == "unknown_platform" {
+            "not-supported"
+        } else {
+            "linux_amd64"
+        };
+        let target = if fault == "wrong_target" {
+            "aarch64-unknown-linux-gnu"
+        } else {
+            "x86_64-unknown-linux-gnu"
+        };
+        match fault {
+            "empty_binary" => fs::File::create(
+                fixture
+                    .root()
+                    .join("target/x86_64-unknown-linux-gnu/release/br"),
+            )
+            .map(|_| ()),
+            "missing_archive" => fs::rename(
+                fixture.root().join(release_archive_name(platform)),
+                fixture.root().join("preserved-archive"),
+            ),
+            "unstripped" => fs::write(
+                fixture.root().join("Cargo.toml"),
+                "[profile.release]\nstrip = false\n",
+            ),
+            "bad_manifest" => fs::write(fixture.root().join("Cargo.toml"), "[broken"),
+            _ => Ok(()),
+        }
+        .map_err(|error| format!("prepare {fault}: {error}"))?;
+        let source = if fault == "missing_source" {
+            ""
+        } else {
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        };
+        let receipt = run_size_gate_with_source(&fixture, platform, target, source, 2)?;
+        assert_eq!(receipt["state"], "inconclusive", "{fault}: {receipt}");
+        assert!(receipt["reason"].is_string(), "{fault}: {receipt}");
+    }
+    assert_eq!(
+        release_step_condition("Upload release size receipt")?.as_deref(),
+        Some("always()")
+    );
+    Ok(())
+}
+
+fn size_fixture(
+    platform: &str,
+    target: &str,
+    binary_size: u64,
+    archive_size: u64,
+) -> Result<WorkflowFixture, String> {
+    let fixture = WorkflowFixture::new()?;
+    let release = fixture.root().join("target").join(target).join("release");
+    fs::create_dir_all(&release).map_err(|error| error.to_string())?;
+    fs::write(
+        fixture.root().join("Cargo.toml"),
+        "[profile.release]\nstrip = true\n",
+    )
+    .map_err(|error| error.to_string())?;
+    fs::write(fixture.root().join("Cargo.lock"), b"fixture lockfile\n")
+        .map_err(|error| error.to_string())?;
+    let binary = release.join(if platform == "windows_amd64" {
+        "br.exe"
+    } else {
+        "br"
+    });
+    // Sparse byte-count fixtures test the real gate; these are not executable
+    // release artifacts and are never presented as runtime measurements.
+    for (path, size) in [
+        (binary, binary_size),
+        (
+            fixture.root().join(release_archive_name(platform)),
+            archive_size,
+        ),
+    ] {
+        fs::File::create(path)
+            .and_then(|file| file.set_len(size))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(fixture)
+}
+
+fn run_size_gate(
+    fixture: &WorkflowFixture,
+    platform: &str,
+    target: &str,
+    expected_exit: i32,
+) -> Result<serde_json::Value, String> {
+    run_size_gate_with_source(
+        fixture,
+        platform,
+        target,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        expected_exit,
+    )
+}
+
+fn run_size_gate_with_source(
+    fixture: &WorkflowFixture,
+    platform: &str,
+    target: &str,
+    source: &str,
+    expected_exit: i32,
+) -> Result<serde_json::Value, String> {
+    let script = release_step_script("Check release artifact size budgets")?;
+    let output = run_bash_step(
+        &script,
+        fixture.root(),
+        &[
+            ("SIZE_PLATFORM", platform),
+            ("SIZE_TARGET", target),
+            ("SIZE_ARCHIVE", &release_archive_name(platform)),
+            ("GITHUB_SHA", source),
+            (
+                "GITHUB_STEP_SUMMARY",
+                &path_string(&fixture.root().join("summary.md")),
+            ),
+        ],
+    )?;
+    if output.status.code() != Some(expected_exit) {
+        return Err(format!(
+            "size gate expected {expected_exit}, got {:?}: {}\n{}",
+            output.status.code(),
+            output.stdout,
+            output.stderr
+        ));
+    }
+    let receipt: serde_json::Value = serde_json::from_str(&output.stdout)
+        .map_err(|error| format!("size receipt: {error}: {}", output.stdout))?;
+    assert_eq!(receipt["gate_exit"], expected_exit);
+    let receipt_platform = if REQUIRED_PLATFORMS.contains(&platform) {
+        platform
+    } else {
+        "unknown"
+    };
+    let saved: serde_json::Value = serde_json::from_str(&read_to_string(
+        &fixture
+            .root()
+            .join(format!("release-size-{receipt_platform}.json")),
+    )?)
+    .map_err(|error| error.to_string())?;
+    assert_eq!(receipt, saved);
+    Ok(receipt)
 }
 
 fn release_step_script(step_name: &str) -> Result<String, String> {

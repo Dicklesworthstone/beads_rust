@@ -12,7 +12,7 @@
 //! reading source code. The CLI surface marks `br schema` as
 //! not-yet-stable; agents should re-call across release boundaries.
 
-use crate::cli::commands::vcs::VcsExportStatus;
+use crate::cli::commands::{init::InitResult, vcs::VcsExportStatus};
 use crate::cli::{
     OutputFormat, SchemaArgs, SchemaTarget, resolve_output_format_basic_with_outer_mode,
 };
@@ -121,9 +121,8 @@ struct CommandShape {
     #[serde(skip_serializing_if = "Option::is_none")]
     item_schema: Option<&'static str>,
     /// Whether machine-mode failures write an `ErrorEnvelope` to stderr.
-    /// False means callers must consult the command notes for the actual
-    /// stream; the current top-level CLI handler emits structured errors on
-    /// stdout for the two safety command shapes below.
+    /// The top-level CLI handler emits structured errors on stdout, so the
+    /// current command shapes report false. stderr is reserved for diagnostics.
     error_envelope_on_stderr: bool,
     /// Free-form notes describing quirks of the envelope.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -189,6 +188,7 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
 
     match target {
         SchemaTarget::All => {
+            schemas.insert("InitResult", schema_for_output::<InitResult>());
             schemas.insert("Issue", schema_for_output::<Issue>());
             schemas.insert("IssueWithCounts", schema_for_output::<IssueWithCounts>());
             schemas.insert("IssueDetails", schema_for_output::<IssueDetails>());
@@ -303,6 +303,21 @@ fn build_commands(target: SchemaTarget) -> BTreeMap<&'static str, CommandShape> 
     insert_aggregate_command_shapes(&mut commands);
     insert_label_command_shapes(&mut commands);
     commands.insert(
+        "init",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".",
+            items_at: None,
+            item_schema: Some("InitResult"),
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "Successful initialization receipt with resolved paths, stored prefix, and file outcomes. \
+                 --force reuses existing issues and rewrites metadata; it does not reset the database. \
+                 Structured errors are emitted on stdout.",
+            ),
+        },
+    );
+    commands.insert(
         "sync --reconcile-additive",
         CommandShape {
             shape: "object",
@@ -358,14 +373,13 @@ fn insert_issue_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
         "show",
         CommandShape {
             shape: "array",
-            jq_filter: ".[0]",
+            jq_filter: ".[]",
             items_at: Some("."),
             item_schema: Some("IssueDetails"),
-            error_envelope_on_stderr: true,
+            error_envelope_on_stderr: false,
             notes: Some(
-                "Always a single-element array on success (wrapped for shape consistency \
-                 with list-style commands). On a missing id, an ErrorEnvelope is written \
-                 to stderr and exit code is non-zero.",
+                "Array containing each requested issue; a single requested ID yields one element. \
+                 On a missing ID, an ErrorEnvelope is written to stdout and exit code is non-zero.",
             ),
         },
     );
@@ -445,9 +459,9 @@ fn insert_comment_command_shapes(commands: &mut BTreeMap<&'static str, CommandSh
             jq_filter: ".[]",
             items_at: Some("."),
             item_schema: None,
-            error_envelope_on_stderr: true,
+            error_envelope_on_stderr: false,
             notes: Some(
-                "Empty array if no comments. ErrorEnvelope on stderr if the issue id \
+                "Empty array if no comments. ErrorEnvelope on stdout if the issue id \
                  cannot be resolved.",
             ),
         },
@@ -462,7 +476,7 @@ fn insert_dependency_command_shapes(commands: &mut BTreeMap<&'static str, Comman
             jq_filter: ".[]",
             items_at: Some("."),
             item_schema: Some("TreeNode"),
-            error_envelope_on_stderr: true,
+            error_envelope_on_stderr: false,
             notes: Some("Pre-order traversal; each node carries a `depth` field."),
         },
     );
@@ -473,7 +487,7 @@ fn insert_dependency_command_shapes(commands: &mut BTreeMap<&'static str, Comman
             jq_filter: ".[]",
             items_at: Some("."),
             item_schema: None,
-            error_envelope_on_stderr: true,
+            error_envelope_on_stderr: false,
             notes: None,
         },
     );
@@ -645,6 +659,27 @@ mod tests {
         let commands = build_commands(SchemaTarget::All);
         assert!(!schemas.is_empty(), "All target must include schemas");
         assert!(!commands.is_empty(), "All target must include commands");
+    }
+
+    #[test]
+    fn init_schema_and_command_shape_are_discoverable() {
+        let schemas = build_schemas(SchemaTarget::All);
+        let schema = serde_json::to_value(&schemas["InitResult"]).expect("init schema JSON");
+        let properties = schema["properties"].as_object().expect("init properties");
+        for field in [
+            "initialized",
+            "beads_dir",
+            "database_path",
+            "prefix",
+            "files",
+        ] {
+            assert!(properties.contains_key(field), "missing init field {field}");
+        }
+        let commands = build_commands(SchemaTarget::Commands);
+        assert_eq!(commands["init"].item_schema, Some("InitResult"));
+        assert_eq!(commands["init"].shape, "object");
+        assert_eq!(commands["init"].jq_filter, ".");
+        assert!(!commands["init"].error_envelope_on_stderr);
     }
 
     #[test]

@@ -158,10 +158,12 @@ git diff .beads/issues.jsonl
 
 ### 3. Explicit Over Implicit
 
-State changes are explicit. Successful mutating commands update SQLite and
-auto-flush JSONL by default, but `br` still never commits, pushes, pulls, or
-imports remote changes without a command. Git-inspection behavior is limited to
-explicit reporting commands and reads history only.
+Successful mutating commands update SQLite and auto-flush JSONL by default.
+Normal issue commands also check for changed local JSONL and import it before
+running, unless `--no-auto-import` or `sync.auto_import: false` disables that
+check. This includes JSONL changed by your own git pull or merge; `br` never
+fetches those changes, commits, pushes, or pulls for you. Git inspection is
+limited to explicitly requested reporting commands.
 
 ```bash
 # Mutations auto-flush .beads/issues.jsonl by default
@@ -170,7 +172,7 @@ br close br-abc123 --reason "Done"
 # Re-run export after --no-auto-flush/config changes, recovery, or as a final check
 br sync --flush-only
 
-# Import is explicit (not automatic)
+# Import local JSONL explicitly when needed; normal issue commands check it automatically
 br sync --import-only
 
 # Merge divergent DB and JSONL edits using the saved base snapshot
@@ -270,12 +272,18 @@ Agent Mail, MCP clients, or fixture update modes.
 | Storage | SQLite + JSONL | Dolt/SQLite |
 | Background daemon | **No** | Yes |
 | Hook installation | **Manual** | Automatic |
-| Binary size | ~26 MB stripped static binary (v0.5.10, x86_64 Linux; ~12 MB compressed download) | ~30+ MB |
+| Binary size | ~26 MiB stripped executable, ~11 MiB compressed (v0.5.10, x86_64 Linux GNU; dynamically linked) | ~30+ MB |
 | Scope | Local CLI, sync, recovery, and agent workflows | Feature-rich ecosystem |
 
 **When to use br:** You want a stable, local-first issue tracker with explicit sync, dependency-aware planning, and machine-readable output.
 
 **When to use beads:** You want advanced features like Linear/Jira sync, RPC daemon, automatic hooks.
+
+Linux releases include GNU and musl targets. The v0.5.10 x86_64 GNU executable
+is 27,307,752 bytes and its archive is 11,613,648 bytes; the musl executable is
+27,443,960 bytes and its archive is 11,730,696 bytes. The musl executable is
+statically linked; the GNU executable needs the system's glibc loader. Sizes
+vary with the target, version, and enabled features.
 
 ### br vs GitHub Issues
 
@@ -391,7 +399,7 @@ when Agent Mail reservation or liveness evidence is required.
 
 The MCP tool surface is `list_issues`, `show_issue`, `create_issue`,
 `update_issue`, `close_issue`, `manage_dependencies`, and `project_overview`.
-The resource surface is `beads://project/info`, `beads://issues/{id}`,
+The resource surface is `beads://project/info`, `beads://issue/{id}`,
 `beads://schema`, `beads://labels`, `beads://issues/ready`,
 `beads://issues/blocked`, `beads://issues/in_progress`,
 `beads://coordination/status`, `beads://issues/deferred`,
@@ -438,6 +446,11 @@ cd my-project
 br init
 # Initialized beads workspace in .beads/
 ```
+
+For automation, `br init --json` returns an initialization receipt with the
+resolved workspace and database paths, the stored prefix, and each file's
+outcome (`created`, `updated`, or `existing`). `br schema all --format json`
+includes its `InitResult` schema.
 
 ### 2. Create Your First Issue
 
@@ -1182,7 +1195,12 @@ See [AGENTS.md](AGENTS.md) for the complete agent integration guide.
 
 ### Q: How do I migrate from the original beads?
 
-br uses the same JSONL format as classic beads:
+br imports classic beads JSONL. Conformance is checked against bd v0.46.0;
+br has additional fields, workflow tables, its own plain-text output, and
+paginated JSON query results. Its length-prefixed content hashes deliberately
+differ from classic bd hashes. Use JSONL interchange rather than assuming
+the two tools can share an identical live database schema. See the
+[documented conformance differences](docs/TEST_HARNESS.md#known-divergences-from-bd-0460).
 
 ```bash
 # Copy your existing issues.jsonl
@@ -1194,7 +1212,7 @@ br sync --import-only
 
 ### Q: Why Rust instead of Go?
 
-- **Single static binary:** one ~26 MB executable (v0.5.10, x86_64 Linux) with no runtime, daemon, or Dolt dependency
+- **Single executable:** no language runtime, daemon, or Dolt dependency; Linux musl releases are static, while GNU releases use the system's glibc loader
 - **Memory safety:** No runtime garbage collection
 - **Operational fit:** The CLI, release pipeline, and agent tooling are already Rust-based
 - **Personal preference:** The author's flywheel tooling is Rust-based

@@ -18,14 +18,17 @@
 //! A second test checks that every `br ...` example in the README command
 //! tables, and every flag in its Global Flags table, names a subcommand and
 //! flags the built binary's `--help` actually lists.
+//! Behavioral checks separately exercise automatic local JSONL import and its
+//! opt-outs; matching example syntax alone does not verify prose semantics.
 #![allow(clippy::pedantic, clippy::nursery)]
 
+mod common;
+
 use assert_cmd::Command;
+use common::cli::{BrWorkspace, run_br};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
-use tempfile::TempDir;
 
 const DOCS: &[&str] = &["docs/ARCHITECTURE.md"];
 
@@ -101,7 +104,7 @@ fn key_paths(value: &Value, prefix: &str, out: &mut BTreeSet<String>) {
     }
 }
 
-fn run_documented_command(workspace: &Path, command: &str) -> Value {
+fn run_documented_command(workspace: &BrWorkspace, command: &str) -> Value {
     let words = shell_words::split(command)
         .unwrap_or_else(|err| panic!("cannot split documented command `{command}`: {err}"));
     assert_eq!(
@@ -109,30 +112,22 @@ fn run_documented_command(workspace: &Path, command: &str) -> Value {
         Some("br"),
         "documented commands must start with `br`"
     );
-    let mut cmd = Command::cargo_bin("br").expect("br binary");
-    cmd.current_dir(workspace)
-        .env("NO_COLOR", "1")
-        .env("RUST_LOG", "error")
-        .env("HOME", workspace)
-        .args(&words[1..]);
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("BD_")
-            || name.starts_with("BEADS_")
-            || name.starts_with("BR_OUTPUT")
-            || name.starts_with("TOON_")
-        {
-            cmd.env_remove(&key);
-        }
-    }
-    let output = cmd.output().expect("run documented command");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(stdout.trim()).unwrap_or_else(|err| {
+    let output = run_br(workspace, &words[1..], "documented_command");
+    let live: Value = serde_json::from_str(&output.stdout).unwrap_or_else(|err| {
         panic!(
-            "`{command}` did not print JSON: {err}\nstdout:\n{stdout}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stderr)
+            "`{command}` did not print JSON: {err}\nstdout:\n{}\nstderr:\n{}",
+            output.stdout, output.stderr
         )
-    })
+    });
+    assert_eq!(
+        output.status.success(),
+        live.get("error").is_none(),
+        "`{command}` exit status disagrees with its result: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        output.stdout,
+        output.stderr
+    );
+    live
 }
 
 #[test]
@@ -143,20 +138,13 @@ fn documented_json_examples_match_live_key_structure() {
         "no `<!-- from: ... -->` markers found in {DOCS:?}; the docs lost their captured examples"
     );
 
-    let temp = TempDir::new().expect("tempdir");
-    Command::cargo_bin("br")
-        .expect("br binary")
-        .current_dir(temp.path())
-        .env("NO_COLOR", "1")
-        .env("RUST_LOG", "error")
-        .env("HOME", temp.path())
-        .args(["init", "--prefix", "doc"])
-        .assert()
-        .success();
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init", "--prefix", "doc"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
 
     let mut failures = Vec::new();
     for example in &examples {
-        let live = run_documented_command(temp.path(), &example.command);
+        let live = run_documented_command(&workspace, &example.command);
         let mut documented = BTreeSet::new();
         key_paths(&example.json, "", &mut documented);
         let mut observed = BTreeSet::new();
@@ -182,6 +170,70 @@ fn documented_json_examples_match_live_key_structure() {
         "documented examples drifted:\n{}",
         failures.join("\n")
     );
+}
+
+#[test]
+fn documented_auto_import_reads_local_edits_and_honors_opt_outs() {
+    for disable_with_config in [false, true] {
+        let workspace = BrWorkspace::new();
+        let init = run_br(&workspace, ["init", "--prefix", "doc"], "init");
+        assert!(init.status.success(), "init failed: {}", init.stderr);
+        let created = run_documented_command(&workspace, "br create 'Original local title' --json");
+        let id = created["id"].as_str().expect("created issue id");
+        let jsonl_path = workspace.root.join(".beads/issues.jsonl");
+        let exported = fs::read_to_string(&jsonl_path).expect("create auto-flushed JSONL");
+        let mut row: Value = serde_json::from_str(&exported).expect("one exported issue");
+        assert_eq!(row["id"], id);
+        row["title"] = Value::String("Changed through the local interchange file".to_string());
+        row["updated_at"] =
+            Value::String((chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339());
+        let edited = format!(
+            "{}\n",
+            serde_json::to_string(&row).expect("encode local edit")
+        );
+        fs::write(&jsonl_path, &edited).expect("write external local JSONL edit");
+
+        // A deliberate real content change must remain absent from the DB when
+        // import is disabled. Rewriting identical bytes would not test this.
+        let list_command = if disable_with_config {
+            let config = run_br(
+                &workspace,
+                ["config", "set", "sync.auto_import", "false"],
+                "disable_auto_import",
+            );
+            assert!(config.status.success(), "config failed: {}", config.stderr);
+            "br list --json"
+        } else {
+            "br list --no-auto-import --json"
+        };
+        let before = run_documented_command(&workspace, list_command);
+        assert_eq!(before["total"], 1);
+        assert_eq!(before["issues"][0]["id"], id);
+        assert_eq!(before["issues"][0]["title"], "Original local title");
+        assert_eq!(fs::read_to_string(&jsonl_path).unwrap(), edited);
+
+        if disable_with_config {
+            let config = run_br(
+                &workspace,
+                ["config", "set", "sync.auto_import", "true"],
+                "enable_auto_import",
+            );
+            assert!(config.status.success(), "config failed: {}", config.stderr);
+        }
+        let after = run_documented_command(&workspace, "br list --json");
+        assert_eq!(after["total"], 1);
+        assert_eq!(after["issues"][0]["id"], id);
+        assert_eq!(after["issues"][0]["title"], row["title"]);
+
+        // A second command with import disabled proves the first imported the
+        // value durably, rather than rendering directly from the JSONL file.
+        let persisted = run_documented_command(&workspace, "br list --no-auto-import --json");
+        assert_eq!(persisted["issues"][0]["title"], row["title"]);
+        assert_eq!(fs::read_to_string(&jsonl_path).unwrap(), edited);
+        eprintln!(
+            "[docs_auto_import] config_opt_out={disable_with_config} id={id}: skipped edit, imported edit, persisted DB value, JSONL bytes preserved"
+        );
+    }
 }
 
 /// Subcommands that only exist in feature-gated builds; their README rows are

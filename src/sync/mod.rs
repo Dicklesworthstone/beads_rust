@@ -11424,7 +11424,7 @@ pub struct StalenessCheck {
     pub db_newer: bool,
 }
 
-fn pending_export_state(
+pub(crate) fn pending_export_state(
     storage: &SqliteStorage,
     jsonl_exists: bool,
 ) -> Result<(usize, bool, bool)> {

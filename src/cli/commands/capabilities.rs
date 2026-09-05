@@ -525,6 +525,11 @@ fn parent_examples(name: &str) -> &'static [&'static str] {
 
 fn command_safety_notes(name: &str) -> &'static [&'static str] {
     match name {
+        "init" => &[
+            "JSON and TOON return an InitResult receipt; discover its schema with `br schema all --json`.",
+            "Without `--force`, an existing database is refused. `--force` preserves issues, sets the prefix, and rewrites metadata.json.",
+            "Existing config.yaml, .gitignore, and issues.jsonl entries are preserved.",
+        ],
         "comments" | "comments add" | "comments list" => comments_safety_notes(name),
         "dep" | "dep add" | "dep import" | "dep remove" | "dep list" | "dep tree"
         | "dep cycles" => dep_safety_notes(name),
@@ -537,8 +542,8 @@ fn command_safety_notes(name: &str) -> &'static [&'static str] {
             "Use `--silent` when automation only needs the created issue ID on stdout.",
         ],
         "q" => &[
-            "Quick capture creates an issue from title words and prints only the ID.",
-            "Use full `create` when automation needs JSON, parent, deps, due, defer, or external-ref fields.",
+            "Quick capture creates an issue from title words; plain text prints the ID and JSON/TOON return the created ID and title.",
+            "Use full `create` when automation needs deps, due, defer, or external-ref fields.",
         ],
         "update" => &[
             "Pass explicit IDs in automation; without IDs, update uses the last-touched issue.",
@@ -856,8 +861,11 @@ fn command_contract(name: &str) -> CommandContract {
         "init" => CommandContract {
             operation: "write",
             workspace: "none",
-            machine_output: &["text"],
-            examples: &["br init --prefix br"],
+            machine_output: &["json", "toon", "text"],
+            examples: &[
+                "br init --prefix br --json",
+                "BR_OUTPUT_FORMAT=toon br init --prefix br",
+            ],
         },
         "create" => CommandContract {
             operation: "write",
@@ -1138,6 +1146,25 @@ fn render_text(output: &CapabilitiesOutput, requested_command: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::{command_contract, command_detail_for_path};
+
+    #[test]
+    fn init_capability_advertises_structured_receipt_and_preservation() {
+        let contract = command_contract("init");
+        assert_eq!(contract.machine_output, ["json", "toon", "text"]);
+        let detail = command_detail_for_path("init").expect("init detail");
+        assert!(
+            detail
+                .safety_notes
+                .iter()
+                .any(|note| note.contains("preserves issues"))
+        );
+        assert!(
+            detail
+                .safety_notes
+                .iter()
+                .any(|note| note.contains("InitResult"))
+        );
+    }
 
     #[test]
     fn vcs_status_capability_is_explicit_read_only_and_machine_discoverable() {

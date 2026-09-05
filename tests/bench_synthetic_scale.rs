@@ -377,6 +377,34 @@ pub struct SyntheticDataset {
     pub metrics: GenerationMetrics,
 }
 
+fn configure_benchmark_environment(command: &mut Command, root: &Path) {
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if ["BR_", "BD_", "BEADS_", "TOON_", "RCH_"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            command.env_remove(key);
+        }
+    }
+    command
+        .current_dir(root)
+        .env("HOME", root)
+        .env("XDG_CONFIG_HOME", root.join(".config"))
+        .env("XDG_CACHE_HOME", root.join(".cache"))
+        .env("XDG_STATE_HOME", root.join(".local/state"))
+        .env("BEADS_DIR", root.join(".beads"))
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", "error")
+        .env("PATH", common::cli::deduplicated_br_path());
+}
+
+fn synthetic_command(binary: &Path, root: &Path) -> Command {
+    let mut command = Command::new(binary);
+    configure_benchmark_environment(&mut command, root);
+    command
+}
+
 impl SyntheticDataset {
     /// Generate a synthetic dataset based on the config.
     ///
@@ -395,7 +423,7 @@ impl SyntheticDataset {
         fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n")?;
 
         // Initialize beads
-        let init_output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
+        let init_output = synthetic_command(br_path, &root)
             .args(["init"])
             .current_dir(&root)
             .env("NO_COLOR", "1")
@@ -490,7 +518,7 @@ impl SyntheticDataset {
         fs::create_dir_all(root.join(".git"))?;
         fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n")?;
 
-        let init_output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
+        let init_output = synthetic_command(br_path, &root)
             .args(["init"])
             .current_dir(&root)
             .env("NO_COLOR", "1")
@@ -1035,7 +1063,7 @@ fn run_br_status<const N: usize>(
     workspace: &Path,
     label: &str,
 ) -> std::io::Result<bool> {
-    let output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
+    let output = synthetic_command(br_path, workspace)
         .args(args)
         .current_dir(workspace)
         .env("NO_COLOR", "1")
@@ -1062,7 +1090,7 @@ fn run_br_status<const N: usize>(
 }
 
 fn doctor_workspace_is_healthy(br_path: &Path, workspace: &Path) -> std::io::Result<bool> {
-    let output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
+    let output = synthetic_command(br_path, workspace)
         .args(["doctor", "--json", "--no-auto-import", "--no-auto-flush"])
         .current_dir(workspace)
         .env("NO_COLOR", "1")
@@ -1102,7 +1130,7 @@ fn doctor_workspace_is_healthy(br_path: &Path, workspace: &Path) -> std::io::Res
 }
 
 fn sync_status_is_clean(br_path: &Path, workspace: &Path) -> std::io::Result<bool> {
-    let output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
+    let output = synthetic_command(br_path, workspace)
         .args(["sync", "--status", "--json"])
         .current_dir(workspace)
         .env("NO_COLOR", "1")
@@ -2948,4 +2976,680 @@ fn direct_sqlite_profile_marks_bypassed_sync_health() {
     assert_eq!(manifest.metrics.load_strategy, "direct_sqlite_seed");
     assert!(!manifest.metrics.health.sync_import_ok);
     assert!(!manifest.metrics.health.doctor_ok);
+}
+
+/// Opt-in measurements from real, explicitly pinned release executables. A fresh
+/// workspace copy warms the filesystem cache; this does not measure cold cache.
+#[cfg(target_os = "linux")]
+mod release_abba {
+    use super::{
+        SyntheticConfig, SyntheticDataset, common, configure_benchmark_environment, sha256_hex,
+        write_json_pretty,
+    };
+    use common::baseline::{
+        MatchedRun, MatchedState, compare_matched_runs, summarize_matched_samples,
+    };
+    use serde::Serialize;
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output};
+    use std::time::{Duration, Instant};
+    use tempfile::TempDir;
+
+    const CACHE_PROTOCOL: &str = "fresh-copy/warm-filesystem; direct fresh CLI process; copy and validation excluded; ABBA; two warmup blocks; cohort timeout outside measured intervals";
+    const RUNNER_PROTOCOL: &str = "identified shared Linux host; one-minute load/logical CPUs <= 0.25; bounded 300s settling before samples with observations retained; compiler inventory retained; A/A calibration required before interpreting A/B";
+
+    #[derive(Serialize)]
+    struct Sample {
+        side: usize,
+        block: usize,
+        position: usize,
+        warmup: bool,
+        elapsed_ms: f64,
+        exit_code: i32,
+        args: Vec<String>,
+        stdout: String,
+        stderr: String,
+        load_before: String,
+        invocations: usize,
+    }
+
+    struct Artifact {
+        binary: PathBuf,
+        metadata: BTreeMap<String, String>,
+    }
+
+    fn required(name: &str) -> String {
+        std::env::var(name).unwrap_or_else(|_| panic!("required measurement input: {name}"))
+    }
+
+    fn count(value: &str, minimum: usize) -> Result<usize, String> {
+        value
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value >= minimum)
+            .ok_or_else(|| format!("expected an integer >= {minimum}, received {value:?}"))
+    }
+
+    fn workload_budgets(value: &str) -> Result<BTreeMap<String, f64>, String> {
+        let budgets: BTreeMap<String, f64> = serde_json::from_str(value)
+            .map_err(|error| format!("invalid workload budgets: {error}"))?;
+        for (name, budget) in &budgets {
+            let known = [1_000, 10_000].into_iter().any(|issue_count| {
+                [
+                    "version", "ready", "list", "show", "create", "update", "close",
+                ]
+                .into_iter()
+                .any(|command| {
+                    ["default-auto-flush", "diagnostic-no-auto-flush"]
+                        .into_iter()
+                        .any(|flush| name == &format!("{issue_count}-{command}-{flush}"))
+                })
+            });
+            if !known || !budget.is_finite() || *budget < 0.0 {
+                return Err(format!(
+                    "unknown workload or invalid nonnegative budget: {name}={budget}"
+                ));
+            }
+        }
+        Ok(budgets)
+    }
+
+    fn text_command(program: &str, args: &[&str]) -> String {
+        let output = Command::new(program).args(args).output().expect(program);
+        assert!(output.status.success(), "{program}: {output:?}");
+        String::from_utf8(output.stdout)
+            .expect("UTF-8 metadata")
+            .trim()
+            .to_string()
+    }
+
+    fn isolated_command(binary: &Path, root: &Path, args: &[String]) -> Command {
+        // The outer cohort supervisor bounds the whole run. Wrapping each CLI
+        // invocation in the installed uutils timeout adds a measured 100ms floor
+        // even to /usr/bin/true, concealing short-command latency and regressions.
+        let mut command = Command::new(binary);
+        command.args(args).current_dir(root);
+        configure_benchmark_environment(&mut command, root);
+        command
+    }
+
+    fn parsed(output: &Output) -> Value {
+        assert!(output.status.success(), "CLI failed: {output:?}");
+        assert!(!output.stdout.contains(&0x1b), "ANSI in JSON stdout");
+        serde_json::from_slice(&output.stdout).expect("entire stdout must be one JSON value")
+    }
+
+    fn query(binary: &Path, root: &Path, args: &[&str]) -> Value {
+        parsed(
+            &isolated_command(
+                binary,
+                root,
+                &args
+                    .iter()
+                    .map(|arg| (*arg).to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .output()
+            .expect("query actual executable"),
+        )
+    }
+
+    fn runner_load_eligible(load_one: f64, cpus: usize) -> bool {
+        cpus > 0 && load_one.is_finite() && load_one >= 0.0 && load_one / cpus as f64 <= 0.25
+    }
+
+    fn quiet_runner() -> String {
+        assert_eq!(
+            required("BR_PERF_QUIET_RUNNER"),
+            "1",
+            "acknowledge the identified runner and its shared-host measurement protocol"
+        );
+        let cpus = std::thread::available_parallelism().unwrap().get();
+        let started = Instant::now();
+        let mut observations = Vec::new();
+        let (load, load_one) = loop {
+            let load = fs::read_to_string("/proc/loadavg").expect("Linux load metadata");
+            let load_one: f64 = load.split_whitespace().next().unwrap().parse().unwrap();
+            observations.push(json!({
+                "elapsed_ms": started.elapsed().as_secs_f64() * 1_000.0,
+                "load_average": load.trim()
+            }));
+            if runner_load_eligible(load_one, cpus) {
+                break (load, load_one);
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(300),
+                "runner did not settle within 300s: {observations:?}"
+            );
+            std::thread::sleep(
+                Duration::from_secs(300)
+                    .saturating_sub(started.elapsed())
+                    .min(Duration::from_secs(5)),
+            );
+        };
+        let mut compilers = Vec::new();
+        for process in fs::read_dir("/proc").expect("process inventory").flatten() {
+            if let Ok(name) = fs::read_to_string(process.path().join("comm"))
+                && matches!(name.trim(), "rustc" | "cc1" | "cc1plus" | "ld" | "lld")
+            {
+                compilers.push(json!({
+                    "pid": process.file_name().to_string_lossy(),
+                    "command": name.trim()
+                }));
+            }
+        }
+        json!({
+            "load_average": load.trim(), "logical_cpus": cpus,
+            "normalized_load_one": load_one / cpus as f64,
+            "compiler_processes": compilers, "protocol": RUNNER_PROTOCOL,
+            "settling_ms": started.elapsed().as_secs_f64() * 1_000.0,
+            "settling_observations": observations
+        })
+        .to_string()
+    }
+
+    fn artifact(side: &str, root: &Path) -> Artifact {
+        let binary = PathBuf::from(required(&format!("BR_PERF_{side}_BINARY")))
+            .canonicalize()
+            .expect("existing executable");
+        let binary_sha = sha256_hex(&fs::read(&binary).expect("read executable"));
+        assert_eq!(
+            binary_sha,
+            required(&format!("BR_PERF_{side}_SHA256")),
+            "executable differs from explicitly pinned artifact"
+        );
+        let version = query(&binary, root, &["version", "--json"]);
+        assert_eq!(version["build"], "release", "debug is not release evidence");
+        let info = query(&binary, root, &["info", "--json"]);
+        let cpu = fs::read_to_string("/proc/cpuinfo")
+            .expect("CPU metadata")
+            .lines()
+            .find(|line| line.starts_with("model name"))
+            .expect("named CPU")
+            .to_string();
+        let features = version.get("features").map_or_else(
+            || "no-default-features".to_string(),
+            |value| serde_json::to_string(value).unwrap(),
+        );
+        let lock = fs::read(required(&format!("BR_PERF_{side}_LOCKFILE")))
+            .expect("lockfile belonging to this artifact");
+        let source = required(&format!("BR_PERF_{side}_SOURCE"));
+        assert!(
+            source.starts_with(version["commit"].as_str().expect("binary source commit")),
+            "source identity must begin with the binary's recorded commit"
+        );
+        let metadata = BTreeMap::from([
+            ("source_revision".into(), source),
+            ("lockfile_sha256".into(), sha256_hex(&lock)),
+            ("binary_sha256".into(), binary_sha),
+            ("build_profile".into(), "release".into()),
+            ("features".into(), features),
+            ("target".into(), version["target"].as_str().unwrap().into()),
+            (
+                "rust_toolchain".into(),
+                version["rust_version"].as_str().unwrap().into(),
+            ),
+            (
+                "engine".into(),
+                info["engine"]["version"].as_str().unwrap().into(),
+            ),
+            ("host".into(), text_command("hostname", &[])),
+            ("cpu".into(), cpu),
+            ("os".into(), text_command("uname", &["-srm"])),
+            (
+                "filesystem".into(),
+                text_command("stat", &["-f", "-c", "%T", root.to_str().unwrap()]),
+            ),
+            ("cache_protocol".into(), CACHE_PROTOCOL.into()),
+            ("runner_protocol".into(), RUNNER_PROTOCOL.into()),
+            (
+                "supervisor".into(),
+                "none inside measured interval; caller must enforce 1800s cohort deadline".into(),
+            ),
+            (
+                "measurement_harness_sha256".into(),
+                sha256_hex(include_bytes!("bench_synthetic_scale.rs")),
+            ),
+        ]);
+        Artifact { binary, metadata }
+    }
+
+    fn copy_tree(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).expect("create isolated copy");
+        for entry in fs::read_dir(source).expect("read fixture") {
+            let entry = entry.expect("fixture entry");
+            let kind = entry.file_type().expect("fixture type");
+            let target = destination.join(entry.file_name());
+            if kind.is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                assert!(kind.is_file(), "fixture must not contain symlinks/devices");
+                fs::copy(entry.path(), target).expect("copy fixture file");
+            }
+        }
+    }
+
+    fn arguments(command: &str, id: &str, no_flush: bool) -> Vec<String> {
+        let mut args: Vec<String> = match command {
+            "version" => vec!["version"],
+            "ready" => vec!["ready", "--limit", "20"],
+            "list" => vec!["list", "--limit", "20"],
+            "show" => vec!["show", id],
+            "create" => vec!["create", "ABBA measurement issue", "--type", "task"],
+            "update" => vec!["update", id, "--notes", "ABBA measured update"],
+            "close" => vec!["close", id, "--reason", "ABBA measured completion"],
+            _ => panic!("unsupported measurement command: {command}"),
+        }
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        args.push("--json".into());
+        if no_flush {
+            args.push("--no-auto-flush".into());
+        }
+        args
+    }
+
+    fn verify_mutation(binary: &Path, root: &Path, command: &str, id: &str, value: &Value) {
+        if !matches!(command, "create" | "update" | "close") {
+            return;
+        }
+        let observed_id = if command == "create" {
+            value["id"].as_str().expect("created issue ID")
+        } else {
+            id
+        };
+        let shown = query(binary, root, &["show", observed_id, "--json"]);
+        let issue = &shown[0];
+        assert_eq!(issue["id"], observed_id);
+        match command {
+            "create" => assert_eq!(issue["title"], "ABBA measurement issue"),
+            "update" => assert_eq!(issue["notes"], "ABBA measured update"),
+            "close" => assert_eq!(issue["status"], "closed"),
+            _ => unreachable!("mutation only"),
+        }
+    }
+
+    fn stripped_size(artifact: &Artifact) -> Value {
+        let target = &artifact.metadata["target"];
+        if !matches!(
+            target.as_str(),
+            "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu"
+        ) {
+            return json!({"target": target, "state": "unsupported_target", "gate_exit": 2});
+        }
+        let sections = text_command("readelf", &["-S", artifact.binary.to_str().unwrap()]);
+        assert!(
+            !sections.contains(".symtab"),
+            "release artifact must be stripped"
+        );
+        let compressed = Command::new("gzip")
+            .args(["-n", "-c"])
+            .arg(&artifact.binary)
+            .output()
+            .expect("measure deterministic gzip stream");
+        assert!(compressed.status.success(), "gzip: {compressed:?}");
+        json!({
+            "target": target,
+            "binary_sha256": artifact.metadata["binary_sha256"],
+            "stripped_bytes": fs::metadata(&artifact.binary).unwrap().len(),
+            "gzip_bytes": compressed.stdout.len(),
+            "compression": "gzip -n -c (binary, not release archive)",
+            "state": "measured_without_accepted_size_budget", "gate_exit": 2
+        })
+    }
+
+    #[test]
+    fn release_measurement_controls_reject_vacuous_counts() {
+        assert_eq!(count("10", 10), Ok(10));
+        for invalid in ["0", "9", "-1", "", "garbage"] {
+            assert!(count(invalid, 10).is_err(), "accepted {invalid:?}");
+        }
+        assert!(
+            arguments("update", "syn-1", false)
+                .iter()
+                .all(|arg| arg != "--no-auto-flush")
+        );
+        assert!(
+            arguments("update", "syn-1", true)
+                .iter()
+                .any(|arg| arg == "--no-auto-flush")
+        );
+        assert!(runner_load_eligible(4.0, 16));
+        assert!(!runner_load_eligible(4.01, 16));
+        assert!(!runner_load_eligible(0.0, 0));
+        assert!(!runner_load_eligible(-1.0, 16));
+        assert!(!runner_load_eligible(f64::NAN, 16));
+        assert!(!runner_load_eligible(f64::INFINITY, 16));
+        assert_eq!(
+            workload_budgets(r#"{"1000-ready-default-auto-flush":12.5}"#).unwrap()["1000-ready-default-auto-flush"].to_bits(),
+            12.5_f64.to_bits()
+        );
+        assert!(workload_budgets("{}").unwrap().is_empty());
+        for invalid in [
+            r#"{"1000-typo-default-auto-flush":10}"#,
+            r#"{"1000-ready-default-auto-flush":-1}"#,
+            r#"{"1000-ready-default-auto-flush":"10"}"#,
+            r#"{"1000-ready-default-auto-flush":null}"#,
+            "[]",
+            "invalid",
+        ] {
+            assert!(workload_budgets(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn release_measurement_invokes_cli_without_interposed_supervisor() {
+        let workspace = TempDir::new_in(common::cli::isolated_temp_root()).unwrap();
+        let output = isolated_command(
+            Path::new("/bin/sh"),
+            workspace.path(),
+            &["-c".into(), "printf '%s' \"$PPID\"".into()],
+        )
+        .output()
+        .expect("observe actual child process parent");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            std::process::id().to_string(),
+            "the timed program must be a direct child; an interposed supervisor changes short-command measurements"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires pinned release artifacts and an identified low-contention Linux runner"]
+    fn release_cli_abba_1k_10k() {
+        let blocks = count(
+            &std::env::var("BR_PERF_ABBA_BLOCKS").unwrap_or_else(|_| "10".into()),
+            10,
+        )
+        .expect("at least twenty retained observations per artifact");
+        let repeats = count(
+            &std::env::var("BR_PERF_NEGATIVE_EXTRA_WORK").unwrap_or_else(|_| "1".into()),
+            1,
+        )
+        .expect("positive real invocation count");
+        let budget = std::env::var("BR_PERF_BUDGET_PCT")
+            .ok()
+            .map(|value| value.parse::<f64>().expect("numeric budget"));
+        let budgets = workload_budgets(
+            &std::env::var("BR_PERF_BUDGETS_JSON").unwrap_or_else(|_| "{}".into()),
+        )
+        .expect("explicit per-workload relative budgets");
+        assert!(
+            budget.is_none() || budgets.is_empty(),
+            "diagnostic global and per-workload budgets must not be mixed"
+        );
+        let output_dir = PathBuf::from(required("BR_PERF_OUTPUT"));
+        fs::create_dir_all(&output_dir).expect("retain raw measurement outputs");
+        let initial_load = quiet_runner();
+        let mut gate_exits = Vec::new();
+        for issue_count in [1_000, 10_000] {
+            let config = SyntheticConfig {
+                dependency_density: 0.25,
+                comment_density: 0.0,
+                claim_density: 0.0,
+                simulated_agent_count: 8,
+                ..SyntheticConfig::ci_profile(42)
+                    .with_issue_count(issue_count)
+                    .with_label_distribution(16, 0, 2)
+            };
+            let paths = [
+                PathBuf::from(required("BR_PERF_BASELINE_BINARY")),
+                PathBuf::from(required("BR_PERF_CANDIDATE_BINARY")),
+            ];
+            let datasets = paths.each_ref().map(|path| {
+                SyntheticDataset::generate(config.clone(), path)
+                    .expect("real CLI import and health checks")
+            });
+            for dataset in &datasets {
+                assert_eq!(dataset.metrics.issue_count, issue_count);
+                assert!(dataset.metrics.health.jsonl_valid);
+                assert!(dataset.metrics.health.sync_import_ok);
+                assert!(dataset.metrics.health.doctor_ok);
+                assert!(dataset.metrics.health.sync_status_clean);
+            }
+            assert_eq!(
+                datasets[0].metrics.content_hash,
+                datasets[1].metrics.content_hash
+            );
+            let artifacts = [
+                artifact("BASELINE", &datasets[0].root),
+                artifact("CANDIDATE", &datasets[1].root),
+            ];
+            if repeats > 1 {
+                assert_eq!(
+                    artifacts[0].metadata["binary_sha256"], artifacts[1].metadata["binary_sha256"],
+                    "the planted slowdown is an A/A control using one artifact"
+                );
+                assert!(
+                    budget.is_some(),
+                    "a planted regression needs an explicit budget"
+                );
+            }
+            write_json_pretty(
+                &output_dir.join(format!("{issue_count}-artifact-identities.json")),
+                &json!({
+                    "baseline": artifacts[0].metadata,
+                    "candidate": artifacts[1].metadata,
+                    "corpus": datasets[0].metrics,
+                    "initial_load": initial_load
+                }),
+            )
+            .unwrap();
+            let ready = query(
+                &artifacts[0].binary,
+                &datasets[0].root,
+                &["ready", "--limit", "1", "--json"],
+            );
+            let id = ready[0]["id"]
+                .as_str()
+                .expect("representative unblocked issue");
+            for no_flush in [false, true] {
+                for command in [
+                    "version", "ready", "list", "show", "create", "update", "close",
+                ] {
+                    let flush_mode = if no_flush {
+                        "diagnostic-no-auto-flush"
+                    } else {
+                        "default-auto-flush"
+                    };
+                    let name = format!("{issue_count}-{command}-{flush_mode}");
+                    let expected_read = if matches!(command, "ready" | "list" | "show") {
+                        let output = isolated_command(
+                            &artifacts[0].binary,
+                            &datasets[0].root,
+                            &arguments(command, id, no_flush),
+                        )
+                        .output()
+                        .unwrap();
+                        let expected = parsed(&output);
+                        let issues = expected
+                            .get("issues")
+                            .unwrap_or(&expected)
+                            .as_array()
+                            .expect("issue array");
+                        assert_eq!(issues.len(), if command == "show" { 1 } else { 20 });
+                        assert!(issues.iter().all(|issue| issue["id"].as_str().is_some()));
+                        Some(expected)
+                    } else {
+                        None
+                    };
+                    let mut samples = Vec::new();
+                    let mut runs = artifacts.each_ref().map(|artifact| {
+                        let mut metadata = artifact.metadata.clone();
+                        metadata.extend([
+                            ("command".into(), command.into()),
+                            ("issue_count".into(), issue_count.to_string()),
+                            (
+                                "dataset_sha256".into(),
+                                datasets[0].metrics.content_hash.clone(),
+                            ),
+                            ("flush_mode".into(), flush_mode.into()),
+                        ]);
+                        MatchedRun {
+                            metadata,
+                            samples_ms: Vec::new(),
+                            exit_codes: Vec::new(),
+                        }
+                    });
+                    for block in 0..blocks + 2 {
+                        for (position, side) in [0, 1, 1, 0].into_iter().enumerate() {
+                            let load_before = quiet_runner();
+                            let workspace =
+                                TempDir::new_in(common::cli::isolated_temp_root()).unwrap();
+                            copy_tree(&datasets[side].beads_dir, &workspace.path().join(".beads"));
+                            let args = arguments(command, id, no_flush);
+                            let invocations = if side == 1 && command == "ready" {
+                                repeats
+                            } else {
+                                1
+                            };
+                            let mut commands: Vec<_> = (0..invocations)
+                                .map(|_| {
+                                    isolated_command(
+                                        &artifacts[side].binary,
+                                        workspace.path(),
+                                        &args,
+                                    )
+                                })
+                                .collect();
+                            let mut outputs = Vec::with_capacity(invocations);
+                            let started = Instant::now();
+                            for invocation in &mut commands {
+                                outputs.push(invocation.output().expect("measured CLI invocation"));
+                            }
+                            let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+                            let exit_code = outputs
+                                .iter()
+                                .find(|output| !output.status.success())
+                                .unwrap_or_else(|| outputs.last().unwrap())
+                                .status
+                                .code()
+                                .unwrap_or(-1);
+                            samples.push(Sample {
+                                side,
+                                block,
+                                position,
+                                warmup: block < 2,
+                                elapsed_ms,
+                                exit_code,
+                                args,
+                                stdout: outputs
+                                    .iter()
+                                    .map(|output| String::from_utf8_lossy(&output.stdout))
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                                stderr: outputs
+                                    .iter()
+                                    .map(|output| String::from_utf8_lossy(&output.stderr))
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                                load_before,
+                                invocations,
+                            });
+                            write_json_pretty(
+                                &output_dir.join(format!("{name}-raw.json")),
+                                &samples,
+                            )
+                            .unwrap();
+                            if exit_code != 0 {
+                                write_json_pretty(
+                                    &output_dir.join("run.json"),
+                                    &json!({
+                                        "state": "inconclusive", "gate_exit": 2,
+                                        "failed_workload": name, "side": side,
+                                        "block": block, "exit_code": exit_code,
+                                        "reason": "command failed; raw stdout/stderr retained"
+                                    }),
+                                )
+                                .unwrap();
+                            }
+                            for output in &outputs {
+                                let value = parsed(output);
+                                if let Some(expected) = &expected_read {
+                                    assert_eq!(
+                                        &value, expected,
+                                        "sampled read differs from the populated baseline fixture"
+                                    );
+                                }
+                                verify_mutation(
+                                    &artifacts[side].binary,
+                                    workspace.path(),
+                                    command,
+                                    id,
+                                    &value,
+                                );
+                            }
+                            if block >= 2 {
+                                runs[side].samples_ms.push(elapsed_ms);
+                                runs[side].exit_codes.push(exit_code);
+                            }
+                        }
+                    }
+                    for (side, run) in runs.iter().enumerate() {
+                        run.validate()
+                            .expect("real observations and complete metadata");
+                        write_json_pretty(&output_dir.join(format!("{name}-{side}.json")), run)
+                            .unwrap();
+                    }
+                    let comparison = compare_matched_runs(
+                        Some(&runs[0]),
+                        &runs[1],
+                        budgets.get(&name).copied().or(budget).unwrap_or(f64::NAN),
+                    );
+                    gate_exits.push(comparison.exit_code());
+                    write_json_pretty(
+                        &output_dir.join(format!("{name}-summary.json")),
+                        &json!({
+                            "baseline": summarize_matched_samples(&runs[0].samples_ms).unwrap(),
+                            "candidate": summarize_matched_samples(&runs[1].samples_ms).unwrap(),
+                            "comparison": comparison, "gate_exit": comparison.exit_code(),
+                            "negative_control_ready_invocations": repeats,
+                            "budget_origin": if budgets.contains_key(&name) {
+                                "operator-supplied per-workload budget"
+                            } else if budget.is_some() {
+                                "global diagnostic control; not an accepted SLO"
+                            } else {
+                                "missing; comparison remains inconclusive"
+                            },
+                            "corpus": datasets[0].metrics,
+                            "startup_objectives_ms": {"warm_version": 50, "cold_version": 100},
+                            "cold_cache_state": "UNPROVEN; no cache eviction performed"
+                        }),
+                    )
+                    .unwrap();
+                    if repeats > 1 && command == "ready" {
+                        assert_eq!(
+                            comparison.state,
+                            MatchedState::Regression,
+                            "planted extra CLI work must produce a regression, not unknown"
+                        );
+                    }
+                }
+            }
+            write_json_pretty(
+                &output_dir.join(format!("{issue_count}-artifact-sizes.json")),
+                &artifacts.each_ref().map(stripped_size),
+            )
+            .unwrap();
+        }
+        write_json_pretty(&output_dir.join("run.json"), &json!({
+            "state": "measurements_completed", "initial_load": initial_load,
+            "cache_protocol": CACHE_PROTOCOL, "latency_gate_exits": gate_exits,
+            "release_budget_gate_exit": 2,
+            "release_budget_state": "inconclusive: target size budgets not calibrated",
+            "workload_budgets": budgets,
+            "budget_status": if budget.is_some() { "operator-supplied diagnostic budget; not an accepted SLO" } else if budgets.is_empty() { "inconclusive: no calibrated budget supplied" } else { "operator-supplied per-workload budgets; missing entries remain inconclusive" }
+        })).unwrap();
+        if budget.is_some() && repeats == 1 {
+            assert!(
+                gate_exits.iter().all(|code| *code == 0),
+                "regression or inconclusive comparison; inspect retained receipts"
+            );
+        }
+    }
 }

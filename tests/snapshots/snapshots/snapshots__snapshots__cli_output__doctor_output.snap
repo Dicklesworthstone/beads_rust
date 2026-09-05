@@ -5,6 +5,7 @@ expression: normalize_output(&output.stdout)
 br doctor
 HEALTH workspace: degraded
 ENGINE ENGINE-REDACTED
+OK db.namespace_identity
 OK jsonl.merge_artifacts
 OK base_jsonl
 OK doctor.runs_dir

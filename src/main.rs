@@ -1932,8 +1932,7 @@ fn emit_read_only_doctor_write_lock_diagnostic(
         .map(|dir| dir.join(".write.lock"))
         .unwrap_or_else(|| PathBuf::from(".beads/.write.lock"));
     let lock_display = lock_path.display().to_string();
-    let remediation =
-        format!("`chmod u+w {lock_display}` or remove the file (the next br call recreates it)");
+    let remediation = format!("`chmod u+w {lock_display}` (preserve the existing lock file)");
     let message = format!(
         "{lock_display} is not writable by owner; br doctor cannot acquire the startup workspace lock for live inspection"
     );

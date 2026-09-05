@@ -1,8 +1,151 @@
-use super::common::cli::run_br;
+use super::common::cli::{BrRun, run_br, run_br_with_env};
 use super::{SnapshotJson, create_issue, init_workspace, normalize_json};
 use insta::{assert_json_snapshot, assert_snapshot};
 use serde_json::Value;
 use std::fs;
+
+fn strict_success_json(run: &BrRun) -> Value {
+    assert!(run.status.success(), "structured command failed: {run:?}");
+    assert!(
+        !run.stdout.contains('\u{1b}'),
+        "structured stdout contains terminal escapes: {run:?}"
+    );
+    serde_json::from_str(&run.stdout).unwrap_or_else(|error| {
+        panic!("successful stdout must be exactly one JSON value: {error}; {run:?}")
+    })
+}
+
+#[test]
+#[cfg(not(feature = "mcp"))]
+fn strict_json_default_build_explicitly_reports_mcp_unavailable() {
+    let workspace = init_workspace();
+    let capabilities = strict_success_json(&run_br(
+        &workspace,
+        ["capabilities", "--format", "json"],
+        "default_build_capabilities",
+    ));
+    assert_eq!(capabilities["build_features"]["mcp"], false);
+    let serve = run_br(&workspace, ["serve", "--help"], "default_build_no_serve");
+    assert_eq!(serve.status.code(), Some(2), "{serve:?}");
+    assert!(serve.stdout.is_empty(), "{serve:?}");
+    assert!(
+        serve.stderr.contains("unrecognized subcommand 'serve'"),
+        "{serve:?}"
+    );
+}
+
+#[test]
+fn strict_json_command_families_honor_mode_precedence() {
+    for (mode, flags, environment) in [
+        ("explicit", vec!["--json"], vec![]),
+        ("environment", vec![], vec![("BR_OUTPUT_FORMAT", "json")]),
+        (
+            "explicit_over_quiet_toon_dumb_terminal",
+            vec!["--json", "--quiet", "--no-color"],
+            vec![("BR_OUTPUT_FORMAT", "toon"), ("TERM", "dumb")],
+        ),
+    ] {
+        let workspace = init_workspace();
+        let invoke = |args: &[&str], step: &str| {
+            let run = run_br_with_env(
+                &workspace,
+                args.iter().copied().chain(flags.iter().copied()),
+                environment.iter().copied(),
+                &format!("strict_json_{mode}_{step}"),
+            );
+            strict_success_json(&run)
+        };
+        let empty = invoke(&["list"], "empty_list");
+        assert_eq!(empty["issues"], serde_json::json!([]));
+        assert_eq!(empty["total"], 0);
+
+        let captured = invoke(&["q", "Strict capture"], "capture");
+        assert_eq!(captured["title"], "Strict capture");
+        let id = captured["id"].as_str().expect("capture id");
+        assert_eq!(
+            captured,
+            serde_json::json!({"id": id, "title": "Strict capture"})
+        );
+        let updated = invoke(&["update", id, "--notes", "Contract note"], "update");
+        assert_eq!(updated.as_array().expect("update array").len(), 1);
+        assert_eq!(updated[0]["id"], id);
+        assert_eq!(updated[0]["status"], "open");
+
+        let listed = invoke(&["list"], "list");
+        assert_eq!(listed["total"], 1);
+        assert_eq!(listed["issues"].as_array().expect("issues").len(), 1);
+        assert_eq!(listed["issues"][0]["id"], id);
+        assert_eq!(invoke(&["count"], "count"), serde_json::json!({"count": 1}));
+        assert_eq!(
+            invoke(&["config", "get", "issue_prefix"], "config"),
+            serde_json::json!({"key": "issue_prefix", "value": "bd"})
+        );
+        let shown = invoke(&["show", id], "show");
+        assert_eq!(shown.as_array().expect("show array").len(), 1);
+        assert_eq!(shown[0]["notes"], "Contract note");
+    }
+}
+
+#[test]
+fn strict_json_partial_close_stream_matches_persisted_state() {
+    let workspace = init_workspace();
+    let blocker = create_issue(&workspace, "Blocking root", "partial_blocker");
+    let blocked = create_issue(&workspace, "Blocked work", "partial_blocked");
+    let free = create_issue(&workspace, "Free work", "partial_free");
+    let dep = run_br(
+        &workspace,
+        ["dep", "add", &blocked, &blocker, "--json"],
+        "partial_dep",
+    );
+    strict_success_json(&dep);
+
+    let close = run_br(
+        &workspace,
+        ["close", &blocked, &free, "--json"],
+        "partial_close_json",
+    );
+    assert_eq!(close.status.code(), Some(3), "partial close: {close:?}");
+    assert!(
+        !close.stdout.contains('\u{1b}'),
+        "ANSI in error stream: {close:?}"
+    );
+    let documents: Vec<Value> = serde_json::Deserializer::from_str(&close.stdout)
+        .into_iter()
+        .collect::<Result<_, _>>()
+        .unwrap_or_else(|error| panic!("complete error stream must parse: {error}; {close:?}"));
+    assert_eq!(
+        documents.len(),
+        2,
+        "partial close must emit payload then error: {close:?}"
+    );
+    assert_eq!(documents[0]["closed"].as_array().expect("closed").len(), 1);
+    assert_eq!(documents[0]["closed"][0]["id"], free);
+    assert_eq!(
+        documents[0]["skipped"].as_array().expect("skipped").len(),
+        1
+    );
+    assert_eq!(documents[0]["skipped"][0]["id"], blocked);
+    assert_eq!(documents[1]["error"]["code"], "CLOSE_INCOMPLETE");
+    assert!(serde_json::from_str::<Value>(&close.stdout).is_err());
+
+    let state = strict_success_json(&run_br(
+        &workspace,
+        ["show", &blocker, &blocked, &free, "--json"],
+        "partial_poststate",
+    ));
+    let issues = state.as_array().expect("show issues");
+    assert_eq!(issues.len(), 3);
+    for (id, status) in [(&blocker, "open"), (&blocked, "open"), (&free, "closed")] {
+        let issue = issues
+            .iter()
+            .find(|issue| issue["id"] == id.as_str())
+            .expect("poststate issue");
+        assert_eq!(
+            issue["status"], status,
+            "unexpected persisted state: {state}"
+        );
+    }
+}
 
 // Representative fixture for exact list/show JSON goldens.
 //

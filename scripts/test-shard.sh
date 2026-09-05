@@ -29,12 +29,13 @@ shard_files() {
     case "$1" in
         e2e-a-l) find tests -maxdepth 1 -name 'e2e_[a-l]*.rs' ;;
         e2e-m-z) find tests -maxdepth 1 -name 'e2e_[m-z]*.rs' ;;
-        storage) find tests -maxdepth 1 \( -name 'storage_*.rs' -o -name 'proptest_*.rs' -o -name 'repro_*.rs' -o -name 'workflow_*.rs' \) ;;
+        storage) find tests -maxdepth 1 \( -name 'storage_*.rs' -o -name 'proptest_*.rs' -o -name 'repro_*.rs' -o -name 'workflow_*.rs' -o -name 'linearizability_multiprocess.rs' \) ;;
         bench) find tests -maxdepth 1 -name 'bench*.rs' ;;
         misc)
             find tests -maxdepth 1 -name '*.rs' \
                 ! -name 'e2e_*.rs' ! -name 'storage_*.rs' ! -name 'proptest_*.rs' \
-                ! -name 'repro_*.rs' ! -name 'workflow_*.rs' ! -name 'bench*.rs'
+                ! -name 'repro_*.rs' ! -name 'workflow_*.rs' ! -name 'bench*.rs' \
+                ! -name 'linearizability_multiprocess.rs'
             ;;
         *) return 1 ;;
     esac | sort

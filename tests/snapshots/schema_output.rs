@@ -23,6 +23,7 @@ const EXPECTED_SCHEMA_NAMES: &[&str] = &[
     "CoordinationStatusOutput",
     "CountGroup",
     "ErrorEnvelope",
+    "InitResult",
     "Issue",
     "IssueDetails",
     "IssueWithCounts",
@@ -308,6 +309,7 @@ fn run_success(workspace: &BrWorkspace, args: &[&str], label: &str) {
         output.stdout,
         output.stderr
     );
+    parse_json(&output.stdout, label);
 }
 
 fn create_live_command_fixture() -> LiveCommandFixture {
@@ -418,6 +420,11 @@ fn create_live_command_fixture() -> LiveCommandFixture {
 fn live_command_cases(fixture: &LiveCommandFixture) -> Vec<LiveCommandCase<'_>> {
     vec![
         LiveCommandCase {
+            name: "init",
+            args: vec!["init", "--force", "--prefix", "bd", "--json"],
+            require_extracted_items: false,
+        },
+        LiveCommandCase {
             name: "blocked",
             args: vec!["blocked", "--json"],
             require_extracted_items: true,
@@ -491,7 +498,7 @@ fn live_command_cases(fixture: &LiveCommandFixture) -> Vec<LiveCommandCase<'_>> 
         },
         LiveCommandCase {
             name: "show",
-            args: vec!["show", &fixture.ready_id, "--json"],
+            args: vec!["show", &fixture.ready_id, &fixture.blocked_id, "--json"],
             require_extracted_items: true,
         },
         LiveCommandCase {
@@ -514,6 +521,16 @@ fn live_command_cases(fixture: &LiveCommandFixture) -> Vec<LiveCommandCase<'_>> 
 
 fn semantic_parity_cases(fixture: &LiveCommandFixture) -> Vec<SemanticParityCase<'_>> {
     vec![
+        SemanticParityCase {
+            name: "blocked",
+            json_args: vec!["blocked", "--json"],
+            toon_args: vec!["blocked", "--format", "toon"],
+        },
+        SemanticParityCase {
+            name: "search",
+            json_args: vec!["search", "contract fixture", "--all", "--json"],
+            toon_args: vec!["search", "contract fixture", "--all", "--format", "toon"],
+        },
         SemanticParityCase {
             name: "list",
             json_args: vec!["list", "--json"],
@@ -902,6 +919,40 @@ fn schema_command_shapes_match_live_json_outputs() {
         assert!(
             !required_fixture_id.is_empty(),
             "fixture id should be populated"
+        );
+    }
+}
+
+#[test]
+fn schema_command_error_streams_match_live_json_outputs() {
+    let workspace = init_workspace();
+    let schema = run_br(
+        &workspace,
+        ["schema", "commands", "--json"],
+        "error_stream_schema",
+    );
+    assert!(schema.status.success(), "schema failed: {schema:?}");
+    let schema = parse_json(&schema.stdout, "error stream schema");
+    for (name, args) in [
+        ("show", vec!["show", "bd-missing", "--json"]),
+        (
+            "comments list",
+            vec!["comments", "list", "bd-missing", "--json"],
+        ),
+        ("dep tree", vec!["dep", "tree", "bd-missing", "--json"]),
+        ("dep list", vec!["dep", "list", "bd-missing", "--json"]),
+    ] {
+        let output = run_br(&workspace, args, &format!("error_stream_{name}"));
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "missing-ID command: {output:?}"
+        );
+        let error = parse_json(&output.stdout, name);
+        assert_eq!(error["error"]["code"], "ISSUE_NOT_FOUND");
+        assert_eq!(
+            schema["commands"][name]["error_envelope_on_stderr"], false,
+            "schema must advertise the actual result stream for {name}"
         );
     }
 }

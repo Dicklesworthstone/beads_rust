@@ -1,6 +1,6 @@
 # Storage Engine Operating Model
 
-**Status:** current as of 2026-09-02 (fsqlite 0.3.14, br 0.5.7 + main)
+**Status:** reviewed 2026-09-04 (main pins fsqlite 0.3.16; released br v0.5.10 uses 0.3.15)
 **Owner bead:** `beads_rust-dk45` (Track B of the 2026-09-01 bridge plan)
 
 This document is the record of how `br` relates to its storage engine, what
@@ -11,7 +11,7 @@ this.
 
 ---
 
-## 1. The decision: FrankenSQLite only, no C SQLite, no FFI
+## 1. The decision: FrankenSQLite only, no C SQLite
 
 `br` links no C SQLite. The storage engine is
 [FrankenSQLite](https://github.com/Dicklesworthstone/frankensqlite) (`fsqlite`
@@ -20,8 +20,9 @@ through the synchronous `src/franken_sync.rs` bridge over the engine's async
 API.
 
 Why:
-- memory safety end to end (`unsafe_code = "deny"` in `Cargo.toml`, with four
-  documented carve-outs none of which touch the engine);
+- Rust safety checks throughout br (`unsafe_code = "deny"` in `Cargo.toml`,
+  with three documented platform carve-outs for inode locking, SIGPIPE, and
+  Windows process exit; none implements the storage engine);
 - a single Rust toolchain for build, test, release, and `cargo install --git`;
 - concurrent-writer support the classic engine does not offer.
 
@@ -75,7 +76,7 @@ the suffix lists; `doctor`'s family walk reads the same constants):
 | `beads.db` | br | main database | `db.exists`, `db.open`, `sqlite.integrity_check` |
 | `beads.db-wal`, `-shm`, `-journal` | engine | classic WAL / WAL-index / rollback journal | `db.sidecars`, `wal_size`; `-shm` reader marks (offsets 100..120) are the one thing a read-only open may write |
 | `beads.db-wal-cert`, `-wal-cert-head` | engine (0.2+) | parallel-WAL durability certificates | derived state; a certificate written by a different engine generation makes every cert-regenerating write fail while reads stay healthy (GH #441); br quarantines it into `.br_recovery/` so the engine regenerates it |
-| `beads.db-fsqlite-ns-gate`, `-fsqlite-ns-use` | engine (0.1.18+) | multi-process namespace admission | refused by the engine when any `0o077` mode bit is set (reads as "unable to open database file"); the lock-free read-only opener declines instead of chmod-ing; ordinary open repairs the mode under authority |
+| `beads.db-fsqlite-ns-gate`, `-fsqlite-ns-use` | engine (0.1.18+) | multi-process namespace admission | `db.namespace_identity` compares the recorded generation with the main file before any live engine open; distinguishes a mismatch from unavailable evidence and absent sidecars. Group/other permission bits also trigger `permissions.db_sidecars`; diagnosis preserves the files and offers no namespace fixer |
 | `beads.db.fsqlite-migration-state` | engine | migration bookkeeping | carried with the family |
 | `.br-db-write-<hash>.lock`, `.br-db-openers-<hash>.lock` | br | write authority and opener lease | `write_lock`, engine block |
 | `.br_recovery/` | br | forensic backups taken before recovery rebuilds (whole family) | `db.recovery_artifacts` (info), `db.recovery_artifacts.aged` (warn past `RECOVERY_AGED_TTL_DAYS = 30`), `db.foreign_recovery_debris` |
@@ -83,6 +84,15 @@ the suffix lists; `doctor`'s family walk reads the same constants):
 
 Recovery artifacts are never removed automatically; `br doctor --repair`
 offers to quarantine only the aged ones. Removal is an operator decision.
+
+FrankenSQLite 0.3.16 can rebind a copied namespace record to the current inode
+when no live opener owns that generation, including on its read-only open
+path. With a live generation lease, a mismatched inode remains refused.
+Doctor checks the existing record through strictly read-only namespace
+admission before this fallback can run. On mismatch or unavailable evidence,
+it skips live database probes, reports pending-merge state as unknown, and
+continues checks on private copies. Preserve the whole family for diagnosis;
+a mismatch does not establish that its WAL or certificates are disposable.
 
 ## 5. Read-only contract (GH #476)
 

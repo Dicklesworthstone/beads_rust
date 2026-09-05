@@ -57,6 +57,10 @@ case "$stage" in
         | select(.status == "warn")
         | select(.details.mode_octal == "444")
         | select(.details.finding_id == "fm-state_files-orphaned-write-lock")
+        | select(.details.remediation
+            | contains("chmod u+w")
+              and contains("preserve the existing lock file")
+              and (test("remove|unlink"; "i") | not))
         | select(.details.startup_error
             | (contains("Failed to open") and contains("write lock"))))
     ' >/dev/null || {

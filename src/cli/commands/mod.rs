@@ -294,7 +294,7 @@ pub(super) fn status_filter_requests_all(statuses: &[String]) -> bool {
 /// capacity scope (GitHub #384 phase 5). Env-only (`BR_SESSION`): a CLI flag
 /// would collide with `br close --session`, which records close metadata,
 /// and session identity is a harness-level property anyway.
-pub(super) fn session_attribution_from_env() -> Option<String> {
+pub(crate) fn session_attribution_from_env() -> Option<String> {
     std::env::var("BR_SESSION")
         .ok()
         .map(|value| value.trim().to_string())
