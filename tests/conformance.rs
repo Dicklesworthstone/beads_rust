@@ -5208,22 +5208,54 @@ fn conformance_init_json_output() {
         bd_init.stderr
     );
 
-    // Both should produce valid JSON or exit successfully
-    let br_json = extract_json_payload(&br_init.stdout);
-    let bd_json = extract_json_payload(&bd_init.stdout);
+    // Classic bd 0.46.0 emits setup prose even with --json. br's InitResult
+    // is a stricter robot contract; both tools must still initialize usable DBs.
+    let br_val: Value = serde_json::from_str(&br_init.stdout).unwrap_or_else(|error| {
+        panic!(
+            "br init stdout must be one complete JSON value: {error}\n{}",
+            br_init.stdout
+        )
+    });
+    assert_eq!(
+        br_val,
+        serde_json::json!({
+            "initialized": true,
+            "beads_dir": dunce::canonicalize(workspace.br_root.join(".beads")).unwrap(),
+            "database_path": dunce::canonicalize(workspace.br_root.join(".beads/beads.db")).unwrap(),
+            "prefix": CONFORMANCE_PREFIX,
+            "files": {
+                "directory": "created", "database": "created", "metadata": "created",
+                "config": "created", "gitignore": "created", "jsonl": "created"
+            }
+        }),
+        "InitResult must describe the actual fresh workspace"
+    );
 
-    // If both produce JSON, they should have similar structure
-    if !br_json.is_empty() && !bd_json.is_empty() {
-        let br_val: Result<Value, _> = serde_json::from_str(&br_json);
-        let bd_val: Result<Value, _> = serde_json::from_str(&bd_json);
-
-        assert_eq!(
-            br_val.is_ok(),
-            bd_val.is_ok(),
-            "JSON validity differs: br valid={}, bd valid={}",
-            br_val.is_ok(),
-            bd_val.is_ok()
+    let title = "Initialized workspace conformance witness";
+    for (side, root, created) in [
+        (
+            "br",
+            &workspace.br_root,
+            workspace.run_br(["create", title, "--json"], "init_create"),
+        ),
+        (
+            "bd",
+            &workspace.bd_root,
+            workspace.run_bd(["create", title, "--json"], "init_create"),
+        ),
+    ] {
+        assert!(
+            created.status.success(),
+            "{side} initialized database cannot create an issue: {}\nstdout:\n{}\nstderr:\n{}",
+            created.status,
+            created.stdout,
+            created.stderr
         );
+        let issue: Value = serde_json::from_str(&created.stdout)
+            .unwrap_or_else(|error| panic!("{side} create JSON: {error}\n{}", created.stdout));
+        assert_eq!(issue["title"], title);
+        assert!(issue["id"].as_str().unwrap().starts_with("bd-"));
+        assert!(fs::metadata(root.join(".beads/beads.db")).unwrap().len() > 0);
     }
 
     info!("conformance_init_json_output passed");

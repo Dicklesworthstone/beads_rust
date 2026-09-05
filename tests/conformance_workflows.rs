@@ -19,6 +19,7 @@ mod common;
 use common::cli::extract_json_payload;
 use serde::Serialize;
 use serde_json::Value;
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -99,6 +100,7 @@ const EQUIVALENT_CLOSE_REASONS: &[(&str, &str)] = &[("done", "Closed")];
 #[derive(Debug, Default)]
 pub struct DiffResult {
     pub matched: bool,
+    pub input_errors: Vec<String>,
     pub structural_diffs: Vec<FieldDiff>,
     pub timestamp_drifts: Vec<String>,
     pub extra_br_fields: Vec<String>,
@@ -117,6 +119,10 @@ pub struct FieldDiff {
 impl DiffResult {
     pub fn explain(&self) -> String {
         let mut parts = Vec::new();
+
+        for error in &self.input_errors {
+            parts.push(format!("Input error: {error}"));
+        }
 
         if !self.structural_diffs.is_empty() {
             parts.push("Structural differences:".to_string());
@@ -308,22 +314,18 @@ fn compare_json_with_diff(br: &Value, bd: &Value, path: &str, result: &mut DiffR
 /// Compare JSONL files with normalization and field-level diffs.
 fn compare_jsonl_files(br_path: &Path, bd_path: &Path) -> DiffResult {
     let mut result = DiffResult::default();
-
-    let br_content = fs::read_to_string(br_path).unwrap_or_default();
-    let bd_content = fs::read_to_string(bd_path).unwrap_or_default();
-
-    // Parse JSONL lines
-    let br_entries: Vec<Value> = br_content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-
-    let bd_entries: Vec<Value> = bd_content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
+    let (br_entries, bd_entries) = match (
+        read_comparison_jsonl(br_path),
+        read_comparison_jsonl(bd_path),
+    ) {
+        (Ok(br), Ok(bd)) => (br, bd),
+        (br, bd) => {
+            result
+                .input_errors
+                .extend([br.err(), bd.err()].into_iter().flatten());
+            return result;
+        }
+    };
 
     if br_entries.len() != bd_entries.len() {
         result.structural_diffs.push(FieldDiff {
@@ -369,17 +371,83 @@ fn compare_jsonl_files(br_path: &Path, bd_path: &Path) -> DiffResult {
     result
 }
 
+fn read_comparison_jsonl(path: &Path) -> Result<Vec<Value>, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("{}: cannot read JSONL: {error}", path.display()))?;
+    content
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            serde_json::from_str(line).map_err(|error| {
+                format!("{}:{}: invalid JSONL: {error}", path.display(), index + 1)
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn workflow_jsonl_control_refuses_missing_unreadable_and_malformed_inputs() {
+    let root = TempDir::new_in(common::cli::isolated_temp_root()).unwrap();
+    let baseline = root.path().join("baseline.jsonl");
+    let candidate = root.path().join("candidate.jsonl");
+    let missing = compare_jsonl_files(&baseline, &candidate);
+    assert!(!missing.matched);
+    assert_eq!(missing.input_errors.len(), 2);
+    assert!(missing.explain().contains(baseline.to_str().unwrap()));
+    assert!(missing.explain().contains(candidate.to_str().unwrap()));
+
+    fs::write(&baseline, "").unwrap();
+    fs::write(&candidate, "").unwrap();
+    assert!(compare_jsonl_files(&baseline, &candidate).matched);
+
+    let unreadable = root.path().join("directory.jsonl");
+    fs::create_dir(&unreadable).unwrap();
+    let diff = compare_jsonl_files(&baseline, &unreadable);
+    assert!(!diff.matched);
+    assert!(diff.explain().contains(unreadable.to_str().unwrap()));
+    assert!(diff.explain().contains("cannot read JSONL"));
+
+    fs::write(&baseline, "{\"title\":\"same\"}\n").unwrap();
+    fs::write(&candidate, "{\"title\":\"same\"}\n").unwrap();
+    assert!(compare_jsonl_files(&baseline, &candidate).matched);
+    fs::write(&candidate, "{\"title\":\"same\"}\nnot JSON\n").unwrap();
+    let diff = compare_jsonl_files(&baseline, &candidate);
+    assert!(!diff.matched);
+    assert!(diff.explain().contains("candidate.jsonl:2: invalid JSONL"));
+
+    fs::write(&baseline, "not JSON\n").unwrap();
+    fs::write(&candidate, "not JSON\n").unwrap();
+    let diff = compare_jsonl_files(&baseline, &candidate);
+    assert!(!diff.matched);
+    assert_eq!(diff.input_errors.len(), 2);
+}
+
 // ============================================================================
 // WORKFLOW WORKSPACE
 // ============================================================================
 
 /// Workspace for multi-step workflow conformance tests.
 pub struct WorkflowWorkspace {
-    pub temp_dir: TempDir,
+    pub temp_dir: Option<TempDir>,
     pub br_root: std::path::PathBuf,
     pub bd_root: std::path::PathBuf,
     pub log_dir: std::path::PathBuf,
     pub workflow_log: Vec<WorkflowStep>,
+    command_sequence: Cell<usize>,
+}
+
+impl Drop for WorkflowWorkspace {
+    fn drop(&mut self) {
+        if std::thread::panicking()
+            && let Some(temp_dir) = self.temp_dir.take()
+        {
+            eprintln!(
+                "Workflow failure workspace retained: {}",
+                temp_dir.keep().display()
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -417,11 +485,12 @@ impl WorkflowWorkspace {
             .ok();
 
         Self {
-            temp_dir,
+            temp_dir: Some(temp_dir),
             br_root,
             bd_root,
             log_dir,
             workflow_log: Vec::new(),
+            command_sequence: Cell::new(0),
         }
     }
 
@@ -429,7 +498,18 @@ impl WorkflowWorkspace {
     pub fn init_both(&mut self) {
         // Use explicit --prefix bd to ensure both tools use the same prefix.
         // bd defaults to directory name, br defaults to "bd", so we need parity.
-        self.run_step(0, &["init", "--prefix", "bd"]);
+        let (br, bd) = self.run_step(0, &["init", "--prefix", "bd"]);
+        assert!(
+            br.status.success() && bd.status.success(),
+            "workflow init failed; commands retained in {}\nbr status: {}\nstdout:\n{}\nstderr:\n{}\nbd status: {}\nstdout:\n{}\nstderr:\n{}",
+            self.log_dir.display(),
+            br.status,
+            br.stdout,
+            br.stderr,
+            bd.status,
+            bd.stdout,
+            bd.stderr,
+        );
     }
 
     /// Run a command on both br and bd, logging the results.
@@ -451,7 +531,8 @@ impl WorkflowWorkspace {
 
     /// Run br command.
     pub fn run_br(&self, args: &[&str]) -> CmdOutput {
-        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("br"));
+        let binary = assert_cmd::cargo::cargo_bin!("br");
+        let mut cmd = std::process::Command::new(binary);
         cmd.current_dir(&self.br_root);
         cmd.args(args);
         cmd.env("NO_COLOR", "1");
@@ -460,6 +541,7 @@ impl WorkflowWorkspace {
         let start = std::time::Instant::now();
         let output = cmd.output().expect("run br");
         let duration = start.elapsed();
+        self.record_command("br", binary, &self.br_root, args, &output);
 
         CmdOutput {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -472,7 +554,8 @@ impl WorkflowWorkspace {
     /// Run bd command.
     /// Respects `BD_BINARY` environment variable for custom binary path.
     pub fn run_bd(&self, args: &[&str]) -> CmdOutput {
-        let mut cmd = std::process::Command::new(get_bd_binary());
+        let binary = get_bd_binary();
+        let mut cmd = std::process::Command::new(&binary);
         cmd.current_dir(&self.bd_root);
         cmd.args(args);
         cmd.env("NO_COLOR", "1");
@@ -481,6 +564,7 @@ impl WorkflowWorkspace {
         let start = std::time::Instant::now();
         let output = cmd.output().expect("run bd");
         let duration = start.elapsed();
+        self.record_command("bd", Path::new(&binary), &self.bd_root, args, &output);
 
         CmdOutput {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -488,6 +572,39 @@ impl WorkflowWorkspace {
             status: output.status,
             duration,
         }
+    }
+
+    /// Persist complete command evidence before a caller can assert or unwind.
+    fn record_command(
+        &self,
+        side: &str,
+        binary: &Path,
+        workspace: &Path,
+        args: &[&str],
+        output: &std::process::Output,
+    ) {
+        let sequence = self.command_sequence.get();
+        self.command_sequence.set(sequence + 1);
+        let stem = format!("{sequence:04}-{side}");
+        let stdout_file = format!("{stem}.stdout");
+        let stderr_file = format!("{stem}.stderr");
+        fs::write(self.log_dir.join(&stdout_file), &output.stdout).expect("retain command stdout");
+        fs::write(self.log_dir.join(&stderr_file), &output.stderr).expect("retain command stderr");
+        let record = serde_json::json!({
+            "program": binary,
+            "argv": args,
+            "cwd": workspace,
+            "status": output.status.to_string(),
+            "exit_code": output.status.code(),
+            "success": output.status.success(),
+            "stdout_file": stdout_file,
+            "stderr_file": stderr_file,
+        });
+        fs::write(
+            self.log_dir.join(format!("{stem}.json")),
+            serde_json::to_vec_pretty(&record).expect("serialize command evidence"),
+        )
+        .expect("retain command evidence");
     }
 
     /// Get the JSONL file paths.
@@ -512,8 +629,9 @@ impl WorkflowWorkspace {
     /// Write workflow log to file.
     pub fn write_log(&self) {
         let log_path = self.log_dir.join("workflow.json");
-        let json = serde_json::to_string_pretty(&self.workflow_log).unwrap_or_default();
-        fs::write(&log_path, json).ok();
+        let json =
+            serde_json::to_string_pretty(&self.workflow_log).expect("serialize workflow log");
+        fs::write(&log_path, json).expect("retain workflow log");
     }
 
     /// Extract issue ID from create output (handles both br and bd formats).
@@ -535,6 +653,76 @@ impl WorkflowWorkspace {
         }
         None
     }
+}
+
+#[test]
+fn workflow_failure_control_retains_failed_init_and_complete_command_evidence() {
+    skip_if_no_bd!();
+    let mut workspace = WorkflowWorkspace::new("failed_init_control");
+    let root = workspace.temp_dir.as_ref().unwrap().path().to_path_buf();
+    // A regular file where the metadata directory belongs makes real br init fail.
+    fs::write(
+        workspace.br_root.join(".beads"),
+        "invalid directory control",
+    )
+    .unwrap();
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        workspace.init_both();
+    }));
+    assert!(
+        failed.is_err(),
+        "invalid initialization must fail before any workflow step"
+    );
+    let panic = failed.unwrap_err();
+    let message = panic
+        .downcast_ref::<String>()
+        .expect("diagnostic init panic");
+    assert!(message.contains("workflow init failed"));
+    assert!(root.is_dir(), "failed workspace was lost during unwinding");
+
+    for (stem, expected_success) in [("0000-br", false), ("0001-bd", true)] {
+        let record: Value = serde_json::from_slice(
+            &fs::read(root.join("logs").join(format!("{stem}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            record["argv"],
+            serde_json::json!(["init", "--prefix", "bd"])
+        );
+        assert_eq!(record["success"], expected_success);
+        assert_eq!(record["exit_code"].as_i64() == Some(0), expected_success);
+        assert!(!record["program"].as_str().unwrap().is_empty());
+        assert!(!record["status"].as_str().unwrap().is_empty());
+        let stdout = fs::read(
+            root.join("logs")
+                .join(record["stdout_file"].as_str().unwrap()),
+        )
+        .unwrap();
+        let stderr = fs::read(
+            root.join("logs")
+                .join(record["stderr_file"].as_str().unwrap()),
+        )
+        .unwrap();
+        assert!(
+            !stdout.is_empty() || !stderr.is_empty(),
+            "missing actual command output"
+        );
+        if !expected_success {
+            assert_eq!(record["exit_code"], 8);
+            assert_eq!(
+                record["cwd"].as_str().unwrap(),
+                root.join("br_workspace").to_str().unwrap()
+            );
+            let stderr = String::from_utf8_lossy(&stderr);
+            assert!(stderr.contains("I/O error"));
+            assert!(message.contains(stderr.as_ref()));
+            assert_eq!(
+                fs::read_to_string(root.join("br_workspace/.beads")).unwrap(),
+                "invalid directory control"
+            );
+        }
+    }
+    assert!(root.join("bd_workspace/.beads/beads.db").is_file());
 }
 
 #[derive(Debug)]

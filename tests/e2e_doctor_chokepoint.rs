@@ -2217,7 +2217,8 @@ fn doctor_selftest_runs_lifecycle_in_throwaway_workspace() {
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );
-    let receipt = parse_trailing_json(&stdout);
+    let receipt: Value =
+        serde_json::from_slice(&out.stdout).expect("whole successful selftest stdout must be JSON");
     assert_eq!(receipt["schema_version"], "br.doctor.selftest.v1");
     assert_eq!(receipt["ok"], true);
     let steps = receipt["steps"].as_array().expect("steps array");
@@ -2259,7 +2260,8 @@ fn doctor_selftest_runs_lifecycle_in_throwaway_workspace() {
         "{}",
         String::from_utf8_lossy(&kept.stderr)
     );
-    let kept_receipt = parse_trailing_json(&String::from_utf8_lossy(&kept.stdout));
+    let kept_receipt: Value = serde_json::from_slice(&kept.stdout)
+        .expect("whole successful kept selftest stdout must be JSON");
     let kept_path = PathBuf::from(kept_receipt["workspace"].as_str().expect("kept path"));
     assert!(
         kept_path.starts_with(keep_dir.path())
