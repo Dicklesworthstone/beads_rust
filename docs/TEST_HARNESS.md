@@ -183,6 +183,13 @@ with a reason pointing here, never as a weakened comparison:
   return `{"issues": [...], "total", "limit", "offset", "has_more"}`; bd
   prints a bare array with the same per-issue fields. Count and shape tests
   unwrap `issues` (`common::cli::extract_issues_array`) before comparing.
+- **`init --json` has different stdout contracts.** Verified bd 0.46.0
+  (`812f4e52`) exits successfully but prints setup prose and a checklist even
+  with `--json`. br emits one complete `InitResult` with the stored prefix,
+  absolute workspace/database paths, and per-file creation outcomes. The
+  conformance test validates the whole br receipt and creates an issue in
+  both initialized databases; it does not require br to reproduce bd's prose
+  or accept two non-JSON outputs as matching robot responses.
 - **Schema.** br-only tables: `capacity_exemption_history`,
   `capacity_exemptions`, `capacity_occupancy`, `close_metadata`,
   `gate_result_history`, `gate_results`. bd-only tables: `compaction_snapshots`,

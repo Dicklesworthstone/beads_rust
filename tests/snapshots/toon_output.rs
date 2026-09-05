@@ -68,7 +68,15 @@ fn toon_golden_list_output() {
     );
     let decoded = strict_toon(&output);
     assert_eq!(decoded["issues"].as_array().expect("list issues").len(), 5);
-    assert_eq!(decoded["issues"][0]["id"], "bd-blocker");
+    // The first fixture record sorts first by title; its imported ID must round-trip.
+    let first_fixture_issue: Value = serde_json::from_str(
+        TOON_JSONL_FIXTURE
+            .lines()
+            .next()
+            .expect("first fixture issue"),
+    )
+    .expect("valid fixture issue");
+    assert_eq!(decoded["issues"][0]["id"], first_fixture_issue["id"]);
 
     let normalized = normalize_toon_output(&output.stdout);
     assert_snapshot!("toon_list_output", normalized);

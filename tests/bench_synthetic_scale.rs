@@ -3033,22 +3033,35 @@ mod release_abba {
             .ok_or_else(|| format!("expected an integer >= {minimum}, received {value:?}"))
     }
 
+    fn workload_issue_count(name: &str) -> Option<usize> {
+        [1_000, 10_000].into_iter().find(|issue_count| {
+            [
+                "version", "ready", "list", "show", "create", "update", "close",
+            ]
+            .into_iter()
+            .any(|command| {
+                ["default-auto-flush", "diagnostic-no-auto-flush"]
+                    .into_iter()
+                    .any(|flush| name == format!("{issue_count}-{command}-{flush}"))
+            })
+        })
+    }
+
+    fn selected_workload(value: Option<&str>) -> Result<Option<(&str, usize)>, String> {
+        value
+            .map(|name| {
+                workload_issue_count(name)
+                    .map(|issue_count| (name, issue_count))
+                    .ok_or_else(|| format!("unknown exact workload selector: {name:?}"))
+            })
+            .transpose()
+    }
+
     fn workload_budgets(value: &str) -> Result<BTreeMap<String, f64>, String> {
         let budgets: BTreeMap<String, f64> = serde_json::from_str(value)
             .map_err(|error| format!("invalid workload budgets: {error}"))?;
         for (name, budget) in &budgets {
-            let known = [1_000, 10_000].into_iter().any(|issue_count| {
-                [
-                    "version", "ready", "list", "show", "create", "update", "close",
-                ]
-                .into_iter()
-                .any(|command| {
-                    ["default-auto-flush", "diagnostic-no-auto-flush"]
-                        .into_iter()
-                        .any(|flush| name == &format!("{issue_count}-{command}-{flush}"))
-                })
-            });
-            if !known || !budget.is_finite() || *budget < 0.0 {
+            if workload_issue_count(name).is_none() || !budget.is_finite() || *budget < 0.0 {
                 return Err(format!(
                     "unknown workload or invalid nonnegative budget: {name}={budget}"
                 ));
@@ -3342,6 +3355,33 @@ mod release_abba {
     }
 
     #[test]
+    fn release_measurement_selector_requires_an_exact_canonical_workload() {
+        assert_eq!(selected_workload(None), Ok(None));
+        let selected = "10000-close-diagnostic-no-auto-flush";
+        assert_eq!(
+            selected_workload(Some(selected)),
+            Ok(Some((selected, 10_000)))
+        );
+        assert_eq!(
+            workload_issue_count("1000-ready-default-auto-flush"),
+            Some(1_000)
+        );
+        for invalid in [
+            "",
+            "close",
+            "10000-close-*",
+            "10000-close",
+            "10000-close-default-auto-flush ",
+            "100-close-default-auto-flush",
+        ] {
+            assert!(
+                selected_workload(Some(invalid)).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
     fn release_measurement_invokes_cli_without_interposed_supervisor() {
         let workspace = TempDir::new_in(common::cli::isolated_temp_root()).unwrap();
         let output = isolated_command(
@@ -3362,6 +3402,13 @@ mod release_abba {
     #[test]
     #[ignore = "requires pinned release artifacts and an identified low-contention Linux runner"]
     fn release_cli_abba_1k_10k() {
+        let selection = std::env::var_os("BR_PERF_WORKLOAD").map(|value| {
+            value
+                .into_string()
+                .expect("workload selector must be UTF-8")
+        });
+        let selected = selected_workload(selection.as_deref())
+            .expect("an exact canonical workload is required before measurements");
         let blocks = count(
             &std::env::var("BR_PERF_ABBA_BLOCKS").unwrap_or_else(|_| "10".into()),
             10,
@@ -3388,6 +3435,9 @@ mod release_abba {
         let initial_load = quiet_runner();
         let mut gate_exits = Vec::new();
         for issue_count in [1_000, 10_000] {
+            if selected.is_some_and(|(_, selected_count)| selected_count != issue_count) {
+                continue;
+            }
             let config = SyntheticConfig {
                 dependency_density: 0.25,
                 comment_density: 0.0,
@@ -3458,6 +3508,9 @@ mod release_abba {
                         "default-auto-flush"
                     };
                     let name = format!("{issue_count}-{command}-{flush_mode}");
+                    if selected.is_some_and(|(wanted, _)| wanted != name.as_str()) {
+                        continue;
+                    }
                     let expected_read = if matches!(command, "ready" | "list" | "show") {
                         let output = isolated_command(
                             &artifacts[0].binary,
@@ -3639,9 +3692,12 @@ mod release_abba {
         }
         write_json_pretty(&output_dir.join("run.json"), &json!({
             "state": "measurements_completed", "initial_load": initial_load,
+            "scope": if selected.is_some() { "separate_exact_workload" } else { "full_matrix" },
+            "selected_workload": selected.map(|(name, _)| name),
+            "completed_workloads": gate_exits.len(),
             "cache_protocol": CACHE_PROTOCOL, "latency_gate_exits": gate_exits,
             "release_budget_gate_exit": 2,
-            "release_budget_state": "inconclusive: target size budgets not calibrated",
+            "release_budget_state": "inconclusive: this collector does not evaluate the release archive-size gate",
             "workload_budgets": budgets,
             "budget_status": if budget.is_some() { "operator-supplied diagnostic budget; not an accepted SLO" } else if budgets.is_empty() { "inconclusive: no calibrated budget supplied" } else { "operator-supplied per-workload budgets; missing entries remain inconclusive" }
         })).unwrap();
