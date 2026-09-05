@@ -1244,6 +1244,46 @@ fn wrap_body(text: &str, width: usize) -> String {
     out
 }
 
+/// Countdown suffix appended to the `Deferred until:` line in
+/// `br show --format text` (#489).
+///
+/// `defer_until` is a time gate, not only a status: `br ready` hides ANY issue
+/// whose `defer_until` is in the future, including plain `open` ones. That makes
+/// it the field a scheduled ("not before this date") bead is built from, so
+/// `br show` states how long the gate still has to run instead of printing a
+/// bare date the reader has to diff against today.
+///
+/// Wording is deliberately conditional. For an `open` issue the gate is the only
+/// thing between it and `br ready`, so "ready in N days" is accurate. For any
+/// other status (`deferred` most of all, which additionally needs `br undefer`,
+/// but also `in_progress`, `blocked`, or a project's custom ready-group member)
+/// the elapsed gate alone does not make the issue ready, so the neutral "in N
+/// days" is used. Returns an empty string once the gate has elapsed — a past
+/// `defer_until` constrains nothing and needs no annotation.
+fn defer_until_countdown_suffix(
+    defer_until: DateTime<Utc>,
+    status: &Status,
+    now: DateTime<Utc>,
+) -> String {
+    let remaining = defer_until.signed_duration_since(now);
+    if remaining <= chrono::Duration::zero() {
+        return String::new();
+    }
+    // Truncating division: anything under 24h reads as "under a day" rather
+    // than rounding up to a day that has not been waited out yet.
+    let days = remaining.num_days();
+    let when = match days {
+        0 => "under a day".to_string(),
+        1 => "1 day".to_string(),
+        n => format!("{n} days"),
+    };
+    if matches!(status, Status::Open) {
+        format!(" (ready in {when})")
+    } else {
+        format!(" (in {when})")
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn format_issue_details(details: &IssueDetails, use_color: bool, wrap: bool) -> String {
     let mut output = String::new();
@@ -1314,7 +1354,12 @@ fn format_issue_details(details: &IssueDetails, use_color: bool, wrap: bool) -> 
     }
 
     if let Some(defer) = &issue.defer_until {
-        let _ = writeln!(output, "Deferred until: {}", defer.format("%Y-%m-%d"));
+        let suffix = defer_until_countdown_suffix(*defer, &issue.status, Utc::now());
+        let _ = writeln!(
+            output,
+            "Deferred until: {}{suffix}",
+            defer.format("%Y-%m-%d")
+        );
     }
 
     if let Some(minutes) = issue.estimated_minutes
@@ -1448,8 +1493,9 @@ fn format_issue_details(details: &IssueDetails, use_color: bool, wrap: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_external_dependency_metadata, build_issue_details_from_jsonl, format_issue_details,
-        load_issue_details_from_jsonl, reorder_details_by_requested_inputs,
+        apply_external_dependency_metadata, build_issue_details_from_jsonl,
+        defer_until_countdown_suffix, format_issue_details, load_issue_details_from_jsonl,
+        reorder_details_by_requested_inputs,
     };
     use crate::format::{IssueDetails, IssueWithDependencyMetadata};
     use crate::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
@@ -2021,5 +2067,132 @@ mod tests {
                 "{fmt:?} should NOT pass the structured-output guard"
             );
         }
+    }
+
+    /// #489: `defer_until` is the time gate a "not before this date" bead is
+    /// built from, so `br show` annotates how long that gate still has to run.
+    #[test]
+    fn defer_until_countdown_reads_ready_for_open_issues() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 4, 12, 0, 0).unwrap();
+        let in_seven_days = Utc.with_ymd_and_hms(2026, 9, 11, 12, 0, 0).unwrap();
+        assert_eq!(
+            defer_until_countdown_suffix(in_seven_days, &Status::Open, now),
+            " (ready in 7 days)"
+        );
+    }
+
+    #[test]
+    fn defer_until_countdown_is_neutral_for_non_open_statuses() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 4, 12, 0, 0).unwrap();
+        let in_seven_days = Utc.with_ymd_and_hms(2026, 9, 11, 12, 0, 0).unwrap();
+        // A `deferred` bead needs `br undefer` on top of the elapsed gate, and a
+        // custom ready-group member is not knowable here, so never claim "ready".
+        for status in [
+            Status::Deferred,
+            Status::InProgress,
+            Status::Blocked,
+            Status::Custom("rework".to_string()),
+        ] {
+            assert_eq!(
+                defer_until_countdown_suffix(in_seven_days, &status, now),
+                " (in 7 days)",
+                "status {status:?} must not claim readiness"
+            );
+        }
+    }
+
+    #[test]
+    fn defer_until_countdown_singular_and_sub_day() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 4, 12, 0, 0).unwrap();
+        assert_eq!(
+            defer_until_countdown_suffix(
+                Utc.with_ymd_and_hms(2026, 9, 5, 12, 0, 0).unwrap(),
+                &Status::Open,
+                now
+            ),
+            " (ready in 1 day)"
+        );
+        // 23h59m is still under a day: truncating, never rounding up to a day
+        // that has not actually been waited out.
+        assert_eq!(
+            defer_until_countdown_suffix(
+                Utc.with_ymd_and_hms(2026, 9, 5, 11, 59, 0).unwrap(),
+                &Status::Open,
+                now
+            ),
+            " (ready in under a day)"
+        );
+        assert_eq!(
+            defer_until_countdown_suffix(
+                Utc.with_ymd_and_hms(2026, 9, 4, 12, 0, 1).unwrap(),
+                &Status::Open,
+                now
+            ),
+            " (ready in under a day)"
+        );
+    }
+
+    #[test]
+    fn defer_until_countdown_is_empty_once_the_gate_elapsed() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 4, 12, 0, 0).unwrap();
+        // Exactly now: the gate no longer constrains anything.
+        assert_eq!(
+            defer_until_countdown_suffix(now, &Status::Open, now),
+            String::new()
+        );
+        assert_eq!(
+            defer_until_countdown_suffix(
+                Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap(),
+                &Status::Open,
+                now
+            ),
+            String::new()
+        );
+    }
+
+    fn details_for_defer_gate(defer_until: chrono::DateTime<Utc>) -> IssueDetails {
+        let mut issue = make_test_issue("bd-489", "Weekly dependency audit");
+        issue.defer_until = Some(defer_until);
+        IssueDetails {
+            issue,
+            labels: Vec::new(),
+            dependencies: Vec::new(),
+            dependents: Vec::new(),
+            comments: Vec::new(),
+            events: Vec::new(),
+            parent: None,
+            rollup: None,
+            inherited_context: Vec::new(),
+            acceptance_items: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn show_text_annotates_a_future_defer_gate() {
+        // +7d1h so the truncating day count is a stable 7 regardless of how
+        // long the test itself takes between here and `Utc::now()` inside the
+        // formatter.
+        let details = details_for_defer_gate(
+            Utc::now() + chrono::Duration::days(7) + chrono::Duration::hours(1),
+        );
+        let output = format_issue_details(&details, false, false);
+        assert!(
+            output.contains("Deferred until: ") && output.contains("(ready in 7 days)"),
+            "unexpected show output: {output}"
+        );
+    }
+
+    #[test]
+    fn show_text_leaves_an_elapsed_defer_gate_unannotated() {
+        let details = details_for_defer_gate(Utc::now() - chrono::Duration::days(3));
+        let output = format_issue_details(&details, false, false);
+        assert!(
+            output.contains("Deferred until: "),
+            "unexpected show output: {output}"
+        );
+        assert!(
+            !output.contains("(ready in") && !output.contains("(in "),
+            "an elapsed gate must not be annotated: {output}"
+        );
     }
 }

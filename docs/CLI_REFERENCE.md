@@ -191,7 +191,7 @@ br create [OPTIONS] [TITLE]
 | `--deps <DEPS>` | Dependencies (format: `type:id,type:id`) |
 | `-e, --estimate <MINUTES>` | Time estimate in minutes |
 | `--due <DATE>` | Due date (RFC3339 or relative like `+2d`, `tomorrow`) |
-| `--defer <DATE>` | Defer until date |
+| `--defer <DATE>` | Time-gate the issue: keeps the status as-is and hides it from `br ready` until the date ([scheduled work](#defer--undefer)) |
 | `--external-ref <REF>` | External reference (e.g., `gh-123`) |
 | `--ephemeral` | Mark as ephemeral (not exported to JSONL) |
 | `-s, --status <STATUS>` | Initial status (`open`, `deferred`, `in_progress`, `closed`) |
@@ -395,7 +395,7 @@ br update [OPTIONS] [IDS]...
 | `--claim` | Atomic claim (assignee=actor + status=in_progress) |
 | `--force` | Force update even if issue is blocked; also required for a destructive rewrite of a non-empty description/design/acceptance-criteria/notes/agent-context value (see the overwrite guard below) |
 | `--due <DATE>` | Set due date (empty string clears) |
-| `--defer <DATE>` | Set defer date (empty string clears) |
+| `--defer <DATE>` | Set the `br ready` time gate; empty string clears it ([scheduled work](#defer--undefer)) |
 | `--estimate <MINUTES>` | Set time estimate |
 | `--add-label <LABEL>` | Add label(s) |
 | `--remove-label <LABEL>` | Remove label(s) |
@@ -537,7 +537,7 @@ br ready [OPTIONS]
 | `-t, --type <TYPE>` | Filter by type |
 | `-p, --priority <N>` | Filter by priority |
 | `--sort <POLICY>` | Sort: hybrid (default), priority, oldest |
-| `--include-deferred` | Include deferred issues |
+| `--include-deferred` | Include `deferred` issues and drop the `defer_until` time gate ([scheduled work](#defer--undefer)) |
 | `--parent <ID>` | Filter to children of a parent issue |
 | `-r, --recursive` | Include all descendants with `--parent` |
 | `--wrap` | Wrap long lines instead of truncating in text output |
@@ -1226,6 +1226,43 @@ br undefer <IDS>... [OPTIONS]
 | `--until <DATE>` | Defer until date |
 | `--transition-comment <TEXT>` | Add a fresh comment atomically with each status transition |
 | `--robot` | Machine-readable output |
+
+**Scheduled ("not before this date") work:**
+
+`defer_until` is a *time gate*, not just a companion to the `deferred` status.
+`br ready` excludes every issue whose `defer_until` is in the future — including
+a plain `open` one — so a bead can be scheduled without a daemon, a calendar, or
+a status change:
+
+```bash
+# Real, open work that no agent should pick up before September 11th.
+br create "Weekly dependency audit" -t task -p 2 --defer 2026-09-11
+
+# Same gate applied (or moved, or cleared with an empty string) later.
+br update <id> --defer 2026-09-11
+br update <id> --defer ''
+```
+
+Semantics of a future `defer_until` on an issue that is **not** `deferred`:
+
+- **`br ready` hides it** exactly as a blocking dependency would, and so do
+  `br scheduler` and the MCP ready resource, which share the ready query.
+- **`br list --status open` still shows it** — it is real, open work — and
+  `br show` prints the date plus how long the gate has left (`Deferred until:
+  2026-09-11 (ready in 7 days)`).
+- **`br ready --include-deferred` surfaces it anyway** when a caller wants the
+  gated backlog too.
+- **JSONL export carries `defer_until`**, so the schedule syncs through git and
+  older readers that do not know the field ignore it.
+- **No transition is needed when the date arrives.** The gate is compared at
+  query time, so the bead becomes ready on its own; nothing has to run
+  `br undefer` (that is only for issues whose *status* is `deferred`).
+
+A recurring task is therefore one epic holding a batch of children, each with
+its own `--defer` a week apart. `br defer <id> --until <date>` remains the
+stronger form: it sets the same gate **and** moves the issue to the `deferred`
+status, which keeps it out of `br ready` even after the date elapses until
+`br undefer` runs.
 
 ---
 
