@@ -337,7 +337,8 @@ jobs:
     env:
       BR_PERF_BASELINE_REVISION: ${{ vars.BR_PERF_BASELINE_REVISION || '081100e4e35920f08b8c6faf6daa350da2cb030a' }}
       BR_PERF_EVIDENCE: ${{ github.workspace }}/target/perf-evidence
-      BR_PERF_ARTIFACT_DIR: ${{ github.workspace }}/target/perf-artifacts
+      # Cargo's cache can restore target/perf-artifacts from a previous run.
+      BR_PERF_ARTIFACT_DIR: ${{ runner.temp }}/br-perf-artifacts
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -434,7 +435,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: benchmark-artifacts
-          path: target/perf-artifacts/
+          path: ${{ env.BR_PERF_ARTIFACT_DIR }}
           compression-level: 1
           if-no-files-found: error
 

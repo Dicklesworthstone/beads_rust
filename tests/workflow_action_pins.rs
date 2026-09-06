@@ -940,7 +940,7 @@ fn require_text_contains(text: &str, needle: &str) -> Result<(), String> {
 /// Their constructed receipts are not measurements of CLI performance.
 mod scheduled_benchmarks {
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
 
     use serde_json::{Value, json};
@@ -1168,7 +1168,22 @@ mod scheduled_benchmarks {
     fn scheduled_package_and_loader_fragments_roundtrip_all_artifact_bytes_and_pins() {
         let control = BundleControl::new(None);
         let source = control.root.path().join("bundle");
-        let packaged = control.root.path().join("packaged");
+        let workspace = control.root.path().join("workspace");
+        let cached_bundle = workspace.join("target/perf-artifacts");
+        fs::create_dir_all(&cached_bundle).unwrap();
+        let cached_binary = cached_bundle.join("candidate-br");
+        fs::write(&cached_binary, "stale cached artifact\n").unwrap();
+        let runner_temp = control.root.path().join("runner-temp");
+        fs::create_dir(&runner_temp).unwrap();
+        // Exercise the workflow's actual staging path with a restored Cargo
+        // cache. Reusing target/perf-artifacts failed the next scheduled run.
+        let packaged = PathBuf::from(
+            workflow()["jobs"]["bench-build"]["env"]["BR_PERF_ARTIFACT_DIR"]
+                .as_str()
+                .unwrap()
+                .replace("${{ github.workspace }}", &workspace.display().to_string())
+                .replace("${{ runner.temp }}", &runner_temp.display().to_string()),
+        );
         let evidence = control.root.path().join("build-evidence");
         fs::create_dir(&evidence).unwrap();
         let build_log = "{\"fixture\":\"artifact transport only, not a compiled binary\"}\n";
@@ -1206,6 +1221,15 @@ mod scheduled_benchmarks {
             "",
         );
         let output = fs::read_to_string(output_path).unwrap();
+        assert_eq!(
+            fs::read_to_string(cached_binary).unwrap(),
+            "stale cached artifact\n"
+        );
+        assert!(packaged.starts_with(&runner_temp));
+        assert_eq!(
+            step("Upload benchmark artifacts")["with"]["path"],
+            "${{ env.BR_PERF_ARTIFACT_DIR }}"
+        );
         let lines = output.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], "CONTROL_SENTINEL=retained");

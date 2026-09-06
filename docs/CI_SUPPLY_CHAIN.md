@@ -139,6 +139,12 @@ regions but all reported `runnervmejwal`. Both sides of each comparison and its
 A/A control must share a boot identity. Receipts without this field cannot pass
 the current gate; historical timings remain observations, not matched-run proof.
 
+Build jobs stage the upload bundle in `${{ runner.temp }}/br-perf-artifacts`,
+outside the cached Cargo target directory. A restored `target/perf-artifacts`
+caused run `34042595559` to stop at packaging after successful compilation.
+The upload uses the same `BR_PERF_ARTIFACT_DIR` value; packaging still refuses
+an existing staging directory instead of replacing its contents.
+
 The receipt gate consumes conditional median and p95 intervals from the Rust
 comparator, with explicit retained block IDs matched to the raw ABBA order.
 It checks the declared protocol, selected block order statistics, endpoint
