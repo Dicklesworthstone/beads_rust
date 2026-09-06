@@ -21,7 +21,7 @@ Arguments:
           - coordination-status:     Coordination status output
           - additive-reconciliation: Additive reconciliation plan/apply receipt
           - vcs-status:              Explicit VCS export-status diagnostic
-          - error:                   Structured error envelope (stderr JSON when robot mode or non-TTY)
+          - error:                   Structured error envelope (stdout JSON in machine output modes)
           - commands:                Per-command JSON output envelope map (top-level shape + jq filter per command)
 
           [default: all]

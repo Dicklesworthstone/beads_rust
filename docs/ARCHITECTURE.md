@@ -28,7 +28,7 @@ This document describes the internal architecture of `beads_rust` (br), a Rust p
 1. **Non-Invasive**: No daemons, no git hooks, no automatic commits
 2. **Local-First**: SQLite is the source of truth; JSONL enables collaboration
 3. **Agent-Friendly**: Machine-readable output (JSON) for AI coding agents
-4. **Deterministic**: Same input produces same output
+4. **Deterministic representations**: Stable content hashing and ID-sorted exports; creation IDs also depend on timestamps, actor metadata, and collision checks
 5. **Safe**: Normal issue state stays in `.beads/`; explicit external database/JSONL routing and commands such as `br agents`, `config edit`, and `completions -o` have their own validated write targets
 
 ### Comparison with Go beads (bd)
@@ -79,6 +79,9 @@ This document describes the internal architecture of `beads_rust` (br), a Rust p
 ---
 
 ## Module Structure
+
+This is an abbreviated map. [AGENTS.md](../AGENTS.md#project-structure) carries
+the module inventory checked by `tests/agents_md_contract.rs`.
 
 ```
 src/
@@ -142,6 +145,10 @@ src/
 
 ### Issue Creation
 
+This diagram shows the logical write path. Output timing and post-commit
+auto-flush failures depend on the command branch; receiving an ID alone is not
+proof that the default JSONL has been finalized.
+
 ```
 User Input                  CLI                     Storage                 Sync
     │                        │                        │                      │
@@ -163,34 +170,30 @@ User Input                  CLI                     Storage                 Sync
     │                        │  (auto-flush if enabled)                      │
     │                        │ ───────────────────────────────────────────> │
     │                        │                        │                      │
-    │  ID: bd-abc123         │                        │                      │
+    │  ID: br-abc123         │                        │                      │
     │ <───────────────────── │                        │                      │
 ```
 
 ### Sync Export
 
-```
-br sync --flush-only
-        │
-        v
-┌───────────────────────────┐
-│  1. Path Validation       │  Verify target is in .beads/
-├───────────────────────────┤
-│  2. Create history backup │  Optional timestamped copy (if overwriting)
-├───────────────────────────┤
-│  3. Get dirty issue IDs   │  SELECT from dirty_issues
-├───────────────────────────┤
-│  4. Load all issues       │  Full export (deterministic)
-├───────────────────────────┤
-│  5. Write to temp file    │  Atomic write pattern
-├───────────────────────────┤
-│  6. Compute content hash  │  SHA-256 of content
-├───────────────────────────┤
-│  7. Atomic rename         │  temp -> issues.jsonl
-├───────────────────────────┤
-│  8. Clear dirty flags     │  DELETE from dirty_issues
-└───────────────────────────┘
-```
+For `br sync --flush-only`, the full-export path in
+[`src/sync/mod.rs`](../src/sync/mod.rs) has these conceptual stages:
+
+1. Resolve and validate the target, acquire the relevant database/JSONL family
+   authority, and retain the expected source generation.
+2. Create an optional history backup and check empty/stale-export guards.
+3. Read issue data and relations, record dirty-marker witnesses, and prepare
+   ID-sorted JSONL with the configured tombstone retention/error policy.
+4. Write, flush, sync, hash, and validate the staged file.
+5. Publish conditionally against the retained source generation; verify the
+   installed generation and, on exchange, the displaced generation.
+6. Finalize the default export in a database transaction: verify the published
+   receipt, reconcile exact issue hashes and dirty timestamps, and update sync
+   metadata. Publication alone does not clear dirty flags.
+
+These stages summarize the full export, not every incremental auto-flush or
+merge-resume branch. The [publication section](#atomic-jsonl-export-writes)
+describes failure states that a simple temp-file/rename diagram would omit.
 
 ---
 
@@ -198,46 +201,43 @@ br sync --flush-only
 
 ### SqliteStorage
 
-The primary storage implementation using the fsqlite stack (`fsqlite`,
-`fsqlite-types`, and `fsqlite-error`).
-
-```rust
-pub struct SqliteStorage {
-    conn: Connection,
-}
-```
+The primary storage implementation uses the fsqlite stack (`fsqlite`,
+`fsqlite-types`, and `fsqlite-error`). The concrete `SqliteStorage` in
+[`src/storage/sqlite.rs`](../src/storage/sqlite.rs) owns a `Connection`,
+database-family write authority when applicable, an opener lease, and mutation,
+policy, and temporary-storage state.
 
 **Key Features:**
 
 - **WAL Mode**: Concurrent reads during writes
-- **Busy Timeout**: Configurable lock timeout (default 30s)
-- **Transactional Mutations**: 4-step protocol for safety
+- **Busy Timeout**: Normal CLI storage opening defaults to 30s; direct
+  `SqliteStorage::open` uses `DEFAULT_BUSY_TIMEOUT_MS = 0`. The storage transaction
+  retry loop and workspace write lock are separate mechanisms.
+- **Transactional Mutations**: Issue changes, audit events, dirty tracking, and
+  cache changes are coordinated by the mutation path
 
 ### Transaction Protocol
 
-All mutations follow this pattern:
+Issue mutations use `SqliteStorage::mutate`; bookkeeping also has dedicated
+transaction paths. Its current signature is shown without the implementation:
 
 ```rust
-storage.mutate("operation", actor, |tx, ctx| {
-    // 1. Perform the operation
-    tx.execute(...)?;
-
-    // 2. Record events for audit trail
-    ctx.record_event(EventType::Created, &issue.id, None);
-
-    // 3. Mark affected issues as dirty
-    ctx.mark_dirty(&issue.id);
-
-    // 4. Invalidate blocked cache if needed
-    ctx.invalidate_cache();
-
-    Ok(result)
-})
+pub fn mutate<F, R>(&mut self, op: &str, actor: &str, f: F) -> Result<R>
+where
+    F: FnMut(&Connection, &mut MutationContext) -> Result<R>;
 ```
+
+The callback changes rows through the connection and records effects through
+`MutationContext::record_event`, `mark_dirty`, and cache invalidation methods.
+The callback can be retried on transient database contention, so it must not
+perform external side effects that would be duplicated by a retry. The storage
+layer persists the accumulated effects within the transaction.
 
 ### Database Schema
 
-```sql
+Table inventory, not executable DDL:
+
+```text
 -- Core tables
 issues              -- Primary issue data
 dependencies        -- Issue relationships
@@ -275,7 +275,9 @@ Issues are marked dirty when:
 - Labels added/removed
 - Comments added
 
-Dirty flags are cleared after successful JSONL export.
+Default-export finalization clears the dirty markers covered by its verified
+publication and timestamp witnesses. An export to another path does not by
+itself make the default interchange copy current.
 
 ### Blocked Cache
 
@@ -292,7 +294,9 @@ CREATE TABLE IF NOT EXISTS blocked_issues_cache (
 CREATE INDEX IF NOT EXISTS idx_blocked_cache_blocked_at ON blocked_issues_cache(blocked_at);
 ```
 
-Only blocked issues have a row; `blocked_by` is the blocking issue id.
+Only blocked issues have a row; `blocked_by` stores a JSON array of blocking
+issue IDs. `rebuild_blocked_cache_impl` serializes the blocker list, and
+`parse_blocked_by_json` validates it when read.
 
 Rebuilt when:
 - Dependencies change
@@ -305,11 +309,13 @@ Rebuilt when:
 
 ### JSONL Format
 
-Each line is a complete JSON object:
+Each line is a complete issue JSON object. These abbreviated illustrations omit
+fields and are **not importable JSONL**; use `br sync --flush-only` to obtain
+actual records:
 
-```json
-{"id":"bd-abc123","title":"Fix bug","status":"open",...}
-{"id":"bd-def456","title":"Add feature","status":"in_progress",...}
+```text
+{"id":"br-abc123","title":"Fix bug","status":"open",...}
+{"id":"br-def456","title":"Add feature","status":"in_progress",...}
 ```
 
 **Benefits:**
@@ -319,52 +325,88 @@ Each line is a complete JSON object:
 
 ### Export Process
 
+Public signature excerpts from [`src/sync/mod.rs`](../src/sync/mod.rs), with
+bodies and imports omitted:
+
 ```rust
 pub fn export_to_jsonl(
     storage: &SqliteStorage,
-    path: &Path,
+    output_path: &Path,
     config: &ExportConfig,
-) -> Result<ExportResult>
+) -> Result<ExportResult>;
+
+pub fn finalize_export(
+    storage: &mut SqliteStorage,
+    result: &ExportResult,
+    issue_hashes: Option<&[(String, String)]>,
+    jsonl_path: &Path,
+) -> Result<()>;
 ```
+
+`export_to_jsonl_with_policy` additionally returns an `ExportReport`.
+`finalize_export` is a separate step for successful default-path exports;
+authority-aware command paths retain locks across these steps.
 
 **Safety Guards:**
 
-1. Path validation (must be in `.beads/`)
-2. Atomic JSONL publication (temp file + rename)
-3. Content hashing (detect corruption)
-4. History backups (optional, created when overwriting JSONL inside `.beads/`)
+1. Path validation against the internal allowlist or authorized external JSONL
+2. Empty/stale-export checks before replacing existing interchange data
+3. Conditional publication with source identity and content witnesses
+4. History backups (optional; an authorized external JSONL target is also
+   eligible when the caller supplies the workspace/history configuration)
+
+CLI callers supply `ExportConfig::beads_dir`. The lower-level API permits
+`beads_dir: None`, which skips that path-validation step; its defaults are not
+a substitute for the CLI's authority and path checks.
 
 ### Import Process
+
+Public signature excerpt (body and imports omitted):
 
 ```rust
 pub fn import_from_jsonl(
     storage: &mut SqliteStorage,
-    path: &Path,
+    input_path: &Path,
     config: &ImportConfig,
-    prefix: Option<&str>,
-) -> Result<ImportResult>
+    expected_prefix: Option<&str>,
+) -> Result<ImportResult>;
 ```
 
-**Collision Handling:**
+The importer captures the input as a retained JSONL source snapshot, rejects
+conflict markers, normalizes records, and applies issue/relation changes through
+the import transaction. `ImportConfig::beads_dir: None` likewise skips initial
+path validation in the lower-level API.
 
-- By default, imports are additive
-- Content hash comparison for conflict detection
-- Force mode to overwrite conflicts
+**Matching and updates:**
+
+- Imports are additive by default; existing DB-only issues are retained.
+- Matching considers external references, IDs, and content hashes; timestamps
+  govern ordinary updates. `force_upsert` permits equal/older incoming records
+  to update matches; it does not disable every validation or tombstone guard.
+- Prefix validation is optional at this API boundary. CLI sync supports mixed
+  prefixes by default; an explicit expected-prefix check or prefix rewrite has
+  its own validation rules.
 
 ### Path Validation
 
-Sync operations enforce a strict path allowlist:
+[`src/sync/path.rs`](../src/sync/path.rs) defines `ALLOWED_EXTENSIONS` as suffixes
+without a leading dot: `db`, `db-wal`, `db-wal-cert`, `db-wal-cert-head`,
+`db-shm`, `db-journal`, `db-fsqlite-ns-gate`, `db-fsqlite-ns-use`, `jsonl`, and
+`jsonl.tmp`. Exact-name exceptions are `.manifest.json` and `metadata.json`;
+PID-scoped `*.jsonl.<pid>.tmp` names are also recognized. Arbitrary `.json` and
+`.yaml` files are not allowed by this sync validator.
 
-```rust
-pub const ALLOWED_EXTENSIONS: &[&str] = &[".jsonl", ".json", ".db", ".yaml"];
-pub const ALLOWED_EXACT_NAMES: &[&str] = &["metadata.json", "config.yaml"];
+`validate_sync_path` returns a `PathValidation` classification;
+`is_sync_path_allowed` is its boolean convenience check.
+`validate_sync_path_with_external(path, beads_dir, allow_external)` returns
+`Result<()>`: internal paths retain containment, allowlist, and symlink checks,
+while external JSONL requires authorization and still rejects traversal,
+symlinks, non-regular existing files, and `.git` targets. An explicit external
+database override can authorize its sibling JSONL through config routing;
+otherwise CLI external JSONL use requires `--allow-external-jsonl`.
 
-pub fn is_sync_path_allowed(path: &Path, beads_dir: &Path) -> bool {
-    // Must be inside .beads/
-    // Must have allowed extension
-    // Must not be in .git/
-}
-```
+Path validation is preflight. Descriptor-based source capture and pinned-parent
+publication checks remain necessary when paths can change during an operation.
 
 ---
 
@@ -376,43 +418,70 @@ Configuration sources in precedence order (highest wins):
 
 ```
 1. CLI overrides        (--json, --db, --actor)
-2. Environment vars     (BD_ACTOR, BEADS_JSONL)
+2. Environment layer    (BD_* keys and selected BEADS_* aliases)
 3. Project config       (.beads/config.yaml)
 4. User config          (~/.config/beads/config.yaml; falls back to ~/.config/bd/config.yaml)
 5. Legacy user config   (~/.beads/config.yaml)
-6. DB config table      (config table in SQLite)
-7. Defaults
+6. DB config table      (runtime keys only, when a storage handle is supplied)
+7. JSONL inference      (issue_prefix from the first issue, when available)
+8. Defaults
 ```
+
+This is the merge order in `load_config_from_startup_layers` in
+[`src/config/mod.rs`](../src/config/mod.rs). Startup path resolution happens
+before that runtime merge: `load_startup_config_with_paths` resolves the
+workspace, database, and JSONL paths from CLI overrides, startup layers,
+metadata, and discovery rules. Variables such as `BEADS_JSONL` select paths
+there; they are not all ordinary keys in `ConfigLayer::from_env`.
 
 ### Configuration Layer
 
+Actual fields of `ConfigLayer` (derive attributes omitted):
+
 ```rust
 pub struct ConfigLayer {
-    pub startup: HashMap<String, String>,  // YAML/env only
-    pub runtime: HashMap<String, String>,  // Can be in DB
+    pub startup: HashMap<String, String>, // File/env/CLI startup settings
+    pub runtime: HashMap<String, String>, // Includes eligible DB settings
 }
 ```
 
-**Startup-only keys** (cannot be stored in DB):
-- `no-db`, `no-daemon`, `no-auto-flush`
-- `db`, `actor`, `identity`
-- `git.*`, `routing.*`, `sync.*`
+`merge_from` normalizes hyphens to underscores and lets higher-precedence layers
+replace values. `ConfigLayer::get` checks runtime before startup keys;
+`ConfigLayer::from_db` excludes keys classified by `is_startup_key`.
+
+**Examples of startup-only keys** (the complete classifier is `is_startup_key`):
+
+- `no-db`, `no-daemon`, `no-auto-flush`, `no-auto-import`, `no-history`
+- `json`, `db`, `actor`, `identity`, `lock-timeout`
+- `git.*`, `routing.*`, `sync.*`, `validation.*`, `display.*`, `directory.*`,
+  `external-projects.*`
+
+Classifying a legacy setting such as `no-daemon` does not create a daemon or an
+automatic git execution path.
 
 ### Key Configuration Options
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `issue_prefix` | `bd` | ID prefix for new issues |
+| `issue_prefix` | `br` fallback | ID prefix; initialization or a higher layer normally supplies the workspace prefix |
 | `default_priority` | `2` | Default priority (0-4) |
 | `default_type` | `task` | Default issue type |
 | `display.color` | auto | ANSI color output |
-| `lock-timeout` | `30000` | SQLite busy timeout (ms) |
+| `lock-timeout` | `30000` in normal CLI storage opening | Lock wait/busy timeout in milliseconds; direct storage APIs may choose another value |
+
+`default_config_layer` inserts only `issue_prefix=br`. Priority and type defaults
+come from `default_priority_from_layer` and `default_issue_type_from_layer`;
+color remains unset for output-mode/terminal resolution unless overridden.
 
 ---
 
 ## Error Handling
 
 ### Error Types
+
+Selected variants from [`src/error/mod.rs`](../src/error/mod.rs), with derive
+attributes and other variants omitted. This is a type excerpt, not a complete
+replacement enum:
 
 ```rust
 pub enum BeadsError {
@@ -429,7 +498,7 @@ pub enum BeadsError {
     // Validation errors
     Validation { field: String, reason: String },
     InvalidStatus { status: String },
-    InvalidPriority { priority: i32 },
+    InvalidPriority { priority: String },
 
     // Dependency errors
     DependencyCycle { path: String },
@@ -447,19 +516,31 @@ pub enum BeadsError {
 
 ### Exit Codes
 
+These are the categories in `ErrorCode::exit_code`, plus success. Individual
+commands also have result-specific exits (for example, doctor's health verdict),
+and argument-parser failures are not necessarily `StructuredError` responses.
+
 | Code | Category | Description |
 |------|----------|-------------|
 | 0 | Success | Command completed |
 | 1 | Internal | Unexpected error |
-| 2 | Database | Not initialized, locked |
-| 3 | Issue | Not found, ambiguous ID |
-| 4 | Validation | Invalid input |
-| 5 | Dependency | Cycle detected |
-| 6 | Sync | JSONL parse error |
-| 7 | Config | Missing configuration |
-| 8 | I/O | File system error |
+| 2 | Database | Missing/locked database, schema/database error, initialization state |
+| 3 | Issue/operation | Missing/ambiguous/invalid ID, collision, nothing to do, incomplete close |
+| 4 | Validation/policy | Invalid input, required field, policy violation, workflow capacity exceeded |
+| 5 | Dependency | Cycle, self/duplicate/missing dependency, existing dependents |
+| 6 | Sync | JSONL parse/prefix/import conflict, conflict markers, path traversal |
+| 7 | Config | Configuration lookup/parse/error |
+| 8 | I/O/serialization | File system, JSON, or YAML error |
+| 130 | Shutdown | `SHUTTING_DOWN` |
 
 ### Structured Error Output
+
+The top-level CLI handler in [`src/main.rs`](../src/main.rs) writes the JSON
+error envelope to **stdout** in machine error mode. Logging and diagnostics go
+to stderr; human-readable errors go to stderr. Inspect the exit status together
+with the structured result. A partially successful batch may emit a result and
+then an error document, so nonzero output is not universally one JSON document
+and does not establish that nothing committed.
 
 Captured from `br show nope-123 --json` on 2026-09-02 (exit code 3):
 
@@ -478,11 +559,15 @@ Captured from `br show nope-123 --json` on 2026-09-02 (exit code 3):
 }
 ```
 
-`code` is the stable `ErrorCode` name (`src/error/structured.rs`), `hint` is
-the actionable next step, `retryable` tells an agent whether a plain retry can
-succeed, and `context` carries code-specific fields. The exit code is derived
-from `code` (`ErrorCode::exit_code`). `br schema error --format json` emits
-the JSON Schema for this envelope.
+`StructuredError::to_json` creates the outer `error` envelope. Its `code` is the
+stable `ErrorCode::as_str` name, `message` describes the failure, and `hint` and
+`context` are nullable remediation/context fields. `retryable` means retry may
+be possible after the reported condition changes, including correcting input;
+it does not promise that repeating an unchanged command will succeed. Preserve
+commit/publication evidence in `context` and follow the hint before retrying
+an uncertain mutation. `ErrorCode::exit_code` supplies the top-level handler's
+exit status. `br schema error --format json` emits the `ErrorEnvelope` schema
+from [`src/cli/commands/schema.rs`](../src/cli/commands/schema.rs).
 
 ---
 
@@ -490,7 +575,9 @@ the JSON Schema for this envelope.
 
 ### Command Structure
 
-Uses Clap's derive macros:
+Uses Clap's derive macros. This abbreviated declaration omits attributes,
+options, and subcommands; consult [`src/cli/mod.rs`](../src/cli/mod.rs) for the
+complete types:
 
 ```rust
 #[derive(Parser)]
@@ -515,34 +602,18 @@ pub enum Commands {
 
 ### Command Flow
 
-```rust
-fn main() {
-    let cli = Cli::parse();
+[`src/main.rs`](../src/main.rs) parses the CLI, resolves output/error modes and
+startup overrides, and chooses the storage/authority path for the command. It
+may preopen storage and auto-import changed JSONL before dispatch. Mutating
+paths retain write authority and dispatch to command-specific `execute`
+functions; their signatures differ.
 
-    // Initialize logging
-    init_logging(cli.verbose, cli.quiet, None)?;
-
-    // Build CLI overrides
-    let overrides = build_cli_overrides(&cli);
-
-    // Dispatch to command handler
-    let result = match cli.command {
-        Commands::Create(args) => commands::create::execute(args, &overrides),
-        Commands::List(args) => commands::list::execute(&args, cli.json, &overrides),
-        // ...
-    };
-
-    // Handle errors
-    if let Err(e) = result {
-        handle_error(&e, cli.json);
-    }
-
-    // Auto-flush if enabled
-    if is_mutating && !cli.no_auto_flush {
-        run_auto_flush(&overrides);
-    }
-}
-```
+The dispatcher routes errors through `handle_error(err, json_mode, color_mode)`.
+Successful mutations with auto-flush enabled then publish pending JSONL through
+the retained storage/authority context. Commands can also finalize their own
+mutations and report partial success. This is a control-flow summary, not
+copyable dispatch code; the actual branches handle routing, JSONL-only mode,
+pending merges, and post-commit failures.
 
 ---
 
@@ -550,25 +621,44 @@ fn main() {
 
 ### ID Generation
 
-Hash-based short IDs for human readability:
+Hash-based short IDs for human readability. Actual `IdConfig` fields, annotated
+with defaults from [`src/util/id.rs`](../src/util/id.rs):
 
 ```rust
 pub struct IdConfig {
-    pub prefix: String,         // e.g., "bd"
+    pub prefix: String,         // "br" fallback; workspace prefix can override
     pub min_hash_length: usize, // 3
     pub max_hash_length: usize, // 8
     pub max_collision_prob: f64, // 0.25
 }
 
-// Generated: bd-abc123
+// Example shape: br-abc123
 ```
 
-**Algorithm:**
-1. Generate random bytes
-2. Encode as alphanumeric hash
-3. Start with min_length
-4. Extend if collision detected
-5. Fail if max_length reached
+For ordinary hash IDs, `IdGenerator::generate` uses this algorithm:
+
+1. `generate_id_seed` frames the title, optional description, optional creator,
+   creation timestamp in nanoseconds, and a numeric nonce as length-prefixed
+   UTF-8 text (`length:value`). Missing description/creator use empty strings.
+2. `compute_id_hash` hashes that seed with SHA-256, interprets the first eight
+   digest bytes as a big-endian integer, and encodes it in lowercase base36,
+   padding/truncating to the requested length. No random bytes are drawn here.
+3. `optimal_length(issue_count)` selects a starting length using a birthday
+   collision-probability approximation over the base36 space, within the
+   configured minimum/maximum. This estimate selects a length; the existence
+   check decides whether an actual candidate is available.
+4. Try nonces 0 through 9 at each length, extending after collisions. An error
+   from the caller's existence lookup propagates instead of treating the ID as
+   free.
+5. If the configured maximum is exhausted, try the 12-character fallback with
+   nonces 0 through 2000, checking the final candidate too. Return `IdCollision`
+   only when those fallback candidates are also occupied.
+
+The same complete seed produces the same candidate, but repeated CLI creates
+need not have the same timestamp or available IDs. Slug IDs use
+`generate_with_slug`, with normalization and a hash-only fallback; dotted child
+IDs use the separate child-counter path. These IDs are distinct from the issue
+content hash below.
 
 ### Content Hashing
 
@@ -591,23 +681,28 @@ substitute for the JSONL publication witness.
 
 ### Atomic JSONL Export Writes
 
-JSONL export publication uses temp + rename:
+`publish_staged_jsonl_conditionally` in [`src/sync/mod.rs`](../src/sync/mod.rs)
+publishes under `JsonlFamilyWriteLock`, using pinned parent/name handles and the
+expected previous source witness. Depending on the target/platform, the
+namespace operation is create-without-replacement, exchange-and-verify, or
+replacement under authority. The publisher checks the installed bytes/identity
+against the staged generation and checks any displaced generation against the
+retained source witness.
 
-```rust
-fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
-    let temp_path = path.with_extension("tmp");
+Directory synchronization, post-publication authority checks, and checked
+cleanup follow the namespace change. A platform that cannot certify directory
+durability is reported explicitly; other synchronization failures can produce
+`JsonlPublishedButNotDurable`. A conflicting or unverified installed/displaced
+generation produces `JsonlPublicationConflict` or
+`JsonlPublishedButUnwitnessed`, with recovery evidence when available. Checked
+cleanup can retain a displaced file and report a warning rather than silently
+discard evidence.
 
-    // Write to temp file
-    let mut file = File::create(&temp_path)?;
-    file.write_all(content)?;
-    file.sync_all()?;
-
-    // Atomic rename
-    fs::rename(&temp_path, path)?;
-
-    Ok(())
-}
-```
+A plain `File::create` plus `fs::rename` helper would omit these contracts.
+Atomic namespace change, verified publication, database finalization, and
+power-loss durability are separate facts; a post-publication failure must not
+be treated as proof that the target is unchanged or that the whole mutation is
+safe to repeat.
 
 ---
 
@@ -628,11 +723,11 @@ same vocabulary and the same recovery envelope.
 
 ### Health States
 
-| State | Meaning | Expected system posture |
-|-------|---------|-------------------------|
 The vocabulary below is `WorkspaceHealth` in `src/health.rs` (`healthy`,
 `degraded`, `recoverable`, `unsafe`); every surface uses these four strings.
 
+| State | Meaning | Expected system posture |
+|-------|---------|-------------------------|
 | `healthy` | SQLite, JSONL, metadata, and derived state agree closely enough for normal operation | Proceed normally; no repair messaging |
 | `degraded` | Operable, but something disagrees: freshness or path metadata differ, derived state is stale, or a non-fatal anomaly was observed | Report the anomaly explicitly; prefer import/export reconciliation over repair |
 | `recoverable` | Primary storage is damaged or incomplete, but authoritative evidence exists to rebuild safely | Preserve evidence, rebuild only through the allowed repair path, then re-verify |
@@ -652,8 +747,8 @@ The vocabulary below is `WorkspaceHealth` in `src/health.rs` (`healthy`,
 | Surface | Object | Required invariant | Allowed automatic action | Forbidden silent behavior |
 |---------|--------|--------------------|--------------------------|---------------------------|
 | Primary data | `issues` + relational tables | Issue rows, dependencies, labels, and comments must remain representable either in SQLite or in valid JSONL records | Rebuild SQLite from valid JSONL when the DB family is recoverably damaged | Dropping primary issue data because a derived table is inconsistent |
-| Primary data | SQLite database family (`beads.db`, `-wal`, `-shm`, `-journal`) | The DB family must be treated as one unit when diagnosing corruption or recovery | Quarantine the whole family into `.beads/.br_recovery/` before rebuilding | Deleting or overwriting only one sidecar and pretending the rest are canonical |
-| Interchange data | `.beads/issues.jsonl` | JSONL must be parseable, conflict-free, and prefix-consistent before import | Reject import and preserve the file for manual repair | Best-effort partial import of malformed or conflicted JSONL |
+| Primary data | SQLite database family (database plus engine sidecars; see the [engine inventory](reliability/ENGINE_OPERATING_MODEL.md)) | The DB family must be treated as one unit when diagnosing corruption or recovery | Preserve the family before an authorized rebuild; a namespace diagnostic alone does not authorize quarantine | Deleting or overwriting only one sidecar and pretending the rest are canonical |
+| Interchange data | `.beads/issues.jsonl` | JSONL must be parseable, conflict-free, and valid for the requested import mode; mixed prefixes are supported by default | Reject invalid import and preserve the file for manual repair | Best-effort partial import of malformed or conflicted JSONL |
 | Interchange data | DB vs JSONL freshness | Empty/stale export must never overwrite non-empty authoritative JSONL by accident | Refuse export unless the operator explicitly forces the destructive direction | Treating a missing import as permission to publish an empty snapshot |
 | Metadata | `.beads/metadata.json` path mapping | Resolved DB + JSONL targets must point at the intended workspace and be explainable | Rehydrate missing defaults from the canonical workspace layout and config rules | Silently operating on a different workspace than the one diagnostics describe |
 | Metadata | Sync witness keys (`last_import_time`, `last_export_time`, `jsonl_content_hash`, JSONL mtime witness) | Metadata must explain whether DB or JSONL is newer and whether divergence is expected | Recompute witness metadata after successful import/export | Claiming a workspace is healthy when witness data proves drift or missing export/import |
@@ -673,8 +768,10 @@ These rules exist so tests and diagnostics can assert what is never allowed.
    `.beads/.br_recovery/` before replacement.
 3. Row-level or index-level corruption that affects writes is classified as
    `recoverable`, not as permission to mutate around the bad row.
-4. Prefix mismatch, malformed JSONL, or unresolved conflict markers promote the
-   workspace to `unsafe` for import/rebuild purposes.
+4. Malformed JSONL or unresolved conflict markers prevent automatic
+   import/rebuild. Reject a prefix mismatch when that import explicitly requires
+   a matching prefix; a valid mixed-prefix workspace is not unsafe merely
+   because its IDs use different prefixes.
 
 ### Derived-State Rebuild Rules
 
@@ -713,7 +810,7 @@ tests talk about the same evidence:
 | `br config list -v` | Preserves config provenance and environment overrides that changed behavior |
 | `.beads/metadata.json` | Captures the explicit DB/JSONL routing contract the workspace claimed to use |
 | `.beads/issues.jsonl` | Preserves the authoritative interchange copy used for taxonomy classification and rebuild decisions |
-| Presence plus hashes of `beads.db`, `beads.db-wal`, `beads.db-shm`, and `beads.db-journal` when present | Distinguishes missing-file drift from sidecar mismatch and partial-copy failures |
+| Presence plus hashes of the complete database family from the [engine inventory](reliability/ENGINE_OPERATING_MODEL.md), including persistent namespace sidecars when present | Distinguishes missing-file drift from sidecar mismatch and partial-copy failures |
 | Directory listing of `.beads/`, `.beads/.br_recovery/`, and `.beads/.br_history/` | Preserves recovery artifacts and interrupted-operation evidence |
 | Environment overrides and process context (`BD_DB`, `BD_DATABASE`, `BEADS_JSONL`, `BEADS_DIR`, `NO_COLOR`, active agents/processes) | Explains discovery/path/output drift and multi-actor contention |
 
@@ -725,14 +822,16 @@ workspace taxonomy without speculative follow-up.
 
 1. **Sync writes confined to its validated `.beads/` authority by default**
    - Path validation before any write
-   - External JSONL requires explicit opt-in
+   - External JSONL requires authorization through the external-JSONL option or
+     explicit external-database routing
 
 2. **No Git operations in sync**
    - `br sync` never runs `git` commands
    - User handles git manually
 
 3. **Atomic JSONL publication**
-   - Export uses a same-directory temp file + rename pattern
+   - Export stages a file and conditionally publishes against retained source
+     and directory authority, then verifies the resulting generation
    - Other durable mutations use their own transaction/receipt contracts
 
 ### Database Safety
@@ -775,15 +874,12 @@ workspace taxonomy without speculative follow-up.
 
 ### Custom Validators
 
-Extend `IssueValidator` in `validation/mod.rs`:
-
-```rust
-impl IssueValidator {
-    pub fn validate_custom_field(&self, issue: &Issue) -> Result<()> {
-        // Custom validation logic
-    }
-}
-```
+Extend the validation performed by `IssueValidator::validate` in
+[`src/validation/mod.rs`](../src/validation/mod.rs). Its actual entry point is
+an associated function taking `&Issue` and returning
+`Result<(), Vec<ValidationError>>`; it accumulates field-specific failures.
+There is no `validate_custom_field` extension method to call. Add the rule to
+that existing path and test accepted input, rejected input, and its boundary.
 
 ---
 

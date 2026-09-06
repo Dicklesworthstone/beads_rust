@@ -1579,7 +1579,7 @@ pub enum SchemaTarget {
     AdditiveReconciliation,
     /// Explicit VCS export-status diagnostic
     VcsStatus,
-    /// Structured error envelope (stderr JSON when robot mode or non-TTY)
+    /// Structured error envelope (stdout JSON in machine output modes)
     Error,
     /// Per-command JSON output envelope map (top-level shape + jq filter per command)
     Commands,

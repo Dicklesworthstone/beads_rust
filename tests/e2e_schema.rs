@@ -19,6 +19,70 @@ use toon_rust::{EncodeOptions, JsonValue};
 const UPDATE_AGENT_BASELINE_ENV: &str = "UPDATE_AGENT_BASELINE";
 
 #[test]
+fn e2e_schema_help_matches_live_json_error_stream() {
+    let _log = common::test_log("e2e_schema_help_matches_live_json_error_stream");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init", "--prefix", "stream"], "stream_init");
+    assert!(init.status.success(), "init failed: {init:?}");
+
+    let create = run_br(
+        &workspace,
+        ["create", "Readable result", "--json"],
+        "stream_create",
+    );
+    assert!(create.status.success(), "create failed: {create:?}");
+    let created: Value = serde_json::from_str(&create.stdout).expect("whole create JSON");
+    let id = created["id"].as_str().expect("created issue ID");
+    let show = run_br(&workspace, ["show", id, "--json"], "stream_show");
+    assert!(show.status.success(), "show failed: {show:?}");
+    let shown: Value = serde_json::from_str(&show.stdout).expect("whole show JSON");
+    assert_eq!(shown[0]["id"], id, "{show:?}");
+
+    let missing = run_br(
+        &workspace,
+        ["show", "stream-missing", "--json"],
+        "stream_missing",
+    );
+    assert_eq!(missing.status.code(), Some(3), "{missing:?}");
+    let error: Value = serde_json::from_str(&missing.stdout)
+        .unwrap_or_else(|error| panic!("whole runtime error JSON on stdout: {error}; {missing:?}"));
+    assert_eq!(error["error"]["code"], "ISSUE_NOT_FOUND", "{missing:?}");
+    assert!(missing.stderr.trim().is_empty(), "{missing:?}");
+
+    let plain_missing = run_br(
+        &workspace,
+        ["show", "stream-missing"],
+        "stream_plain_missing",
+    );
+    assert_eq!(plain_missing.status.code(), Some(3), "{plain_missing:?}");
+    assert!(plain_missing.stdout.trim().is_empty(), "{plain_missing:?}");
+    assert!(
+        plain_missing.stderr.contains("ISSUE_NOT_FOUND"),
+        "{plain_missing:?}"
+    );
+
+    let help = run_br(&workspace, ["schema", "--help"], "stream_schema_help");
+    assert!(help.status.success(), "schema help failed: {help:?}");
+    let error_help = help
+        .stdout
+        .split("- error:")
+        .nth(1)
+        .expect("error target in schema help")
+        .split("- commands:")
+        .next()
+        .expect("error target description")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        error_help.contains("stdout JSON")
+            && !error_help.contains("stderr JSON")
+            && !error_help.contains("non-TTY"),
+        "schema help must describe the observed runtime error stream: {help:?}"
+    );
+}
+
+#[test]
 fn e2e_schema_vcs_shape_matches_live_success_and_error_streams() {
     let _log = common::test_log("e2e_schema_vcs_shape_matches_live_success_and_error_streams");
     let workspace = BrWorkspace::new();
