@@ -139,7 +139,7 @@ flate2 = "1.1"
 # SqliteStorage::Drop flush the WAL instead of stranding frames on disk (#270).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.185"
-rustix = { version = "1.1.4", features = ["fs"] }
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 signal-hook = "0.4.4"
 
 [target.'cfg(windows)'.dependencies]

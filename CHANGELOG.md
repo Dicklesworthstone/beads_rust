@@ -68,6 +68,38 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ## Unreleased -- on `main` after v0.5.10
 
+- Writes to a database on a filesystem that does not persist POSIX permission
+  bits — a Windows drive under WSL (`/mnt/<drive>`) mounted without the
+  `metadata` option, FAT/exFAT — no longer fail with the engine's bare
+  `Database error: unable to open database file: '<db>-fsqlite-ns-gate'`, and
+  a database whose namespace sidecars are group/other-accessible no longer
+  wedges every command (#491, and the #403 wedge that had come back as
+  `Pending sync-merge state is unknown because fsqlite namespace sidecar
+  repair would require mutation before the pending-saga verdict`, exit 6).
+  FrankenSQLite creates `-fsqlite-ns-gate`/`-fsqlite-ns-use` with
+  `open(O_CREAT|O_EXCL, 0600)` and then refuses them when `fstat` reports
+  any group/other bit; such a mount reports its fixed mask (0777) for every
+  file and ignores every chmod, so the first write open created the gate
+  and failed on it, while `count` on a sidecar-less snapshot never touched
+  the gate (sidecar-less read-only admission) and worked. Now: the
+  authority-gated owner-only mode repair runs before the pending-saga
+  verdict (it changes no byte of any family member, and without it no
+  verdict is reachable), so a merely loosened sidecar heals and the command
+  proceeds on a POSIX filesystem; a chmod the filesystem accepts but ignores,
+  or refuses for the owner, is classified as the filesystem limitation and
+  refused up front with the mount, the `metadata` remedy, and the
+  keep-it-on-the-Linux-filesystem alternative (exit 7, `CONFIG_ERROR`); an
+  engine `CannotOpen` that names a sidecar is explained after the fact by its
+  actual cause (mount mask on a sidecar the engine just created, pre-existing
+  loose mode, foreign owner, extra hard links) instead of reading as database
+  corruption; `br doctor` names the mount limitation when the database carries
+  the same mask and its `--repair` chmod verifies that the mode actually
+  changed; and the reviewed additive reconcile path repairs sidecar modes
+  under its authority before its non-repairing open. Reads are unchanged.
+  Writing on such a mount also needs the engine change in FrankenSQLite
+  (namespace sidecars accept a mount-imposed mask), which lands with the next
+  fsqlite release; until then br refuses with the explanation above.
+
 - CI runs again: every workflow pins the manifest's toolchain
   (`nightly-2026-08-31`) instead of floating `nightly` (release.yml still
   said 2026-08-25 after the manifest moved), the audit gate installs

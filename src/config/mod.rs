@@ -10989,12 +10989,15 @@ routing:
     }
 
     /// The config-layer fast-open fallback must not repair engine namespace
-    /// permissions until it owns the database-family authority. Startup must
-    /// also classify any pending sync saga before its first mutation, so modes
-    /// that prevent that read-only verdict must fail closed without a chmod.
+    /// permissions until it owns the database-family authority. Once it does,
+    /// the owner-only mode repair is the one content-free change allowed
+    /// before the pending-saga verdict, because the engine refuses even the
+    /// read-only verdict connection until the sidecars are owner-only; a
+    /// group-accessible sidecar must therefore heal, not wedge every command
+    /// (GitHub #403, #491).
     #[cfg(unix)]
     #[test]
-    fn read_only_fast_open_refuses_namespace_repair_before_pending_verdict() {
+    fn read_only_fast_open_repairs_namespace_modes_under_authority_then_opens() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = TempDir::new().expect("tempdir");
@@ -11058,7 +11061,7 @@ routing:
         }
         drop(held_lock);
 
-        let error = open_storage_with_cli(
+        let opened = open_storage_with_cli(
             &beads_dir,
             &CliOverrides {
                 lock_timeout: Some(1_000),
@@ -11066,23 +11069,21 @@ routing:
                 ..CliOverrides::default()
             },
         )
-        .expect_err("startup must classify pending sync state before namespace repair");
-        assert!(
-            error
-                .to_string()
-                .contains("repair would require mutation before the pending-saga verdict"),
-            "unexpected fail-closed startup error: {error}"
-        );
+        .expect("the authority-holding fallback repairs the sidecar modes and opens");
+        drop(opened);
         for (sidecar, (bytes, mode)) in sidecars.iter().zip(&before) {
             assert_eq!(fs::read(sidecar).expect("reread namespace sidecar"), *bytes);
+            let healed = fs::metadata(sidecar)
+                .expect("reinspect namespace sidecar")
+                .permissions()
+                .mode();
             assert_eq!(
-                fs::metadata(sidecar)
-                    .expect("reinspect namespace sidecar")
-                    .permissions()
-                    .mode(),
-                *mode,
-                "fail-closed pending-saga inspection must not chmod {}",
-                sidecar.display()
+                healed & 0o077,
+                0,
+                "{} must be owner-only after the authority-gated repair (was {:04o}, now {:04o})",
+                sidecar.display(),
+                mode & 0o7777,
+                healed & 0o7777
             );
         }
     }

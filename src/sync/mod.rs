@@ -4738,6 +4738,18 @@ pub(crate) fn apply_reviewed_additive_reconcile_under_authority(
         ));
     }
     write_authority.verify_database_authority()?;
+    // The reconcile opener is deliberately non-repairing; the authority held
+    // here is what licenses the owner-only sidecar mode repair the engine
+    // needs before it will open the database at all (GitHub #403, #491).
+    redact_reviewed_path_result(
+        SqliteStorage::repair_namespace_sidecar_modes_under_authority(
+            &canonical_database,
+            &write_authority,
+        ),
+        &canonical_database,
+        "database",
+        "repair the fsqlite namespace sidecar modes of",
+    )?;
     let mut storage = redact_reviewed_path_result(
         SqliteStorage::open_current_for_reconcile(&canonical_database, request.lock_timeout_ms),
         &canonical_database,

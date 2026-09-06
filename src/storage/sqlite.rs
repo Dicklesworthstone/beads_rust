@@ -43,6 +43,12 @@ thread_local! {
     #[cfg(unix)]
     static SWAP_NAMESPACE_SIDECAR_AFTER_OPEN: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
+    /// Test-only emulation of a mount that accepts `fchmod` and ignores it
+    /// (WSL drvfs without `metadata`, FAT/exFAT): the sidecar mode repair
+    /// reports success while the observed bits stay put (GitHub #491).
+    #[cfg(unix)]
+    static IGNORE_NAMESPACE_SIDECAR_CHMOD: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Number of mutations between WAL checkpoint attempts.
@@ -1906,6 +1912,11 @@ impl SqliteStorage {
         });
     }
 
+    #[cfg(all(test, unix))]
+    fn set_namespace_sidecar_chmod_ignored_for_test(ignored: bool) {
+        IGNORE_NAMESPACE_SIDECAR_CHMOD.with(|flag| flag.set(ignored));
+    }
+
     pub(crate) fn attach_write_authority(
         &mut self,
         authority: Arc<crate::sync::DatabaseFamilyWriteLock>,
@@ -2409,7 +2420,9 @@ impl SqliteStorage {
         // Register as an opener before the engine open so this process never
         // starts reading a WAL that a peer's exclusive checkpoint is resetting.
         let opener_lease = Some(crate::sync::DatabaseOpenerLease::register(path)?);
-        let conn = Connection::open(path.to_string_lossy().into_owned())?;
+        let absent_namespace_sidecars = absent_namespace_sidecar_suffixes(path);
+        let conn = Connection::open(path.to_string_lossy().into_owned())
+            .map_err(|error| explain_engine_open_error(path, &absent_namespace_sidecars, error))?;
 
         // Keep SQLite's busy handler aligned with the caller's requested
         // bound. The `.write.lock` serializes normal mutating processes, while
@@ -2510,6 +2523,27 @@ impl SqliteStorage {
         Ok(storage)
     }
 
+    /// Strip group/other permission bits from fsqlite's namespace sidecars
+    /// under the exact database-family authority, without opening the
+    /// database. See [`open_with_timeout_under_write_authority`] for the
+    /// fail-closed preconditions; a filesystem that cannot hold the bits
+    /// fails with the named limitation (GitHub #491).
+    ///
+    /// [`open_with_timeout_under_write_authority`]: Self::open_with_timeout_under_write_authority
+    pub(crate) fn repair_namespace_sidecar_modes_under_authority(
+        path: &Path,
+        authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
+    ) -> Result<()> {
+        heal_namespace_sidecar_modes_under_authority(path, authority)
+    }
+
+    /// Whether the lock-free read-only lane would decline `path` because an
+    /// fsqlite namespace sidecar beside it is group/other accessible and
+    /// needs the authority-gated owner-only repair first (GitHub #403).
+    pub(crate) fn namespace_sidecars_need_mode_repair(path: &Path) -> Result<bool> {
+        namespace_sidecar_mode_repair_required(path)
+    }
+
     pub(crate) fn open_current_read_only(path: &Path) -> Result<Option<Self>> {
         let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
         // Cheap header pre-filter: only reject when the file is definitively not
@@ -2604,10 +2638,12 @@ impl SqliteStorage {
             });
         }
         let opener_lease = Some(crate::sync::DatabaseOpenerLease::register(path)?);
+        let absent_namespace_sidecars = absent_namespace_sidecar_suffixes(path);
         let conn = open_with_flags(
             path.to_string_lossy().as_ref(),
             OpenFlags::SQLITE_OPEN_READ_WRITE,
-        )?;
+        )
+        .map_err(|error| explain_engine_open_error(path, &absent_namespace_sidecars, error))?;
         if let Some(timeout_ms) = lock_timeout_ms {
             conn.execute(&format!("PRAGMA busy_timeout={timeout_ms}"))?;
         }
@@ -16481,6 +16517,137 @@ fn namespace_sidecar_mode_repair_witnesses(
     Ok(witnesses)
 }
 
+/// Effective uid of this process, for sidecar ownership classification.
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+/// The actionable refusal for a namespace sidecar whose group/other bits are
+/// imposed by the filesystem rather than by anyone's chmod (GitHub #491).
+///
+/// FrankenSQLite admits `<db>-fsqlite-ns-gate` / `-fsqlite-ns-use` only when
+/// they are owner-only (0600). A mount that does not persist POSIX permission
+/// bits — a Windows drive under WSL (`/mnt/<drive>`) mounted without the
+/// `metadata` option, FAT/exFAT volumes, some network filesystems — reports a
+/// fixed mask such as 0777 for every file, ignores the 0600 creation mode and
+/// every chmod, and so can never satisfy the engine. Nothing br could do to the
+/// sidecar changes that, so the refusal names the limitation and the remedy
+/// instead of the bare `unable to open database file` the engine produces.
+#[cfg(unix)]
+fn permissionless_filesystem_error(
+    sidecar: &Path,
+    observed_mode: u32,
+    evidence: &str,
+) -> BeadsError {
+    BeadsError::Config(format!(
+        "fsqlite namespace sidecar {} reports mode {:04o} {evidence}: the filesystem holding this database does not persist POSIX permission bits, and FrankenSQLite requires its namespace lock sidecars to be owner-only (0600). This is typical of a Windows drive under WSL (/mnt/<drive>) mounted without the `metadata` option, of FAT/exFAT volumes, and of some network mounts. Remedy: on WSL add `[automount]` with `options = \"metadata\"` to /etc/wsl.conf and run `wsl --shutdown`, or keep the .beads database on the Linux filesystem (for example under $HOME); a Windows build of br can write a database on a Windows drive from Windows",
+        sidecar.display(),
+        observed_mode & 0o7777,
+    ))
+}
+
+/// Namespace sidecar suffixes that do not exist beside `db_path` right now.
+///
+/// Recorded immediately before an engine open so a later `CannotOpen` naming
+/// one of them can be attributed to the engine's own 0600 creation rather than
+/// to a pre-existing file (see [`explain_engine_open_error`]).
+#[cfg(unix)]
+fn absent_namespace_sidecar_suffixes(db_path: &Path) -> Vec<&'static str> {
+    crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES
+        .iter()
+        .copied()
+        .filter(|suffix| {
+            matches!(
+                std::fs::symlink_metadata(database_sidecar_path(db_path, suffix)),
+                Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        })
+        .collect()
+}
+
+#[cfg(not(unix))]
+fn absent_namespace_sidecar_suffixes(_db_path: &Path) -> Vec<&'static str> {
+    Vec::new()
+}
+
+/// Which namespace sidecar, if any, an engine `CannotOpen` path names.
+#[cfg(unix)]
+fn namespace_sidecar_suffix_of(db_path: &Path, failed_path: &Path) -> Option<&'static str> {
+    let db_name = db_path.file_name()?.to_str()?;
+    let failed_name = failed_path.file_name()?.to_str()?;
+    crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES
+        .iter()
+        .copied()
+        .find(|suffix| failed_name == format!("{db_name}{suffix}"))
+}
+
+/// Replace the engine's bare `unable to open database file: '<sidecar>'` with
+/// the reason the engine refused the namespace sidecar (GitHub #403, #491).
+///
+/// FrankenSQLite reports every sidecar refusal — wrong owner, extra hard
+/// links, group/other permission bits — as `CannotOpen` naming the sidecar,
+/// which reads as database corruption. The sidecar is inspected only after the
+/// failure and nothing is changed; when the inspection does not explain the
+/// refusal the original engine error is returned unchanged.
+fn explain_engine_open_error(
+    db_path: &Path,
+    absent_sidecars_before_open: &[&'static str],
+    error: fsqlite_error::FrankenError,
+) -> BeadsError {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        if let fsqlite_error::FrankenError::CannotOpen { path } = &error
+            && let Some(suffix) = namespace_sidecar_suffix_of(db_path, path)
+            && let Ok(metadata) = std::fs::symlink_metadata(path)
+            && metadata.is_file()
+            && !metadata.file_type().is_symlink()
+        {
+            let mode = metadata.permissions().mode();
+            if metadata.uid() != effective_uid() {
+                return BeadsError::Config(format!(
+                    "fsqlite refused its namespace sidecar {} because it is owned by uid {}, not the current user (uid {}); the database itself is fine. Run br as the owner, or have the owner remove the stale `{suffix}` sidecar files (they are regenerable lock files)",
+                    path.display(),
+                    metadata.uid(),
+                    effective_uid(),
+                ));
+            }
+            if metadata.nlink() != 1 {
+                return BeadsError::Config(format!(
+                    "fsqlite refused its namespace sidecar {} because it has {} hard links and the engine requires exactly one; the database itself is fine. Remove the extra links",
+                    path.display(),
+                    metadata.nlink(),
+                ));
+            }
+            if mode & 0o077 != 0 {
+                if absent_sidecars_before_open.contains(&suffix) {
+                    // The engine created this file with mode 0600 during the
+                    // open that just failed; the bits it reads back are the
+                    // mount's, not anyone's chmod.
+                    return permissionless_filesystem_error(
+                        path,
+                        mode,
+                        "immediately after fsqlite created it with mode 0600",
+                    );
+                }
+                return BeadsError::Config(format!(
+                    "fsqlite refused its namespace sidecar {} because it has mode {:04o} and the engine requires owner-only permissions (0600); the database itself is fine. br repairs this automatically when it opens the database under its database-family authority; otherwise run `br doctor --repair` or `chmod 0600 {}`",
+                    path.display(),
+                    mode & 0o7777,
+                    path.display(),
+                ));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (db_path, absent_sidecars_before_open);
+    }
+    BeadsError::Database(error)
+}
+
 fn namespace_sidecar_mode_repair_required(db_path: &Path) -> Result<bool> {
     #[cfg(unix)]
     {
@@ -16975,6 +17142,25 @@ fn verify_namespace_healing_authority(
     Ok(())
 }
 
+/// `fchmod` the no-follow repair handle to `mode`.
+///
+/// Test builds can emulate a permission-less mount, which returns success and
+/// leaves the observed bits unchanged; the caller re-reads the handle metadata
+/// afterwards and treats that outcome as the filesystem limitation it is.
+#[cfg(unix)]
+fn apply_namespace_sidecar_mode_repair(
+    sidecar_file: &std::fs::File,
+    mode: u32,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(test)]
+    if IGNORE_NAMESPACE_SIDECAR_CHMOD.with(std::cell::Cell::get) {
+        return Ok(());
+    }
+    sidecar_file.set_permissions(std::fs::Permissions::from_mode(mode))
+}
+
 #[cfg(all(test, unix))]
 fn maybe_swap_namespace_sidecar_after_open_for_test(sidecar: &Path) -> Result<()> {
     let victim = SWAP_NAMESPACE_SIDECAR_AFTER_OPEN.with(|pending| pending.borrow_mut().take());
@@ -17100,23 +17286,36 @@ fn heal_namespace_sidecar_modes_under_authority(
             verify_namespace_healing_authority(db_path, authority)?;
             verify_namespace_healing_schema_precondition(db_path)?;
             let repaired_mode = handle_metadata.permissions().mode() & !0o077;
-            sidecar_file
-                .set_permissions(std::fs::Permissions::from_mode(repaired_mode))
-                .map_err(|error| {
-                    BeadsError::Io(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        format!(
-                            "fsqlite namespace sidecar {} has mode {:04o}; fsqlite requires owner-only permissions and the authority-gated handle repair failed ({error})",
-                            sidecar.display(),
-                            observed_mode & 0o7777
+            if let Err(error) = apply_namespace_sidecar_mode_repair(&sidecar_file, repaired_mode) {
+                // The chmod attempt is the ownership test. A refused chmod on
+                // a sidecar this user owns is the filesystem declining to
+                // store permission bits at all (GH #491), not a policy
+                // violation br can repair.
+                if handle_metadata.uid() == effective_uid() {
+                    return Err(permissionless_filesystem_error(
+                        &sidecar,
+                        observed_mode,
+                        &format!(
+                            "and the owner's chmod to {:04o} was refused ({error})",
+                            repaired_mode & 0o7777
                         ),
-                    ))
-                })?;
+                    ));
+                }
+                return Err(BeadsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "fsqlite namespace sidecar {} has mode {:04o} and is owned by uid {}, not the current user (uid {}); fsqlite requires an owner-only (0600) sidecar owned by the user running br, and the authority-gated handle repair failed ({error}). Have the owner run `chmod 0600` on it, or remove the stale sidecar files (they are regenerable lock files) as the owner",
+                        sidecar.display(),
+                        observed_mode & 0o7777,
+                        handle_metadata.uid(),
+                        effective_uid(),
+                    ),
+                )));
+            }
 
             let repaired_metadata = sidecar_file.metadata()?;
             let final_path_metadata = std::fs::symlink_metadata(&sidecar)?;
-            if repaired_metadata.permissions().mode() & 0o077 != 0
-                || final_path_metadata.file_type().is_symlink()
+            if final_path_metadata.file_type().is_symlink()
                 || !final_path_metadata.is_file()
                 || (repaired_metadata.dev(), repaired_metadata.ino()) != handle_identity
                 || (final_path_metadata.dev(), final_path_metadata.ino()) != handle_identity
@@ -17127,6 +17326,21 @@ fn heal_namespace_sidecar_modes_under_authority(
                         sidecar.display()
                     ),
                 });
+            }
+            let repaired_observed_mode = repaired_metadata.permissions().mode();
+            if repaired_observed_mode & 0o077 != 0 {
+                // fchmod on the still-identical inode returned success but
+                // the group/other bits are unchanged: the mount reports a
+                // fixed mask (WSL drvfs without `metadata`, FAT/exFAT) and
+                // silently ignores chmod (GH #491).
+                return Err(permissionless_filesystem_error(
+                    &sidecar,
+                    repaired_observed_mode,
+                    &format!(
+                        "after the owner's chmod to {:04o} returned success",
+                        repaired_mode & 0o7777
+                    ),
+                ));
             }
             verify_namespace_healing_authority(db_path, authority)?;
 
@@ -20029,7 +20243,11 @@ impl SqliteStorage {
     /// exception, and only its reader-mark array: the read-only connection
     /// takes a WAL read lock so an uncheckpointed WAL is observed (#373), and
     /// the WAL reader protocol registers that snapshot in `aReadMark` exactly
-    /// as stock SQLite does. Nothing durable changes.
+    /// as stock SQLite does. Nothing durable changes, with one content-free
+    /// exception: group/other permission bits on fsqlite's namespace lock
+    /// sidecars are stripped to owner-only under the held authority first,
+    /// because the engine refuses every open — read-only included — until they
+    /// are (GitHub #403, #491).
     pub(crate) fn inspect_pending_sync_merge_under_authority(
         path: &Path,
         authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
@@ -20056,18 +20274,20 @@ impl SqliteStorage {
         if !is_sqlite {
             return Ok(PendingSyncMergeInspection::Absent);
         }
-        // Pending-saga classification must precede every database-family
-        // mutation, including chmod. If fsqlite's namespace sidecars need a
-        // repair before they can be opened, the pending state is unknowable;
-        // fail closed and leave the entire family untouched. Once an exact
-        // Absent verdict is available, the ordinary authority-gated opener may
-        // perform the separately reviewed repair.
-        if namespace_sidecar_mode_repair_required(path)? {
-            return Err(BeadsError::SyncConflict {
-                message: "Pending sync-merge state is unknown because fsqlite namespace sidecar repair would require mutation before the pending-saga verdict"
-                    .to_string(),
-            });
-        }
+        // Pending-saga classification precedes every database-family content
+        // mutation. The one thing allowed before it is the authority-gated
+        // owner-only mode repair of fsqlite's namespace sidecars: the engine
+        // refuses even a read-only open while a sidecar is group/other
+        // accessible, so without the repair no verdict is reachable and every
+        // command — including the `br sync --merge` that would resume a
+        // pending saga — stays wedged (GitHub #403 regression, #491). The
+        // repair changes no byte of the database, WAL, journal, or sidecar
+        // records, only permission bits on regenerable lock files, and it is
+        // fail-closed on authority, inode identity, and schema readability
+        // (see `heal_namespace_sidecar_modes_under_authority`). A filesystem
+        // that cannot hold the bits fails here with the named limitation.
+        heal_namespace_sidecar_modes_under_authority(path, authority)?;
+        authority.verify_database_authority()?;
         let Some(mut storage) = Self::open_current_read_only(path)? else {
             let found = effective_database_user_version(path)?;
             return match found {
@@ -20861,9 +21081,13 @@ mod tests {
         assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
     }
 
+    /// GitHub #403 / #491: a pending receipt behind group/other-accessible
+    /// namespace sidecars must still be classified. The authority-gated mode
+    /// repair is the only thing allowed before the verdict — it changes no
+    /// byte of any family member — and the verdict then reports the receipt.
     #[cfg(unix)]
     #[test]
-    fn pending_inspection_refuses_sidecar_repair_without_mutating_valid_receipt_family() {
+    fn pending_inspection_heals_sidecar_modes_then_classifies_valid_receipt_without_byte_changes() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = TempDir::new().unwrap();
@@ -20910,19 +21134,41 @@ mod tests {
         );
         let family_before = directory_bytes_and_modes(temp.path());
 
-        let error = SqliteStorage::inspect_pending_sync_merge_under_authority(&db_path, &authority)
-            .expect_err("pending inspection must not chmod before its verdict");
+        let inspection =
+            SqliteStorage::inspect_pending_sync_merge_under_authority(&db_path, &authority)
+                .expect("pending inspection reaches a verdict after the sidecar mode repair");
         assert!(
-            error
-                .to_string()
-                .contains("repair would require mutation before the pending-saga verdict"),
-            "unexpected pending-sidecar inspection error: {error}"
+            matches!(inspection, PendingSyncMergeInspection::Valid(_)),
+            "expected the valid pending receipt, got {inspection:?}"
         );
-        assert_eq!(
-            directory_bytes_and_modes(temp.path()),
-            family_before,
-            "pending inspection changed database-family bytes or modes before returning"
-        );
+
+        let family_after = directory_bytes_and_modes(temp.path());
+        let sidecar_names: Vec<String> = sidecars
+            .iter()
+            .map(|sidecar| sidecar.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        for (name, (bytes_before, mode_before)) in &family_before {
+            let (bytes_after, mode_after) = family_after
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} vanished during pending inspection"));
+            // The read-only verdict connection registers its WAL snapshot in
+            // the `-shm` reader-mark array exactly as stock SQLite does
+            // (#476); every other family member must be byte-identical.
+            if !name.ends_with("-shm") {
+                assert_eq!(bytes_after, bytes_before, "{name} bytes changed");
+            }
+            if sidecar_names.contains(name) {
+                assert_eq!(mode_before & 0o077, 0o064, "{name} fixture mode");
+                assert_eq!(
+                    mode_after & 0o077,
+                    0,
+                    "{name} must be owner-only after the repair (mode {:04o})",
+                    mode_after & 0o7777
+                );
+            } else {
+                assert_eq!(mode_after, mode_before, "{name} mode changed");
+            }
+        }
     }
 
     #[test]
@@ -21372,6 +21618,339 @@ mod tests {
                 sidecar.display(),
                 mode & 0o7777
             );
+        }
+    }
+
+    /// Seed a checkpointed database with one issue and return it closed.
+    #[cfg(unix)]
+    fn seed_closed_database(db_path: &Path, issue_id: &str) {
+        let mut storage = SqliteStorage::open(db_path).unwrap();
+        let issue = make_issue(
+            issue_id,
+            "sidecar mode fixture",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .conn
+            .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+    }
+
+    /// Resets the chmod-ignored emulation when a test unwinds.
+    #[cfg(unix)]
+    struct ChmodIgnoredGuard;
+
+    #[cfg(unix)]
+    impl Drop for ChmodIgnoredGuard {
+        fn drop(&mut self) {
+            SqliteStorage::set_namespace_sidecar_chmod_ignored_for_test(false);
+        }
+    }
+
+    /// GitHub #491: on a mount that accepts chmod and ignores it (WSL drvfs
+    /// without `metadata`, FAT/exFAT) the authority-gated repair cannot make
+    /// a sidecar owner-only. Both the writable opener and the pending-saga
+    /// verdict must then refuse with the named filesystem limitation and its
+    /// remedy — not the engine's bare `unable to open database file`, and not
+    /// a misattributed "changed identity" or "state is unknown" refusal — and
+    /// leave every byte alone. Once the mount honours chmod again the same
+    /// database heals and opens.
+    #[cfg(unix)]
+    #[test]
+    fn permissionless_mount_emulation_refuses_with_named_limitation_then_heals() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        seed_closed_database(&db_path, "bd-drvfs");
+        let sidecars = existing_namespace_sidecars(&db_path);
+        assert_eq!(sidecars.len(), 2, "both namespace sidecars exist");
+        for sidecar in &sidecars {
+            fs::set_permissions(sidecar, fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        let bytes_before: Vec<Vec<u8>> = sidecars.iter().map(|s| fs::read(s).unwrap()).collect();
+        let database_before = fs::read(&db_path).unwrap();
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                temp.path(),
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+
+        let _guard = ChmodIgnoredGuard;
+        SqliteStorage::set_namespace_sidecar_chmod_ignored_for_test(true);
+
+        let assert_named_limitation = |error: &BeadsError, lane: &str| {
+            assert!(
+                matches!(error, BeadsError::Config(_)),
+                "{lane}: expected a configuration error, got {error:?}"
+            );
+            let text = error.to_string();
+            for needle in [
+                "-fsqlite-ns-gate",
+                "reports mode 0777",
+                "does not persist POSIX permission bits",
+                "owner-only (0600)",
+                "/mnt/<drive>",
+                "`metadata`",
+                "/etc/wsl.conf",
+                "Linux filesystem",
+            ] {
+                assert!(
+                    text.contains(needle),
+                    "{lane}: missing {needle:?} in {text}"
+                );
+            }
+            assert!(
+                !text.contains("unable to open database file"),
+                "{lane}: must not surface the bare engine error: {text}"
+            );
+        };
+
+        let error =
+            SqliteStorage::open_with_timeout_under_write_authority(&db_path, Some(50), &authority)
+                .expect_err("chmod-ignoring mount cannot satisfy the engine");
+        assert_named_limitation(&error, "writable open");
+
+        let error = SqliteStorage::inspect_pending_sync_merge_under_authority(&db_path, &authority)
+            .expect_err("verdict cannot be reached on a chmod-ignoring mount");
+        assert_named_limitation(&error, "pending-saga verdict");
+        assert!(
+            !error.to_string().contains("state is unknown"),
+            "the limitation must not be reported as verdict uncertainty: {error}"
+        );
+
+        assert_eq!(fs::read(&db_path).unwrap(), database_before);
+        for (sidecar, before) in sidecars.iter().zip(&bytes_before) {
+            assert_eq!(&fs::read(sidecar).unwrap(), before, "{}", sidecar.display());
+            assert_eq!(
+                fs::metadata(sidecar).unwrap().permissions().mode() & 0o777,
+                0o777,
+                "emulated mount keeps its mask on {}",
+                sidecar.display()
+            );
+        }
+
+        // The mount honours chmod again: the same authority heals and opens.
+        SqliteStorage::set_namespace_sidecar_chmod_ignored_for_test(false);
+        assert!(matches!(
+            SqliteStorage::inspect_pending_sync_merge_under_authority(&db_path, &authority)
+                .expect("verdict after the repair"),
+            PendingSyncMergeInspection::Absent
+        ));
+        let storage =
+            SqliteStorage::open_with_timeout_under_write_authority(&db_path, Some(50), &authority)
+                .expect("healed sidecars open");
+        assert!(storage.get_issue("bd-drvfs").unwrap().is_some());
+        for sidecar in &sidecars {
+            assert_eq!(
+                fs::metadata(sidecar).unwrap().permissions().mode() & 0o077,
+                0
+            );
+        }
+    }
+
+    /// GitHub #403 / #491: the engine reports every namespace-sidecar refusal
+    /// as `unable to open database file: '<sidecar>'`. br explains the actual
+    /// cause after the fact — filesystem mask on a sidecar the engine just
+    /// created, a pre-existing loose mode, extra hard links — and leaves any
+    /// other engine error untouched.
+    #[cfg(unix)]
+    #[test]
+    fn engine_sidecar_refusal_is_explained_by_cause() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        fs::write(&db_path, b"not inspected").unwrap();
+        let gate = database_sidecar_path(&db_path, "-fsqlite-ns-gate");
+        let cannot_open = || fsqlite_error::FrankenError::CannotOpen { path: gate.clone() };
+
+        // Created by the engine during the failed open, bits imposed by the
+        // mount: the named filesystem limitation.
+        fs::write(&gate, b"").unwrap();
+        fs::set_permissions(&gate, fs::Permissions::from_mode(0o777)).unwrap();
+        let explained = explain_engine_open_error(&db_path, &["-fsqlite-ns-gate"], cannot_open());
+        assert!(matches!(explained, BeadsError::Config(_)), "{explained:?}");
+        let text = explained.to_string();
+        assert!(
+            text.contains("immediately after fsqlite created it with mode 0600"),
+            "{text}"
+        );
+        assert!(
+            text.contains("does not persist POSIX permission bits"),
+            "{text}"
+        );
+        assert!(text.contains("/etc/wsl.conf"), "{text}");
+
+        // Pre-existing loose mode: a repairable policy violation.
+        let explained = explain_engine_open_error(&db_path, &[], cannot_open());
+        assert!(matches!(explained, BeadsError::Config(_)), "{explained:?}");
+        let text = explained.to_string();
+        assert!(text.contains("has mode 0777"), "{text}");
+        assert!(text.contains("owner-only permissions (0600)"), "{text}");
+        assert!(text.contains("br doctor --repair"), "{text}");
+        assert!(!text.contains("does not persist"), "{text}");
+
+        // Extra hard link, owner-only mode.
+        fs::set_permissions(&gate, fs::Permissions::from_mode(0o600)).unwrap();
+        let alias = temp.path().join("gate-alias");
+        fs::hard_link(&gate, &alias).unwrap();
+        let explained = explain_engine_open_error(&db_path, &[], cannot_open());
+        let text = explained.to_string();
+        assert!(text.contains("has 2 hard links"), "{text}");
+        fs::remove_file(&alias).unwrap();
+
+        // Owner-only, single link, owned by us: nothing to explain — the
+        // engine error is returned unchanged.
+        let explained = explain_engine_open_error(&db_path, &[], cannot_open());
+        assert!(
+            matches!(
+                &explained,
+                BeadsError::Database(fsqlite_error::FrankenError::CannotOpen { path }) if *path == gate
+            ),
+            "{explained:?}"
+        );
+
+        // A `CannotOpen` naming the database itself, and a non-open error.
+        let explained = explain_engine_open_error(
+            &db_path,
+            &["-fsqlite-ns-gate"],
+            fsqlite_error::FrankenError::CannotOpen {
+                path: db_path.clone(),
+            },
+        );
+        assert!(
+            matches!(explained, BeadsError::Database(_)),
+            "{explained:?}"
+        );
+        let explained = explain_engine_open_error(
+            &db_path,
+            &["-fsqlite-ns-gate"],
+            fsqlite_error::FrankenError::Busy,
+        );
+        assert!(
+            matches!(
+                explained,
+                BeadsError::Database(fsqlite_error::FrankenError::Busy)
+            ),
+            "{explained:?}"
+        );
+    }
+
+    /// GitHub #491: a standalone snapshot (database copied without the engine's
+    /// writer sidecars) reads through the lock-free read-only lane without
+    /// creating a sidecar, which is why `br count` works where `br create`
+    /// fails on a permission-less mount.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_without_namespace_sidecars_reads_without_creating_them() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        seed_closed_database(&db_path, "bd-snapshot");
+        for sidecar in existing_namespace_sidecars(&db_path) {
+            fs::remove_file(sidecar).unwrap();
+        }
+        assert!(existing_namespace_sidecars(&db_path).is_empty());
+        assert_eq!(absent_namespace_sidecar_suffixes(&db_path).len(), 2);
+
+        let storage = SqliteStorage::open_current_read_only(&db_path)
+            .expect("read-only open of a sidecar-less snapshot")
+            .expect("current schema");
+        assert!(storage.get_issue("bd-snapshot").unwrap().is_some());
+        drop(storage);
+        assert!(
+            existing_namespace_sidecars(&db_path).is_empty(),
+            "the read-only lane must not create namespace sidecars"
+        );
+    }
+
+    /// GitHub #491, opt-in against a real permission-less mount: point
+    /// `BR_PERMISSIONLESS_FS_DIR` at a writable directory on a WSL Windows
+    /// drive without `metadata`, or a FAT volume mounted with a 0777 mask, and
+    /// a standalone snapshot copied there must read, and must either write or
+    /// refuse with the named limitation — never with the bare engine error.
+    #[cfg(unix)]
+    #[test]
+    fn permissionless_mount_snapshot_reads_and_write_is_supported_or_explained() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(root) = std::env::var_os("BR_PERMISSIONLESS_FS_DIR") else {
+            eprintln!("BR_PERMISSIONLESS_FS_DIR unset; skipping");
+            return;
+        };
+        let seed = TempDir::new().unwrap();
+        let seed_db = seed.path().join("beads.db");
+        seed_closed_database(&seed_db, "bd-mount");
+
+        let mount_dir = tempfile::Builder::new()
+            .prefix("br-ns-mask-")
+            .tempdir_in(root)
+            .unwrap();
+        let beads_dir = mount_dir.path().join(".beads");
+        fs::create_dir(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        fs::copy(&seed_db, &db_path).unwrap();
+        let probe = beads_dir.join("mode-probe");
+        fs::write(&probe, b"").unwrap();
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o600)).unwrap();
+        let probe_mode = fs::metadata(&probe).unwrap().permissions().mode();
+        assert_ne!(
+            probe_mode & 0o077,
+            0,
+            "{} does not look like a permission-less mount (probe mode {:04o})",
+            beads_dir.display(),
+            probe_mode & 0o7777
+        );
+
+        // Read lane: sidecar-less snapshot reads.
+        let storage = SqliteStorage::open_current_read_only(&db_path)
+            .expect("read-only open on the mount")
+            .expect("current schema");
+        assert!(storage.get_issue("bd-mount").unwrap().is_some());
+        drop(storage);
+
+        // Write lane: supported (engine tolerates the mount mask) or refused
+        // with the actionable explanation.
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+        match SqliteStorage::open_with_timeout_under_write_authority(&db_path, Some(50), &authority)
+        {
+            Ok(mut storage) => {
+                let issue = make_issue(
+                    "bd-mount-write",
+                    "write on a permission-less mount",
+                    Status::Open,
+                    2,
+                    None,
+                    Utc::now(),
+                    None,
+                );
+                storage.create_issue(&issue, "tester").unwrap();
+            }
+            Err(error) => {
+                let text = error.to_string();
+                assert!(matches!(error, BeadsError::Config(_)), "{error:?}");
+                assert!(
+                    text.contains("does not persist POSIX permission bits"),
+                    "{text}"
+                );
+                assert!(text.contains("/etc/wsl.conf"), "{text}");
+                assert!(!text.contains("unable to open database file"), "{text}");
+            }
         }
     }
 

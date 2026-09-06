@@ -278,6 +278,12 @@ fn main() {
                 let routed = reviewed_schema_migration_required(error);
                 handle_error(&routed, json_error_mode, color_error_mode)
             }
+            // An environment refusal (a filesystem that cannot hold the
+            // engine's sidecar permission bits, #491) is not inspection
+            // uncertainty: surface it as itself, remedy included.
+            Err(error @ BeadsError::Config(_)) => {
+                handle_error(&error, json_error_mode, color_error_mode)
+            }
             Err(error) => handle_error(
                 &BeadsError::SyncConflict {
                     message: format!(
@@ -336,6 +342,11 @@ fn main() {
             Err(error @ BeadsError::SchemaMismatch { .. }) => {
                 let routed = reviewed_schema_migration_required(error);
                 handle_error(&routed, json_error_mode, color_error_mode);
+            }
+            // See the no-DB gate above: a named environment refusal is not
+            // inspection uncertainty (#491).
+            Err(error @ BeadsError::Config(_)) => {
+                handle_error(&error, json_error_mode, color_error_mode);
             }
             Err(error) => {
                 handle_error(

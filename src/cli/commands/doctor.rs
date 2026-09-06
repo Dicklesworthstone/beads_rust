@@ -1071,14 +1071,25 @@ pub fn inspect_pending_sync_merge_at_path(db_path: &Path) -> Result<Option<Pendi
         }
     }
 
-    let storage = SqliteStorage::open_current_read_only(db_path)?.ok_or_else(|| {
-        BeadsError::SyncConflict {
+    let Some(storage) = SqliteStorage::open_current_read_only(db_path)? else {
+        // The lock-free lane also declines when an fsqlite namespace sidecar
+        // needs the authority-gated owner-only mode repair; that is not a
+        // schema problem and must not be reported as one (GitHub #491).
+        if SqliteStorage::namespace_sidecars_need_mode_repair(db_path)? {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Pending sync-merge state is unknown because an fsqlite namespace sidecar beside database '{}' is group/other accessible; the repair to owner-only (0600) runs once the database-family authority is held",
+                    db_path.display()
+                ),
+            });
+        }
+        return Err(BeadsError::SyncConflict {
             message: format!(
                 "Pending sync-merge state is unknown because database '{}' does not have the current supported schema",
                 db_path.display()
             ),
-        }
-    })?;
+        });
+    };
     Ok(PendingSyncMergeState::from_inspection(
         storage.inspect_pending_sync_merge()?,
     ))
@@ -6497,11 +6508,29 @@ fn check_db_sidecar_modes(db_path: &Path, checks: &mut Vec<CheckResult>) {
             .map(|(path, mode)| format!("{} (mode {mode:04o})", path.display()))
             .collect::<Vec<_>>()
             .join(", ");
-        let remediation = offenders
+        // A database carrying exactly the same group/other bits as every
+        // offending sidecar is the signature of a mount that reports a fixed
+        // mask instead of stored permission bits (WSL drvfs without
+        // `metadata`, FAT/exFAT; GitHub #491). chmod cannot fix that, so say
+        // so instead of prescribing a no-op.
+        let database_mask = fs::symlink_metadata(db_path)
+            .ok()
+            .filter(|meta| meta.is_file() && !meta.file_type().is_symlink())
+            .map(|meta| meta.permissions().mode() & 0o077);
+        let filesystem_mask_suspected = database_mask
+            .is_some_and(|mask| offenders.iter().all(|(_, mode)| mode & 0o077 == mask));
+        let mut remediation = offenders
             .iter()
             .map(|(path, _)| format!("chmod 0600 {}", path.display()))
             .collect::<Vec<_>>()
             .join("; ");
+        if filesystem_mask_suspected {
+            remediation.push_str(
+                "; if chmod has no effect, the filesystem does not persist POSIX permission bits \
+                 (a Windows drive under WSL mounted without the `metadata` option, FAT/exFAT): \
+                 mount it with `metadata` or keep the .beads database on the Linux filesystem",
+            );
+        }
         push_check(
             checks,
             "permissions.db_sidecars",
@@ -6519,6 +6548,7 @@ fn check_db_sidecar_modes(db_path: &Path, checks: &mut Vec<CheckResult>) {
                     }))
                     .collect::<Vec<_>>(),
                 "required_mode_octal": "0600",
+                "filesystem_mask_suspected": filesystem_mask_suspected,
                 "remediation": remediation,
             })),
         );
@@ -6592,6 +6622,22 @@ fn fix_db_sidecar_modes_if_warned(
             session.set_fixer("doctor.db_sidecar_mode_chmod");
             match chokepoint::mutate(&session.ctx, &sidecar, Op::Chmod { mode: new_mode }) {
                 Ok(result) if result.ok => {
+                    // A mount that ignores chmod (WSL drvfs without
+                    // `metadata`, FAT/exFAT) reports success and keeps its
+                    // mask; that is not a repair (GitHub #491).
+                    let observed = fs::symlink_metadata(&sidecar)
+                        .map(|meta| meta.permissions().mode())
+                        .unwrap_or(new_mode);
+                    if observed & 0o077 != 0 {
+                        if !ctx.is_json() {
+                            ctx.warning(&format!(
+                                "chmod on database sidecar {} returned success but the mode is still {:04o}: this filesystem does not persist POSIX permission bits (a Windows drive under WSL mounted without `metadata`, FAT/exFAT). Mount it with `metadata` or keep the .beads database on the Linux filesystem",
+                                sidecar.display(),
+                                observed & 0o7777
+                            ));
+                        }
+                        continue;
+                    }
                     repaired_any = true;
                     if !ctx.is_json() {
                         ctx.info(&format!(
