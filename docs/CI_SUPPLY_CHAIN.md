@@ -117,11 +117,32 @@ benchmark shell controls live in `tests/workflow_action_pins.rs`. Calibrated
 budgets belong in `BR_PERF_BUDGETS_JSON`; changing them requires reviewing the
 retained measurements, rather than accepting a failed run as the next baseline.
 
+The receipt gate consumes conditional median and p95 intervals from the Rust
+comparator, with explicit retained block IDs matched to the raw ABBA order.
+It checks the declared protocol, selected block order statistics, endpoint
+arithmetic and budget decision; it does not recompute binomial ranks in Python.
+The 95% joint coverage applies to one comparison under the stated assumption
+of independent, identically distributed whole blocks, allowing dependence
+within each block. It does not cover all 28 workloads simultaneously, and low
+runner load does not establish the assumption. Observed support remains
+descriptive; an overflowing support percentage is null and cannot alone veto
+finite quantile inference. Legacy or malformed inference cannot pass. A full
+pass requires both quantile upper bounds within budget; either lower bound can
+establish a regression. Unbounded or inconclusive A/A comparisons remain exit 2.
+The unchanged ten-block live default has insufficient observations for a finite
+p95 upper bound at this error allocation; at least 99 blocks are needed for
+that endpoint. The shell's positive serialization control explicitly declares
+99 blocks and is not evidence of a live calibrated performance pass. Full raw
+row and retained-sample counts follow the declared block count, with two warmup
+blocks still required.
+
 The same job separately selects `1000-ready-default-auto-flush` and measures the
 candidate against itself, with 20 real ready invocations on the second side.
 This sensitivity control must retain all 48 ABBA observations and report
 `Regression` at a fixed 100% diagnostic threshold; that threshold is not an
-accepted SLO. Its actual collector exit and combined stdout/stderr log are
+accepted SLO. Its ten retained blocks can establish a median regression while
+p95 upper bounds remain null; its receipt IDs must still match the raw blocks.
+Its actual collector exit and combined stdout/stderr log are
 uploaded under `planted-ready`, including on failure. A failed control remains
 a failed job step while the full A/A and A/B cohorts still run after a successful
 build. The fragment tests use an explicitly labeled mock collector to check

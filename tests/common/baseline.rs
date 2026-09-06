@@ -630,6 +630,10 @@ pub const MATCHED_RUN_METADATA: [&str; 16] = [
     "build_profile",
 ];
 
+/// Coverage is conditional on IID whole blocks, not independent invocations.
+/// A quiet-runner admission check does not establish this statistical assumption.
+pub const MATCHED_BLOCK_PROTOCOL: &str = "abba_two_per_side_iid_blocks_assumed_v1";
+
 /// A single side of an alternating baseline/candidate release measurement.
 /// Timings include every measured invocation; failed invocations are retained.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -638,6 +642,10 @@ pub struct MatchedRun {
     pub metadata: BTreeMap<String, String>,
     pub samples_ms: Vec<f64>,
     pub exit_codes: Vec<i32>,
+    /// Actual retained ABBA block IDs, aligned with timings and exit codes.
+    /// Absent block evidence permits descriptive summaries only.
+    #[serde(default)]
+    pub block_ids: Vec<usize>,
 }
 
 impl MatchedRun {
@@ -698,6 +706,33 @@ impl MatchedRun {
         }
         Ok(())
     }
+
+    fn validate_blocks(&self) -> Result<(), String> {
+        if self.metadata.get("sampling_protocol").map(String::as_str)
+            != Some(MATCHED_BLOCK_PROTOCOL)
+        {
+            return Err("missing or unsupported sampling_protocol for quantile inference".into());
+        }
+        if self.block_ids.len() != self.samples_ms.len()
+            || !self.block_ids.len().is_multiple_of(2)
+            || self
+                .block_ids
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .any(|pair| pair[0] != pair[1])
+            || self
+                .block_ids
+                .windows(4)
+                .step_by(2)
+                .any(|window| window[0].checked_add(1) != Some(window[2]))
+        {
+            return Err(
+                "block_ids must identify contiguous blocks with exactly two samples each".into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -737,8 +772,9 @@ pub struct ObservedSupportInterval {
     pub method: String,
     pub lower_ms: f64,
     pub upper_ms: f64,
-    pub lower_pct: f64,
-    pub upper_pct: f64,
+    /// None means the descriptive percentage is outside the finite f64 range.
+    pub lower_pct: Option<f64>,
+    pub upper_pct: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -748,8 +784,35 @@ pub struct MatchedComparison {
     pub budget_pct: Option<f64>,
     pub median: Option<TimingDelta>,
     pub p95: Option<TimingDelta>,
-    pub uncertainty: Option<ObservedSupportInterval>,
+    pub observed_support: Option<ObservedSupportInterval>,
+    pub uncertainty: Option<QuantileUncertainty>,
     pub diagnostic: String,
+}
+
+/// One-based order-statistic ranks; 0 and block_count+1 mean unbounded endpoints.
+/// JSON nulls preserve unavailable bounds instead of clamping them to extrema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuantileInterval {
+    pub lower_rank: usize,
+    pub upper_rank: usize,
+    pub baseline_lower_ms: f64,
+    pub baseline_upper_ms: Option<f64>,
+    pub candidate_lower_ms: f64,
+    pub candidate_upper_ms: Option<f64>,
+    pub lower: Option<TimingDelta>,
+    pub upper: Option<TimingDelta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuantileUncertainty {
+    pub method: String,
+    pub assumption: String,
+    pub coverage_scope: String,
+    pub confidence_level: f64,
+    pub one_sided_error_probability: f64,
+    pub block_count: usize,
+    pub median: QuantileInterval,
+    pub p95: QuantileInterval,
 }
 
 impl MatchedComparison {
@@ -832,11 +895,165 @@ fn validate_and_summarize_matched_runs(
     ))
 }
 
+const QUANTILE_TAIL_ALPHA: f64 = 1.0 / 160.0;
+
+/// Exact binomial order-statistic construction (NIST TN 2119, section 5.3).
+/// For K~Bin(n,p), choose largest r with P(K<r)<=alpha and smallest s with
+/// P(K>=s)<=alpha. Ranks 0/n+1 represent genuinely unbounded endpoints.
+/// Mode-centered relative masses avoid underflow at p=.95 for large n.
+fn quantile_ranks(
+    blocks: usize,
+    numerator: u32,
+    denominator: u32,
+) -> Result<(usize, usize), String> {
+    let trials = u32::try_from(blocks).map_err(|_| "too many blocks for quantile inference")?;
+    let mode =
+        u32::try_from((u64::from(trials) + 1) * u64::from(numerator) / u64::from(denominator))
+            .map_err(|_| "binomial mode overflow")?;
+    let mode_index = usize::try_from(mode).map_err(|_| "binomial mode exceeds index range")?;
+    let n = f64::from(trials);
+    let odds = f64::from(numerator) / f64::from(denominator - numerator);
+    let mut masses = vec![0.0; blocks + 1];
+    masses[mode_index] = 1.0;
+    let mut k = f64::from(mode);
+    for index in (1..=mode_index).rev() {
+        masses[index - 1] = masses[index] * k / (n - k + 1.0) / odds;
+        k -= 1.0;
+    }
+    k = f64::from(mode);
+    for index in mode_index..blocks {
+        masses[index + 1] = masses[index] * (n - k) / (k + 1.0) * odds;
+        k += 1.0;
+    }
+    let total: f64 = masses.iter().sum();
+    // Widen, never narrow, the interval when a tail is near the floating-point
+    // comparison boundary. Accumulate each tail directly, never as 1-CDF.
+    let alpha = (32.0 * f64::EPSILON).mul_add(-(n + 1.0), QUANTILE_TAIL_ALPHA);
+    if !positive_finite(total) || alpha <= 0.0 {
+        return Err("insufficient numerical precision for binomial tails".into());
+    }
+    let mut lower = 0;
+    let mut tail = 0.0;
+    for (index, mass) in masses.iter().take(blocks).enumerate() {
+        tail += mass / total;
+        if tail > alpha {
+            break;
+        }
+        lower = index + 1;
+    }
+    let mut upper = blocks + 1;
+    tail = 0.0;
+    for (index, mass) in masses.iter().enumerate().skip(1).rev() {
+        tail += mass / total;
+        if tail > alpha {
+            break;
+        }
+        upper = index;
+    }
+    Ok((lower, upper))
+}
+
+fn block_extrema(run: &MatchedRun) -> (Vec<f64>, Vec<f64>) {
+    let (mut minima, mut maxima): (Vec<_>, Vec<_>) = run
+        .samples_ms
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| (pair[0].min(pair[1]), pair[0].max(pair[1])))
+        .unzip();
+    minima.sort_by(f64::total_cmp);
+    maxima.sort_by(f64::total_cmp);
+    (minima, maxima)
+}
+
+fn quantile_interval(
+    baseline: &(Vec<f64>, Vec<f64>),
+    candidate: &(Vec<f64>, Vec<f64>),
+    numerator: u32,
+    denominator: u32,
+) -> Result<QuantileInterval, String> {
+    let (lower_rank, upper_rank) = quantile_ranks(baseline.0.len(), numerator, denominator)?;
+    let baseline_lower_ms = lower_rank.checked_sub(1).map_or(0.0, |i| baseline.0[i]);
+    let candidate_lower_ms = lower_rank.checked_sub(1).map_or(0.0, |i| candidate.0[i]);
+    let baseline_upper_ms = baseline.1.get(upper_rank - 1).copied();
+    let candidate_upper_ms = candidate.1.get(upper_rank - 1).copied();
+    let lower = baseline_upper_ms.map(|ms| TimingDelta::new(ms, candidate_lower_ms));
+    let upper = candidate_upper_ms
+        .filter(|_| baseline_lower_ms > 0.0)
+        .map(|ms| TimingDelta::new(baseline_lower_ms, ms));
+    if lower
+        .iter()
+        .chain(upper.iter())
+        .any(|delta| !delta.delta_ms.is_finite() || !delta.delta_pct.is_finite())
+    {
+        return Err("quantile comparison arithmetic overflow".into());
+    }
+    Ok(QuantileInterval {
+        lower_rank,
+        upper_rank,
+        baseline_lower_ms,
+        baseline_upper_ms,
+        candidate_lower_ms,
+        candidate_upper_ms,
+        lower,
+        upper,
+    })
+}
+
+fn infer_quantiles(
+    baseline: &MatchedRun,
+    candidate: &MatchedRun,
+) -> Result<QuantileUncertainty, String> {
+    baseline.validate_blocks()?;
+    candidate.validate_blocks()?;
+    if baseline.block_ids != candidate.block_ids {
+        return Err("mismatched baseline/candidate block_ids".into());
+    }
+    let baseline_extrema = block_extrema(baseline);
+    let candidate_extrema = block_extrema(candidate);
+    Ok(QuantileUncertainty {
+        method: "binomial_order_statistics_of_block_minima_and_maxima".into(),
+        assumption: "independent identically distributed whole ABBA blocks; dependence within a block allowed; runner load does not establish this assumption".into(),
+        coverage_scope: "joint median and p95 for this comparison only; not simultaneous across workloads or repeated comparisons".into(),
+        confidence_level: 0.95,
+        one_sided_error_probability: QUANTILE_TAIL_ALPHA,
+        block_count: baseline_extrema.0.len(),
+        median: quantile_interval(&baseline_extrema, &candidate_extrema, 1, 2)?,
+        p95: quantile_interval(&baseline_extrema, &candidate_extrema, 19, 20)?,
+    })
+}
+
+impl QuantileUncertainty {
+    fn classify(&self, budget_pct: f64) -> MatchedState {
+        if !budget_pct.is_finite() || budget_pct < 0.0 {
+            return MatchedState::Inconclusive;
+        }
+        let intervals = [&self.median, &self.p95];
+        let budget_ms = |delta: &TimingDelta| delta.baseline_ms * (budget_pct / 100.0);
+        if intervals.iter().any(|interval| {
+            interval.lower.as_ref().is_some_and(|delta| {
+                budget_ms(delta).is_finite() && delta.delta_ms > budget_ms(delta)
+            })
+        }) {
+            MatchedState::Regression
+        } else if intervals.iter().all(|interval| {
+            interval.upper.as_ref().is_some_and(|delta| {
+                budget_ms(delta).is_finite() && delta.delta_ms <= budget_ms(delta)
+            })
+        }) {
+            MatchedState::Pass
+        } else {
+            MatchedState::Inconclusive
+        }
+    }
+}
+
 /// Compare raw timings without filtering outliers. Median averages the middle
 /// two values for even counts; p95 uses nearest rank (ceil(0.95*n), one-based).
 /// Source/lockfile/binary provenance may differ intentionally; all other metadata
-/// must match. A decision requires the entire observed-support interval to lie
-/// on one side of the relative budget. Overlap is inconclusive, not a pass.
+/// must match. Conditional IID-block quantile bounds decide the gate: both
+/// upper bounds must meet budget to pass; either lower bound can prove a
+/// regression. Extrema remain descriptive and never substitute for uncertainty.
 /// An invalid/absent budget retains descriptive deltas but cannot pass the gate.
 pub fn compare_matched_runs(
     baseline: Option<&MatchedRun>,
@@ -861,6 +1078,7 @@ pub fn compare_matched_runs(
         budget_pct: valid_budget.then_some(budget_pct),
         median: None,
         p95: None,
+        observed_support: None,
         uncertainty: None,
     };
     let reason = validate_and_summarize_matched_runs(baseline, candidate);
@@ -878,9 +1096,7 @@ pub fn compare_matched_runs(
     let p95 = TimingDelta::new(baseline_summary.p95_ms, candidate_summary.p95_ms);
     let lower = TimingDelta::new(baseline_summary.max_ms, candidate_summary.min_ms);
     let upper = TimingDelta::new(baseline_summary.min_ms, candidate_summary.max_ms);
-    let lower_budget_ms = lower.baseline_ms * (budget_pct / 100.0);
-    let upper_budget_ms = upper.baseline_ms * (budget_pct / 100.0);
-    if [&median, &p95, &lower, &upper]
+    if [&median, &p95]
         .iter()
         .any(|delta| !delta.delta_ms.is_finite() || !delta.delta_pct.is_finite())
     {
@@ -889,18 +1105,32 @@ pub fn compare_matched_runs(
             .push_str("; inconclusive: comparison arithmetic overflow");
         return comparison;
     }
-    comparison.state =
-        if !valid_budget || !lower_budget_ms.is_finite() || !upper_budget_ms.is_finite() {
-            MatchedState::Inconclusive
-        } else if lower.delta_ms > lower_budget_ms {
-            MatchedState::Regression
-        } else if upper.delta_ms <= upper_budget_ms {
-            MatchedState::Pass
+    let inference = infer_quantiles(baseline.expect("validated baseline receipt"), candidate);
+    let inference_diagnostic = match inference {
+        Ok(uncertainty) => {
+            comparison.state = uncertainty.classify(budget_pct);
+            let diagnostic = format!(
+                "conditional IID-block 95% joint median/p95 bounds for this comparison only; {} blocks; median ranks [{}, {}], p95 ranks [{}, {}]; unbounded endpoints remain null",
+                uncertainty.block_count,
+                uncertainty.median.lower_rank,
+                uncertainty.median.upper_rank,
+                uncertainty.p95.lower_rank,
+                uncertainty.p95.upper_rank,
+            );
+            comparison.uncertainty = Some(uncertainty);
+            diagnostic
+        }
+        Err(reason) => format!("quantile inference unavailable: {reason}"),
+    };
+    let support_percentage = |pct: f64| {
+        if pct.is_finite() {
+            format!("{pct:+.3}%")
         } else {
-            MatchedState::Inconclusive
-        };
+            "unrepresentable".into()
+        }
+    };
     comparison.diagnostic = format!(
-        "{}: {:?}; budget {}; median delta {:+.6} ms ({:+.3}%); p95 delta {:+.6} ms ({:+.3}%); observed-support range [{:+.3}%, {:+.3}%] (not a confidence interval)",
+        "{}: {:?}; budget {}; median delta {:+.6} ms ({:+.3}%); p95 delta {:+.6} ms ({:+.3}%); observed-support range [{}, {}] (descriptive only); {}",
         comparison.command,
         comparison.state,
         budget_description,
@@ -908,17 +1138,18 @@ pub fn compare_matched_runs(
         median.delta_pct,
         p95.delta_ms,
         p95.delta_pct,
-        lower.delta_pct,
-        upper.delta_pct,
+        support_percentage(lower.delta_pct),
+        support_percentage(upper.delta_pct),
+        inference_diagnostic,
     );
     comparison.median = Some(median);
     comparison.p95 = Some(p95);
-    comparison.uncertainty = Some(ObservedSupportInterval {
+    comparison.observed_support = Some(ObservedSupportInterval {
         method: "observed_support_extrema_not_confidence_interval".to_string(),
         lower_ms: lower.delta_ms,
         upper_ms: upper.delta_ms,
-        lower_pct: lower.delta_pct,
-        upper_pct: upper.delta_pct,
+        lower_pct: lower.delta_pct.is_finite().then_some(lower.delta_pct),
+        upper_pct: upper.delta_pct.is_finite().then_some(upper.delta_pct),
     });
     comparison
 }

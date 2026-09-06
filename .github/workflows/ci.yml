@@ -436,6 +436,64 @@ jobs:
           import json, math, os, pathlib
           directory = pathlib.Path(os.environ['BR_PERF_EVIDENCE'], 'planted-ready')
           name = '1000-ready-default-auto-flush'
+          def finite(value):
+              return type(value) in (int, float) and math.isfinite(value)
+
+          def delta_matches(value, baseline, candidate):
+              expected = (baseline, candidate, candidate - baseline, (candidate / baseline - 1) * 100)
+              if not isinstance(value, dict) or any(not finite(value.get(key)) or not math.isclose(value[key], number, rel_tol=1e-12, abs_tol=1e-12) for key, number in zip(('baseline_ms', 'candidate_ms', 'delta_ms', 'delta_pct'), expected)):
+                  raise ValueError('control quantile timing delta differs from observations or endpoints')
+
+          def validate_regression(comparison, receipts):
+              # This separate ten-block control can establish a median regression
+              # while its p95 upper endpoint remains unbounded. Rust owns rank inference.
+              if comparison['command'] != 'ready':
+                  raise ValueError('control comparison command differs from the measured workload')
+              uncertainty = comparison['uncertainty']
+              expected = {
+                  'method': 'binomial_order_statistics_of_block_minima_and_maxima',
+                  'assumption': 'independent identically distributed whole ABBA blocks; dependence within a block allowed; runner load does not establish this assumption',
+                  'coverage_scope': 'joint median and p95 for this comparison only; not simultaneous across workloads or repeated comparisons',
+              }
+              if not isinstance(uncertainty, dict) or any(uncertainty.get(key) != value for key, value in expected.items()) or type(uncertainty.get('block_count')) is not int or uncertainty['block_count'] != 10:
+                  raise ValueError('invalid control quantile method, assumption, scope or block count')
+              if any(not finite(uncertainty.get(key)) or uncertainty[key] != value for key, value in (('confidence_level', 0.95), ('one_sided_error_probability', 0.00625))):
+                  raise ValueError('invalid control per-comparison confidence allocation')
+              support = comparison['observed_support']
+              if not isinstance(support, dict) or support.get('method') != 'observed_support_extrema_not_confidence_interval' or any(not finite(support.get(key)) for key in ('lower_ms', 'upper_ms')) or any(support[key] is not None and not finite(support[key]) for key in ('lower_pct', 'upper_pct')):
+                  raise ValueError('invalid control descriptive observed support')
+              samples = [receipt['samples_ms'] for receipt in receipts]
+              minima = [sorted(min(side[index:index + 2]) for index in range(0, 20, 2)) for side in samples]
+              maxima = [sorted(max(side[index:index + 2]) for index in range(0, 20, 2)) for side in samples]
+              exceeds = []
+              for quantile in ('median', 'p95'):
+                  ordered = [sorted(side) for side in samples]
+                  points = [side[9] + (side[10] - side[9]) / 2 if quantile == 'median' else side[18] for side in ordered]
+                  delta_matches(comparison[quantile], *points)
+                  interval = uncertainty[quantile]
+                  lower_rank, upper_rank = interval['lower_rank'], interval['upper_rank']
+                  if type(lower_rank) is not int or type(upper_rank) is not int or not 0 <= lower_rank < upper_rank <= 11 or lower_rank > 10:
+                      raise ValueError('invalid control quantile order-statistic ranks')
+                  if quantile == 'p95' and upper_rank != 11:
+                      raise ValueError('insufficient control blocks for a finite p95 upper endpoint')
+                  lower = [side[lower_rank - 1] if lower_rank else 0 for side in minima]
+                  upper = [side[upper_rank - 1] if upper_rank <= 10 else None for side in maxima]
+                  for side, prefix in enumerate(('baseline', 'candidate')):
+                      for suffix, endpoint in (('lower', lower[side]), ('upper', upper[side])):
+                          actual = interval[f'{prefix}_{suffix}_ms']
+                          if (actual is not None if endpoint is None else not finite(actual) or actual != endpoint):
+                              raise ValueError('control quantile endpoint differs from raw block order statistics')
+                  for label, baseline, candidate in (('lower', upper[0], lower[1]), ('upper', lower[0], upper[1])):
+                      if baseline is None or baseline == 0 or candidate is None:
+                          if interval[label] is not None:
+                              raise ValueError('unbounded control quantile delta must remain null')
+                      else:
+                          delta_matches(interval[label], baseline, candidate)
+                          if label == 'lower':
+                              exceeds.append(candidate - baseline > baseline * (comparison['budget_pct'] / 100))
+              if not any(exceeds):
+                  raise ValueError('control Regression is not established by a quantile lower bound')
+
           try:
               run = json.loads((directory / 'run.json').read_text())
               if type(run['completed_workloads']) is not int or not isinstance(run['latency_gate_exits'], list) or any(type(code) is not int for code in run['latency_gate_exits']):
@@ -453,6 +511,8 @@ jobs:
                   metadata = receipt['metadata']
                   if (metadata['command'], metadata['issue_count'], metadata['flush_mode'], metadata['build_profile']) != ('ready', '1000', 'default-auto-flush', 'release'):
                       raise ValueError('control workload identity mismatch')
+                  if metadata.get('sampling_protocol') != 'abba_two_per_side_iid_blocks_assumed_v1':
+                      raise ValueError('missing or invalid control block sampling protocol')
                   for key, suffix in (('binary_sha256', 'SHA256'), ('lockfile_sha256', 'LOCK_SHA256'), ('source_revision', 'SOURCE')):
                       if metadata[key] != os.environ[f'BR_PERF_CANDIDATE_{suffix}']:
                           raise ValueError(f'control {key} differs from candidate artifact pin')
@@ -464,9 +524,10 @@ jobs:
               if receipts[0]['metadata'] != receipts[1]['metadata']:
                   raise ValueError('same-candidate control metadata differs')
               raw = json.loads((directory / f'{name}-raw.json').read_text())
-              if len(raw) != 48:
+              if not isinstance(raw, list) or len(raw) != 48:
                   raise ValueError('incomplete control raw ABBA log')
               retained = [[], []]
+              retained_blocks = [[], []]
               for index, sample in enumerate(raw):
                   block, position = divmod(index, 4)
                   side = (0, 1, 1, 0)[position]
@@ -477,9 +538,15 @@ jobs:
                       raise ValueError('invalid control elapsed time')
                   if not sample['warmup']:
                       retained[side].append(elapsed)
+                      retained_blocks[side].append(block)
               if retained != [receipt['samples_ms'] for receipt in receipts]:
                   raise ValueError('control raw observations differ from retained samples')
-          except (OSError, ValueError, KeyError, TypeError) as error:
+              for side, receipt in enumerate(receipts):
+                  ids = receipt['block_ids']
+                  if not isinstance(ids, list) or any(type(block) is not int for block in ids) or ids != retained_blocks[side]:
+                      raise ValueError('explicit control block IDs differ from raw ABBA observations')
+              validate_regression(summary['comparison'], receipts)
+          except (OSError, ValueError, KeyError, TypeError, OverflowError) as error:
               print(f'benchmark_sensitivity: inconclusive: {error}')
               raise SystemExit(2)
           print('benchmark_sensitivity: Regression observed for 20x ready work; diagnostic 100% threshold, not an accepted SLO')
@@ -534,7 +601,74 @@ jobs:
           names = [f'{count}-{command}-{flush}' for count in (1000, 10000)
                    for flush in ('default-auto-flush', 'diagnostic-no-auto-flush')
                    for command in ('version', 'ready', 'list', 'show', 'create', 'update', 'close')]
+          def finite(value):
+              return type(value) in (int, float) and math.isfinite(value)
+
+          def delta_matches(value, baseline, candidate):
+              expected = (baseline, candidate, candidate - baseline, (candidate / baseline - 1) * 100)
+              if not isinstance(value, dict) or any(not finite(value.get(key)) or not math.isclose(value[key], number, rel_tol=1e-12, abs_tol=1e-12) for key, number in zip(('baseline_ms', 'candidate_ms', 'delta_ms', 'delta_pct'), expected)):
+                  raise ValueError('quantile timing delta differs from its observations or endpoints')
+
+          def validate_comparison(comparison, receipts, blocks, code, budget):
+              # Validate the producer's schema, selected order statistics and decision;
+              # the Rust comparator owns binomial rank inference, not this consumer.
+              if comparison['command'] != receipts[0]['metadata']['command']:
+                  raise ValueError('comparison command differs from the measured workload')
+              uncertainty = comparison['uncertainty']
+              if uncertainty is None and code == 2:
+                  return
+              if not isinstance(uncertainty, dict):
+                  raise ValueError('missing quantile uncertainty')
+              expected = {
+                  'method': 'binomial_order_statistics_of_block_minima_and_maxima',
+                  'assumption': 'independent identically distributed whole ABBA blocks; dependence within a block allowed; runner load does not establish this assumption',
+                  'coverage_scope': 'joint median and p95 for this comparison only; not simultaneous across workloads or repeated comparisons',
+              }
+              if any(uncertainty.get(key) != value for key, value in expected.items()) or type(uncertainty.get('block_count')) is not int or uncertainty['block_count'] != blocks:
+                  raise ValueError('invalid quantile method, assumption, scope or block count')
+              if any(not finite(uncertainty.get(key)) or uncertainty[key] != value for key, value in (('confidence_level', 0.95), ('one_sided_error_probability', 0.00625))):
+                  raise ValueError('invalid per-comparison confidence allocation')
+              support = comparison['observed_support']
+              if not isinstance(support, dict) or support.get('method') != 'observed_support_extrema_not_confidence_interval' or any(not finite(support.get(key)) for key in ('lower_ms', 'upper_ms')) or any(support[key] is not None and not finite(support[key]) for key in ('lower_pct', 'upper_pct')):
+                  raise ValueError('invalid descriptive observed support')
+              samples = [receipt['samples_ms'] for receipt in receipts]
+              minima = [sorted(min(side[index:index + 2]) for index in range(0, len(side), 2)) for side in samples]
+              maxima = [sorted(max(side[index:index + 2]) for index in range(0, len(side), 2)) for side in samples]
+              fits, exceeds = [], []
+              for quantile in ('median', 'p95'):
+                  ordered = [sorted(side) for side in samples]
+                  points = [side[len(side) // 2 - 1] + (side[len(side) // 2] - side[len(side) // 2 - 1]) / 2 if quantile == 'median' else side[len(side) - len(side) // 20 - 1] for side in ordered]
+                  delta_matches(comparison[quantile], *points)
+                  interval = uncertainty[quantile]
+                  lower_rank, upper_rank = interval['lower_rank'], interval['upper_rank']
+                  if type(lower_rank) is not int or type(upper_rank) is not int or not 0 <= lower_rank < upper_rank <= blocks + 1 or upper_rank < 1 or lower_rank > blocks:
+                      raise ValueError('invalid quantile order-statistic ranks')
+                  if quantile == 'p95' and blocks < 99 and upper_rank != blocks + 1:
+                      raise ValueError('insufficient blocks for a finite p95 upper endpoint')
+                  lower = [side[lower_rank - 1] if lower_rank else 0 for side in minima]
+                  upper = [side[upper_rank - 1] if upper_rank <= blocks else None for side in maxima]
+                  for side, prefix in enumerate(('baseline', 'candidate')):
+                      for suffix, endpoint in (('lower', lower[side]), ('upper', upper[side])):
+                          actual = interval[f'{prefix}_{suffix}_ms']
+                          if (actual is not None if endpoint is None else not finite(actual) or actual != endpoint):
+                              raise ValueError('quantile endpoint differs from raw block order statistics')
+                  for label, baseline, candidate in (('lower', upper[0], lower[1]), ('upper', lower[0], upper[1])):
+                      if baseline is None or baseline == 0 or candidate is None:
+                          if interval[label] is not None:
+                              raise ValueError('unbounded quantile delta must remain null')
+                          (fits if label == 'upper' else exceeds).append(False)
+                      else:
+                          delta_matches(interval[label], baseline, candidate)
+                          delta, allowance = candidate - baseline, baseline * (budget / 100)
+                          (fits if label == 'upper' else exceeds).append(finite(allowance) and (delta <= allowance if label == 'upper' else delta > allowance))
+              expected_code = 1 if any(exceeds) else 0 if all(fits) else 2
+              if code != expected_code:
+                  raise ValueError('comparison decision is not established by the quantile bounds and budget')
+
           try:
+              blocks = int(os.environ['BR_PERF_ABBA_BLOCKS'])
+              if blocks < 10:
+                  raise ValueError('insufficient declared ABBA blocks')
               budgets = json.loads(os.environ.get('BR_PERF_BUDGETS_JSON') or '{}')
               if not isinstance(budgets, dict) or set(budgets) != set(names) or any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in budgets.values()):
                   raise ValueError('missing or invalid calibrated per-workload budgets')
@@ -554,17 +688,12 @@ jobs:
                       code = summary['gate_exit']
                       if type(code) is not int or code not in (0, 1, 2) or comparison['state'] != ('pass', 'regression', 'inconclusive')[code]:
                           raise ValueError(f'{cohort}/{name}: inconsistent comparison state')
-                      if comparison['budget_pct'] != budgets[name]:
+                      if not finite(comparison['budget_pct']) or comparison['budget_pct'] != budgets[name]:
                           raise ValueError(f'{cohort}/{name}: comparison used a different budget')
-                      for field, keys in (('median', ('baseline_ms', 'candidate_ms', 'delta_ms', 'delta_pct')),
-                                          ('p95', ('baseline_ms', 'candidate_ms', 'delta_ms', 'delta_pct')),
-                                          ('uncertainty', ('lower_ms', 'upper_ms', 'lower_pct', 'upper_pct'))):
-                          if any(type(comparison[field][key]) not in (int, float) or not math.isfinite(comparison[field][key]) for key in keys):
-                              raise ValueError(f'{cohort}/{name}: missing or invalid descriptive {field}')
                       receipts = [json.loads((directory / f'{name}-{side}.json').read_text()) for side in (0, 1)]
                       for side, receipt in enumerate(receipts):
                           samples = receipt['samples_ms']
-                          if len(samples) < 20 or len(samples) != len(receipt['exit_codes']) or any(type(x) not in (int, float) or not math.isfinite(x) or x <= 0 for x in samples):
+                          if not isinstance(samples, list) or len(samples) != 2 * blocks or not isinstance(receipt['exit_codes'], list) or len(samples) != len(receipt['exit_codes']) or any(not finite(x) or x <= 0 for x in samples):
                               raise ValueError(f'{cohort}/{name}: invalid raw samples')
                           if any(type(code) is not int or code != 0 for code in receipt['exit_codes']):
                               raise ValueError(f'{cohort}/{name}: failed measured process')
@@ -572,6 +701,8 @@ jobs:
                           required = ('command', 'issue_count', 'dataset_sha256', 'flush_mode', 'cache_protocol', 'host', 'cpu', 'os', 'filesystem', 'target', 'features', 'engine', 'source_revision', 'lockfile_sha256', 'binary_sha256', 'build_profile')
                           if not isinstance(metadata, dict) or any(not isinstance(metadata.get(key), str) or metadata[key].strip().lower() in ('', 'unknown', 'default', 'unavailable', 'n/a', 'placeholder', 'unset') for key in required):
                               raise ValueError(f'{cohort}/{name}: missing or placeholder provenance')
+                          if metadata.get('sampling_protocol') != 'abba_two_per_side_iid_blocks_assumed_v1':
+                              raise ValueError(f'{cohort}/{name}: missing or invalid block sampling protocol')
                           for key in ('dataset_sha256', 'lockfile_sha256', 'binary_sha256'):
                               if not re.fullmatch('[0-9a-fA-F]{64}', metadata[key]) or int(metadata[key], 16) == 0:
                                   raise ValueError(f'{cohort}/{name}: malformed {key}')
@@ -590,9 +721,10 @@ jobs:
                       if cohort == 'aa' and receipts[0]['metadata']['binary_sha256'] != receipts[1]['metadata']['binary_sha256']:
                           raise ValueError(f'{cohort}/{name}: A/A artifact mismatch')
                       raw = json.loads((directory / f'{name}-raw.json').read_text())
-                      if len(raw) != 48:
+                      if not isinstance(raw, list) or len(raw) != 4 * (blocks + 2):
                           raise ValueError(f'{cohort}/{name}: incomplete raw ABBA log')
                       retained = [[], []]
+                      retained_blocks = [[], []]
                       for index, sample in enumerate(raw):
                           block, position = divmod(index, 4)
                           side = (0, 1, 1, 0)[position]
@@ -609,18 +741,24 @@ jobs:
                               raise ValueError(f'{cohort}/{name}: invalid runner-load observation')
                           if not sample['warmup']:
                               retained[side].append(elapsed)
+                              retained_blocks[side].append(block)
                       if retained != [receipt['samples_ms'] for receipt in receipts]:
                           raise ValueError(f'{cohort}/{name}: raw observations do not match comparison samples')
+                      for side, receipt in enumerate(receipts):
+                          ids = receipt['block_ids']
+                          if not isinstance(ids, list) or any(type(block) is not int for block in ids) or ids != retained_blocks[side]:
+                              raise ValueError(f'{cohort}/{name}: explicit block IDs differ from raw ABBA observations')
+                      validate_comparison(comparison, receipts, blocks, code, budgets[name])
                       print(f'{cohort}/{name}: {comparison["diagnostic"]}')
                       codes.append(code)
-                  if run['latency_gate_exits'] != codes:
+                  if not isinstance(run['latency_gate_exits'], list) or any(type(code) is not int for code in run['latency_gate_exits']) or run['latency_gate_exits'] != codes:
                       raise ValueError(f'{cohort}: aggregate does not match all workload receipts')
                   decisions[cohort] = codes
               if any(code != 0 for code in decisions['aa']):
                   raise ValueError('A/A control did not establish stable comparisons')
               if 2 in decisions['ab']:
                   raise ValueError('one or more candidate comparisons are inconclusive')
-          except (OSError, ValueError, KeyError, TypeError) as error:
+          except (OSError, ValueError, KeyError, TypeError, OverflowError) as error:
               print(f'benchmark_gate: inconclusive: {error}')
               raise SystemExit(2)
           if 1 in decisions['ab']:

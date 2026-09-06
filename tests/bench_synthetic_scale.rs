@@ -2987,7 +2987,8 @@ mod release_abba {
         write_json_pretty,
     };
     use common::baseline::{
-        MatchedRun, MatchedState, compare_matched_runs, summarize_matched_samples,
+        MATCHED_BLOCK_PROTOCOL, MatchedRun, MatchedState, compare_matched_runs,
+        summarize_matched_samples,
     };
     use serde::Serialize;
     use serde_json::{Value, json};
@@ -3019,6 +3020,14 @@ mod release_abba {
     struct Artifact {
         binary: PathBuf,
         metadata: BTreeMap<String, String>,
+    }
+
+    fn retain_sample(run: &mut MatchedRun, sample: &Sample) {
+        if !sample.warmup {
+            run.samples_ms.push(sample.elapsed_ms);
+            run.exit_codes.push(sample.exit_code);
+            run.block_ids.push(sample.block);
+        }
     }
 
     fn required(name: &str) -> String {
@@ -3218,6 +3227,8 @@ mod release_abba {
             ),
             ("cache_protocol".into(), CACHE_PROTOCOL.into()),
             ("runner_protocol".into(), RUNNER_PROTOCOL.into()),
+            // Low normalized load does not establish independence between blocks.
+            ("sampling_protocol".into(), MATCHED_BLOCK_PROTOCOL.into()),
             (
                 "supervisor".into(),
                 "none inside measured interval; caller must enforce 1800s cohort deadline".into(),
@@ -3379,6 +3390,47 @@ mod release_abba {
                 "accepted {invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn release_measurement_receipts_preserve_retained_raw_block_alignment() {
+        // Synthetic serialization control, not live timing evidence.
+        let mut runs = [0, 1].map(|_| MatchedRun {
+            metadata: BTreeMap::new(),
+            samples_ms: Vec::new(),
+            exit_codes: Vec::new(),
+            block_ids: Vec::new(),
+        });
+        for block in 0..12 {
+            for (position, side) in [0, 1, 1, 0].into_iter().enumerate() {
+                let sample = Sample {
+                    side,
+                    block,
+                    position,
+                    warmup: block < 2,
+                    elapsed_ms: (block * 4 + position + 1) as f64,
+                    exit_code: 0,
+                    args: Vec::new(),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    load_before: String::new(),
+                    invocations: 1,
+                };
+                retain_sample(&mut runs[side], &sample);
+            }
+        }
+        let expected_blocks: Vec<_> = (2..12).flat_map(|block| [block, block]).collect();
+        for (side, run) in runs.iter().enumerate() {
+            let positions = if side == 0 { [0, 3] } else { [1, 2] };
+            let expected_samples: Vec<_> = (2..12)
+                .flat_map(|block| positions.map(|position| f64::from(block * 4 + position + 1)))
+                .collect();
+            let receipt = serde_json::to_value(run).expect("serialize retained measurements");
+            assert_eq!(receipt["block_ids"], json!(expected_blocks));
+            assert_eq!(receipt["samples_ms"], json!(expected_samples));
+            assert_eq!(receipt["exit_codes"], json!(vec![0; 20]));
+        }
+        assert_eq!(runs[0].block_ids, runs[1].block_ids);
     }
 
     #[test]
@@ -3547,6 +3599,7 @@ mod release_abba {
                             metadata,
                             samples_ms: Vec::new(),
                             exit_codes: Vec::new(),
+                            block_ids: Vec::new(),
                         }
                     });
                     for block in 0..blocks + 2 {
@@ -3637,10 +3690,7 @@ mod release_abba {
                                     &value,
                                 );
                             }
-                            if block >= 2 {
-                                runs[side].samples_ms.push(elapsed_ms);
-                                runs[side].exit_codes.push(exit_code);
-                            }
+                            retain_sample(&mut runs[side], samples.last().unwrap());
                         }
                     }
                     for (side, run) in runs.iter().enumerate() {

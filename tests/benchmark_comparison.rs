@@ -1634,8 +1634,8 @@ fn test_benchmark_comparison_calculations() {
 mod matched_arithmetic {
     use super::*;
     use common::baseline::{
-        BaselineStore, MATCHED_RUN_METADATA, MatchedRun, MatchedState, OperationBaseline,
-        RegressionConfig, RegressionResult, RegressionStatus, RegressionSummary,
+        BaselineStore, MATCHED_BLOCK_PROTOCOL, MATCHED_RUN_METADATA, MatchedRun, MatchedState,
+        OperationBaseline, RegressionConfig, RegressionResult, RegressionStatus, RegressionSummary,
         compare_matched_runs, summarize_matched_samples,
     };
 
@@ -1654,6 +1654,7 @@ mod matched_arithmetic {
             ("engine", "arithmetic-control-engine"),
             ("source_revision", "arithmetic-control-source"),
             ("build_profile", "release"),
+            ("sampling_protocol", MATCHED_BLOCK_PROTOCOL),
         ]
         .into_iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
@@ -1665,6 +1666,7 @@ mod matched_arithmetic {
         .collect();
         MatchedRun {
             exit_codes: vec![0; samples_ms.len()],
+            block_ids: (0..samples_ms.len()).map(|index| index / 2).collect(),
             metadata,
             samples_ms,
         }
@@ -1679,25 +1681,28 @@ mod matched_arithmetic {
 
     #[test]
     fn equal_positive_zero_variance_passes_without_dividing_by_variance() {
-        let baseline = control(vec![10.0; 20]);
+        let baseline = control(vec![10.0; 198]);
         let result = compare_matched_runs(Some(&baseline), &baseline, 0.0);
         assert_eq!(result.state, MatchedState::Pass);
         assert_eq!(result.exit_code(), 0);
         close(result.median.unwrap().delta_ms, 0.0);
         close(result.p95.unwrap().delta_pct, 0.0);
-        let interval = result.uncertainty.unwrap();
-        close(interval.lower_pct, 0.0);
-        close(interval.upper_pct, 0.0);
+        let interval = result.observed_support.unwrap();
+        close(interval.lower_pct.unwrap(), 0.0);
+        close(interval.upper_pct.unwrap(), 0.0);
         assert_eq!(
             interval.method,
             "observed_support_extrema_not_confidence_interval"
         );
+        let uncertainty = result.uncertainty.unwrap();
+        assert_eq!(uncertainty.block_count, 99);
+        close(uncertainty.p95.upper.unwrap().delta_pct, 0.0);
     }
 
     #[test]
     fn inclusive_budget_boundary_and_small_variation_are_not_false_regressions() {
-        let baseline = control(vec![10.0; 20]);
-        let candidate = control(vec![11.0; 20]);
+        let baseline = control(vec![10.0; 198]);
+        let candidate = control(vec![11.0; 198]);
         assert_eq!(
             compare_matched_runs(Some(&baseline), &candidate, 10.0).exit_code(),
             0
@@ -1706,7 +1711,7 @@ mod matched_arithmetic {
             compare_matched_runs(Some(&baseline), &candidate, 9.99).exit_code(),
             1
         );
-        let varied = control((0..20).map(|n| 10.0 + f64::from(n) / 100.0).collect());
+        let varied = control((0..198).map(|n| 10.0 + f64::from(n % 20) / 100.0).collect());
         assert_eq!(
             compare_matched_runs(Some(&baseline), &varied, 10.0).exit_code(),
             0
@@ -1728,11 +1733,11 @@ mod matched_arithmetic {
         close(p95.candidate_ms, 33.0);
         close(p95.delta_ms, 5.0);
         close(p95.delta_pct, 5.0 / 28.0 * 100.0);
-        let interval = result.uncertainty.unwrap();
+        let interval = result.observed_support.unwrap();
         close(interval.lower_ms, -14.0); // 15 - 29
         close(interval.upper_ms, 24.0); // 34 - 10
-        close(interval.lower_pct, (15.0 / 29.0 - 1.0) * 100.0);
-        close(interval.upper_pct, 240.0);
+        close(interval.lower_pct.unwrap(), (15.0 / 29.0 - 1.0) * 100.0);
+        close(interval.upper_pct.unwrap(), 240.0);
         assert_eq!(result.state, MatchedState::Inconclusive);
 
         let odd = summarize_matched_samples(&(1..=21).map(f64::from).collect::<Vec<_>>())
@@ -1749,8 +1754,8 @@ mod matched_arithmetic {
         let root = TempDir::new().expect("arithmetic control directory");
         let baseline_path = root.path().join("baseline.json");
         let candidate_path = root.path().join("degraded.json");
-        let baseline = control(vec![10.0; 20]);
-        let mut candidate = control(vec![15.0; 20]);
+        let baseline = control(vec![10.0; 198]);
+        let mut candidate = control(vec![15.0; 198]);
         candidate
             .metadata
             .insert("binary_sha256".to_string(), "4".repeat(64));
@@ -1916,7 +1921,7 @@ mod matched_arithmetic {
             assert!(result.diagnostic.contains("budget unavailable"));
             close(result.median.unwrap().delta_ms, 0.0);
             close(result.p95.unwrap().delta_ms, 0.0);
-            close(result.uncertainty.unwrap().upper_ms, 0.0);
+            close(result.observed_support.unwrap().upper_ms, 0.0);
         }
         let tiny = control(vec![f64::MIN_POSITIVE; 20]);
         let huge = control(vec![f64::MAX; 20]);
@@ -1934,9 +1939,10 @@ mod matched_arithmetic {
         let result = compare_matched_runs(Some(&baseline), &candidate, 20.0);
         assert_eq!(result.state, MatchedState::Inconclusive);
         assert_eq!(result.exit_code(), 2);
-        // Nearest-rank p95 is unchanged, but the extreme sample is still in the gate.
+        // The empirical p95 is unchanged, but ten blocks cannot bound its tail.
         close(result.p95.unwrap().delta_ms, 0.0);
-        close(result.uncertainty.unwrap().upper_ms, 990.0);
+        close(result.observed_support.unwrap().upper_ms, 990.0);
+        assert!(result.uncertainty.unwrap().p95.upper.is_none());
         assert_eq!(candidate.samples_ms.len(), 20);
         close(
             summarize_matched_samples(&candidate.samples_ms)
@@ -1944,6 +1950,204 @@ mod matched_arithmetic {
                 .max_ms,
             1000.0,
         );
+    }
+
+    #[test]
+    fn binomial_ranks_match_independent_integer_probability_calculations() {
+        // Independently derived using integer binomial weights, not the floating
+        // recurrence under test. An upper rank B+1 must remain unbounded.
+        for (blocks, median_ranks, p95_ranks) in [
+            (10, (1, 10), (7, 11)),
+            (98, (37, 62), (87, 99)),
+            (99, (37, 63), (88, 99)),
+            (200, (82, 119), (182, 198)),
+            (300, (128, 173), (275, 295)),
+            (1000, (461, 540), (932, 967)),
+        ] {
+            let run = control(vec![100.0; blocks * 2]);
+            let result = compare_matched_runs(Some(&run), &run, 0.0);
+            assert_eq!(result.exit_code(), if blocks >= 99 { 0 } else { 2 });
+            let uncertainty = result.uncertainty.unwrap();
+            assert_eq!(uncertainty.block_count, blocks);
+            assert_eq!(
+                (uncertainty.median.lower_rank, uncertainty.median.upper_rank),
+                median_ranks,
+            );
+            assert_eq!(
+                (uncertainty.p95.lower_rank, uncertainty.p95.upper_rank),
+                p95_ranks,
+            );
+            assert_eq!(uncertainty.p95.upper.is_some(), blocks >= 99);
+            assert_eq!(uncertainty.p95.baseline_upper_ms.is_some(), blocks >= 99);
+            close(uncertainty.confidence_level, 0.95);
+            close(uncertainty.one_sided_error_probability, 1.0 / 160.0);
+        }
+    }
+
+    #[test]
+    fn median_regression_does_not_require_a_finite_p95_upper_bound() {
+        let baseline = control(vec![10.0; 20]);
+        let candidate = control(vec![15.0; 20]);
+        let result = compare_matched_runs(Some(&baseline), &candidate, 20.0);
+        assert_eq!(result.state, MatchedState::Regression);
+        let uncertainty = result.uncertainty.unwrap();
+        close(uncertainty.median.lower.unwrap().delta_pct, 50.0);
+        assert!(uncertainty.p95.upper.is_none());
+        assert!(uncertainty.p95.lower.is_none());
+    }
+
+    #[test]
+    fn median_and_tail_regressions_are_decided_separately() {
+        let baseline = control(vec![100.0; 400]);
+        let tail = control(
+            (0..200)
+                .flat_map(|block| [if block < 180 { 100.0 } else { 140.0 }; 2])
+                .collect(),
+        );
+        let result = compare_matched_runs(Some(&baseline), &tail, 20.0);
+        assert_eq!(result.state, MatchedState::Regression);
+        close(result.median.unwrap().delta_ms, 0.0);
+        close(result.p95.unwrap().delta_ms, 40.0);
+        let uncertainty = result.uncertainty.unwrap();
+        close(uncertainty.median.upper.unwrap().delta_pct, 0.0);
+        close(uncertainty.p95.lower.unwrap().delta_pct, 40.0);
+
+        let baseline = control(
+            (0..200)
+                .flat_map(|block| [if block < 180 { 100.0 } else { 200.0 }; 2])
+                .collect(),
+        );
+        let candidate = control(
+            (0..200)
+                .flat_map(|block| [if block < 180 { 140.0 } else { 200.0 }; 2])
+                .collect(),
+        );
+        let result = compare_matched_runs(Some(&baseline), &candidate, 20.0);
+        assert_eq!(result.state, MatchedState::Regression);
+        close(result.p95.unwrap().delta_ms, 0.0);
+        close(
+            result.uncertainty.unwrap().median.lower.unwrap().delta_pct,
+            40.0,
+        );
+    }
+
+    #[test]
+    fn sufficient_variable_samples_pass_without_discarding_extreme_observations() {
+        let varied = control(
+            (0..400)
+                .map(|n| 100.0 + f64::from(n % 10) / 100.0)
+                .collect(),
+        );
+        assert_eq!(
+            compare_matched_runs(Some(&varied), &varied, 1.0).exit_code(),
+            0
+        );
+
+        let baseline = control(vec![100.0; 400]);
+        let mut candidate = baseline.clone();
+        candidate.samples_ms[399] = 1000.0;
+        let result = compare_matched_runs(Some(&baseline), &candidate, 0.0);
+        assert_eq!(result.state, MatchedState::Pass);
+        close(result.observed_support.unwrap().upper_ms, 900.0);
+        close(result.uncertainty.unwrap().p95.upper.unwrap().delta_ms, 0.0);
+        assert_eq!(candidate.samples_ms.len(), 400);
+        close(candidate.samples_ms[399], 1000.0);
+        close(
+            summarize_matched_samples(&candidate.samples_ms)
+                .unwrap()
+                .max_ms,
+            1000.0,
+        );
+    }
+
+    #[test]
+    fn persistent_within_block_ambiguity_cannot_be_hidden_by_block_averages() {
+        let baseline = control(vec![100.0; 400]);
+        let candidate = control((0..200).flat_map(|_| [1.0, 199.0]).collect());
+        let result = compare_matched_runs(Some(&baseline), &candidate, 20.0);
+        assert_eq!(result.state, MatchedState::Inconclusive);
+        close(result.median.unwrap().delta_ms, 0.0);
+        close(result.p95.unwrap().delta_ms, 99.0);
+        let interval = result.uncertainty.unwrap().p95;
+        close(interval.candidate_lower_ms, 1.0);
+        close(interval.candidate_upper_ms.unwrap(), 199.0);
+    }
+
+    #[test]
+    fn descriptive_percentage_overflow_does_not_veto_finite_quantile_bounds() {
+        let baseline = control(vec![1.0; 400]);
+        let mut candidate = baseline.clone();
+        candidate.samples_ms[399] = f64::MAX;
+        let result = compare_matched_runs(Some(&baseline), &candidate, 0.0);
+        assert_eq!(result.state, MatchedState::Pass);
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json["observed_support"]["upper_pct"].is_null());
+        close(result.observed_support.unwrap().upper_ms, f64::MAX);
+        close(result.uncertainty.unwrap().p95.upper.unwrap().delta_ms, 0.0);
+        assert_eq!(candidate.samples_ms[399].to_bits(), f64::MAX.to_bits());
+
+        // At 99 blocks the p95 upper endpoint includes that observation, so
+        // actual quantile arithmetic overflow must still refuse the gate.
+        let baseline = control(vec![1.0; 198]);
+        let mut candidate = baseline.clone();
+        candidate.samples_ms[197] = f64::MAX;
+        let result = compare_matched_runs(Some(&baseline), &candidate, 0.0);
+        assert_eq!(result.state, MatchedState::Inconclusive);
+        assert!(
+            result
+                .diagnostic
+                .contains("quantile comparison arithmetic overflow")
+        );
+    }
+
+    #[test]
+    fn absent_malformed_or_mismatched_block_evidence_cannot_pass() {
+        let baseline = control(vec![100.0; 198]);
+        let mut malformed = Vec::new();
+        let mut absent = baseline.clone();
+        absent.block_ids.clear();
+        malformed.push(absent);
+        let mut orphan = baseline.clone();
+        orphan.block_ids.pop();
+        malformed.push(orphan);
+        let mut reused = baseline.clone();
+        reused.block_ids[2] = 0;
+        reused.block_ids[3] = 0;
+        malformed.push(reused);
+        let mut split = baseline.clone();
+        split.block_ids.swap(1, 2);
+        malformed.push(split);
+        let mut skipped = baseline.clone();
+        skipped.block_ids[196] = 99;
+        skipped.block_ids[197] = 99;
+        malformed.push(skipped);
+        let mut different = baseline.clone();
+        for block in &mut different.block_ids {
+            *block += 1;
+        }
+        malformed.push(different);
+        let mut protocol = baseline.clone();
+        protocol.metadata.remove("sampling_protocol");
+        malformed.push(protocol);
+        for candidate in malformed {
+            let result = compare_matched_runs(Some(&baseline), &candidate, 20.0);
+            assert_eq!(result.exit_code(), 2, "{}", result.diagnostic);
+            assert!(result.uncertainty.is_none());
+        }
+        // Raw receipts without block evidence remain readable/descriptive, but
+        // the comparator must never invent independent units from their rows.
+        let mut raw = serde_json::to_value(&baseline).unwrap();
+        raw.as_object_mut().unwrap().remove("block_ids");
+        raw["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("sampling_protocol");
+        let raw: MatchedRun = serde_json::from_value(raw).unwrap();
+        let result = compare_matched_runs(Some(&raw), &raw, 20.0);
+        assert_eq!(result.exit_code(), 2);
+        close(result.median.unwrap().delta_ms, 0.0);
+        close(result.observed_support.unwrap().upper_ms, 0.0);
+        assert!(result.uncertainty.is_none());
     }
 
     #[test]

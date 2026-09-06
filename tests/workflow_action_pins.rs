@@ -949,6 +949,9 @@ mod scheduled_benchmarks {
     const FIRST: &str = "1000-version-default-auto-flush";
     const PLANTED: &str = "Measure planted ready slowdown control";
     const READY: &str = "1000-ready-default-auto-flush";
+    // Shell/serialization controls, not live timing evidence. The positive
+    // full-matrix fixture explicitly declares enough blocks for finite p95 bounds.
+    const CONTROL_BLOCKS: usize = 99;
 
     fn workflow() -> Value {
         serde_yml::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap()
@@ -1005,12 +1008,16 @@ mod scheduled_benchmarks {
             .collect()
     }
 
-    fn raw_control(name: &str) -> Value {
+    fn raw_control(name: &str, blocks: usize) -> Value {
         let mut parts = name.splitn(3, '-');
         let count = parts.next().unwrap();
         let command = parts.next().unwrap();
         let flush = parts.next().unwrap();
-        json!({"samples_ms": vec![10; 20], "exit_codes": vec![0; 20], "metadata": {
+        let block_ids = (2..blocks + 2)
+            .flat_map(|block| [block, block])
+            .collect::<Vec<_>>();
+        json!({"samples_ms": vec![10; 2 * blocks], "exit_codes": vec![0; 2 * blocks],
+            "block_ids": block_ids, "metadata": {
             "command": command, "issue_count": count, "flush_mode": flush,
             "build_profile": "release", "dataset_sha256": "1".repeat(64),
             "binary_sha256": "2".repeat(64), "lockfile_sha256": "3".repeat(64),
@@ -1018,23 +1025,73 @@ mod scheduled_benchmarks {
             "host": "arithmetic-control-host", "cpu": "arithmetic-control-cpu",
             "os": "arithmetic-control-os", "filesystem": "arithmetic-control-fs",
             "target": "arithmetic-control-target", "features": "arithmetic-control-features",
-            "engine": "arithmetic-control-engine"
+            "engine": "arithmetic-control-engine",
+            "sampling_protocol": "abba_two_per_side_iid_blocks_assumed_v1"
+        }})
+    }
+
+    fn timing_control(candidate: f64) -> Value {
+        json!({"baseline_ms": 10, "candidate_ms": candidate,
+            "delta_ms": candidate - 10.0, "delta_pct": (candidate / 10.0 - 1.0) * 100.0})
+    }
+
+    fn quantile_control(blocks: usize, ranks: [usize; 2], low: f64, high: f64) -> Value {
+        let finite_upper = ranks[1] <= blocks;
+        json!({"lower_rank": ranks[0], "upper_rank": ranks[1],
+            "baseline_lower_ms": 10, "candidate_lower_ms": low,
+            "baseline_upper_ms": finite_upper.then_some(10),
+            "candidate_upper_ms": finite_upper.then_some(high),
+            "lower": finite_upper.then(|| timing_control(low)),
+            "upper": finite_upper.then(|| timing_control(high))})
+    }
+
+    fn bounded_summary_control(
+        name: &str,
+        blocks: usize,
+        code: usize,
+        low: f64,
+        high: f64,
+        budget: usize,
+    ) -> Value {
+        // Hand-checked ranks for these two serialization controls. No invocation
+        // of the comparator under test, generated confidence, or live claim.
+        let (median_ranks, p95_ranks) = match blocks {
+            10 => ([1, 10], [7, 11]),
+            99 => ([37, 63], [88, 99]),
+            _ => panic!("no hand-checked fixture ranks for {blocks} blocks"),
+        };
+        json!({"gate_exit": code, "comparison": {
+            "state": (["pass", "regression", "inconclusive"][code]), "budget_pct": budget,
+            "command": name.split('-').nth(1).unwrap(),
+            "diagnostic": format!("arithmetic transport control {name}: budget={budget}"),
+            "median": timing_control(low + (high - low) / 2.0), "p95": timing_control(high),
+            "observed_support": {"method": "observed_support_extrema_not_confidence_interval",
+                "lower_ms": low - 10.0, "upper_ms": high - 10.0,
+                "lower_pct": (low / 10.0 - 1.0) * 100.0, "upper_pct": (high / 10.0 - 1.0) * 100.0},
+            "uncertainty": {
+                "method": "binomial_order_statistics_of_block_minima_and_maxima",
+                "assumption": "independent identically distributed whole ABBA blocks; dependence within a block allowed; runner load does not establish this assumption",
+                "coverage_scope": "joint median and p95 for this comparison only; not simultaneous across workloads or repeated comparisons",
+                "confidence_level": 0.95, "one_sided_error_probability": 0.00625, "block_count": blocks,
+                "median": quantile_control(blocks, median_ranks, low, high),
+                "p95": quantile_control(blocks, p95_ranks, low, high)
+            }
         }})
     }
 
     fn summary_control(name: &str, code: usize) -> Value {
-        json!({"gate_exit": code, "comparison": {
-            "state": (["pass", "regression", "inconclusive"][code]), "budget_pct": 7,
-            "diagnostic": format!("arithmetic transport control {name}: budget=7 delta=0"),
-            "median": {"baseline_ms": 10, "candidate_ms": 10, "delta_ms": 0, "delta_pct": 0},
-            "p95": {"baseline_ms": 10, "candidate_ms": 10, "delta_ms": 0, "delta_pct": 0},
-            "uncertainty": {"lower_ms": 0, "upper_ms": 0, "lower_pct": 0, "upper_pct": 0}
-        }})
+        let (low, high) = match code {
+            0 => (10.0, 10.0),
+            1 => (12.0, 12.0),
+            2 => (10.0, 12.0),
+            _ => panic!("invalid control exit {code}"),
+        };
+        bounded_summary_control(name, CONTROL_BLOCKS, code, low, high, 7)
     }
 
-    fn abba_control() -> Value {
+    fn abba_control(blocks: usize) -> Value {
         Value::Array(
-            (0..48)
+            (0..4 * (blocks + 2))
                 .map(|index| {
                     let block = index / 4;
                     let position = index % 4;
@@ -1052,35 +1109,42 @@ mod scheduled_benchmarks {
     struct ReceiptControl {
         root: tempfile::TempDir,
         budgets: Value,
+        blocks: usize,
     }
 
     impl ReceiptControl {
         fn new(omitted: Option<&str>) -> Self {
+            Self::with_blocks(omitted, CONTROL_BLOCKS)
+        }
+
+        fn with_blocks(omitted: Option<&str>, blocks: usize) -> Self {
             let control = Self {
                 root: tempfile::TempDir::new().unwrap(),
                 budgets: Value::Object(names().into_iter().map(|name| (name, json!(7))).collect()),
+                blocks,
             };
+            let code = usize::from(blocks == 10) * 2;
             for cohort in ["aa", "ab"] {
                 let directory = control.root.path().join(cohort);
                 fs::create_dir(&directory).unwrap();
                 fs::write(directory.join("collector.exit"), "0\n").unwrap();
                 control.write(
                     &format!("{cohort}/run.json"),
-                    &json!({"state": "measurements_completed", "latency_gate_exits": vec![0; 28]}),
+                    &json!({"state": "measurements_completed", "latency_gate_exits": vec![code; 28]}),
                 );
                 for name in names() {
                     control.write(
                         &format!("{cohort}/{name}-summary.json"),
-                        &summary_control(&name, 0),
+                        &bounded_summary_control(&name, blocks, code, 10.0, 10.0, 7),
                     );
                     let raw_path = format!("{cohort}/{name}-raw.json");
                     if omitted != Some(raw_path.as_str()) {
-                        control.write(&raw_path, &abba_control());
+                        control.write(&raw_path, &abba_control(blocks));
                     }
                     for side in 0..2 {
                         let path = format!("{cohort}/{name}-{side}.json");
                         if omitted != Some(path.as_str()) {
-                            control.write(&path, &raw_control(&name));
+                            control.write(&path, &raw_control(&name, blocks));
                         }
                     }
                 }
@@ -1102,6 +1166,7 @@ mod scheduled_benchmarks {
                 self.root.path(),
                 &[
                     ("BR_PERF_EVIDENCE", self.root.path().display().to_string()),
+                    ("BR_PERF_ABBA_BLOCKS", self.blocks.to_string()),
                     ("BR_PERF_BUDGETS_JSON", self.budgets.to_string()),
                     ("BR_PERF_BASELINE_SHA256", "2".repeat(64)),
                     ("BR_PERF_CANDIDATE_SHA256", "2".repeat(64)),
@@ -1124,6 +1189,22 @@ mod scheduled_benchmarks {
                 &format!("{cohort}/{FIRST}-summary.json"),
                 &summary_control(FIRST, code),
             );
+            let mut receipt = raw_control(FIRST, CONTROL_BLOCKS);
+            let mut raw = abba_control(CONTROL_BLOCKS);
+            let pair = match code {
+                0 => [10, 10],
+                1 => [12, 12],
+                2 => [10, 12],
+                _ => panic!("invalid control exit {code}"),
+            };
+            receipt["samples_ms"] = json!(pair.repeat(CONTROL_BLOCKS));
+            for sample in raw.as_array_mut().unwrap() {
+                if sample["side"] == 1 {
+                    sample["elapsed_ms"] = json!(pair[usize::from(sample["position"] == 2)]);
+                }
+            }
+            self.write(&format!("{cohort}/{FIRST}-1.json"), &receipt);
+            self.write(&format!("{cohort}/{FIRST}-raw.json"), &raw);
             let mut codes = vec![0; 28];
             codes[0] = code;
             self.write(
@@ -1140,6 +1221,7 @@ mod scheduled_benchmarks {
         let control = ReceiptControl {
             root: tempfile::TempDir::new().unwrap(),
             budgets: json!({}),
+            blocks: 10,
         };
         fs::create_dir(control.root.path().join("planted-ready")).unwrap();
         control.write(
@@ -1147,12 +1229,11 @@ mod scheduled_benchmarks {
             &json!({"state": "measurements_completed", "scope": "separate_exact_workload",
                 "selected_workload": READY, "completed_workloads": 1, "latency_gate_exits": [1]}),
         );
-        let mut summary = summary_control(READY, 1);
-        summary["comparison"]["budget_pct"] = json!(100);
+        let mut summary = bounded_summary_control(READY, 10, 1, 200.0, 200.0, 100);
         summary["negative_control_ready_invocations"] = json!(20);
         summary["budget_origin"] = json!("global diagnostic control; not an accepted SLO");
         control.write(&format!("planted-ready/{READY}-summary.json"), &summary);
-        let mut raw = abba_control();
+        let mut raw = abba_control(10);
         for sample in raw.as_array_mut().unwrap() {
             let invocations = if sample["side"] == 0 { 1 } else { 20 };
             sample["invocations"] = json!(invocations);
@@ -1162,7 +1243,7 @@ mod scheduled_benchmarks {
         }
         control.write(&format!("planted-ready/{READY}-raw.json"), &raw);
         for side in 0..2 {
-            let mut receipt = raw_control(READY);
+            let mut receipt = raw_control(READY, 10);
             receipt["samples_ms"] = json!(vec![if side == 0 { 10 } else { 200 }; 20]);
             control.write(&format!("planted-ready/{READY}-{side}.json"), &receipt);
         }
@@ -1344,7 +1425,7 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
             "incomplete control raw ABBA log",
         );
         let control = planted_control();
-        let mut receipt = raw_control(READY);
+        let mut receipt = raw_control(READY, 10);
         receipt["exit_codes"] = json!(vec![false; 20]);
         control.write(&format!("planted-ready/{READY}-0.json"), &receipt);
         expect_exit(
@@ -1353,7 +1434,7 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
             "expected twenty successful retained samples per side",
         );
         let control = planted_control();
-        let mut receipt = raw_control(READY);
+        let mut receipt = raw_control(READY, 10);
         receipt["metadata"]["binary_sha256"] = json!("4".repeat(64));
         control.write(&format!("planted-ready/{READY}-0.json"), &receipt);
         expect_exit(
@@ -1379,6 +1460,257 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
     }
 
     #[test]
+    fn scheduled_receipt_fragment_refuses_legacy_or_malformed_quantile_evidence() {
+        let control = ReceiptControl::new(None);
+        for (pointer, value) in [
+            ("/command", json!("wrong-command")),
+            ("/uncertainty", Value::Null),
+            (
+                "/uncertainty",
+                json!({"lower_ms": 0, "upper_ms": 0, "lower_pct": 0, "upper_pct": 0}),
+            ),
+            ("/uncertainty/method", json!("observed_support")),
+            ("/uncertainty/assumption", json!("runner load proves IID")),
+            (
+                "/uncertainty/coverage_scope",
+                json!("simultaneous across all workloads"),
+            ),
+            ("/uncertainty/confidence_level", json!(0.99)),
+            ("/uncertainty/one_sided_error_probability", json!(0.05)),
+            ("/uncertainty/block_count", json!(98)),
+            ("/uncertainty/block_count", json!(true)),
+            ("/uncertainty/median", Value::Null),
+            ("/uncertainty/p95", Value::Null),
+            ("/uncertainty/median/lower_rank", json!(true)),
+            ("/uncertainty/p95/upper_rank", json!(101)),
+            ("/uncertainty/median/baseline_lower_ms", json!(11)),
+            ("/uncertainty/p95/candidate_upper_ms", json!(11)),
+            ("/uncertainty/median/lower/delta_ms", json!(1)),
+            ("/uncertainty/p95/upper/delta_pct", json!(1)),
+            ("/median/baseline_ms", json!(11)),
+            ("/p95/candidate_ms", json!(11)),
+        ] {
+            let mut summary = summary_control(FIRST, 0);
+            *summary["comparison"].pointer_mut(pointer).unwrap() = value;
+            control.write(&format!("ab/{FIRST}-summary.json"), &summary);
+            expect_exit(&control.run(), 2, "benchmark_gate: inconclusive");
+        }
+        let mut summary = summary_control(FIRST, 0);
+        summary["comparison"]["uncertainty"]
+            .as_object_mut()
+            .unwrap()
+            .remove("p95");
+        control.write(&format!("ab/{FIRST}-summary.json"), &summary);
+        expect_exit(&control.run(), 2, "benchmark_gate: inconclusive");
+    }
+
+    #[test]
+    fn scheduled_receipt_fragment_requires_bounded_p95_even_with_equal_point_samples() {
+        let control = ReceiptControl::new(None);
+        let mut summary = summary_control(FIRST, 0);
+        let p95 = &mut summary["comparison"]["uncertainty"]["p95"];
+        p95["upper_rank"] = json!(100);
+        for key in ["baseline_upper_ms", "candidate_upper_ms", "lower", "upper"] {
+            p95[key] = Value::Null;
+        }
+        control.write(&format!("ab/{FIRST}-summary.json"), &summary);
+        expect_exit(
+            &control.run(),
+            2,
+            "decision is not established by the quantile bounds",
+        );
+        // A planted median lower bound also cannot be fabricated from a state
+        // label: the same observations only support Pass under this budget.
+        let mut summary = summary_control(FIRST, 0);
+        summary["gate_exit"] = json!(1);
+        summary["comparison"]["state"] = json!("regression");
+        control.write(&format!("ab/{FIRST}-summary.json"), &summary);
+        expect_exit(
+            &control.run(),
+            2,
+            "decision is not established by the quantile bounds",
+        );
+    }
+
+    #[test]
+    fn scheduled_receipt_fragment_requires_explicit_aligned_blocks_and_declared_counts() {
+        let control = ReceiptControl::new(None);
+        for ids in [
+            Value::Null,
+            json!([]),
+            json!(vec![2; 2 * CONTROL_BLOCKS]),
+            json!(
+                (0..CONTROL_BLOCKS)
+                    .flat_map(|block| [block, block])
+                    .collect::<Vec<_>>()
+            ),
+            json!(
+                (2..CONTROL_BLOCKS + 2)
+                    .flat_map(|block| [block, block + 1])
+                    .collect::<Vec<_>>()
+            ),
+            json!(vec![true; 2 * CONTROL_BLOCKS]),
+        ] {
+            let mut receipt = raw_control(FIRST, CONTROL_BLOCKS);
+            receipt["block_ids"] = ids;
+            control.write(&format!("ab/{FIRST}-1.json"), &receipt);
+            expect_exit(&control.run(), 2, "explicit block IDs differ from raw ABBA");
+        }
+        for key in ["block_ids", "sampling_protocol"] {
+            let mut receipt = raw_control(FIRST, CONTROL_BLOCKS);
+            if key == "block_ids" {
+                receipt.as_object_mut().unwrap().remove(key);
+            } else {
+                receipt["metadata"].as_object_mut().unwrap().remove(key);
+            }
+            control.write(&format!("ab/{FIRST}-1.json"), &receipt);
+            expect_exit(&control.run(), 2, "benchmark_gate: inconclusive");
+        }
+        control.write(&format!("ab/{FIRST}-1.json"), &raw_control(FIRST, 10));
+        expect_exit(&control.run(), 2, "invalid raw samples");
+    }
+
+    #[test]
+    fn scheduled_receipt_fragment_keeps_overflowed_support_descriptive() {
+        let control = ReceiptControl::new(None);
+        // One small baseline observation makes the support percentage overflow;
+        // the selected median/p95 block ranks and both point estimates remain 10.
+        let mut receipt = raw_control(FIRST, CONTROL_BLOCKS);
+        receipt["samples_ms"][0] = json!(f64::MIN_POSITIVE);
+        control.write(&format!("ab/{FIRST}-0.json"), &receipt);
+        let mut raw = abba_control(CONTROL_BLOCKS);
+        raw[8]["elapsed_ms"] = json!(f64::MIN_POSITIVE);
+        control.write(&format!("ab/{FIRST}-raw.json"), &raw);
+        let mut summary = summary_control(FIRST, 0);
+        summary["comparison"]["observed_support"]["upper_ms"] = json!(10.0 - f64::MIN_POSITIVE);
+        summary["comparison"]["observed_support"]["upper_pct"] = Value::Null;
+        control.write(&format!("ab/{FIRST}-summary.json"), &summary);
+        expect_exit(&control.run(), 0, "all 28 matched latency workloads");
+    }
+
+    #[test]
+    fn scheduled_receipt_fragment_ten_blocks_cannot_establish_a_full_pass() {
+        let control = ReceiptControl::with_blocks(None, 10);
+        expect_exit(
+            &control.run(),
+            2,
+            "A/A control did not establish stable comparisons",
+        );
+        // Even a forged finite p95 bound using the observed maximum cannot make
+        // the live ten-block default sufficient for this declared confidence.
+        let mut summary = bounded_summary_control(FIRST, 10, 0, 10.0, 10.0, 7);
+        summary["comparison"]["uncertainty"]["p95"] = quantile_control(10, [7, 10], 10.0, 10.0);
+        control.write(&format!("aa/{FIRST}-summary.json"), &summary);
+        expect_exit(
+            &control.run(),
+            2,
+            "insufficient blocks for a finite p95 upper endpoint",
+        );
+    }
+
+    #[test]
+    fn scheduled_receipt_fragment_refuses_overflowed_budget_allowance() {
+        let mut control = ReceiptControl::new(None);
+        control.budgets[FIRST] = json!(f64::MAX);
+        let mut summary = summary_control(FIRST, 0);
+        summary["comparison"]["budget_pct"] = json!(f64::MAX);
+        let timing = json!({"baseline_ms": 1000, "candidate_ms": 1000,
+            "delta_ms": 0, "delta_pct": 0});
+        for quantile in ["median", "p95"] {
+            summary["comparison"][quantile] = timing.clone();
+            let interval = &mut summary["comparison"]["uncertainty"][quantile];
+            for key in [
+                "baseline_lower_ms",
+                "baseline_upper_ms",
+                "candidate_lower_ms",
+                "candidate_upper_ms",
+            ] {
+                interval[key] = json!(1000);
+            }
+            interval["lower"] = timing.clone();
+            interval["upper"] = timing.clone();
+        }
+        // Both cohorts use the calibrated budget; the A/A receipt is the first
+        // attempted forged Pass. Equal samples do not make an infinite allowance valid.
+        for cohort in ["aa", "ab"] {
+            control.write(&format!("{cohort}/{FIRST}-summary.json"), &summary);
+            for side in 0..2 {
+                let mut receipt = raw_control(FIRST, CONTROL_BLOCKS);
+                receipt["samples_ms"] = json!(vec![1000; 2 * CONTROL_BLOCKS]);
+                control.write(&format!("{cohort}/{FIRST}-{side}.json"), &receipt);
+            }
+            let mut raw = abba_control(CONTROL_BLOCKS);
+            for sample in raw.as_array_mut().unwrap() {
+                sample["elapsed_ms"] = json!(1000);
+            }
+            control.write(&format!("{cohort}/{FIRST}-raw.json"), &raw);
+        }
+        expect_exit(
+            &control.run(),
+            2,
+            "decision is not established by the quantile bounds",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scheduled_planted_fragment_requires_block_alignment_and_real_quantile_regression() {
+        let control = planted_control();
+        // Positive control is deliberately median-only inference: twenty
+        // observations are ten blocks, so both p95 upper endpoints are null.
+        let summary: Value = serde_json::from_slice(
+            &fs::read(
+                control
+                    .root
+                    .path()
+                    .join(format!("planted-ready/{READY}-summary.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(summary["comparison"]["uncertainty"]["p95"]["upper"].is_null());
+        expect_exit(&run_planted(&control, 0), 0, "Regression observed");
+        for (pointer, value) in [
+            ("/uncertainty", Value::Null),
+            (
+                "/uncertainty",
+                json!({"lower_ms": 190, "upper_ms": 190, "lower_pct": 1900, "upper_pct": 1900}),
+            ),
+            ("/uncertainty/block_count", json!(99)),
+            ("/uncertainty/confidence_level", json!(0.99)),
+            ("/uncertainty/median/lower/delta_ms", json!(0)),
+            ("/uncertainty/median/candidate_lower_ms", json!(10)),
+            ("/uncertainty/p95/upper_rank", json!(10)),
+            ("/uncertainty/p95/upper", timing_control(200.0)),
+        ] {
+            let mut malformed = summary.clone();
+            *malformed["comparison"].pointer_mut(pointer).unwrap() = value;
+            control.write(&format!("planted-ready/{READY}-summary.json"), &malformed);
+            expect_exit(
+                &run_planted(&control, 0),
+                2,
+                "benchmark_sensitivity: inconclusive",
+            );
+        }
+        control.write(&format!("planted-ready/{READY}-summary.json"), &summary);
+        for ids in [
+            Value::Null,
+            json!([]),
+            json!(vec![2; 20]),
+            json!((0..10).flat_map(|block| [block, block]).collect::<Vec<_>>()),
+        ] {
+            let mut receipt = raw_control(READY, 10);
+            receipt["block_ids"] = ids;
+            control.write(&format!("planted-ready/{READY}-0.json"), &receipt);
+            expect_exit(
+                &run_planted(&control, 0),
+                2,
+                "explicit control block IDs differ",
+            );
+        }
+    }
+
+    #[test]
     fn scheduled_receipt_fragment_refuses_missing_corrupt_and_failed_evidence() {
         let missing = ReceiptControl::new(Some(&format!("ab/{FIRST}-0.json")));
         expect_exit(&missing.run(), 2, "inconclusive");
@@ -1397,14 +1729,15 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
             json!({"samples_ms": [], "exit_codes": []}),
             json!({"samples_ms": vec![0; 20], "exit_codes": vec![0; 20]}),
             json!({"samples_ms": vec![10; 19], "exit_codes": vec![0; 19]}),
-            json!({"samples_ms": vec![10; 20], "exit_codes": vec![1; 20]}),
+            json!({"samples_ms": vec![10; 2 * CONTROL_BLOCKS], "exit_codes": vec![1; 2 * CONTROL_BLOCKS]}),
+            json!({"samples_ms": vec![10; 2 * CONTROL_BLOCKS], "exit_codes": vec![false; 2 * CONTROL_BLOCKS]}),
             json!({"samples_ms": vec![10; 21], "exit_codes": vec![0; 21]}),
         ] {
             control.write(&format!("ab/{FIRST}-1.json"), &receipt);
             expect_exit(&control.run(), 2, "inconclusive");
         }
         let control = ReceiptControl::new(None);
-        let mut receipt = raw_control(FIRST);
+        let mut receipt = raw_control(FIRST, CONTROL_BLOCKS);
         receipt["metadata"]["binary_sha256"] = json!("4".repeat(64));
         control.write(&format!("aa/{FIRST}-1.json"), &receipt);
         expect_exit(
@@ -1424,7 +1757,7 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
             ("command", "wrong-command", "workload identity mismatch"),
             ("host", "different-host", "matched metadata differs"),
         ] {
-            let mut receipt = raw_control(FIRST);
+            let mut receipt = raw_control(FIRST, CONTROL_BLOCKS);
             receipt["metadata"][key] = json!(value);
             control.write(&format!("ab/{FIRST}-1.json"), &receipt);
             expect_exit(&control.run(), 2, reason);
@@ -1472,12 +1805,12 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
             ("stdout", Value::Null, "missing raw process output"),
             ("elapsed_ms", json!(0), "invalid raw elapsed time"),
         ] {
-            let mut raw = abba_control();
+            let mut raw = abba_control(CONTROL_BLOCKS);
             raw[0][key] = value;
             control.write(&format!("ab/{FIRST}-raw.json"), &raw);
             expect_exit(&control.run(), 2, diagnostic);
         }
-        let mut raw = abba_control();
+        let mut raw = abba_control(CONTROL_BLOCKS);
         raw[8]["elapsed_ms"] = json!(20);
         control.write(&format!("ab/{FIRST}-raw.json"), &raw);
         expect_exit(
