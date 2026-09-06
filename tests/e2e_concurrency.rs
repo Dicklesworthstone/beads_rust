@@ -298,7 +298,7 @@ fn issue_title_count(root: &Path, title: &str) -> i64 {
     rows.first()
         .and_then(|row| row.get(0))
         .and_then(SqliteValue::as_integer)
-        .unwrap_or(0)
+        .expect("issue COUNT(*) must return one integer row")
 }
 
 /// Extract JSON payload from stdout (skip non-JSON preamble).
@@ -622,23 +622,44 @@ fn e2e_write_lock_contention_respects_lock_timeout() {
         create.stdout, create.stderr
     );
     assert!(
-        elapsed < Duration::from_secs(3),
-        "write lock timeout should not block indefinitely; elapsed={elapsed:?}"
+        (Duration::from_millis(75)..Duration::from_secs(3)).contains(&elapsed),
+        "write lock must honor the requested budget without blocking indefinitely; elapsed={elapsed:?}"
     );
-    let combined = format!("{}{}", create.stdout, create.stderr);
+    assert_eq!(create.exit_code, Some(7), "{create:?}");
+    let payload: serde_json::Value =
+        serde_json::from_str(&create.stdout).expect("write-lock timeout must be whole JSON");
+    assert_eq!(payload["error"]["code"], "CONFIG_ERROR", "{payload}");
+    let message = payload["error"]["message"]
+        .as_str()
+        .expect("write-lock timeout must include an error message");
+    // Routing checks consume part of the shared acquisition budget before
+    // the workspace lock is attempted, so its remaining timeout can be <75ms.
+    let remaining_timeout_ms = message
+        .strip_prefix("Configuration error: Timed out after ")
+        .and_then(|rest| rest.split_once("ms waiting for write lock (workspace write lock) at "))
+        .map(|(timeout, _)| timeout.parse::<u64>().expect("numeric timeout in ms"))
+        .expect("workspace write-lock timeout diagnostic");
     assert!(
-        combined.contains("Timed out after 75ms")
-            && combined.contains("write lock")
-            && combined.contains(".write.lock"),
-        "error should include bounded write-lock diagnostics: {combined}"
+        remaining_timeout_ms <= 75 && message.contains(".beads/.write.lock"),
+        "error should include bounded write-lock diagnostics: {message}"
     );
 
     drop(write_lock);
+    assert_eq!(
+        issue_title_count(&root, "Blocked by held write lock"),
+        0,
+        "timed-out command must not create an issue"
+    );
     let after = run_br_in_dir(&root, ["create", "After write lock timeout", "--json"]);
     assert!(
         after.success,
         "workspace should accept writes after lock release: stdout={} stderr={}",
         after.stdout, after.stderr
+    );
+    assert_eq!(
+        issue_title_count(&root, "After write lock timeout"),
+        1,
+        "write after lock release must persist exactly one issue"
     );
 }
 
