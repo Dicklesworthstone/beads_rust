@@ -1,6 +1,281 @@
 # Bridge Plan: beads_rust (`br`)
 
-## Current assessment — 2026-09-04
+## Current assessment — 2026-09-06
+
+**The core tracker works, and the September 4 functional gaps have been fixed
+on `main`. Useful performance acceptance and delivery of those fixes in a new
+release remain unfinished.** This refresh found a smaller additional defect:
+live schema help still tells agents to read structured errors from stderr,
+although the implemented contract uses stdout. Some architecture sketches also
+describe the historical design as though it were the implementation.
+
+This section supersedes the dated status below without erasing its evidence.
+Assessment bead: `beads_rust-fhym3`. The reviewed checkout is `36dd4145`; its
+executable sources equal `954156ac8e7d8f2dbc1cb87ccfc0157031dd8802` (the intervening
+commit changes only Beads). This assessment changes the plan and task graph;
+it does not implement the newly identified documentation fix or close the
+performance/release contracts.
+
+### Evidence collected and its limits
+
+- Read **all 1,087 lines of AGENTS.md and all 1,384 lines of README.md** anew.
+  Read the entire existing bridge and current architecture, engine operating
+  model, health contract, capacity acceptance matrix and E2E coverage matrix.
+  Rechecked current CI performance contracts and relevant code/proof paths.
+  The earlier full reading of the historical porting, Rich, write-combining,
+  TOON and research documents remains applicable: a diff from the previous
+  assessment finds those documents unchanged. Their supersession decisions
+  still apply; this is not a claim to have freshly reread every archived line.
+- Rechecked CLI dispatch/startup, MCP request policy installation and resource
+  routing, init output and schema registration, the independent storage model,
+  coupled histories, and ID generation. A fresh source keyword scan found no
+  `todo!`/`unimplemented!` implementations; its sole TODO match is a test string.
+  The previous AST audit remains separately attributed historical evidence.
+- [Current-source CI run 34047413559](https://github.com/Dicklesworthstone/beads_rust/actions/runs/34047413559)
+  completed on September 6: Check, security, quick E2E, audit guards,
+  reliability, all five test shards, all five platform builds, version audit,
+  benchmark build/package and all four measurement shards passed. **The overall
+  run failed:** its final benchmark gate exited 2 because calibrated
+  per-workload budgets were missing. Collection success is not acceptance.
+- Downloaded and inspected actual job logs. The all-feature lib run reports
+  3,061 passed / 11 ignored; bins 67 passed; doc tests 10 ignored; the separate
+  default lib run reports 2,969 passed / 4 ignored. The real MCP stdio target
+  ran **10 tests, all passed, none ignored**. The linearizability target reports
+  176 passes, including shared helper tests; these are not 176 independent
+  concurrency scenarios. Do not sum repeated helpers into a product coverage
+  percentage. The previously recorded model/stress proofs retain their source,
+  timeout/retry and ignored-case boundaries.
+- Downloaded Linux x86_64 CI artifact `9993693641`, verified provider ZIP digest
+  `16eaf830832372a4b4f9a526a56ccdf6590a10dd7c8a64ca6dde8589c1bd8737`.
+  Its 27,372,584-byte release binary hashes to
+  `a6d1abdc39e14398d30843b2303d858200dec3c2a0e8cb53e5ad3fa954524f30`,
+  reports source `954156ac`, default `self_update`, and FrankenSQLite 0.3.16.
+  Executed it directly: **45/45 selftest steps passed**, including real
+  persistence, blocking/unblocking, export/import and doctor. Workspace retained
+  at `/dev/shm/br-reality-20260906/br-selftest-Mvh9V9`.
+- A separate strict-stdout probe confirmed typed init JSON, actual stored IDs,
+  dependency refusal, capacity refusal without changing the issue, unblocking
+  after close, the init schema in `schema all`, clean sync status and doctor.
+  The probe itself needed two corrections: a blocked issue reaches dependency
+  admission before capacity, and `schema init` is not a supported selector.
+  Those failures remain in `strict-lifecycle.jsonl`; they are fixture/operator
+  mistakes, not product regressions. No Git repository was created by these
+  commands. Full stdout/stderr and selftest receipts are retained under
+  `/dev/shm/br-reality-20260906/`; this local scratch retention is not permanent
+  release evidence.
+- The GitHub latest-release endpoint still returns
+  [v0.5.10](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.10),
+  published September 4 at source `6c8283c4`, engine 0.3.15. Its older native
+  archive canaries do not certify current engine/MCP/init changes. Current CI
+  artifacts report the same package version, so **source and digest**, not the
+  version string alone, distinguish them. No new release was published here.
+- The installed tracker binary's `br doctor --json` on this repository exits
+  **1**, with `ok: false` but `workspace_health: healthy`: stale merge anchor,
+  a retained temporary base variant reported by two checks, and 11 preserved
+  recovery artifacts. This is not a clean doctor result or a new data-loss
+  finding. The older `di3tb` zero-warning aspiration does not authorize deleting
+  evidence. All artifacts remain in place; the existing deferred decision trail
+  now records the current counts and exact diagnosis.
+
+### Vision checklist, refreshed without dropping goals
+
+`WORKING` means supported within the exercised scope, not universally proven.
+`UNPROVEN` is distinct from broken. V numbers preserve the original inventory.
+
+| Goal | September 6 status and remaining obligation |
+|---|---|
+| V1 CRUD, dependencies, labels, comments, queries | WORKING; direct current-binary selftest and hosted shards |
+| V2 SQLite + JSONL | WORKING; current engine and explicit sync exercised |
+| V3 Non-invasive collaboration | WORKING; no automatic Git/hook/daemon requirement introduced |
+| V4 Classic-bd interchange | WORKING in documented scope; identical database schemas intentionally superseded |
+| V5 IDs and deduplication | WORKING; remaining architecture ID description needs correction (R11) |
+| V6 Go conformance | Existing pinned bd 0.46 proof applies to its stated scope; require current-candidate release evidence |
+| V7 Structured results/errors | Init fixed; live schema help contradicts the error stream (R11) |
+| V8 TOON and precedence | Init proof now includes TOON/environment/quiet precedence |
+| V9 Rich/plain | WORKING within existing goldens and hosted tests |
+| V10 Markdown/syntax | Live Markdown works; separate dormant renderer remains superseded |
+| V11 Sync safety | Current reliability/engine tests pass; preserve failure and authority guards |
+| V12 Acknowledged-data preservation | Stronger model/stress/fault evidence; remains bounded proof, not a universal theorem |
+| V13 Merge/reconcile/salvage/plans | Implemented; exact CASS rehearsal remains an operator-dependent separate task |
+| V14 Local history | WORKING; current selftest and hosted history tests |
+| V15 Workflow policy/capacity | CLI/MCP parity fixed, including long-lived policy refresh and refusal postconditions |
+| V16 Stale-claim diagnosis | WORKING as advisory evidence; no automatic reclaim introduced |
+| V17 Routing/external dependencies | Existing tests retained; local atomicity does not promise distributed transactions |
+| V18 Doctor/repair/bundle/migration | Current engine proof completed; direct current-binary doctor passes |
+| V19 MCP tools/resources/prompts | Policy and literal-URI defects fixed; 10 actual stdio tests passed |
+| V20 Cold/warm startup and faster-than-bd objectives | Cold-cache and comparative performance remain UNPROVEN; preserve explicit workload definitions |
+| V21 Useful latency/size regression budgets | Size mechanism exists; latency calibration and accepted complete matrix remain unfinished |
+| V22 Storage abstraction/decomposition | SUPERSEDED as a shipping prerequisite; concrete single-engine architecture retained |
+| V23 Write-combining/cache | SUPERSEDED as a shipping prerequisite; do not wire in dormant code without evidence |
+| V24 Cross-platform distributions | Older release works; newer-source native archive canaries/publication remain |
+| V25 Cargo installation | Older published crate verified; newer candidate is not yet released |
+| V26 Explicit self-update | Existing checksum-verified mechanism retained; new version delivery is separate |
+| V27 Meaningful oracles | Ready/blocked and coupled-history blind spots fixed, with deliberate negative controls |
+| V28 Unsafe discipline | Deny-by-default and three sanctioned exceptions retained |
+| V29 Accurate actionable docs | September 4 semantic fixes landed; remaining live-help/design-sketch contradictions R11 |
+| V30 Honest task status | Performance/release parents remain open; refresh stale executable descriptions |
+| V31 Windows | Current platform build passed; older release selftest is not a current-artifact native canary |
+| V32 Broken pipes | Existing exercised contract retained; no new failure observed |
+| V33 Acceptance items | MCP enforcement and CLI/MCP parity proof now included |
+| V34 Agent hints | Init repaired; schema error-stream hint still wrong (R11) |
+| V35 One-command selftest | Current downloaded binary passes all 45 steps; keep platform scope explicit |
+
+### Performance evidence: collection works, acceptance does not yet
+
+Before opening receipts, audit comment 1181 fixed the inspection order: all A/A
+controls first, with no A/B-derived threshold selection. All four ZIPs matched
+their GitHub artifact digests:
+
+| Artifact | Workload shard | SHA-256 |
+|---|---|---|
+| 9994083767 | 1k default flush | `054a32c0506353a83558e67b1056cf3c4ee98a4f9ddf8cdbe16292e9e8e22248` |
+| 9994104707 | 1k diagnostic | `b4efcb8b099ecbfc6fbc0e8dd031f4298d16c347481ec9369553b38f154a821e` |
+| 9994795458 | 10k default flush | `ddea6aae40e922a54b547709fe6b08eed17410685dac93bdc0a63df2db8b28f5` |
+| 9994556233 | 10k diagnostic | `d74c37d1b1f67c403a2599ecff83e549c8dc5df48f199f5c5be3cb1ead239525` |
+
+All **28 A/A workloads** contain 404 raw ABBA rows, eight warmup observations,
+198 retained observations per side, successful process/collector/log-capture
+exits, and equal side identities. Each shard has one distinct Linux boot ID;
+the newly added boot-identity field is present in real hosted receipts. This
+audit did not open A/B measurements or validate cross-phase A/A–A/B matching.
+
+The unchanged binary's conditional p95 upper relative bounds range from
+**8.723% to 1,029.023%**. Even the 1k/default ready comparison has a 23.749%
+upper bound. Ninety-nine blocks yield finite endpoints, not necessarily useful
+precision; low runner load does not prove independent identically distributed
+blocks. These are per-comparison bounds, not simultaneous 28-workload coverage.
+No stable budget is accepted from these controls, and no cause is assigned to
+the long tail without profiling.
+
+Descriptive same-binary default-flush medians include 1k ready 46.037 ms,
+1k update 73.478 ms, 10k ready 313.140 ms and **10k close 1,434.577 ms**.
+Different shards ran on different VMs; default-versus-diagnostic differences
+cannot establish the causal cost of auto-flush. Fresh-copy/warm-filesystem
+measurements do not establish cold-cache startup or superiority to Go bd.
+
+The separate planted control performs 20 real ready invocations on its second
+side: 504 total invocations, all successful; medians 47.900 versus 904.943 ms;
+the actual comparator returns **Regression / exit 1** at its fixed diagnostic
+100% threshold. This proves gross-slowdown sensitivity, not small-regression
+sensitivity or an accepted production latency allowance.
+
+### Initial bridge and task coverage
+
+| Priority/order | Gap and bounded next action | Existing owner / required proof |
+|---|---|---|
+| P1, performance | Diagnose precision and expensive writes before setting budgets; preserve all samples and acknowledgment guards | `zxfz.1` calibration; active `naul5` runtime profile; `azxef.10` pass/fail/refusal companion |
+| P1, release | Finish source-coherent CI/size/native-canary evidence for the next candidate and publish through existing machinery | `uze9`; final `0wb0w` integration |
+| P2, independent quick fix | Correct schema error-stream help and misleading architecture sketches using current code contracts | R11: `azxef.14` implementation; `azxef.15` companion proof |
+| Explicitly parked | Generator, gate registry, dormant deletion, sample-index cleanup and exact CASS operator data | Existing deferred beads; do not resurrect them as release blockers |
+
+R11 is reproduced by the downloaded binary's `schema --help`: the `error`
+target says "stderr JSON when robot mode or non-TTY", while the captured
+structured `VALIDATION_FAILED` and `WORKFLOW_CAPACITY_EXCEEDED` errors are on
+stdout. Source: `src/cli/mod.rs::SchemaTarget::Error`. Architecture's ID
+algorithm says random bytes; `IdGenerator::generate_candidate` hashes a seed of
+issue metadata/time/nonce instead. Review the nearby abbreviated configuration,
+error and publication examples so illustrative design is not presented as
+copyable current API. Do not change working error streams or ID semantics to
+make stale prose true; the existing error-stream and ID tests are the authority.
+
+The original R1/R2/R3/R4/R5/R8/R10 fixes now have closed implementation/proof
+beads and current hosted evidence. R7's current-engine work also has completed
+stress/foreign-sidecar evidence. Performance, current-release acceptance and
+R11 remain; neither closed-task totals nor the green collection jobs close them.
+
+### Ambition revision 1: make the next experiment answer a question
+
+The first revision replaces "rerun the matrix and choose budgets" with an
+explicit decision sequence. More collection alone has already failed to make
+the acceptance contract useful. Before the next full matrix, `zxfz.1` must
+specify the workload, useful regression size, runner/cache conditions, fixed
+sample/stopping rule and what an inconclusive control will trigger. Preserve
+the original startup objectives separately. A/A variability is evidence about
+measurement precision, not permission to tolerate an equally large slowdown.
+Do not repeatedly change sample counts or select a quieter-looking run after
+seeing candidate outcomes. Keep untouched A/B measurements held out until the
+calibration decision is recorded.
+
+For `naul5`, the next useful investigation is a bounded profile of the expensive
+10k close/update path on the same identified machine and fixture. Attribute
+startup/open, transaction/commit, graph/cache work and publication costs before
+choosing a code change. A deliberate same-host default/diagnostic comparison
+can test export cost; the existing four-VM measurements cannot. The old
+flush-lock cause was disproved in comment 970, and schema-witness plus
+update/close connection reuse have already landed. Preserve those findings in
+the executable bead description so a future agent does not repeat the wrong
+optimization. Do not reclaim the active owner merely to refresh the plan.
+
+Both tasks use the existing collector/comparator/profile surfaces. Keep
+negative controls, current engine reliability, sync authority, complete raw
+outputs and unknown-commit outcomes intact. If timing precision remains
+insufficient, record that result and the narrowed cause; do not alter the gate
+to turn inconclusive into pass. Runtime fixes require their existing unit,
+real-workspace, multiprocess and fault-injection proof obligations; a timing
+gain cannot waive an acknowledged-data regression.
+
+### Ambition revision 2: deliver one identifiable candidate
+
+The second revision treats release acceptance as a source-and-artifact handoff,
+not a pile of independently green historical jobs. `uze9` should reuse current
+successful checks whose executable inputs are unchanged, while requiring new
+evidence for any changed source, lockfile, feature set or archive. Build success
+on five platforms is distinct from running the downloaded native archive. Keep
+one compact candidate record of source, lockfile, engine, features, binary and
+archive digests, size decisions and native canaries; store that summary with
+durable release evidence rather than relying solely on expiring job artifacts.
+
+Preserve the existing seven-target size boundaries and their explicit product
+allowances (1 MiB binary, 512 KiB archive relative to verified v0.5.10 assets).
+These are separate from statistical latency budgets. A checked Linux CI binary
+or its ZIP size cannot certify every published tar/ZIP archive. A new release
+must accurately identify the newer engine and delivered behavior; matching
+the old `0.5.10` version string is insufficient.
+
+Execution can advance along two independent paths: finish R11 and its proof
+while the existing performance owners resolve calibration/profile evidence.
+Neither path waits for a documentation generator, dormant-module deletion,
+exact CASS operator data or sample-index cleanup. Final `0wb0w` acceptance
+still requires both paths plus the relevant release evidence. Do not add a
+parent dependency that makes calibration depend on its own proof descendant.
+The engine workaround remains until an actual pinned release and probe justify
+removal; that cleanup is not a prerequisite for a correctly contained release.
+
+### Audit TODO and refinement record
+
+- [x] Read full current AGENTS/README and applicable historical/current vision.
+- [x] Inspect changed code, actual assertions, hosted results and release identity.
+- [x] Exercise the current downloaded binary and inspect all A/A controls.
+- [x] Write current goal/gap/evidence inventory in this existing plan.
+- [x] Apply frozen bead-generation prompt and add only uncovered R11/proof tasks.
+- [x] Complete two substantive ambition revisions in place.
+- [x] Regenerate covered Beads from the revised plan, preserving ownership.
+- [x] Run five frozen refinement passes, ending with a no-change pass.
+- [x] Validate actual ready work, cycles, dependency order and preserved ownership.
+- [x] Close only the audit bead, preserve evidence and hand off remaining work.
+
+The frozen generation prompt was applied twice (audit comments 1182/1185),
+with two in-place ambition revisions between them. The unchanged refinement
+prompt is recorded in comment 1187 and was applied for five reviews:
+
+| Pass | Review and outcome |
+|---|---|
+| 1 | Goal/ownership coverage: corrected the stale Track F parent status; kept all 35 goals and existing owners |
+| 2 | Proof sufficiency: real error streams, partial results, negative controls and actual persistence; no further amendment |
+| 3 | Statistical honesty: all 28 final workloads, precision, cache/boot matching and held-out decisions; no further amendment |
+| 4 | Scheduling/delivery: checked actual dependencies and release scope; no graph change needed |
+| 5 | Final coverage/truth review, including retained doctor warnings; no further change found |
+
+`br dep cycles --json` reports zero active cycles. `bv --robot-insights` also
+reports no cycles with cycle computation enabled and no skip reason; its source
+is this repository's SQLite tracker. `br ready --json` and the claimable `bv`
+top pick agree: **`beads_rust-azxef.14`**. Its companion `.15` waits only for
+that fix; `.10` waits for `zxfz.1`. Performance owners retain their claims.
+The forecast's average confidence is only 0.439 and it includes parent/deferred
+work; its dates are not delivery commitments. No new framework or cleanup
+permission is needed to execute the ready fix.
+
+## Historical assessment — 2026-09-04
 
 This dated assessment supersedes the September 1 status and execution plan below.
 The older material remains an audit trail, not a list of still-missing features.
