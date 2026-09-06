@@ -326,21 +326,18 @@ jobs:
           name: br-${{ matrix.name }}
           path: target/${{ matrix.target }}/release/br.exe
 
-  bench:
-    name: Matched release benchmarks
+  bench-build:
+    name: Build matched benchmark artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 120
     needs: check
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    outputs:
+      pins: ${{ steps.benchmark_artifacts.outputs.pins }}
     env:
       BR_PERF_BASELINE_REVISION: ${{ vars.BR_PERF_BASELINE_REVISION || '081100e4e35920f08b8c6faf6daa350da2cb030a' }}
-      # Exact workload names map to calibrated relative budgets. An absent
-      # budget retains measurements and exits inconclusive; it never passes.
-      BR_PERF_BUDGETS_JSON: ${{ vars.BR_PERF_BUDGETS_JSON }}
-      BR_PERF_QUIET_RUNNER: '1'
-      BR_PERF_ABBA_BLOCKS: '10'
-      BR_PERF_NEGATIVE_EXTRA_WORK: '1'
       BR_PERF_EVIDENCE: ${{ github.workspace }}/target/perf-evidence
+      BR_PERF_ARTIFACT_DIR: ${{ github.workspace }}/target/perf-artifacts
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -404,7 +401,120 @@ jobs:
               env.write('BR_PERF_HARNESS=' + executables.pop() + '\n')
           PY
 
+      - name: Package benchmark artifacts
+        id: benchmark_artifacts
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil
+          directory = pathlib.Path(os.environ['BR_PERF_ARTIFACT_DIR'])
+          directory.mkdir(parents=True, exist_ok=False)
+          pins = {f'BR_PERF_{side}_{field}': os.environ[f'BR_PERF_{side}_{field}']
+                  for side in ('BASELINE', 'CANDIDATE') for field in ('SOURCE', 'SHA256', 'LOCK_SHA256')}
+          files = (
+              ('baseline-br', 'BR_PERF_BASELINE_BINARY', 'BR_PERF_BASELINE_SHA256'),
+              ('candidate-br', 'BR_PERF_CANDIDATE_BINARY', 'BR_PERF_CANDIDATE_SHA256'),
+              ('baseline-Cargo.lock', 'BR_PERF_BASELINE_LOCKFILE', 'BR_PERF_BASELINE_LOCK_SHA256'),
+              ('candidate-Cargo.lock', 'BR_PERF_CANDIDATE_LOCKFILE', 'BR_PERF_CANDIDATE_LOCK_SHA256'),
+              ('measurement-driver', 'BR_PERF_HARNESS', 'BR_PERF_HARNESS_SHA256'),
+          )
+          for name, source, digest in files:
+              destination = directory / name
+              shutil.copyfile(os.environ[source], destination)
+              with destination.open('rb') as stream:
+                  actual = hashlib.file_digest(stream, 'sha256').hexdigest()
+              if digest in pins and actual != pins[digest]:
+                  raise SystemExit(f'benchmark_gate: inconclusive: {name} changed after build')
+              pins[digest] = actual
+          shutil.copyfile(pathlib.Path(os.environ['BR_PERF_EVIDENCE'], 'build-artifacts.jsonl'), directory / 'build-artifacts.jsonl')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write('pins=' + json.dumps(pins, sort_keys=True) + '\n')
+          PY
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: benchmark-artifacts
+          path: target/perf-artifacts/
+          compression-level: 1
+          if-no-files-found: error
+
+  bench:
+    name: Matched benchmarks (${{ matrix.issue_count }}, ${{ matrix.flush }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    needs: bench-build
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        issue_count: [1000, 10000]
+        flush: [default-auto-flush, diagnostic-no-auto-flush]
+    env:
+      BR_PERF_ARTIFACT_PINS: ${{ needs.bench-build.outputs.pins }}
+      BR_PERF_ARTIFACT_DIR: ${{ github.workspace }}/target/perf-artifacts
+      BR_PERF_SHARD_ISSUE_COUNT: ${{ matrix.issue_count }}
+      BR_PERF_SHARD_FLUSH: ${{ matrix.flush }}
+      # Fixed before collecting: 99 blocks permit a finite p95 upper endpoint.
+      # Budgets still require prospective calibration, never a failed baseline.
+      BR_PERF_ABBA_BLOCKS: '99'
+      BR_PERF_BUDGETS_JSON: ${{ vars.BR_PERF_BUDGETS_JSON }}
+      BR_PERF_QUIET_RUNNER: '1'
+      BR_PERF_NEGATIVE_EXTRA_WORK: '1'
+      BR_PERF_EVIDENCE: ${{ github.workspace }}/target/perf-evidence
+    steps:
+      - name: Download benchmark artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: benchmark-artifacts
+          path: target/perf-artifacts/
+
+      - name: Verify benchmark artifact bundle
+        id: benchmark_artifacts
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re
+          try:
+              directory = pathlib.Path(os.environ['BR_PERF_ARTIFACT_DIR']).resolve(strict=True)
+              pins = json.loads(os.environ['BR_PERF_ARTIFACT_PINS'])
+              keys = {f'BR_PERF_{side}_{field}' for side in ('BASELINE', 'CANDIDATE') for field in ('SOURCE', 'SHA256', 'LOCK_SHA256')} | {'BR_PERF_HARNESS_SHA256'}
+              if not isinstance(pins, dict) or set(pins) != keys:
+                  raise ValueError('incomplete artifact pins')
+              for key, value in pins.items():
+                  size = 40 if key.endswith('_SOURCE') else 64
+                  if not isinstance(value, str) or not re.fullmatch(f'[0-9a-f]{{{size}}}', value) or int(value, 16) == 0:
+                      raise ValueError(f'invalid artifact pin: {key}')
+              if pins['BR_PERF_CANDIDATE_SOURCE'] != os.environ['GITHUB_SHA']:
+                  raise ValueError('candidate artifact source differs from this workflow revision')
+              files = (
+                  ('baseline-br', 'BR_PERF_BASELINE_BINARY', 'BR_PERF_BASELINE_SHA256'),
+                  ('candidate-br', 'BR_PERF_CANDIDATE_BINARY', 'BR_PERF_CANDIDATE_SHA256'),
+                  ('baseline-Cargo.lock', 'BR_PERF_BASELINE_LOCKFILE', 'BR_PERF_BASELINE_LOCK_SHA256'),
+                  ('candidate-Cargo.lock', 'BR_PERF_CANDIDATE_LOCKFILE', 'BR_PERF_CANDIDATE_LOCK_SHA256'),
+                  ('measurement-driver', 'BR_PERF_HARNESS', 'BR_PERF_HARNESS_SHA256'),
+              )
+              paths = {}
+              for name, variable, digest in files:
+                  path = directory / name
+                  if path.is_symlink() or not path.is_file():
+                      raise ValueError(f'missing regular artifact: {name}')
+                  with path.open('rb') as stream:
+                      actual = hashlib.file_digest(stream, 'sha256').hexdigest()
+                  if actual != pins[digest]:
+                      raise ValueError(f'artifact digest mismatch: {name}')
+                  paths[variable] = str(path)
+              for name in ('baseline-br', 'candidate-br', 'measurement-driver'):
+                  (directory / name).chmod(0o755)
+              with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+                  for key, value in (pins | paths).items():
+                      env.write(f'{key}={value}\n')
+          except (OSError, ValueError, KeyError, TypeError) as error:
+              print(f'benchmark_gate: inconclusive: {error}')
+              raise SystemExit(2)
+          print('benchmark_artifacts: verified source pins and all five file digests')
+          PY
+
       - name: Measure planted ready slowdown control
+        if: matrix.issue_count == 1000 && matrix.flush == 'default-auto-flush'
         run: |
           set -euo pipefail
           directory="$BR_PERF_EVIDENCE/planted-ready"
@@ -554,43 +664,83 @@ jobs:
 
       - name: Measure release A-A control and A-B comparison
         id: measure
-        # Preserve full cohorts after a failed sensitivity control. That earlier
-        # step remains failed even if these collectors or the later gate pass.
-        if: ${{ !cancelled() && steps.benchmark_build.outcome == 'success' }}
+        # A failed sensitivity control cannot cancel the remaining workloads
+        # or become a successful shard through a later passing collector.
+        if: ${{ !cancelled() && steps.benchmark_artifacts.outcome == 'success' }}
         run: |
           set -euo pipefail
-          # Allow build load to decay before the collector's per-sample checks.
-          # This observes low contention; the A/A cohort tests its stability.
-          python3 - <<'PY'
-          import os, time
-          deadline = time.monotonic() + 300
-          while os.getloadavg()[0] / len(os.sched_getaffinity(0)) > 0.25:
-              if time.monotonic() >= deadline:
-                  print('benchmark_gate: inconclusive: runner load did not settle')
-                  raise SystemExit(2)
-              time.sleep(5)
-          PY
+          if [[ "$BR_PERF_SHARD_ISSUE_COUNT" != 1000 && "$BR_PERF_SHARD_ISSUE_COUNT" != 10000 ]] ||
+             [[ "$BR_PERF_SHARD_FLUSH" != default-auto-flush && "$BR_PERF_SHARD_FLUSH" != diagnostic-no-auto-flush ]]; then
+            echo 'benchmark_gate: inconclusive: invalid workload shard'
+            exit 2
+          fi
+          # No compilation occurs on measurement runners. Each collector owns
+          # its unchanged initial/per-sample load admission and 300s settling.
+          unset BR_PERF_BUDGET_PCT BR_PERF_WORKLOAD
+          export BR_PERF_NEGATIVE_EXTRA_WORK=1
           if [[ -z "$BR_PERF_BUDGETS_JSON" ]]; then
             unset BR_PERF_BUDGETS_JSON
           fi
           overall=0
-          for cohort in aa ab; do
-            mkdir -p "$BR_PERF_EVIDENCE/$cohort"
-            status=0
-            (
-              export BR_PERF_OUTPUT="$BR_PERF_EVIDENCE/$cohort"
-              if [[ "$cohort" == aa ]]; then
-                export BR_PERF_BASELINE_BINARY="$BR_PERF_CANDIDATE_BINARY"
-                export BR_PERF_BASELINE_SHA256="$BR_PERF_CANDIDATE_SHA256"
-                export BR_PERF_BASELINE_LOCKFILE="$BR_PERF_CANDIDATE_LOCKFILE"
-                export BR_PERF_BASELINE_SOURCE="$BR_PERF_CANDIDATE_SOURCE"
-              fi
-              timeout --signal=TERM --kill-after=10s 1800s "$BR_PERF_HARNESS" --exact release_abba::release_cli_abba_1k_10k --ignored --nocapture
-            ) 2>&1 | tee "$BR_PERF_EVIDENCE/$cohort/collector.log" || status=$?
-            printf '%s\n' "$status" > "$BR_PERF_EVIDENCE/$cohort/collector.exit"
-            if [[ "$status" != 0 ]]; then overall=2; fi
+          for command in version ready list show create update close; do
+            workload="$BR_PERF_SHARD_ISSUE_COUNT-$command-$BR_PERF_SHARD_FLUSH"
+            for cohort in aa ab; do
+              directory="$BR_PERF_EVIDENCE/$cohort/$workload"
+              mkdir -p "$directory"
+              set +e
+              (
+                set -e
+                export BR_PERF_OUTPUT="$directory" BR_PERF_WORKLOAD="$workload"
+                if [[ "$cohort" == aa ]]; then
+                  export BR_PERF_BASELINE_BINARY="$BR_PERF_CANDIDATE_BINARY"
+                  export BR_PERF_BASELINE_SHA256="$BR_PERF_CANDIDATE_SHA256"
+                  export BR_PERF_BASELINE_LOCKFILE="$BR_PERF_CANDIDATE_LOCKFILE"
+                  export BR_PERF_BASELINE_LOCK_SHA256="$BR_PERF_CANDIDATE_LOCK_SHA256"
+                  export BR_PERF_BASELINE_SOURCE="$BR_PERF_CANDIDATE_SOURCE"
+                fi
+                timeout --signal=TERM --kill-after=10s 1800s "$BR_PERF_HARNESS" --exact release_abba::release_cli_abba_1k_10k --ignored --nocapture
+              ) 2>&1 | tee "$directory/collector.log"
+              pipeline_status=("${PIPESTATUS[@]}")
+              set -e
+              printf '%s\n' "${pipeline_status[0]}" > "$directory/collector.exit"
+              printf '%s\n' "${pipeline_status[1]}" > "$directory/log-capture.exit"
+              if (( pipeline_status[0] != 0 || pipeline_status[1] != 0 )); then overall=2; fi
+            done
           done
           exit "$overall"
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: benchmark-results-${{ matrix.issue_count }}-${{ matrix.flush }}
+          path: target/perf-evidence/
+          if-no-files-found: error
+
+  bench-gate:
+    name: Complete matched benchmark gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [bench-build, bench]
+    if: ${{ always() && needs.bench-build.result == 'success' }}
+    env:
+      BR_PERF_EVIDENCE: ${{ github.workspace }}/target/perf-evidence
+      BR_PERF_ABBA_BLOCKS: '99'
+      BR_PERF_BUDGETS_JSON: ${{ vars.BR_PERF_BUDGETS_JSON }}
+      BR_PERF_SHARDS_RESULT: ${{ needs.bench.result }}
+      BR_PERF_BASELINE_SOURCE: ${{ fromJSON(needs.bench-build.outputs.pins).BR_PERF_BASELINE_SOURCE }}
+      BR_PERF_BASELINE_SHA256: ${{ fromJSON(needs.bench-build.outputs.pins).BR_PERF_BASELINE_SHA256 }}
+      BR_PERF_BASELINE_LOCK_SHA256: ${{ fromJSON(needs.bench-build.outputs.pins).BR_PERF_BASELINE_LOCK_SHA256 }}
+      BR_PERF_CANDIDATE_SOURCE: ${{ fromJSON(needs.bench-build.outputs.pins).BR_PERF_CANDIDATE_SOURCE }}
+      BR_PERF_CANDIDATE_SHA256: ${{ fromJSON(needs.bench-build.outputs.pins).BR_PERF_CANDIDATE_SHA256 }}
+      BR_PERF_CANDIDATE_LOCK_SHA256: ${{ fromJSON(needs.bench-build.outputs.pins).BR_PERF_CANDIDATE_LOCK_SHA256 }}
+    steps:
+      - name: Download every benchmark shard
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: benchmark-results-*
+          merge-multiple: true
+          path: target/perf-evidence/
 
       - name: Enforce complete matched benchmark receipts
         if: always()
@@ -666,22 +816,31 @@ jobs:
                   raise ValueError('comparison decision is not established by the quantile bounds and budget')
 
           try:
+              if os.environ.get('BR_PERF_SHARDS_RESULT') != 'success':
+                  raise ValueError('one or more benchmark shards or the planted control failed')
               blocks = int(os.environ['BR_PERF_ABBA_BLOCKS'])
               if blocks < 10:
                   raise ValueError('insufficient declared ABBA blocks')
               budgets = json.loads(os.environ.get('BR_PERF_BUDGETS_JSON') or '{}')
               if not isinstance(budgets, dict) or set(budgets) != set(names) or any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in budgets.values()):
                   raise ValueError('missing or invalid calibrated per-workload budgets')
-              decisions = {}
+              decisions, paired_dimensions = {}, {}
               for cohort in ('aa', 'ab'):
-                  directory = root / cohort
-                  if (directory / 'collector.exit').read_text().strip() != '0':
-                      raise ValueError(f'{cohort}: collector did not complete successfully')
-                  run = json.loads((directory / 'run.json').read_text())
-                  if run['state'] != 'measurements_completed':
-                      raise ValueError(f'{cohort}: incomplete run')
+                  cohort_directory = root / cohort
+                  if {path.name for path in cohort_directory.iterdir()} != set(names):
+                      raise ValueError(f'{cohort}: expected exactly all 28 workload directories')
                   codes = []
                   for name in names:
+                      directory = cohort_directory / name
+                      if directory.is_symlink() or not directory.is_dir():
+                          raise ValueError(f'{cohort}/{name}: missing workload directory')
+                      if (directory / 'collector.exit').read_text().strip() != '0':
+                          raise ValueError(f'{cohort}/{name}: collector did not complete successfully')
+                      if (directory / 'log-capture.exit').read_text().strip() != '0':
+                          raise ValueError(f'{cohort}/{name}: collector log capture failed')
+                      run = json.loads((directory / 'run.json').read_text())
+                      if run['state'] != 'measurements_completed' or run['scope'] != 'separate_exact_workload' or run['selected_workload'] != name or type(run['completed_workloads']) is not int or run['completed_workloads'] != 1:
+                          raise ValueError(f'{cohort}/{name}: incomplete or mismatched workload run')
                       count, command, flush = name.split('-', 2)
                       summary = json.loads((directory / f'{name}-summary.json').read_text())
                       comparison = summary['comparison']
@@ -718,6 +877,10 @@ jobs:
                       dimensions = [{key: value for key, value in receipt['metadata'].items() if key not in provenance} for receipt in receipts]
                       if dimensions[0] != dimensions[1]:
                           raise ValueError(f'{cohort}/{name}: matched metadata differs')
+                      if cohort == 'aa':
+                          paired_dimensions[name] = dimensions[0]
+                      elif dimensions[0] != paired_dimensions[name]:
+                          raise ValueError(f'{cohort}/{name}: A/A and A/B runner or workload dimensions differ')
                       if cohort == 'aa' and receipts[0]['metadata']['binary_sha256'] != receipts[1]['metadata']['binary_sha256']:
                           raise ValueError(f'{cohort}/{name}: A/A artifact mismatch')
                       raw = json.loads((directory / f'{name}-raw.json').read_text())
@@ -749,10 +912,10 @@ jobs:
                           if not isinstance(ids, list) or any(type(block) is not int for block in ids) or ids != retained_blocks[side]:
                               raise ValueError(f'{cohort}/{name}: explicit block IDs differ from raw ABBA observations')
                       validate_comparison(comparison, receipts, blocks, code, budgets[name])
+                      if not isinstance(run['latency_gate_exits'], list) or any(type(value) is not int for value in run['latency_gate_exits']) or run['latency_gate_exits'] != [code]:
+                          raise ValueError(f'{cohort}/{name}: aggregate does not match workload receipt')
                       print(f'{cohort}/{name}: {comparison["diagnostic"]}')
                       codes.append(code)
-                  if not isinstance(run['latency_gate_exits'], list) or any(type(code) is not int for code in run['latency_gate_exits']) or run['latency_gate_exits'] != codes:
-                      raise ValueError(f'{cohort}: aggregate does not match all workload receipts')
                   decisions[cohort] = codes
               if any(code != 0 for code in decisions['aa']):
                   raise ValueError('A/A control did not establish stable comparisons')
@@ -766,14 +929,6 @@ jobs:
               raise SystemExit(1)
           print('benchmark_gate: pass: all 28 matched latency workloads and A/A controls passed; release size is gated separately')
           PY
-
-      - name: Upload benchmark results
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        with:
-          name: benchmark-results
-          path: target/perf-evidence/
-          if-no-files-found: error
 
   # Verify version auditing info is correctly embedded
   version-audit:

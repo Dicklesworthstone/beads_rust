@@ -944,10 +944,13 @@ mod scheduled_benchmarks {
     use std::process::{Command, Output};
 
     use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
 
     const GATE: &str = "Enforce complete matched benchmark receipts";
     const FIRST: &str = "1000-version-default-auto-flush";
     const PLANTED: &str = "Measure planted ready slowdown control";
+    const MEASURE: &str = "Measure release A-A control and A-B comparison";
+    const VERIFY_BUNDLE: &str = "Verify benchmark artifact bundle";
     const READY: &str = "1000-ready-default-auto-flush";
     // Shell/serialization controls, not live timing evidence. The positive
     // full-matrix fixture explicitly declares enough blocks for finite p95 bounds.
@@ -958,13 +961,18 @@ mod scheduled_benchmarks {
     }
 
     fn step(name: &str) -> Value {
-        workflow()["jobs"]["bench"]["steps"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|step| step["name"] == name)
-            .unwrap_or_else(|| panic!("missing scheduled benchmark step: {name}"))
-            .clone()
+        let workflow = workflow();
+        let matches = ["bench-build", "bench", "bench-gate"]
+            .into_iter()
+            .flat_map(|job| workflow["jobs"][job]["steps"].as_array().unwrap())
+            .filter(|step| step["name"] == name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matches.len(),
+            1,
+            "scheduled benchmark step must be unique: {name}"
+        );
+        matches[0].clone()
     }
 
     fn run_fragment(name: &str, root: &Path, variables: &[(&str, String)]) -> Output {
@@ -1006,6 +1014,447 @@ mod scheduled_benchmarks {
                     })
             })
             .collect()
+    }
+
+    const BUNDLE_FILES: [(&str, &str); 5] = [
+        ("baseline-br", "BR_PERF_BASELINE_SHA256"),
+        ("candidate-br", "BR_PERF_CANDIDATE_SHA256"),
+        ("measurement-driver", "BR_PERF_HARNESS_SHA256"),
+        ("baseline-Cargo.lock", "BR_PERF_BASELINE_LOCK_SHA256"),
+        ("candidate-Cargo.lock", "BR_PERF_CANDIDATE_LOCK_SHA256"),
+    ];
+
+    struct BundleControl {
+        root: tempfile::TempDir,
+        pins: Value,
+    }
+
+    impl BundleControl {
+        fn new(omitted: Option<&str>) -> Self {
+            let root = tempfile::TempDir::new().unwrap();
+            fs::create_dir(root.path().join("bundle")).unwrap();
+            let mut pins = json!({"BR_PERF_BASELINE_SOURCE": "a".repeat(40),
+                "BR_PERF_CANDIDATE_SOURCE": "b".repeat(40)});
+            for (file, key) in BUNDLE_FILES {
+                // Real bytes and SHA256 transport checks; these are explicitly
+                // inert artifact fixtures, not compiled performance binaries.
+                let bytes = format!("inert benchmark artifact control: {file}\n");
+                pins[key] = json!(beads_rust::util::hex_encode(&Sha256::digest(
+                    bytes.as_bytes()
+                )));
+                if omitted != Some(file) {
+                    fs::write(root.path().join("bundle").join(file), bytes).unwrap();
+                }
+            }
+            fs::write(
+                root.path().join("github-env"),
+                "CONTROL_SENTINEL=retained\n",
+            )
+            .unwrap();
+            Self { root, pins }
+        }
+
+        fn run(&self) -> Output {
+            run_fragment(
+                VERIFY_BUNDLE,
+                self.root.path(),
+                &[
+                    (
+                        "BR_PERF_ARTIFACT_DIR",
+                        self.root.path().join("bundle").display().to_string(),
+                    ),
+                    ("BR_PERF_ARTIFACT_PINS", self.pins.to_string()),
+                    ("GITHUB_SHA", "b".repeat(40)),
+                    (
+                        "GITHUB_ENV",
+                        self.root.path().join("github-env").display().to_string(),
+                    ),
+                ],
+            )
+        }
+
+        fn assert_no_export(&self) {
+            assert_eq!(
+                fs::read_to_string(self.root.path().join("github-env")).unwrap(),
+                "CONTROL_SENTINEL=retained\n"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scheduled_bundle_fragment_verifies_real_bytes_before_exporting_pins_and_paths() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let control = BundleControl::new(None);
+        for (file, _) in BUNDLE_FILES {
+            fs::set_permissions(
+                control.root.path().join("bundle").join(file),
+                fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
+        expect_exit(&control.run(), 0, "all five file digests");
+        let env = fs::read_to_string(control.root.path().join("github-env")).unwrap();
+        let records = env
+            .lines()
+            .map(|line| line.split_once('=').unwrap())
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            records.len(),
+            13,
+            "one sentinel, seven pins and five paths: {env}"
+        );
+        assert_eq!(env.lines().count(), 13, "duplicate exports: {env}");
+        for (key, expected) in control.pins.as_object().unwrap() {
+            assert_eq!(records[key.as_str()], expected.as_str().unwrap());
+        }
+        for (file, key) in [
+            ("baseline-br", "BR_PERF_BASELINE_BINARY"),
+            ("candidate-br", "BR_PERF_CANDIDATE_BINARY"),
+            ("measurement-driver", "BR_PERF_HARNESS"),
+            ("baseline-Cargo.lock", "BR_PERF_BASELINE_LOCKFILE"),
+            ("candidate-Cargo.lock", "BR_PERF_CANDIDATE_LOCKFILE"),
+        ] {
+            let path = fs::canonicalize(control.root.path().join("bundle"))
+                .unwrap()
+                .join(file);
+            assert_eq!(records[key], path.display().to_string());
+            let mode = fs::metadata(path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o111 != 0,
+                matches!(file, "baseline-br" | "candidate-br" | "measurement-driver")
+            );
+        }
+    }
+
+    #[test]
+    fn scheduled_bundle_fragment_refuses_missing_corrupt_and_wrong_source_artifacts() {
+        for (file, _) in BUNDLE_FILES {
+            let missing = BundleControl::new(Some(file));
+            expect_exit(&missing.run(), 2, "missing regular artifact");
+            missing.assert_no_export();
+            let corrupt = BundleControl::new(None);
+            fs::write(
+                corrupt.root.path().join("bundle").join(file),
+                "changed bytes\n",
+            )
+            .unwrap();
+            expect_exit(&corrupt.run(), 2, "artifact digest mismatch");
+            corrupt.assert_no_export();
+        }
+        for (key, value) in [
+            ("BR_PERF_CANDIDATE_SOURCE", json!("c".repeat(40))),
+            ("BR_PERF_BASELINE_SOURCE", json!("0".repeat(40))),
+            ("BR_PERF_BASELINE_SOURCE", json!("main")),
+            ("BR_PERF_CANDIDATE_SOURCE", json!("B".repeat(40))),
+            ("BR_PERF_HARNESS_SHA256", json!("0".repeat(64))),
+            ("BR_PERF_HARNESS_SHA256", json!("malformed")),
+        ] {
+            let mut control = BundleControl::new(None);
+            control.pins[key] = value;
+            expect_exit(&control.run(), 2, "inconclusive");
+            control.assert_no_export();
+        }
+        for pins in [json!({}), json!([]), json!(null)] {
+            let mut control = BundleControl::new(None);
+            control.pins = pins;
+            expect_exit(&control.run(), 2, "inconclusive");
+            control.assert_no_export();
+        }
+    }
+
+    #[test]
+    fn scheduled_package_and_loader_fragments_roundtrip_all_artifact_bytes_and_pins() {
+        let control = BundleControl::new(None);
+        let source = control.root.path().join("bundle");
+        let packaged = control.root.path().join("packaged");
+        let evidence = control.root.path().join("build-evidence");
+        fs::create_dir(&evidence).unwrap();
+        let build_log = "{\"fixture\":\"artifact transport only, not a compiled binary\"}\n";
+        fs::write(evidence.join("build-artifacts.jsonl"), build_log).unwrap();
+        let output_path = control.root.path().join("github-output");
+        fs::write(&output_path, "CONTROL_SENTINEL=retained\n").unwrap();
+        let mut variables = control
+            .pins
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str().unwrap().to_string()))
+            .collect::<Vec<_>>();
+        variables.extend([
+            ("BR_PERF_ARTIFACT_DIR", packaged.display().to_string()),
+            ("BR_PERF_EVIDENCE", evidence.display().to_string()),
+            ("GITHUB_OUTPUT", output_path.display().to_string()),
+        ]);
+        for (file, variable) in [
+            ("baseline-br", "BR_PERF_BASELINE_BINARY"),
+            ("candidate-br", "BR_PERF_CANDIDATE_BINARY"),
+            ("measurement-driver", "BR_PERF_HARNESS"),
+            ("baseline-Cargo.lock", "BR_PERF_BASELINE_LOCKFILE"),
+            ("candidate-Cargo.lock", "BR_PERF_CANDIDATE_LOCKFILE"),
+        ] {
+            variables.push((variable, source.join(file).display().to_string()));
+        }
+        expect_exit(
+            &run_fragment(
+                "Package benchmark artifacts",
+                control.root.path(),
+                &variables,
+            ),
+            0,
+            "",
+        );
+        let output = fs::read_to_string(output_path).unwrap();
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "CONTROL_SENTINEL=retained");
+        let pins: Value = serde_json::from_str(lines[1].strip_prefix("pins=").unwrap()).unwrap();
+        assert_eq!(pins, control.pins);
+        for (file, _) in BUNDLE_FILES {
+            assert_eq!(
+                fs::read(packaged.join(file)).unwrap(),
+                fs::read(source.join(file)).unwrap()
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(packaged.join("build-artifacts.jsonl")).unwrap(),
+            build_log
+        );
+        expect_exit(
+            &run_fragment(
+                VERIFY_BUNDLE,
+                control.root.path(),
+                &[
+                    ("BR_PERF_ARTIFACT_DIR", packaged.display().to_string()),
+                    ("BR_PERF_ARTIFACT_PINS", pins.to_string()),
+                    ("GITHUB_SHA", "b".repeat(40)),
+                    (
+                        "GITHUB_ENV",
+                        control.root.path().join("github-env").display().to_string(),
+                    ),
+                ],
+            ),
+            0,
+            "all five file digests",
+        );
+        let env = fs::read_to_string(control.root.path().join("github-env")).unwrap();
+        let harness = fs::canonicalize(packaged)
+            .unwrap()
+            .join("measurement-driver");
+        assert!(env.contains(&format!("BR_PERF_HARNESS={}\n", harness.display())));
+    }
+
+    #[cfg(unix)]
+    struct ShardControl {
+        root: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl ShardControl {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let root = tempfile::TempDir::new().unwrap();
+            let harness = root.path().join("mock-collector");
+            // This mock records only the real shell transport. It makes no
+            // admission, timing, statistical or complete-receipt claim.
+            fs::write(
+                &harness,
+                r"#!/usr/bin/env python3
+import json, os, pathlib, sys
+root = pathlib.Path(os.environ['BR_PERF_EVIDENCE'])
+relative = pathlib.Path(os.environ['BR_PERF_OUTPUT']).relative_to(root)
+keys = ('OUTPUT', 'WORKLOAD', 'ABBA_BLOCKS', 'QUIET_RUNNER', 'NEGATIVE_EXTRA_WORK',
+        'BUDGET_PCT', 'BUDGETS_JSON', 'BASELINE_BINARY', 'CANDIDATE_BINARY',
+        'BASELINE_SHA256', 'CANDIDATE_SHA256', 'BASELINE_LOCKFILE', 'CANDIDATE_LOCKFILE',
+        'BASELINE_LOCK_SHA256', 'CANDIDATE_LOCK_SHA256', 'BASELINE_SOURCE', 'CANDIDATE_SOURCE')
+with (root / 'invocations.jsonl').open('a') as log:
+    log.write(json.dumps({'args': sys.argv[1:], 'relative': str(relative),
+        'env': {key: os.environ.get('BR_PERF_' + key) for key in keys}}) + '\n')
+print('mock shard collector transport control: stdout')
+print('mock shard collector transport control: stderr', file=sys.stderr)
+raise SystemExit(37 if str(relative) == os.environ['BR_PERF_FIXTURE_FAILURE'] else 0)
+",
+            )
+            .unwrap();
+            fs::set_permissions(harness, fs::Permissions::from_mode(0o755)).unwrap();
+            Self { root }
+        }
+
+        fn run(&self, count: &str, flush: &str, failure: &str) -> Output {
+            run_fragment(
+                MEASURE,
+                self.root.path(),
+                &[
+                    ("BR_PERF_EVIDENCE", self.root.path().display().to_string()),
+                    (
+                        "BR_PERF_HARNESS",
+                        self.root
+                            .path()
+                            .join("mock-collector")
+                            .display()
+                            .to_string(),
+                    ),
+                    ("BR_PERF_SHARD_ISSUE_COUNT", count.into()),
+                    ("BR_PERF_SHARD_FLUSH", flush.into()),
+                    ("BR_PERF_ABBA_BLOCKS", "99".into()),
+                    ("BR_PERF_QUIET_RUNNER", "1".into()),
+                    ("BR_PERF_BUDGETS_JSON", json!({READY: 7}).to_string()),
+                    ("BR_PERF_BUDGET_PCT", "99999".into()),
+                    ("BR_PERF_WORKLOAD", "wrong-inherited-selector".into()),
+                    ("BR_PERF_OUTPUT", "wrong-inherited-output".into()),
+                    ("BR_PERF_NEGATIVE_EXTRA_WORK", "20".into()),
+                    ("BR_PERF_BASELINE_BINARY", "baseline-release-br".into()),
+                    ("BR_PERF_CANDIDATE_BINARY", "candidate-release-br".into()),
+                    ("BR_PERF_BASELINE_SHA256", "1".repeat(64)),
+                    ("BR_PERF_CANDIDATE_SHA256", "2".repeat(64)),
+                    ("BR_PERF_BASELINE_LOCKFILE", "baseline-Cargo.lock".into()),
+                    ("BR_PERF_CANDIDATE_LOCKFILE", "candidate-Cargo.lock".into()),
+                    ("BR_PERF_BASELINE_LOCK_SHA256", "3".repeat(64)),
+                    ("BR_PERF_CANDIDATE_LOCK_SHA256", "4".repeat(64)),
+                    ("BR_PERF_BASELINE_SOURCE", "a".repeat(40)),
+                    ("BR_PERF_CANDIDATE_SOURCE", "b".repeat(40)),
+                    ("BR_PERF_FIXTURE_FAILURE", failure.into()),
+                ],
+            )
+        }
+
+        fn invocations(&self) -> Vec<Value> {
+            fs::read_to_string(self.root.path().join("invocations.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+
+        fn assert_pipeline(&self, relative: &str, collector: i32, capture: i32) {
+            let directory = self.root.path().join(relative);
+            assert_eq!(
+                fs::read_to_string(directory.join("collector.exit")).unwrap(),
+                format!("{collector}\n")
+            );
+            assert_eq!(
+                fs::read_to_string(directory.join("log-capture.exit")).unwrap(),
+                format!("{capture}\n")
+            );
+            if capture == 0 {
+                let log = fs::read_to_string(directory.join("collector.log")).unwrap();
+                assert!(log.contains("transport control: stdout"));
+                assert!(log.contains("transport control: stderr"));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scheduled_shard_fragment_executes_all_56_workloads_with_exact_pins_and_order() {
+        let control = ShardControl::new();
+        for count in ["1000", "10000"] {
+            for flush in ["default-auto-flush", "diagnostic-no-auto-flush"] {
+                expect_exit(
+                    &control.run(count, flush, ""),
+                    0,
+                    "mock shard collector transport control",
+                );
+            }
+        }
+        let invocations = control.invocations();
+        assert_eq!(invocations.len(), 56);
+        let expected = names()
+            .into_iter()
+            .flat_map(|name| [format!("aa/{name}"), format!("ab/{name}")])
+            .collect::<Vec<_>>();
+        for (invocation, relative) in invocations.iter().zip(expected) {
+            assert_eq!(invocation["relative"], relative);
+            assert_eq!(
+                invocation["args"],
+                json!([
+                    "--exact",
+                    "release_abba::release_cli_abba_1k_10k",
+                    "--ignored",
+                    "--nocapture"
+                ])
+            );
+            let env = &invocation["env"];
+            assert_eq!(env["WORKLOAD"], relative.split_once('/').unwrap().1);
+            assert_eq!(
+                env["OUTPUT"],
+                control.root.path().join(&relative).display().to_string()
+            );
+            assert_eq!(env["ABBA_BLOCKS"], "99");
+            assert_eq!(env["QUIET_RUNNER"], "1");
+            assert_eq!(env["NEGATIVE_EXTRA_WORK"], "1");
+            assert!(env["BUDGET_PCT"].is_null());
+            assert_eq!(
+                serde_json::from_str::<Value>(env["BUDGETS_JSON"].as_str().unwrap()).unwrap(),
+                json!({READY: 7})
+            );
+            for (suffix, candidate, baseline) in [
+                (
+                    "BINARY",
+                    "candidate-release-br".into(),
+                    "baseline-release-br".into(),
+                ),
+                ("SHA256", "2".repeat(64), "1".repeat(64)),
+                (
+                    "LOCKFILE",
+                    "candidate-Cargo.lock".into(),
+                    "baseline-Cargo.lock".into(),
+                ),
+                ("LOCK_SHA256", "4".repeat(64), "3".repeat(64)),
+                ("SOURCE", "b".repeat(40), "a".repeat(40)),
+            ] {
+                assert_eq!(env[format!("CANDIDATE_{suffix}")], candidate);
+                assert_eq!(
+                    env[format!("BASELINE_{suffix}")],
+                    if relative.starts_with("aa/") {
+                        candidate
+                    } else {
+                        baseline
+                    }
+                );
+            }
+            control.assert_pipeline(&relative, 0, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scheduled_shard_fragment_continues_after_collector_and_log_capture_failures() {
+        let control = ShardControl::new();
+        let first = format!("aa/{FIRST}");
+        expect_exit(
+            &control.run("1000", "default-auto-flush", &first),
+            2,
+            "mock shard collector transport control",
+        );
+        assert_eq!(control.invocations().len(), 14);
+        control.assert_pipeline(&first, 37, 0);
+        control.assert_pipeline("ab/1000-close-default-auto-flush", 0, 0);
+
+        let control = ShardControl::new();
+        // A real filesystem obstruction makes tee fail; the workflow still
+        // records both pipeline exits and attempts every later workload.
+        fs::create_dir_all(control.root.path().join(&first).join("collector.log")).unwrap();
+        expect_exit(
+            &control.run("1000", "default-auto-flush", ""),
+            2,
+            "mock shard collector transport control",
+        );
+        assert_eq!(control.invocations().len(), 14);
+        control.assert_pipeline(&first, 0, 1);
+        control.assert_pipeline("ab/1000-close-default-auto-flush", 0, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scheduled_shard_fragment_refuses_invalid_selectors_before_launching() {
+        for (count, flush) in [("100", "default-auto-flush"), ("1000", "unknown"), ("", "")] {
+            let control = ShardControl::new();
+            expect_exit(&control.run(count, flush, ""), 2, "invalid workload shard");
+            assert!(!control.root.path().join("invocations.jsonl").exists());
+        }
     }
 
     fn raw_control(name: &str, blocks: usize) -> Value {
@@ -1110,6 +1559,12 @@ mod scheduled_benchmarks {
         root: tempfile::TempDir,
         budgets: Value,
         blocks: usize,
+        shards_result: &'static str,
+    }
+
+    fn run_control(name: &str, code: usize) -> Value {
+        json!({"state": "measurements_completed", "scope": "separate_exact_workload",
+            "selected_workload": name, "completed_workloads": 1, "latency_gate_exits": [code]})
     }
 
     impl ReceiptControl {
@@ -1122,27 +1577,36 @@ mod scheduled_benchmarks {
                 root: tempfile::TempDir::new().unwrap(),
                 budgets: Value::Object(names().into_iter().map(|name| (name, json!(7))).collect()),
                 blocks,
+                shards_result: "success",
             };
             let code = usize::from(blocks == 10) * 2;
             for cohort in ["aa", "ab"] {
-                let directory = control.root.path().join(cohort);
-                fs::create_dir(&directory).unwrap();
-                fs::write(directory.join("collector.exit"), "0\n").unwrap();
-                control.write(
-                    &format!("{cohort}/run.json"),
-                    &json!({"state": "measurements_completed", "latency_gate_exits": vec![code; 28]}),
-                );
                 for name in names() {
+                    let relative_directory = format!("{cohort}/{name}");
+                    if omitted == Some(relative_directory.as_str()) {
+                        continue;
+                    }
+                    let directory = control.root.path().join(&relative_directory);
+                    fs::create_dir_all(&directory).unwrap();
+                    for exit in ["collector.exit", "log-capture.exit"] {
+                        if omitted != Some(format!("{relative_directory}/{exit}").as_str()) {
+                            fs::write(directory.join(exit), "0\n").unwrap();
+                        }
+                    }
+                    let run_path = format!("{relative_directory}/run.json");
+                    if omitted != Some(run_path.as_str()) {
+                        control.write(&run_path, &run_control(&name, code));
+                    }
                     control.write(
-                        &format!("{cohort}/{name}-summary.json"),
+                        &format!("{cohort}/{name}/{name}-summary.json"),
                         &bounded_summary_control(&name, blocks, code, 10.0, 10.0, 7),
                     );
-                    let raw_path = format!("{cohort}/{name}-raw.json");
+                    let raw_path = format!("{cohort}/{name}/{name}-raw.json");
                     if omitted != Some(raw_path.as_str()) {
                         control.write(&raw_path, &abba_control(blocks));
                     }
                     for side in 0..2 {
-                        let path = format!("{cohort}/{name}-{side}.json");
+                        let path = format!("{cohort}/{name}/{name}-{side}.json");
                         if omitted != Some(path.as_str()) {
                             control.write(&path, &raw_control(&name, blocks));
                         }
@@ -1167,6 +1631,7 @@ mod scheduled_benchmarks {
                 &[
                     ("BR_PERF_EVIDENCE", self.root.path().display().to_string()),
                     ("BR_PERF_ABBA_BLOCKS", self.blocks.to_string()),
+                    ("BR_PERF_SHARDS_RESULT", self.shards_result.to_string()),
                     ("BR_PERF_BUDGETS_JSON", self.budgets.to_string()),
                     ("BR_PERF_BASELINE_SHA256", "2".repeat(64)),
                     ("BR_PERF_CANDIDATE_SHA256", "2".repeat(64)),
@@ -1186,7 +1651,7 @@ mod scheduled_benchmarks {
 
         fn decide(&self, cohort: &str, code: usize) {
             self.write(
-                &format!("{cohort}/{FIRST}-summary.json"),
+                &format!("{cohort}/{FIRST}/{FIRST}-summary.json"),
                 &summary_control(FIRST, code),
             );
             let mut receipt = raw_control(FIRST, CONTROL_BLOCKS);
@@ -1203,13 +1668,11 @@ mod scheduled_benchmarks {
                     sample["elapsed_ms"] = json!(pair[usize::from(sample["position"] == 2)]);
                 }
             }
-            self.write(&format!("{cohort}/{FIRST}-1.json"), &receipt);
-            self.write(&format!("{cohort}/{FIRST}-raw.json"), &raw);
-            let mut codes = vec![0; 28];
-            codes[0] = code;
+            self.write(&format!("{cohort}/{FIRST}/{FIRST}-1.json"), &receipt);
+            self.write(&format!("{cohort}/{FIRST}/{FIRST}-raw.json"), &raw);
             self.write(
-                &format!("{cohort}/run.json"),
-                &json!({"state": "measurements_completed", "latency_gate_exits": codes}),
+                &format!("{cohort}/{FIRST}/run.json"),
+                &run_control(FIRST, code),
             );
         }
     }
@@ -1222,6 +1685,7 @@ mod scheduled_benchmarks {
             root: tempfile::TempDir::new().unwrap(),
             budgets: json!({}),
             blocks: 10,
+            shards_result: "success",
         };
         fs::create_dir(control.root.path().join("planted-ready")).unwrap();
         control.write(
@@ -1460,6 +1924,83 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
     }
 
     #[test]
+    fn scheduled_receipt_fragment_requires_every_shard_and_workload() {
+        let mut control = ReceiptControl::new(None);
+        expect_exit(&control.run(), 0, "all 28 matched latency workloads");
+        for result in ["failure", "cancelled", "skipped", "", "unknown"] {
+            control.shards_result = result;
+            expect_exit(&control.run(), 2, "inconclusive");
+        }
+        for name in [
+            "1000-close-default-auto-flush",
+            "1000-close-diagnostic-no-auto-flush",
+            "10000-close-default-auto-flush",
+            "10000-close-diagnostic-no-auto-flush",
+        ] {
+            let control = ReceiptControl::new(Some(&format!("ab/{name}")));
+            expect_exit(&control.run(), 2, "inconclusive");
+        }
+        let control = ReceiptControl::new(None);
+        fs::create_dir(control.root.path().join("ab/duplicate-or-unknown-workload")).unwrap();
+        expect_exit(
+            &control.run(),
+            2,
+            "expected exactly all 28 workload directories",
+        );
+    }
+
+    #[test]
+    fn scheduled_receipt_fragment_requires_unique_exact_workload_scope() {
+        let control = ReceiptControl::new(None);
+        for (key, value) in [
+            ("state", json!("incomplete")),
+            ("scope", json!("full_matrix")),
+            ("selected_workload", json!(READY)),
+            ("completed_workloads", json!(0)),
+            ("completed_workloads", json!(2)),
+            ("completed_workloads", json!(true)),
+            ("latency_gate_exits", json!([])),
+            ("latency_gate_exits", json!([0, 0])),
+            ("latency_gate_exits", json!([1])),
+            ("latency_gate_exits", json!([true])),
+        ] {
+            let mut run = run_control(FIRST, 0);
+            run[key] = value;
+            control.write(&format!("ab/{FIRST}/run.json"), &run);
+            expect_exit(&control.run(), 2, "inconclusive");
+        }
+        let control = ReceiptControl::new(Some(&format!("ab/{FIRST}/run.json")));
+        expect_exit(&control.run(), 2, "inconclusive");
+    }
+
+    #[test]
+    fn scheduled_receipt_fragment_requires_both_pipeline_exits() {
+        for file in ["collector.exit", "log-capture.exit"] {
+            let path = format!("ab/{FIRST}/{file}");
+            let missing = ReceiptControl::new(Some(&path));
+            expect_exit(&missing.run(), 2, "inconclusive");
+            let control = ReceiptControl::new(None);
+            for status in ["1\n", "101\n", "true\n", ""] {
+                fs::write(control.root.path().join(&path), status).unwrap();
+                expect_exit(&control.run(), 2, "inconclusive");
+            }
+        }
+    }
+
+    #[test]
+    fn scheduled_receipt_fragment_requires_same_host_for_workload_aa_and_ab() {
+        let control = ReceiptControl::new(None);
+        // Each A/B pair remains internally matched. Its A/A control must have
+        // observed the same environment, rather than a different shard host.
+        for side in 0..2 {
+            let mut receipt = raw_control(FIRST, CONTROL_BLOCKS);
+            receipt["metadata"]["host"] = json!("different-shard-host");
+            control.write(&format!("ab/{FIRST}/{FIRST}-{side}.json"), &receipt);
+        }
+        expect_exit(&control.run(), 2, "inconclusive");
+    }
+
+    #[test]
     fn scheduled_receipt_fragment_refuses_legacy_or_malformed_quantile_evidence() {
         let control = ReceiptControl::new(None);
         for (pointer, value) in [
@@ -1492,7 +2033,7 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
         ] {
             let mut summary = summary_control(FIRST, 0);
             *summary["comparison"].pointer_mut(pointer).unwrap() = value;
-            control.write(&format!("ab/{FIRST}-summary.json"), &summary);
+            control.write(&format!("ab/{FIRST}/{FIRST}-summary.json"), &summary);
             expect_exit(&control.run(), 2, "benchmark_gate: inconclusive");
         }
         let mut summary = summary_control(FIRST, 0);
@@ -1500,7 +2041,7 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
             .as_object_mut()
             .unwrap()
             .remove("p95");
-        control.write(&format!("ab/{FIRST}-summary.json"), &summary);
+        control.write(&format!("ab/{FIRST}/{FIRST}-summary.json"), &summary);
         expect_exit(&control.run(), 2, "benchmark_gate: inconclusive");
     }
 
@@ -1513,7 +2054,7 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
         for key in ["baseline_upper_ms", "candidate_upper_ms", "lower", "upper"] {
             p95[key] = Value::Null;
         }
-        control.write(&format!("ab/{FIRST}-summary.json"), &summary);
+        control.write(&format!("ab/{FIRST}/{FIRST}-summary.json"), &summary);
         expect_exit(
             &control.run(),
             2,
@@ -1524,7 +2065,7 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
         let mut summary = summary_control(FIRST, 0);
         summary["gate_exit"] = json!(1);
         summary["comparison"]["state"] = json!("regression");
-        control.write(&format!("ab/{FIRST}-summary.json"), &summary);
+        control.write(&format!("ab/{FIRST}/{FIRST}-summary.json"), &summary);
         expect_exit(
             &control.run(),
             2,
@@ -1553,7 +2094,7 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
         ] {
             let mut receipt = raw_control(FIRST, CONTROL_BLOCKS);
             receipt["block_ids"] = ids;
-            control.write(&format!("ab/{FIRST}-1.json"), &receipt);
+            control.write(&format!("ab/{FIRST}/{FIRST}-1.json"), &receipt);
             expect_exit(&control.run(), 2, "explicit block IDs differ from raw ABBA");
         }
         for key in ["block_ids", "sampling_protocol"] {
@@ -1563,10 +2104,13 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
             } else {
                 receipt["metadata"].as_object_mut().unwrap().remove(key);
             }
-            control.write(&format!("ab/{FIRST}-1.json"), &receipt);
+            control.write(&format!("ab/{FIRST}/{FIRST}-1.json"), &receipt);
             expect_exit(&control.run(), 2, "benchmark_gate: inconclusive");
         }
-        control.write(&format!("ab/{FIRST}-1.json"), &raw_control(FIRST, 10));
+        control.write(
+            &format!("ab/{FIRST}/{FIRST}-1.json"),
+            &raw_control(FIRST, 10),
+        );
         expect_exit(&control.run(), 2, "invalid raw samples");
     }
 
@@ -1577,14 +2121,14 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
         // the selected median/p95 block ranks and both point estimates remain 10.
         let mut receipt = raw_control(FIRST, CONTROL_BLOCKS);
         receipt["samples_ms"][0] = json!(f64::MIN_POSITIVE);
-        control.write(&format!("ab/{FIRST}-0.json"), &receipt);
+        control.write(&format!("ab/{FIRST}/{FIRST}-0.json"), &receipt);
         let mut raw = abba_control(CONTROL_BLOCKS);
         raw[8]["elapsed_ms"] = json!(f64::MIN_POSITIVE);
-        control.write(&format!("ab/{FIRST}-raw.json"), &raw);
+        control.write(&format!("ab/{FIRST}/{FIRST}-raw.json"), &raw);
         let mut summary = summary_control(FIRST, 0);
         summary["comparison"]["observed_support"]["upper_ms"] = json!(10.0 - f64::MIN_POSITIVE);
         summary["comparison"]["observed_support"]["upper_pct"] = Value::Null;
-        control.write(&format!("ab/{FIRST}-summary.json"), &summary);
+        control.write(&format!("ab/{FIRST}/{FIRST}-summary.json"), &summary);
         expect_exit(&control.run(), 0, "all 28 matched latency workloads");
     }
 
@@ -1600,7 +2144,7 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
         // the live ten-block default sufficient for this declared confidence.
         let mut summary = bounded_summary_control(FIRST, 10, 0, 10.0, 10.0, 7);
         summary["comparison"]["uncertainty"]["p95"] = quantile_control(10, [7, 10], 10.0, 10.0);
-        control.write(&format!("aa/{FIRST}-summary.json"), &summary);
+        control.write(&format!("aa/{FIRST}/{FIRST}-summary.json"), &summary);
         expect_exit(
             &control.run(),
             2,
@@ -1633,17 +2177,17 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
         // Both cohorts use the calibrated budget; the A/A receipt is the first
         // attempted forged Pass. Equal samples do not make an infinite allowance valid.
         for cohort in ["aa", "ab"] {
-            control.write(&format!("{cohort}/{FIRST}-summary.json"), &summary);
+            control.write(&format!("{cohort}/{FIRST}/{FIRST}-summary.json"), &summary);
             for side in 0..2 {
                 let mut receipt = raw_control(FIRST, CONTROL_BLOCKS);
                 receipt["samples_ms"] = json!(vec![1000; 2 * CONTROL_BLOCKS]);
-                control.write(&format!("{cohort}/{FIRST}-{side}.json"), &receipt);
+                control.write(&format!("{cohort}/{FIRST}/{FIRST}-{side}.json"), &receipt);
             }
             let mut raw = abba_control(CONTROL_BLOCKS);
             for sample in raw.as_array_mut().unwrap() {
                 sample["elapsed_ms"] = json!(1000);
             }
-            control.write(&format!("{cohort}/{FIRST}-raw.json"), &raw);
+            control.write(&format!("{cohort}/{FIRST}/{FIRST}-raw.json"), &raw);
         }
         expect_exit(
             &control.run(),
@@ -1712,13 +2256,24 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
 
     #[test]
     fn scheduled_receipt_fragment_refuses_missing_corrupt_and_failed_evidence() {
-        let missing = ReceiptControl::new(Some(&format!("ab/{FIRST}-0.json")));
+        let missing = ReceiptControl::new(Some(&format!("ab/{FIRST}/{FIRST}-0.json")));
         expect_exit(&missing.run(), 2, "inconclusive");
         let control = ReceiptControl::new(None);
-        fs::write(control.root.path().join("ab/run.json"), "{broken").unwrap();
+        fs::write(
+            control.root.path().join(format!("ab/{FIRST}/run.json")),
+            "{broken",
+        )
+        .unwrap();
         expect_exit(&control.run(), 2, "inconclusive");
         control.decide("ab", 0);
-        fs::write(control.root.path().join("ab/collector.exit"), "101\n").unwrap();
+        fs::write(
+            control
+                .root
+                .path()
+                .join(format!("ab/{FIRST}/collector.exit")),
+            "101\n",
+        )
+        .unwrap();
         expect_exit(&control.run(), 2, "collector did not complete successfully");
     }
 
@@ -1733,13 +2288,13 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
             json!({"samples_ms": vec![10; 2 * CONTROL_BLOCKS], "exit_codes": vec![false; 2 * CONTROL_BLOCKS]}),
             json!({"samples_ms": vec![10; 21], "exit_codes": vec![0; 21]}),
         ] {
-            control.write(&format!("ab/{FIRST}-1.json"), &receipt);
+            control.write(&format!("ab/{FIRST}/{FIRST}-1.json"), &receipt);
             expect_exit(&control.run(), 2, "inconclusive");
         }
         let control = ReceiptControl::new(None);
         let mut receipt = raw_control(FIRST, CONTROL_BLOCKS);
         receipt["metadata"]["binary_sha256"] = json!("4".repeat(64));
-        control.write(&format!("aa/{FIRST}-1.json"), &receipt);
+        control.write(&format!("aa/{FIRST}/{FIRST}-1.json"), &receipt);
         expect_exit(
             &control.run(),
             2,
@@ -1759,7 +2314,7 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
         ] {
             let mut receipt = raw_control(FIRST, CONTROL_BLOCKS);
             receipt["metadata"][key] = json!(value);
-            control.write(&format!("ab/{FIRST}-1.json"), &receipt);
+            control.write(&format!("ab/{FIRST}/{FIRST}-1.json"), &receipt);
             expect_exit(&control.run(), 2, reason);
         }
     }
@@ -1793,10 +2348,10 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
 
     #[test]
     fn scheduled_receipt_fragment_requires_complete_raw_abba_observations() {
-        let missing = ReceiptControl::new(Some(&format!("ab/{FIRST}-raw.json")));
+        let missing = ReceiptControl::new(Some(&format!("ab/{FIRST}/{FIRST}-raw.json")));
         expect_exit(&missing.run(), 2, "inconclusive");
         let control = ReceiptControl::new(None);
-        control.write(&format!("ab/{FIRST}-raw.json"), &json!([]));
+        control.write(&format!("ab/{FIRST}/{FIRST}-raw.json"), &json!([]));
         expect_exit(&control.run(), 2, "incomplete raw ABBA log");
         for (key, value, diagnostic) in [
             ("side", json!(1), "invalid raw ABBA order"),
@@ -1807,12 +2362,12 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
         ] {
             let mut raw = abba_control(CONTROL_BLOCKS);
             raw[0][key] = value;
-            control.write(&format!("ab/{FIRST}-raw.json"), &raw);
+            control.write(&format!("ab/{FIRST}/{FIRST}-raw.json"), &raw);
             expect_exit(&control.run(), 2, diagnostic);
         }
         let mut raw = abba_control(CONTROL_BLOCKS);
         raw[8]["elapsed_ms"] = json!(20);
-        control.write(&format!("ab/{FIRST}-raw.json"), &raw);
+        control.write(&format!("ab/{FIRST}/{FIRST}-raw.json"), &raw);
         expect_exit(
             &control.run(),
             2,
@@ -1828,14 +2383,16 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
             bench["if"],
             "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
         );
-        for step in bench["steps"].as_array().unwrap() {
-            assert_ne!(step["continue-on-error"], true);
-            assert!(
-                !step["uses"]
-                    .as_str()
-                    .unwrap_or("")
-                    .starts_with("actions/cache/")
-            );
+        for job in ["bench-build", "bench", "bench-gate"] {
+            for step in workflow["jobs"][job]["steps"].as_array().unwrap() {
+                assert_ne!(step["continue-on-error"], true);
+                assert!(
+                    !step["uses"]
+                        .as_str()
+                        .unwrap_or("")
+                        .starts_with("actions/cache/")
+                );
+            }
         }
         assert_eq!(step(GATE)["if"], "always()");
         let upload = step("Upload benchmark results");
@@ -1847,12 +2404,16 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
         assert!(script.contains("--release --locked --bin br"));
         assert!(script.contains("--test bench_synthetic_scale --no-run"));
         assert!(!script.contains("cargo test --release"));
-        let measure = step("Measure release A-A control and A-B comparison");
+        let measure = step(MEASURE);
         assert_eq!(
             measure["if"],
-            "${{ !cancelled() && steps.benchmark_build.outcome == 'success' }}"
+            "${{ !cancelled() && steps.benchmark_artifacts.outcome == 'success' }}"
         );
         let planted = step(PLANTED);
+        assert_eq!(
+            planted["if"],
+            "matrix.issue_count == 1000 && matrix.flush == 'default-auto-flush'"
+        );
         let script = planted["run"].as_str().unwrap();
         assert!(script.contains("timeout --signal=TERM --kill-after=10s 1800s"));
         assert!(!script.contains("cargo "));
@@ -1861,7 +2422,103 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
         assert!(script.contains("--exact release_abba::release_cli_abba_1k_10k --ignored"));
         assert!(script.contains("timeout --signal=TERM --kill-after=10s 1800s"));
         assert!(script.contains("collector.exit"));
+        assert!(script.contains("log-capture.exit"));
         assert!(!script.contains("cargo "));
+    }
+
+    #[test]
+    fn scheduled_benchmark_matrix_builds_once_and_gates_every_shard() {
+        let workflow = workflow();
+        let jobs = &workflow["jobs"];
+        let build = &jobs["bench-build"];
+        let bench = &jobs["bench"];
+        let gate = &jobs["bench-gate"];
+        assert_eq!(build["needs"], "check");
+        assert_eq!(
+            build["if"],
+            "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
+        );
+        assert_eq!(build["timeout-minutes"], 120);
+        assert_eq!(
+            build["outputs"]["pins"],
+            "${{ steps.benchmark_artifacts.outputs.pins }}"
+        );
+        assert_eq!(
+            step("Package benchmark artifacts")["id"],
+            "benchmark_artifacts"
+        );
+        assert_eq!(bench["needs"], "bench-build");
+        assert_eq!(bench["timeout-minutes"], 120);
+        assert_eq!(bench["strategy"]["fail-fast"], false);
+        assert_eq!(
+            bench["strategy"]["matrix"],
+            json!({"issue_count": [1000, 10000], "flush": ["default-auto-flush", "diagnostic-no-auto-flush"]})
+        );
+        assert_eq!(
+            bench["env"]["BR_PERF_SHARD_ISSUE_COUNT"],
+            "${{ matrix.issue_count }}"
+        );
+        assert_eq!(bench["env"]["BR_PERF_SHARD_FLUSH"], "${{ matrix.flush }}");
+        assert_eq!(bench["env"]["BR_PERF_ABBA_BLOCKS"], "99");
+        assert_eq!(bench["env"]["BR_PERF_QUIET_RUNNER"], "1");
+        assert_eq!(
+            bench["env"]["BR_PERF_ARTIFACT_PINS"],
+            "${{ needs.bench-build.outputs.pins }}"
+        );
+        for step in bench["steps"].as_array().unwrap() {
+            assert!(!step["run"].as_str().unwrap_or("").contains("cargo "));
+        }
+        let upload_bundle = step("Upload benchmark artifacts");
+        let download_bundle = step("Download benchmark artifacts");
+        assert_eq!(upload_bundle["with"]["name"], "benchmark-artifacts");
+        assert_eq!(
+            download_bundle["with"]["name"],
+            upload_bundle["with"]["name"]
+        );
+        assert_eq!(upload_bundle["with"]["if-no-files-found"], "error");
+        assert_eq!(
+            step("Upload benchmark results")["with"]["name"],
+            "benchmark-results-${{ matrix.issue_count }}-${{ matrix.flush }}"
+        );
+        assert_eq!(gate["needs"], json!(["bench-build", "bench"]));
+        assert_eq!(
+            gate["if"],
+            "${{ always() && needs.bench-build.result == 'success' }}"
+        );
+        assert_eq!(gate["env"]["BR_PERF_ABBA_BLOCKS"], "99");
+        assert_eq!(
+            gate["env"]["BR_PERF_SHARDS_RESULT"],
+            "${{ needs.bench.result }}"
+        );
+        for side in ["BASELINE", "CANDIDATE"] {
+            for suffix in ["SOURCE", "SHA256", "LOCK_SHA256"] {
+                let key = format!("BR_PERF_{side}_{suffix}");
+                assert_eq!(
+                    gate["env"][&key],
+                    format!("${{{{ fromJSON(needs.bench-build.outputs.pins).{key} }}}}")
+                );
+            }
+        }
+        let download = step("Download every benchmark shard");
+        assert_eq!(download["with"]["pattern"], "benchmark-results-*");
+        assert_eq!(download["with"]["merge-multiple"], true);
+        assert_eq!(download["with"]["path"], "target/perf-evidence/");
+        let step_names = bench["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            step_names,
+            [
+                "Download benchmark artifacts",
+                VERIFY_BUNDLE,
+                PLANTED,
+                MEASURE,
+                "Upload benchmark results"
+            ]
+        );
     }
 
     #[test]

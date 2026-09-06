@@ -108,8 +108,23 @@ decision. The receipt upload runs even when the gate fails. The harness executes
 all seven target boundaries, one-byte overruns and missing/incompatible-input
 refusals. Its sparse byte fixtures test the gate and are not release measurements.
 
-Scheduled benchmark CI builds a pinned baseline and the candidate in the same
-job before collecting A/A and A/B samples. It retains raw results even when
+Scheduled benchmark CI builds a pinned baseline, candidate and measurement
+driver once in `bench-build`. The four `bench` jobs split the 1k/10k datasets
+and default/diagnostic flush modes. Each downloads the same artifacts and
+checks all five binary/lockfile digests against the build job's outputs before
+measurement. The candidate source must match the workflow revision. Compilation
+does not run on measurement runners; the collector still enforces its initial
+and per-sample load admission and bounded settling.
+
+Each shard measures all seven commands, running A/A then A/B for each exact
+workload on that runner. Each collector keeps the 1800-second external deadline;
+the shard job keeps its 120-minute limit. Collector and log-capture exits are
+retained separately, and a failure does not skip subsequent workloads. Results
+live under `<aa|ab>/<workload>/` in four uniquely named artifacts. The final
+`bench-gate` job requires all four shard jobs to succeed and validates all 28
+workload pairs, including each individual run's scope and matching A/A–A/B
+runner metadata. A missing workload, failed log capture, or failed planted
+control cannot become a passing aggregate. Raw artifacts are uploaded even when
 collection or enforcement fails. Missing per-workload budgets, failed samples,
 unmatched provenance and unstable A/A controls are inconclusive, with exit 2;
 regressions exit 1. Only complete, matched passing comparisons exit 0. The
@@ -129,15 +144,18 @@ descriptive; an overflowing support percentage is null and cannot alone veto
 finite quantile inference. Legacy or malformed inference cannot pass. A full
 pass requires both quantile upper bounds within budget; either lower bound can
 establish a regression. Unbounded or inconclusive A/A comparisons remain exit 2.
-The unchanged ten-block live default has insufficient observations for a finite
-p95 upper bound at this error allocation; at least 99 blocks are needed for
-that endpoint. The shell's positive serialization control explicitly declares
-99 blocks and is not evidence of a live calibrated performance pass. Full raw
+The full matrix uses 99 retained blocks, fixed before collection: this is the
+minimum needed for a finite p95 upper endpoint at this error allocation, not a
+guarantee of a narrow interval or a calibrated performance pass. Each workload
+retains 198 observations per artifact and all 404 raw ABBA rows, including its
+two warmup blocks. The shell's positive serialization control is fixture
+evidence only. The standalone collector default remains ten blocks. Full raw
 row and retained-sample counts follow the declared block count, with two warmup
 blocks still required.
 
-The same job separately selects `1000-ready-default-auto-flush` and measures the
-candidate against itself, with 20 real ready invocations on the second side.
+The 1k/default-flush shard separately selects `1000-ready-default-auto-flush`
+and measures the candidate against itself, with 20 real ready invocations on
+the second side.
 This sensitivity control must retain all 48 ABBA observations and report
 `Regression` at a fixed 100% diagnostic threshold; that threshold is not an
 accepted SLO. Its ten retained blocks can establish a median regression while
