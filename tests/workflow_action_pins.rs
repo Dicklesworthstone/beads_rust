@@ -1178,7 +1178,7 @@ mod scheduled_benchmarks {
         // Exercise the workflow's actual staging path with a restored Cargo
         // cache. Reusing target/perf-artifacts failed the next scheduled run.
         let packaged = PathBuf::from(
-            workflow()["jobs"]["bench-build"]["env"]["BR_PERF_ARTIFACT_DIR"]
+            step("Package benchmark artifacts")["env"]["BR_PERF_ARTIFACT_DIR"]
                 .as_str()
                 .unwrap()
                 .replace("${{ github.workspace }}", &workspace.display().to_string())
@@ -1228,7 +1228,7 @@ mod scheduled_benchmarks {
         assert!(packaged.starts_with(&runner_temp));
         assert_eq!(
             step("Upload benchmark artifacts")["with"]["path"],
-            "${{ env.BR_PERF_ARTIFACT_DIR }}"
+            step("Package benchmark artifacts")["env"]["BR_PERF_ARTIFACT_DIR"]
         );
         let lines = output.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 2);
@@ -2515,6 +2515,14 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
         let bench = &jobs["bench"];
         let gate = &jobs["bench-gate"];
         assert_eq!(build["needs"], "check");
+        assert!(
+            build["env"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|value| { !value.as_str().unwrap().contains("runner.") }),
+            "GitHub runner context is unavailable in job-level env"
+        );
         assert_eq!(
             build["if"],
             "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
