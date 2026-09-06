@@ -611,13 +611,14 @@ impl RegressionSummary {
 }
 
 /// Required provenance and workload dimensions for raw release measurements.
-pub const MATCHED_RUN_METADATA: [&str; 16] = [
+pub const MATCHED_RUN_METADATA: [&str; 17] = [
     "command",
     "issue_count",
     "dataset_sha256",
     "flush_mode",
     "cache_protocol",
     "host",
+    "host_boot_id",
     "cpu",
     "os",
     "filesystem",

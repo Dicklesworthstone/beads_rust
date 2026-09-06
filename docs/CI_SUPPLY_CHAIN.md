@@ -132,6 +132,13 @@ benchmark shell controls live in `tests/workflow_action_pins.rs`. Calibrated
 budgets belong in `BR_PERF_BUDGETS_JSON`; changing them requires reviewing the
 retained measurements, rather than accepting a failed run as the next baseline.
 
+Runner matching includes `host_boot_id`, read directly from Linux
+`/proc/sys/kernel/random/boot_id`. Hostname alone is insufficient: the four
+measurement VMs in run `34011068650` had distinct provider worker IDs and Azure
+regions but all reported `runnervmejwal`. Both sides of each comparison and its
+A/A control must share a boot identity. Receipts without this field cannot pass
+the current gate; historical timings remain observations, not matched-run proof.
+
 The receipt gate consumes conditional median and p95 intervals from the Rust
 comparator, with explicit retained block IDs matched to the raw ABBA order.
 It checks the declared protocol, selected block order statistics, endpoint

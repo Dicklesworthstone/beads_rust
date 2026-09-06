@@ -1646,6 +1646,7 @@ mod matched_arithmetic {
             ("flush_mode", "auto-flush-enabled"),
             ("cache_protocol", "warm-after-one-discarded-warmup"),
             ("host", "arithmetic-control-host"),
+            ("host_boot_id", "11111111-1111-4111-8111-111111111111"),
             ("cpu", "arithmetic-control-cpu"),
             ("os", "arithmetic-control-os"),
             ("filesystem", "arithmetic-control-filesystem"),
@@ -1785,9 +1786,10 @@ mod matched_arithmetic {
         let missing_path = root.path().join("missing.json");
         let mismatched_path = root.path().join("mismatched.json");
         let mut mismatched = baseline.clone();
-        mismatched
-            .metadata
-            .insert("host".to_string(), "another-control-host".to_string());
+        mismatched.metadata.insert(
+            "host_boot_id".to_string(),
+            "another-control-boot".to_string(),
+        );
         fs::write(&mismatched_path, serde_json::to_vec(&mismatched).unwrap()).unwrap();
         for (candidate, reference, budget, exit, diagnostic) in [
             (&baseline_path, &baseline_path, "20", 0, "Pass"),
@@ -1804,7 +1806,7 @@ mod matched_arithmetic {
                 &baseline_path,
                 "20",
                 2,
-                "mismatched metadata: host",
+                "mismatched metadata: host_boot_id",
             ),
             (
                 &baseline_path,
@@ -2152,7 +2154,11 @@ mod matched_arithmetic {
 
     #[test]
     fn missing_placeholder_and_mismatched_metadata_are_inconclusive() {
-        let baseline = control(vec![10.0; 20]);
+        let baseline = control(vec![10.0; 198]);
+        assert_eq!(
+            compare_matched_runs(Some(&baseline), &baseline, 20.0).exit_code(),
+            0
+        );
         for key in MATCHED_RUN_METADATA {
             let mut candidate = baseline.clone();
             candidate.metadata.remove(key);

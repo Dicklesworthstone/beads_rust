@@ -619,6 +619,8 @@ jobs:
               receipts = [json.loads((directory / f'{name}-{side}.json').read_text()) for side in (0, 1)]
               for receipt in receipts:
                   metadata = receipt['metadata']
+                  if not isinstance(metadata, dict) or not isinstance(metadata.get('host_boot_id'), str) or metadata['host_boot_id'].strip().lower() in ('', 'unknown', 'default', 'unavailable', 'n/a', 'placeholder', 'unset'):
+                      raise ValueError('missing or placeholder control host_boot_id')
                   if (metadata['command'], metadata['issue_count'], metadata['flush_mode'], metadata['build_profile']) != ('ready', '1000', 'default-auto-flush', 'release'):
                       raise ValueError('control workload identity mismatch')
                   if metadata.get('sampling_protocol') != 'abba_two_per_side_iid_blocks_assumed_v1':
@@ -857,7 +859,7 @@ jobs:
                           if any(type(code) is not int or code != 0 for code in receipt['exit_codes']):
                               raise ValueError(f'{cohort}/{name}: failed measured process')
                           metadata = receipt['metadata']
-                          required = ('command', 'issue_count', 'dataset_sha256', 'flush_mode', 'cache_protocol', 'host', 'cpu', 'os', 'filesystem', 'target', 'features', 'engine', 'source_revision', 'lockfile_sha256', 'binary_sha256', 'build_profile')
+                          required = ('command', 'issue_count', 'dataset_sha256', 'flush_mode', 'cache_protocol', 'host', 'host_boot_id', 'cpu', 'os', 'filesystem', 'target', 'features', 'engine', 'source_revision', 'lockfile_sha256', 'binary_sha256', 'build_profile')
                           if not isinstance(metadata, dict) or any(not isinstance(metadata.get(key), str) or metadata[key].strip().lower() in ('', 'unknown', 'default', 'unavailable', 'n/a', 'placeholder', 'unset') for key in required):
                               raise ValueError(f'{cohort}/{name}: missing or placeholder provenance')
                           if metadata.get('sampling_protocol') != 'abba_two_per_side_iid_blocks_assumed_v1':

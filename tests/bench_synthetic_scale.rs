@@ -3219,6 +3219,15 @@ mod release_abba {
                 info["engine"]["version"].as_str().unwrap().into(),
             ),
             ("host".into(), text_command("hostname", &[])),
+            // Hosted VM images can reuse a hostname across distinct runners.
+            // The kernel boot identity must match across both sides and A/A–A/B.
+            (
+                "host_boot_id".into(),
+                fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                    .expect("Linux kernel boot identity")
+                    .trim()
+                    .to_string(),
+            ),
             ("cpu".into(), cpu),
             ("os".into(), text_command("uname", &["-srm"])),
             (

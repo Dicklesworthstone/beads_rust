@@ -1472,6 +1472,7 @@ raise SystemExit(37 if str(relative) == os.environ['BR_PERF_FIXTURE_FAILURE'] el
             "binary_sha256": "2".repeat(64), "lockfile_sha256": "3".repeat(64),
             "source_revision": "arithmetic-control-source", "cache_protocol": "arithmetic-control-cache",
             "host": "arithmetic-control-host", "cpu": "arithmetic-control-cpu",
+            "host_boot_id": "11111111-1111-4111-8111-111111111111",
             "os": "arithmetic-control-os", "filesystem": "arithmetic-control-fs",
             "target": "arithmetic-control-target", "features": "arithmetic-control-features",
             "engine": "arithmetic-control-engine",
@@ -1989,15 +1990,70 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
 
     #[test]
     fn scheduled_receipt_fragment_requires_same_host_for_workload_aa_and_ab() {
-        let control = ReceiptControl::new(None);
         // Each A/B pair remains internally matched. Its A/A control must have
-        // observed the same environment, rather than a different shard host.
-        for side in 0..2 {
-            let mut receipt = raw_control(FIRST, CONTROL_BLOCKS);
-            receipt["metadata"]["host"] = json!("different-shard-host");
-            control.write(&format!("ab/{FIRST}/{FIRST}-{side}.json"), &receipt);
+        // observed the same environment. Distinct hosted VMs can share a name.
+        for (key, value) in [
+            ("host", "different-shard-host"),
+            ("host_boot_id", "22222222-2222-4222-8222-222222222222"),
+        ] {
+            let control = ReceiptControl::new(None);
+            for side in 0..2 {
+                let mut receipt = raw_control(FIRST, CONTROL_BLOCKS);
+                receipt["metadata"][key] = json!(value);
+                control.write(&format!("ab/{FIRST}/{FIRST}-{side}.json"), &receipt);
+            }
+            expect_exit(
+                &control.run(),
+                2,
+                "A/A and A/B runner or workload dimensions differ",
+            );
         }
-        expect_exit(&control.run(), 2, "inconclusive");
+    }
+
+    #[test]
+    fn scheduled_receipt_fragments_require_explicit_boot_identity_on_both_sides() {
+        for invalid in [
+            None,
+            Some(json!("")),
+            Some(json!("unknown")),
+            Some(Value::Null),
+        ] {
+            let control = ReceiptControl::new(None);
+            let planted = planted_control();
+            for side in 0..2 {
+                let path = format!("aa/{FIRST}/{FIRST}-{side}.json");
+                let planted_path = format!("planted-ready/{READY}-{side}.json");
+                for (fixture, path) in [(&control, path), (&planted, planted_path)] {
+                    let mut receipt: Value =
+                        serde_json::from_slice(&fs::read(fixture.root.path().join(&path)).unwrap())
+                            .unwrap();
+                    let metadata = receipt["metadata"].as_object_mut().unwrap();
+                    if let Some(value) = &invalid {
+                        metadata.insert("host_boot_id".into(), value.clone());
+                    } else {
+                        metadata.remove("host_boot_id");
+                    }
+                    fixture.write(&path, &receipt);
+                }
+            }
+            expect_exit(&control.run(), 2, "missing or placeholder provenance");
+            expect_exit(&run_planted(&planted, 0), 2, "control host_boot_id");
+        }
+
+        let planted = planted_control();
+        let path = format!("planted-ready/{READY}-1.json");
+        let mut receipt: Value =
+            serde_json::from_slice(&fs::read(planted.root.path().join(&path)).unwrap()).unwrap();
+        receipt["metadata"]["host_boot_id"] = json!("different-boot-same-hostname");
+        planted.write(&path, &receipt);
+        expect_exit(
+            &run_planted(&planted, 0),
+            2,
+            "same-candidate control metadata differs",
+        );
+        receipt["metadata"] = json!([]);
+        planted.write(&path, &receipt);
+        expect_exit(&run_planted(&planted, 0), 2, "control host_boot_id");
     }
 
     #[test]
@@ -2311,6 +2367,7 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
             ("build_profile", "debug", "workload identity mismatch"),
             ("command", "wrong-command", "workload identity mismatch"),
             ("host", "different-host", "matched metadata differs"),
+            ("host_boot_id", "different-boot", "matched metadata differs"),
         ] {
             let mut receipt = raw_control(FIRST, CONTROL_BLOCKS);
             receipt["metadata"][key] = json!(value);
