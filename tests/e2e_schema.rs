@@ -57,7 +57,9 @@ fn e2e_schema_help_matches_live_json_error_stream() {
     assert_eq!(plain_missing.status.code(), Some(3), "{plain_missing:?}");
     assert!(plain_missing.stdout.trim().is_empty(), "{plain_missing:?}");
     assert!(
-        plain_missing.stderr.contains("ISSUE_NOT_FOUND"),
+        plain_missing
+            .stderr
+            .contains("Issue not found: stream-missing"),
         "{plain_missing:?}"
     );
 
