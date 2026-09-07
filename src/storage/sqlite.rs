@@ -1520,8 +1520,8 @@ pub struct MutationContext {
     pub events: Vec<Event>,
     pub dirty_ids: HashSet<String>,
     pub invalidate_blocked_cache: bool,
-    /// When set, only these issue IDs (and their transitive parent-child
-    /// descendants) need their blocked-cache entries recomputed.  If `None`
+    /// When set, only these issue IDs and their connected parent-child
+    /// components need their blocked-cache entries recomputed. If `None`
     /// while `invalidate_blocked_cache` is true, the entire cache is rebuilt.
     pub cache_affected_ids: Option<HashSet<String>>,
     /// When true, skip the storage-layer post-commit cache refresh.  Command
@@ -1858,6 +1858,9 @@ impl MutationContext {
     /// affected IDs.  If `invalidate_cache()` was already called (which sets
     /// `cache_affected_ids = None`), the full rebuild path takes precedence.
     pub fn invalidate_cache_for(&mut self, ids: &[&str]) {
+        if self.invalidate_blocked_cache && self.cache_affected_ids.is_none() {
+            return;
+        }
         self.invalidate_blocked_cache = true;
         let set = self.cache_affected_ids.get_or_insert_with(HashSet::new);
         for id in ids {
@@ -6610,6 +6613,40 @@ impl SqliteStorage {
                     blocked_cache_plan = Some(BlockedCacheRefreshPlan::Full);
                 }
                 storage.set_metadata_in_tx(BLOCKED_CACHE_STATE_KEY, BLOCKED_CACHE_STATE_STALE)?;
+
+                if let Some(BlockedCacheRefreshPlan::Incremental(ids)) = &blocked_cache_plan {
+                    // Check freshness, update the component and clear stale in
+                    // the SAME write transaction. A second transaction could
+                    // clear an intervening writer's unrelated invalidation.
+                    // Keep the stale marker outside the savepoint so a cache
+                    // failure can preserve the primary mutation and fall back
+                    // to a complete post-commit repair.
+                    storage.conn.execute("SAVEPOINT br_blocked_cache")?;
+                    let refresh = Self::incremental_blocked_cache_update(&storage.conn, ids)
+                        .and_then(|count| {
+                            Self::upsert_metadata_key_in_tx(
+                                &storage.conn,
+                                BLOCKED_CACHE_STATE_KEY,
+                                METADATA_EMPTY_VALUE,
+                            )?;
+                            Ok(count)
+                        });
+                    match refresh {
+                        Ok(refreshed) => {
+                            storage.conn.execute("RELEASE br_blocked_cache")?;
+                            tracing::debug!(operation = op, refreshed, "Refreshed blocked cache inside mutation");
+                            blocked_cache_plan = None;
+                        }
+                        Err(error) => {
+                            // If either boundary fails, abort the outer
+                            // transaction rather than commit partial cache data.
+                            storage.conn.execute("ROLLBACK TO br_blocked_cache")?;
+                            storage.conn.execute("RELEASE br_blocked_cache")?;
+                            tracing::warn!(operation = op, %error, "Incremental cache refresh rolled back; scheduling full repair");
+                            blocked_cache_plan = Some(BlockedCacheRefreshPlan::Full);
+                        }
+                    }
+                }
             }
 
             if ctx.force_flush {
@@ -7510,7 +7547,21 @@ impl SqliteStorage {
             if updates.skip_cache_rebuild {
                 ctx.invalidate_cache_deferred();
             } else {
-                ctx.invalidate_cache();
+                // A status change affects this issue's parent-child component
+                // and every direct blocking dependent's component. Blocking
+                // edges depend on status, not on the blocker's cached readiness,
+                // so they do not require recursive dependency traversal.
+                ctx.invalidate_cache_for(&[id]);
+                let dependents = conn.query_with_params(
+                    "SELECT issue_id FROM dependencies WHERE depends_on_id = ?
+                     AND type IN ('blocks', 'conditional-blocks', 'waits-for')",
+                    &[SqliteValue::from(id)],
+                )?;
+                for row in &dependents {
+                    if let Some(dependent) = row.get(0).and_then(SqliteValue::as_text) {
+                        ctx.invalidate_cache_for(&[dependent]);
+                    }
+                }
             }
         }
 
@@ -7532,6 +7583,15 @@ impl SqliteStorage {
 
         // Issue type
         if let Some(ref issue_type) = updates.issue_type {
+            if issue.issue_type != *issue_type {
+                // Becoming or ceasing to be an epic changes child-open rollup,
+                // including when another issue changes status in this batch.
+                if updates.skip_cache_rebuild {
+                    ctx.invalidate_cache_deferred();
+                } else {
+                    ctx.invalidate_cache_for(&[id]);
+                }
+            }
             issue.issue_type.clone_from(issue_type);
             add_update("issue_type", SqliteValue::from(issue_type.as_str()));
         }
@@ -11137,7 +11197,7 @@ impl SqliteStorage {
     }
 
     /// Incremental blocked-cache update: recompute only the entries for the
-    /// given seed issue IDs and their transitive parent-child descendants.
+    /// given seed issue IDs and their connected parent-child components.
     ///
     /// This avoids the full DELETE + INSERT cycle of `rebuild_blocked_cache_impl`
     /// when only a small number of dependency edges changed.
@@ -30270,6 +30330,298 @@ mod tests {
         );
     }
 
+    fn persisted_blocked_cache(storage: &SqliteStorage) -> Vec<(String, String)> {
+        storage
+            .conn
+            .query("SELECT issue_id, blocked_by FROM blocked_issues_cache ORDER BY issue_id")
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row.get(0)
+                        .and_then(SqliteValue::as_text)
+                        .unwrap()
+                        .to_string(),
+                    row.get(1)
+                        .and_then(SqliteValue::as_text)
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_full_blocked_cache_invalidation_dominates_incremental() {
+        for full_first in [false, true] {
+            let mut ctx = MutationContext::new("test", "tester");
+            if full_first {
+                ctx.invalidate_cache();
+                ctx.invalidate_cache_for(&["bd-a"]);
+            } else {
+                ctx.invalidate_cache_for(&["bd-a"]);
+                ctx.invalidate_cache();
+            }
+            ctx.invalidate_cache_for(&["bd-b"]);
+            assert!(matches!(
+                BlockedCacheRefreshPlan::from_context(&ctx),
+                Some(BlockedCacheRefreshPlan::Full)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_status_batch_refreshes_persisted_blockers_selectively() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for id in [
+            "bd-a",
+            "bd-b",
+            "bd-blocks",
+            "bd-waits",
+            "bd-conditional",
+            "bd-related",
+            "bd-other",
+            "bd-other-blocker",
+        ] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 2, None, Utc::now(), None),
+                    "tester",
+                )
+                .unwrap();
+        }
+        for (id, kind) in [
+            ("bd-blocks", "blocks"),
+            ("bd-waits", "waits-for"),
+            ("bd-conditional", "conditional-blocks"),
+            ("bd-related", "related"),
+        ] {
+            storage.add_dependency(id, "bd-a", kind, "tester").unwrap();
+        }
+        storage
+            .add_dependency("bd-blocks", "bd-b", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-other", "bd-other-blocker", "blocks", "tester")
+            .unwrap();
+        storage.ensure_blocked_cache_fresh().unwrap();
+        storage.conn.execute("UPDATE blocked_issues_cache SET blocked_at = '2000-01-01' WHERE issue_id = 'bd-other'").unwrap();
+
+        // Closing only one blocker must preserve the second blocker. Query the
+        // persisted rows, not getters that can silently compute from the graph.
+        storage
+            .update_issue(
+                "bd-a",
+                &IssueUpdate {
+                    status: Some(Status::Closed),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap();
+        assert_eq!(
+            persisted_blocked_cache(&storage),
+            vec![
+                ("bd-blocks".to_string(), r#"["bd-b:open"]"#.to_string()),
+                (
+                    "bd-other".to_string(),
+                    r#"["bd-other-blocker:open"]"#.to_string()
+                ),
+            ]
+        );
+        let untouched = storage
+            .conn
+            .query_row("SELECT blocked_at FROM blocked_issues_cache WHERE issue_id = 'bd-other'")
+            .unwrap();
+        assert_eq!(
+            untouched.get(0).and_then(SqliteValue::as_text),
+            Some("2000-01-01")
+        );
+        assert!(!storage.blocked_cache_marked_stale().unwrap());
+
+        // One atomic batch must merge both invalidation sets, and reopening
+        // restores all three blocking types without treating related as one.
+        storage
+            .update_issues_atomically(
+                &[
+                    (
+                        "bd-a".to_string(),
+                        IssueUpdate {
+                            status: Some(Status::InProgress),
+                            ..IssueUpdate::default()
+                        },
+                    ),
+                    (
+                        "bd-b".to_string(),
+                        IssueUpdate {
+                            status: Some(Status::Closed),
+                            ..IssueUpdate::default()
+                        },
+                    ),
+                ],
+                "tester",
+            )
+            .unwrap();
+        assert_eq!(
+            persisted_blocked_cache(&storage),
+            vec![
+                (
+                    "bd-blocks".to_string(),
+                    r#"["bd-a:in_progress"]"#.to_string()
+                ),
+                (
+                    "bd-conditional".to_string(),
+                    r#"["bd-a:in_progress"]"#.to_string()
+                ),
+                (
+                    "bd-other".to_string(),
+                    r#"["bd-other-blocker:open"]"#.to_string()
+                ),
+                (
+                    "bd-waits".to_string(),
+                    r#"["bd-a:in_progress"]"#.to_string()
+                ),
+            ]
+        );
+        assert!(!storage.blocked_cache_marked_stale().unwrap());
+    }
+
+    #[test]
+    fn test_failed_incremental_cache_refresh_preserves_close_and_stale_rows() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for id in ["bd-a", "bd-b", "bd-dependent"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 2, None, Utc::now(), None),
+                    "tester",
+                )
+                .unwrap();
+        }
+        for blocker in ["bd-a", "bd-b"] {
+            storage
+                .add_dependency("bd-dependent", blocker, "blocks", "tester")
+                .unwrap();
+        }
+        storage.ensure_blocked_cache_fresh().unwrap();
+        // A real SQL failure AFTER selective DELETE: inserts name blocked_at.
+        // Full post-commit repair will also fail, exercising durable staleness.
+        storage
+            .conn
+            .execute("ALTER TABLE blocked_issues_cache RENAME COLUMN blocked_at TO unavailable_at")
+            .unwrap();
+        storage
+            .update_issue(
+                "bd-a",
+                &IssueUpdate {
+                    status: Some(Status::Closed),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap();
+        assert_eq!(
+            storage.get_issue("bd-a").unwrap().unwrap().status,
+            Status::Closed
+        );
+        assert!(storage.blocked_cache_marked_stale().unwrap());
+        assert!(SqliteStorage::foreign_keys_enabled(&storage.conn).unwrap());
+        let rows = storage
+            .conn
+            .query("SELECT blocked_by FROM blocked_issues_cache")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "failed cache writes must roll back their DELETEs"
+        );
+        assert_eq!(
+            rows[0].get(0).and_then(SqliteValue::as_text),
+            Some(r#"["bd-a:open","bd-b:open"]"#)
+        );
+        assert_eq!(storage.get_blockers("bd-dependent").unwrap(), vec!["bd-b"]);
+        let events = storage
+            .conn
+            .query("SELECT actor FROM events WHERE issue_id = 'bd-a' AND event_type = 'closed'")
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get(0).and_then(SqliteValue::as_text),
+            Some("tester")
+        );
+        storage
+            .conn
+            .execute("ALTER TABLE blocked_issues_cache RENAME COLUMN unavailable_at TO blocked_at")
+            .unwrap();
+        assert!(storage.ensure_blocked_cache_fresh().unwrap());
+        let rows = storage
+            .conn
+            .query("SELECT blocked_by FROM blocked_issues_cache")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get(0).and_then(SqliteValue::as_text),
+            Some(r#"["bd-b:open"]"#)
+        );
+    }
+
+    #[test]
+    fn test_status_and_type_batch_refreshes_unrelated_epic_rollup() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for id in ["bd-a", "bd-parent", "bd-child"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 2, None, Utc::now(), None),
+                    "tester",
+                )
+                .unwrap();
+        }
+        storage
+            .set_parent("bd-child", Some("bd-parent"), "tester")
+            .unwrap();
+        assert!(!storage.blocked_cache_marked_stale().unwrap());
+        for (status, issue_type, expected) in [
+            (
+                Status::Closed,
+                IssueType::Epic,
+                Some(r#"["bd-child:child-open"]"#),
+            ),
+            (Status::Open, IssueType::Task, None),
+        ] {
+            storage
+                .update_issues_atomically(
+                    &[
+                        (
+                            "bd-a".to_string(),
+                            IssueUpdate {
+                                status: Some(status),
+                                ..IssueUpdate::default()
+                            },
+                        ),
+                        (
+                            "bd-parent".to_string(),
+                            IssueUpdate {
+                                issue_type: Some(issue_type),
+                                ..IssueUpdate::default()
+                            },
+                        ),
+                    ],
+                    "tester",
+                )
+                .unwrap();
+            let rows = storage
+                .conn
+                .query("SELECT blocked_by FROM blocked_issues_cache WHERE issue_id = 'bd-parent'")
+                .unwrap();
+            assert_eq!(
+                rows.first()
+                    .and_then(|row| row.get(0))
+                    .and_then(SqliteValue::as_text),
+                expected
+            );
+            assert!(!storage.blocked_cache_marked_stale().unwrap());
+        }
+    }
+
     #[test]
     fn test_update_issue_skip_cache_rebuild_marks_cache_stale_reads_compute_in_memory() {
         let temp_dir = TempDir::new().unwrap();
@@ -30474,6 +30826,9 @@ mod tests {
             .add_dependency("bd-unrelated", "bd-unrelated-blocker", "blocks", "tester")
             .unwrap();
 
+        storage.ensure_blocked_cache_fresh().unwrap();
+        storage.conn.execute("UPDATE blocked_issues_cache SET blocked_at = '2000-01-01' WHERE issue_id = 'bd-unrelated'").unwrap();
+
         assert!(storage.is_blocked("bd-parent").unwrap());
         assert!(storage.is_blocked("bd-parent.1").unwrap());
         assert!(storage.is_blocked("bd-parent.2").unwrap());
@@ -30492,6 +30847,31 @@ mod tests {
 
         let seed_ids = HashSet::from(["bd-parent.1".to_string()]);
         SqliteStorage::incremental_blocked_cache_update(&storage.conn, &seed_ids).unwrap();
+
+        assert!(!storage.blocked_cache_marked_stale().unwrap());
+        assert_eq!(
+            persisted_blocked_cache(&storage),
+            vec![
+                (
+                    "bd-parent".to_string(),
+                    r#"["bd-parent.1:child-open","bd-parent.2:child-open"]"#.to_string()
+                ),
+                (
+                    "bd-unrelated".to_string(),
+                    r#"["bd-unrelated-blocker:open"]"#.to_string()
+                ),
+            ]
+        );
+        let untouched = storage
+            .conn
+            .query_row(
+                "SELECT blocked_at FROM blocked_issues_cache WHERE issue_id = 'bd-unrelated'",
+            )
+            .unwrap();
+        assert_eq!(
+            untouched.get(0).and_then(SqliteValue::as_text),
+            Some("2000-01-01")
+        );
 
         let parent_blockers = storage.get_blockers("bd-parent").unwrap();
         assert_eq!(

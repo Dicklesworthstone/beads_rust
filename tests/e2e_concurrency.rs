@@ -2681,6 +2681,22 @@ fn e2e_close_update_reopen_preserve_blocked_cache_integrity() {
     assert!(update_issue.success, "create update target failed");
     let update_id = parse_created_id(&update_issue.stdout);
 
+    // Exercise real cache entries: each independently changing blocker has a
+    // dependent that stays open throughout the concurrent workload.
+    let mut dependent_pairs = Vec::new();
+    for blocker in close_ids.iter().chain(&reopen_ids) {
+        let created = run_br_in_dir(&root, ["create", &format!("Dependent of {blocker}")]);
+        assert!(
+            created.success,
+            "create dependent failed: {}",
+            created.stderr
+        );
+        let dependent = parse_created_id(&created.stdout);
+        let edge = run_br_in_dir(&root, ["dep", "add", &dependent, blocker]);
+        assert!(edge.success, "seed dependency failed: {}", edge.stderr);
+        dependent_pairs.push((dependent, blocker.clone()));
+    }
+
     let barrier = Arc::new(Barrier::new(4));
     let shared_root = Arc::new(root.clone());
 
@@ -2828,8 +2844,6 @@ fn e2e_close_update_reopen_preserve_blocked_cache_integrity() {
         "expected at least one successful reader command"
     );
 
-    assert_doctor_healthy(&root);
-
     let update_show = run_br_in_dir(&root, ["--no-auto-import", "show", &update_id, "--json"]);
     assert!(
         update_show.success,
@@ -2846,6 +2860,60 @@ fn e2e_close_update_reopen_preserve_blocked_cache_integrity() {
         let show = run_br_in_dir(&root, ["--no-auto-import", "show", issue_id, "--json"]);
         assert!(show.success, "show reopen target failed: {}", show.stderr);
     }
+
+    // Compute an independent graph oracle from final primary statuses. Inspect
+    // raw cache rows so stale-aware public getters cannot mask cache corruption.
+    let conn = beads_rust::franken_sync::compat::open_with_flags(
+        &root.join(".beads/beads.db").to_string_lossy(),
+        beads_rust::franken_sync::compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open quiescent database read-only");
+    let marker = conn
+        .query("SELECT value FROM metadata WHERE key = 'blocked_cache_state'")
+        .expect("cache marker");
+    assert!(
+        marker
+            .iter()
+            .all(|row| row.get(0).and_then(SqliteValue::as_text) != Some("stale")),
+        "successful non-deferred status writes should leave a fresh cache"
+    );
+    for (dependent, blocker) in dependent_pairs {
+        let status_rows = conn
+            .query_with_params(
+                "SELECT status FROM issues WHERE id = ?",
+                &[SqliteValue::from(blocker.as_str())],
+            )
+            .expect("blocker status");
+        let status = status_rows[0]
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .expect("status text");
+        let cached = conn
+            .query_with_params(
+                "SELECT blocked_by FROM blocked_issues_cache WHERE issue_id = ?",
+                &[SqliteValue::from(dependent.as_str())],
+            )
+            .expect("persisted cache");
+        if matches!(status, "closed" | "tombstone") {
+            assert!(
+                cached.is_empty(),
+                "{dependent} must not remain blocked by terminal {blocker}"
+            );
+        } else {
+            assert_eq!(cached.len(), 1, "{dependent} must be blocked by {blocker}");
+            let refs: Vec<String> = serde_json::from_str(
+                cached[0]
+                    .get(0)
+                    .and_then(SqliteValue::as_text)
+                    .expect("blocker JSON"),
+            )
+            .expect("parse blocker witnesses");
+            assert_eq!(refs, vec![format!("{blocker}:{status}")]);
+        }
+    }
+    drop(conn);
+    // Doctor's fallback can repair caches, so it must follow the raw oracle.
+    assert_doctor_healthy(&root);
 }
 
 /// Regression for the ts2 report: mixed DB-backed commands in parallel must

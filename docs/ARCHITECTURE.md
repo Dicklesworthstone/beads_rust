@@ -294,14 +294,24 @@ CREATE TABLE IF NOT EXISTS blocked_issues_cache (
 CREATE INDEX IF NOT EXISTS idx_blocked_cache_blocked_at ON blocked_issues_cache(blocked_at);
 ```
 
-Only blocked issues have a row; `blocked_by` stores a JSON array of blocking
-issue IDs. `rebuild_blocked_cache_impl` serializes the blocker list, and
+Only blocked issues have a row; `blocked_by` stores a JSON array of blocker
+references such as `br-abc:open` or `br-child:child-open`.
+`rebuild_blocked_cache_impl` serializes the blocker list, and
 `parse_blocked_by_json` validates it when read.
 
-Rebuilt when:
-- Dependencies change
-- Issues closed (may unblock others)
-- Cache explicitly invalidated
+Status changes refresh the changed issues, their direct blocking dependents,
+and those issues' complete parent-child components. Type changes also refresh
+their component because epic open-child rollup depends on issue type. An atomic
+close batch combines these affected sets and refreshes once inside its write
+transaction; unrelated cache rows remain untouched.
+
+Selective refresh requires an already fresh cache. A prior stale marker or full
+invalidation requires a full rebuild. The mutation marks stale before a cache
+savepoint; if selective refresh fails, successful rollback to that savepoint
+preserves the primary mutation and schedules full repair after commit. A failed
+savepoint boundary aborts the outer transaction. Reads compute blocked state
+from the graph while stale without repairing the database. Deferred dependency
+mutations retain their existing stale-marker and command-finalization path.
 
 ---
 

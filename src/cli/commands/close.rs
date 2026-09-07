@@ -1144,7 +1144,6 @@ fn execute_route_with_storage(
             } else {
                 None
             },
-            skip_cache_rebuild: true,
             ..Default::default()
         };
 
@@ -1228,7 +1227,12 @@ fn execute_route_with_storage(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    if cache_dirty {
+    if cache_dirty
+        && storage_ctx
+            .storage
+            .blocked_cache_marked_stale()
+            .unwrap_or(true)
+    {
         tracing::info!(
             "Rebuilding blocked cache after closing {} issues",
             closed_issues.len()
