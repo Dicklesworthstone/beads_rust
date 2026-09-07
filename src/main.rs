@@ -174,7 +174,7 @@ fn main() {
                 // contended command is `br doctor --repair`, surface the
                 // structured `ConcurrencyLost` (exit code 5) documented
                 // in `doctor_subsystems::exit_codes` instead of the
-                // generic `BeadsError::Config` exit code. Other commands
+                // generic lock-acquisition error. Other commands
                 // still flow through `handle_error` unchanged.
                 if let Commands::Doctor(doctor_args) = &cli.command {
                     let lock_path = ctx
@@ -949,6 +949,8 @@ fn main() {
     // the process exits (#270).
     if let Some(exit_code) = beads_rust::shutdown::exit_code() {
         drop(storage_result);
+        drop(overrides);
+        drop(ctx);
         drop(write_lock);
         beads_rust::shutdown::exit_process(exit_code);
     }
@@ -1010,6 +1012,10 @@ fn main() {
     }
 
     if let Some(err) = beads_rust::output::take_output_serialization_failure() {
+        drop(storage_result);
+        drop(overrides);
+        drop(ctx);
+        drop(write_lock);
         beads_rust::shutdown::exit_process(err.exit_code());
     }
 
@@ -1020,6 +1026,8 @@ fn main() {
     // `SqliteStorage::Drop` checkpoints the WAL before the process exits (#270).
     if let Some(exit_code) = beads_rust::output::take_pending_exit_code() {
         drop(storage_result);
+        drop(overrides);
+        drop(ctx);
         drop(write_lock);
         beads_rust::shutdown::exit_process(exit_code);
     }
@@ -1029,8 +1037,12 @@ fn main() {
     // `exit()` teardown, where an atexit/TLS destructor joining a thread
     // that `ExitProcess` already terminated aborts with 0xC0000409 and
     // corrupts the exit code of a command that worked. Storage is dropped
-    // first so `SqliteStorage::Drop` checkpoints the WAL (#270).
+    // first so `SqliteStorage::Drop` checkpoints the WAL (#270). Configuration
+    // retains authority clones too; release them before the final guard so
+    // kernel process teardown does not extend the workspace critical section.
     drop(storage_result);
+    drop(overrides);
+    drop(ctx);
     drop(write_lock);
     beads_rust::shutdown::exit_process(0);
 }
@@ -1993,12 +2005,12 @@ fn is_unwritable_write_lock_open_error(lock_path: &Path, err: &BeadsError) -> bo
 }
 
 fn is_write_lock_contention_error(lock_path: &Path, err: &BeadsError) -> bool {
-    let BeadsError::Config(message) = err else {
-        return false;
-    };
-    message.contains("Timed out after")
-        && message.contains("waiting for write lock")
-        && message.contains(lock_path.to_string_lossy().as_ref())
+    matches!(
+        err,
+        BeadsError::WriteLockTimeout { role, path_display, .. }
+            if role == "workspace write lock"
+                && path_display == &lock_path.display().to_string()
+    )
 }
 
 fn emit_read_only_doctor_live_write_lock_diagnostic(
@@ -2504,10 +2516,12 @@ mod tests {
             "Failed to open write lock at {}: Permission denied",
             lock.display()
         ));
-        let timeout_err = BeadsError::Config(format!(
-            "Timed out after 1ms waiting for write lock at {}",
-            lock.display()
-        ));
+        let timeout_err = BeadsError::WriteLockTimeout {
+            role: "workspace write lock".to_string(),
+            path_display: lock.display().to_string(),
+            timeout_ms: 1,
+            retryable: true,
+        };
 
         #[cfg(unix)]
         assert!(is_unwritable_write_lock_open_error(&lock, &open_err));
@@ -2637,10 +2651,12 @@ mod tests {
     #[test]
     fn write_lock_contention_detection_is_path_scoped() {
         let lock = PathBuf::from("/workspace/.beads/.write.lock");
-        let timeout = BeadsError::Config(format!(
-            "Timed out after 1ms waiting for write lock at {}",
-            lock.display()
-        ));
+        let timeout = BeadsError::WriteLockTimeout {
+            role: "workspace write lock".to_string(),
+            path_display: lock.display().to_string(),
+            timeout_ms: 1,
+            retryable: true,
+        };
         let other_lock = PathBuf::from("/other/.beads/.write.lock");
         let open_error = BeadsError::Config(format!(
             "Failed to open write lock at {}: Permission denied",
@@ -2649,6 +2665,17 @@ mod tests {
 
         assert!(is_write_lock_contention_error(&lock, &timeout));
         assert!(!is_write_lock_contention_error(&other_lock, &timeout));
+        assert!(!is_write_lock_contention_error(
+            &PathBuf::from("/workspace/.beads/.write"),
+            &timeout
+        ));
+        let other_authority = BeadsError::WriteLockTimeout {
+            role: "JSONL-family write lock".to_string(),
+            path_display: lock.display().to_string(),
+            timeout_ms: 1,
+            retryable: false,
+        };
+        assert!(!is_write_lock_contention_error(&lock, &other_authority));
         assert!(!is_write_lock_contention_error(&lock, &open_error));
     }
 

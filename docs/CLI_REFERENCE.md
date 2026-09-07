@@ -2001,6 +2001,16 @@ rewrite or retire those files without changing database semantics. `apply`
 captures and verifies a fresh byte-exact family backup after logical-token
 validation and before migration.
 
+The version stamp alone does not establish eligibility. Planning also checks
+the core table declarations and index names. Historical layouts with extra
+columns, incompatible keys or constraints, or operator indexes on core tables
+are refused before a token is issued. For example, a legacy dependency table
+that permits both `blocks` and `parent-child` rows for the same issue pair needs
+an explicit data decision; migration will not silently choose one edge. Keep
+the source database and resolve the named table before planning again. Known
+index definitions can be recreated during maintenance; operator tables outside
+the core schema remain preserved by the existing migration and undo workflow.
+
 `apply` re-plans under database-family write authority and rejects stale tokens
 before allocating a run. It writes a verified, private recovery bundle and a
 prepared receipt before running the reviewed steps in one `BEGIN IMMEDIATE`

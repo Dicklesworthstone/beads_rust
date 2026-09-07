@@ -34,6 +34,20 @@ pub enum BeadsError {
     #[error("Database is locked: {path}")]
     DatabaseLocked { path: PathBuf },
 
+    /// A write authority remained held beyond its acquisition deadline.
+    ///
+    /// Only workspace admission is known to precede the requested mutation.
+    /// Other authority acquisitions may follow committed work, so their caller
+    /// must inspect state before retrying. This error never triggers internal
+    /// transaction retries after the acquisition budget has been spent.
+    #[error("Timed out after {timeout_ms}ms waiting for write lock ({role}) at {path_display}")]
+    WriteLockTimeout {
+        role: String,
+        path_display: String,
+        timeout_ms: u64,
+        retryable: bool,
+    },
+
     /// Database schema version doesn't match expected.
     #[error("Schema version mismatch: expected {expected}, found {found}")]
     SchemaMismatch { expected: i32, found: i32 },
@@ -424,6 +438,16 @@ impl BeadsError {
         match self {
             Self::NotInitialized => Some("Run: br init"),
             Self::DatabaseNotFound { .. } => Some("Check path or run: br init"),
+            Self::WriteLockTimeout {
+                retryable: true, ..
+            } => Some(
+                "Retry after the active writer finishes; investigate a stuck process if contention persists. Do not delete the lock file.",
+            ),
+            Self::WriteLockTimeout {
+                retryable: false, ..
+            } => Some(
+                "Inspect the operation state before retrying: this authority may be acquired after writes. Do not delete the lock file or blindly repeat the primary mutation.",
+            ),
             Self::AmbiguousId { .. } => Some("Provide more characters of the ID"),
             Self::HasDependents { .. } => Some("Use --force or --cascade to delete anyway"),
             Self::ImportCollision { .. } => Some("Use --force to overwrite or resolve manually"),

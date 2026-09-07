@@ -1957,25 +1957,28 @@ fn auxiliary_runtime_indexes_canonical(
                 || semantic_partial_index_predicate_canonical(conn, expected.name))
     });
 
-    expected_indexes_match
-        && index_rows.iter().all(|row| {
-            let Some(name) = row.get(1).and_then(SqliteValue::as_text) else {
-                return false;
-            };
-            match row.get(3).and_then(SqliteValue::as_text) {
-                // A canonical PRIMARY KEY may have an automatic backing index.
-                Some(origin) if origin.eq_ignore_ascii_case("pk") => true,
-                // Every explicit index must be in the exact table manifest.
-                // Even a non-UNIQUE expression or partial index is maintained
-                // on writes and can reject otherwise-valid canonical data.
-                Some(origin) if origin.eq_ignore_ascii_case("c") => {
-                    indexes.iter().any(|expected| expected.name == name)
-                }
-                // An automatic UNIQUE constraint (origin `u`) or any unknown
-                // origin is outside the explicit manifest.
-                _ => false,
+    expected_indexes_match && runtime_index_names_canonical(&index_rows, indexes)
+}
+
+fn runtime_index_names_canonical(rows: &[Row], indexes: &[ExpectedRuntimeIndex]) -> bool {
+    rows.iter().all(|row| {
+        let Some(name) = row.get(1).and_then(SqliteValue::as_text) else {
+            return false;
+        };
+        match row.get(3).and_then(SqliteValue::as_text) {
+            // A canonical PRIMARY KEY may have an automatic backing index.
+            Some(origin) if origin.eq_ignore_ascii_case("pk") => true,
+            // Every explicit index must be in the exact table manifest.
+            // Even a non-UNIQUE expression or partial index is maintained
+            // on writes and can reject otherwise-valid canonical data.
+            Some(origin) if origin.eq_ignore_ascii_case("c") => {
+                indexes.iter().any(|expected| expected.name == name)
             }
-        })
+            // An automatic UNIQUE constraint (origin `u`) or any unknown
+            // origin is outside the explicit manifest.
+            _ => false,
+        }
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2616,9 +2619,28 @@ fn core_runtime_table_canonical(
     autoincrement_primary_key: Option<&str>,
     forbid_unique_indexes: bool,
 ) -> bool {
+    core_runtime_table_declaration_canonical(
+        conn,
+        table,
+        columns,
+        issue_reference_columns,
+        order_sensitive,
+        autoincrement_primary_key,
+        forbid_unique_indexes,
+    ) && auxiliary_runtime_indexes_canonical(conn, table, indexes)
+}
+
+fn core_runtime_table_declaration_canonical(
+    conn: &Connection,
+    table: &str,
+    columns: &[ExpectedSchemaColumn],
+    issue_reference_columns: &[&str],
+    order_sensitive: bool,
+    autoincrement_primary_key: Option<&str>,
+    forbid_unique_indexes: bool,
+) -> bool {
     let cols = core_runtime_columns_canonical(conn, table, columns, order_sensitive);
     let fks = core_runtime_foreign_keys_canonical(conn, table, issue_reference_columns);
-    let idx = auxiliary_runtime_indexes_canonical(conn, table, indexes);
     let pk = runtime_primary_key_shape_canonical(conn, table, columns);
     let opts = runtime_table_options_canonical(conn, table);
     let checks = table == "issues" || table_check_constraints_canonical(conn, table, &[]);
@@ -2627,9 +2649,77 @@ fn core_runtime_table_canonical(
         .is_none_or(|column| table_declares_autoincrement_primary_key(conn, table, column));
     let uniq = !forbid_unique_indexes || table_has_no_unique_indexes(conn, table);
     tracing::debug!(
-        "DIAG core_runtime_table_canonical table={table} cols={cols} fks={fks} idx={idx} pk={pk} opts={opts} checks={checks} clauses={clauses} ai={ai} uniq={uniq}"
+        "DIAG core_runtime_table_declaration_canonical table={table} cols={cols} fks={fks} pk={pk} opts={opts} checks={checks} clauses={clauses} ai={ai} uniq={uniq}"
     );
-    cols && fks && idx && pk && opts && checks && clauses && ai && uniq
+    cols && fks && pk && opts && checks && clauses && ai && uniq
+}
+
+/// Refuse historical core-table layouts the reviewed migration cannot preserve.
+/// Versioned auxiliary tables are handled by their migration steps. Core table
+/// columns, constraints and operator indexes must already be representable;
+/// only known index definitions are rebuilt by candidate maintenance.
+pub(crate) fn attest_reviewed_migration_source_core_tables(conn: &Connection) -> Result<()> {
+    refuse_persistent_triggers(conn, "reviewed schema migration plan")?;
+    for (table, columns, indexes) in [
+        ("issues", ISSUES_RUNTIME_COLUMNS, ISSUES_RUNTIME_INDEXES),
+        (
+            "dependencies",
+            DEPENDENCIES_RUNTIME_COLUMNS,
+            DEPENDENCIES_RUNTIME_INDEXES,
+        ),
+        ("labels", LABELS_RUNTIME_COLUMNS, LABELS_RUNTIME_INDEXES),
+        (
+            "comments",
+            COMMENTS_RUNTIME_COLUMNS,
+            COMMENTS_RUNTIME_INDEXES,
+        ),
+        ("events", EVENTS_RUNTIME_COLUMNS, EVENTS_RUNTIME_INDEXES),
+        ("config", CONFIG_RUNTIME_COLUMNS, CONFIG_RUNTIME_INDEXES),
+        (
+            "metadata",
+            METADATA_RUNTIME_COLUMNS,
+            METADATA_RUNTIME_INDEXES,
+        ),
+        (
+            "dirty_issues",
+            DIRTY_ISSUES_RUNTIME_COLUMNS,
+            DIRTY_ISSUES_RUNTIME_INDEXES,
+        ),
+        ("export_hashes", EXPORT_HASHES_RUNTIME_COLUMNS, &[][..]),
+        (
+            "blocked_issues_cache",
+            BLOCKED_CACHE_RUNTIME_COLUMNS,
+            BLOCKED_CACHE_RUNTIME_INDEXES,
+        ),
+        ("child_counters", CHILD_COUNTERS_RUNTIME_COLUMNS, &[][..]),
+    ] {
+        let references: &[&str] = match table {
+            "issues" | "config" | "metadata" => &[],
+            "child_counters" => &["parent_id"],
+            _ => &["issue_id"],
+        };
+        let declaration_ok = core_runtime_table_declaration_canonical(
+            conn,
+            table,
+            columns,
+            references,
+            table == "issues",
+            matches!(table, "comments" | "events").then_some("id"),
+            matches!(table, "config" | "metadata"),
+        ) && (table != "issues" || issues_required_checks_canonical(conn));
+        let indexes_ok = conn
+            .query(&format!("PRAGMA index_list('{table}')"))
+            .is_ok_and(|rows| runtime_index_names_canonical(&rows, indexes));
+        if !declaration_ok || !indexes_ok {
+            return Err(BeadsError::Config(format!(
+                "reviewed schema migration refused: unsupported historical shape for core table \
+                 {table}; its columns, constraints, or operator indexes require an explicit \
+                 data/schema decision. Preserve the source database and resolve that table \
+                 before planning again; no migration token was issued"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn issues_required_checks_canonical(conn: &Connection) -> bool {

@@ -11,7 +11,9 @@ mod common;
 
 use assert_cmd::Command;
 use beads_rust::franken_sync::Connection;
-use common::dataset_registry::{DatasetRegistry, IsolatedDataset, KnownDataset};
+use common::dataset_registry::{
+    DatasetOverride, DatasetRegistry, IsolatedDataset, KnownDataset, isolated_from_override,
+};
 use fsqlite_types::SqliteValue;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
@@ -625,23 +627,42 @@ fn e2e_write_lock_contention_respects_lock_timeout() {
         (Duration::from_millis(75)..Duration::from_secs(3)).contains(&elapsed),
         "write lock must honor the requested budget without blocking indefinitely; elapsed={elapsed:?}"
     );
-    assert_eq!(create.exit_code, Some(7), "{create:?}");
+    assert_eq!(create.exit_code, Some(2), "{create:?}");
     let payload: serde_json::Value =
         serde_json::from_str(&create.stdout).expect("write-lock timeout must be whole JSON");
-    assert_eq!(payload["error"]["code"], "CONFIG_ERROR", "{payload}");
+    assert_eq!(payload["error"]["code"], "DATABASE_LOCKED", "{payload}");
+    assert_eq!(payload["error"]["retryable"], true, "{payload}");
+    assert_eq!(
+        payload["error"]["context"]["lock_role"], "workspace write lock",
+        "{payload}"
+    );
+    assert!(
+        payload["error"]["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("Retry after") && hint.contains("Do not delete")),
+        "timeout must explain safe retry without removing the lock: {payload}"
+    );
     let message = payload["error"]["message"]
         .as_str()
         .expect("write-lock timeout must include an error message");
     // Routing checks consume part of the shared acquisition budget before
     // the workspace lock is attempted, so its remaining timeout can be <75ms.
     let remaining_timeout_ms = message
-        .strip_prefix("Configuration error: Timed out after ")
+        .strip_prefix("Timed out after ")
         .and_then(|rest| rest.split_once("ms waiting for write lock (workspace write lock) at "))
         .map(|(timeout, _)| timeout.parse::<u64>().expect("numeric timeout in ms"))
         .expect("workspace write-lock timeout diagnostic");
     assert!(
         remaining_timeout_ms <= 75 && message.contains(".beads/.write.lock"),
         "error should include bounded write-lock diagnostics: {message}"
+    );
+    assert_eq!(
+        payload["error"]["context"]["timeout_ms"],
+        remaining_timeout_ms
+    );
+    assert_eq!(
+        payload["error"]["context"]["path"],
+        root.join(".beads/.write.lock").display().to_string()
     );
 
     drop(write_lock);
@@ -650,16 +671,16 @@ fn e2e_write_lock_contention_respects_lock_timeout() {
         0,
         "timed-out command must not create an issue"
     );
-    let after = run_br_in_dir(&root, ["create", "After write lock timeout", "--json"]);
+    let after = run_br_in_dir(&root, ["create", "Blocked by held write lock", "--json"]);
     assert!(
         after.success,
         "workspace should accept writes after lock release: stdout={} stderr={}",
         after.stdout, after.stderr
     );
     assert_eq!(
-        issue_title_count(&root, "After write lock timeout"),
+        issue_title_count(&root, "Blocked by held write lock"),
         1,
-        "write after lock release must persist exactly one issue"
+        "retrying the same request after lock release must persist exactly one issue"
     );
 }
 
@@ -1227,21 +1248,34 @@ fn e2e_concurrent_reads_succeed() {
 /// This guards against the failure mode we actually care about: hidden
 /// write-like teardown work surfacing as `database is busy` or corrupting the
 /// workspace under concurrent read traffic.
+/// `BR_CONCURRENCY_DATASET` and `BR_CONCURRENCY_DATASET_REASON` allow an explicit
+/// corpus replay without replacing the worker's historical dataset.
 #[test]
 fn e2e_parallel_read_only_commands_serialize_without_busy_on_drop() {
     let _log = common::test_log("e2e_parallel_read_only_commands_serialize_without_busy_on_drop");
 
-    let registry = DatasetRegistry::new();
-    if !registry.is_available(KnownDataset::BeadsRust) {
-        eprintln!("skipping: beads_rust dataset is unavailable in this environment");
-        return;
+    let isolated = if let Some(path) = std::env::var_os("BR_CONCURRENCY_DATASET") {
+        let reason = std::env::var("BR_CONCURRENCY_DATASET_REASON")
+            .expect("an explicit concurrency corpus requires BR_CONCURRENCY_DATASET_REASON");
+        assert!(!reason.trim().is_empty(), "corpus reason must not be empty");
+        isolated_from_override(&DatasetOverride::new(path, reason).with_name("beads_rust"))
+            .expect("copy the explicit concurrency corpus")
+    } else {
+        let registry = DatasetRegistry::new();
+        if !registry.is_available(KnownDataset::BeadsRust) {
+            eprintln!("skipping: beads_rust dataset is unavailable in this environment");
+            return;
+        }
+        IsolatedDataset::from_dataset(KnownDataset::BeadsRust).expect("copy beads_rust dataset")
+    };
+    eprintln!("concurrency corpus: {}", isolated.metadata.to_json());
+    if let Err(error) = isolated.migrate_to_current_schema() {
+        let retained = isolated.temp_dir.keep();
+        panic!(
+            "migrate isolated beads_rust dataset: {error}; failing workspace retained at {}",
+            retained.display()
+        );
     }
-
-    let isolated =
-        IsolatedDataset::from_dataset(KnownDataset::BeadsRust).expect("copy beads_rust dataset");
-    isolated
-        .migrate_to_current_schema()
-        .expect("migrate isolated beads_rust dataset");
     let root = isolated.root.clone();
 
     let create = run_br_in_dir(
