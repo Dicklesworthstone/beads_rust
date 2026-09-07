@@ -2203,6 +2203,15 @@ fn e2e_structured_error_not_initialized() {
 
 #[test]
 fn e2e_partially_applied_close_batch_does_not_exit_zero() {
+    assert_partial_close_error_checkpoints(false);
+}
+
+#[test]
+fn e2e_partially_applied_close_batch_json_checkpoints_before_error_exit() {
+    assert_partial_close_error_checkpoints(true);
+}
+
+fn assert_partial_close_error_checkpoints(json: bool) {
     // The process-level half of the defect. `br close <blocked> <closeable>`
     // exited 0 while printing "Warning: Skipped ..." and leaving the blocked
     // issue untouched, because the terminal error was gated on
@@ -2218,37 +2227,16 @@ fn e2e_partially_applied_close_batch_does_not_exit_zero() {
     let init = run_br(&workspace, ["init"], "partial_close_init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    let blocker = run_br(
-        &workspace,
-        ["create", "Blocker issue", "-p", "2"],
-        "partial_close_create_blocker",
-    );
-    assert!(
-        blocker.status.success(),
-        "blocker create failed: {}",
-        blocker.stderr
-    );
-    let blocker_id = parse_created_id(&blocker.stdout);
+    let create = |title: &str, label: &str| {
+        let result = run_br(&workspace, ["create", title, "-p", "2"], label);
+        assert!(result.status.success(), "{title}: {}", result.stderr);
+        parse_created_id(&result.stdout)
+    };
+    let blocker_id = create("Blocker issue", "partial_close_create_blocker");
 
-    let blocked = run_br(
-        &workspace,
-        ["create", "Blocked issue", "-p", "2"],
-        "partial_close_create_blocked",
-    );
-    assert!(
-        blocked.status.success(),
-        "blocked create failed: {}",
-        blocked.stderr
-    );
-    let blocked_id = parse_created_id(&blocked.stdout);
+    let blocked_id = create("Blocked issue", "partial_close_create_blocked");
 
-    let free = run_br(
-        &workspace,
-        ["create", "Independently closeable issue", "-p", "2"],
-        "partial_close_create_free",
-    );
-    assert!(free.status.success(), "free create failed: {}", free.stderr);
-    let free_id = parse_created_id(&free.stdout);
+    let free_id = create("Independently closeable issue", "partial_close_create_free");
 
     let dep_add = run_br(
         &workspace,
@@ -2262,11 +2250,11 @@ fn e2e_partially_applied_close_batch_does_not_exit_zero() {
     );
 
     // One id is refused, the other closes. The batch is partially applied.
-    let close = run_br(
-        &workspace,
-        ["close", &blocked_id, &free_id, "--reason", "partial batch"],
-        "partial_close_batch",
-    );
+    let mut args = vec!["close", &blocked_id, &free_id, "--reason", "partial batch"];
+    if json {
+        args.push("--json");
+    }
+    let close = run_br(&workspace, args, "partial_close_batch");
 
     assert!(
         !close.status.success(),
@@ -2280,6 +2268,38 @@ fn e2e_partially_applied_close_batch_does_not_exit_zero() {
         "partial close should exit 3, not 0; stdout={} stderr={}",
         close.stdout,
         close.stderr
+    );
+
+    if json {
+        let documents = serde_json::Deserializer::from_str(&close.stdout)
+            .into_iter::<Value>()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("partial batch payload followed by the structured error");
+        assert_eq!(documents.len(), 2, "{}", close.stdout);
+        assert_eq!(documents[0]["closed"][0]["id"], free_id);
+        assert_eq!(documents[0]["skipped"][0]["id"], blocked_id);
+        assert_eq!(documents[1]["error"]["code"], "CLOSE_INCOMPLETE");
+        assert_eq!(documents[1]["error"]["retryable"], false);
+        assert_eq!(documents[1]["error"]["context"]["closed"], 1);
+        assert_eq!(documents[1]["error"]["context"]["skipped"], 1);
+        assert!(close.stderr.is_empty(), "{}", close.stderr);
+    }
+
+    // Check before any later engine open can checkpoint the failed command's
+    // WAL. This isolated workspace has no peer openers. A clean exit can leave
+    // a 32-byte WAL header, but must drain frames from its committed close.
+    // The old process-exit path stranded 82,432 bytes and left the main file's
+    // issue status at "open", despite reporting that the issue was closed.
+    let wal_path = workspace.root.join(".beads/beads.db-wal");
+    let wal_bytes = fs::metadata(&wal_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or_else(|error| {
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+            0
+        });
+    assert!(
+        wal_bytes <= 32,
+        "partial close must checkpoint before error exit; WAL has {wal_bytes} bytes"
     );
 
     // The record is the authority, not the transcript: one closed, one refused.

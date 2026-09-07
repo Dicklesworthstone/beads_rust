@@ -22,7 +22,6 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(not(test))]
 const DISABLE_READ_ONLY_FAST_OPEN_ENV: &str = "BR_DISABLE_READ_ONLY_FAST_OPEN";
 
-#[allow(clippy::too_many_lines)]
 fn main() {
     CompleteEnv::with_factory(Cli::command).complete();
 
@@ -36,9 +35,6 @@ fn main() {
     let cli = Cli::parse();
     let json_error_mode = should_render_errors_as_json(&cli);
     let color_error_mode = should_color_human_errors_for_cli(&cli);
-    let output_ctx = OutputContext::from_args(&cli);
-    let is_mutating = is_mutating_command(&cli.command);
-    let command_supports_auto_import = should_auto_import(&cli.command);
 
     // Initialize logging
     if let Err(e) = init_logging(cli.verbose, cli.quiet, None) {
@@ -55,6 +51,20 @@ fn main() {
         handle_error(&error, json_error_mode, color_error_mode);
     }
 
+    // Keep storage and every retained authority inside the returning scope.
+    // Error exits must run their destructors too: a partial batch can commit
+    // writes before returning an error, leaving WAL frames to checkpoint.
+    match run(cli, json_error_mode) {
+        Ok(exit_code) => beads_rust::shutdown::exit_process(exit_code),
+        Err(error) => handle_error(&error, json_error_mode, color_error_mode),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
+    let output_ctx = OutputContext::from_args(&cli);
+    let is_mutating = is_mutating_command(&cli.command);
+    let command_supports_auto_import = should_auto_import(&cli.command);
     let mut overrides = build_cli_overrides(&cli);
 
     // Phase 1: Startup & Discovery (One-time)
@@ -62,7 +72,7 @@ fn main() {
         Ok(ctx) => ctx,
         Err(e) => {
             if command_supports_auto_import {
-                handle_error(&e, json_error_mode, color_error_mode);
+                return Err(e);
             }
             StartupContext::empty(overrides.clone())
         }
@@ -216,28 +226,28 @@ fn main() {
                                  Underlying error: {e}",
                             );
                         }
-                        beads_rust::shutdown::exit_process(beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode::ConcurrencyLost.as_i32());
+                        return Ok(beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode::ConcurrencyLost.as_i32());
                     }
                     if doctor_args.subcommand.is_none() {
                         if is_unwritable_write_lock_open_error(&lock_path, &e) {
-                            emit_read_only_doctor_write_lock_diagnostic(
+                            return Ok(emit_read_only_doctor_write_lock_diagnostic(
                                 ctx.beads_dir.as_deref(),
                                 &e,
                                 json_error_mode,
                                 doctor_args.robot_triage,
-                            );
+                            ));
                         }
                         if is_write_lock_contention_error(&lock_path, &e) {
-                            emit_read_only_doctor_live_write_lock_diagnostic(
+                            return Ok(emit_read_only_doctor_live_write_lock_diagnostic(
                                 ctx.beads_dir.as_deref(),
                                 &e,
                                 json_error_mode,
                                 doctor_args.robot_triage,
-                            );
+                            ));
                         }
                     }
                 }
-                handle_error(&e, json_error_mode, color_error_mode)
+                return Err(e);
             }
             None => None,
         }
@@ -256,43 +266,30 @@ fn main() {
         && (no_db_jsonl_write || pending_merge_mutation_gate_required)
         && let Some(paths) = ctx.paths.as_ref()
     {
-        let authority = write_lock.as_ref().unwrap_or_else(|| {
-            handle_error(
-                &BeadsError::SyncConflict {
-                    message:
-                        "Refusing no-DB mutation because no database-family authority is available for the pending sync-merge gate"
-                            .to_string(),
-                },
-                json_error_mode,
-                color_error_mode,
-            )
-        });
+        let authority = write_lock.as_ref().ok_or_else(|| BeadsError::SyncConflict {
+            message:
+                "Refusing no-DB mutation because no database-family authority is available for the pending sync-merge gate"
+                    .to_string(),
+        })?;
         match inspect_pending_sync_merge_for_startup_under_authority(&paths.db_path, authority) {
-            Ok(Some(state)) => handle_error(
-                &pending_sync_merge_no_db_refusal_error(&state),
-                json_error_mode,
-                color_error_mode,
-            ),
+            Ok(Some(state)) => return Err(pending_sync_merge_no_db_refusal_error(&state)),
             Ok(None) => {}
             Err(error @ BeadsError::SchemaMismatch { .. }) => {
-                let routed = reviewed_schema_migration_required(error);
-                handle_error(&routed, json_error_mode, color_error_mode)
+                return Err(reviewed_schema_migration_required(error));
             }
             // An environment refusal (a filesystem that cannot hold the
             // engine's sidecar permission bits, #491) is not inspection
             // uncertainty: surface it as itself, remedy included.
             Err(error @ BeadsError::Config(_)) => {
-                handle_error(&error, json_error_mode, color_error_mode)
+                return Err(error);
             }
-            Err(error) => handle_error(
-                &BeadsError::SyncConflict {
+            Err(error) => {
+                return Err(BeadsError::SyncConflict {
                     message: format!(
                         "Refusing no-DB mutation because pending sync-merge state could not be inspected under database-family authority: {error}"
                     ),
-                },
-                json_error_mode,
-                color_error_mode,
-            ),
+                });
+            }
         }
     } else if ctx.is_initialized()
         && !ctx.no_db()
@@ -308,26 +305,16 @@ fn main() {
         && !(write_lock.is_none() && ctx.overrides.read_only_fast_open)
         && let Some(paths) = ctx.paths.as_ref()
     {
-        let authority = write_lock.as_ref().unwrap_or_else(|| {
-            handle_error(
-                &BeadsError::SyncConflict {
-                    message:
-                        "Refusing storage open because no database-family authority is available for the live pending sync-merge gate"
-                            .to_string(),
-                },
-                json_error_mode,
-                color_error_mode,
-            )
-        });
+        let authority = write_lock.as_ref().ok_or_else(|| BeadsError::SyncConflict {
+            message:
+                "Refusing storage open because no database-family authority is available for the live pending sync-merge gate"
+                    .to_string(),
+        })?;
         match inspect_pending_sync_merge_for_startup_under_authority(&paths.db_path, authority) {
             Ok(Some(state))
                 if pending_merge_disposition == PendingMergeStartupDisposition::Refuse =>
             {
-                handle_error(
-                    &pending_sync_merge_refusal_error(&state),
-                    json_error_mode,
-                    color_error_mode,
-                )
+                return Err(pending_sync_merge_refusal_error(&state));
             }
             Ok(Some(state)) => {
                 if !pending_merge_warning_emitted {
@@ -340,24 +327,19 @@ fn main() {
             }
             Ok(None) => {}
             Err(error @ BeadsError::SchemaMismatch { .. }) => {
-                let routed = reviewed_schema_migration_required(error);
-                handle_error(&routed, json_error_mode, color_error_mode);
+                return Err(reviewed_schema_migration_required(error));
             }
             // See the no-DB gate above: a named environment refusal is not
             // inspection uncertainty (#491).
             Err(error @ BeadsError::Config(_)) => {
-                handle_error(&error, json_error_mode, color_error_mode);
+                return Err(error);
             }
             Err(error) => {
-                handle_error(
-                    &BeadsError::SyncConflict {
-                        message: format!(
-                            "Refusing storage open because pending sync-merge state could not be inspected under database-family authority: {error}"
-                        ),
-                    },
-                    json_error_mode,
-                    color_error_mode,
-                );
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Refusing storage open because pending sync-merge state could not be inspected under database-family authority: {error}"
+                    ),
+                });
             }
         }
     }
@@ -392,7 +374,7 @@ fn main() {
             Ok(res) => Some(res),
             Err(e) => {
                 if should_auto_import_now {
-                    handle_error(&e, json_error_mode, color_error_mode);
+                    return Err(e);
                 }
                 None
             }
@@ -431,7 +413,7 @@ fn main() {
                 .map(Arc::new)
             }) {
                 Some(Ok(lock)) => Some(lock),
-                Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
+                Some(Err(e)) => return Err(e),
                 None => None,
             };
         }
@@ -470,7 +452,7 @@ fn main() {
                     .map(Arc::new)
                 }) {
                     Some(Ok(lock)) => Some(lock),
-                    Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
+                    Some(Err(e)) => return Err(e),
                     None => None,
                 };
             }
@@ -486,24 +468,20 @@ fn main() {
             if ctx.overrides.read_only_fast_open
                 && let Some(authority) = auto_import_write_lock.as_ref()
             {
-                match reopen_and_reprobe_fast_open_auto_import_under_authority(
+                let reprobe = reopen_and_reprobe_fast_open_auto_import_under_authority(
                     &mut storage_result,
                     paths,
                     &ctx.overrides,
                     authority,
                     allow_external_jsonl,
-                ) {
-                    Ok(reprobe) => {
-                        should_attempt_auto_import = apply_fast_open_auto_import_reprobe(
-                            reprobe,
-                            &mut pending_merge_warning_emitted,
-                            &mut overrides,
-                            &mut ctx.overrides,
-                            json_error_mode,
-                        );
-                    }
-                    Err(error) => handle_error(&error, json_error_mode, color_error_mode),
-                }
+                )?;
+                should_attempt_auto_import = apply_fast_open_auto_import_reprobe(
+                    reprobe,
+                    &mut pending_merge_warning_emitted,
+                    &mut overrides,
+                    &mut ctx.overrides,
+                    json_error_mode,
+                );
             }
         }
 
@@ -514,41 +492,24 @@ fn main() {
                 let authority = auto_import_write_lock
                     .as_ref()
                     .or(write_lock.as_ref())
-                    .unwrap_or_else(|| {
-                        handle_error(
-                            &BeadsError::SyncConflict {
-                                message:
-                                    "Writable fast-open reopen has no database-family authority"
-                                        .to_string(),
-                            },
-                            json_error_mode,
-                            color_error_mode,
-                        )
-                    });
+                    .ok_or_else(|| BeadsError::SyncConflict {
+                        message: "Writable fast-open reopen has no database-family authority"
+                            .to_string(),
+                    })?;
                 writable_overrides.mark_database_family_lock_held(&paths.beads_dir, authority);
                 let frozen_startup = storage_result
                     .as_ref()
                     .map(config::OpenStorageResult::retained_startup_config)
-                    .unwrap_or_else(|| {
-                        handle_error(
-                            &BeadsError::SyncConflict {
-                                message: "Writable fast-open reopen lost its startup snapshot"
-                                    .to_string(),
-                            },
-                            json_error_mode,
-                            color_error_mode,
-                        )
-                    });
+                    .ok_or_else(|| BeadsError::SyncConflict {
+                        message: "Writable fast-open reopen lost its startup snapshot".to_string(),
+                    })?;
                 drop(storage_result.take());
-                match config::open_storage_with_startup_config_under_write_lock(
+                storage_result = Some(config::open_storage_with_startup_config_under_write_lock(
                     frozen_startup,
                     &writable_overrides,
                     false,
                     authority,
-                ) {
-                    Ok(writable_res) => storage_result = Some(writable_res),
-                    Err(e) => handle_error(&e, json_error_mode, color_error_mode),
-                }
+                )?);
             }
 
             let _ = auto_import_write_lock.as_ref();
@@ -562,20 +523,15 @@ fn main() {
                     tracing::debug!("Auto-import skipped because .sync.lock is held");
                     None
                 }
-                Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
+                Some(Err(e)) => return Err(e),
                 None => None,
             };
             if sync_lock.is_some()
                 && let Some(res) = storage_result.as_mut()
             {
-                let expected_prefix = match resolve_auto_import_expected_prefix(res, &ctx.overrides)
-                {
-                    Ok(prefix) => Some(prefix),
-                    Err(e) => {
-                        handle_error(&e, json_error_mode, color_error_mode);
-                    }
-                };
-                let outcome = auto_import_if_stale(
+                let expected_prefix =
+                    Some(resolve_auto_import_expected_prefix(res, &ctx.overrides)?);
+                auto_import_if_stale(
                     &mut res.storage,
                     &paths.beads_dir,
                     &paths.jsonl_path,
@@ -583,10 +539,7 @@ fn main() {
                     allow_external_jsonl,
                     false,
                     false,
-                );
-                if let Err(e) = outcome {
-                    handle_error(&e, json_error_mode, color_error_mode);
-                }
+                )?;
             }
             // sync_lock drops here, releasing the advisory lock before command execution
         }
@@ -937,22 +890,19 @@ fn main() {
         }
     };
 
-    // Handle command result
-    if let Err(e) = result {
-        handle_error(&e, json_error_mode, color_error_mode);
-    }
+    result?;
 
     // Cooperative shutdown: if a SIGINT/SIGTERM/SIGHUP arrived while
     // the command was executing, skip the auto-flush phase and let
     // every local — including `storage_result` — drop on the way out
-    // of `main`, so `SqliteStorage::Drop` checkpoints the WAL before
+    // of `run`, so `SqliteStorage::Drop` checkpoints the WAL before
     // the process exits (#270).
     if let Some(exit_code) = beads_rust::shutdown::exit_code() {
         drop(storage_result);
         drop(overrides);
         drop(ctx);
         drop(write_lock);
-        beads_rust::shutdown::exit_process(exit_code);
+        return Ok(exit_code);
     }
 
     // Phase 5: Auto-Flush (with advisory flock to serialize concurrent access)
@@ -1016,7 +966,7 @@ fn main() {
         drop(overrides);
         drop(ctx);
         drop(write_lock);
-        beads_rust::shutdown::exit_process(err.exit_code());
+        return Ok(err.exit_code());
     }
 
     // A command emitted its normal output and any auto-flush has now completed,
@@ -1029,7 +979,7 @@ fn main() {
         drop(overrides);
         drop(ctx);
         drop(write_lock);
-        beads_rust::shutdown::exit_process(exit_code);
+        return Ok(exit_code);
     }
 
     // Successful exit goes through the same funnel as every other exit
@@ -1044,7 +994,7 @@ fn main() {
     drop(overrides);
     drop(ctx);
     drop(write_lock);
-    beads_rust::shutdown::exit_process(0);
+    Ok(0)
 }
 
 struct StartupContext {
@@ -1950,7 +1900,7 @@ fn emit_read_only_doctor_write_lock_diagnostic(
     err: &BeadsError,
     json_mode: bool,
     robot_triage: bool,
-) -> ! {
+) -> i32 {
     let lock_path = beads_dir
         .map(|dir| dir.join(".write.lock"))
         .unwrap_or_else(|| PathBuf::from(".beads/.write.lock"));
@@ -1992,7 +1942,7 @@ fn emit_read_only_doctor_write_lock_diagnostic(
         );
     }
 
-    beads_rust::shutdown::exit_process(exit_code.as_i32());
+    exit_code.as_i32()
 }
 
 fn is_unwritable_write_lock_open_error(lock_path: &Path, err: &BeadsError) -> bool {
@@ -2018,7 +1968,7 @@ fn emit_read_only_doctor_live_write_lock_diagnostic(
     err: &BeadsError,
     json_mode: bool,
     robot_triage: bool,
-) -> ! {
+) -> i32 {
     let lock_path = beads_dir
         .map(|dir| dir.join(".write.lock"))
         .unwrap_or_else(|| PathBuf::from(".beads/.write.lock"));
@@ -2049,7 +1999,7 @@ fn emit_read_only_doctor_live_write_lock_diagnostic(
         );
     }
 
-    beads_rust::shutdown::exit_process(exit_code.as_i32());
+    exit_code.as_i32()
 }
 
 fn read_only_doctor_live_write_lock_triage_payload(
