@@ -164,7 +164,8 @@ fn render_lint_output(summary: LintSummary, ctx: &OutputContext) {
         if summary.results.is_empty() {
             return;
         }
-        crate::shutdown::exit_process(summary.exit_code(false));
+        crate::output::record_pending_exit_code(summary.exit_code(false));
+        return;
     }
 
     if ctx.is_rich() {
@@ -197,7 +198,11 @@ fn render_lint_output(summary: LintSummary, ctx: &OutputContext) {
         }
     }
 
-    crate::shutdown::exit_process(summary.exit_code(false));
+    // Lint can follow an auto-import owned by main. Let that storage checkpoint
+    // before applying the warning status, just like other diagnostic commands.
+    if summary.warnings != 0 {
+        crate::output::record_pending_exit_code(summary.exit_code(false));
+    }
 }
 
 fn render_lint_rich(summary: &LintSummary, ctx: &OutputContext) {

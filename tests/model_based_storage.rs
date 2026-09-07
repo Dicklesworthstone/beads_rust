@@ -919,8 +919,12 @@ fn integrity_checker_rejects_trailing_corruption_and_malformed_results() {
 }
 
 fn fresh_storage() -> (SqliteStorage, TempDir, std::path::PathBuf) {
-    let (storage, dir) = common::test_db_with_dir();
+    let (storage, mut dir) = common::test_db_with_dir();
     let db_path = dir.path().join(".beads").join("beads.db");
+    if std::env::var_os("BR_KEEP_TEMP").is_some() {
+        dir.disable_cleanup(true);
+        eprintln!("[model] retaining database family: {}", db_path.display());
+    }
     (storage, dir, db_path)
 }
 

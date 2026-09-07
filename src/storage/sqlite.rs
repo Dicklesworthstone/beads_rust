@@ -9015,28 +9015,14 @@ impl SqliteStorage {
 
         let labels_and = filters.labels.as_deref().unwrap_or(&[]);
         let labels_or = filters.labels_or.as_deref().unwrap_or(&[]);
-        // fsqlite regression (seen on 0.3.6, still present on 0.3.16; fixed
-        // upstream in frankensqlite#407 after the 0.3.16 tag):
-        // `SELECT COUNT(*) ... WHERE id IN (SELECT ... GROUP BY ... HAVING
-        // COUNT(DISTINCT label) = ?)` evaluates to NULL (read as 0 below) as
-        // soon as further predicates follow the IN-subquery, which the
-        // default-visibility status and template clauses do; the minimal
-        // statement counts correctly (beads_rust-ro3m; the ignored probe
-        // `grouped_having_in_subquery_count_with_bound_params` enumerates the
-        // variants and flips green when the engine is fixed).
-        // The bare membership subquery is unaffected, so multi-label AND
-        // counting routes through the two-step candidate-ids path instead of
-        // the uncorrelated IN fast path; `multi_label_and_count_matches_list`
-        // guards the behavior.
-        let multi_label_and = unique_label_refs(labels_and).len() > 1;
-        let label_filters_can_use_uncorrelated_in = !multi_label_and
-            && filters.statuses.as_ref().is_none_or(Vec::is_empty)
-            && filters.types.as_ref().is_none_or(Vec::is_empty)
-            && filters.priorities.as_ref().is_none_or(Vec::is_empty)
-            && filters.assignee.is_none()
-            && filters.title_contains.is_none()
-            && filters.updated_before.is_none()
-            && filters.updated_after.is_none();
+        let label_filters_can_use_uncorrelated_in =
+            filters.statuses.as_ref().is_none_or(Vec::is_empty)
+                && filters.types.as_ref().is_none_or(Vec::is_empty)
+                && filters.priorities.as_ref().is_none_or(Vec::is_empty)
+                && filters.assignee.is_none()
+                && filters.title_contains.is_none()
+                && filters.updated_before.is_none()
+                && filters.updated_after.is_none();
         let label_candidate_ids = if label_filters_can_use_uncorrelated_in {
             None
         } else {
@@ -21331,10 +21317,10 @@ mod tests {
         assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
     }
 
-    /// GitHub #403 / #491: a pending receipt behind group/other-accessible
-    /// namespace sidecars must still be classified. The authority-gated mode
-    /// repair is the only thing allowed before the verdict — it changes no
-    /// byte of any family member — and the verdict then reports the receipt.
+    /// GitHub #403 / #491: a pending receipt behind namespace sidecars with
+    /// broader access than its private database must still be classified. The
+    /// authority-gated mode repair is the only thing allowed before the verdict
+    /// — it changes no byte of any family member — and the verdict reports the receipt.
     #[cfg(unix)]
     #[test]
     fn pending_inspection_heals_sidecar_modes_then_classifies_valid_receipt_without_byte_changes() {
@@ -21369,6 +21355,9 @@ mod tests {
                 .unwrap();
         }
 
+        // The repair precondition must not depend on the process umask: 0.3.18
+        // admits sidecars whose exposure is no broader than the database's.
+        fs::set_permissions(&db_path, fs::Permissions::from_mode(0o600)).unwrap();
         let sidecars = existing_namespace_sidecars(&db_path);
         assert!(!sidecars.is_empty(), "namespace sidecar fixture");
         for sidecar in &sidecars {
@@ -21812,6 +21801,7 @@ mod tests {
                 .unwrap();
         }
 
+        fs::set_permissions(&db_path, fs::Permissions::from_mode(0o600)).unwrap();
         let loosened = existing_namespace_sidecars(&db_path);
         for sidecar in &loosened {
             fs::set_permissions(sidecar, fs::Permissions::from_mode(0o664)).unwrap();
@@ -22544,6 +22534,7 @@ mod tests {
                 .execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 .unwrap();
         }
+        fs::set_permissions(&db_path, fs::Permissions::from_mode(0o600)).unwrap();
         let sidecars = existing_namespace_sidecars(&db_path);
         let target = sidecars
             .first()
@@ -22608,6 +22599,7 @@ mod tests {
                 .execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 .unwrap();
         }
+        fs::set_permissions(&db_path, fs::Permissions::from_mode(0o600)).unwrap();
         let first = database_sidecar_path(
             &db_path,
             crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES[0],
@@ -27103,15 +27095,10 @@ mod tests {
     /// On fsqlite 0.3.15 and 0.3.16 the two production-shaped variants return
     /// NULL (`Ok(None)`) while the minimal statement counts 1 through both
     /// query APIs: the grouped/HAVING IN-subquery breaks once further
-    /// predicates follow it (fixed upstream after the 0.3.16 tag). Run with
-    /// `--ignored` after an engine bump; when every variant counts 1, drop
-    /// the `multi_label_and` detour in `count_issues_with_filters` and
-    /// un-ignore this test.
+    /// predicates follow it. The original probe passes on fsqlite 0.3.18;
+    /// keep all four variants in the normal suite now that the public count
+    /// uses the grouped subquery directly again.
     #[test]
-    #[ignore = "beads_rust-ro3m / upstream frankensqlite#407: fsqlite 0.3.15 and 0.3.16 return NULL for \
-                the grouped/HAVING IN-subquery count when further predicates follow the subquery \
-                (minimal statement counts 1); fixed upstream after the 0.3.16 tag, rerun after the \
-                next engine bump"]
     fn grouped_having_in_subquery_count_with_bound_params() {
         let storage = storage_with_multi_label_fixture();
         let params = [
@@ -32574,6 +32561,7 @@ mod tests {
             "reviewed-reconcile future refusal must leave the database family byte and mode neutral"
         );
 
+        fs::set_permissions(&db_path, fs::Permissions::from_mode(0o600)).unwrap();
         let sidecars = existing_namespace_sidecars(&db_path);
         assert!(!sidecars.is_empty(), "namespace sidecar fixture");
         for sidecar in &sidecars {
@@ -32816,6 +32804,7 @@ mod tests {
             "the fixture must put the future version in the main header"
         );
 
+        fs::set_permissions(&db_path, fs::Permissions::from_mode(0o600)).unwrap();
         let sidecars = existing_namespace_sidecars(&db_path);
         assert!(!sidecars.is_empty(), "namespace sidecar fixture");
         let mut modes_before = Vec::new();

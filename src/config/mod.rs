@@ -9807,8 +9807,36 @@ routing:
         );
     }
 
+    /// Returns true once the parent has checked the isolated test's result.
+    fn run_compaction_test_in_subprocess(name: &str) -> bool {
+        // The checkpoint requires a sole opener. A separate test process keeps
+        // parallel tests' child processes from inheriting this fixture's lease.
+        const CHILD_ENV: &str = "BR_TEST_ISOLATED_COMPACTION";
+        if std::env::var(CHILD_ENV).as_deref() == Ok(name) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD_ENV, name)
+            .output()
+            .expect("run isolated compaction test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains(&format!("test {name} ... ok")),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
     #[test]
     fn vacuum_into_reopen_failure_returns_error_without_storage_handle() {
+        if run_compaction_test_in_subprocess(
+            "config::tests::vacuum_into_reopen_failure_returns_error_without_storage_handle",
+        ) {
+            return;
+        }
+
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("beads.db");
         let sidecar_path = PathBuf::from(format!("{}-wal-cert", db_path.display()));
@@ -9887,6 +9915,12 @@ routing:
     fn vacuum_into_preserves_same_byte_foreign_swap_after_candidate_lock() {
         use std::os::unix::fs::MetadataExt;
 
+        if run_compaction_test_in_subprocess(
+            "config::tests::vacuum_into_preserves_same_byte_foreign_swap_after_candidate_lock",
+        ) {
+            return;
+        }
+
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("beads.db");
         let retained_original = temp.path().join("retained-original.db");
@@ -9956,6 +9990,12 @@ routing:
     #[test]
     fn vacuum_into_post_adoption_failure_restores_main_and_sidecar() {
         use std::os::unix::fs::MetadataExt;
+
+        if run_compaction_test_in_subprocess(
+            "config::tests::vacuum_into_post_adoption_failure_restores_main_and_sidecar",
+        ) {
+            return;
+        }
 
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("beads.db");
@@ -10027,6 +10067,12 @@ routing:
     #[test]
     fn vacuum_into_parent_sync_failure_restores_retained_main() {
         use std::os::unix::fs::MetadataExt;
+
+        if run_compaction_test_in_subprocess(
+            "config::tests::vacuum_into_parent_sync_failure_restores_retained_main",
+        ) {
+            return;
+        }
 
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("beads.db");
@@ -10992,9 +11038,9 @@ routing:
     /// permissions until it owns the database-family authority. Once it does,
     /// the owner-only mode repair is the one content-free change allowed
     /// before the pending-saga verdict, because the engine refuses even the
-    /// read-only verdict connection until the sidecars are owner-only; a
-    /// group-accessible sidecar must therefore heal, not wedge every command
-    /// (GitHub #403, #491).
+    /// read-only verdict connection when sidecars expose a private database;
+    /// the excessive sidecar permissions must therefore heal, not wedge every
+    /// command (GitHub #403, #491).
     #[cfg(unix)]
     #[test]
     fn read_only_fast_open_repairs_namespace_modes_under_authority_then_opens() {
@@ -11005,6 +11051,8 @@ routing:
         let db_path = beads_dir.join("beads.db");
         fs::create_dir_all(&beads_dir).expect("create beads dir");
         drop(SqliteStorage::open(&db_path).expect("initialize current schema"));
+        fs::set_permissions(&db_path, fs::Permissions::from_mode(0o600))
+            .expect("make database private regardless of the process umask");
 
         let sidecars: Vec<_> = FSQLITE_NAMESPACE_SIDECAR_SUFFIXES
             .iter()

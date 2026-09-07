@@ -1,6 +1,6 @@
 # Storage Engine Operating Model
 
-**Status:** reviewed 2026-09-04 (main pins fsqlite 0.3.16; released br v0.5.10 uses 0.3.15)
+**Status:** reviewed 2026-09-07 (main pins fsqlite 0.3.18; released br v0.5.10 uses 0.3.15)
 **Owner bead:** `beads_rust-dk45` (Track B of the 2026-09-01 bridge plan)
 
 This document is the record of how `br` relates to its storage engine, what
@@ -76,7 +76,7 @@ the suffix lists; `doctor`'s family walk reads the same constants):
 | `beads.db` | br | main database | `db.exists`, `db.open`, `sqlite.integrity_check` |
 | `beads.db-wal`, `-shm`, `-journal` | engine | classic WAL / WAL-index / rollback journal | `db.sidecars`, `wal_size`; `-shm` reader marks (offsets 100..120) are the one thing a read-only open may write |
 | `beads.db-wal-cert`, `-wal-cert-head` | engine (0.2+) | parallel-WAL durability certificates | derived state; a certificate written by a different engine generation makes every cert-regenerating write fail while reads stay healthy (GH #441); br quarantines it into `.br_recovery/` so the engine regenerates it |
-| `beads.db-fsqlite-ns-gate`, `-fsqlite-ns-use` | engine (0.1.18+) | multi-process namespace admission | `db.namespace_identity` compares the recorded generation with the main file before any live engine open; distinguishes a mismatch from unavailable evidence and absent sidecars. Group/other permission bits also trigger `permissions.db_sidecars`; diagnosis preserves the files and offers no namespace fixer |
+| `beads.db-fsqlite-ns-gate`, `-fsqlite-ns-use` | engine (0.1.18+) | multi-process namespace admission | `db.namespace_identity` compares the recorded generation with the main file before any live engine open; distinguishes a mismatch from unavailable evidence and absent sidecars. `permissions.db_sidecars` flags group/other exposure beyond what the linked engine admits; namespace identity diagnosis preserves the files and offers no namespace fixer |
 | `beads.db.fsqlite-migration-state` | engine | migration bookkeeping | carried with the family |
 | `.br-db-write-<hash>.lock`, `.br-db-openers-<hash>.lock` | br | write authority and opener lease | `write_lock`, engine block |
 | `.br_recovery/` | br | forensic backups taken before recovery rebuilds (whole family) | `db.recovery_artifacts` (info), `db.recovery_artifacts.aged` (warn past `RECOVERY_AGED_TTL_DAYS = 30`), `db.foreign_recovery_debris` |
@@ -93,6 +93,13 @@ admission before this fallback can run. On mismatch or unavailable evidence,
 it skips live database probes, reports pending-merge state as unknown, and
 continues checks on private copies. Preserve the whole family for diagnosis;
 a mismatch does not establish that its WAL or certificates are disposable.
+
+FrankenSQLite 0.3.18 also admits an existing namespace sidecar whose group/other
+exposure does not exceed the database file's exposure to the same principals;
+group permissions require matching groups. The br permission probe already
+selects this rule from the linked engine version. This permits mount-imposed
+modes on FAT/exFAT or WSL drives without treating an admitted mode as a repair
+finding. Owner, regular-file and single-hard-link requirements still apply.
 
 ## 5. Read-only contract (GH #476)
 
@@ -141,7 +148,7 @@ A release without these receipts is not a release.
 
 | Bead | Symptom in br | Upstream |
 |---|---|---|
-| `beads_rust-ro3m` | `SELECT COUNT(*) ... WHERE id IN (SELECT ... GROUP BY ... HAVING COUNT(DISTINCT label) = ?)` counts 0 when the labels and threshold are bound parameters (the literal statement is right; confirmed on fsqlite 0.3.15); br routes multi-label AND counting through candidate ids. Probe: `grouped_having_in_subquery_count_with_bound_params` (ignored; run with `--ignored` after an engine bump), guard: `multi_label_and_count_matches_list` | [frankensqlite#407](https://github.com/Dicklesworthstone/frankensqlite/issues/407), filed 2026-09-03; closed upstream 2026-09-04 (`007822add`, `efdf9e2a0`), both commits after the v0.3.16 tag; the probe re-run on 0.3.16 (2026-09-04) still fails, so 0.3.16 keeps the workaround and the probe stays ignored until the next engine release carries them |
+| `beads_rust-ro3m` (engine fix verified) | Grouped/HAVING IN-subquery counts returned NULL with bound parameters and trailing predicates on 0.3.15/0.3.16. All four original `grouped_having_in_subquery_count_with_bound_params` variants pass on 0.3.18 (2026-09-07); the probe is now a normal regression test and the multi-label AND count detour is removed. `multi_label_and_count_matches_list` guards the public result. | [frankensqlite#407](https://github.com/Dicklesworthstone/frankensqlite/issues/407), fixed after the v0.3.16 tag; the pinned 0.3.18 release carries the correction |
 | `beads_rust-f3r4` | B-tree rowid-order corruption after 264 sequential dep-remove writes (GH #426) | not filed: the #426 sequence passes on fsqlite 0.3.15; `gh426_sequential_dependency_removals_keep_projections_and_integrity` (tests/model_based_storage.rs) guards it |
 | `beads_rust-ajui` | migrate-schema 16→17 reports success but leaves the DB failing `integrity_check` (GH #428) | not filed: br-side fix landed (migration requires a clean fresh-connection integrity witness, `doctor_subsystems/schema_migration.rs`; `tests/e2e_schema_migration_upgrade.rs`); bead closed |
 | `beads_rust-891u` | `VACUUM INTO` re-serializes DDL so the raw `sqlite_master` hash never matches the witness | not filed (re-serialized DDL is not an upstream defect once the witness ignores formatting); br-side landed: the witness hashes DDL tokens (`ddl_token_fingerprint`, `schema_witness_survives_vacuum_into_reserialization`) |

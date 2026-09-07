@@ -17,6 +17,8 @@ mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, run_br};
 use serde_json::Value;
+use std::fs;
+use std::time::{Duration, SystemTime};
 
 // =============================================================================
 // Helper Functions
@@ -125,6 +127,77 @@ fn e2e_lint_issue_with_all_required_sections_passes() {
 // =============================================================================
 // Missing Sections Tests by Issue Type
 // =============================================================================
+
+fn assert_lint_warning_exit_checkpoints_auto_import(quiet: bool) {
+    let workspace = BrWorkspace::new();
+    init_workspace(&workspace);
+    let id = create_issue_with_description(&workspace, "Original bug", "bug", None);
+    let jsonl = workspace.root.join(".beads/issues.jsonl");
+    let mut issue: Value =
+        serde_json::from_str(fs::read_to_string(&jsonl).unwrap().trim()).unwrap();
+    issue["title"] = Value::from("Imported warning");
+    issue["updated_at"] =
+        Value::from((chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339());
+    issue.as_object_mut().unwrap().remove("content_hash");
+    fs::write(
+        &jsonl,
+        format!("{}\n", serde_json::to_string(&issue).unwrap()),
+    )
+    .unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&jsonl)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(60)))
+        .unwrap();
+
+    let lint = run_br(
+        &workspace,
+        ["lint", if quiet { "--quiet" } else { "--no-color" }],
+        "lint_after_auto_import",
+    );
+    assert_eq!(lint.status.code(), Some(1), "{lint:?}");
+    assert!(lint.stderr.is_empty(), "{}", lint.stderr);
+    if quiet {
+        assert!(lint.stdout.is_empty(), "{}", lint.stdout);
+    } else {
+        assert!(lint.stdout.contains("Imported warning"), "{}", lint.stdout);
+        assert!(
+            lint.stdout.contains("Steps to Reproduce"),
+            "{}",
+            lint.stdout
+        );
+    }
+
+    // Inspect before any engine or CLI reopen can hide missed teardown.
+    let wal = workspace.root.join(".beads/beads.db-wal");
+    let wal_size = match fs::metadata(&wal) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => panic!("read WAL metadata: {error}"),
+    };
+    assert!(
+        wal_size <= 32,
+        "lint warning exit must checkpoint its auto-import; WAL has {wal_size} bytes"
+    );
+
+    let shown = run_br(&workspace, ["show", &id, "--json"], "show_imported_issue");
+    assert!(shown.status.success(), "{shown:?}");
+    let issues: Value = serde_json::from_str(&shown.stdout).unwrap();
+    assert_eq!(issues[0]["title"], "Imported warning");
+}
+
+#[test]
+fn e2e_lint_text_warning_exit_checkpoints_auto_import() {
+    let _log = common::test_log("e2e_lint_text_warning_exit_checkpoints_auto_import");
+    assert_lint_warning_exit_checkpoints_auto_import(false);
+}
+
+#[test]
+fn e2e_lint_quiet_warning_exit_checkpoints_auto_import() {
+    let _log = common::test_log("e2e_lint_quiet_warning_exit_checkpoints_auto_import");
+    assert_lint_warning_exit_checkpoints_auto_import(true);
+}
 
 #[test]
 fn e2e_lint_bug_missing_steps_to_reproduce() {

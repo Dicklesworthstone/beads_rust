@@ -25441,11 +25441,16 @@ mod tests {
         let hold = holder.try_exclusive().expect("sole opener");
 
         let newcomer_path = db_path.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
         let newcomer = thread::spawn(move || {
             let started = Instant::now();
+            started_tx.send(()).unwrap();
             let lease = DatabaseOpenerLease::register(&newcomer_path).unwrap();
             (lease.is_registered(), started.elapsed())
         });
+        // Start the hold interval only after the newcomer is scheduled; time
+        // spent waiting to start that thread does not test lease contention.
+        started_rx.recv().unwrap();
         thread::sleep(Duration::from_millis(200));
         holder.release_exclusive(hold);
 

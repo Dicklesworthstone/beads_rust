@@ -31,7 +31,13 @@
 //! schedules; `BR_COUPLED_SEARCH_BUDGET` limits search without treating an
 //! exhausted search as success.
 
-mod common;
+// Loading the complete common module also runs its storage-heavy helper tests
+// alongside this timed workload. Keep only the CLI helpers used here; the other
+// helpers retain their tests in the integration targets that use them.
+mod common {
+    #![allow(dead_code)]
+    pub mod cli;
+}
 
 use beads_rust::franken_sync::compat::{OpenFlags, open_with_flags};
 use fsqlite_types::SqliteValue;

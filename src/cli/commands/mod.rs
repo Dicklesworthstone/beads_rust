@@ -775,17 +775,28 @@ mod tests {
         fs::create_dir_all(&beads_dir).expect("create beads dir");
 
         let _held = crate::sync::blocking_write_lock(&beads_dir).expect("hold write lock");
-        let result = acquire_routed_workspace_write_lock(&beads_dir, true, Some(1));
-        let err = result.err().ok_or_else(|| {
-            "external routed lock should wait for and time out on held lock".to_string()
-        })?;
-        let message = err.to_string();
-        assert!(
-            message.contains("Routed external workspace is busy")
-                && message.contains("target write lock")
-                && message.contains("Timed out after 1ms waiting for write lock"),
-            "{message}"
-        );
+        for timeout_ms in [0, 1] {
+            let result = acquire_routed_workspace_write_lock(&beads_dir, true, Some(timeout_ms));
+            let err = result
+                .err()
+                .ok_or_else(|| "external routed lock should time out on held lock".to_string())?;
+            let message = err.to_string();
+            assert!(
+                message.contains("Routed external workspace is busy")
+                    && message.contains("target write lock")
+                    && message.contains(&beads_dir.join(".write.lock").display().to_string()),
+                "{message}"
+            );
+            // Family setup spends part of the shared budget before the inner
+            // workspace lock is attempted. Its remaining timeout may be zero,
+            // but must never revert to the default or exceed the supplied limit.
+            assert!(
+                (0..=timeout_ms).any(|remaining| message.contains(&format!(
+                    "Timed out after {remaining}ms waiting for write lock"
+                ))),
+                "requested {timeout_ms}ms: {message}"
+            );
+        }
         Ok(())
     }
 

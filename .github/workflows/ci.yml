@@ -69,7 +69,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf  # v2.87.2
+        uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8  # v2.87.5
         with:
           tool: cargo-audit
 
@@ -203,7 +203,7 @@ jobs:
       # Prebuilt binary: compiling cargo-insta from source on the runner
       # failed when a newer nightly rejected its rustix dependency.
       - name: Install cargo-insta
-        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf  # v2.87.2
+        uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8  # v2.87.5
         with:
           tool: cargo-insta@1.46.1
 

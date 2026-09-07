@@ -794,6 +794,12 @@ fn e2e_doctor_namespace_identity_absence_and_permission_failures_are_not_mismatc
     let workspace = BrWorkspace::new();
     let init = run_br(&workspace, ["init", "--prefix", "ns"], "init");
     assert!(init.status.success(), "{init:?}");
+    // The sidecar must expose more than the database even with a permissive umask.
+    fs::set_permissions(
+        workspace.root.join(".beads/beads.db"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
     let gate = workspace.root.join(".beads/beads.db-fsqlite-ns-gate");
     let use_file = workspace.root.join(".beads/beads.db-fsqlite-ns-use");
     fs::set_permissions(&gate, fs::Permissions::from_mode(0o644)).unwrap();

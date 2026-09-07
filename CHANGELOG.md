@@ -97,13 +97,24 @@ this repo): commits `55c186682` + `5946b3b7c` in
   changed; and the reviewed additive reconcile path repairs sidecar modes
   under its authority before its non-repairing open. Reads are unchanged.
   Writing on such a mount also needs the engine change in FrankenSQLite
-  (namespace sidecars accept a mount-imposed mask), which lands with the next
-  fsqlite release; br's own sidecar checks mirror the engine's rule (a
-  group/other exposure bounded by the database file's, per principal class
-  and GID) and switch on automatically once the locked `fsqlite` in
-  `Cargo.lock` is 0.3.18 or newer, with a parity test that opens such a
-  family through the linked engine so the two cannot drift. Until that bump
-  br refuses with the explanation above.
+  0.3.18 (namespace sidecars accept a mount-imposed mask: a sidecar this
+  process just created is accepted whatever mode the mount reports back, and
+  an existing sidecar is accepted when it grants no group/other bit the
+  database file does not already grant to the same principals); br's own
+  sidecar checks mirror that rule (a group/other exposure bounded by the
+  database file's, per principal class and GID) and switch on automatically
+  once the locked `fsqlite` in `Cargo.lock` is 0.3.18 or newer, with a parity
+  test that opens such a family through the linked engine so the two cannot
+  drift. The pins are now `fsqlite` 0.3.18 (from 0.3.16), so a build of this
+  version writes on such a mount out of the box; verified on a FAT image
+  mounted with a 0777 mask (first write, second write, read).
+- Engine: FrankenSQLite 0.3.16 -> 0.3.18. Besides the sidecar admission rule
+  above: `WHERE <rowid> IN (?, ?, …)` on an INTEGER PRIMARY KEY table plans
+  as rowid seeks instead of a full scan; leaving WAL mode after a checkpoint
+  no longer leaves stale-snapshot errors behind; prepared reads that
+  recompile after a schema change release the failed attempt's read
+  transaction. No on-disk format change: a database written by br 0.5.10
+  (fsqlite 0.3.16) opens with no first-open migration.
 - Exit-code note: a `Configuration error` raised inside the startup
   pending-sync-merge gate (a sidecar the filesystem cannot repair, or a
   database whose schema version is newer than this binary supports) now

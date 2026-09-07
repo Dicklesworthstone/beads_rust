@@ -18960,8 +18960,8 @@ mod tests {
         }
     }
 
-    /// GitHub #403: a group/other-accessible fsqlite namespace sidecar wedges
-    /// every database open while doctor reported the workspace healthy and
+    /// GitHub #403: a namespace sidecar with broader access than its private
+    /// database wedges every open while doctor reported the workspace healthy and
     /// said nothing at all. The check must name the file and its mode, and
     /// `--repair` must restore owner-only permissions through the chokepoint.
     #[cfg(unix)]
@@ -18973,6 +18973,7 @@ mod tests {
         fs::create_dir_all(&beads_dir).unwrap();
         let db_path = beads_dir.join("beads.db");
         fs::write(&db_path, b"SQLite format 3\0").unwrap();
+        fs::set_permissions(&db_path, fs::Permissions::from_mode(0o600)).unwrap();
         let gate = beads_dir.join("beads.db-fsqlite-ns-gate");
         let use_file = beads_dir.join("beads.db-fsqlite-ns-use");
         fs::write(&gate, b"FSQLNS01").unwrap();
