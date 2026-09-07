@@ -164,6 +164,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "ar_archive_writer"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73cd58deff2140a0a8eae87e417bd01db68a33e148aa93d1e8cd837e55e312b6"
+dependencies = [
+ "object 0.39.1",
+]
+
+[[package]]
 name = "arc-swap"
 version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -368,7 +377,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "miniz_oxide 0.8.9",
- "object",
+ "object 0.37.3",
  "rustc-demangle",
  "windows-link",
 ]
@@ -1726,9 +1735,9 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsqlite"
-version = "0.3.16"
+version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac52d94d28e12e6a584437630275e8334ac214db5b13c24cbea8e8a5b4e3ee40"
+checksum = "08fec08ab10876b67a132b9c6eaa3eeaea62b58b4ebb3370684bcbb2333875c8"
 dependencies = [
  "asupersync",
  "fsqlite-core",
@@ -1745,9 +1754,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ast"
-version = "0.3.16"
+version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f92fd22b225f785b3e205d754bda86130ab76ea1fa655edbe9056ce836f4f9de"
+checksum = "1778525c27addb7225e26bd76b294dd775005257043a65dd823100f9afc1e794"
 dependencies = [
  "fsqlite-types",
  "smallvec",
@@ -1755,9 +1764,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-btree"
-version = "0.3.16"
+version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5f9089618fd4bfda3b8857a4488ce07220314ec958cc87f8bf1f349133934d2"
+checksum = "a1899d0d276e4a4f4e930bca4dc9901b78dda5cb7944ba2beaf9216f253035eb"
 dependencies = [
  "foldhash",
  "fsqlite-error",
@@ -1773,9 +1782,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-core"
-version = "0.3.16"
+version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "098970d5412cb7ba8e5ec4ebd3d8b93ab626c4c9f691c132820a03c049b4d468"
+checksum = "9e852b4dc7b6d643cddd29d4ba52915e79ba7fce373b6cac33d65bea3b3ac6a2"
 dependencies = [
  "asupersync",
  "blake3",
@@ -1805,6 +1814,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "stacker",
  "tempfile",
  "tracing",
  "xxhash-rust",
@@ -1812,18 +1822,18 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-error"
-version = "0.3.16"
+version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e3dd98713ee2d5acfc30345f0cb9df3fbed22498adbfd37ce10666797dc8100"
+checksum = "159b84a266836f9fc76790d0761bdf3a638182732ebefb8bf3952318f3ac285a"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "fsqlite-ext-fts5"
-version = "0.3.16"
+version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d4f5a4522c22a348ddb5198d980afe46a6d266140ae3aa8a40830c3face632e"
+checksum = "2db7d770b1fa8e955c1a9e8177aca5eb1ee2bfdd84112dbf4bb5dbcfc62041cf"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1834,9 +1844,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-icu"
-version = "0.3.16"
+version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42671769185dd99dba092badf4eae8f070009c04e3761c9be573e5f4537f891f"
+checksum = "04be8473a03c7ffe4c555b3f499dbe2470ff6f395f350bb854296fae43543497"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1846,9 +1856,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-json"
-version = "0.3.16"
+version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5640df966b2b2ec4d1865434dce650d4442530ea0fcf5c7c435a6258363eb29f"
+checksum = "34d0ba5139aaef2d4cbf3e902be2aa7e317e1bf1c28ea19ad762cefc218d8cf1"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1859,9 +1869,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-misc"
-version = "0.3.16"
+version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b540fbb591b63edfeb01af6a16cad2e660e334dec4ddb622ff80035dc3cc00b1"
+checksum = "005075254e984e4f43ed4926181fe1b703b29f25eba403cdd82e88003280f0a6"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1873,9 +1883,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-rtree"
-version = "0.3.16"
+version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44ef8079f535af409c9e9edef1e7271a90ac89da55d03169e89c67bb6f2750f0"
+checksum = "f5c2c04c82fd2ed5e23189bb3b991c7ee345ae9044560eef08feaab6e2bd557b"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1884,9 +1894,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-func"
-version = "0.3.16"
+version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd780ee41de17dc9474ae8fab898e8b5ff0c5076512713499b26d0e046bf2daa"
+checksum = "b628232be3ba21224daaad69b0dbfad7b1d97ed814d02a0c2009f496b7c3c29c"
 dependencies = [
  "chrono",
  "fsqlite-error",
@@ -1896,9 +1906,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-mvcc"
-version = "0.3.16"
+version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7979648e53fcffde0d03a9476bf4704af9c666c1a307e5bc19d67185cf7f64fe"
+checksum = "0db34e12732af792d19b8c75255649078503a45c7f0633a8fba18b6021e5b1c0"
 dependencies = [
  "asupersync",
  "blake3",
@@ -1922,9 +1932,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-observability"
-version = "0.3.16"
+version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe0a4ae442af15d9b32367d8a410f74844992e71a38c1391ff81fe38611b81a0"
+checksum = "271e7a469a2a15777487c3a0bafe3ede4c28fe8e6034482af6ef9bf55ecdd695"
 dependencies = [
  "fsqlite-types",
  "parking_lot",
@@ -1934,9 +1944,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-pager"
-version = "0.3.16"
+version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97b3b7ed0f7861101356c96a74128e736668e32b03984391fd3923a9526888ca"
+checksum = "357ac1292256ea0603db2c59b9ec75f0b0d53d00d55dc9c81934d307044388f3"
 dependencies = [
  "argon2",
  "asupersync",
@@ -1960,9 +1970,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-parser"
-version = "0.3.16"
+version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a029e576429997c9be7d9d992b8a5a4da696650566ad413e46dd3476bc4e04c"
+checksum = "0dde794db1cf4cef6a93805042ef92bbcc0f597478b93fb1180ec3a9fbf4aa64"
 dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
@@ -1974,9 +1984,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-planner"
-version = "0.3.16"
+version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e8263183befcd7a815191b9a5d3851648a5a425441878637c234dd4512d181f"
+checksum = "76a0508f07c9b8f0bc52075db32bb7affa9e14993f0c5ce75cde7fafcfdd6e3c"
 dependencies = [
  "blake3",
  "fsqlite-ast",
@@ -1992,9 +2002,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-types"
-version = "0.3.16"
+version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57664d471007d8dd9d5053fc4b487f8b64720910789286b7ffd81983b162b10c"
+checksum = "9974dce756642291b9b81abcb20ecc14d2fde963ceb719843ed9bc27d848f343"
 dependencies = [
  "asupersync",
  "bitflags 2.13.1",
@@ -2012,9 +2022,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vdbe"
-version = "0.3.16"
+version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42494f57979be85a3d8803491f236e40bebe3eed05c92ece991cab381c89b0d6"
+checksum = "85012bf442126ead3abe0da3a91e6b87896f864c0a0b29ae7c89e461ace9f3dd"
 dependencies = [
  "asupersync",
  "crossbeam-deque",
@@ -2023,6 +2033,7 @@ dependencies = [
  "fsqlite-error",
  "fsqlite-func",
  "fsqlite-mvcc",
+ "fsqlite-observability",
  "fsqlite-pager",
  "fsqlite-parser",
  "fsqlite-types",
@@ -2035,9 +2046,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vfs"
-version = "0.3.16"
+version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65b063afadb146896133e8ff394afb7eaaad813c6b325b42b5bd7e2b36549f8c"
+checksum = "37fda6518a5db34e159568c226e6a880b51cc4a6487bdbcfe98593ca1c7bf82b"
 dependencies = [
  "advisory-lock",
  "asupersync",
@@ -2054,9 +2065,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-wal"
-version = "0.3.16"
+version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a891247c8855cd6a5d368fa6992945593d4b6276fed4f9c6a599a3ae3f919cdc"
+checksum = "2621e7ad33d12159369166277e26143720635bfbf3272996eb6600b421efc6e6"
 dependencies = [
  "asupersync",
  "blake3",
@@ -4055,6 +4066,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "object"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "oid-registry"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4425,6 +4445,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "psm"
+version = "0.1.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4dcd034599e63b970727f70d79e02d62390a4a84f7c6b827c27c46d5ac3fa622"
+dependencies = [
+ "ar_archive_writer",
+ "cc",
 ]
 
 [[package]]
@@ -5401,6 +5431,19 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "stacker"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "707f49d46706bacf8a2b00d51dace3f9de527c13eec3778f570c411f89e69967"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "psm",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "stdio-override"
