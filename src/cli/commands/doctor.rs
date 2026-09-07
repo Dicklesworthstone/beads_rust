@@ -3393,7 +3393,7 @@ fn jsonl_rebuild_root_error(err: &BeadsError) -> &BeadsError {
 /// wording changes.
 fn is_database_unavailable_failure(err: &BeadsError) -> bool {
     match jsonl_rebuild_root_error(err) {
-        BeadsError::DatabaseLocked { .. } => true,
+        BeadsError::DatabaseLocked { .. } | BeadsError::WriteLockTimeout { .. } => true,
         BeadsError::Database(inner) => matches!(
             inner,
             FrankenError::CannotOpen { .. }
@@ -3432,6 +3432,12 @@ fn is_jsonl_content_failure(err: &BeadsError) -> bool {
 /// Each branch now names the remedy that actually applies, and the residual
 /// case reports the failure without attributing a cause to either store.
 fn jsonl_rebuild_failure_message(err: &BeadsError) -> String {
+    if let timeout @ BeadsError::WriteLockTimeout { .. } = jsonl_rebuild_root_error(err) {
+        return format!(
+            "Repair import failed: {err}. {}",
+            timeout.suggestion().unwrap_or_default()
+        );
+    }
     if is_database_unavailable_failure(err) {
         return format!(
             "Repair import failed: {err}. \
@@ -22495,6 +22501,27 @@ mod tests {
             }),
         };
         assert!(is_database_unavailable_failure(&wrapped));
+    }
+
+    #[test]
+    fn repair_lock_timeout_preserves_inspection_guidance() {
+        let wrapped = BeadsError::WithContext {
+            context: "acquiring repair publication authority".to_string(),
+            source: Box::new(BeadsError::WriteLockTimeout {
+                role: "JSONL-family write lock".to_string(),
+                path_display: "<redacted authority>".to_string(),
+                timeout_ms: 75,
+                retryable: false,
+            }),
+        };
+        assert!(is_database_unavailable_failure(&wrapped));
+        assert!(!is_jsonl_content_failure(&wrapped));
+        let message = jsonl_rebuild_failure_message(&wrapped);
+        assert!(message.contains("Inspect the operation state before retrying"));
+        assert!(message.contains("Do not delete the lock file"));
+        assert!(!message.contains("No database writes were applied"));
+        assert!(!message.contains("corrupt"));
+        assert!(!message.contains("The database could not be opened"));
     }
 
     #[test]

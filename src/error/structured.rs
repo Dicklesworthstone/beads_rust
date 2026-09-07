@@ -320,12 +320,16 @@ impl StructuredError {
     pub fn from_error(err: &BeadsError) -> Self {
         let (code, context) = Self::extract_code_and_context(err);
         let hint = Self::generate_hint(Self::hint_source(err), context.as_ref());
+        let retryable = match Self::innermost_beads_error(err) {
+            BeadsError::WriteLockTimeout { retryable, .. } => *retryable,
+            _ => code.is_retryable(),
+        };
 
         Self {
             code,
             message: err.to_string(),
             hint,
-            retryable: code.is_retryable(),
+            retryable,
             context,
         }
     }
@@ -637,6 +641,19 @@ impl StructuredError {
             BeadsError::DatabaseLocked { path } => (
                 ErrorCode::DatabaseLocked,
                 Some(json!({"path": path.display().to_string()})),
+            ),
+            BeadsError::WriteLockTimeout {
+                role,
+                path_display,
+                timeout_ms,
+                ..
+            } => (
+                ErrorCode::DatabaseLocked,
+                Some(json!({
+                    "lock_role": role,
+                    "path": path_display,
+                    "timeout_ms": timeout_ms,
+                })),
             ),
             BeadsError::SchemaMismatch { expected, found } => (
                 ErrorCode::SchemaMismatch,
@@ -1591,6 +1608,89 @@ mod tests {
             context["wrapper_context"],
             "failed to rename recovered database"
         );
+    }
+
+    #[test]
+    fn write_lock_timeout_retry_safety_survives_context_wrappers() {
+        for retryable in [true, false] {
+            let timeout = || BeadsError::WriteLockTimeout {
+                role: "test write authority".to_string(),
+                path_display: "<redacted authority>".to_string(),
+                timeout_ms: 75,
+                retryable,
+            };
+            for err in [
+                &timeout(),
+                &BeadsError::WithContext {
+                    context: "acquiring authority".to_string(),
+                    source: Box::new(BeadsError::WithContext {
+                        context: "nested acquisition".to_string(),
+                        source: Box::new(timeout()),
+                    }),
+                },
+            ] {
+                let structured = StructuredError::from_error(err);
+                assert_eq!(structured.code, ErrorCode::DatabaseLocked);
+                assert_eq!(structured.retryable, retryable);
+                let context = structured.context.expect("lock evidence");
+                assert_eq!(context["lock_role"], "test write authority");
+                assert_eq!(context["path"], "<redacted authority>");
+                assert_eq!(context["timeout_ms"], 75);
+                let hint = structured.hint.expect("safe retry guidance");
+                assert!(hint.contains("Do not delete"));
+                if retryable {
+                    assert!(hint.starts_with("Retry after"));
+                } else {
+                    assert!(hint.starts_with("Inspect the operation state"));
+                }
+                assert!(!err.is_transient(), "do not restart the spent timeout");
+            }
+        }
+    }
+
+    #[test]
+    fn committed_write_lock_timeouts_never_recommend_repeating_the_mutation() {
+        fn timeout() -> BeadsError {
+            // Even a retryable source must not override the enclosing commit.
+            BeadsError::WriteLockTimeout {
+                role: "workspace write lock".to_string(),
+                path_display: ".beads/.write.lock".to_string(),
+                timeout_ms: 75,
+                retryable: true,
+            }
+        }
+
+        for committed in [
+            BeadsError::CommittedStateUnwitnessed {
+                operation: "create".to_string(),
+                source: Box::new(timeout()),
+            },
+            BeadsError::CommittedArtifactFailure {
+                operation: "flush".to_string(),
+                primary_path: ".beads/issues.jsonl".into(),
+                artifact_path: ".beads/manifest.json".into(),
+                source: Box::new(timeout()),
+            },
+        ] {
+            let wrapped = BeadsError::WithContext {
+                context: "finishing mutation".to_string(),
+                source: Box::new(committed),
+            };
+            let structured = StructuredError::from_error(&wrapped);
+            assert_eq!(structured.code, ErrorCode::SyncConflict);
+            assert!(!structured.retryable);
+            assert!(wrapped.primary_mutation_committed());
+            let context = structured.context.expect("commit and lock evidence");
+            assert_eq!(context["source_context"]["timeout_ms"], 75);
+            assert_eq!(
+                context["source_context"]["lock_role"],
+                "workspace write lock"
+            );
+            assert!(
+                !structured.hint.unwrap().starts_with("Retry after"),
+                "commit recovery guidance must take precedence over lock retry guidance"
+            );
+        }
     }
 
     #[test]

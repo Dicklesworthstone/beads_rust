@@ -21,8 +21,11 @@
 //!
 //! Knobs: `BR_LINEARIZABILITY_PROCESSES` (default 8),
 //! `BR_LINEARIZABILITY_SECONDS` (default 30), and
-//! `BR_LINEARIZABILITY_ARTIFACT_DIR` (where the merged history and the failing
-//! partition are written on a violation; default: the kept temp workspace).
+//! `BR_LINEARIZABILITY_ARTIFACT_DIR` (retained workload and binary identity;
+//! also the merged history and failing partition on a violation). Failed
+//! workloads retain their temporary workspace even without an explicit path.
+//! `BR_BINARY` selects an explicit baseline or release binary for the same
+//! oracle; the default remains Cargo's compiled `br`, never a PATH fallback.
 //! The separate `coupled` cases keep one state for a shared capacity pool and
 //! typed dependency graph. `BR_COUPLED_CASES` and `BR_COUPLED_SEED` replay bounded
 //! schedules; `BR_COUPLED_SEARCH_BUDGET` limits search without treating an
@@ -34,6 +37,7 @@ use beads_rust::franken_sync::compat::{OpenFlags, open_with_flags};
 use fsqlite_types::SqliteValue;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -563,9 +567,21 @@ fn plain_outcome(output: &Output) -> Outcome {
 
 impl Harness {
     fn new(root: PathBuf) -> Self {
+        let binary = std::env::var_os("BR_BINARY").map_or_else(
+            || PathBuf::from(assert_cmd::cargo::cargo_bin!("br")),
+            PathBuf::from,
+        );
+        let binary = binary
+            .canonicalize()
+            .expect("locate br binary (explicit BR_BINARY must exist)");
+        assert!(
+            binary.is_file(),
+            "br binary must be a file: {}",
+            binary.display()
+        );
         Self {
             root,
-            binary: PathBuf::from(assert_cmd::cargo::cargo_bin!("br")),
+            binary,
             origin: Instant::now(),
         }
     }
@@ -950,14 +966,18 @@ fn integrity_control_rejects_trailing_corruption_and_malformed_rows() {
     }
 }
 
-fn persist_violation(dir: &Path, entries: &[Entry], violation: &Violation) {
-    fs::create_dir_all(dir).expect("artifact dir");
+fn persist_history(path: &Path, entries: &[Entry]) {
     let mut history = String::new();
     for entry in entries {
         history.push_str(&serde_json::to_string(entry).expect("serialize entry"));
         history.push('\n');
     }
-    fs::write(dir.join("history.jsonl"), history).expect("write history");
+    fs::write(path, history).expect("write history");
+}
+
+fn persist_violation(dir: &Path, entries: &[Entry], violation: &Violation) {
+    fs::create_dir_all(dir).expect("artifact dir");
+    persist_history(&dir.join("history.jsonl"), entries);
     fs::write(
         dir.join("violation.json"),
         serde_json::to_string_pretty(violation).expect("serialize violation"),
@@ -983,7 +1003,7 @@ fn concurrent_br_histories_are_linearizable_and_match_the_published_jsonl() {
     let processes =
         usize::try_from(knob("BR_LINEARIZABILITY_PROCESSES", DEFAULT_PROCESSES)).unwrap_or(8);
     let seconds = knob("BR_LINEARIZABILITY_SECONDS", DEFAULT_SECONDS);
-    let temp = TempDir::new_in(common::cli::isolated_temp_root()).expect("temp workspace");
+    let mut temp = TempDir::new_in(common::cli::isolated_temp_root()).expect("temp workspace");
     let harness = Harness::new(temp.path().to_path_buf());
     harness.init_workspace();
     let pool = Mutex::new(harness.seed_pool());
@@ -1006,6 +1026,44 @@ fn concurrent_br_histories_are_linearizable_and_match_the_published_jsonl() {
     entries.sort_by_key(|entry| (entry.invoke_ns, entry.pid, entry.seq));
 
     let dropped_creates = entries.iter().filter(|entry| entry.key.is_empty()).count();
+    let workload_failed = entries.len().saturating_sub(dropped_creates) < MIN_OPERATIONS
+        || dropped_creates != 0
+        || entries
+            .iter()
+            .any(|entry| matches!(entry.outcome, Outcome::Failed(_)));
+    let requested_artifact_dir = std::env::var_os("BR_LINEARIZABILITY_ARTIFACT_DIR");
+    if workload_failed || requested_artifact_dir.is_some() {
+        temp.disable_cleanup(workload_failed);
+        let artifact_dir = requested_artifact_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(|| temp.path().join("linearizability"));
+        fs::create_dir_all(&artifact_dir).expect("workload artifact dir");
+        persist_history(&artifact_dir.join("workload.jsonl"), &entries);
+        let identity = serde_json::json!({
+            "binary": harness.binary,
+            "binary_sha256": beads_rust::util::hex_encode(&sha2::Sha256::digest(
+                fs::read(&harness.binary).expect("read tested br binary")
+            )),
+            "checker_source": option_env!("VERGEN_GIT_SHA"),
+            "checker_engine": env!("BR_FSQLITE_VERSION"),
+            "checker_features": {"mcp": cfg!(feature = "mcp"), "self_update": cfg!(feature = "self_update")},
+            "processes": processes,
+            "seconds": seconds,
+            "minimum_operations": MIN_OPERATIONS,
+            "dropped_creates": dropped_creates,
+            "workspace": temp.path(),
+            "workspace_retained": workload_failed,
+        });
+        fs::write(
+            artifact_dir.join("workload-context.json"),
+            serde_json::to_vec_pretty(&identity).expect("serialize workload identity"),
+        )
+        .expect("write workload identity");
+        eprintln!(
+            "[linearizability] workload artifacts: {}",
+            artifact_dir.display()
+        );
+    }
     entries.retain(|entry| !entry.key.is_empty());
     let mut per_op: BTreeMap<&str, usize> = BTreeMap::new();
     for entry in &entries {
@@ -1047,6 +1105,10 @@ fn concurrent_br_histories_are_linearizable_and_match_the_published_jsonl() {
             .map(|entry| describe(entry))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+    assert_eq!(
+        dropped_creates, 0,
+        "every create must succeed and return an observable issue id"
     );
 
     // Quiescent read pass: one `show` per issue after every worker has

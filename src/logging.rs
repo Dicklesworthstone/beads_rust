@@ -127,7 +127,10 @@ mod tests {
     #[test]
     fn default_filter_varies_with_verbosity() {
         assert_eq!(default_filter(1, false), "beads_rust=debug,fsqlite=warn");
+        #[cfg(debug_assertions)]
         assert_eq!(default_filter(0, false), "beads_rust=debug,fsqlite=error");
+        #[cfg(not(debug_assertions))]
+        assert_eq!(default_filter(0, false), "error");
         assert_eq!(
             default_filter(2, false),
             "beads_rust=debug,fsqlite=info,fsqlite_btree=warn,fsqlite_vdbe=warn,fsqlite_pager=warn"

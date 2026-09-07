@@ -21,6 +21,7 @@
 
 mod common;
 
+use beads_rust::franken_sync::Connection;
 use common::cli::{BrWorkspace, extract_json_payload, run_br};
 use flate2::read::GzDecoder;
 use serde_json::Value;
@@ -369,4 +370,76 @@ fn e2e_migrate_schema_upgrades_real_schema16_database() {
         16,
         3,
     );
+}
+
+#[test]
+fn e2e_migrate_schema_refuses_unsupported_core_shapes_before_issuing_a_token() {
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "dirty_issues",
+            &["ALTER TABLE dirty_issues ADD COLUMN content_hash TEXT"],
+        ),
+        (
+            "issues",
+            &["CREATE INDEX operator_title_lookup ON issues(title)"],
+        ),
+        (
+            "dependencies",
+            &[
+                "ALTER TABLE dependencies RENAME TO legacy_edges",
+                "CREATE TABLE dependencies (
+                    issue_id TEXT NOT NULL, depends_on_id TEXT NOT NULL,
+                    type TEXT NOT NULL DEFAULT 'blocks',
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    created_by TEXT NOT NULL DEFAULT '', metadata TEXT DEFAULT '{}',
+                    thread_id TEXT DEFAULT '', PRIMARY KEY (issue_id, depends_on_id, type),
+                    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+                )",
+                "INSERT INTO dependencies SELECT * FROM legacy_edges",
+                "INSERT INTO dependencies
+                 SELECT issue_id, depends_on_id, 'parent-child', created_at,
+                        created_by, metadata, thread_id FROM legacy_edges LIMIT 1",
+                "DROP TABLE legacy_edges",
+            ],
+        ),
+    ];
+    for (table, statements) in cases {
+        let workspace = BrWorkspace::new();
+        install_fixture_workspace(
+            &workspace,
+            "schema15_pre384_era.db.gz",
+            "schema15_issues.jsonl",
+            "schema15_config.yaml",
+        );
+        let db_path = workspace.root.join(".beads/beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open fixture");
+        for statement in *statements {
+            conn.execute(statement).expect("prepare unsupported source");
+        }
+        conn.close().expect("close source fixture");
+        let source = fs::read(&db_path).expect("capture source bytes");
+        let plan = run_br(
+            &workspace,
+            ["doctor", "migrate-schema", "plan", "--json"],
+            &format!("refuse_{table}"),
+        );
+        assert!(!plan.status.success(), "unexpected plan: {}", plan.stdout);
+        let error: Value = serde_json::from_str(&plan.stdout).expect("structured refusal");
+        assert_eq!(error["error"]["code"], "CONFIG_ERROR");
+        assert!(error["error"]["message"].as_str().is_some_and(|message| {
+            message.contains(&format!(
+                "unsupported historical shape for core table {table}"
+            )) && message.contains("no migration token was issued")
+        }));
+        assert!(error.get("plan_token").is_none());
+        assert_eq!(fs::read(&db_path).expect("source after refusal"), source);
+        assert_eq!(header_user_version(&db_path), 15);
+        assert!(
+            !workspace
+                .root
+                .join(".beads/.br_recovery/schema-migrations")
+                .exists(),
+            "planning must refuse before allocating migration recovery work"
+        );
+    }
 }

@@ -270,6 +270,7 @@ pub fn blocking_write_lock_with_timeout(
         "workspace write lock",
         false,
         ExclusiveLockMechanism::LockSidecar,
+        LockRetrySafety::BeforeMutation,
     )
 }
 
@@ -291,6 +292,13 @@ enum ExclusiveLockMechanism {
     /// One-byte range lock at [`db_inode_lock::DATABASE_INODE_LOCK_OFFSET`] —
     /// for any inode a SQLite engine may open.
     DatabaseInode,
+}
+
+/// Whether acquiring this authority is known to precede the requested write.
+#[derive(Clone, Copy)]
+enum LockRetrySafety {
+    BeforeMutation,
+    InspectOperationState,
 }
 
 /// Non-blocking exclusive lock attempt through the selected mechanism.
@@ -327,6 +335,7 @@ fn blocking_database_file_lock_with_timeout(
         "database write authority",
         true,
         ExclusiveLockMechanism::DatabaseInode,
+        LockRetrySafety::InspectOperationState,
     )
 }
 
@@ -1581,6 +1590,7 @@ pub fn blocking_jsonl_family_write_lock_with_timeout(
         "JSONL-family write lock",
         true,
         ExclusiveLockMechanism::LockSidecar,
+        LockRetrySafety::InspectOperationState,
     )?;
     let canonical_after = canonical_database_authority_key(jsonl_path)?;
     if canonical_after != canonical_jsonl_path {
@@ -1647,6 +1657,7 @@ pub fn blocking_database_family_write_lock_with_timeout(
         "database-family write lock",
         true,
         ExclusiveLockMechanism::LockSidecar,
+        LockRetrySafety::InspectOperationState,
     )?;
     let (database_lock, database_identity) = match fs::symlink_metadata(&canonical_database_path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -1727,6 +1738,7 @@ fn open_and_lock_regular_file(
     role: &str,
     redact_path: bool,
     mechanism: ExclusiveLockMechanism,
+    retry_safety: LockRetrySafety,
 ) -> Result<File> {
     let lock_path_display = if redact_path {
         if role.starts_with("JSONL-") {
@@ -1832,6 +1844,7 @@ fn open_and_lock_regular_file(
                 &lock_path_display,
                 role,
                 timeout_ms,
+                retry_safety,
             ));
         }
 
@@ -1982,12 +1995,18 @@ fn verify_database_authority_path_still_missing(path: &Path) -> Result<()> {
     }
 }
 
-fn write_lock_timeout_error(lock_path_display: &str, role: &str, timeout_ms: u64) -> BeadsError {
-    BeadsError::Config(format!(
-        "Timed out after {timeout_ms}ms waiting for write lock ({role}) at {}. \
-         Another br process may be holding that authority; retry after it exits or investigate a stuck process.",
-        lock_path_display
-    ))
+fn write_lock_timeout_error(
+    lock_path_display: &str,
+    role: &str,
+    timeout_ms: u64,
+    retry_safety: LockRetrySafety,
+) -> BeadsError {
+    BeadsError::WriteLockTimeout {
+        role: role.to_string(),
+        path_display: lock_path_display.to_string(),
+        timeout_ms,
+        retryable: matches!(retry_safety, LockRetrySafety::BeforeMutation),
+    }
 }
 
 #[must_use]
@@ -16933,18 +16952,54 @@ mod tests {
         assert!(
             matches!(
                 &err,
-                BeadsError::Config(message)
-                    if message.contains("Timed out after 25ms")
-                        && message.contains(".write.lock")
-                        && message.contains("stuck process")
+                BeadsError::WriteLockTimeout {
+                    role,
+                    path_display,
+                    timeout_ms: 25,
+                    retryable: true,
+                } if role == "workspace write lock"
+                    && path_display == &lock_path.display().to_string()
             ),
             "unexpected error: {err}"
+        );
+        assert!(
+            !err.is_transient(),
+            "a spent acquisition deadline must not trigger internal transaction retries"
         );
 
         drop(held_lock);
         let acquired =
             blocking_write_lock_with_timeout(&beads_dir, Some(25)).expect("lock after release");
         drop(acquired);
+    }
+
+    #[test]
+    #[allow(clippy::incompatible_msrv)]
+    fn blocking_write_lock_retries_when_owner_unlocks_without_closing() {
+        let temp = TempDir::new().unwrap();
+        let owner = blocking_write_lock(temp.path()).unwrap();
+        let started = std::sync::Barrier::new(2);
+
+        let acquired = thread::scope(|scope| {
+            let waiting = scope.spawn(|| {
+                started.wait();
+                blocking_write_lock_with_timeout(temp.path(), Some(5_000))
+            });
+            started.wait();
+            thread::sleep(Duration::from_millis(50));
+            owner.unlock().expect("release without a close event");
+            waiting
+                .join()
+                .unwrap()
+                .expect("timed polling must detect an explicit unlock")
+        });
+
+        assert!(owner.metadata().is_ok(), "the original handle remains open");
+        assert!(matches!(owner.try_lock(), Err(TryLockError::WouldBlock)));
+        drop(acquired);
+        owner
+            .try_lock()
+            .expect("reacquire after contender releases");
     }
 
     #[test]
@@ -17724,6 +17779,19 @@ mod tests {
         assert!(
             !rendered.contains(temp.path().to_string_lossy().as_ref()),
             "external database authority errors must not disclose absolute paths: {rendered}"
+        );
+        let structured = crate::error::StructuredError::from_error(&error);
+        assert!(!structured.retryable, "inode authority can follow writes");
+        assert_eq!(structured.code, crate::error::ErrorCode::DatabaseLocked);
+        assert_eq!(
+            structured.context.as_ref().unwrap()["lock_role"],
+            "database write authority"
+        );
+        assert!(
+            !serde_json::to_string(&structured)
+                .unwrap()
+                .contains(temp.path().to_string_lossy().as_ref()),
+            "structured authority errors must preserve path redaction"
         );
 
         drop(first_authority);

@@ -41,6 +41,7 @@ use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use crate::storage::schema::{
     CURRENT_SCHEMA_VERSION, REVIEWED_MIGRATION_SOURCE_VERSIONS, ReviewedSchemaMigrationEffects,
+    attest_reviewed_migration_source_core_tables,
     run_reviewed_schema_migration_steps_in_transaction, runtime_schema_compatible,
 };
 use crate::sync::{DatabaseFamilyWriteLock, DatabaseTargetAuthorityState};
@@ -370,6 +371,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
 
     let conn = open_read_only(db_path)?;
     require_source_tables(&conn, from)?;
+    attest_reviewed_migration_source_core_tables(&conn)?;
     let issue_count = query_count(&conn, "SELECT COUNT(*) FROM issues")?;
     let gate_result_history_created = !named_table_exists(&conn, "gate_result_history")?;
     close_connection(conn)?;
@@ -4149,6 +4151,13 @@ mod tests {
     )]
     fn reviewed_plan_apply_and_undo_round_trip_exact_logical_state() {
         let (_temp, migration) = reviewed_v14_migration_context();
+        // A missing known index is repairable derived state. Plan must still
+        // permit it, apply must recreate it, and undo must restore its absence.
+        let conn = Connection::open(migration.db_path.to_string_lossy().into_owned())
+            .expect("open source to remove a known index");
+        conn.execute("DROP INDEX idx_issues_ready")
+            .expect("remove known index");
+        close_connection(conn).expect("close source with missing index");
         let plan = build_plan(&migration.db_path).expect("build plan");
         assert!(plan.eligible);
         assert_eq!(plan.from_version, 14);

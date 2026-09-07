@@ -37,6 +37,24 @@ Shape:
 }
 ```
 
+## Write-lock timeouts
+
+Direct write-lock acquisition timeouts use `DATABASE_LOCKED` (exit `2`). Their context
+contains `lock_role`, `path`, and `timeout_ms`; external authority paths remain
+redacted. The reported timeout is the remaining acquisition budget, which can be
+smaller than the requested `--lock-timeout` after earlier routing checks.
+
+When the workspace `.write.lock` times out before the requested mutation,
+`retryable` is `true`: wait for the active writer to finish, then retry the same
+request. Investigate persistent contention; do not delete the lock file.
+
+Other authority locks can be acquired after writes, so those timeouts report
+`retryable: false` and require inspecting the operation state first. Honor the
+envelope's `retryable` flag and `hint`, rather than inferring retry safety from
+`DATABASE_LOCKED` alone. An enclosing committed-write error retains its own
+reconciliation or artifact-repair guidance; repeating the primary mutation could
+duplicate work.
+
 ## Partial-batch failures: two documents on stdout
 
 Since [#336], a command that partially applies a batch (e.g. `br close <blocked> <closeable> --json`) exits non-zero and writes **two** JSON documents to stdout: first the payload document describing what *did* happen, then the error envelope describing what failed:
