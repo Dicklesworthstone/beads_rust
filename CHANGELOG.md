@@ -98,7 +98,19 @@ this repo): commits `55c186682` + `5946b3b7c` in
   under its authority before its non-repairing open. Reads are unchanged.
   Writing on such a mount also needs the engine change in FrankenSQLite
   (namespace sidecars accept a mount-imposed mask), which lands with the next
-  fsqlite release; until then br refuses with the explanation above.
+  fsqlite release; br's own sidecar checks mirror the engine's rule (a
+  group/other exposure bounded by the database file's, per principal class
+  and GID) and switch on automatically once the locked `fsqlite` in
+  `Cargo.lock` is 0.3.18 or newer, with a parity test that opens such a
+  family through the linked engine so the two cannot drift. Until that bump
+  br refuses with the explanation above.
+- Exit-code note: a `Configuration error` raised inside the startup
+  pending-sync-merge gate (a sidecar the filesystem cannot repair, or a
+  database whose schema version is newer than this binary supports) now
+  surfaces as itself — `CONFIG_ERROR`, exit 7 — instead of being wrapped in
+  a `Sync conflict: Refusing storage open because pending sync-merge state
+  could not be inspected ...` (exit 6). Both map to the categories in the
+  documented exit-code table; only the future-schema case changes code.
 
 - CI runs again: every workflow pins the manifest's toolchain
   (`nightly-2026-08-31`) instead of floating `nightly` (release.yml still

@@ -6478,6 +6478,8 @@ fn check_db_sidecar_modes(db_path: &Path, checks: &mut Vec<CheckResult>) {
     {
         use std::os::unix::fs::PermissionsExt;
 
+        use std::os::unix::fs::MetadataExt;
+
         let mut offenders = Vec::new();
         for sidecar in fsqlite_namespace_sidecar_paths(db_path) {
             let Ok(meta) = fs::symlink_metadata(&sidecar) else {
@@ -6487,7 +6489,10 @@ fn check_db_sidecar_modes(db_path: &Path, checks: &mut Vec<CheckResult>) {
                 continue;
             }
             let mode = meta.permissions().mode() & 0o7777;
-            if mode & 0o077 != 0 {
+            // A group/other exposure the linked engine admits as it is (bounded
+            // by the database file's, FrankenSQLite 0.3.18+) blocks nothing and
+            // is not a finding (GitHub #491).
+            if !SqliteStorage::namespace_sidecar_mode_is_admitted(mode, meta.gid(), db_path) {
                 offenders.push((sidecar, mode));
             }
         }
@@ -6536,8 +6541,9 @@ fn check_db_sidecar_modes(db_path: &Path, checks: &mut Vec<CheckResult>) {
             "permissions.db_sidecars",
             CheckStatus::Warn,
             Some(format!(
-                "fsqlite namespace sidecar(s) are group/other accessible and block every \
-                 database open until the mode is owner-only (0600): {summary}"
+                "fsqlite namespace sidecar(s) carry group/other permission the engine refuses and \
+                 block every database open until the mode is owner-only (0600): {summary}. {}",
+                SqliteStorage::engine_namespace_sidecar_rule()
             )),
             Some(serde_json::json!({
                 "sidecars": offenders
@@ -6548,6 +6554,7 @@ fn check_db_sidecar_modes(db_path: &Path, checks: &mut Vec<CheckResult>) {
                     }))
                     .collect::<Vec<_>>(),
                 "required_mode_octal": "0600",
+                "engine_rule": SqliteStorage::engine_namespace_sidecar_rule(),
                 "filesystem_mask_suspected": filesystem_mask_suspected,
                 "remediation": remediation,
             })),
@@ -6601,7 +6608,7 @@ fn fix_db_sidecar_modes_if_warned(
     };
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let mut repaired_any = false;
         for sidecar in fsqlite_namespace_sidecar_paths(db_path) {
@@ -6614,8 +6621,14 @@ fn fix_db_sidecar_modes_if_warned(
             let current = meta.permissions().mode();
             // Already owner-only (group/other bits all clear) — TOCTOU defense
             // (the storage layer may have self-healed it between detection and
-            // repair).
-            if current.trailing_zeros() >= 6 {
+            // repair) — or an exposure the linked engine admits as it is.
+            if current.trailing_zeros() >= 6
+                || SqliteStorage::namespace_sidecar_mode_is_admitted(
+                    current & 0o7777,
+                    meta.gid(),
+                    db_path,
+                )
+            {
                 continue;
             }
             let new_mode = current & !0o077;
