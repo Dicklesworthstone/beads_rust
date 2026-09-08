@@ -1098,6 +1098,110 @@ fn e2e_update_claim_json_echo_reports_assignee() {
     assert!(bumped[0]["assignee"].is_null());
 }
 
+/// GitHub #497: `br update --claim` on a closed issue used to flip it to
+/// `in_progress` and erase `closed_at` / `close_reason`. It must refuse before
+/// any mutation, leave the close record intact, and point at `br reopen`.
+#[test]
+fn e2e_update_claim_refuses_closed_issue_and_preserves_close_fields() {
+    let _log = common::test_log("e2e_update_claim_refuses_closed_issue_and_preserves_close_fields");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init", "--prefix", "test"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Closed claim target", "--json"],
+        "create_closed_claim_target",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let created: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let id = created["id"].as_str().expect("issue id").to_string();
+
+    let close = run_br(
+        &workspace,
+        [
+            "--actor",
+            "repro-agent",
+            "close",
+            &id,
+            "--reason",
+            "DONE: baseline close",
+            "--json",
+        ],
+        "close_claim_target",
+    );
+    assert!(close.status.success(), "close failed: {}", close.stderr);
+
+    let before = run_br(&workspace, ["show", &id, "--json"], "show_before_claim");
+    assert!(before.status.success(), "show failed: {}", before.stderr);
+    let before: Value =
+        serde_json::from_str(&extract_json_payload(&before.stdout)).expect("show json");
+    assert_eq!(before[0]["status"].as_str(), Some("closed"));
+    assert_eq!(
+        before[0]["close_reason"].as_str(),
+        Some("DONE: baseline close")
+    );
+    let closed_at = before[0]["closed_at"].clone();
+    assert!(closed_at.is_string(), "closed_at must be set: {before}");
+
+    for (extra, label) in [
+        (None, "claim_closed"),
+        (Some("--force"), "claim_closed_force"),
+    ] {
+        let mut args = vec!["--actor", "repro-agent", "update", id.as_str(), "--claim"];
+        if let Some(flag) = extra {
+            args.push(flag);
+        }
+        args.push("--json");
+        let claim = run_br(&workspace, args, label);
+        assert!(
+            !claim.status.success(),
+            "claiming a closed issue must fail ({label}): {}",
+            claim.stdout
+        );
+        assert_eq!(claim.status.code(), Some(4), "{label}: {}", claim.stderr);
+        let error: Value = serde_json::from_str(&extract_json_payload(&claim.stdout))
+            .expect("structured error json");
+        assert_eq!(error["error"]["code"], "VALIDATION_FAILED", "{error}");
+        let message = error["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(&format!("cannot claim closed issue {id}")),
+            "{label}: {message}"
+        );
+        assert!(
+            message.contains(&format!("br reopen {id}")),
+            "{label}: {message}"
+        );
+    }
+
+    let after = run_br(&workspace, ["show", &id, "--json"], "show_after_claim");
+    assert!(after.status.success(), "show failed: {}", after.stderr);
+    let after: Value =
+        serde_json::from_str(&extract_json_payload(&after.stdout)).expect("show json");
+    assert_eq!(after[0]["status"].as_str(), Some("closed"));
+    assert!(after[0]["assignee"].is_null(), "{after}");
+    assert_eq!(
+        after[0]["close_reason"].as_str(),
+        Some("DONE: baseline close")
+    );
+    assert_eq!(after[0]["closed_at"], closed_at, "{after}");
+
+    // The sanctioned path still works: reopen, then claim.
+    let reopen = run_br(&workspace, ["reopen", &id, "--json"], "reopen_claim_target");
+    assert!(reopen.status.success(), "reopen failed: {}", reopen.stderr);
+    let claim = run_br(
+        &workspace,
+        ["--actor", "repro-agent", "update", &id, "--claim", "--json"],
+        "claim_reopened",
+    );
+    assert!(claim.status.success(), "claim failed: {}", claim.stderr);
+    let claimed: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&claim.stdout)).expect("claim json");
+    assert_eq!(claimed[0]["status"].as_str(), Some("in_progress"));
+    assert_eq!(claimed[0]["assignee"].as_str(), Some("repro-agent"));
+}
+
 #[test]
 fn e2e_create_updates_last_touched_context() {
     let _log = common::test_log("e2e_create_updates_last_touched_context");

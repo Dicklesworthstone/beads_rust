@@ -1235,7 +1235,36 @@ fn validate_transition_to_in_progress(
             .as_ref()
             .is_some_and(|status| status.eq_ignore_ascii_case("in_progress"));
 
-    if !transitioning_to_in_progress || args.force {
+    if !transitioning_to_in_progress {
+        return Ok(());
+    }
+
+    // `--claim` is a start-work shorthand, not a reopen. Left unchecked it
+    // moved a closed issue to `in_progress` and erased `closed_at` /
+    // `close_reason` — the terminal-state contract `br close` enforces on the
+    // way in was silently undone on the way out (GitHub #497). Refuse before
+    // any mutation and point at `br reopen`, which clears the close fields
+    // deliberately and records the transition. `--force` only waives the
+    // advisory guards below; it is not a reopen either.
+    if args.claim {
+        for id in ids {
+            let Some(issue) = storage.get_issue(id)? else {
+                continue;
+            };
+            if issue.status == Status::Closed {
+                return Err(BeadsError::validation(
+                    "claim",
+                    format!(
+                        "cannot claim closed issue {id}: `--claim` starts work on an open issue \
+                         and never reopens one, so its close_reason and closed_at are left \
+                         intact. Reopen it first with `br reopen {id}`, then claim it"
+                    ),
+                ));
+            }
+        }
+    }
+
+    if args.force {
         return Ok(());
     }
 
@@ -3269,6 +3298,94 @@ because downstream tooling links to them.\n\n- [ ] schema migration applied\n\
 
         info!(
             "test_validate_route_runtime_guards_rejects_assigned_claim_target: assertions passed"
+        );
+    }
+
+    /// GitHub #497: `--claim` on a closed issue must refuse (with or without
+    /// `--force`) instead of reopening it; an open sibling in the same batch
+    /// does not rescue the request, and `--status in_progress` stays an
+    /// explicit transition that this guard does not touch.
+    #[test]
+    fn test_validate_transition_to_in_progress_rejects_claim_on_closed_issue() {
+        init_test_logging();
+        info!("test_validate_transition_to_in_progress_rejects_claim_on_closed_issue: starting");
+
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = chrono::Utc::now();
+        let closed = Issue {
+            id: "bd-closed".to_string(),
+            title: "Closed issue".to_string(),
+            status: Status::Closed,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            created_at: now,
+            updated_at: now,
+            closed_at: Some(now),
+            close_reason: Some("DONE: baseline close".to_string()),
+            ..Issue::default()
+        };
+        storage.create_issue(&closed, "tester").unwrap();
+        let open = Issue {
+            id: "bd-open-sibling".to_string(),
+            title: "Open sibling".to_string(),
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            created_at: now,
+            updated_at: now,
+            ..Issue::default()
+        };
+        storage.create_issue(&open, "tester").unwrap();
+
+        let claim = UpdateArgs {
+            claim: true,
+            ..Default::default()
+        };
+        let err = validate_transition_to_in_progress(&storage, &["bd-closed".to_string()], &claim)
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("cannot claim closed issue bd-closed"),
+            "{text}"
+        );
+        assert!(text.contains("br reopen bd-closed"), "{text}");
+
+        let forced = UpdateArgs {
+            claim: true,
+            force: true,
+            ..Default::default()
+        };
+        let err = validate_transition_to_in_progress(&storage, &["bd-closed".to_string()], &forced)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot claim closed issue"),
+            "--force must not turn a claim into a reopen: {err}"
+        );
+
+        let err = validate_transition_to_in_progress(
+            &storage,
+            &["bd-open-sibling".to_string(), "bd-closed".to_string()],
+            &claim,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot claim closed issue bd-closed"),
+            "a closed member fails the whole batch: {err}"
+        );
+
+        validate_transition_to_in_progress(&storage, &["bd-open-sibling".to_string()], &claim)
+            .expect("claiming an open issue is unaffected");
+
+        let explicit_status = UpdateArgs {
+            status: Some("in_progress".to_string()),
+            ..Default::default()
+        };
+        validate_transition_to_in_progress(&storage, &["bd-closed".to_string()], &explicit_status)
+            .expect("an explicit --status in_progress is not a claim");
+
+        info!(
+            "test_validate_transition_to_in_progress_rejects_claim_on_closed_issue: assertions passed"
         );
     }
 
