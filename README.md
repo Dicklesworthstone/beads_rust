@@ -995,14 +995,22 @@ wanted.
 
 ### Safety Model
 
-`br sync` is designed to be **provably safe**:
+`br sync` uses explicit guards to preserve issue data and constrain writes:
 
-| Guarantee | Implementation |
+| Guard | Implementation |
 |-----------|----------------|
 | Sync never executes git | No runtime `Command::new("git")` calls in `src/sync/` or `src/cli/commands/sync.rs` |
 | Sync uses an allowlist for writes | Default writes stay in `.beads/`; external JSONL paths require `--allow-external-jsonl` or an explicit external DB/JSONL family and `.git/` paths are still rejected |
 | Checked publication and transactions | JSONL/base/manifest publication uses checked temporary replacement; database mutations use transactions and operation-specific rollback |
-| No data loss | Guards prevent overwriting non-empty JSONL with empty DB |
+| Refuse accidental issue loss on export | An empty or stale DB cannot overwrite JSONL rows it lacks unless they were explicitly purged or the operator uses `--force` |
+
+These guards and the failure tests cover specific failure modes; they are not
+a universal no-data-loss guarantee. An error after database commit or JSONL
+publication can mean the operation took effect but its final verification or
+durability check failed. Preserve the reported recovery evidence and inspect
+the resulting state before repeating a mutation. See the
+[publication contract](docs/ARCHITECTURE.md#atomic-jsonl-export-writes) for these
+boundaries.
 
 The storage engine is FrankenSQLite (pure Rust, no C SQLite). How br contains
 engine-level risk, which sidecar files belong to a database, and what must
@@ -1015,15 +1023,23 @@ pass before the engine is bumped are documented in
 
 ### Error: "Database locked"
 
-**Cause:** Another process has the database open.
+**Cause:** A competing writer holds exclusive authority, or the storage engine
+remains busy beyond the configured wait. Read-only handles can share a database;
+another process merely having it open does not establish the cause.
 
 ```bash
 # Check for other br processes
 pgrep -f "br "
 
-# Force close and retry
-br sync --status  # Safe read-only check
+# Inspect sync state; this diagnoses the workspace and does not release locks
+br sync --status --json
 ```
+
+Write-lock waits are bounded; `--lock-timeout <ms>` changes the wait budget.
+After the competing writer finishes, a pre-mutation timeout can be retried.
+For automation, inspect the structured error's `retryable` field. If an error
+reports that a mutation committed or publication may have occurred, inspect
+the result before retrying it.
 
 ### Error: "Issue not found"
 

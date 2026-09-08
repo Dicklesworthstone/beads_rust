@@ -949,16 +949,18 @@ br search <QUERY> [OPTIONS]
 Supports all filter options from `list`. Unlike `list`/`ready` (which are
 complete by default), `search` results are **capped at 50 by default**
 (`--limit <N>`, `0`=unlimited) — a broad text query can match a large fraction
-of the corpus, so a bounded, relevance-ordered result set is the default. Text
+of the corpus, so a bounded, priority-ordered result set is the default. Text
 and CSV output explicitly note when more matches exist; JSON/TOON reports
 `limit`, `offset`, and `has_more`.
 
-`--limit` bounds the rows **returned**, not the rows inspected: results are
-ordered (`priority ASC, created_at DESC`) and the substring match cannot use an
-index, so a page is complete only once `limit + 1` matches have been seen in
-that order — for a sparse query (an id fragment, a rare token) that means every
-visible issue is examined exactly once. A bounded search never costs more than
-the same search with `--limit 0`.
+`--limit` bounds the rows **returned**, not the rows inspected. With the default
+filters and ordering (`priority ASC, created_at DESC, id ASC`), the first page
+uses one substring-matching scan to select issue IDs, then hydrates those rows.
+It requests one extra match to determine `has_more`; a sparse query (an ID
+fragment or a rare token) can require inspecting every visible issue. This
+avoids the earlier repeated matching scans, but does not guarantee lower
+elapsed time than `--limit 0`: sorting, row hydration, cache state, and the host
+also affect latency.
 
 **Closed issues are excluded by default** (tombstones always). When that
 exclusion hides matches, text output ends with a trailing note

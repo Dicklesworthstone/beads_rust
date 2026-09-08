@@ -8,7 +8,7 @@
 //! - `health`      — sub-200 ms liveness summary; exit-code = liveness.
 //! - `ls`          — list runs in `.doctor/runs/`.
 //! - `undo`        — restore from `.doctor/runs/<run-id>/backups/`.
-//! - `explain`     — expand a single finding (stub).
+//! - `explain`     — expand a finding with live evidence and repair commands.
 //!
 //! Every JSON surface pins a `schema_version`. The `--robot-triage` flag
 //! on the flat doctor command also lives here ([`emit_robot_triage`]).
@@ -1942,7 +1942,7 @@ fn now_ns() -> u128 {
 }
 
 // =============================================================================
-// explain (stub)
+// explain — finding registry, live observation, and repair commands
 // =============================================================================
 
 /// Narrow a capabilities document to the rows whose ids mention `filter`.

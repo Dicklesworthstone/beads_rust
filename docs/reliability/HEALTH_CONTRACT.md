@@ -63,7 +63,7 @@ to explicitly configured database families outside `.beads/`.
 
 | Anomaly | Severity | Detection | Recovery |
 |---------|----------|-----------|----------|
-| `BlockedCacheStale` | Degraded | Metadata key check | Lazy rebuild on next read |
+| `BlockedCacheStale` | Degraded | Metadata key check | Reads compute blocked state from the graph in memory; a subsequent write or explicit repair refreshes the stored cache |
 | `BlockedCacheContentMismatch` | Degraded | Recompute the blocked set from the dependency graph and compare with `blocked_issues_cache` | Rebuild the cache |
 | `ReadyProjectionContentMismatch` | Degraded | Recompute the ready projection and compare with the cached projection | Rebuild the projection |
 | `ChildCountDrift` | Degraded | Compare stored vs actual dep count | Recompute |
@@ -87,7 +87,7 @@ Each row is a workspace component; columns indicate which subsystem owns and val
 | JSONL file | sync | - | - | parse + export | conflict markers |
 | Export hash | sync | - | - | compare | compare |
 | Dirty flag (needs_flush) | sync | staleness probe | set on write | clear on flush | compare |
-| Blocked cache | storage | lazy rebuild | refresh after mutation | - | stale marker |
+| Blocked cache | storage | read queries use an in-memory fallback if stale | refresh, or mark stale when refresh is deferred | - | stale marker |
 | Child counters | storage | - | update on dep add/remove | - | count vs query |
 | Dependencies table | storage | - | add/remove_dependency | - | FK integrity |
 

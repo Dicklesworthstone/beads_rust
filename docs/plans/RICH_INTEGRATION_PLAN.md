@@ -1558,7 +1558,7 @@ fn test_show_output_snapshot() {
 
 ### Phase 6: Polish (Week 6)
 - [ ] Add syntax highlighting for code blocks (deferred, see below)
-- [ ] Add markdown rendering option (built, unwired; see below)
+- [x] Render Markdown descriptions in Rich `br show` (wired 2026-09-02; see below)
 - [x] Performance optimization (lazy console/width/theme via `OnceLock`)
 - [x] Comprehensive testing (`tests/golden_rich_panels.rs`, `tests/e2e_global_flags.rs`, insta snapshots)
 - [x] Update documentation (README §Design 5, AGENTS.md Output Modes)
