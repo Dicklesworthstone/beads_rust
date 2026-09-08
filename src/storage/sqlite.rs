@@ -16776,7 +16776,7 @@ fn explain_engine_open_error(
             let mode = metadata.permissions().mode();
             if metadata.uid() != effective_uid() {
                 return BeadsError::Config(format!(
-                    "fsqlite refused its namespace sidecar {} because it is owned by uid {}, not the current user (uid {}); the database itself is fine. Run br as the owner, or have the owner remove the stale `{suffix}` sidecar files (they are regenerable lock files)",
+                    "fsqlite refused its namespace sidecar {} because it is owned by uid {}, not the current user (uid {}). Database integrity remains unverified. Run br as the workspace owner, or have that owner correct the database-family ownership while no br process is using the workspace",
                     path.display(),
                     metadata.uid(),
                     effective_uid(),
@@ -16784,7 +16784,7 @@ fn explain_engine_open_error(
             }
             if metadata.nlink() != 1 {
                 return BeadsError::Config(format!(
-                    "fsqlite refused its namespace sidecar {} because it has {} hard links and the engine requires exactly one; the database itself is fine. Remove the extra links",
+                    "fsqlite refused its namespace sidecar {} because it has {} hard links and the engine requires exactly one. Database integrity remains unverified. Have the workspace owner resolve the extra links while no br process is using the workspace",
                     path.display(),
                     metadata.nlink(),
                 ));
@@ -16824,7 +16824,7 @@ fn explain_engine_open_error(
                     )
                 };
                 return BeadsError::Config(format!(
-                    "fsqlite refused its namespace sidecar {} because it has mode {:04o}; the database itself is fine. {rule}. {situation}. br repairs the mode automatically when it opens the database under its database-family authority; otherwise run `br doctor --repair` or `chmod 0600 {}`",
+                    "fsqlite refused its namespace sidecar {} because it has mode {:04o}. Database integrity remains unverified. {rule}. {situation}. br repairs the mode automatically when it opens the database under its database-family authority; otherwise run `br doctor --repair`, or have the workspace owner run `chmod 0600 {}` while no br process is using the workspace",
                     path.display(),
                     mode & 0o7777,
                     path.display(),
@@ -22097,6 +22097,71 @@ mod tests {
             ),
             "{explained:?}"
         );
+    }
+
+    /// GitHub #499: exercise the real engine refusal through every existing
+    /// database open lane, including reconciliation and external capability reads.
+    #[cfg(unix)]
+    #[test]
+    fn engine_sidecar_hard_link_refusal_preserves_every_open_lane() {
+        type OpenLane = fn(&Path) -> Result<()>;
+
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        seed_closed_database(&db_path, "bd-open-lanes");
+        let lanes: [(&str, OpenLane); 5] = [
+            ("writable", |path| SqliteStorage::open(path).map(drop)),
+            ("read_only", |path| {
+                SqliteStorage::open_current_read_only(path)
+                    .map(|storage| assert!(storage.is_some(), "current schema must open"))
+            }),
+            ("reconcile", |path| {
+                SqliteStorage::open_current_for_reconcile(path, Some(100))
+                    .map(|storage| assert!(storage.is_some(), "current schema must reconcile"))
+            }),
+            ("effective_schema", |path| {
+                effective_database_user_version(path).map(|version| {
+                    assert_eq!(
+                        version,
+                        Some(u32::try_from(CURRENT_SCHEMA_VERSION).unwrap())
+                    );
+                })
+            }),
+            ("external_capabilities", |path| {
+                query_external_project_capabilities(path, &HashSet::from(["proof".to_string()]))
+                    .map(drop)
+            }),
+        ];
+        // Prove that the same database and all five lanes work before adding
+        // the filesystem fault; an unrelated open failure cannot satisfy this test.
+        for (name, open) in lanes {
+            open(&db_path).unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
+        let gate = database_sidecar_path(&db_path, "-fsqlite-ns-gate");
+        fs::hard_link(&gate, temp.path().join("gate-alias")).unwrap();
+        let before = directory_bytes_and_modes(temp.path());
+        for (name, open) in lanes {
+            let error = open(&db_path).expect_err(name);
+            let text = error.to_string();
+            assert!(
+                text.contains("fsqlite refused its namespace sidecar"),
+                "{name}: {text}"
+            );
+            assert!(text.contains("has 2 hard links"), "{name}: {text}");
+            assert!(
+                text.contains("Database integrity remains unverified"),
+                "{name}: a sidecar inspection cannot establish database integrity: {text}"
+            );
+            assert!(
+                !text.contains("unable to open database file"),
+                "{name}: {text}"
+            );
+            assert_eq!(
+                directory_bytes_and_modes(temp.path()),
+                before,
+                "{name}: refused open changed the database family"
+            );
+        }
     }
 
     /// GitHub #491: a standalone snapshot (database copied without the engine's

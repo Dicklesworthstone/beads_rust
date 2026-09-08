@@ -18,7 +18,8 @@
   description = "beads_rust - Agent-first issue tracker (SQLite + JSONL)";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # 26.05 supports every advertised system; 26.11 drops Intel macOS.
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
     crane.url = "github:ipetkov/crane";
 
@@ -76,10 +77,8 @@
 
           buildInputs = with pkgs; [
             openssl
-          ] ++ lib.optionals stdenv.isDarwin [
-            darwin.apple_sdk.frameworks.Security
-            darwin.apple_sdk.frameworks.SystemConfiguration
-            darwin.apple_sdk.frameworks.CoreFoundation
+          ] ++ lib.optionals stdenv.hostPlatform.isDarwin [
+            # Darwin stdenv supplies the SDK and its system frameworks.
             libiconv
           ];
 

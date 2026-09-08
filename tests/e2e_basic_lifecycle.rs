@@ -1098,12 +1098,7 @@ fn e2e_update_claim_json_echo_reports_assignee() {
     assert!(bumped[0]["assignee"].is_null());
 }
 
-/// GitHub #497: `br update --claim` on a closed issue used to flip it to
-/// `in_progress` and erase `closed_at` / `close_reason`. It must refuse before
-/// any mutation, leave the close record intact, and point at `br reopen`.
-#[test]
-fn e2e_update_claim_refuses_closed_issue_and_preserves_close_fields() {
-    let _log = common::test_log("e2e_update_claim_refuses_closed_issue_and_preserves_close_fields");
+fn closed_claim_workspace() -> (BrWorkspace, String, String) {
     let workspace = BrWorkspace::new();
     let init = run_br(&workspace, ["init", "--prefix", "test"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
@@ -1124,7 +1119,10 @@ fn e2e_update_claim_refuses_closed_issue_and_preserves_close_fields() {
     assert!(open_create.status.success(), "{open_create:?}");
     let open_created: Value =
         serde_json::from_str(&open_create.stdout).expect("whole open create json");
-    let open_id = open_created["id"].as_str().expect("open issue id");
+    let open_id = open_created["id"]
+        .as_str()
+        .expect("open issue id")
+        .to_string();
 
     let close = run_br(
         &workspace,
@@ -1140,6 +1138,28 @@ fn e2e_update_claim_refuses_closed_issue_and_preserves_close_fields() {
         "close_claim_target",
     );
     assert!(close.status.success(), "close failed: {}", close.stderr);
+    (workspace, id, open_id)
+}
+
+fn claim_issue_event_snapshot(workspace: &BrWorkspace, closed_id: &str, open_id: &str) -> Value {
+    let storage = SqliteStorage::open(&workspace.root.join(".beads/beads.db"))
+        .expect("open canonical workspace for independent state reads");
+    serde_json::json!({
+        "closed_issue": storage.get_issue(closed_id).unwrap(),
+        "open_issue": storage.get_issue(open_id).unwrap(),
+        "closed_events": storage.get_events(closed_id, 0).unwrap(),
+        "open_events": storage.get_events(open_id, 0).unwrap(),
+    })
+}
+
+/// GitHub #497: `br update --claim` on a closed issue used to flip it to
+/// `in_progress` and erase `closed_at` / `close_reason`. It must refuse before
+/// any mutation, leave the close record intact, and point at `br reopen`.
+#[test]
+fn e2e_update_claim_refuses_closed_issue_and_preserves_close_fields() {
+    let _log = common::test_log("e2e_update_claim_refuses_closed_issue_and_preserves_close_fields");
+    let (workspace, id, open_id_owned) = closed_claim_workspace();
+    let open_id = open_id_owned.as_str();
 
     let before = run_br(&workspace, ["show", &id, "--json"], "show_before_claim");
     assert!(before.status.success(), "show failed: {}", before.stderr);
@@ -1152,16 +1172,7 @@ fn e2e_update_claim_refuses_closed_issue_and_preserves_close_fields() {
     let closed_at = before[0]["closed_at"].clone();
     assert!(closed_at.is_string(), "closed_at must be set: {before}");
 
-    let snapshot = || {
-        let storage = SqliteStorage::open(&workspace.root.join(".beads/beads.db"))
-            .expect("open canonical workspace for independent state reads");
-        serde_json::json!({
-            "closed_issue": storage.get_issue(&id).unwrap(),
-            "open_issue": storage.get_issue(open_id).unwrap(),
-            "closed_events": storage.get_events(&id, 0).unwrap(),
-            "open_events": storage.get_events(open_id, 0).unwrap(),
-        })
-    };
+    let snapshot = || claim_issue_event_snapshot(&workspace, &id, open_id);
     let baseline = snapshot();
     let jsonl_before = fs::read(workspace.root.join(".beads/issues.jsonl")).unwrap();
     for (ids, extra, label) in [
@@ -1224,6 +1235,12 @@ fn e2e_update_claim_refuses_closed_issue_and_preserves_close_fields() {
         Some("DONE: baseline close")
     );
     assert_eq!(after[0]["closed_at"], closed_at, "{after}");
+}
+
+#[test]
+fn e2e_update_claim_accepts_reopened_and_open_issues() {
+    let _log = common::test_log("e2e_update_claim_accepts_reopened_and_open_issues");
+    let (workspace, id, open_id) = closed_claim_workspace();
 
     // The sanctioned path still works: reopen, then claim.
     let reopen = run_br(&workspace, ["reopen", &id, "--json"], "reopen_claim_target");
@@ -1231,13 +1248,23 @@ fn e2e_update_claim_refuses_closed_issue_and_preserves_close_fields() {
     let claim = run_br(
         &workspace,
         [
-            "--actor", "repro-agent", "update", open_id, &id, "--claim", "--json",
+            "--actor",
+            "repro-agent",
+            "update",
+            &open_id,
+            &id,
+            "--claim",
+            "--json",
         ],
         "claim_reopened",
     );
     assert!(claim.status.success(), "claim failed: {}", claim.stderr);
     let claimed: Vec<Value> = serde_json::from_str(&claim.stdout).expect("whole claim json");
-    assert_eq!(claimed.len(), 2, "both reopened/open targets must be claimed");
+    assert_eq!(
+        claimed.len(),
+        2,
+        "both reopened/open targets must be claimed"
+    );
     for issue in &claimed {
         assert_eq!(issue["status"].as_str(), Some("in_progress"));
         assert_eq!(issue["assignee"].as_str(), Some("repro-agent"));

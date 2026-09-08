@@ -2546,8 +2546,12 @@ fn e2e_engine_sidecar_refusal_is_explained_on_every_open_lane() {
         );
         assert!(text.contains("has 2 hard links"), "{label}: {run:?}");
         assert!(
-            text.contains("the database itself is fine"),
+            text.contains("Database integrity remains unverified"),
             "{label}: {run:?}"
+        );
+        assert!(
+            text.contains("while no br process is using the workspace"),
+            "{label}: sidecar repairs require an idle workspace: {run:?}"
         );
         assert!(
             !text.contains("unable to open database file"),

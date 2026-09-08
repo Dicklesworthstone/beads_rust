@@ -202,6 +202,9 @@ opt-level = 1
 # stack in integration-test child binaries before the test assertions run.
 [profile.test]
 opt-level = 1
+# Keep file/line backtraces without duplicating full type/variable debug data
+# into every integration binary (the full-debug CLI alone exceeds 1 GiB).
+debug = "line-tables-only"
 
 [features]
 default = ["self_update"]
