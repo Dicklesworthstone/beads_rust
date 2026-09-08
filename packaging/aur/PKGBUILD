@@ -14,6 +14,8 @@ license=('LicenseRef-MIT-OpenAI-Anthropic-Rider')
 provides=('br')
 conflicts=('br' 'br-git')
 depends=('gcc-libs')
+# Preserve the verified release executable, which is already stripped.
+options=('!strip' '!debug')
 
 source_x86_64=("${pkgname}-${pkgver}-x86_64.tar.gz::https://github.com/Dicklesworthstone/beads_rust/releases/download/v${pkgver}/br-${pkgver}-linux_amd64.tar.gz")
 source_aarch64=("${pkgname}-${pkgver}-aarch64.tar.gz::https://github.com/Dicklesworthstone/beads_rust/releases/download/v${pkgver}/br-${pkgver}-linux_arm64.tar.gz")
