@@ -21,6 +21,7 @@ use crate::storage::sqlite::ListRelationMetadata;
 use chrono::Utc;
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
+use unicode_width::UnicodeWidthStr;
 
 // Large default-visible structured pages are faster through the existing full
 // scan/relation path; smaller pages keep the medium-page relation queries.
@@ -715,7 +716,9 @@ fn render_long_text_issues(
     format_options: TextFormatOptions,
 ) {
     for (index, issue) in issues.iter().enumerate() {
-        ctx.print_line(&format_issue_long_with(issue, format_options));
+        // The formatter sanitizes every untrusted field itself; the colour
+        // it adds afterwards is trusted and must not be re-escaped (#498).
+        ctx.print_styled_line(&format_issue_long_with(issue, format_options));
         if index + 1 != issues.len() {
             ctx.print_line("");
         }
@@ -804,8 +807,19 @@ struct TreeRenderer<'a> {
 
 impl TreeRenderer<'_> {
     fn render_node(&self, index: usize, prefix: &str, connector: &str, child_prefix: &str) {
-        let line = format_issue_line_with(&self.issues[index], self.format_options);
-        self.ctx.print_line(&format!("{prefix}{connector}{line}"));
+        // The connectors eat into the terminal width, so shrink the title
+        // budget by the indent so a truncated line still fits on one row.
+        let indent_width = UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(connector);
+        let mut format_options = self.format_options;
+        format_options.max_width = format_options
+            .max_width
+            .map(|width| width.saturating_sub(indent_width));
+        let line = format_issue_line_with(&self.issues[index], format_options);
+        // `format_issue_line_with` sanitizes the ID and title before it adds
+        // colour; re-sanitizing the styled line through `print_line` would
+        // turn every SGR escape into a literal `\u{1b}[..m` (GitHub #498).
+        self.ctx
+            .print_styled_line(&format!("{prefix}{connector}{line}"));
         if let Some(kids) = self.children.get(&index) {
             for (position, &kid) in kids.iter().enumerate() {
                 let last = position + 1 == kids.len();
@@ -825,7 +839,7 @@ fn render_pretty_text_issues(
     include_extended: bool,
 ) {
     for (index, issue) in issues.iter().enumerate() {
-        ctx.print_line(&format_issue_pretty_with(
+        ctx.print_styled_line(&format_issue_pretty_with(
             issue,
             format_options,
             include_extended,
@@ -992,6 +1006,138 @@ mod tests {
             title: title.to_string(),
             ..Issue::default()
         }
+    }
+
+    /// A small dependency graph for the `--tree` golden tests: an epic with
+    /// three children (one of which has a grandchild, and one numbered `.10`
+    /// so numeric sibling order is exercised) plus a standalone task. Stored
+    /// deliberately out of order to prove the renderer sorts siblings.
+    fn tree_fixture() -> Vec<Issue> {
+        let mut root = issue_with_id("bd-a", "Root epic");
+        root.issue_type = IssueType::Epic;
+        root.priority = Priority(1);
+        let mut tenth = issue_with_id("bd-a.10", "Tenth child");
+        tenth.priority = Priority(2);
+        let mut second = issue_with_id("bd-a.2", "Second child");
+        second.issue_type = IssueType::Bug;
+        second.priority = Priority(1);
+        let mut grandchild = issue_with_id("bd-a.2.1", "Grandchild");
+        grandchild.priority = Priority(3);
+        let mut first = issue_with_id("bd-a.1", "First child");
+        first.priority = Priority(2);
+        let mut solo = issue_with_id("bd-b", "Standalone");
+        solo.priority = Priority(2);
+        vec![root, tenth, second, grandchild, first, solo]
+    }
+
+    const TREE_GOLDEN: &str = "\
+○ bd-a [● P1] [epic] - Root epic
+├── ○ bd-a.1 [● P2] [task] - First child
+├── ○ bd-a.2 [● P1] [bug] - Second child
+│   └── ○ bd-a.2.1 [● P3] [task] - Grandchild
+└── ○ bd-a.10 [● P2] [task] - Tenth child
+○ bd-b [● P2] [task] - Standalone
+";
+
+    /// Golden output for `br list --tree` on a terminal without colour.
+    #[test]
+    fn test_render_tree_golden_plain_in_terminal_mode() {
+        init_logging();
+        let ctx = OutputContext::with_mode(OutputMode::Rich);
+        let issues = tree_fixture();
+        let (rendered, styled) = ctx.capture_rich(|ctx| {
+            render_tree_text_issues(ctx, &issues, TextFormatOptions::plain());
+        });
+        assert_eq!(rendered, TREE_GOLDEN);
+        assert!(!styled, "no colour was requested");
+    }
+
+    /// GitHub #498: on a colour terminal the tree used to arrive as literal
+    /// `\u{1b}[38;5;10m○\u{1b}[39m ...` because the styled line was pushed
+    /// through the untrusted-text sanitizer. The visible text must be the
+    /// same golden as the plain run, with the colour carried as styling.
+    #[test]
+    fn test_render_tree_golden_colored_in_terminal_mode() {
+        init_logging();
+        let ctx = OutputContext::with_mode(OutputMode::Rich);
+        let issues = tree_fixture();
+        let options = TextFormatOptions {
+            use_color: true,
+            max_width: None,
+            wrap: false,
+        };
+        let (rendered, styled) = ctx.capture_rich(|ctx| {
+            render_tree_text_issues(ctx, &issues, options);
+        });
+        assert_eq!(rendered, TREE_GOLDEN);
+        assert!(
+            styled,
+            "colour must survive as styled spans, not be dropped"
+        );
+        assert!(
+            !rendered.contains("\\u{1b}"),
+            "SGR escapes leaked as literal text: {rendered}"
+        );
+    }
+
+    /// The colour fix must not reopen terminal injection: an issue title
+    /// carrying its own escape sequence is still neutralized in tree mode.
+    #[test]
+    fn test_render_tree_still_escapes_controls_in_untrusted_fields() {
+        init_logging();
+        let ctx = OutputContext::with_mode(OutputMode::Rich);
+        let mut issues = tree_fixture();
+        issues[0].title = "evil\x1b[2Jtitle\x07".to_string();
+        let options = TextFormatOptions {
+            use_color: true,
+            max_width: None,
+            wrap: false,
+        };
+        let (rendered, _) = ctx.capture_rich(|ctx| {
+            render_tree_text_issues(ctx, &issues, options);
+        });
+        assert!(
+            rendered.contains("- evil\\u{1b}[2Jtitle\\u{7}\n"),
+            "untrusted title escapes must render as literal text: {rendered}"
+        );
+        assert!(
+            !rendered.contains('\x1b'),
+            "no raw ESC may reach the terminal: {rendered:?}"
+        );
+    }
+
+    /// Nested lines carry connector indentation, so title truncation must
+    /// budget for it or the row wraps and breaks the tree's vertical rails.
+    #[test]
+    fn test_render_tree_truncates_nested_titles_within_terminal_width() {
+        init_logging();
+        let ctx = OutputContext::with_mode(OutputMode::Rich);
+        let mut issues = tree_fixture();
+        let long_title = "x".repeat(200);
+        for issue in &mut issues {
+            issue.title.clone_from(&long_title);
+        }
+        let width = 48;
+        let options = TextFormatOptions {
+            use_color: false,
+            max_width: Some(width),
+            wrap: false,
+        };
+        let (rendered, _) = ctx.capture_rich(|ctx| {
+            render_tree_text_issues(ctx, &issues, options);
+        });
+        for line in rendered.lines() {
+            assert!(
+                UnicodeWidthStr::width(line) <= width,
+                "line exceeds the {width}-column budget ({}): {line}",
+                UnicodeWidthStr::width(line)
+            );
+            assert!(line.ends_with("..."), "long titles are truncated: {line}");
+        }
+        assert!(
+            rendered.lines().any(|line| line.starts_with("│   └── ")),
+            "the grandchild keeps its full connector prefix: {rendered}"
+        );
     }
 
     #[test]

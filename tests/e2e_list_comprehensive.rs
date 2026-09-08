@@ -15,7 +15,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, parse_list_issues, parse_list_page, run_br};
+use common::cli::{BrWorkspace, parse_list_issues, parse_list_page, run_br, run_br_with_env};
 
 fn parse_created_id(stdout: &str) -> String {
     let line = stdout.lines().next().unwrap_or("");
@@ -228,6 +228,133 @@ fn e2e_list_tree_output_groups_children_under_parents() {
             && !line.starts_with("└──")),
         "an issue without a listed parent stays at the top level: {}",
         tree.stdout
+    );
+}
+
+/// Drop CSI sequences (`ESC [ ... final-byte`) so a coloured run can be
+/// compared against its plain twin.
+fn strip_csi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for param in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&param) {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// GitHub #498: with colour enabled, `br list --tree` (and its `--pretty`
+/// and `search` siblings) rendered every ANSI escape as literal
+/// `\u{1b}[38;5;10m` text because the already-styled line was routed through
+/// the untrusted-text sanitizer. Colour is forced through config here (and
+/// the harness's `NO_COLOR=1` cleared, since crossterm honours it on its own)
+/// so the non-TTY harness exercises the exact code path a terminal user hits.
+#[test]
+fn e2e_list_tree_with_color_emits_real_escapes_not_escaped_text() {
+    // no-color.org: an EMPTY `NO_COLOR` counts as unset.
+    let color_env = [("NO_COLOR", "")];
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let epic = run_br(
+        &workspace,
+        ["create", "Epic parent", "-t", "epic", "-p", "1"],
+        "create_epic",
+    );
+    assert!(epic.status.success(), "create epic failed: {}", epic.stderr);
+    let epic_id = parse_created_id(&epic.stdout);
+    let child = run_br(
+        &workspace,
+        [
+            "create",
+            "child bug",
+            "-t",
+            "bug",
+            "-p",
+            "2",
+            "--parent",
+            &epic_id,
+        ],
+        "create_child",
+    );
+    assert!(
+        child.status.success(),
+        "create child failed: {}",
+        child.stderr
+    );
+
+    let plain_tree = run_br(&workspace, ["list", "--tree"], "list_tree_plain");
+    assert!(plain_tree.status.success(), "{}", plain_tree.stderr);
+    let plain_pretty = run_br(&workspace, ["list", "--pretty"], "list_pretty_plain");
+    assert!(plain_pretty.status.success(), "{}", plain_pretty.stderr);
+    let plain_search = run_br(&workspace, ["search", "child"], "search_plain");
+    assert!(plain_search.status.success(), "{}", plain_search.stderr);
+    for plain in [&plain_tree, &plain_pretty, &plain_search] {
+        assert!(
+            !plain.stdout.contains('\x1b') && !plain.stdout.contains("\\u{1b}"),
+            "colour is off by default in the harness: {:?}",
+            plain.stdout
+        );
+    }
+
+    let set = run_br(
+        &workspace,
+        ["config", "set", "display.color", "true"],
+        "config_color_on",
+    );
+    assert!(set.status.success(), "config set failed: {}", set.stderr);
+
+    let cases = [
+        (vec!["list", "--tree"], "list_tree_color", &plain_tree),
+        (vec!["list", "--pretty"], "list_pretty_color", &plain_pretty),
+        (vec!["search", "child"], "search_color", &plain_search),
+    ];
+    for (args, label, plain) in cases {
+        let colored = run_br_with_env(&workspace, args.clone(), color_env, label);
+        assert!(
+            colored.status.success(),
+            "{label} failed: {}",
+            colored.stderr
+        );
+        assert!(
+            !colored.stdout.contains("\\u{1b}"),
+            "{label}: ANSI escapes leaked as literal text:\n{}",
+            colored.stdout
+        );
+        assert!(
+            colored.stdout.contains("\x1b[") && colored.stdout.contains("\x1b[39m"),
+            "{label}: expected real SGR sequences with colour on:\n{:?}",
+            colored.stdout
+        );
+        assert_eq!(
+            strip_csi(&colored.stdout),
+            plain.stdout,
+            "{label}: visible text must match the plain run once colour is stripped"
+        );
+    }
+
+    // `--no-color` outranks the config: it used to be a silent no-op because
+    // the flag landed in the startup config map and the colour resolver only
+    // read the runtime map.
+    let no_color = run_br_with_env(
+        &workspace,
+        ["--no-color", "list", "--tree"],
+        color_env,
+        "list_tree_no_color_flag",
+    );
+    assert!(no_color.status.success(), "{}", no_color.stderr);
+    assert_eq!(
+        no_color.stdout, plain_tree.stdout,
+        "--no-color must switch colour off even when config says display.color=true"
     );
 }
 

@@ -262,8 +262,11 @@ where
     // RUST_LOG through the caller `env_vars`, which are applied after these
     // defaults and so still win.
     cmd.env("RUST_LOG", "error");
-    cmd.envs(env_vars);
+    // Colour off by default so text assertions see bare output. Set before
+    // the caller `env_vars` so a colour-path test can pass `NO_COLOR=""`
+    // (the no-color.org convention for "unset") and exercise ANSI output.
     cmd.env("NO_COLOR", "1");
+    cmd.envs(env_vars);
     cmd.env("RUST_BACKTRACE", "1");
     cmd.env("PATH", deduplicated_br_path());
 }

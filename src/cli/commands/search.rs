@@ -326,8 +326,10 @@ fn render_search_results(
         ));
     }
     for issue in &issues {
+        // Styled by the formatter (which sanitized the untrusted fields
+        // first); `print_line` would escape the colour codes (GitHub #498).
         let line = format_issue_line_with(issue, format_options);
-        ctx.print_line(&line);
+        ctx.print_styled_line(&line);
     }
     emit_hidden_closed_note(&ctx, hidden_closed_count);
     emit_search_truncation_note(issues.len(), limit, offset, has_more, false);

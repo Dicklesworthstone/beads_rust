@@ -6905,9 +6905,18 @@ pub fn default_issue_type_from_layer(layer: &ConfigLayer) -> Result<IssueType> {
 /// Resolve display color preference from a merged config layer.
 ///
 /// Accepts keys: `display.color`, `display-color`, `display_color`.
+///
+/// `display.*` is a startup-key prefix (see [`is_startup_key`]), so both the
+/// `--no-color` override (`CliOverrides::display_color`) and a `display.color`
+/// entry in `config.yaml` land in the STARTUP map. Reading only the runtime
+/// map silently ignored both, which is why `br --no-color list` still
+/// coloured its output (GitHub #498). Check both maps so the key is found
+/// wherever a layer stored it.
 #[must_use]
 pub fn display_color_from_layer(layer: &ConfigLayer) -> Option<bool> {
-    get_value(layer, &["display.color", "display-color", "display_color"])
+    const KEYS: &[&str] = &["display.color", "display-color", "display_color"];
+    get_startup_value(layer, KEYS)
+        .or_else(|| get_value(layer, KEYS))
         .and_then(|value| parse_bool(value))
 }
 
@@ -8566,6 +8575,53 @@ labels:
 
         let resolved = resolve_jsonl_path(&beads_dir, &Metadata::default(), Some(&db_override));
         assert_eq!(resolved, beads_dir.join("beads.jsonl"));
+    }
+
+    /// GitHub #498: `--no-color` maps to `CliOverrides::display_color =
+    /// Some(false)`, which `as_layer` files under the STARTUP map because
+    /// `display.` is a startup prefix. The colour resolver must read it from
+    /// there, otherwise the flag (and `display.color` in config.yaml) is a
+    /// silent no-op and coloured text output cannot be turned off.
+    #[test]
+    fn display_color_is_read_from_the_startup_layer_where_cli_overrides_put_it() {
+        let off = CliOverrides {
+            display_color: Some(false),
+            ..CliOverrides::default()
+        }
+        .as_layer();
+        assert!(is_startup_key("display.color"));
+        assert_eq!(
+            off.startup.get("display.color").map(String::as_str),
+            Some("false")
+        );
+        assert!(!off.runtime.contains_key("display.color"));
+        assert_eq!(display_color_from_layer(&off), Some(false));
+        assert!(
+            !should_use_color(&off),
+            "--no-color must win over TTY detection"
+        );
+
+        let on = CliOverrides {
+            display_color: Some(true),
+            ..CliOverrides::default()
+        }
+        .as_layer();
+        assert_eq!(display_color_from_layer(&on), Some(true));
+        assert!(
+            should_use_color(&on),
+            "an explicit colour=true wins over NO_COLOR and pipes"
+        );
+
+        let mut runtime_only = ConfigLayer::default();
+        runtime_only
+            .runtime
+            .insert("display_color".to_string(), "false".to_string());
+        assert_eq!(
+            display_color_from_layer(&runtime_only),
+            Some(false),
+            "a value stored under the runtime map is still honoured"
+        );
+        assert_eq!(display_color_from_layer(&ConfigLayer::default()), None);
     }
 
     #[test]

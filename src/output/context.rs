@@ -957,10 +957,62 @@ impl OutputContext {
         }
     }
 
+    /// Print one line that already carries trusted ANSI styling.
+    ///
+    /// [`Self::print_line`] treats its input as untrusted and escapes every
+    /// control character, so a line assembled by a colouring formatter such
+    /// as `format_issue_line_with(.., use_color = true)` would reach the
+    /// terminal as literal `\u{1b}[38;5;10m` noise (GitHub #498). This entry
+    /// point keeps the SGR sequences: in Rich mode they are decoded into
+    /// styled spans, in Plain mode the line is written verbatim.
+    ///
+    /// The caller is responsible for having sanitized every untrusted field
+    /// (`sanitize_terminal_inline` on IDs, titles, labels, ...) BEFORE the
+    /// styling was applied; the formatters in `crate::format::text` do so.
+    /// Never route raw user text through this method.
+    pub fn print_styled_line(&self, content: &str) {
+        match self.mode {
+            OutputMode::Rich => {
+                let mut text = Text::from_ansi(content);
+                text.append("\n");
+                self.console().print_renderable(&text);
+            }
+            OutputMode::Plain => println!("{content}"),
+            OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {}
+        }
+    }
+
     pub fn render<R: Renderable>(&self, renderable: &R) {
         if self.is_rich() {
             self.console().print_renderable(renderable);
         }
+    }
+
+    /// Run `emit` with the Rich console recording instead of writing to
+    /// stdout, and return what it would have shown: the plain text (styling
+    /// stripped) plus whether any segment carried a style. Lets command
+    /// renderers be golden-tested in the mode a terminal user sees.
+    #[cfg(test)]
+    pub(crate) fn capture_rich(&self, emit: impl FnOnce(&Self)) -> (String, bool) {
+        assert!(
+            self.is_rich(),
+            "capture_rich needs a Rich context, got {:?}",
+            self.mode
+        );
+        self.console().begin_capture();
+        emit(self);
+        let segments = self.console().end_capture();
+        let styled = segments.iter().any(|segment| {
+            segment
+                .style
+                .as_ref()
+                .is_some_and(|style| style.color.is_some())
+        });
+        let text = segments
+            .into_iter()
+            .map(|segment| segment.text.into_owned())
+            .collect();
+        (text, styled)
     }
 
     fn report_serialization_error(&self, format: &str, err: &serde_json::Error) {
@@ -1844,5 +1896,45 @@ mod tests {
         assert!(rendered.contains("created\n"));
         assert!(rendered.contains("details\n"));
         assert!(rendered.contains("careful\n"));
+    }
+
+    /// A line as produced by `format_issue_line_with(.., use_color = true)`:
+    /// 256-colour SGR around the status icon and priority, bold+colour around
+    /// the type badge, plain text elsewhere.
+    const STYLED_ISSUE_LINE: &str = "\x1b[38;5;10m○\x1b[39m bd-1 [● \x1b[38;5;9mP1\x1b[39m] \
+                                     [\x1b[38;5;13m\x1b[1mepic\x1b[0m] - Ship it";
+
+    /// GitHub #498: `print_line` escapes trusted colour codes into literal
+    /// `\u{1b}[..m` text; `print_styled_line` decodes them into styling.
+    #[test]
+    fn rich_print_styled_line_keeps_trusted_colour_as_styling() {
+        let ctx = rich_test_context();
+
+        let (escaped, _) = ctx.capture_rich(|ctx| ctx.print_line(STYLED_ISSUE_LINE));
+        assert!(
+            escaped.contains("\\u{1b}[38;5;10m"),
+            "print_line is the untrusted path and must keep escaping ESC: {escaped:?}"
+        );
+
+        let (styled, has_colour) = ctx.capture_rich(|ctx| ctx.print_styled_line(STYLED_ISSUE_LINE));
+        assert_eq!(styled, "○ bd-1 [● P1] [epic] - Ship it\n");
+        assert!(
+            has_colour,
+            "SGR sequences must survive as styled spans, not be dropped"
+        );
+    }
+
+    /// `print_styled_line` trusts its input, so a caller that sanitized an
+    /// untrusted field first must still see that field's escapes rendered as
+    /// harmless text rather than interpreted by the decoder.
+    #[test]
+    fn rich_print_styled_line_leaves_pre_sanitized_fields_escaped() {
+        let ctx = rich_test_context();
+        let title = crate::format::sanitize_terminal_inline("evil\x1b[2Jtitle\x07");
+        let line = format!("\x1b[38;5;10m○\x1b[39m bd-2 - {title}");
+
+        let (rendered, _) = ctx.capture_rich(|ctx| ctx.print_styled_line(&line));
+        assert_eq!(rendered, "○ bd-2 - evil\\u{1b}[2Jtitle\\u{7}\n");
+        assert!(!rendered.contains('\x1b'), "no raw ESC may reach stdout");
     }
 }
