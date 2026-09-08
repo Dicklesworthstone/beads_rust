@@ -2508,3 +2508,56 @@ fn e2e_show_json_exposes_acceptance_items() {
         "acceptance_items must be omitted without a checklist: {record}"
     );
 }
+
+/// A namespace sidecar the engine refuses for a reason the mode preflight
+/// cannot see — an extra hard link here; a foreign owner takes the same engine
+/// path — used to surface as the bare `unable to open database file:
+/// '<sidecar>'` on the lock-free read lane and on the pending-saga gate that
+/// precedes every writable open, while only the writable open itself carried
+/// the explanation. Every lane must name the cause and leave the family alone.
+#[cfg(unix)]
+#[test]
+fn e2e_engine_sidecar_refusal_is_explained_on_every_open_lane() {
+    let _log = common::test_log("e2e_engine_sidecar_refusal_is_explained_on_every_open_lane");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init", "--prefix", "ns"], "init");
+    assert!(init.status.success(), "{init:?}");
+
+    let gate = workspace.root.join(".beads/beads.db-fsqlite-ns-gate");
+    let alias = workspace.root.join("gate-alias");
+    fs::hard_link(&gate, &alias).unwrap();
+    let before = namespace_family_bytes(&workspace);
+
+    for (args, label) in [
+        (vec!["count", "--json"], "count_read_lane"),
+        (vec!["list", "--json"], "list_read_lane"),
+        (
+            vec!["create", "Refused create", "--json"],
+            "create_write_lane",
+        ),
+        (vec!["count"], "count_read_lane_text"),
+    ] {
+        let run = run_br(&workspace, args, label);
+        assert!(!run.status.success(), "{label}: {run:?}");
+        let text = format!("{}\n{}", run.stdout, run.stderr);
+        assert!(
+            text.contains("fsqlite refused its namespace sidecar"),
+            "{label} must explain the refusal: {run:?}"
+        );
+        assert!(text.contains("has 2 hard links"), "{label}: {run:?}");
+        assert!(
+            text.contains("the database itself is fine"),
+            "{label}: {run:?}"
+        );
+        assert!(
+            !text.contains("unable to open database file"),
+            "{label} must not surface the bare engine error: {run:?}"
+        );
+    }
+    assert_namespace_family_preserved(&workspace, &before, false);
+
+    // Dropping the extra link restores the family without any repair.
+    fs::remove_file(&alias).unwrap();
+    let count = run_br(&workspace, ["count", "--json"], "count_after_unlink");
+    assert!(count.status.success(), "{count:?}");
+}

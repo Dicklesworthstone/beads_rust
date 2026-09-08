@@ -2587,10 +2587,12 @@ impl SqliteStorage {
             return Ok(None);
         }
         let opener_lease = Some(crate::sync::DatabaseOpenerLease::register(path)?);
-        let conn = open_with_flags(
-            path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
+        // The mode preflight above only sees group/other bits. A sidecar the
+        // engine refuses for another reason — foreign owner, extra hard link
+        // — surfaces here as a bare `CannotOpen`, and this lane is the first
+        // open every read command and the pending-saga gate perform, so it
+        // must carry the same explanation the writable open does.
+        let conn = open_engine_connection_explained(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         // Now that the connection is open, consult the effective schema version
         // (WAL-aware) and fall back to the header peek. Reviewed reconciliation
         // is intentionally exact-version only: a future schema may add columns,
@@ -2662,12 +2664,7 @@ impl SqliteStorage {
             });
         }
         let opener_lease = Some(crate::sync::DatabaseOpenerLease::register(path)?);
-        let absent_namespace_sidecars = absent_namespace_sidecar_suffixes(path);
-        let conn = open_with_flags(
-            path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_WRITE,
-        )
-        .map_err(|error| explain_engine_open_error(path, &absent_namespace_sidecars, error))?;
+        let conn = open_engine_connection_explained(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         if let Some(timeout_ms) = lock_timeout_ms {
             conn.execute(&format!("PRAGMA busy_timeout={timeout_ms}"))?;
         }
@@ -17863,10 +17860,7 @@ fn effective_database_user_version(path: &Path) -> Result<Option<u32>> {
     if checked_database_header_user_version(path)?.is_none() {
         return Ok(None);
     }
-    let conn = open_with_flags(
-        path.to_string_lossy().as_ref(),
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
+    let conn = open_engine_connection_explained(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let version = connection_user_version(&conn).or(checked_database_header_user_version(path)?);
     conn.close().map_err(BeadsError::Database)?;
     Ok(version)
@@ -18493,11 +18487,22 @@ fn open_existing_read_only_connection(path: &Path) -> Result<Connection> {
         )));
     }
 
-    open_with_flags(
-        path.to_string_lossy().as_ref(),
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(Into::into)
+    open_engine_connection_explained(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+}
+
+/// Open the engine at `path` with `flags`, replacing a bare namespace-sidecar
+/// `CannotOpen` with the reason the engine refused it.
+///
+/// Every engine open of an existing database goes through this (or the
+/// equivalent `Connection::open` mapping in [`SqliteStorage::open_with_timeout`])
+/// so a foreign-owner or hard-linked sidecar reads the same on the lock-free
+/// read lane, the pending-saga inspection, and external-project reads as it
+/// does on the writable open. Nothing is inspected before the open, and the
+/// engine error is returned unchanged when no sidecar explains it.
+fn open_engine_connection_explained(path: &Path, flags: OpenFlags) -> Result<Connection> {
+    let absent_namespace_sidecars = absent_namespace_sidecar_suffixes(path);
+    open_with_flags(path.to_string_lossy().as_ref(), flags)
+        .map_err(|error| explain_engine_open_error(path, &absent_namespace_sidecars, error))
 }
 
 fn parse_datetime(s: &str) -> Result<DateTime<Utc>> {
