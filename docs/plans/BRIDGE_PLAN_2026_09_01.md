@@ -45,10 +45,22 @@ existing plan and Beads; it does not itself implement or release these fixes.
   library passes, native canaries and retained-family stress. Repeated helper
   tests, skipped corpus helpers and ten ignored doctests do not become extra
   independent proof. These are attributed prior results, not fresh reruns.
-- A strict-RCH seven-target run is underway on frozen `7a8aa3e1`: lifecycle,
-  workspace, real MCP stdio, README examples, AGENTS contract, docs examples,
-  and package manifests. The newer color change is outside that input cut.
-  Results are pending; no source test pass is claimed yet.
+- Fresh source verification is **PARTIAL**, on frozen `7a8aa3e1` with MCP
+  enabled. Strict RCH compiled the seven selected targets in 28m06s;
+  `agents_md_contract` passed 3/3 and `docs_examples` 161/161. The latter
+  includes shared harness tests, not 161 distinct documented workflows.
+  Lifecycle's closed-claim preservation and mixed-claim atomicity tests
+  reported `ok`, but the target was interrupted by the unchanged 1,800-second
+  command cap. The other four targets had not started. No complete lifecycle,
+  fresh MCP, workspace, README or package-target pass is claimed.
+- The automatic retry was canceled before another cold build. A same-worker
+  attempt downloaded dependencies again and was canceled before observed
+  compilation. A final RCH job tried the existing test executables, but the
+  original remote checkout was no longer available; it exited 2 before tests.
+  Their contexts were not reconstructed or replaced to obtain a green result.
+  Exact attempts and retained log paths are on `sj1u0` comment 1417 and
+  `i9yzo` comment 1416. The later color commit, a real Nix build, current
+  whole-target check/Clippy, and full qualification remain open on `i9yzo`.
 - Fresh policy controls on the released executable produced nine expected
   outcomes: unfinished criteria were refused without changing issue/comments,
   prose criteria entered planning, and initial/global route restrictions
@@ -212,8 +224,12 @@ the exact prompts and each frozen refinement pass are recorded in `sj1u0`.
 4. Execution/provenance: corrected nonexistent test-target pointers, kept the
    later color commit outside the frozen test input, and made absent Nix and
    unrepeated platform/performance coverage explicit.
-5. Final convergence remains pending until source-test and final graph results
-   have been reviewed.
+5. Current task state: removed stale claims that the already-closed `naul5`
+   optimization was still active. Both performance tasks now explicitly use
+   the authorized RCH/DSR path; historical CI receipts do not authorize Actions.
+6. No-change convergence: all eight new tasks and original obligations were
+   rechecked after the partial source result. No further task, dependency,
+   priority or acceptance change was warranted; qualification remains open.
 
 `bv v0.24.1` currently computes no cycles, but reports source authority
 `partial`, `claim_safe:false`, `readiness:provisional`: one invalid issue,
@@ -225,16 +241,37 @@ provides work. This is a failed interoperability condition, not a clean graph
 validation. `4e7b0` owns diagnosis on a preserved copy before any live correction.
 Do not discard legitimate custom statuses or historical records to satisfy bv.
 
+Final `br ready --json` returns five leaves: `i9yzo`, `xmrw6`, `g8cib`,
+`8dtr0`, and `4e7b0`. `br dep cycles` reports zero active cycles and bv computes
+the same cycle result, with its separate source-authority failure unchanged.
+
+The honesty/real-work review is recorded on `sj1u0` comment 1414, with final
+test-attempt limitations on 1417. The five recent implementation/build commits
+contain four user-facing fixes on main and one Nix build enabler. This audit
+itself is explicitly requested planning and verification; it ships no runtime
+fix. No test, assertion, golden, workload floor or tolerance was weakened in
+this audit. The bounded CASS history review was inconclusive, not historical
+clearance. UBS exited 3 because the Markdown-only diff has no supported
+language; it is not a scanner pass. Manual checks confirm clean whitespace,
+all 35 goal rows, unchanged historical assessment text and parseable JSONL.
+
+The existing queue before this audit was insufficient: it omitted maintenance
+delivery of the five main-only changes, the remaining documentation corrections,
+two requested workflow extensions and the actual bv integration failure. Eight
+new tasks now cover those gaps, while original migration, fairness, performance
+and venue work remains open. The next work block should qualify and deliver
+the already-landed fixes, with the bounded docs and bv corrections alongside it.
+
 ### Phase checklist
 
 - [x] Read requested files, inspect live code, preserve all 35 original goals.
 - [x] Run released software and a separate semantic counterexample.
-- [ ] Finish bounded fresh source tests and record their exact coverage.
+- [x] Finish bounded source-verification attempts and record partial coverage.
 - [x] Generate self-contained Beads with the frozen phase-3a prompt.
 - [x] Two ambition rounds, revised in this same document and Beads.
-- [ ] Five frozen refinement passes, ending with a no-change pass.
-- [ ] Validate actual ready work and dependency cycles; complete honesty review.
-- [ ] Commit the assessment and task state; deliver the final steering report.
+- [x] Six frozen refinement passes, ending with a no-change pass.
+- [x] Validate actual ready work and dependency cycles; complete honesty review.
+- [x] Prepare final assessment and task handoff; delivery is recorded on `sj1u0`.
 
 ## Historical assessment — 2026-09-06
 
