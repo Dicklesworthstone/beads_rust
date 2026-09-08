@@ -347,11 +347,10 @@ fn test_source_install_documentation_uses_locked_resolution() {
         let logical_lines = content.replace("\\\n", " ");
 
         for (line_index, line) in logical_lines.lines().enumerate() {
-            let is_git_source_install = line.contains(
-                "cargo install --git https://github.com/Dicklesworthstone/beads_rust.git",
-            );
-            let is_source_install =
-                line.contains("cargo install --path .") || is_git_source_install;
+            // Cover both `cargo install` and `cargo +toolchain install`.
+            let is_git_source_install =
+                line.contains("install --git https://github.com/Dicklesworthstone/beads_rust.git");
+            let is_source_install = line.contains("install --path .") || is_git_source_install;
             if is_source_install {
                 assert!(
                     line.contains("--locked"),
@@ -362,7 +361,7 @@ fn test_source_install_documentation_uses_locked_resolution() {
             if is_git_source_install {
                 assert!(
                     line.contains(
-                        "cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust",
+                        "install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust",
                     ),
                     "{path}:{} git source-install command must select the beads_rust package: {line}",
                     line_index + 1
@@ -477,8 +476,8 @@ fn test_package_manifests_use_dsr_asset_names() {
         fs::read_to_string("packaging/homebrew/br.rb").expect("Failed to read Homebrew formula");
     assert!(formula.contains("br-#{version}-darwin_arm64.tar.gz"));
     assert!(formula.contains("br-#{version}-darwin_amd64.tar.gz"));
-    assert!(formula.contains("br-#{version}-linux_arm64.tar.gz"));
-    assert!(formula.contains("br-#{version}-linux_amd64.tar.gz"));
+    assert!(formula.contains("br-#{version}-linux_musl_arm64.tar.gz"));
+    assert!(formula.contains("br-#{version}-linux_musl_amd64.tar.gz"));
 
     let scoop = fs::read_to_string("packaging/scoop/br.json").expect("Failed to read Scoop file");
     assert!(scoop.contains("br-$version-windows_amd64.zip"));

@@ -27,21 +27,22 @@ class Br < Formula
     end
   end
 
+  # Match the published tap: static musl binaries avoid a host glibc dependency.
   on_linux do
     on_arm do
-      url "https://github.com/Dicklesworthstone/beads_rust/releases/download/v#{version}/br-#{version}-linux_arm64.tar.gz"
-      sha256 "31d5e91382e6c84d75be6d94530f403f8c1b4773575339ce8398608dab704f1e"  # linux_arm64
+      url "https://github.com/Dicklesworthstone/beads_rust/releases/download/v#{version}/br-#{version}-linux_musl_arm64.tar.gz"
+      sha256 "30070d0492994936c316f0a2d1366898f15478a38fd69128e1146a22a2476c60"  # linux_musl_arm64
     end
     on_intel do
-      url "https://github.com/Dicklesworthstone/beads_rust/releases/download/v#{version}/br-#{version}-linux_amd64.tar.gz"
-      sha256 "596852fd124b84ca2bdd28136537e2b36b77f582dd686d55908a1cfa7539103f"  # linux_amd64
+      url "https://github.com/Dicklesworthstone/beads_rust/releases/download/v#{version}/br-#{version}-linux_musl_amd64.tar.gz"
+      sha256 "a91401484ee30fe55d88255b1a7f2775879fcbdbce3f96806b8179dceb85ced1"  # linux_musl_amd64
     end
   end
 
   def install
     bin.install "br"
-    # v0.4.1 predates bundled licenses; v0.5.1 and later archives include it.
-    doc.install "LICENSE" if File.exist?("LICENSE")
+    doc.install "LICENSE"
+    generate_completions_from_executable(bin/"br", "completions")
   end
 
   test do

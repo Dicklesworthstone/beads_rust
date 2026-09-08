@@ -316,6 +316,22 @@ vary with the target, version, and enabled features.
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/install.sh?$(date +%s)" | bash
 ```
 
+### Homebrew (macOS and Linux)
+
+```bash
+brew install dicklesworthstone/tap/br
+```
+
+The formula installs the release binary and shell completions. Linux uses the
+static musl build.
+
+### Scoop (Windows)
+
+```powershell
+scoop bucket add dicklesworthstone https://github.com/Dicklesworthstone/scoop-bucket
+scoop install dicklesworthstone/br
+```
+
 ### From Source
 
 ```bash
@@ -331,8 +347,17 @@ cargo install --path . --locked
 
 ### Cargo Install
 
+Install the published release from crates.io with the pinned nightly toolchain:
+
 ```bash
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked
+rustup toolchain install nightly-2026-08-31 --profile minimal
+cargo +nightly-2026-08-31 install beads_rust --locked
+```
+
+To install the development version from GitHub:
+
+```bash
+cargo +nightly-2026-08-31 install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked
 ```
 
 The explicit `beads_rust` package selector avoids ambiguity with the
@@ -365,7 +390,7 @@ it with `install.sh --with-migration-skill` if you are still migrating from
 cargo build --release --no-default-features
 
 # Or install without it
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked --no-default-features
+cargo +nightly-2026-08-31 install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked --no-default-features
 ```
 
 ### Enable MCP Server Support
@@ -378,7 +403,7 @@ Context Protocol instead of shelling out to CLI commands.
 cargo build --release --features mcp
 
 # Or install globally with MCP support
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked --features mcp
+cargo +nightly-2026-08-31 install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked --features mcp
 ```
 
 Run it from an initialized beads workspace:
