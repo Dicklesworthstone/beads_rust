@@ -28,16 +28,9 @@
     };
 
     flake-utils.url = "github:numtide/flake-utils";
-
-    # Sibling dependency: toon_rust
-    # Fetched from GitHub since Nix flakes cannot use relative path dependencies
-    toon_rust = {
-      url = "github:Dicklesworthstone/toon_rust";
-      flake = false;
-    };
   };
 
-  outputs = { self, nixpkgs, crane, fenix, flake-utils, toon_rust, ... }:
+  outputs = { self, nixpkgs, crane, fenix, flake-utils, ... }:
     flake-utils.lib.eachSystem [
       "x86_64-linux"
       "aarch64-linux"
@@ -59,47 +52,23 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        # Filter source to include only what's needed for the build
-        sourceFilter = path: type:
-          (craneLib.filterCargoSources path type)
-          || builtins.match ".*\\.toml$" path != null
-          || builtins.match ".*\\.rs$" path != null
-          || builtins.match ".*\\.sql$" path != null;
-
-        # Combined source tree with beads_rust and toon_rust
-        # Required because Cargo.toml references path = "../toon_rust"
-        combinedSrc = pkgs.runCommand "beads_rust-src" { } ''
-          mkdir -p $out/beads_rust $out/toon_rust
-
-          # Copy beads_rust
-          cp ${./Cargo.toml} $out/beads_rust/Cargo.toml
-          cp ${./Cargo.lock} $out/beads_rust/Cargo.lock
-          cp ${./build.rs} $out/beads_rust/build.rs
-          cp ${./LICENSE} $out/beads_rust/LICENSE
-          cp -r ${./src} $out/beads_rust/src
-
-          # Optional directories
-          ${pkgs.lib.optionalString (builtins.pathExists ./benches) "cp -r ${./benches} $out/beads_rust/benches"}
-          ${pkgs.lib.optionalString (builtins.pathExists ./tests) "cp -r ${./tests} $out/beads_rust/tests"}
-
-          # Copy toon_rust dependency
-          cp -r ${toon_rust}/* $out/toon_rust/
-        '';
+        # The crate is self-contained: every dependency (including `tru`, the
+        # published toon_rust crate) comes from crates.io via Cargo.lock, so
+        # the source root is the repository root and Crane finds Cargo.lock
+        # where it expects it (GitHub #496). The whole tree is used rather
+        # than a Cargo-only filter because `src/mcp` and `src/cli` embed
+        # README.md and docs/*.md with `include_str!`, and `checks.tests`
+        # needs the fixtures under `tests/`.
+        src = self;
 
         # Common arguments shared between dependency and final builds
         commonArgs = {
-          src = combinedSrc;
+          inherit src;
 
           pname = "beads_rust";
           version = "0.5.11";
 
           strictDeps = true;
-
-          # Build from the beads_rust subdirectory
-          postUnpack = ''
-            cd $sourceRoot/beads_rust
-            sourceRoot=$PWD
-          '';
 
           nativeBuildInputs = with pkgs; [
             pkg-config
@@ -192,11 +161,7 @@
           });
 
           fmt = craneLib.cargoFmt {
-            src = combinedSrc;
-            postUnpack = ''
-              cd $sourceRoot/beads_rust
-              sourceRoot=$PWD
-            '';
+            inherit src;
           };
 
           tests = craneLib.cargoTest (commonArgs // {
