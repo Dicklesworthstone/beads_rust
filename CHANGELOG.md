@@ -66,7 +66,25 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
-## Unreleased -- on `main` after v0.5.10
+## v0.5.11 -- 2026-09-08 (Unreleased)
+
+- Storage now checkpoints committed changes before diagnostic and error exits,
+  including a partially successful multi-issue close and lint warnings after
+  auto-import. Exit codes and structured error receipts are preserved.
+- Multi-label counts use the engine's grouped query again: FrankenSQLite
+  0.3.18 fixes the grouped/HAVING count regression, and the original regression
+  test now runs without a workaround.
+- Historical migrations preflight dependency keys before modifying the database.
+  A legacy tracker containing multiple dependency types for one issue pair is
+  refused with an explanation; loss-preserving conversion remains pending.
+- Write-lock timeouts report typed, retryable admission failures and respect
+  the remaining wait budget. Sustained ext4 contention can still starve a
+  participant; this release does not claim to resolve that scheduling issue.
+- Status changes refresh the affected blocked-cache component selectively and
+  batch dependent invalidations. Close and update reuse the startup connection.
+- Scheduled issues display the remaining deferral interval. Tracker policy,
+  structured output, initialization receipts, and the documented `BEADS_DB`
+  environment alias now follow their CLI contracts.
 
 - Writes to a database on a filesystem that does not persist POSIX permission
   bits — a Windows drive under WSL (`/mnt/<drive>`) mounted without the
@@ -113,8 +131,8 @@ this repo): commits `55c186682` + `5946b3b7c` in
   as rowid seeks instead of a full scan; leaving WAL mode after a checkpoint
   no longer leaves stale-snapshot errors behind; prepared reads that
   recompile after a schema change release the failed attempt's read
-  transaction. No on-disk format change: a database written by br 0.5.10
-  (fsqlite 0.3.16) opens with no first-open migration.
+  transaction. No on-disk format change: a database written by released br
+  0.5.10 (fsqlite 0.3.15) opens with no first-open migration.
 - Exit-code note: a `Configuration error` raised inside the startup
   pending-sync-merge gate (a sidecar the filesystem cannot repair, or a
   database whose schema version is newer than this binary supports) now
@@ -123,7 +141,7 @@ this repo): commits `55c186682` + `5946b3b7c` in
   could not be inspected ...` (exit 6). Both map to the categories in the
   documented exit-code table; only the future-schema case changes code.
 
-- CI runs again: every workflow pins the manifest's toolchain
+- Workflow maintenance before the switch to DSR: every workflow pins the manifest's toolchain
   (`nightly-2026-08-31`) instead of floating `nightly` (release.yml still
   said 2026-08-25 after the manifest moved), the audit gate installs
   `cargo-insta` as a prebuilt binary (source builds failed on a newer
@@ -171,8 +189,8 @@ this repo): commits `55c186682` + `5946b3b7c` in
   EOF-growth double-grant closed under the reserved append lock, bd-9inpb;
   WAL appended-tail reads no longer rescan the whole WAL per page on
   writable open and checkpoint, GH#382; FTS5 work br does not use;
-  frankensqlite#407 is fixed upstream but after the 0.3.16 tag, so the
-  multi-label counting workaround and its ignored probe stay), fastmcp-rust
+  frankensqlite#407 was fixed after the 0.3.16 tag and is now covered by
+  the 0.3.18 upgrade described above), fastmcp-rust
   =0.7.1 → =0.8.1 (caller-owned runtime contexts, which `br serve` already
   provided; `log` 0.4.34 by its pin), toon_rust/`tru` 0.2.3 → 0.2.4. Held:
   asupersync =0.4.9 and toml =1.1.4, both exact pins of fastmcp 0.8.1.
