@@ -1114,9 +1114,17 @@ fn e2e_update_claim_refuses_closed_issue_and_preserves_close_fields() {
         "create_closed_claim_target",
     );
     assert!(create.status.success(), "create failed: {}", create.stderr);
-    let created: Value =
-        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let created: Value = serde_json::from_str(&create.stdout).expect("whole create json");
     let id = created["id"].as_str().expect("issue id").to_string();
+    let open_create = run_br(
+        &workspace,
+        ["create", "Open batch claim target", "--json"],
+        "create_open_claim_target",
+    );
+    assert!(open_create.status.success(), "{open_create:?}");
+    let open_created: Value =
+        serde_json::from_str(&open_create.stdout).expect("whole open create json");
+    let open_id = open_created["id"].as_str().expect("open issue id");
 
     let close = run_br(
         &workspace,
@@ -1135,8 +1143,7 @@ fn e2e_update_claim_refuses_closed_issue_and_preserves_close_fields() {
 
     let before = run_br(&workspace, ["show", &id, "--json"], "show_before_claim");
     assert!(before.status.success(), "show failed: {}", before.stderr);
-    let before: Value =
-        serde_json::from_str(&extract_json_payload(&before.stdout)).expect("show json");
+    let before: Value = serde_json::from_str(&before.stdout).expect("whole show json");
     assert_eq!(before[0]["status"].as_str(), Some("closed"));
     assert_eq!(
         before[0]["close_reason"].as_str(),
@@ -1145,11 +1152,37 @@ fn e2e_update_claim_refuses_closed_issue_and_preserves_close_fields() {
     let closed_at = before[0]["closed_at"].clone();
     assert!(closed_at.is_string(), "closed_at must be set: {before}");
 
-    for (extra, label) in [
-        (None, "claim_closed"),
-        (Some("--force"), "claim_closed_force"),
+    let snapshot = || {
+        let storage = SqliteStorage::open(&workspace.root.join(".beads/beads.db"))
+            .expect("open canonical workspace for independent state reads");
+        serde_json::json!({
+            "closed_issue": storage.get_issue(&id).unwrap(),
+            "open_issue": storage.get_issue(open_id).unwrap(),
+            "closed_events": storage.get_events(&id, 0).unwrap(),
+            "open_events": storage.get_events(open_id, 0).unwrap(),
+        })
+    };
+    let baseline = snapshot();
+    let jsonl_before = fs::read(workspace.root.join(".beads/issues.jsonl")).unwrap();
+    for (ids, extra, label) in [
+        (vec![id.as_str()], None, "claim_closed"),
+        (vec![id.as_str()], Some("--force"), "claim_closed_force"),
+        (vec![open_id, id.as_str()], None, "claim_open_then_closed"),
+        (vec![id.as_str(), open_id], None, "claim_closed_then_open"),
+        (
+            vec![open_id, id.as_str()],
+            Some("--force"),
+            "claim_open_then_closed_force",
+        ),
+        (
+            vec![id.as_str(), open_id],
+            Some("--force"),
+            "claim_closed_then_open_force",
+        ),
     ] {
-        let mut args = vec!["--actor", "repro-agent", "update", id.as_str(), "--claim"];
+        let mut args = vec!["--actor", "repro-agent", "update"];
+        args.extend(ids);
+        args.push("--claim");
         if let Some(flag) = extra {
             args.push(flag);
         }
@@ -1161,8 +1194,8 @@ fn e2e_update_claim_refuses_closed_issue_and_preserves_close_fields() {
             claim.stdout
         );
         assert_eq!(claim.status.code(), Some(4), "{label}: {}", claim.stderr);
-        let error: Value = serde_json::from_str(&extract_json_payload(&claim.stdout))
-            .expect("structured error json");
+        let error: Value =
+            serde_json::from_str(&claim.stdout).expect("whole structured error json");
         assert_eq!(error["error"]["code"], "VALIDATION_FAILED", "{error}");
         let message = error["error"]["message"].as_str().unwrap_or_default();
         assert!(
@@ -1173,12 +1206,17 @@ fn e2e_update_claim_refuses_closed_issue_and_preserves_close_fields() {
             message.contains(&format!("br reopen {id}")),
             "{label}: {message}"
         );
+        assert_eq!(snapshot(), baseline, "{label}: issue/event state changed");
+        assert_eq!(
+            fs::read(workspace.root.join(".beads/issues.jsonl")).unwrap(),
+            jsonl_before,
+            "{label}: failed claim changed the published JSONL"
+        );
     }
 
     let after = run_br(&workspace, ["show", &id, "--json"], "show_after_claim");
     assert!(after.status.success(), "show failed: {}", after.stderr);
-    let after: Value =
-        serde_json::from_str(&extract_json_payload(&after.stdout)).expect("show json");
+    let after: Value = serde_json::from_str(&after.stdout).expect("whole show json");
     assert_eq!(after[0]["status"].as_str(), Some("closed"));
     assert!(after[0]["assignee"].is_null(), "{after}");
     assert_eq!(
@@ -1192,14 +1230,18 @@ fn e2e_update_claim_refuses_closed_issue_and_preserves_close_fields() {
     assert!(reopen.status.success(), "reopen failed: {}", reopen.stderr);
     let claim = run_br(
         &workspace,
-        ["--actor", "repro-agent", "update", &id, "--claim", "--json"],
+        [
+            "--actor", "repro-agent", "update", open_id, &id, "--claim", "--json",
+        ],
         "claim_reopened",
     );
     assert!(claim.status.success(), "claim failed: {}", claim.stderr);
-    let claimed: Vec<Value> =
-        serde_json::from_str(&extract_json_payload(&claim.stdout)).expect("claim json");
-    assert_eq!(claimed[0]["status"].as_str(), Some("in_progress"));
-    assert_eq!(claimed[0]["assignee"].as_str(), Some("repro-agent"));
+    let claimed: Vec<Value> = serde_json::from_str(&claim.stdout).expect("whole claim json");
+    assert_eq!(claimed.len(), 2, "both reopened/open targets must be claimed");
+    for issue in &claimed {
+        assert_eq!(issue["status"].as_str(), Some("in_progress"));
+        assert_eq!(issue["assignee"].as_str(), Some("repro-agent"));
+    }
 }
 
 #[test]
