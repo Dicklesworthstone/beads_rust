@@ -166,3 +166,37 @@ into a universal performance promise. The stronger eef72c58 claim regression
 is undergoing current-source qualification, not a new published guarantee.
 Nix package construction and the required Rust gates remain in progress under
 i9yzo; no build success or new release is inferred from this changelog update.
+
+### Qualification follow-through at e77ba905 (September 8)
+
+Reviewed the complete e77ba905 diff: three namespace diagnostic messages,
+five real engine open-lane probes, the separated positive claim test,
+the stable Nix package set/current Darwin SDK interface, test debug profile,
+and the exact agent version-example correction from 0.5.10 to 0.5.11.
+No runtime behavior is inferred from tracker-only changes. The original
+schema-test failure is retained; the full schema target passed after the
+single-field correction, without snapshot regeneration.
+
+The four Nix outputs evaluated successfully. Native Linux amd64 construction
+produced `/nix/store/1457jm60j6r0bdr9b3xwljvl33r32ssd-beads_rust-0.5.11`,
+whose binary SHA-256 is
+`001bf43acf4ace6ccc2c08f2960aa1a09b6a86c423cdc98fe2cbaaa15149a951`.
+Its 45-step self-test passed with default `self_update` and FrankenSQLite
+0.3.18. Nix used the September 8 Fenix nightly; the RCH checks use the pinned
+August 31 nightly. Evaluation alone does not establish the other three
+Nix builds or seven-target DSR release success.
+
+The same-target all-features CLI sizes were 1,417,694,056 bytes before the
+test-profile change and 470,013,824 bytes afterward. The latter retains
+`.debug_line`, passed 45 self-test steps, and has SHA-256
+`3edf33e2f8ccabf1e0812f03d8bfb282dac29f657668ad8b3196cf65215ce515`.
+Neither number is a release-binary budget measurement or a latency claim.
+Required whole-target check/Clippy and affected CLI, docs, Markdown, and
+MCP tests passed. Common dataset helpers and pinned-BV goldens that returned
+early are not credited as exercised coverage. Full current-library and
+feature-mode qualification remain in progress; prior timeouts remain failures.
+
+Raw command output and the source manifest are retained under
+`/data/tmp/br-i9yzo-20260908-rdczih`; Beads i9yzo comments 1435–1437 and
+xmrw6 comment 1436 record the exact test scope, skips, and independent review.
+The new changes remain Unreleased; published v0.5.11 assets are unchanged.

@@ -16,7 +16,7 @@ This changelog is organized by capability rather than diff order. Each version s
 **Scope window:** every version from inception (v0.1.0, 2026-01-18) through the current
 release (v0.5.11, 2026-09-08), plus the post-release distribution follow-up
 and unreleased fixes through
-[53fbfd41](https://github.com/Dicklesworthstone/beads_rust/commit/53fbfd41).
+[e77ba905](https://github.com/Dicklesworthstone/beads_rust/commit/e77ba905).
 The full per-version detail is in the sections below; the timeline names the
 recent line and the milestone anchors. The September 8 audit examined all 79
 commits in `v0.5.10..v0.5.11` and six subsequent commits against Git diffs,
@@ -115,20 +115,37 @@ progress.
 - Namespace-sidecar refusal explanations now reach read-only opens,
   reconciliation, schema inspection, and external-project reads. Ownership
   and hard-link failures carry their specific cause through these paths
-  instead of a bare database-open error
+  instead of a bare database-open error. The explanation leaves database
+  integrity unverified and requires an idle workspace for manual ownership,
+  link, or permission repairs
   ([503415c4](https://github.com/Dicklesworthstone/beads_rust/commit/503415c4),
+  [e77ba905](https://github.com/Dicklesworthstone/beads_rust/commit/e77ba905),
   [#499](https://github.com/Dicklesworthstone/beads_rust/issues/499)).
 - Nix uses the repository root so Crane can find `Cargo.lock`, embedded
   documentation, and test fixtures. The obsolete sibling `toon_rust` source
   assembly is removed; Cargo already uses its published crate
   ([7a8aa3e1](https://github.com/Dicklesworthstone/beads_rust/commit/7a8aa3e1),
   [#496](https://github.com/Dicklesworthstone/beads_rust/issues/496)).
+- Nix uses the 26.05 package set, which supports the advertised Intel macOS
+  target, and obtains Darwin frameworks from the standard environment's SDK.
+  All four package targets evaluate; the Linux amd64 package has also been
+  built and its 45-step self-test passed. The other three Nix package builds
+  remain unverified
+  ([e77ba905](https://github.com/Dicklesworthstone/beads_rust/commit/e77ba905)).
 - Documentation describes export guards and uncertain outcomes explicitly,
   distinguishes write contention from shared reads, and explains that stale
   blocked-cache reads compute results in memory. It also corrects the current
   engine version and the already-wired Markdown and doctor-explain features
   ([4fe8e47b](https://github.com/Dicklesworthstone/beads_rust/commit/4fe8e47b),
   [3a6bc0d8](https://github.com/Dicklesworthstone/beads_rust/commit/3a6bc0d8)).
+
+### Development builds
+
+- Test builds retain file and line information without full variable/type
+  debugging data. In the measured Linux amd64 all-features build, the CLI
+  shrank from 1.42 GB to 470 MB; test optimization and assertions are unchanged.
+  This changes test artifacts, not the release profile
+  ([e77ba905](https://github.com/Dicklesworthstone/beads_rust/commit/e77ba905)).
 
 ## After v0.5.11 — distribution follow-up (2026-09-08)
 
