@@ -15,7 +15,7 @@ The existing earlier history is retained; this is not a full-history re-audit.
 - [x] Link representative commits and exact checked-in Beads records.
 - [x] Check claims against diffs, tracker status, and release assets.
 - [x] Run the skill validator, verify affected links, and check the final diff.
-- [ ] Record completion in Beads and deliver the documentation on main and its mirror.
+- [x] Record completion in Beads and deliver the documentation on main and its mirror.
 
 ## Evidence spine
 
@@ -142,3 +142,8 @@ the skill validator's network mode hard-codes a different User-Agent.
 - This change edits documentation and the release bead only. No Cargo suite
   was rerun, no historical test success was relabeled as fresh verification,
   and no GitHub Actions were run.
+
+Delivery: [4b3b7b19](https://github.com/Dicklesworthstone/beads_rust/commit/4b3b7b191f7a0c0b7d5a582d8afe9cf15ed1a37f)
+was pushed and both remote branch tips were verified at that commit. The
+release tag remains b42de9b9. This final completion record accompanies the
+delivered documentation; vq1xl remains blocked only for its unresolved AUR step.
