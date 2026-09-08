@@ -30,11 +30,11 @@ class Br < Formula
   on_linux do
     on_arm do
       url "https://github.com/Dicklesworthstone/beads_rust/releases/download/v#{version}/br-#{version}-linux_arm64.tar.gz"
-      sha256 "7ae3a4b5a0e2ea0f11bce3a47f21d3d52f7f96e073aa8eecd5d38422d2d5a668"  # linux_arm64
+      sha256 "31d5e91382e6c84d75be6d94530f403f8c1b4773575339ce8398608dab704f1e"  # linux_arm64
     end
     on_intel do
       url "https://github.com/Dicklesworthstone/beads_rust/releases/download/v#{version}/br-#{version}-linux_amd64.tar.gz"
-      sha256 "a1e740b0840464886f066a32e048721d028202e0bff9df024bf9d6fcc49ee0c7"  # linux_amd64
+      sha256 "596852fd124b84ca2bdd28136537e2b36b77f582dd686d55908a1cfa7539103f"  # linux_amd64
     end
   end
 
