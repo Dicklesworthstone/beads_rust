@@ -2367,7 +2367,8 @@ impl SqliteStorage {
         )
     }
 
-    /// Mark the blocked-cache as stale so a future read can rebuild it on demand.
+    /// Mark the blocked cache as stale so reads compute blocked state in memory
+    /// until a non-deferred write or explicit repair refreshes the stored cache.
     ///
     /// # Errors
     ///
@@ -6675,7 +6676,7 @@ impl SqliteStorage {
                 // transaction eliminates DB lock contention for dep add/remove.
                 tracing::debug!(
                     operation = op,
-                    "Blocked cache refresh deferred; will rebuild lazily on next read"
+                    "Blocked cache refresh deferred; reads will compute blocked state in memory"
                 );
             }
             Some(ref plan) => {

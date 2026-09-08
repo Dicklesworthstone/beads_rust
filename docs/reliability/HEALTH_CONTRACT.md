@@ -63,7 +63,7 @@ to explicitly configured database families outside `.beads/`.
 
 | Anomaly | Severity | Detection | Recovery |
 |---------|----------|-----------|----------|
-| `BlockedCacheStale` | Degraded | Metadata key check | Reads compute blocked state from the graph in memory; a subsequent write or explicit repair refreshes the stored cache |
+| `BlockedCacheStale` | Degraded | Metadata key check | Reads compute blocked state from the graph in memory; a subsequent non-deferred write or explicit repair refreshes the stored cache |
 | `BlockedCacheContentMismatch` | Degraded | Recompute the blocked set from the dependency graph and compare with `blocked_issues_cache` | Rebuild the cache |
 | `ReadyProjectionContentMismatch` | Degraded | Recompute the ready projection and compare with the cached projection | Rebuild the projection |
 | `ChildCountDrift` | Degraded | Compare stored vs actual dep count | Recompute |
