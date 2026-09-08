@@ -15,7 +15,8 @@ This changelog is organized by capability rather than diff order. Each version s
 
 **Scope window:** every version from inception (v0.1.0, 2026-01-18) through the current
 release (v0.5.11, 2026-09-08), plus the post-release distribution follow-up
-through [b330072c](https://github.com/Dicklesworthstone/beads_rust/commit/b330072c).
+and unreleased fixes through
+[53fbfd41](https://github.com/Dicklesworthstone/beads_rust/commit/53fbfd41).
 The full per-version detail is in the sections below; the timeline names the
 recent line and the milestone anchors. The September 8 audit examined all 79
 commits in `v0.5.10..v0.5.11` and six subsequent commits against Git diffs,
@@ -80,6 +81,54 @@ this repo): commits `55c186682` + `5946b3b7c` in
 <https://github.com/Dicklesworthstone/frankensqlite>, shipped as fsqlite 0.3.12.
 
 ---
+
+## Unreleased
+
+These changes are on `main` after v0.5.11. They are not included in that
+release's binary archives; qualification for the next release is still in
+progress.
+
+### Claiming work and searching the backlog
+
+- `br update --claim` refuses closed issues with `VALIDATION_FAILED` (exit 4)
+  and points to `br reopen`. This preserves the close reason and timestamp;
+  `--force` does not override the refusal, and a closed member prevents a
+  mixed batch from claiming any issue
+  ([584e9081](https://github.com/Dicklesworthstone/beads_rust/commit/584e9081),
+  [#497](https://github.com/Dicklesworthstone/beads_rust/issues/497)).
+- The default visible search page selects matching IDs in one ordered scan,
+  then loads those issues in page order. Sparse ID and comment matches no
+  longer trigger up to three scans of the visible backlog. `--limit` bounds
+  returned rows; it does not bound inspected rows or guarantee a latency
+  ceiling ([0c6a05f2](https://github.com/Dicklesworthstone/beads_rust/commit/0c6a05f2),
+  [#495](https://github.com/Dicklesworthstone/beads_rust/issues/495)).
+
+### Terminal output, storage diagnostics, and Nix
+
+- Tree, pretty, long-list, and search output retain formatter-generated
+  colors instead of displaying literal escape codes. User-supplied control
+  characters remain escaped. Nested tree rows account for connector width
+  when truncating titles, and `--no-color` and `display.color` are read from
+  the correct configuration layer
+  ([1bd33da0](https://github.com/Dicklesworthstone/beads_rust/commit/1bd33da0),
+  [#498](https://github.com/Dicklesworthstone/beads_rust/issues/498)).
+- Namespace-sidecar refusal explanations now reach read-only opens,
+  reconciliation, schema inspection, and external-project reads. Ownership
+  and hard-link failures carry their specific cause through these paths
+  instead of a bare database-open error
+  ([503415c4](https://github.com/Dicklesworthstone/beads_rust/commit/503415c4),
+  [#499](https://github.com/Dicklesworthstone/beads_rust/issues/499)).
+- Nix uses the repository root so Crane can find `Cargo.lock`, embedded
+  documentation, and test fixtures. The obsolete sibling `toon_rust` source
+  assembly is removed; Cargo already uses its published crate
+  ([7a8aa3e1](https://github.com/Dicklesworthstone/beads_rust/commit/7a8aa3e1),
+  [#496](https://github.com/Dicklesworthstone/beads_rust/issues/496)).
+- Documentation describes export guards and uncertain outcomes explicitly,
+  distinguishes write contention from shared reads, and explains that stale
+  blocked-cache reads compute results in memory. It also corrects the current
+  engine version and the already-wired Markdown and doctor-explain features
+  ([4fe8e47b](https://github.com/Dicklesworthstone/beads_rust/commit/4fe8e47b),
+  [3a6bc0d8](https://github.com/Dicklesworthstone/beads_rust/commit/3a6bc0d8)).
 
 ## After v0.5.11 — distribution follow-up (2026-09-08)
 

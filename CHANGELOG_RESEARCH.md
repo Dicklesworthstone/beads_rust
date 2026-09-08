@@ -147,3 +147,22 @@ Delivery: [4b3b7b19](https://github.com/Dicklesworthstone/beads_rust/commit/4b3b
 was pushed and both remote branch tips were verified at that commit. The
 release tag remains b42de9b9. This final completion record accompanies the
 delivered documentation; vq1xl remains blocked only for its unresolved AUR step.
+
+## September 8 continuation — unreleased fixes
+
+The existing historical reconstruction is retained. This bounded continuation
+reviews `b330072c..53fbfd41`: five runtime/build fixes, their regression tests,
+the documentation corrections, and the intervening plan/tracker records.
+Read the actual implementation diffs for 584e9081 (closed claims), 0c6a05f2
+(search page selection), 503415c4 (engine-open explanation routing), 7a8aa3e1
+(Nix source root), and 1bd33da0 (trusted styling and configuration precedence).
+Read 4fe8e47b/3a6bc0d8 for the user-facing documentation corrections. The other
+commits record research, plans, or tests; they do not add runtime capabilities.
+
+The September 8 GitHub API recheck still identifies v0.5.11, published at
+02:24:24 UTC with 24 assets, as the latest release. These later changes belong
+under Unreleased. Do not copy the search commit's one-host timing observations
+into a universal performance promise. The stronger eef72c58 claim regression
+is undergoing current-source qualification, not a new published guarantee.
+Nix package construction and the required Rust gates remain in progress under
+i9yzo; no build success or new release is inferred from this changelog update.
