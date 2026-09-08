@@ -272,16 +272,16 @@ Agent Mail, MCP clients, or fixture update modes.
 | Storage | SQLite + JSONL | Dolt/SQLite |
 | Background daemon | **No** | Yes |
 | Hook installation | **Manual** | Automatic |
-| Binary size | ~26 MiB stripped executable, ~11 MiB compressed (v0.5.10, x86_64 Linux GNU; dynamically linked) | ~30+ MB |
+| Binary size | ~26 MiB stripped executable, ~11 MiB compressed (v0.5.11, x86_64 Linux GNU; dynamically linked) | ~30+ MB |
 | Scope | Local CLI, sync, recovery, and agent workflows | Feature-rich ecosystem |
 
 **When to use br:** You want a stable, local-first issue tracker with explicit sync, dependency-aware planning, and machine-readable output.
 
 **When to use beads:** You want advanced features like Linear/Jira sync, RPC daemon, automatic hooks.
 
-Linux releases include GNU and musl targets. The v0.5.10 x86_64 GNU executable
-is 27,307,752 bytes and its archive is 11,613,648 bytes; the musl executable is
-27,443,960 bytes and its archive is 11,730,696 bytes. The musl executable is
+Linux releases include GNU and musl targets. The v0.5.11 x86_64 GNU executable
+is 27,673,760 bytes and its archive is 11,735,518 bytes; the musl executable is
+26,579,176 bytes and its archive is 11,691,141 bytes. The musl executable is
 statically linked; the GNU executable needs the system's glibc loader. Sizes
 vary with the target, version, and enabled features.
 

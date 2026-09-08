@@ -14,7 +14,7 @@ This changelog is organized by capability rather than diff order. Each version s
 - Release links: `https://github.com/Dicklesworthstone/beads_rust/releases/tag/<TAG>`
 
 **Scope window:** every version from inception (v0.1.0, 2026-01-18) through the current
-release (v0.5.7, 2026-08-29). The full per-version detail is in the sections
+release (v0.5.11, 2026-09-08). The full per-version detail is in the sections
 below; the timeline names the recent line and the milestone anchors.
 
 ## Version Timeline
@@ -23,6 +23,7 @@ Recent line (0.5.x — storage-safety and the multi-process corruption program):
 
 | Version | Date | Kind | Headline |
 |---|---|---|---|
+| [v0.5.11](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.11) | 2026-09-08 | Release | Checkpoints before diagnostic exits; FrankenSQLite 0.3.18 grouped-count fix; migration preflight and typed admission failures; seven-platform DSR release |
 | [v0.5.10](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.10) | 2026-09-04 | Release | Six silent-loss fixes (#466–#477, #487); acceptance checklist edits; `doctor --bundle`; FrankenSQLite 0.3.15; linearizability, model-based, README, and Go-bd proof suites; schema-witness fast open |
 | v0.5.9 | 2026-09-03 | Tag | Tagged, no binaries: the hosted lib shard passed, then the new multi-process stress gate ran its script with relative paths that its own `cd` broke; fixed and re-cut as v0.5.10 |
 | v0.5.8 | 2026-09-03 | Tag | Tagged, no binaries: the first hosted run of the release gates caught a binary unit test broken by the fsqlite 0.3.15 sidecar behavior; fixed and re-cut |
@@ -66,7 +67,14 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
-## v0.5.11 -- 2026-09-08 (Unreleased)
+## v0.5.11 -- 2026-09-08 (Release)
+
+[Release and signed downloads](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.11).
+Built through DSR from `b42de9b9aad92d91c926c40a613b73479962e776`, with GitHub
+Actions disabled. All seven platform binaries passed the 45-step lifecycle
+selftest and the existing size-growth limits; Intel macOS execution used
+Rosetta. Every published archive has a SHA-256 sidecar and a signature from the
+existing br Minisign key. SPDX and CycloneDX SBOMs accompany the release.
 
 - Storage now checkpoints committed changes before diagnostic and error exits,
   including a partially successful multi-issue close and lint warnings after

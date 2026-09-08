@@ -19,11 +19,11 @@ class Br < Formula
   on_macos do
     on_arm do
       url "https://github.com/Dicklesworthstone/beads_rust/releases/download/v#{version}/br-#{version}-darwin_arm64.tar.gz"
-      sha256 "d338990921265761426e7d2c81c7b33ea972989af28c24610d4090ccf44e58f2"  # darwin_arm64
+      sha256 "0b4790b47440d8a2c50c97512ac0e99368f1ae2adbf473bc946e96ea429375d2"  # darwin_arm64
     end
     on_intel do
       url "https://github.com/Dicklesworthstone/beads_rust/releases/download/v#{version}/br-#{version}-darwin_amd64.tar.gz"
-      sha256 "ad2c465ae39ea2ef8e4345436a21cd774bf5cf6de4c97baf1cac22b144b81850"  # darwin_amd64
+      sha256 "9cd2551f6f17ba5e9b5a9ab7319d785b92866cbd12efb7a7a5e3b9829eeeacf4"  # darwin_amd64
     end
   end
 
