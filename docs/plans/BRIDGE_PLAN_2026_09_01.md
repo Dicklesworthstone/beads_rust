@@ -1,6 +1,242 @@
 # Bridge Plan: beads_rust (`br`)
 
-## Current assessment — 2026-09-06
+## Current assessment — 2026-09-08
+
+**The core local issue tracker is working and v0.5.11 is published. The project
+is not finished: the shipped binary still has a reproducible closed-claim bug,
+historical migration and sustained-contention goals remain incomplete, and
+useful latency acceptance has not been established.** Another broad framework
+or dormant-module wiring campaign would not address those failures.
+
+Assessment bead: `beads_rust-sj1u0`. This section supersedes dated status below,
+not the original goals or retained failed experiments. The initial source cut
+is `7a8aa3e1`; `1bd33da0` arrived during the audit and is reviewed separately.
+The released source is `b42de9b9` (v0.5.11, fsqlite 0.3.18). Identical package
+versions do not establish identical executables. This assessment changes the
+existing plan and Beads; it does not itself implement or release these fixes.
+
+### Evidence and limits
+
+- Fresh full reading: AGENTS.md (1,087 lines), README.md (1,409), this existing
+  bridge, ARCHITECTURE.md, engine operating model, health contract and
+  write-combining design. The three historical porting documents and Rich plan
+  are unchanged since the September 4 full-reading baseline (`git diff` against
+  `5e81e796`); their prior goal inventory is retained. Their historical and
+  deferred decision sections were rechecked, not relabeled as a fresh full
+  reading of the entire archival corpus.
+- Fresh Linux x86_64 release probe: `doctor --selftest --keep --json` passes
+  45/45 steps in 4,311 ms. Binary SHA-256:
+  `0a10ca91ed2f7f35609291f0192806717be0a818d3ddb7bcdfbf1cb378e435b1`.
+  This is a bounded lifecycle canary, not a stress, migration or timing proof.
+- A separate retained real CLI sequence creates and closes an issue, then
+  claims it. On the release, claim exits 0, changes `closed` to `in_progress`,
+  assigns the actor and clears `closed_at` and `close_reason`. Source commit
+  `584e9081` adds a pre-mutation guard and positive reopen-then-claim coverage.
+  Raw commands/results and workspace are retained under
+  `/data/tmp/br-sj1u0-reality-20260908-bzp0v_da/`.
+- Fresh GitHub metadata confirms v0.5.11 is latest, published
+  `2026-09-08T02:24:24Z`, with seven archives, checksums, signatures and two
+  SBOMs (24 assets). The crates.io API, Homebrew and Scoop currently name
+  0.5.11. GitHub Actions
+  remains disabled. AUR publication is still an external credential blocker
+  on `vq1xl`; prior native Arch package proof is not an AUR upload.
+- Prior release evidence on `05rjp`/`vq1xl` covers all 149 non-benchmark
+  integration targets, 3,075 all-feature library passes, 2,983 no-default
+  library passes, native canaries and retained-family stress. Repeated helper
+  tests, skipped corpus helpers and ten ignored doctests do not become extra
+  independent proof. These are attributed prior results, not fresh reruns.
+- A strict-RCH seven-target run is underway on frozen `7a8aa3e1`: lifecycle,
+  workspace, real MCP stdio, README examples, AGENTS contract, docs examples,
+  and package manifests. The newer color change is outside that input cut.
+  Results are pending; no source test pass is claimed yet.
+- Fresh policy controls on the released executable produced nine expected
+  outcomes: unfinished criteria were refused without changing issue/comments,
+  prose criteria entered planning, and initial/global route restrictions
+  refused forbidden creates/transitions. Successful stdout was parsed whole.
+  These prove current semantics, not the proposed stage/class extensions.
+  The release advertises 46 commands, `mcp:false`, `self_update:true`; optional
+  `serve` accounts for the documented 47th command.
+
+### All original goals, carried forward
+
+WORKING below means implemented with relevant bounded evidence. It never means
+all inputs, platforms, interleavings or failure modes have been proved.
+
+| Goal | Current status and code/proof anchor | Remaining obligation |
+|---|---|---|
+| V1 CRUD, relations, queries | WORKING core; `main.rs` dispatch, command modules, lifecycle canary | Deliver closed-claim correction; keep explicit status semantics distinct |
+| V2 SQLite + JSONL | WORKING; concrete `SqliteStorage`, sync import/export | Historical conversion below, not a second engine |
+| V3 Non-invasive explicit Git handoff | WORKING; sync has no Git dispatch, explicit reporting commands have bounded Git reads | Preserve path/authority proof; do not enable Actions |
+| V4 Classic bd interchange | WORKING within documented JSONL boundary | Identical live schemas/text are SUPERSEDED expectations |
+| V5 IDs and deduplication | WORKING; `util/id.rs`, `util/hash.rs`, property/model tests | Content hash excludes relations and differs deliberately from bd |
+| V6 Real-bd conformance | Prior pinned 0.46.0 proof; current full comparison UNPROVEN | Source qualification must label missing-bd skips |
+| V7 Machine-readable outputs | WORKING bounded JSON/error contracts; typed init and stream tests | Parse documented partial-batch streams; do not infer rollback from nonzero exit |
+| V8 TOON and mode precedence | WORKING; output context and strict mode tests | Recheck changed color configuration separately |
+| V9 Rich/plain output | PARTIAL in release; source color/tree fix `1bd33da0` | Prove trusted styling plus untrusted-text sanitation, then deliver |
+| V10 Markdown and syntax | Markdown WORKING through live issue panel; old highlighter SUPERSEDED/deferred | No dormant renderer wiring prerequisite |
+| V11 Sync guards and publication | WORKING bounded fault/witness proof | Preserve source generation, authority and post-publication distinctions |
+| V12 Acknowledged-data preservation | PARTIAL assurance; model, coupled history, checkpoint containment | No universal no-loss theorem; retain original failures |
+| V13 Merge/reconcile/recovery | WORKING current paths; historical conversion PARTIAL | `yyhki`; exact historical CASS corpus remains separately deferred |
+| V14 History | WORKING; snapshot/restore and canary | Historical schema conversion is not established by current-schema history tests |
+| V15 Workflow/capacity/gates | WORKING current CLI/MCP contract | New stage/class features are extensions, not evidence current semantics are broken |
+| V16 Stale-claim coordination | WORKING advisory diagnosis | Old claims require evidence, not automatic reclamation |
+| V17 Routing/external dependencies | WORKING explicit local routing | No distributed atomicity claim |
+| V18 Doctor/repair/migration/bundle | WORKING diagnosis/current schema; historical conversion PARTIAL | `yyhki` positive loss-preserving conversion |
+| V19 MCP | WORKING optional 7 tools/resources/prompts; real stdio tests | Fresh feature-enabled execution, not zero-run default build |
+| V20 Startup/speed objectives | UNPROVEN | `zxfz.1`: retain cold <100 ms/warm <50 ms definitions and honest bd comparison |
+| V21 Useful performance gates | Seven-target size gate WORKING; latency PARTIAL | `zxfz.1` and `azxef.10`; no noise-sized tolerance |
+| V22 Storage trait/decomposition | SUPERSEDED shipping prerequisite | Concrete single-engine design and independent model are deliberate |
+| V23 Cache/write combining | SUPERSEDED shipping prerequisite | Optimize measured live paths; dormant queue has no production caller |
+| V24 Cross-platform distribution | WORKING seven-platform v0.5.11; all-venue completion PARTIAL | AUR `vq1xl`; next maintenance delivery for main-only fixes |
+| V25 Cargo install | WORKING prior release proof, pinned nightly documented | Distinguish crates release from moving Git HEAD |
+| V26 Verified self-update | WORKING mandatory SHA sidecars; signatures manual | Native downloaded-artifact checks for each new release |
+| V27 Meaningful tests/oracles | WORKING bounded independent checks | Fresh source qualification and positive sensitivity; test totals alone insufficient |
+| V28 Unsafe boundary | WORKING deny plus three sanctioned carve-outs | No new unsafe code implied |
+| V29 Accurate actionable docs | PARTIAL; broad corrections landed | Residual safety/cache/engine/diagnostic wording needs a bounded correction |
+| V30 Truthful tracker | PARTIAL; original positive gaps remain open; bv source is provisional | Reconcile descriptions and restore trustworthy source loading without discarding history |
+| V31 Windows | WORKING prior native v0.5.11 canary | No fresh Windows run or all-Windows-filesystem claim in this audit |
+| V32 Broken pipes | WORKING prior SIGPIPE/PTY regressions | Preserve behavior in color-path qualification |
+| V33 Acceptance items | WORKING parser and item mutation API | Presence/prerequisite extension is separate from current completion semantics |
+| V34 Actionable hints | WORKING broadly; namespace-open diagnosis improves on main | Deliver `503415c4`; safe timeout diagnostics do not cure starvation |
+| V35 Installed-binary selftest | WORKING fresh 45/45 canary | Demonstrated blind spot: green selftest did not catch closed-claim bug |
+
+### Bridge: highest-value remaining work
+
+| Gap | Specific outcome, proof and complexity | Coverage before this audit |
+|---|---|---|
+| R12 Main-only fixes reach users (P1) | Qualify closed-claim, single-pass search, sidecar diagnosis, Nix source root and color changes on one source; publish a new immutable seven-platform DSR release with native canaries and venue verification. Qualification M; delivery M. | Initially NO_BEAD; now `i9yzo` qualification → `phm7n` delivery; `vq1xl` retains its own AUR obligation |
+| R13 Residual actionable-doc drift (P2) | Bound README safety language; correct lock troubleshooting, stale-cache read behavior, released engine identity and live doctor-explain comments. Reuse executable doc examples, no generator project. S. | Initially NO_BEAD; now `xmrw6`; earlier corrections have narrower truthful closes |
+| R6 Useful latency acceptance (P1) | Freeze a useful regression decision before opening held-out A/B; same-host controls, all 28 workloads, source/cache/boot identity; real pass/regression/inconclusive tests. L. | `zxfz.1`, companion `azxef.10`; size already passes |
+| R14 Historical migration (P2) | Preserve actual noncanonical v15 source; implement representable loss-preserving conversion and full schema/row/event/undo checks. Test canonical 13/14/15/16 controls plus ambiguous conversion refusal. L. | `yyhki`; eligibility refusals are delivered, positive conversion is not |
+| R15 Sustained contention (P2) | Explain retained bypass intervals, improve bounded fair progress without raising deadlines/lowering workload floors, retain process-death and identity safety. L. | `46zqi`; retryability and teardown are delivered, starvation cure is not |
+| R16 Complete v0.5.11 venues (P1 external) | Authorized AUR account publishes prepared metadata/package and independent install verifies it. S once credential exists. | `vq1xl`; blocked, never relabel package construction as publication |
+| R19 Trustworthy bv recommendations (P2) | Diagnose partial source authority, preserve historical/custom issue semantics, repair only confirmed data/loader faults and prove a real ready claim plus invalid-input refusal. M. | Initially NO_BEAD; now `4e7b0`, blocking final integration but not source qualification |
+
+Completing the previously open Beads alone would **not** deliver R12 or fix R13.
+The repaired queue must cover both, while retaining all positive migration,
+fairness and calibrated-performance obligations. Final integration remains
+`0wb0w`. Deferred generators, a gate registry, deletion, a Storage trait and
+write combining are not prerequisites. No file deletion is authorized here.
+
+### Ambition round 1: finish the useful workflow, preserve its guarantees
+
+Two live user requests were missing from the tracker when this assessment
+started: [#493](https://github.com/Dicklesworthstone/beads_rust/issues/493) and
+[#494](https://github.com/Dicklesworthstone/beads_rust/issues/494). These extend
+V15/V33; they are not evidence the existing completion/global-route contract is
+broken. Source inspection confirms `TransitionRequiredField` has only acceptance
+completion and transition comments, while `Workflow::validate_transition`
+receives only global `from`/`to`. No existing bead matched either request.
+
+- **R17 Stage-specific presence and prerequisites — NOT_STARTED, P2, L.** An
+  opt-in presence requirement must accept unfinished acceptance criteria at
+  planning entry without marking them complete. A separate per-issue
+  prerequisite checklist must be nonempty and fully checked at configured
+  handoffs. Preserve completion requirements and their composition with exact
+  edges, target states, comments and close policy. Carry any new field through
+  the model, persistence/migration, JSONL, hashes where appropriate, CLI/MCP,
+  schemas and documentation. Test prospective replacements/clears and atomic
+  mixed batches, including events/exports, not just error strings.
+- **R18 Explicit class-specific routes — NOT_STARTED, P2, M/L.** Allow only the
+  configured class/edge pair to omit planning. Preserve ordinary initial
+  status, unknown-class defaults, strict statuses and every other configured
+  gate/capacity/claim/close requirement. Evaluate prospective classification
+  inside the storage transaction, including simultaneous class/status updates
+  and mixed batches; prove CLI and MCP agreement. No class grants an implicit
+  bypass or permission to create directly in implementation.
+
+Each extension gets a self-contained implementation bead and dependent proof
+bead. They are independent product work, share policy/storage edit surfaces and
+therefore need reservations; neither becomes an artificial prerequisite of
+the other or of the maintenance release. The next release should first make
+already-fixed behavior available to users.
+
+Bead mapping: R17 implementation `g8cib` → companion `7zm00`; R18 implementation
+`8dtr0` → companion `5pow5`. Implementation closure requires its own positive and
+negative tests; the companion's broader independent behavioral matrix is
+required before calling the feature validated or including it in a release.
+Requiring a dependent companion to finish before its implementation can close
+would be a logical deadlock even with zero computed graph cycles.
+
+### Ambition round 2: make the next work block produce a decision
+
+The optimal order follows user impact and actual dependencies:
+
+1. **Qualify existing main fixes (`i9yzo`) and correct actionable docs
+   (`xmrw6`), then deliver them (`phm7n`).** These tasks turn completed code
+   into changed behavior for installed users. AUR credential availability and
+   proposed workflow features do not prevent source verification. A missing
+   Nix build remains an explicit qualification gap, not a silent pass.
+   Diagnose the narrow bv source-loading failure (`4e7b0`) alongside this work
+   so the existing triage integration can regain usable recommendations.
+2. **Complete the original positive reliability goals.** `yyhki` must compare
+   the retained historical source, converted candidate and restored original:
+   issues, typed edges, labels, comments, events, workflow audit, sequence IDs,
+   custom schema and undo all matter. Eligibility refusal is already delivered.
+   `46zqi` must analyze individual wait intervals and peer bypasses, not infer
+   fairness from aggregate throughput or a successful short stress run. Safe
+   timeout hints and normal/error teardown are already delivered.
+3. **Resolve useful performance acceptance.** Before another full matrix,
+   `zxfz.1` should specify a same-host control and meaningful regression size,
+   sampling/stopping rule and inconclusive outcome prospectively. Earlier
+   28-workload A/A evidence had p95 upper changes from 8.723% to 1029.023%; it
+   cannot justify production budgets. Preserve the full eventual 28-workload
+   requirement and unopened held-out A/B boundary. `azxef.10` must show actual
+   pass, meaningful degradation failure and mismatch/inconclusive refusal;
+   a 20-fold slowdown control alone proves only gross sensitivity.
+4. **Implement the requested workflow extensions with companion proof.**
+   Both have users and clear atomicity boundaries. Reserve their shared policy
+   and storage files; do not add a dependency merely to serialize editing.
+5. **Finish final integration (`0wb0w`) only with coherent evidence.** Keep
+   current release, next release, calibrated acceptance, migration and fairness
+   identities separate. Do not close it because source qualification passes
+   or because the old campaign has many closed children.
+
+The source/qualification/delivery chain is the best immediate return. The
+reliability and latency work remains essential, but its next experiment must
+answer a defined question before consuming another broad verification run.
+
+### Refinement findings and graph validation
+
+The frozen phase-3a prompt was applied before and after the two ambition rounds;
+the exact prompts and each frozen refinement pass are recorded in `sj1u0`.
+
+1. Necessity/preservation: retained the 35 original goals, corrected stale
+   present-tense descriptions on `yyhki`, `46zqi` and `0wb0w`; no positive
+   capability was closed by a refusal, a document or a short stress run.
+2. Dependencies: repaired the new presence-task closure/companion deadlock;
+   found actual bv loading failure despite an acyclic graph, added `4e7b0`.
+3. Oracles: distinguished meaningful state tests from strict output parsing,
+   and pre-mutation refusal from committed-but-flush-failed results. Preserved
+   positive CLI/MCP, prospective-state, concurrency and persistence coverage.
+4. Execution/provenance: corrected nonexistent test-target pointers, kept the
+   later color commit outside the frozen test input, and made absent Nix and
+   unrepeated platform/performance coverage explicit.
+5. Final convergence remains pending until source-test and final graph results
+   have been reviewed.
+
+`bv v0.24.1` currently computes no cycles, but reports source authority
+`partial`, `claim_safe:false`, `readiness:provisional`: one invalid issue,
+16 read errors and 17 warnings. Visible examples are old `relates-to` edges;
+the March 23 test issue `yh98` has status `invalid`. The displayed warning list
+is capped at ten, so these examples are not a complete root-cause diagnosis.
+Every bv recommendation disables claiming, even though actual `br ready`
+provides work. This is a failed interoperability condition, not a clean graph
+validation. `4e7b0` owns diagnosis on a preserved copy before any live correction.
+Do not discard legitimate custom statuses or historical records to satisfy bv.
+
+### Phase checklist
+
+- [x] Read requested files, inspect live code, preserve all 35 original goals.
+- [x] Run released software and a separate semantic counterexample.
+- [ ] Finish bounded fresh source tests and record their exact coverage.
+- [x] Generate self-contained Beads with the frozen phase-3a prompt.
+- [x] Two ambition rounds, revised in this same document and Beads.
+- [ ] Five frozen refinement passes, ending with a no-change pass.
+- [ ] Validate actual ready work and dependency cycles; complete honesty review.
+- [ ] Commit the assessment and task state; deliver the final steering report.
+
+## Historical assessment — 2026-09-06
 
 **The core tracker works, and the September 4 functional gaps have been fixed
 on `main`. Useful performance acceptance and delivery of those fixes in a new
