@@ -9812,6 +9812,21 @@ impl SqliteStorage {
         Ok(usize::try_from(count).unwrap_or(0))
     }
 
+    /// First page of a default-visible search in a single pass (GitHub #495).
+    ///
+    /// The needle predicate cannot use an index, so any ordered page has to
+    /// evaluate it on every visible row until `limit` matches are in hand —
+    /// and, because the caller asks for one row past the page to disclose
+    /// truncation, on every visible row whenever fewer than `limit + 1`
+    /// match. That scan is the floor; `--limit` bounds the rows returned, not
+    /// the rows inspected. What this path guarantees is that the floor is
+    /// paid exactly once: the page's ids are selected in the canonical
+    /// `priority ASC, created_at DESC, id ASC` order with only the sort key
+    /// in the sorter, and the page rows are then hydrated by id. The earlier
+    /// shape — an unsorted existence probe, then a critical-priority window,
+    /// then an ordered tail window — evaluated the predicate over the corpus
+    /// up to three times, so a sparse needle such as an id fragment cost more
+    /// with `--limit 20` than with `--limit 0`.
     fn search_default_visible_limited_page(
         &self,
         query: &str,
@@ -9825,92 +9840,47 @@ impl SqliteStorage {
             "status NOT IN ('closed', 'tombstone', 'deferred')"
         };
         let needle = query.to_ascii_lowercase();
-        if !self.search_default_visible_has_match(status_filter, &needle)? {
-            return Ok(Vec::new());
-        }
-
-        let mut issues = self.search_default_visible_priority_window(
-            status_filter,
-            &needle,
-            projection,
-            "priority = ?",
-            Priority::CRITICAL.0,
-            "created_at DESC, id ASC",
-            limit,
-        )?;
-
-        let remaining = limit.saturating_sub(issues.len());
-        if remaining > 0 {
-            issues.extend(self.search_default_visible_priority_window(
-                status_filter,
-                &needle,
-                projection,
-                "priority > ?",
-                Priority::CRITICAL.0,
-                "priority ASC, created_at DESC, id ASC",
-                remaining,
-            )?);
-        }
-
-        Ok(issues)
-    }
-
-    fn search_default_visible_has_match(&self, status_filter: &str, needle: &str) -> Result<bool> {
-        let sql = format!(
-            "SELECT 1 FROM issues
+        let keys_sql = format!(
+            "SELECT id FROM issues
              WHERE {status_filter}
                AND (is_template = 0 OR is_template IS NULL)
                AND {SEARCH_NEEDLE_PREDICATE}
-             LIMIT 1"
+             ORDER BY priority ASC, created_at DESC, id ASC
+             LIMIT {limit}"
         );
-        let rows = self.conn.query_with_params(
-            &sql,
+        let key_rows = self.conn.query_with_params(
+            &keys_sql,
             &[
-                SqliteValue::from(needle),
-                SqliteValue::from(needle),
-                SqliteValue::from(needle),
-                SqliteValue::from(needle),
+                SqliteValue::from(needle.as_str()),
+                SqliteValue::from(needle.as_str()),
+                SqliteValue::from(needle.as_str()),
+                SqliteValue::from(needle.as_str()),
             ],
         )?;
-        Ok(!rows.is_empty())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn search_default_visible_priority_window(
-        &self,
-        status_filter: &str,
-        needle: &str,
-        projection: SearchIssueProjection,
-        priority_predicate: &str,
-        priority_value: i32,
-        order_by: &str,
-        limit: usize,
-    ) -> Result<Vec<Issue>> {
-        let sql = format!(
-            r"{}
-              AND {status_filter}
-              AND (is_template = 0 OR is_template IS NULL)
-              AND {priority_predicate}
-              AND {SEARCH_NEEDLE_PREDICATE}
-              ORDER BY {order_by}
-              LIMIT {limit}",
-            projection.select_clause()
-        );
-        let rows = self.conn.query_with_params(
-            &sql,
-            &[
-                SqliteValue::from(i64::from(priority_value)),
-                SqliteValue::from(needle),
-                SqliteValue::from(needle),
-                SqliteValue::from(needle),
-                SqliteValue::from(needle),
-            ],
-        )?;
-        let mut issues = Vec::with_capacity(rows.len());
-        for row in &rows {
-            issues.push(projection.parse_issue(row)?);
+        let page_ids: Vec<String> = key_rows
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text))
+            .map(str::to_string)
+            .collect();
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(issues)
+
+        let mut sql = String::from(projection.select_clause());
+        let mut params: Vec<SqliteValue> = Vec::new();
+        append_issue_id_membership_filter(&mut sql, &mut params, &page_ids);
+        let rows = self.conn.query_with_params(&sql, &params)?;
+        let mut hydrated: HashMap<String, Issue> = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let issue = projection.parse_issue(row)?;
+            hydrated.insert(issue.id.clone(), issue);
+        }
+        // Restore the key order; a row that vanished between the two
+        // statements is simply absent, exactly as a later read would show it.
+        Ok(page_ids
+            .iter()
+            .filter_map(|id| hydrated.remove(id))
+            .collect())
     }
 
     /// Get ready issues (configured ready status, unblocked, not time-deferred,
@@ -35472,6 +35442,70 @@ mod tests {
 
         assert_eq!(fast_no_match, generic_no_match);
         assert!(fast_no_match.is_empty());
+    }
+
+    /// GitHub #495: the default-visible limited page selects its keys in one
+    /// ordered pass and hydrates them by id. Matches that live only in the id
+    /// or only in a comment must survive both steps, a page wider than the
+    /// match set returns every match in canonical order, and a narrower page
+    /// truncates in that same order.
+    #[test]
+    fn test_search_issues_default_visible_limited_page_hydrates_sparse_matches_in_order() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let base = Utc.with_ymd_and_hms(2025, 9, 4, 0, 0, 0).unwrap();
+        for (id, title, priority, minutes) in [
+            ("bd-zamjw", "id-only match", 2, 1),
+            ("bd-plain-a", "no match here", 1, 2),
+            ("bd-plain-b", "no match here either", 0, 3),
+            ("bd-comment-host", "comment-only match", 2, 4),
+        ] {
+            let issue = make_issue(
+                id,
+                title,
+                Status::Open,
+                priority,
+                None,
+                base + chrono::Duration::minutes(minutes),
+                None,
+            );
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .add_comment(
+                "bd-comment-host",
+                "tester",
+                "handoff note mentions zamjw once",
+            )
+            .unwrap();
+
+        let wide = ListFilters {
+            limit: Some(20),
+            ..ListFilters::default()
+        };
+        let generic = ListFilters {
+            limit: Some(20),
+            sort: Some("priority".to_string()),
+            ..ListFilters::default()
+        };
+        let fast_ids = issue_ids(storage.search_issues("ZAMJW", &wide).unwrap());
+        let generic_ids = issue_ids(storage.search_issues("ZAMJW", &generic).unwrap());
+        assert_eq!(fast_ids, generic_ids);
+        // Same priority: newer first.
+        assert_eq!(fast_ids, vec!["bd-comment-host", "bd-zamjw"]);
+
+        let narrow = ListFilters {
+            limit: Some(1),
+            ..ListFilters::default()
+        };
+        assert_eq!(
+            issue_ids(storage.search_issues("zamjw", &narrow).unwrap()),
+            vec!["bd-comment-host"]
+        );
+
+        let command_text = storage
+            .search_issues_for_command_output("zamjw", &wide)
+            .unwrap();
+        assert_eq!(issue_ids(command_text), vec!["bd-comment-host", "bd-zamjw"]);
     }
 
     #[test]

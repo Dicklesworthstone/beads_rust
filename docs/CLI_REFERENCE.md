@@ -953,6 +953,13 @@ of the corpus, so a bounded, relevance-ordered result set is the default. Text
 and CSV output explicitly note when more matches exist; JSON/TOON reports
 `limit`, `offset`, and `has_more`.
 
+`--limit` bounds the rows **returned**, not the rows inspected: results are
+ordered (`priority ASC, created_at DESC`) and the substring match cannot use an
+index, so a page is complete only once `limit + 1` matches have been seen in
+that order — for a sparse query (an id fragment, a rare token) that means every
+visible issue is examined exactly once. A bounded search never costs more than
+the same search with `--limit 0`.
+
 **Closed issues are excluded by default** (tombstones always). When that
 exclusion hides matches, text output ends with a trailing note
 (`note: N closed match(es) hidden; rerun with --all to include them`), and
