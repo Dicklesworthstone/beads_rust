@@ -6923,16 +6923,16 @@ pub fn display_color_from_layer(layer: &ConfigLayer) -> Option<bool> {
 /// Determine whether human-readable output should use ANSI color.
 ///
 /// Precedence:
-/// 1) Config `display.color` (if set)
-/// 3) `NO_COLOR` environment variable (standard)
+/// 1) Nonempty `NO_COLOR` disables ANSI output, including configured color
+/// 2) Config `display.color` (including the `--no-color` override, if set)
 /// 3) stdout is a terminal
 #[must_use]
 pub fn should_use_color(layer: &ConfigLayer) -> bool {
+    if env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()) {
+        return false;
+    }
     if let Some(value) = display_color_from_layer(layer) {
         return value;
-    }
-    if env::var_os("NO_COLOR").is_some() {
-        return false;
     }
     std::io::stdout().is_terminal()
 }
@@ -8607,10 +8607,8 @@ labels:
         }
         .as_layer();
         assert_eq!(display_color_from_layer(&on), Some(true));
-        assert!(
-            should_use_color(&on),
-            "an explicit colour=true wins over NO_COLOR and pipes"
-        );
+        // Actual color emission and NO_COLOR precedence are exercised in
+        // e2e_list_comprehensive with isolated child-process environments.
 
         let mut runtime_only = ConfigLayer::default();
         runtime_only
