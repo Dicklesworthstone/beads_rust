@@ -9,49 +9,63 @@ This changelog is organized by capability rather than diff order. Each version s
 **Notation**
 
 - **Release** = published GitHub Release with pre-built binaries attached.
-- **Tag** = git tag only (no binaries; used for rapid stabilization cuts during CI iteration).
+- **Tag** = git tag without a published GitHub Release.
 - Commit links: `https://github.com/Dicklesworthstone/beads_rust/commit/<HASH>`
 - Release links: `https://github.com/Dicklesworthstone/beads_rust/releases/tag/<TAG>`
 
 **Scope window:** every version from inception (v0.1.0, 2026-01-18) through the current
-release (v0.5.11, 2026-09-08). The full per-version detail is in the sections
-below; the timeline names the recent line and the milestone anchors.
+release (v0.5.11, 2026-09-08), plus the post-release distribution follow-up
+through [b330072c](https://github.com/Dicklesworthstone/beads_rust/commit/b330072c).
+The full per-version detail is in the sections below; the timeline names the
+recent line and the milestone anchors. The September 8 audit examined all 79
+commits in `v0.5.10..v0.5.11` and six subsequent commits against Git diffs,
+GitHub release metadata, and checked-in Beads records. Earlier capability
+sections retain their prior research; see [research notes](CHANGELOG_RESEARCH.md).
 
 ## Version Timeline
 
 Recent line (0.5.x — storage-safety and the multi-process corruption program):
 
+Dates in these tables use UTC publication dates for Releases and UTC tag
+creation dates for tags. Earlier sections retain their original dates unless
+explicitly corrected during this audit.
+
 | Version | Date | Kind | Headline |
 |---|---|---|---|
 | [v0.5.11](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.11) | 2026-09-08 | Release | Checkpoints before diagnostic exits; FrankenSQLite 0.3.18 grouped-count fix; migration preflight and typed admission failures; seven-platform DSR release |
 | [v0.5.10](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.10) | 2026-09-04 | Release | Six silent-loss fixes (#466–#477, #487); acceptance checklist edits; `doctor --bundle`; FrankenSQLite 0.3.15; linearizability, model-based, README, and Go-bd proof suites; schema-witness fast open |
-| v0.5.9 | 2026-09-03 | Tag | Tagged, no binaries: the hosted lib shard passed, then the new multi-process stress gate ran its script with relative paths that its own `cd` broke; fixed and re-cut as v0.5.10 |
-| v0.5.8 | 2026-09-03 | Tag | Tagged, no binaries: the first hosted run of the release gates caught a binary unit test broken by the fsqlite 0.3.15 sidecar behavior; fixed and re-cut |
+| [v0.5.9](https://github.com/Dicklesworthstone/beads_rust/tree/v0.5.9) | 2026-09-03 | Tag | Tagged, no binaries: the hosted lib shard passed, then the new multi-process stress gate ran its script with relative paths that its own `cd` broke; fixed and re-cut as v0.5.10 |
+| [v0.5.8](https://github.com/Dicklesworthstone/beads_rust/tree/v0.5.8) | 2026-09-03 | Tag | Tagged, no binaries: the first hosted run of the release gates caught a binary unit test broken by the fsqlite 0.3.15 sidecar behavior; fixed and re-cut |
 | [v0.5.7](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.7) | 2026-08-29 | Release | `doctor health` schema-incompatibility tripwire (#464); FrankenSQLite 0.3.13 reader-slot follow-up |
 | [v0.5.6](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.6) | 2026-08-29 | Release | Review-round correctness/hygiene fixes (agent_context merge, blocked-cache, temp-sidecar leak) |
 | [v0.5.5](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.5) | 2026-08-29 | Release | FrankenSQLite 0.3.12 engine fix (cross-process WAL reader registration) for the page-aliasing corruption |
-| [v0.5.4](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.4) | 2026-08-28 | Release | Sole-opener WAL checkpoint containment; Windows doctor/long-path fixes; #463 query fix |
+| [v0.5.4](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.4) | 2026-08-29 | Release | Sole-opener WAL checkpoint containment; Windows doctor/long-path fixes; #463 query fix |
 | [v0.5.3](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.3) | 2026-08-27 | Release | Storage-correctness follow-up; adopts published FrankenSQLite 0.3.11 schema fixes |
-| v0.5.2 | 2026-08-25 | Release | Stabilization cut on the 0.5 line |
-| v0.5.1 / v0.5.0 | 2026-08-25 | Tag | Rapid 0.5 stabilization tags (no binaries) |
+| [v0.5.2](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.2) | 2026-08-26 | Release | Stabilization cut on the 0.5 line |
+| [v0.5.1](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.1) | 2026-08-25 | Release | Published 0.5 stabilization cut with binaries |
+| [v0.5.0](https://github.com/Dicklesworthstone/beads_rust/tree/v0.5.0) | 2026-08-25 | Tag | Initial 0.5 tag; no published GitHub Release |
 
 Milestone anchors (see the per-version sections below for detail):
 
 | Version | Date | Kind | Milestone |
 |---|---|---|---|
 | [v0.4.1](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.4.1) | 2026-08-24 | Release | Windows recovery wave |
-| [v0.4.0](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.4.0) | 2026-08-22 | Release | 0.4 line |
+| [v0.4.0](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.4.0) | 2026-08-23 | Release | 0.4 line |
 | [v0.3.0](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.3.0) | 2026-08-14 | Release | FrankenSQLite engine generation upgrade (0.1.18 → 0.3.1) |
 | [v0.2.22](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.2.22) | 2026-08-06 | Release | Late 0.2 stabilization |
 | [v0.2.10](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.2.10) | 2026-05-14 | Release | Mid 0.2 line |
-| v0.1.0 | 2026-01-18 | Tag | First tagged cut (inception 2026-01-15) |
+| [v0.1.0](https://github.com/Dicklesworthstone/beads_rust/tree/v0.1.0) | 2026-01-18 | Tag | First tagged cut (inception 2026-01-15) |
 
 ## Representative commits
 
 The commits to inspect first for the current storage-safety program (the
-multi-process page-aliasing corruption and its fallout), newest first. Full
+multi-process page-aliasing corruption and its fallout), recent releases first. Full
 per-version detail is in the sections below.
 
+- [b1dfa462](https://github.com/Dicklesworthstone/beads_rust/commit/b1dfa462), [222dd050](https://github.com/Dicklesworthstone/beads_rust/commit/222dd050) — checkpoint main-owned storage before diagnostic/error exits and remove the grouped-count workaround on FrankenSQLite 0.3.18 (v0.5.11).
+- [f81fdc03](https://github.com/Dicklesworthstone/beads_rust/commit/f81fdc03) — MCP policy enforcement, unambiguous resource URIs, typed initialization receipts, and stronger independent correctness models (v0.5.11).
+- [de4b231b](https://github.com/Dicklesworthstone/beads_rust/commit/de4b231b) — refuse unsupported historical schemas before migration approval and classify write-lock failures by retry safety (v0.5.11).
+- [bbd1e44f](https://github.com/Dicklesworthstone/beads_rust/commit/bbd1e44f), [b6e95891](https://github.com/Dicklesworthstone/beads_rust/commit/b6e95891) — refresh affected blocked-cache components and batch dependent lookups (v0.5.11).
 - [8b504e5c](https://github.com/Dicklesworthstone/beads_rust/commit/8b504e5c) — `br doctor health` reads the schema `user_version` from the database header (engine-free) and reports `db=schema_incompatible` (exit 1) instead of `healthy` on a tracker that refuses every mutation, #464 (v0.5.7).
 - [6a6839f9](https://github.com/Dicklesworthstone/beads_rust/commit/6a6839f9) — `sync_equals` now compares `agent_context`, stopping silent merge data loss (v0.5.6).
 - [e202f67b](https://github.com/Dicklesworthstone/beads_rust/commit/e202f67b) — blocked-cache: upgrade an incremental refresh to a full rebuild when already stale (v0.5.6).
@@ -67,182 +81,229 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
+## After v0.5.11 — distribution follow-up (2026-09-08)
+
+These changes landed after the frozen release source. They update package
+metadata and installation guidance; the seven v0.5.11 binary archives retain
+their original contents.
+
+- Package manifests now carry the published v0.5.11 archive hashes. The
+  [crates.io version record](https://crates.io/api/v1/crates/beads_rust/0.5.11),
+  [Homebrew formula](https://github.com/Dicklesworthstone/homebrew-tap/blob/dbcd7d7f3b532f763f3b52099a000ced06429bfa/Formula/br.rb),
+  and [Scoop manifest](https://github.com/Dicklesworthstone/scoop-bucket/blob/564dda951de3eb1ee20d9745845da38a05aeeec7/br.json)
+  were published and their installation receipts recorded
+  ([7858e054](https://github.com/Dicklesworthstone/beads_rust/commit/7858e054),
+  [b70a288d](https://github.com/Dicklesworthstone/beads_rust/commit/b70a288d),
+  [60613b20](https://github.com/Dicklesworthstone/beads_rust/commit/60613b20)).
+- The repository's Homebrew formula matches the published tap: static musl
+  Linux binaries, required bundled license, and generated shell completions.
+  README installation instructions now include Homebrew, Scoop, and crates.io,
+  with the pinned nightly for Cargo installations. Existing manifest checks
+  also recognize `cargo +toolchain` commands
+  ([b330072c](https://github.com/Dicklesworthstone/beads_rust/commit/b330072c)).
+- The Arch binary recipe disables makepkg's strip/debug processing so it
+  preserves the verified release executable. Native x86-64 package installation
+  passed the 45-step lifecycle test; ARM64 packaging was checked without
+  claiming native Arch ARM64 execution
+  ([38ccff60](https://github.com/Dicklesworthstone/beads_rust/commit/38ccff60)).
+  **AUR publication remains blocked on an authorized account/key.** Preparation
+  and local package tests are not a published AUR entry; the
+  [release workstream](https://github.com/Dicklesworthstone/beads_rust/blob/b330072c/.beads/issues.jsonl#L980)
+  remains open for that venue.
+
 ## v0.5.11 -- 2026-09-08 (Release)
 
 [Release and signed downloads](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.11).
-Built through DSR from `b42de9b9aad92d91c926c40a613b73479962e776`, with GitHub
-Actions disabled. All seven platform binaries passed the 45-step lifecycle
-selftest and the existing size-growth limits; Intel macOS execution used
-Rosetta. Every published archive has a SHA-256 sidecar and a signature from the
-existing br Minisign key. SPDX and CycloneDX SBOMs accompany the release.
+Built through DSR from the frozen
+[b42de9b9 source](https://github.com/Dicklesworthstone/beads_rust/commit/b42de9b9),
+with GitHub Actions disabled. This release covers Linux GNU and static musl on
+x86-64 and ARM64, macOS on Intel and Apple Silicon, and Windows x86-64. All
+seven binaries passed the 45-step lifecycle selftest and existing size-growth
+limits; Intel macOS execution used Rosetta. The 24 assets comprise seven
+archives, their SHA-256 sidecars and existing-key Minisign signatures, aggregate
+checksums, and SPDX/CycloneDX SBOMs. Distributed binaries include self-update;
+MCP remains an optional source-build feature.
 
-- Storage now checkpoints committed changes before diagnostic and error exits,
-  including a partially successful multi-issue close and lint warnings after
-  auto-import. Exit codes and structured error receipts are preserved.
-- Multi-label counts use the engine's grouped query again: FrankenSQLite
-  0.3.18 fixes the grouped/HAVING count regression, and the original regression
-  test now runs without a workaround.
-- Historical migrations preflight dependency keys before modifying the database.
-  A legacy tracker containing multiple dependency types for one issue pair is
-  refused with an explanation; loss-preserving conversion remains pending.
-- Write-lock timeouts report typed, retryable admission failures and respect
-  the remaining wait budget. Sustained ext4 contention can still starve a
-  participant; this release does not claim to resolve that scheduling issue.
-- Status changes refresh the affected blocked-cache component selectively and
-  batch dependent invalidations. Close and update reuse the startup connection.
-- Scheduled issues display the remaining deferral interval. Tracker policy,
-  structured output, initialization receipts, and the documented `BEADS_DB`
-  environment alias now follow their CLI contracts.
+### Storage durability, admission, and import correctness
 
-- Writes to a database on a filesystem that does not persist POSIX permission
-  bits — a Windows drive under WSL (`/mnt/<drive>`) mounted without the
-  `metadata` option, FAT/exFAT — no longer fail with the engine's bare
-  `Database error: unable to open database file: '<db>-fsqlite-ns-gate'`, and
-  a database whose namespace sidecars are group/other-accessible no longer
-  wedges every command (#491, and the #403 wedge that had come back as
-  `Pending sync-merge state is unknown because fsqlite namespace sidecar
-  repair would require mutation before the pending-saga verdict`, exit 6).
-  FrankenSQLite creates `-fsqlite-ns-gate`/`-fsqlite-ns-use` with
-  `open(O_CREAT|O_EXCL, 0600)` and then refuses them when `fstat` reports
-  any group/other bit; such a mount reports its fixed mask (0777) for every
-  file and ignores every chmod, so the first write open created the gate
-  and failed on it, while `count` on a sidecar-less snapshot never touched
-  the gate (sidecar-less read-only admission) and worked. Now: the
-  authority-gated owner-only mode repair runs before the pending-saga
-  verdict (it changes no byte of any family member, and without it no
-  verdict is reachable), so a merely loosened sidecar heals and the command
-  proceeds on a POSIX filesystem; a chmod the filesystem accepts but ignores,
-  or refuses for the owner, is classified as the filesystem limitation and
-  refused up front with the mount, the `metadata` remedy, and the
-  keep-it-on-the-Linux-filesystem alternative (exit 7, `CONFIG_ERROR`); an
-  engine `CannotOpen` that names a sidecar is explained after the fact by its
-  actual cause (mount mask on a sidecar the engine just created, pre-existing
-  loose mode, foreign owner, extra hard links) instead of reading as database
-  corruption; `br doctor` names the mount limitation when the database carries
-  the same mask and its `--repair` chmod verifies that the mode actually
-  changed; and the reviewed additive reconcile path repairs sidecar modes
-  under its authority before its non-repairing open. Reads are unchanged.
-  Writing on such a mount also needs the engine change in FrankenSQLite
-  0.3.18 (namespace sidecars accept a mount-imposed mask: a sidecar this
-  process just created is accepted whatever mode the mount reports back, and
-  an existing sidecar is accepted when it grants no group/other bit the
-  database file does not already grant to the same principals); br's own
-  sidecar checks mirror that rule (a group/other exposure bounded by the
-  database file's, per principal class and GID) and switch on automatically
-  once the locked `fsqlite` in `Cargo.lock` is 0.3.18 or newer, with a parity
-  test that opens such a family through the linked engine so the two cannot
-  drift. The pins are now `fsqlite` 0.3.18 (from 0.3.16), so a build of this
-  version writes on such a mount out of the box; verified on a FAT image
-  mounted with a 0777 mask (first write, second write, read).
-- Engine: FrankenSQLite 0.3.16 -> 0.3.18. Besides the sidecar admission rule
-  above: `WHERE <rowid> IN (?, ?, …)` on an INTEGER PRIMARY KEY table plans
-  as rowid seeks instead of a full scan; leaving WAL mode after a checkpoint
-  no longer leaves stale-snapshot errors behind; prepared reads that
-  recompile after a schema change release the failed attempt's read
-  transaction. No on-disk format change: a database written by released br
-  0.5.10 (fsqlite 0.3.15) opens with no first-open migration.
-- Exit-code note: a `Configuration error` raised inside the startup
-  pending-sync-merge gate (a sidecar the filesystem cannot repair, or a
-  database whose schema version is newer than this binary supports) now
-  surfaces as itself — `CONFIG_ERROR`, exit 7 — instead of being wrapped in
-  a `Sync conflict: Refusing storage open because pending sync-merge state
-  could not be inspected ...` (exit 6). Both map to the categories in the
-  documented exit-code table; only the future-schema case changes code.
+- Startup, auto-import, and command errors return through the scope that owns
+  storage, allowing teardown checkpoints before exit. This also covers a
+  partially successful multi-issue close and lint warnings after auto-import;
+  their error receipts and diagnostic statuses remain intact
+  ([222dd050](https://github.com/Dicklesworthstone/beads_rust/commit/222dd050),
+  [b1dfa462](https://github.com/Dicklesworthstone/beads_rust/commit/b1dfa462)).
+- When several JSONL records collapse onto one issue during import, semantic
+  verification checks the last record applied. Superseded records no longer
+  cause a valid import to roll back
+  ([cb92e944](https://github.com/Dicklesworthstone/beads_rust/commit/cb92e944)).
+- Historical migration planning checks core-table declarations, constraints,
+  and operator indexes before issuing a migration token. Unsupported layouts,
+  including dependency keys permitting several types for one issue pair,
+  receive an explicit refusal before candidate migration
+  ([de4b231b](https://github.com/Dicklesworthstone/beads_rust/commit/de4b231b)).
+- Write-lock timeouts now report `DATABASE_LOCKED` with lock role, remaining
+  timeout, and retry guidance. Workspace admission is retryable because it
+  precedes the mutation; later authority failures require inspecting the
+  operation state. Committed-write recovery guidance takes precedence over
+  retry advice ([de4b231b](https://github.com/Dicklesworthstone/beads_rust/commit/de4b231b)).
 
-- Workflow maintenance before the switch to DSR: every workflow pins the manifest's toolchain
-  (`nightly-2026-08-31`) instead of floating `nightly` (release.yml still
-  said 2026-08-25 after the manifest moved), the audit gate installs
-  `cargo-insta` as a prebuilt binary (source builds failed on a newer
-  nightly's `rustix`), the runtime index diagnostics are rustfmt-clean
-  (the formatting check had failed on every push since they landed), and
-  the CI concurrency group is keyed by event so the six-hourly scheduled
-  run no longer cancels a push run's shards mid-flight, and the Quick E2E
-  job's timeout covers a cold compile (it was cancelled at 9:57 of 10).
-  The `misc` shard's golden `init` file-set tests now treat the sole-opener
-  lease file (`.br-db-openers-<hash>.lock`, #457) as engine state like the
-  WAL sidecars; they had been red since that lease landed on 2026-08-28.
-  The audit gate's snapshot-freshness step runs only the four insta-using
-  targets instead of `--workspace` (162 binaries from cold overran the job).
-  The Quick E2E harness (`scripts/e2e.sh`) compiles its six test binaries
-  before the per-test 180 s timeout starts; a cold release compile inside
-  that budget had been reported as the first test's failure without the
-  test ever running. The job also runs the harness in the dev profile
-  (`E2E_PROFILE=dev`; release stays the local default): linking six test
-  binaries with the release profile's fat LTO killed the hosted runner
-  ("runner has received a shutdown signal") on two consecutive runs before
-  any test ran. The audit gate's suspect-close-reason script matches
-  the same literal hedge phrases as the doctor rule it mirrors
-  (`audit.suspect_close_reasons`); its greedy `forced.*close.*cycle` regex
-  flagged the audit's own policy bead (30ci) for naming
-  `forced_cycle_close_audit.sh` in its close reason, so the job had failed
-  on every hosted run. The sync-safety filesystem witness
-  (`sync_safety_witness.sh`) accepts the digest-named write-authority locks
-  (`.br-db-write-<hash>.lock`, `.br-jsonl-write-<hash>.lock`) that `br sync`
-  has created since the July write-authority work, matching the Rust
-  allowlist in `e2e_sync_git_safety.rs` it mirrors; it had flagged them as
-  out-of-allowlist writes. The witness also pins `LC_ALL=C` so its
-  `sort`/`comm` file diff cannot abort on locale collation of the
-  digest-named files.
+### FrankenSQLite and filesystem permissions
 
-- `br upgrade --version 0.5.10` no longer 404s: a bare version is looked up
-  as the `v`-prefixed release tag GitHub actually carries (found while
-  installing v0.5.10 through the shipped 0.5.7 binary; the no-version path
-  was unaffected).
-- Measured on the same host with the same loops as before the schema-witness
-  fast open (20 sequential operations each, installed release binaries):
-  `create` 144 → 112 ms, `update --priority` 238 → 188 ms, `show --json`
-  53 → 45 ms per operation from v0.5.7 to v0.5.10 (bead naul5).
-- Dependencies (`/library-updater`, one at a time, each gated on RCH; see
-  `UPGRADE_LOG.md`): the FrankenSQLite family 0.3.15 → 0.3.16 (page-allocator
-  EOF-growth double-grant closed under the reserved append lock, bd-9inpb;
-  WAL appended-tail reads no longer rescan the whole WAL per page on
-  writable open and checkpoint, GH#382; FTS5 work br does not use;
-  frankensqlite#407 was fixed after the 0.3.16 tag and is now covered by
-  the 0.3.18 upgrade described above), fastmcp-rust
-  =0.7.1 → =0.8.1 (caller-owned runtime contexts, which `br serve` already
-  provided; `log` 0.4.34 by its pin), toon_rust/`tru` 0.2.3 → 0.2.4. Held:
-  asupersync =0.4.9 and toml =1.1.4, both exact pins of fastmcp 0.8.1.
-- `br update` and `br close` reuse the connection `main` already opened at
-  startup for the auto-import probe and the auto-flush instead of opening a
-  second one for the write (the remaining fixed cost measured on the update
-  path, bead naul5). The connection goes back to `main` after the write so
-  the auto-flush still runs through the connection that performed it; a
-  pre-opened connection for a different workspace is left alone, and routed
-  external batches keep opening their own. `br create` already worked this
-  way.
-- Import no longer rolls back with `Import semantic verification failed ...
-  (differing fields: content_hash, created_at, external_ref, title,
-  updated_at)` when two records of one JSONL file collapse onto the same
-  issue (an external-ref collision remapped onto an existing id, then an
-  explicit record for that id). The verifier added on 2026-08-27 compared
-  the persisted row against every record applied to the issue, including
-  the superseded first one; it now checks the last record applied. The
-  `misc` CI shard's `jsonl_import_export` binary had been red on this since
-  that verifier landed (bead 72j0i).
-- The model-based storage property test (`tests/model_based_storage.rs`)
-  predicts dependency cycles the way the storage detects them: parent-child
-  edges run parent → child in the blocker graph and `related` edges are
-  never cycle-checked. Its reference model walked every edge as
-  issue → dependency, so a `blocks` chain plus a reversed parent-child edge
-  (a real deadlock the storage refuses) made the test expect success; the
-  hosted `misc` shard hit that case once the import verifier fix let the
-  binary run. A deterministic regression case covers both orientations and
-  the non-blocking edge.
-- The multi-process linearizability check (`tests/linearizability_multiprocess.rs`)
-  ends its workload with a quiescent read pass (one `show --json` per issue,
-  appended to the history) so a linearization has to end in the state the
-  database actually reached. Two overlapping writes on one issue with no
-  later read admit two valid end states, and the check compared the
-  published JSONL against whichever the search found first; on the hosted
-  `misc` shard (run 33881198051) that produced a false "published JSONL
-  diverges from the linearized final state" for one issue's priority.
-- `tests/e2e_upgrade.rs`'s pinned-version dry run accepts a reported lookup
-  failure (non-zero exit with a message) as well as the named target
-  version. It required the output to contain the version, `NetworkError`,
-  or a lowercase `error`, and the unauthenticated GitHub API rate limit
-  hosted runners hit yields `Error: Upgrade failed: ...`, none of those; the
-  e2e m–z shard failed on it in the same run. The parse-acceptance check
-  stays, and the failure message now carries the outputs.
+- The engine family moves from released v0.5.10's **0.3.15 to 0.3.18**, via
+  0.3.16. Multi-label AND counts use the grouped/HAVING query directly again:
+  all four original regression variants pass. The workaround is removed and
+  the original probe runs in the normal suite
+  ([b1dfa462](https://github.com/Dicklesworthstone/beads_rust/commit/b1dfa462)).
+- Namespace-sidecar checks now match the engine's mount-mask rule, enabling
+  writes on affected WSL/FAT-style filesystems. A newly created sidecar can
+  retain the mount-imposed mask; an existing sidecar's group/other exposure
+  must be bounded by its database's exposure to those principals. A FAT image
+  with a 0777 mask passed first-write, second-write, and read verification.
+  Repairable POSIX sidecar permissions heal under write authority before
+  pending-merge inspection; unresolved ownership, link, and permission
+  failures receive specific diagnostics. Doctor verifies that a repair
+  actually changed permissions
+  ([dac8ea99](https://github.com/Dicklesworthstone/beads_rust/commit/dac8ea99),
+  [0a12d6a0](https://github.com/Dicklesworthstone/beads_rust/commit/0a12d6a0),
+  [bee3df3e](https://github.com/Dicklesworthstone/beads_rust/commit/bee3df3e);
+  [#491](https://github.com/Dicklesworthstone/beads_rust/issues/491),
+  [#403](https://github.com/Dicklesworthstone/beads_rust/issues/403)).
+- The engine upgrades also carry the page-allocation EOF-growth fix, bounded
+  WAL-tail lookup cost, rowid `IN` seeks, and WAL-mode/schema-recompile read
+  fixes. Ordinary databases written by released v0.5.10 need no format
+  migration ([5e81e796](https://github.com/Dicklesworthstone/beads_rust/commit/5e81e796),
+  [bee3df3e](https://github.com/Dicklesworthstone/beads_rust/commit/bee3df3e);
+  [engine operating model](docs/reliability/ENGINE_OPERATING_MODEL.md)).
+- Configuration errors discovered by the startup pending-merge gate now retain
+  `CONFIG_ERROR` / exit 7, including a newer unsupported schema, instead of
+  being wrapped as `SYNC_CONFLICT` / exit 6. Runtime index diagnostics expose
+  the failing index-contract checks to operator tooling
+  ([dac8ea99](https://github.com/Dicklesworthstone/beads_rust/commit/dac8ea99),
+  [48636625](https://github.com/Dicklesworthstone/beads_rust/commit/48636625)).
+
+### Agent-facing CLI and MCP contracts
+
+- MCP reads use current workflow policy, and mutations reload policy under
+  write authority so capacity, transition, and close gates agree with the CLI.
+  Partial outcomes and JSONL publication failures retain committed-write and
+  retry information. Individual issue resources move to `beads://issue/{id}`,
+  making fixed resources such as `beads://issues/ready` reachable
+  ([f81fdc03](https://github.com/Dicklesworthstone/beads_rust/commit/f81fdc03)).
+- `br init --json` and `--format toon` emit a typed receipt with resolved
+  workspace/database paths, stored prefix, and created/existing/updated file
+  outcomes. Schema and capability discovery expose `InitResult`; schema help
+  correctly identifies stdout as the structured-error stream and supports
+  multi-ID `show` arrays
+  ([f81fdc03](https://github.com/Dicklesworthstone/beads_rust/commit/f81fdc03),
+  [4957808c](https://github.com/Dicklesworthstone/beads_rust/commit/4957808c)).
+- Text `show` displays the remaining deferral interval, including partial days.
+  The countdown describes the time gate; dependencies and other readiness
+  conditions still apply
+  ([e824f4dc](https://github.com/Dicklesworthstone/beads_rust/commit/e824f4dc),
+  [e5e86232](https://github.com/Dicklesworthstone/beads_rust/commit/e5e86232);
+  [#489](https://github.com/Dicklesworthstone/beads_rust/issues/489)).
+- The documented `BEADS_DB` alias now selects the database (after `BD_DB` and
+  `BD_DATABASE` in environment precedence). `br upgrade --version 0.5.10`
+  resolves the `v0.5.10` release tag instead of returning a 404
+  ([829a8357](https://github.com/Dicklesworthstone/beads_rust/commit/829a8357),
+  [29a79f9d](https://github.com/Dicklesworthstone/beads_rust/commit/29a79f9d)).
+- Optional fastmcp-rust moves from 0.7.1 to 0.8.1 and toon_rust from 0.2.3 to
+  0.2.4; asupersync 0.4.9 and toml 1.1.4 remain held by exact dependency pins
+  ([5e81e796](https://github.com/Dicklesworthstone/beads_rust/commit/5e81e796)).
+
+### Less repeated work on mutation paths
+
+- `update` and `close` reuse the startup connection through mutation and
+  auto-flush. Routed external batches retain their own workspace connections
+  ([cb92e944](https://github.com/Dicklesworthstone/beads_rust/commit/cb92e944),
+  [dbcf1ebe](https://github.com/Dicklesworthstone/beads_rust/commit/dbcf1ebe)).
+- Status changes refresh affected blocked-cache components within the write
+  transaction, with a full-rebuild fallback when necessary. Atomic batches
+  collect dependent IDs in bounded queries, avoiding a query per changed issue
+  ([bbd1e44f](https://github.com/Dicklesworthstone/beads_rust/commit/bbd1e44f),
+  [b6e95891](https://github.com/Dicklesworthstone/beads_rust/commit/b6e95891)).
+
+**Known remaining work:** loss-preserving conversion of unsupported historical
+dependency layouts ([yyhki](https://github.com/Dicklesworthstone/beads_rust/blob/b330072c/.beads/issues.jsonl#L1045)),
+starvation under sustained ext4 contention ([46zqi](https://github.com/Dicklesworthstone/beads_rust/blob/b330072c/.beads/issues.jsonl#L265)),
+and matched release latency calibration ([zxfz.1](https://github.com/Dicklesworthstone/beads_rust/blob/b330072c/.beads/issues.jsonl#L1063))
+remain open. The connection/cache changes do not establish a general v0.5.11
+speedup; fixture-specific slowdowns are retained in the performance workstream.
+
+### Verification and release tooling
+
+- Independent storage models now cover readiness, typed dependencies, and
+  rejection invariants; coupled histories exercise shared capacity and
+  dependency graphs. Hand-checked negative traces test the oracles themselves
+  ([f81fdc03](https://github.com/Dicklesworthstone/beads_rust/commit/f81fdc03)).
+  The model's parent-child orientation was corrected, and linearizability
+  histories end with quiescent reads so final JSONL comparison cannot select
+  the wrong otherwise-valid end state
+  ([b9b58dbe](https://github.com/Dicklesworthstone/beads_rust/commit/b9b58dbe),
+  [9bad2299](https://github.com/Dicklesworthstone/beads_rust/commit/9bad2299)).
+- Failed Go/Rust conformance commands retain argv, status, stdout/stderr, and
+  workspaces; missing or malformed JSONL refuses comparison. Failed concurrent
+  workloads retain histories and tested-binary identities and can replay an
+  explicit `BR_BINARY`. JSON/TOON tests parse complete output and check real
+  initialization receipts and persisted files
+  ([305687e1](https://github.com/Dicklesworthstone/beads_rust/commit/305687e1),
+  [51521b96](https://github.com/Dicklesworthstone/beads_rust/commit/51521b96),
+  [3828b602](https://github.com/Dicklesworthstone/beads_rust/commit/3828b602)).
+- Benchmark tooling records matched baseline/candidate release measurements,
+  actual sampling blocks, and host boot identity. Conditional block-based
+  median/p95 bounds distinguish pass, regression, and inconclusive evidence;
+  insufficient or mismatched receipts do not pass. Workload selection and
+  sharded collection preserve measurement identity. Prospective latency
+  calibration and live slowdown sensitivity remain unfinished
+  ([658b62ee](https://github.com/Dicklesworthstone/beads_rust/commit/658b62ee),
+  [0347b90b](https://github.com/Dicklesworthstone/beads_rust/commit/0347b90b),
+  [2298d899](https://github.com/Dicklesworthstone/beads_rust/commit/2298d899);
+  [azxef.10](https://github.com/Dicklesworthstone/beads_rust/blob/b330072c/.beads/issues.jsonl#L483)).
+- Historical workflow maintenance pinned `nightly-2026-08-31`, separated
+  scheduled/push concurrency, scoped snapshot checks to their four targets,
+  precompiled E2E executables before test timeouts, and updated immutable
+  action-pin inventories. Audit scripts now recognize legitimate authority
+  locks and use the doctor's literal suspect-close phrases
+  ([f25efeff](https://github.com/Dicklesworthstone/beads_rust/commit/f25efeff),
+  [2d8232c5](https://github.com/Dicklesworthstone/beads_rust/commit/2d8232c5),
+  [20014205](https://github.com/Dicklesworthstone/beads_rust/commit/20014205),
+  [cb92e944](https://github.com/Dicklesworthstone/beads_rust/commit/cb92e944),
+  [b9b58dbe](https://github.com/Dicklesworthstone/beads_rust/commit/b9b58dbe),
+  [c1525c80](https://github.com/Dicklesworthstone/beads_rust/commit/c1525c80)).
+  These are landed tooling changes; the v0.5.11 release itself used DSR with
+  GitHub Actions disabled.
+- Coverage limits remain explicit: old history fixtures below the supported
+  migration floor are skipped; upgrade dry runs may accept a reported remote
+  lookup failure; long-running README server examples are excluded. Golden
+  init tests recognize opener-lease files, and isolated compaction tests avoid
+  inherited leases from parallel test processes
+  ([65b44361](https://github.com/Dicklesworthstone/beads_rust/commit/65b44361),
+  [9bad2299](https://github.com/Dicklesworthstone/beads_rust/commit/9bad2299),
+  [761e782c](https://github.com/Dicklesworthstone/beads_rust/commit/761e782c),
+  [e1b8ace0](https://github.com/Dicklesworthstone/beads_rust/commit/e1b8ace0),
+  [b1dfa462](https://github.com/Dicklesworthstone/beads_rust/commit/b1dfa462)).
+
+The recorded integration campaign completed all 149 non-benchmark targets
+without failures, plus 3,075 all-feature library tests (9 existing ignores),
+67 binary tests, and 2,983 no-default-feature library tests (2 existing
+ignores). Strict RCH compiler/Clippy checks, real CLI WAL inspection, and
+retained-family stress supplemented those results. Counts include shared
+helpers and environment-dependent early returns; this is not a fresh complete
+Go/bv parity certification. The
+[05rjp record](https://github.com/Dicklesworthstone/beads_rust/blob/b330072c/.beads/issues.jsonl#L2)
+identifies tested sources, individual target coverage, skips, and retained
+failures rather than treating all test-process successes as executed coverage.
+
+### Completed workstreams
+
+| Workstream | Delivered capability |
+|---|---|
+| [05rjp](https://github.com/Dicklesworthstone/beads_rust/blob/b330072c/.beads/issues.jsonl#L2), [ro3m](https://github.com/Dicklesworthstone/beads_rust/blob/b330072c/.beads/issues.jsonl#L859) | Error-exit checkpoint integration and removal of the grouped-count workaround |
+| [72j0i](https://github.com/Dicklesworthstone/beads_rust/blob/b330072c/.beads/issues.jsonl#L332), [5cxmj](https://github.com/Dicklesworthstone/beads_rust/blob/b330072c/.beads/issues.jsonl#L298) | Last-applied-record import verification and pinned-version upgrades |
+| [azxef.1](https://github.com/Dicklesworthstone/beads_rust/blob/b330072c/.beads/issues.jsonl#L482), [azxef.12](https://github.com/Dicklesworthstone/beads_rust/blob/b330072c/.beads/issues.jsonl#L485) | MCP policy parity and reachable fixed resources |
+| [azxef.2](https://github.com/Dicklesworthstone/beads_rust/blob/b330072c/.beads/issues.jsonl#L489), [azxef.14](https://github.com/Dicklesworthstone/beads_rust/blob/b330072c/.beads/issues.jsonl#L487) | Typed initialization and accurate schema/error documentation |
+| [naul5](https://github.com/Dicklesworthstone/beads_rust/blob/b330072c/.beads/issues.jsonl#L772) | Connection reuse and selective cache maintenance, with measured limitations retained |
+| [azxef.5](https://github.com/Dicklesworthstone/beads_rust/blob/b330072c/.beads/issues.jsonl#L492), [azxef.8](https://github.com/Dicklesworthstone/beads_rust/blob/b330072c/.beads/issues.jsonl#L495), [azxef.13](https://github.com/Dicklesworthstone/beads_rust/blob/b330072c/.beads/issues.jsonl#L486) | Independent state/history models and preserved conformance failures |
 
 ## v0.5.10 -- 2026-09-04 (Release)
 
@@ -275,6 +336,11 @@ handed as a relative path. Both were fixed and the release re-cut.
   linearizability workload on the same worker class: 334 operations in 30 s
   after the change versus 224–235 before (bead naul5 carries the per-step
   profile of a mutation).
+- A subsequent same-host observation of installed v0.5.7 and v0.5.10 binaries
+  used 20 sequential operations per command: `create` 144 → 112 ms,
+  `update --priority` 238 → 188 ms, and `show --json` 53 → 45 ms. These are
+  revision-scoped observations, not calibrated v0.5.11 performance budgets
+  ([088f5b53](https://github.com/Dicklesworthstone/beads_rust/commit/088f5b53)).
 
 ### Silent-loss fixes (#466, #467, #471, #473, #474, #475, #476, #477)
 
@@ -621,7 +687,7 @@ containment from v0.5.4 stays in place as defense in depth.
 - br's sole-opener checkpoint containment (v0.5.4) is retained as defense in
   depth; the two protections are independent.
 
-## v0.5.4 -- 2026-08-28 (Release)
+## v0.5.4 -- 2026-08-29 (Release)
 
 Storage-safety and Windows follow-up. Real migrated workspaces exposed
 FrankenSQLite 0.3.11 page-aliasing corruption under short-lived multi-process
@@ -737,7 +803,7 @@ fail-closed exits.
 
 ---
 
-## v0.5.2 -- 2026-08-25 (Release)
+## v0.5.2 -- 2026-08-26 (Release)
 
 Cross-platform correctness release driven by a full GitHub-issue triage pass.
 Windows sync and schema migration are structurally repaired, stale engine
@@ -825,7 +891,7 @@ and search stops hiding the fact that it hid something.
 
 ---
 
-## v0.5.1 -- 2026-08-25 (Tag)
+## v0.5.1 -- 2026-08-25 (Release)
 
 Safety-focused storage and recovery release, with a retained profile-driven
 speedup for structured `ready` output. The user-facing changes are deliberately
@@ -1033,7 +1099,7 @@ migrated workspaces on every platform.
   (GitHub #309,
   [0064a5dd](https://github.com/Dicklesworthstone/beads_rust/commit/0064a5dd)).
 
-## v0.4.0 -- 2026-08-22 (Release)
+## v0.4.0 -- 2026-08-23 (Release)
 
 Restricted-filesystem robustness wave plus one CLI capability. The headline
 fixes make `br` behave correctly where the filesystem is not a friendly
