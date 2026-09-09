@@ -46,7 +46,7 @@
 
 use crate::error::{BeadsError, Result};
 use sha2::{Digest, Sha256};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 #[cfg(not(any(unix, windows)))]
@@ -1189,6 +1189,130 @@ fn validate_pinned_jsonl_leaf(leaf: &OsStr) -> Result<()> {
 }
 
 impl PinnedJsonlName {
+    /// Creates an optional directory relative to the retained parent. The
+    /// caller must pin the resulting directory before opening any children.
+    pub(super) fn create_directory_if_absent(&self) -> Result<()> {
+        self.parent.verify_route()?;
+        #[cfg(unix)]
+        let result = rustix::fs::mkdirat(self.parent.as_file(), &self.leaf, rustix::fs::Mode::RWXU)
+            .map_err(std::io::Error::from);
+        #[cfg(windows)]
+        let result = cap_primitives::fs::create_dir(
+            self.parent.as_file(),
+            Path::new(&self.leaf),
+            &cap_primitives::fs::DirOptions::new(),
+        );
+        #[cfg(not(any(unix, windows)))]
+        let result = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "pinned directories are unavailable on this platform",
+        ));
+        match result {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.parent.verify_route()
+    }
+
+    /// Enumerates names through the retained directory, never its mutable path.
+    pub(super) fn sibling_names(&self) -> Result<Vec<OsString>> {
+        self.parent.verify_route()?;
+        #[cfg(unix)]
+        let names = {
+            use std::os::unix::ffi::OsStrExt;
+
+            rustix::fs::Dir::read_from(self.parent.as_file())
+                .map_err(|error| BeadsError::Io(error.into()))?
+                .map(|entry| {
+                    entry
+                        .map(|entry| OsStr::from_bytes(entry.file_name().to_bytes()).to_os_string())
+                        .map_err(|error| BeadsError::Io(error.into()))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        #[cfg(windows)]
+        let names = cap_primitives::fs::read_dir(self.parent.as_file(), Path::new("."))?
+            .map(|entry| entry.map(|entry| entry.file_name()).map_err(BeadsError::Io))
+            .collect::<Result<Vec<_>>>()?;
+        #[cfg(not(any(unix, windows)))]
+        let names = Vec::new();
+        self.parent.verify_route()?;
+        Ok(names)
+    }
+
+    /// Opens a lock probe without following a leaf symlink. Windows probes
+    /// share deletion so a waiter's delete-on-close handle can remain live.
+    pub(super) fn open_optional_lock_registration(&self) -> Result<Option<OpenedJsonlSource>> {
+        #[cfg(unix)]
+        let opened = match self.open_relative_regular_once()? {
+            Some(file) => {
+                let identity =
+                    jsonl_file_identity(&regular_jsonl_fd_metadata(&file, &self.display_path)?);
+                Some(OpenedJsonlSource { file, identity })
+            }
+            None => None,
+        };
+        #[cfg(windows)]
+        let opened = {
+            let share_mode = Self::FILE_SHARE_READ | Self::FILE_SHARE_WRITE | 0x0000_0004;
+            match self.open_relative_regular_once_with_share_mode(share_mode)? {
+                Some(file) => {
+                    let identity = windows_jsonl_file_identity(&file, &self.display_path)?;
+                    Some(OpenedJsonlSource { file, identity })
+                }
+                None => None,
+            }
+        };
+        #[cfg(not(any(unix, windows)))]
+        let opened = None;
+        Ok(opened)
+    }
+
+    /// Allocates a new waiter through the pinned directory. Windows ties
+    /// cleanup to this handle, rather than deleting a potentially replaced path.
+    pub(super) fn create_lock_registration_if_absent(&self) -> Result<Option<OpenedJsonlSource>> {
+        self.parent.verify_route()?;
+        #[cfg(unix)]
+        let opened = match self.create_new_regular_if_absent()? {
+            Some(file) => {
+                let identity =
+                    jsonl_file_identity(&regular_jsonl_fd_metadata(&file, &self.display_path)?);
+                Some(OpenedJsonlSource { file, identity })
+            }
+            None => None,
+        };
+        #[cfg(windows)]
+        let opened = {
+            use cap_primitives::fs::{FollowSymlinks, OpenOptions, OpenOptionsExt, open};
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_DELETE_ON_CLOSE, FILE_SHARE_DELETE,
+            };
+
+            let share_mode = Self::FILE_SHARE_READ | Self::FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            options._cap_fs_ext_follow(FollowSymlinks::No);
+            options
+                .share_mode(share_mode)
+                .custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
+            match open(self.parent.as_file(), Path::new(&self.leaf), &options) {
+                Ok(file) => {
+                    regular_jsonl_fd_metadata(&file, &self.display_path)?;
+                    let identity = windows_jsonl_file_identity(&file, &self.display_path)?;
+                    self.verify_relative_identity_with_share_mode(identity, share_mode)?;
+                    Some(OpenedJsonlSource { file, identity })
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        #[cfg(not(any(unix, windows)))]
+        let opened = None;
+        self.parent.verify_route()?;
+        Ok(opened)
+    }
+
     /// Returns the retained parent-directory capability.
     #[must_use]
     pub(crate) fn parent(&self) -> &PinnedJsonlParent {

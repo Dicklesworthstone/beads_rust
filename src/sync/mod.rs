@@ -96,6 +96,7 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_WRITE_LOCK_TIMEOUT_MS: u64 = 30_000;
 const WRITE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const WRITE_WAITER_DIRECTORY: &str = ".write-waiters.lock";
 const EXPORT_ISSUE_BATCH_SIZE: usize = 1024;
 const EXPORT_FULL_SCAN_ISSUE_THRESHOLD: usize = 20_000;
 const EXPORT_PARALLEL_PREPARE_MIN_ISSUES: usize = 256;
@@ -245,8 +246,8 @@ fn verify_expected_jsonl_source_state_observed(
 ///
 /// This serializes all mutating operations across processes, preventing
 /// concurrent-write deadlocks in the underlying SQLite engine. Uses a fast-path
-/// `try_lock()` for the uncontended case, then polls with a bounded timeout for
-/// contended locks. The lock is held until the returned `File` drops.
+/// `try_lock()` for the uncontended case, then orders registered waiters before
+/// polling with a bounded timeout. The lock is held until the returned `File` drops.
 #[allow(clippy::incompatible_msrv)]
 pub fn blocking_write_lock(beads_dir: &Path) -> Result<File> {
     blocking_write_lock_with_timeout(beads_dir, None)
@@ -1730,6 +1731,191 @@ pub fn blocking_database_family_write_lock_with_timeout(
     })
 }
 
+/// A locked registration advertises a live workspace waiter. The actual write
+/// authority remains `.write.lock`; registrations only determine who retries it.
+struct WorkspaceWriteWaiter {
+    opened: path::OpenedJsonlSource,
+    name: PinnedJsonlName,
+    order: (u64, String),
+}
+
+impl WorkspaceWriteWaiter {
+    #[cfg(test)]
+    fn join(queue: &Path) -> Result<Self> {
+        Self::join_until(
+            queue,
+            Instant::now(),
+            DEFAULT_WRITE_LOCK_TIMEOUT_MS,
+            LockRetrySafety::BeforeMutation,
+        )
+    }
+
+    fn join_until(
+        queue: &Path,
+        start: Instant,
+        timeout_ms: u64,
+        retry_safety: LockRetrySafety,
+    ) -> Result<Self> {
+        use std::hash::BuildHasher;
+
+        let parent_anchor = pin_jsonl_target(&queue.with_file_name(".waiter-parent-anchor"))?;
+        parent_anchor
+            .with_sibling_path(queue)?
+            .create_directory_if_absent()?;
+        let anchor = pin_jsonl_target(&queue.join(".waiter-anchor"))?;
+        let sequence = live_pinned_workspace_waiters(&anchor)?
+            .iter()
+            .map(|(sequence, _)| *sequence)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| workspace_waiter_error(queue, "waiter sequence exhausted"))?;
+        for attempt in 0..MAX_JSONL_TEMP_PATH_ATTEMPTS {
+            let nonce = RandomState::new().hash_one((sequence, attempt));
+            let leaf = format!("{sequence:020}-{nonce:016x}.waiter");
+            let name = anchor.with_leaf(leaf.as_ref())?;
+            let Some(opened) = name.create_lock_registration_if_absent()? else {
+                continue;
+            };
+            // Registration becomes live at lock acquisition. Observers never
+            // delete unlocked entries, including one still being registered.
+            let waiter = Self {
+                opened,
+                name,
+                order: (sequence, leaf),
+            };
+            loop {
+                if start.elapsed() >= Duration::from_millis(timeout_ms) {
+                    return Err(write_lock_timeout_error(
+                        &queue.with_file_name(".write.lock").display().to_string(),
+                        "workspace write lock",
+                        timeout_ms,
+                        retry_safety,
+                    ));
+                }
+                match try_lock_exclusive(
+                    waiter.opened.as_file(),
+                    ExclusiveLockMechanism::LockSidecar,
+                ) {
+                    Ok(()) => break,
+                    // A scanner can briefly probe our not-yet-locked file.
+                    // Registration shares the original deadline, never an
+                    // unbounded blocking lock or a fresh timeout budget.
+                    Err(TryLockError::WouldBlock) => thread::sleep(
+                        Duration::from_millis(timeout_ms)
+                            .saturating_sub(start.elapsed())
+                            .min(WRITE_LOCK_POLL_INTERVAL),
+                    ),
+                    Err(TryLockError::Error(error)) => {
+                        return Err(workspace_waiter_error(queue, &error));
+                    }
+                }
+            }
+            waiter.verify_identity()?;
+            return Ok(waiter);
+        }
+        Err(workspace_waiter_error(
+            queue,
+            "waiter name allocation exhausted",
+        ))
+    }
+
+    fn verify_identity(&self) -> Result<()> {
+        self.name.parent().verify_route()?;
+        let observed = self.name.open_optional_lock_registration()?;
+        if !observed.is_some_and(|opened| opened.identity() == self.opened.identity()) {
+            return Err(workspace_waiter_error(
+                self.name.display_path(),
+                "waiter registration changed or disappeared",
+            ));
+        }
+        Ok(())
+    }
+
+    fn is_first(&self) -> Result<bool> {
+        self.verify_identity()?;
+        Ok(live_pinned_workspace_waiters(&self.name)?
+            .iter()
+            .min()
+            .is_some_and(|order| *order == self.order))
+    }
+}
+
+impl Drop for WorkspaceWriteWaiter {
+    fn drop(&mut self) {
+        // Keep the liveness lock through exact, handle-relative cleanup. A
+        // replaced route or leaf is preserved. Windows closes the allocating
+        // delete-on-close handle instead of deleting by a mutable path.
+        #[cfg(unix)]
+        if let Err(error) = self.name.remove_regular_if_identity(self.opened.identity()) {
+            tracing::debug!(%error, "workspace waiter retained after cleanup refusal");
+        }
+    }
+}
+
+fn workspace_waiter_error(path: &Path, error: impl std::fmt::Display) -> BeadsError {
+    BeadsError::Config(format!(
+        "Workspace write waiter queue {}: {error}",
+        path.display()
+    ))
+}
+
+fn live_workspace_waiters(queue: &Path) -> Result<Vec<(u64, String)>> {
+    match fs::symlink_metadata(queue) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(workspace_waiter_error(
+                queue,
+                "expected a directory, not a symlink or special file",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(workspace_waiter_error(queue, &error)),
+    }
+    let anchor = pin_jsonl_target(&queue.join(".waiter-anchor"))?;
+    live_pinned_workspace_waiters(&anchor)
+}
+
+fn live_pinned_workspace_waiters(anchor: &PinnedJsonlName) -> Result<Vec<(u64, String)>> {
+    let queue = anchor.parent().canonical_path();
+    let mut live = Vec::new();
+    for name in anchor.sibling_names()? {
+        let name = name
+            .to_str()
+            .ok_or_else(|| workspace_waiter_error(queue, "non-UTF-8 waiter name"))?;
+        if matches!(name, "." | "..") {
+            continue;
+        }
+        let order = name.strip_suffix(".waiter").and_then(|stem| {
+            let (sequence, nonce) = stem.split_once('-')?;
+            (sequence.len() == 20
+                && sequence.bytes().all(|byte| byte.is_ascii_digit())
+                && nonce.len() == 16
+                && nonce.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+            .then(|| sequence.parse::<u64>().ok())
+            .flatten()
+        });
+        let sequence =
+            order.ok_or_else(|| workspace_waiter_error(queue, "unexpected waiter entry"))?;
+        let pinned = anchor.with_leaf(name.as_ref())?;
+        let Some(opened) = pinned.open_optional_lock_registration()? else {
+            continue;
+        };
+        match try_lock_exclusive(opened.as_file(), ExclusiveLockMechanism::LockSidecar) {
+            Ok(()) => {
+                // The owning process closed or died. Leave its evidence in
+                // place, but do not let an abandoned registration block work.
+            }
+            Err(TryLockError::WouldBlock) => live.push((sequence, name.to_owned())),
+            Err(TryLockError::Error(error)) => {
+                return Err(workspace_waiter_error(pinned.display_path(), &error));
+            }
+        }
+    }
+    anchor.parent().verify_route()?;
+    Ok(live)
+}
+
 #[allow(clippy::too_many_lines)]
 fn open_and_lock_regular_file(
     lock_path: &Path,
@@ -1813,8 +1999,25 @@ fn open_and_lock_regular_file(
     #[cfg(not(unix))]
     let _ = opened_metadata;
 
-    // Fast path: non-blocking try for the common uncontended case.
-    match try_lock_exclusive(&file, mechanism) {
+    let timeout_ms = lock_timeout_ms.unwrap_or(DEFAULT_WRITE_LOCK_TIMEOUT_MS);
+    let timeout = Duration::from_millis(timeout_ms);
+    let start = Instant::now();
+    let queue =
+        (role == "workspace write lock").then(|| lock_path.with_file_name(WRITE_WAITER_DIRECTORY));
+    let has_waiters = queue
+        .as_deref()
+        .map(live_workspace_waiters)
+        .transpose()?
+        .is_some_and(|waiters| !waiters.is_empty());
+
+    // SAFETY: later arrivals may not use the fast path ahead of registered
+    // waiters. The queue never substitutes for the original OS write lock.
+    let initial_attempt = if has_waiters {
+        Err(TryLockError::WouldBlock)
+    } else {
+        try_lock_exclusive(&file, mechanism)
+    };
+    match initial_attempt {
         Ok(()) => {
             verify_locked_file_identity(&file, lock_path, role, redact_path)?;
             return Ok(file);
@@ -1828,9 +2031,18 @@ fn open_and_lock_regular_file(
         }
     }
 
-    let timeout_ms = lock_timeout_ms.unwrap_or(DEFAULT_WRITE_LOCK_TIMEOUT_MS);
-    let timeout = Duration::from_millis(timeout_ms);
-    let start = Instant::now();
+    if start.elapsed() >= timeout {
+        return Err(write_lock_timeout_error(
+            &lock_path_display,
+            role,
+            timeout_ms,
+            retry_safety,
+        ));
+    }
+    let waiter = queue
+        .as_deref()
+        .map(|queue| WorkspaceWriteWaiter::join_until(queue, start, timeout_ms, retry_safety))
+        .transpose()?;
     tracing::debug!(
         timeout_ms,
         lock_path = %lock_path_display,
@@ -1851,9 +2063,18 @@ fn open_and_lock_regular_file(
         let remaining = timeout.saturating_sub(start.elapsed());
         thread::sleep(remaining.min(WRITE_LOCK_POLL_INTERVAL));
 
+        if let Some(waiter) = &waiter
+            && !waiter.is_first()?
+        {
+            continue;
+        }
+
         match try_lock_exclusive(&file, mechanism) {
             Ok(()) => {
                 verify_locked_file_identity(&file, lock_path, role, redact_path)?;
+                if let Some(waiter) = &waiter {
+                    waiter.verify_identity()?;
+                }
                 return Ok(file);
             }
             Err(TryLockError::WouldBlock) => {}
@@ -17015,6 +17236,161 @@ mod tests {
         owner
             .try_lock()
             .expect("reacquire after contender releases");
+    }
+
+    #[test]
+    fn workspace_waiter_prevents_fast_path_bypass_and_cleans_up_on_timeout() {
+        let temp = TempDir::new().unwrap();
+        let queue = temp.path().join(WRITE_WAITER_DIRECTORY);
+        let first = WorkspaceWriteWaiter::join(&queue).unwrap();
+        assert!(first.is_first().unwrap());
+
+        // The write lock itself is free. A later caller must nevertheless
+        // respect the earlier registered waiter, including with no wait budget.
+        for timeout in [0, 25] {
+            let error = blocking_write_lock_with_timeout(temp.path(), Some(timeout)).unwrap_err();
+            assert!(matches!(
+                error,
+                BeadsError::WriteLockTimeout { timeout_ms, retryable: true, .. }
+                    if timeout_ms == timeout
+            ));
+            assert_eq!(
+                live_workspace_waiters(&queue).unwrap(),
+                vec![first.order.clone()]
+            );
+            assert_eq!(fs::read_dir(&queue).unwrap().count(), 1);
+        }
+
+        drop(first);
+        let lock = blocking_write_lock_with_timeout(temp.path(), Some(0)).unwrap();
+        assert!(live_workspace_waiters(&queue).unwrap().is_empty());
+        drop(lock);
+    }
+
+    #[test]
+    fn workspace_waiters_promote_in_registration_order_and_skip_abandoned_files() {
+        let temp = TempDir::new().unwrap();
+        let queue = temp.path().join(WRITE_WAITER_DIRECTORY);
+        let first = WorkspaceWriteWaiter::join(&queue).unwrap();
+        let second = WorkspaceWriteWaiter::join(&queue).unwrap();
+        let third = WorkspaceWriteWaiter::join(&queue).unwrap();
+        assert!(first.order < second.order && second.order < third.order);
+        assert!(first.is_first().unwrap());
+        assert!(!second.is_first().unwrap());
+        assert!(!third.is_first().unwrap());
+
+        let abandoned = queue.join("00000000000000000000-abcdefghijklmnop.waiter");
+        fs::write(&abandoned, b"retained abandoned waiter").unwrap();
+        drop(first);
+        assert!(second.is_first().unwrap());
+        assert!(!third.is_first().unwrap());
+        drop(second);
+        assert!(third.is_first().unwrap());
+        drop(third);
+        assert!(live_workspace_waiters(&queue).unwrap().is_empty());
+        assert_eq!(fs::read(&abandoned).unwrap(), b"retained abandoned waiter");
+    }
+
+    #[test]
+    fn workspace_waiters_simultaneous_registration_has_one_first_waiter() {
+        let temp = TempDir::new().unwrap();
+        let queue = temp.path().join(WRITE_WAITER_DIRECTORY);
+        let joined = std::sync::Barrier::new(16);
+        let observed = std::sync::Barrier::new(16);
+        let results = thread::scope(|scope| {
+            let workers = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let waiter = WorkspaceWriteWaiter::join(&queue).unwrap();
+                        joined.wait();
+                        let first = waiter.is_first().unwrap();
+                        observed.wait();
+                        (waiter.order.clone(), first)
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|(_, first)| *first).count(), 1);
+        let keys = results
+            .iter()
+            .map(|(order, _)| order)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(keys.len(), 16);
+        assert!(results.iter().find(|(_, first)| *first).unwrap().0 == **keys.first().unwrap());
+        assert!(live_workspace_waiters(&queue).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_waiter_replacement_is_refused_and_preserved() {
+        let temp = TempDir::new().unwrap();
+        let queue = temp.path().join(WRITE_WAITER_DIRECTORY);
+        let waiter = WorkspaceWriteWaiter::join(&queue).unwrap();
+        let original = queue.join("original-registration");
+        fs::rename(waiter.name.display_path(), &original).unwrap();
+        fs::write(waiter.name.display_path(), b"operator replacement").unwrap();
+        let replaced_path = waiter.name.display_path().to_path_buf();
+        assert!(waiter.is_first().is_err());
+        drop(waiter);
+        assert_eq!(fs::read(replaced_path).unwrap(), b"operator replacement");
+        assert!(original.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_waiter_parent_swap_refuses_create_scan_and_cleanup() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let queue = temp.path().join(WRITE_WAITER_DIRECTORY);
+        let waiter = WorkspaceWriteWaiter::join(&queue).unwrap();
+        let retained = temp.path().join("retained-queue");
+        let outside = temp.path().join("operator-directory");
+        fs::create_dir(&outside).unwrap();
+        let marker = outside.join(waiter.name.leaf());
+        fs::write(&marker, b"operator data").unwrap();
+        fs::rename(&queue, &retained).unwrap();
+        symlink(&outside, &queue).unwrap();
+
+        assert!(waiter.is_first().is_err());
+        assert!(waiter.name.sibling_names().is_err());
+        let next = waiter.name.with_leaf("new-registration".as_ref()).unwrap();
+        assert!(next.create_lock_registration_if_absent().is_err());
+        assert!(WorkspaceWriteWaiter::join(&queue).is_err());
+        drop(waiter);
+        assert_eq!(fs::read(&marker).unwrap(), b"operator data");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&retained).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_waiter_rejects_symlink_queue_and_registration() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("operator-directory");
+        fs::create_dir(&target).unwrap();
+        let queue = temp.path().join(WRITE_WAITER_DIRECTORY);
+        symlink(&target, &queue).unwrap();
+        assert!(blocking_write_lock_with_timeout(temp.path(), Some(25)).is_err());
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+
+        let queue = temp.path().join("regular-queue");
+        fs::create_dir(&queue).unwrap();
+        let target = temp.path().join("operator-file");
+        fs::write(&target, b"preserve me").unwrap();
+        symlink(
+            &target,
+            queue.join("00000000000000000001-abcdefghijklmnop.waiter"),
+        )
+        .unwrap();
+        assert!(live_workspace_waiters(&queue).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"preserve me");
     }
 
     #[test]

@@ -256,6 +256,7 @@ pub fn execute(
 
 # Lock files
 .write.lock
+.write-waiters.lock/
 *.lock
 
 # Temporary
@@ -741,6 +742,7 @@ mod tests {
             "init must emit the canonical write-lock rule expected by doctor: {content}"
         );
         assert!(content.contains("*.lock"));
+        assert!(content.lines().any(|line| line == ".write-waiters.lock/"));
         info!("test_gitignore_excludes_db_files: assertions passed");
     }
 }
