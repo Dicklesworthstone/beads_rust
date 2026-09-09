@@ -11,9 +11,7 @@ mod common;
 
 use assert_cmd::Command;
 use beads_rust::franken_sync::Connection;
-use common::dataset_registry::{
-    DatasetOverride, DatasetRegistry, IsolatedDataset, KnownDataset, isolated_from_override,
-};
+use common::dataset_registry::isolated_beads_rust_replay;
 use fsqlite_types::SqliteValue;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
@@ -1248,34 +1246,19 @@ fn e2e_concurrent_reads_succeed() {
 /// This guards against the failure mode we actually care about: hidden
 /// write-like teardown work surfacing as `database is busy` or corrupting the
 /// workspace under concurrent read traffic.
-/// `BR_CONCURRENCY_DATASET` and `BR_CONCURRENCY_DATASET_REASON` allow an explicit
-/// corpus replay without replacing the worker's historical dataset.
+/// `BR_DATASET_REPLAY` and `BR_DATASET_REPLAY_REASON` select the same explicit
+/// legacy corpus replay used by the real-dataset history and label tests.
 #[test]
 fn e2e_parallel_read_only_commands_serialize_without_busy_on_drop() {
     let _log = common::test_log("e2e_parallel_read_only_commands_serialize_without_busy_on_drop");
 
-    let isolated = if let Some(path) = std::env::var_os("BR_CONCURRENCY_DATASET") {
-        let reason = std::env::var("BR_CONCURRENCY_DATASET_REASON")
-            .expect("an explicit concurrency corpus requires BR_CONCURRENCY_DATASET_REASON");
-        assert!(!reason.trim().is_empty(), "corpus reason must not be empty");
-        isolated_from_override(&DatasetOverride::new(path, reason).with_name("beads_rust"))
-            .expect("copy the explicit concurrency corpus")
-    } else {
-        let registry = DatasetRegistry::new();
-        if !registry.is_available(KnownDataset::BeadsRust) {
-            eprintln!("skipping: beads_rust dataset is unavailable in this environment");
-            return;
-        }
-        IsolatedDataset::from_dataset(KnownDataset::BeadsRust).expect("copy beads_rust dataset")
+    let Some(isolated) = isolated_beads_rust_replay(
+        "e2e_parallel_read_only_commands_serialize_without_busy_on_drop",
+        false,
+    )
+    .expect("prepare concurrent read corpus") else {
+        return;
     };
-    eprintln!("concurrency corpus: {}", isolated.metadata.to_json());
-    if let Err(error) = isolated.migrate_to_current_schema() {
-        let retained = isolated.temp_dir.keep();
-        panic!(
-            "migrate isolated beads_rust dataset: {error}; failing workspace retained at {}",
-            retained.display()
-        );
-    }
     let root = isolated.root.clone();
 
     let create = run_br_in_dir(

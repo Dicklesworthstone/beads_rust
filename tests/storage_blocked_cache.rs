@@ -446,7 +446,7 @@ fn remove_parent_unblocks_child() {
 
     // Remove parent-child link
     storage
-        .remove_dependency(&child.id, &parent.id, "tester")
+        .remove_dependency(&child.id, &parent.id, None, "tester")
         .unwrap();
 
     assert!(

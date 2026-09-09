@@ -19,7 +19,7 @@
 mod common;
 
 use common::cli::{BrWorkspace, run_br};
-use common::dataset_registry::{DatasetRegistry, IsolatedDataset, KnownDataset};
+use common::dataset_registry::isolated_beads_rust_replay;
 use std::fs;
 use std::thread;
 use std::time::Duration;
@@ -95,11 +95,6 @@ fn setup_workspace_with_jsonl() -> BrWorkspace {
 fn read_file_bytes(workspace: &BrWorkspace, relative_path: &str) -> Vec<u8> {
     let path = workspace.root.join(relative_path);
     fs::read(&path).unwrap_or_default()
-}
-
-/// Check if beads_rust dataset is available for testing.
-fn is_dataset_available() -> bool {
-    DatasetRegistry::new().is_available(KnownDataset::BeadsRust)
 }
 
 // =============================================================================
@@ -531,29 +526,11 @@ fn e2e_history_prune_no_backups_to_delete() {
 fn e2e_history_restore_with_real_dataset() {
     let _log = common::test_log("e2e_history_restore_with_real_dataset");
 
-    if !is_dataset_available() {
-        eprintln!(
-            "Skipping e2e_history_restore_with_real_dataset: beads_rust dataset not available"
-        );
+    let Some(isolated) = isolated_beads_rust_replay("e2e_history_restore_with_real_dataset", true)
+        .expect("prepare history restore corpus")
+    else {
         return;
-    }
-
-    // Create isolated workspace from real dataset
-    let isolated = IsolatedDataset::from_dataset(KnownDataset::BeadsRust)
-        .expect("should copy beads_rust dataset");
-    if let Err(error) = isolated.migrate_to_current_schema() {
-        // The reviewed migration covers schemas 13 and later; a checkout
-        // whose live `.beads` predates that (RCH workers carry old copies)
-        // cannot host this scenario, and the helper says so with
-        // `Unsupported` rather than a failure of the code under test.
-        if error.kind() == std::io::ErrorKind::Unsupported {
-            eprintln!(
-                "Skipping e2e_history_restore_with_real_dataset: dataset schema is below the reviewed-migration floor: {error}"
-            );
-            return;
-        }
-        panic!("migrate isolated beads_rust dataset: {error}");
-    }
+    };
 
     // Write test summary for debugging
     let _summary_path = isolated.write_summary().expect("write summary");
@@ -623,25 +600,11 @@ fn e2e_history_restore_with_real_dataset() {
 fn e2e_history_prune_with_real_dataset() {
     let _log = common::test_log("e2e_history_prune_with_real_dataset");
 
-    if !is_dataset_available() {
-        eprintln!("Skipping e2e_history_prune_with_real_dataset: beads_rust dataset not available");
+    let Some(isolated) = isolated_beads_rust_replay("e2e_history_prune_with_real_dataset", true)
+        .expect("prepare history prune corpus")
+    else {
         return;
-    }
-
-    // Create isolated workspace from real dataset
-    let isolated = IsolatedDataset::from_dataset(KnownDataset::BeadsRust)
-        .expect("should copy beads_rust dataset");
-    if let Err(error) = isolated.migrate_to_current_schema() {
-        // See e2e_history_restore_with_real_dataset: a pre-floor dataset is
-        // an environment gap, reported by the helper as `Unsupported`.
-        if error.kind() == std::io::ErrorKind::Unsupported {
-            eprintln!(
-                "Skipping e2e_history_prune_with_real_dataset: dataset schema is below the reviewed-migration floor: {error}"
-            );
-            return;
-        }
-        panic!("migrate isolated beads_rust dataset: {error}");
-    }
+    };
 
     let workspace = BrWorkspace {
         temp_dir: isolated.temp_dir,

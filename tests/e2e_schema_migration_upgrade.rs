@@ -81,6 +81,7 @@ fn upgrade_fixture_end_to_end(
     expected_from: u64,
     expected_issue_total: u64,
 ) {
+    let target = u32::try_from(beads_rust::storage::schema::CURRENT_SCHEMA_VERSION).unwrap();
     let workspace = BrWorkspace::new();
     install_fixture_workspace(&workspace, db_gz, issues, config);
     let db_path = workspace.root.join(".beads").join("beads.db");
@@ -134,14 +135,15 @@ fn upgrade_fixture_end_to_end(
         "{label}: plan not eligible"
     );
     assert_eq!(plan_json["from_version"].as_u64(), Some(expected_from));
-    assert_eq!(plan_json["to_version"].as_u64(), Some(18));
+    assert_eq!(plan_json["to_version"].as_u64(), Some(u64::from(target)));
     assert_eq!(plan_json["forecast"]["prerequisites_column_added"], true);
+    assert_eq!(plan_json["forecast"]["dependency_type_key_added"], true);
     let plan_token = plan_json["plan_token"]
         .as_str()
         .expect("plan token")
         .to_string();
 
-    // 3. Apply migrates atomically to schema 18.
+    // 3. Apply migrates atomically to the current schema.
     let apply = run_br(
         &workspace,
         [
@@ -167,7 +169,7 @@ fn upgrade_fixture_end_to_end(
     let run_id = applied_json["run_id"].as_str().expect("run id").to_string();
     assert_eq!(
         header_user_version(&db_path),
-        18,
+        target,
         "{label}: post-apply schema"
     );
     for table in [
@@ -266,7 +268,7 @@ fn upgrade_fixture_end_to_end(
     );
     assert_eq!(
         header_user_version(&db_path),
-        18,
+        target,
         "{label}: rejected stale apply must not mutate the database"
     );
 
@@ -341,7 +343,7 @@ fn upgrade_fixture_end_to_end(
         apply2.stdout,
         apply2.stderr
     );
-    assert_eq!(header_user_version(&db_path), 18);
+    assert_eq!(header_user_version(&db_path), target);
 }
 
 /// Schema 15 (gate-history era, pre-#384) upgrades to the current schema.

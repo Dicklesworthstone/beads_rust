@@ -617,7 +617,7 @@ fn apply(op: &Op, storage: &mut SqliteStorage, model: &mut Model) -> String {
             }
             let (to, kind) = outgoing[which % outgoing.len()].clone();
             storage
-                .remove_dependency(&id, &to, ACTOR)
+                .remove_dependency(&id, &to, None, ACTOR)
                 .expect("remove dependency");
             model.deps.remove(&(id.clone(), to.clone(), kind));
             format!("dep remove {id} -> {to}")
