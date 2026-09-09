@@ -120,6 +120,12 @@ this repo): commits `55c186682` + `5946b3b7c` in
   when type and status change together; rejected local batches preserve all
   members. See the [policy examples](docs/CLI_REFERENCE.md) and
   [#494](https://github.com/Dicklesworthstone/beads_rust/issues/494).
+- Policy refusals are no longer worded as a close. `POLICY_VIOLATION` errors
+  raised by workflow required fields or gates on any status move now render
+  as `Policy violation for <id>: transition 'draft -> planning' requires …`
+  instead of `Policy violation closing <id>: …`; the structured error code,
+  context, and violations are unchanged
+  ([#493](https://github.com/Dicklesworthstone/beads_rust/issues/493)).
 
 ## v0.5.12 — 2026-09-09
 

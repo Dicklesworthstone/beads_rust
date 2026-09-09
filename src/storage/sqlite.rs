@@ -21707,6 +21707,56 @@ mod tests {
         }
     }
 
+    /// GitHub #493: a required-field refusal on a non-close transition used
+    /// to render as "Policy violation closing <id>". The rendered error must
+    /// name the issue and the actual transition without claiming a close.
+    #[test]
+    fn transition_required_field_refusal_is_not_worded_as_a_close() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut workflow = crate::close_policy::Workflow::default();
+        workflow.required_fields.insert(
+            "draft -> in_planning".to_string(),
+            vec![crate::close_policy::TransitionRequiredField::AcceptanceCriteriaPresent],
+        );
+        storage.set_workflow_policy(workflow);
+        let issue = make_issue(
+            "bd-plan",
+            "planning candidate",
+            Status::Draft,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let error = storage
+            .update_issue(
+                "bd-plan",
+                &IssueUpdate {
+                    status: Some(Status::Custom("in_planning".to_string())),
+                    ..Default::default()
+                },
+                "tester",
+            )
+            .unwrap_err();
+        assert!(matches!(error, BeadsError::PolicyViolation { .. }));
+        let rendered = error.to_string();
+        assert!(
+            rendered.starts_with("Policy violation for bd-plan: "),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("closing"), "{rendered}");
+        assert!(
+            rendered.contains("transition 'draft -> in_planning'"),
+            "{rendered}"
+        );
+        assert_eq!(
+            storage.get_issue("bd-plan").unwrap().unwrap().status,
+            Status::Draft
+        );
+    }
+
     #[test]
     fn prerequisite_updates_use_prospective_values_and_preserve_every_refused_row() {
         let mut storage = SqliteStorage::open_memory().unwrap();
