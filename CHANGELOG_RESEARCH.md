@@ -746,3 +746,8 @@ The all-feature and no-default-feature workers each matched 868 source inputs;
 changed input. These runs provide feature coverage, not performance calibration.
 The final review and original-data replays were performed by the implementing
 agent; they are not independent human verification. No GitHub Actions were used.
+
+The subsequent `origin/main` update to `21becc16` contained byte-identical
+Rust sources, tests, manifest, lockfile and build script. Its history was
+merged with only this research-note reconciliation; the runtime and test
+inputs qualified above did not change.
