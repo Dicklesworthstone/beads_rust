@@ -71,6 +71,9 @@ Options:
 
           [alias: --acceptance]
 
+      --prerequisites <PREREQUISITES>
+          Prerequisite checklist recorded separately from acceptance criteria
+
       --ID-REDACTED <AGENT_CONTEXT>
           Set the initial `agent_context` ID-REDACTED JSON (beads_rust#408).
 

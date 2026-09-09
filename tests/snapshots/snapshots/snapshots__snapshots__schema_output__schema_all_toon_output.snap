@@ -1350,6 +1350,9 @@ schemas:
       acceptance_criteria:
         description: Acceptance criteria.
         type[2]: string,"null"
+      prerequisites:
+        description: "Per-issue prerequisite checklist, separate from acceptance criteria\nand dependency edges. Policy decides which transitions require it."
+        type[2]: string,"null"
       notes:
         description: Additional notes.
         type[2]: string,"null"
@@ -1547,6 +1550,9 @@ schemas:
         type[2]: string,"null"
       acceptance_criteria:
         description: Acceptance criteria.
+        type[2]: string,"null"
+      prerequisites:
+        description: "Per-issue prerequisite checklist, separate from acceptance criteria\nand dependency edges. Policy decides which transitions require it."
         type[2]: string,"null"
       notes:
         description: Additional notes.
@@ -1860,6 +1866,9 @@ schemas:
       acceptance_criteria:
         description: Acceptance criteria.
         type[2]: string,"null"
+      prerequisites:
+        description: "Per-issue prerequisite checklist, separate from acceptance criteria\nand dependency edges. Policy decides which transitions require it."
+        type[2]: string,"null"
       notes:
         description: Additional notes.
         type[2]: string,"null"
@@ -2048,10 +2057,11 @@ schemas:
   ReadyIssue:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
     title: ReadyIssue
-    description: "Minimal issue output for ready command (bd parity).\n\nContains only the fields that bd's ready command outputs.\nDoes NOT include: `compaction_level`, `original_size`, `dependency_count`, `dependent_count`"
+    description: "Minimal issue output for ready command (bd parity).\n\nContains the ready-work context, including br's per-issue prerequisites.\nDoes NOT include: `compaction_level`, `original_size`, `dependency_count`, `dependent_count`"
     type: object
     properties:
       acceptance_criteria.type[2]: string,"null"
+      prerequisites.type[2]: string,"null"
       assignee.type[2]: string,"null"
       created_at:
         type: string

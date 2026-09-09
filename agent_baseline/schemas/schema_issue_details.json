@@ -37,6 +37,13 @@
             "null"
           ]
         },
+        "prerequisites": {
+          "description": "Per-issue prerequisite checklist, separate from acceptance criteria\nand dependency edges. Policy decides which transitions require it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "notes": {
           "description": "Additional notes.",
           "type": [

@@ -42,6 +42,33 @@ changes, regenerate them with:
 UPDATE_AGENT_BASELINE=1 cargo test --test e2e_schema agent_baseline_snapshots_match_current_binary -- --nocapture
 ```
 
+## Issue checklist fields
+
+Issue JSON, JSONL, TOON, and the `Issue`/`IssueDetails` schemas expose two
+independent optional strings:
+
+| Field | Meaning |
+|---|---|
+| `acceptance_criteria` | Delivery criteria, with optional Markdown checklist items exposed through `acceptance_items` in issue details |
+| `prerequisites` | Preparation checklist stored verbatim; independent from dependency edges and acceptance criteria |
+
+CLI `create` and `update` accept `--prerequisites` and
+`--acceptance-criteria`. MCP `create_issue` and `update_issue` accept the same
+field names with underscores. An absent update field leaves its value alone;
+an empty string or MCP update `null` clears the optional value. Empty strings
+are normalized to absence when read from storage. Destructive whole-field replacements use the normal overwrite
+guard (`--force` / MCP `force: true`). MCP whole-field acceptance input cannot
+be combined with the acceptance item edit parameters.
+
+Workflow `required_fields` separates presence and completion:
+`acceptance_criteria_present` accepts a nonempty prospective value,
+`acceptance_criteria` additionally refuses unchecked checklist items, and
+`prerequisites_complete` requires at least one prerequisite checklist item
+with every item checked. Matching requirements compose with fresh transition
+comments and other policy gates. Force cannot bypass them. A field and status
+submitted together are validated against the proposed field values before
+their atomic mutation.
+
 ## Key folding (TOON)
 
 When emitting TOON, br may "fold" nested keys into dotted keys (safe folding) to save tokens.

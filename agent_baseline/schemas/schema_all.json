@@ -2985,6 +2985,13 @@
             "null"
           ]
         },
+        "prerequisites": {
+          "description": "Per-issue prerequisite checklist, separate from acceptance criteria\nand dependency edges. Policy decides which transitions require it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "notes": {
           "description": "Additional notes.",
           "type": [
@@ -3424,6 +3431,13 @@
         },
         "acceptance_criteria": {
           "description": "Acceptance criteria.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "prerequisites": {
+          "description": "Per-issue prerequisite checklist, separate from acceptance criteria\nand dependency edges. Policy decides which transitions require it.",
           "type": [
             "string",
             "null"
@@ -4096,6 +4110,13 @@
             "null"
           ]
         },
+        "prerequisites": {
+          "description": "Per-issue prerequisite checklist, separate from acceptance criteria\nand dependency edges. Policy decides which transitions require it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "notes": {
           "description": "Additional notes.",
           "type": [
@@ -4520,10 +4541,16 @@
     "ReadyIssue": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "ReadyIssue",
-      "description": "Minimal issue output for ready command (bd parity).\n\nContains only the fields that bd's ready command outputs.\nDoes NOT include: `compaction_level`, `original_size`, `dependency_count`, `dependent_count`",
+      "description": "Minimal issue output for ready command (bd parity).\n\nContains the ready-work context, including br's per-issue prerequisites.\nDoes NOT include: `compaction_level`, `original_size`, `dependency_count`, `dependent_count`",
       "type": "object",
       "properties": {
         "acceptance_criteria": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "prerequisites": {
           "type": [
             "string",
             "null"

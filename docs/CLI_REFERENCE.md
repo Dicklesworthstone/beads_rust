@@ -183,6 +183,8 @@ br create [OPTIONS] [TITLE]
 | `-t, --type <TYPE>` | Issue type (task, bug, feature, epic, chore, docs, question) |
 | `-p, --priority <PRIORITY>` | Priority (0-4 or P0-P4, where 0=critical) |
 | `-d, --description <TEXT>` | Issue description |
+| `--acceptance-criteria <TEXT>` | Initial acceptance criteria, preserved verbatim |
+| `--prerequisites <TEXT>` | Initial prerequisite checklist, separate from acceptance criteria and dependency edges; also applied to each issue in a markdown bulk import |
 | `--slug <SLUG>` | Human-readable slug embedded in the generated ID (lowercase ASCII alphanumerics + single hyphens, capped at 48 chars; see [Slug normalization](#slug-normalization)) |
 | `-a, --assignee <NAME>` | Assign to person |
 | `--owner <EMAIL>` | Set owner email |
@@ -381,6 +383,7 @@ br update [OPTIONS] [IDS]...
 | `--description <TEXT>` | Update description |
 | `--design <TEXT>` | Update design notes |
 | `--acceptance-criteria <TEXT>` | Update acceptance criteria (whole field) |
+| `--prerequisites <TEXT>` | Replace the prerequisite checklist verbatim (empty string clears); policy evaluates the proposed value in the same transaction as a status change |
 | `--check-acceptance <ITEMS>` | Tick acceptance checklist items in place: 1-based numbers (`1,4,5`) or a text selector matching exactly one item; repeatable; atomic; never needs `--force` |
 | `--uncheck-acceptance <ITEMS>` | Untick acceptance checklist items in place (same selectors) |
 | `--add-acceptance <TEXT>` | Append an unchecked `- [ ] TEXT` criterion without rewriting the field; repeatable |
@@ -393,7 +396,7 @@ br update [OPTIONS] [IDS]...
 | `--assignee <NAME>` | Assign (empty string clears) |
 | `--owner <EMAIL>` | Set owner (empty string clears) |
 | `--claim` | Atomic claim (assignee=actor + status=in_progress) |
-| `--force` | Force update even if issue is blocked; also required for a destructive rewrite of a non-empty description/design/acceptance-criteria/notes/agent-context value (see the overwrite guard below) |
+| `--force` | Force update even if issue is blocked; also required for a destructive rewrite of a non-empty description/design/acceptance-criteria/prerequisites/notes/agent-context value (see the overwrite guard below); never bypasses workflow requirements or capacity |
 | `--due <DATE>` | Set due date (empty string clears) |
 | `--defer <DATE>` | Set the `br ready` time gate; empty string clears it ([scheduled work](#defer--undefer)) |
 | `--estimate <MINUTES>` | Set time estimate |
@@ -423,10 +426,10 @@ br update bd-abc123 --append-notes "decision: keep the WAL until the migration i
 ```
 
 **Overwrite guard for accumulating text fields (#467, #481).** `description`,
-`design`, `acceptance_criteria`, `notes`, and `agent_context` build up over an
+`design`, `acceptance_criteria`, `prerequisites`, `notes`, and `agent_context` build up over an
 issue's life and are often supplied from shell variables, where an unset
 variable or a truncated heredoc silently destroys the field. A whole-field
-write (`--description`, `--design`, `--acceptance-criteria`, `--notes`,
+write (`--description`, `--design`, `--acceptance-criteria`, `--prerequisites`, `--notes`,
 `--agent-context`) is therefore classified by what it would lose, per field
 and per issue, using only the current and incoming values:
 
@@ -1372,6 +1375,10 @@ workflow:
     "draft -> in_planning":
       - acceptance_criteria_present
       - transition_comment
+    "in_planning -> in_implementation":
+      - prerequisites_complete
+      - acceptance_criteria_present
+      - transition_comment
     in_review:
       - transition_comment
     "in_progress -> in_review":
@@ -1395,12 +1402,41 @@ prospective field value, accepting prose and unfinished checklists without
 changing their items. `acceptance_criteria` additionally rejects any unchecked
 Markdown checklist item. If both requirements match, completion is still
 required. Both reject absent, empty, and whitespace-only criteria.
+`prerequisites_complete` evaluates the separate `prerequisites` field: it must
+contain at least one Markdown checklist item, and every item must be checked.
+Missing, empty, whitespace-only, prose-only, and unfinished prerequisite
+values fail. Completing prerequisites does not complete or modify acceptance
+criteria, and prerequisite text never creates dependency edges. The rule uses
+the value submitted with the transition, so an old completed value cannot
+authorize a request that clears it or replaces it with unfinished work.
+`--force` permits an explicitly requested text replacement but cannot bypass
+these policy requirements.
 `transition_comment` must be a new non-empty comment carried by the same
 request; old comments are intentionally ignored. Validation and comment/status
 mutation share one transaction, and a failed item rolls back the entire
 repository-local batch. Supply comments with `update`, `close`, `defer`, and
 `undefer` via `--transition-comment`; `reopen --reason` and
 `epic close-eligible --transition-comment` use the same atomic path.
+
+For example, a prepared issue may enter implementation while its delivery
+criteria remain unfinished:
+
+```bash
+br update br-abc --status in_implementation \
+  --prerequisites '- [x] Access approved' \
+  --acceptance-criteria '- [ ] Deliver feature' \
+  --transition-comment 'Preparation complete'
+```
+
+`br show` displays distinct Prerequisites and Acceptance Criteria sections;
+JSON and TOON retain the original field strings. MCP `create_issue` and
+`update_issue` accept `prerequisites` and `acceptance_criteria` whole-field
+values. In MCP updates, `null` clears either field, destructive replacements
+require `force: true`, and whole-field `acceptance_criteria` conflicts with
+`check_acceptance`, `uncheck_acceptance`, and `add_acceptance`. In-place
+acceptance item edits retain their existing behavior. The MCP server reloads
+workflow policy before each operation and enforces the same prospective
+requirements as the CLI.
 
 ---
 
@@ -2004,11 +2040,14 @@ br doctor migrate-schema undo \
 ```
 
 `plan` accepts the explicitly reviewed transitions from source schemas 13, 14,
-15 (the #388 gate-history schema), and 16 (the #384 capacity-exemptions schema
-created by the released v0.2.19 binary) to the current schema. Each source runs
+15 (the #388 gate-history schema), 16 (the #384 capacity-exemptions schema
+created by the released v0.2.19 binary), and 17 (capacity occupancy) to the
+current schema 18. Each source runs
 exactly the version-gated step chain it is missing — content-hash rebuild
 (13→14), transition-scoped gate history (→15), capacity exemptions (→16), and
-capacity occupancy (→17). Its deterministic token binds the absolute database
+capacity occupancy (→17), and the prerequisite field (→18). The last step is
+reported as `prerequisites_column_added` and preserves existing issue values
+with an unset prerequisite field. Its deterministic token binds the absolute database
 path, a complete logical row/schema witness, and the exact migration forecast.
 The receipt reports every raw SQLite family member, but raw page/WAL/SHM/journal
 layout is deliberately not token-bound: process close and checkpoint may
