@@ -425,3 +425,56 @@ plain rendering was source-reviewed. The implementation bead g8cib closes
 under its original criterion; its separate verification companion 7zm00
 retains the outstanding release-profile maintenance run. No overall feature
 release or full release-profile suite pass is claimed.
+
+### September 9 — class-specific workflow routes
+
+Bead 8dtr0 implements the requested additional workflow edge using the existing
+issue type. `workflow.class_transitions` is a list of exact type/from/to rules;
+global routes and initial admission remain authoritative. The storage
+transaction evaluates the prospective type before required fields, gates,
+and capacity. A related storage gap was fixed: an explicit same-status update
+must still satisfy a newly loaded strict status vocabulary. Explicit audited
+bypass behavior is preserved.
+
+The candidate at SHA-256
+`217bdef62139e935f0d727c319dfb66cf398e2a053f7f745d86797d007e8f2b5`
+passed 3,110 all-feature library tests (nine pre-existing ignores), 242 CLI
+error tests, 18 actual MCP protocol tests, 163 capacity-scope tests, and 161
+documentation examples. These target counts include shared helpers. Final
+whole-target/all-feature Clippy, check, formatting, and whitespace checks
+passed. All 1,155 tracked source/test/build-input files in the recorded
+manifest matched the worker; the subsequent Clippy-only test correction
+removed raw-string delimiter hashes without changing YAML fixture bytes.
+
+An independent reviewer executed 21 fresh CLI calls against the preserved
+binary. A matching bug and a task changed into a bug took the additional edge;
+an ordinary task used the global planning route. Initial, nonmatching,
+unknown-type, prospective bug-to-task, and omitted close-edge refusals kept
+the persistent database/WAL/journal/export bytes unchanged. The original
+broader file comparison failed on SHM byte 104 (`aReadMark[1]`), which is
+retained as a coordination-state observation; whole-family byte identity is
+not claimed. This review did not independently rerun the MCP or concurrency
+matrix.
+
+Original failures are retained: a default-only policy-field inventory missed
+the omitted-when-empty class field, two new MCP close requests used an
+unsupported `force` argument, and Clippy found needless raw-string hashes.
+Both policy inventory assertions remain intact and now inspect populated
+serialization; corrected MCP requests still require the same policy errors
+and unchanged state. Two cold dependency checks reached RCH's unchanged
+300-second cap before a warmed-worker check passed. An overlapping check was
+refused before execution by active-project exclusion; local fallback stayed
+disabled. A compiled old-type mutant made the existing storage test fail by
+incorrectly admitting a task into `open`; the correct source was restored
+byte for byte before the passing suite. No mutant was committed.
+
+Evidence remains in `/data/tmp/br-g8cib-prerequisite-20260909-QV5BvoMg` and
+the independent workspace `/data/tmp/br-8dtr0-independent-1xxhp7ya` on ovh-a.
+UBS remains non-clean: policy/CLI/MCP source reported two critical findings,
+storage 220, and the two integration files 17. Reported samples include
+existing test panics, non-secret comparisons, fixture SQL, and a false
+security-randomness match on `client.finish()`. No blanket warning clearance
+is claimed. The original companion 5pow5 remains open for complete evidence
+retention: the existing MCP harness preserves failure transcripts but does
+not yet retain passing transcripts. This is an unreleased implementation,
+not a new published binary or full project/release qualification.

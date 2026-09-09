@@ -113,6 +113,13 @@ this repo): commits `55c186682` + `5946b3b7c` in
   stream, with diagnostics on stderr. Gate and capacity commands now expose
   their read/write operations, workspace requirement, and supported
   JSON/TOON/text formats in the command inventory.
+- `workflow.class_transitions` adds exact status edges for an existing issue
+  type: a bug can enter `open` directly from `draft` while tasks follow the
+  global planning route. Initial admission, strict statuses, required fields,
+  gates, and capacity still apply. CLI and MCP evaluate the proposed type
+  when type and status change together; rejected local batches preserve all
+  members. See the [policy examples](docs/CLI_REFERENCE.md) and
+  [#494](https://github.com/Dicklesworthstone/beads_rust/issues/494).
 
 ## v0.5.12 — 2026-09-09
 

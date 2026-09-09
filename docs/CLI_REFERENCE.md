@@ -1396,6 +1396,55 @@ workflow:
           gate: security_sign_off
 ```
 
+For an issue type that needs an additional route, add exact edges under
+`class_transitions`. The global graph remains in effect for every type:
+
+```yaml
+workflow:
+  strict: true
+  statuses: [draft, planned, open, in_progress, review, closed]
+  transitions:
+    initial: [draft]
+    draft: [planned]
+    planned: [open]
+    open: [in_progress, draft]
+    in_progress: [review]
+    review: [closed]
+  class_transitions:
+    - issue_type: bug
+      from: draft
+      to: open
+  required_fields:
+    open: [acceptance_criteria_present, transition_comment]
+```
+
+This lets a bug move from `draft` directly to `open`. Tasks and unconfigured
+types still go through `planned`. All issues must first enter through the
+global `initial` rule. A class edge adds permission for that exact move;
+required fields, fresh transition comments, gates, and capacity still apply.
+Omitting `class_transitions` preserves the global routes. With `strict: false`,
+route and status enforcement remains advisory.
+
+`issue_type` matches the parsed type stored on the issue, case-insensitively;
+it introduces no additional issue field. An update that changes both type and
+status uses the new type, and a refused repository-local batch leaves every
+member unchanged. Selectors and wildcards are not supported in class rules.
+Rules require a nonempty global transitions graph, reject duplicate triples
+and unknown properties, and, when strict status validation is active, must
+name declared statuses. `initial` and `any` are reserved global source keys.
+
+```bash
+br create 'Repair the parser' --type bug --status draft
+br update br-abc --status open \
+  --acceptance-criteria '- [ ] Handle the malformed input' \
+  --transition-comment 'Ready to implement'
+```
+
+MCP `update_issue` uses the same class rules and reloads policy per operation.
+MCP `create_issue` starts in `open`, so a policy permitting only initial `draft`
+refuses that creation; use CLI creation with `--status draft`. MCP `updates`
+arrays retain ordered, per-item results and partial-success behavior.
+
 `required_fields` accepts exact `"from -> to"` keys and bare target-status
 keys; matching rules compose. `acceptance_criteria_present` requires a nonempty
 prospective field value, accepting prose and unfinished checklists without
