@@ -85,6 +85,19 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ## Unreleased — after the v0.5.12 source freeze
 
+- Contended workspace writers use live, ordered registrations under
+  `.beads/.write-waiters.lock/` before retrying `.write.lock`. Registrations
+  preserve parent and file identity, and abandoned entries do not block later
+  writers. The original OS lock remains the write authority and the configured
+  deadline is unchanged. Sustained-starvation acceptance remains open; the
+  measured candidate traded longer typical calls for shorter tails
+  ([e752c86d](https://github.com/Dicklesworthstone/beads_rust/commit/e752c86d),
+  [validation evidence](CHANGELOG_RESEARCH.md#2026-09-09--ordered-workspace-waiters-and-native-windows-recovery)).
+- Native Windows RCH source archives exclude build caches, Git metadata, and
+  runtime databases while retaining required source, fixtures, Cargo
+  configuration, and tracked JSONL. The exclusions now match the archive's
+  `./` paths as well as the existing rsync transfer rules
+  ([b9eff611](https://github.com/Dicklesworthstone/beads_rust/commit/b9eff611)).
 - Workflow `required_fields` accepts `acceptance_criteria_present`: a planning
   transition can require written criteria while leaving checklist items
   unfinished. Empty and whitespace-only values fail. The existing

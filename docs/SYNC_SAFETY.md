@@ -163,6 +163,25 @@ The migration deliberately does not probe Git or infer staged/unstaged state;
 all `br sync` modes retain zero Git authority. Run `br vcs-status --json`
 separately before applying when VCS state is part of the operator's review.
 
+### Workspace write admission
+
+The OS lock on `.beads/.write.lock` grants write authority. When contended,
+writers publish locked registrations in `.beads/.write-waiters.lock/`; the
+earliest live registration retries the authority lock. New callers inspect
+the registrations before attempting the uncontended path. Registration and
+polling share the original configured timeout, whose default remains 30 seconds.
+
+Queue operations retain parent and file identity and refuse changed routes or
+symlinks. An unlocked abandoned registration does not block writers. Unix
+cleanup removes only the registration with the captured identity; Windows
+uses the allocating handle's delete-on-close behavior. Observers preserve
+abandoned files, and the queue directory is excluded by `br init`'s gitignore.
+
+The queue does not authorize writes by itself or guarantee completion under
+arbitrary scheduler or filesystem stalls. The original sustained-starvation
+acceptance remains open; see the
+[validation evidence](../CHANGELOG_RESEARCH.md#2026-09-09--ordered-workspace-waiters-and-native-windows-recovery).
+
 ---
 
 ## Using --force Safely
