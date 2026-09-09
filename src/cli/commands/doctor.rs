@@ -16,6 +16,8 @@ use crate::health::{AnomalyClass, ReliabilityAuditRecord, WorkspaceClassificatio
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::storage::sqlite::PendingSyncMergeInspection;
+#[cfg(test)]
+use crate::sync::METADATA_SYNC_MERGE_PENDING_LEGACY;
 use crate::sync::{
     JsonlSourceSnapshot, JsonlTombstoneFilter, PathValidation, PreservedIssue,
     SyncMergePendingPhase, SyncMergePendingReceipt, blocking_jsonl_family_write_lock_with_timeout,
@@ -14488,7 +14490,6 @@ mod tests {
     use crate::health::{AnomalyClass, WorkspaceHealth};
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
-    use crate::sync::METADATA_SYNC_MERGE_PENDING_LEGACY;
     use chrono::Utc;
     use std::collections::BTreeMap;
     use std::fs;
