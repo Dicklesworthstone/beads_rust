@@ -751,3 +751,87 @@ The subsequent `origin/main` update to `21becc16` contained byte-identical
 Rust sources, tests, manifest, lockfile and build script. Its history was
 merged with only this research-note reconciliation; the runtime and test
 inputs qualified above did not change.
+
+## 2026-09-09 — Ordered workspace waiters and native Windows recovery
+
+This narrow update covers the landed waiter implementation in `e752c86d`,
+the concurrency regressions in `5519f01b`, the unchanged-behavior fast-path
+cleanup in `11468bbb`, and native archive exclusions in `b9eff611`.
+Git diffs and the `beads_rust-46zqi` issue thread were examined. GitHub's API
+confirmed the representative implementation and archive commits are live.
+The latest published release remains v0.5.12, published at
+2026-09-09T02:07:08Z; these commits are outside that release.
+
+The V3 source manifest contains 1,203 inputs. Its retained release executable
+on ovh-a is `/data/tmp/br-46zqi-queue-v3-H9HqM9Mf/br`, SHA-256
+`3e672d5403e8f0fda54c73d70537ad903b47f2b04fc2062e5356b8c6e401e523`.
+Default release library tests passed 3,058 tests with two existing ignores;
+the concurrency target passed all 187. All-feature/all-target check and
+Clippy with warnings denied passed through RCH. The preceding V2 sync-safety
+batch passed 1,587 test invocations; it is preceding-source evidence, not
+a rerun of those nine targets after the two V3 lint fixes. UBS remains
+non-clean; no blanket scanner clearance is claimed.
+
+Four eight-stream, 120-second correctness runs used the same preserved
+baseline, candidate, and checker on shared ovh-a. All passed the complete
+linearizability and final-state oracle, with no failed calls or dropped creates.
+The original 100-operation floor and 30-second lock deadline were unchanged.
+
+| Run | Operations | Mutation p50 | Mutation p99 | Longest mutation | CPU per operation |
+|---|---:|---:|---:|---:|---:|
+| A1 baseline | 1,978 | 493 ms | 3,373 ms | 8,862 ms | 77.59 ms |
+| B1 candidate | 1,656 | 845 ms | 1,496 ms | 2,185 ms | 82.09 ms |
+| B2 candidate | 1,638 | 850 ms | 1,607 ms | 2,145 ms | 86.00 ms |
+| A2 baseline | 1,665 | 476 ms | 5,644 ms | 13,494 ms | 81.96 ms |
+
+CPU per operation divides the checker's total user-plus-system CPU time,
+including child processes, setup, and final-state checks, by recorded calls.
+It is not an isolated measurement of lock acquisition cost.
+
+The maximum number of Applied peer calls wholly inside a mutation call was
+74/1/1/43. These are whole CLI intervals, not measured lock-acquisition
+intervals. Candidate tails improved in both pairs, but median calls became
+longer, CPU per operation rose about 5–6%, and throughput fell by different
+amounts in the two pairs. Shared load and a 37-minute gap between B1 and B2
+preclude calibrated performance claims. Neither baseline reproduced the
+original starvation timeout, so `beads_rust-46zqi` remains open.
+
+Raw histories, logs, CPU accounting, source identities, and input checksums
+are retained under `/tmp/br-46zqi-queue-v3-abba-evidence-20260909/` locally and
+`/data/tmp/br-46zqi-queue-v3-H9HqM9Mf/abba-*-120/` on ovh-a. The local
+`analysis.json` has SHA-256
+`fe4c1c1719bf71668ee3709dfa96e753f5c6c2d41170a66a97ea1b7cfba80b89`.
+
+Native Windows qualification is pending. Worker repairs restored SSH,
+selected the verified MSVC linker, and corrected RCH's recovery rejection of
+NTFS's unavailable Unix inode count. The root dispatcher automatically
+passed its retained recovery probes and configured `rustc --version` canary
+at 18:41:47 UTC. This is recovery evidence, not a project test pass.
+The first native release test build exceeded its unchanged 30-minute budget
+at 18:23:05 UTC without executing tests. No compiler processes remained when
+inspected at 18:55–18:56 UTC; the retry started at 18:58:18 UTC using the
+retained cache. The second dispatcher's repaired executable is staged while
+active jobs finish. No GitHub Actions or new release were used for this work.
+
+At 19:30:37 UTC the second dispatcher was also upgraded after a successful
+drain. Both running executables match SHA-256
+`e76d7fafb14fa8dcfcdcb3e06f0913aa92e77be888eff4714bdde3378732608a`;
+both original executables were retained. Live capability refreshes confirmed
+the installed Windows and Linux toolchains. All 868 required source and
+fixture files on Windows matched the V3 manifest. The warm native invocation
+had timed out at 19:28:48 UTC; its surviving compiler was left undisturbed
+until it exited, and no test executable was found. That attempt remains a
+failure, not a native test pass.
+
+The native compiler exposed two unused-import warnings. Imports used only
+by Unix tests were moved into those existing test scopes in `doctor.rs` and
+the sync command; no test gate, assertion, or runtime behavior changed.
+The current native attempt starts from the completed dependency cache and
+reports neither import warning. Its 13 pre-existing dead-code warnings remain.
+The import-only source passed all-feature/all-target Linux `cargo check`
+through RCH in 180 seconds after two capped cold/warming attempts and one
+startup-inventory refusal. Matching all-feature/all-target Clippy with warnings
+denied passed in 231 seconds. Native test execution remains pending.
+Formatting and whitespace checks passed. The two-file UBS scan remains
+non-clean: 77 critical, 4,003 warning, and 1,074 informational findings; the
+import-only review is not a blanket clearance of those files.
