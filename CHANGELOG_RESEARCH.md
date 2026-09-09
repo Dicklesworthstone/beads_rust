@@ -443,8 +443,8 @@ error tests, 18 actual MCP protocol tests, 163 capacity-scope tests, and 161
 documentation examples. These target counts include shared helpers. Final
 whole-target/all-feature Clippy, check, formatting, and whitespace checks
 passed. All 1,155 tracked source/test/build-input files in the recorded
-manifest matched the worker; the subsequent Clippy-only test correction
-removed raw-string delimiter hashes without changing YAML fixture bytes.
+manifest matched the worker after the Clippy-only test correction removed
+raw-string delimiter hashes without changing YAML fixture bytes.
 
 An independent reviewer executed 21 fresh CLI calls against the preserved
 binary. A matching bug and a task changed into a bug took the additional edge;
@@ -474,7 +474,7 @@ UBS remains non-clean: policy/CLI/MCP source reported two critical findings,
 storage 220, and the two integration files 17. Reported samples include
 existing test panics, non-secret comparisons, fixture SQL, and a false
 security-randomness match on `client.finish()`. No blanket warning clearance
-is claimed. The original companion 5pow5 remains open for complete evidence
+is claimed. The original companion 5pow5 remains unfinished for complete evidence
 retention: the existing MCP harness preserves failure transcripts but does
 not yet retain passing transcripts. This is an unreleased implementation,
 not a new published binary or full project/release qualification.
