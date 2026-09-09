@@ -6699,6 +6699,8 @@ impl SqliteStorage {
     pub fn create_issue(&mut self, issue: &Issue, actor: &str) -> Result<()> {
         IssueValidator::validate(issue).map_err(BeadsError::from_validation_errors)?;
         validate_issue_comments_for_create(issue)?;
+        let dependencies =
+            Self::validated_unique_import_dependencies(&issue.id, &issue.dependencies)?;
         let capacity_policy = self.workflow_capacity_policy.clone();
         let workflow_policy = self.workflow_transition_policy.clone();
 
@@ -6851,17 +6853,7 @@ impl SqliteStorage {
             }
 
             // Insert Dependencies
-            let mut seen_deps = HashSet::new();
-            for dep in &issue.dependencies {
-                if dep.depends_on_id == issue.id {
-                    return Err(BeadsError::SelfDependency {
-                        id: issue.id.clone(),
-                    });
-                }
-
-                if !seen_deps.insert(dep.depends_on_id.as_str()) {
-                    continue;
-                }
+            for dep in &dependencies {
                 Self::ensure_dependency_target_exists_in_tx(conn, &dep.depends_on_id)?;
                 // Check cycle if blocking.
                 if Self::check_dependency_cycle_for_type(
@@ -6880,14 +6872,16 @@ impl SqliteStorage {
                 }
 
                 conn.execute_with_params(
-                    "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
-                     VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)",
                     &[
                         SqliteValue::from(issue.id.as_str()),
                         SqliteValue::from(dep.depends_on_id.as_str()),
                         SqliteValue::from(dep.dep_type.as_str()),
                         SqliteValue::from(dep.created_at.to_rfc3339()),
                         SqliteValue::from(dep.created_by.as_deref().unwrap_or(actor)),
+                        SqliteValue::from(dep.metadata.as_deref().unwrap_or("{}")),
+                        SqliteValue::from(dep.thread_id.as_deref().unwrap_or("")),
                     ],
                 )?;
 
@@ -12176,15 +12170,15 @@ impl SqliteStorage {
         }
     }
 
-    fn existing_dependency_targets_for_issue_ids(
+    fn existing_dependency_keys_for_issue_ids(
         conn: &Connection,
         issue_ids: &[&str],
-    ) -> Result<HashMap<String, HashSet<String>>> {
-        let mut targets_by_issue_id: HashMap<String, HashSet<String>> = HashMap::new();
+    ) -> Result<HashMap<String, HashSet<(String, String)>>> {
+        let mut keys_by_issue_id: HashMap<String, HashSet<(String, String)>> = HashMap::new();
         for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
             let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
             let sql = format!(
-                "SELECT issue_id, depends_on_id FROM dependencies WHERE issue_id IN ({})",
+                "SELECT issue_id, depends_on_id, type FROM dependencies WHERE issue_id IN ({})",
                 placeholders.join(",")
             );
             let params: Vec<SqliteValue> = chunk
@@ -12199,14 +12193,17 @@ impl SqliteStorage {
                 let Some(depends_on_id) = row.get(1).and_then(SqliteValue::as_text) else {
                     continue;
                 };
-                targets_by_issue_id
+                let Some(dep_type) = row.get(2).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                keys_by_issue_id
                     .entry(issue_id.to_string())
                     .or_default()
-                    .insert(depends_on_id.to_string());
+                    .insert((depends_on_id.to_string(), dep_type.to_string()));
             }
         }
 
-        Ok(targets_by_issue_id)
+        Ok(keys_by_issue_id)
     }
 
     /// Find issue IDs that end with the given hash substring.
@@ -12434,10 +12431,11 @@ impl SqliteStorage {
             }
 
             let existing = conn.query_with_params(
-                "SELECT 1 FROM dependencies WHERE issue_id = ? AND depends_on_id = ? LIMIT 1",
+                "SELECT 1 FROM dependencies WHERE issue_id = ? AND depends_on_id = ? AND type = ? LIMIT 1",
                 &[
                     SqliteValue::from(issue_id),
                     SqliteValue::from(depends_on_id),
+                    SqliteValue::from(dep_type),
                 ],
             )?;
             if !existing.is_empty() {
@@ -12536,8 +12534,8 @@ impl SqliteStorage {
                 .collect();
             source_issue_ids.sort_unstable();
             source_issue_ids.dedup();
-            let existing_targets =
-                Self::existing_dependency_targets_for_issue_ids(conn, &source_issue_ids)?;
+            let existing_keys =
+                Self::existing_dependency_keys_for_issue_ids(conn, &source_issue_ids)?;
 
             for dep in dependencies {
                 if dep.issue_id == dep.depends_on_id {
@@ -12574,9 +12572,9 @@ impl SqliteStorage {
                 }
                 Self::ensure_dependency_target_exists_in_tx(conn, &dep.depends_on_id)?;
 
-                if existing_targets
+                if existing_keys
                     .get(dep.issue_id.as_str())
-                    .is_some_and(|targets| targets.contains(dep.depends_on_id.as_str()))
+                    .is_some_and(|keys| keys.contains(&(dep.depends_on_id.clone(), dep_type.clone())))
                 {
                     continue;
                 }
@@ -12609,7 +12607,7 @@ impl SqliteStorage {
                     }
                 }
 
-                if seen_edges.insert((dep.issue_id.clone(), dep.depends_on_id.clone())) {
+                if seen_edges.insert((dep.issue_id.clone(), dep.depends_on_id.clone(), dep_type.clone())) {
                     unique_dependencies.push((dep, dep_type));
                 }
             }
@@ -12694,7 +12692,8 @@ impl SqliteStorage {
         })
     }
 
-    /// Remove a dependency link.
+    /// Remove one dependency link. An omitted type must resolve to a unique
+    /// edge; ambiguous pairs are refused without changing any relationship.
     ///
     /// # Errors
     ///
@@ -12703,16 +12702,43 @@ impl SqliteStorage {
         &mut self,
         issue_id: &str,
         depends_on_id: &str,
+        dep_type: Option<&str>,
         actor: &str,
     ) -> Result<bool> {
+        let dep_type =
+            dep_type.map(|kind| Self::canonical_standard_dependency_type(kind).unwrap_or(kind));
         self.mutate("remove_dependency", actor, |conn, ctx| {
             Self::ensure_issue_mutable_in_tx(conn, issue_id, "remove dependency from")?;
 
+            let matches = conn.query_with_params(
+                "SELECT type FROM dependencies WHERE issue_id = ? AND depends_on_id = ? ORDER BY type",
+                &[issue_id.into(), depends_on_id.into()],
+            )?;
+            let selected_type = if let Some(kind) = dep_type {
+                kind
+            } else {
+                if matches.len() > 1 {
+                    return Err(BeadsError::Validation {
+                        field: "dep_type".to_owned(),
+                        reason: format!(
+                            "multiple dependency types connect {issue_id} to {depends_on_id}; specify --type to remove one relationship"
+                        ),
+                    });
+                }
+                let Some(row) = matches.first() else {
+                    return Ok(false);
+                };
+                row.get(0).and_then(SqliteValue::as_text).ok_or_else(|| {
+                    BeadsError::internal("dependency type is not text")
+                })?
+            };
+
             let rows = conn.execute_with_params(
-                "DELETE FROM dependencies WHERE issue_id = ? AND depends_on_id = ?",
+                "DELETE FROM dependencies WHERE issue_id = ? AND depends_on_id = ? AND type = ?",
                 &[
                     SqliteValue::from(issue_id),
                     SqliteValue::from(depends_on_id),
+                    SqliteValue::from(selected_type),
                 ],
             )?;
 
@@ -12728,7 +12754,7 @@ impl SqliteStorage {
                 ctx.record_event(
                     EventType::DependencyRemoved,
                     issue_id,
-                    Some(format!("Removed dependency on {depends_on_id}")),
+                    Some(format!("Removed dependency on {depends_on_id} ({selected_type})")),
                 );
                 ctx.mark_dirty(issue_id);
                 // Defer rebuild for the same reason as add_dependency_with_metadata.
@@ -14221,7 +14247,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_dependents(&self, issue_id: &str) -> Result<Vec<String>> {
         let rows = self.conn.query_with_params(
-            "SELECT issue_id FROM dependencies WHERE depends_on_id = ?",
+            "SELECT DISTINCT issue_id FROM dependencies WHERE depends_on_id = ?",
             &[SqliteValue::from(issue_id)],
         )?;
         Ok(rows
@@ -14283,7 +14309,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_dependencies(&self, issue_id: &str) -> Result<Vec<String>> {
         let rows = self.conn.query_with_params(
-            "SELECT depends_on_id FROM dependencies WHERE issue_id = ?",
+            "SELECT DISTINCT depends_on_id FROM dependencies WHERE issue_id = ?",
             &[SqliteValue::from(issue_id)],
         )?;
         Ok(rows
@@ -19863,10 +19889,8 @@ impl SqliteStorage {
                 &dep.depends_on_id,
                 dep.dep_type.as_str(),
             )?;
-            // Deduplicate by target because the dependencies table is keyed by
-            // (issue_id, depends_on_id). Type-distinct duplicates would be
-            // ignored by insertion anyway.
-            if seen_deps.insert(dep.depends_on_id.as_str()) {
+            // Different relationship types on one pair are distinct records.
+            if seen_deps.insert((dep.depends_on_id.as_str(), dep.dep_type.as_str())) {
                 unique_deps.push(dep);
             }
         }
@@ -28506,7 +28530,7 @@ required_fields:
         assert_eq!(deps, vec!["bd-b1".to_string()]);
 
         let removed = storage
-            .remove_dependency("bd-a1", "bd-b1", "tester")
+            .remove_dependency("bd-a1", "bd-b1", None, "tester")
             .unwrap();
         assert!(removed);
         let deps = storage.get_dependencies("bd-a1").unwrap();
@@ -28611,7 +28635,75 @@ required_fields:
     }
 
     #[test]
-    fn test_add_dependency_existing_pair_skips_cycle_check() {
+    fn create_issue_preserves_typed_dependency_payloads_and_rejects_invalid_relations() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let time = Utc.with_ymd_and_hms(2026, 9, 9, 0, 0, 0).unwrap();
+        let target = make_issue(
+            "bd-create-target",
+            "Target",
+            Status::Open,
+            2,
+            None,
+            time,
+            None,
+        );
+        storage.create_issue(&target, "original-actor").unwrap();
+        let mut source = make_issue(
+            "bd-create-source",
+            "Source",
+            Status::Open,
+            2,
+            None,
+            time,
+            None,
+        );
+        source.dependencies = [DependencyType::Blocks, DependencyType::Related]
+            .into_iter()
+            .map(|dep_type| Dependency {
+                issue_id: source.id.clone(),
+                depends_on_id: target.id.clone(),
+                metadata: Some(format!(r#"{{"kind":"{}"}}"#, dep_type.as_str())),
+                thread_id: Some(format!("{}-thread", dep_type.as_str())),
+                created_at: time,
+                created_by: Some("relation-actor".into()),
+                dep_type,
+            })
+            .collect();
+        let before = serde_json::json!({
+            "events": storage.get_all_events(0).unwrap(),
+            "dirty": storage.get_dirty_issue_metadata().unwrap(),
+        });
+        for wrong_owner in [false, true] {
+            let mut invalid = source.clone();
+            if wrong_owner {
+                invalid.dependencies[0].issue_id = "bd-wrong-owner".into();
+            } else {
+                invalid.dependencies[0].metadata = Some("not JSON".into());
+            }
+            let error = storage.create_issue(&invalid, "creator").unwrap_err();
+            assert!(matches!(error, BeadsError::Validation { .. }), "{error}");
+            assert!(storage.get_issue(&source.id).unwrap().is_none());
+            assert_eq!(
+                serde_json::json!({
+                    "events": storage.get_all_events(0).unwrap(),
+                    "dirty": storage.get_dirty_issue_metadata().unwrap(),
+                }),
+                before
+            );
+        }
+        storage.create_issue(&source, "creator").unwrap();
+        assert_eq!(
+            storage.get_dependencies_full(&source.id).unwrap(),
+            source.dependencies
+        );
+        assert_eq!(
+            storage.get_dependencies(&source.id).unwrap(),
+            vec![target.id]
+        );
+    }
+
+    #[test]
+    fn test_add_dependency_existing_type_is_idempotent_but_new_type_checks_cycles() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
 
@@ -28627,11 +28719,15 @@ required_fields:
             .add_dependency("bd-existing-b", "bd-existing-a", "blocks", "tester")
             .unwrap();
 
-        let added = storage
+        assert!(
+            !storage
+                .add_dependency("bd-existing-a", "bd-existing-b", "related", "tester")
+                .expect("the exact existing typed edge is unchanged")
+        );
+        let error = storage
             .add_dependency("bd-existing-a", "bd-existing-b", "blocks", "tester")
-            .expect("existing pair should return unchanged instead of false cycle");
-
-        assert!(!added);
+            .expect_err("a different type is a new edge and must pass cycle validation");
+        assert!(matches!(error, BeadsError::DependencyCycle { .. }));
         let dep_types: Vec<String> = storage
             .get_dependencies_full("bd-existing-a")
             .unwrap()
@@ -28642,7 +28738,7 @@ required_fields:
     }
 
     #[test]
-    fn test_bulk_dependency_import_ignores_existing_pairs_before_cycle_check() {
+    fn test_bulk_dependency_import_checks_new_types_before_any_insert() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
 
@@ -28659,7 +28755,7 @@ required_fields:
             )
             .unwrap();
 
-        let inserted = storage
+        let error = storage
             .add_dependencies_bulk_for_import(
                 &[
                     BulkDependencyInsert {
@@ -28675,9 +28771,9 @@ required_fields:
                 ],
                 "tester",
             )
-            .expect("ignored duplicate pair should not create a false proposed cycle");
+            .expect_err("a type-distinct edge participates in the proposed cycle");
 
-        assert_eq!(inserted, 1);
+        assert!(matches!(error, BeadsError::DependencyCycle { .. }));
         let dep_types_a: Vec<String> = storage
             .get_dependencies_full("bd-bulk-existing-a")
             .unwrap()
@@ -28685,9 +28781,12 @@ required_fields:
             .map(|dep| dep.dep_type.as_str().to_string())
             .collect();
         assert_eq!(dep_types_a, vec!["related".to_string()]);
-        assert_eq!(
-            storage.get_dependencies("bd-bulk-existing-b").unwrap(),
-            vec!["bd-bulk-existing-a".to_string()]
+        assert!(
+            storage
+                .get_dependencies("bd-bulk-existing-b")
+                .unwrap()
+                .is_empty(),
+            "the cycle refusal must roll back the whole batch"
         );
     }
 
@@ -28938,7 +29037,7 @@ required_fields:
             .unwrap();
 
         let remove_error = storage
-            .remove_dependency("bd-dep-child", "bd-dep-old-parent", "tester")
+            .remove_dependency("bd-dep-child", "bd-dep-old-parent", None, "tester")
             .unwrap_err();
         assert!(
             matches!(
