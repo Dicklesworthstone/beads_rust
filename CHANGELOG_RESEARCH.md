@@ -802,7 +802,8 @@ are retained under `/tmp/br-46zqi-queue-v3-abba-evidence-20260909/` locally and
 `analysis.json` has SHA-256
 `fe4c1c1719bf71668ee3709dfa96e753f5c6c2d41170a66a97ea1b7cfba80b89`.
 
-Native Windows qualification is pending. Worker repairs restored SSH,
+Native Windows queue and CLI lifecycle checks passed.
+Worker repairs restored SSH,
 selected the verified MSVC linker, and corrected RCH's recovery rejection of
 NTFS's unavailable Unix inode count. The root dispatcher automatically
 passed its retained recovery probes and configured `rustc --version` canary
@@ -810,8 +811,9 @@ at 18:41:47 UTC. This is recovery evidence, not a project test pass.
 The first native release test build exceeded its unchanged 30-minute budget
 at 18:23:05 UTC without executing tests. No compiler processes remained when
 inspected at 18:55–18:56 UTC; the retry started at 18:58:18 UTC using the
-retained cache. The second dispatcher's repaired executable is staged while
-active jobs finish. No GitHub Actions or new release were used for this work.
+retained cache. The second dispatcher's repaired executable was initially
+staged while active jobs finished. No GitHub Actions or new release were used
+for this work.
 
 At 19:30:37 UTC the second dispatcher was also upgraded after a successful
 drain. Both running executables match SHA-256
@@ -826,12 +828,103 @@ failure, not a native test pass.
 The native compiler exposed two unused-import warnings. Imports used only
 by Unix tests were moved into those existing test scopes in `doctor.rs` and
 the sync command; no test gate, assertion, or runtime behavior changed.
-The current native attempt starts from the completed dependency cache and
-reports neither import warning. Its 13 pre-existing dead-code warnings remain.
+The third native attempt reused the completed dependency cache and reported
+neither import warning. Its 13 pre-existing dead-code warnings remain.
 The import-only source passed all-feature/all-target Linux `cargo check`
 through RCH in 180 seconds after two capped cold/warming attempts and one
 startup-inventory refusal. Matching all-feature/all-target Clippy with warnings
-denied passed in 231 seconds. Native test execution remains pending.
+denied passed in 231 seconds.
 Formatting and whitespace checks passed. The two-file UBS scan remains
 non-clean: 77 critical, 4,003 warning, and 1,074 informational findings; the
 import-only review is not a blanket clearance of those files.
+
+At 19:52:13 UTC the native Windows invocation completed successfully through
+RCH after 13 minutes 10 seconds of release compilation. All three selected
+`workspace_waiter` library tests executed and passed; none failed or were
+ignored, and 2,517 unrelated tests were filtered. They cover simultaneous
+registration, fast-path bypass prevention, timeout cleanup, ordered promotion,
+and abandoned waiters. The log is
+`/tmp/br-46zqi-windows-imports-native-tests-20260909.log`.
+The 41,137,152-byte test executable was retrieved and independently checksummed
+at `/tmp/br-46zqi-windows-native-unit-20260909.exe`, SHA-256
+`0a4567e593528272cf14b517c75f5c48f093f72e5c5ff2d861f21a94856b5089`.
+All 868 required inputs had passed the current-source manifest check before
+compilation; its manifest SHA-256 is
+`1098fbf692f4abbe182d34eb18c18b5dd7a9bf692ac02281a97e71020caffe64`.
+
+The first two CLI lifecycle dispatches transferred source but refused before
+Cargo because the dependency probe exceeded its 20-second SSH budget. Their
+failures and refused local fallback are retained in
+`/tmp/br-46zqi-windows-native-lifecycle-20260909.log` and
+`/tmp/br-46zqi-windows-native-lifecycle-retry-20260909.log`. Read-only direct
+manifest probes subsequently passed in 0.66–1.26 seconds. An unrelated native
+FrankenTerm build was active and left untouched; its presence alone does not
+establish the cause of either timeout.
+
+The third unchanged lifecycle dispatch uploaded source in 9.45 seconds,
+verified all 161 dependency preflight entries, and started native Cargo at
+20:03:15 UTC. Its log is
+`/tmp/br-46zqi-windows-native-lifecycle-retry2-20260909.log`. It reached the
+unchanged 1,830-second SSH deadline at 20:33:45 UTC before executing the test;
+this is another failed invocation. All 868 required local inputs still match
+the source manifest. Before timeout, two native compilers were building the
+application library under the owned Cargo process. The worker's 16 GiB RAM
+was pressured by concurrent builds; Windows expanded its system-managed
+pagefile. No system setting or unrelated process was changed. The surviving
+Cargo process continued into the CLI and lifecycle-test targets. By 20:50 UTC
+it and its children had exited, and both completed executables were present.
+No source transfer or second Cargo build overlapped those surviving compilers.
+
+The normal strict-RCH retry on `wsurf` then passed at 20:51:41 UTC:
+
+```bash
+cargo test --locked --release --target x86_64-pc-windows-msvc \
+  --test e2e_basic_lifecycle --jobs 1 -- --exact e2e_basic_lifecycle --nocapture
+```
+
+It reused the completed artifacts. Exactly one test executed and passed in
+9.20 seconds, with zero failures or ignores and 202 unrelated tests filtered.
+The complete remote Cargo command took 43.6 seconds. Its eight real CLI calls
+covered init, create, update, JSON/text list, JSON/text show, and close; every
+call exited zero with empty stderr. The trace names the actual native CLI and
+the isolated Windows workspace. The log is
+`/tmp/br-46zqi-windows-native-lifecycle-final-20260909.log`.
+The original cold-build timeout remains a failure; this passing warm run does
+not establish that a cold build fits the dispatch budget on this 16 GiB worker.
+
+The CLI and lifecycle-test executables were retrieved independently of RCH's
+zero-file artifact return. Local checksums match the worker's checksums after
+the successful run:
+
+| Local artifact | Bytes | SHA-256 |
+|---|---:|---|
+| `/tmp/br-46zqi-windows-native-cli-20260909.exe` | 22,596,096 | `d0260f099d454ac99b465738fb90c1cdc4ff4e7d94ce90449fda207f560de1e6` |
+| `/tmp/br-46zqi-windows-native-lifecycle-20260909.exe` | 24,846,336 | `52ec1fe3a835e1fb752b4ae8164ad8b58e5f608cbbc68ce312485a65bc3984ba` |
+
+The final worker check also verified all 868 required source/fixture inputs;
+its log is `/tmp/br-46zqi-windows-final-source-and-binaries-20260909.log`.
+Five existing Windows library dead-code warnings and an MSVC linker-message
+warning remain in the lifecycle transcript. Native execution is verified;
+Windows warning-free qualification and the original starvation acceptance
+remain separate from these passing checks.
+
+Before saving this evidence, upstream merge `5427ea14` was integrated. Its
+source delta reversed both lint fixes from `11468bbb`: it synthesized
+`TryLockError::WouldBlock`, which the retained V2 Clippy log rejects for the
+declared MSRV, and restored an equality expression inside `assert!`.
+The guarded direct lock attempt and `assert_eq!` were restored manually.
+Both versions skip the exclusive fast path while a waiter is registered;
+the correction preserves that behavior. All 868 required inputs again match
+the exact manifest used for the successful native runs. No new Windows
+behavior or new native-build result is claimed for this reconciliation.
+
+The final all-feature/all-target Linux check passed on ovh-a in 289 seconds;
+the first selected worker, hz4, had refused admission for stale disk-pressure
+telemetry before running Cargo. The first final Clippy attempt on hz3 reached
+its unchanged 300-second cold-build cap. The warm retry then passed with
+warnings denied in 246 seconds at 21:08:41 UTC. The complete logs are
+`/tmp/br-46zqi-final-merge-check-ovh-20260909.log` and
+`/tmp/br-46zqi-final-merge-clippy-hz3-warm-20260909.log`.
+The scoped final UBS scan remains non-clean: 189 critical, 3,224 warning, and
+932 informational findings in `src/sync/mod.rs`. Restoring the already-tested
+source does not claim to clear that file's broader scanner findings.
