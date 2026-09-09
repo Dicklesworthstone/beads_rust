@@ -8,6 +8,7 @@
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -800,6 +801,114 @@ fn get_git_commit(repo_path: &Path) -> Option<String> {
 // Dataset Override Support (beads_rust-b4nj)
 // =============================================================================
 
+const DATASET_REPLAY_ENV: &str = "BR_DATASET_REPLAY";
+const DATASET_REPLAY_REASON_ENV: &str = "BR_DATASET_REPLAY_REASON";
+
+fn dataset_replay_override_with(
+    mut read_env: impl FnMut(&str) -> Option<OsString>,
+) -> std::io::Result<Option<DatasetOverride>> {
+    let path = read_env(DATASET_REPLAY_ENV);
+    let reason = read_env(DATASET_REPLAY_REASON_ENV);
+    let (path, reason) = match (path, reason) {
+        (None, None) => return Ok(None),
+        (Some(path), Some(reason)) if !path.is_empty() => (path, reason),
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "explicit corpus replay requires nonempty BR_DATASET_REPLAY and BR_DATASET_REPLAY_REASON",
+            ));
+        }
+    };
+    let reason = reason.into_string().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "BR_DATASET_REPLAY_REASON must be UTF-8 text",
+        )
+    })?;
+    if reason.trim().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "BR_DATASET_REPLAY_REASON must explain the explicit corpus replay",
+        ));
+    }
+    Ok(Some(
+        DatasetOverride::new(path, reason).with_name(KnownDataset::BeadsRust.name()),
+    ))
+}
+
+/// Prepare the BeadsRust corpus for the five history, label and read-concurrency
+/// replay tests. `BR_DATASET_REPLAY` names a workspace containing `.beads`, and
+/// `BR_DATASET_REPLAY_REASON` records why that corpus was selected. The normal
+/// dataset remains the default; explicit replay never skips or rebuilds JSONL
+/// into a replacement dataset when its source or reviewed migration is invalid.
+pub fn isolated_beads_rust_replay(
+    test_name: &str,
+    allow_unsupported_default: bool,
+) -> std::io::Result<Option<IsolatedDataset>> {
+    let override_config = dataset_replay_override_with(|name| std::env::var_os(name))?;
+    let mut isolated = if let Some(override_config) = override_config {
+        for name in ["beads.db", "issues.jsonl"] {
+            let path = override_config.path.join(".beads").join(name);
+            let metadata = path.symlink_metadata().map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "explicit corpus replay cannot inspect {}: {error}",
+                        path.display()
+                    ),
+                )
+            })?;
+            if !metadata.file_type().is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "explicit corpus replay requires a regular file: {}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        isolated_from_override(&override_config)?
+    } else {
+        if !DatasetRegistry::new().is_available(KnownDataset::BeadsRust) {
+            eprintln!("Skipping {test_name}: beads_rust dataset not available");
+            return Ok(None);
+        }
+        IsolatedDataset::from_dataset(KnownDataset::BeadsRust)?
+    };
+    if isolated.metadata.is_override {
+        isolated.temp_dir.disable_cleanup(true);
+        eprintln!(
+            "explicit dataset replay workspace retained for {test_name}: {}",
+            isolated.root.display()
+        );
+    }
+    eprintln!(
+        "dataset replay: {}",
+        serde_json::json!({
+            "test": test_name,
+            "workspace": isolated.root,
+            "dataset": isolated.metadata.to_json(),
+        })
+    );
+    if let Err(error) = isolated.migrate_to_current_schema() {
+        let skip_default = allow_unsupported_default
+            && !isolated.metadata.is_override
+            && error.kind() == std::io::ErrorKind::Unsupported;
+        let retained = isolated.temp_dir.keep();
+        let message = format!(
+            "{test_name}: migrate isolated beads_rust dataset: {error}; failing workspace retained at {}",
+            retained.display()
+        );
+        if skip_default {
+            eprintln!("Skipping default corpus below the reviewed-migration floor: {message}");
+            return Ok(None);
+        }
+        return Err(std::io::Error::new(error.kind(), message));
+    }
+    Ok(Some(isolated))
+}
+
 /// Configuration for dataset override.
 ///
 /// Allows tests to use custom `.beads` directories instead of known datasets.
@@ -1387,6 +1496,68 @@ mod tests {
     // =========================================================================
     // DatasetOverride tests (beads_rust-b4nj)
     // =========================================================================
+
+    #[test]
+    fn test_dataset_replay_override_absent_preserves_default_selection() {
+        assert!(dataset_replay_override_with(|_| None).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_dataset_replay_override_preserves_explicit_path_and_reason() {
+        let override_config = dataset_replay_override_with(|name| match name {
+            DATASET_REPLAY_ENV => Some(OsString::from("/retained corpus/workspace")),
+            DATASET_REPLAY_REASON_ENV => {
+                Some(OsString::from("replay the original schema-15 corpus"))
+            }
+            _ => None,
+        })
+        .unwrap()
+        .expect("explicit corpus selected");
+        assert_eq!(
+            override_config.path,
+            PathBuf::from("/retained corpus/workspace")
+        );
+        assert_eq!(
+            override_config.reason,
+            "replay the original schema-15 corpus"
+        );
+        assert_eq!(override_config.name.as_deref(), Some("beads_rust"));
+    }
+
+    #[test]
+    fn test_dataset_replay_override_rejects_incomplete_or_empty_inputs() {
+        for (path, reason) in [
+            (Some("/retained/workspace"), None),
+            (None, Some("retain the original corpus")),
+            (Some(""), Some("retain the original corpus")),
+            (Some("/retained/workspace"), Some("")),
+            (Some("/retained/workspace"), Some(" \t\n")),
+        ] {
+            let error = dataset_replay_override_with(|name| match name {
+                DATASET_REPLAY_ENV => path.map(OsString::from),
+                DATASET_REPLAY_REASON_ENV => reason.map(OsString::from),
+                _ => None,
+            })
+            .expect_err("an invalid explicit replay must not fall back or skip");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("BR_DATASET_REPLAY"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_dataset_replay_override_rejects_nontext_reason() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let error = dataset_replay_override_with(|name| match name {
+            DATASET_REPLAY_ENV => Some(OsString::from("/retained/workspace")),
+            DATASET_REPLAY_REASON_ENV => Some(OsString::from_vec(vec![0xff])),
+            _ => None,
+        })
+        .expect_err("a replay reason must be printable text");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("UTF-8"));
+    }
 
     #[test]
     fn test_dataset_override_creation() {

@@ -200,7 +200,7 @@ fn remove_dependency_removes_link() {
         .unwrap();
 
     let removed = storage
-        .remove_dependency(&blocked.id, &blocker.id, "tester")
+        .remove_dependency(&blocked.id, &blocker.id, None, "tester")
         .unwrap();
     assert!(removed);
 
@@ -220,9 +220,86 @@ fn remove_dependency_nonexistent_returns_false() {
 
     // No dependency exists
     let removed = storage
-        .remove_dependency(&issue1.id, &issue2.id, "tester")
+        .remove_dependency(&issue1.id, &issue2.id, None, "tester")
         .unwrap();
     assert!(!removed);
+}
+
+#[test]
+fn remove_dependency_selects_exact_type_and_refuses_ambiguous_pairs() {
+    for (kind, selector) in [("blocks", "BLOCKS"), ("parent-child", "PARENT-CHILD")] {
+        let mut storage = test_db();
+        let source = fixtures::issue("typed-source");
+        let target = fixtures::issue("typed-target");
+        storage.create_issue(&source, "tester").unwrap();
+        storage.create_issue(&target, "tester").unwrap();
+        for dep_type in [kind, "related"] {
+            assert!(
+                storage
+                    .add_dependency(&source.id, &target.id, dep_type, "tester")
+                    .unwrap()
+            );
+        }
+        let dependencies = storage.get_dependencies_full(&source.id).unwrap();
+        assert_eq!(dependencies.len(), 2);
+        assert_eq!(
+            storage.get_dependencies(&source.id).unwrap(),
+            vec![target.id.clone()]
+        );
+        assert_eq!(
+            storage.get_dependents(&target.id).unwrap(),
+            vec![source.id.clone()]
+        );
+        let related = dependencies
+            .iter()
+            .find(|dep| dep.dep_type == DependencyType::Related)
+            .unwrap()
+            .clone();
+        let before = serde_json::json!({
+            "issue": storage.get_issue(&source.id).unwrap(),
+            "dependencies": dependencies,
+            "events": storage.get_events(&source.id, 0).unwrap(),
+            "dirty": storage.get_dirty_issue_metadata().unwrap(),
+        });
+        let error = storage
+            .remove_dependency(&source.id, &target.id, None, "remover")
+            .unwrap_err();
+        assert!(error.to_string().contains("--type"), "{error}");
+        assert_eq!(
+            serde_json::json!({
+                "issue": storage.get_issue(&source.id).unwrap(),
+                "dependencies": storage.get_dependencies_full(&source.id).unwrap(),
+                "events": storage.get_events(&source.id, 0).unwrap(),
+                "dirty": storage.get_dirty_issue_metadata().unwrap(),
+            }),
+            before
+        );
+        assert!(
+            storage
+                .remove_dependency(&source.id, &target.id, Some(selector), "remover")
+                .unwrap()
+        );
+        assert_eq!(
+            storage.get_dependencies_full(&source.id).unwrap(),
+            vec![related]
+        );
+        assert!(
+            !storage
+                .remove_dependency(&source.id, &target.id, Some(kind), "remover")
+                .unwrap()
+        );
+        assert!(
+            storage
+                .remove_dependency(&source.id, &target.id, None, "remover")
+                .unwrap()
+        );
+        assert!(
+            storage
+                .get_dependencies_full(&source.id)
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
 
 #[test]
@@ -245,7 +322,7 @@ fn remove_dependency_records_event() {
         .unwrap();
 
     storage
-        .remove_dependency(&blocked.id, &blocker.id, "remover")
+        .remove_dependency(&blocked.id, &blocker.id, None, "remover")
         .unwrap();
 
     let details = storage
@@ -289,7 +366,7 @@ fn remove_dependency_marks_dirty() {
 
     // Remove dependency
     storage
-        .remove_dependency(&blocked.id, &blocker.id, "tester")
+        .remove_dependency(&blocked.id, &blocker.id, None, "tester")
         .unwrap();
 
     let dirty_ids = storage.get_dirty_issue_ids().unwrap();
@@ -1023,7 +1100,7 @@ fn blocked_cache_invalidated_on_remove_dependency() {
 
     // Remove dependency - cache should be invalidated
     storage
-        .remove_dependency(&blocked.id, &blocker.id, "tester")
+        .remove_dependency(&blocked.id, &blocker.id, None, "tester")
         .unwrap();
 
     // After removing, blocked should not be in cache
@@ -1325,7 +1402,7 @@ fn test_dep_remove_parent_allows_subsequent_add() {
 
     // Remove
     storage
-        .remove_dependency(&child.id, &parent_a.id, "tester")
+        .remove_dependency(&child.id, &parent_a.id, None, "tester")
         .expect("remove must succeed");
 
     let deps = storage.get_dependencies(&child.id).unwrap();

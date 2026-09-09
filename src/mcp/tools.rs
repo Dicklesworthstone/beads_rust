@@ -2933,6 +2933,7 @@ fn manage_dependencies_remove_json(
     state: &BeadsState,
     id: &str,
     depends_on: &str,
+    dep_type_raw: Option<&str>,
 ) -> McpResult<Value> {
     if let Some(err) = detect_placeholder(depends_on) {
         return Err(err);
@@ -2940,15 +2941,58 @@ fn manage_dependencies_remove_json(
 
     require_valid_issue(storage, id)?;
 
+    let requested_type = dep_type_raw
+        .map(|kind| parse_dep_type_for_removal(storage, id, depends_on, kind))
+        .transpose()?;
+    let dep_type = match &requested_type {
+        Some((dep_type, _)) => Some(dep_type.clone()),
+        None => storage
+            .get_dependencies_full(id)
+            .map_err(beads_to_mcp)?
+            .into_iter()
+            .find(|dep| dep.depends_on_id == depends_on)
+            .map(|dep| dep.dep_type.to_string()),
+    };
     let removed = storage
-        .remove_dependency(id, depends_on, &state.actor)
+        .remove_dependency(
+            id,
+            depends_on,
+            requested_type
+                .as_ref()
+                .map(|(dep_type, _)| dep_type.as_str()),
+            &state.actor,
+        )
         .map_err(beads_to_mcp)?;
 
-    Ok(json!({
+    let mut result = json!({
         "removed": removed,
         "from": id,
         "to": depends_on,
-    }))
+        "dep_type": dep_type,
+    });
+    if let Some((_, Some(warning))) = requested_type {
+        result["coercion"] = json!(warning);
+    }
+    Ok(result)
+}
+
+fn parse_dep_type_for_removal(
+    storage: &SqliteStorage,
+    id: &str,
+    depends_on: &str,
+    requested: &str,
+) -> McpResult<(String, Option<String>)> {
+    // An imported custom type may even have the spelling of a standard alias.
+    // Exact existing names must win so removing it preserves other edges.
+    if storage
+        .get_dependencies_full(id)
+        .map_err(beads_to_mcp)?
+        .iter()
+        .any(|dep| dep.depends_on_id == depends_on && dep.dep_type.as_str() == requested)
+    {
+        return Ok((requested.to_owned(), None));
+    }
+    parse_dep_type(requested)
 }
 
 fn manage_dependencies_operation_json(
@@ -2970,7 +3014,14 @@ fn manage_dependencies_operation_json(
         "remove" => {
             let depends_on = required_str_arg(args, "depends_on")
                 .map_err(|err| McpError::invalid_params(format!("{err} for action 'remove'")))?;
-            manage_dependencies_remove_json(storage, state, &id, &depends_on)
+            let dep_type_raw = optional_str_arg(args, "dep_type")?;
+            manage_dependencies_remove_json(
+                storage,
+                state,
+                &id,
+                &depends_on,
+                dep_type_raw.as_deref(),
+            )
         }
         other => Err(invalid_dependency_action_error(other)),
     }
@@ -3095,7 +3146,7 @@ impl ToolHandler for ManageDependenciesTool {
                  Discovery: Get issue IDs from list_issues. See beads://schema for dep types.\n\
                  When to use: Linking related issues, establishing blocking relationships.\n\
                  NOT for: Viewing blocked issues overview — use beads://issues/blocked resource.\n\
-                 Do: Use 'list' action first to see existing deps before modifying, or operations[] for ordered batch work.\n\
+                 Do: Use 'list' action first to see existing deps before modifying, or operations[] for ordered batch work. Specify dep_type when removing one of several types between the same pair.\n\
                  Don't: Create circular deps — the system will reject them with guidance.\n\
                  Common mistakes: Swapping source/target for 'blocks' type; using placeholder IDs.\n\
                  Batch semantics: operations[] uses one storage envelope and returns {items,count,ok_count,error_count}; each item has ok:true with the legacy result or ok:false with a structured error.\n\
@@ -3120,8 +3171,7 @@ impl ToolHandler for ManageDependenciesTool {
                     },
                     "dep_type": {
                         "type": "string",
-                        "description": "Dependency type: blocks (default), related, parent-child, waits-for, duplicates, supersedes, caused-by. Aliases auto-corrected (e.g. 'parent_child' → 'parent-child').",
-                        "default": "blocks"
+                        "description": "Dependency type: blocks, related, parent-child, waits-for, duplicates, supersedes, caused-by. Add defaults to blocks. Remove without a type requires a unique edge; specify a type when the pair has several. Removal accepts an exact existing custom type before alias correction (e.g. 'parent_child' → 'parent-child')."
                     },
                     "operations": {
                         "type": "array",
@@ -3138,7 +3188,7 @@ impl ToolHandler for ManageDependenciesTool {
                                 "depends_on": {"type": "string"},
                                 "dep_type": {
                                     "type": "string",
-                                    "default": "blocks"
+                                    "description": "Add defaults to blocks; remove without a type requires a unique edge."
                                 }
                             },
                             "required": ["action", "id"],
@@ -3211,8 +3261,15 @@ impl ToolHandler for ManageDependenciesTool {
                 let depends_on = required_str_arg(&args, "depends_on").map_err(|err| {
                     McpError::invalid_params(format!("{err} for action 'remove'"))
                 })?;
+                let dep_type_raw = optional_str_arg(&args, "dep_type")?;
                 let removed = self.0.with_mutation(|storage, _| {
-                    manage_dependencies_remove_json(storage, &self.0, &id, &depends_on)
+                    manage_dependencies_remove_json(
+                        storage,
+                        &self.0,
+                        &id,
+                        &depends_on,
+                        dep_type_raw.as_deref(),
+                    )
                 })?;
                 Ok(vec![Content::text(removed.to_string())])
             }

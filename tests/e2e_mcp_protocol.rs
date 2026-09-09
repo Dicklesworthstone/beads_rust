@@ -805,6 +805,378 @@ fn read_only_db(root: &Path) -> beads_rust::franken_sync::Connection {
     .expect("read-only database observer")
 }
 
+fn dependency_workspace_state(root: &Path) -> Value {
+    let connection = read_only_db(root);
+    let names = connection
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .expect("dependency workspace tables");
+    let mut tables = serde_json::Map::new();
+    for row in names {
+        let name = row
+            .get(0)
+            .and_then(beads_rust::franken_sync::SqliteValue::as_text)
+            .expect("table name");
+        let sql = format!(
+            "SELECT * FROM \"{}\" ORDER BY rowid",
+            name.replace('"', "\"\"")
+        );
+        let rows = connection.query(&sql).expect("complete persisted rows");
+        tables.insert(name.to_owned(), json!(format!("{rows:?}")));
+    }
+    connection.close().expect("close dependency observer");
+    let jsonl =
+        std::fs::read_to_string(root.join(".beads/issues.jsonl")).expect("dependency export");
+    let state = json!({"tables": tables, "jsonl": jsonl});
+    eprintln!(
+        "{}",
+        json!({"kind": "dependency_workspace_state", "workspace": root, "state": state})
+    );
+    state
+}
+
+fn assert_cli_dependency_types(root: &Path, source: &str, target: &str, expected: &[&str]) {
+    let listed = cli_json(root, &["dep", "list", source]);
+    let edges = listed.as_array().expect("dependency list");
+    assert_eq!(edges.len(), expected.len(), "{listed}");
+    assert!(edges.iter().all(|edge| edge["depends_on_id"] == target));
+    assert_eq!(
+        edges
+            .iter()
+            .map(|edge| edge["type"].as_str().expect("type"))
+            .collect::<BTreeSet<_>>(),
+        expected.iter().copied().collect::<BTreeSet<_>>()
+    );
+}
+
+fn exported_dependency(root: &Path, source: &str, dep_type: &str) -> Value {
+    let jsonl =
+        std::fs::read_to_string(root.join(".beads/issues.jsonl")).expect("dependency export");
+    let issue = jsonl
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("issue JSON"))
+        .find(|issue| issue["id"] == source)
+        .expect("source exported");
+    issue["dependencies"]
+        .as_array()
+        .expect("exported dependencies")
+        .iter()
+        .find(|edge| edge["type"] == dep_type)
+        .expect("exported typed edge")
+        .clone()
+}
+
+fn assert_dependency_removal_schema(client: &mut McpClient) {
+    let definitions = client.request("tools/list", json!({}));
+    let tool = definitions["tools"]
+        .as_array()
+        .expect("tool definitions")
+        .iter()
+        .find(|tool| tool["name"] == "manage_dependencies")
+        .expect("dependency tool");
+    let properties = &tool["inputSchema"]["properties"];
+    for dep_type in [
+        &properties["dep_type"],
+        &properties["operations"]["items"]["properties"]["dep_type"],
+    ] {
+        assert_eq!(dep_type["type"], "string");
+        assert!(
+            dep_type.get("default").is_none(),
+            "removal must not acquire an implicit type: {dep_type}"
+        );
+    }
+}
+
+#[test]
+fn cli_typed_dependency_removal_preserves_parallel_edges() {
+    let workspace = ProtocolWorkspace::new().expect("workspace");
+    let root = workspace.path();
+    cli_json(root, &["init", "--prefix", "typedcli"]);
+    let source = first_id(&cli_json(root, &["create", "Dependency source"]));
+    let target = first_id(&cli_json(root, &["create", "Dependency target"]));
+    let added = cli_json(root, &["dep", "add", &source, &target]);
+    assert_eq!(added["type"], "blocks");
+    cli_json(
+        root,
+        &[
+            "dep",
+            "add",
+            &source,
+            &target,
+            "--type",
+            "related",
+            "--metadata",
+            r#"{"context":"keep related metadata"}"#,
+        ],
+    );
+    assert_cli_dependency_types(root, &source, &target, &["blocks", "related"]);
+    let related = exported_dependency(root, &source, "related");
+    assert_eq!(
+        related["metadata"],
+        r#"{"context":"keep related metadata"}"#
+    );
+    let before = dependency_workspace_state(root);
+    assert_cli_policy_refusal_unchanged(
+        root,
+        &["dep", "remove", &source, &target],
+        "VALIDATION_FAILED",
+    );
+    assert_eq!(dependency_workspace_state(root), before);
+    assert_cli_policy_refusal_unchanged(
+        root,
+        &["dep", "remove", &source, &target, "-t", "relatd"],
+        "VALIDATION_FAILED",
+    );
+    assert_eq!(dependency_workspace_state(root), before);
+    let removed = cli_json(root, &["dep", "remove", &source, &target, "-t", "blocks"]);
+    assert_eq!(removed["action"], "removed");
+    assert_eq!(removed["type"], "blocks");
+    assert_cli_dependency_types(root, &source, &target, &["related"]);
+    assert_eq!(exported_dependency(root, &source, "related"), related);
+    let missing = cli_json(
+        root,
+        &["dep", "remove", &source, &target, "--type", "blocks"],
+    );
+    assert_eq!(missing["action"], "not_found");
+    assert_eq!(exported_dependency(root, &source, "related"), related);
+    let unique = cli_json(root, &["dep", "remove", &source, &target]);
+    assert_eq!(unique["action"], "removed");
+    assert_eq!(unique["type"], "related");
+    assert_cli_dependency_types(root, &source, &target, &[]);
+}
+
+#[test]
+fn mcp_typed_dependency_removal_handles_single_and_batch_requests() {
+    let workspace = ProtocolWorkspace::new().expect("workspace");
+    let root = workspace.path();
+    cli_json(root, &["init", "--prefix", "typedmcp"]);
+    let source = first_id(&cli_json(root, &["create", "Dependency source"]));
+    let target = first_id(&cli_json(root, &["create", "Dependency target"]));
+    let mut client = McpClient::spawn(root);
+    assert_dependency_removal_schema(&mut client);
+    let added = client.call_tool(
+        "manage_dependencies",
+        json!({"action": "add", "id": source, "depends_on": target}),
+    );
+    assert_eq!(added["dep_type"], "blocks");
+    client.call_tool(
+        "manage_dependencies",
+        json!({"action": "add", "id": source, "depends_on": target, "dep_type": "related"}),
+    );
+    assert_cli_dependency_types(root, &source, &target, &["blocks", "related"]);
+    let related = exported_dependency(root, &source, "related");
+    let before = dependency_workspace_state(root);
+    let error = assert_policy_refusal_unchanged(
+        &mut client,
+        root,
+        "manage_dependencies",
+        json!({"action": "remove", "id": source, "depends_on": target}),
+        "VALIDATION_FAILED",
+    );
+    assert!(contains_text(&error, "--type"), "{error}");
+    assert_eq!(dependency_workspace_state(root), before);
+    let batch = client.call_tool(
+        "manage_dependencies",
+        json!({"operations": [
+            {"action": "remove", "id": source, "depends_on": target},
+            {"action": "list", "id": source}
+        ]}),
+    );
+    assert_eq!(batch["ok_count"], 1);
+    assert_eq!(batch["error_count"], 1);
+    assert_eq!(
+        batch["items"][0]["error"]["data"]["error_type"],
+        "VALIDATION_FAILED"
+    );
+    assert_eq!(
+        batch["items"][1]["result"]["depends_on"]
+            .as_array()
+            .expect("listed edges")
+            .len(),
+        2
+    );
+    assert_eq!(dependency_workspace_state(root), before);
+    let removed = client.call_tool(
+        "manage_dependencies",
+        json!({"action": "remove", "id": source, "depends_on": target, "dep_type": "blocking"}),
+    );
+    assert_eq!(removed["removed"], true);
+    assert_eq!(removed["dep_type"], "blocks");
+    assert!(removed["coercion"].is_string());
+    assert_cli_dependency_types(root, &source, &target, &["related"]);
+    assert_eq!(exported_dependency(root, &source, "related"), related);
+    assert_mcp_typed_dependency_batch(&mut client, root, &source, &target);
+    let (status, stderr) = client.finish();
+    assert!(
+        status.success() || status.code() == Some(130),
+        "{status}: {stderr}"
+    );
+}
+
+fn assert_mcp_typed_dependency_batch(
+    client: &mut McpClient,
+    root: &Path,
+    source: &str,
+    target: &str,
+) {
+    client.call_tool(
+        "manage_dependencies",
+        json!({"action": "add", "id": source, "depends_on": target}),
+    );
+    let typed = client.call_tool(
+        "manage_dependencies",
+        json!({"operations": [
+            {"action": "remove", "id": source, "depends_on": target, "dep_type": "related"},
+            {"action": "list", "id": source},
+            {"action": "remove", "id": source, "depends_on": target}
+        ]}),
+    );
+    assert_eq!(typed["ok_count"], 3);
+    assert_eq!(typed["error_count"], 0);
+    assert_eq!(typed["items"][0]["result"]["dep_type"], "related");
+    assert_eq!(
+        typed["items"][1]["result"]["depends_on"],
+        json!([{"id": target, "dep_type": "blocks"}])
+    );
+    assert_eq!(typed["items"][2]["result"]["dep_type"], "blocks");
+    assert_cli_dependency_types(root, source, target, &[]);
+}
+
+fn import_custom_dependency_pair(root: &Path, custom: &str) -> (String, String) {
+    cli_json(root, &["init", "--prefix", "customdep"]);
+    let source = first_id(&cli_json(root, &["create", "Imported dependency source"]));
+    let target = first_id(&cli_json(root, &["create", "Imported dependency target"]));
+    let path = root.join(".beads/issues.jsonl");
+    let original = std::fs::read_to_string(&path).expect("original export");
+    let mut issues: Vec<Value> = original
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("exported issue"))
+        .collect();
+    let issue = issues
+        .iter_mut()
+        .find(|issue| issue["id"] == source)
+        .expect("source");
+    // Normal import uses strictly newer updated_at for an existing ID. This
+    // external relation edit is a new revision, not an equal-timestamp replay.
+    let previous_revision = chrono::DateTime::parse_from_rfc3339(
+        issue["updated_at"].as_str().expect("exported revision"),
+    )
+    .expect("revision timestamp");
+    issue["updated_at"] = json!((previous_revision + chrono::Duration::seconds(1)).to_rfc3339());
+    issue["dependencies"] = json!(["blocks", "related", custom].map(|kind| {
+        json!({"issue_id": source, "depends_on_id": target, "type": kind,
+            "created_at": issue["created_at"], "created_by": "jsonl-importer",
+            "metadata": format!("{{\"kind\":\"{kind}\",\"context\":\"préserve\"}}"),
+            "thread_id": format!("thread-{kind}")})
+    }));
+    let imported = issues
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(&path, imported).expect("stage actual JSONL import");
+    let result = cli_json(root, &["sync", "--import-only"]);
+    assert_eq!(result["created"], 0, "{result}");
+    assert_eq!(result["updated"], 1, "{result}");
+    assert_eq!(result["skipped"], 1, "{result}");
+    assert_cli_dependency_types(root, &source, &target, &["blocks", "related", custom]);
+    let imported_custom = exported_dependency(root, &source, custom);
+    assert_eq!(imported_custom["created_by"], "jsonl-importer");
+    assert_eq!(imported_custom["thread_id"], format!("thread-{custom}"));
+    (source, target)
+}
+
+#[test]
+fn cli_removes_exact_imported_custom_dependency_and_preserves_other_payloads() {
+    let workspace = ProtocolWorkspace::new().expect("workspace");
+    let root = workspace.path();
+    let (source, target) = import_custom_dependency_pair(root, "custom-review");
+    let related = exported_dependency(root, &source, "related");
+    let blocks = exported_dependency(root, &source, "blocks");
+    let before = dependency_workspace_state(root);
+    for args in [
+        vec!["dep", "remove", &source, &target],
+        vec!["dep", "remove", &source, &target, "--type", "custom-reveiw"],
+        vec!["dep", "add", &source, &target, "--type", "custom-review"],
+    ] {
+        assert_cli_policy_refusal_unchanged(root, &args, "VALIDATION_FAILED");
+        assert_eq!(dependency_workspace_state(root), before);
+    }
+    let removed = cli_json(
+        root,
+        &["dep", "remove", &source, &target, "--type", "custom-review"],
+    );
+    assert_eq!(removed["action"], "removed");
+    assert_eq!(removed["type"], "custom-review");
+    assert_cli_dependency_types(root, &source, &target, &["blocks", "related"]);
+    assert_eq!(exported_dependency(root, &source, "related"), related);
+    assert_eq!(exported_dependency(root, &source, "blocks"), blocks);
+}
+
+#[test]
+fn mcp_removes_exact_imported_custom_dependency_before_alias_coercion() {
+    let workspace = ProtocolWorkspace::new().expect("workspace");
+    let root = workspace.path();
+    let (source, target) = import_custom_dependency_pair(root, "blocking");
+    let related = exported_dependency(root, &source, "related");
+    let blocks = exported_dependency(root, &source, "blocks");
+    let mut client = McpClient::spawn(root);
+    let outbound = client.call_tool(
+        "manage_dependencies",
+        json!({"action": "list", "id": source}),
+    );
+    let edges = outbound["depends_on"]
+        .as_array()
+        .expect("typed outbound edges");
+    assert_eq!(edges.len(), 3);
+    assert_eq!(
+        edges
+            .iter()
+            .map(|edge| edge["dep_type"].as_str().expect("dependency type"))
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["blocking", "blocks", "related"])
+    );
+    let inbound = client.call_tool(
+        "manage_dependencies",
+        json!({"action": "list", "id": target}),
+    );
+    assert_eq!(inbound["depended_on_by"], json!([source]));
+    let before = dependency_workspace_state(root);
+    assert_policy_refusal_unchanged(
+        &mut client,
+        root,
+        "manage_dependencies",
+        json!({"action": "remove", "id": source, "depends_on": target}),
+        "VALIDATION_FAILED",
+    );
+    assert_eq!(dependency_workspace_state(root), before);
+    for action in ["remove", "add"] {
+        assert_policy_refusal_unchanged(
+            &mut client,
+            root,
+            "manage_dependencies",
+            json!({"action": action, "id": source, "depends_on": target, "dep_type": "blockign"}),
+            "INVALID_DEP_TYPE",
+        );
+        assert_eq!(dependency_workspace_state(root), before);
+    }
+    let removed = client.call_tool(
+        "manage_dependencies",
+        json!({"action": "remove", "id": source, "depends_on": target, "dep_type": "blocking"}),
+    );
+    assert_eq!(removed["removed"], true);
+    assert_eq!(removed["dep_type"], "blocking");
+    assert!(removed.get("coercion").is_none());
+    assert_cli_dependency_types(root, &source, &target, &["blocks", "related"]);
+    assert_eq!(exported_dependency(root, &source, "related"), related);
+    assert_eq!(exported_dependency(root, &source, "blocks"), blocks);
+    let (status, stderr) = client.finish();
+    assert!(
+        status.success() || status.code() == Some(130),
+        "{status}: {stderr}"
+    );
+}
+
 fn policy_bookkeeping(root: &Path) -> Value {
     let connection = read_only_db(root);
     // Read the stored rows directly without opening a mutable storage facade.

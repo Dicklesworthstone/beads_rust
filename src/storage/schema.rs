@@ -2,13 +2,16 @@
 
 use crate::franken_sync::{Connection, Row};
 use chrono::Utc;
-use fsqlite_types::SqliteValue;
+use fsqlite_types::{SqliteValue, TypeAffinity};
 
 use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 18;
+#[cfg(test)]
+pub(crate) use tests::LEGACY_V15_TEST_CORE_SQL;
+
+pub const CURRENT_SCHEMA_VERSION: i32 = 19;
 const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
 
 // Persisted witnesses are valid only for this exact compatibility predicate.
@@ -18,7 +21,7 @@ const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
 // schema rebuild, overwhelming the compile-time savings of the runtime fast
 // path itself.
 const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str =
-    "v18-prerequisites-exact-ddl-version-domain-cookie-fenced";
+    "v19-typed-dependencies-exact-ddl-version-domain-cookie-fenced";
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 const GATE_RESULT_HISTORY_MIGRATION_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS gate_result_history (
@@ -226,6 +229,8 @@ pub struct ReviewedSchemaMigrationEffects {
     pub gate_result_history_created: bool,
     /// Whether v18 appended the distinct prerequisite checklist column.
     pub prerequisites_column_added: bool,
+    /// Whether v19 added dependency type to the primary key without changing rows.
+    pub dependency_type_key_added: bool,
 }
 
 /// The complete SQL schema for the beads database.
@@ -351,7 +356,7 @@ pub const SCHEMA_SQL: &str = r"
         created_by TEXT NOT NULL DEFAULT '',
         metadata TEXT DEFAULT '{}',
         thread_id TEXT DEFAULT '',
-        PRIMARY KEY (issue_id, depends_on_id),
+        PRIMARY KEY (issue_id, depends_on_id, type),
         FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
         -- Note: depends_on_id FK intentionally removed to allow external issue references
     );
@@ -744,6 +749,34 @@ pub(crate) fn canonical_index_creation_statements() -> Vec<&'static str> {
         .collect()
 }
 
+/// Identify only indexes whose definitions the migration and runtime schema
+/// attestations own. Operator indexes must retain their exact schema witness.
+pub(crate) fn is_reviewed_migration_managed_index(table: &str, name: &str) -> bool {
+    let indexes = match table {
+        "issues" => ISSUES_RUNTIME_INDEXES,
+        "dependencies" => DEPENDENCIES_RUNTIME_INDEXES,
+        "labels" => LABELS_RUNTIME_INDEXES,
+        "comments" => COMMENTS_RUNTIME_INDEXES,
+        "events" => EVENTS_RUNTIME_INDEXES,
+        "config" => CONFIG_RUNTIME_INDEXES,
+        "metadata" => METADATA_RUNTIME_INDEXES,
+        "dirty_issues" => DIRTY_ISSUES_RUNTIME_INDEXES,
+        "blocked_issues_cache" => BLOCKED_CACHE_RUNTIME_INDEXES,
+        "close_metadata" => CLOSE_METADATA_INDEXES,
+        "gate_results" => GATE_RESULTS_INDEXES,
+        "capacity_exemptions" => CAPACITY_EXEMPTION_INDEXES,
+        "capacity_exemption_history" => CAPACITY_EXEMPTION_HISTORY_INDEXES,
+        "capacity_occupancy" => CAPACITY_OCCUPANCY_INDEXES,
+        "gate_result_history" => {
+            return GATE_RESULT_HISTORY_INDEXES
+                .iter()
+                .any(|(expected, _)| *expected == name);
+        }
+        _ => return false,
+    };
+    indexes.iter().any(|index| index.name == name)
+}
+
 pub(crate) fn execute_batch(conn: &Connection, sql: &str) -> Result<()> {
     for stmt in split_sql_statements(sql) {
         let res = conn.execute(stmt);
@@ -879,8 +912,9 @@ fn connection_user_version(conn: &Connection) -> Result<u32> {
 /// stay upgradeable here: 13/14 (pre-gate-history releases), 15 (the #388
 /// gate-history schema shipped in the v0.2.19-era line) and 16 (the #384
 /// capacity-exemptions schema created by the released v0.2.19 binary), and
-/// 17 (capacity occupancy, before prerequisite checklists). See GitHub #398.
-pub const REVIEWED_MIGRATION_SOURCE_VERSIONS: [u32; 5] = [13, 14, 15, 16, 17];
+/// 17 (capacity occupancy) and 18 (prerequisite checklists, before typed
+/// dependency identity). See GitHub #398.
+pub const REVIEWED_MIGRATION_SOURCE_VERSIONS: [u32; 6] = [13, 14, 15, 16, 17, 18];
 
 fn current_schema_version_u32() -> Result<u32> {
     u32::try_from(CURRENT_SCHEMA_VERSION).map_err(|_| {
@@ -936,7 +970,7 @@ fn validate_reviewed_schema_migration(
     if !REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         return Err(BeadsError::internal(format!(
             "schema migrate refused — reviewed migrations are supported only from source \
-             schemas 13, 14, 15, 16, and 17 to {supported_target} (got {from}->{target_version})"
+             schemas 13, 14, 15, 16, 17, and 18 to {supported_target} (got {from}->{target_version})"
         )));
     }
     if marked_at.is_empty() {
@@ -961,7 +995,7 @@ fn validate_reviewed_schema_migration(
 /// `BEGIN IMMEDIATE` transaction before calling it. All validation occurs
 /// before the first migration write.
 ///
-/// Sources in [`REVIEWED_MIGRATION_SOURCE_VERSIONS`] (13 through 17) are
+/// Sources in [`REVIEWED_MIGRATION_SOURCE_VERSIONS`] (13 through 18) are
 /// accepted, each running exactly the version-gated step chain up to
 /// `CURRENT_SCHEMA_VERSION` (#398). `marked_at` is written verbatim to every
 /// `dirty_issues` row rewritten by the v13 content-hash step, making the
@@ -1021,6 +1055,8 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
 
     tracing::info!("Migrating database to schema version 18 (prerequisite checklists)");
     let prerequisites_column_added = apply_prerequisites_migration_in_transaction(conn)?;
+    tracing::info!("Migrating database to schema version 19 (typed dependency identity)");
+    let dependency_type_key_added = apply_dependency_type_key_migration_in_transaction(conn, from)?;
 
     conn.execute(&format!("PRAGMA user_version = {target_version}"))
         .map_err(BeadsError::Database)?;
@@ -1038,6 +1074,7 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
         content_hash_rows_rebuilt,
         gate_result_history_created,
         prerequisites_column_added,
+        dependency_type_key_added,
     })
 }
 
@@ -1326,7 +1363,7 @@ const ISSUES_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
 const DEPENDENCIES_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
     schema_column("issue_id", "TEXT", true, None, 1),
     schema_column("depends_on_id", "TEXT", true, None, 2),
-    schema_column("type", "TEXT", true, Some("'blocks'"), 0),
+    schema_column("type", "TEXT", true, Some("'blocks'"), 3),
     schema_column("created_at", "DATETIME", true, Some("CURRENT_TIMESTAMP"), 0),
     schema_column("created_by", "TEXT", true, Some("''"), 0),
     schema_column("metadata", "TEXT", false, Some("'{}'"), 0),
@@ -2437,6 +2474,10 @@ fn semantic_partial_index_predicate_canonical(conn: &Connection, index: &str) ->
     else {
         return false;
     };
+    partial_index_predicate_matches(conn, index, predicate)
+}
+
+fn partial_index_predicate_matches(conn: &Connection, index: &str, predicate: &str) -> bool {
     let escaped_index = index.replace('\'', "''");
     let Ok(row) = conn.query_row(&format!(
         "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = '{escaped_index}'"
@@ -2671,17 +2712,57 @@ fn core_runtime_table_declaration_canonical(
 /// Refuse historical core-table layouts the reviewed migration cannot preserve.
 /// Versioned auxiliary tables are handled by their migration steps. Core table
 /// columns, constraints and operator indexes must already be representable;
-/// only known index definitions are rebuilt by candidate maintenance.
-pub(crate) fn attest_reviewed_migration_source_core_tables(conn: &Connection) -> Result<()> {
+/// only known index definitions are rebuilt by candidate maintenance. Returns
+/// true only for the separately attested legacy-v15 conversion profile.
+pub(crate) fn attest_reviewed_migration_source_core_tables(conn: &Connection) -> Result<bool> {
+    match attest_reviewed_source_core_tables(conn, false) {
+        Ok(()) => Ok(false),
+        Err(canonical_error) => {
+            // The legacy declaration selects its diagnostic path, not its
+            // admission. A malformed canonical v15 table must retain the
+            // original precise error instead of reporting unrelated legacy
+            // differences in dependencies. The entire legacy profile still
+            // has to pass below before it can authorize conversion.
+            let legacy_dependencies =
+                legacy_v15_core_columns("dependencies", DEPENDENCIES_RUNTIME_COLUMNS);
+            if connection_user_version(conn)? != 15
+                || !core_runtime_table_declaration_canonical(
+                    conn,
+                    "dependencies",
+                    &legacy_dependencies,
+                    &["issue_id"],
+                    false,
+                    None,
+                    false,
+                )
+                || !legacy_v15_table_declaration_exact(conn, "dependencies", &legacy_dependencies)
+            {
+                return Err(canonical_error);
+            }
+            attest_reviewed_legacy_v15_source(conn)?;
+            Ok(true)
+        }
+    }
+}
+
+fn attest_reviewed_source_core_tables(conn: &Connection, legacy_v15: bool) -> Result<()> {
     refuse_persistent_triggers(conn, "reviewed schema migration plan")?;
-    // Every reviewed source predates the appended v18 column. Requiring the
-    // exact old prefix also rejects a forged v17 stamp on a current schema.
-    let source_issue_columns = &ISSUES_RUNTIME_COLUMNS[..ISSUES_RUNTIME_COLUMNS.len() - 1];
+    refuse_dependency_key_references(conn)?;
+    // Attest the version's actual shape, including the old pair dependency key.
+    // Merely changing a version stamp must never authorize a different shape.
+    let from = connection_user_version(conn)?;
+    let source_issue_columns = if from < 18 {
+        &ISSUES_RUNTIME_COLUMNS[..ISSUES_RUNTIME_COLUMNS.len() - 1]
+    } else {
+        ISSUES_RUNTIME_COLUMNS
+    };
+    let mut source_dependency_columns = DEPENDENCIES_RUNTIME_COLUMNS.to_vec();
+    source_dependency_columns[2].primary_key_position = 0;
     for (table, columns, indexes) in [
         ("issues", source_issue_columns, ISSUES_RUNTIME_INDEXES),
         (
             "dependencies",
-            DEPENDENCIES_RUNTIME_COLUMNS,
+            source_dependency_columns.as_slice(),
             DEPENDENCIES_RUNTIME_INDEXES,
         ),
         ("labels", LABELS_RUNTIME_COLUMNS, LABELS_RUNTIME_INDEXES),
@@ -2711,22 +2792,29 @@ pub(crate) fn attest_reviewed_migration_source_core_tables(conn: &Connection) ->
         ("child_counters", CHILD_COUNTERS_RUNTIME_COLUMNS, &[][..]),
     ] {
         let references: &[&str] = match table {
+            "comments" | "dirty_issues" | "export_hashes" | "child_counters" if legacy_v15 => &[],
             "issues" | "config" | "metadata" => &[],
             "child_counters" => &["parent_id"],
             _ => &["issue_id"],
         };
+        let legacy_columns = legacy_v15.then(|| legacy_v15_core_columns(table, columns));
+        let columns = legacy_columns.as_deref().unwrap_or(columns);
         let declaration_ok = core_runtime_table_declaration_canonical(
             conn,
             table,
             columns,
             references,
             table == "issues",
-            matches!(table, "comments" | "events").then_some("id"),
+            (!legacy_v15 && matches!(table, "comments" | "events")).then_some("id"),
             matches!(table, "config" | "metadata"),
-        ) && (table != "issues" || issues_required_checks_canonical(conn));
-        let indexes_ok = conn
-            .query(&format!("PRAGMA index_list('{table}')"))
-            .is_ok_and(|rows| runtime_index_names_canonical(&rows, indexes));
+        ) && (table != "issues" || issues_required_checks_canonical(conn))
+            && (!legacy_v15 || legacy_v15_table_declaration_exact(conn, table, columns));
+        let indexes_ok = if legacy_v15 {
+            legacy_v15_indexes_canonical(conn, table, indexes)
+        } else {
+            conn.query(&format!("PRAGMA index_list('{table}')"))
+                .is_ok_and(|rows| runtime_index_names_canonical(&rows, indexes))
+        };
         if !declaration_ok || !indexes_ok {
             return Err(BeadsError::Config(format!(
                 "reviewed schema migration refused: unsupported historical shape for core table \
@@ -2736,6 +2824,497 @@ pub(crate) fn attest_reviewed_migration_source_core_tables(conn: &Connection) ->
             )));
         }
     }
+    Ok(())
+}
+
+/// Exact legacy accelerators retired by the reviewed v15 conversion. Unknown
+/// indexes, including same-name indexes with different keys, remain refused.
+pub(crate) const REVIEWED_LEGACY_V15_RETIRED_INDEXES: &[&str] = &[
+    "idx_dependencies_depends_on_type_issue",
+    "idx_dependencies_issue_type",
+    "idx_comments_issue_id",
+    "idx_events_event_type",
+    "idx_events_issue_id",
+    "idx_events_issue_type",
+    "idx_labels_label_issue",
+];
+
+const LEGACY_V15_REBUILT_TABLES: &[(&str, &[ExpectedSchemaColumn], &[ExpectedRuntimeIndex])] = &[
+    (
+        "dependencies",
+        DEPENDENCIES_RUNTIME_COLUMNS,
+        DEPENDENCIES_RUNTIME_INDEXES,
+    ),
+    (
+        "comments",
+        COMMENTS_RUNTIME_COLUMNS,
+        COMMENTS_RUNTIME_INDEXES,
+    ),
+    ("events", EVENTS_RUNTIME_COLUMNS, EVENTS_RUNTIME_INDEXES),
+    (
+        "dirty_issues",
+        DIRTY_ISSUES_RUNTIME_COLUMNS,
+        DIRTY_ISSUES_RUNTIME_INDEXES,
+    ),
+    ("export_hashes", EXPORT_HASHES_RUNTIME_COLUMNS, &[]),
+    ("child_counters", CHILD_COUNTERS_RUNTIME_COLUMNS, &[]),
+];
+
+fn legacy_v15_core_columns(
+    table: &str,
+    canonical: &[ExpectedSchemaColumn],
+) -> Vec<ExpectedSchemaColumn> {
+    let mut columns = canonical.to_vec();
+    match table {
+        "dependencies" => {
+            columns[2].primary_key_position = 3;
+            columns[3].data_type = "TIMESTAMP";
+            columns[3].not_null = false;
+            for index in [4, 5, 6] {
+                columns[index].default_value = None;
+            }
+        }
+        "comments" => columns[4].default_value = None,
+        "events" => {
+            columns[3].default_value = None;
+            columns[7].not_null = false;
+        }
+        "dirty_issues" => {
+            columns[1].data_type = "TEXT";
+            columns[1].default_value = None;
+            columns.push(schema_column("content_hash", "TEXT", false, None, 0));
+        }
+        "export_hashes" => {
+            columns[2].data_type = "TEXT";
+            columns[2].default_value = None;
+        }
+        "child_counters" => {
+            columns[1].not_null = false;
+            columns[1].default_value = None;
+            columns.insert(
+                1,
+                schema_column("next_child_number", "INTEGER", true, Some("1"), 0),
+            );
+        }
+        _ => {}
+    }
+    columns
+}
+
+fn legacy_v15_table_declaration_exact(
+    conn: &Connection,
+    table: &str,
+    columns: &[ExpectedSchemaColumn],
+) -> bool {
+    // Do not inherit the canonical-source allowances for old empty-string
+    // defaults: this profile names one precise historical declaration.
+    let Ok(rows) = conn.query(&format!("PRAGMA main.table_xinfo('{table}')")) else {
+        return false;
+    };
+    if rows.len() != columns.len()
+        || !rows.iter().zip(columns).all(|(row, column)| {
+            row.get(1).and_then(SqliteValue::as_text) == Some(column.name)
+                && sql_default_matches(
+                    row.get(4).and_then(SqliteValue::as_text),
+                    column.default_value,
+                )
+        })
+    {
+        return false;
+    }
+    if matches!(table, "comments" | "events") {
+        let Ok(row) = conn.query_row(&format!(
+            "SELECT sql FROM main.sqlite_master WHERE type = 'table' AND name = '{table}'"
+        )) else {
+            return false;
+        };
+        return row
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .is_some_and(|sql| !sql_contains_token_sequence(sql, "AUTOINCREMENT"));
+    }
+    true
+}
+
+fn legacy_v15_indexes_canonical(
+    conn: &Connection,
+    table: &str,
+    canonical: &[ExpectedRuntimeIndex],
+) -> bool {
+    let mut indexes = canonical.to_vec();
+    match table {
+        "dependencies" => {
+            indexes.push(runtime_index(
+                REVIEWED_LEGACY_V15_RETIRED_INDEXES[0],
+                &["depends_on_id", "type", "issue_id"],
+                false,
+                false,
+            ));
+            indexes.push(runtime_index(
+                REVIEWED_LEGACY_V15_RETIRED_INDEXES[1],
+                &["issue_id", "type"],
+                false,
+                false,
+            ));
+        }
+        "comments" => indexes.push(runtime_index(
+            REVIEWED_LEGACY_V15_RETIRED_INDEXES[2],
+            &["issue_id"],
+            false,
+            false,
+        )),
+        "events" => {
+            for index in &mut indexes {
+                if index.name == "idx_events_actor" {
+                    index.partial = false;
+                }
+            }
+            indexes.push(runtime_index(
+                REVIEWED_LEGACY_V15_RETIRED_INDEXES[3],
+                &["event_type"],
+                false,
+                false,
+            ));
+            indexes.push(runtime_index(
+                REVIEWED_LEGACY_V15_RETIRED_INDEXES[4],
+                &["issue_id"],
+                false,
+                false,
+            ));
+            indexes.push(runtime_index(
+                REVIEWED_LEGACY_V15_RETIRED_INDEXES[5],
+                &["issue_id", "event_type"],
+                false,
+                false,
+            ));
+        }
+        "labels" => indexes.push(runtime_index(
+            REVIEWED_LEGACY_V15_RETIRED_INDEXES[6],
+            &["label", "issue_id"],
+            false,
+            false,
+        )),
+        _ => {}
+    }
+    let Ok(rows) = conn.query(&format!("PRAGMA main.index_list('{table}')")) else {
+        return false;
+    };
+    runtime_index_names_canonical(&rows, &indexes)
+        && indexes.iter().all(|index| {
+            let Some(row) = rows
+                .iter()
+                .find(|row| row.get(1).and_then(SqliteValue::as_text) == Some(index.name))
+            else {
+                return false;
+            };
+            row.get(2).and_then(SqliteValue::as_integer) == Some(i64::from(index.unique))
+                && row.get(3).and_then(SqliteValue::as_text) == Some("c")
+                && row.get(4).and_then(SqliteValue::as_integer) == Some(i64::from(index.partial))
+                && runtime_index_key_shape_canonical(conn, index.name, index.columns)
+                && (!index.partial
+                    || if index.name == "idx_dependencies_blocking" {
+                        partial_index_predicate_matches(
+                            conn,
+                            index.name,
+                            "type IN ('blocks', 'parent-child', 'conditional-blocks', 'waits-for')",
+                        )
+                    } else {
+                        semantic_partial_index_predicate_canonical(conn, index.name)
+                    })
+        })
+}
+
+fn legacy_v15_refusal(reason: impl std::fmt::Display) -> BeadsError {
+    BeadsError::Config(format!("reviewed legacy v15 conversion refused: {reason}"))
+}
+
+fn attest_reviewed_legacy_v15_source(conn: &Connection) -> Result<()> {
+    if connection_user_version(conn)? != 15 {
+        return Err(legacy_v15_refusal("source version must be 15"));
+    }
+    for table in [
+        "capacity_exemptions",
+        "capacity_exemption_history",
+        "capacity_occupancy",
+    ] {
+        if table_exists(conn, table) {
+            return Err(legacy_v15_refusal(format!(
+                "future table {table} is already present"
+            )));
+        }
+    }
+    attest_reviewed_source_core_tables(conn, true)?;
+    for (table, columns, indexes) in [
+        (
+            "close_metadata",
+            CLOSE_METADATA_COLUMNS,
+            CLOSE_METADATA_INDEXES,
+        ),
+        ("gate_results", GATE_RESULTS_COLUMNS, GATE_RESULTS_INDEXES),
+    ] {
+        if !auxiliary_runtime_table_canonical(conn, table, columns, indexes) {
+            return Err(legacy_v15_refusal(format!("{table} is not canonical")));
+        }
+    }
+    attest_gate_result_history_schema(conn)?;
+    if !conn
+        .query("SELECT 1 FROM main.sqlite_sequence WHERE name IN ('comments', 'events') LIMIT 1")?
+        .is_empty()
+    {
+        return Err(legacy_v15_refusal(
+            "comments/events have an unexplained sequence reservation",
+        ));
+    }
+    for row in conn.query("SELECT name FROM main.sqlite_master WHERE type = 'table'")? {
+        let name = row
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .ok_or_else(|| legacy_v15_refusal("table name is not text"))?;
+        let escaped = name.replace('\'', "''");
+        for foreign_key in conn.query(&format!("PRAGMA main.foreign_key_list('{escaped}')"))? {
+            if foreign_key
+                .get(2)
+                .and_then(SqliteValue::as_text)
+                .is_some_and(|parent| {
+                    LEGACY_V15_REBUILT_TABLES
+                        .iter()
+                        .any(|(table, _, _)| parent.eq_ignore_ascii_case(table))
+                })
+            {
+                return Err(legacy_v15_refusal(format!(
+                    "table {name} references a rebuilt legacy table"
+                )));
+            }
+        }
+    }
+    attest_legacy_v15_projection_values(conn)
+}
+
+fn attest_legacy_v15_projection_values(conn: &Connection) -> Result<()> {
+    for &(table, columns, _) in LEGACY_V15_REBUILT_TABLES {
+        let stage = format!("{table}_legacy_v15_stage");
+        if !conn
+            .query(&format!(
+                "SELECT 1 FROM main.sqlite_master WHERE name = '{stage}' COLLATE NOCASE LIMIT 1"
+            ))?
+            .is_empty()
+        {
+            return Err(legacy_v15_refusal(format!(
+                "staging name {stage} already exists"
+            )));
+        }
+        let parent_column = if table == "child_counters" {
+            "parent_id"
+        } else {
+            "issue_id"
+        };
+        if !conn.query(&format!("SELECT 1 FROM main.{table} AS source LEFT JOIN main.issues AS issue ON issue.id = source.{parent_column} WHERE issue.id IS NULL LIMIT 1"))?.is_empty() {
+            return Err(legacy_v15_refusal(format!("{table} contains an orphan issue reference")));
+        }
+        for column in columns {
+            let kind = if column.data_type == "INTEGER" {
+                "integer"
+            } else {
+                "text"
+            };
+            let null_allowed = !column.not_null && column.primary_key_position == 0;
+            let name = column.name;
+            let null_clause = if null_allowed {
+                format!(" AND typeof({name}) <> 'null'")
+            } else {
+                String::new()
+            };
+            if !conn.query(&format!("SELECT 1 FROM main.{table} WHERE typeof({name}) <> '{kind}'{null_clause} LIMIT 1"))?.is_empty() {
+                return Err(legacy_v15_refusal(format!("{table}.{name} cannot be copied without changing its storage class or nullability")));
+            }
+        }
+        if matches!(table, "comments" | "events")
+            && !conn.query(&format!("SELECT 1 FROM main.{table} WHERE rowid <> id OR id = 9223372036854775807 LIMIT 1"))?.is_empty()
+        {
+            return Err(legacy_v15_refusal(format!("{table} IDs cannot preserve rowid and future sequence allocation")));
+        }
+    }
+    attest_legacy_v15_timestamp_affinity(conn)?;
+    attest_legacy_v15_dependency_type_spelling(conn)?;
+    if !conn
+        .query("SELECT 1 FROM main.dirty_issues WHERE typeof(content_hash) <> 'null' LIMIT 1")?
+        .is_empty()
+    {
+        return Err(legacy_v15_refusal(
+            "dirty_issues.content_hash contains non-NULL legacy data",
+        ));
+    }
+    let counters =
+        conn.query("SELECT parent_id, next_child_number, last_child FROM main.child_counters")?;
+    let issue_rows = conn.query("SELECT id FROM main.issues")?;
+    for row in counters {
+        let parent = row
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .ok_or_else(|| legacy_v15_refusal("counter parent is not text"))?;
+        let next = row.get(1).and_then(SqliteValue::as_integer);
+        let last = row
+            .get(2)
+            .and_then(SqliteValue::as_integer)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                legacy_v15_refusal(format!("counter for {parent} has an invalid last_child"))
+            })?;
+        if !next.is_some_and(|next| next >= 1 && next <= i64::from(last) + 1) {
+            return Err(legacy_v15_refusal(format!(
+                "counter for {parent} reserves a next_child_number beyond last_child"
+            )));
+        }
+        for issue in &issue_rows {
+            let Some(id) = issue.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let Ok(parsed) = crate::util::id::parse_id(id) else {
+                continue;
+            };
+            if parsed.parent().as_deref() == Some(parent)
+                && parsed.child_path.last().is_some_and(|child| *child > last)
+            {
+                return Err(legacy_v15_refusal(format!(
+                    "counter for {parent} precedes existing child {id}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn attest_legacy_v15_dependency_type_spelling(conn: &Connection) -> Result<()> {
+    for row in conn.query("SELECT DISTINCT type FROM main.dependencies")? {
+        let kind = row
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .ok_or_else(|| legacy_v15_refusal("dependency type is not text"))?;
+        // The interchange model normalizes type spelling. Copying two raw
+        // case-distinct keys would make them collide on the next JSONL import.
+        // Preserve the historical source by refusing before approval instead.
+        if kind.parse::<crate::model::DependencyType>()?.as_str() != kind {
+            return Err(legacy_v15_refusal(format!(
+                "dependency type {kind:?} cannot preserve its spelling through JSONL interchange"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn attest_legacy_v15_timestamp_affinity(conn: &Connection) -> Result<()> {
+    // These are the only projected columns whose affinity changes from TEXT
+    // to DATETIME (NUMERIC). Check the engine's actual coercion before issuing
+    // a plan; numeric text must not silently change storage class on copying.
+    for (table, name) in [
+        ("dirty_issues", "marked_at"),
+        ("export_hashes", "exported_at"),
+    ] {
+        if conn
+            .query(&format!("SELECT {name} FROM main.{table}"))?
+            .iter()
+            .any(|row| {
+                row.get(0).is_none_or(|value| {
+                    value.clone().apply_affinity(TypeAffinity::Numeric) != *value
+                })
+            })
+        {
+            return Err(legacy_v15_refusal(format!(
+                "{table}.{name} cannot be copied without DATETIME affinity changing its value or storage class"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Convert only the explicitly attested legacy-v15 core on a private candidate.
+/// The doctor owns the active transaction, source decision and final projected
+/// witness. This function neither changes the version nor admits new edges.
+pub(crate) fn apply_reviewed_legacy_v15_core_conversion_in_transaction(
+    conn: &Connection,
+) -> Result<()> {
+    attest_reviewed_legacy_v15_source(conn)?;
+    for &(table, columns, indexes) in LEGACY_V15_REBUILT_TABLES {
+        let stage = format!("{table}_legacy_v15_stage");
+        let names = columns
+            .iter()
+            .map(|column| column.name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute(&format!(
+            "CREATE TABLE main.{stage} (source_rowid INTEGER, {names})"
+        ))?;
+        conn.execute(&format!(
+            "INSERT INTO main.{stage} SELECT rowid, {names} FROM main.{table}"
+        ))?;
+        conn.execute(&format!("DROP TABLE main.{table}"))?;
+        let prefix = format!("CREATE TABLE IF NOT EXISTS {table} (");
+        let declaration = split_sql_statements(SCHEMA_SQL)
+            .into_iter()
+            .find_map(|statement| statement.find(&prefix).map(|start| &statement[start..]))
+            .ok_or_else(|| {
+                legacy_v15_refusal(format!("canonical declaration for {table} is missing"))
+            })?;
+        conn.execute(&declaration.replacen(&prefix, &format!("CREATE TABLE main.{table} ("), 1))?;
+        // INTEGER PRIMARY KEY already aliases rowid; avoid binding the same
+        // destination column twice on the comments/events engine path.
+        let (destination, source) = if matches!(table, "comments" | "events") {
+            (names.clone(), names.clone())
+        } else {
+            (format!("rowid, {names}"), format!("source_rowid, {names}"))
+        };
+        conn.execute(&format!(
+            "INSERT INTO main.{table} ({destination}) SELECT {source} FROM main.{stage}"
+        ))?;
+        if matches!(table, "comments" | "events") {
+            // Explicitly establish the same high-water mark for empty and
+            // populated copies; engines differ on zero-row INSERT SELECT.
+            conn.execute(&format!(
+                "DELETE FROM main.sqlite_sequence WHERE name = '{table}'"
+            ))?;
+            conn.execute(&format!("INSERT INTO main.sqlite_sequence (name, seq) SELECT '{table}', MAX(0, COALESCE(MAX(id), 0)) FROM main.{table}"))?;
+        }
+        conn.execute(&format!("DROP TABLE main.{stage}"))?;
+        for index in indexes {
+            let declaration = canonical_index_creation_statements()
+                .into_iter()
+                .find(|statement| {
+                    sql_contains_token_sequence(
+                        statement,
+                        &format!("CREATE INDEX IF NOT EXISTS {}", index.name),
+                    )
+                })
+                .ok_or_else(|| {
+                    legacy_v15_refusal(format!("canonical index {} is missing", index.name))
+                })?;
+            conn.execute(declaration)?;
+        }
+        let references = if table == "child_counters" {
+            &["parent_id"][..]
+        } else {
+            &["issue_id"][..]
+        };
+        if !core_runtime_table_canonical(
+            conn,
+            table,
+            columns,
+            references,
+            indexes,
+            true,
+            matches!(table, "comments" | "events").then_some("id"),
+            false,
+        ) {
+            return Err(legacy_v15_refusal(format!(
+                "canonical {table} postcondition failed"
+            )));
+        }
+    }
+    // The other six retired names disappeared only with their owning rebuilt
+    // tables. Labels are preserved in place, including every rowid and value.
+    conn.execute(&format!(
+        "DROP INDEX main.{}",
+        REVIEWED_LEGACY_V15_RETIRED_INDEXES[6]
+    ))?;
     Ok(())
 }
 
@@ -3004,6 +3583,8 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
         ));
     }
 
+    let source_rowid = issues_hidden_rowid_alias(conn)?;
+
     // Preserve exact DDL for operator-defined indexes attached to the canonical
     // issues table. Dropping the table removes every attached index, but only
     // br-owned indexes are recreated by SCHEMA_SQL. Without this snapshot an
@@ -3094,7 +3675,7 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
 
     // Copy data out to the temp table.
     let copy_out_sql = format!(
-        "INSERT INTO main.issues_rebuild_tmp ({cols}) SELECT {cols} FROM main.issues",
+        "INSERT INTO main.issues_rebuild_tmp (rowid, {cols}) SELECT {source_rowid}, {cols} FROM main.issues",
         cols = projected_columns.join(", ")
     );
     conn.execute(&copy_out_sql)?;
@@ -3108,7 +3689,7 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
 
     // Copy data back.
     let copy_back_sql = format!(
-        "INSERT INTO main.issues ({cols}) SELECT {cols} FROM main.issues_rebuild_tmp",
+        "INSERT INTO main.issues (rowid, {cols}) SELECT rowid, {cols} FROM main.issues_rebuild_tmp",
         cols = projected_columns.join(", ")
     );
     conn.execute(&copy_back_sql)?;
@@ -3124,6 +3705,30 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
     }
 
     Ok(())
+}
+
+fn issues_hidden_rowid_alias(conn: &Connection) -> Result<&'static str> {
+    let rowid_table = conn
+        .query("PRAGMA main.table_list('issues')")?
+        .iter()
+        .any(|row| {
+            row.get(0).and_then(SqliteValue::as_text) == Some("main")
+                && row.get(1).and_then(SqliteValue::as_text) == Some("issues")
+                && row.get(2).and_then(SqliteValue::as_text) == Some("table")
+                && row.get(4).and_then(SqliteValue::as_integer) == Some(0)
+        });
+    if !rowid_table {
+        return Err(BeadsError::Config(
+            "Cannot rebuild issues table without preserving its implicit rowid: source is not a rowid table".to_string(),
+        ));
+    }
+    let columns = conn.query("PRAGMA main.table_xinfo('issues')")?;
+    ["rowid", "_rowid_", "oid"].into_iter().find(|alias| {
+        !columns.iter().any(|row| row.get(1).and_then(SqliteValue::as_text)
+            .is_some_and(|name| name.eq_ignore_ascii_case(alias)))
+    }).ok_or_else(|| BeadsError::Config(
+        "Cannot rebuild issues table without preserving its implicit rowid: every rowid alias is shadowed".to_string(),
+    ))
 }
 
 /// Backfill storage-class NULL values in NOT NULL DEFAULT columns.
@@ -3938,6 +4543,26 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         apply_prerequisites_migration_in_transaction(conn)?;
     }
 
+    if user_version < 19 {
+        // The general, pre-reviewed migration path historically fills omitted
+        // dependency columns. Keep that path working without widening the
+        // reviewed v13+ admission contract.
+        if user_version < 13 {
+            ensure_columns(conn, "dependencies", DEPENDENCY_COLUMNS)?;
+        }
+        let source_version = connection_user_version(conn)?;
+        conn.execute("BEGIN IMMEDIATE")?;
+        if let Err(error) = apply_dependency_type_key_migration_in_transaction(conn, source_version)
+        {
+            let _ = conn.execute("ROLLBACK");
+            return Err(error);
+        }
+        if let Err(error) = conn.execute("COMMIT") {
+            let _ = conn.execute("ROLLBACK");
+            return Err(error.into());
+        }
+    }
+
     // Migration: Add missing indexes for bd parity
     // These use IF NOT EXISTS so they're safe to run multiple times
     execute_batch(
@@ -4405,6 +5030,165 @@ fn apply_prerequisites_migration_in_transaction(conn: &Connection) -> Result<boo
         ));
     }
     Ok(added)
+}
+
+/// A foreign key to the old pair key cannot retain its meaning once parallel
+/// types are allowed. Preserve the operator schema by refusing before copying.
+fn refuse_dependency_key_references(conn: &Connection) -> Result<()> {
+    for table in conn.query("SELECT name FROM main.sqlite_schema WHERE type = 'table'")? {
+        let name = table
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .ok_or_else(|| BeadsError::internal("schema table name is not text"))?;
+        let escaped = name.replace('\'', "''");
+        for foreign_key in conn.query(&format!("PRAGMA main.foreign_key_list('{escaped}')"))? {
+            if foreign_key
+                .get(2)
+                .and_then(SqliteValue::as_text)
+                .is_some_and(|parent| parent.eq_ignore_ascii_case("dependencies"))
+            {
+                return Err(BeadsError::Config(format!(
+                    "schema migrate v19 refused: table {name} has a foreign key referencing \
+                     dependencies; its operator schema requires an explicit typed-key conversion"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Admit the canonical pair table or the bounded pre-v13 general-path shape.
+fn attest_pair_key_dependency_source(conn: &Connection, source_version: u32) -> Result<()> {
+    refuse_dependency_key_references(conn)?;
+    let mut old_columns = DEPENDENCIES_RUNTIME_COLUMNS.to_vec();
+    old_columns[2].primary_key_position = 0;
+    let canonical_pair = core_runtime_table_declaration_canonical(
+        conn,
+        "dependencies",
+        &old_columns,
+        &["issue_id"],
+        false,
+        None,
+        false,
+    );
+    // Pre-v13 general migrations also supported the old pair table without
+    // its issue FK. The copy installs the FK and fails atomically for orphan
+    // rows; reviewed v13+ sources must already declare the canonical FK.
+    let legacy_pair = source_version < 13
+        && core_runtime_table_declaration_canonical(
+            conn,
+            "dependencies",
+            &old_columns,
+            &[],
+            false,
+            None,
+            false,
+        );
+    if !canonical_pair && !legacy_pair {
+        return Err(BeadsError::Config(
+            "schema migrate v19 refused: dependencies must have the reviewed pair-key shape".into(),
+        ));
+    }
+    if legacy_pair
+        && !conn
+            .query(
+                "SELECT 1 FROM main.dependencies AS d LEFT JOIN main.issues AS i \
+                 ON i.id = d.issue_id WHERE i.id IS NULL LIMIT 1",
+            )?
+            .is_empty()
+    {
+        return Err(BeadsError::Config(
+            "schema migrate v19 refused: legacy dependencies contains orphan source issues".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Preserve every dependency value and rowid while widening the pair key to
+/// include its type. The caller already owns the family and transaction.
+/// Historical graph state is copied without new-edge admission checks.
+fn apply_dependency_type_key_migration_in_transaction(
+    conn: &Connection,
+    source_version: u32,
+) -> Result<bool> {
+    let indexes_admitted = conn
+        .query("PRAGMA index_list('dependencies')")
+        .is_ok_and(|rows| runtime_index_names_canonical(&rows, DEPENDENCIES_RUNTIME_INDEXES));
+    if !indexes_admitted {
+        return Err(BeadsError::Config(
+            "schema migrate v19 refused: dependencies has unreviewed indexes".into(),
+        ));
+    }
+    if core_runtime_table_declaration_canonical(
+        conn,
+        "dependencies",
+        DEPENDENCIES_RUNTIME_COLUMNS,
+        &["issue_id"],
+        false,
+        None,
+        false,
+    ) {
+        return Ok(false);
+    }
+    attest_pair_key_dependency_source(conn, source_version)?;
+    if table_exists(conn, "dependencies_v19_stage") {
+        return Err(BeadsError::Config(
+            "schema migrate v19 refused: dependencies_v19_stage already exists".into(),
+        ));
+    }
+    // Affinity-free staging columns preserve SQLite storage classes. Qualify
+    // every reference so a connection-local TEMP name cannot shadow the copy.
+    execute_batch(
+        conn,
+        r"
+        CREATE TABLE main.dependencies_v19_stage (
+            source_rowid INTEGER, issue_id, depends_on_id, type, created_at,
+            created_by, metadata, thread_id
+        );
+        INSERT INTO main.dependencies_v19_stage
+            SELECT rowid, issue_id, depends_on_id, type, created_at, created_by,
+                   metadata, thread_id FROM main.dependencies;
+        DROP TABLE main.dependencies;
+        CREATE TABLE main.dependencies (
+            issue_id TEXT NOT NULL,
+            depends_on_id TEXT NOT NULL,
+            type TEXT NOT NULL DEFAULT 'blocks',
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            created_by TEXT NOT NULL DEFAULT '',
+            metadata TEXT DEFAULT '{}',
+            thread_id TEXT DEFAULT '',
+            PRIMARY KEY (issue_id, depends_on_id, type),
+            FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+        );
+        INSERT INTO main.dependencies
+            (rowid, issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id)
+            SELECT source_rowid, issue_id, depends_on_id, type, created_at,
+                   created_by, metadata, thread_id FROM main.dependencies_v19_stage;
+        DROP TABLE main.dependencies_v19_stage;
+        CREATE INDEX idx_dependencies_issue ON dependencies(issue_id);
+        CREATE INDEX idx_dependencies_depends_on ON dependencies(depends_on_id);
+        CREATE INDEX idx_dependencies_type ON dependencies(type);
+        CREATE INDEX idx_dependencies_depends_on_type ON dependencies(depends_on_id, type);
+        CREATE INDEX idx_dependencies_thread ON dependencies(thread_id) WHERE thread_id != '';
+        CREATE INDEX idx_dependencies_blocking ON dependencies(depends_on_id, issue_id)
+            WHERE (type = 'blocks' OR type = 'parent-child' OR type = 'conditional-blocks' OR type = 'waits-for');
+    ",
+    )?;
+    if !core_runtime_table_canonical(
+        conn,
+        "dependencies",
+        DEPENDENCIES_RUNTIME_COLUMNS,
+        &["issue_id"],
+        DEPENDENCIES_RUNTIME_INDEXES,
+        false,
+        None,
+        false,
+    ) {
+        return Err(BeadsError::Config(
+            "schema migrate v19 post-check failed: typed dependency schema is not canonical".into(),
+        ));
+    }
+    Ok(true)
 }
 
 fn rebuild_content_hashes_for_current_format_in_transaction(
@@ -5013,6 +5797,7 @@ mod tests {
                 content_hash_rows_rebuilt: 1,
                 gate_result_history_created: true,
                 prerequisites_column_added: false,
+                dependency_type_key_added: false,
             }
         );
         let hash = conn
@@ -5109,6 +5894,7 @@ mod tests {
                 content_hash_rows_rebuilt: 0,
                 gate_result_history_created: true,
                 prerequisites_column_added: false,
+                dependency_type_key_added: false,
             }
         );
         let issue = conn
@@ -5604,13 +6390,543 @@ mod tests {
         }
     }
 
+    pub const LEGACY_V15_TEST_CORE_SQL: &str = r#"
+        DROP TABLE dependencies;
+        DROP TABLE comments;
+        DROP TABLE events;
+        DROP TABLE dirty_issues;
+        DROP TABLE export_hashes;
+        DROP TABLE child_counters;
+        DROP TABLE capacity_exemption_history;
+        DROP TABLE capacity_exemptions;
+        DROP TABLE capacity_occupancy;
+        CREATE TABLE dependencies (
+            issue_id TEXT NOT NULL, depends_on_id TEXT NOT NULL,
+            type TEXT NOT NULL DEFAULT 'blocks', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_by TEXT NOT NULL, metadata TEXT, thread_id TEXT,
+            PRIMARY KEY (issue_id, depends_on_id, type),
+            FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_dependencies_issue ON dependencies(issue_id);
+        CREATE INDEX idx_dependencies_depends_on ON dependencies(depends_on_id);
+        CREATE INDEX idx_dependencies_type ON dependencies(type);
+        CREATE INDEX idx_dependencies_depends_on_type ON dependencies(depends_on_id, type);
+        CREATE INDEX idx_dependencies_thread ON dependencies(thread_id) WHERE thread_id != '';
+        CREATE INDEX idx_dependencies_blocking ON dependencies(depends_on_id, issue_id)
+            WHERE type IN ('blocks', 'parent-child', 'conditional-blocks', 'waits-for');
+        CREATE INDEX idx_dependencies_issue_type ON dependencies(issue_id, type);
+        CREATE INDEX idx_dependencies_depends_on_type_issue ON dependencies(depends_on_id, type, issue_id);
+        CREATE TABLE comments (
+            id INTEGER PRIMARY KEY, issue_id TEXT NOT NULL, author TEXT NOT NULL,
+            text TEXT NOT NULL, created_at DATETIME NOT NULL
+        );
+        CREATE INDEX idx_comments_issue ON comments(issue_id);
+        CREATE INDEX idx_comments_created_at ON comments(created_at);
+        CREATE INDEX idx_comments_issue_id ON comments(issue_id);
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY, issue_id TEXT NOT NULL, event_type TEXT NOT NULL,
+            actor TEXT NOT NULL, old_value TEXT, new_value TEXT, comment TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            agent_name TEXT, harness TEXT, model TEXT,
+            FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_events_issue ON events(issue_id);
+        CREATE INDEX idx_events_type ON events(event_type);
+        CREATE INDEX idx_events_created_at ON events(created_at);
+        CREATE INDEX idx_events_actor ON events(actor);
+        CREATE INDEX idx_events_event_type ON events(event_type);
+        CREATE INDEX idx_events_issue_id ON events(issue_id);
+        CREATE INDEX idx_events_issue_type ON events(issue_id, event_type);
+        CREATE TABLE dirty_issues (issue_id TEXT PRIMARY KEY, marked_at TEXT NOT NULL, content_hash TEXT);
+        CREATE INDEX idx_dirty_issues_marked_at ON dirty_issues(marked_at);
+        CREATE TABLE export_hashes (issue_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, exported_at TEXT NOT NULL);
+        CREATE TABLE child_counters (parent_id TEXT PRIMARY KEY, next_child_number INTEGER NOT NULL DEFAULT 1, last_child INTEGER);
+        CREATE INDEX idx_labels_label_issue ON labels(label, issue_id);
+        CREATE TABLE operator_notes (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT NOT NULL UNIQUE);
+        INSERT INTO operator_notes (id, note) VALUES (9, 'operator payload');
+        INSERT INTO issues (rowid, id, title, content_hash)
+            VALUES (12, 'bd-legacy', 'Parent', 'original-parent-hash'),
+                   (28, 'bd-legacy.1', 'Child', 'original-child-hash');
+        INSERT INTO dependencies (rowid, issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id)
+            VALUES (11, 'bd-legacy.1', 'bd-legacy', 'blocks', '2026-01-30 04:07:21', 'import', NULL, NULL),
+                   (23, 'bd-legacy.1', 'bd-legacy', 'parent-child', '2026-01-30 04:07:21', 'import', NULL, NULL),
+                   (39, 'bd-legacy.1', 'bd-legacy', 'parent_child', '2026-01-31 04:07:21', 'other', '{"keep":"é"}', 'thread');
+        INSERT INTO comments (id, issue_id, author, text, created_at)
+            VALUES (197, 'bd-legacy', 'reviewer', 'Preserve this comment', '2026-01-30 04:07:21');
+        INSERT INTO events (id, issue_id, event_type, actor, old_value, new_value, comment, created_at, agent_name, harness, model)
+            VALUES (79, 'bd-legacy', 'updated', 'operator', NULL, 'new', 'audit payload', '2026-01-30 04:07:21', 'agent', NULL, 'model');
+        INSERT INTO dirty_issues (rowid, issue_id, marked_at, content_hash)
+            VALUES (51, 'bd-legacy', '2026-01-30T04:07:21Z', NULL),
+                   (52, 'bd-legacy.1', '2026-01-30T04:07:21Z', NULL);
+        INSERT INTO child_counters (rowid, parent_id, next_child_number, last_child)
+            VALUES (61, 'bd-legacy', 1, 1);
+        INSERT INTO export_hashes (rowid, issue_id, content_hash, exported_at)
+            VALUES (71, 'bd-legacy', 'unchanged-export-hash', '2026-01-30T04:07:21Z');
+        INSERT INTO labels (rowid, issue_id, label) VALUES (81, 'bd-legacy', 'preserved');
+        PRAGMA user_version = 15;
+    "#;
+
+    fn legacy_v15_test_source() -> (TempDir, Connection) {
+        let temp = TempDir::new().unwrap();
+        let conn =
+            Connection::open(temp.path().join("legacy.db").to_string_lossy().into_owned()).unwrap();
+        execute_batch(
+            &conn,
+            &SCHEMA_SQL.replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", ""),
+        )
+        .unwrap();
+        execute_batch(&conn, LEGACY_V15_TEST_CORE_SQL).unwrap();
+        (temp, conn)
+    }
+
+    fn legacy_v15_test_state(conn: &Connection) -> String {
+        let mut state = format!(
+            "{:?}",
+            conn.query("SELECT * FROM sqlite_master ORDER BY name")
+                .unwrap()
+        );
+        for row in conn
+            .query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap()
+        {
+            let name = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap()
+                .replace('"', "\"\"");
+            state.push_str(&format!(
+                "{:?}",
+                conn.query(&format!("SELECT rowid, * FROM \"{name}\" ORDER BY rowid"))
+                    .unwrap()
+            ));
+        }
+        state.push_str(&format!("{:?}", conn.query("PRAGMA user_version").unwrap()));
+        state
+    }
+
+    #[test]
+    fn reviewed_v15_profile_dispatch_retains_precise_table_diagnostics() {
+        for legacy in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let conn =
+                Connection::open(temp.path().join("source.db").to_string_lossy().into_owned())
+                    .unwrap();
+            let schema = SCHEMA_SQL
+                .replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "")
+                .replace(
+                    "PRIMARY KEY (issue_id, depends_on_id, type)",
+                    "PRIMARY KEY (issue_id, depends_on_id)",
+                );
+            execute_batch(&conn, &schema).unwrap();
+            if legacy {
+                execute_batch(&conn, LEGACY_V15_TEST_CORE_SQL).unwrap();
+            } else {
+                execute_batch(
+                    &conn,
+                    "DROP TABLE capacity_exemption_history;
+                     DROP TABLE capacity_exemptions;
+                     DROP TABLE capacity_occupancy;
+                     PRAGMA user_version = 15;",
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                attest_reviewed_migration_source_core_tables(&conn).unwrap(),
+                legacy
+            );
+            for table in ["comments", "dirty_issues", "export_hashes"] {
+                conn.execute("BEGIN IMMEDIATE").unwrap();
+                conn.execute(&format!(
+                    "ALTER TABLE {table} ADD COLUMN operator_payload TEXT"
+                ))
+                .unwrap();
+                let before = legacy_v15_test_state(&conn);
+                let error = attest_reviewed_migration_source_core_tables(&conn)
+                    .expect_err("unsupported columns must retain the relevant table diagnostic");
+                assert!(
+                    error.to_string().contains(&format!(
+                        "unsupported historical shape for core table {table}"
+                    )),
+                    "legacy={legacy}, table={table}: {error}"
+                );
+                assert!(error.to_string().contains("no migration token was issued"));
+                assert_eq!(legacy_v15_test_state(&conn), before);
+                conn.execute("ROLLBACK").unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn reviewed_legacy_v15_refuses_numeric_text_timestamp_coercion_without_writes() {
+        let (_temp, conn) = legacy_v15_test_source();
+        for (table, column) in [
+            ("dirty_issues", "marked_at"),
+            ("export_hashes", "exported_at"),
+        ] {
+            for numeric_text in ["0", "123", "00123", "-4", "1.25", ".5", "  +1e3  ", "1e100"] {
+                conn.execute("BEGIN IMMEDIATE").unwrap();
+                conn.execute_with_params(
+                    &format!("UPDATE {table} SET {column} = ?"),
+                    &[SqliteValue::from(numeric_text)],
+                )
+                .unwrap();
+                let values = conn
+                    .query(&format!("SELECT {column} FROM {table}"))
+                    .unwrap();
+                assert!(!values.is_empty());
+                assert!(values.iter().all(|row| {
+                    row.get(0).and_then(SqliteValue::as_text) == Some(numeric_text)
+                }));
+                let before = legacy_v15_test_state(&conn);
+                let error = attest_reviewed_migration_source_core_tables(&conn)
+                    .expect_err("numeric text cannot be represented unchanged as DATETIME");
+                assert!(
+                    error.to_string().contains(&format!("{table}.{column}"))
+                        && error.to_string().contains("DATETIME affinity"),
+                    "{table}.{column}={numeric_text:?}: {error}"
+                );
+                assert_eq!(legacy_v15_test_state(&conn), before);
+                let error = apply_reviewed_legacy_v15_core_conversion_in_transaction(&conn)
+                    .expect_err("candidate conversion must reattest numeric text refusal");
+                assert!(error.to_string().contains("DATETIME affinity"));
+                assert_eq!(legacy_v15_test_state(&conn), before);
+                conn.execute("ROLLBACK").unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn reviewed_legacy_v15_preserves_nonnumeric_timestamp_text_without_normalization() {
+        let (_temp, conn) = legacy_v15_test_source();
+        for text in [
+            "2026-01-30 04:07:21",
+            "2026-01-30T04:07:21.000000Z",
+            "2026-01-30T05:07:21+01:00",
+            "123not-a-number",
+            "",
+        ] {
+            conn.execute("BEGIN IMMEDIATE").unwrap();
+            for (table, column) in [
+                ("dirty_issues", "marked_at"),
+                ("export_hashes", "exported_at"),
+            ] {
+                conn.execute_with_params(
+                    &format!("UPDATE {table} SET {column} = ?"),
+                    &[SqliteValue::from(text)],
+                )
+                .unwrap();
+            }
+            let queries = [
+                "SELECT rowid, issue_id, marked_at FROM dirty_issues ORDER BY rowid",
+                "SELECT rowid, * FROM export_hashes ORDER BY rowid",
+            ];
+            let before = queries.map(|query| format!("{:?}", conn.query(query).unwrap()));
+            assert!(attest_reviewed_migration_source_core_tables(&conn).unwrap());
+            apply_reviewed_legacy_v15_core_conversion_in_transaction(&conn).unwrap();
+            for (query, expected) in queries.iter().zip(before) {
+                assert_eq!(
+                    format!("{:?}", conn.query(query).unwrap()),
+                    expected,
+                    "timestamp={text:?}, query={query}"
+                );
+            }
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
+
+    #[test]
+    fn reviewed_migration_managed_indexes_require_exact_table_and_name() {
+        for (table, name) in [
+            ("blocked_issues_cache", "idx_blocked_cache_blocked_at"),
+            ("labels", "idx_labels_issue"),
+            ("labels", "idx_labels_label"),
+            ("config", "idx_config_key"),
+            ("metadata", "idx_metadata_key"),
+            ("gate_result_history", "idx_gate_result_history_issue"),
+            ("gate_result_history", "idx_gate_result_history_scope"),
+            ("dependencies", "idx_dependencies_blocking"),
+        ] {
+            assert!(is_reviewed_migration_managed_index(table, name));
+            assert!(!is_reviewed_migration_managed_index("operator_table", name));
+            assert!(!is_reviewed_migration_managed_index(
+                table,
+                &format!("{name}_operator")
+            ));
+        }
+        for name in REVIEWED_LEGACY_V15_RETIRED_INDEXES {
+            for table in ["dependencies", "labels", "comments", "events"] {
+                assert!(!is_reviewed_migration_managed_index(table, name));
+            }
+        }
+        assert!(!is_reviewed_migration_managed_index(
+            "labels",
+            "idx_config_key"
+        ));
+        assert!(!is_reviewed_migration_managed_index(
+            "labels",
+            "sqlite_autoindex_labels_1"
+        ));
+    }
+
+    #[test]
+    fn reviewed_legacy_v15_conversion_preserves_rows_types_cycles_and_sequences() {
+        let (_temp, conn) = legacy_v15_test_source();
+        let before = legacy_v15_test_state(&conn);
+        assert!(attest_reviewed_migration_source_core_tables(&conn).unwrap());
+        assert_eq!(
+            legacy_v15_test_state(&conn),
+            before,
+            "planning is read-only"
+        );
+        let queries = [
+            "SELECT rowid, * FROM dependencies ORDER BY rowid",
+            "SELECT rowid, * FROM comments ORDER BY rowid",
+            "SELECT rowid, * FROM events ORDER BY rowid",
+            "SELECT rowid, issue_id, marked_at FROM dirty_issues ORDER BY rowid",
+            "SELECT rowid, parent_id, last_child FROM child_counters ORDER BY rowid",
+            "SELECT rowid, * FROM export_hashes ORDER BY rowid",
+            "SELECT rowid, * FROM issues ORDER BY rowid",
+            "SELECT rowid, * FROM labels ORDER BY rowid",
+            "SELECT rowid, * FROM operator_notes ORDER BY rowid",
+        ];
+        let rows_before = queries.map(|query| format!("{:?}", conn.query(query).unwrap()));
+        conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        apply_reviewed_legacy_v15_core_conversion_in_transaction(&conn).unwrap();
+        conn.execute("COMMIT").unwrap();
+        assert_eq!(connection_user_version(&conn).unwrap(), 15);
+        for (query, expected) in queries.iter().zip(rows_before) {
+            assert_eq!(
+                format!("{:?}", conn.query(query).unwrap()),
+                expected,
+                "{query}"
+            );
+        }
+        let sequences = conn
+            .query("SELECT name, seq FROM sqlite_sequence ORDER BY name")
+            .unwrap();
+        assert_eq!(sequences.len(), 3);
+        for (row, (name, high_water)) in
+            sequences
+                .iter()
+                .zip([("comments", 197), ("events", 79), ("operator_notes", 9)])
+        {
+            assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some(name));
+            assert_eq!(
+                row.get(1).and_then(SqliteValue::as_integer),
+                Some(high_water)
+            );
+        }
+        for name in REVIEWED_LEGACY_V15_RETIRED_INDEXES {
+            assert!(
+                conn.query(&format!(
+                    "SELECT 1 FROM sqlite_master WHERE name = '{name}'"
+                ))
+                .unwrap()
+                .is_empty()
+            );
+        }
+        assert!(
+            conn.execute("INSERT INTO operator_notes(note) VALUES ('operator payload')")
+                .is_err()
+        );
+        assert!(conn.execute("INSERT INTO dependencies SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id FROM dependencies WHERE rowid = 11").is_err());
+        conn.execute("INSERT INTO comments(issue_id, author, text) VALUES ('bd-legacy', 'next', 'after migration')").unwrap();
+        assert_eq!(
+            conn.query_row("SELECT MAX(id) FROM comments")
+                .unwrap()
+                .get(0)
+                .and_then(SqliteValue::as_integer),
+            Some(198)
+        );
+    }
+
+    #[test]
+    fn reviewed_legacy_v15_profile_refuses_ambiguous_projection_without_writes() {
+        for mutation in [
+            "PRAGMA user_version = 16",
+            "ALTER TABLE issues ADD COLUMN prerequisites TEXT NOT NULL DEFAULT ''",
+            "CREATE TABLE capacity_occupancy (issue_id TEXT)",
+            "UPDATE dirty_issues SET content_hash = 'unmapped legacy hash' WHERE issue_id = 'bd-legacy'",
+            "UPDATE child_counters SET next_child_number = 3",
+            "UPDATE child_counters SET last_child = 0",
+            "UPDATE child_counters SET last_child = NULL",
+            "UPDATE comments SET issue_id = 'bd-missing'",
+            "UPDATE events SET created_at = NULL",
+            "UPDATE dependencies SET type = 'Review-Custom' WHERE type = 'blocks'",
+            "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id) SELECT issue_id, depends_on_id, 'BLOCKS', created_at, created_by, metadata, thread_id FROM dependencies WHERE type = 'blocks'",
+            "INSERT INTO sqlite_sequence(name, seq) VALUES ('comments', 900)",
+            "CREATE TABLE comments_legacy_v15_stage (payload TEXT)",
+            "CREATE INDEX operator_dependency_index ON dependencies(created_by)",
+            "DROP INDEX idx_dependencies_issue_type; CREATE INDEX idx_dependencies_issue_type ON dependencies(type, issue_id)",
+            "DROP INDEX idx_labels_label_issue; CREATE UNIQUE INDEX idx_labels_label_issue ON labels(label, issue_id)",
+            "DROP INDEX idx_events_issue_type; CREATE INDEX idx_events_issue_type ON events(issue_id COLLATE NOCASE, event_type)",
+            "DROP INDEX idx_comments_issue_id; CREATE INDEX idx_comments_issue_id ON comments(issue_id) WHERE author <> ''",
+            "CREATE TABLE operator_references (comment_id INTEGER REFERENCES comments(id))",
+            "CREATE TRIGGER operator_event_trigger AFTER INSERT ON events BEGIN SELECT 1; END",
+        ] {
+            let (_temp, conn) = legacy_v15_test_source();
+            if mutation.starts_with("CREATE TRIGGER") {
+                // Trigger bodies contain statement separators of their own.
+                conn.execute(mutation).unwrap();
+            } else {
+                execute_batch(&conn, mutation).unwrap();
+            }
+            let before = legacy_v15_test_state(&conn);
+            assert!(
+                attest_reviewed_migration_source_core_tables(&conn).is_err(),
+                "{mutation}"
+            );
+            assert_eq!(legacy_v15_test_state(&conn), before, "{mutation}");
+            conn.execute("BEGIN IMMEDIATE").unwrap();
+            assert!(
+                apply_reviewed_legacy_v15_core_conversion_in_transaction(&conn).is_err(),
+                "{mutation}"
+            );
+            conn.execute("ROLLBACK").unwrap();
+            assert_eq!(legacy_v15_test_state(&conn), before, "{mutation}");
+        }
+    }
+
+    #[test]
+    fn reviewed_legacy_v15_vacuum_candidate_remains_attested_and_rolls_back() {
+        let (temp, conn) = legacy_v15_test_source();
+        let source_before = legacy_v15_test_state(&conn);
+        let candidate_path = temp.path().join("candidate.db");
+        conn.execute(&format!(
+            "VACUUM INTO '{}'",
+            candidate_path.to_string_lossy().replace('\'', "''")
+        ))
+        .unwrap();
+        let candidate = Connection::open(candidate_path.to_string_lossy().into_owned()).unwrap();
+        assert!(attest_reviewed_migration_source_core_tables(&candidate).unwrap());
+        let candidate_before = legacy_v15_test_state(&candidate);
+        candidate.execute("BEGIN IMMEDIATE").unwrap();
+        apply_reviewed_legacy_v15_core_conversion_in_transaction(&candidate).unwrap();
+        candidate.execute("ROLLBACK").unwrap();
+        assert_eq!(legacy_v15_test_state(&candidate), candidate_before);
+        assert_eq!(legacy_v15_test_state(&conn), source_before);
+    }
+
+    #[test]
+    fn reviewed_legacy_v15_empty_audit_tables_start_sequences_at_zero() {
+        let (_temp, conn) = legacy_v15_test_source();
+        conn.execute("DELETE FROM comments").unwrap();
+        conn.execute("DELETE FROM events").unwrap();
+        assert!(attest_reviewed_migration_source_core_tables(&conn).unwrap());
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        apply_reviewed_legacy_v15_core_conversion_in_transaction(&conn).unwrap();
+        conn.execute("COMMIT").unwrap();
+        for table in ["comments", "events"] {
+            let rows = conn
+                .query(&format!(
+                    "SELECT seq FROM sqlite_sequence WHERE name = '{table}'"
+                ))
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get(0).and_then(SqliteValue::as_integer), Some(0));
+        }
+        assert_eq!(
+            conn.query_row("SELECT seq FROM sqlite_sequence WHERE name = 'operator_notes'")
+                .unwrap()
+                .get(0)
+                .and_then(SqliteValue::as_integer),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn test_v19_typed_dependencies_preserve_v18_rows_and_existing_cycles() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let source_schema = SCHEMA_SQL.replace(
+            "PRIMARY KEY (issue_id, depends_on_id, type)",
+            "PRIMARY KEY (issue_id, depends_on_id)",
+        );
+        execute_batch(&conn, &source_schema).unwrap();
+        execute_batch(
+            &conn,
+            r#"
+            INSERT INTO issues (id, title, prerequisites, content_hash)
+                VALUES ('bd-first', 'First', '- [x] input', 'first-hash'),
+                       ('bd-second', 'Second', '- [ ] input', 'second-hash');
+            INSERT INTO dependencies
+                (rowid, issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id)
+                VALUES (7, 'bd-first', 'bd-second', 'blocks', '2026-01-30 04:07:21',
+                        'first-actor', '{"note":"préserver"}', 'original-thread'),
+                       (19, 'bd-second', 'bd-first', 'blocks', '2026-01-31 04:07:21',
+                        'second-actor', NULL, NULL);
+            PRAGMA user_version = 18;
+        "#,
+        )
+        .unwrap();
+        attest_reviewed_migration_source_core_tables(&conn).unwrap();
+        let before = format!(
+            "{:?}",
+            conn.query("SELECT rowid, * FROM dependencies ORDER BY rowid")
+                .unwrap()
+        );
+        let issues_before = format!(
+            "{:?}",
+            conn.query("SELECT * FROM issues ORDER BY id").unwrap()
+        );
+        conn.close().unwrap();
+        let bytes_before = std::fs::read(&db_path).unwrap();
+        assert!(
+            crate::storage::SqliteStorage::open_current_read_only(&db_path)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(std::fs::read(&db_path).unwrap(), bytes_before);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        run_migrations_atomic(&conn, 18, current_schema_version_u32().unwrap()).unwrap();
+        assert!(runtime_schema_compatible(&conn));
+        assert_eq!(
+            format!(
+                "{:?}",
+                conn.query("SELECT rowid, * FROM dependencies ORDER BY rowid")
+                    .unwrap()
+            ),
+            before
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                conn.query("SELECT * FROM issues ORDER BY id").unwrap()
+            ),
+            issues_before
+        );
+        conn.execute("INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES ('bd-first', 'bd-second', 'related')").unwrap();
+        assert!(conn.execute("INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES ('bd-first', 'bd-second', 'related')").is_err());
+        assert_eq!(
+            conn.query("SELECT type FROM dependencies WHERE issue_id = 'bd-first' ORDER BY type")
+                .unwrap()
+                .len(),
+            2
+        );
+        conn.close().unwrap();
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        assert!(runtime_schema_compatible(&conn));
+        assert_eq!(
+            conn.query("SELECT type FROM dependencies").unwrap().len(),
+            3
+        );
+        conn.close().unwrap();
+    }
+
     #[test]
     fn test_v18_prerequisites_require_explicit_upgrade_from_canonical_v17() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("beads.db");
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        let source_schema =
-            SCHEMA_SQL.replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "");
+        let source_schema = SCHEMA_SQL
+            .replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "")
+            .replace(
+                "PRIMARY KEY (issue_id, depends_on_id, type)",
+                "PRIMARY KEY (issue_id, depends_on_id)",
+            );
         execute_batch(&conn, &source_schema).expect("create canonical pre-prerequisite schema");
         conn.execute("PRAGMA user_version = 17").unwrap();
         conn.execute(
@@ -5630,7 +6946,8 @@ mod tests {
         assert_eq!(std::fs::read(&db_path).unwrap(), before);
 
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        run_migrations_atomic(&conn, 17, 18).expect("explicit upgrade");
+        run_migrations_atomic(&conn, 17, current_schema_version_u32().unwrap())
+            .expect("explicit upgrade");
         assert!(runtime_schema_compatible(&conn));
         assert!(issues_column_order_matches(&conn));
         let row = conn
@@ -6727,6 +8044,90 @@ mod tests {
             index_exists(&conn, "idx_issues_status"),
             "the refused rebuild must leave existing indexes intact"
         );
+    }
+
+    #[test]
+    fn test_rebuild_issues_table_preserves_sparse_rowids_and_payloads() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("sparse-issues.db");
+        let conn = Connection::open(path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).unwrap();
+        conn.execute("INSERT INTO issues (rowid, id, title, prerequisites, content_hash) VALUES (12, 'bd-first', 'First', '- [x] input', 'first-hash'), (28, 'bd-second', 'Second', '- [ ] input', 'second-hash')").unwrap();
+        let before = format!(
+            "{:?}",
+            conn.query("SELECT rowid, * FROM main.issues ORDER BY rowid")
+                .unwrap()
+        );
+        rebuild_issues_table(&conn).unwrap();
+        assert_eq!(
+            format!(
+                "{:?}",
+                conn.query("SELECT rowid, * FROM main.issues ORDER BY rowid")
+                    .unwrap()
+            ),
+            before
+        );
+        assert!(issues_required_checks_canonical(&conn));
+        assert!(issues_column_order_matches(&conn));
+        conn.close().unwrap();
+        let reopened = Connection::open(path.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(
+            format!(
+                "{:?}",
+                reopened
+                    .query("SELECT rowid, * FROM main.issues ORDER BY rowid")
+                    .unwrap()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn test_rebuild_issues_table_refuses_unavailable_hidden_rowid_before_changes() {
+        for declaration in [
+            "CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL) WITHOUT ROWID",
+            "CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL, RoWiD TEXT, _RoWiD_ TEXT, OiD TEXT)",
+        ] {
+            let temp = TempDir::new().unwrap();
+            let conn = Connection::open(
+                temp.path()
+                    .join("rowid-authority.db")
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .unwrap();
+            conn.execute(declaration).unwrap();
+            conn.execute("CREATE UNIQUE INDEX operator_issue_title ON issues(title)")
+                .unwrap();
+            conn.execute("INSERT INTO issues (id, title) VALUES ('bd-owned', 'Preserve me')")
+                .unwrap();
+            let schema_before = format!(
+                "{:?}",
+                conn.query("SELECT * FROM sqlite_master ORDER BY name")
+                    .unwrap()
+            );
+            let rows_before = format!("{:?}", conn.query("SELECT * FROM issues").unwrap());
+            let error = rebuild_issues_table(&conn).expect_err("no implicit rowid may be guessed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("without preserving its implicit rowid"),
+                "{error}"
+            );
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    conn.query("SELECT * FROM sqlite_master ORDER BY name")
+                        .unwrap()
+                ),
+                schema_before
+            );
+            assert_eq!(
+                format!("{:?}", conn.query("SELECT * FROM issues").unwrap()),
+                rows_before
+            );
+            assert!(index_exists(&conn, "operator_issue_title"));
+        }
     }
 
     #[test]

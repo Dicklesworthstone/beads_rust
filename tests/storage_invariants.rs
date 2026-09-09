@@ -232,7 +232,7 @@ fn dependency_crud_updates_blocked_cache() {
     );
 
     let removed = storage
-        .remove_dependency(&blocked_issue.id, &blocking_issue.id, "tester")
+        .remove_dependency(&blocked_issue.id, &blocking_issue.id, None, "tester")
         .unwrap();
     assert!(removed);
     storage.rebuild_blocked_cache(true).unwrap();

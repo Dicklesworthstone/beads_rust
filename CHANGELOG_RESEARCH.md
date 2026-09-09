@@ -510,3 +510,199 @@ The preserved release-profile executable on hz3 is
 Earlier capped or interrupted attempts remain recorded without pass credit.
 These changes remain unreleased and do not complete
 the historical migration, lock fairness, or performance calibration work.
+
+### September 9 — typed relationships and the original legacy migration
+
+The schema-19 change makes dependency identity `(source, target, type)` across
+storage, CLI/MCP removal, JSONL import/export, and additive reconciliation.
+Ambiguous untyped removals refuse before mutation. Exact imported custom type
+names take precedence over alias coercion; the remaining relationship keeps
+its payload. Canonical schema-18 migration, typed removal, and an operator
+foreign-key refusal were independently exercised with candidate
+`473f315a6069693493b9c0ce766334b94294a389ad84c650d210d3c45e9abc97`.
+The journal is `typed-independent-commands-and-observations.jsonl`, SHA-256
+`b5f0d17c408f24f8dd9264a190bf574d8a1be96b7c14f11a18962302cec0f58e`.
+An initial whole-family undo assertion failed on the namespace-use sidecar;
+the narrower documented DB/WAL/SHM/journal receipt was exact. The stronger
+failure and a subsequent observer field-name error remain recorded.
+
+The separate legacy-v15 conversion now admits the exact historical table
+profile only after validating declarations, indexes, values, references,
+dirty hashes, and child-counter reservations. It stages raw values and row
+IDs, preserves parallel and custom relationships without cycle normalization,
+and establishes comments/events sequence counters from existing IDs. A
+projected witness binds every table, hidden row IDs, and preserved operator
+schema. The existing issues rebuild was corrected to retain sparse row IDs.
+Unknown operator constraints and incoming references are not silently rebuilt.
+
+The first complete legacy run passed 3,126 library tests with nine existing
+ignores; one of 161 migration CLI tests failed because the new fallback hid
+the correct canonical-table diagnostic. The assertion stayed unchanged and
+dispatch was fixed. A first actual historical apply refused before installation:
+all table projections matched, but recreated canonical indexes differed in
+`IF NOT EXISTS` and quoting. Only independently attested managed indexes are
+now excluded from the operator-schema spelling witness. The original source
+database and failed candidate remain retained.
+
+The corrected run passed 3,131 library tests and all 161 migration CLI tests.
+Its preserved executable is
+`/data/tmp/br-yyhki-legacy-second-ja_bdmh1/br` on ovh-a, SHA-256
+`9da9cbb4892bf1a3766bf0b12a1d6d8fb0725cf1679fca21d412d5f667082c4d`.
+The 1,203-file source manifest has SHA-256
+`b21d6a8b8ae3cb7e2566b714495fa4e58a703b4666277af86b8bc05fda03589c`.
+An independent SQLite 3.46.1 observer compared the actual 550-issue source,
+successful schema-19 candidate, and undo. Every projected value, storage class,
+column, and row ID in all 18 original tables matched, including 465 dependency
+rows and sequence values. The three new capacity tables were empty. Eighteen
+unreconstructed schema objects, including operator indexes and views, matched
+exactly. Undo restored source DB SHA-256
+`e9d1b5d9ab67c620cb6128709604da089b88ae1e8cdbe2ddcea0546a42abc205`
+and every receipt-covered component. JSONL and the original fixture stayed
+unchanged. The complete observer journal has SHA-256
+`cd14815339ee8ba7410c68732272747e2a5cdb9e92e804b6eacd12ab2e578928`.
+
+All five original workload failures subsequently passed with explicit
+`BR_DATASET_REPLAY` and `BR_DATASET_REPLAY_REASON`: history restore/prune,
+label list-all/rename, and the unchanged six-reader, six-iteration concurrency
+workload. Their full targets passed 186, 180, and 189 tests respectively.
+The original fixture deliberately retains its 550-row DB and 971-line JSONL
+starting discrepancy; it was not replaced by a synthetic current-schema
+tracker. Explicit replay workspaces are retained even after successful
+migration. Shared registry helpers still early-return when their separate
+default corpus is absent; those passes are not historical-corpus evidence.
+The workload log has SHA-256
+`54a801f633e700fca144e75182aada3b61016278481102cc7f0693933a08075d`.
+
+These artifacts live under
+`/data/tmp/br-yyhki-typed-20260909-r8QH57VB`. Final qualification is still open:
+a subsequent review proved that folding double-quoted text case can hide a
+changed SQLite CHECK constraint. That fold was removed and regression tests
+added; the executable and workload results above predate this correction.
+The first Clippy failure was a redundant visibility qualifier on a private
+test fixture, corrected without suppression. UBS remains non-clean; the
+two migration files reported 54 critical, 3,039 warning, and 364 informational
+findings, including fixture panics/SQL and non-secret-token heuristics.
+Release-profile verification is running under unchanged RCH time limits.
+Neither yyhki closure nor a complete release-suite pass is claimed here.
+
+The final quoted-text correction was then requalified on executable
+`fcd570d76e2d443e59e0542b857ba57c19bec9ad7f15241249b191bc218cc195`,
+preserved at `/data/tmp/br-yyhki-legacy-final-mzefvkdn/br` on ovh-a.
+All 1,203 source-manifest entries matched the working tree before the final
+checks; the manifest SHA-256 is
+`ea4a0dbb9fd9693ab6b3d40d8573adc6cad74a16771ec52f796eddaefdef9465`.
+The embedded Git SHA comes from a cached build and is not its source identity.
+The all-feature matrix passed 3,131 library tests (nine existing ignores),
+186 concurrency, 180 history, 189 labels, 22 MCP, 165 migration, 174 sync-safety,
+and 189 reconciliation tests. All five original historical workloads executed
+and passed; shared harness tests account for repeated per-target counts.
+The matrix log SHA-256 is
+`a104459a4e153a0af6fec3d6562ad53db198fc56afa9a1d52c3ca14eb4d4b5ca`.
+Whole-target all-feature check and Clippy passed, followed by formatting.
+
+The original-source canary was repeated with that final executable: apply took
+1.930 seconds and exact receipt-family undo took 0.316 seconds. Independent
+SQLite checks again verified all 18 projected tables, raw storage classes and
+row IDs, sequence values, three empty capacity tables, foreign keys, and
+integrity. The resulting DB SHA-256
+`db5ede49f5505a32a452611c86077f3f9e44d9110e670a6d8a6bcf16c3e841ef`
+is identical to the earlier candidate whose 18 preserved schema objects were
+compared separately. The final observer journal SHA-256 is
+`9e1e2946f2d230d96d80adab1d3676c4d7f995d35b602084d46cb62d01c56036`.
+These are debug-profile, isolated-copy results; the live tracker is untouched.
+
+The full changed-Rust UBS scan remains non-clean: 490 critical, 18,506 warning,
+and 3,124 informational findings. Its log SHA-256 is
+`f365e0fc7e7626f82777f0cb4c344b61424c647de458230b95dbe5572d38c854`;
+not every warning has been individually triaged. An earlier release-library
+run passed 3,051 tests with two existing ignores, but predates the final quoted
+text correction and therefore does not qualify the final candidate. The first
+full release-suite attempt failed during clean-overlay source transfer before
+Cargo; its log is retained as `legacy-full-release-first.log`. The retry and
+separate final-source release sync targets are still running. Full release
+qualification, fairness, and calibrated performance remain open.
+
+The next release-profile candidate exposed another representability boundary:
+legacy dependency types `Review-Custom` and `review-custom` remained distinct
+in the converted database but exported to the same normalized JSONL identity.
+The source copy and successful-but-colliding export are retained on hz4 at
+`/data/tmp/br-legacy-type-case-049yangm`. Admission now refuses any legacy type
+whose spelling changes through the interchange model. The negative replay on
+ovh-a at `/data/tmp/br-legacy-case-refusal-_bze71mr` returned `CONFIG_ERROR`
+before changing the source DB hash. Lowercase custom types remain supported.
+
+With the spelling guard and original fixed polling, release executable
+`6b1dfca7489b2a10658ad2cc85776ff383fca87ba70f18510917a8f79bb1beba`, retained
+at `/data/tmp/br-fixed-case-final-core-tnz0pnlu/br` on ovh-a, passed 3,051 library
+tests (two existing ignores), 66 binary tests, the five original historical
+workloads, and the full migration and three sync targets. A fresh independent
+SQLite canary verified all 18 table projections and exact receipt-family undo
+of the original 550-issue database; apply took 1.909 seconds and undo 0.324
+seconds. Its candidate DB hash again matched `db5ede49…e841ef`. Complete
+observations are retained beside the executable. The original fixture and
+JSONL were unchanged. This executable predates the behavior-preserving helper
+extraction used to fix Clippy's function-length warning, so final-source
+qualification still requires that newer source to pass.
+
+The separate aged-polling experiment was rejected and reverted. All four
+release ABBA runs completed their unchanged eight-stream, 120-second workload
+with zero failed or dropped operations and full final-state checks. Although
+p95 improved, median latency rose from 135–154 ms to 245–249 ms. A diagnostic
+trace still observed a 16.567-second wait while 23 later arrivals acquired the
+lock. Those results do not establish fairness or calibrated performance.
+Raw comparison and trace evidence remains on ovh-a under
+`/data/tmp/br-46zqi-syscall-jwi2sl4x/`.
+
+Qualification remains incomplete: two cold release batches reached RCH's
+unchanged 30-minute limit before test execution. Local ENOSPC also truncated
+one batch log and prevented a tracker export; the export was subsequently
+recovered, and retries use logs in `/tmp`. Missing-`sqlite3` failures in two
+sync-artifact tests passed unchanged on a worker with the actual oracle.
+The detailed pending targets, source distinctions, and bounded self-review
+are recorded in yyhki comment 1500. No test ignores, workload reductions,
+timeout increases, GitHub Actions, or new releases were introduced.
+
+The final helper extraction is now qualified. Default release executable
+`ad56a8a4c6bfba289f88a09d95f7b0311f9ec1d5aebdca39fa10ee561bca77cc`, retained
+at `/data/tmp/br-extracted-helper-release-qcef0br5/br` on ovh-a, matches all
+1,203 entries in source manifest `c04f0d2c…fe2846`. Its original-copy replay
+passed all 18 table projections, storage classes, row IDs, sequences, foreign
+keys, integrity, and exact DB/WAL/SHM/journal undo. The complete observations
+have SHA-256 `9aec283766e9c8c805f0efaeb6a13fbdf1cdac05ce6481470eae69ff961f2475`.
+The same executable refused the case-distinct legacy types without changing
+the source DB. Later edits changed two integration tests and documentation;
+the runtime sources remain identical to this executable's inputs.
+
+Release-profile coverage completed through bounded RCH Cargo batches for all
+156 integration targets. One target contains only an existing ignored test;
+no executed-test credit is assigned to it. The default library passed 3,051
+tests with two existing ignores; all features passed 3,131 with nine, and no
+default features passed 3,038 with two. The binary's 66 tests, all 22 enabled
+MCP protocol tests, and the MCP shutdown test passed. The documentation-test
+command succeeded with zero executed tests and ten existing ignores.
+The last storage-model target passed all 172 tests independently of a slow
+combined batch that reached the unchanged 30-minute cap. Its four remaining
+storage targets then passed on the same worker using their compiled binaries.
+Two redundant cold fallback builds were cancelled; their logs and cancellation
+receipts remain in `/tmp`, and neither receives test credit. Target membership,
+failed attempts, and individual proof logs are recorded in the yyhki bead.
+
+The complete suite exposed two obsolete test assumptions. Schema conformance
+against pinned Go `bd` 0.46.0 had omitted the previously shipped
+`issues.prerequisites` column; it now asserts that exact TEXT/NOT NULL/empty
+default declaration and requires the typed dependency key to match. The doctor
+chokepoint test had stamped a current database as version 14 while retaining
+later columns and keys. Its positive path now derives v14 from the frozen
+`d1b90640` schema-15 fixture by removing the v15 gate-history table. The former
+mismatched layout remains an explicit no-mutation refusal test. Existing
+plan/apply/barrier/undo assertions remain, with byte-exact undo added. Both
+corrected targets passed; neither required weakening production admission.
+
+After both test corrections, whole-crate all-feature check and Clippy with
+warnings denied passed, as did formatting and whitespace checks. The normal
+runtime dependency closure contained no Git-authority libraries. UBS remains
+non-clean: its 49 schema SQL findings are all in test fixtures, and the new
+integration-file scans report fixture panics and explicit test-binary launches.
+This is recorded triage, not a blanket scanner clearance. Qualification used
+isolated copies and a fresh solo review; it is not independent human review,
+a new release, a starvation fix, or calibrated performance acceptance.

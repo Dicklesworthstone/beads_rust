@@ -35,10 +35,12 @@ use beads_rust::cli::commands::doctor_subsystems::mutate::{
     Capabilities, DbArg, MutateContext, Op, mutate,
 };
 use beads_rust::franken_sync::Connection;
+use flate2::read::GzDecoder;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tempfile::TempDir;
@@ -1842,12 +1844,64 @@ fn startup_auto_recovery_preserves_dirty_unflushed_issue() {
 }
 
 #[test]
+fn e2e_reviewed_schema_migration_refuses_current_layout_with_historical_stamp() {
+    let temp = isolated_tempdir();
+    let root = temp.path();
+    br_init(root);
+    let db_path = root.join(".beads/beads.db");
+    let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open current db");
+    conn.execute("DROP TABLE gate_result_history")
+        .expect("remove gate history");
+    conn.execute("PRAGMA user_version = 14")
+        .expect("stamp mismatched historical version");
+    conn.close().expect("close mismatched fixture");
+    let before = fs::read(&db_path).expect("read mismatched source");
+
+    let plan = br_cmd(root)
+        .args(["doctor", "migrate-schema", "plan", "--json"])
+        .output()
+        .expect("migration plan spawned");
+    assert!(
+        !plan.status.success(),
+        "a version stamp cannot establish eligibility"
+    );
+    let payload = parse_trailing_json(&String::from_utf8_lossy(&plan.stdout));
+    assert_eq!(payload["error"]["code"], "CONFIG_ERROR");
+    assert!(payload["error"]["message"].as_str().is_some_and(|message| {
+        message.contains("unsupported historical shape for core table issues")
+    }));
+    assert_eq!(fs::read(&db_path).expect("read refused source"), before);
+    assert_eq!(db_user_version(&db_path), 14);
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn e2e_reviewed_schema_migration_plan_apply_barrier_and_non_deleting_undo() {
     let temp = isolated_tempdir();
     let root = temp.path().to_path_buf();
-    br_init(&root);
+    let beads_dir = root.join(".beads");
+    fs::create_dir_all(&beads_dir).expect("create historical workspace");
     let db_path = root.join(".beads/beads.db");
+    // Derive v14 from the frozen d1b90640 schema-15 fixture by removing the
+    // v15 gate-history table below. A current init plus a version stamp would
+    // retain later columns and the typed key, and must remain ineligible.
+    let fixture = include_bytes!("fixtures/schema_migration/schema15_pre384_era.db.gz");
+    let mut source = Vec::new();
+    GzDecoder::new(fixture.as_slice())
+        .read_to_end(&mut source)
+        .expect("decode historical schema-15 fixture");
+    fs::write(&db_path, source).expect("install historical database");
+    fs::write(
+        beads_dir.join("issues.jsonl"),
+        include_bytes!("fixtures/schema_migration/schema15_issues.jsonl"),
+    )
+    .expect("install historical JSONL");
+    fs::write(
+        beads_dir.join("config.yaml"),
+        include_bytes!("fixtures/schema_migration/schema15_config.yaml"),
+    )
+    .expect("install historical config");
+    assert_eq!(db_user_version(&db_path), 15);
 
     {
         let conn =
@@ -1866,6 +1920,7 @@ fn e2e_reviewed_schema_migration_plan_apply_barrier_and_non_deleting_undo() {
         conn.execute("PRAGMA user_version = 14").expect("stamp v14");
         conn.close().expect("close v14 fixture");
     }
+    let source_bytes = fs::read(&db_path).expect("read v14 source bytes");
 
     let refused = br_cmd(&root)
         .args(["--no-auto-import", "--allow-stale", "list", "--json"])
@@ -2004,6 +2059,10 @@ fn e2e_reviewed_schema_migration_plan_apply_barrier_and_non_deleting_undo() {
     );
     assert_eq!(undo_json["dry_run"], false);
     assert_eq!(db_user_version(&db_path), 14);
+    assert_eq!(
+        fs::read(&db_path).expect("read restored source"),
+        source_bytes
+    );
     assert!(run_dir.join("undone.json").is_file());
     let quarantine_entries = fs::read_dir(run_dir.join("undo-quarantine"))
         .expect("read undo quarantine")

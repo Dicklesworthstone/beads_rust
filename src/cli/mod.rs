@@ -2250,6 +2250,10 @@ pub struct DepRemoveArgs {
     /// Target issue ID to remove dependency to
     #[arg(add = ArgValueCompleter::new(issue_id_completer))]
     pub depends_on: String,
+
+    /// Dependency type to remove (required when the pair has multiple types)
+    #[arg(long = "type", short = 't', add = ArgValueCompleter::new(dep_type_completer))]
+    pub dep_type: Option<String>,
 }
 
 #[derive(Args, Debug)]

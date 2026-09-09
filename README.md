@@ -561,10 +561,19 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 |---------|-------------|---------|
 | `dep add` | Add dependency | `br dep add br-child br-parent` |
 | `dep import` | Bulk import dependency JSONL | `br dep import edges.jsonl --robot` |
-| `dep remove` | Remove dependency | `br dep remove br-child br-parent` |
+| `dep remove` | Remove one dependency type | `br dep remove br-child br-parent --type blocks` |
 | `dep list` | List dependencies | `br dep list br-abc123` |
 | `dep tree` | Dependency tree | `br dep tree br-abc123` |
 | `dep cycles` | Find cycles | `br dep cycles` |
+
+Different relationship types can connect the same two issues. Removing a
+dependency without `--type` succeeds only when that pair has a single type;
+otherwise specify the type to preserve the other relationships.
+
+Existing trackers need an explicit `br doctor migrate-schema plan` and reviewed
+`apply` to reach schema 19. The migration supports canonical schemas 13–18 and
+one strictly checked legacy schema-15 layout, preserving parallel typed edges.
+See the [migration reference](docs/CLI_REFERENCE.md#doctor) for eligibility and undo.
 
 ### Labels
 

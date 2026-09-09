@@ -40,8 +40,10 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use crate::storage::schema::{
-    CURRENT_SCHEMA_VERSION, REVIEWED_MIGRATION_SOURCE_VERSIONS, ReviewedSchemaMigrationEffects,
-    attest_reviewed_migration_source_core_tables,
+    CURRENT_SCHEMA_VERSION, REVIEWED_LEGACY_V15_RETIRED_INDEXES,
+    REVIEWED_MIGRATION_SOURCE_VERSIONS, ReviewedSchemaMigrationEffects,
+    apply_reviewed_legacy_v15_core_conversion_in_transaction,
+    attest_reviewed_migration_source_core_tables, is_reviewed_migration_managed_index,
     run_reviewed_schema_migration_steps_in_transaction, runtime_schema_compatible,
 };
 use crate::sync::{DatabaseFamilyWriteLock, DatabaseTargetAuthorityState};
@@ -85,6 +87,23 @@ struct LogicalDatabaseWitness {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LegacyTableProjection {
+    #[serde(flatten)]
+    table: LogicalTableWitness,
+    rowid_included: bool,
+}
+
+/// The expected destination, computed from the admitted source before any
+/// write. Unlike the general logical witness, this also binds hidden rowids.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LegacyV15Projection {
+    profile: String,
+    tables: Vec<LegacyTableProjection>,
+    preserved_schema_sha256: String,
+    retired_indexes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct MigrationForecast {
     from_version: u32,
     to_version: u32,
@@ -92,6 +111,10 @@ struct MigrationForecast {
     gate_result_history_created: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     prerequisites_column_added: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    dependency_type_key_added: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_v15_conversion: Option<LegacyV15Projection>,
     #[serde(default, skip_serializing_if = "is_false")]
     post_migration_maintenance: bool,
 }
@@ -188,6 +211,10 @@ struct ReviewedSchemaMigrationEffectsReceipt {
     #[serde(default, skip_serializing_if = "is_false")]
     prerequisites_column_added: bool,
     #[serde(default, skip_serializing_if = "is_false")]
+    dependency_type_key_added: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    legacy_v15_tables_converted: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     post_migration_maintenance_completed: bool,
 }
 
@@ -199,6 +226,8 @@ impl From<ReviewedSchemaMigrationEffects> for ReviewedSchemaMigrationEffectsRece
             content_hash_rows_rebuilt: value.content_hash_rows_rebuilt,
             gate_result_history_created: value.gate_result_history_created,
             prerequisites_column_added: value.prerequisites_column_added,
+            dependency_type_key_added: value.dependency_type_key_added,
+            legacy_v15_tables_converted: false,
             post_migration_maintenance_completed: false,
         }
     }
@@ -324,6 +353,8 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
                 content_hash_rows_rebuilt: 0,
                 gate_result_history_created: false,
                 prerequisites_column_added: false,
+                dependency_type_key_added: false,
+                legacy_v15_conversion: None,
                 post_migration_maintenance: true,
             };
             let plan_token = compute_plan_token(&database_path, &logical_witness, &forecast)?;
@@ -363,7 +394,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     }
     if !REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         return Err(BeadsError::internal(format!(
-            "reviewed schema migration is available only from source schemas 13, 14, 15, 16, and 17 \
+            "reviewed schema migration is available only from source schemas 13, 14, 15, 16, 17, and 18 \
              to {target}; observed unsupported source version {from}"
         )));
     }
@@ -377,7 +408,10 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
 
     let conn = open_read_only(db_path)?;
     require_source_tables(&conn, from)?;
-    attest_reviewed_migration_source_core_tables(&conn)?;
+    let legacy_v15 = attest_reviewed_migration_source_core_tables(&conn)?;
+    let legacy_v15_conversion = legacy_v15
+        .then(|| legacy_v15_projection(&conn, true))
+        .transpose()?;
     let issue_count = query_count(&conn, "SELECT COUNT(*) FROM issues")?;
     let gate_result_history_created = !named_table_exists(&conn, "gate_result_history")?;
     close_connection(conn)?;
@@ -395,7 +429,9 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
             0
         },
         gate_result_history_created,
-        prerequisites_column_added: true,
+        prerequisites_column_added: from < 18,
+        dependency_type_key_added: !legacy_v15,
+        legacy_v15_conversion,
         post_migration_maintenance: true,
     };
     let plan_token = compute_plan_token(&database_path, &logical_witness, &forecast)?;
@@ -510,8 +546,7 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
     let mut failed_stage: Option<String> = None;
     let migration_result = apply_reviewed_migration(
         &migration.db_path,
-        forecast.from_version,
-        forecast.to_version,
+        &forecast,
         &marked_at,
         &run_dir,
         &migration.write_authority,
@@ -577,6 +612,8 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
         || effects.content_hash_rows_rebuilt != forecast.content_hash_rows_rebuilt
         || effects.gate_result_history_created != forecast.gate_result_history_created
         || effects.prerequisites_column_added != forecast.prerequisites_column_added
+        || effects.dependency_type_key_added != forecast.dependency_type_key_added
+        || effects.legacy_v15_tables_converted != forecast.legacy_v15_conversion.is_some()
         || !maintenance_matches_forecast
     {
         attestation_errors.push(format!(
@@ -772,6 +809,9 @@ fn validate_commit_ready_marker(
         || marker.effects.content_hash_rows_rebuilt != marker.forecast.content_hash_rows_rebuilt
         || marker.effects.gate_result_history_created != marker.forecast.gate_result_history_created
         || marker.effects.prerequisites_column_added != marker.forecast.prerequisites_column_added
+        || marker.effects.dependency_type_key_added != marker.forecast.dependency_type_key_added
+        || marker.effects.legacy_v15_tables_converted
+            != marker.forecast.legacy_v15_conversion.is_some()
         || maintenance_completion_disagrees_with_forecast
         || marker.logical_after.user_version != marker.forecast.to_version
         || !integrity_check_is_clean(&marker.logical_after.integrity_check)
@@ -838,6 +878,12 @@ fn resume_commit_ready_migration(
         let applied: AppliedMigrationReceipt = read_json(&applied_path)?;
         validate_applied_against_commit_ready(&applied, &marker, &run_dir)?;
         let logical_live = logical_witness(&migration.db_path).ok();
+        let projection_unchanged = verify_legacy_v15_projection(
+            &migration.db_path,
+            applied.forecast.legacy_v15_conversion.as_ref(),
+            false,
+        )
+        .is_ok();
         // Capture the fallback raw witness after the SQLite probe so a
         // legitimate shared-memory sidecar rewrite cannot stale it immediately.
         let raw_live = raw_family_witness(&migration.db_path)?;
@@ -846,6 +892,7 @@ fn resume_commit_ready_migration(
             &raw_live,
             logical_live.as_ref(),
             &applied.run_id,
+            projection_unchanged,
         )
         .is_ok()
         {
@@ -922,6 +969,11 @@ fn resume_commit_ready_migration(
             run_dir.display()
         )));
     }
+    verify_legacy_v15_projection(
+        &migration.db_path,
+        marker.forecast.legacy_v15_conversion.as_ref(),
+        false,
+    )?;
     if !current_runtime_shape_is_canonical(&migration.db_path)? {
         return Err(BeadsError::internal(format!(
             "commit-ready schema migration {} matches logically but not the canonical runtime shape",
@@ -1176,8 +1228,7 @@ fn validate_applied_against_commit_ready(
 
 fn apply_reviewed_migration(
     db_path: &Path,
-    from: u32,
-    to: u32,
+    forecast: &MigrationForecast,
     marked_at: &str,
     run_dir: &Path,
     write_authority: &Arc<DatabaseFamilyWriteLock>,
@@ -1185,8 +1236,7 @@ fn apply_reviewed_migration(
 ) -> Result<ReviewedSchemaMigrationEffectsReceipt> {
     run_post_migration_maintenance(
         db_path,
-        from,
-        to,
+        forecast,
         marked_at,
         run_dir,
         write_authority,
@@ -1254,15 +1304,17 @@ fn canonical_index_name(statement: &str) -> Result<&str> {
 #[allow(clippy::too_many_lines)]
 fn run_post_migration_maintenance(
     db_path: &Path,
-    from: u32,
-    to: u32,
+    forecast: &MigrationForecast,
     marked_at: &str,
     run_dir: &Path,
     write_authority: &Arc<DatabaseFamilyWriteLock>,
     failed_stage: &mut Option<String>,
 ) -> Result<ReviewedSchemaMigrationEffectsReceipt> {
+    let from = forecast.from_version;
+    let to = forecast.to_version;
     mark_stage(failed_stage, "source-witness");
     write_authority.verify_database_authority()?;
+    verify_legacy_v15_projection(db_path, forecast.legacy_v15_conversion.as_ref(), true)?;
     let source_logical = logical_witness(db_path)?;
     let source_permissions_witness = raw_family_witness(db_path)?;
     let source_unix_mode = component_for_suffix(&source_permissions_witness, "")?.unix_mode;
@@ -1291,6 +1343,8 @@ fn run_post_migration_maintenance(
             content_hash_rows_rebuilt: 0,
             gate_result_history_created: false,
             prerequisites_column_added: false,
+            dependency_type_key_added: false,
+            legacy_v15_tables_converted: false,
             post_migration_maintenance_completed: false,
         }
     } else {
@@ -1298,7 +1352,12 @@ fn run_post_migration_maintenance(
         let conn = Connection::open(candidate_path.to_string_lossy().into_owned())?;
         conn.execute("PRAGMA foreign_keys = ON")?;
         conn.execute("BEGIN IMMEDIATE")?;
-        let result = run_reviewed_schema_migration_steps_in_transaction(&conn, from, to, marked_at);
+        let result = (|| {
+            if forecast.legacy_v15_conversion.is_some() {
+                apply_reviewed_legacy_v15_core_conversion_in_transaction(&conn)?;
+            }
+            run_reviewed_schema_migration_steps_in_transaction(&conn, from, to, marked_at)
+        })();
         let result = match result {
             Ok(effects) => match conn.execute("COMMIT") {
                 Ok(_) => Ok(effects),
@@ -1313,7 +1372,9 @@ fn run_post_migration_maintenance(
             }
         };
         close_connection(conn)?;
-        ReviewedSchemaMigrationEffectsReceipt::from(result?)
+        let mut effects = ReviewedSchemaMigrationEffectsReceipt::from(result?);
+        effects.legacy_v15_tables_converted = forecast.legacy_v15_conversion.is_some();
+        effects
     };
 
     mark_stage(failed_stage, "candidate-maintenance");
@@ -1381,6 +1442,11 @@ fn run_post_migration_maintenance(
     }
 
     mark_stage(failed_stage, "candidate-attestation");
+    verify_legacy_v15_projection(
+        &candidate_path,
+        forecast.legacy_v15_conversion.as_ref(),
+        false,
+    )?;
     let candidate_logical = logical_witness(&candidate_path)?;
     let candidate_matches_reviewed_operation = if from == to {
         logical_witnesses_match_except_integrity(&source_logical, &candidate_logical)
@@ -1403,6 +1469,7 @@ fn run_post_migration_maintenance(
     }
 
     let source_logical_after = logical_witness(db_path)?;
+    verify_legacy_v15_projection(db_path, forecast.legacy_v15_conversion.as_ref(), true)?;
     if source_logical_after != source_logical {
         return Err(BeadsError::internal(format!(
             "live database changed while the copy-on-write migration candidate was prepared; \
@@ -2302,11 +2369,23 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
         receipt
     } else {
         let logical_live = logical_witness(&migration.db_path).ok();
+        let projection_unchanged = verify_legacy_v15_projection(
+            &migration.db_path,
+            applied.forecast.legacy_v15_conversion.as_ref(),
+            false,
+        )
+        .is_ok();
         // The receipt later governs exact quarantine moves. Capture it after
         // the SQLite probe, which may legitimately rewrite the volatile -shm
         // sidecar even though the logical database is unchanged.
         let raw_live = raw_family_witness(&migration.db_path)?;
-        require_unchanged_applied_state(&applied, &raw_live, logical_live.as_ref(), &args.run_id)?;
+        require_unchanged_applied_state(
+            &applied,
+            &raw_live,
+            logical_live.as_ref(),
+            &args.run_id,
+            projection_unchanged,
+        )?;
 
         let quarantine_id = format!(
             "undo-{}-{}",
@@ -2779,6 +2858,7 @@ fn require_unchanged_applied_state(
     raw_live: &RawFamilyWitness,
     logical_live: Option<&LogicalDatabaseWitness>,
     run_id: &str,
+    projection_unchanged: bool,
 ) -> Result<()> {
     let unchanged = if let Some(expected) = applied.logical_after.as_ref() {
         logical_live == Some(expected)
@@ -2788,7 +2868,7 @@ fn require_unchanged_applied_state(
             .as_ref()
             .is_some_and(|expected| stable_raw_eq(raw_live, expected))
     };
-    if !unchanged {
+    if !unchanged || !projection_unchanged {
         return Err(BeadsError::internal(format!(
             "schema migration undo refused because the live database has changed since run \
              {run_id}; preserving both states is safer than overwriting newer tracker work"
@@ -2905,6 +2985,228 @@ fn current_runtime_shape_is_canonical(db_path: &Path) -> Result<bool> {
     Ok(canonical)
 }
 
+const LEGACY_V15_PROFILE: &str = "legacy-v15-typed-dependencies-null-dirty-hashes-v1";
+const LEGACY_V15_NEW_TABLES: &[&str] = &[
+    "capacity_exemption_history",
+    "capacity_exemptions",
+    "capacity_occupancy",
+];
+
+fn legacy_projection_rowid(conn: &Connection, table: &str) -> Result<Option<&'static str>> {
+    if table == "sqlite_sequence" {
+        // Sequence identity is its table name and high-water value. Engine
+        // allocation of the sequence catalog's own rowids is not user data.
+        return Ok(None);
+    }
+    let escaped = table.replace('\'', "''");
+    let rows = conn.query(&format!("PRAGMA main.table_list('{escaped}')"))?;
+    let row = rows
+        .iter()
+        .find(|row| row.get(1).and_then(SqliteValue::as_text) == Some(table))
+        .ok_or_else(|| BeadsError::internal(format!("table_list omitted {table}")))?;
+    if row.get(2).and_then(SqliteValue::as_text) != Some("table") {
+        return Err(BeadsError::Config(format!(
+            "legacy v15 conversion refused: {table} is not an ordinary table"
+        )));
+    }
+    match row.get(4).and_then(SqliteValue::as_integer) {
+        Some(1) => return Ok(None),
+        Some(0) => {}
+        _ => return Err(BeadsError::internal("table_list omitted its rowid mode")),
+    }
+    let columns = conn.query(&format!("PRAGMA main.table_xinfo('{escaped}')"))?;
+    if columns.is_empty() {
+        return Err(BeadsError::internal(format!("table_xinfo omitted {table}")));
+    }
+    ["rowid", "_rowid_", "oid"]
+        .into_iter()
+        .find(|alias| {
+            !columns.iter().any(|column| {
+                column
+                    .get(1)
+                    .and_then(SqliteValue::as_text)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(alias))
+            })
+        })
+        .map(Some)
+        .ok_or_else(|| {
+            BeadsError::Config(format!(
+                "legacy v15 conversion refused: {table} shadows every hidden rowid alias"
+            ))
+        })
+}
+
+fn legacy_table_projection(
+    conn: &Connection,
+    table: &str,
+    project_source: bool,
+) -> Result<LegacyTableProjection> {
+    let rowid = legacy_projection_rowid(conn, table)?;
+    let prefix = rowid.map_or_else(String::new, |alias| format!("{alias}, "));
+    let columns = match (project_source, table) {
+        (_, "sqlite_sequence") => "name, seq",
+        (true, "issues") => "*, ''",
+        (true, "dirty_issues") => "issue_id, marked_at",
+        (true, "child_counters") => "parent_id, last_child",
+        _ => "*",
+    };
+    let mut rows: Vec<Vec<SqliteValue>> = conn
+        .query(&format!(
+            "SELECT {prefix}{columns} FROM main.{}",
+            quote_identifier(table)
+        ))?
+        .into_iter()
+        .map(|row| row.values().to_vec())
+        .collect();
+    if project_source && table == "sqlite_sequence" {
+        // The legacy declarations are non-AUTOINCREMENT, and admission
+        // refuses stale sequence entries for these names. Explicit inserts
+        // into the new tables establish their high-water marks, including 0
+        // for an empty source. Other sequence entries must stay exact.
+        for name in ["comments", "events"] {
+            let maximum = conn
+                .query_row(&format!("SELECT MAX(id) FROM main.{name}"))?
+                .get(0)
+                .and_then(SqliteValue::as_integer)
+                .unwrap_or(0)
+                .max(0);
+            rows.push(vec![name.into(), maximum.into()]);
+        }
+    }
+    legacy_rows_projection(table, rowid.is_some(), &rows)
+}
+
+fn legacy_rows_projection(
+    table: &str,
+    rowid_included: bool,
+    rows: &[Vec<SqliteValue>],
+) -> Result<LegacyTableProjection> {
+    let mut encoded_rows: Vec<Vec<u8>> = rows
+        .iter()
+        .map(|row| {
+            let mut encoded = Vec::new();
+            for value in row {
+                encode_sqlite_value(&mut encoded, value);
+            }
+            encoded
+        })
+        .collect();
+    encoded_rows.sort();
+    let mut hasher = Sha256::new();
+    hash_len_prefixed(&mut hasher, table.as_bytes());
+    for row in encoded_rows {
+        hash_len_prefixed(&mut hasher, &row);
+    }
+    Ok(LegacyTableProjection {
+        table: LogicalTableWitness {
+            name: table.to_owned(),
+            row_count: u64::try_from(rows.len())
+                .map_err(|_| BeadsError::internal("projection row count does not fit u64"))?,
+            rows_sha256: hex_digest(hasher.finalize().as_slice()),
+        },
+        rowid_included,
+    })
+}
+
+fn legacy_preserved_schema_witness(conn: &Connection) -> Result<String> {
+    let mut hasher = Sha256::new();
+    for row in conn.query(
+        "SELECT type, name, tbl_name, COALESCE(sql, '') FROM main.sqlite_schema \
+         ORDER BY type, name, tbl_name, COALESCE(sql, '')",
+    )? {
+        let object_type = row.get(0).and_then(SqliteValue::as_text).unwrap_or("");
+        let name = row.get(1).and_then(SqliteValue::as_text).unwrap_or("");
+        let table = row.get(2).and_then(SqliteValue::as_text).unwrap_or("");
+        if matches!(
+            table,
+            "issues"
+                | "dependencies"
+                | "comments"
+                | "events"
+                | "dirty_issues"
+                | "export_hashes"
+                | "child_counters"
+        ) || LEGACY_V15_NEW_TABLES.contains(&table)
+            || REVIEWED_LEGACY_V15_RETIRED_INDEXES.contains(&name)
+            || (object_type == "index" && is_reviewed_migration_managed_index(table, name))
+        {
+            // Managed index definitions are independently checked by source
+            // admission and candidate runtime attestation. Their recreation
+            // may add IF NOT EXISTS or unquote canonical column names.
+            continue;
+        }
+        for value in row.values().iter().take(3) {
+            hash_sqlite_value(&mut hasher, value);
+        }
+        let sql = row.get(3).and_then(SqliteValue::as_text).unwrap_or("");
+        // Retain grouping for this newly admitted conversion. A rewrite that
+        // changes operator CHECK/partial-index parentheses must be refused,
+        // even when its present rows happen to satisfy both expressions.
+        hash_len_prefixed(&mut hasher, ddl_token_fingerprint(sql, true).as_bytes());
+    }
+    Ok(hex_digest(hasher.finalize().as_slice()))
+}
+
+fn legacy_v15_projection(conn: &Connection, project_source: bool) -> Result<LegacyV15Projection> {
+    if !project_source {
+        for row in conn.query("SELECT name FROM main.sqlite_schema WHERE type='index'")? {
+            if let Some(name) = row.get(0).and_then(SqliteValue::as_text)
+                && REVIEWED_LEGACY_V15_RETIRED_INDEXES.contains(&name)
+            {
+                return Err(BeadsError::Config(format!(
+                    "legacy v15 conversion left retired index {name} in the destination"
+                )));
+            }
+        }
+    }
+    let mut tables = Vec::new();
+    for row in conn.query("SELECT name FROM main.sqlite_schema WHERE type='table' ORDER BY name")? {
+        let name = row
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .ok_or_else(|| BeadsError::internal("projection table name is not text"))?;
+        tables.push(legacy_table_projection(conn, name, project_source)?);
+    }
+    if project_source {
+        for name in LEGACY_V15_NEW_TABLES {
+            tables.push(legacy_rows_projection(name, true, &[])?);
+        }
+    }
+    tables.sort_by(|left, right| left.table.name.cmp(&right.table.name));
+    Ok(LegacyV15Projection {
+        profile: LEGACY_V15_PROFILE.to_owned(),
+        tables,
+        preserved_schema_sha256: legacy_preserved_schema_witness(conn)?,
+        retired_indexes: REVIEWED_LEGACY_V15_RETIRED_INDEXES
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect(),
+    })
+}
+
+fn verify_legacy_v15_projection(
+    db_path: &Path,
+    expected: Option<&LegacyV15Projection>,
+    project_source: bool,
+) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let conn = open_read_only(db_path)?;
+    let observed = legacy_v15_projection(&conn, project_source);
+    let closed = close_connection(conn);
+    let observed = observed?;
+    closed?;
+    if &observed != expected {
+        return Err(BeadsError::internal(format!(
+            "legacy v15 conversion projection mismatch at {}; refusing to install or \
+             overwrite this database (expected={expected:?}, observed={observed:?})",
+            db_path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn logical_witness(db_path: &Path) -> Result<LogicalDatabaseWitness> {
     let conn = open_read_only(db_path)?;
     // FrankenSQLite's integrity walker intentionally switches to the
@@ -2970,7 +3272,10 @@ fn logical_witness_from_connection(
             );
         }
         let ddl = row.get(3).and_then(SqliteValue::as_text).unwrap_or("");
-        hash_len_prefixed(&mut schema_hasher, ddl_token_fingerprint(ddl).as_bytes());
+        hash_len_prefixed(
+            &mut schema_hasher,
+            ddl_token_fingerprint(ddl, false).as_bytes(),
+        );
     }
     let schema_sha256 = hex_digest(schema_hasher.finalize().as_slice());
 
@@ -3081,8 +3386,11 @@ fn quote_identifier(identifier: &str) -> String {
 /// that changes what the schema means, so the witness hashes the statement's
 /// tokens with comments, whitespace, parentheses, identifier quotes, and case
 /// outside string literals removed. Source and candidate then agree exactly
-/// when their schemas agree (beads_rust-891u).
-fn ddl_token_fingerprint(sql: &str) -> String {
+/// when their normalized tokens agree (beads_rust-891u). The legacy-v15
+/// preservation check keeps parentheses and identifiers needing quotation:
+/// accepting only that stronger equality avoids hiding expression grouping
+/// or identifier changes behind the old layout-maintenance normalization.
+fn ddl_token_fingerprint(sql: &str, preserve_grouping: bool) -> String {
     fn flush(word: &mut String, tokens: &mut Vec<String>) {
         if !word.is_empty() {
             tokens.push(word.to_ascii_lowercase());
@@ -3130,6 +3438,37 @@ fn ddl_token_fingerprint(sql: &str) -> String {
                     }
                 }
                 tokens.push(literal);
+            }
+            '"' | '`' | '[' if preserve_grouping => {
+                flush(&mut word, &mut tokens);
+                let closing = if c == '[' { ']' } else { c };
+                let mut identifier = String::new();
+                while let Some(inner) = chars.next() {
+                    if inner == closing {
+                        if chars.peek() == Some(&closing) {
+                            identifier.push(inner);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    } else {
+                        identifier.push(inner);
+                    }
+                }
+                // Use the same identifier classification as VACUUM's SQL
+                // serializer. Reserved words and numeric-looking names must
+                // retain their quoting: "null" is a column, not NULL. Keep
+                // case too: SQLite can interpret an unknown double-quoted
+                // name as a string literal, whose case changes its meaning.
+                if fsqlite_ast::quote_ident_if_needed(&identifier) == identifier {
+                    tokens.push(identifier);
+                } else {
+                    tokens.push(format!("quoted:{}", hex_digest(identifier.as_bytes())));
+                }
+            }
+            '(' | ')' if preserve_grouping => {
+                flush(&mut word, &mut tokens);
+                tokens.push(c.to_string());
             }
             c if c.is_whitespace() || matches!(c, '"' | '`' | '[' | ']' | '(' | ')' | ';') => {
                 flush(&mut word, &mut tokens);
@@ -3852,22 +4191,71 @@ mod tests {
         let reserialized = "create table labels(issue_id text not null, label text not null check \
                             label <> '', primary key issue_id, label)";
         assert_eq!(
-            ddl_token_fingerprint(canonical),
-            ddl_token_fingerprint(reserialized)
+            ddl_token_fingerprint(canonical, false),
+            ddl_token_fingerprint(reserialized, false)
         );
         assert_ne!(
-            ddl_token_fingerprint(canonical),
-            ddl_token_fingerprint("CREATE TABLE labels (issue_id TEXT NOT NULL, label TEXT)"),
+            ddl_token_fingerprint(canonical, false),
+            ddl_token_fingerprint(
+                "CREATE TABLE labels (issue_id TEXT NOT NULL, label TEXT)",
+                false
+            ),
             "a real schema difference must still change the fingerprint"
         );
         assert_ne!(
-            ddl_token_fingerprint("CHECK (status IN ('Open'))"),
-            ddl_token_fingerprint("CHECK (status IN ('open'))"),
+            ddl_token_fingerprint("CHECK (status IN ('Open'))", false),
+            ddl_token_fingerprint("CHECK (status IN ('open'))", false),
             "string literals keep their case"
         );
         assert_eq!(
-            ddl_token_fingerprint("DEFAULT 'it''s' /* block\ncomment */ NOT NULL"),
+            ddl_token_fingerprint("DEFAULT 'it''s' /* block\ncomment */ NOT NULL", false),
             "default 'it''s' not null"
+        );
+    }
+
+    #[test]
+    fn legacy_schema_fingerprint_keeps_operator_grouping_and_compound_identifiers() {
+        for (before, changed) in [
+            (
+                "CREATE TABLE operator(a, b, c, CHECK(a * (b + c) > 0))",
+                "CREATE TABLE operator(a, b, c, CHECK(a * b + c > 0))",
+            ),
+            (
+                "CREATE TABLE operator(\"a b\" TEXT)",
+                "CREATE TABLE operator(a b TEXT)",
+            ),
+            (
+                "CREATE TABLE operator(\"null\", CHECK(\"null\" IS NULL))",
+                "CREATE TABLE operator(\"null\", CHECK(null IS NULL))",
+            ),
+            (
+                "CREATE TABLE operator(\"1\", CHECK(\"1\" > 0))",
+                "CREATE TABLE operator(\"1\", CHECK(1 > 0))",
+            ),
+            (
+                "CREATE TABLE operator(\"current_timestamp\", CHECK(\"current_timestamp\" IS NULL))",
+                "CREATE TABLE operator(\"current_timestamp\", CHECK(current_timestamp IS NULL))",
+            ),
+            (
+                "CREATE TABLE operator(a, CHECK(\"ALLOWED\" = 'ALLOWED'))",
+                "CREATE TABLE operator(a, CHECK(\"allowed\" = 'ALLOWED'))",
+            ),
+        ] {
+            assert_eq!(
+                ddl_token_fingerprint(before, false),
+                ddl_token_fingerprint(changed, false),
+                "control: the inherited layout fingerprint misses this distinction"
+            );
+            assert_ne!(
+                ddl_token_fingerprint(before, true),
+                ddl_token_fingerprint(changed, true),
+                "the new conversion must bind the actual operator schema"
+            );
+        }
+        assert_eq!(
+            ddl_token_fingerprint("CREATE TABLE \"operator\" (\"a b\" TEXT)", true),
+            ddl_token_fingerprint("create table operator ([a b] text)", true),
+            "equivalent quoting and keyword case can still be reserialized"
         );
     }
 
@@ -3920,6 +4308,8 @@ mod tests {
             content_hash_rows_rebuilt: 0,
             gate_result_history_created: true,
             prerequisites_column_added: false,
+            dependency_type_key_added: false,
+            legacy_v15_conversion: None,
             post_migration_maintenance: true,
         };
         let first = compute_plan_token("db", &logical, &forecast).unwrap();
@@ -4029,14 +4419,20 @@ mod tests {
         database_name: &str,
         version: u32,
     ) -> (TempDir, MigrationContext) {
-        assert!(matches!(version, 14 | 17));
+        assert!(matches!(version, 14 | 17 | 18));
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
         fs::create_dir(&beads_dir).expect("create beads dir");
         let db_path = beads_dir.join(database_name);
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open db");
-        let source_schema = crate::storage::schema::SCHEMA_SQL
-            .replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "");
+        let mut source_schema = crate::storage::schema::SCHEMA_SQL.replace(
+            "PRIMARY KEY (issue_id, depends_on_id, type)",
+            "PRIMARY KEY (issue_id, depends_on_id)",
+        );
+        if version < 18 {
+            source_schema =
+                source_schema.replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "");
+        }
         crate::storage::schema::execute_batch(&conn, &source_schema)
             .expect("create pre-v18 schema");
         conn.execute(
@@ -4078,12 +4474,251 @@ mod tests {
         reviewed_v14_migration_context_with_database_name("beads.db")
     }
 
+    fn legacy_v15_migration_context() -> (TempDir, MigrationContext) {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        crate::storage::schema::execute_batch(
+            &conn,
+            &crate::storage::schema::SCHEMA_SQL
+                .replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", ""),
+        )
+        .unwrap();
+        crate::storage::schema::execute_batch(
+            &conn,
+            crate::storage::schema::LEGACY_V15_TEST_CORE_SQL,
+        )
+        .unwrap();
+        crate::storage::schema::execute_batch(
+            &conn,
+            r#"
+            CREATE TABLE "operator'opaque" (key TEXT PRIMARY KEY, payload BLOB);
+            INSERT INTO "operator'opaque" (rowid, key, payload) VALUES (991, 'retain', X'00FF');
+            CREATE TABLE operator_without_rowid (key TEXT PRIMARY KEY, payload TEXT) WITHOUT ROWID;
+            INSERT INTO operator_without_rowid VALUES ('retain', 'full operator value');
+            DROP INDEX idx_labels_issue;
+            CREATE INDEX idx_labels_issue ON labels(issue_id);
+            DROP INDEX idx_blocked_cache_blocked_at;
+            CREATE INDEX idx_blocked_cache_blocked_at ON blocked_issues_cache(blocked_at);
+            DROP INDEX idx_config_key;
+            CREATE INDEX IF NOT EXISTS idx_config_key ON config("key");
+            "#,
+        )
+        .unwrap();
+        close_connection(conn).unwrap();
+        let write_authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &db_path,
+                Some(1000),
+            )
+            .unwrap(),
+        );
+        (
+            temp,
+            MigrationContext {
+                beads_dir,
+                db_path,
+                write_authority,
+            },
+        )
+    }
+
+    fn apply_legacy_v15_upgrade(migration: &MigrationContext) -> AppliedMigrationReceipt {
+        let plan = build_plan(&migration.db_path).expect("plan the reviewed legacy profile");
+        assert!(plan.eligible);
+        let forecast = plan.forecast.as_ref().unwrap();
+        assert_eq!((forecast.from_version, forecast.to_version), (15, 19));
+        assert!(!forecast.dependency_type_key_added);
+        assert!(forecast.prerequisites_column_added);
+        assert_eq!(forecast.content_hash_rows_rebuilt, 0);
+        let projection = forecast.legacy_v15_conversion.as_ref().unwrap();
+        assert_eq!(projection.profile, LEGACY_V15_PROFILE);
+        assert_eq!(projection.retired_indexes.len(), 7);
+        assert!(projection.tables.iter().any(|table| {
+            table.table.name == "operator_without_rowid" && !table.rowid_included
+        }));
+        execute_apply(
+            &DoctorMigrateSchemaApplyArgs {
+                plan_token: plan.plan_token.unwrap(),
+                json: false,
+            },
+            migration,
+        )
+        .expect("install the fully projected legacy conversion");
+        let runs: Vec<_> = fs::read_dir(migration_runs_root(&migration.beads_dir))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(runs.len(), 1);
+        let applied: AppliedMigrationReceipt = read_json(&runs[0].join("applied.json")).unwrap();
+        assert!(applied.attested, "{:?}", applied.attestation_errors);
+        assert!(applied.effects.legacy_v15_tables_converted);
+        assert!(!applied.effects.dependency_type_key_added);
+        applied
+    }
+
+    fn raw_legacy_payloads(db_path: &Path) -> Vec<String> {
+        let conn = open_read_only(db_path).unwrap();
+        let rows = [
+            "SELECT rowid, id, title, content_hash FROM issues ORDER BY rowid",
+            "SELECT rowid, * FROM dependencies ORDER BY rowid",
+            "SELECT rowid, * FROM comments ORDER BY rowid",
+            "SELECT rowid, * FROM events ORDER BY rowid",
+            "SELECT rowid, issue_id, marked_at FROM dirty_issues ORDER BY rowid",
+            "SELECT rowid, * FROM export_hashes ORDER BY rowid",
+            "SELECT rowid, parent_id, last_child FROM child_counters ORDER BY rowid",
+            "SELECT rowid, * FROM labels ORDER BY rowid",
+            "SELECT rowid, * FROM operator_notes ORDER BY rowid",
+            "SELECT rowid, * FROM \"operator'opaque\" ORDER BY rowid",
+            "SELECT * FROM operator_without_rowid ORDER BY key",
+        ]
+        .into_iter()
+        .map(|sql| format!("{:?}", conn.query(sql).unwrap()))
+        .collect();
+        close_connection(conn).unwrap();
+        rows
+    }
+
+    #[test]
+    fn reviewed_legacy_v15_plan_apply_and_undo_preserve_projected_data_and_source_bytes() {
+        let (_temp, migration) = legacy_v15_migration_context();
+        let payloads = raw_legacy_payloads(&migration.db_path);
+        let applied = apply_legacy_v15_upgrade(&migration);
+        assert_eq!(raw_legacy_payloads(&migration.db_path), payloads);
+        let conn = open_read_only(&migration.db_path).unwrap();
+        assert_eq!(
+            conn.query("SELECT name, seq FROM sqlite_sequence WHERE name IN ('comments', 'events') ORDER BY name")
+                .unwrap()
+                .into_iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![SqliteValue::from("comments"), SqliteValue::from(197_i64)],
+                vec![SqliteValue::from("events"), SqliteValue::from(79_i64)],
+            ]
+        );
+        assert!(conn.query("PRAGMA foreign_key_check").unwrap().is_empty());
+        assert_eq!(integrity_check_messages(&conn).unwrap(), vec!["ok"]);
+        close_connection(conn).unwrap();
+        execute_undo(
+            &DoctorMigrateSchemaUndoArgs {
+                run_id: applied.run_id,
+                dry_run: false,
+                json: false,
+            },
+            &migration,
+        )
+        .unwrap();
+        assert_eq!(
+            raw_family_witness(&migration.db_path).unwrap(),
+            applied.raw_before
+        );
+        assert_eq!(
+            logical_witness(&migration.db_path).unwrap(),
+            applied.logical_before
+        );
+        assert_eq!(raw_legacy_payloads(&migration.db_path), payloads);
+    }
+
+    #[test]
+    fn legacy_upgrade_plan_and_undo_bind_hidden_rowids_even_when_values_are_equal() {
+        for mutation in [
+            "UPDATE dependencies SET rowid = 2001 WHERE rowid = 11",
+            "UPDATE \"operator'opaque\" SET rowid = 2002 WHERE rowid = 991",
+        ] {
+            let (_temp, migration) = legacy_v15_migration_context();
+            let applied = apply_legacy_v15_upgrade(&migration);
+            let logical_before = logical_witness(&migration.db_path).unwrap();
+            let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
+            conn.execute(mutation).unwrap();
+            close_connection(conn).unwrap();
+            assert_eq!(logical_witness(&migration.db_path).unwrap(), logical_before);
+            let bytes_before = fs::read(&migration.db_path).unwrap();
+            let error = execute_undo(
+                &DoctorMigrateSchemaUndoArgs {
+                    run_id: applied.run_id.clone(),
+                    dry_run: false,
+                    json: false,
+                },
+                &migration,
+            )
+            .expect_err("hidden rowid changes are newer work, despite equal ordinary values");
+            assert!(
+                error.to_string().contains("live database has changed"),
+                "{error}"
+            );
+            assert_eq!(fs::read(&migration.db_path).unwrap(), bytes_before);
+            assert!(
+                !migration_runs_root(&migration.beads_dir)
+                    .join(applied.run_id)
+                    .join("undo-prepared.json")
+                    .exists()
+            );
+        }
+
+        let (_temp, migration) = legacy_v15_migration_context();
+        let plan_before = build_plan(&migration.db_path).unwrap();
+        let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("UPDATE dependencies SET rowid = 2003 WHERE rowid = 11")
+            .unwrap();
+        close_connection(conn).unwrap();
+        let plan_after = build_plan(&migration.db_path).unwrap();
+        assert_eq!(plan_before.logical_witness, plan_after.logical_witness);
+        assert_ne!(plan_before.plan_token, plan_after.plan_token);
+    }
+
+    #[test]
+    fn legacy_upgrade_refuses_stale_operator_constraints_even_with_equal_rows() {
+        for (before, changed) in [
+            ("a * (b + c) > 0", "a * b + c > 0"),
+            ("\"null\" IS NULL", "null IS NULL"),
+            ("\"1\" > 0", "1 > 0"),
+            ("\"ALLOWED\" = 'ALLOWED'", "\"allowed\" = 'ALLOWED'"),
+        ] {
+            let (_temp, migration) = legacy_v15_migration_context();
+            let declaration = |predicate| {
+                format!(
+                    "CREATE TABLE operator_constraint (a, b, c, \"null\", \"1\", CHECK({predicate}))"
+                )
+            };
+            let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
+            conn.execute(&declaration(before)).unwrap();
+            close_connection(conn).unwrap();
+            let plan_before = build_plan(&migration.db_path).unwrap();
+            let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
+            conn.execute("DROP TABLE operator_constraint").unwrap();
+            conn.execute(&declaration(changed)).unwrap();
+            close_connection(conn).unwrap();
+            let plan_after = build_plan(&migration.db_path).unwrap();
+            assert_eq!(plan_before.logical_witness, plan_after.logical_witness);
+            assert_ne!(plan_before.plan_token, plan_after.plan_token);
+            let bytes_before = fs::read(&migration.db_path).unwrap();
+            execute_apply(
+                &DoctorMigrateSchemaApplyArgs {
+                    plan_token: plan_before.plan_token.unwrap(),
+                    json: false,
+                },
+                &migration,
+            )
+            .expect_err("an old plan cannot authorize different operator constraints");
+            assert_eq!(fs::read(&migration.db_path).unwrap(), bytes_before);
+            assert!(!migration_runs_root(&migration.beads_dir).exists());
+        }
+    }
+
     fn apply_prerequisite_upgrade(migration: &MigrationContext) -> AppliedMigrationReceipt {
         let plan = build_plan(&migration.db_path).expect("plan v17 upgrade");
         assert!(plan.eligible);
-        assert_eq!((plan.from_version, plan.to_version), (17, 18));
+        assert_eq!(
+            (plan.from_version, plan.to_version),
+            (17, current_schema_version().unwrap())
+        );
         let forecast = plan.forecast.as_ref().expect("migration forecast");
         assert!(forecast.prerequisites_column_added);
+        assert!(forecast.dependency_type_key_added);
         assert_eq!(forecast.content_hash_rows_rebuilt, 0);
         assert!(!forecast.gate_result_history_created);
         execute_apply(
@@ -4103,6 +4738,7 @@ mod tests {
             read_json(&runs[0].join("applied.json")).expect("applied receipt");
         assert!(applied.attested, "{:?}", applied.attestation_errors);
         assert!(applied.effects.prerequisites_column_added);
+        assert!(applied.effects.dependency_type_key_added);
         assert_eq!(applied.effects.content_hash_rows_rebuilt, 0);
         applied
     }
@@ -4133,6 +4769,136 @@ mod tests {
              INSERT INTO child_counters (parent_id, last_child) VALUES ('bd-schema-rehearsal', 7);",
         )
         .expect("seed v17 auxiliary state and history");
+    }
+
+    #[test]
+    fn typed_key_plan_refuses_operator_foreign_keys_without_changing_source() {
+        let (_temp, migration) = reviewed_source_migration_context("beads.db", 18);
+        let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
+        crate::storage::schema::execute_batch(
+            &conn,
+            r#"
+            INSERT INTO issues (id, title) VALUES ('bd-target', 'Target');
+            INSERT INTO dependencies (issue_id, depends_on_id)
+                VALUES ('bd-schema-rehearsal', 'bd-target');
+            CREATE TABLE "operator'notes" (
+                source TEXT, target TEXT, note TEXT,
+                FOREIGN KEY (source, target)
+                    REFERENCES "DEPENDENCIES" (issue_id, depends_on_id) ON DELETE CASCADE
+            );
+            INSERT INTO "operator'notes" VALUES
+                ('bd-schema-rehearsal', 'bd-target', 'preserve this relationship');
+            "#,
+        )
+        .unwrap();
+        close_connection(conn).unwrap();
+        let raw_before = raw_family_witness(&migration.db_path).unwrap();
+        let logical_before = logical_witness(&migration.db_path).unwrap();
+        let error =
+            build_plan(&migration.db_path).expect_err("pair foreign key cannot survive widening");
+        assert!(error.to_string().contains("operator'notes"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("foreign key referencing dependencies"),
+            "{error}"
+        );
+        assert_eq!(raw_family_witness(&migration.db_path).unwrap(), raw_before);
+        assert_eq!(logical_witness(&migration.db_path).unwrap(), logical_before);
+        assert!(!migration_runs_root(&migration.beads_dir).exists());
+    }
+
+    #[test]
+    fn reviewed_v18_typed_key_preserves_data_and_restores_source_bytes() {
+        let (_temp, migration) = reviewed_source_migration_context("beads.db", 18);
+        let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
+        seed_v17_auxiliary_rows(&conn);
+        crate::storage::schema::execute_batch(
+            &conn,
+            r#"
+            UPDATE issues SET prerequisites = '- [x] original input',
+                acceptance_criteria = '- [ ] final outcome', content_hash = 'original-hash';
+            INSERT INTO issues (id, title) VALUES ('bd-target', 'Dependency target');
+            INSERT INTO dependencies
+                (rowid, issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id)
+                VALUES (41, 'bd-schema-rehearsal', 'bd-target', 'blocks',
+                        '2026-01-30 04:07:21', 'original-actor', '{"keep":"payload"}', 'thread-19');
+            DROP INDEX idx_dependencies_thread;
+            "#,
+        )
+        .unwrap();
+        close_connection(conn).unwrap();
+        let plan =
+            build_plan(&migration.db_path).expect("plan canonical v18 with a missing owned index");
+        assert!(plan.eligible);
+        assert_eq!(
+            (plan.from_version, plan.to_version),
+            (18, current_schema_version().unwrap())
+        );
+        let forecast = plan.forecast.unwrap();
+        assert!(forecast.dependency_type_key_added);
+        assert!(!forecast.prerequisites_column_added);
+        assert_eq!(forecast.content_hash_rows_rebuilt, 0);
+        assert!(!forecast.gate_result_history_created);
+        execute_apply(
+            &DoctorMigrateSchemaApplyArgs {
+                plan_token: plan.plan_token.unwrap(),
+                json: false,
+            },
+            &migration,
+        )
+        .expect("apply typed-key migration and repair owned index");
+        let runs = fs::read_dir(migration_runs_root(&migration.beads_dir))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(runs.len(), 1);
+        let applied: AppliedMigrationReceipt = read_json(&runs[0].join("applied.json")).unwrap();
+        assert!(applied.attested, "{:?}", applied.attestation_errors);
+        assert!(applied.effects.dependency_type_key_added);
+        assert!(!applied.effects.prerequisites_column_added);
+        assert_eq!(
+            applied.logical_after.as_ref().unwrap().tables,
+            applied.logical_before.tables
+        );
+        let conn = open_read_only(&migration.db_path).unwrap();
+        let rows = conn
+            .query("SELECT rowid, metadata, thread_id FROM dependencies")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).and_then(SqliteValue::as_integer), Some(41));
+        assert_eq!(
+            rows[0].get(1).and_then(SqliteValue::as_text),
+            Some(r#"{"keep":"payload"}"#)
+        );
+        assert_eq!(
+            rows[0].get(2).and_then(SqliteValue::as_text),
+            Some("thread-19")
+        );
+        assert_eq!(
+            conn.query("SELECT name FROM sqlite_schema WHERE name = 'idx_dependencies_thread'")
+                .unwrap()
+                .len(),
+            1
+        );
+        close_connection(conn).unwrap();
+        execute_undo(
+            &DoctorMigrateSchemaUndoArgs {
+                run_id: applied.run_id,
+                dry_run: false,
+                json: false,
+            },
+            &migration,
+        )
+        .expect("undo v18 upgrade");
+        assert_eq!(
+            raw_family_witness(&migration.db_path).unwrap(),
+            applied.raw_before
+        );
+        assert_eq!(
+            logical_witness(&migration.db_path).unwrap(),
+            applied.logical_before
+        );
     }
 
     #[test]
@@ -4251,7 +5017,7 @@ mod tests {
     fn prerequisite_upgrade_plan_rejects_false_version_and_malformed_column() {
         for (statements, expected_error) in [
             (
-                vec!["PRAGMA user_version = 18"],
+                vec!["PRAGMA user_version = 19"],
                 "runtime shape is not canonical",
             ),
             (
@@ -4261,7 +5027,7 @@ mod tests {
             (
                 vec![
                     "ALTER TABLE issues ADD COLUMN prerequisites TEXT DEFAULT ''",
-                    "PRAGMA user_version = 18",
+                    "PRAGMA user_version = 19",
                 ],
                 "runtime shape is not canonical",
             ),
@@ -5059,6 +5825,8 @@ mod tests {
                 content_hash_rows_rebuilt: forecast.content_hash_rows_rebuilt,
                 gate_result_history_created: forecast.gate_result_history_created,
                 prerequisites_column_added: forecast.prerequisites_column_added,
+                dependency_type_key_added: forecast.dependency_type_key_added,
+                legacy_v15_tables_converted: forecast.legacy_v15_conversion.is_some(),
                 post_migration_maintenance_completed: true,
             },
         )
@@ -5541,8 +6309,7 @@ mod tests {
         let mut failed_stage = None;
         run_post_migration_maintenance(
             &migration.db_path,
-            forecast.from_version,
-            forecast.to_version,
+            &forecast,
             &marked_at,
             &run_dir,
             &migration.write_authority,

@@ -1085,7 +1085,7 @@ br dep <COMMAND>
 | Command | Description |
 |---------|-------------|
 | `add <ISSUE> <DEPENDS_ON>` | Add dependency (ISSUE depends on DEPENDS_ON) |
-| `remove <ISSUE> <DEPENDS_ON>` | Remove dependency |
+| `remove <ISSUE> <DEPENDS_ON> [--type <TYPE>]` | Remove one dependency type; an omitted type requires a unique edge |
 | `list <ISSUE>` | List dependencies of an issue |
 | `tree <ISSUE>` | Show dependency tree |
 | `cycles` | Detect dependency cycles |
@@ -1104,12 +1104,25 @@ br dep add bd-123 bd-456  # bd-123 is blocked by bd-456
 # Add with type
 br dep add bd-123 bd-456 --type discovered-from
 
+# Remove only the blocking relationship, preserving other types
+br dep remove bd-123 bd-456 --type blocks
+
 # Show tree
 br dep tree bd-123
 
 # Check for cycles
 br dep cycles
 ```
+
+Dependencies are identified by source, target, and type. For example, `blocks`
+and `related` may coexist between the same pair and retain separate metadata
+through JSONL export and import. Adding the same typed edge twice is a no-op.
+`dep remove` without `--type` refuses an ambiguous pair without changing it.
+Removal also accepts an exact existing custom type imported through JSONL;
+that exact name takes precedence over aliases. MCP `manage_dependencies`
+uses the optional `dep_type` field for the same selection, including in
+`operations[]`. Omitting it defaults to `blocks` for add and requires a unique
+edge for remove.
 
 An issue reachable through more than one parent (a diamond) is listed under
 every parent, but only its first occurrence expands the subtree beneath it.
@@ -2090,13 +2103,15 @@ br doctor migrate-schema undo \
 
 `plan` accepts the explicitly reviewed transitions from source schemas 13, 14,
 15 (the #388 gate-history schema), 16 (the #384 capacity-exemptions schema
-created by the released v0.2.19 binary), and 17 (capacity occupancy) to the
-current schema 18. Each source runs
+created by the released v0.2.19 binary), 17 (capacity occupancy), and 18
+(prerequisites) to the current schema 19. Each source runs
 exactly the version-gated step chain it is missing — content-hash rebuild
 (13→14), transition-scoped gate history (→15), capacity exemptions (→16), and
-capacity occupancy (→17), and the prerequisite field (→18). The last step is
-reported as `prerequisites_column_added` and preserves existing issue values
-with an unset prerequisite field. Its deterministic token binds the absolute database
+capacity occupancy (→17), the prerequisite field (→18), and typed dependency
+identity (→19). `prerequisites_column_added` reports the new field and preserves
+existing issue values with an unset prerequisite field. The
+`dependency_type_key_added` step widens the dependency key to include its type,
+preserving existing rows and row IDs. Its deterministic token binds the absolute database
 path, a complete logical row/schema witness, and the exact migration forecast.
 The receipt reports every raw SQLite family member, but raw page/WAL/SHM/journal
 layout is deliberately not token-bound: process close and checkpoint may
@@ -2107,12 +2122,38 @@ validation and before migration.
 The version stamp alone does not establish eligibility. Planning also checks
 the core table declarations and index names. Historical layouts with extra
 columns, incompatible keys or constraints, or operator indexes on core tables
-are refused before a token is issued. For example, a legacy dependency table
-that permits both `blocks` and `parent-child` rows for the same issue pair needs
-an explicit data decision; migration will not silently choose one edge. Keep
+are refused before a token is issued. Schema 19 can represent parallel typed
+edges, but this does not admit arbitrary historical table layouts. Migration
+will not silently choose one edge. Keep
 the source database and resolve the named table before planning again. Known
 index definitions can be recreated during maintenance; operator tables outside
 the core schema remain preserved by the existing migration and undo workflow.
+An operator foreign key referencing the old dependency pair key is refused:
+it needs a typed relationship definition before that key can be widened.
+
+One additional legacy schema-15 layout has a separately checked conversion.
+Its forecast includes `legacy_v15_conversion`, identifying the profile,
+projected table witnesses, and seven redundant legacy indexes to retire. This
+layout already has a typed dependency key; conversion preserves its raw types,
+timestamps, creators, metadata, thread IDs, and row IDs, including archived
+cycles. Comments and events keep their IDs, and their new sequence counters
+start at the existing maximum (or zero for empty tables). Existing sequence
+reservations for other tables are preserved.
+
+Admission requires the exact reviewed legacy declarations and index
+definitions. The removed `dirty_issues.content_hash` column must contain only
+NULLs; `last_child` must represent every existing direct child, and the legacy
+`next_child_number` cannot reserve a later allocation. Values that would change
+storage class during copying or dependency type spelling during JSONL
+interchange refuse before approval. This includes mixed-case custom names and
+case-distinct keys that would collapse on reimport. Incoming foreign keys to
+rebuilt tables, persistent triggers, and unexplained extensions refuse before a
+token is issued. Operator tables retain their data and schema witness; changes to their
+constraints or hidden row IDs invalidate the plan or undo. Candidate
+verification must match every projected table before installation. The exact
+undo backup covers the database and its WAL, SHM, and rollback journal;
+namespace admission sidecars are coordination state outside that byte-copy
+receipt.
 
 `apply` re-plans under database-family write authority and rejects stale tokens
 before allocating a run. It writes a verified, private recovery bundle and a

@@ -105,7 +105,7 @@ this repo): commits `55c186682` + `5946b3b7c` in
   [b0464e66](https://github.com/Dicklesworthstone/beads_rust/commit/b0464e66),
   [e1e93bfb](https://github.com/Dicklesworthstone/beads_rust/commit/e1e93bfb)).
   Existing schema-17 databases require explicit
-  `br doctor migrate-schema plan` and approved `apply` to reach schema 18;
+  `br doctor migrate-schema plan` and approved `apply` to reach the current schema;
   ordinary opens refuse the older schema. Migration preserves existing data,
   and undo restores the saved database family unless later writes make the
   undo stale. These changes are outside the frozen v0.5.12 source.
@@ -120,6 +120,22 @@ this repo): commits `55c186682` + `5946b3b7c` in
   when type and status change together; rejected local batches preserve all
   members. See the [policy examples](docs/CLI_REFERENCE.md) and
   [#494](https://github.com/Dicklesworthstone/beads_rust/issues/494).
+- Dependency identity includes its type, so the same source and target can
+  retain both `blocks` and `related` through storage, JSONL, and reconciliation.
+  CLI `dep remove --type` and MCP `dep_type` remove one relationship; omitted
+  types refuse ambiguous pairs. Exact imported custom type names remain
+  removable. Schema 19 requires an explicit reviewed migration from canonical
+  schemas 13–18 and preserves existing dependency values and row IDs.
+- Reviewed migration also converts the specifically supported legacy schema-15
+  layout without choosing between parallel dependency types. It preserves raw
+  relation payloads, comments, events, row IDs, sequence allocation, and operator
+  data. Non-NULL legacy dirty hashes, ambiguous child counters, incoming foreign
+  keys to rebuilt tables, dependency spellings that would change during JSONL
+  interchange, and unsupported schema extensions still refuse.
+  The original 550-issue fixture passed conversion and exact database-family
+  undo. Its five historical history, label, and concurrent-reader workloads
+  also passed, along with release-profile regression, conformance, and MCP
+  coverage. Existing ignored tests remain unchanged.
 
 ## v0.5.12 — 2026-09-09
 
