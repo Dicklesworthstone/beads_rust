@@ -359,6 +359,59 @@ fn e2e_list_tree_with_color_emits_real_escapes_not_escaped_text() {
 }
 
 #[test]
+fn e2e_plain_environment_suppresses_configured_color_in_all_text_layouts() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "no_color_init");
+    assert!(init.status.success(), "{init:?}");
+    let create = run_br(
+        &workspace,
+        ["create", "NO_COLOR canary title \u{1b}[2J\u{7}"],
+        "no_color_create",
+    );
+    assert!(create.status.success(), "{create:?}");
+    let config = run_br(
+        &workspace,
+        ["config", "set", "display.color", "true"],
+        "no_color_config",
+    );
+    assert!(config.status.success(), "{config:?}");
+
+    for (args, layout) in [
+        (vec!["list", "--tree"], "tree"),
+        (vec!["list", "--pretty"], "pretty"),
+        (vec!["list", "--long"], "long"),
+        (vec!["search", "NO_COLOR canary"], "search"),
+    ] {
+        let colored = run_br_with_env(
+            &workspace,
+            args.clone(),
+            [("NO_COLOR", ""), ("TERM", "xterm-256color")],
+            &format!("{layout}_color_enabled"),
+        );
+        assert!(colored.status.success(), "{colored:?}");
+        assert!(colored.stdout.contains("\u{1b}[39m"), "{colored:?}");
+        assert!(!colored.stdout.contains("\u{1b}[2J"), "{colored:?}");
+        assert!(!colored.stdout.contains('\u{7}'), "{colored:?}");
+        for (value, term) in [
+            ("1", "xterm-256color"),
+            ("0", "xterm-256color"),
+            ("", "dumb"),
+        ] {
+            let plain = run_br_with_env(
+                &workspace,
+                args.clone(),
+                [("NO_COLOR", value), ("TERM", term)],
+                &format!("{layout}_no_color_{value}_term_{term}"),
+            );
+            assert!(plain.status.success(), "{plain:?}");
+            assert!(!plain.stdout.contains('\u{1b}'), "{plain:?}");
+            assert!(!plain.stdout.contains('\u{7}'), "{plain:?}");
+            assert_eq!(plain.stdout, strip_csi(&colored.stdout), "{layout}");
+        }
+    }
+}
+
+#[test]
 fn e2e_list_basic_text_output() {
     let _log = common::test_log("e2e_list_basic_text_output");
     let (workspace, ids) = setup_diverse_workspace();

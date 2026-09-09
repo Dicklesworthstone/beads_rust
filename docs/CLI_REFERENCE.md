@@ -2257,7 +2257,8 @@ source ~/.bashrc
 | `BEADS_JSONL` | Override JSONL file path (requires `--allow-external-jsonl`) |
 | `BD_ACTOR` | Default actor name for audit trail |
 | `EDITOR` | Editor for `br config edit` |
-| `NO_COLOR` | Disable colored output (any value) |
+| `NO_COLOR` | Disable ANSI color in text output and diagnostics when nonempty, including when `display.color=true`; an empty value leaves color selection unchanged |
+| `TERM=dumb` | Disable ANSI color in text output and diagnostics, including when `display.color=true` |
 | `RUST_LOG` | Logging level (debug, info, warn, error) |
 
 Recommended routine default:

@@ -37,7 +37,7 @@ fn main() {
     let color_error_mode = should_color_human_errors_for_cli(&cli);
 
     // Initialize logging
-    if let Err(e) = init_logging(cli.verbose, cli.quiet, None) {
+    if let Err(e) = init_logging(cli.verbose, cli.quiet, cli.no_color, None) {
         eprintln!("Failed to initialize logging: {e}");
     }
     // Text-mode commands are Unix filters: a reader that closes the pipe
@@ -1856,16 +1856,17 @@ const fn should_restore_default_sigpipe(cli: &Cli, structured_output: bool) -> b
 
 const fn should_color_human_errors(
     no_color_flag: bool,
-    no_color_env_present: bool,
+    plain_environment: bool,
     stderr_is_terminal: bool,
 ) -> bool {
-    !no_color_flag && !no_color_env_present && stderr_is_terminal
+    !no_color_flag && !plain_environment && stderr_is_terminal
 }
 
 fn should_color_human_errors_for_cli(cli: &Cli) -> bool {
     should_color_human_errors(
         cli.no_color,
-        std::env::var_os("NO_COLOR").is_some(),
+        std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
+            || std::env::var("TERM").as_deref() == Ok("dumb"),
         io::stderr().is_terminal(),
     )
 }
