@@ -983,7 +983,7 @@ fn mcp_prerequisites_and_acceptance_round_trip_through_prospective_policy() {
             "acceptance_criteria": acceptance}),
     );
     let id = created["id"].as_str().expect("created ID");
-    assert_checklist_fields(&mut client, root, id, pending, acceptance);
+    assert_checklist_fields(&mut client, root, id, pending, acceptance, None);
     let cli_id = first_id(&cli_json(
         root,
         &[
@@ -1002,14 +1002,29 @@ fn mcp_prerequisites_and_acceptance_round_trip_through_prospective_policy() {
             "acceptance_criteria": acceptance, "transition_comment": "Ready to plan"}),
     );
     assert_eq!(changed["status"], "in_planning");
-    assert_checklist_fields(&mut client, root, id, complete, acceptance);
+    assert_checklist_fields(&mut client, root, id, complete, acceptance, None);
     let shown = client.call_tool("show_issue", json!({"id": id}));
     assert_eq!(shown["comments"][0]["text"], "Ready to plan", "{shown}");
-    assert_imported_checklists(
+    cli_json(
         root,
         &[
-            (id, complete, acceptance),
-            (&cli_id, cli_pending, cli_acceptance),
+            "comments",
+            "add",
+            &cli_id,
+            "--message",
+            "CLI source discussion: preserve accès and context",
+            "--author",
+            "cli-reviewer",
+        ],
+    );
+    cli_json(root, &["dep", "add", &cli_id, id, "--type", "related"]);
+    assert_mcp_presence_handoffs(&mut client, root);
+    assert_imported_checklists(
+        &mut client,
+        root,
+        &[
+            (id, complete, acceptance, None),
+            (&cli_id, cli_pending, cli_acceptance, Some(id)),
         ],
     );
 
@@ -1034,12 +1049,41 @@ fn mcp_prerequisites_and_acceptance_round_trip_through_prospective_policy() {
         id,
         complete,
         "Delivery:\n- [x] implement feature\n",
+        None,
     );
     let (status, stderr) = client.finish();
     assert!(
         status.success() || status.code() == Some(130),
         "{status}: {stderr}"
     );
+}
+
+fn assert_mcp_presence_handoffs(client: &mut McpClient, root: &Path) {
+    for criteria in ["Planning prose", "- [x] Planning review complete"] {
+        let id = first_id(&client.call_tool(
+            "create_issue",
+            json!({"title": format!("Presence handoff: {criteria}"),
+                "prerequisites": "- [ ] Review preparation"}),
+        ));
+        let changed = client.call_tool(
+            "update_issue",
+            json!({"id": id, "status": "in_planning",
+                "prerequisites": "- [x] Review preparation",
+                "acceptance_criteria": criteria, "transition_comment": "Presence is sufficient"}),
+        );
+        assert_eq!(changed["status"], "in_planning", "{changed}");
+        assert_checklist_fields(
+            client,
+            root,
+            &id,
+            "- [x] Review preparation",
+            criteria,
+            None,
+        );
+        let comments = cli_json(root, &["comments", "list", &id]);
+        assert_eq!(comments.as_array().expect("handoff comments").len(), 1);
+        assert_eq!(comments[0]["text"], "Presence is sufficient");
+    }
 }
 
 fn write_prerequisite_policy(root: &Path, target: &str, acceptance_requirement: &str) {
@@ -1052,7 +1096,20 @@ fn write_prerequisite_policy(root: &Path, target: &str, acceptance_requirement: 
     .expect("prerequisite policy");
 }
 
-fn assert_imported_checklists(source: &Path, issues: &[(&str, &str, &str)]) {
+fn assert_imported_checklists(
+    source_client: &mut McpClient,
+    source: &Path,
+    issues: &[(&str, &str, &str, Option<&str>)],
+) {
+    let before: Vec<_> = issues
+        .iter()
+        .map(|(id, _, _, _)| {
+            (
+                first_record(cli_json(source, &["show", id])),
+                source_client.call_tool("show_issue", json!({"id": id})),
+            )
+        })
+        .collect();
     let imported = ProtocolWorkspace::new().expect("second independent workspace");
     let root = imported.path();
     cli_json(root, &["init", "--prefix", "imported"]);
@@ -1063,8 +1120,43 @@ fn assert_imported_checklists(source: &Path, issues: &[(&str, &str, &str)]) {
     .expect("copy actual source export into import workspace");
     cli_json(root, &["sync", "--import-only"]);
     let mut client = McpClient::spawn(root);
-    for (id, prerequisites, acceptance) in issues {
-        assert_checklist_fields(&mut client, root, id, prerequisites, acceptance);
+    for ((id, prerequisites, acceptance, dependency), (source_cli, source_mcp)) in
+        issues.iter().zip(before)
+    {
+        assert_checklist_fields(
+            &mut client,
+            root,
+            id,
+            prerequisites,
+            acceptance,
+            *dependency,
+        );
+        for (original, imported) in [
+            (source_cli, first_record(cli_json(root, &["show", id]))),
+            (
+                source_mcp,
+                client.call_tool("show_issue", json!({"id": id})),
+            ),
+        ] {
+            for field in [
+                "id",
+                "title",
+                "description",
+                "status",
+                "priority",
+                "issue_type",
+                "labels",
+                "comments",
+                "dependencies",
+                "dependents",
+            ] {
+                assert_eq!(
+                    imported.get(field),
+                    original.get(field),
+                    "import changed {id}.{field}: {imported}"
+                );
+            }
+        }
     }
     let (status, stderr) = client.finish();
     assert!(
@@ -1079,6 +1171,7 @@ fn assert_checklist_fields(
     id: &str,
     prerequisites: &str,
     acceptance: &str,
+    expected_dependency: Option<&str>,
 ) {
     let jsonl = std::fs::read_to_string(root.join(".beads/issues.jsonl")).expect("JSONL");
     let exported = jsonl
@@ -1086,19 +1179,45 @@ fn assert_checklist_fields(
         .map(|line| serde_json::from_str::<Value>(line).expect("exported issue"))
         .find(|issue| issue["id"] == id)
         .expect("created issue exported");
-    for shown in [
-        client.call_tool("show_issue", json!({"id": id})),
-        first_record(cli_json(root, &["show", id])),
-        exported,
+    for (shown, dependency_id_key, dependency_type_key) in [
+        (
+            client.call_tool("show_issue", json!({"id": id})),
+            "id",
+            "dep_type",
+        ),
+        (
+            first_record(cli_json(root, &["show", id])),
+            "id",
+            "dependency_type",
+        ),
+        (exported, "depends_on_id", "type"),
     ] {
         assert_eq!(shown["prerequisites"], prerequisites, "{shown}");
         assert_eq!(shown["acceptance_criteria"], acceptance, "{shown}");
-        assert!(
-            shown
-                .get("dependencies")
-                .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty)),
-            "prerequisite text must not create edges: {shown}"
-        );
+        if let Some(expected_id) = expected_dependency {
+            let dependencies = shown["dependencies"]
+                .as_array()
+                .expect("explicit dependency");
+            assert_eq!(dependencies.len(), 1, "{shown}");
+            let dependency = &dependencies[0];
+            assert_eq!(
+                dependency.get(dependency_id_key),
+                Some(&json!(expected_id)),
+                "{shown}"
+            );
+            assert_eq!(
+                dependency.get(dependency_type_key),
+                Some(&json!("related")),
+                "{shown}"
+            );
+        } else {
+            assert!(
+                shown
+                    .get("dependencies")
+                    .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty)),
+                "prerequisite text must not create edges: {shown}"
+            );
+        }
     }
 }
 
@@ -1135,6 +1254,7 @@ fn mcp_prerequisite_refusals_use_new_values_and_ignore_force() {
             json!(" \t\n"),
             json!("All done"),
             json!("- [ ] access"),
+            json!("- [x] access\n- [ ] Review pending"),
         ] {
             assert_policy_refusal_unchanged(
                 &mut client,
@@ -1147,14 +1267,7 @@ fn mcp_prerequisite_refusals_use_new_values_and_ignore_force() {
             );
         }
     }
-    assert_policy_refusal_unchanged(
-        &mut client,
-        root,
-        "update_issue",
-        json!({"id": absent, "status": "in_planning", "prerequisites": "- [x] access",
-            "acceptance_criteria": " ", "force": true, "transition_comment": "Criteria still required"}),
-        "POLICY_VIOLATION",
-    );
+    assert_mcp_presence_refusals(&mut client, root, &absent);
     assert_policy_refusal_unchanged(
         &mut client,
         root,
@@ -1167,6 +1280,38 @@ fn mcp_prerequisite_refusals_use_new_values_and_ignore_force() {
         status.success() || status.code() == Some(130),
         "{status}: {stderr}"
     );
+}
+
+fn assert_mcp_presence_refusals(client: &mut McpClient, root: &Path, populated: &str) {
+    let missing = first_id(&client.call_tool(
+        "create_issue",
+        json!({"title": "Missing acceptance criteria", "prerequisites": "- [x] access"}),
+    ));
+    assert_policy_refusal_unchanged(
+        client,
+        root,
+        "update_issue",
+        json!({"id": missing, "status": "in_planning",
+            "transition_comment": "Omitted criteria must remain absent", "comment": "Must not append"}),
+        "POLICY_VIOLATION",
+    );
+    for id in [populated, missing.as_str()] {
+        for criteria in [Value::Null, json!(""), json!(" "), json!(" \t\n")] {
+            let error = assert_policy_refusal_unchanged(
+                client,
+                root,
+                "update_issue",
+                json!({"id": id, "status": "in_planning", "prerequisites": "- [x] access",
+                    "acceptance_criteria": criteria, "title": "Must roll back", "force": true,
+                    "transition_comment": "Criteria still required", "comment": "Must not append"}),
+                "POLICY_VIOLATION",
+            );
+            assert!(
+                contains_text(&error, "acceptance_criteria_present"),
+                "{error}"
+            );
+        }
+    }
 }
 
 #[test]

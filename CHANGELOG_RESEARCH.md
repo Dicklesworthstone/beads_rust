@@ -338,3 +338,90 @@ public archive, with normal checksum verification enabled, then passed all
 emitted a nonterminating missing-shims-directory diagnostic before creating
 that directory; it remains in the captured PowerShell error stream. A separate
 shim invocation verifies the installed command launches version 0.5.12.
+
+### September 9 — distinct prerequisites and command discovery
+
+Reviewed the complete prerequisite change now committed in
+`f9adebc0..b5f3fcac`: model/storage, schema-18 migration, policy, CLI/rendering,
+MCP, schemas/docs, and regression tests. The shared tree was committed by
+another session during qualification; that did not itself close g8cib or
+7zm00. The new field is independent of acceptance criteria. The opt-in
+`prerequisites_complete` rule requires a nonempty real checklist with no
+unchecked items and composes with presence, completion, and fresh-comment
+requirements. Storage evaluates replacements inside the existing atomic
+transition preflight. Absent/empty prerequisites preserve the old content
+hash; nonempty content participates in hashing, merge equality, and JSONL.
+
+Candidate SHA-256
+`058bc11c165b95c46151e260e22eeacc66deae25af9756111928f47f46f269e6`
+passed an actual released-0.5.11/schema-17 upgrade, byte-exact database-family
+undo, reapply, prerequisite write, and stale-undo refusal. All 119 source,
+manifest, lockfile, and toolchain files matched the build worker. A second
+reader checked those hashes after the commits: only the separately edited
+capabilities file differed. This candidate is a development build, not a
+replacement for the immutable v0.5.12 release artifact.
+
+Strict RCH passed 3,097 library tests, with nine pre-existing ignored tests;
+205 lifecycle, 239 error, 14 real MCP, 161 schema-migration, 170 sync-safety,
+185 reconciliation, 163 capacity-scope, 196 CRUD, and 17 hash-parity tests.
+The affected property, snapshot, documentation, and AGENTS-contract targets
+also passed. Counts include shared helper tests, not unique independent
+scenarios. Whole-target/all-feature check and Clippy passed. This is an
+affected-target matrix, not a claim that every release-profile target ran.
+
+Original failures remain retained: cold compiles reached the unchanged RCH
+caps; one new clear-field assertion incorrectly expected an empty string
+instead of an omitted field; and three snapshots needed the intentional
+schema/help additions. Manual snapshot edits were bounded to those additions,
+with inverse checks preserving every unrelated byte. A stale MCP executable
+initially reported 13 tests after the source contained 14. Matching source
+hashes did not prove the executable was fresh: preserved source timestamps
+preceded completion of an older compilation. Touching only source metadata
+and rerunning produced the named new race and all 14 passes.
+
+Two separately compiled, deliberately incorrect implementations were tested:
+vacuous checklist completion, then use of the stored prerequisite value.
+Each made the existing CLI regression fail because it admitted a forbidden
+replacement (exit 0 instead of 4). Both production files were manually
+restored and compared byte for byte with their saved correct versions.
+Retained mutant binaries also reproduced prose-only and unchecked-replacement
+admission in separate durable workspaces; their receipts identify the invalid
+state changes and are negative controls, not product passes. The initial
+Cargo test workspaces used the existing temporary-workspace cleanup; the
+separate reproductions retain database, command streams, and before/after
+state. The first reproduction's Python observer did not explicitly close its
+read connection and was slow; the second explicitly closes it before writes.
+
+During command discovery, `capabilities` incorrectly described structured
+errors as stderr output and classified gate/capacity commands as unknown and
+text-only. Bead bs36u corrects the existing metadata. Its new real workflow
+contract test first failed on the old classification, then the full 176-test
+schema target passed with actual JSON and TOON gate report/list and capacity
+grant/renew/history/revoke commands. An existing real-error test now compares
+the published guarantee with observed stdout JSON and stderr plain errors.
+
+Evidence is retained under
+`/data/tmp/br-g8cib-prerequisite-20260909-QV5BvoMg`, with the actual migration
+workspace at `/data/tmp/br-g8cib-live-upgrade-by_6900g`. UBS reports are not
+clean: the capabilities scan reports one existing test-panic critical and
+233 warnings; broader prerequisite scans include existing test panics and
+SQL/non-secret-comparison heuristics. No blanket scanner pass is claimed.
+The final MCP extensions passed all 14 tests: missing/null/empty/whitespace
+presence refusals, prose/checked presence handoffs, mixed-checklist refusal,
+and unrelated title/comment/dependency preservation through real import.
+The first extended run passed 13 and failed one because its assertion omitted
+CLI show's `dependency_type` key. The corrected helper checks each surface's
+exact keys rather than using a permissive fallback. Both failure workspaces
+remain on the worker. Final source check, Clippy, formatting, and diff checks
+passed after the last edit. The final MCP test file hash is
+`d4ab1c3c2feac494f5e17f7a3e51b553fc74d280eaae547b0941ad3214db3d86`.
+
+An independent bs36u verifier exercised all eight contracts and all six
+examples' argument parsing and workspace admission with candidate SHA-256
+`4a2ff194921ac5418479d8031be82933eccff6d7bd39f1794e9763b3b7c16267`.
+It returned `NOT_INITIALIZED` JSON on stdout with empty stderr from outside
+a workspace. Successful mutations are established by the full schema tests;
+plain rendering was source-reviewed. The implementation bead g8cib closes
+under its original criterion; its separate verification companion 7zm00
+retains the outstanding release-profile maintenance run. No overall feature
+release or full release-profile suite pass is claimed.

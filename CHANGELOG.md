@@ -16,7 +16,7 @@ This changelog is organized by capability rather than diff order. Each version s
 **Scope window:** every version from inception (v0.1.0, 2026-01-18) through the current
 release (v0.5.12, 2026-09-09), including the source frozen at
 [366c69a6](https://github.com/Dicklesworthstone/beads_rust/commit/366c69a6),
-plus the post-freeze workflow change described under Unreleased.
+plus the post-freeze changes described under Unreleased.
 The full per-version detail is in the sections below; the timeline names the
 recent line and the milestone anchors. The September 8 audit examined all 79
 commits in `v0.5.10..v0.5.11` and six subsequent commits against Git diffs,
@@ -91,10 +91,28 @@ this repo): commits `55c186682` + `5946b3b7c` in
   `acceptance_criteria` completion requirement and separately requested fresh
   transition comments still apply; matching requirements compose. Validation
   uses the prospective value, and rejected batches preserve fields, comments,
-  audit events, and JSONL. This implements the presence portion of
-  [#493](https://github.com/Dicklesworthstone/beads_rust/issues/493); a distinct
-  prerequisite checklist remains unfinished. This change is outside the
-  frozen v0.5.12 source.
+  audit events, and JSONL
+  ([27284d1f](https://github.com/Dicklesworthstone/beads_rust/commit/27284d1f),
+  [#493](https://github.com/Dicklesworthstone/beads_rust/issues/493)).
+- Issues have a separate `prerequisites` field, available through CLI
+  create/update/show, MCP, and JSONL interchange. An opt-in
+  `prerequisites_complete` transition requirement needs at least one actual
+  checklist item and every item checked; prose alone does not qualify.
+  Completing prerequisites leaves acceptance criteria untouched. A combined
+  field/status update evaluates the proposed checklist, and failed batches
+  preserve their persisted state
+  ([f9adebc0](https://github.com/Dicklesworthstone/beads_rust/commit/f9adebc0),
+  [b0464e66](https://github.com/Dicklesworthstone/beads_rust/commit/b0464e66),
+  [e1e93bfb](https://github.com/Dicklesworthstone/beads_rust/commit/e1e93bfb)).
+  Existing schema-17 databases require explicit
+  `br doctor migrate-schema plan` and approved `apply` to reach schema 18;
+  ordinary opens refuse the older schema. Migration preserves existing data,
+  and undo restores the saved database family unless later writes make the
+  undo stale. These changes are outside the frozen v0.5.12 source.
+- `br capabilities` correctly identifies stdout as the structured error
+  stream, with diagnostics on stderr. Gate and capacity commands now expose
+  their read/write operations, workspace requirement, and supported
+  JSON/TOON/text formats in the command inventory.
 
 ## v0.5.12 — 2026-09-09
 

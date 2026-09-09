@@ -82,6 +82,20 @@ fn e2e_schema_help_matches_live_json_error_stream() {
             && !error_help.contains("non-TTY"),
         "schema help must describe the observed runtime error stream: {help:?}"
     );
+    let capabilities = capabilities_command_detail_output(&workspace, "show");
+    let guarantee = capabilities["safety"]
+        .as_array()
+        .expect("safety inventory")
+        .iter()
+        .find(|entry| entry["name"] == "structured_errors")
+        .expect("structured error guarantee")["guarantee"]
+        .as_str()
+        .expect("guarantee text");
+    assert!(
+        guarantee.contains("error envelopes on stdout")
+            && !guarantee.contains("error envelopes on stderr"),
+        "capabilities must describe the observed error stream: {guarantee}"
+    );
 }
 
 #[test]
@@ -283,6 +297,122 @@ fn e2e_capabilities_json_no_workspace() {
         }),
         "missing exit-code contract: {json}"
     );
+}
+
+#[test]
+fn e2e_capabilities_workflow_commands_match_live_json_and_toon() {
+    let workspace = BrWorkspace::new();
+    assert_workflow_capability_metadata(&workspace);
+    assert_json_command_succeeds(&workspace, ["init", "--json"], "workflow_contract_init");
+    let created = assert_json_command_succeeds(
+        &workspace,
+        ["create", "Workflow command contracts", "--json"],
+        "workflow_contract_create",
+    );
+    let id = created["id"].as_str().expect("created ID");
+    std::fs::write(
+        workspace.root.join(".beads/policy.yaml"),
+        "workflow:\n  statuses: [open, in_progress, closed]\n  gates:\n    'open -> in_progress':\n      require_all: [ci_green]\n  capacity:\n    statuses:\n      in_progress:\n        hard: 1\n    exemptions:\n      providers: [operator]\n",
+    )
+    .expect("workflow command policy");
+    for format in ["json", "toon"] {
+        assert_workflow_command_mode(&workspace, id, format);
+    }
+}
+
+fn assert_workflow_capability_metadata(workspace: &BrWorkspace) {
+    for (command, operation) in [
+        ("gate", "mixed"),
+        ("gate report", "write"),
+        ("gate list", "read"),
+        ("capacity", "mixed"),
+        ("capacity exempt", "write"),
+        ("capacity renew", "write"),
+        ("capacity revoke", "write"),
+        ("capacity exemptions", "read"),
+    ] {
+        let output = capabilities_command_detail_output(workspace, command);
+        let detail = &output["command_detail"];
+        assert_eq!(detail["operation"], operation, "{command}: {detail}");
+        assert_eq!(detail["workspace"], "required", "{command}: {detail}");
+        assert_eq!(
+            detail["machine_output"],
+            serde_json::json!(["json", "toon", "text"]),
+            "{command}: {detail}"
+        );
+    }
+}
+
+fn assert_workflow_command_mode(workspace: &BrWorkspace, id: &str, format: &str) {
+    let calls: &[&[&str]] = &[
+        &[
+            "gate",
+            "report",
+            id,
+            "--gate",
+            "ci_green",
+            "--provider",
+            "ci",
+            "--status",
+            "pass",
+            "--to",
+            "in_progress",
+        ],
+        &["gate", "list", id],
+        &[
+            "capacity",
+            "exempt",
+            id,
+            "--status",
+            "in_progress",
+            "--provider",
+            "operator",
+            "--reason",
+            "Contract proof",
+            "--expires",
+            "+1h",
+        ],
+        &[
+            "capacity",
+            "renew",
+            id,
+            "--status",
+            "in_progress",
+            "--provider",
+            "operator",
+            "--reason",
+            "Renewal proof",
+            "--expires",
+            "+2h",
+        ],
+        &["capacity", "exemptions", id, "--history"],
+        &[
+            "capacity",
+            "revoke",
+            id,
+            "--status",
+            "in_progress",
+            "--provider",
+            "operator",
+            "--reason",
+            "Revoke proof",
+        ],
+    ];
+    for (index, args) in calls.iter().enumerate() {
+        let run = run_br_with_env(
+            workspace,
+            args.iter().copied(),
+            [("BR_OUTPUT_FORMAT", format)],
+            &format!("workflow_contract_{format}_{index}"),
+        );
+        assert!(run.status.success(), "{args:?}: {run:?}");
+        let output: Value = if format == "json" {
+            serde_json::from_str(&run.stdout).expect("whole JSON result")
+        } else {
+            Value::from(parse_toon(run.stdout.trim(), None).expect("whole TOON result"))
+        };
+        assert_eq!(output["issue_id"], id, "{args:?}: {output}");
+    }
 }
 
 #[test]

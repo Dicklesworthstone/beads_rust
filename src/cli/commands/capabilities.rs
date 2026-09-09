@@ -269,7 +269,7 @@ const SAFETY: &[SafetyCapability] = &[
     },
     SafetyCapability {
         name: "structured_errors",
-        guarantee: "machine-output contexts render structured error envelopes on stderr.",
+        guarantee: "machine-output contexts render structured error envelopes on stdout; stderr carries diagnostics.",
     },
 ];
 
@@ -516,6 +516,14 @@ fn parent_examples(name: &str) -> &'static [&'static str] {
         "epic" => &[
             "br epic status --json",
             "br epic close-eligible --dry-run --json",
+        ],
+        "gate" => &[
+            "br gate list br-abc --json",
+            "br gate report br-abc --gate ci_green --provider ci --status pass --to in_progress --json",
+        ],
+        "capacity" => &[
+            "br capacity exemptions br-abc --history --json",
+            "br capacity exempt br-abc --status in_progress --provider operator --reason incident --expires +1h --json",
         ],
         "config" => &["br config get output.format --json"],
         "history" => &["br history list --json"],
@@ -828,6 +836,50 @@ fn command_contract(name: &str) -> CommandContract {
             machine_output: &["json", "toon", "text"],
             examples: &["br epic close-eligible --dry-run --json"],
         },
+        "gate report" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &[
+                "br gate report br-abc --gate ci_green --provider ci --status pass --to in_progress --json",
+            ],
+        },
+        "gate list" => CommandContract {
+            operation: "read",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &["br gate list br-abc --json"],
+        },
+        "capacity exempt" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &[
+                "br capacity exempt br-abc --status in_progress --provider operator --reason incident --expires +1h --json",
+            ],
+        },
+        "capacity renew" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &[
+                "br capacity renew br-abc --status in_progress --provider operator --reason incident --expires +2h --json",
+            ],
+        },
+        "capacity revoke" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &[
+                "br capacity revoke br-abc --status in_progress --provider operator --reason resolved --json",
+            ],
+        },
+        "capacity exemptions" => CommandContract {
+            operation: "read",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &["br capacity exemptions br-abc --history --json"],
+        },
         "capabilities" => CommandContract {
             operation: "read",
             workspace: "none",
@@ -1034,12 +1086,14 @@ fn command_contract(name: &str) -> CommandContract {
             machine_output: &["json", "text"],
             examples: parent_examples(name),
         },
-        "history" | "query" | "dep" | "label" | "comments" | "epic" => CommandContract {
-            operation: "mixed",
-            workspace: "required",
-            machine_output: &["json", "toon", "text"],
-            examples: parent_examples(name),
-        },
+        "history" | "query" | "dep" | "label" | "comments" | "epic" | "gate" | "capacity" => {
+            CommandContract {
+                operation: "mixed",
+                workspace: "required",
+                machine_output: &["json", "toon", "text"],
+                examples: parent_examples(name),
+            }
+        }
         "graph" | "orphans" | "changelog" | "lint" | "audit" => CommandContract {
             operation: "mixed",
             workspace: "required",
