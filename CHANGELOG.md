@@ -14,9 +14,8 @@ This changelog is organized by capability rather than diff order. Each version s
 - Release links: `https://github.com/Dicklesworthstone/beads_rust/releases/tag/<TAG>`
 
 **Scope window:** every version from inception (v0.1.0, 2026-01-18) through the current
-release (v0.5.11, 2026-09-08), plus the post-release distribution follow-up
-and the pending v0.5.12 fixes through
-[d42ced50](https://github.com/Dicklesworthstone/beads_rust/commit/d42ced50),
+release (v0.5.12, 2026-09-09), including the source frozen at
+[366c69a6](https://github.com/Dicklesworthstone/beads_rust/commit/366c69a6),
 plus the post-freeze workflow change described under Unreleased.
 The full per-version detail is in the sections below; the timeline names the
 recent line and the milestone anchors. The September 8 audit examined all 79
@@ -34,6 +33,7 @@ explicitly corrected during this audit.
 
 | Version | Date | Kind | Headline |
 |---|---|---|---|
+| [v0.5.12](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.12) | 2026-09-09 | Release | Closed-claim refusal; bounded search page loading; terminal color controls; namespace diagnostics; Nix source repair; seven-platform DSR release |
 | [v0.5.11](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.11) | 2026-09-08 | Release | Checkpoints before diagnostic exits; FrankenSQLite 0.3.18 grouped-count fix; migration preflight and typed admission failures; seven-platform DSR release |
 | [v0.5.10](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.10) | 2026-09-04 | Release | Six silent-loss fixes (#466–#477, #487); acceptance checklist edits; `doctor --bundle`; FrankenSQLite 0.3.15; linearizability, model-based, README, and Go-bd proof suites; schema-witness fast open |
 | [v0.5.9](https://github.com/Dicklesworthstone/beads_rust/tree/v0.5.9) | 2026-09-03 | Tag | Tagged, no binaries: the hosted lib shard passed, then the new multi-process stress gate ran its script with relative paths that its own `cd` broke; fixed and re-cut as v0.5.10 |
@@ -96,11 +96,12 @@ this repo): commits `55c186682` + `5946b3b7c` in
   prerequisite checklist remains unfinished. This change is outside the
   frozen v0.5.12 source.
 
-## v0.5.12 — pending release
+## v0.5.12 — 2026-09-09
 
-These changes are on `main` after v0.5.11. They are not included in that
-release's binary archives. Source qualification is complete; the next
-release's platform builds and publication remain pending.
+[Published release](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.12),
+frozen at [366c69a6](https://github.com/Dicklesworthstone/beads_rust/commit/366c69a6).
+The seven binary archives contain the changes below. The later acceptance
+presence rule remains under Unreleased.
 
 ### Claiming work and searching the backlog
 
@@ -165,6 +166,32 @@ release's platform builds and publication remain pending.
   shrank from 1.42 GB to 470 MB; test optimization and assertions are unchanged.
   This changes test artifacts, not the release profile
   ([e77ba905](https://github.com/Dicklesworthstone/beads_rust/commit/e77ba905)).
+
+### Distribution
+
+- Seven platform archives were built through DSR without GitHub Actions:
+  Linux GNU and musl on amd64 and arm64, macOS on Intel and Apple Silicon,
+  and Windows amd64. GNU binaries retain the GLIBC 2.28 floor; musl binaries
+  are static. All seven public downloads passed checksum, Minisign signature,
+  and archive-payload verification. Each downloaded binary passed its CLI
+  canaries and all 45 doctor self-test steps; Intel macOS ran through Rosetta.
+- The [crates.io package](https://crates.io/crates/beads_rust/0.5.12),
+  [Homebrew formula](https://github.com/Dicklesworthstone/homebrew-tap/blob/1ec62f2/Formula/br.rb),
+  and [Scoop manifest](https://github.com/Dicklesworthstone/scoop-bucket/blob/f054ed8/br.json)
+  are published with the verified archive hashes. Homebrew's native Apple
+  Silicon upgrade and formula test passed. Native Windows Scoop installation
+  passed with the exact binary. Both installed binaries passed all 45 doctor
+  self-test steps.
+- The public installer passed on Linux amd64 and two Apple Silicon hosts.
+  Real `br upgrade` runs from 0.5.11 to 0.5.12 passed on Linux amd64 and Apple
+  Silicon; both replaced binaries matched the release hashes and passed all
+  45 doctor self-test steps.
+- The Arch package is prepared for x86_64 and aarch64 with upstream binary
+  bytes preserved. Native x86_64 installation, package integrity, and all 45
+  self-test steps passed. AUR publication remains blocked on an authorized
+  account credential; the aarch64 Arch package has no native Arch runtime
+  receipt. The research notes record these limits and the separate source
+  package qualification results.
 
 ## After v0.5.11 — distribution follow-up (2026-09-08)
 

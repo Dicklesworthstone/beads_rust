@@ -259,3 +259,82 @@ for a distinct prerequisite field and its CLI/MCP/storage/sync behavior;
 7zm00 retains the full proof matrix. The existing MCP suite passed, but does
 not itself establish a new presence-specific MCP scenario. These changes do
 not belong in the pending v0.5.12 release notes or packaged source.
+
+### September 9 — v0.5.12 publication and distribution
+
+GitHub release 385174315 became public at 02:07:08 UTC, with tag v0.5.12
+pointing to `366c69a63fe18260afc4deff798850053954cac9`. The publication did
+not move the tag or include the later acceptance-presence implementation.
+The release API and independent unauthenticated downloads establish the
+complete 24-asset set: seven archives, seven SHA-256 sidecars, seven Minisign
+signatures, an aggregate checksum file, and SPDX/CycloneDX source inventories.
+Every archive contains exactly its binary, README.md, and LICENSE. All seven
+signatures verified with the established release key (ID 36B847D11BA5A0D0).
+The source inventories include every one of the 633 Cargo.lock packages;
+they are source inventories, not assertions about linked binary dependencies.
+
+DSR v0.1.2 at `87d0be6c6fdf8536decd1663fe2975f13bc9094f` built the artifacts
+without Actions, act, or dispatch. The original seven-target run completed
+four targets and failed three; its GNU amd64 output also exceeded the intended
+glibc floor. Those results remain retained and were not relabeled successful.
+Separate GNU and musl runs supplied the four accepted Linux binaries. All
+4,169 tracked source files matched the frozen source in every selected build
+snapshot. GNU outputs require at most GLIBC 2.28; both musl outputs have no
+interpreter, dynamic dependency, or GLIBC references. All seven binaries and
+archives fit the unchanged size budgets against both v0.5.10 and v0.5.11.
+
+DSR's strict publisher validated and uploaded its supported 16-asset contract
+to a draft. Its first attempt to describe the established 24-asset layout
+failed before publication; that failure remains recorded. The operator then
+uploaded the eight already-verified signature/aggregate files while the
+release was still a draft. Independent verification required the final exact
+24 assets before publication and repeated the check on public downloads.
+This is not a claim that the older DSR manifest schema accepts every layout.
+
+All seven GitHub-downloaded binaries passed platform CLI canaries and 45
+doctor self-test steps. The six Unix targets also passed 29 real PTY checks;
+their CLI driver has 51 commands, while Windows has 48. macOS Intel ran under
+Rosetta; Linux arm64 ran in native arm64 containers. These checks do not
+establish every reconcile invariant or the other three Nix package builds.
+Windows retains five existing dead-code warnings; no warning-free Windows
+build is claimed.
+
+Crates.io published 0.5.12 at 02:07:38 UTC. Its version API reports an unyanked
+3,805,711-byte package with SHA-256
+`6d555b0649b2fc85705a71f87019fee5417c5f6daf5a10cd13c60edfd4b23330`, exactly
+the separately qualified package. That extracted package compiled with all
+features through strict RCH and its binary passed 51 CLI canaries and 45
+self-test steps. Publishing used `--no-verify` after that separate compile.
+Packaged repository-contract tests are not all green: two AGENTS contract
+checks require excluded docs/scripts/tracker files, and two of 235 CLI error
+tests require excluded database fixtures. Those failures remain evidence;
+they are not credited as passes or masked with new skips.
+
+The public Homebrew formula commit is `1ec62f2`; Scoop is `f054ed8`. Both
+repositories had Actions disabled before their pushes. Native Apple Silicon
+Homebrew upgraded 0.5.11 to 0.5.12, passed its formula test and all 45 doctor
+steps, and retained the exact published binary hash. Both Arch package
+architectures built with upstream binary bytes and license preserved; native
+x86_64 pacman integrity reported seven files and zero alterations, and 45
+doctor steps passed. The aarch64 package has packaging proof only. AUR still
+needs an authorized publication credential, so the release bead remains open.
+
+Raw build, publication, installation, checksum, and signature receipts are
+retained under `/data/tmp/br-phm7n-20260908-7sPfyV` and the remote paths recorded
+in Bead phm7n comments 1461–1465. No registry success is inferred merely from
+a manifest version bump, and unfinished post-freeze features remain Unreleased.
+
+Installation follow-through: the public latest installer passed on Linux
+amd64 and two separate Apple Silicon machines. Real `br upgrade --json` runs
+on isolated copies of 0.5.11 selected public 0.5.12 on Linux amd64 and Apple
+Silicon, replaced themselves with the exact published binary, and passed all
+45 doctor steps. The initial Mac follow-up used a nonexistent self-test flag
+and exited 2; the corrected `--keep` invocation and original failure are
+both retained. No installer or product guard was changed to obtain a pass.
+
+Native Windows Scoop installed the public manifest and independently fetched
+public archive, with normal checksum verification enabled, then passed all
+45 doctor steps with the exact Windows binary. The portable-client bootstrap
+emitted a nonterminating missing-shims-directory diagnostic before creating
+that directory; it remains in the captured PowerShell error stream. A separate
+shim invocation verifies the installed command launches version 0.5.12.
