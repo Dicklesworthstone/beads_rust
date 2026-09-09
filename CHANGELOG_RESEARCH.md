@@ -498,6 +498,15 @@ both under the evidence directory above. Their actual CLI bytes match the
 independently reviewed `217bdef6...` candidate. The embedded Git SHA in that
 cached build predates the dirty class implementation; source manifests and
 the executable hash establish identity instead. Earlier incomplete logs
-remain retained. The prerequisite companion 7zm00 still requires the frozen
-release-profile sync run. These changes remain unreleased and do not complete
+remain retained. The prerequisite companion's frozen `9ac36fa8` release-profile
+run subsequently passed 170 sync-safety and 185 reconciliation tests, with no
+failures, ignores, or filtered cases. RCH's source-isolation receipt and the
+original fixed 1,800-second limit remain in the log
+`release-sync-sixth-frozen.log` (SHA-256
+`fa09aa4d9303938b71ffdd8071f375b04b32fdc5d7de62fd675414c0480ba1b6`).
+The preserved release-profile executable on hz3 is
+`/data/tmp/br-7zm00-prerequisite-release-20260909-0435`, SHA-256
+`ddcceef81ae9aede43863d9b7722e0e91795c5a147ede40e8ce32f5b6e7aeb68`.
+Earlier capped or interrupted attempts remain recorded without pass credit.
+These changes remain unreleased and do not complete
 the historical migration, lock fairness, or performance calibration work.
