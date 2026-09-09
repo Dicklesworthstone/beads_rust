@@ -2012,22 +2012,19 @@ fn open_and_lock_regular_file(
 
     // SAFETY: later arrivals may not use the fast path ahead of registered
     // waiters. The queue never substitutes for the original OS write lock.
-    let initial_attempt = if has_waiters {
-        Err(TryLockError::WouldBlock)
-    } else {
-        try_lock_exclusive(&file, mechanism)
-    };
-    match initial_attempt {
-        Ok(()) => {
-            verify_locked_file_identity(&file, lock_path, role, redact_path)?;
-            return Ok(file);
-        }
-        Err(TryLockError::WouldBlock) => {}
-        Err(TryLockError::Error(err)) => {
-            return Err(BeadsError::Config(format!(
-                "Failed to acquire {role} at {}: {err}",
-                lock_path_display
-            )));
+    if !has_waiters {
+        match try_lock_exclusive(&file, mechanism) {
+            Ok(()) => {
+                verify_locked_file_identity(&file, lock_path, role, redact_path)?;
+                return Ok(file);
+            }
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(err)) => {
+                return Err(BeadsError::Config(format!(
+                    "Failed to acquire {role} at {}: {err}",
+                    lock_path_display
+                )));
+            }
         }
     }
 
@@ -17320,7 +17317,10 @@ mod tests {
             .map(|(order, _)| order)
             .collect::<BTreeSet<_>>();
         assert_eq!(keys.len(), 16);
-        assert!(results.iter().find(|(_, first)| *first).unwrap().0 == **keys.first().unwrap());
+        assert_eq!(
+            results.iter().find(|(_, first)| *first).unwrap().0,
+            **keys.first().unwrap()
+        );
         assert!(live_workspace_waiters(&queue).unwrap().is_empty());
     }
 
