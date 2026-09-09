@@ -3011,6 +3011,469 @@ fn create_presence_draft(workspace: &BrWorkspace, title: &str, criteria: &str) -
     issue["id"].as_str().unwrap().to_owned()
 }
 
+fn class_transition_workspace(open_capacity: usize) -> BrWorkspace {
+    let workspace = BrWorkspace::new();
+    class_cli(&workspace, &["init"]);
+    fs::write(
+        workspace.root.join(".beads/policy.yaml"),
+        format!(
+            r#"workflow:
+  strict: true
+  statuses: [draft, planned, open, in_progress, review, closed]
+  transitions:
+    initial: [draft]
+    draft: [planned]
+    planned: [open]
+    open: [in_progress, draft]
+    in_progress: [review]
+    review: [closed]
+    closed: [draft]
+  class_transitions:
+    - {{issue_type: bug, from: draft, to: open}}
+  required_fields:
+    "draft -> open": [acceptance_criteria_present, transition_comment]
+  gates:
+    "draft -> open":
+      require_all: [ci_green]
+      require_if:
+        - label: security
+          gate: security_review
+  capacity:
+    statuses:
+      open: {{hard: {open_capacity}}}
+close_policy:
+  require_acceptance_criteria_satisfied:
+    enabled: true
+"#
+        ),
+    )
+    .unwrap();
+    workspace
+}
+
+fn class_cli(workspace: &BrWorkspace, args: &[&str]) -> Value {
+    let mut args = args.to_vec();
+    args.push("--json");
+    let output = run_br(workspace, args, "class_transition_command");
+    assert!(output.status.success(), "{output:?}");
+    serde_json::from_str(&output.stdout).unwrap()
+}
+
+fn class_draft(workspace: &BrWorkspace, title: &str, kind: Option<&str>, criteria: &str) -> String {
+    let mut args = vec![
+        "create",
+        title,
+        "--status",
+        "draft",
+        "--acceptance-criteria",
+        criteria,
+        "--labels",
+        "security",
+    ];
+    if let Some(kind) = kind {
+        args.extend(["--type", kind]);
+    }
+    class_cli(workspace, &args)["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+fn class_gate(workspace: &BrWorkspace, id: &str, gate: &str, status: &str) {
+    class_cli(
+        workspace,
+        &[
+            "gate",
+            "report",
+            id,
+            "--gate",
+            gate,
+            "--provider",
+            "ci",
+            "--status",
+            status,
+            "--to",
+            "open",
+        ],
+    );
+}
+
+fn prepare_class_gates(workspace: &BrWorkspace, id: &str) {
+    for gate in ["ci_green", "security_review"] {
+        class_gate(workspace, id, gate, "pass");
+    }
+}
+
+#[test]
+fn e2e_class_transitions_preserve_initial_global_and_strict_routes() {
+    let workspace = class_transition_workspace(1);
+    let bug = class_draft(&workspace, "Matching bug", Some("bug"), "- [x] Reviewed");
+    let task = class_draft(&workspace, "Default task", None, "- [x] Reviewed");
+    let unknown = class_draft(
+        &workspace,
+        "Unknown class",
+        Some("undone_work"),
+        "- [x] Reviewed",
+    );
+    assert_prerequisite_policy_refusal(
+        &workspace,
+        &[
+            "create",
+            "Cannot skip initial",
+            "--type",
+            "bug",
+            "--status",
+            "open",
+            "--json",
+        ],
+        "VALIDATION_FAILED",
+        None,
+    );
+    for id in [&bug, &task, &unknown] {
+        prepare_class_gates(&workspace, id);
+    }
+    for id in [&task, &unknown] {
+        assert_prerequisite_policy_refusal(
+            &workspace,
+            &[
+                "update",
+                id,
+                "--status",
+                "open",
+                "--transition-comment",
+                "Not a bug",
+                "--force",
+                "--json",
+            ],
+            "VALIDATION_FAILED",
+            None,
+        );
+    }
+    for status in ["review", "closed", "unlisted_status"] {
+        assert_prerequisite_policy_refusal(
+            &workspace,
+            &[
+                "update",
+                &bug,
+                "--status",
+                status,
+                "--transition-comment",
+                "Only the named edge",
+                "--force",
+                "--json",
+            ],
+            "VALIDATION_FAILED",
+            None,
+        );
+    }
+    class_cli(
+        &workspace,
+        &[
+            "update",
+            &bug,
+            "--status",
+            "open",
+            "--transition-comment",
+            "Class edge approved",
+            "--actor",
+            "class-router",
+        ],
+    );
+    assert_class_transition_and_global_route(&workspace, &bug, &task);
+}
+
+fn assert_class_transition_and_global_route(workspace: &BrWorkspace, bug: &str, task: &str) {
+    let storage = SqliteStorage::open(&workspace.root.join(".beads/beads.db")).unwrap();
+    let admitted = storage.get_issue(bug).unwrap().unwrap();
+    assert_eq!(admitted.issue_type.as_str(), "bug");
+    assert_eq!(admitted.status.as_str(), "open");
+    let events = storage.get_events(bug, 0).unwrap();
+    let transitions: Vec<_> = events
+        .iter()
+        .filter(|event| event.event_type == beads_rust::model::EventType::StatusChanged)
+        .collect();
+    assert_eq!(transitions.len(), 1);
+    assert_eq!(transitions[0].actor, "class-router");
+    assert_eq!(transitions[0].old_value.as_deref(), Some("draft"));
+    assert_eq!(transitions[0].new_value.as_deref(), Some("open"));
+    drop(storage);
+    class_cli(workspace, &["update", bug, "--status", "draft"]);
+    class_cli(workspace, &["update", task, "--status", "planned"]);
+    class_cli(workspace, &["update", task, "--status", "open"]);
+    assert_eq!(
+        class_cli(workspace, &["show", task])[0]["issue_type"],
+        "task"
+    );
+}
+
+#[test]
+fn e2e_class_transitions_use_prospective_types_and_commit_corrected_batches() {
+    let workspace = class_transition_workspace(2);
+    let bug = class_draft(&workspace, "Original bug", Some("bug"), "- [ ] Deliver bug");
+    let task = class_draft(&workspace, "Original task", None, "- [ ] Deliver task");
+    for id in [&bug, &task] {
+        prepare_class_gates(&workspace, id);
+    }
+    assert_prerequisite_policy_refusal(
+        &workspace,
+        &[
+            "update",
+            &bug,
+            "--type",
+            "task",
+            "--status",
+            "open",
+            "--title",
+            "Must roll back",
+            "--transition-comment",
+            "Old class cannot authorize",
+            "--json",
+        ],
+        "VALIDATION_FAILED",
+        None,
+    );
+    class_cli(
+        &workspace,
+        &[
+            "update",
+            &task,
+            "--type",
+            "bug",
+            "--status",
+            "open",
+            "--transition-comment",
+            "Prospective class approved",
+        ],
+    );
+    let shown = class_cli(&workspace, &["show", &task]);
+    assert_eq!(shown[0]["issue_type"], "bug");
+    assert_eq!(shown[0]["status"], "open");
+    class_cli(
+        &workspace,
+        &["update", &task, "--type", "task", "--status", "draft"],
+    );
+    prepare_class_gates(&workspace, &task);
+    for ids in [[&bug, &task], [&task, &bug]] {
+        assert_prerequisite_policy_refusal(
+            &workspace,
+            &[
+                "update",
+                ids[0],
+                ids[1],
+                "--status",
+                "open",
+                "--title",
+                "Must roll back",
+                "--transition-comment",
+                "Mixed batch",
+                "--json",
+            ],
+            "VALIDATION_FAILED",
+            None,
+        );
+    }
+    let before_bug = class_cli(&workspace, &["show", &bug]);
+    class_cli(&workspace, &["update", &task, "--type", "bug"]);
+    assert_eq!(class_cli(&workspace, &["show", &bug]), before_bug);
+    class_cli(
+        &workspace,
+        &[
+            "update",
+            &task,
+            &bug,
+            "--status",
+            "open",
+            "--transition-comment",
+            "Corrected batch",
+            "--actor",
+            "batch-router",
+        ],
+    );
+    assert_corrected_class_batch(&workspace, &bug, &task);
+}
+
+fn assert_corrected_class_batch(workspace: &BrWorkspace, bug: &str, task: &str) {
+    let storage = SqliteStorage::open(&workspace.root.join(".beads/beads.db")).unwrap();
+    for (id, title, criteria) in [
+        (bug, "Original bug", "- [ ] Deliver bug"),
+        (task, "Original task", "- [ ] Deliver task"),
+    ] {
+        let issue = storage.get_issue(id).unwrap().unwrap();
+        assert_eq!(issue.issue_type.as_str(), "bug");
+        assert_eq!(issue.status.as_str(), "open");
+        assert_eq!(issue.title, title);
+        assert_eq!(issue.acceptance_criteria.as_deref(), Some(criteria));
+        let events = storage.get_events(id, 0).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.actor == "batch-router"
+                    && event.event_type == beads_rust::model::EventType::StatusChanged)
+                .count(),
+            1
+        );
+        assert_eq!(
+            storage
+                .get_comments(id)
+                .unwrap()
+                .iter()
+                .filter(
+                    |comment| comment.body == "Corrected batch" && comment.author == "batch-router"
+                )
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn e2e_class_transitions_preserve_required_fields_gates_capacity_claim_and_close() {
+    let workspace = class_transition_workspace(1);
+    let bug = class_draft(&workspace, "Guarded bug", Some("bug"), "");
+    prepare_class_gates(&workspace, &bug);
+    assert_class_entry_guards(&workspace, &bug);
+    let occupant = class_draft(&workspace, "Occupied slot", Some("bug"), "- [x] Ready");
+    prepare_class_gates(&workspace, &occupant);
+    class_cli(
+        &workspace,
+        &[
+            "update",
+            &occupant,
+            "--status",
+            "open",
+            "--transition-comment",
+            "First admission",
+        ],
+    );
+    assert_prerequisite_policy_refusal(
+        &workspace,
+        &[
+            "update",
+            &bug,
+            "--status",
+            "open",
+            "--transition-comment",
+            "Capacity applies",
+            "--force",
+            "--json",
+        ],
+        "WORKFLOW_CAPACITY_EXCEEDED",
+        None,
+    );
+    class_cli(&workspace, &["update", &occupant, "--status", "draft"]);
+    class_cli(
+        &workspace,
+        &[
+            "update",
+            &bug,
+            "--status",
+            "open",
+            "--transition-comment",
+            "All guards satisfied",
+        ],
+    );
+    assert_class_claim_and_close_guards(&workspace, &bug, &occupant);
+}
+
+fn assert_class_entry_guards(workspace: &BrWorkspace, bug: &str) {
+    assert_prerequisite_policy_refusal(
+        workspace,
+        &[
+            "update",
+            bug,
+            "--status",
+            "open",
+            "--transition-comment",
+            "Still needs criteria",
+            "--json",
+        ],
+        "POLICY_VIOLATION",
+        Some("transition_acceptance_criteria_missing"),
+    );
+    class_cli(
+        workspace,
+        &["update", bug, "--acceptance-criteria", "- [ ] Deliver fix"],
+    );
+    class_cli(
+        workspace,
+        &[
+            "comments",
+            "add",
+            bug,
+            "--message",
+            "Earlier discussion cannot authorize this transition",
+        ],
+    );
+    assert_prerequisite_policy_refusal(
+        workspace,
+        &["update", bug, "--status", "open", "--json"],
+        "POLICY_VIOLATION",
+        Some("transition_comment_missing"),
+    );
+    for gate in ["ci_green", "security_review"] {
+        class_gate(workspace, bug, gate, "fail");
+        assert_prerequisite_policy_refusal(
+            workspace,
+            &[
+                "update",
+                bug,
+                "--status",
+                "open",
+                "--transition-comment",
+                "Gate must pass",
+                "--force",
+                "--json",
+            ],
+            "POLICY_VIOLATION",
+            Some(&format!("gate_{gate}")),
+        );
+        class_gate(workspace, bug, gate, "pass");
+    }
+}
+
+fn assert_class_claim_and_close_guards(workspace: &BrWorkspace, bug: &str, blocker: &str) {
+    class_cli(workspace, &["dep", "add", bug, blocker]);
+    assert_prerequisite_policy_refusal(
+        workspace,
+        &[
+            "update",
+            bug,
+            "--claim",
+            "--actor",
+            "class-claimant",
+            "--json",
+        ],
+        "VALIDATION_FAILED",
+        None,
+    );
+    class_cli(workspace, &["dep", "remove", bug, blocker]);
+    class_cli(workspace, &["update", bug, "--assignee", "existing-owner"]);
+    assert_prerequisite_policy_refusal(
+        workspace,
+        &[
+            "update",
+            bug,
+            "--claim",
+            "--actor",
+            "class-claimant",
+            "--json",
+        ],
+        "VALIDATION_FAILED",
+        None,
+    );
+    class_cli(workspace, &["update", bug, "--status", "in_progress"]);
+    class_cli(workspace, &["update", bug, "--status", "review"]);
+    assert_prerequisite_policy_refusal(
+        workspace,
+        &["close", bug, "--force", "--json"],
+        "POLICY_VIOLATION",
+        Some("acceptance_criteria_unchecked"),
+    );
+    class_cli(workspace, &["update", bug, "--check-acceptance", "1"]);
+    class_cli(workspace, &["close", bug]);
+    assert_eq!(class_cli(workspace, &["show", bug])[0]["status"], "closed");
+}
+
 #[test]
 fn e2e_workflow_capacity_rejection_is_structured_and_atomic() {
     let _log = common::test_log("e2e_workflow_capacity_rejection_is_structured_and_atomic");

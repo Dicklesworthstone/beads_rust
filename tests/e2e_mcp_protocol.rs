@@ -1058,6 +1058,429 @@ fn mcp_prerequisites_and_acceptance_round_trip_through_prospective_policy() {
     );
 }
 
+fn write_mcp_class_policy(root: &Path, enabled: bool, open_capacity: usize) {
+    let class_rules = if enabled {
+        "  class_transitions:\n    - {issue_type: bug, from: draft, to: open}\n"
+    } else {
+        ""
+    };
+    std::fs::write(
+        root.join(".beads/policy.yaml"),
+        format!(
+            r#"workflow:
+  strict: true
+  statuses: [draft, planned, open, in_progress, review, closed]
+  transitions:
+    initial: [draft]
+    draft: [planned]
+    planned: [open]
+    open: [in_progress, draft]
+    in_progress: [review]
+    review: [closed]
+    closed: [draft]
+{class_rules}  required_fields:
+    "draft -> open": [acceptance_criteria_present, transition_comment]
+  gates:
+    "draft -> open":
+      require_all: [ci_green]
+      require_if:
+        - label: security
+          gate: security_review
+  capacity:
+    statuses:
+      open: {{hard: {open_capacity}}}
+close_policy:
+  require_acceptance_criteria_satisfied:
+    enabled: true
+"#
+        ),
+    )
+    .expect("class transition policy");
+}
+
+fn mcp_class_draft(root: &Path, title: &str, kind: &str, criteria: &str) -> String {
+    first_id(&cli_json(
+        root,
+        &[
+            "create",
+            title,
+            "--status",
+            "draft",
+            "--type",
+            kind,
+            "--acceptance-criteria",
+            criteria,
+            "--labels",
+            "security",
+            "--prerequisites",
+            "- [x] Retain preparation context",
+        ],
+    ))
+}
+
+fn mcp_class_gate(root: &Path, id: &str, gate: &str, status: &str) {
+    cli_json(
+        root,
+        &[
+            "gate",
+            "report",
+            id,
+            "--gate",
+            gate,
+            "--provider",
+            "ci",
+            "--status",
+            status,
+            "--to",
+            "open",
+        ],
+    );
+}
+
+fn prepare_mcp_class_gates(root: &Path, id: &str) {
+    for gate in ["ci_green", "security_review"] {
+        mcp_class_gate(root, id, gate, "pass");
+    }
+}
+
+#[test]
+fn mcp_class_transitions_refresh_prospective_types_and_preserve_imported_data() {
+    let workspace = ProtocolWorkspace::new().expect("workspace");
+    let root = workspace.path();
+    cli_json(root, &["init", "--prefix", "class"]);
+    write_mcp_class_policy(root, true, 2);
+    let bug = mcp_class_draft(root, "Class bug context", "bug", "- [x] Reviewed");
+    let task = mcp_class_draft(root, "Class task context", "task", "- [ ] Deliver task");
+    let unknown = mcp_class_draft(
+        root,
+        "Custom class context",
+        "undone_work",
+        "- [x] Reviewed",
+    );
+    for id in [&bug, &task, &unknown] {
+        prepare_mcp_class_gates(root, id);
+    }
+    let mut client = McpClient::spawn(root);
+    assert_mcp_class_scope_refusals(&mut client, root, &bug, &task, &unknown);
+    write_mcp_class_policy(root, false, 2);
+    assert_policy_refusal_unchanged(
+        &mut client,
+        root,
+        "update_issue",
+        json!({"id": bug, "status": "open", "transition_comment": "Removed class edge"}),
+        "VALIDATION_FAILED",
+    );
+    write_mcp_class_policy(root, true, 2);
+    let admitted = client.call_tool(
+        "update_issue",
+        json!({"id": bug, "status": "open", "transition_comment": "Refreshed class edge"}),
+    );
+    assert_eq!(admitted["status"], "open");
+    let prospective = client.call_tool(
+        "update_issue",
+        json!({"id": task, "type": "bug", "status": "open", "transition_comment": "Prospective class edge"}),
+    );
+    assert_eq!(prospective["status"], "open");
+    for id in [&bug, &task] {
+        let shown = first_record(cli_json(root, &["show", id]));
+        assert_eq!(shown["issue_type"], "bug");
+        assert_eq!(shown["status"], "open");
+        assert_mcp_class_transition_event(root, id);
+    }
+    cli_json(root, &["dep", "add", &task, &bug, "--type", "related"]);
+    assert_imported_checklists(
+        &mut client,
+        root,
+        &[
+            (
+                &bug,
+                "- [x] Retain preparation context",
+                "- [x] Reviewed",
+                None,
+            ),
+            (
+                &task,
+                "- [x] Retain preparation context",
+                "- [ ] Deliver task",
+                Some(&bug),
+            ),
+            (
+                &unknown,
+                "- [x] Retain preparation context",
+                "- [x] Reviewed",
+                None,
+            ),
+        ],
+    );
+    let (status, stderr) = client.finish();
+    assert!(
+        status.success() || status.code() == Some(130),
+        "{status}: {stderr}"
+    );
+}
+
+fn assert_mcp_class_scope_refusals(
+    client: &mut McpClient,
+    root: &Path,
+    bug: &str,
+    task: &str,
+    unknown: &str,
+) {
+    // MCP create has no status input: its open default still obeys initial admission.
+    assert_policy_refusal_unchanged(
+        client,
+        root,
+        "create_issue",
+        json!({"title": "Cannot skip draft", "type": "bug", "acceptance_criteria": "- [x] Ready"}),
+        "VALIDATION_FAILED",
+    );
+    for id in [task, unknown] {
+        assert_policy_refusal_unchanged(
+            client,
+            root,
+            "update_issue",
+            json!({"id": id, "status": "open", "transition_comment": "Wrong class", "force": true}),
+            "VALIDATION_FAILED",
+        );
+    }
+    assert_policy_refusal_unchanged(
+        client,
+        root,
+        "update_issue",
+        json!({"id": bug, "type": "task", "status": "open", "title": "Must not persist",
+            "transition_comment": "Old class cannot authorize"}),
+        "VALIDATION_FAILED",
+    );
+    for status in ["review", "unlisted_status"] {
+        assert_policy_refusal_unchanged(
+            client,
+            root,
+            "update_issue",
+            json!({"id": bug, "status": status, "transition_comment": "Only the named edge", "force": true}),
+            "VALIDATION_FAILED",
+        );
+    }
+    assert_policy_refusal_unchanged(
+        client,
+        root,
+        "close_issue",
+        json!({"id": bug, "reason": "Omitted edge"}),
+        "VALIDATION_FAILED",
+    );
+}
+
+fn assert_mcp_class_transition_event(root: &Path, id: &str) {
+    let connection = read_only_db(root);
+    let events = connection.query_with_params(
+        "SELECT old_value, new_value, actor FROM events WHERE issue_id = ? AND event_type = 'status_changed' ORDER BY id",
+        &[id.into()],
+    ).expect("class transition events");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].get(0), Some(&"draft".into()));
+    assert_eq!(events[0].get(1), Some(&"open".into()));
+    assert_eq!(events[0].get(2), Some(&ACTOR.into()));
+    connection.close().expect("close class event observer");
+}
+
+#[test]
+fn mcp_class_transitions_keep_required_fields_gates_capacity_and_close_guards() {
+    let workspace = ProtocolWorkspace::new().expect("workspace");
+    let root = workspace.path();
+    cli_json(root, &["init", "--prefix", "guard"]);
+    write_mcp_class_policy(root, true, 1);
+    let bug = mcp_class_draft(root, "Guarded class bug", "bug", "");
+    let occupant = mcp_class_draft(root, "Other class bug", "bug", "- [x] Ready");
+    for id in [&bug, &occupant] {
+        prepare_mcp_class_gates(root, id);
+    }
+    let mut client = McpClient::spawn(root);
+    assert_mcp_class_entry_guards(&mut client, root, &bug);
+    client.call_tool(
+        "update_issue",
+        json!({"id": occupant, "status": "open", "transition_comment": "First admission"}),
+    );
+    assert_policy_refusal_unchanged(
+        &mut client,
+        root,
+        "update_issue",
+        json!({"id": bug, "status": "open", "transition_comment": "Capacity applies", "force": true}),
+        "WORKFLOW_CAPACITY_EXCEEDED",
+    );
+    client.call_tool("update_issue", json!({"id": occupant, "status": "draft"}));
+    client.call_tool(
+        "update_issue",
+        json!({"id": bug, "status": "open", "transition_comment": "All guards satisfied"}),
+    );
+    cli_json(root, &["dep", "add", &bug, &occupant]);
+    assert_policy_refusal_unchanged(
+        &mut client,
+        root,
+        "update_issue",
+        json!({"id": bug, "status": "in_progress"}),
+        "VALIDATION_FAILED",
+    );
+    cli_json(root, &["dep", "remove", &bug, &occupant]);
+    client.call_tool("update_issue", json!({"id": bug, "status": "in_progress"}));
+    client.call_tool("update_issue", json!({"id": bug, "status": "review"}));
+    let error = assert_policy_refusal_unchanged(
+        &mut client,
+        root,
+        "close_issue",
+        json!({"id": bug}),
+        "POLICY_VIOLATION",
+    );
+    assert!(
+        contains_text(&error, "acceptance_criteria_unchecked"),
+        "{error}"
+    );
+    client.call_tool(
+        "update_issue",
+        json!({"id": bug, "check_acceptance": ["1"]}),
+    );
+    assert_eq!(
+        client.call_tool("close_issue", json!({"id": bug}))["status"],
+        "closed"
+    );
+    assert_eq!(
+        first_record(cli_json(root, &["show", &bug]))["status"],
+        "closed"
+    );
+    let (status, stderr) = client.finish();
+    assert!(
+        status.success() || status.code() == Some(130),
+        "{status}: {stderr}"
+    );
+}
+
+fn assert_mcp_class_entry_guards(client: &mut McpClient, root: &Path, bug: &str) {
+    let error = assert_policy_refusal_unchanged(
+        client,
+        root,
+        "update_issue",
+        json!({"id": bug, "status": "open", "transition_comment": "Still needs criteria"}),
+        "POLICY_VIOLATION",
+    );
+    assert!(
+        contains_text(&error, "transition_acceptance_criteria_missing"),
+        "{error}"
+    );
+    client.call_tool(
+        "update_issue",
+        json!({"id": bug, "acceptance_criteria": "- [ ] Deliver fix"}),
+    );
+    cli_json(
+        root,
+        &[
+            "comments",
+            "add",
+            bug,
+            "--message",
+            "Earlier discussion cannot authorize this transition",
+        ],
+    );
+    let error = assert_policy_refusal_unchanged(
+        client,
+        root,
+        "update_issue",
+        json!({"id": bug, "status": "open"}),
+        "POLICY_VIOLATION",
+    );
+    assert!(
+        contains_text(&error, "transition_comment_missing"),
+        "{error}"
+    );
+    for gate in ["ci_green", "security_review"] {
+        mcp_class_gate(root, bug, gate, "fail");
+        let error = assert_policy_refusal_unchanged(
+            client,
+            root,
+            "update_issue",
+            json!({"id": bug, "status": "open", "transition_comment": "Gate must pass", "force": true}),
+            "POLICY_VIOLATION",
+        );
+        assert!(contains_text(&error, &format!("gate_{gate}")), "{error}");
+        mcp_class_gate(root, bug, gate, "pass");
+    }
+}
+
+#[test]
+fn mcp_class_batch_retains_ordered_partial_results_without_loser_mutations() {
+    let workspace = ProtocolWorkspace::new().expect("workspace");
+    let root = workspace.path();
+    cli_json(root, &["init", "--prefix", "partialclass"]);
+    write_mcp_class_policy(root, true, 1);
+    let bug = mcp_class_draft(root, "Allowed batch member", "bug", "- [ ] Deliver bug");
+    let task = mcp_class_draft(root, "Refused batch member", "task", "- [ ] Deliver task");
+    for id in [&bug, &task] {
+        prepare_mcp_class_gates(root, id);
+    }
+    let mut client = McpClient::spawn(root);
+    let before = capacity_contender_state(root, &task);
+    let batch = client.call_tool("update_issue", json!({"updates": [
+        {"id": bug, "status": "open", "transition_comment": "First item commits"},
+        {"id": task, "status": "open", "title": "Must not persist", "transition_comment": "Second item refuses"}
+    ]}));
+    assert_eq!(batch["count"], 2);
+    assert_eq!(batch["ok_count"], 1);
+    assert_eq!(batch["error_count"], 1);
+    assert_eq!(batch["items"][0]["id"], bug);
+    assert_eq!(batch["items"][0]["ok"], true);
+    assert_eq!(batch["items"][1]["id"], task);
+    assert_eq!(batch["items"][1]["ok"], false);
+    assert_eq!(
+        batch["items"][1]["error"]["data"]["error_type"],
+        "VALIDATION_FAILED"
+    );
+    assert_eq!(capacity_contender_state(root, &task), before);
+    assert_eq!(
+        first_record(cli_json(root, &["show", &bug]))["status"],
+        "open"
+    );
+    assert_mcp_class_transition_event(root, &bug);
+    let comments = cli_json(root, &["comments", "list", &bug]);
+    assert_eq!(comments.as_array().expect("winner comments").len(), 1);
+    assert_eq!(comments[0]["text"], "First item commits");
+    assert_eq!(comments[0]["author"], ACTOR);
+    let (status, stderr) = client.finish();
+    assert!(
+        status.success() || status.code() == Some(130),
+        "{status}: {stderr}"
+    );
+}
+
+#[test]
+fn cli_and_mcp_class_edges_compete_for_one_capacity_slot() {
+    let workspace = ProtocolWorkspace::new().expect("workspace");
+    let root = workspace.path();
+    cli_json(root, &["init", "--prefix", "classrace"]);
+    std::fs::write(
+        root.join(".beads/policy.yaml"),
+        r"workflow:
+  strict: true
+  statuses: [draft, open, in_progress, closed]
+  transitions:
+    initial: [draft]
+    draft: [open]
+    in_progress: [open]
+  class_transitions:
+    - {issue_type: bug, from: draft, to: in_progress}
+  capacity:
+    statuses:
+      in_progress: {hard: 1}
+",
+    )
+    .expect("class capacity race policy");
+    let cli_id = mcp_class_draft(root, "CLI class contender", "bug", "- [ ] Deliver CLI");
+    let mcp_id = mcp_class_draft(root, "MCP class contender", "bug", "- [ ] Deliver MCP");
+    let mut client = McpClient::spawn(root);
+    assert_capacity_race(&mut client, root, &cli_id, &mcp_id, 0, false);
+    let (status, stderr) = client.finish();
+    assert!(
+        status.success() || status.code() == Some(130),
+        "{status}: {stderr}"
+    );
+}
+
 fn assert_mcp_presence_handoffs(client: &mut McpClient, root: &Path) {
     for criteria in ["Planning prose", "- [x] Planning review complete"] {
         let id = first_id(&client.call_tool(
