@@ -24,9 +24,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const WRITE_LOCK_WAIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const WRITE_LOCK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CONTENTION_SUCCESS_LOCK_TIMEOUT_MS: &str = "1000";
 
@@ -147,6 +147,34 @@ fn wait_for_child_to_block_on_write_lock(child: &mut std::process::Child, label:
             status.is_none(),
             "{label} should still be waiting on .write.lock; status={status:?}"
         );
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_workspace_waiters(root: &Path, count: usize) -> Vec<PathBuf> {
+    let queue = root.join(".beads/.write-waiters.lock");
+    let deadline = Instant::now() + WRITE_LOCK_WAIT_OBSERVATION_TIMEOUT;
+    loop {
+        let mut registrations = match fs::read_dir(&queue) {
+            Ok(entries) => entries
+                .map(|entry| entry.expect("read waiter entry").path())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "waiter")
+                })
+                .collect::<Vec<_>>(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("read workspace waiter queue: {error}"),
+        };
+        registrations.sort();
+        if registrations.len() == count {
+            return registrations;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected {count} published waiters, found {registrations:?}"
+        );
+        thread::sleep(WRITE_LOCK_WAIT_POLL_INTERVAL);
     }
 }
 
@@ -488,6 +516,7 @@ fn e2e_killed_writer_waiting_on_write_lock_does_not_poison_workspace() {
         ["create", "Killed while waiting for write lock", "--json"],
     );
     wait_for_child_to_block_on_write_lock(&mut blocked_writer, "writer create");
+    let registrations = wait_for_workspace_waiters(&root, 1);
 
     blocked_writer.kill().expect("kill blocked writer");
     let killed = blocked_writer
@@ -497,6 +526,10 @@ fn e2e_killed_writer_waiting_on_write_lock_does_not_poison_workspace() {
         !killed.status.success(),
         "killed writer must not report success"
     );
+    assert!(
+        registrations[0].exists(),
+        "retain the killed waiter's registration"
+    );
     drop(write_lock);
 
     let after = run_br_in_dir(&root, ["create", "After killed writer", "--json"]);
@@ -504,6 +537,10 @@ fn e2e_killed_writer_waiting_on_write_lock_does_not_poison_workspace() {
         after.success,
         "post-kill writer failed: stdout={} stderr={}",
         after.stdout, after.stderr
+    );
+    assert!(
+        registrations[0].exists(),
+        "recovery must not delete abandoned evidence"
     );
 
     let list = run_br_in_dir(&root, ["--no-auto-import", "list", "--json"]);
@@ -536,6 +573,67 @@ fn e2e_killed_writer_waiting_on_write_lock_does_not_poison_workspace() {
     );
 
     assert_doctor_healthy(&root);
+}
+
+#[test]
+#[cfg(unix)]
+fn e2e_later_writer_waits_for_registered_earlier_waiter() {
+    let _log = common::test_log("e2e_later_writer_waits_for_registered_earlier_waiter");
+    let temp = isolated_temp_dir("ordered workspace waiters");
+    let root = temp.path().to_path_buf();
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "{init:?}");
+    let beads_dir = root.join(".beads");
+    let owner = beads_rust::sync::blocking_write_lock(&beads_dir).unwrap();
+    let (acquired_sender, acquired_receiver) = std::sync::mpsc::channel();
+    let (release_sender, release_receiver) = std::sync::mpsc::channel();
+
+    let later = thread::scope(|scope| {
+        let earlier = scope.spawn(move || {
+            let lock = beads_rust::sync::blocking_write_lock_with_timeout(&beads_dir, Some(5_000))
+                .expect("earlier waiter acquires first");
+            acquired_sender.send(()).unwrap();
+            release_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            drop(lock);
+        });
+        let first = wait_for_workspace_waiters(&root, 1);
+        let mut later = spawn_br_child_in_dir(
+            &root,
+            ["create", "Later writer", "--json", "--lock-timeout", "5000"],
+        );
+        let both = wait_for_workspace_waiters(&root, 2);
+        assert_eq!(
+            first[0], both[0],
+            "later arrival must register behind the earlier waiter"
+        );
+        drop(owner);
+        acquired_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            later.try_wait().unwrap().is_none(),
+            "later writer bypassed earlier waiter"
+        );
+        release_sender.send(()).unwrap();
+        earlier.join().unwrap();
+        later
+    });
+    let output = later.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "later writer failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(wait_for_workspace_waiters(&root, 0).is_empty());
+    let issues = run_br_in_dir(&root, ["list", "--json"]);
+    assert!(issues.success, "{issues:?}");
+    let issues = extract_issues_array(&issues.stdout);
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0]["title"], "Later writer");
+    assert_upstream_sqlite_integrity_ok(&root, "ordered workspace waiters");
 }
 
 /// A broken `.write.lock` path must fail closed. Mutating commands must not
