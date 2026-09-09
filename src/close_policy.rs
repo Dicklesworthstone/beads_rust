@@ -789,6 +789,9 @@ pub enum TransitionRequiredField {
     /// The issue must have non-empty acceptance criteria after applying the
     /// prospective update; checklist items may remain unfinished.
     AcceptanceCriteriaPresent,
+    /// The separate prerequisite field must contain at least one actual
+    /// checklist item, with every item checked, after the prospective update.
+    PrerequisitesComplete,
     /// The transition request must carry a new, non-empty comment that is
     /// committed atomically with the status change.
     TransitionComment,
@@ -1155,6 +1158,7 @@ pub fn evaluate_transition_required_fields(
     from: Option<&str>,
     to: &str,
     acceptance_criteria: Option<&str>,
+    prerequisites: Option<&str>,
     transition_comment: Option<&str>,
 ) -> Vec<PolicyViolation> {
     let required = workflow.required_fields_for(from, to);
@@ -1216,6 +1220,13 @@ pub fn evaluate_transition_required_fields(
                     });
                 }
             }
+            TransitionRequiredField::PrerequisitesComplete => {
+                if let Some(violation) =
+                    evaluate_transition_prerequisites(issue_id, from, to, prerequisites)
+                {
+                    violations.push(violation);
+                }
+            }
             TransitionRequiredField::TransitionComment => {
                 if transition_comment.map(str::trim).is_none_or(str::is_empty) {
                     violations.push(PolicyViolation {
@@ -1237,6 +1248,48 @@ pub fn evaluate_transition_required_fields(
         }
     }
     violations
+}
+
+fn evaluate_transition_prerequisites(
+    issue_id: &str,
+    from: Option<&str>,
+    to: &str,
+    prerequisites: Option<&str>,
+) -> Option<PolicyViolation> {
+    let checklist =
+        crate::model::acceptance::AcceptanceChecklist::parse(prerequisites.unwrap_or_default());
+    let unchecked: Vec<String> = checklist
+        .items()
+        .into_iter()
+        .filter(|item| !item.checked)
+        .map(|item| item.text)
+        .collect();
+    if !checklist.is_empty() && unchecked.is_empty() {
+        return None;
+    }
+    let reason = if checklist.is_empty() {
+        "no_checklist_items"
+    } else {
+        "unchecked"
+    };
+    Some(PolicyViolation {
+        gate: "transition_prerequisites_incomplete".to_owned(),
+        message: format!(
+            "transition '{} -> {to}' requires a non-empty completed prerequisite checklist for {issue_id}; {} item(s), {} unchecked",
+            from.unwrap_or("initial"),
+            checklist.len(),
+            unchecked.len()
+        ),
+        detail: Some(serde_json::json!({
+            "issue_id": issue_id,
+            "from": from,
+            "to": to,
+            "required_field": "prerequisites_complete",
+            "reason": reason,
+            "total": checklist.len(),
+            "unchecked": unchecked,
+        })),
+    })
 }
 
 /// Parse a `"from -> to"` transition key into its two sides, trimming
@@ -2895,6 +2948,7 @@ mod tests {
             Some("in_progress"),
             "in_review",
             None,
+            None,
             Some("  "),
         );
         assert_eq!(missing.len(), 2);
@@ -2907,6 +2961,7 @@ mod tests {
             Some("in_progress"),
             "in_review",
             Some("## Phase one\n- [x] Built\n## Phase two\n- [ ] Verified\n"),
+            None,
             Some("Ready for a fresh review"),
         );
         assert_eq!(unchecked.len(), 1);
@@ -2926,6 +2981,7 @@ mod tests {
                 Some("in_progress"),
                 "in_review",
                 Some("- [x] Built\n- [X] Verified\n"),
+                None,
                 Some("Ready for a fresh review"),
             )
             .is_empty()
@@ -2950,6 +3006,7 @@ required_fields:
                 Some("draft"),
                 "planning",
                 criteria,
+                None,
                 Some("Begin planning"),
             );
             assert_eq!(violations.len(), 1);
@@ -2967,6 +3024,7 @@ required_fields:
                     Some("draft"),
                     "planning",
                     Some(criteria),
+                    None,
                     Some("Begin planning"),
                 )
                 .is_empty()
@@ -2978,6 +3036,7 @@ required_fields:
             Some("implementation"),
             "planning",
             Some("- [ ] Not implemented"),
+            None,
             Some("  "),
         );
         assert_eq!(combined.len(), 2);
@@ -2994,12 +3053,108 @@ required_fields:
             Some("draft"),
             "planning",
             Some("- [ ] Not implemented"),
+            None,
             Some("Begin planning"),
         );
         assert_eq!(completion.len(), 1);
         assert_eq!(
             completion[0].gate,
             "transition_acceptance_criteria_unchecked"
+        );
+    }
+
+    #[test]
+    fn prerequisite_completion_is_nonvacuous_and_composes_with_other_fields() {
+        let workflow: Workflow = serde_yml::from_str(
+            r#"
+required_fields:
+  handoff: [prerequisites_complete, acceptance_criteria_present]
+  "build -> handoff": [acceptance_criteria, transition_comment]
+"#,
+        )
+        .unwrap();
+        workflow.validate_required_fields().unwrap();
+        let acceptance = Some("- [ ] Work is still pending");
+        for prerequisites in [
+            None,
+            Some(""),
+            Some(" \t\n"),
+            Some("All preparation is done"),
+            Some("```\n- [x] Example only\n```"),
+            Some("- [x] One done\n+ [ ] Two pending"),
+        ] {
+            let violations = evaluate_transition_required_fields(
+                &workflow,
+                "stage-1",
+                Some("plan"),
+                "handoff",
+                acceptance,
+                prerequisites,
+                None,
+            );
+            assert_eq!(violations.len(), 1, "{prerequisites:?}: {violations:?}");
+            assert_eq!(violations[0].gate, "transition_prerequisites_incomplete");
+            assert_eq!(
+                violations[0].detail.as_ref().unwrap()["required_field"],
+                "prerequisites_complete"
+            );
+        }
+        let prerequisites = Some("## Prepare\n- [x] Schema ready\n* [X] Review booked\n");
+        assert!(
+            evaluate_transition_required_fields(
+                &workflow,
+                "stage-1",
+                Some("plan"),
+                "handoff",
+                acceptance,
+                prerequisites,
+                None,
+            )
+            .is_empty()
+        );
+        let composed = evaluate_transition_required_fields(
+            &workflow,
+            "stage-1",
+            Some("build"),
+            "handoff",
+            acceptance,
+            prerequisites,
+            Some(" "),
+        );
+        let gates: Vec<&str> = composed
+            .iter()
+            .map(|violation| violation.gate.as_str())
+            .collect();
+        assert_eq!(
+            gates,
+            [
+                "transition_acceptance_criteria_unchecked",
+                "transition_comment_missing"
+            ]
+        );
+        assert!(
+            evaluate_transition_required_fields(
+                &workflow,
+                "stage-1",
+                Some("build"),
+                "handoff",
+                Some("- [x] Work complete"),
+                prerequisites,
+                Some("Fresh handoff"),
+            )
+            .is_empty()
+        );
+        assert!(
+            evaluate_transition_required_fields(
+                &workflow,
+                "stage-1",
+                Some("plan"),
+                "unconfigured",
+                None,
+                None,
+                None,
+            )
+            .is_empty()
         );
     }
 
