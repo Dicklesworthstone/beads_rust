@@ -2548,11 +2548,14 @@ fn e2e_acceptance_presence_refusals_preserve_batch_fields_comments_and_export() 
             "dirty": storage.get_dirty_issue_metadata().unwrap(),
         });
         drop(storage);
-        (
-            issues,
-            audit,
-            fs::read(workspace.root.join(".beads/issues.jsonl")).unwrap(),
-        )
+        let jsonl = fs::read(workspace.root.join(".beads/issues.jsonl")).unwrap();
+        eprintln!(
+            "{}",
+            serde_json::json!({"kind": "presence_batch_state",
+            "workspace": workspace.root, "issues": issues, "audit": audit,
+            "jsonl": String::from_utf8_lossy(&jsonl)})
+        );
+        (issues, audit, jsonl)
     };
     let before = snapshot();
     for (first, second) in [(&valid, &missing), (&missing, &valid)] {
@@ -2642,10 +2645,13 @@ fn prerequisite_database_state(
         );
     }
     connection.close().unwrap();
-    (
-        state,
-        fs::read(workspace.root.join(".beads/issues.jsonl")).unwrap(),
-    )
+    let jsonl = fs::read(workspace.root.join(".beads/issues.jsonl")).unwrap();
+    eprintln!(
+        "{}",
+        serde_json::json!({"kind": "prerequisite_database_state",
+        "workspace": workspace.root, "tables": state, "jsonl": String::from_utf8_lossy(&jsonl)})
+    );
+    (state, jsonl)
 }
 
 #[test]
@@ -2737,6 +2743,8 @@ fn e2e_prerequisites_refuse_prospective_invalid_batches_without_any_persisted_ch
     ] {
         assert_stored_prerequisite_handoff(&storage, id, criteria, prerequisite);
     }
+    drop(storage);
+    let _ = prerequisite_database_state(&workspace);
 }
 
 fn assert_stored_prerequisite_handoff(
@@ -3324,6 +3332,8 @@ fn assert_corrected_class_batch(workspace: &BrWorkspace, bug: &str, task: &str) 
             1
         );
     }
+    drop(storage);
+    let _ = prerequisite_database_state(workspace);
 }
 
 #[test]

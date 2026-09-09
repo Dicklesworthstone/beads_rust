@@ -474,7 +474,30 @@ UBS remains non-clean: policy/CLI/MCP source reported two critical findings,
 storage 220, and the two integration files 17. Reported samples include
 existing test panics, non-secret comparisons, fixture SQL, and a false
 security-randomness match on `client.finish()`. No blanket warning clearance
-is claimed. The original companion 5pow5 remains unfinished for complete evidence
-retention: the existing MCP harness preserves failure transcripts but does
-not yet retain passing transcripts. This is an unreleased implementation,
-not a new published binary or full project/release qualification.
+is claimed.
+
+The companion verification now retains successful CLI and MCP observations
+through the existing test harnesses. The final CLI run passed all 242 tests
+and records both rejected batch orders plus the corrected class and
+prerequisite batches, including raw tables, audit rows, and JSONL. The final
+MCP run passed all 18 tests, with complete request/response frames, server
+stderr, successful class-transition event IDs/actors, and contention loser
+projections. All original assertions, barriers, workload counts, and
+timeouts remain intact. Final all-target/all-feature check and Clippy,
+formatting, and whitespace checks passed. UBS on the three changed test
+files reported 28 critical findings, 1,849 warnings, and 242 informational
+findings; inspected critical categories were existing test panics, the
+`client.finish()` randomness false match, and the fixed Cargo test executable
+flagged as an untrusted command. This is not a blanket scanner clearance.
+
+The retained CLI log is `companion-cli-complete-batch-traces.log` (SHA-256
+`fac25efc1c29b6013d0db6ce97473d05b7d8665484d232ba2222d4f846bd838a`);
+the final MCP log is `companion-cli-mcp-full-traces-final.log` (SHA-256
+`98817b956fc369abc998e14073db4cbec71bf77db1ec08036aa21606f284fd95`),
+both under the evidence directory above. Their actual CLI bytes match the
+independently reviewed `217bdef6...` candidate. The embedded Git SHA in that
+cached build predates the dirty class implementation; source manifests and
+the executable hash establish identity instead. Earlier incomplete logs
+remain retained. The prerequisite companion 7zm00 still requires the frozen
+release-profile sync run. These changes remain unreleased and do not complete
+the historical migration, lock fairness, or performance calibration work.

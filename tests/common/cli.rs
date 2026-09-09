@@ -323,6 +323,14 @@ where
         stderr
     );
     fs::write(&log_path, log_body).expect("write log");
+    eprintln!(
+        "{}",
+        serde_json::json!({"kind": "cli_harness", "workspace": root, "label": label,
+            "binary": assert_cmd::cargo::cargo_bin!("br"),
+            "args": cmd.get_args().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>(),
+            "exit": output.status.code(), "duration_ms": duration.as_millis(),
+            "stdout": stdout, "stderr": stderr})
+    );
 
     BrRun {
         stdout,

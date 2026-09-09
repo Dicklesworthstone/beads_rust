@@ -120,6 +120,12 @@ fn cli_json(root: &Path, args: &[&str]) -> Value {
         .output()
         .expect("run br");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    eprintln!(
+        "{}",
+        json!({"kind": "cli", "workspace": root, "binary": env!("CARGO_BIN_EXE_br"),
+            "args": args, "json_flag": true, "exit": output.status.code(),
+            "stdout": stdout, "stderr": String::from_utf8_lossy(&output.stderr)})
+    );
     assert!(
         output.status.success(),
         "br {} failed with {}\nstdout:\n{stdout}\nstderr:\n{}",
@@ -221,6 +227,11 @@ impl McpClient {
     }
 
     fn send(&mut self, message: &Value) {
+        eprintln!(
+            "{}",
+            json!({"kind": "mcp_sent", "workspace": self.root, "pid": self.child.id(),
+                "at": chrono::Utc::now(), "frame": message})
+        );
         self.trace.push(json!({"sent": message}));
         let stdin = self.stdin.as_mut().expect("serve stdin still open");
         writeln!(stdin, "{message}").expect("write to serve stdin");
@@ -257,6 +268,11 @@ impl McpClient {
             };
             let message: Value = serde_json::from_str(&line)
                 .unwrap_or_else(|err| panic!("non-JSON stdout during {method}: {err}: {line}"));
+            eprintln!(
+                "{}",
+                json!({"kind": "mcp_received", "workspace": self.root, "pid": self.child.id(),
+                    "at": chrono::Utc::now(), "frame": message})
+            );
             self.trace.push(json!({"received": message}));
             assert_eq!(message["jsonrpc"], "2.0", "invalid frame: {message}");
             if message.get("id") != Some(&json!(id)) {
@@ -357,6 +373,13 @@ impl McpClient {
             .stderr
             .recv_timeout(Duration::from_secs(2))
             .unwrap_or_default();
+        eprintln!(
+            "{}",
+            json!({"kind": "mcp_exit", "workspace": self.root, "pid": self.child.id(),
+                "binary": env!("CARGO_BIN_EXE_br"), "source": option_env!("VERGEN_GIT_SHA"),
+                "engine": env!("BR_FSQLITE_VERSION"), "mcp": cfg!(feature = "mcp"),
+                "exit": status.code(), "stderr": stderr})
+        );
         (status, stderr)
     }
 }
@@ -719,15 +742,23 @@ fn assert_policy_refusal_unchanged(
     let before = cli_json(root, &["list", "--all"]);
     let events = client.read_resource("beads://events/recent");
     let jsonl = std::fs::read(root.join(".beads/issues.jsonl")).expect("JSONL before");
+    eprintln!(
+        "{}",
+        json!({"kind": "jsonl_before_refusal", "workspace": root,
+        "jsonl": String::from_utf8_lossy(&jsonl)})
+    );
     let bookkeeping = policy_bookkeeping(root);
     let error = client.tool_error(tool, arguments);
     assert_eq!(error["data"]["error_type"], expected_error, "{error}");
     assert_eq!(cli_json(root, &["list", "--all"]), before);
     assert_eq!(client.read_resource("beads://events/recent"), events);
-    assert_eq!(
-        std::fs::read(root.join(".beads/issues.jsonl")).expect("JSONL after"),
-        jsonl
+    let jsonl_after = std::fs::read(root.join(".beads/issues.jsonl")).expect("JSONL after");
+    eprintln!(
+        "{}",
+        json!({"kind": "jsonl_after_refusal", "workspace": root,
+        "jsonl": String::from_utf8_lossy(&jsonl_after)})
     );
+    assert_eq!(jsonl_after, jsonl);
     assert_eq!(policy_bookkeeping(root), bookkeeping);
     error
 }
@@ -735,19 +766,35 @@ fn assert_policy_refusal_unchanged(
 fn assert_cli_policy_refusal_unchanged(root: &Path, args: &[&str], expected: &str) {
     let before = policy_bookkeeping(root);
     let jsonl = std::fs::read(root.join(".beads/issues.jsonl")).expect("JSONL before CLI refusal");
+    eprintln!(
+        "{}",
+        json!({"kind": "jsonl_before_cli_refusal", "workspace": root,
+        "jsonl": String::from_utf8_lossy(&jsonl)})
+    );
     let output = br_command(root)
         .args(args)
         .arg("--json")
         .output()
         .expect("CLI refusal");
+    eprintln!(
+        "{}",
+        json!({"kind": "cli_refusal", "workspace": root,
+        "args": args, "json_flag": true, "exit": output.status.code(),
+        "stdout": String::from_utf8_lossy(&output.stdout),
+        "stderr": String::from_utf8_lossy(&output.stderr)})
+    );
     assert_eq!(output.status.code(), Some(4), "{output:?}");
     let error: Value = serde_json::from_slice(&output.stdout).expect("whole CLI refusal JSON");
     assert_eq!(error["error"]["code"], expected, "{error}");
     assert_eq!(policy_bookkeeping(root), before);
-    assert_eq!(
-        std::fs::read(root.join(".beads/issues.jsonl")).expect("JSONL after CLI refusal"),
-        jsonl
+    let jsonl_after =
+        std::fs::read(root.join(".beads/issues.jsonl")).expect("JSONL after CLI refusal");
+    eprintln!(
+        "{}",
+        json!({"kind": "jsonl_after_cli_refusal", "workspace": root,
+        "jsonl": String::from_utf8_lossy(&jsonl_after)})
     );
+    assert_eq!(jsonl_after, jsonl);
 }
 
 fn read_only_db(root: &Path) -> beads_rust::franken_sync::Connection {
@@ -772,6 +819,10 @@ fn policy_bookkeeping(root: &Path) -> Value {
         "occupancy": format!("{:?}", connection.query("SELECT * FROM capacity_occupancy ORDER BY issue_id").expect("capacity occupancy")),
     });
     connection.close().expect("close observer");
+    eprintln!(
+        "{}",
+        json!({"kind": "policy_bookkeeping", "workspace": root, "rows": result})
+    );
     result
 }
 
@@ -1272,9 +1323,14 @@ fn assert_mcp_class_scope_refusals(
 fn assert_mcp_class_transition_event(root: &Path, id: &str) {
     let connection = read_only_db(root);
     let events = connection.query_with_params(
-        "SELECT old_value, new_value, actor FROM events WHERE issue_id = ? AND event_type = 'status_changed' ORDER BY id",
+        "SELECT old_value, new_value, actor, id FROM events WHERE issue_id = ? AND event_type = 'status_changed' ORDER BY id",
         &[id.into()],
     ).expect("class transition events");
+    eprintln!(
+        "{}",
+        json!({"kind": "class_transition_events", "workspace": root,
+        "id": id, "rows": format!("{events:?}")})
+    );
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0].get(0), Some(&"draft".into()));
     assert_eq!(events[0].get(1), Some(&"open".into()));
@@ -2097,6 +2153,10 @@ fn capacity_contender_state(root: &Path, id: &str) -> Value {
         .find(|line| serde_json::from_str::<Value>(line).expect("exported issue")["id"] == id)
         .expect("contender exported");
     snapshot.insert("jsonl_row".to_owned(), json!(row));
+    eprintln!(
+        "{}",
+        json!({"kind": "contender_state", "workspace": root, "id": id, "rows": snapshot})
+    );
     Value::Object(snapshot)
 }
 
@@ -2153,14 +2213,23 @@ fn run_capacity_contenders(
     let barrier = Barrier::new(3);
     thread::scope(|scope| {
         let cli_thread = scope.spawn(|| {
+            let invoked_at = chrono::Utc::now();
             let child = br_command(root)
-                .args(cli_args)
+                .args(&cli_args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
                 .expect("start CLI contender");
             barrier.wait();
-            child.wait_with_output().expect("CLI contender outcome")
+            let output = child.wait_with_output().expect("CLI contender outcome");
+            eprintln!(
+                "{}",
+                json!({"kind": "cli_contender", "workspace": root,
+                "args": cli_args, "invoked_at": invoked_at, "returned_at": chrono::Utc::now(),
+                "exit": output.status.code(), "stdout": String::from_utf8_lossy(&output.stdout),
+                "stderr": String::from_utf8_lossy(&output.stderr)})
+            );
+            output
         });
         let mcp_thread = scope.spawn(|| {
                 let request_id = client.next_id;
