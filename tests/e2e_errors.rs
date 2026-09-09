@@ -2526,6 +2526,89 @@ fn e2e_acceptance_presence_uses_prospective_content_without_completing_it() {
     }
 }
 
+/// GitHub #493: a refused non-close transition must not be worded as a
+/// close. Both the JSON `message` and the human stderr rendering name the
+/// issue and the actual `draft -> planning` edge instead.
+#[test]
+fn e2e_presence_refusal_on_non_close_transition_is_not_worded_as_closing() {
+    let workspace = acceptance_presence_workspace();
+    let create = run_br(
+        &workspace,
+        ["create", "No criteria yet", "--status", "draft", "--json"],
+        "presence_wording_create",
+    );
+    assert!(create.status.success(), "{create:?}");
+    let created: Value = serde_json::from_str(&create.stdout).unwrap();
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    let refused_json = run_br(
+        &workspace,
+        [
+            "update",
+            &id,
+            "--status",
+            "planning",
+            "--transition-comment",
+            "Begin planning",
+            "--json",
+        ],
+        "presence_wording_json",
+    );
+    assert_eq!(refused_json.status.code(), Some(4), "{refused_json:?}");
+    let error: Value = serde_json::from_str(&refused_json.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "POLICY_VIOLATION");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with(&format!("Policy violation for {id}: ")),
+        "{message}"
+    );
+    assert!(
+        message.contains("transition 'draft -> planning'"),
+        "{message}"
+    );
+    assert!(!message.contains("closing"), "{message}");
+    assert_eq!(
+        error["error"]["context"]["violations"][0]["detail"]["required_field"],
+        "acceptance_criteria_present"
+    );
+
+    let refused_human = run_br(
+        &workspace,
+        [
+            "update",
+            &id,
+            "--status",
+            "planning",
+            "--transition-comment",
+            "Begin planning",
+        ],
+        "presence_wording_human",
+    );
+    assert!(!refused_human.status.success(), "{refused_human:?}");
+    assert!(
+        refused_human.stderr.contains("Policy violation for"),
+        "{}",
+        refused_human.stderr
+    );
+    assert!(
+        refused_human
+            .stderr
+            .contains("transition 'draft -> planning'"),
+        "{}",
+        refused_human.stderr
+    );
+    assert!(
+        !refused_human.stderr.contains("closing"),
+        "{}",
+        refused_human.stderr
+    );
+
+    let show = run_br(&workspace, ["show", &id, "--json"], "presence_wording_show");
+    assert!(show.status.success(), "{show:?}");
+    let rows: Value = serde_json::from_str(&show.stdout).unwrap();
+    assert_eq!(rows[0]["status"], "draft");
+}
+
 #[test]
 fn e2e_acceptance_presence_refusals_preserve_batch_fields_comments_and_export() {
     let workspace = acceptance_presence_workspace();

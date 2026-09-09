@@ -706,3 +706,43 @@ integration-file scans report fixture panics and explicit test-binary launches.
 This is recorded triage, not a blanket scanner clearance. Qualification used
 isolated copies and a fresh solo review; it is not independent human review,
 a new release, a starvation fix, or calibrated performance acceptance.
+
+Before landing, `origin/main` advanced to `e64aa62b`. The merge preserves
+GitHub #493's operation-neutral policy error and both regression tests, while
+retaining the qualified schema implementation and fixed polling. Compared
+with the qualified implementation in `542537e5`, the only production change
+is the policy error's display prefix. The 156-target suite above remains
+pre-merge evidence; it is not a claim that every target was rerun after merging.
+
+The merged default-release executable has SHA-256
+`2ef2dde9fb8acb22813c2474ac7a4ec3858b29b1f618be277511bf69b6912a53` and is
+retained at `/data/tmp/br-merged-release-t_nqi3hf/br` on ovh-a. All 1,203 source
+manifest entries matched. It re-executed the original-copy
+migration and exact receipt-family undo, preserving every raw projection
+and the original JSONL. The full observation journal has SHA-256
+`48dc77b4401eef00f97d966533ba1972f5c6c6d476eb71aaf0f134f96c0d2e5b`.
+The case-spelling refusal also preserved the database. Its observer initially
+omitted `its` from the expected diagnostic substring; the corrected observer
+checked the retained output and hashes without rerunning or changing the CLI.
+
+Merged-source all-feature/all-target check and Clippy passed through strict
+RCH. The first check attempt failed at SSH before Cargo started; its retry
+passed. Default release passed 3,052 library tests, 66 binary tests and all
+12 selected integration targets, including the new policy regression.
+The no-default-feature library passed 3,039 tests. Existing ignores remain:
+two in each library run and eleven in text conformance. The merged-file UBS
+scan remains non-clean; the final changed-code review does not claim a
+blanket clearance of existing whole-file findings. Completed logs and the
+source manifest are also retained under
+`/data/tmp/br-yyhki-typed-20260909-r8QH57VB/`.
+
+The merged all-feature release library subsequently passed 3,132 tests with
+nine existing ignores; all 22 MCP protocol tests and the shutdown test passed.
+The MCP executable is retained at `/data/tmp/br-merged-mcp-_vjzly5k/br` on hz3
+with SHA-256
+`08c23c6f12e866f6dbef928affb6e1a72a8f4260228ccfdb1e6a3cd2229ca7eb`.
+The all-feature and no-default-feature workers each matched 868 source inputs;
+335 historical performance artifacts were absent, with no other missing or
+changed input. These runs provide feature coverage, not performance calibration.
+The final review and original-data replays were performed by the implementing
+agent; they are not independent human verification. No GitHub Actions were used.

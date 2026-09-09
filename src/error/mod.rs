@@ -293,13 +293,18 @@ pub enum BeadsError {
     },
 
     // === Policy Errors ===
-    /// One or more closure-time policy gates fired.
+    /// One or more policy gates fired: a close-policy gate, or a workflow
+    /// transition requirement (required fields / named gates) on any status
+    /// move.
     ///
     /// Display format intentionally repeats the gate that fired and a
     /// short explanation so terminal output stays readable; structured
     /// callers should serialise the inner [`crate::close_policy::PolicyViolation`]s
-    /// via [`StructuredError::context`].
-    #[error("Policy violation closing {issue_id}: {summary}")]
+    /// via [`StructuredError::context`]. The prefix is deliberately
+    /// operation-neutral: the same variant is raised for `draft ->
+    /// in_planning` as for a close, and the summary already names the
+    /// transition (GitHub #493).
+    #[error("Policy violation for {issue_id}: {summary}")]
     PolicyViolation {
         issue_id: String,
         summary: String,

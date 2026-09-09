@@ -136,6 +136,12 @@ this repo): commits `55c186682` + `5946b3b7c` in
   undo. Its five historical history, label, and concurrent-reader workloads
   also passed, along with release-profile regression, conformance, and MCP
   coverage. Existing ignored tests remain unchanged.
+- Policy refusals are no longer worded as a close. `POLICY_VIOLATION` errors
+  raised by workflow required fields or gates on any status move now render
+  as `Policy violation for <id>: transition 'draft -> planning' requires …`
+  instead of `Policy violation closing <id>: …`; the structured error code,
+  context, and violations are unchanged
+  ([#493](https://github.com/Dicklesworthstone/beads_rust/issues/493)).
 
 ## v0.5.12 — 2026-09-09
 
