@@ -8,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 17;
+pub const CURRENT_SCHEMA_VERSION: i32 = 18;
 const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
 
 // Persisted witnesses are valid only for this exact compatibility predicate.
@@ -17,7 +17,8 @@ const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
 // caused rustc to interpret hundreds of thousands of loop iterations on every
 // schema rebuild, overwhelming the compile-time savings of the runtime fast
 // path itself.
-const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str = "v14-exact-ddl-version-domain-cookie-fenced";
+const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str =
+    "v18-prerequisites-exact-ddl-version-domain-cookie-fenced";
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 const GATE_RESULT_HISTORY_MIGRATION_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS gate_result_history (
@@ -210,7 +211,7 @@ const GATE_RESULT_HISTORY_INDEXES: &[(&str, &[&str])] = &[
 /// Effects produced by one explicit reviewed schema migration.
 ///
 /// The reviewed migration surface is intentionally narrow: this binary only
-/// accepts schema 13 or 14 as input and always migrates to
+/// accepts the released schemas in [`REVIEWED_MIGRATION_SOURCE_VERSIONS`] and migrates to
 /// [`CURRENT_SCHEMA_VERSION`]. Callers use these counts to compare the
 /// transaction result with their reviewed plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +224,8 @@ pub struct ReviewedSchemaMigrationEffects {
     pub content_hash_rows_rebuilt: usize,
     /// Whether v15 created `gate_result_history` rather than finding it present.
     pub gate_result_history_created: bool,
+    /// Whether v18 appended the distinct prerequisite checklist column.
+    pub prerequisites_column_added: bool,
 }
 
 /// The complete SQL schema for the beads database.
@@ -284,6 +287,7 @@ pub const SCHEMA_SQL: &str = r"
         -- column itself stays a TEXT bag. NULL means no inherited context;
         -- emission for descendants silently skips ancestors with NULL.
         agent_context TEXT,
+        prerequisites TEXT NOT NULL DEFAULT '',
         CHECK (
             (status = 'closed' AND closed_at IS NOT NULL) OR
             (status = 'tombstone') OR
@@ -874,9 +878,9 @@ fn connection_user_version(conn: &Connection) -> Result<u32> {
 /// `br doctor migrate-schema` lifecycle. Every released schema since v13 must
 /// stay upgradeable here: 13/14 (pre-gate-history releases), 15 (the #388
 /// gate-history schema shipped in the v0.2.19-era line) and 16 (the #384
-/// capacity-exemptions schema created by the released v0.2.19 binary). See
-/// GitHub #398.
-pub const REVIEWED_MIGRATION_SOURCE_VERSIONS: [u32; 4] = [13, 14, 15, 16];
+/// capacity-exemptions schema created by the released v0.2.19 binary), and
+/// 17 (capacity occupancy, before prerequisite checklists). See GitHub #398.
+pub const REVIEWED_MIGRATION_SOURCE_VERSIONS: [u32; 5] = [13, 14, 15, 16, 17];
 
 fn current_schema_version_u32() -> Result<u32> {
     u32::try_from(CURRENT_SCHEMA_VERSION).map_err(|_| {
@@ -932,7 +936,7 @@ fn validate_reviewed_schema_migration(
     if !REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         return Err(BeadsError::internal(format!(
             "schema migrate refused — reviewed migrations are supported only from source \
-             schemas 13, 14, 15, and 16 to {supported_target} (got {from}->{target_version})"
+             schemas 13, 14, 15, 16, and 17 to {supported_target} (got {from}->{target_version})"
         )));
     }
     if marked_at.is_empty() {
@@ -957,7 +961,7 @@ fn validate_reviewed_schema_migration(
 /// `BEGIN IMMEDIATE` transaction before calling it. All validation occurs
 /// before the first migration write.
 ///
-/// Sources in [`REVIEWED_MIGRATION_SOURCE_VERSIONS`] (13, 14, 15, 16) are
+/// Sources in [`REVIEWED_MIGRATION_SOURCE_VERSIONS`] (13 through 17) are
 /// accepted, each running exactly the version-gated step chain up to
 /// `CURRENT_SCHEMA_VERSION` (#398). `marked_at` is written verbatim to every
 /// `dirty_issues` row rewritten by the v13 content-hash step, making the
@@ -1006,10 +1010,17 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
         attest_capacity_exemptions_schema(conn)?;
     }
 
-    tracing::info!(
-        "Migrating database to schema version 17 (capacity occupancy - GitHub #384 phase 5)"
-    );
-    apply_capacity_occupancy_migration_in_transaction(conn)?;
+    if from < 17 {
+        tracing::info!(
+            "Migrating database to schema version 17 (capacity occupancy - GitHub #384 phase 5)"
+        );
+        apply_capacity_occupancy_migration_in_transaction(conn)?;
+    } else {
+        attest_capacity_occupancy_schema(conn)?;
+    }
+
+    tracing::info!("Migrating database to schema version 18 (prerequisite checklists)");
+    let prerequisites_column_added = apply_prerequisites_migration_in_transaction(conn)?;
 
     conn.execute(&format!("PRAGMA user_version = {target_version}"))
         .map_err(BeadsError::Database)?;
@@ -1026,6 +1037,7 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
         to_version: target_version,
         content_hash_rows_rebuilt,
         gate_result_history_created,
+        prerequisites_column_added,
     })
 }
 
@@ -1238,6 +1250,7 @@ const ISSUE_COLUMNS: &[(&str, &str)] = &[
     // Append-at-end keeps EXPECTED_ISSUE_COLUMN_ORDER aligned for fresh
     // and migrated databases.
     ("agent_context", "TEXT"),
+    ("prerequisites", "TEXT NOT NULL DEFAULT ''"),
 ];
 
 const DEPENDENCY_COLUMNS: &[(&str, &str)] = &[
@@ -1307,6 +1320,7 @@ const ISSUES_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
     schema_column("is_template", "INTEGER", true, Some("0"), 0),
     schema_column("source_repo_path", "TEXT", false, None, 0),
     schema_column("agent_context", "TEXT", false, None, 0),
+    schema_column("prerequisites", "TEXT", true, Some("''"), 0),
 ];
 
 const DEPENDENCIES_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
@@ -2660,8 +2674,11 @@ fn core_runtime_table_declaration_canonical(
 /// only known index definitions are rebuilt by candidate maintenance.
 pub(crate) fn attest_reviewed_migration_source_core_tables(conn: &Connection) -> Result<()> {
     refuse_persistent_triggers(conn, "reviewed schema migration plan")?;
+    // Every reviewed source predates the appended v18 column. Requiring the
+    // exact old prefix also rejects a forged v17 stamp on a current schema.
+    let source_issue_columns = &ISSUES_RUNTIME_COLUMNS[..ISSUES_RUNTIME_COLUMNS.len() - 1];
     for (table, columns, indexes) in [
-        ("issues", ISSUES_RUNTIME_COLUMNS, ISSUES_RUNTIME_INDEXES),
+        ("issues", source_issue_columns, ISSUES_RUNTIME_INDEXES),
         (
             "dependencies",
             DEPENDENCIES_RUNTIME_COLUMNS,
@@ -2829,6 +2846,7 @@ const EXPECTED_ISSUE_COLUMN_ORDER: &[&str] = &[
     "is_template",
     "source_repo_path",
     "agent_context",
+    "prerequisites",
 ];
 
 /// Check whether the issues table has columns in the expected order.
@@ -3915,6 +3933,11 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         apply_capacity_occupancy_migration_in_transaction(conn)?;
     }
 
+    if user_version < 18 {
+        tracing::info!("Migrating database to schema version 18 (prerequisite checklists)");
+        apply_prerequisites_migration_in_transaction(conn)?;
+    }
+
     // Migration: Add missing indexes for bd parity
     // These use IF NOT EXISTS so they're safe to run multiple times
     execute_batch(
@@ -4367,16 +4390,38 @@ fn apply_capacity_occupancy_migration_in_transaction(conn: &Connection) -> Resul
     attest_capacity_occupancy_schema(conn)
 }
 
+/// Append the v18 prerequisite checklist without rewriting existing issue
+/// values, hashes, export bookkeeping, or audit history. Empty prerequisites
+/// have the same content hash as an issue that predates this column.
+fn apply_prerequisites_migration_in_transaction(conn: &Connection) -> Result<bool> {
+    let added = !column_exists(conn, "issues", "prerequisites");
+    if added {
+        conn.execute("ALTER TABLE issues ADD COLUMN prerequisites TEXT NOT NULL DEFAULT ''")?;
+    }
+    if !core_runtime_columns_canonical(conn, "issues", ISSUES_RUNTIME_COLUMNS, true) {
+        return Err(BeadsError::Config(
+            "schema migrate v18 post-check failed — issues prerequisite column or column order is not canonical"
+                .to_string(),
+        ));
+    }
+    Ok(added)
+}
+
 fn rebuild_content_hashes_for_current_format_in_transaction(
     conn: &Connection,
     marked_at: &str,
 ) -> Result<usize> {
-    let rows = conn.query(
+    let prerequisites = if column_exists(conn, "issues", "prerequisites") {
+        "prerequisites"
+    } else {
+        "NULL"
+    };
+    let rows = conn.query(&format!(
         "SELECT id, title, description, design, acceptance_criteria, notes, \
                 status, priority, issue_type, assignee, owner, created_by, \
-                external_ref, source_system, pinned, is_template \
-         FROM issues ORDER BY id",
-    )?;
+                external_ref, source_system, pinned, is_template, {prerequisites} \
+         FROM issues ORDER BY id"
+    ))?;
 
     let mut updated = 0;
     for row in &rows {
@@ -4404,6 +4449,7 @@ fn rebuild_content_hashes_for_current_format_in_transaction(
         let source_system = row_optional_text(row, 13);
         let pinned = row_bool(row, 14);
         let is_template = row_bool(row, 15);
+        let prerequisites = row_optional_text(row, 16);
 
         let status = status_raw
             .parse::<Status>()
@@ -4416,6 +4462,7 @@ fn rebuild_content_hashes_for_current_format_in_transaction(
             description.as_deref(),
             design.as_deref(),
             acceptance_criteria.as_deref(),
+            prerequisites.as_deref(),
             notes.as_deref(),
             &status,
             &priority,
@@ -4965,6 +5012,7 @@ mod tests {
                 to_version: current_schema_version_u32().expect("current version"),
                 content_hash_rows_rebuilt: 1,
                 gate_result_history_created: true,
+                prerequisites_column_added: false,
             }
         );
         let hash = conn
@@ -5060,6 +5108,7 @@ mod tests {
                 to_version: current_schema_version_u32().expect("current version"),
                 content_hash_rows_rebuilt: 0,
                 gate_result_history_created: true,
+                prerequisites_column_added: false,
             }
         );
         let issue = conn
@@ -5553,6 +5602,67 @@ mod tests {
                 "v17 migration missing capacity_occupancy.{column}"
             );
         }
+    }
+
+    #[test]
+    fn test_v18_prerequisites_require_explicit_upgrade_from_canonical_v17() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let source_schema =
+            SCHEMA_SQL.replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "");
+        execute_batch(&conn, &source_schema).expect("create canonical pre-prerequisite schema");
+        conn.execute("PRAGMA user_version = 17").unwrap();
+        conn.execute(
+            "INSERT INTO issues (id, title, acceptance_criteria, content_hash)
+             VALUES ('bd-upgrade', 'Preserve inputs', '- [ ] outcome', 'existing-hash')",
+        )
+        .unwrap();
+        attest_reviewed_migration_source_core_tables(&conn).expect("attest actual v17 shape");
+        assert!(!runtime_schema_compatible(&conn));
+        conn.close().unwrap();
+        let before = std::fs::read(&db_path).unwrap();
+        assert!(
+            crate::storage::SqliteStorage::open_current_read_only(&db_path)
+                .expect("inspect old schema")
+                .is_none()
+        );
+        assert_eq!(std::fs::read(&db_path).unwrap(), before);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        run_migrations_atomic(&conn, 17, 18).expect("explicit upgrade");
+        assert!(runtime_schema_compatible(&conn));
+        assert!(issues_column_order_matches(&conn));
+        let row = conn
+            .query_row("SELECT acceptance_criteria, prerequisites, content_hash FROM issues")
+            .unwrap();
+        assert_eq!(
+            row.get(0).and_then(SqliteValue::as_text),
+            Some("- [ ] outcome")
+        );
+        assert_eq!(row.get(1).and_then(SqliteValue::as_text), Some(""));
+        assert_eq!(
+            row.get(2).and_then(SqliteValue::as_text),
+            Some("existing-hash")
+        );
+        assert!(
+            conn.execute("UPDATE issues SET prerequisites = NULL")
+                .is_err(),
+            "the new column must enforce its non-null contract"
+        );
+        conn.execute("UPDATE issues SET prerequisites = '- [x] input ready'")
+            .unwrap();
+        let row = conn
+            .query_row("SELECT acceptance_criteria, prerequisites FROM issues")
+            .unwrap();
+        assert_eq!(
+            row.get(0).and_then(SqliteValue::as_text),
+            Some("- [ ] outcome")
+        );
+        assert_eq!(
+            row.get(1).and_then(SqliteValue::as_text),
+            Some("- [x] input ready")
+        );
     }
 
     /// Regression for beads_rust#290: legacy DBs that pre-date the

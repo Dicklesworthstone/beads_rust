@@ -5474,6 +5474,7 @@ fn additive_explicit_scalar_resolution_conflict(
         "description",
         "design",
         "acceptance_criteria",
+        "prerequisites",
         "notes",
         "priority",
         "issue_type",
@@ -5642,6 +5643,7 @@ fn parse_strict_additive_issue(trimmed: &str, line_num: usize) -> Result<Issue> 
         "description",
         "design",
         "acceptance_criteria",
+        "prerequisites",
         "notes",
         "status",
         "priority",
@@ -5736,6 +5738,7 @@ fn parse_strict_additive_issue(trimmed: &str, line_num: usize) -> Result<Issue> 
         ("description", issue.description.as_deref()),
         ("design", issue.design.as_deref()),
         ("acceptance_criteria", issue.acceptance_criteria.as_deref()),
+        ("prerequisites", issue.prerequisites.as_deref()),
         ("notes", issue.notes.as_deref()),
         ("assignee", issue.assignee.as_deref()),
         ("owner", issue.owner.as_deref()),
@@ -14154,6 +14157,7 @@ pub(crate) fn canonicalize_persisted_issue_defaults(issue: &mut Issue) {
         &mut issue.description,
         &mut issue.design,
         &mut issue.acceptance_criteria,
+        &mut issue.prerequisites,
         &mut issue.notes,
         &mut issue.assignee,
         &mut issue.owner,
@@ -16364,6 +16368,7 @@ mod tests {
             design: None,
             acceptance_criteria: None,
             notes: None,
+            prerequisites: None,
             status: Status::Open,
             priority: Priority::MEDIUM,
             issue_type: IssueType::Task,
@@ -17070,6 +17075,7 @@ mod tests {
             design: None,
             acceptance_criteria: None,
             notes: None,
+            prerequisites: None,
             status: Status::Open,
             priority: Priority::MEDIUM,
             issue_type: IssueType::Task,
@@ -21211,6 +21217,7 @@ mod tests {
             "description",
             "design",
             "acceptance_criteria",
+            "prerequisites",
             "notes",
             "assignee",
             "close_reason",
@@ -21234,6 +21241,7 @@ mod tests {
         assert_eq!(stored.description, None);
         assert_eq!(stored.design, None);
         assert_eq!(stored.acceptance_criteria, None);
+        assert_eq!(stored.prerequisites, None);
         assert_eq!(stored.notes, None);
         assert_eq!(stored.assignee, None);
         assert_eq!(stored.close_reason, None);
@@ -21241,9 +21249,11 @@ mod tests {
 
         let mut canonical = issue.clone();
         canonical.acceptance_criteria = Some(String::new());
+        canonical.prerequisites = Some(String::new());
         canonical.owner = Some(String::new());
         canonicalize_persisted_issue_defaults(&mut canonical);
         assert_eq!(canonical.acceptance_criteria, None);
+        assert_eq!(canonical.prerequisites, None);
         assert_eq!(canonical.owner, None);
         assert_eq!(canonical.source_repo.as_deref(), Some("."));
     }
@@ -24597,6 +24607,7 @@ mod tests {
             design: None,
             acceptance_criteria: None,
             notes: None,
+            prerequisites: None,
             status: Status::Open,
             priority: Priority::MEDIUM,
             issue_type: IssueType::Task,
@@ -24652,6 +24663,54 @@ mod tests {
             make_issue_with_hash("bd-2", "New External", fixed_time_merge(100), Some("hash2"));
         let result = merge_issue(None, None, Some(&external), ConflictResolution::PreferNewer);
         assert!(matches!(result, MergeResult::Keep(issue) if issue.id == "bd-2"));
+    }
+
+    #[test]
+    fn test_merge_prerequisite_only_changes_preserve_distinct_acceptance() {
+        let mut base = make_issue_with_hash(
+            "bd-prerequisite-merge",
+            "Preparation",
+            fixed_time_merge(100),
+            None,
+        );
+        base.acceptance_criteria = Some("- [ ] Deliver the feature".to_string());
+        base.prerequisites = Some("- [ ] Approve the interface".to_string());
+        let mut external = base.clone();
+        external.prerequisites = Some("- [x] Approve the interface\r\n".to_string());
+        // Deliberately equal timestamps and absent hashes: the field itself
+        // must distinguish a changed branch from the common ancestor.
+        let merged = merge_issue(
+            Some(&base),
+            Some(&base),
+            Some(&external),
+            ConflictResolution::Manual,
+        );
+        let MergeResult::Keep(issue) = merged else {
+            panic!("a prerequisite-only change on one branch should merge: {merged:?}");
+        };
+        assert_eq!(issue.prerequisites, external.prerequisites);
+        assert_eq!(issue.acceptance_criteria, base.acceptance_criteria);
+
+        let mut local = base.clone();
+        local.prerequisites = Some("- [x] Different local preparation".to_string());
+        assert!(matches!(
+            merge_issue(
+                Some(&base),
+                Some(&local),
+                Some(&external),
+                ConflictResolution::Manual
+            ),
+            MergeResult::Conflict(ConflictType::BothModified)
+        ));
+        assert!(matches!(
+            merge_issue(
+                Some(&base),
+                None,
+                Some(&external),
+                ConflictResolution::Manual
+            ),
+            MergeResult::Conflict(ConflictType::DeleteVsModify)
+        ));
     }
 
     #[test]

@@ -168,7 +168,7 @@ fn validate_issue_text_fields(issue: &Issue, errors: &mut Vec<ValidationError>) 
     }
     reject_nul("title", &issue.title, errors);
 
-    // Long-text fields (description, design, acceptance_criteria, notes) are
+    // Long-text fields (description, design, acceptance_criteria, prerequisites, notes) are
     // unbounded by design — these capture full specs, RFC text, agent
     // session transcripts, etc. A prior 100KB cap rejected legitimate
     // pre-existing records on JSONL rebuild and blocked workspace recovery
@@ -183,6 +183,9 @@ fn validate_issue_text_fields(issue: &Issue, errors: &mut Vec<ValidationError>) 
     }
     if let Some(s) = issue.acceptance_criteria.as_deref() {
         reject_nul("acceptance_criteria", s, errors);
+    }
+    if let Some(s) = issue.prerequisites.as_deref() {
+        reject_nul("prerequisites", s, errors);
     }
     if let Some(s) = issue.notes.as_deref() {
         reject_nul("notes", s, errors);
@@ -870,6 +873,7 @@ mod tests {
             description: None,
             design: None,
             acceptance_criteria: None,
+            prerequisites: None,
             notes: None,
             status: Status::Open,
             priority: Priority::MEDIUM,
@@ -938,6 +942,7 @@ mod tests {
         issue.description = Some("nul\0description".to_string());
         issue.design = Some("nul\0design".to_string());
         issue.acceptance_criteria = Some("nul\0acceptance".to_string());
+        issue.prerequisites = Some("nul\0prerequisites".to_string());
         issue.notes = Some("nul\0notes".to_string());
         issue.status = Status::Custom("nul\0status".to_string());
         issue.issue_type = IssueType::Custom("nul\0type".to_string());
@@ -954,6 +959,7 @@ mod tests {
             "description",
             "design",
             "acceptance_criteria",
+            "prerequisites",
             "notes",
             "status",
             "issue_type",

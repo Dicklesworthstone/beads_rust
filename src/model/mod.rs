@@ -482,6 +482,11 @@ pub struct Issue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceptance_criteria: Option<String>,
 
+    /// Per-issue prerequisite checklist, separate from acceptance criteria
+    /// and dependency edges. Policy decides which transitions require it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prerequisites: Option<String>,
+
     /// Additional notes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
@@ -654,6 +659,7 @@ impl Default for Issue {
             description: None,
             design: None,
             acceptance_criteria: None,
+            prerequisites: None,
             notes: None,
             status: Status::default(),
             priority: Priority::default(),
@@ -722,6 +728,7 @@ impl Issue {
             || self.description != other.description
             || self.design != other.design
             || self.acceptance_criteria != other.acceptance_criteria
+            || self.prerequisites != other.prerequisites
             || self.notes != other.notes
             || self.status != other.status
             || self.priority != other.priority
@@ -1040,6 +1047,7 @@ mod tests {
             design: None,
             acceptance_criteria: None,
             notes: None,
+            prerequisites: None,
             status: Status::Open,
             priority: Priority::MEDIUM,
             issue_type: IssueType::Task,
@@ -1512,6 +1520,7 @@ mod tests {
             design: None,
             acceptance_criteria: None,
             notes: None,
+            prerequisites: None,
             status: Status::Open,
             priority: Priority::MEDIUM,
             issue_type: IssueType::Task,
@@ -1744,6 +1753,27 @@ mod tests {
         issue2.due_at = Some(Utc.timestamp_opt(1_800_000_000, 0).unwrap());
 
         assert!(!issue1.sync_equals(&issue2));
+    }
+
+    #[test]
+    fn prerequisites_survive_serialization_and_affect_sync_equality() {
+        let mut issue = create_test_issue();
+        issue.acceptance_criteria = Some("- [ ] Implement behavior\n".to_owned());
+        issue.prerequisites = Some("## Prepare\r\n- [X] Review the API\r\n".to_owned());
+        let json = serde_json::to_value(&issue).unwrap();
+        assert_eq!(
+            json["prerequisites"],
+            issue.prerequisites.as_deref().unwrap()
+        );
+        let decoded: Issue = serde_json::from_value(json).unwrap();
+        assert!(issue.sync_equals(&decoded));
+        assert_eq!(decoded.acceptance_criteria, issue.acceptance_criteria);
+        let mut changed = decoded.clone();
+        changed.prerequisites = Some("- [ ] Review the API".to_owned());
+        assert!(!issue.sync_equals(&changed));
+        assert!(!changed.sync_equals(&issue));
+        changed.prerequisites = None;
+        assert!(!issue.sync_equals(&changed));
     }
 
     #[test]

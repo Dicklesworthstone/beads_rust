@@ -1676,12 +1676,13 @@ impl ReadyIssueProjection {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context"
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context,
+                         prerequisites"
             }
             Self::Command => {
                 r"SELECT id, title, description, acceptance_criteria, notes, status, priority,
                          issue_type, assignee, owner, estimated_minutes, created_at, created_by,
-                         updated_at"
+                         updated_at, prerequisites"
             }
             Self::Summary => {
                 r"SELECT id, title, status, priority, issue_type, created_at, updated_at"
@@ -1708,7 +1709,8 @@ impl SearchIssueProjection {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context,
+                         prerequisites
                   FROM issues
                   WHERE 1=1"
             }
@@ -1739,7 +1741,7 @@ impl BlockedIssueProjection {
                      i.due_at, i.defer_until, i.external_ref, i.source_system, i.source_repo,
                      i.deleted_at, i.deleted_by, i.delete_reason, i.original_type, i.compaction_level,
                      i.compacted_at, i.compacted_at_commit, i.original_size, i.sender, i.ephemeral,
-                     i.pinned, i.is_template, i.source_repo_path, i.agent_context,
+                     i.pinned, i.is_template, i.source_repo_path, i.agent_context, i.prerequisites,
                      bc.blocked_by"
             }
             Self::Command => {
@@ -1758,7 +1760,7 @@ impl BlockedIssueProjection {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template, source_repo_path, agent_context"
+                     pinned, is_template, source_repo_path, agent_context, prerequisites"
             }
             Self::Command => {
                 r"SELECT id, title, description, status, priority, issue_type,
@@ -1769,11 +1771,9 @@ impl BlockedIssueProjection {
 
     const fn cached_blocked_by_index(self) -> usize {
         match self {
-            // Bumped from 37 → 38 after `agent_context` was appended
-            // to the Full SELECT at position 37 (beads_rust#297).
-            // Source_repo_path is at 36, agent_context is at 37, so
-            // bc.blocked_by lands at 38 in the joined projection.
-            Self::Full => 38,
+            // Prerequisites is the last full issue column (38); the joined
+            // blocked-by payload follows it.
+            Self::Full => 39,
             Self::Command => 9,
         }
     }
@@ -6770,8 +6770,8 @@ impl SqliteStorage {
                     closed_by_session, due_at, defer_until, external_ref, source_system,
                     source_repo, source_repo_path, deleted_at, deleted_by, delete_reason, original_type,
                     compaction_level, compacted_at, compacted_at_commit, original_size,
-                    sender, ephemeral, pinned, is_template, agent_context
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    sender, ephemeral, pinned, is_template, agent_context, prerequisites
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 &[
                     SqliteValue::from(issue.id.as_str()),
                     SqliteValue::from(content_hash.as_str()),
@@ -6811,6 +6811,7 @@ impl SqliteStorage {
                     SqliteValue::from(i64::from(i32::from(issue.pinned))),
                     SqliteValue::from(i64::from(i32::from(issue.is_template))),
                     issue.agent_context.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                    SqliteValue::from(issue.prerequisites.as_deref().unwrap_or("")),
                 ],
             )?;
 
@@ -7116,12 +7117,18 @@ impl SqliteStorage {
                 .as_ref()
                 .map(|value| value.as_deref())
                 .unwrap_or(issue.acceptance_criteria.as_deref());
+            let prospective_prerequisites = update
+                .prerequisites
+                .as_ref()
+                .map(|value| value.as_deref())
+                .unwrap_or(issue.prerequisites.as_deref());
             let mut violations = crate::close_policy::evaluate_transition_required_fields(
                 workflow,
                 id,
                 Some(from),
                 to,
                 prospective_acceptance_criteria,
+                prospective_prerequisites,
                 update.transition_comment.as_deref(),
             );
 
@@ -7466,6 +7473,13 @@ impl SqliteStorage {
         if let Some(ref val) = updates.notes {
             issue.notes.clone_from(val);
             add_update("notes", SqliteValue::from(val.as_deref().unwrap_or("")));
+        }
+        if let Some(ref val) = updates.prerequisites {
+            issue.prerequisites.clone_from(val);
+            add_update(
+                "prerequisites",
+                SqliteValue::from(val.as_deref().unwrap_or("")),
+            );
         }
 
         // Status
@@ -8108,7 +8122,8 @@ impl SqliteStorage {
                    due_at, defer_until, external_ref, source_system, source_repo,
                    deleted_at, deleted_by, delete_reason, original_type,
                    compaction_level, compacted_at, compacted_at_commit, original_size,
-                   sender, ephemeral, pinned, is_template, source_repo_path, agent_context
+                   sender, ephemeral, pinned, is_template, source_repo_path, agent_context,
+                   prerequisites
             FROM issues
             WHERE id = ?
         ";
@@ -8148,7 +8163,8 @@ impl SqliteStorage {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context,
+                         prerequisites
                   FROM issues WHERE id IN ({})",
                 placeholders.join(",")
             );
@@ -8284,7 +8300,8 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type,
                      compaction_level, compacted_at, compacted_at_commit, original_size,
-                     sender, ephemeral, pinned, is_template, source_repo_path, agent_context",
+                     sender, ephemeral, pinned, is_template, source_repo_path, agent_context,
+                     prerequisites",
         );
 
         let mut params: Vec<SqliteValue> = Vec::new();
@@ -8476,7 +8493,8 @@ impl SqliteStorage {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context,
+                         prerequisites
                   FROM issues
                   WHERE {status_filter}
                     AND is_template = 0
@@ -14905,7 +14923,7 @@ impl SqliteStorage {
                            due_at, defer_until, external_ref, source_system, source_repo,
                            deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                            compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                           pinned, is_template, source_repo_path, agent_context
+                           pinned, is_template, source_repo_path, agent_context, prerequisites
                     FROM issues
                     WHERE (ephemeral = 0 OR ephemeral IS NULL)
                       AND id NOT LIKE '%-wisp-%'
@@ -15852,6 +15870,7 @@ impl SqliteStorage {
             description: get_non_empty_str(3),
             design: get_non_empty_str(4),
             acceptance_criteria: get_non_empty_str(5),
+            prerequisites: get_non_empty_str(38),
             notes: get_non_empty_str(6),
             status: parse_status(row.get(7).and_then(SqliteValue::as_text)),
             priority: Priority(get_opt_i32(8).unwrap_or_else(|| Priority::default().0)),
@@ -15885,11 +15904,6 @@ impl SqliteStorage {
             ephemeral: get_bool(33),
             pinned: get_bool(34),
             is_template: get_bool(35),
-            // Position 36 lands after `is_template` in the Full SELECT
-            // and before `bc.blocked_by` in the BlockedIssue::Full
-            // variant; the cached_blocked_by_index was bumped to 37
-            // in lock-step so the projection-specific blocked-by
-            // accessor still finds the right column.
             source_repo_path: get_non_empty_str(36),
             agent_context: get_non_empty_str(37),
             labels: vec![],
@@ -15925,6 +15939,7 @@ impl SqliteStorage {
             description: get_non_empty_str(2),
             design: None,
             acceptance_criteria: get_non_empty_str(3),
+            prerequisites: get_non_empty_str(14),
             notes: get_non_empty_str(4),
             status: parse_status(row.get(5).and_then(SqliteValue::as_text)),
             priority: Priority(get_opt_i32(6).unwrap_or_else(|| Priority::default().0)),
@@ -15994,6 +16009,7 @@ impl SqliteStorage {
             design: None,
             acceptance_criteria: None,
             notes: None,
+            prerequisites: None,
             status: parse_status(row.get(3).and_then(SqliteValue::as_text)),
             priority: Priority(get_opt_i32(4).unwrap_or_else(|| Priority::default().0)),
             issue_type: parse_issue_type(row.get(5).and_then(SqliteValue::as_text)),
@@ -16062,6 +16078,7 @@ impl SqliteStorage {
             design: None,
             acceptance_criteria: None,
             notes: None,
+            prerequisites: None,
             status: parse_status(row.get(2).and_then(SqliteValue::as_text)),
             priority: Priority(get_opt_i32(3).unwrap_or_else(|| Priority::default().0)),
             issue_type: parse_issue_type(row.get(4).and_then(SqliteValue::as_text)),
@@ -16124,6 +16141,7 @@ impl SqliteStorage {
             design: None,
             acceptance_criteria: None,
             notes: None,
+            prerequisites: None,
             status: parse_status(row.get(3).and_then(SqliteValue::as_text)),
             priority: Priority::default(),
             issue_type: parse_issue_type(row.get(4).and_then(SqliteValue::as_text)),
@@ -16192,6 +16210,7 @@ impl SqliteStorage {
             design: None,
             acceptance_criteria: None,
             notes: None,
+            prerequisites: None,
             status: parse_status(row.get(3).and_then(SqliteValue::as_text)),
             priority: Priority(get_opt_i32(4).unwrap_or_else(|| Priority::default().0)),
             issue_type: parse_issue_type(row.get(5).and_then(SqliteValue::as_text)),
@@ -16254,6 +16273,7 @@ impl SqliteStorage {
             design: None,
             acceptance_criteria: None,
             notes: None,
+            prerequisites: None,
             status: parse_status(row.get(2).and_then(SqliteValue::as_text)),
             priority: Priority(get_opt_i32(3).unwrap_or_else(|| Priority::default().0)),
             issue_type: parse_issue_type(row.get(4).and_then(SqliteValue::as_text)),
@@ -17945,6 +17965,7 @@ pub struct IssueUpdate {
     pub description: Option<Option<String>>,
     pub design: Option<Option<String>>,
     pub acceptance_criteria: Option<Option<String>>,
+    pub prerequisites: Option<Option<String>>,
     pub notes: Option<Option<String>>,
     pub status: Option<Status>,
     pub priority: Option<Priority>,
@@ -18000,6 +18021,7 @@ impl IssueUpdate {
             && self.description.is_none()
             && self.design.is_none()
             && self.acceptance_criteria.is_none()
+            && self.prerequisites.is_none()
             && self.notes.is_none()
             && self.status.is_none()
             && self.priority.is_none()
@@ -19272,7 +19294,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template, source_repo_path, agent_context
+                     pinned, is_template, source_repo_path, agent_context, prerequisites
                FROM issues WHERE external_ref = ?",
             &[SqliteValue::from(external_ref)],
         ) {
@@ -19295,7 +19317,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template, source_repo_path, agent_context
+                     pinned, is_template, source_repo_path, agent_context, prerequisites
                FROM issues WHERE content_hash = ?",
             &[SqliteValue::from(content_hash)],
         ) {
@@ -19397,6 +19419,7 @@ impl SqliteStorage {
                 .agent_context
                 .as_deref()
                 .map_or(SqliteValue::Null, SqliteValue::from),
+            SqliteValue::from(issue.prerequisites.as_deref().unwrap_or("")),
         ]
     }
 
@@ -19406,9 +19429,9 @@ impl SqliteStorage {
     pub(crate) fn import_issue_raw_row_for_witness(issue: &Issue) -> Result<Vec<SqliteValue>> {
         let timestamps = ImportIssueTimestampStrings::from_issue(issue);
         let mut fields = Self::import_issue_field_values(issue, &timestamps);
-        if fields.len() != 37 {
+        if fields.len() != 38 {
             return Err(BeadsError::Config(format!(
-                "Import issue raw witness expected 37 fields, found {}",
+                "Import issue raw witness expected 38 fields, found {}",
                 fields.len()
             )));
         }
@@ -19416,17 +19439,21 @@ impl SqliteStorage {
         // readability, while migrated physical schemas append it immediately
         // before agent_context. Reorder into SELECT * / schema-catalog order.
         let source_repo_path = fields.remove(23);
+        let prerequisites = fields.pop().ok_or_else(|| {
+            BeadsError::Config("Import issue raw witness lost the prerequisites field".to_string())
+        })?;
         let agent_context = fields.pop().ok_or_else(|| {
             BeadsError::Config("Import issue raw witness lost the agent_context field".to_string())
         })?;
-        let mut row = Vec::with_capacity(38);
+        let mut row = Vec::with_capacity(39);
         row.push(SqliteValue::from(issue.id.as_str()));
         row.extend(fields);
         row.push(source_repo_path);
         row.push(agent_context);
-        if row.len() != 38 {
+        row.push(prerequisites);
+        if row.len() != 39 {
             return Err(BeadsError::Config(format!(
-                "Import issue raw witness expected 38 columns, found {}",
+                "Import issue raw witness expected 39 columns, found {}",
                 row.len()
             )));
         }
@@ -19438,7 +19465,7 @@ impl SqliteStorage {
         issue: &Issue,
         timestamps: &ImportIssueTimestampStrings,
     ) -> Result<usize> {
-        let mut insert_params = Vec::with_capacity(38);
+        let mut insert_params = Vec::with_capacity(39);
         insert_params.push(SqliteValue::from(issue.id.as_str()));
         insert_params.extend(Self::import_issue_field_values(issue, timestamps));
 
@@ -19450,9 +19477,9 @@ impl SqliteStorage {
                 due_at, defer_until, external_ref, source_system, source_repo, source_repo_path,
                 deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                 compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                pinned, is_template, agent_context
+                pinned, is_template, agent_context, prerequisites
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )",
             &insert_params,
         )?;
@@ -19477,7 +19504,7 @@ impl SqliteStorage {
                 external_ref = ?, source_system = ?, source_repo = ?, source_repo_path = ?,
                 deleted_at = ?, deleted_by = ?, delete_reason = ?, original_type = ?, compaction_level = ?,
                 compacted_at = ?, compacted_at_commit = ?, original_size = ?, sender = ?,
-                ephemeral = ?, pinned = ?, is_template = ?, agent_context = ?
+                ephemeral = ?, pinned = ?, is_template = ?, agent_context = ?, prerequisites = ?
               WHERE id = ?",
             &params,
         )?;
@@ -21119,6 +21146,7 @@ mod tests {
             design: None,
             acceptance_criteria: None,
             notes: None,
+            prerequisites: None,
             assignee: assignee.map(str::to_string),
             owner: None,
             estimated_minutes: None,
@@ -21666,6 +21694,99 @@ mod tests {
             assert!(issue.acceptance_criteria.is_none());
             assert!(storage.get_comments(id).unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn prerequisite_updates_use_prospective_values_and_preserve_every_refused_row() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let workflow: crate::close_policy::Workflow = serde_yml::from_str(
+            "required_fields:\n  handoff: [prerequisites_complete, acceptance_criteria_present, transition_comment]\n",
+        ).unwrap();
+        storage.set_workflow_policy(workflow);
+        let mut issue = make_issue(
+            "bd-prepare",
+            "Prepare",
+            Status::Draft,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        issue.acceptance_criteria = Some("- [ ] Implement the API".to_owned());
+        issue.prerequisites = Some("- [x] Reviewed schema".to_owned());
+        storage.create_issue(&issue, "tester").unwrap();
+        let snapshot = |storage: &SqliteStorage| {
+            [
+                "issues",
+                "comments",
+                "events",
+                "dirty_issues",
+                "metadata",
+                "capacity_occupancy",
+                "gate_result_history",
+            ]
+            .map(|table| {
+                format!(
+                    "{:?}",
+                    storage
+                        .conn
+                        .query(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                        .unwrap()
+                )
+            })
+        };
+        let before = snapshot(&storage);
+        for replacement in [
+            None,
+            Some(""),
+            Some(" \n"),
+            Some("Only prose"),
+            Some("- [ ] Pending"),
+        ] {
+            let update = IssueUpdate {
+                status: Some(Status::Custom("handoff".to_owned())),
+                prerequisites: Some(replacement.map(str::to_owned)),
+                acceptance_criteria: Some(Some("- [ ] New unfinished criteria".to_owned())),
+                transition_comment: Some("Must not leak".to_owned()),
+                ..Default::default()
+            };
+            let error = storage
+                .update_issue(&issue.id, &update, "tester")
+                .unwrap_err();
+            assert!(
+                matches!(error, BeadsError::PolicyViolation { .. }),
+                "{error}"
+            );
+            assert_eq!(
+                snapshot(&storage),
+                before,
+                "refusal mutated state for {replacement:?}"
+            );
+        }
+        let invalidate = IssueUpdate {
+            prerequisites: Some(None),
+            ..Default::default()
+        };
+        storage
+            .update_issue(&issue.id, &invalidate, "tester")
+            .unwrap();
+        let update = IssueUpdate {
+            status: Some(Status::Custom("handoff".to_owned())),
+            prerequisites: Some(Some("+ [X] Reviewed API\r\n".to_owned())),
+            transition_comment: Some("Ready to build".to_owned()),
+            ..Default::default()
+        };
+        let handed_off = storage.update_issue(&issue.id, &update, "tester").unwrap();
+        assert_eq!(handed_off.status.as_str(), "handoff");
+        assert_eq!(handed_off.prerequisites, update.prerequisites.unwrap());
+        assert_eq!(handed_off.acceptance_criteria, issue.acceptance_criteria);
+        assert_eq!(
+            handed_off.content_hash.as_deref(),
+            Some(handed_off.compute_content_hash().as_str())
+        );
+        let comments = storage.get_comments(&issue.id).unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].body, "Ready to build");
     }
 
     #[cfg(unix)]
@@ -25412,6 +25533,7 @@ mod tests {
             design: None,
             acceptance_criteria: None,
             notes: None,
+            prerequisites: None,
             assignee: None,
             owner: None,
             estimated_minutes: None,
@@ -29229,6 +29351,7 @@ mod tests {
             design: None,
             acceptance_criteria: None,
             notes: None,
+            prerequisites: None,
             status: Status::Open,
             priority: Priority::MEDIUM,
             issue_type: IssueType::Task,
@@ -29313,6 +29436,7 @@ mod tests {
             design: None,
             acceptance_criteria: None,
             notes: None,
+            prerequisites: None,
             status: Status::Open,
             priority: Priority::MEDIUM,
             issue_type: IssueType::Task,
@@ -29391,6 +29515,7 @@ mod tests {
             design: None,
             acceptance_criteria: None,
             notes: None,
+            prerequisites: None,
             status: Status::Open,
             priority: Priority::MEDIUM,
             issue_type: IssueType::Task,
@@ -29526,6 +29651,7 @@ mod tests {
             design: None,
             acceptance_criteria: None,
             notes: None,
+            prerequisites: None,
             status: Status::Open,
             priority: Priority::MEDIUM,
             issue_type: IssueType::Task,
@@ -30147,6 +30273,7 @@ mod tests {
             design: None,
             acceptance_criteria: None,
             notes: None,
+            prerequisites: None,
             status: Status::Open,
             priority: Priority::MEDIUM,
             issue_type: IssueType::Task,
@@ -31285,6 +31412,8 @@ mod tests {
         ready.description = Some("Description".to_string());
         ready.design = Some("Should not be loaded for ready output".to_string());
         ready.acceptance_criteria = Some("AC".to_string());
+        ready.prerequisites =
+            Some("- [x] Interface reviewed\r\n- [ ] Environment ready".to_string());
         ready.notes = Some("Notes".to_string());
         ready.owner = Some("product".to_string());
         ready.estimated_minutes = Some(45);
@@ -31341,6 +31470,11 @@ mod tests {
             .collect();
 
         assert_eq!(projected, full);
+        let detailed = projected
+            .iter()
+            .find(|issue| issue.id == "bd-ready-detailed")
+            .unwrap();
+        assert_eq!(detailed.prerequisites, ready.prerequisites);
     }
 
     #[test]
@@ -36558,7 +36692,8 @@ mod tests {
                 pinned INTEGER,
                 is_template INTEGER,
                 source_repo_path TEXT,
-                agent_context TEXT
+                agent_context TEXT,
+                prerequisites TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE blocked_issues_cache (
                 issue_id TEXT PRIMARY KEY,
@@ -39655,6 +39790,8 @@ mod tests {
         timestamp.updated_at += chrono::Duration::nanoseconds(1);
         let mut content_hash = planned.clone();
         content_hash.content_hash = Some("substituted-content-hash".to_string());
+        let mut prerequisites = planned.clone();
+        prerequisites.prerequisites = Some("- [x] Unreviewed prerequisite payload".to_string());
 
         for (field, substituted) in [
             ("scalar", scalar),
@@ -39663,6 +39800,7 @@ mod tests {
             ("comment", comment),
             ("timestamp", timestamp),
             ("content_hash", content_hash),
+            ("prerequisites", prerequisites),
         ] {
             assert_eq!(substituted.id, planned.id);
             assert_sync_merge_substituted_issue_rejected_without_writes(

@@ -919,7 +919,11 @@ fn classify_create(args: &CreateArgs) -> CommandCompatibility {
     if args.title.is_none() && args.title_flag.is_none() {
         return CommandCompatibility::DirectOnly(DirectOnlyReason::MissingPayload);
     }
-    if args.ephemeral || args.parent.is_some() || !args.deps.is_empty() {
+    if args.ephemeral
+        || args.parent.is_some()
+        || !args.deps.is_empty()
+        || args.prerequisites.is_some()
+    {
         return CommandCompatibility::DirectOnly(DirectOnlyReason::UnsupportedOption);
     }
     CommandCompatibility::Candidate(CompatibleMutation::CreateIssue)
@@ -965,6 +969,7 @@ fn has_supported_update_payload(args: &UpdateArgs) -> bool {
 fn has_unsupported_update_option(args: &UpdateArgs) -> bool {
     args.design.is_some()
         || args.acceptance_criteria.is_some()
+        || args.prerequisites.is_some()
         || args.notes.is_some()
         || args.owner.is_some()
         || args.force

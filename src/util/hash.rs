@@ -58,6 +58,7 @@ impl ContentHashable for Issue {
 /// - `external_ref`, `source_system`
 /// - pinned, `is_template`
 /// - empty/default placeholders for reserved fields not represented in Rust
+/// - a domain-tagged prerequisites suffix, when the field is nonempty
 ///
 /// Fields excluded:
 /// - id, `content_hash` (circular)
@@ -79,6 +80,7 @@ pub fn content_hash(issue: &Issue) -> String {
         issue.description.as_deref(),
         issue.design.as_deref(),
         issue.acceptance_criteria.as_deref(),
+        issue.prerequisites.as_deref(),
         issue.notes.as_deref(),
         &issue.status,
         &issue.priority,
@@ -101,6 +103,7 @@ pub fn content_hash_from_parts(
     description: Option<&str>,
     design: Option<&str>,
     acceptance_criteria: Option<&str>,
+    prerequisites: Option<&str>,
     notes: Option<&str>,
     status: &Status,
     priority: &Priority,
@@ -150,6 +153,14 @@ pub fn content_hash_from_parts(
     writer.field(""); // actor
     writer.field(""); // target
     writer.field(""); // payload
+
+    // An absent or empty optional checklist leaves existing issue identities
+    // unchanged. The tagged suffix gives populated prerequisites their own
+    // unambiguous content slot without shifting any established field.
+    if let Some(prerequisites) = prerequisites.filter(|value| !value.is_empty()) {
+        writer.field("prerequisites");
+        writer.field(prerequisites);
+    }
 
     writer.finalize()
 }
@@ -204,6 +215,7 @@ mod tests {
             description: Some("A test description".to_string()),
             design: None,
             acceptance_criteria: None,
+            prerequisites: None,
             notes: None,
             status: Status::Open,
             priority: Priority::MEDIUM,
@@ -280,6 +292,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &Status::Open,
             &Priority::MEDIUM,
             &IssueType::Task,
@@ -294,6 +307,7 @@ mod tests {
         let hash_b = content_hash_from_parts(
             "x\0y",
             Some("z"),
+            None,
             None,
             None,
             None,
@@ -378,6 +392,7 @@ mod tests {
             issue.description.as_deref(),
             issue.design.as_deref(),
             issue.acceptance_criteria.as_deref(),
+            issue.prerequisites.as_deref(),
             issue.notes.as_deref(),
             &issue.status,
             &issue.priority,
@@ -391,6 +406,33 @@ mod tests {
             issue.is_template,
         );
         assert_eq!(direct, from_parts);
+    }
+
+    #[test]
+    fn prerequisite_hash_distinguishes_content_and_preserves_absent_identity() {
+        let mut issue = make_test_issue();
+        let absent = content_hash(&issue);
+        issue.prerequisites = Some(String::new());
+        assert_eq!(absent, content_hash(&issue));
+        issue.prerequisites = Some("- [x] Prepare schema".to_owned());
+        let completed = content_hash(&issue);
+        assert_ne!(absent, completed);
+        issue.prerequisites = Some("- [ ] Prepare schema".to_owned());
+        assert_ne!(completed, content_hash(&issue));
+        issue.prerequisites = None;
+        issue.acceptance_criteria = Some("- [x] Prepare schema".to_owned());
+        assert_ne!(
+            completed,
+            content_hash(&issue),
+            "the two fields cannot substitute"
+        );
+        issue.acceptance_criteria = None;
+        issue.notes = Some("prerequisites\0- [x] Prepare schema".to_owned());
+        assert_ne!(
+            completed,
+            content_hash(&issue),
+            "the suffix must retain field boundaries"
+        );
     }
 
     #[test]
