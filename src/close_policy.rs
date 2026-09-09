@@ -786,6 +786,9 @@ pub enum TransitionRequiredField {
     /// The issue must have non-empty acceptance criteria with no unchecked
     /// checklist items after applying the prospective update.
     AcceptanceCriteria,
+    /// The issue must have non-empty acceptance criteria after applying the
+    /// prospective update; checklist items may remain unfinished.
+    AcceptanceCriteriaPresent,
     /// The transition request must carry a new, non-empty comment that is
     /// committed atomically with the status change.
     TransitionComment,
@@ -1159,7 +1162,14 @@ pub fn evaluate_transition_required_fields(
 
     for field in required {
         match field {
-            TransitionRequiredField::AcceptanceCriteria => {
+            TransitionRequiredField::AcceptanceCriteria
+            | TransitionRequiredField::AcceptanceCriteriaPresent => {
+                let presence_only = field == TransitionRequiredField::AcceptanceCriteriaPresent;
+                let required_field = if presence_only {
+                    "acceptance_criteria_present"
+                } else {
+                    "acceptance_criteria"
+                };
                 let criteria = acceptance_criteria.map(str::trim).unwrap_or_default();
                 if criteria.is_empty() {
                     violations.push(PolicyViolation {
@@ -1172,10 +1182,14 @@ pub fn evaluate_transition_required_fields(
                             "issue_id": issue_id,
                             "from": from,
                             "to": to,
-                            "required_field": "acceptance_criteria",
+                            "required_field": required_field,
                             "reason": "missing",
                         })),
                     });
+                    continue;
+                }
+
+                if presence_only {
                     continue;
                 }
 
@@ -2915,6 +2929,77 @@ mod tests {
                 Some("Ready for a fresh review"),
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn transition_acceptance_presence_preserves_completion_and_comment_requirements() {
+        let mut workflow: Workflow = serde_yml::from_str(
+            r#"
+required_fields:
+  planning: [acceptance_criteria_present, transition_comment]
+  "implementation -> planning": [acceptance_criteria]
+"#,
+        )
+        .unwrap();
+        workflow.validate_required_fields().unwrap();
+        for criteria in [None, Some(""), Some(" \n\t ")] {
+            let violations = evaluate_transition_required_fields(
+                &workflow,
+                "plan-1",
+                Some("draft"),
+                "planning",
+                criteria,
+                Some("Begin planning"),
+            );
+            assert_eq!(violations.len(), 1);
+            assert_eq!(violations[0].gate, "transition_acceptance_criteria_missing");
+            assert_eq!(
+                violations[0].detail.as_ref().unwrap()["required_field"],
+                "acceptance_criteria_present"
+            );
+        }
+        for criteria in ["- [ ] Not implemented", "- [x] Verified", "Nonempty prose"] {
+            assert!(
+                evaluate_transition_required_fields(
+                    &workflow,
+                    "plan-1",
+                    Some("draft"),
+                    "planning",
+                    Some(criteria),
+                    Some("Begin planning"),
+                )
+                .is_empty()
+            );
+        }
+        let combined = evaluate_transition_required_fields(
+            &workflow,
+            "plan-1",
+            Some("implementation"),
+            "planning",
+            Some("- [ ] Not implemented"),
+            Some("  "),
+        );
+        assert_eq!(combined.len(), 2);
+        assert_eq!(combined[0].gate, "transition_acceptance_criteria_unchecked");
+        assert_eq!(combined[1].gate, "transition_comment_missing");
+
+        workflow.required_fields.insert(
+            "planning".to_owned(),
+            vec![TransitionRequiredField::AcceptanceCriteria],
+        );
+        let completion = evaluate_transition_required_fields(
+            &workflow,
+            "plan-1",
+            Some("draft"),
+            "planning",
+            Some("- [ ] Not implemented"),
+            Some("Begin planning"),
+        );
+        assert_eq!(completion.len(), 1);
+        assert_eq!(
+            completion[0].gate,
+            "transition_acceptance_criteria_unchecked"
         );
     }
 

@@ -2473,6 +2473,180 @@ workflow:
 }
 
 #[test]
+fn e2e_acceptance_presence_uses_prospective_content_without_completing_it() {
+    let workspace = acceptance_presence_workspace();
+    for (index, criteria) in ["- [ ] Implement", "- [x] Verified", "Planning prose"]
+        .into_iter()
+        .enumerate()
+    {
+        let id = create_presence_draft(&workspace, &format!("Planning {index}"), "Stored prose");
+        let transition = run_br(
+            &workspace,
+            [
+                "update",
+                &id,
+                "--status",
+                "planning",
+                "--acceptance-criteria",
+                criteria,
+                "--transition-comment",
+                "Begin planning",
+                "--json",
+            ],
+            &format!("presence_accept_{index}"),
+        );
+        assert!(transition.status.success(), "{transition:?}");
+        let show = run_br(&workspace, ["show", &id, "--json"], "presence_show");
+        assert!(show.status.success(), "{show:?}");
+        let rows: Value = serde_json::from_str(&show.stdout).unwrap();
+        assert_eq!(rows[0]["status"], "planning");
+        assert_eq!(rows[0]["acceptance_criteria"], criteria);
+        let comments = run_br(
+            &workspace,
+            ["comments", "list", &id, "--json"],
+            "presence_comments",
+        );
+        assert!(comments.status.success(), "{comments:?}");
+        let comments: Value = serde_json::from_str(&comments.stdout).unwrap();
+        assert_eq!(comments.as_array().unwrap().len(), 1);
+        assert_eq!(comments[0]["text"], "Begin planning");
+        if index == 0 {
+            let review = run_br(
+                &workspace,
+                ["update", &id, "--status", "review", "--json"],
+                "presence_review",
+            );
+            assert_eq!(review.status.code(), Some(4), "{review:?}");
+            let error: Value = serde_json::from_str(&review.stdout).unwrap();
+            assert_eq!(
+                error["error"]["context"]["violations"][0]["gate"],
+                "transition_acceptance_criteria_unchecked"
+            );
+        }
+    }
+}
+
+#[test]
+fn e2e_acceptance_presence_refusals_preserve_batch_fields_comments_and_export() {
+    let workspace = acceptance_presence_workspace();
+    let valid = create_presence_draft(&workspace, "Has criteria", "- [ ] Still pending");
+    let missing = create_presence_draft(&workspace, "Missing criteria", "");
+    let snapshot = || {
+        let show = run_br(
+            &workspace,
+            ["show", &valid, &missing, "--json"],
+            "presence_batch_state",
+        );
+        assert!(show.status.success(), "{show:?}");
+        let issues: Value = serde_json::from_str(&show.stdout).unwrap();
+        let storage = SqliteStorage::open(&workspace.root.join(".beads/beads.db")).unwrap();
+        let audit = serde_json::json!({
+            "valid_events": storage.get_events(&valid, 0).unwrap(),
+            "missing_events": storage.get_events(&missing, 0).unwrap(),
+            "valid_comments": storage.get_comments(&valid).unwrap(),
+            "missing_comments": storage.get_comments(&missing).unwrap(),
+            "dirty": storage.get_dirty_issue_metadata().unwrap(),
+        });
+        drop(storage);
+        (
+            issues,
+            audit,
+            fs::read(workspace.root.join(".beads/issues.jsonl")).unwrap(),
+        )
+    };
+    let before = snapshot();
+    for (first, second) in [(&valid, &missing), (&missing, &valid)] {
+        for replacement in [None, Some(""), Some(" \n\t ")] {
+            let mut args = vec![
+                "update",
+                first,
+                second,
+                "--status",
+                "planning",
+                "--transition-comment",
+                "Must roll back",
+                "--json",
+            ];
+            if let Some(criteria) = replacement {
+                args.extend(["--acceptance-criteria", criteria]);
+                let guarded = run_br(&workspace, args.clone(), "presence_overwrite_guard");
+                assert_eq!(guarded.status.code(), Some(4), "{guarded:?}");
+                let error: Value = serde_json::from_str(&guarded.stdout).unwrap();
+                assert_eq!(error["error"]["code"], "VALIDATION_FAILED");
+                assert_eq!(error["error"]["context"]["field"], "update");
+                assert_eq!(
+                    snapshot(),
+                    before,
+                    "overwrite refusal changed persisted state"
+                );
+                // Force authorizes replacing the text; it must not bypass policy.
+                args.push("--force");
+            }
+            let refused = run_br(&workspace, args, "presence_batch_refused");
+            assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+            let error: Value = serde_json::from_str(&refused.stdout).unwrap();
+            assert_eq!(error["error"]["code"], "POLICY_VIOLATION");
+            assert_eq!(
+                error["error"]["context"]["violations"][0]["detail"]["required_field"],
+                "acceptance_criteria_present"
+            );
+            assert_eq!(snapshot(), before, "rejected batch changed persisted state");
+        }
+    }
+    let no_comment = run_br(
+        &workspace,
+        [
+            "update",
+            &valid,
+            "--status",
+            "planning",
+            "--acceptance-criteria",
+            "Replacement",
+            "--json",
+        ],
+        "presence_missing_comment",
+    );
+    assert_eq!(no_comment.status.code(), Some(4), "{no_comment:?}");
+    let error: Value = serde_json::from_str(&no_comment.stdout).unwrap();
+    assert_eq!(
+        error["error"]["context"]["violations"][0]["gate"],
+        "transition_comment_missing"
+    );
+    assert_eq!(snapshot(), before);
+}
+
+fn acceptance_presence_workspace() -> BrWorkspace {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "presence_init");
+    assert!(init.status.success(), "{init:?}");
+    fs::write(
+        workspace.root.join(".beads/policy.yaml"),
+        "workflow:\n  required_fields:\n    planning: [acceptance_criteria_present, transition_comment]\n    review: [acceptance_criteria]\n",
+    )
+    .unwrap();
+    workspace
+}
+
+fn create_presence_draft(workspace: &BrWorkspace, title: &str, criteria: &str) -> String {
+    let create = run_br(
+        workspace,
+        [
+            "create",
+            title,
+            "--status",
+            "draft",
+            "--acceptance-criteria",
+            criteria,
+            "--json",
+        ],
+        "presence_create",
+    );
+    assert!(create.status.success(), "{create:?}");
+    let issue: Value = serde_json::from_str(&create.stdout).unwrap();
+    issue["id"].as_str().unwrap().to_owned()
+}
+
+#[test]
 fn e2e_workflow_capacity_rejection_is_structured_and_atomic() {
     let _log = common::test_log("e2e_workflow_capacity_rejection_is_structured_and_atomic");
     let workspace = BrWorkspace::new();

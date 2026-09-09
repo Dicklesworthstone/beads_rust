@@ -1369,6 +1369,9 @@ reviewer providers (provider name `reviewer`, or namespaced `reviewer:<who>` /
 workflow:
   strict: true
   required_fields:
+    "draft -> in_planning":
+      - acceptance_criteria_present
+      - transition_comment
     in_review:
       - transition_comment
     "in_progress -> in_review":
@@ -1387,8 +1390,11 @@ workflow:
 ```
 
 `required_fields` accepts exact `"from -> to"` keys and bare target-status
-keys; matching rules compose. `acceptance_criteria` validates the prospective
-field value and rejects any unchecked markdown checklist item.
+keys; matching rules compose. `acceptance_criteria_present` requires a nonempty
+prospective field value, accepting prose and unfinished checklists without
+changing their items. `acceptance_criteria` additionally rejects any unchecked
+Markdown checklist item. If both requirements match, completion is still
+required. Both reject absent, empty, and whitespace-only criteria.
 `transition_comment` must be a new non-empty comment carried by the same
 request; old comments are intentionally ignored. Validation and comment/status
 mutation share one transaction, and a failed item rolls back the entire

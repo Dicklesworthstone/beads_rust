@@ -233,3 +233,29 @@ Evidence is in the existing qualification root above and
 acceptance and bounded solo review. These are source-qualification results,
 not seven-platform release or publication receipts. GitHub Actions remain
 disabled, and v0.5.11 still has its original 24 assets.
+
+### September 9 — acceptance presence after the v0.5.12 freeze
+
+Reviewed the complete `src/close_policy.rs`, `tests/e2e_errors.rs`, and
+CLI-reference diff after frozen source `366c69a63fe18260afc4deff798850053954cac9`.
+The new opt-in spelling is `acceptance_criteria_present`; the completion rule
+is unchanged. Exact-edge and target-state rules compose. The real CLI matrix
+checks prospective text, checked and unchecked checklists, prose, absent or
+blank values, both batch orders, fresh comments, and unchanged persisted state
+after refusal. Destructive text replacement first encounters the existing
+overwrite guard; explicit `--force` still cannot bypass the policy.
+
+Strict RCH passed 111 policy units, 237 CLI error tests, 10 MCP protocol tests,
+and all-target/all-feature Clippy and check. The first new test run failed
+because it expected the internal comment field name instead of JSON `text`
+and overlooked the overwrite guard; the corrected tests retain both guards'
+state-preservation assertions. Initial whole-target lint/check attempts hit
+the unchanged 300-second cap; documented split runs warmed the same worker,
+then whole-target commands passed. Formatting and `git diff --check` pass.
+No snapshots, ignored tests, lint suppressions, or time limits changed.
+
+This closes only the presence implementation subtask. Bead g8cib remains open
+for a distinct prerequisite field and its CLI/MCP/storage/sync behavior;
+7zm00 retains the full proof matrix. The existing MCP suite passed, but does
+not itself establish a new presence-specific MCP scenario. These changes do
+not belong in the pending v0.5.12 release notes or packaged source.

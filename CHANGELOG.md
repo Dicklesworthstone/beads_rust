@@ -15,8 +15,9 @@ This changelog is organized by capability rather than diff order. Each version s
 
 **Scope window:** every version from inception (v0.1.0, 2026-01-18) through the current
 release (v0.5.11, 2026-09-08), plus the post-release distribution follow-up
-and unreleased fixes through
-[d42ced50](https://github.com/Dicklesworthstone/beads_rust/commit/d42ced50).
+and the pending v0.5.12 fixes through
+[d42ced50](https://github.com/Dicklesworthstone/beads_rust/commit/d42ced50),
+plus the post-freeze workflow change described under Unreleased.
 The full per-version detail is in the sections below; the timeline names the
 recent line and the milestone anchors. The September 8 audit examined all 79
 commits in `v0.5.10..v0.5.11` and six subsequent commits against Git diffs,
@@ -81,6 +82,19 @@ this repo): commits `55c186682` + `5946b3b7c` in
 <https://github.com/Dicklesworthstone/frankensqlite>, shipped as fsqlite 0.3.12.
 
 ---
+
+## Unreleased — after the v0.5.12 source freeze
+
+- Workflow `required_fields` accepts `acceptance_criteria_present`: a planning
+  transition can require written criteria while leaving checklist items
+  unfinished. Empty and whitespace-only values fail. The existing
+  `acceptance_criteria` completion requirement and separately requested fresh
+  transition comments still apply; matching requirements compose. Validation
+  uses the prospective value, and rejected batches preserve fields, comments,
+  audit events, and JSONL. This implements the presence portion of
+  [#493](https://github.com/Dicklesworthstone/beads_rust/issues/493); a distinct
+  prerequisite checklist remains unfinished. This change is outside the
+  frozen v0.5.12 source.
 
 ## v0.5.12 — pending release
 
