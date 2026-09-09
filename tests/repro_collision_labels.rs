@@ -19,6 +19,7 @@ fn make_issue(id: &str, title: &str) -> Issue {
         // Defaults
         design: None,
         acceptance_criteria: None,
+        prerequisites: None,
         notes: None,
         assignee: None,
         owner: None,

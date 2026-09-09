@@ -334,6 +334,88 @@ fn bare_sync_refused_and_reconcile_mode_exclusive() {
 // ============================================================================
 
 #[test]
+fn prerequisite_only_reconcile_preserves_acceptance_and_audit() {
+    let ws = BrWorkspace::new();
+    init_workspace(&ws, "prerequisite");
+    let id = create_issue(&ws, "Prepare before implementation", "prerequisite_create");
+    let criteria = "- [ ] Implement the real API\r\n";
+    let original = "- [ ] Review the API\n";
+    let completed = "## Preparation\n- [X] Review the API\n";
+    let set = run_br(
+        &ws,
+        [
+            "update",
+            &id,
+            "--acceptance-criteria",
+            criteria,
+            "--prerequisites",
+            original,
+            "--json",
+        ],
+        "prerequisite_set",
+    );
+    assert!(set.status.success(), "{set:?}");
+    let before = SqliteStorage::open(&db_path(&ws)).unwrap();
+    let events = before.get_all_events(0).unwrap();
+    let original_issue = before.get_issue(&id).unwrap().unwrap();
+    let newer = original_issue.updated_at + chrono::Duration::seconds(1);
+    let hash = original_issue.content_hash;
+    drop(before);
+    let mut lines = read_jsonl_lines(&ws);
+    assert_eq!(lines.len(), 1);
+    lines[0] = set_row_field(&lines[0], "prerequisites", json!(completed));
+    lines[0] = set_row_field(&lines[0], "updated_at", json!(newer));
+    write_jsonl_lines(&ws, &lines);
+    let source = fs::read(jsonl_path(&ws)).unwrap();
+    let dry = run_br(
+        &ws,
+        ["sync", "--reconcile", "--dry-run", "--json"],
+        "prerequisite_reconcile_dry",
+    );
+    assert!(dry.status.success(), "{dry:?}");
+    let dry_receipt: Value = serde_json::from_str(&dry.stdout).unwrap();
+    assert_eq!(plan_count(&dry_receipt, "updated"), 1);
+    let unchanged = SqliteStorage::open(&db_path(&ws)).unwrap();
+    assert_eq!(
+        unchanged
+            .get_issue(&id)
+            .unwrap()
+            .unwrap()
+            .prerequisites
+            .as_deref(),
+        Some(original)
+    );
+    assert_eq!(unchanged.get_all_events(0).unwrap(), events);
+    drop(unchanged);
+    let apply = run_br(
+        &ws,
+        ["sync", "--reconcile", "--json"],
+        "prerequisite_reconcile_apply",
+    );
+    assert!(apply.status.success(), "{apply:?}");
+    assert_eq!(fs::read(jsonl_path(&ws)).unwrap(), source);
+    let after = SqliteStorage::open(&db_path(&ws)).unwrap();
+    let issue = after.get_issue(&id).unwrap().unwrap();
+    assert_eq!(issue.prerequisites.as_deref(), Some(completed));
+    assert_eq!(issue.acceptance_criteria.as_deref(), Some(criteria));
+    assert_ne!(issue.content_hash, hash);
+    assert_eq!(after.get_all_events(0).unwrap(), events);
+    drop(after);
+    let repeated = run_br(
+        &ws,
+        ["sync", "--reconcile", "--json"],
+        "prerequisite_reconcile_noop",
+    );
+    assert!(repeated.status.success(), "{repeated:?}");
+    let repeated_receipt: Value = serde_json::from_str(&repeated.stdout).unwrap();
+    assert_eq!(plan_count(&repeated_receipt, "updated"), 0);
+    assert_eq!(plan_count(&repeated_receipt, "skipped_equal"), 1);
+    assert_eq!(fs::read(jsonl_path(&ws)).unwrap(), source);
+    let repeated_storage = SqliteStorage::open(&db_path(&ws)).unwrap();
+    assert_eq!(repeated_storage.get_all_events(0).unwrap(), events);
+}
+
+#[test]
 fn source_repo_path_migration_reconciles_and_is_idempotent() {
     let ws = BrWorkspace::new();
     init_workspace(&ws, "pathmig");

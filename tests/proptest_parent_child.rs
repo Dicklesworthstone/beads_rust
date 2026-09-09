@@ -26,6 +26,7 @@ fn make_test_issue(id: &str) -> Issue {
         description: None,
         design: None,
         acceptance_criteria: None,
+        prerequisites: None,
         notes: None,
         assignee: None,
         owner: None,

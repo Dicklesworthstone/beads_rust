@@ -269,6 +269,7 @@ fn content_hash_deterministic_fixture() {
         None,
         None,
         None,
+        None,
         &Status::Open,
         &Priority::HIGH,
         &IssueType::Bug,
@@ -284,6 +285,7 @@ fn content_hash_deterministic_fixture() {
     let hash2 = content_hash_from_parts(
         "Fix authentication bug",
         Some("Users are getting logged out unexpectedly"),
+        None,
         None,
         None,
         None,
@@ -320,6 +322,7 @@ fn exp_101_no_collision() {
         None,
         None,
         None,
+        None,
         &Status::Open,
         &Priority::MEDIUM,
         &IssueType::Task,
@@ -334,6 +337,7 @@ fn exp_101_no_collision() {
     let hash_b = content_hash_from_parts(
         "x\0y",
         Some("z"),
+        None,
         None,
         None,
         None,
@@ -380,6 +384,7 @@ fn content_hash_title_sensitivity() {
         None,
         None,
         None,
+        None,
         &Status::Open,
         &Priority::MEDIUM,
         &IssueType::Task,
@@ -394,6 +399,7 @@ fn content_hash_title_sensitivity() {
 
     let hash2 = content_hash_from_parts(
         "Title Two",
+        None,
         None,
         None,
         None,
@@ -441,6 +447,7 @@ fn content_hash_status_sensitivity() {
         base_args.1,
         base_args.2,
         base_args.3,
+        None,
         base_args.4,
         &Status::Open,
         base_args.5,
@@ -459,6 +466,7 @@ fn content_hash_status_sensitivity() {
         base_args.1,
         base_args.2,
         base_args.3,
+        None,
         base_args.4,
         &Status::Closed,
         base_args.5,
@@ -487,6 +495,7 @@ fn content_hash_priority_sensitivity() {
         None,
         None,
         None,
+        None,
         &Status::Open,
         &Priority::HIGH,
         &IssueType::Task,
@@ -501,6 +510,7 @@ fn content_hash_priority_sensitivity() {
 
     let hash_p3 = content_hash_from_parts(
         "Test",
+        None,
         None,
         None,
         None,
@@ -532,6 +542,7 @@ fn content_hash_type_sensitivity() {
         None,
         None,
         None,
+        None,
         &Status::Open,
         &Priority::MEDIUM,
         &IssueType::Bug,
@@ -546,6 +557,7 @@ fn content_hash_type_sensitivity() {
 
     let hash_feature = content_hash_from_parts(
         "Test",
+        None,
         None,
         None,
         None,
@@ -577,6 +589,7 @@ fn content_hash_boolean_sensitivity() {
         None,
         None,
         None,
+        None,
         &Status::Open,
         &Priority::MEDIUM,
         &IssueType::Task,
@@ -595,6 +608,7 @@ fn content_hash_boolean_sensitivity() {
         None,
         None,
         None,
+        None,
         &Status::Open,
         &Priority::MEDIUM,
         &IssueType::Task,
@@ -609,6 +623,7 @@ fn content_hash_boolean_sensitivity() {
 
     let hash_template = content_hash_from_parts(
         "Test",
+        None,
         None,
         None,
         None,
@@ -646,6 +661,7 @@ fn content_hash_trait_implementation() {
         description: Some("Description".to_string()),
         design: None,
         acceptance_criteria: None,
+        prerequisites: None,
         notes: None,
         status: Status::Open,
         priority: Priority::MEDIUM,
@@ -723,6 +739,7 @@ fn content_hash_optional_fields() {
         None,
         None,
         None,
+        None,
         &Status::Open,
         &Priority::MEDIUM,
         &IssueType::Task,
@@ -739,6 +756,7 @@ fn content_hash_optional_fields() {
     let hash_desc = content_hash_from_parts(
         "Test",
         Some("Description"),
+        None,
         None,
         None,
         None,
@@ -761,6 +779,7 @@ fn content_hash_optional_fields() {
         Some("Design notes"),
         None,
         None,
+        None,
         &Status::Open,
         &Priority::MEDIUM,
         &IssueType::Task,
@@ -776,6 +795,7 @@ fn content_hash_optional_fields() {
     // With external_ref
     let hash_ext = content_hash_from_parts(
         "Test",
+        None,
         None,
         None,
         None,

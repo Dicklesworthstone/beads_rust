@@ -412,6 +412,7 @@ fn conformance_content_hash_matches_length_prefixed_br_fixture() {
         Some("Users are getting logged out unexpectedly"),
         Some("Use token refresh"),
         Some("Session survives refresh"),
+        None,
         Some("Check logs"),
         &Status::InProgress,
         &Priority::HIGH,

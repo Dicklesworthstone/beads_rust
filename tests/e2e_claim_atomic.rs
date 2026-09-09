@@ -23,6 +23,7 @@ fn seed_issue(storage: &mut SqliteStorage, id: &str, assignee: Option<&str>) {
         description: None,
         design: None,
         acceptance_criteria: None,
+        prerequisites: None,
         notes: None,
         owner: None,
         estimated_minutes: None,

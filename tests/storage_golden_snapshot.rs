@@ -34,6 +34,7 @@ fn fixed_issue() -> Issue {
         description: Some("Initial description".to_string()),
         design: None,
         acceptance_criteria: None,
+        prerequisites: None,
         notes: None,
         status: Status::Open,
         priority: Priority::MEDIUM,

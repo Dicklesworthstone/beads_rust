@@ -13,6 +13,7 @@ fn make_issue(id: &str, title: &str) -> Issue {
         description: None,
         design: None,
         acceptance_criteria: None,
+        prerequisites: None,
         notes: None,
         status: Status::Open,
         priority: Priority::MEDIUM,

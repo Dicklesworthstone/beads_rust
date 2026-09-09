@@ -26,6 +26,7 @@ pub fn issue(title: &str) -> Issue {
         content_hash: None,
         design: None,
         acceptance_criteria: None,
+        prerequisites: None,
         notes: None,
         owner: None,
         estimated_minutes: None,

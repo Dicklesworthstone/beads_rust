@@ -763,6 +763,8 @@ fn policy_bookkeeping(root: &Path) -> Value {
     // Read the stored rows directly without opening a mutable storage facade.
     // Debug preserves the SQL value types and every column in this comparison.
     let result = json!({
+        "issues": format!("{:?}", connection.query("SELECT * FROM issues ORDER BY id").expect("all issue fields")),
+        "comments": format!("{:?}", connection.query("SELECT * FROM comments ORDER BY id").expect("all comments")),
         "events": format!("{:?}", connection.query("SELECT * FROM events ORDER BY id").expect("events including status revisions")),
         "gates": format!("{:?}", connection.query("SELECT * FROM gate_result_history ORDER BY id").expect("gate history")),
         "legacy_gates": format!("{:?}", connection.query("SELECT * FROM gate_results ORDER BY issue_id, gate, provider").expect("legacy gates")),
@@ -964,6 +966,262 @@ fn mcp_honors_required_fields_fresh_gates_and_exact_custom_status_names() {
     );
 }
 
+#[test]
+fn mcp_prerequisites_and_acceptance_round_trip_through_prospective_policy() {
+    let workspace = ProtocolWorkspace::new().expect("workspace");
+    let root = workspace.path();
+    cli_json(root, &["init", "--prefix", "prereq"]);
+    let mut client = McpClient::spawn(root);
+    let pending = "Preparation:\r\n- [ ] accès approved\r\n";
+    let complete = "Preparation:\r\n- [x] accès approved\r\n";
+    let acceptance = "Delivery:\n- [ ] implement feature\n";
+    let cli_pending = "- [ ] Review the CLI interface\n";
+    let cli_acceptance = "- [ ] Ship the CLI behavior\n";
+    let created = client.call_tool(
+        "create_issue",
+        json!({"title": "Independent checklists", "prerequisites": pending,
+            "acceptance_criteria": acceptance}),
+    );
+    let id = created["id"].as_str().expect("created ID");
+    assert_checklist_fields(&mut client, root, id, pending, acceptance);
+    let cli_id = first_id(&cli_json(
+        root,
+        &[
+            "create",
+            "CLI checklist source",
+            "--prerequisites",
+            cli_pending,
+            "--acceptance-criteria",
+            cli_acceptance,
+        ],
+    ));
+    write_prerequisite_policy(root, "in_planning", "acceptance_criteria_present");
+    let changed = client.call_tool(
+        "update_issue",
+        json!({"id": id, "status": "in_planning", "prerequisites": complete,
+            "acceptance_criteria": acceptance, "transition_comment": "Ready to plan"}),
+    );
+    assert_eq!(changed["status"], "in_planning");
+    assert_checklist_fields(&mut client, root, id, complete, acceptance);
+    let shown = client.call_tool("show_issue", json!({"id": id}));
+    assert_eq!(shown["comments"][0]["text"], "Ready to plan", "{shown}");
+    assert_imported_checklists(
+        root,
+        &[
+            (id, complete, acceptance),
+            (&cli_id, cli_pending, cli_acceptance),
+        ],
+    );
+
+    // The same running server must observe the newly strengthened target rule.
+    write_prerequisite_policy(root, "in_implementation", "acceptance_criteria");
+    assert_policy_refusal_unchanged(
+        &mut client,
+        root,
+        "update_issue",
+        json!({"id": id, "status": "in_implementation", "force": true,
+            "transition_comment": "Completion now required"}),
+        "POLICY_VIOLATION",
+    );
+    client.call_tool(
+        "update_issue",
+        json!({"id": id, "status": "in_implementation", "check_acceptance": ["1"],
+            "transition_comment": "Implementation complete"}),
+    );
+    assert_checklist_fields(
+        &mut client,
+        root,
+        id,
+        complete,
+        "Delivery:\n- [x] implement feature\n",
+    );
+    let (status, stderr) = client.finish();
+    assert!(
+        status.success() || status.code() == Some(130),
+        "{status}: {stderr}"
+    );
+}
+
+fn write_prerequisite_policy(root: &Path, target: &str, acceptance_requirement: &str) {
+    std::fs::write(
+        root.join(".beads/policy.yaml"),
+        format!(
+            "workflow:\n  strict: true\n  statuses: [open, in_planning, in_implementation, closed]\n  required_fields:\n    {target}: [prerequisites_complete, {acceptance_requirement}, transition_comment]\n"
+        ),
+    )
+    .expect("prerequisite policy");
+}
+
+fn assert_imported_checklists(source: &Path, issues: &[(&str, &str, &str)]) {
+    let imported = ProtocolWorkspace::new().expect("second independent workspace");
+    let root = imported.path();
+    cli_json(root, &["init", "--prefix", "imported"]);
+    std::fs::copy(
+        source.join(".beads/issues.jsonl"),
+        root.join(".beads/issues.jsonl"),
+    )
+    .expect("copy actual source export into import workspace");
+    cli_json(root, &["sync", "--import-only"]);
+    let mut client = McpClient::spawn(root);
+    for (id, prerequisites, acceptance) in issues {
+        assert_checklist_fields(&mut client, root, id, prerequisites, acceptance);
+    }
+    let (status, stderr) = client.finish();
+    assert!(
+        status.success() || status.code() == Some(130),
+        "{status}: {stderr}"
+    );
+}
+
+fn assert_checklist_fields(
+    client: &mut McpClient,
+    root: &Path,
+    id: &str,
+    prerequisites: &str,
+    acceptance: &str,
+) {
+    let jsonl = std::fs::read_to_string(root.join(".beads/issues.jsonl")).expect("JSONL");
+    let exported = jsonl
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("exported issue"))
+        .find(|issue| issue["id"] == id)
+        .expect("created issue exported");
+    for shown in [
+        client.call_tool("show_issue", json!({"id": id})),
+        first_record(cli_json(root, &["show", id])),
+        exported,
+    ] {
+        assert_eq!(shown["prerequisites"], prerequisites, "{shown}");
+        assert_eq!(shown["acceptance_criteria"], acceptance, "{shown}");
+        assert!(
+            shown
+                .get("dependencies")
+                .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty)),
+            "prerequisite text must not create edges: {shown}"
+        );
+    }
+}
+
+#[test]
+fn mcp_prerequisite_refusals_use_new_values_and_ignore_force() {
+    let workspace = ProtocolWorkspace::new().expect("workspace");
+    let root = workspace.path();
+    cli_json(root, &["init", "--prefix", "prereq"]);
+    let mut client = McpClient::spawn(root);
+    let absent = first_id(&client.call_tool(
+        "create_issue",
+        json!({"title": "Absent prerequisites", "acceptance_criteria": "- [ ] deliver"}),
+    ));
+    let complete = first_id(&client.call_tool(
+        "create_issue",
+        json!({"title": "Previously complete prerequisites", "prerequisites": "- [x] access",
+            "acceptance_criteria": "- [ ] deliver"}),
+    ));
+    write_prerequisite_policy(root, "in_planning", "acceptance_criteria_present");
+    for force in [false, true] {
+        assert_policy_refusal_unchanged(
+            &mut client,
+            root,
+            "update_issue",
+            json!({"id": absent, "status": "in_planning", "force": force,
+                "transition_comment": "Cannot authorize absent prerequisites"}),
+            "POLICY_VIOLATION",
+        );
+    }
+    for id in [&absent, &complete] {
+        for replacement in [
+            Value::Null,
+            json!(""),
+            json!(" \t\n"),
+            json!("All done"),
+            json!("- [ ] access"),
+        ] {
+            assert_policy_refusal_unchanged(
+                &mut client,
+                root,
+                "update_issue",
+                json!({"id": id, "status": "in_planning", "prerequisites": replacement,
+                    "title": "Must roll back", "force": true,
+                    "transition_comment": "Invalid prospective checklist", "comment": "Must not append"}),
+                "POLICY_VIOLATION",
+            );
+        }
+    }
+    assert_policy_refusal_unchanged(
+        &mut client,
+        root,
+        "update_issue",
+        json!({"id": absent, "status": "in_planning", "prerequisites": "- [x] access",
+            "acceptance_criteria": " ", "force": true, "transition_comment": "Criteria still required"}),
+        "POLICY_VIOLATION",
+    );
+    assert_policy_refusal_unchanged(
+        &mut client,
+        root,
+        "update_issue",
+        json!({"id": absent, "status": "in_planning", "prerequisites": "- [x] access"}),
+        "POLICY_VIOLATION",
+    );
+    let (status, stderr) = client.finish();
+    assert!(
+        status.success() || status.code() == Some(130),
+        "{status}: {stderr}"
+    );
+}
+
+#[test]
+fn mcp_whole_checklist_replacements_are_guarded_and_conflict_with_item_edits() {
+    let workspace = ProtocolWorkspace::new().expect("workspace");
+    let root = workspace.path();
+    cli_json(root, &["init", "--prefix", "prereq"]);
+    let mut client = McpClient::spawn(root);
+    let created = client.call_tool(
+        "create_issue",
+        json!({"title": "Guarded checklists", "prerequisites": "- [x] access approved",
+            "acceptance_criteria": "- [ ] feature delivered"}),
+    );
+    let id = created["id"].as_str().expect("created ID");
+    for field in ["prerequisites", "acceptance_criteria"] {
+        for replacement in [Value::Null, json!(""), json!("x")] {
+            let mut args = json!({"id": id, "comment": "Must not append"});
+            args[field] = replacement;
+            assert_policy_refusal_unchanged(
+                &mut client,
+                root,
+                "update_issue",
+                args,
+                "VALIDATION_FAILED",
+            );
+        }
+    }
+    for edit in ["check_acceptance", "uncheck_acceptance", "add_acceptance"] {
+        let before = policy_bookkeeping(root);
+        let mut args = json!({"id": id, "acceptance_criteria": "- [ ] replacement", "force": true});
+        args[edit] = json!(["1"]);
+        let error = client.tool_error("update_issue", args);
+        assert!(contains_text(&error, "cannot be combined"), "{error}");
+        assert_eq!(policy_bookkeeping(root), before);
+    }
+    client.call_tool(
+        "update_issue",
+        json!({"id": id, "prerequisites": null, "acceptance_criteria": null, "force": true}),
+    );
+    let shown = client.call_tool("show_issue", json!({"id": id}));
+    assert!(
+        shown.get("prerequisites").is_none_or(Value::is_null),
+        "{shown}"
+    );
+    assert!(
+        shown.get("acceptance_criteria").is_none_or(Value::is_null),
+        "{shown}"
+    );
+    let (status, stderr) = client.finish();
+    assert!(
+        status.success() || status.code() == Some(130),
+        "{status}: {stderr}"
+    );
+}
+
 fn assert_required_fields_and_custom_statuses(client: &mut McpClient, root: &Path, id: &str) {
     let changed = client.call_tool("update_issue", json!({"id": id, "status": "active"}));
     assert_eq!(changed["status"], "active");
@@ -1092,7 +1350,7 @@ fn cli_and_mcp_compete_for_one_capacity_slot_without_loser_side_effects() {
     let mut client = McpClient::spawn(root);
     assert_discovery_surface(&mut client);
     for round in 0..4 {
-        assert_capacity_race(&mut client, root, &cli_id, &mcp_id, round);
+        assert_capacity_race(&mut client, root, &cli_id, &mcp_id, round, false);
     }
     let (status, stderr) = client.finish();
     assert!(
@@ -1102,53 +1360,64 @@ fn cli_and_mcp_compete_for_one_capacity_slot_without_loser_side_effects() {
     cli_json(root, &["update", &cli_id, "--status", "in_progress"]);
 }
 
+#[test]
+fn cli_and_mcp_prerequisite_handoffs_compete_without_loser_field_or_comment_changes() {
+    let workspace = ProtocolWorkspace::new().expect("workspace");
+    let root = workspace.path();
+    cli_json(root, &["init", "--prefix", "handoff"]);
+    let cli_id = first_id(&cli_json(
+        root,
+        &[
+            "create",
+            "CLI handoff",
+            "--acceptance-criteria",
+            "- [ ] Deliver CLI",
+        ],
+    ));
+    let mcp_id = first_id(&cli_json(
+        root,
+        &[
+            "create",
+            "MCP handoff",
+            "--acceptance-criteria",
+            "- [ ] Deliver MCP",
+        ],
+    ));
+    std::fs::write(
+        root.join(".beads/policy.yaml"),
+        "workflow:\n  statuses: [open, in_progress, closed]\n  required_fields:\n    in_progress: [prerequisites_complete, acceptance_criteria_present, transition_comment]\n  capacity:\n    statuses:\n      in_progress:\n        hard: 1\n",
+    )
+    .expect("prerequisite admission policy");
+    let mut client = McpClient::spawn(root);
+    for round in 0..4 {
+        for (id, pending) in [
+            (&cli_id, "- [ ] CLI input ready"),
+            (&mcp_id, "- [ ] MCP input ready"),
+        ] {
+            cli_json(root, &["update", id, "--prerequisites", pending, "--force"]);
+        }
+        assert_capacity_race(&mut client, root, &cli_id, &mcp_id, round, true);
+    }
+    let (status, stderr) = client.finish();
+    assert!(
+        status.success() || status.code() == Some(130),
+        "{status}: {stderr}"
+    );
+}
+
 fn assert_capacity_race(
     client: &mut McpClient,
     root: &Path,
     cli_id: &str,
     mcp_id: &str,
     round: usize,
+    prerequisites: bool,
 ) {
     let before = cli_json(root, &["list", "--all"]);
     let events = client.read_resource("beads://events/recent");
-    let authority =
-        beads_rust::sync::blocking_write_lock(&root.join(".beads")).expect("hold admission lock");
-    let barrier = Barrier::new(3);
-    let (cli, response) = thread::scope(|scope| {
-        let cli_thread = scope.spawn(|| {
-            let child = br_command(root)
-                .args([
-                    "update",
-                    cli_id,
-                    "--status",
-                    "in_progress",
-                    "--actor",
-                    "cli-racer",
-                    "--json",
-                ])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("start CLI contender");
-            barrier.wait();
-            child.wait_with_output().expect("CLI contender outcome")
-        });
-        let mcp_thread = scope.spawn(|| {
-                let request_id = client.next_id;
-                client.next_id += 1;
-                client.send(&json!({"jsonrpc": "2.0", "id": request_id, "method": "tools/call", "params": with_era(json!({"name": "update_issue", "arguments": {"id": mcp_id, "status": "in_progress"}}))}));
-                barrier.wait();
-                client.receive_response(request_id, "tools/call")
-            });
-        // Both real clients are in flight while the shared admission lock
-        // is held. Release it only after both invocation barriers arrive.
-        barrier.wait();
-        drop(authority);
-        (
-            cli_thread.join().expect("CLI thread"),
-            mcp_thread.join().expect("MCP thread"),
-        )
-    });
+    let comments_before = [cli_id, mcp_id].map(|id| cli_json(root, &["comments", "list", id]));
+    let stored_before = [cli_id, mcp_id].map(|id| capacity_contender_state(root, id));
+    let (cli, response) = run_capacity_contenders(client, root, cli_id, mcp_id, prerequisites);
     assert!(response.get("error").is_none(), "round {round}: {response}");
     let mcp_ok = response["result"]["isError"] != true;
     assert_ne!(
@@ -1172,6 +1441,10 @@ fn assert_capacity_race(
         );
         mcp_id
     };
+    assert_eq!(
+        capacity_contender_state(root, loser),
+        stored_before[usize::from(loser == mcp_id)]
+    );
     let after = cli_json(root, &["list", "--all"]);
     let records = after["issues"].as_array().expect("issues");
     assert_eq!(
@@ -1189,6 +1462,14 @@ fn assert_capacity_race(
             .iter()
             .find(|issue| issue["id"] == loser)
     );
+    for (index, id) in [cli_id, mcp_id].iter().enumerate() {
+        let comments = cli_json(root, &["comments", "list", id]);
+        if *id == loser || !prerequisites {
+            assert_eq!(comments, comments_before[index]);
+        } else {
+            assert_prerequisite_race_winner(root, id, index, &comments, &comments_before[index]);
+        }
+    }
     let after_events = client.read_resource("beads://events/recent");
     let loser_events = |value: &Value| {
         value["events"]
@@ -1210,6 +1491,125 @@ fn assert_capacity_race(
     connection.close().expect("close observer");
     cli_json(root, &["update", cli_id, "--status", "open"]);
     cli_json(root, &["update", mcp_id, "--status", "open"]);
+}
+
+fn capacity_contender_state(root: &Path, id: &str) -> Value {
+    let connection = read_only_db(root);
+    let mut snapshot = serde_json::Map::new();
+    for (name, sql) in [
+        ("issue", "SELECT * FROM issues WHERE id = ?"),
+        (
+            "comments",
+            "SELECT * FROM comments WHERE issue_id = ? ORDER BY id",
+        ),
+        (
+            "events",
+            "SELECT * FROM events WHERE issue_id = ? ORDER BY id",
+        ),
+        (
+            "occupancy",
+            "SELECT * FROM capacity_occupancy WHERE issue_id = ?",
+        ),
+        ("dirty", "SELECT * FROM dirty_issues WHERE issue_id = ?"),
+        (
+            "export_hash",
+            "SELECT content_hash FROM export_hashes WHERE issue_id = ?",
+        ),
+    ] {
+        let rows = connection
+            .query_with_params(sql, &[id.into()])
+            .expect("raw contender rows including stored content hash");
+        snapshot.insert(name.to_owned(), json!(format!("{rows:?}")));
+    }
+    connection.close().expect("close contender observer");
+    let jsonl =
+        std::fs::read_to_string(root.join(".beads/issues.jsonl")).expect("contender export");
+    let row = jsonl
+        .lines()
+        .find(|line| serde_json::from_str::<Value>(line).expect("exported issue")["id"] == id)
+        .expect("contender exported");
+    snapshot.insert("jsonl_row".to_owned(), json!(row));
+    Value::Object(snapshot)
+}
+
+fn assert_prerequisite_race_winner(
+    root: &Path,
+    id: &str,
+    index: usize,
+    comments: &Value,
+    before: &Value,
+) {
+    let shown = first_record(cli_json(root, &["show", id]));
+    let name = ["CLI", "MCP"][index];
+    assert_eq!(shown["prerequisites"], format!("- [x] {name} input ready"));
+    assert_eq!(
+        shown["acceptance_criteria"],
+        format!("- [ ] Deliver {name}")
+    );
+    let comments = comments.as_array().expect("comments");
+    let before = before.as_array().expect("before comments");
+    assert_eq!(comments.len(), before.len() + 1);
+    assert_eq!(&comments[..before.len()], before);
+    assert_eq!(comments.last().unwrap()["text"], format!("{name} prepared"));
+}
+
+fn run_capacity_contenders(
+    client: &mut McpClient,
+    root: &Path,
+    cli_id: &str,
+    mcp_id: &str,
+    prerequisites: bool,
+) -> (std::process::Output, Value) {
+    let mut cli_args = vec![
+        "update",
+        cli_id,
+        "--status",
+        "in_progress",
+        "--actor",
+        "cli-racer",
+        "--json",
+    ];
+    let mut mcp_args = json!({"id": mcp_id, "status": "in_progress"});
+    if prerequisites {
+        cli_args.extend([
+            "--prerequisites",
+            "- [x] CLI input ready",
+            "--transition-comment",
+            "CLI prepared",
+        ]);
+        mcp_args["prerequisites"] = json!("- [x] MCP input ready");
+        mcp_args["transition_comment"] = json!("MCP prepared");
+    }
+    let authority =
+        beads_rust::sync::blocking_write_lock(&root.join(".beads")).expect("hold admission lock");
+    let barrier = Barrier::new(3);
+    thread::scope(|scope| {
+        let cli_thread = scope.spawn(|| {
+            let child = br_command(root)
+                .args(cli_args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("start CLI contender");
+            barrier.wait();
+            child.wait_with_output().expect("CLI contender outcome")
+        });
+        let mcp_thread = scope.spawn(|| {
+                let request_id = client.next_id;
+                client.next_id += 1;
+                client.send(&json!({"jsonrpc": "2.0", "id": request_id, "method": "tools/call", "params": with_era(json!({"name": "update_issue", "arguments": mcp_args}))}));
+                barrier.wait();
+                client.receive_response(request_id, "tools/call")
+            });
+        // Both real clients are in flight while the shared admission lock
+        // is held. Release it only after both invocation barriers arrive.
+        barrier.wait();
+        drop(authority);
+        (
+            cli_thread.join().expect("CLI thread"),
+            mcp_thread.join().expect("MCP thread"),
+        )
+    })
 }
 
 #[test]

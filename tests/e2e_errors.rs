@@ -2615,6 +2615,371 @@ fn e2e_acceptance_presence_refusals_preserve_batch_fields_comments_and_export() 
     assert_eq!(snapshot(), before);
 }
 
+fn prerequisite_database_state(
+    workspace: &BrWorkspace,
+) -> (std::collections::BTreeMap<String, String>, Vec<u8>) {
+    use beads_rust::franken_sync::SqliteValue;
+    use beads_rust::franken_sync::compat::{OpenFlags, open_with_flags};
+
+    let connection = open_with_flags(
+        &workspace.root.join(".beads/beads.db").to_string_lossy(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let tables = connection
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .unwrap();
+    let mut state = std::collections::BTreeMap::new();
+    for row in tables {
+        let name = row.get(0).and_then(SqliteValue::as_text).unwrap();
+        let sql = format!(
+            "SELECT * FROM \"{}\" ORDER BY rowid",
+            name.replace('"', "\"\"")
+        );
+        state.insert(
+            name.to_owned(),
+            format!("{:?}", connection.query(&sql).unwrap()),
+        );
+    }
+    connection.close().unwrap();
+    (
+        state,
+        fs::read(workspace.root.join(".beads/issues.jsonl")).unwrap(),
+    )
+}
+
+#[test]
+fn e2e_prerequisites_refuse_prospective_invalid_batches_without_any_persisted_change() {
+    let workspace = acceptance_presence_workspace();
+    fs::write(workspace.root.join(".beads/policy.yaml"), "workflow:\n  required_fields:\n    handoff: [prerequisites_complete, acceptance_criteria_present, transition_comment]\n").unwrap();
+    let first = create_presence_draft(&workspace, "Prepared schema", "- [ ] Implement schema");
+    let second = create_presence_draft(&workspace, "Prepared API", "- [ ] Implement API");
+    let populated = run_br(
+        &workspace,
+        [
+            "update",
+            &first,
+            "--prerequisites",
+            "- [x] Schema reviewed",
+            "--json",
+        ],
+        "prereq_populate",
+    );
+    assert!(populated.status.success(), "{populated:?}");
+    let before = prerequisite_database_state(&workspace);
+    for (left, right) in [(&first, &second), (&second, &first)] {
+        for replacement in [
+            None,
+            Some(""),
+            Some(" \t\n"),
+            Some("All done"),
+            Some("- [x] One\n- [ ] Two"),
+        ] {
+            let mut args = vec![
+                "update",
+                left,
+                right,
+                "--status",
+                "handoff",
+                "--transition-comment",
+                "Fresh handoff",
+                "--json",
+            ];
+            if let Some(value) = replacement {
+                args.extend(["--prerequisites", value, "--force"]);
+            }
+            let refused = run_br(&workspace, args, "prereq_batch_refused");
+            assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+            let error: Value = serde_json::from_str(&refused.stdout).unwrap();
+            assert_eq!(error["error"]["code"], "POLICY_VIOLATION");
+            assert_eq!(
+                error["error"]["context"]["violations"][0]["gate"],
+                "transition_prerequisites_incomplete"
+            );
+            assert_eq!(
+                prerequisite_database_state(&workspace),
+                before,
+                "old stored values or vacuous prose admitted {replacement:?}"
+            );
+        }
+    }
+    let fixed = run_br(
+        &workspace,
+        [
+            "update",
+            &second,
+            "--prerequisites",
+            "* [X] API reviewed",
+            "--json",
+        ],
+        "prereq_fix_invalid",
+    );
+    assert!(fixed.status.success(), "{fixed:?}");
+    let completed = run_br(
+        &workspace,
+        [
+            "update",
+            &second,
+            &first,
+            "--status",
+            "handoff",
+            "--transition-comment",
+            "Actual handoff",
+            "--json",
+        ],
+        "prereq_batch_positive",
+    );
+    assert!(completed.status.success(), "{completed:?}");
+    let storage = SqliteStorage::open(&workspace.root.join(".beads/beads.db")).unwrap();
+    for (id, criteria, prerequisite) in [
+        (&first, "- [ ] Implement schema", "- [x] Schema reviewed"),
+        (&second, "- [ ] Implement API", "* [X] API reviewed"),
+    ] {
+        assert_stored_prerequisite_handoff(&storage, id, criteria, prerequisite);
+    }
+}
+
+fn assert_stored_prerequisite_handoff(
+    storage: &SqliteStorage,
+    id: &str,
+    criteria: &str,
+    prerequisite: &str,
+) {
+    let issue = storage.get_issue(id).unwrap().unwrap();
+    assert_eq!(issue.status.as_str(), "handoff");
+    assert_eq!(issue.acceptance_criteria.as_deref(), Some(criteria));
+    assert_eq!(issue.prerequisites.as_deref(), Some(prerequisite));
+    let comments = storage.get_comments(id).unwrap();
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0].body, "Actual handoff");
+    assert_eq!(
+        storage
+            .get_events(id, 0)
+            .unwrap()
+            .iter()
+            .filter(|event| event.event_type == beads_rust::model::EventType::StatusChanged)
+            .count(),
+        1
+    );
+}
+
+fn assert_prerequisite_policy_refusal(
+    workspace: &BrWorkspace,
+    args: &[&str],
+    code: &str,
+    gate: Option<&str>,
+) {
+    let before = prerequisite_database_state(workspace);
+    let output = run_br(workspace, args.iter().copied(), "prereq_composed_refusal");
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    let error: Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(error["error"]["code"], code, "{error}");
+    if let Some(gate) = gate {
+        assert!(
+            error["error"]["context"]["violations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|violation| violation["gate"] == gate),
+            "{error}"
+        );
+    }
+    assert_eq!(prerequisite_database_state(workspace), before);
+}
+
+fn composed_prerequisite_workspace() -> (BrWorkspace, String, String) {
+    let workspace = acceptance_presence_workspace();
+    let first = create_presence_draft(&workspace, "First prepared issue", "- [ ] Deliver first");
+    let second = create_presence_draft(&workspace, "Second prepared issue", "- [ ] Deliver second");
+    let fields = run_br(
+        &workspace,
+        [
+            "update",
+            &first,
+            &second,
+            "--prerequisites",
+            "- [x] API available",
+            "--json",
+        ],
+        "prereq_composed_fields",
+    );
+    assert!(fields.status.success(), "{fields:?}");
+    fs::write(
+        workspace.root.join(".beads/policy.yaml"),
+        r#"
+workflow:
+  strict: true
+  statuses: [draft, handoff, closed]
+  required_fields:
+    handoff: [acceptance_criteria_present, prerequisites_complete, transition_comment]
+    closed: [acceptance_criteria, prerequisites_complete, transition_comment]
+  gates:
+    "draft -> handoff":
+      require_all: [ci_green]
+  capacity:
+    statuses:
+      handoff:
+        hard: 1
+close_policy:
+  require_acceptance_criteria_satisfied:
+    enabled: true
+"#,
+    )
+    .unwrap();
+    (workspace, first, second)
+}
+
+fn assert_prerequisite_comment_and_gate_requirements(
+    workspace: &BrWorkspace,
+    first: &str,
+    second: &str,
+) {
+    assert_prerequisite_policy_refusal(
+        workspace,
+        &["update", first, "--status", "handoff", "--force", "--json"],
+        "POLICY_VIOLATION",
+        Some("transition_comment_missing"),
+    );
+    assert_prerequisite_policy_refusal(
+        workspace,
+        &[
+            "update",
+            first,
+            "--status",
+            "handoff",
+            "--transition-comment",
+            "Gate missing",
+            "--force",
+            "--json",
+        ],
+        "POLICY_VIOLATION",
+        Some("gate_ci_green"),
+    );
+    for id in [first, second] {
+        let report = run_br(
+            workspace,
+            [
+                "gate",
+                "report",
+                id,
+                "--gate",
+                "ci_green",
+                "--provider",
+                "ci",
+                "--status",
+                "pass",
+                "--to",
+                "handoff",
+                "--json",
+            ],
+            "prereq_composed_gate",
+        );
+        assert!(report.status.success(), "{report:?}");
+    }
+    // Even completed preparation and a gate pass cannot supply a fresh comment.
+    assert_prerequisite_policy_refusal(
+        workspace,
+        &["update", first, "--status", "handoff", "--force", "--json"],
+        "POLICY_VIOLATION",
+        Some("transition_comment_missing"),
+    );
+}
+
+#[test]
+fn e2e_completed_prerequisites_preserve_comment_gate_capacity_and_close_requirements() {
+    let (workspace, first, second) = composed_prerequisite_workspace();
+    assert_prerequisite_comment_and_gate_requirements(&workspace, &first, &second);
+    let first_handoff = run_br(
+        &workspace,
+        [
+            "update",
+            &first,
+            "--status",
+            "handoff",
+            "--transition-comment",
+            "Ready to implement",
+            "--json",
+        ],
+        "prereq_composed_handoff",
+    );
+    assert!(first_handoff.status.success(), "{first_handoff:?}");
+    assert_prerequisite_policy_refusal(
+        &workspace,
+        &[
+            "update",
+            &second,
+            "--status",
+            "handoff",
+            "--transition-comment",
+            "Capacity full",
+            "--force",
+            "--json",
+        ],
+        "WORKFLOW_CAPACITY_EXCEEDED",
+        None,
+    );
+    assert_prerequisite_policy_refusal(
+        &workspace,
+        &[
+            "close",
+            &first,
+            "--transition-comment",
+            "Acceptance still pending",
+            "--force",
+            "--json",
+        ],
+        "POLICY_VIOLATION",
+        Some("acceptance_criteria_unchecked"),
+    );
+    let checked = run_br(
+        &workspace,
+        ["update", &first, "--check-acceptance", "1", "--json"],
+        "prereq_composed_complete",
+    );
+    assert!(checked.status.success(), "{checked:?}");
+    let closed = run_br(
+        &workspace,
+        [
+            "close",
+            &first,
+            "--transition-comment",
+            "Delivery verified",
+            "--json",
+        ],
+        "prereq_composed_close",
+    );
+    assert!(closed.status.success(), "{closed:?}");
+    let next = run_br(
+        &workspace,
+        [
+            "update",
+            &second,
+            "--status",
+            "handoff",
+            "--transition-comment",
+            "Slot now free",
+            "--json",
+        ],
+        "prereq_composed_next",
+    );
+    assert!(next.status.success(), "{next:?}");
+    let storage = SqliteStorage::open(&workspace.root.join(".beads/beads.db")).unwrap();
+    assert_eq!(
+        storage.get_issue(&first).unwrap().unwrap().status.as_str(),
+        "closed"
+    );
+    let remaining = storage.get_issue(&second).unwrap().unwrap();
+    assert_eq!(remaining.status.as_str(), "handoff");
+    assert_eq!(
+        remaining.acceptance_criteria.as_deref(),
+        Some("- [ ] Deliver second")
+    );
+    assert_eq!(
+        remaining.prerequisites.as_deref(),
+        Some("- [x] API available")
+    );
+}
+
 fn acceptance_presence_workspace() -> BrWorkspace {
     let workspace = BrWorkspace::new();
     let init = run_br(&workspace, ["init"], "presence_init");

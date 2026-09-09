@@ -292,7 +292,7 @@ proptest! {
         title in "[a-z]{1,20}",
     ) {
         let reference_hash = content_hash_from_parts(
-            &title, None, None, None, None,
+            &title, None, None, None, None, None,
             &expected, &beads_rust::model::Priority::MEDIUM,
             &IssueType::Task, None, None, None, None, None, false, false,
         );
@@ -300,7 +300,7 @@ proptest! {
             let json = format!("\"{}\"", variant);
             let status: Status = serde_json::from_str(&json).unwrap();
             let hash = content_hash_from_parts(
-                &title, None, None, None, None,
+                &title, None, None, None, None, None,
                 &status, &beads_rust::model::Priority::MEDIUM,
                 &IssueType::Task, None, None, None, None, None, false, false,
             );
@@ -318,7 +318,7 @@ proptest! {
         title in "[a-z]{1,20}",
     ) {
         let reference_hash = content_hash_from_parts(
-            &title, None, None, None, None,
+            &title, None, None, None, None, None,
             &Status::Open, &beads_rust::model::Priority::MEDIUM,
             &expected, None, None, None, None, None, false, false,
         );
@@ -326,7 +326,7 @@ proptest! {
             let json = format!("\"{}\"", variant);
             let issue_type: IssueType = serde_json::from_str(&json).unwrap();
             let hash = content_hash_from_parts(
-                &title, None, None, None, None,
+                &title, None, None, None, None, None,
                 &Status::Open, &beads_rust::model::Priority::MEDIUM,
                 &issue_type, None, None, None, None, None, false, false,
             );

@@ -39,6 +39,7 @@ fn create_test_issue(i: usize) -> Issue {
         description: Some(format!("Description for benchmark issue {i}")),
         design: None,
         acceptance_criteria: None,
+        prerequisites: None,
         notes: None,
         status: Status::Open,
         priority: Priority(i32::try_from(i % 5).expect("priority fits i32")),

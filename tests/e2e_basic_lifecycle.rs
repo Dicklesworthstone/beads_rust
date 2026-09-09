@@ -51,6 +51,7 @@ fn make_issue(id: &str, title: &str, now: chrono::DateTime<Utc>) -> Issue {
         description: None,
         design: None,
         acceptance_criteria: None,
+        prerequisites: None,
         notes: None,
         assignee: None,
         owner: None,
@@ -143,6 +144,298 @@ fn read_jsonl_values(path: &Path) -> Vec<Value> {
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("parse exported issue"))
         .collect()
+}
+
+#[test]
+fn e2e_prerequisites_preserve_distinct_checklists_and_gate_prospective_updates() {
+    let workspace = BrWorkspace::new();
+    assert_br_success(&run_br(&workspace, ["init"], "init_prerequisites"), "init");
+    let pending = "- [ ] accès granted\r\n- [x] owner assigned\r\n";
+    let completed = "- [x] accès granted\r\n- [x] owner assigned\r\n";
+    let acceptance = "- [ ] deliver feature\n";
+    let create = run_br(
+        &workspace,
+        [
+            "create",
+            "Two distinct checklists",
+            "--prerequisites",
+            pending,
+            "--acceptance-criteria",
+            acceptance,
+            "--json",
+        ],
+        "create_prerequisites",
+    );
+    assert_br_success(&create, "create checklists");
+    let created: Value = serde_json::from_str(&create.stdout).expect("whole create JSON");
+    let id = created["id"].as_str().expect("created ID");
+    assert_cli_checklists(&workspace, id, pending, acceptance);
+    fs::write(
+        workspace.root.join(".beads/policy.yaml"),
+        "workflow:\n  required_fields:\n    in_planning: [prerequisites_complete, acceptance_criteria_present, transition_comment]\n",
+    )
+    .expect("policy");
+    let update = run_br(
+        &workspace,
+        [
+            "update",
+            id,
+            "--status",
+            "in_planning",
+            "--prerequisites",
+            completed,
+            "--transition-comment",
+            "Ready for planning",
+            "--json",
+        ],
+        "complete_prerequisites_and_transition",
+    );
+    assert_br_success(
+        &update,
+        "prospective completed prerequisites admit planning",
+    );
+    assert_cli_checklists(&workspace, id, completed, acceptance);
+    let shown: Value =
+        serde_json::from_str(&run_br(&workspace, ["show", id, "--json"], "show_planning").stdout)
+            .expect("whole show JSON");
+    assert_eq!(shown[0]["status"], "in_planning");
+    assert_eq!(shown[0]["comments"][0]["text"], "Ready for planning");
+
+    let clear = run_br(
+        &workspace,
+        ["update", id, "--prerequisites", "", "--json"],
+        "guard_prerequisite_clear",
+    );
+    assert_eq!(clear.status.code(), Some(4), "{}", clear.stderr);
+    assert!(clear.stdout.contains("prerequisites"), "{}", clear.stdout);
+    assert_cli_checklists(&workspace, id, completed, acceptance);
+    assert_br_success(
+        &run_br(
+            &workspace,
+            ["update", id, "--prerequisites", "", "--force", "--json"],
+            "clear_prerequisites_explicitly",
+        ),
+        "explicit whole-field clear outside transition",
+    );
+    assert_cli_checklists(&workspace, id, "", acceptance);
+}
+
+fn assert_cli_checklists(workspace: &BrWorkspace, id: &str, prerequisites: &str, acceptance: &str) {
+    let shown = run_br(workspace, ["show", id, "--json"], "show_checklists_json");
+    assert_br_success(&shown, "show JSON");
+    let shown: Value = serde_json::from_str(&shown.stdout).expect("whole show JSON");
+    let exported = read_jsonl_values(&workspace.root.join(".beads/issues.jsonl"))
+        .into_iter()
+        .find(|issue| issue["id"] == id)
+        .expect("exported issue");
+    for issue in [&shown[0], &exported] {
+        if prerequisites.is_empty() {
+            assert!(issue.get("prerequisites").is_none(), "{issue}");
+        } else {
+            assert_eq!(issue["prerequisites"], prerequisites, "{issue}");
+        }
+        assert_eq!(issue["acceptance_criteria"], acceptance, "{issue}");
+        assert!(
+            issue
+                .get("dependencies")
+                .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
+        );
+    }
+    let plain = run_br(
+        workspace,
+        ["show", id, "--no-color"],
+        "show_checklists_plain",
+    );
+    assert_br_success(&plain, "show plain");
+    assert!(
+        plain.stdout.contains("Acceptance Criteria:"),
+        "{}",
+        plain.stdout
+    );
+    if !prerequisites.is_empty() {
+        assert!(plain.stdout.contains("Prerequisites:"), "{}", plain.stdout);
+        assert!(plain.stdout.contains("accès granted"), "{}", plain.stdout);
+    } else {
+        assert!(!plain.stdout.contains("Prerequisites:"), "{}", plain.stdout);
+    }
+    assert!(!plain.stdout.contains("Dependencies:"), "{}", plain.stdout);
+}
+
+#[test]
+fn e2e_prerequisite_replacements_cannot_use_old_completion_or_force_for_admission() {
+    let workspace = BrWorkspace::new();
+    assert_br_success(
+        &run_br(&workspace, ["init"], "init_prerequisite_refusals"),
+        "init",
+    );
+    let create = run_br(
+        &workspace,
+        [
+            "create",
+            "Previously complete",
+            "--prerequisites",
+            "- [x] access granted",
+            "--acceptance-criteria",
+            "- [ ] deliver",
+            "--json",
+        ],
+        "create_completed_prerequisite",
+    );
+    assert_br_success(&create, "create");
+    let created: Value = serde_json::from_str(&create.stdout).expect("whole create JSON");
+    let id = created["id"].as_str().expect("created ID");
+    fs::write(
+        workspace.root.join(".beads/policy.yaml"),
+        "workflow:\n  required_fields:\n    in_planning: [prerequisites_complete, acceptance_criteria_present, transition_comment]\n",
+    )
+    .expect("policy");
+    for (index, replacement) in ["", " \t\n", "All done", "- [ ] access granted"]
+        .iter()
+        .enumerate()
+    {
+        let before = run_br(
+            &workspace,
+            ["show", id, "--json"],
+            "before_prerequisite_refusal",
+        );
+        assert_br_success(&before, "show before");
+        let before: Value = serde_json::from_str(&before.stdout).expect("whole before JSON");
+        let jsonl = fs::read(workspace.root.join(".beads/issues.jsonl")).expect("before JSONL");
+        let refused = run_br(
+            &workspace,
+            [
+                "update",
+                id,
+                "--status",
+                "in_planning",
+                "--prerequisites",
+                replacement,
+                "--title",
+                "Must roll back",
+                "--force",
+                "--transition-comment",
+                "Must not append",
+                "--json",
+            ],
+            &format!("refuse_prerequisites_{index}"),
+        );
+        assert_eq!(refused.status.code(), Some(4), "{}", refused.stderr);
+        let error: Value = serde_json::from_str(&refused.stdout).expect("whole refusal JSON");
+        assert_eq!(error["error"]["code"], "POLICY_VIOLATION", "{error}");
+        let after = run_br(
+            &workspace,
+            ["show", id, "--json"],
+            "after_prerequisite_refusal",
+        );
+        assert_br_success(&after, "show after");
+        assert_eq!(
+            serde_json::from_str::<Value>(&after.stdout).expect("whole after JSON"),
+            before
+        );
+        assert_eq!(
+            fs::read(workspace.root.join(".beads/issues.jsonl")).expect("after JSONL"),
+            jsonl
+        );
+    }
+    assert_prerequisite_batch_atomicity(&workspace, id);
+}
+
+fn assert_prerequisite_batch_atomicity(workspace: &BrWorkspace, prepared_id: &str) {
+    let created = run_br(
+        workspace,
+        [
+            "create",
+            "Missing preparation",
+            "--acceptance-criteria",
+            "- [ ] deliver",
+            "--json",
+        ],
+        "create_unprepared_batch_sibling",
+    );
+    assert_br_success(&created, "create unprepared sibling");
+    let created: Value = serde_json::from_str(&created.stdout).expect("whole create JSON");
+    let missing_id = created["id"].as_str().expect("unprepared ID");
+    for ids in [[prepared_id, missing_id], [missing_id, prepared_id]] {
+        let before = prerequisite_batch_snapshot(workspace);
+        let jsonl =
+            fs::read(workspace.root.join(".beads/issues.jsonl")).expect("before batch JSONL");
+        let rejected = run_br(
+            workspace,
+            [
+                "update",
+                ids[0],
+                ids[1],
+                "--status",
+                "in_planning",
+                "--title",
+                "Must roll back",
+                "--transition-comment",
+                "Must not append",
+                "--force",
+                "--json",
+            ],
+            "reject_prerequisite_batch",
+        );
+        assert_eq!(rejected.status.code(), Some(4), "{}", rejected.stderr);
+        let error: Value = serde_json::from_str(&rejected.stdout).expect("whole batch error JSON");
+        assert_eq!(error["error"]["code"], "POLICY_VIOLATION", "{error}");
+        assert_eq!(prerequisite_batch_snapshot(workspace), before);
+        assert_eq!(
+            fs::read(workspace.root.join(".beads/issues.jsonl")).expect("after batch JSONL"),
+            jsonl
+        );
+    }
+    let prepared = run_br(
+        workspace,
+        [
+            "update",
+            missing_id,
+            "--prerequisites",
+            "- [x] access granted",
+            "--json",
+        ],
+        "prepare_batch_sibling",
+    );
+    assert_br_success(&prepared, "prepare sibling");
+    let admitted = run_br(
+        workspace,
+        [
+            "update",
+            missing_id,
+            prepared_id,
+            "--status",
+            "in_planning",
+            "--transition-comment",
+            "Batch prepared",
+            "--json",
+        ],
+        "admit_prepared_batch",
+    );
+    assert_br_success(&admitted, "admit every prepared sibling");
+    let storage = SqliteStorage::open(&workspace.root.join(".beads/beads.db")).expect("read batch");
+    let comments = storage.get_all_comments().expect("batch comments");
+    for id in [prepared_id, missing_id] {
+        let issue = storage
+            .get_issue(id)
+            .expect("read admitted issue")
+            .expect("issue exists");
+        assert_eq!(issue.status.as_str(), "in_planning");
+        assert_eq!(issue.acceptance_criteria.as_deref(), Some("- [ ] deliver"));
+        assert_eq!(issue.prerequisites.as_deref(), Some("- [x] access granted"));
+        assert_eq!(comments[id].len(), 1);
+        assert_eq!(comments[id][0].body, "Batch prepared");
+    }
+}
+
+fn prerequisite_batch_snapshot(workspace: &BrWorkspace) -> Value {
+    let storage =
+        SqliteStorage::open(&workspace.root.join(".beads/beads.db")).expect("batch observer");
+    serde_json::json!({
+        "issues": storage.get_all_issues_for_export().expect("all issue fields"),
+        "comments": storage.get_all_comments().expect("all comments"),
+        "events": storage.get_all_events(0).expect("complete audit history"),
+        "dirty": storage.get_dirty_issue_metadata().expect("dirty bookkeeping"),
+    })
 }
 
 fn prepare_merge_conflict_workspace() -> (BrWorkspace, String) {

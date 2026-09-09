@@ -95,6 +95,7 @@ fn make_issue(
         description,
         design,
         acceptance_criteria,
+        prerequisites: None,
         notes,
         status,
         priority,
@@ -319,6 +320,7 @@ prop_compose! {
         description in optional_text(),
         design in optional_text(),
         acceptance_criteria in optional_text(),
+        prerequisites in optional_text(),
         notes in optional_text(),
         status in status_strategy(),
         priority in priority_strategy(),
@@ -345,7 +347,7 @@ prop_compose! {
     ) -> RoundTripCase {
         let source_id = format!("bd-{suffix}");
         let blocker_id = format!("bd-target{suffix}");
-        let source = make_issue(
+        let mut source = make_issue(
             source_id.clone(),
             title,
             description,
@@ -366,6 +368,7 @@ prop_compose! {
             created_offset_secs,
             update_delta_secs,
         );
+        source.prerequisites = prerequisites;
         let blocker = make_issue(
             blocker_id.clone(),
             format!("Blocker {suffix}"),

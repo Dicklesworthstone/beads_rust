@@ -43,6 +43,7 @@ fn create_issue_all_fields_populated() {
         description: Some("Detailed description".to_string()),
         design: Some("Technical design notes".to_string()),
         acceptance_criteria: Some("Must pass all tests".to_string()),
+        prerequisites: Some("- [x] Review the specification".to_string()),
         notes: Some("Additional notes".to_string()),
         status: Status::Open,
         priority: Priority::HIGH,
@@ -102,6 +103,7 @@ fn create_issue_all_fields_populated() {
         Some("Must pass all tests".to_string())
     );
     assert_eq!(retrieved.notes, Some("Additional notes".to_string()));
+    assert_eq!(retrieved.prerequisites, issue.prerequisites);
     assert_eq!(
         retrieved.agent_context,
         Some(r#"{"workflow":"tdd"}"#.to_string())
@@ -525,6 +527,7 @@ fn update_issue_clear_optional_fields() {
         content_hash: None,
         design: None,
         acceptance_criteria: None,
+        prerequisites: None,
         notes: None,
         created_by: None,
         closed_at: None,
@@ -847,6 +850,7 @@ fn upsert_issue_stores_all_fields() {
         description: Some("Detailed description".to_string()),
         design: Some("Technical design notes".to_string()),
         acceptance_criteria: Some("Must pass all tests".to_string()),
+        prerequisites: Some("- [x] Review the specification".to_string()),
         notes: Some("Additional notes".to_string()),
         status: Status::Open,
         priority: Priority::HIGH,

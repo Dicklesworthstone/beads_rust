@@ -33,6 +33,7 @@ fn make_issue(title: &str, description: Option<&str>) -> Issue {
         description: description.map(ToString::to_string),
         design: None,
         acceptance_criteria: None,
+        prerequisites: None,
         notes: None,
         status: Status::Open,
         priority: Priority::MEDIUM,
@@ -243,11 +244,13 @@ proptest! {
         title in "\\PC{1,100}",
         description in proptest::option::of("\\PC{0,100}"),
         notes in proptest::option::of("\\PC{0,100}"),
+        prerequisites in proptest::option::of("\\PC{0,100}"),
     ) {
         init_test_logging();
 
         let mut issue = make_issue(&title, description.as_deref());
         issue.notes = notes;
+        issue.prerequisites = prerequisites;
 
         let direct = content_hash(&issue);
         let from_parts = content_hash_from_parts(
@@ -255,6 +258,7 @@ proptest! {
             issue.description.as_deref(),
             issue.design.as_deref(),
             issue.acceptance_criteria.as_deref(),
+            issue.prerequisites.as_deref(),
             issue.notes.as_deref(),
             &issue.status,
             &issue.priority,
@@ -406,6 +410,7 @@ fn hash_distinguishes_structural_pairs_with_embedded_nuls() {
             None,
             None,
             None,
+            None,
             &Status::Open,
             &Priority::MEDIUM,
             &IssueType::Task,
@@ -420,6 +425,7 @@ fn hash_distinguishes_structural_pairs_with_embedded_nuls() {
         let hash_b = content_hash_from_parts(
             &title_b,
             Some(&suffix),
+            None,
             None,
             None,
             None,

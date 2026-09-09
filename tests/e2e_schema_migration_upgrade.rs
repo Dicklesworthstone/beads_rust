@@ -134,13 +134,14 @@ fn upgrade_fixture_end_to_end(
         "{label}: plan not eligible"
     );
     assert_eq!(plan_json["from_version"].as_u64(), Some(expected_from));
-    assert_eq!(plan_json["to_version"].as_u64(), Some(17));
+    assert_eq!(plan_json["to_version"].as_u64(), Some(18));
+    assert_eq!(plan_json["forecast"]["prerequisites_column_added"], true);
     let plan_token = plan_json["plan_token"]
         .as_str()
         .expect("plan token")
         .to_string();
 
-    // 3. Apply migrates atomically to schema 17.
+    // 3. Apply migrates atomically to schema 18.
     let apply = run_br(
         &workspace,
         [
@@ -166,7 +167,7 @@ fn upgrade_fixture_end_to_end(
     let run_id = applied_json["run_id"].as_str().expect("run id").to_string();
     assert_eq!(
         header_user_version(&db_path),
-        17,
+        18,
         "{label}: post-apply schema"
     );
     for table in [
@@ -265,7 +266,7 @@ fn upgrade_fixture_end_to_end(
     );
     assert_eq!(
         header_user_version(&db_path),
-        17,
+        18,
         "{label}: rejected stale apply must not mutate the database"
     );
 
@@ -340,7 +341,7 @@ fn upgrade_fixture_end_to_end(
         apply2.stdout,
         apply2.stderr
     );
-    assert_eq!(header_user_version(&db_path), 17);
+    assert_eq!(header_user_version(&db_path), 18);
 }
 
 /// Schema 15 (gate-history era, pre-#384) upgrades to the current schema.
