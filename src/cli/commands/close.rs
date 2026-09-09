@@ -181,6 +181,7 @@ pub(crate) fn evaluate_close_policy(
             Some(from),
             to,
             issue.acceptance_criteria.as_deref(),
+            issue.prerequisites.as_deref(),
             args.transition_comment.as_deref(),
         ));
         if workflow.gates_enforced() && workflow.gate_rule_for(from, to).is_some() {

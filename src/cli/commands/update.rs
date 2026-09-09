@@ -1640,7 +1640,7 @@ fn classify_text_field_overwrite(current: &str, incoming: &str) -> OverwriteTier
 /// Refuse to silently destroy a non-empty accumulating text field
 /// (GitHub #467), proportionally to what the write would lose (GitHub #481).
 ///
-/// `description`, `design`, `acceptance_criteria`, `notes`, and
+/// `description`, `design`, `acceptance_criteria`, `prerequisites`, `notes`, and
 /// `agent_context` build up over an issue's life and are frequently supplied
 /// from shell variables in scripted/agent flows, where a typo, truncated
 /// heredoc, or unset variable silently destroys the whole field. Those
@@ -1651,7 +1651,7 @@ fn classify_text_field_overwrite(current: &str, incoming: &str) -> OverwriteTier
 /// advisory (returned here, printed by the caller) rather than refused.
 /// Writing into an empty field and re-writing the identical value stay
 /// silent so legitimate idempotent scripts keep working.
-fn validate_text_field_overwrite_guard(
+pub(crate) fn validate_text_field_overwrite_guard(
     storage: &SqliteStorage,
     ids: &[String],
     update: &IssueUpdate,
@@ -1660,10 +1660,11 @@ fn validate_text_field_overwrite_guard(
     if force {
         return Ok(Vec::new());
     }
-    let requested: [(&str, Option<&Option<String>>); 5] = [
+    let requested: [(&str, Option<&Option<String>>); 6] = [
         ("description", update.description.as_ref()),
         ("design", update.design.as_ref()),
         ("acceptance_criteria", update.acceptance_criteria.as_ref()),
+        ("prerequisites", update.prerequisites.as_ref()),
         ("notes", update.notes.as_ref()),
         ("agent_context", update.agent_context.as_ref()),
     ];
@@ -1684,6 +1685,7 @@ fn validate_text_field_overwrite_guard(
                 "description" => issue.description.as_deref(),
                 "design" => issue.design.as_deref(),
                 "acceptance_criteria" => issue.acceptance_criteria.as_deref(),
+                "prerequisites" => issue.prerequisites.as_deref(),
                 "notes" => issue.notes.as_deref(),
                 "agent_context" => issue.agent_context.as_deref(),
                 _ => unreachable!(),
@@ -1834,6 +1836,7 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
         description: args.description.clone().map(Some),
         design: args.design.clone().map(Some),
         acceptance_criteria: args.acceptance_criteria.clone().map(Some),
+        prerequisites: args.prerequisites.clone().map(Some),
         notes: args.notes.clone().map(Some),
         status,
         priority,
@@ -2454,6 +2457,7 @@ mod tests {
             issue_type: IssueType::Task,
             priority: Priority::MEDIUM,
             description: Some("line one\nline two\nline three".to_string()),
+            prerequisites: Some("- [x] access granted\n- [ ] owner review".to_string()),
             ..Default::default()
         };
         storage.create_issue(&issue, "tester").unwrap();
@@ -2500,6 +2504,18 @@ mod tests {
             ..Default::default()
         };
         validate_text_field_overwrite_guard(&storage, &ids, &status_only, false).unwrap();
+
+        for prerequisites in [Some(String::new()), None] {
+            let clear = IssueUpdate {
+                prerequisites: Some(prerequisites),
+                ..Default::default()
+            };
+            let error = validate_text_field_overwrite_guard(&storage, &ids, &clear, false)
+                .expect_err("prerequisites use the same destructive replacement guard");
+            assert!(error.to_string().contains("prerequisites"), "{error}");
+            validate_text_field_overwrite_guard(&storage, &ids, &clear, true)
+                .expect("explicit replacement permission");
+        }
     }
 
     // === Magnitude-tiered overwrite guard (GitHub #481) ===

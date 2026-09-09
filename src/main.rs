@@ -2283,6 +2283,7 @@ mod tests {
             assignee: None,
             owner: None,
             acceptance_criteria: None,
+            prerequisites: None,
             agent_context: None,
             labels: Vec::new(),
             parent: None,

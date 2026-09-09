@@ -502,6 +502,7 @@ pub fn create_issue_impl(
             content_hash: None,
             design: None,
             acceptance_criteria: args.acceptance_criteria.clone(),
+            prerequisites: args.prerequisites.clone(),
             notes: None,
             created_by: Some(config.actor.clone()),
             closed_at,
@@ -1021,6 +1022,7 @@ fn execute_import(
                 ephemeral: args.ephemeral,
                 design: design.clone(),
                 acceptance_criteria: acceptance_criteria.clone(),
+                prerequisites: args.prerequisites.clone(),
                 content_hash: None,
                 notes: None,
                 // Keep import hashes actor-independent so identical markdown imports
@@ -1516,6 +1518,7 @@ mod tests {
             assignee: None,
             owner: None,
             acceptance_criteria: None,
+            prerequisites: None,
             agent_context: None,
             labels: vec![],
             parent: None,

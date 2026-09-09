@@ -1729,6 +1729,7 @@ mod tests {
             description: Some("Visible blocked description".to_string()),
             design: Some("0000000000000000000002".to_string()),
             acceptance_criteria: Some("done, quoted".to_string()),
+            prerequisites: None,
             notes: Some("line\nwith tab\tand carriage\rcontrol".to_string()),
             status: Status::Open,
             priority: Priority(0),

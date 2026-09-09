@@ -2113,6 +2113,7 @@ mod tests {
             description: None,
             design: None,
             acceptance_criteria: None,
+            prerequisites: None,
             notes: None,
             status: Status::Open,
             priority: Priority::MEDIUM,

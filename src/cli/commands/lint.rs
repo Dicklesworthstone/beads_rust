@@ -502,6 +502,7 @@ mod tests {
             description: description.map(str::to_string),
             design: None,
             acceptance_criteria: None,
+            prerequisites: None,
             notes: None,
             status: Status::Open,
             priority: crate::model::Priority::MEDIUM,

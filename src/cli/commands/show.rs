@@ -1413,6 +1413,18 @@ fn format_issue_details(details: &IssueDetails, use_color: bool, wrap: bool) -> 
         );
     }
 
+    if let Some(prerequisites) = &issue.prerequisites
+        && !prerequisites.is_empty()
+    {
+        output.push('\n');
+        let _ = writeln!(output, "Prerequisites:");
+        let _ = writeln!(
+            output,
+            "{}",
+            wrap_body(sanitize_terminal_text(prerequisites).as_ref(), wrap_width)
+        );
+    }
+
     if let Some(ac) = &issue.acceptance_criteria
         && !ac.is_empty()
     {
@@ -1510,6 +1522,7 @@ mod tests {
             description: Some("Test description".to_string()),
             design: None,
             acceptance_criteria: None,
+            prerequisites: None,
             notes: None,
             status: Status::Open,
             priority: Priority::MEDIUM,

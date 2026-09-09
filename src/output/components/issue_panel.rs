@@ -111,6 +111,8 @@ impl<'a> IssuePanel<'a> {
             content.append("\n");
         }
 
+        self.append_workflow_fields(&mut content);
+
         // Metadata section
         content.append_styled(
             "\n───────────────────────────────────\n",
@@ -183,6 +185,25 @@ impl<'a> IssuePanel<'a> {
             .border_style(self.theme.panel_border.clone());
 
         ctx.render(&panel);
+    }
+
+    fn append_workflow_fields(&self, content: &mut Text) {
+        for (heading, body) in [
+            ("Prerequisites", self.issue.prerequisites.as_deref()),
+            (
+                "Acceptance Criteria",
+                self.issue.acceptance_criteria.as_deref(),
+            ),
+        ] {
+            if let Some(body) = body.filter(|body| !body.is_empty()) {
+                content.append_styled(&format!("\n{heading}:\n"), self.theme.emphasis.clone());
+                content.append_styled(
+                    sanitize_terminal_text(body).as_ref(),
+                    self.theme.issue_description.clone(),
+                );
+                content.append("\n");
+            }
+        }
     }
 
     /// Render the derived parent-child subtree rollup (GitHub #384 phase 3).
@@ -344,12 +365,41 @@ fn render_dependency_refs(deps: &[Dependency], content: &mut Text, theme: &Theme
 
 #[cfg(test)]
 mod tests {
-    use super::{dependency_arrow, render_dependency_list, render_dependency_refs};
+    use super::{IssuePanel, dependency_arrow, render_dependency_list, render_dependency_refs};
     use crate::format::IssueWithDependencyMetadata;
-    use crate::model::{Dependency, DependencyType, Priority, Status};
+    use crate::model::{Dependency, DependencyType, Issue, Priority, Status};
     use crate::output::Theme;
     use chrono::Utc;
     use rich_rust::prelude::Text;
+
+    #[test]
+    fn workflow_fields_are_distinct_and_terminal_safe() {
+        let issue = Issue {
+            prerequisites: Some("- [x] access granted\n- [ ] review\x1b[2J\x07".to_string()),
+            acceptance_criteria: Some("- [ ] ship feature".to_string()),
+            ..Issue::default()
+        };
+        let original = issue.clone();
+        let theme = Theme::default();
+        let panel = IssuePanel::new(&issue, &theme);
+        let mut content = Text::new("");
+        panel.append_workflow_fields(&mut content);
+        assert_eq!(
+            content.plain(),
+            "\nPrerequisites:\n- [x] access granted\n- [ ] review\\u{1b}[2J\\u{7}\n\nAcceptance Criteria:\n- [ ] ship feature\n"
+        );
+        assert_eq!(issue.prerequisites, original.prerequisites);
+        assert_eq!(issue.acceptance_criteria, original.acceptance_criteria);
+        assert!(!content.plain().contains("Dependencies:"));
+
+        let empty = Issue {
+            prerequisites: Some(String::new()),
+            ..Issue::default()
+        };
+        let mut content = Text::new("");
+        IssuePanel::new(&empty, &theme).append_workflow_fields(&mut content);
+        assert!(content.plain().is_empty());
+    }
 
     #[test]
     fn test_dependency_arrow_tracks_direction() {

@@ -144,6 +144,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
         content_hash: None,
         design: None,
         acceptance_criteria: None,
+        prerequisites: None,
         notes: None,
         assignee: None,
         owner: None,

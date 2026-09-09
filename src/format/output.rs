@@ -20,12 +20,14 @@ pub struct StaleIssue {
 
 /// Minimal issue output for ready command (bd parity).
 ///
-/// Contains only the fields that bd's ready command outputs.
+/// Contains the ready-work context, including br's per-issue prerequisites.
 /// Does NOT include: `compaction_level`, `original_size`, `dependency_count`, `dependent_count`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ReadyIssue {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acceptance_criteria: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prerequisites: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -57,6 +59,7 @@ impl From<Issue> for ReadyIssue {
     fn from(issue: Issue) -> Self {
         Self {
             acceptance_criteria: issue.acceptance_criteria,
+            prerequisites: issue.prerequisites,
             assignee: issue.assignee,
             created_at: issue.created_at,
             created_by: issue.created_by,
@@ -396,6 +399,7 @@ mod tests {
             description: None,
             design: None,
             acceptance_criteria: None,
+            prerequisites: None,
             notes: None,
             status: Status::Open,
             priority: Priority::MEDIUM,

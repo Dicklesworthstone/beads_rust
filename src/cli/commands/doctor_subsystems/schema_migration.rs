@@ -91,6 +91,8 @@ struct MigrationForecast {
     content_hash_rows_rebuilt: usize,
     gate_result_history_created: bool,
     #[serde(default, skip_serializing_if = "is_false")]
+    prerequisites_column_added: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     post_migration_maintenance: bool,
 }
 
@@ -184,6 +186,8 @@ struct ReviewedSchemaMigrationEffectsReceipt {
     content_hash_rows_rebuilt: usize,
     gate_result_history_created: bool,
     #[serde(default, skip_serializing_if = "is_false")]
+    prerequisites_column_added: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     post_migration_maintenance_completed: bool,
 }
 
@@ -194,6 +198,7 @@ impl From<ReviewedSchemaMigrationEffects> for ReviewedSchemaMigrationEffectsRece
             to_version: value.to_version,
             content_hash_rows_rebuilt: value.content_hash_rows_rebuilt,
             gate_result_history_created: value.gate_result_history_created,
+            prerequisites_column_added: value.prerequisites_column_added,
             post_migration_maintenance_completed: false,
         }
     }
@@ -318,6 +323,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
                 to_version: target,
                 content_hash_rows_rebuilt: 0,
                 gate_result_history_created: false,
+                prerequisites_column_added: false,
                 post_migration_maintenance: true,
             };
             let plan_token = compute_plan_token(&database_path, &logical_witness, &forecast)?;
@@ -357,7 +363,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     }
     if !REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         return Err(BeadsError::internal(format!(
-            "reviewed schema migration is available only from source schemas 13, 14, 15, and 16 \
+            "reviewed schema migration is available only from source schemas 13, 14, 15, 16, and 17 \
              to {target}; observed unsupported source version {from}"
         )));
     }
@@ -389,6 +395,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
             0
         },
         gate_result_history_created,
+        prerequisites_column_added: true,
         post_migration_maintenance: true,
     };
     let plan_token = compute_plan_token(&database_path, &logical_witness, &forecast)?;
@@ -569,6 +576,7 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
         || effects.to_version != forecast.to_version
         || effects.content_hash_rows_rebuilt != forecast.content_hash_rows_rebuilt
         || effects.gate_result_history_created != forecast.gate_result_history_created
+        || effects.prerequisites_column_added != forecast.prerequisites_column_added
         || !maintenance_matches_forecast
     {
         attestation_errors.push(format!(
@@ -763,6 +771,7 @@ fn validate_commit_ready_marker(
         || marker.effects.to_version != marker.forecast.to_version
         || marker.effects.content_hash_rows_rebuilt != marker.forecast.content_hash_rows_rebuilt
         || marker.effects.gate_result_history_created != marker.forecast.gate_result_history_created
+        || marker.effects.prerequisites_column_added != marker.forecast.prerequisites_column_added
         || maintenance_completion_disagrees_with_forecast
         || marker.logical_after.user_version != marker.forecast.to_version
         || !integrity_check_is_clean(&marker.logical_after.integrity_check)
@@ -1281,6 +1290,7 @@ fn run_post_migration_maintenance(
             to_version: to,
             content_hash_rows_rebuilt: 0,
             gate_result_history_created: false,
+            prerequisites_column_added: false,
             post_migration_maintenance_completed: false,
         }
     } else {
@@ -3909,6 +3919,7 @@ mod tests {
             to_version: 15,
             content_hash_rows_rebuilt: 0,
             gate_result_history_created: true,
+            prerequisites_column_added: false,
             post_migration_maintenance: true,
         };
         let first = compute_plan_token("db", &logical, &forecast).unwrap();
@@ -4011,12 +4022,23 @@ mod tests {
     fn reviewed_v14_migration_context_with_database_name(
         database_name: &str,
     ) -> (TempDir, MigrationContext) {
+        reviewed_source_migration_context(database_name, 14)
+    }
+
+    fn reviewed_source_migration_context(
+        database_name: &str,
+        version: u32,
+    ) -> (TempDir, MigrationContext) {
+        assert!(matches!(version, 14 | 17));
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
         fs::create_dir(&beads_dir).expect("create beads dir");
         let db_path = beads_dir.join(database_name);
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open db");
-        crate::storage::schema::apply_schema(&conn).expect("create current schema");
+        let source_schema = crate::storage::schema::SCHEMA_SQL
+            .replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "");
+        crate::storage::schema::execute_batch(&conn, &source_schema)
+            .expect("create pre-v18 schema");
         conn.execute(
             "INSERT INTO issues (
                 id, title, status, priority, issue_type, created_at, updated_at
@@ -4026,9 +4048,12 @@ mod tests {
              )",
         )
         .expect("seed issue");
-        conn.execute("DROP TABLE gate_result_history")
-            .expect("restore v14 shape");
-        conn.execute("PRAGMA user_version = 14").expect("stamp v14");
+        if version == 14 {
+            conn.execute("DROP TABLE gate_result_history")
+                .expect("restore v14 shape");
+        }
+        conn.execute(&format!("PRAGMA user_version = {version}"))
+            .expect("stamp matching source version");
         close_connection(conn).expect("close fixture");
 
         let authority = Arc::new(
@@ -4051,6 +4076,213 @@ mod tests {
 
     fn reviewed_v14_migration_context() -> (TempDir, MigrationContext) {
         reviewed_v14_migration_context_with_database_name("beads.db")
+    }
+
+    fn apply_prerequisite_upgrade(migration: &MigrationContext) -> AppliedMigrationReceipt {
+        let plan = build_plan(&migration.db_path).expect("plan v17 upgrade");
+        assert!(plan.eligible);
+        assert_eq!((plan.from_version, plan.to_version), (17, 18));
+        let forecast = plan.forecast.as_ref().expect("migration forecast");
+        assert!(forecast.prerequisites_column_added);
+        assert_eq!(forecast.content_hash_rows_rebuilt, 0);
+        assert!(!forecast.gate_result_history_created);
+        execute_apply(
+            &DoctorMigrateSchemaApplyArgs {
+                plan_token: plan.plan_token.expect("plan token"),
+                json: false,
+            },
+            migration,
+        )
+        .expect("apply v17 upgrade");
+        let runs = fs::read_dir(migration_runs_root(&migration.beads_dir))
+            .expect("read runs")
+            .map(|entry| entry.expect("run entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(runs.len(), 1);
+        let applied: AppliedMigrationReceipt =
+            read_json(&runs[0].join("applied.json")).expect("applied receipt");
+        assert!(applied.attested, "{:?}", applied.attestation_errors);
+        assert!(applied.effects.prerequisites_column_added);
+        assert_eq!(applied.effects.content_hash_rows_rebuilt, 0);
+        applied
+    }
+
+    fn seed_v17_auxiliary_rows(conn: &Connection) {
+        crate::storage::schema::execute_batch(
+            conn,
+            "INSERT INTO labels (issue_id, label) VALUES ('bd-schema-rehearsal', 'handoff');
+             INSERT INTO comments (issue_id, author, text)
+                 VALUES ('bd-schema-rehearsal', 'reviewer', 'Preserve this audit trail');
+             INSERT INTO events (issue_id, event_type, actor, new_value, harness)
+                 VALUES ('bd-schema-rehearsal', 'created', 'owner', 'open', 'codex');
+             INSERT INTO gate_results (issue_id, gate, provider, passed)
+                 VALUES ('bd-schema-rehearsal', 'reviewed', 'reviewer', 1);
+             INSERT INTO gate_result_history
+                 (issue_id, from_status, to_status, status_revision, gate, provider, passed)
+                 VALUES ('bd-schema-rehearsal', 'open', 'in_progress', 0, 'reviewed', 'reviewer', 1);
+             INSERT INTO capacity_exemptions
+                 (issue_id, capacity_kind, capacity_name, provider, reason, granted_by)
+                 VALUES ('bd-schema-rehearsal', 'status', 'open', 'lead', 'external review', 'owner');
+             INSERT INTO capacity_exemption_history
+                 (issue_id, capacity_kind, capacity_name, action, provider, reason, actor)
+                 VALUES ('bd-schema-rehearsal', 'status', 'open', 'grant', 'lead', 'external review', 'owner');
+             INSERT INTO capacity_occupancy (issue_id, actor, harness, session)
+                 VALUES ('bd-schema-rehearsal', 'owner', 'codex', 'original-session');
+             INSERT INTO config (key, value) VALUES ('issue_prefix', 'bd');
+             INSERT INTO metadata (key, value) VALUES ('needs_flush', 'true');
+             INSERT INTO child_counters (parent_id, last_child) VALUES ('bd-schema-rehearsal', 7);",
+        )
+        .expect("seed v17 auxiliary state and history");
+    }
+
+    #[test]
+    fn reviewed_v17_prerequisite_upgrade_preserves_rows_and_undo_bytes() {
+        let (_temp, migration) = reviewed_source_migration_context("beads.db", 17);
+        let conn = Connection::open(migration.db_path.to_string_lossy().into_owned())
+            .expect("open v17 source");
+        conn.execute(
+            "UPDATE issues SET acceptance_criteria = '- [ ] final outcome',
+             content_hash = 'preserved-source-hash' WHERE id = 'bd-schema-rehearsal'",
+        )
+        .expect("seed distinct acceptance criteria");
+        conn.execute(
+            "INSERT INTO dirty_issues (issue_id, marked_at)
+             VALUES ('bd-schema-rehearsal', '2026-09-09T01:00:00Z')",
+        )
+        .expect("seed dirty bookkeeping");
+        conn.execute(
+            "INSERT INTO export_hashes (issue_id, content_hash, exported_at)
+             VALUES ('bd-schema-rehearsal', 'previous-export', '2026-09-09T00:00:00Z')",
+        )
+        .expect("seed export bookkeeping");
+        seed_v17_auxiliary_rows(&conn);
+        let source_row = conn.query_row("SELECT * FROM issues").expect("source row");
+        close_connection(conn).expect("close source");
+        let applied = apply_prerequisite_upgrade(&migration);
+        let after = applied
+            .logical_after
+            .as_ref()
+            .expect("attested after state");
+        for table in applied
+            .logical_before
+            .tables
+            .iter()
+            .filter(|t| t.name != "issues")
+        {
+            assert_eq!(
+                after.tables.iter().find(|t| t.name == table.name),
+                Some(table)
+            );
+        }
+        let conn = open_read_only(&migration.db_path).expect("open migrated database");
+        let row = conn
+            .query_row("SELECT * FROM issues")
+            .expect("migrated row");
+        for index in 0..38 {
+            assert_eq!(row.get(index), source_row.get(index), "column {index}");
+        }
+        assert_eq!(row.get(38).and_then(SqliteValue::as_text), Some(""));
+        close_connection(conn).expect("close migrated database");
+        execute_undo(
+            &DoctorMigrateSchemaUndoArgs {
+                run_id: applied.run_id,
+                dry_run: false,
+                json: false,
+            },
+            &migration,
+        )
+        .expect("undo v17 migration");
+        assert_eq!(
+            raw_family_witness(&migration.db_path).expect("restored bytes"),
+            applied.raw_before
+        );
+        assert_eq!(
+            logical_witness(&migration.db_path).expect("restored contents"),
+            applied.logical_before
+        );
+    }
+
+    #[test]
+    fn reviewed_v17_prerequisite_write_stales_undo_and_preserves_acceptance() {
+        let (_temp, migration) = reviewed_source_migration_context("beads.db", 17);
+        let applied = apply_prerequisite_upgrade(&migration);
+        let conn = Connection::open(migration.db_path.to_string_lossy().into_owned())
+            .expect("open migrated database");
+        conn.execute(
+            "UPDATE issues SET acceptance_criteria = '- [ ] outcome',
+             prerequisites = '- [x] input ready' WHERE id = 'bd-schema-rehearsal'",
+        )
+        .expect("write distinct prerequisite content");
+        close_connection(conn).expect("close write");
+        let before_refusal = logical_witness(&migration.db_path).expect("post-write witness");
+        let error = execute_undo(
+            &DoctorMigrateSchemaUndoArgs {
+                run_id: applied.run_id,
+                dry_run: false,
+                json: false,
+            },
+            &migration,
+        )
+        .expect_err("undo must preserve subsequent prerequisite writes");
+        assert!(
+            error.to_string().contains("live database has changed"),
+            "{error}"
+        );
+        assert_eq!(
+            logical_witness(&migration.db_path).expect("after refusal"),
+            before_refusal
+        );
+        let conn = open_read_only(&migration.db_path).expect("read refused state");
+        let row = conn
+            .query_row("SELECT acceptance_criteria, prerequisites FROM issues")
+            .expect("read independent fields");
+        assert_eq!(
+            row.get(0).and_then(SqliteValue::as_text),
+            Some("- [ ] outcome")
+        );
+        assert_eq!(
+            row.get(1).and_then(SqliteValue::as_text),
+            Some("- [x] input ready")
+        );
+        close_connection(conn).expect("close read");
+    }
+
+    #[test]
+    fn prerequisite_upgrade_plan_rejects_false_version_and_malformed_column() {
+        for (statements, expected_error) in [
+            (
+                vec!["PRAGMA user_version = 18"],
+                "runtime shape is not canonical",
+            ),
+            (
+                vec!["ALTER TABLE issues ADD COLUMN prerequisites TEXT NOT NULL DEFAULT ''"],
+                "unsupported historical shape for core table issues",
+            ),
+            (
+                vec![
+                    "ALTER TABLE issues ADD COLUMN prerequisites TEXT DEFAULT ''",
+                    "PRAGMA user_version = 18",
+                ],
+                "runtime shape is not canonical",
+            ),
+        ] {
+            let (_temp, migration) = reviewed_source_migration_context("beads.db", 17);
+            let conn = Connection::open(migration.db_path.to_string_lossy().into_owned())
+                .expect("open source");
+            for statement in statements {
+                conn.execute(statement)
+                    .expect("install malformed declaration");
+            }
+            close_connection(conn).expect("close malformed source");
+            let before = logical_witness(&migration.db_path).expect("before witness");
+            let error = build_plan(&migration.db_path).expect_err("refuse malformed source");
+            assert!(error.to_string().contains(expected_error), "{error}");
+            assert_eq!(
+                logical_witness(&migration.db_path).expect("after witness"),
+                before
+            );
+            assert!(!migration_runs_root(&migration.beads_dir).exists());
+        }
     }
 
     #[test]
@@ -4826,6 +5058,7 @@ mod tests {
                 to_version: forecast.to_version,
                 content_hash_rows_rebuilt: forecast.content_hash_rows_rebuilt,
                 gate_result_history_created: forecast.gate_result_history_created,
+                prerequisites_column_added: forecast.prerequisites_column_added,
                 post_migration_maintenance_completed: true,
             },
         )

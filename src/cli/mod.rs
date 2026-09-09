@@ -1128,6 +1128,10 @@ pub struct CreateArgs {
     #[arg(long, visible_alias = "acceptance", allow_hyphen_values = true)]
     pub acceptance_criteria: Option<String>,
 
+    /// Prerequisite checklist recorded separately from acceptance criteria
+    #[arg(long, allow_hyphen_values = true)]
+    pub prerequisites: Option<String>,
+
     /// Set the initial `agent_context` governing-instructions JSON
     /// (beads_rust#408).
     ///
@@ -1231,6 +1235,10 @@ pub struct UpdateArgs {
     #[arg(long, visible_alias = "acceptance", allow_hyphen_values = true)]
     pub acceptance_criteria: Option<String>,
 
+    /// Replace the prerequisite checklist (empty string clears)
+    #[arg(long, allow_hyphen_values = true)]
+    pub prerequisites: Option<String>,
+
     /// Tick acceptance-criteria checklist items in place (GitHub #477).
     ///
     /// ITEMS is either a comma-separated list of 1-based item numbers
@@ -1318,7 +1326,7 @@ pub struct UpdateArgs {
     pub claim: bool,
 
     /// Force update even if issue is blocked, and allow a destructive
-    /// rewrite of a non-empty description/design/acceptance-criteria/
+    /// rewrite of a non-empty description/design/acceptance-criteria/prerequisites/
     /// notes/agent-context value: clearing it, or replacing it with content
     /// shorter than half its current length (GitHub #467, #481). Revisions
     /// that keep at least half the length pass without this flag.
