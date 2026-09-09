@@ -359,7 +359,7 @@ fn e2e_list_tree_with_color_emits_real_escapes_not_escaped_text() {
 }
 
 #[test]
-fn e2e_no_color_environment_suppresses_configured_color_in_all_text_layouts() {
+fn e2e_plain_environment_suppresses_configured_color_in_all_text_layouts() {
     let workspace = BrWorkspace::new();
     let init = run_br(&workspace, ["init"], "no_color_init");
     assert!(init.status.success(), "{init:?}");
@@ -385,19 +385,23 @@ fn e2e_no_color_environment_suppresses_configured_color_in_all_text_layouts() {
         let colored = run_br_with_env(
             &workspace,
             args.clone(),
-            [("NO_COLOR", "")],
+            [("NO_COLOR", ""), ("TERM", "xterm-256color")],
             &format!("{layout}_color_enabled"),
         );
         assert!(colored.status.success(), "{colored:?}");
         assert!(colored.stdout.contains("\u{1b}[39m"), "{colored:?}");
         assert!(!colored.stdout.contains("\u{1b}[2J"), "{colored:?}");
         assert!(!colored.stdout.contains('\u{7}'), "{colored:?}");
-        for value in ["1", "0"] {
+        for (value, term) in [
+            ("1", "xterm-256color"),
+            ("0", "xterm-256color"),
+            ("", "dumb"),
+        ] {
             let plain = run_br_with_env(
                 &workspace,
                 args.clone(),
-                [("NO_COLOR", value)],
-                &format!("{layout}_no_color_{value}"),
+                [("NO_COLOR", value), ("TERM", term)],
+                &format!("{layout}_no_color_{value}_term_{term}"),
             );
             assert!(plain.status.success(), "{plain:?}");
             assert!(!plain.stdout.contains('\u{1b}'), "{plain:?}");

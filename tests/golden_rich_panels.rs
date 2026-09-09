@@ -212,7 +212,18 @@ fn run_rich_br_with_env(
         String::from_utf8_lossy(&output.stderr)
     );
 
-    normalize_rich_output(&String::from_utf8_lossy(&output.stdout))
+    let raw = String::from_utf8_lossy(&output.stdout);
+    if args.contains(&"--no-color")
+        || extra_env.iter().any(|(key, value)| {
+            (*key == "NO_COLOR" && !value.is_empty()) || (*key == "TERM" && *value == "dumb")
+        })
+    {
+        assert!(
+            !raw.contains('\u{1b}'),
+            "plain PTY output must contain no ANSI before normalization: {raw:?}"
+        );
+    }
+    normalize_rich_output(&raw)
 }
 
 fn issue_id_re() -> &'static Regex {
@@ -391,10 +402,6 @@ fn term_dumb_pty_selects_plain_mode() {
         &["show", &fixture.show_id],
     );
     assert!(
-        !dumb.contains("\x1b["),
-        "TERM=dumb output must not contain ANSI escape codes:\n{dumb}"
-    );
-    assert!(
         !dumb.contains('│') && !dumb.contains('╭') && !dumb.contains('─'),
         "TERM=dumb output must not contain box drawing:\n{dumb}"
     );
@@ -402,4 +409,98 @@ fn term_dumb_pty_selects_plain_mode() {
         dumb.contains("Alpha layout regression"),
         "plain output must still show the issue:\n{dumb}"
     );
+}
+
+#[test]
+fn empty_no_color_keeps_rich_layout_on_a_real_pty() {
+    let fixture = init_fixture();
+    let args = ["show", fixture.show_id.as_str()];
+    let rich = run_rich_br_with_env(&fixture.root, 80, &[("TERM", "xterm-256color")], &args);
+    assert_rich_frame(&rich, "show", 80);
+    let empty = run_rich_br_with_env(
+        &fixture.root,
+        80,
+        &[("TERM", "xterm-256color"), ("NO_COLOR", "")],
+        &args,
+    );
+    assert_eq!(empty, rich, "empty NO_COLOR must preserve the Rich layout");
+    let plain = run_rich_br_with_env(
+        &fixture.root,
+        80,
+        &[("TERM", "xterm-256color"), ("NO_COLOR", "1")],
+        &args,
+    );
+    // The helper checks raw ANSI before normalization; compare layout and
+    // retained content here as well.
+    assert!(!plain.contains('│') && !plain.contains('╭') && !plain.contains('─'));
+    assert!(plain.contains("Alpha layout regression"));
+}
+
+#[test]
+fn plain_terminal_controls_preserve_diagnostics_without_ansi() {
+    let fixture = init_fixture();
+    for (flag, no_color, term) in [
+        (false, "1", "xterm-256color"),
+        (false, "0", "xterm-256color"),
+        (true, "", "xterm-256color"),
+        (false, "", "dumb"),
+    ] {
+        let mut args = vec!["show", fixture.show_id.as_str()];
+        if flag {
+            args.push("--no-color");
+        }
+        let plain = run_rich_br_with_env(
+            &fixture.root,
+            80,
+            &[
+                ("NO_COLOR", no_color),
+                ("TERM", term),
+                ("RUST_LOG", "beads_rust=debug"),
+            ],
+            &args,
+        );
+        // The helper rejects raw ANSI before normalization. Require logs
+        // and issue content too, so disabling diagnostics cannot pass.
+        assert!(plain.contains("DEBUG"), "diagnostics missing: {plain}");
+        assert!(plain.contains("Alpha layout regression"));
+    }
+}
+
+#[test]
+fn human_errors_honor_terminal_color_controls() {
+    let fixture = init_fixture();
+    for (flag, no_color, term, expect_color) in [
+        (false, None, "xterm-256color", true),
+        (false, Some(""), "xterm-256color", true),
+        (false, Some("1"), "xterm-256color", false),
+        (false, Some("0"), "xterm-256color", false),
+        (true, Some(""), "xterm-256color", false),
+        (false, None, "dumb", false),
+    ] {
+        let binary = assert_cmd::cargo::cargo_bin!("br");
+        let command_line = format!(
+            "{} show missing-1234 {}",
+            sh_quote(binary.as_os_str()),
+            if flag { "--no-color" } else { "" },
+        );
+        let mut cmd = Command::new("script");
+        cmd.current_dir(&fixture.root);
+        cmd.args(["-q", "-e", "-c", &command_line, "/dev/null"]);
+        clear_inherited_br_env(&mut cmd);
+        cmd.env("HOME", &fixture.root);
+        cmd.env("TERM", term);
+        cmd.env("RUST_LOG", "error");
+        if let Some(value) = no_color {
+            cmd.env("NO_COLOR", value);
+        }
+        let output = cmd.output().expect("run failing br under pseudo-terminal");
+        assert_eq!(output.status.code(), Some(3));
+        let raw = String::from_utf8_lossy(&output.stdout);
+        assert!(raw.contains("missing-1234"), "error missing: {raw}");
+        assert_eq!(
+            raw.contains('\u{1b}'),
+            expect_color,
+            "flag={flag}, NO_COLOR={no_color:?}, TERM={term}: {raw:?}"
+        );
+    }
 }
