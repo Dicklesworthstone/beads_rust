@@ -60,4 +60,5 @@ sync_base.jsonl
 *-fsqlite-ns-gate
 *-fsqlite-ns-use
 .write.lock
+.write-waiters.lock/
 *.tmp
