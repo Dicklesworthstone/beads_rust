@@ -82,7 +82,7 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
-## Unreleased
+## v0.5.12 — pending release
 
 These changes are on `main` after v0.5.11. They are not included in that
 release's binary archives. Source qualification is complete; the next

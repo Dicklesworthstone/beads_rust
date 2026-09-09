@@ -1,5 +1,5 @@
 {
-  "version": "0.5.11",
+  "version": "0.5.12",
   "build": "<build>",
   "rust_version": "<rust_version>",
   "target": "<target>",
