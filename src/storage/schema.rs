@@ -3135,6 +3135,7 @@ fn attest_legacy_v15_projection_values(conn: &Connection) -> Result<()> {
         }
     }
     attest_legacy_v15_timestamp_affinity(conn)?;
+    attest_legacy_v15_dependency_type_spelling(conn)?;
     if !conn
         .query("SELECT 1 FROM main.dirty_issues WHERE typeof(content_hash) <> 'null' LIMIT 1")?
         .is_empty()
@@ -3178,6 +3179,24 @@ fn attest_legacy_v15_projection_values(conn: &Connection) -> Result<()> {
                     "counter for {parent} precedes existing child {id}"
                 )));
             }
+        }
+    }
+    Ok(())
+}
+
+fn attest_legacy_v15_dependency_type_spelling(conn: &Connection) -> Result<()> {
+    for row in conn.query("SELECT DISTINCT type FROM main.dependencies")? {
+        let kind = row
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .ok_or_else(|| legacy_v15_refusal("dependency type is not text"))?;
+        // The interchange model normalizes type spelling. Copying two raw
+        // case-distinct keys would make them collide on the next JSONL import.
+        // Preserve the historical source by refusing before approval instead.
+        if kind.parse::<crate::model::DependencyType>()?.as_str() != kind {
+            return Err(legacy_v15_refusal(format!(
+                "dependency type {kind:?} cannot preserve its spelling through JSONL interchange"
+            )));
         }
     }
     Ok(())
@@ -6734,6 +6753,8 @@ mod tests {
             "UPDATE child_counters SET last_child = NULL",
             "UPDATE comments SET issue_id = 'bd-missing'",
             "UPDATE events SET created_at = NULL",
+            "UPDATE dependencies SET type = 'Review-Custom' WHERE type = 'blocks'",
+            "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id) SELECT issue_id, depends_on_id, 'BLOCKS', created_at, created_by, metadata, thread_id FROM dependencies WHERE type = 'blocks'",
             "INSERT INTO sqlite_sequence(name, seq) VALUES ('comments', 900)",
             "CREATE TABLE comments_legacy_v15_stage (payload TEXT)",
             "CREATE INDEX operator_dependency_index ON dependencies(created_by)",
