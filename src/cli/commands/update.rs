@@ -655,19 +655,19 @@ fn prepare_single_route_with_storage(
         let transitions_enforced = policy.workflow.transitions_enforced();
         if transitions_enforced {
             for id in &resolved_ids {
-                // The current status is the `from` state for the transition
-                // check. An issue that cannot be read (missing/unresolved)
-                // validates against the `initial` key (from = None), mirroring
-                // a create.
-                let current = storage_ctx
-                    .storage
-                    .get_issue(id)?
-                    .map(|issue| issue.status.as_str().to_string());
-                if transitions_enforced {
-                    policy
-                        .workflow
-                        .validate_transition(current.as_deref(), new_status.as_str())?;
-                }
+                // A combined type/status edit selects edges using its new
+                // type. Storage repeats this check inside the atomic batch.
+                // An unresolved issue retains the ordinary initial check.
+                let current = storage_ctx.storage.get_issue(id)?;
+                let prospective_type = update
+                    .issue_type
+                    .as_ref()
+                    .or_else(|| current.as_ref().map(|issue| &issue.issue_type));
+                policy.workflow.validate_transition(
+                    current.as_ref().map(|issue| issue.status.as_str()),
+                    new_status.as_str(),
+                    prospective_type.map(crate::model::IssueType::as_str),
+                )?;
             }
         }
     }

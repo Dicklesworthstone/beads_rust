@@ -6700,8 +6700,13 @@ impl SqliteStorage {
         IssueValidator::validate(issue).map_err(BeadsError::from_validation_errors)?;
         validate_issue_comments_for_create(issue)?;
         let capacity_policy = self.workflow_capacity_policy.clone();
+        let workflow_policy = self.workflow_transition_policy.clone();
 
         self.mutate("create_issue", actor, |conn, ctx| {
+            workflow_policy.validate_status(issue.status.as_str())?;
+            // Class-specific edges apply only after creation; every issue
+            // enters through the same configured initial route.
+            workflow_policy.validate_transition(None, issue.status.as_str(), None)?;
             // Explicit duplicate check since fsqlite does not enforce
             // UNIQUE constraints on non-rowid columns.
             match conn.query_row_with_params(
@@ -7074,6 +7079,11 @@ impl SqliteStorage {
 
             let issue = Self::get_issue_from_conn(conn, id)?
                 .ok_or_else(|| BeadsError::IssueNotFound { id: id.clone() })?;
+            if update.workflow_policy_bypass_reason.is_none() {
+                // An explicit target must remain declared even when a policy
+                // reload has made the stored, same-status value obsolete.
+                workflow.validate_status(to_status.as_str())?;
+            }
             if issue.status == *to_status {
                 if update.transition_comment.is_some()
                     || update.workflow_policy_bypass_reason.is_some()
@@ -7110,7 +7120,8 @@ impl SqliteStorage {
             // before any row is touched — makes a batch close all-or-nothing
             // and leaves `--bypass-policy` semantics intact because an
             // explicit bypass reason already `continue`d above.
-            workflow.validate_transition(Some(from), to)?;
+            let prospective_type = update.issue_type.as_ref().unwrap_or(&issue.issue_type);
+            workflow.validate_transition(Some(from), to, Some(prospective_type.as_str()))?;
 
             let prospective_acceptance_criteria = update
                 .acceptance_criteria
@@ -21787,6 +21798,212 @@ mod tests {
         let comments = storage.get_comments(&issue.id).unwrap();
         assert_eq!(comments.len(), 1);
         assert_eq!(comments[0].body, "Ready to build");
+    }
+
+    fn class_transition_workflow() -> crate::close_policy::Workflow {
+        serde_yml::from_str(
+            r"strict: true
+statuses: [draft, planned, open, in_progress, closed]
+transitions:
+  initial: [draft]
+  draft: [planned]
+  planned: [open]
+  open: [in_progress]
+  in_progress: [closed]
+class_transitions:
+  - issue_type: bug
+    from: draft
+    to: open
+required_fields:
+  open: [acceptance_criteria_present, transition_comment]
+",
+        )
+        .unwrap()
+    }
+
+    fn class_transition_rows(storage: &SqliteStorage) -> [String; 7] {
+        [
+            "issues",
+            "comments",
+            "events",
+            "dirty_issues",
+            "metadata",
+            "capacity_occupancy",
+            "gate_result_history",
+        ]
+        .map(|table| {
+            format!(
+                "{:?}",
+                storage
+                    .conn
+                    .query(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                    .unwrap()
+            )
+        })
+    }
+
+    #[test]
+    fn class_transition_storage_enforces_initial_vocabulary_and_fresh_requirements() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage.set_workflow_policy(class_transition_workflow());
+        let mut issue = make_issue(
+            "bd-class",
+            "A classified issue",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        issue.issue_type = IssueType::Bug;
+        let empty = class_transition_rows(&storage);
+        for initial in [Status::Open, Status::Custom("undone_work".to_owned())] {
+            issue.status = initial;
+            let error = storage.create_issue(&issue, "route-tester").unwrap_err();
+            assert!(matches!(error, BeadsError::Validation { .. }), "{error}");
+            assert_eq!(class_transition_rows(&storage), empty);
+        }
+        issue.status = Status::Draft;
+        storage.create_issue(&issue, "route-tester").unwrap();
+        storage
+            .add_comment(&issue.id, "route-tester", "A historical comment")
+            .unwrap();
+        let before = class_transition_rows(&storage);
+        for status in [Status::Closed, Status::Custom("undone_work".to_owned())] {
+            let update = IssueUpdate {
+                status: Some(status),
+                acceptance_criteria: Some(Some("- [ ] Deliver the fix".to_owned())),
+                transition_comment: Some("A forbidden shortcut".to_owned()),
+                ..Default::default()
+            };
+            let error = storage
+                .update_issue(&issue.id, &update, "route-tester")
+                .unwrap_err();
+            assert!(matches!(error, BeadsError::Validation { .. }), "{error}");
+            assert_eq!(class_transition_rows(&storage), before);
+        }
+        let mut update = IssueUpdate {
+            status: Some(Status::Open),
+            acceptance_criteria: Some(Some("- [ ] Deliver the fix".to_owned())),
+            ..Default::default()
+        };
+        let error = storage
+            .update_issue(&issue.id, &update, "route-tester")
+            .unwrap_err();
+        assert!(
+            matches!(error, BeadsError::PolicyViolation { .. }),
+            "{error}"
+        );
+        assert_eq!(class_transition_rows(&storage), before);
+        update.transition_comment = Some("Ready to implement".to_owned());
+        let opened = storage
+            .update_issue(&issue.id, &update, "route-tester")
+            .unwrap();
+        assert_eq!(opened.status, Status::Open);
+        assert_eq!(opened.issue_type, IssueType::Bug);
+        assert_eq!(
+            opened.acceptance_criteria,
+            update.acceptance_criteria.unwrap()
+        );
+        assert_eq!(
+            opened.content_hash.as_deref(),
+            Some(opened.compute_content_hash().as_str())
+        );
+        let comments = storage.get_comments(&issue.id).unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[1].body, "Ready to implement");
+    }
+
+    #[test]
+    fn class_transition_storage_uses_prospective_type_and_preflights_both_batch_orders() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage.set_workflow_policy(class_transition_workflow());
+        for (id, issue_type) in [
+            ("bd-class-bug", IssueType::Bug),
+            ("bd-class-task", IssueType::Task),
+        ] {
+            let mut issue = make_issue(id, id, Status::Draft, 2, None, Utc::now(), None);
+            issue.issue_type = issue_type;
+            storage.create_issue(&issue, "route-tester").unwrap();
+        }
+        let before = class_transition_rows(&storage);
+        let update = IssueUpdate {
+            status: Some(Status::Open),
+            acceptance_criteria: Some(Some("Unfinished work is allowed here".to_owned())),
+            transition_comment: Some("Ready by class route".to_owned()),
+            ..Default::default()
+        };
+        let invalid_type = IssueUpdate {
+            issue_type: Some(IssueType::Task),
+            ..update.clone()
+        };
+        let error = storage
+            .update_issue("bd-class-bug", &invalid_type, "route-tester")
+            .unwrap_err();
+        assert!(matches!(error, BeadsError::Validation { .. }), "{error}");
+        assert_eq!(class_transition_rows(&storage), before);
+
+        let mut batch = vec![
+            ("bd-class-bug".to_owned(), update.clone()),
+            ("bd-class-task".to_owned(), update),
+        ];
+        for _ in 0..2 {
+            let error = storage
+                .update_issues_atomically(&batch, "route-tester")
+                .unwrap_err();
+            assert!(matches!(error, BeadsError::Validation { .. }), "{error}");
+            assert_eq!(class_transition_rows(&storage), before);
+            batch.reverse();
+        }
+        batch[1].1.issue_type = Some(IssueType::Bug);
+        storage
+            .update_issues_atomically(&batch, "route-tester")
+            .unwrap();
+        for (id, _) in &batch {
+            let opened = storage.get_issue(id).unwrap().unwrap();
+            assert_eq!(opened.status, Status::Open);
+            assert_eq!(opened.issue_type, IssueType::Bug);
+            assert_eq!(
+                opened.content_hash.as_deref(),
+                Some(opened.compute_content_hash().as_str())
+            );
+            let comments = storage.get_comments(id).unwrap();
+            assert_eq!(comments.len(), 1);
+            assert_eq!(comments[0].body, "Ready by class route");
+            assert_eq!(comments[0].author, "route-tester");
+        }
+    }
+
+    #[test]
+    fn class_transition_storage_refuses_same_obsolete_status_after_policy_reload() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut issue = make_issue(
+            "bd-class-obsolete",
+            "Existing status removed by policy",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        issue.issue_type = IssueType::Bug;
+        storage.create_issue(&issue, "route-tester").unwrap();
+        storage.set_workflow_policy(crate::close_policy::Workflow {
+            strict: true,
+            statuses: vec!["draft".to_owned()],
+            ..Default::default()
+        });
+        let before = class_transition_rows(&storage);
+        let update = IssueUpdate {
+            status: Some(Status::Open),
+            issue_type: Some(IssueType::Task),
+            ..Default::default()
+        };
+        let error = storage
+            .update_issue(&issue.id, &update, "route-tester")
+            .unwrap_err();
+        assert!(matches!(error, BeadsError::Validation { .. }), "{error}");
+        assert_eq!(class_transition_rows(&storage), before);
     }
 
     #[cfg(unix)]

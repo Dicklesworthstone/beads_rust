@@ -181,6 +181,20 @@ pub struct Workflow {
     /// compatible).
     #[serde(default)]
     pub transitions: std::collections::BTreeMap<String, Vec<String>>,
+    /// Additional exact status edges for an issue's prospective stored type.
+    /// These compose with the global `transitions` graph when `strict` is on;
+    /// they never change initial-status admission or bypass transition gates.
+    ///
+    /// ```yaml
+    /// class_transitions:
+    ///   - {issue_type: bug, from: draft, to: open}
+    /// ```
+    ///
+    /// Unlisted types keep the global graph. Rules require that graph to be
+    /// configured, and neither wildcard selectors nor `initial`/`any` sources
+    /// are accepted. Matching is exact and case-insensitive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub class_transitions: Vec<ClassTransition>,
     /// Per-transition gate rules (issue #312, layer 2). A map of
     /// `"from -> to"` (the transition the gates guard) to the set of gate
     /// conditions required before that move is allowed.
@@ -240,6 +254,18 @@ pub struct Workflow {
     /// or misspelled names before storage is opened.
     #[serde(default)]
     pub capacity: CapacityPolicy,
+}
+
+/// One additional workflow edge for an exact issue type (GitHub #494).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassTransition {
+    /// Prospective parsed/stored issue type, including an explicitly named custom type.
+    pub issue_type: String,
+    /// Exact existing status; reserved global sources and wildcards are forbidden.
+    pub from: String,
+    /// Exact target status, still subject to ordinary status and transition gates.
+    pub to: String,
 }
 
 /// Repository-level workflow capacity policy (GitHub #384).
@@ -1613,6 +1639,70 @@ impl Workflow {
         self.strict && !self.transitions.is_empty()
     }
 
+    /// Validate opt-in class edges without changing the global workflow graph.
+    ///
+    /// # Errors
+    ///
+    /// Rejects ambiguous rules, selectors instead of literal names, a missing
+    /// global graph, or class statuses outside an enforced status vocabulary.
+    pub fn validate_class_transitions(&self) -> Result<()> {
+        if self.class_transitions.is_empty() {
+            return Ok(());
+        }
+        let invalid = |reason| BeadsError::validation("workflow.class_transitions", reason);
+        if self.transitions.is_empty() {
+            return Err(invalid(
+                "class transitions require a non-empty workflow.transitions graph".to_string(),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (index, rule) in self.class_transitions.iter().enumerate() {
+            for (field, value) in [
+                ("issue_type", rule.issue_type.as_str()),
+                ("from", rule.from.as_str()),
+                ("to", rule.to.as_str()),
+            ] {
+                if value.is_empty()
+                    || value.trim() != value
+                    || value.chars().any(char::is_control)
+                    || value.contains(['*', '?', '[', ']'])
+                {
+                    return Err(invalid(format!(
+                        "rule {index} {field} must be a non-empty literal name without outer whitespace, control characters, or wildcards"
+                    )));
+                }
+            }
+            if rule.from.eq_ignore_ascii_case(TRANSITION_INITIAL)
+                || rule.from.eq_ignore_ascii_case(TRANSITION_ANY_FROM)
+            {
+                return Err(invalid(format!(
+                    "rule {index} source '{}' is reserved for workflow.transitions",
+                    rule.from
+                )));
+            }
+            if self.is_enforced() {
+                for status in [&rule.from, &rule.to] {
+                    if !self.allows(status) {
+                        return Err(invalid(format!(
+                            "rule {index} status '{status}' is not declared in workflow.statuses"
+                        )));
+                    }
+                }
+            }
+            if !seen.insert((
+                rule.issue_type.to_lowercase(),
+                rule.from.to_lowercase(),
+                rule.to.to_lowercase(),
+            )) {
+                return Err(invalid(format!(
+                    "rule {index} duplicates class transition '{}' '{}' -> '{}' (case-insensitive)",
+                    rule.issue_type, rule.from, rule.to
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Case-insensitive lookup of the to-statuses listed for `from`. Returns
     /// `None` when `from` has no entry in the map.
     fn transitions_from(&self, from: &str) -> Option<&Vec<String>> {
@@ -1675,6 +1765,9 @@ impl Workflow {
     /// `from` is the issue's current status, or `None` when there is no
     /// recorded current status (a create, or an unresolved current status —
     /// validated against the reserved `initial` key).
+    /// `issue_type` is the prospective parsed/stored type after this update.
+    /// It can add only exact configured edges for an existing issue; creates
+    /// always consult the global initial rule, even if a type is supplied.
     ///
     /// Returns `Ok(())` when transition enforcement is off, the move is a
     /// no-op, or the move is permitted. Returns a [`BeadsError::Validation`]
@@ -1685,7 +1778,12 @@ impl Workflow {
     ///
     /// Returns a validation error when transition enforcement is configured
     /// and the `from -> to` move is not in the allowed set.
-    pub fn validate_transition(&self, from: Option<&str>, to: &str) -> Result<()> {
+    pub fn validate_transition(
+        &self,
+        from: Option<&str>,
+        to: &str,
+        issue_type: Option<&str>,
+    ) -> Result<()> {
         if !self.transitions_enforced() {
             return Ok(());
         }
@@ -1712,7 +1810,28 @@ impl Workflow {
                 if self.allows_transition(from, to) {
                     return Ok(());
                 }
-                let allowed = self.allowed_targets_from(from);
+                let mut allowed = self.allowed_targets_from(from);
+                if let Some(issue_type) = issue_type {
+                    let issue_type = issue_type.to_lowercase();
+                    let source = from.to_lowercase();
+                    let target = to.to_lowercase();
+                    for rule in &self.class_transitions {
+                        if rule.issue_type.to_lowercase() != issue_type
+                            || rule.from.to_lowercase() != source
+                        {
+                            continue;
+                        }
+                        if rule.to.to_lowercase() == target {
+                            return Ok(());
+                        }
+                        if !allowed
+                            .iter()
+                            .any(|value| value.to_lowercase() == rule.to.to_lowercase())
+                        {
+                            allowed.push(rule.to.clone());
+                        }
+                    }
+                }
                 let allowed_list = if allowed.is_empty() {
                     "(none)".to_string()
                 } else {
@@ -2711,6 +2830,7 @@ pub fn load_for_beads_dir(beads_dir: &Path) -> Result<PolicyDocument> {
     })?;
     document.workflow.validate_capacity()?;
     document.workflow.validate_required_fields()?;
+    document.workflow.validate_class_transitions()?;
 
     // Re-parse the raw YAML into a free-form value tree so we can diff it
     // against the typed schema and surface unknown fields without failing
@@ -2812,6 +2932,7 @@ impl PolicyNode {
                 ("strict", Self::Scalar),
                 ("statuses", Self::Scalar),
                 ("transitions", Self::Scalar),
+                ("class_transitions", Self::Scalar),
                 // The gate rules are a free-form map of `"from -> to"` keys to
                 // gate specs; we don't descend into them for unknown-field
                 // detection (their shape is validated at parse time by the
@@ -3944,21 +4065,22 @@ close_policy:
     /// **false-positive** "unknown field" warning on every canonical
     /// document containing that field. The owner explicitly acknowledged
     /// this sync hazard in the commit message — this test makes the drift
-    /// impossible to ship: it serialises a `Default` instance of every
+    /// impossible to ship: it serialises a representative instance of every
     /// close-policy struct and asserts the produced key set is a subset of
-    /// the corresponding `PolicyNode`'s `child_table()` keys.
+    /// the corresponding `PolicyNode`'s `child_table()` keys. The workflow
+    /// includes class rules so its omitted-when-empty field is represented.
     ///
     /// We assert "subset" rather than "equality" because table keys may
     /// intentionally list `Option<T>` fields that serialise to nothing in
-    /// the default form (none today, but future-proofing).
+    /// the default form.
     #[test]
     fn policy_node_child_table_covers_every_typed_struct_field() {
-        fn field_names_of<T: serde::Serialize + Default>() -> Vec<String> {
-            let value =
-                serde_yml::to_value(T::default()).expect("default struct must serialise to value");
+        fn field_names_of<T: serde::Serialize>(instance: &T) -> Vec<String> {
+            let value = serde_yml::to_value(instance)
+                .expect("representative struct must serialise to value");
             let mapping = value
                 .as_mapping()
-                .expect("default struct must serialise as a mapping");
+                .expect("representative struct must serialise as a mapping");
             mapping
                 .iter()
                 .filter_map(|(k, _)| k.as_str().map(String::from))
@@ -3981,37 +4103,37 @@ close_policy:
 
         assert_table_covers(
             PolicyNode::Document,
-            &field_names_of::<PolicyDocument>(),
+            &field_names_of(&PolicyDocument::default()),
             "PolicyDocument",
         );
         assert_table_covers(
             PolicyNode::ClosePolicy,
-            &field_names_of::<ClosePolicy>(),
+            &field_names_of(&ClosePolicy::default()),
             "ClosePolicy",
         );
         assert_table_covers(
             PolicyNode::RequireCloseReason,
-            &field_names_of::<RequireCloseReason>(),
+            &field_names_of(&RequireCloseReason::default()),
             "RequireCloseReason",
         );
         assert_table_covers(
             PolicyNode::ToggleGate,
-            &field_names_of::<ToggleGate>(),
+            &field_names_of(&ToggleGate::default()),
             "ToggleGate",
         );
         assert_table_covers(
             PolicyNode::Attribution,
-            &field_names_of::<Attribution>(),
+            &field_names_of(&Attribution::default()),
             "Attribution",
         );
         assert_table_covers(
             PolicyNode::RequireTypedReferences,
-            &field_names_of::<RequireTypedReferences>(),
+            &field_names_of(&RequireTypedReferences::default()),
             "RequireTypedReferences",
         );
         assert_table_covers(
             PolicyNode::Workflow,
-            &field_names_of::<Workflow>(),
+            &field_names_of(&class_transition_workflow()),
             "Workflow",
         );
     }
@@ -4024,15 +4146,16 @@ close_policy:
     /// the typed parse).
     ///
     /// `regex: Option<String>` is in the default serialised mapping as a
-    /// null entry, so it counts as "present" for this check.
+    /// null entry, so it counts as "present" for this check. Class rules are
+    /// populated to expose the workflow field omitted from its default form.
     #[test]
     fn policy_node_child_table_has_no_stale_entries() {
-        fn field_names_of<T: serde::Serialize + Default>() -> std::collections::HashSet<String> {
-            let value =
-                serde_yml::to_value(T::default()).expect("default struct must serialise to value");
+        fn field_names_of<T: serde::Serialize>(instance: &T) -> std::collections::HashSet<String> {
+            let value = serde_yml::to_value(instance)
+                .expect("representative struct must serialise to value");
             let mapping = value
                 .as_mapping()
-                .expect("default struct must serialise as a mapping");
+                .expect("representative struct must serialise as a mapping");
             mapping
                 .iter()
                 .filter_map(|(k, _)| k.as_str().map(String::from))
@@ -4057,37 +4180,37 @@ close_policy:
 
         assert_no_stale(
             PolicyNode::Document,
-            &field_names_of::<PolicyDocument>(),
+            &field_names_of(&PolicyDocument::default()),
             "PolicyDocument",
         );
         assert_no_stale(
             PolicyNode::ClosePolicy,
-            &field_names_of::<ClosePolicy>(),
+            &field_names_of(&ClosePolicy::default()),
             "ClosePolicy",
         );
         assert_no_stale(
             PolicyNode::RequireCloseReason,
-            &field_names_of::<RequireCloseReason>(),
+            &field_names_of(&RequireCloseReason::default()),
             "RequireCloseReason",
         );
         assert_no_stale(
             PolicyNode::ToggleGate,
-            &field_names_of::<ToggleGate>(),
+            &field_names_of(&ToggleGate::default()),
             "ToggleGate",
         );
         assert_no_stale(
             PolicyNode::Attribution,
-            &field_names_of::<Attribution>(),
+            &field_names_of(&Attribution::default()),
             "Attribution",
         );
         assert_no_stale(
             PolicyNode::RequireTypedReferences,
-            &field_names_of::<RequireTypedReferences>(),
+            &field_names_of(&RequireTypedReferences::default()),
             "RequireTypedReferences",
         );
         assert_no_stale(
             PolicyNode::Workflow,
-            &field_names_of::<Workflow>(),
+            &field_names_of(&class_transition_workflow()),
             "Workflow",
         );
     }
@@ -4728,8 +4851,12 @@ capacity:
         let workflow = Workflow::default();
         assert!(!workflow.transitions_enforced());
         // With enforcement off every transition is permitted.
-        assert!(workflow.validate_transition(Some("open"), "bogus").is_ok());
-        assert!(workflow.validate_transition(None, "bogus").is_ok());
+        assert!(
+            workflow
+                .validate_transition(Some("open"), "bogus", None)
+                .is_ok()
+        );
+        assert!(workflow.validate_transition(None, "bogus", None).is_ok());
     }
 
     #[test]
@@ -4740,7 +4867,7 @@ capacity:
         // Not strict => transitions advisory only, nothing rejected.
         assert!(
             workflow
-                .validate_transition(Some("open"), "deferred")
+                .validate_transition(Some("open"), "deferred", None)
                 .is_ok()
         );
     }
@@ -4756,7 +4883,7 @@ capacity:
         assert!(!workflow.transitions_enforced());
         assert!(
             workflow
-                .validate_transition(Some("open"), "blocked")
+                .validate_transition(Some("open"), "blocked", None)
                 .is_ok()
         );
     }
@@ -4767,17 +4894,17 @@ capacity:
         assert!(workflow.allows_transition("open", "in_progress"));
         assert!(
             workflow
-                .validate_transition(Some("open"), "in_progress")
+                .validate_transition(Some("open"), "in_progress", None)
                 .is_ok()
         );
         assert!(
             workflow
-                .validate_transition(Some("in_progress"), "in_review")
+                .validate_transition(Some("in_progress"), "in_review", None)
                 .is_ok()
         );
         assert!(
             workflow
-                .validate_transition(Some("in_review"), "closed")
+                .validate_transition(Some("in_review"), "closed", None)
                 .is_ok()
         );
     }
@@ -4786,7 +4913,7 @@ capacity:
     fn transition_invalid_move_is_rejected_with_actionable_error() {
         let workflow = transition_workflow();
         let err = workflow
-            .validate_transition(Some("open"), "in_review")
+            .validate_transition(Some("open"), "in_review", None)
             .expect_err("open -> in_review is not configured");
         let message = err.to_string();
         // Names current, attempted, and the valid next statuses.
@@ -4802,7 +4929,7 @@ capacity:
         let workflow = transition_workflow();
         // `blocked` has no entry and there is no `any` wildcard.
         let err = workflow
-            .validate_transition(Some("blocked"), "open")
+            .validate_transition(Some("blocked"), "open", None)
             .expect_err("blocked has no allowed targets");
         let message = err.to_string();
         assert!(message.contains("(none)"), "{message}");
@@ -4812,11 +4939,15 @@ capacity:
     fn transition_no_op_is_always_allowed() {
         let workflow = transition_workflow();
         // Same status, even when there is no explicit self-loop rule.
-        assert!(workflow.validate_transition(Some("open"), "open").is_ok());
+        assert!(
+            workflow
+                .validate_transition(Some("open"), "open", None)
+                .is_ok()
+        );
         // Even for a status with no rule at all.
         assert!(
             workflow
-                .validate_transition(Some("blocked"), "blocked")
+                .validate_transition(Some("blocked"), "blocked", None)
                 .is_ok()
         );
     }
@@ -4826,7 +4957,7 @@ capacity:
         let workflow = transition_workflow();
         assert!(
             workflow
-                .validate_transition(Some("OPEN"), "In_Progress")
+                .validate_transition(Some("OPEN"), "In_Progress", None)
                 .is_ok()
         );
     }
@@ -4841,17 +4972,17 @@ capacity:
         // their own rules and ones with none.
         assert!(
             workflow
-                .validate_transition(Some("open"), "deferred")
+                .validate_transition(Some("open"), "deferred", None)
                 .is_ok()
         );
         assert!(
             workflow
-                .validate_transition(Some("blocked"), "deferred")
+                .validate_transition(Some("blocked"), "deferred", None)
                 .is_ok()
         );
         // Wildcard targets are merged into the error message's "valid next".
         let err = workflow
-            .validate_transition(Some("open"), "bogus")
+            .validate_transition(Some("open"), "bogus", None)
             .expect_err("bogus is not reachable");
         assert!(err.to_string().contains("deferred"), "{err}");
     }
@@ -4864,10 +4995,10 @@ capacity:
             vec!["open".to_string(), "draft".to_string()],
         );
         // No prior status => validated against `initial`.
-        assert!(workflow.validate_transition(None, "open").is_ok());
-        assert!(workflow.validate_transition(None, "draft").is_ok());
+        assert!(workflow.validate_transition(None, "open", None).is_ok());
+        assert!(workflow.validate_transition(None, "draft", None).is_ok());
         let err = workflow
-            .validate_transition(None, "in_progress")
+            .validate_transition(None, "in_progress", None)
             .expect_err("in_progress is not an allowed initial status");
         let message = err.to_string();
         assert!(message.contains("initial"), "{message}");
@@ -4881,8 +5012,8 @@ capacity:
         // `transition_workflow()` has no `initial` key — any starting status
         // is accepted since there is no prior state to validate against.
         let workflow = transition_workflow();
-        assert!(workflow.validate_transition(None, "open").is_ok());
-        assert!(workflow.validate_transition(None, "anything").is_ok());
+        assert!(workflow.validate_transition(None, "open", None).is_ok());
+        assert!(workflow.validate_transition(None, "anything", None).is_ok());
     }
 
     #[test]
@@ -4923,23 +5054,23 @@ workflow:
         assert!(workflow.transitions_enforced());
         assert!(
             workflow
-                .validate_transition(Some("open"), "in_progress")
+                .validate_transition(Some("open"), "in_progress", None)
                 .is_ok()
         );
         assert!(
             workflow
-                .validate_transition(Some("open"), "in_review")
+                .validate_transition(Some("open"), "in_review", None)
                 .is_err()
         );
         // `any: [closed]` allows close from a from-status without an explicit rule.
         assert!(
             workflow
-                .validate_transition(Some("blocked"), "closed")
+                .validate_transition(Some("blocked"), "closed", None)
                 .is_ok()
         );
         // `initial` gates creates.
-        assert!(workflow.validate_transition(None, "open").is_ok());
-        assert!(workflow.validate_transition(None, "closed").is_err());
+        assert!(workflow.validate_transition(None, "open", None).is_ok());
+        assert!(workflow.validate_transition(None, "closed", None).is_err());
     }
 
     #[test]
@@ -4955,7 +5086,7 @@ workflow:
         assert!(
             policy
                 .workflow
-                .validate_transition(Some("closed"), "open")
+                .validate_transition(Some("closed"), "open", None)
                 .is_ok()
         );
     }
@@ -4970,6 +5101,337 @@ workflow:
 ";
         let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
         assert!(detect_unknown_policy_fields(&raw).is_empty());
+    }
+
+    fn class_transition_workflow() -> Workflow {
+        let workflow: Workflow = serde_yml::from_str(
+            r"strict: true
+statuses: [draft, planning, open, closed]
+transitions:
+  initial: [draft]
+  draft: [planning]
+  planning: [open]
+class_transitions:
+  - {issue_type: bug, from: draft, to: open}
+",
+        )
+        .unwrap();
+        workflow.validate_class_transitions().unwrap();
+        workflow
+    }
+
+    #[test]
+    fn class_transitions_add_only_the_exact_type_and_edge_to_global_permissions() {
+        let workflow = class_transition_workflow();
+        for issue_type in [None, Some("task"), Some("bug"), Some("unknown")] {
+            assert!(
+                workflow
+                    .validate_transition(Some("draft"), "planning", issue_type)
+                    .is_ok(),
+                "global edge must remain available to {issue_type:?}"
+            );
+        }
+        assert!(
+            workflow
+                .validate_transition(Some("draft"), "open", Some("bug"))
+                .is_ok()
+        );
+        for issue_type in [None, Some("task"), Some("unknown"), Some("bugfix")] {
+            assert!(
+                workflow
+                    .validate_transition(Some("draft"), "open", issue_type)
+                    .is_err(),
+                "unmatched type must not gain the class edge: {issue_type:?}"
+            );
+        }
+        for (from, to) in [
+            ("draft", "closed"),
+            ("closed", "open"),
+            ("open", "planning"),
+        ] {
+            assert!(
+                workflow
+                    .validate_transition(Some(from), to, Some("bug"))
+                    .is_err(),
+                "class must not authorize an omitted edge: {from} -> {to}"
+            );
+        }
+        assert!(!workflow.allows_transition("draft", "open"));
+        assert_eq!(workflow.allowed_targets_from("draft"), ["planning"]);
+    }
+
+    #[test]
+    fn class_transitions_never_override_global_initial_admission() {
+        let mut workflow = class_transition_workflow();
+        for issue_type in [None, Some("bug"), Some("task")] {
+            assert!(
+                workflow
+                    .validate_transition(None, "draft", issue_type)
+                    .is_ok()
+            );
+            let error = workflow
+                .validate_transition(None, "open", issue_type)
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Allowed initial statuses: draft.")
+            );
+        }
+        workflow.transitions.remove("initial");
+        assert!(
+            workflow
+                .validate_transition(None, "open", Some("bug"))
+                .is_ok()
+        );
+        assert!(workflow.validate_transition(None, "open", None).is_ok());
+    }
+
+    #[test]
+    fn class_transitions_match_case_insensitively_including_custom_names() {
+        let mut workflow = class_transition_workflow();
+        assert!(
+            workflow
+                .validate_transition(Some("DRAFT"), "OPEN", Some("BUG"))
+                .is_ok()
+        );
+        workflow
+            .statuses
+            .extend(["étude".to_string(), "prêt".to_string()]);
+        workflow.class_transitions.push(ClassTransition {
+            issue_type: "DÉFAUT".to_string(),
+            from: "ÉTUDE".to_string(),
+            to: "PRÊT".to_string(),
+        });
+        workflow.validate_class_transitions().unwrap();
+        assert!(
+            workflow
+                .validate_transition(Some("étude"), "prêt", Some("défaut"))
+                .is_ok()
+        );
+        assert!(
+            workflow
+                .validate_transition(Some("étude"), "prêt", Some("defaut"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn class_transition_errors_list_only_applicable_additional_targets() {
+        let mut workflow = class_transition_workflow();
+        workflow.class_transitions.push(ClassTransition {
+            issue_type: "bug".to_string(),
+            from: "draft".to_string(),
+            to: "PLANNING".to_string(),
+        });
+        workflow.validate_class_transitions().unwrap();
+        for (issue_type, targets) in [
+            (Some("bug"), "planning, open"),
+            (Some("task"), "planning"),
+            (None, "planning"),
+        ] {
+            let error = workflow
+                .validate_transition(Some("draft"), "closed", issue_type)
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .ends_with(&format!("Valid next statuses from 'draft': {targets}.")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn class_transitions_preserve_no_ops_global_wildcards_and_advisory_mode() {
+        let mut workflow = class_transition_workflow();
+        for issue_type in [None, Some("bug"), Some("unknown")] {
+            assert!(
+                workflow
+                    .validate_transition(Some("closed"), "closed", issue_type)
+                    .is_ok()
+            );
+        }
+        workflow
+            .transitions
+            .insert("any".to_string(), vec!["closed".to_string()]);
+        for issue_type in [None, Some("bug"), Some("unknown")] {
+            assert!(
+                workflow
+                    .validate_transition(Some("draft"), "closed", issue_type)
+                    .is_ok()
+            );
+        }
+        workflow.strict = false;
+        workflow.validate_class_transitions().unwrap();
+        assert!(
+            workflow
+                .validate_transition(Some("closed"), "unlisted", Some("unknown"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn class_transition_validation_respects_strict_vocabulary_without_replacing_it() {
+        let mut workflow = class_transition_workflow();
+        assert!(workflow.validate_status("unlisted").is_err());
+        for field in ["from", "to"] {
+            let mut invalid = workflow.clone();
+            if field == "from" {
+                invalid.class_transitions[0].from = "unlisted".to_string();
+            } else {
+                invalid.class_transitions[0].to = "unlisted".to_string();
+            }
+            let error = invalid.validate_class_transitions().unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("not declared in workflow.statuses")
+            );
+            invalid.strict = false;
+            invalid.validate_class_transitions().unwrap();
+            invalid.strict = true;
+            invalid.statuses.clear();
+            invalid.validate_class_transitions().unwrap();
+        }
+        workflow.class_transitions.clear();
+        assert!(
+            workflow
+                .validate_transition(Some("draft"), "open", Some("bug"))
+                .is_err()
+        );
+        let serialized = serde_json::to_value(&workflow).unwrap();
+        assert!(serialized.get("class_transitions").is_none());
+        let restored: Workflow = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored, workflow);
+    }
+
+    #[test]
+    fn class_transition_validation_rejects_missing_graph_and_duplicate_triples() {
+        let mut workflow = class_transition_workflow();
+        workflow.transitions.clear();
+        let error = workflow.validate_class_transitions().unwrap_err();
+        assert!(error.to_string().contains("non-empty workflow.transitions"));
+        workflow = class_transition_workflow();
+        workflow.class_transitions.push(ClassTransition {
+            issue_type: "BUG".to_string(),
+            from: "DRAFT".to_string(),
+            to: "OPEN".to_string(),
+        });
+        let error = workflow.validate_class_transitions().unwrap_err();
+        assert!(error.to_string().contains("duplicates class transition"));
+        workflow.class_transitions[1].issue_type = "task".to_string();
+        workflow.validate_class_transitions().unwrap();
+        workflow.class_transitions[1].issue_type = "bug".to_string();
+        workflow.class_transitions[1].to = "closed".to_string();
+        workflow.validate_class_transitions().unwrap();
+        assert!(
+            workflow
+                .validate_transition(Some("draft"), "closed", Some("bug"))
+                .is_ok(),
+            "multiple explicitly distinct edges for one class are allowed"
+        );
+    }
+
+    #[test]
+    fn class_transition_validation_rejects_nonliteral_names_and_reserved_sources() {
+        for field in ["issue_type", "from", "to"] {
+            for value in [
+                "",
+                " ",
+                " bug",
+                "bug ",
+                "bug\nname",
+                "bug\0",
+                "*",
+                "bug*",
+                "?",
+                "[ab]",
+            ] {
+                let mut workflow = class_transition_workflow();
+                let rule = &mut workflow.class_transitions[0];
+                match field {
+                    "issue_type" => rule.issue_type = value.to_string(),
+                    "from" => rule.from = value.to_string(),
+                    _ => rule.to = value.to_string(),
+                }
+                let error = workflow.validate_class_transitions().unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("{field} must be a non-empty literal name")),
+                    "{field}={value:?}: {error}"
+                );
+            }
+        }
+        for from in ["initial", "INITIAL", "any", "ANY"] {
+            let mut workflow = class_transition_workflow();
+            workflow.class_transitions[0].from = from.to_string();
+            let error = workflow.validate_class_transitions().unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("reserved for workflow.transitions")
+            );
+        }
+    }
+
+    #[test]
+    fn class_transition_deserialization_rejects_ambiguous_or_unknown_members() {
+        for (rule, expected) in [
+            (
+                "{issue_type: bug, from: draft, to: open, label: urgent}",
+                "unknown field",
+            ),
+            (
+                "{issue_type: bug, issue_type: task, from: draft, to: open}",
+                "duplicate field",
+            ),
+            (
+                "{issue_type: bug, from: draft, from: planning, to: open}",
+                "duplicate field",
+            ),
+            (
+                "{issue_type: bug, from: draft, to: open, to: closed}",
+                "duplicate field",
+            ),
+            ("{issue_type: bug, from: draft}", "missing field"),
+        ] {
+            let yaml = format!("class_transitions: [{rule}]\n");
+            let error = serde_yml::from_str::<Workflow>(&yaml).unwrap_err();
+            assert!(error.to_string().contains(expected), "{rule}: {error}");
+        }
+    }
+
+    #[test]
+    fn loader_recognizes_and_validates_class_transition_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(POLICY_FILE_NAME);
+        let policy = PolicyDocument {
+            workflow: class_transition_workflow(),
+            ..Default::default()
+        };
+        let yaml = serde_yml::to_string(&policy).unwrap();
+        let raw: serde_yml::Value = serde_yml::from_str(&yaml).unwrap();
+        assert!(detect_unknown_policy_fields(&raw).is_empty());
+        std::fs::write(&path, &yaml).unwrap();
+        let loaded = load_for_beads_dir(dir.path()).unwrap();
+        assert_eq!(
+            loaded.workflow.class_transitions,
+            policy.workflow.class_transitions
+        );
+        assert!(
+            loaded
+                .workflow
+                .validate_transition(Some("draft"), "open", Some("bug"))
+                .is_ok()
+        );
+        let invalid = yaml.replace("issue_type: bug", "issue_type: ' bug'");
+        assert_ne!(invalid, yaml);
+        std::fs::write(&path, invalid).unwrap();
+        let error = load_for_beads_dir(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("workflow.class_transitions"));
+        assert!(error.to_string().contains("outer whitespace"));
     }
 
     // =========================================================================

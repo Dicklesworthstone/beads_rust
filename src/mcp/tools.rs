@@ -1746,7 +1746,7 @@ fn create_issue_json(
         .validate_status(issue.status.as_str())
         .map_err(beads_to_mcp)?;
     workflow
-        .validate_transition(None, issue.status.as_str())
+        .validate_transition(None, issue.status.as_str(), None)
         .map_err(beads_to_mcp)?;
     storage.set_pending_event_attribution(mcp_event_attribution(args)?);
     storage

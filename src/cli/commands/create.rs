@@ -271,7 +271,9 @@ fn enforce_workflow_status(beads_dir: &Path, raw_status: Option<&str>) -> Result
     // Initial-transition enforcement (issue #312, layer 1): a create has no
     // prior status, so the effective starting status is validated against the
     // reserved `initial` key (no-op when `transitions`/`initial` is absent).
-    policy.workflow.validate_transition(None, parsed.as_str())
+    policy
+        .workflow
+        .validate_transition(None, parsed.as_str(), None)
 }
 
 fn auto_flush_after_create(storage_ctx: &mut config::OpenStorageResult, ctx: &OutputContext) {
