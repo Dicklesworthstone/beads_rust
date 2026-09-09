@@ -33,6 +33,8 @@ use super::{BeadsState, ensure_not_shutting_down, mcp_ready_issues};
 const UPDATE_FIELD_KEYS: &[&str] = &[
     "title",
     "description",
+    "acceptance_criteria",
+    "prerequisites",
     "status",
     "priority",
     "type",
@@ -858,6 +860,8 @@ fn parse_update_fields(
         updates.title = Some(title);
     }
     updates.description = nullable_str(args, "description")?;
+    updates.acceptance_criteria = nullable_str(args, "acceptance_criteria")?;
+    updates.prerequisites = nullable_str(args, "prerequisites")?;
     updates.transition_comment = optional_str_arg(args, "transition_comment")?;
     if let Some(s) = optional_str_arg(args, "status")? {
         let (status, warning) = parse_status(&s, workflow)?;
@@ -1677,6 +1681,8 @@ fn create_issue_json(
 
     let parent_id = optional_str_arg(args, "parent")?;
     let description = optional_str_arg(args, "description")?;
+    let acceptance_criteria = optional_str_arg(args, "acceptance_criteria")?;
+    let prerequisites = optional_str_arg(args, "prerequisites")?;
     let assignee = optional_str_arg(args, "assignee")?;
     let labels_to_add = optional_label_array_arg(args, "labels")?;
 
@@ -1706,6 +1712,8 @@ fn create_issue_json(
         id: id.clone(),
         title: title.clone(),
         description: description.clone(),
+        acceptance_criteria,
+        prerequisites,
         status: Status::Open,
         priority,
         issue_type: issue_type.clone(),
@@ -1763,6 +1771,8 @@ fn create_issue_batch_items(args: &Value) -> McpResult<Option<Vec<Value>>> {
     if [
         "title",
         "description",
+        "acceptance_criteria",
+        "prerequisites",
         "type",
         "priority",
         "assignee",
@@ -1891,6 +1901,14 @@ impl ToolHandler for CreateIssueTool {
                         "type": "string",
                         "description": "Detailed description of the issue"
                     },
+                    "acceptance_criteria": {
+                        "type": "string",
+                        "description": "Acceptance criteria preserved verbatim, separately from prerequisites"
+                    },
+                    "prerequisites": {
+                        "type": "string",
+                        "description": "Prerequisite checklist preserved verbatim; separate from acceptance criteria and dependency edges"
+                    },
                     "type": {
                         "type": "string",
                         "description": "Issue type: task (default), bug, feature, epic, chore, docs, question. Aliases: feat, defect, enhancement, refactor, doc."
@@ -1919,7 +1937,7 @@ impl ToolHandler for CreateIssueTool {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": CREATE_ISSUE_BATCH_MAX,
-                        "description": "Batch of issue objects using the same fields as a single create item: title, description, type, priority, assignee, labels, and parent. Returns {items,count,ok_count,error_count}; each item is either {index,title,id,ok:true,result} using the legacy single-create result shape, or {index,title,ok:false,error}. Partial failures do not fail the whole batch.",
+                        "description": "Batch of issue objects using the same fields as a single create item, including title, description, acceptance_criteria, prerequisites, type, priority, assignee, labels, and parent. Returns {items,count,ok_count,error_count}; each item is either {index,title,id,ok:true,result} using the legacy single-create result shape, or {index,title,ok:false,error}. Partial failures do not fail the whole batch.",
                         "items": {
                             "type": "object",
                             "required": ["title"],
@@ -1975,7 +1993,12 @@ impl UpdateIssueTool {
     }
 }
 
-fn update_issue_result_json(issue: &Issue, coercions: &[String]) -> Value {
+fn update_issue_result_json(
+    issue: &Issue,
+    coercions: &[String],
+    overwrite_advisories: &[String],
+    acceptance: Option<&McpAcceptancePlan>,
+) -> Value {
     let mut result = json!({
         "id": &issue.id,
         "title": &issue.title,
@@ -1986,9 +2009,23 @@ fn update_issue_result_json(issue: &Issue, coercions: &[String]) -> Value {
 
     if !coercions.is_empty() {
         result["coercions"] = json!(coercions);
-        result["warnings"] = result["coercions"].clone();
     }
-
+    if !coercions.is_empty() || !overwrite_advisories.is_empty() {
+        result["warnings"] = json!(
+            coercions
+                .iter()
+                .chain(overwrite_advisories)
+                .collect::<Vec<_>>()
+        );
+    }
+    if let Some(plan) = acceptance {
+        let mut report = serde_json::to_value(AcceptanceCriteriaOutput::from_edit(&plan.edit))
+            .unwrap_or_default();
+        if let Some(obj) = report.as_object_mut() {
+            obj.insert("changed".into(), json!(plan.changed));
+        }
+        result["acceptance_criteria"] = report;
+    }
     result
 }
 
@@ -2009,6 +2046,15 @@ fn plan_mcp_acceptance_edit(
     let check = optional_string_array_arg(args, "check_acceptance")?;
     let uncheck = optional_string_array_arg(args, "uncheck_acceptance")?;
     let append = optional_string_array_arg(args, "add_acceptance")?;
+    if args.get("acceptance_criteria").is_some()
+        && ["check_acceptance", "uncheck_acceptance", "add_acceptance"]
+            .iter()
+            .any(|key| args.get(*key).is_some())
+    {
+        return Err(McpError::invalid_params(
+            "acceptance_criteria cannot be combined with acceptance item edits",
+        ));
+    }
     if check.is_empty() && uncheck.is_empty() && append.is_empty() {
         return Ok(None);
     }
@@ -2089,6 +2135,14 @@ fn apply_update_issue_json(
     }
 
     let acceptance = plan_mcp_acceptance_edit(storage, &id, args)?;
+    let force = optional_bool_arg(args, "force")?.unwrap_or(false);
+    let overwrite_advisories = crate::cli::commands::update::validate_text_field_overwrite_guard(
+        storage,
+        std::slice::from_ref(&id),
+        &updates,
+        force,
+    )
+    .map_err(beads_to_mcp)?;
     let acceptance_rewrite = acceptance.as_ref().is_some_and(|plan| plan.changed);
     if let Some(plan) = acceptance.as_ref().filter(|plan| plan.changed) {
         updates.acceptance_criteria = Some(Some(plan.edit.body.clone()));
@@ -2149,16 +2203,12 @@ fn apply_update_issue_json(
             .map_err(beads_to_mcp)?;
     }
 
-    let mut result = update_issue_result_json(&issue, &coercions);
-    if let Some(plan) = acceptance {
-        let mut report = serde_json::to_value(AcceptanceCriteriaOutput::from_edit(&plan.edit))
-            .unwrap_or_default();
-        if let Some(obj) = report.as_object_mut() {
-            obj.insert("changed".into(), json!(plan.changed));
-        }
-        result["acceptance_criteria"] = report;
-    }
-    Ok(result)
+    Ok(update_issue_result_json(
+        &issue,
+        &coercions,
+        &overwrite_advisories,
+        acceptance.as_ref(),
+    ))
 }
 
 fn update_issue_batch_items(args: &Value) -> McpResult<Option<Vec<Value>>> {
@@ -2286,7 +2336,19 @@ impl ToolHandler for UpdateIssueTool {
                     },
                     "description": {
                         "type": ["string", "null"],
-                        "description": "New description (null to clear)"
+                        "description": "New description (null to clear). Destructive replacements require force."
+                    },
+                    "acceptance_criteria": {
+                        "type": ["string", "null"],
+                        "description": "Replace acceptance criteria verbatim (null to clear). Cannot be combined with check_acceptance, uncheck_acceptance, or add_acceptance. Destructive replacements require force."
+                    },
+                    "prerequisites": {
+                        "type": ["string", "null"],
+                        "description": "Replace the prerequisite checklist verbatim (null to clear). Separate from acceptance criteria and dependency edges. Destructive replacements require force."
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Allow destructive whole-field text replacements. Never bypasses workflow policy, prerequisite requirements, or capacity limits."
                     },
                     "status": {
                         "type": "string",
@@ -2364,7 +2426,7 @@ impl ToolHandler for UpdateIssueTool {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": UPDATE_ISSUE_BATCH_MAX,
-                        "description": "Batch of update objects using the same fields as a single update item: id plus optional title, description, status, priority, type, assignee, owner, due_at, defer_until, estimated_minutes, external_ref, labels_add, labels_remove, and comment. Returns {items,count,ok_count,error_count}; each item is either {index,id,ok:true,result} using the legacy single-update result shape, or {index,id,ok:false,error}. Partial failures do not fail the whole batch.",
+                        "description": "Batch of update objects using the same fields as a single update item, including id, title, description, acceptance_criteria, prerequisites, force, status, transition_comment, acceptance item edits, priority, type, assignee, owner, dates, labels, and comment. Returns {items,count,ok_count,error_count}; each item is either {index,id,ok:true,result} using the legacy single-update result shape, or {index,id,ok:false,error}. Partial failures do not fail the whole batch.",
                         "items": {
                             "type": "object",
                             "required": ["id"],
@@ -5144,6 +5206,45 @@ mod tests {
         .expect_err("blank title must be rejected");
 
         assert!(err.to_string().contains("Title must be 1-500 characters"));
+    }
+
+    #[test]
+    fn parse_update_fields_preserves_independent_nullable_checklists() {
+        let workflow = crate::close_policy::Workflow::default();
+        let (unchanged, _) = parse_update_fields("br-fields", &json!({}), &workflow).unwrap();
+        assert_eq!(unchanged.prerequisites, None);
+        assert_eq!(unchanged.acceptance_criteria, None);
+        let (set, _) = parse_update_fields(
+            "br-fields",
+            &json!({"prerequisites": "- [x] access\r\n", "acceptance_criteria": "- [ ] deliver\n"}),
+            &workflow,
+        )
+        .unwrap();
+        assert_eq!(
+            set.prerequisites,
+            Some(Some("- [x] access\r\n".to_string()))
+        );
+        assert_eq!(
+            set.acceptance_criteria,
+            Some(Some("- [ ] deliver\n".to_string()))
+        );
+        let (cleared, _) = parse_update_fields(
+            "br-fields",
+            &json!({"prerequisites": null, "acceptance_criteria": ""}),
+            &workflow,
+        )
+        .unwrap();
+        assert_eq!(cleared.prerequisites, Some(None));
+        assert_eq!(cleared.acceptance_criteria, Some(Some(String::new())));
+        for field in ["prerequisites", "acceptance_criteria"] {
+            for value in [json!(true), json!(17), json!(["- [x] access"])] {
+                let mut args = json!({});
+                args[field] = value;
+                let error = parse_update_fields("br-fields", &args, &workflow).unwrap_err();
+                assert_eq!(error.code, McpErrorCode::InvalidParams);
+                assert!(error.message.contains(field), "{error}");
+            }
+        }
     }
 
     #[test]
