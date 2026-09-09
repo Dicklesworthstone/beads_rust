@@ -12,13 +12,23 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 /// Initialize logging for the CLI.
 ///
 /// Logging honors `RUST_LOG` if set; otherwise a default filter is used based
-/// on verbosity and quiet flags.
+/// on verbosity and quiet flags. ANSI styling also honors `--no-color`,
+/// nonempty `NO_COLOR`, and `TERM=dumb` without suppressing log messages.
 ///
 /// # Errors
 ///
 /// Returns an error if logging initialization fails.
-pub fn init_logging(verbosity: u8, quiet: bool, log_file: Option<&Path>) -> Result<()> {
+pub fn init_logging(
+    verbosity: u8,
+    quiet: bool,
+    no_color: bool,
+    log_file: Option<&Path>,
+) -> Result<()> {
     let env_filter = resolve_env_filter(verbosity, quiet)?;
+    let color = !no_color
+        && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
+        && std::env::var("TERM").as_deref() != Ok("dumb")
+        && std::io::stderr().is_terminal();
 
     let fmt_layer = fmt::layer()
         .with_writer(std::io::stderr)
@@ -26,7 +36,7 @@ pub fn init_logging(verbosity: u8, quiet: bool, log_file: Option<&Path>) -> Resu
         .with_level(true)
         .with_file(cfg!(debug_assertions))
         .with_line_number(cfg!(debug_assertions))
-        .with_ansi(std::io::stderr().is_terminal());
+        .with_ansi(color);
 
     let subscriber = tracing_subscriber::registry()
         .with(env_filter)
@@ -175,7 +185,7 @@ mod tests {
         let result = std::panic::catch_unwind(|| {
             INIT_LOGGING.call_once(|| {
                 let temp = tempfile::NamedTempFile::new().expect("temp log file");
-                let result = init_logging(0, false, Some(temp.path()));
+                let result = init_logging(0, false, false, Some(temp.path()));
                 if let Err(err) = result {
                     let message = err.to_string();
                     let is_already_set = message.contains("global")

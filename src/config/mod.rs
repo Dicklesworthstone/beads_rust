@@ -6923,12 +6923,14 @@ pub fn display_color_from_layer(layer: &ConfigLayer) -> Option<bool> {
 /// Determine whether human-readable output should use ANSI color.
 ///
 /// Precedence:
-/// 1) Nonempty `NO_COLOR` disables ANSI output, including configured color
+/// 1) Nonempty `NO_COLOR` or `TERM=dumb` disables ANSI, including configured color
 /// 2) Config `display.color` (including the `--no-color` override, if set)
 /// 3) stdout is a terminal
 #[must_use]
 pub fn should_use_color(layer: &ConfigLayer) -> bool {
-    if env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()) {
+    if env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
+        || env::var("TERM").as_deref() == Ok("dumb")
+    {
         return false;
     }
     if let Some(value) = display_color_from_layer(layer) {
