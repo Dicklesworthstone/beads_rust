@@ -744,6 +744,8 @@ const KNOWN_BR_ONLY_COLUMNS: &[&str] = &[
     "owner",
     "source_system",
     "agent_context",
+    // Separate prerequisite checklist introduced in br schema 18.
+    "prerequisites",
 ];
 
 /// Known type differences between br and bd that are acceptable.
@@ -884,6 +886,16 @@ fn conformance_schema_issues_columns() {
         );
     }
 
+    let prerequisites = br_cols
+        .iter()
+        .find(|column| column.name == "prerequisites")
+        .expect("br must store its separate prerequisite checklist");
+    assert_eq!(prerequisites.col_type, "TEXT");
+    assert!(prerequisites.notnull);
+    assert_eq!(prerequisites.dflt_value.as_deref(), Some("''"));
+    assert!(!prerequisites.pk);
+    assert!(!bd_names.contains("prerequisites"));
+
     // bd should not have unexpected columns br doesn't have (feature parity)
     // Filter out known bd-only columns (Gastown features intentionally not ported)
     let bd_only: Vec<&String> = bd_names.difference(&br_names).collect();
@@ -942,6 +954,16 @@ fn conformance_schema_dependencies_structure() {
             "Column '{}' missing in bd dependencies table",
             col
         );
+    }
+
+    // Both tools must retain parallel relation kinds between the same pair.
+    for (binary, columns) in [("br", &br_cols), ("bd", &bd_cols)] {
+        let key: Vec<&str> = columns
+            .iter()
+            .filter(|column| column.pk)
+            .map(|column| column.name.as_str())
+            .collect();
+        assert_eq!(key, ["issue_id", "depends_on_id", "type"], "{binary}");
     }
 }
 
@@ -1164,7 +1186,6 @@ const KNOWN_OTHER_TABLE_DIFFS: &[(&str, &str, &str)] = &[
     ("metadata", "key", "notnull_mismatch"),
     ("metadata", "key", "pk_mismatch"),
     ("dependencies", "created_at", "notnull_mismatch"),
-    ("dependencies", "type", "pk_mismatch"),
     // NOT NULL differences: br is stricter than bd
     ("dependencies", "created_by", "notnull_mismatch"),
 ];
