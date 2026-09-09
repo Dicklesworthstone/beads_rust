@@ -1837,7 +1837,6 @@ fn open_and_lock_regular_file(
         role,
         "write authority is held by another process; waiting with timeout"
     );
-    let mut poll_interval = WRITE_LOCK_POLL_INTERVAL;
 
     loop {
         if start.elapsed() >= timeout {
@@ -1850,22 +1849,14 @@ fn open_and_lock_regular_file(
         }
 
         let remaining = timeout.saturating_sub(start.elapsed());
-        thread::sleep(remaining.min(poll_interval));
+        thread::sleep(remaining.min(WRITE_LOCK_POLL_INTERVAL));
 
         match try_lock_exclusive(&file, mechanism) {
             Ok(()) => {
                 verify_locked_file_identity(&file, lock_path, role, redact_path)?;
                 return Ok(file);
             }
-            Err(TryLockError::WouldBlock) => {
-                if matches!(retry_safety, LockRetrySafety::BeforeMutation) {
-                    // Newly arriving writers get an immediate attempt. Shorten
-                    // retries for existing waiters to reduce the window in which
-                    // a sustained stream of arrivals can pass sleeping waiters.
-                    // This remains bounded polling, not a FIFO lock guarantee.
-                    poll_interval = (poll_interval / 2).max(Duration::from_millis(1));
-                }
-            }
+            Err(TryLockError::WouldBlock) => {}
             Err(TryLockError::Error(err)) => {
                 tracing::debug!(role, "failed to acquire write authority: {err}");
                 return Err(BeadsError::Config(format!(
