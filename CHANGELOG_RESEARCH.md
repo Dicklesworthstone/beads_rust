@@ -621,3 +621,88 @@ full release-suite attempt failed during clean-overlay source transfer before
 Cargo; its log is retained as `legacy-full-release-first.log`. The retry and
 separate final-source release sync targets are still running. Full release
 qualification, fairness, and calibrated performance remain open.
+
+The next release-profile candidate exposed another representability boundary:
+legacy dependency types `Review-Custom` and `review-custom` remained distinct
+in the converted database but exported to the same normalized JSONL identity.
+The source copy and successful-but-colliding export are retained on hz4 at
+`/data/tmp/br-legacy-type-case-049yangm`. Admission now refuses any legacy type
+whose spelling changes through the interchange model. The negative replay on
+ovh-a at `/data/tmp/br-legacy-case-refusal-_bze71mr` returned `CONFIG_ERROR`
+before changing the source DB hash. Lowercase custom types remain supported.
+
+With the spelling guard and original fixed polling, release executable
+`6b1dfca7489b2a10658ad2cc85776ff383fca87ba70f18510917a8f79bb1beba`, retained
+at `/data/tmp/br-fixed-case-final-core-tnz0pnlu/br` on ovh-a, passed 3,051 library
+tests (two existing ignores), 66 binary tests, the five original historical
+workloads, and the full migration and three sync targets. A fresh independent
+SQLite canary verified all 18 table projections and exact receipt-family undo
+of the original 550-issue database; apply took 1.909 seconds and undo 0.324
+seconds. Its candidate DB hash again matched `db5ede49…e841ef`. Complete
+observations are retained beside the executable. The original fixture and
+JSONL were unchanged. This executable predates the behavior-preserving helper
+extraction used to fix Clippy's function-length warning, so final-source
+qualification still requires that newer source to pass.
+
+The separate aged-polling experiment was rejected and reverted. All four
+release ABBA runs completed their unchanged eight-stream, 120-second workload
+with zero failed or dropped operations and full final-state checks. Although
+p95 improved, median latency rose from 135–154 ms to 245–249 ms. A diagnostic
+trace still observed a 16.567-second wait while 23 later arrivals acquired the
+lock. Those results do not establish fairness or calibrated performance.
+Raw comparison and trace evidence remains on ovh-a under
+`/data/tmp/br-46zqi-syscall-jwi2sl4x/`.
+
+Qualification remains incomplete: two cold release batches reached RCH's
+unchanged 30-minute limit before test execution. Local ENOSPC also truncated
+one batch log and prevented a tracker export; the export was subsequently
+recovered, and retries use logs in `/tmp`. Missing-`sqlite3` failures in two
+sync-artifact tests passed unchanged on a worker with the actual oracle.
+The detailed pending targets, source distinctions, and bounded self-review
+are recorded in yyhki comment 1500. No test ignores, workload reductions,
+timeout increases, GitHub Actions, or new releases were introduced.
+
+The final helper extraction is now qualified. Default release executable
+`ad56a8a4c6bfba289f88a09d95f7b0311f9ec1d5aebdca39fa10ee561bca77cc`, retained
+at `/data/tmp/br-extracted-helper-release-qcef0br5/br` on ovh-a, matches all
+1,203 entries in source manifest `c04f0d2c…fe2846`. Its original-copy replay
+passed all 18 table projections, storage classes, row IDs, sequences, foreign
+keys, integrity, and exact DB/WAL/SHM/journal undo. The complete observations
+have SHA-256 `9aec283766e9c8c805f0efaeb6a13fbdf1cdac05ce6481470eae69ff961f2475`.
+The same executable refused the case-distinct legacy types without changing
+the source DB. Later edits changed two integration tests and documentation;
+the runtime sources remain identical to this executable's inputs.
+
+Release-profile coverage completed through bounded RCH Cargo batches for all
+156 integration targets. One target contains only an existing ignored test;
+no executed-test credit is assigned to it. The default library passed 3,051
+tests with two existing ignores; all features passed 3,131 with nine, and no
+default features passed 3,038 with two. The binary's 66 tests, all 22 enabled
+MCP protocol tests, and the MCP shutdown test passed. The documentation-test
+command succeeded with zero executed tests and ten existing ignores.
+The last storage-model target passed all 172 tests independently of a slow
+combined batch that reached the unchanged 30-minute cap. Its four remaining
+storage targets then passed on the same worker using their compiled binaries.
+Two redundant cold fallback builds were cancelled; their logs and cancellation
+receipts remain in `/tmp`, and neither receives test credit. Target membership,
+failed attempts, and individual proof logs are recorded in the yyhki bead.
+
+The complete suite exposed two obsolete test assumptions. Schema conformance
+against pinned Go `bd` 0.46.0 had omitted the previously shipped
+`issues.prerequisites` column; it now asserts that exact TEXT/NOT NULL/empty
+default declaration and requires the typed dependency key to match. The doctor
+chokepoint test had stamped a current database as version 14 while retaining
+later columns and keys. Its positive path now derives v14 from the frozen
+`d1b90640` schema-15 fixture by removing the v15 gate-history table. The former
+mismatched layout remains an explicit no-mutation refusal test. Existing
+plan/apply/barrier/undo assertions remain, with byte-exact undo added. Both
+corrected targets passed; neither required weakening production admission.
+
+After both test corrections, whole-crate all-feature check and Clippy with
+warnings denied passed, as did formatting and whitespace checks. The normal
+runtime dependency closure contained no Git-authority libraries. UBS remains
+non-clean: its 49 schema SQL findings are all in test fixtures, and the new
+integration-file scans report fixture panics and explicit test-binary launches.
+This is recorded triage, not a blanket scanner clearance. Qualification used
+isolated copies and a fresh solo review; it is not independent human review,
+a new release, a starvation fix, or calibrated performance acceptance.

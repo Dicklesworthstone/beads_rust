@@ -130,10 +130,12 @@ this repo): commits `55c186682` + `5946b3b7c` in
   layout without choosing between parallel dependency types. It preserves raw
   relation payloads, comments, events, row IDs, sequence allocation, and operator
   data. Non-NULL legacy dirty hashes, ambiguous child counters, incoming foreign
-  keys to rebuilt tables, and unsupported schema extensions still refuse.
+  keys to rebuilt tables, dependency spellings that would change during JSONL
+  interchange, and unsupported schema extensions still refuse.
   The original 550-issue fixture passed conversion and exact database-family
   undo. Its five historical history, label, and concurrent-reader workloads
-  also passed; full release-suite qualification remains open.
+  also passed, along with release-profile regression, conformance, and MCP
+  coverage. Existing ignored tests remain unchanged.
 - Policy refusals are no longer worded as a close. `POLICY_VIOLATION` errors
   raised by workflow required fields or gates on any status move now render
   as `Policy violation for <id>: transition 'draft -> planning' requires …`

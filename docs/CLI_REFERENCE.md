@@ -2144,9 +2144,11 @@ Admission requires the exact reviewed legacy declarations and index
 definitions. The removed `dirty_issues.content_hash` column must contain only
 NULLs; `last_child` must represent every existing direct child, and the legacy
 `next_child_number` cannot reserve a later allocation. Values that would change
-storage class during copying, incoming foreign keys to rebuilt tables,
-persistent triggers, and unexplained extensions refuse before a token is
-issued. Operator tables retain their data and schema witness; changes to their
+storage class during copying or dependency type spelling during JSONL
+interchange refuse before approval. This includes mixed-case custom names and
+case-distinct keys that would collapse on reimport. Incoming foreign keys to
+rebuilt tables, persistent triggers, and unexplained extensions refuse before a
+token is issued. Operator tables retain their data and schema witness; changes to their
 constraints or hidden row IDs invalidate the plan or undo. Candidate
 verification must match every projected table before installation. The exact
 undo backup covers the database and its WAL, SHM, and rollback journal;

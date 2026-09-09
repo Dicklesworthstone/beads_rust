@@ -194,13 +194,16 @@ with a reason pointing here, never as a weakened comparison:
   `capacity_exemptions`, `capacity_occupancy`, `close_metadata`,
   `gate_result_history`, `gate_results`. bd-only tables: `compaction_snapshots`,
   `issue_snapshots`, `repo_mtimes`. br-only columns: `issues.owner`,
-  `issues.agent_context`, `issues.source_system`, `events.agent_name`,
-  `events.harness`, `events.model`, `blocked_issues_cache.blocked_at`.
+  `issues.agent_context`, `issues.source_system`, `issues.prerequisites`,
+  `events.agent_name`, `events.harness`, `events.model`,
+  `blocked_issues_cache.blocked_at`.
   bd-only column: `dirty_issues.content_hash`. Constraint differences:
-  `config.key` (bd: primary key, nullable), `dependencies.type` (bd: part of
-  the primary key), `dependencies.created_at` and
+  `config.key` (bd: primary key, nullable), `dependencies.created_at` and
   `blocked_issues_cache.issue_id` (NOT NULL differs). bd 0.46 dropped
-  `issues.owner`, so it is no longer in the core column set.
+  `issues.owner`, so it is no longer in the core column set. br's separate
+  prerequisite checklist has a required TEXT column with an empty default;
+  conformance checks that declaration explicitly. Since br schema 19, both
+  tools include `type` in the dependency primary key; that key must match.
 - **br's JSONL dependency records carry `thread_id` and `metadata`**
   (per-edge provenance, #484–#486); bd's do not. The workflow JSONL
   comparison ignores those two br-only leaf fields.
