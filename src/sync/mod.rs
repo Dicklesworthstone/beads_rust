@@ -1837,6 +1837,7 @@ fn open_and_lock_regular_file(
         role,
         "write authority is held by another process; waiting with timeout"
     );
+    let mut poll_interval = WRITE_LOCK_POLL_INTERVAL;
 
     loop {
         if start.elapsed() >= timeout {
@@ -1849,14 +1850,22 @@ fn open_and_lock_regular_file(
         }
 
         let remaining = timeout.saturating_sub(start.elapsed());
-        thread::sleep(remaining.min(WRITE_LOCK_POLL_INTERVAL));
+        thread::sleep(remaining.min(poll_interval));
 
         match try_lock_exclusive(&file, mechanism) {
             Ok(()) => {
                 verify_locked_file_identity(&file, lock_path, role, redact_path)?;
                 return Ok(file);
             }
-            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::WouldBlock) => {
+                if matches!(retry_safety, LockRetrySafety::BeforeMutation) {
+                    // Newly arriving writers get an immediate attempt. Shorten
+                    // retries for existing waiters to reduce the window in which
+                    // a sustained stream of arrivals can pass sleeping waiters.
+                    // This remains bounded polling, not a FIFO lock guarantee.
+                    poll_interval = (poll_interval / 2).max(Duration::from_millis(1));
+                }
+            }
             Err(TryLockError::Error(err)) => {
                 tracing::debug!(role, "failed to acquire write authority: {err}");
                 return Err(BeadsError::Config(format!(
@@ -7341,7 +7350,7 @@ fn plan_additive_reconcile_in_snapshot(
                 issue_has_conflict = true;
             }
         }
-        let mut dependency_targets = BTreeSet::new();
+        let mut dependency_identities = BTreeSet::new();
         let mut parent_child_count = 0usize;
         let mut parent_candidates = Vec::new();
         for (dependency_ordinal, dependency) in issue.dependencies.iter().enumerate() {
@@ -7371,7 +7380,11 @@ fn plan_additive_reconcile_in_snapshot(
                 )?;
                 issue_has_conflict = true;
             }
-            if !dependency_targets.insert(dependency.depends_on_id.as_str()) {
+            if !dependency_identities.insert((
+                dependency.issue_id.as_str(),
+                dependency.depends_on_id.as_str(),
+                dependency.dep_type.as_str(),
+            )) {
                 record_additive_conflict_detail(
                     &mut conflict_reasons,
                     &mut conflict_ids,
@@ -7962,9 +7975,13 @@ fn plan_additive_reconcile_in_snapshot(
                 additive_sqlite_value_witness(SqliteValue::from(label.as_str())),
             ]);
         }
-        let mut dependency_targets = BTreeSet::new();
+        let mut dependency_identities = BTreeSet::new();
         for dependency in &issue.dependencies {
-            if dependency_targets.insert(dependency.depends_on_id.as_str()) {
+            if dependency_identities.insert((
+                dependency.issue_id.as_str(),
+                dependency.depends_on_id.as_str(),
+                dependency.dep_type.as_str(),
+            )) {
                 expected_dependency_rows.push(vec![
                     additive_sqlite_value_witness(SqliteValue::from(issue.id.as_str())),
                     additive_sqlite_value_witness(SqliteValue::from(
@@ -13425,16 +13442,18 @@ fn normalize_issue(issue: &mut Issue) -> usize {
         }
     }
 
-    // Deduplicate dependencies by the database key (issue_id, depends_on_id),
-    // keeping only the most recent entry by created_at. This handles duplicate
-    // parent-child entries from reparenting or migration artifacts (see issue #159).
+    // Deduplicate only the same typed relationship, keeping the most recent
+    // entry by created_at and the first entry on a tie. Parallel relationship
+    // types between the same issues carry independent payloads.
     if issue.dependencies.len() > 1 {
         use std::collections::HashMap;
-        // The storage schema has one row per pair, so type-distinct duplicates
-        // cannot be preserved without a schema migration.
-        let mut best: HashMap<(String, String), usize> = HashMap::new();
+        let mut best: HashMap<(String, String, DependencyType), usize> = HashMap::new();
         for (i, dep) in issue.dependencies.iter().enumerate() {
-            let key = (dep.issue_id.clone(), dep.depends_on_id.clone());
+            let key = (
+                dep.issue_id.clone(),
+                dep.depends_on_id.clone(),
+                dep.dep_type.clone(),
+            );
             match best.get(&key) {
                 Some(&prev_idx) if issue.dependencies[prev_idx].created_at >= dep.created_at => {
                     // existing entry is newer or equal, skip
@@ -18249,6 +18268,123 @@ mod tests {
     }
 
     #[test]
+    fn additive_reconcile_preserves_parallel_typed_dependency_payloads_and_events() {
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let target = make_issue_at(
+            "bd-typed-target",
+            "Target with existing history",
+            fixed_time(100),
+        );
+        storage.create_issue(&target, "original-author").unwrap();
+        let events_before = storage.get_all_events(0).unwrap();
+        assert!(!events_before.is_empty());
+        let mut source = make_issue_at(
+            "bd-typed-source",
+            "Parallel typed relations",
+            fixed_time(200),
+        );
+        source.dependencies = [DependencyType::Blocks, DependencyType::Related]
+            .into_iter()
+            .map(|dep_type| Dependency {
+                issue_id: source.id.clone(),
+                depends_on_id: target.id.clone(),
+                created_at: fixed_time(180),
+                created_by: Some(format!("{}-author", dep_type.as_str())),
+                metadata: Some(format!(r#"{{"relation":"{}"}}"#, dep_type.as_str())),
+                thread_id: Some(format!("{}-discussion", dep_type.as_str())),
+                dep_type,
+            })
+            .collect();
+        write_additive_issues(&jsonl_path, std::slice::from_ref(&source));
+        let source_bytes = fs::read(&jsonl_path).unwrap();
+        let database_before = hydrate_additive_database_issues(&storage).unwrap();
+        let witness_before = additive_database_witness(&storage, &database_before).unwrap();
+
+        let plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        assert_eq!(plan.receipt().status, AdditiveReconcileStatus::Ready);
+        assert_eq!(plan.receipt().created, 1);
+        assert_eq!(plan.receipt().conflicted, 0);
+        assert_eq!(plan.receipt().relation_rows_planned.dependencies, 2);
+        assert_eq!(plan.receipt().relations_after.dependencies, 2);
+        assert_eq!(plan.receipt().target_before, witness_before);
+        assert_additive_prestate_untouched(&storage, &plan, &source.id);
+        assert_eq!(fs::read(&jsonl_path).unwrap(), source_bytes);
+
+        let receipt =
+            apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &plan).unwrap();
+        assert_eq!(receipt.status, AdditiveReconcileStatus::Applied);
+        assert_eq!(receipt.relation_rows_applied.dependencies, 2);
+        assert_eq!(
+            receipt.target_after.as_ref(),
+            Some(&plan.receipt().expected_target_after)
+        );
+        assert_eq!(storage.get_all_events(0).unwrap(), events_before);
+        assert_eq!(fs::read(&jsonl_path).unwrap(), source_bytes);
+        let stored = hydrate_additive_database_issues(&storage).unwrap();
+        assert_eq!(stored[&source.id].dependencies, source.dependencies);
+        assert_eq!(stored[&target.id], database_before[&target.id]);
+
+        let second = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        assert_eq!(second.receipt().status, AdditiveReconcileStatus::NoChanges);
+        assert_eq!(second.receipt().relation_rows_planned.dependencies, 0);
+        assert_eq!(second.receipt().relations_after.dependencies, 2);
+        assert_eq!(storage.get_all_events(0).unwrap(), events_before);
+    }
+
+    #[test]
+    fn additive_reconcile_rejects_duplicate_typed_dependency_identity_without_mutation() {
+        for different_payload in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let target = make_issue_at("bd-duplicate-target", "Existing target", fixed_time(100));
+            storage.create_issue(&target, "original-author").unwrap();
+            let mut source =
+                make_issue_at("bd-duplicate-source", "Duplicate identity", fixed_time(200));
+            let first = Dependency {
+                issue_id: source.id.clone(),
+                depends_on_id: target.id.clone(),
+                dep_type: DependencyType::Related,
+                created_at: fixed_time(180),
+                created_by: Some("first-author".to_string()),
+                metadata: Some(r#"{"version":1}"#.to_string()),
+                thread_id: Some("original-discussion".to_string()),
+            };
+            let mut duplicate = first.clone();
+            if different_payload {
+                duplicate.created_at = fixed_time(190);
+                duplicate.created_by = Some("second-author".to_string());
+                duplicate.metadata = Some(r#"{"version":2}"#.to_string());
+                duplicate.thread_id = Some("different-discussion".to_string());
+            }
+            source.dependencies = vec![first, duplicate];
+            write_additive_issues(&jsonl_path, std::slice::from_ref(&source));
+            let source_bytes = fs::read(&jsonl_path).unwrap();
+            let events_before = storage.get_all_events(0).unwrap();
+
+            let plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+            assert_eq!(plan.receipt().status, AdditiveReconcileStatus::Conflicted);
+            assert_eq!(
+                plan.receipt()
+                    .conflict_reasons
+                    .get("duplicate_dependency_target"),
+                Some(&1)
+            );
+            assert_eq!(plan.receipt().conflicted, 1);
+            assert_eq!(plan.mutation_count(), 0);
+            assert_additive_prestate_untouched(&storage, &plan, &source.id);
+            assert!(
+                apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &plan).is_err()
+            );
+            assert_additive_prestate_untouched(&storage, &plan, &source.id);
+            assert_eq!(storage.get_all_events(0).unwrap(), events_before);
+            assert_eq!(fs::read(&jsonl_path).unwrap(), source_bytes);
+        }
+    }
+
+    #[test]
     fn additive_reconcile_conflicts_on_equal_timestamp_drift_and_resurrection() {
         let temp = TempDir::new().unwrap();
         let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
@@ -21994,6 +22130,56 @@ mod tests {
             issue.dependencies[0].dep_type,
             crate::model::DependencyType::ParentChild
         );
+    }
+
+    #[test]
+    fn test_normalize_issue_preserves_typed_dependencies_and_exact_triple_recency() {
+        let mut issue = make_issue_at(
+            "bd-typed-source",
+            "Typed dependency normalization",
+            fixed_time(300),
+        );
+        let older = Dependency {
+            issue_id: issue.id.clone(),
+            depends_on_id: "bd-typed-target".to_string(),
+            dep_type: DependencyType::Blocks,
+            created_at: fixed_time(100),
+            created_by: Some("older-author".to_string()),
+            metadata: Some(r#"{"version":"older"}"#.to_string()),
+            thread_id: Some("older-discussion".to_string()),
+        };
+        let mut related = older.clone();
+        related.dep_type = DependencyType::Related;
+        related.created_by = Some("related-author".to_string());
+        related.metadata = Some(r#"{"version":"related"}"#.to_string());
+        related.thread_id = Some("related-discussion".to_string());
+        let mut newer = older.clone();
+        newer.created_at = fixed_time(200);
+        newer.created_by = Some("newer-author".to_string());
+        newer.metadata = Some(r#"{"version":"newer"}"#.to_string());
+        newer.thread_id = Some("newer-discussion".to_string());
+        let mut tied = newer.clone();
+        tied.created_by = Some("later-tied-author".to_string());
+        tied.metadata = Some(r#"{"version":"tie"}"#.to_string());
+        tied.thread_id = Some("tied-discussion".to_string());
+
+        for (incoming, expected) in [
+            (
+                vec![older.clone(), related.clone(), newer.clone(), tied.clone()],
+                vec![related.clone(), newer.clone()],
+            ),
+            (
+                vec![newer.clone(), related.clone(), older, tied],
+                vec![newer, related],
+            ),
+        ] {
+            issue.dependencies = incoming;
+            assert_eq!(normalize_issue(&mut issue), 0);
+            assert_eq!(issue.dependencies, expected);
+            let normalized = issue.clone();
+            assert_eq!(normalize_issue(&mut issue), 0);
+            assert_eq!(issue, normalized);
+        }
     }
 
     #[test]

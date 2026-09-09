@@ -726,14 +726,32 @@ fn dep_remove(
         resolve_issue_id(&storage_ctx.storage, resolver, &args.depends_on)?
     };
 
-    let dep_type = dependency_type_for_pair(&storage_ctx.storage, &issue_id, &depends_on_id)?
-        .unwrap_or_else(|| "unknown".to_string());
-    let removed = retry_mutation_with_jsonl_recovery(
+    let (removed, dep_type) = retry_mutation_with_jsonl_recovery(
         storage_ctx,
         true,
         "dep remove",
         Some(issue_id.as_str()),
-        |storage| storage.remove_dependency(&issue_id, &depends_on_id, actor),
+        |storage| {
+            let requested_type = args
+                .dep_type
+                .as_deref()
+                .map(|kind| {
+                    parse_dependency_type_for_removal(storage, &issue_id, &depends_on_id, kind)
+                })
+                .transpose()?;
+            let dep_type = match &requested_type {
+                Some(dep_type) => dep_type.clone(),
+                None => dependency_type_for_pair(storage, &issue_id, &depends_on_id)?
+                    .unwrap_or_else(|| "unknown".to_string()),
+            };
+            let removed = storage.remove_dependency(
+                &issue_id,
+                &depends_on_id,
+                requested_type.as_deref(),
+                actor,
+            )?;
+            Ok((removed, dep_type))
+        },
     )?;
 
     finalize_dep_mutation(storage_ctx, removed, "dep remove")?;
@@ -765,18 +783,15 @@ fn dep_remove(
     } else if removed {
         let issue_id_display = dep_display_text(&issue_id);
         let depends_on_id_display = dep_display_text(&depends_on_id);
+        let dep_type_display = dep_display_text(&dep_type);
         if ctx.is_rich() {
             ctx.success(&format!(
-                "Removed dependency: {} → {}",
-                issue_id_display, depends_on_id_display
-            ));
-            ctx.print_line(&format!(
-                "  {} no longer depends on {}",
-                issue_id_display, depends_on_id_display
+                "Removed dependency: {} → {} ({})",
+                issue_id_display, depends_on_id_display, dep_type_display
             ));
         } else {
             ctx.success(&format!(
-                "Removed dependency: {issue_id_display} -> {depends_on_id_display}"
+                "Removed dependency: {issue_id_display} -> {depends_on_id_display} ({dep_type_display})"
             ));
         }
     } else {
@@ -800,6 +815,24 @@ fn dependency_type_for_pair(
         .into_iter()
         .find(|dep| dep.depends_on_id == depends_on_id)
         .map(|dep| dep.dep_type.as_str().to_string()))
+}
+
+fn parse_dependency_type_for_removal(
+    storage: &SqliteStorage,
+    issue_id: &str,
+    depends_on_id: &str,
+    requested: &str,
+) -> Result<String> {
+    // JSONL can contain custom types that add intentionally refuses to invent.
+    // Prefer an existing exact name so removal never selects a different edge.
+    if storage
+        .get_dependencies_full(issue_id)?
+        .iter()
+        .any(|dep| dep.depends_on_id == depends_on_id && dep.dep_type.as_str() == requested)
+    {
+        return Ok(requested.to_owned());
+    }
+    Ok(parse_dependency_type(requested)?.as_str().to_owned())
 }
 
 fn dep_display_text(value: &str) -> String {
@@ -2345,7 +2378,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dep_import_bulk_storage_path_skips_type_distinct_duplicate_pairs() {
+    fn test_dep_import_bulk_storage_path_preserves_types_and_skips_exact_duplicates() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         for id in ["bd-source", "bd-target"] {
             storage
@@ -2353,32 +2386,44 @@ mod tests {
                 .unwrap();
         }
 
+        let dependencies = [
+            BulkDependencyInsert {
+                issue_id: "bd-source".to_string(),
+                depends_on_id: "bd-target".to_string(),
+                dep_type: "blocks".to_string(),
+            },
+            BulkDependencyInsert {
+                issue_id: "bd-source".to_string(),
+                depends_on_id: "bd-target".to_string(),
+                dep_type: "related".to_string(),
+            },
+        ];
         let inserted = storage
-            .add_dependencies_bulk_for_import(
-                &[
-                    BulkDependencyInsert {
-                        issue_id: "bd-source".to_string(),
-                        depends_on_id: "bd-target".to_string(),
-                        dep_type: "blocks".to_string(),
-                    },
-                    BulkDependencyInsert {
-                        issue_id: "bd-source".to_string(),
-                        depends_on_id: "bd-target".to_string(),
-                        dep_type: "related".to_string(),
-                    },
-                ],
-                "tester",
-            )
+            .add_dependencies_bulk_for_import(&dependencies, "tester")
             .unwrap();
 
-        assert_eq!(inserted, 1);
-        let dep_types: Vec<String> = storage
-            .get_dependencies_full("bd-source")
-            .unwrap()
-            .into_iter()
+        assert_eq!(inserted, 2);
+        let stored = storage.get_dependencies_full("bd-source").unwrap();
+        let mut dep_types: Vec<String> = stored
+            .iter()
             .map(|dep| dep.dep_type.as_str().to_string())
             .collect();
-        assert_eq!(dep_types, vec!["blocks".to_string()]);
+        dep_types.sort();
+        assert_eq!(dep_types, vec!["blocks".to_string(), "related".to_string()]);
+        assert!(stored.iter().all(|dep| dep.issue_id == "bd-source"
+            && dep.depends_on_id == "bd-target"
+            && dep.created_by.as_deref() == Some("tester")));
+        let events = storage.get_events("bd-source", 0).unwrap();
+        let dirty = storage.get_dirty_issue_metadata().unwrap();
+        assert_eq!(
+            storage
+                .add_dependencies_bulk_for_import(&dependencies, "another-actor")
+                .unwrap(),
+            0
+        );
+        assert_eq!(storage.get_dependencies_full("bd-source").unwrap(), stored);
+        assert_eq!(storage.get_events("bd-source", 0).unwrap(), events);
+        assert_eq!(storage.get_dirty_issue_metadata().unwrap(), dirty);
     }
 
     #[test]
@@ -2422,13 +2467,13 @@ mod tests {
             .unwrap();
 
         let removed = storage
-            .remove_dependency("bd-001", "bd-002", "tester")
+            .remove_dependency("bd-001", "bd-002", None, "tester")
             .unwrap();
         assert!(removed);
 
         // Removing again should return false
         let removed_again = storage
-            .remove_dependency("bd-001", "bd-002", "tester")
+            .remove_dependency("bd-001", "bd-002", None, "tester")
             .unwrap();
         assert!(!removed_again);
         info!("test_remove_dependency: assertions passed");
