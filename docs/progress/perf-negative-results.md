@@ -615,3 +615,67 @@ Entries preserve failed experiments as reusable evidence. A retry is justified o
   make calibration pass. A CPU optimization needs a symbol-capable profile
   of the remaining work before any source change.
 - **Bead:** `beads_rust-zxfz.1` remains in progress; no production code changed.
+
+### 2026-09-10 — Symbol-ready baseline and launcher RSS correction — inconclusive
+
+- **Workload and identity:** `ready --limit 20 --json` on hz2, using the same
+  1,000-issue corpus above. Strict RCH built source `e7c1ea94` on hz4 with the
+  existing `release-perf` profile, default features and forced frame pointers.
+  All 118 selected source/build inputs matched the worker. Binary SHA-256:
+  `950ef5a75df198eb6b67a34cb86aba6219325d88ab4094279d0da87a542bd8b2`.
+  The 209,707,032-byte artifact retains symbols; its size and timings are not
+  measurements of the size-optimized distribution profile. Its version output
+  does not embed the source revision; the source archive and input manifest
+  establish that attribution.
+- **Fixed baseline:** One copied-inode admission, three warmups, then 40 fresh
+  processes on that admitted workspace. All 44 calls returned the exact
+  expected 20 issues (7,243 bytes), exited zero and emitted no stderr. Main
+  database, WAL, journal, JSONL, configuration and metadata hashes remained
+  unchanged; the namespace record changed only during admission.
+- **Rejected quiet gate, passing stability:** The two 20-call epochs had
+  median ratios of `1.010912` and nearest-rank p95 ratios of `1.063013`, both
+  below the prospectively frozen `1.10` limit. However, five of 88 before/after
+  observations contained a `rustc` process name, violating the frozen quiet
+  condition. The cohort therefore exited 2 and was not replaced with another
+  run. Process arguments were not captured, so these observations cannot
+  distinguish compilation from short compiler-version probes or establish
+  causal timing interference. Descriptive wall median/p95 were
+  `68.716644/88.786696 ms`; they do not establish release acceptance or precise
+  tail behavior. No application Callgrind or Massif profile was run.
+- **RSS oracle defect:** Every baseline `wait4` peak was `224,632 KiB`.
+  The scratch collector had read the entire symbol-bearing executable into
+  its Python parent before spawning children. Two fresh parent controls,
+  each launching ten identical `/usr/bin/true` children, demonstrated the
+  contamination: streaming the hash yielded `17,932–18,096 KiB` child peaks;
+  reading/freeing the whole binary yielded `222,440 KiB` for every child.
+  GNU time measured `1,544 KiB` for the corresponding reference child in both
+  cases. Streaming alone lowers the parent floor rather than removing it.
+  Retract all 44 baseline RSS values as application-memory evidence. Earlier
+  scratch `wait4` measurements using this launcher pattern also require the
+  parent-floor caveat; no corrected historical RSS can be reconstructed from
+  these controls.
+- **Corrected observation:** Exactly five separately declared real `ready`
+  calls under `/usr/bin/time -v` measured peak RSS of `71,192`, `78,352`,
+  `77,456`, `77,600` and `77,788 KiB`. All five retained exact output, empty
+  stderr, zero exit and unchanged database-family hashes. These are memory
+  observations for this artifact/workload, not replacement timing samples,
+  allocator-object attribution or a release memory budget. The existing
+  `tests/bench_synthetic_scale.rs::run_measured_br_command` already uses GNU
+  time, so no repository benchmark or runtime change was needed.
+- **Evidence and review:** RCH jobs `j-30015430739361819` (build),
+  `j-30015430739361838` (rejected baseline), `j-30015430739361840` (RSS control)
+  and `j-30015430739361844` (five corrected RSS probes). Scripts, pinned source,
+  binary, corpus, raw outputs and logs remain at
+  `/data/tmp/br-zxfz1-cpu-evidence-20260910-PhPqBOHI`; worker copies are at
+  `hz2:/data/tmp/br-zxfz1-cpu-profile-20260910-R6LIEWIN`. A fresh solo readback
+  verified all 49 payloads and family states, both epoch ratios, the 5/88
+  process observations, and all RSS control records. This was self-review of
+  raw evidence, not independent execution or a published durable archive.
+- **Outcome and next condition:** Measurement correction only; no runtime
+  improvement or new calibrated budget. Keep the failed cohort intact and
+  stop expanding measurement machinery. CPU attribution still requires an
+  eligible baseline under the declared conditions; do not bypass that gate
+  with the RSS controls. The original 28 release workloads, small-regression
+  sensitivity, cold/warm startup definitions and seven-target size obligations
+  remain required. Historical held-out A/B remains unopened.
+- **Bead:** `beads_rust-zxfz.1` remains in progress.
