@@ -1184,7 +1184,6 @@ fn validate_route_runtime_guards(
             let issue = storage
                 .get_issue(id)?
                 .ok_or_else(|| BeadsError::IssueNotFound { id: id.clone() })?;
-            SqliteStorage::validate_claim_target(&issue, chrono::Utc::now())?;
             let trimmed = issue
                 .assignee
                 .as_deref()
@@ -1252,7 +1251,16 @@ fn validate_transition_to_in_progress(
             let Some(issue) = storage.get_issue(id)? else {
                 continue;
             };
-            SqliteStorage::validate_claim_target(&issue, chrono::Utc::now())?;
+            if issue.status == Status::Closed {
+                return Err(BeadsError::validation(
+                    "claim",
+                    format!(
+                        "cannot claim closed issue {id}: `--claim` starts work on an open issue \
+                         and never reopens one, so its close_reason and closed_at are left \
+                         intact. Reopen it first with `br reopen {id}`, then claim it"
+                    ),
+                ));
+            }
         }
     }
 
