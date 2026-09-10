@@ -7374,6 +7374,39 @@ impl SqliteStorage {
             .collect()
     }
 
+    /// Check current work eligibility before a claim, without reopening or
+    /// canceling deferral as a side effect. Storage repeats CLI preflight
+    /// inside the write transaction.
+    pub(crate) fn validate_claim_target(issue: &Issue, now: DateTime<Utc>) -> Result<()> {
+        let id = &issue.id;
+        if issue.status == Status::Tombstone {
+            return Err(BeadsError::validation(
+                "claim",
+                format!("cannot claim tombstone issue {id}"),
+            ));
+        }
+        if issue.status == Status::Closed {
+            return Err(BeadsError::validation(
+                "claim",
+                format!(
+                    "cannot claim closed issue {id}: `--claim` starts work on an open issue \
+                     and never reopens one, so its close_reason and closed_at are left \
+                     intact. Reopen it first with `br reopen {id}`, then claim it"
+                ),
+            ));
+        }
+        if issue.status == Status::Deferred || issue.defer_until.is_some_and(|until| until > now) {
+            return Err(BeadsError::validation(
+                "claim",
+                format!(
+                    "cannot claim deferred issue {id}: `--claim` does not cancel deferral. \
+                     Run `br undefer {id}` first, then claim it"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     fn update_issue_in_tx(
         conn: &Connection,
@@ -7402,21 +7435,22 @@ impl SqliteStorage {
             });
         }
 
-        // Atomic claim guard: check assignee INSIDE the CONCURRENT transaction
-        // to prevent TOCTOU races where two agents both see "unassigned".
+        // Recheck eligibility and assignment inside the write transaction.
+        // A saved claim command must not undo a later close or deferral.
+        let mut claim_state = None;
         if updates.expect_unassigned {
-            let current_assignee = match conn.query_row_with_params(
-                "SELECT assignee FROM issues WHERE id = ?",
+            Self::validate_claim_target(&issue, Utc::now())?;
+            let row = conn.query_row_with_params(
+                "SELECT assignee, status, defer_until FROM issues WHERE id = ?",
                 &[SqliteValue::from(id)],
-            ) {
-                Ok(row) => row.get(0).and_then(SqliteValue::as_text).map(String::from),
-                Err(FrankenError::QueryReturnedNoRows) => None,
-                Err(error) => return Err(error.into()),
-            };
-            let trimmed = current_assignee
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
+            )?;
+            let current_assignee = row.get(0).and_then(SqliteValue::as_text);
+            claim_state = Some((
+                row.get(0).cloned().unwrap_or(SqliteValue::Null),
+                row.get(1).cloned().unwrap_or(SqliteValue::Null),
+                row.get(2).cloned().unwrap_or(SqliteValue::Null),
+            ));
+            let trimmed = current_assignee.map(str::trim).filter(|s| !s.is_empty());
             let claim_actor = updates.claim_actor.as_deref().unwrap_or("");
 
             match trimmed {
@@ -7794,18 +7828,14 @@ impl SqliteStorage {
         // if two writers both observed the row as unassigned earlier.
         let mut where_clause = "id = ?".to_string();
         params.push(SqliteValue::from(id));
-        if updates.expect_unassigned {
-            where_clause.push_str(" AND (assignee IS NULL OR TRIM(assignee) = ''");
-            if !updates.claim_exclusive
-                && let Some(claim_actor) = updates
-                    .claim_actor
-                    .as_deref()
-                    .filter(|actor| !actor.is_empty())
-            {
-                where_clause.push_str(" OR assignee = ?");
-                params.push(SqliteValue::from(claim_actor));
-            }
-            where_clause.push(')');
+        if let Some((assignee, status, defer_until)) = claim_state {
+            // Compare exactly what passed the Rust eligibility/assignment
+            // checks. This preserves whitespace handling and RFC3339 offsets
+            // without a second, subtly different SQL interpretation.
+            where_clause.push_str(" AND assignee IS ? AND status = ? AND defer_until IS ?");
+            params.push(assignee);
+            params.push(status);
+            params.push(defer_until);
         }
 
         let sql = format!(
@@ -7815,6 +7845,9 @@ impl SqliteStorage {
         let updated_rows = conn.execute_with_params(&sql, &params)?;
         if updated_rows == 0 {
             if updates.expect_unassigned {
+                if let Some(current) = Self::get_issue_from_conn(conn, id)? {
+                    Self::validate_claim_target(&current, Utc::now())?;
+                }
                 let current_assignee = match conn.query_row_with_params(
                     "SELECT assignee FROM issues WHERE id = ?",
                     &[SqliteValue::from(id)],
@@ -7833,7 +7866,13 @@ impl SqliteStorage {
                 };
                 return Err(BeadsError::validation(
                     "claim",
-                    format!("issue {id} already assigned to {current_assignee}"),
+                    if current_assignee == "<unknown>" {
+                        format!(
+                            "claim preconditions changed for issue {id}; reload it before claiming"
+                        )
+                    } else {
+                        format!("issue {id} already assigned to {current_assignee}")
+                    },
                 ));
             }
 
@@ -18042,8 +18081,8 @@ pub struct IssueUpdate {
     /// If true, do not rebuild the blocked cache after update.
     /// Caller is responsible for rebuilding cache if needed.
     pub skip_cache_rebuild: bool,
-    /// If true, verify the issue is unassigned (or assigned to `claim_actor`)
-    /// inside the IMMEDIATE transaction to prevent TOCTOU races.
+    /// If true, verify current claim eligibility and that the issue is
+    /// unassigned (or assigned to `claim_actor`) inside the write transaction.
     pub expect_unassigned: bool,
     /// If true, reject re-claims even by the same actor.
     pub claim_exclusive: bool,
