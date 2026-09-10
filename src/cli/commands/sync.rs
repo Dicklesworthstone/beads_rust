@@ -5645,9 +5645,9 @@ fn render_merge_result_rich(report: &crate::sync::MergeReport, ctx: &OutputConte
 #[cfg(test)]
 mod tests {
     use super::{
-        GitExportStatus, SyncOperation, additive_conflict_human_lines,
+        GitExportStatus, SyncOperation, SyncPathPolicy, additive_conflict_human_lines,
         auto_rebuild_semantic_conflict_field, auto_rebuild_semantic_flag_conflict_reason,
-        classify_sync_status_workspace, detect_prefix_from_jsonl,
+        build_base_witness_artifacts, classify_sync_status_workspace, detect_prefix_from_jsonl,
         fresh_force_import_maintenance_gate_applies, jsonl_contains_duplicate_external_refs,
         jsonl_contains_prefix_mismatch, merge_conflict_resolution, prepare_sync_startup,
         should_defer_jsonl_recovery, should_render_human_sync_output, sync_operation,
@@ -5938,7 +5938,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn build_base_witness_artifacts_rejects_symlinked_base_snapshot() {
-        use super::{SyncPathPolicy, build_base_witness_artifacts};
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new().unwrap();
