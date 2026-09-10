@@ -16,7 +16,8 @@ use crate::health::{AnomalyClass, ReliabilityAuditRecord, WorkspaceClassificatio
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::storage::sqlite::PendingSyncMergeInspection;
-#[cfg(test)]
+// The only consumer is the Unix-only test module below.
+#[cfg(all(test, unix))]
 use crate::sync::METADATA_SYNC_MERGE_PENDING_LEGACY;
 use crate::sync::{
     JsonlSourceSnapshot, JsonlTombstoneFilter, PathValidation, PreservedIssue,

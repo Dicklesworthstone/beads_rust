@@ -5645,15 +5645,18 @@ fn render_merge_result_rich(report: &crate::sync::MergeReport, ctx: &OutputConte
 #[cfg(test)]
 mod tests {
     use super::{
-        GitExportStatus, SyncOperation, SyncPathPolicy, additive_conflict_human_lines,
+        GitExportStatus, SyncOperation, additive_conflict_human_lines,
         auto_rebuild_semantic_conflict_field, auto_rebuild_semantic_flag_conflict_reason,
-        build_base_witness_artifacts, classify_sync_status_workspace, detect_prefix_from_jsonl,
+        classify_sync_status_workspace, detect_prefix_from_jsonl,
         fresh_force_import_maintenance_gate_applies, jsonl_contains_duplicate_external_refs,
         jsonl_contains_prefix_mismatch, merge_conflict_resolution, prepare_sync_startup,
         should_defer_jsonl_recovery, should_render_human_sync_output, sync_operation,
         validate_operator_requested_sync_path, validate_sync_mode_args, validate_sync_paths,
         write_manifest_atomically,
     };
+    // These names are used only by the Unix symlink fixture.
+    #[cfg(unix)]
+    use super::{SyncPathPolicy, build_base_witness_artifacts};
     use crate::cli::SyncArgs;
     use crate::config::{self, CliOverrides};
     use crate::error::BeadsError;
