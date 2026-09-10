@@ -85,6 +85,15 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ## Unreleased — after the v0.5.12 source freeze
 
+- A saved `br update --claim` command refuses work that has since been deferred,
+  including with `--force`. Claim eligibility is checked before routed or batch
+  writes and again inside the storage transaction. Refusal preserves issue
+  fields, labels, audit events, and JSONL; `br undefer` makes the work claimable
+  again, and expired soft deferrals remain eligible. Real process tests cover
+  two competing claimants and a claim queued behind a deferral
+  ([c07f1c0f](https://github.com/Dicklesworthstone/beads_rust/commit/c07f1c0f),
+  [08723c51](https://github.com/Dicklesworthstone/beads_rust/commit/08723c51),
+  [validation evidence](CHANGELOG_RESEARCH.md#2026-09-10--saved-claim-eligibility)).
 - Contended workspace writers use live, ordered registrations under
   `.beads/.write-waiters.lock/` before retrying `.write.lock`. Registrations
   preserve parent and file identity, and abandoned entries do not block later

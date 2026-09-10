@@ -19883,12 +19883,12 @@ mod tests {
             .collect();
 
         // Scan the runtime half of this file (everything before the test
-        // module) for the ids the gates actually consult.
+        // module) for the ids the gates actually consult. Other items, such
+        // as test-only imports, can carry the same cfg as the module.
         let source = include_str!("doctor.rs");
-        let runtime = source
-            .split("#[cfg(all(test, unix))]")
-            .next()
-            .expect("split never yields zero items");
+        let (runtime, _) = source
+            .split_once("\nmod tests {")
+            .expect("test module boundary present in doctor source");
 
         // Resolve `const FM_*` definitions to their string values.
         let mut const_values: HashMap<String, &str> = HashMap::new();

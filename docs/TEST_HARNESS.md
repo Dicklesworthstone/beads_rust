@@ -13,6 +13,10 @@ The test harness provides:
 
 ## Quick Start
 
+The sync and concurrency integrity tests require the upstream `sqlite3` CLI
+on the test worker's `PATH`. They fail if that independent checker is missing;
+the application's own database checks do not replace it.
+
 ```bash
 # Fast feedback loop (recommended during development)
 scripts/e2e.sh                    # Quick E2E subset (~6 tests)

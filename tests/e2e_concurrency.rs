@@ -440,15 +440,8 @@ fn assert_upstream_sqlite_integrity_ok(root: &Path, label: &str) {
     let output = StdCommand::new("sqlite3")
         .arg(&db_path)
         .arg("PRAGMA integrity_check;")
-        .output();
-
-    let output = match output {
-        Ok(output) => output,
-        Err(err) => {
-            eprintln!("{label}: sqlite3 unavailable, skipping upstream integrity check: {err}");
-            return;
-        }
-    };
+        .output()
+        .expect("sqlite3 is required for the independent concurrency integrity check");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

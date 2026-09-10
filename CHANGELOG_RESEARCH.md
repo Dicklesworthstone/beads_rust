@@ -928,3 +928,76 @@ warnings denied in 246 seconds at 21:08:41 UTC. The complete logs are
 The scoped final UBS scan remains non-clean: 189 critical, 3,224 warning, and
 932 informational findings in `src/sync/mod.rs`. Restoring the already-tested
 source does not claim to clear that file's broader scanner findings.
+
+## 2026-09-10 — Saved-claim eligibility
+
+This narrow update follows `beads_rust-sb4mn`: implementation `c07f1c0f`,
+storage/batch/routing regressions `ea4b3bd5`, integration documentation
+`9a38fa85`, actual process tests `08723c51`, and test-only platform imports
+`01272585`. Their complete relevant diffs and the issue thread were reviewed.
+GitHub's API confirmed the representative commit links and the latest published
+release, v0.5.12 at `366c69a6`, published September 9 at 02:07:08 UTC.
+The claim changes are Unreleased.
+
+The retained release accepted a saved claim after a future deferral, setting
+an assignee and `in_progress` while leaving the future date. This observed
+sequential stale-readiness defect motivated shared CLI/storage validation and
+an exact comparison of the approved assignee, status, and deferral inside the
+write transaction. The old threaded storage tests serialized connections;
+their names now say so. New tests instead observe two real CLI processes
+waiting on the actual workspace lock. They establish the exercised admission
+outcomes, without claiming an engine-internal interleaving proof.
+
+The expanded Linux test-profile run passed 20 claim integration tests across
+four targets; the library claim filter passed 19. The isolated candidate is
+`/data/tmp/br-sb4mn-candidate-hz4-20260910/br`, SHA-256
+`d050b484672ac2eb3ad77f966911b2f4f3da7eaef2b78dd1c1a916a1b5897fa4`.
+An actual installed-BV replay saved its generated argv while work was open,
+deferred the issue, then executed that unchanged argv: exit 4, unchanged issue
+and JSONL. Explicit undefer followed by the same argv succeeded. All 12 calls
+are retained in `/data/tmp/br-sb4mn-viewer-replay-20260910-_un_wm9l`.
+
+LavenderBridge independently passed all 18 viewer cases against this candidate.
+The same four new future/hard-deferral cases failed against the installed
+release through actual mutation. Two viewer helpers first needed to parse
+stdout separately from retained stderr diagnostics; the initial failed run
+remains evidence. No refusal or state-preservation assertion was weakened.
+This is isolated consumer qualification, not an installed or released canary.
+
+The release-profile candidate also passed that complete 12-call replay:
+`/data/tmp/br-sb4mn-release-local-20260910-zmpdipwh/br`, SHA-256
+`72f5d9ba2b7f530f5243f84a3b815021c765a17fec4b837e4fded3984541e07f`.
+Its evidence is `/data/tmp/br-sb4mn-viewer-replay-20260910-wpn0a_t4`.
+
+Broader qualification exposed two harness problems. The doctor source scan
+mistook a test-only import's cfg attribute for the test-module boundary;
+it now requires the actual module declaration and retains both fixer-ID
+consistency assertions. The release library then passed 3,058 tests with
+two existing ignores. Eight sync/VCS targets passed 1,414 invocations, while
+two tests in `e2e_sync_artifacts` failed because hz3 lacked `sqlite3`.
+The original failing logs remain
+`/tmp/br-sb4mn-release-maintenance-20260910.log` and
+`/tmp/br-sb4mn-release-boundary-fixed-20260910.log`.
+
+The older concurrency helper also skipped its independent SQLite integrity
+check when the executable was missing. That happened in the initial two-process
+run: its scheduling and state assertions passed, but this oracle did not run.
+The helper now fails on a missing checker. Matching packaged SQLite 3.46.1
+executables were provisioned on hz3/hz4, with byte identity and real probes
+verified. The unchanged integrity assertions then passed in all 189 release
+concurrency tests and all 173 sync-artifact tests, with no ignores or checker
+skips. A separate real missing-checker control failed at the required oracle;
+its initial missing-`CARGO_BIN_EXE_br` setup failure is retained separately.
+See `/tmp/br-sb4mn-required-checker-release-20260910.log` and
+`/tmp/br-sb4mn-missing-checker-negative-pinned-20260910.log`.
+
+Final all-feature/all-target Cargo check and Clippy with warnings denied passed
+through RCH. All 868 worker inputs matched manifest SHA-256
+`27f4ad962540cc329e9d5868ec0b8dcdc9d68774ba370b44b24c168889ad58f4`.
+Later source changes after the release-binary replay concern only test helpers
+and documentation. The normal all-feature runtime dependency tree contains
+no Git-authority package. The library, nine sync/VCS targets, and concurrency
+target are the executed release scope; this was not a whole-crate integration
+run. UBS remains non-clean, with bounded changed-hunk review on the issue.
+This work has not run a new Windows claim canary, published a release, or used
+GitHub Actions.
