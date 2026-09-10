@@ -559,3 +559,59 @@ Entries preserve failed experiments as reusable evidence. A retry is justified o
 - **Retry-condition predicate:** Do not retry this v13-to-v14 shape. Reprofile only after another runtime-witness contract bump, a schema-attestation implementation change, or a representative fixture change; preserve the balanced order, output parity, witness immutability, integrity checks, and `1m < 10` load gate. Do not make the lock-free path persist a witness merely to improve the result.
 - **Bead id (if applicable):** `beads_rust-7kw0`
 - **Commit (if attempted):** no runtime edit; measurement-only release evidence after the runtime-contract-token bump.
+
+### 2026-09-10 — Copied namespace admission in ready calibration — measured
+
+- **Hypothesis:** Fresh `.beads` copies in the release benchmark introduce a
+  namespace-generation write into otherwise read-only `ready` calls, exposing
+  their tails to durable filesystem flushes.
+- **Workload:** Pinned release/default-feature br, SHA-256
+  `3e672d5403e8f0fda54c73d70537ad903b47f2b04fc2062e5356b8c6e401e523`,
+  source `fcd3be7d03c14b09700f7a977f0918fd81c18d81`, fsqlite 0.3.18;
+  `ready --limit 20 --json` on the exact 1,000-issue synthetic corpus
+  (260 dependencies, 1,028 label assignments), JSONL SHA-256
+  `76ab7e082a787d45ecbd8bd40144a11529b00d554b285b80c0411f869692abc7`.
+  All execution used strict remote RCH on hz4. No cache or kernel tuning.
+- **Collection:** One fixed 48-call A/A diagnostic with eight warmups remained
+  Inconclusive/exit 2, as specified without a budget. Five calls observed
+  compiler processes. A separate fixed resource diagnostic retained 20 direct
+  fresh-copy calls and three syscall traces. Its follow-up retained ten
+  untraced first/second-open pairs and three traced pairs, one copied workspace
+  per pair. Every resource-phase call observed compilers; these are contention
+  diagnostics, not an isolated latency calibration. Failed preflights and the
+  helper's initial overly strict doctor-exit check are also retained.
+
+| Rank | Observed cost | Evidence and interpretation |
+|---|---|---|
+| 1 | Namespace flush on copied-inode admission | `ready-trace-01.strace` lines 357–364 records `fdatasync(beads.db-fsqlite-ns-use)` taking 264.264 ms. All 13 paired workspaces changed the namespace record on first open and preserved it on second open. All three first-open traces flushed it; no second-open trace did. |
+| 2 | Remaining process CPU | The 20 direct fresh-copy calls used median 75.132 ms total user/system CPU, with wall median 74.391 ms and maximum 1,162.735 ms. This identifies additional off-CPU time in the long calls but does not attribute the remaining CPU to a function. |
+| 3 | Lock calls in the initial traces | Main-thread `flock` and `fcntl` calls totaled 5.952–6.051 ms per traced process. They did not account for the observed 264 ms stall. Tracing overhead is included; thread totals are not elapsed latency. |
+
+- **Mechanism:** The engine's `replace_quiescent_identity_record` and
+  `write_fresh_identity_record` persist admission to the copied inode; see
+  [the operating model](../reliability/ENGINE_OPERATING_MODEL.md#4-database-family-and-sidecar-inventory).
+  First opens in all ten untraced pairs reported eight output blocks; second
+  opens reported zero. Main database, WAL, journal and JSONL hashes stayed
+  unchanged across every pair, and all 97 measured ready calls across the
+  three phases returned the same expected 20 issues without stderr or errors.
+- **Outcome:** Mechanism established, no runtime optimization attempted.
+  The earlier hz3 33.881-second observation remains unexplained by direct
+  tracing. These samples do not establish acceptable p95 precision, controlled
+  cold-cache behavior, CPU-function or heap attribution, scaling, or a release
+  budget. The earlier 804-call inconclusive cohort remains intact; historical
+  held-out A/B remains unopened.
+- **Evidence:** Full raw data, all nine traces, per-child `wait4` resources,
+  identities, corpus, host fingerprints and independent audit are retained at
+  `/data/tmp/br-zxfz1-stall-evidence-20260910-zPLbxJjF`, with original worker
+  evidence at `hz4:/data/tmp/br-zxfz1-stall-diagnosis-20260910-dg1Rf8qv`.
+  Independent audit SHA-256:
+  `0fe639ebb181c4dd4c628f3b731d8ef1a71f5f9b74f7defbb908d645effca2a0`.
+  These are retained scratch artifacts, not a published durable archive.
+- **Next condition:** Distinguish first admission of a copied database from
+  subsequent processes on an admitted workspace when specifying the next
+  diagnostic. Preserve all original 28 release workload requirements and
+  previously collected results. Do not silently pre-open every measured copy,
+  discard slow calls, widen budgets, or remove namespace durability checks to
+  make calibration pass. A CPU optimization needs a symbol-capable profile
+  of the remaining work before any source change.
+- **Bead:** `beads_rust-zxfz.1` remains in progress; no production code changed.
