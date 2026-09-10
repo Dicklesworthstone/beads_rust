@@ -1531,6 +1531,108 @@ fn e2e_update_claim_refuses_closed_issue_and_preserves_close_fields() {
 }
 
 #[test]
+fn e2e_update_claim_refuses_deferred_work_and_preserves_batch_state() {
+    let _log = common::test_log("e2e_update_claim_refuses_deferred_work_and_preserves_batch_state");
+    for hard_defer in [false, true] {
+        let workspace = BrWorkspace::new();
+        let init = run_br(
+            &workspace,
+            ["init", "--prefix", "dc"],
+            "init_deferred_claim",
+        );
+        assert!(init.status.success(), "{}", init.stderr);
+        let mut ids = Vec::new();
+        for title in ["Deferred target", "Open sibling"] {
+            let created = run_br(
+                &workspace,
+                ["create", title, "--json"],
+                "create_claim_target",
+            );
+            assert!(created.status.success(), "{}", created.stderr);
+            let value: Value = serde_json::from_str(&created.stdout).unwrap();
+            ids.push(value["id"].as_str().unwrap().to_string());
+        }
+        let id = ids[0].as_str();
+        let sibling = ids[1].as_str();
+        let deferred = if hard_defer {
+            run_br(&workspace, ["defer", id, "--json"], "hard_defer_target")
+        } else {
+            run_br(
+                &workspace,
+                ["update", id, "--defer", "2099-01-01T00:00:00Z", "--json"],
+                "soft_defer_target",
+            )
+        };
+        assert!(deferred.status.success(), "{}", deferred.stderr);
+        let before = claim_issue_event_snapshot(&workspace, id, sibling);
+        let jsonl_before = fs::read(workspace.root.join(".beads/issues.jsonl")).unwrap();
+        for force in [false, true] {
+            for targets in [vec![id], vec![sibling, id], vec![id, sibling]] {
+                let mut args = vec![
+                    "--actor",
+                    "claimer",
+                    "--no-auto-import",
+                    "update",
+                    "--claim",
+                    "--add-label",
+                    "must-not-land",
+                    "--json",
+                ];
+                if force {
+                    args.push("--force");
+                }
+                args.push("--");
+                args.extend(targets);
+                let claimed = run_br(&workspace, args, "refuse_stale_deferred_claim");
+                assert_eq!(
+                    claimed.status.code(),
+                    Some(4),
+                    "{} {}",
+                    claimed.stdout,
+                    claimed.stderr
+                );
+                let error: Value = serde_json::from_str(&claimed.stdout).unwrap();
+                assert_eq!(error["error"]["code"], "VALIDATION_FAILED");
+                let message = error["error"]["message"].as_str().unwrap();
+                assert!(
+                    message.contains(&format!("cannot claim deferred issue {id}")),
+                    "{message}"
+                );
+                assert!(message.contains(&format!("br undefer {id}")), "{message}");
+                assert_eq!(claim_issue_event_snapshot(&workspace, id, sibling), before);
+                assert_eq!(
+                    fs::read(workspace.root.join(".beads/issues.jsonl")).unwrap(),
+                    jsonl_before
+                );
+            }
+        }
+        let undeferred = run_br(
+            &workspace,
+            ["undefer", id, "--json"],
+            "explicit_undefer_before_claim",
+        );
+        assert!(undeferred.status.success(), "{}", undeferred.stderr);
+        let claimed = run_br(
+            &workspace,
+            ["--actor", "claimer", "update", id, "--claim", "--json"],
+            "claim_undeferred_target",
+        );
+        assert!(
+            claimed.status.success(),
+            "{} {}",
+            claimed.stdout,
+            claimed.stderr
+        );
+        let shown = run_br(&workspace, ["show", id, "--json"], "show_undeferred_claim");
+        assert!(shown.status.success(), "{}", shown.stderr);
+        let issue: Value = serde_json::from_str(&shown.stdout).unwrap();
+        assert_eq!(issue[0]["status"], "in_progress");
+        assert_eq!(issue[0]["assignee"], "claimer");
+        assert!(issue[0]["defer_until"].is_null());
+    }
+}
+
+#[test]
 fn e2e_update_claim_accepts_reopened_and_open_issues() {
     let _log = common::test_log("e2e_update_claim_accepts_reopened_and_open_issues");
     let (workspace, id, open_id) = closed_claim_workspace();

@@ -2844,6 +2844,95 @@ fn e2e_routing_update_claim_failure_does_not_mutate_earlier_routes() {
 }
 
 #[test]
+fn e2e_routing_deferred_claim_preserves_both_workspaces() {
+    let _log = common::test_log("e2e_routing_deferred_claim_preserves_both_workspaces");
+    let local = BrWorkspace::new();
+    let external = BrWorkspace::new();
+    init_workspace(&local, "init_deferred_claim_local");
+    init_workspace(&external, "init_deferred_claim_external");
+    configure_external_route(&local, &external);
+    let local_id = create_issue_and_get_id(&local, "Local claim", "create_local_claim");
+    let external_id = create_issue_and_get_id(&external, "External claim", "create_external_claim");
+    let deferred = run_br(
+        &external,
+        [
+            "update",
+            &external_id,
+            "--defer",
+            "2099-01-01T00:00:00Z",
+            "--json",
+        ],
+        "defer_external_before_saved_claim",
+    );
+    assert!(deferred.status.success(), "{}", deferred.stderr);
+    let snapshot = || {
+        [&local, &external].map(|workspace| {
+            let storage =
+                beads_rust::storage::SqliteStorage::open(&workspace.root.join(".beads/beads.db"))
+                    .unwrap();
+            (
+                fs::read(workspace.root.join(".beads/issues.jsonl")).unwrap(),
+                serde_json::to_value(storage.get_all_events(0).unwrap()).unwrap(),
+            )
+        })
+    };
+    let before = snapshot();
+    for force in [false, true] {
+        for ids in [
+            [local_id.as_str(), external_id.as_str()],
+            [external_id.as_str(), local_id.as_str()],
+        ] {
+            let mut args = vec![
+                "--actor",
+                "claimer",
+                "update",
+                "--claim",
+                "--add-label",
+                "must-not-land",
+                "--json",
+            ];
+            if force {
+                args.push("--force");
+            }
+            args.push("--");
+            args.extend(ids);
+            let result = run_br(&local, args, "refuse_routed_deferred_claim");
+            assert_eq!(
+                result.status.code(),
+                Some(4),
+                "{} {}",
+                result.stdout,
+                result.stderr
+            );
+            let error: Value = serde_json::from_str(&result.stdout).unwrap();
+            assert_eq!(error["error"]["code"], "VALIDATION_FAILED");
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("cannot claim deferred issue")
+            );
+            assert_eq!(
+                snapshot(),
+                before,
+                "routed refusal changed issue/audit state"
+            );
+        }
+    }
+    let local_after = show_issue_json(&local, &local_id, "show_local_after_deferred_claim");
+    let external_after = show_issue_json(
+        &external,
+        &external_id,
+        "show_external_after_deferred_claim",
+    );
+    assert_eq!(local_after[0]["status"], "open");
+    assert!(local_after[0]["assignee"].is_null());
+    assert_eq!(external_after[0]["status"], "open");
+    assert!(external_after[0]["assignee"].is_null());
+    assert_eq!(external_after[0]["defer_until"], "2099-01-01T00:00:00Z");
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn e2e_routing_update_text_preserves_requested_order_across_routes() {
     let _log = common::test_log("e2e_routing_update_text_preserves_requested_order_across_routes");

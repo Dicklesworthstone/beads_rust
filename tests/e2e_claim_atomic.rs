@@ -81,6 +81,113 @@ fn test_claim_unassigned_succeeds() {
 }
 
 #[test]
+fn test_claim_refuses_terminal_and_deferred_state_without_mutation() {
+    let future = Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
+    let past = Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap();
+    for (status, defer_until) in [
+        (Status::Closed, None),
+        (Status::Deferred, None),
+        (Status::Deferred, Some(past)),
+        (Status::Open, Some(future)),
+    ] {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        seed_issue(&mut storage, "test-stale-claim", None);
+        let state = IssueUpdate {
+            status: Some(status.clone()),
+            defer_until: Some(defer_until),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("test-stale-claim", &state, "planner")
+            .unwrap();
+        let before = serde_json::to_value((
+            storage.get_issue("test-stale-claim").unwrap(),
+            storage.get_events("test-stale-claim", 0).unwrap(),
+        ))
+        .unwrap();
+        let claim = IssueUpdate {
+            status: Some(Status::InProgress),
+            assignee: Some(Some("alice".to_string())),
+            expect_unassigned: true,
+            claim_actor: Some("alice".to_string()),
+            ..IssueUpdate::default()
+        };
+        let error = storage
+            .update_issue("test-stale-claim", &claim, "alice")
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("cannot claim"),
+            "{status}: {error}"
+        );
+        let after = serde_json::to_value((
+            storage.get_issue("test-stale-claim").unwrap(),
+            storage.get_events("test-stale-claim", 0).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(
+            after, before,
+            "refused {status} claim changed issue/audit state"
+        );
+    }
+}
+
+#[test]
+fn test_claim_accepts_expired_soft_deferral_and_explicit_undefer() {
+    let mut storage = SqliteStorage::open_memory().unwrap();
+    seed_issue(&mut storage, "test-expired", None);
+    seed_issue(&mut storage, "test-undeferred", None);
+    let past = Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap();
+    storage
+        .update_issue(
+            "test-expired",
+            &IssueUpdate {
+                defer_until: Some(Some(past)),
+                ..IssueUpdate::default()
+            },
+            "planner",
+        )
+        .unwrap();
+    storage
+        .update_issue(
+            "test-undeferred",
+            &IssueUpdate {
+                status: Some(Status::Deferred),
+                ..IssueUpdate::default()
+            },
+            "planner",
+        )
+        .unwrap();
+    storage
+        .update_issue(
+            "test-undeferred",
+            &IssueUpdate {
+                status: Some(Status::Open),
+                defer_until: Some(None),
+                ..IssueUpdate::default()
+            },
+            "planner",
+        )
+        .unwrap();
+    for id in ["test-expired", "test-undeferred"] {
+        let issue = storage
+            .update_issue(
+                id,
+                &IssueUpdate {
+                    status: Some(Status::InProgress),
+                    assignee: Some(Some("alice".to_string())),
+                    expect_unassigned: true,
+                    claim_actor: Some("alice".to_string()),
+                    ..IssueUpdate::default()
+                },
+                "alice",
+            )
+            .unwrap();
+        assert_eq!(issue.status, Status::InProgress);
+        assert_eq!(issue.assignee.as_deref(), Some("alice"));
+    }
+}
+
+#[test]
 fn test_claim_already_assigned_different_actor_fails() {
     let mut storage = SqliteStorage::open_memory().unwrap();
     seed_issue(&mut storage, "test-2", Some("bob"));
@@ -101,19 +208,24 @@ fn test_claim_already_assigned_different_actor_fails() {
 
 #[test]
 fn test_claim_same_actor_idempotent() {
-    let mut storage = SqliteStorage::open_memory().unwrap();
-    seed_issue(&mut storage, "test-3", Some("alice"));
+    for assignee in ["alice", " alice "] {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        seed_issue(&mut storage, "test-3", Some(assignee));
 
-    let update = IssueUpdate {
-        status: Some(Status::InProgress),
-        assignee: Some(Some("alice".to_string())),
-        expect_unassigned: true,
-        claim_actor: Some("alice".to_string()),
-        ..IssueUpdate::default()
-    };
+        let update = IssueUpdate {
+            status: Some(Status::InProgress),
+            assignee: Some(Some("alice".to_string())),
+            expect_unassigned: true,
+            claim_actor: Some("alice".to_string()),
+            ..IssueUpdate::default()
+        };
 
-    let result = storage.update_issue("test-3", &update, "alice");
-    assert!(result.is_ok(), "Same-actor re-claim should be idempotent");
+        let result = storage.update_issue("test-3", &update, "alice");
+        assert!(
+            result.is_ok(),
+            "Same-actor re-claim should be idempotent: {assignee:?}: {result:?}"
+        );
+    }
 }
 
 #[test]
