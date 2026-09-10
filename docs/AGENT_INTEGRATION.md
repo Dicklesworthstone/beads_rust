@@ -278,9 +278,15 @@ The verifier currently covers:
 # Atomic claim (recommended)
 br update br-123 --claim --json
 
-# Manual claim (equivalent)
+# Explicit status and assignment update
 br update br-123 --status in_progress --assignee "$BD_ACTOR" --json
 ```
+
+`--claim` rechecks the issue's current state. It refuses closed issues,
+indefinitely deferred issues, and issues whose `defer_until` is still in the
+future, including with `--force`. Use `br reopen` or `br undefer` explicitly
+before claiming that work. An expired timestamp on an otherwise open issue
+does not prevent a claim.
 
 ### Stale Claims and Abandoned Work
 
