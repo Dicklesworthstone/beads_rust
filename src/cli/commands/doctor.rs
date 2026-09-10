@@ -16,8 +16,7 @@ use crate::health::{AnomalyClass, ReliabilityAuditRecord, WorkspaceClassificatio
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::storage::sqlite::PendingSyncMergeInspection;
-// The only consumer is the Unix-only test module below.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 use crate::sync::METADATA_SYNC_MERGE_PENDING_LEGACY;
 use crate::sync::{
     JsonlSourceSnapshot, JsonlTombstoneFilter, PathValidation, PreservedIssue,
@@ -19883,12 +19882,12 @@ mod tests {
             .collect();
 
         // Scan the runtime half of this file (everything before the test
-        // module) for the ids the gates actually consult. Other items, such
-        // as test-only imports, can carry the same cfg as the module.
+        // module) for the ids the gates actually consult.
         let source = include_str!("doctor.rs");
-        let (runtime, _) = source
-            .split_once("\nmod tests {")
-            .expect("test module boundary present in doctor source");
+        let runtime = source
+            .split("#[cfg(all(test, unix))]")
+            .next()
+            .expect("split never yields zero items");
 
         // Resolve `const FM_*` definitions to their string values.
         let mut const_values: HashMap<String, &str> = HashMap::new();
