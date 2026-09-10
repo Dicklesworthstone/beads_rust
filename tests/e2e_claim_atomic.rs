@@ -1,4 +1,6 @@
-//! Atomic claim guard tests — verifies TOCTOU-safe claiming via IMMEDIATE transactions.
+//! Claim eligibility and assignment guards inside write transactions.
+//! The threaded storage tests serialize connections; real process contention
+//! is covered in `e2e_concurrency`.
 
 use beads_rust::model::{Priority, Status};
 use beads_rust::storage::{IssueUpdate, SqliteStorage};
@@ -296,7 +298,7 @@ fn test_claim_empty_string_assignee_treated_as_unassigned() {
 
 #[test]
 #[allow(clippy::needless_collect)]
-fn test_concurrent_claim_exactly_one_wins() {
+fn test_serialized_claim_exactly_one_wins() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("beads.db");
 
@@ -348,7 +350,7 @@ fn test_concurrent_claim_exactly_one_wins() {
 }
 
 #[test]
-fn test_concurrent_claim_different_issues_both_succeed() {
+fn test_serialized_claim_different_issues_both_succeed() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("beads.db");
 

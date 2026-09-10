@@ -636,6 +636,156 @@ fn e2e_later_writer_waits_for_registered_earlier_waiter() {
     assert_upstream_sqlite_integrity_ok(&root, "ordered workspace waiters");
 }
 
+#[test]
+#[cfg(unix)]
+fn e2e_simultaneous_claim_processes_have_one_winner() {
+    let _log = common::test_log("e2e_simultaneous_claim_processes_have_one_winner");
+    let temp = isolated_temp_dir("simultaneous claim processes");
+    let root = temp.path().to_path_buf();
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "{init:?}");
+    let created = run_br_in_dir(&root, ["create", "Contested claim", "--json"]);
+    assert!(created.success, "{created:?}");
+    let issue: serde_json::Value = serde_json::from_str(&created.stdout).unwrap();
+    let id = issue["id"].as_str().unwrap();
+    let owner = beads_rust::sync::blocking_write_lock(&root.join(".beads")).unwrap();
+    let children = ["alice", "bob"].map(|actor| {
+        (
+            actor,
+            spawn_br_child_in_dir(
+                &root,
+                [
+                    "--actor",
+                    actor,
+                    "--no-auto-import",
+                    "update",
+                    id,
+                    "--claim",
+                    "--json",
+                ],
+            ),
+        )
+    });
+    assert_eq!(wait_for_workspace_waiters(&root, 2).len(), 2);
+    drop(owner);
+    let outputs = children.map(|(actor, child)| (actor, child.wait_with_output().unwrap()));
+    assert_eq!(
+        outputs
+            .iter()
+            .filter(|(_, output)| output.status.success())
+            .count(),
+        1,
+        "{outputs:?}"
+    );
+    let winner = outputs
+        .iter()
+        .find(|(_, output)| output.status.success())
+        .unwrap()
+        .0;
+    for (_, output) in &outputs {
+        if !output.status.success() {
+            assert_eq!(output.status.code(), Some(4), "{output:?}");
+            let error: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(error["error"]["code"], "VALIDATION_FAILED");
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("already assigned to {winner}")),
+                "{error}"
+            );
+        }
+    }
+    let shown = run_br_in_dir(&root, ["--no-auto-import", "show", id, "--json"]);
+    assert!(shown.success, "{shown:?}");
+    let shown: serde_json::Value = serde_json::from_str(&shown.stdout).unwrap();
+    assert_eq!(shown[0]["status"], "in_progress");
+    assert_eq!(shown[0]["assignee"], winner);
+    assert!(wait_for_workspace_waiters(&root, 0).is_empty());
+    assert_upstream_sqlite_integrity_ok(&root, "simultaneous claim processes");
+}
+
+#[test]
+#[cfg(unix)]
+fn e2e_claim_waiting_behind_deferral_refuses_without_mutation() {
+    let _log = common::test_log("e2e_claim_waiting_behind_deferral_refuses_without_mutation");
+    let temp = isolated_temp_dir("claim queued behind deferral");
+    let root = temp.path().to_path_buf();
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "{init:?}");
+    let created = run_br_in_dir(
+        &root,
+        ["create", "Deferred before claim admission", "--json"],
+    );
+    assert!(created.success, "{created:?}");
+    let issue: serde_json::Value = serde_json::from_str(&created.stdout).unwrap();
+    let id = issue["id"].as_str().unwrap();
+    let owner = beads_rust::sync::blocking_write_lock(&root.join(".beads")).unwrap();
+    let deferrer = spawn_br_child_in_dir(
+        &root,
+        [
+            "--actor",
+            "planner",
+            "update",
+            id,
+            "--defer",
+            "2099-01-01T00:00:00Z",
+            "--json",
+        ],
+    );
+    let first = wait_for_workspace_waiters(&root, 1);
+    let claimer = spawn_br_child_in_dir(
+        &root,
+        [
+            "--actor",
+            "claimer",
+            "--no-auto-import",
+            "update",
+            id,
+            "--claim",
+            "--add-label",
+            "must-not-land",
+            "--json",
+        ],
+    );
+    let both = wait_for_workspace_waiters(&root, 2);
+    assert_eq!(first[0], both[0], "deferrer must be admitted before claim");
+    drop(owner);
+    let deferred = deferrer.wait_with_output().unwrap();
+    let claimed = claimer.wait_with_output().unwrap();
+    assert!(deferred.status.success(), "{deferred:?}");
+    assert_eq!(claimed.status.code(), Some(4), "{claimed:?}");
+    let error: serde_json::Value = serde_json::from_slice(&claimed.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "VALIDATION_FAILED");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot claim deferred issue")
+    );
+    let shown = run_br_in_dir(&root, ["--no-auto-import", "show", id, "--json"]);
+    assert!(shown.success, "{shown:?}");
+    let shown: serde_json::Value = serde_json::from_str(&shown.stdout).unwrap();
+    assert_eq!(shown[0]["status"], "open");
+    assert!(shown[0]["assignee"].is_null());
+    assert_eq!(shown[0]["defer_until"], "2099-01-01T00:00:00Z");
+    assert!(shown[0]["labels"].is_null() || shown[0]["labels"].as_array().unwrap().is_empty());
+    let storage = beads_rust::storage::SqliteStorage::open(&root.join(".beads/beads.db")).unwrap();
+    let events = storage.get_events(id, 0).unwrap();
+    assert!(
+        events.iter().all(|event| event.actor != "claimer"),
+        "{events:?}"
+    );
+    drop(storage);
+    let exported = fs::read_to_string(root.join(".beads/issues.jsonl")).unwrap();
+    let exported: serde_json::Value = serde_json::from_str(exported.trim()).unwrap();
+    assert_eq!(exported["status"], "open");
+    assert!(exported["assignee"].is_null());
+    assert_eq!(exported["defer_until"], "2099-01-01T00:00:00Z");
+    assert!(wait_for_workspace_waiters(&root, 0).is_empty());
+    assert_upstream_sqlite_integrity_ok(&root, "claim queued behind deferral");
+}
+
 /// A broken `.write.lock` path must fail closed. Mutating commands must not
 /// bypass cross-process serialization just because the advisory lock cannot be
 /// opened.
