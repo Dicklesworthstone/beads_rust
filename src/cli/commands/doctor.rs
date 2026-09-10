@@ -16,8 +16,6 @@ use crate::health::{AnomalyClass, ReliabilityAuditRecord, WorkspaceClassificatio
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::storage::sqlite::PendingSyncMergeInspection;
-#[cfg(test)]
-use crate::sync::METADATA_SYNC_MERGE_PENDING_LEGACY;
 use crate::sync::{
     JsonlSourceSnapshot, JsonlTombstoneFilter, PathValidation, PreservedIssue,
     SyncMergePendingPhase, SyncMergePendingReceipt, blocking_jsonl_family_write_lock_with_timeout,
@@ -14490,6 +14488,7 @@ mod tests {
     use crate::health::{AnomalyClass, WorkspaceHealth};
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
+    use crate::sync::METADATA_SYNC_MERGE_PENDING_LEGACY;
     use chrono::Utc;
     use std::collections::BTreeMap;
     use std::fs;
@@ -19882,12 +19881,12 @@ mod tests {
             .collect();
 
         // Scan the runtime half of this file (everything before the test
-        // module) for the ids the gates actually consult.
+        // module) for the ids the gates actually consult. Test-only imports
+        // may carry the same cfg as the module, so use the module boundary.
         let source = include_str!("doctor.rs");
-        let runtime = source
-            .split("#[cfg(all(test, unix))]")
-            .next()
-            .expect("split never yields zero items");
+        let (runtime, _) = source
+            .split_once("\nmod tests {")
+            .expect("test module boundary present in doctor source");
 
         // Resolve `const FM_*` definitions to their string values.
         let mut const_values: HashMap<String, &str> = HashMap::new();
