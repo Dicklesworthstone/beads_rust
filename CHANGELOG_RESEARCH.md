@@ -1085,7 +1085,7 @@ invocations, the two stale golden failures above, and 104 existing ignores.
 Its exit 137 records that timeout; it does not establish an out-of-memory
 failure. Compilation consumed 66 minutes 52 seconds. The interruption occurred
 in `repro_mergereport_determinism`; that target, 23 later integration targets
-and doc tests still need completion. The resume accounting is retained in
+and doc tests required separate completion, recorded below. The resume accounting is retained in
 `full-release-resume-accounting.json`. No case count or assertion was reduced.
 The attempted warm resume (`j-30015430739361940`) instead started a full
 dependency rebuild and was cancelled after about 48 seconds to release the
@@ -1141,9 +1141,55 @@ retry and positive control are retained in
 `windows-native-queue-isolated-resume.log` and
 `windows-source-lock-stdin-probe.json`.
 
-The remaining 24 Linux release targets are compiling from clean commit
-`2c8cb980` on hz4 (`j-30015430739361945`). Their results, doc tests, native
-Windows queue/lifecycle tests, corrected source-lock frontend and shared
-daemon deployment are pending. The original sustained starvation and
-calibrated release-performance acceptance remain open. No GitHub Actions
-were used for these builds or tests.
+The remaining 24 Linux release targets passed from clean commit `2c8cb980`
+on hz4 (`j-30015430739361945`): 2,386 passing invocations, zero failures and
+zero ignores. Remote execution finished at 02:46:14 UTC; artifact retrieval
+and the enclosing command completed successfully at 02:46:16. The unchanged
+determinism and workspace-failure campaigns both completed. All 24 test
+executables and their CLI were archived; the local archive's 25 members match
+their individual remote sizes and hashes. The archive SHA-256 is
+`fc52ac9a7b7674eb57eddb9e1fd37c009704efaf13eb6d2e6ffb7de260640771`.
+Its optional 60-second SSH wrapper timed out before the remote archive finished
+at about 65 seconds; the completed archive was then copied and verified.
+
+Release doc tests also completed successfully on hz4
+(`j-30015430739361961`, enclosing command exit zero at 03:11:41 UTC).
+All ten doc examples retain their existing ignore annotations; this run adds
+no passing executable examples. An earlier attempt was cancelled after it
+started rebuilding dependencies and before tests. The successful invocation
+used the existing stable worker Cargo home in offline mode and needed a
+16-minute dependency rebuild. The former archive Cargo home was absent when
+inspected; its disappearance is not attributed to a particular component.
+
+The assembled default-feature release coverage is now complete: two unit-test
+binaries, all 156 integration-test files, and doc tests. There are 24,686
+passing invocations, zero final failures, 104 existing binary-test ignores
+and ten existing doc-test ignores. Shared harness cases run in multiple
+binaries, so these are invocation counts, not unique tests. The original
+timeout and stale snapshot failures remain recorded; this was not one
+uninterrupted passing command. Exact target accounting and doc output are in
+`assembled-default-release-binary-results.json` and
+`release-doc-tests-stable-cache-hz4.log` in the evidence directory above.
+
+The RCH source-lock and benchmark repairs at `cc03f20d` passed 6,864 author-run
+tests, all-target check and denied-warning Clippy, followed by 164 independently
+executed SSH and benchmark tests with no failures or ignores. The corrected
+frontend binary was copied and its hash verified after automatic retrieval
+timed out. Its embedded Git label is stale; the transferred source hashes and
+binary hash establish its identity separately. Native scratch controls prove
+same-root lock exclusion, independent-root progress and release on stdin EOF.
+Compiled native acceptance remains separate: the first small fixture attempt
+was refused before dispatch because RCH inferred August 30 from the compiler
+commit date instead of the inherited August 31 toolchain pin. An explicit
+August 31 retry passed that check but was refused for critical memory pressure
+at 03:23:50 UTC. Neither attempt reached source-lock acquisition or Cargo.
+
+The production daemon canary continues to return fresh native telemetry with
+a closed circuit and zero consecutive failures, while slow health responses
+have caused several degraded transitions followed by recovery. This is not
+a continuously healthy result. Other native release builds occupy the Windows
+worker; no foreign processes were terminated. Current-source Windows
+queue/lifecycle tests, compiled frontend acceptance, the native benchmark and
+shared daemon deployment remain pending. The original sustained starvation
+and calibrated release-performance acceptance also remain open. No GitHub
+Actions were used for these builds or tests.
