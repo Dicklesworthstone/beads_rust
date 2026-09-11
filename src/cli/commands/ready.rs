@@ -132,6 +132,7 @@ fn execute_inner(
     let workflow = crate::close_policy::load_for_beads_dir(beads_dir)?.workflow;
     workflow.validate_ready_status_group()?;
     let ready_statuses = workflow.ready_status_group();
+    let has_external_dependencies = storage.has_external_dependencies(true)?;
 
     let filters = ReadyFilters {
         assignee,
@@ -142,8 +143,12 @@ fn execute_inner(
         priorities: parse_priorities(&args.priority)?,
         include_deferred: args.include_deferred,
         ready_statuses,
-        // Fetch all candidates to allow post-filtering of external blockers
-        limit: None,
+        // Structured output needs only the requested rows. Text output needs
+        // the full total, and external blockers must be filtered before limiting.
+        limit: (args.limit > 0
+            && matches!(output_format, OutputFormat::Json | OutputFormat::Toon)
+            && !has_external_dependencies)
+            .then_some(args.limit),
         parent: resolved_parent,
         // --epic implies descent through the whole subtree.
         recursive: args.recursive || args.epic.is_some(),
@@ -158,20 +163,12 @@ fn execute_inner(
 
     info!("Fetching ready issues");
 
-    // Fetch the full ready set (no SQL LIMIT) so we always know the exact total
-    // before truncation — this lets us emit an accurate "showing N of M" note
-    // when `--limit` actually truncates, consistent with `br list` and the MCP
-    // ready surface (which prints "N total, showing top M"). See issue #91:
-    // results must never be *silently* truncated.
-    let mut filters = filters;
-    filters.limit = None;
-
     debug!(filters = ?filters, sort = ?sort_policy, "Applied ready filters");
 
     let mut ready_issues =
         get_ready_issues_for_output(storage, &filters, sort_policy, output_format)?;
 
-    if !ready_issues.is_empty() && storage.has_external_dependencies(true)? {
+    if !ready_issues.is_empty() && has_external_dependencies {
         let config_layer = load_config_layer()?;
         auto_import_external_projects_if_stale(&config_layer, beads_dir, cli);
         let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
