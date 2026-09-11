@@ -1044,6 +1044,106 @@ missing `Cargo.toml` and the source files. The damaged entry was preserved and
 only missing files restored; the ordinary RCH cache subsequently passed the
 same tree query (`j-30015430739361896`). The original failures and non-clean
 UBS output are retained.
-The complete release suite and native Windows queue checks are still pending;
-the original sustained starvation and calibrated release-performance
-acceptance remain open.
+
+The complete release run (`j-30015430739361886`) exposed two stale init
+snapshots: commit `e752c86d` added `.write-waiters.lock/` to the generated
+`.gitignore`, but the text snapshot omitted it and the directory snapshot
+still expected 1,247 rather than 1,268 bytes. Both existing snapshots were
+corrected manually after reviewing that exact 21-byte difference. The initial
+failures remain in `full-release-suite-hz3.log`. The clean-commit rerun on
+hz2 (`j-30015430739361937`, base `2c8cb980`) passed all 167 tests with zero
+failures or ignores at 01:40:16 UTC on September 11. Its complete receipt is
+`golden-init-clean-commit-rerun-hz2-j2.log` in the same evidence directory.
+The 501-entry source manifest still matches the local and worker Rust inputs;
+it does not cover `.snap` files. The corrected snapshot hashes are
+`292225c28e2d7763a3e9286bb13c675a318a144707fba7a746239a2b9c40b7ab`
+(directory listing) and
+`09c5deb95607825b9704ec801ea0dd336733b0f2fcb2f94093c5d23dfda4ffcc`
+(text contents).
+
+Native qualification required repairing the Windows RCH worker. Its old
+capability scans had accumulated 41 simultaneous probes. The RCH changes
+cache verified Rustup inventory with cross-process exclusion and a bounded
+incremental scan; a separate portability fix makes the shared Cargo path
+helpers available to the Windows build. Strict RCH job
+`j-30015430739361924` built the native worker executable, SHA-256
+`e2739e2e85bd3e0efbbeeed8ac30f4ee43fed7ccc935e29185a34f6be56f989a`.
+On Windows, the first scan returned partial inventory with explicit warnings;
+the next completed all 19 toolchains and 134 component facts. Two simultaneous
+warm calls completed in 5.185 and 6.013 seconds with complete inventory and
+fresh dynamic observations. The installed worker's previous executable was
+preserved. A subsequent RCH probe succeeded, and native MSVC job
+`j-30015430739361933` reached actual compilation. A fresh process inventory
+showed zero capability probes, one Cargo process and one real compiler;
+the old scans drained without forced termination. These receipts are in the
+same evidence directory, including `windows-cache-native-warm.json` and
+`windows-process-inventory-after-repair.json`.
+
+The complete release command reached its external 7,200-second cap at
+01:33:53 UTC on September 11, after 134 completed test binaries: 22,298 passing
+invocations, the two stale golden failures above, and 104 existing ignores.
+Its exit 137 records that timeout; it does not establish an out-of-memory
+failure. Compilation consumed 66 minutes 52 seconds. The interruption occurred
+in `repro_mergereport_determinism`; that target, 23 later integration targets
+and doc tests still need completion. The resume accounting is retained in
+`full-release-resume-accounting.json`. No case count or assertion was reduced.
+The attempted warm resume (`j-30015430739361940`) instead started a full
+dependency rebuild and was cancelled after about 48 seconds to release the
+shared timing host. No tests ran. The prior test executables were absent when
+inspected afterward; their loss is not attributed to a particular component.
+The successful hz2 golden run's CLI and test executable were copied out and
+verified against their remote hashes before planning the remaining targets.
+
+The installed Windows worker can compile, but daemon telemetry subsequently
+reopened its quarantine. The exact daemon command fails under Windows' default
+command interpreter with `-v was unexpected at this time.` The shared SSH
+runner had passed its POSIX script verbatim. Sending a script through `sh -s`
+that executes the original command with `sh -c` and null stdin succeeded on
+the same host, returning fresh telemetry in 9.019 seconds. Native controls also
+preserved shell metacharacters, newlines and stdin EOF. The failure and positive
+control remain in `windows-telemetry-exact-failure.json` and
+`windows-telemetry-stdin-positive.json`; RCH bead `bd-squlv.1` tracks the shared
+runner repair. These controls are not proof of an installed daemon fix.
+
+The compiled shared-SSH CLI subsequently passed its native worker probe in
+10.976 seconds. It reported 19 toolchains and 137 current component facts;
+an initial diagnostic incorrectly expected the earlier 134 and failed. The
+three additions were installed August 25 standard-library targets, with none
+removed. That correction and inventory comparison are retained. The RCH
+maintainer reported 6,856 passing tests and all-target check/Clippy; an
+independent reviewer verified the affected SSH and shim tests and closed
+the narrow telemetry repair after inspecting actual daemon evidence.
+
+The isolated compiled daemon recorded successive fresh Windows telemetry
+samples and stayed healthy with a closed circuit and zero consecutive
+failures. Both shared schedulers were drained for Windows before this canary.
+The production `daemon-release` build on hz2 (`j-30015430739361950`) passed
+at 02:21:48 UTC. Its 22,111,496-byte executable was copied and verified against
+the remote SHA-256
+`cfaa93374b3e4c5b37f49d4399d2c19bf8ad736ec79c5514a66e96d550f32c20`.
+After confirming no active or queued canary jobs, the owned debug daemon
+stopped gracefully and the production executable started in the same isolated
+configuration at 02:28:33 UTC. Shared daemon deployment is still pending.
+The canary also exposed a separate benchmark caller that passes `~` through
+Windows CMD; RCH bead `bd-squlv.2` tracks that distinct failure.
+
+The original native queue command reached its SSH timeout after 3,630 seconds
+without completing a test. Native process inspection afterward found no
+remaining Cargo or rustc process. Its retry used a 7,200-second orchestration
+allowance without changing test deadlines, assertions or counts. The repaired
+scheduler admitted the retry, but the frontend failed before compilation:
+its persistent source-lock command still crossed the Windows quoting boundary,
+producing a `printf` usage error. A native scratch control sent the bootstrap
+through `sh -s`, retained stdin to hold the lock, observed the exact ready
+marker, and exited zero when stdin closed. This control identifies a repair;
+it does not establish that the compiled frontend has that repair. The failed
+retry and positive control are retained in
+`windows-native-queue-isolated-resume.log` and
+`windows-source-lock-stdin-probe.json`.
+
+The remaining 24 Linux release targets are compiling from clean commit
+`2c8cb980` on hz4 (`j-30015430739361945`). Their results, doc tests, native
+Windows queue/lifecycle tests, corrected source-lock frontend and shared
+daemon deployment are pending. The original sustained starvation and
+calibrated release-performance acceptance remain open. No GitHub Actions
+were used for these builds or tests.
