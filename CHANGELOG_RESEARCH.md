@@ -20,10 +20,29 @@ Receipts are retained under
 release candidate is 27,713,440 bytes, SHA-256
 `ccea777c07cd440bdae2aeecb2110722f78cb02f62b0a51ebf257e1bb4b5804d`.
 Its matched pre-change release baseline is retained separately. The bounded
-before/after comparison remains pending; no speedup is claimed. Static UBS
+before/after comparison completed but failed its qualification criteria;
+no speedup is claimed. Static UBS
 scanning of the two changed Rust files reports zero critical findings, 293
 warnings and 27 informational findings; this is not a warning-free audit.
-Bead `beads_rust-3dzbd` remains in progress for comparison and review.
+Changed-hunk review found test assertions and diagnostic-name allocations;
+the existing production indexing warning is guarded by a length check.
+Bead `beads_rust-3dzbd` remains in progress for qualified performance evidence.
+
+The prospectively fixed A-B-B-A comparison ran through strict RCH on
+vmi1167313, with one copied workspace per block, three warmups and 40 measured
+calls per block. All 160 measured calls matched the 7,243-byte expected output
+and preserved database-family hashes. Only the first baseline block passed
+both quietness and stability requirements. Foreign compiler processes appeared
+during both candidate blocks; the final baseline block also exceeded the
+1.10 p95 epoch-ratio threshold. No block was retried or dropped.
+
+Descriptive pooled results (80 calls per binary) were baseline/candidate
+median 161.11/152.90 ms, p95 232.81/237.20 ms, and median peak RSS
+73,252/69,144 KiB. These contaminated, unstable samples do not establish a
+latency or memory improvement. Full receipts are retained in `abba-retained/`
+under the directory above; the compressed receipt archive SHA-256 is
+`acdca6429856dc52082216abb9563e4b6409be9a4ee62f1000a6326e313c7dd9`.
+The original held-out performance-calibration data was not opened.
 
 Requested scope: audit the latest release using `changelog-md-workmanship`.
 The existing earlier history is retained; this is not a full-history re-audit.
