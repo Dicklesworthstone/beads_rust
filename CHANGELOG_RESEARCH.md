@@ -26,7 +26,10 @@ scanning of the two changed Rust files reports zero critical findings, 293
 warnings and 27 informational findings; this is not a warning-free audit.
 Changed-hunk review found test assertions and diagnostic-name allocations;
 the existing production indexing warning is guarded by a length check.
-Bead `beads_rust-3dzbd` remains in progress for qualified performance evidence.
+Bead `beads_rust-3dzbd` is closed for its original implementation, regression
+and comparison-report scope. Qualified performance evidence remains under
+the existing calibration bead `beads_rust-zxfz.1`; the failed timing
+qualification is unchanged and no performance benefit is accepted.
 
 The prospectively fixed A-B-B-A comparison ran through strict RCH on
 vmi1167313, with one copied workspace per block, three warmups and 40 measured
