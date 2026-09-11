@@ -85,6 +85,11 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ## Unreleased — after the v0.5.12 source freeze
 
+- A contended writer that resumes after its `--lock-timeout` deadline refuses
+  before mutation, even if the previous owner has released the lock. Admission
+  rechecks the deadline after polling and queue inspection and immediately
+  after acquiring the OS lock. Writers resumed within budget can still proceed
+  ([deadline regression evidence](CHANGELOG_RESEARCH.md#2026-09-10--expired-lock-wait-admission)).
 - A saved `br update --claim` command refuses work that has since been deferred,
   including with `--force`. Claim eligibility is checked before routed or batch
   writes and again inside the storage transaction. Refusal preserves issue

@@ -1001,3 +1001,49 @@ target are the executed release scope; this was not a whole-crate integration
 run. UBS remains non-clean, with bounded changed-hunk review on the issue.
 This work has not run a new Windows claim canary, published a release, or used
 GitHub Actions.
+
+## 2026-09-10 — Expired lock-wait admission
+
+This narrow Unreleased change belongs to `beads_rust-46zqi`. The shared lock
+retry loop at `ab63b68d` checked its timeout before sleeping, then could acquire
+and return a lock after the deadline without checking again. The GitHub API
+still identifies v0.5.12 at `366c69a6` as the latest release; no new release or
+tag is part of this repair.
+
+Strict RCH job `j-30015430739361860` reproduced the defect on hz2 using the
+retained `e7c1ea94` release-perf executable, SHA-256
+`950ef5a75df198eb6b67a34cb86aba6219325d88ab4094279d0da87a542bd8b2`.
+The probe held the real workspace lock, observed the registered writer in
+`hrtimer_nanosleep`, stopped that child for 1,200 ms against a 1,000 ms budget,
+released the owner and resumed the writer. It incorrectly exited zero and
+created the issue. A positive control with a 5,000 ms budget and 50 ms pause
+also succeeded. Both real workspaces and complete outputs remain at
+`/data/tmp/br-46zqi-deadline-evidence-20260910-uzZxNlmi/br-46zqi-deadline-9ffrykbt`
+and on hz2 at `/data/tmp/br-46zqi-deadline-9ffrykbt`.
+
+The repair checks expiry after the polling sleep and queue scan, and again
+immediately after contended acquisition. It retains the uncontended
+nonblocking fast path, configured budget, polling interval, identity checks
+and OS lock authority. Linux process regressions exercise both resume
+outcomes; the expired case also requires unchanged database/WAL/JSONL bytes,
+registration cleanup and one successful retry. The pre-fix Rust regression
+failed as expected (expired writer exited zero); its within-budget control
+passed. After rebuilding the candidate, strict RCH job
+`j-30015430739361877` passed all 191 concurrency tests on hz3. The first
+candidate attempt had reused the baseline executable because its build
+finished after the edited source timestamps; that failed run is retained,
+and refreshing the two source mtimes caused an actual recompilation.
+
+Final all-feature/all-target Clippy with warnings denied passed on hz4 in
+`j-30015430739361878`, followed by matching Cargo check in
+`j-30015430739361888`. Formatting and whitespace checks passed. The resolved
+normal all-feature dependency tree contains no Git-authority package
+(`j-30015430739361885`). An isolated Cargo home first bypassed hz2's registry
+source error. Inspection then found its RCH cache's `hex-0.4.3` source entry
+missing `Cargo.toml` and the source files. The damaged entry was preserved and
+only missing files restored; the ordinary RCH cache subsequently passed the
+same tree query (`j-30015430739361896`). The original failures and non-clean
+UBS output are retained.
+The complete release suite and native Windows queue checks are still pending;
+the original sustained starvation and calibrated release-performance
+acceptance remain open.

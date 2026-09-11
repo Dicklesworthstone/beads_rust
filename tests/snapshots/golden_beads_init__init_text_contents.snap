@@ -20,6 +20,7 @@ expression: contents
 
 # Lock files
 .write.lock
+.write-waiters.lock/
 *.lock
 
 # Temporary

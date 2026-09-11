@@ -2068,8 +2068,25 @@ fn open_and_lock_regular_file(
             continue;
         }
 
+        // Sleeping, queue inspection, or process suspension can consume the
+        // remaining budget. Return through the timeout branch before retrying
+        // the OS lock, even if its previous owner has released it meanwhile.
+        if start.elapsed() >= timeout {
+            continue;
+        }
+
         match try_lock_exclusive(&file, mechanism) {
             Ok(()) => {
+                // A deschedule between the preceding check and acquisition
+                // must not turn an expired wait into authority to mutate.
+                if start.elapsed() >= timeout {
+                    return Err(write_lock_timeout_error(
+                        &lock_path_display,
+                        role,
+                        timeout_ms,
+                        retry_safety,
+                    ));
+                }
                 verify_locked_file_identity(&file, lock_path, role, redact_path)?;
                 if let Some(waiter) = &waiter {
                     waiter.verify_identity()?;

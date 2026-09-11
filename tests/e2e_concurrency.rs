@@ -178,6 +178,62 @@ fn wait_for_workspace_waiters(root: &Path, count: usize) -> Vec<PathBuf> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn run_paused_write_lock_waiter(
+    root: &Path,
+    budget_ms: u64,
+    pause: Duration,
+) -> std::process::Output {
+    use rustix::process::{Pid, Signal, kill_process};
+
+    // Reap the owned child even if observing or resuming it fails. In
+    // particular, a failed assertion must not leave a stopped writer behind.
+    struct ChildGuard(Option<std::process::Child>);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let owner = beads_rust::sync::blocking_write_lock(&root.join(".beads")).unwrap();
+    let mut guard = ChildGuard(Some(spawn_br_child_in_dir(
+        root,
+        [
+            "create",
+            "Paused writer",
+            "--json",
+            "--lock-timeout",
+            &budget_ms.to_string(),
+        ],
+    )));
+    let child = guard.0.as_mut().unwrap();
+    wait_for_workspace_waiters(root, 1);
+    wait_for_child_to_block_on_write_lock(child, "paused writer");
+    let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+    kill_process(pid, Signal::STOP).expect("pause owned writer");
+    let deadline = Instant::now() + WRITE_LOCK_WAIT_OBSERVATION_TIMEOUT;
+    loop {
+        let status = fs::read_to_string(format!("/proc/{}/status", child.id())).unwrap();
+        if status.lines().any(|line| line.starts_with("State:\tT")) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "writer did not stop: {status}");
+        thread::sleep(Duration::from_millis(1));
+    }
+    thread::sleep(pause);
+    drop(owner);
+    kill_process(pid, Signal::CONT).expect("resume owned writer");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "resumed writer did not exit");
+        thread::sleep(WRITE_LOCK_WAIT_POLL_INTERVAL);
+    }
+    guard.0.take().unwrap().wait_with_output().unwrap()
+}
+
 /// Run br command in a specific directory.
 fn run_br_in_dir<I, S>(root: &PathBuf, args: I) -> BrResult
 where
@@ -921,6 +977,65 @@ fn e2e_write_lock_contention_respects_lock_timeout() {
         1,
         "retrying the same request after lock release must persist exactly one issue"
     );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_write_lock_resumed_after_deadline_refuses_without_mutation() {
+    let _log = common::test_log("e2e_write_lock_resumed_after_deadline_refuses_without_mutation");
+    let temp = isolated_temp_dir("expired paused writer");
+    let root = temp.path().to_path_buf();
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "{init:?}");
+
+    let snapshot = || {
+        ["beads.db", "beads.db-wal", "issues.jsonl"].map(|name| {
+            let path = root.join(".beads").join(name);
+            path.exists().then(|| fs::read(path).unwrap())
+        })
+    };
+    let before = snapshot();
+    let output = run_paused_write_lock_waiter(&root, 1_000, Duration::from_millis(1_200));
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["error"]["code"], "DATABASE_LOCKED", "{payload}");
+    assert_eq!(payload["error"]["retryable"], true, "{payload}");
+    assert_eq!(
+        payload["error"]["context"]["lock_role"], "workspace write lock",
+        "{payload}"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(
+        snapshot(),
+        before,
+        "expired waiter changed database or JSONL"
+    );
+    assert!(wait_for_workspace_waiters(&root, 0).is_empty());
+    assert_eq!(issue_title_count(&root, "Paused writer"), 0);
+
+    let retry = run_br_in_dir(&root, ["create", "Paused writer", "--json"]);
+    assert!(retry.success, "{retry:?}");
+    assert_eq!(issue_title_count(&root, "Paused writer"), 1);
+    assert_upstream_sqlite_integrity_ok(&root, "expired paused writer retry");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_write_lock_resumed_within_deadline_applies_once() {
+    let _log = common::test_log("e2e_write_lock_resumed_within_deadline_applies_once");
+    let temp = isolated_temp_dir("paused writer within budget");
+    let root = temp.path().to_path_buf();
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "{init:?}");
+
+    let output = run_paused_write_lock_waiter(&root, 5_000, Duration::from_millis(50));
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["title"], "Paused writer");
+    assert!(wait_for_workspace_waiters(&root, 0).is_empty());
+    assert_eq!(issue_title_count(&root, "Paused writer"), 1);
+    assert_upstream_sqlite_integrity_ok(&root, "paused writer within budget");
 }
 
 /// Flat doctor surfaces must classify a genuinely held advisory lock before
