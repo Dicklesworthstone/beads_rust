@@ -1,5 +1,30 @@
 # Changelog research — 2026-09-08
 
+## 2026-09-11 — bounded ready output follow-through
+
+Implementation `16cb8245` connects positive JSON/TOON ready limits to the
+existing bounded storage query. External dependency filtering still precedes
+truncation, and text output retains the complete total. Complete-row regression
+comparisons cover hybrid, priority and oldest ordering at limits 1, 2, 3, 5
+and 10, plus an externally blocked leading row with an independent survivor.
+
+Strict RCH validation on hz4 passed all-feature/all-target `cargo check` and
+Clippy with warnings denied. Four release test targets (`e2e_ready`,
+`e2e_ready_limit`, `storage_ready`, `snapshots`) passed 810 test invocations,
+with no failures or ignores. The tested source, manifest, lockfile and
+toolchain hashes match committed tree `9591dd1b`. These are targeted checks,
+not a new whole-suite or native Windows qualification.
+
+Receipts are retained under
+`/data/tmp/br-3dzbd-ready-limit-20260911-w60hpYP2/`. The retrieved default
+release candidate is 27,713,440 bytes, SHA-256
+`ccea777c07cd440bdae2aeecb2110722f78cb02f62b0a51ebf257e1bb4b5804d`.
+Its matched pre-change release baseline is retained separately. The bounded
+before/after comparison remains pending; no speedup is claimed. Static UBS
+scanning of the two changed Rust files reports zero critical findings, 293
+warnings and 27 informational findings; this is not a warning-free audit.
+Bead `beads_rust-3dzbd` remains in progress for comparison and review.
+
 Requested scope: audit the latest release using `changelog-md-workmanship`.
 The existing earlier history is retained; this is not a full-history re-audit.
 

@@ -85,6 +85,12 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ## Unreleased — after the v0.5.12 source freeze
 
+- `br ready --limit N` uses the existing bounded query for JSON and TOON
+  output when no external blocking dependencies require post-filtering.
+  External blockers are still filtered before limiting, and text output keeps
+  its exact total. Regression tests compare complete rows across all three
+  sort policies; a measured speedup is not yet established
+  ([16cb8245](https://github.com/Dicklesworthstone/beads_rust/commit/16cb8245)).
 - A contended writer that resumes after its `--lock-timeout` deadline refuses
   before mutation, even if the previous owner has released the lock. Admission
   rechecks the deadline after polling and queue inspection and immediately
