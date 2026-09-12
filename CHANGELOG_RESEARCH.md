@@ -1,5 +1,29 @@
 # Changelog research — 2026-09-08
 
+## 2026-09-11 — dependency update and next release preparation
+
+The release campaign is tracked by `beads_rust-4e2n1`. Live release metadata
+still identifies v0.5.12 (published 2026-09-09 02:07:08 UTC) as the latest
+release. Reviewed the complete `v0.5.12..a22c251b` commit range against the
+Unreleased section: prerequisites, class-specific workflow routes, typed
+relationships/schema 19, reviewed legacy migration, claim guards, ordered
+writer admission, expired-lock refusal and bounded ready output are covered.
+The section is now assigned to pending v0.6.0, which has no remote tag,
+GitHub release or crates.io version at the availability check. Source changes
+and passing Linux tests do not establish seven-platform release qualification.
+
+The dependency inventory and published-source research are recorded in
+[UPGRADE_LOG.md](UPGRADE_LOG.md). FastMCP 0.9.0, asupersync 0.4.10 and TOML
+1.1.5 form one resolvable update because FastMCP pins the latter two exactly.
+FrankenSQLite stays at 0.3.18. Baseline and candidate each passed 3,138 active
+library tests with the same nine ignores through RCH. The full integration
+shards, default/no-default libraries, binary/ordinary benchmark targets,
+all-target check and Clippy subsequently passed; the doc command had zero
+executable cases and ten existing ignores. Version-sensitive checks and actual
+release binaries remain pending. Fresh RustSec audit found zero vulnerabilities,
+including without project exclusions. No speedup, Windows qualification or
+publication is inferred from these results.
+
 ## 2026-09-11 — bounded ready output follow-through
 
 Implementation `16cb8245` connects positive JSON/TOON ready limits to the

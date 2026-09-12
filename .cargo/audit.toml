@@ -4,15 +4,9 @@
 [advisories]
 # Ignore specific advisories that don't affect our use case
 ignore = [
-    # gix-date: Non-utf8 String can be created with TimeBuf::as_str
-    # This is a low-risk issue in a transitive dependency (vergen-gix -> gix).
-    # We don't use gix-date directly and the issue only affects edge cases
-    # with malformed git timestamps. Waiting for vergen-gix to update.
-    # https://rustsec.org/advisories/RUSTSEC-2025-0140
-    "RUSTSEC-2025-0140",
     # rustls-pemfile 2.2.0: unmaintained (superseded by rustls-pki-types'
-    # PemObject API). Pulled only through asupersync =0.4.9, which is pinned
-    # exactly by the fsqlite family (>=0.4.3,<0.5) and fastmcp-rust 0.7.x;
+    # PemObject API). Pulled through asupersync =0.4.10, pinned exactly
+    # by fastmcp-rust 0.9.0 and accepted by fsqlite's >=0.4.3,<0.5 range;
     # br never parses PEM itself. Drop this entry when asupersync stops
     # depending on rustls-pemfile. Recorded 2026-09-02 (beads_rust-uze9.1).
     # https://rustsec.org/advisories/RUSTSEC-2025-0134

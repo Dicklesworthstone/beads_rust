@@ -16,7 +16,7 @@ This changelog is organized by capability rather than diff order. Each version s
 **Scope window:** every version from inception (v0.1.0, 2026-01-18) through the current
 release (v0.5.12, 2026-09-09), including the source frozen at
 [366c69a6](https://github.com/Dicklesworthstone/beads_rust/commit/366c69a6),
-plus the post-freeze changes described under Unreleased.
+plus the post-freeze changes prepared for v0.6.0 below.
 The full per-version detail is in the sections below; the timeline names the
 recent line and the milestone anchors. The September 8 audit examined all 79
 commits in `v0.5.10..v0.5.11` and six subsequent commits against Git diffs,
@@ -83,7 +83,12 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
-## Unreleased — after the v0.5.12 source freeze
+## v0.6.0 — pending release
+
+Prepared from the changes since v0.5.12. Binary builds and publication are
+pending; this section does not claim that release artifacts are available.
+
+### Ready work and write contention
 
 - `br ready --limit N` uses the existing bounded query for JSON and TOON
   output when no external blocking dependencies require post-filtering.
@@ -118,6 +123,9 @@ this repo): commits `55c186682` + `5946b3b7c` in
   configuration, and tracked JSONL. The exclusions now match the archive's
   `./` paths as well as the existing rsync transfer rules
   ([b9eff611](https://github.com/Dicklesworthstone/beads_rust/commit/b9eff611)).
+
+### Planning requirements and workflow routes
+
 - Workflow `required_fields` accepts `acceptance_criteria_present`: a planning
   transition can require written criteria while leaving checklist items
   unfinished. Empty and whitespace-only values fail. The existing
@@ -141,7 +149,7 @@ this repo): commits `55c186682` + `5946b3b7c` in
   `br doctor migrate-schema plan` and approved `apply` to reach the current schema;
   ordinary opens refuse the older schema. Migration preserves existing data,
   and undo restores the saved database family unless later writes make the
-  undo stale. These changes are outside the frozen v0.5.12 source.
+  undo stale.
 - `br capabilities` correctly identifies stdout as the structured error
   stream, with diagnostics on stderr. Gate and capacity commands now expose
   their read/write operations, workspace requirement, and supported
@@ -153,6 +161,15 @@ this repo): commits `55c186682` + `5946b3b7c` in
   when type and status change together; rejected local batches preserve all
   members. See the [policy examples](docs/CLI_REFERENCE.md) and
   [#494](https://github.com/Dicklesworthstone/beads_rust/issues/494).
+- Policy refusals are no longer worded as a close. `POLICY_VIOLATION` errors
+  raised by workflow required fields or gates on any status move now render
+  as `Policy violation for <id>: transition 'draft -> planning' requires …`
+  instead of `Policy violation closing <id>: …`; the structured error code,
+  context, and violations are unchanged
+  ([#493](https://github.com/Dicklesworthstone/beads_rust/issues/493)).
+
+### Typed dependencies and reviewed migrations
+
 - Dependency identity includes its type, so the same source and target can
   retain both `blocks` and `related` through storage, JSONL, and reconciliation.
   CLI `dep remove --type` and MCP `dep_type` remove one relationship; omitted
@@ -169,19 +186,21 @@ this repo): commits `55c186682` + `5946b3b7c` in
   undo. Its five historical history, label, and concurrent-reader workloads
   also passed, along with release-profile regression, conformance, and MCP
   coverage. Existing ignored tests remain unchanged.
-- Policy refusals are no longer worded as a close. `POLICY_VIOLATION` errors
-  raised by workflow required fields or gates on any status move now render
-  as `Policy violation for <id>: transition 'draft -> planning' requires …`
-  instead of `Policy violation closing <id>: …`; the structured error code,
-  context, and violations are unchanged
-  ([#493](https://github.com/Dicklesworthstone/beads_rust/issues/493)).
+
+### Dependencies
+
+- Update the optional MCP server to FastMCP 0.9.0, with its required
+  asupersync 0.4.10 and TOML 1.1.5 pins. The existing caller-owned runtime
+  and transport API remains in use; default features are unchanged.
+  FrankenSQLite remains at 0.3.18. See the
+  [dependency research and validation log](UPGRADE_LOG.md).
 
 ## v0.5.12 — 2026-09-09
 
 [Published release](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.12),
 frozen at [366c69a6](https://github.com/Dicklesworthstone/beads_rust/commit/366c69a6).
 The seven binary archives contain the changes below. The later acceptance
-presence rule remains under Unreleased.
+presence rule is included in the prepared v0.6.0 section.
 
 ### Claiming work and searching the backlog
 
