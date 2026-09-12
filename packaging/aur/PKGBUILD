@@ -2,7 +2,8 @@
 # br-bin - Pre-built binary package for br (agent-first issue tracker)
 #
 # To build: makepkg -si
-# To install from AUR: yay -S br-bin
+# Local recipe: br-bin is not registered on AUR as of 2026-09-12.
+# The separately maintained beads-rust-bin package is not this recipe.
 
 pkgname=br-bin
 pkgver=0.6.0

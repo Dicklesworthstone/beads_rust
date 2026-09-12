@@ -8,6 +8,18 @@ built, but AUR publication remains blocked by SSH authentication. The release
 bead stays open for that obligation. The chronological evidence below retains
 earlier pending states and failed attempts.
 
+**AUR follow-up:** live RPC lookup on 2026-09-12 confirms `br-bin` is not
+registered. The existing package for this repository is
+[`beads-rust-bin`](https://aur.archlinux.org/packages/beads-rust-bin), version
+0.2.7-1, maintained by `sQVe`. Our `br-bin` recipe and built packages are local
+artifacts, not an update already accepted by that maintainer. The configured
+controller SSH identity still receives `Permission denied (publickey)`;
+neither controller nor Mac has an AUR-specific identity configured. Completion
+needs the authorized publishing account/host/key and confirmation of the
+intended package identity. The user has been asked for this missing information.
+No new key, duplicate package, account change, or maintainer message was sent.
+RPC evidence: `aur-package-identity.json` in the retained evidence directory.
+
 - GitHub release `387447968`, published 04:05:02 UTC, has exactly 24 assets.
   All draft and unauthenticated public downloads passed size/hash/signature/
   payload checks; each draft-downloaded binary passed its CLI/migration canary.
