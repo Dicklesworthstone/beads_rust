@@ -1,5 +1,44 @@
 # Changelog research — 2026-09-08
 
+## 2026-09-12 — unreleased shared-mount migration guard
+
+Narrow follow-up scope: `beads_rust-q93wv`, after v0.6.0. Git history through
+`5c4ea26b` contains only release records and the bug claim after the frozen
+release source. GitHub still reports v0.6.0 published at 04:05:02 UTC.
+
+A real `renameat2(RENAME_EXCHANGE)` probe on the affected macOS Docker bind
+mount returned success while removing the source pathname and replacing the
+destination; the native Linux volume swapped both files correctly. Both
+original failed migration backups were independently checked against every
+raw-family presence, length and SHA-256 entry in their prepared receipts.
+Evidence: `/tmp/br-q93wv-{bind,native}-identity.jsonl` and
+`/tmp/br-q93wv-original-backup-verification.jsonl` on the controller.
+The guard probes locked disposable files before apply/resume and
+non-dry-run undo; the existing live authority witnesses are unchanged.
+Clippy caught standard-library lock calls newer than the manifest's declared
+MSRV; the final patch uses the existing Rustix nonblocking exclusive lock.
+Final-source RCH gates passed: all-target/all-feature check and Clippy with
+warnings denied, 177 schema unit tests (including all 40 migration tests),
+and five schema CLI tests. Earlier broader CLI/doctor suites passed 350 tests
+with one pre-existing ignored doctor repair dry-run test.
+
+The final ARM64 GNU binary was built through RCH and executed on native
+aarch64 Docker. On the writable macOS bind mount, apply and undo refused
+before changing database-family/JSONL bytes, inode identities or device IDs;
+the failed probes remained available. Undo dry-run succeeded without a probe.
+On a native Linux volume, schema 15 → 19 migration and byte-exact undo passed.
+Binary SHA-256:
+`4f8bcd2bfda2f715a3b4869d12c7c3fbb59da98f50cc6c49b10a1461f032ca7b`.
+Runtime records: `/tmp/br-q93wv-{bind,native,undo}-runtime.jsonl`; assertion
+harnesses: `/tmp/br-q93wv-{migration,undo}-canary.py`. The changelog entry is
+explicitly Unreleased; no v0.6.0 artifact was replaced.
+
+The separate JSONL publication caller also reproduces the shared-mount
+failure: `sync --flush-only` changes the output, then reports an uncertified
+publication and a nonexistent recovery path. `beads_rust-og86t` tracks that
+unfixed sync issue with `/tmp/br-q93wv-sync-observation.jsonl`; this migration
+fix does not claim to qualify general JSONL publication on that mount.
+
 ## 2026-09-12 — v0.6.0 publication verified
 
 GitHub release `387447968` was published at 04:05:02 UTC from frozen commit

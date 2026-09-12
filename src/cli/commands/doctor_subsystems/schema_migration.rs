@@ -498,6 +498,10 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
             "schema migration apply requires a non-empty --plan-token",
         ));
     }
+    // Resume can also install a retained candidate. Check the actual database
+    // filesystem before either a fresh migration or a recovery path can write.
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    verify_migration_exchange_support(&migration.db_path, exchange_database_paths)?;
     if let Some((applied, before_dir)) = resume_commit_ready_migration(args, migration)? {
         return emit_applied(&applied, args.json, &before_dir);
     }
@@ -1911,6 +1915,74 @@ fn exchange_database_paths(left: &Path, right: &Path) -> Result<()> {
         .map_err(|error| BeadsError::Io(std::io::Error::from(error)))
 }
 
+/// Some shared filesystems report a successful EXCHANGE but perform an
+/// ordinary replacement instead. Detect that on disposable files before an
+/// exchange can unlink a live database generation. The existing installation
+/// witnesses remain necessary: this probe does not prove future atomicity.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn verify_migration_exchange_support<F>(db_path: &Path, exchange: F) -> Result<()>
+where
+    F: FnOnce(&Path, &Path) -> Result<()>,
+{
+    use rustix::fs::{FlockOperation, flock};
+    use std::os::unix::fs::MetadataExt;
+
+    let parent = db_path
+        .parent()
+        .ok_or_else(|| BeadsError::Config("migration database has no parent directory".into()))?;
+    let probe = tempfile::Builder::new()
+        .prefix(".br-schema-exchange-")
+        .tempdir_in(parent)?;
+    let outcome = (|| -> Result<()> {
+        let first_path = probe.path().join("first");
+        let second_path = probe.path().join("second");
+        let mut first = open_private_file_new(&first_path)?;
+        let mut second = open_private_file_new(&second_path)?;
+        first.write_all(b"first exchange probe")?;
+        second.write_all(b"second exchange probe")?;
+        for file in [&first, &second] {
+            flock(file, FlockOperation::NonBlockingLockExclusive).map_err(std::io::Error::from)?;
+        }
+        let identity = |metadata: &fs::Metadata| (metadata.dev(), metadata.ino());
+        let first_before = identity(&first.metadata()?);
+        let second_before = identity(&second.metadata()?);
+        let database_device = fs::symlink_metadata(db_path)?.dev();
+        if first_before == second_before
+            || first_before.0 != database_device
+            || second_before.0 != database_device
+        {
+            return Err(BeadsError::Config(
+                "exchange probe cannot establish distinct files on the database filesystem".into(),
+            ));
+        }
+        exchange(&first_path, &second_path)?;
+        let first_after = fs::symlink_metadata(&first_path)?;
+        let second_after = fs::symlink_metadata(&second_path)?;
+        if !first_after.is_file()
+            || !second_after.is_file()
+            || identity(&first_after) != second_before
+            || identity(&second_after) != first_before
+            || identity(&first.metadata()?) != first_before
+            || identity(&second.metadata()?) != second_before
+        {
+            return Err(BeadsError::Config(
+                "atomic exchange did not preserve both locked file identities".into(),
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(error) = outcome {
+        let retained = probe.keep();
+        return Err(BeadsError::Config(format!(
+            "schema migration filesystem exchange preflight failed ({error}); refusing \
+             database replacement. Use the native host binary or a native Linux volume \
+             instead of an incompatible shared mount. Probe retained at {}",
+            retained.display()
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompactedInstallFailureDisposition {
     OriginalRestored,
@@ -2347,6 +2419,11 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
 
     let before_dir = run_dir.join("before");
     verify_backup_family(&migration.db_path, &before_dir, &applied.raw_before)?;
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    if !args.dry_run {
+        verify_migration_exchange_support(&migration.db_path, exchange_database_paths)?;
+    }
 
     let undo_prepared_path = run_dir.join("undo-prepared.json");
     let mut receipt = if undo_prepared_path.exists() {
@@ -4182,6 +4259,50 @@ fn sync_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn exchange_preflight_accepts_real_exchange_without_touching_database() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("beads.db");
+        fs::write(&database, b"untouched database").unwrap();
+        verify_migration_exchange_support(&database, exchange_database_paths).unwrap();
+        assert_eq!(fs::read(&database).unwrap(), b"untouched database");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn exchange_preflight_refuses_successful_ordinary_rename_and_retains_probe() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("beads.db");
+        fs::write(&database, b"untouched database").unwrap();
+        // Reproduce the shared mount's real failure: EXCHANGE reports success
+        // while only moving one file over the other.
+        let error = verify_migration_exchange_support(&database, |left, right| {
+            fs::rename(left, right).map_err(BeadsError::Io)
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("filesystem exchange preflight failed")
+        );
+        assert!(error.to_string().contains("Probe retained"));
+        assert_eq!(fs::read(&database).unwrap(), b"untouched database");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn exchange_preflight_refuses_noop_success() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("beads.db");
+        fs::write(&database, b"untouched database").unwrap();
+        let error = verify_migration_exchange_support(&database, |_, _| Ok(())).unwrap_err();
+        assert!(error.to_string().contains("both locked file identities"));
+        assert_eq!(fs::read(&database).unwrap(), b"untouched database");
+    }
 
     #[test]
     fn ddl_token_fingerprint_ignores_comments_whitespace_parens_quotes_and_case() {
