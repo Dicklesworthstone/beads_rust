@@ -2,6 +2,40 @@
 
 ## In progress: 2026-09-11 (beads_rust-4e2n1)
 
+**Release outcome (2026-09-12):** v0.6.0 is published on GitHub and crates.io;
+Homebrew and Scoop updates are installed and verified. Both Arch packages are
+built, but AUR publication remains blocked by SSH authentication. The release
+bead stays open for that obligation. The chronological evidence below retains
+earlier pending states and failed attempts.
+
+- GitHub release `387447968`, published 04:05:02 UTC, has exactly 24 assets.
+  All draft and unauthenticated public downloads passed size/hash/signature/
+  payload checks; each draft-downloaded binary passed its CLI/migration canary.
+  A first GNU arm64 invocation targeted a stopped retained container and never
+  ran; the replacement invocation passed in the live native Linux container.
+- Four strict DSR snapshots match all 4,169 frozen tracked entries; all seven
+  successful RCH receipts match the source, including all 118 required build
+  inputs. Witness SHA-256:
+  `0d5eacac423f95ccb456fcaece23818a81072add7d04d0770c30cdf2572dbf53`.
+  Seven archives satisfy the unchanged 0.5.10/0.5.11 size budgets and carry
+  signatures from br key `36B847D11BA5A0D0`.
+- crates.io published at 04:05:43 UTC with registry checksum
+  `0d0fbac9a6c83b1ee48ab585f3d5f3fe9c8005a05cab7e039502d9293ed1cecf`,
+  exactly matching the separately qualified upload payload.
+- Homebrew tap `e6ee63a` and Scoop bucket `b311b12` are live. A concurrent
+  unrelated Homebrew formula addition was merged before the push; no force
+  update was used. Homebrew's real upgrade/test and Scoop's real shim install
+  passed; installed hashes match, and each passed all 45 doctor steps.
+- Public installers and actual 0.5.12-to-0.6.0 `br upgrade` passed on Linux
+  amd64 and Apple Silicon. All four installed/upgraded binaries match release
+  hashes and passed 45 doctor steps each. Both Arch package payloads preserve
+  the accepted binaries; amd64 `pacman -Qkk` reports seven files, zero altered,
+  and its installed doctor passed 45 steps. ARM Arch installation was not run.
+- Final three-manifest overlay passed ten `package_manifests` tests through
+  RCH, zero failures/ignores. Evidence and ready-to-publish Arch packages are
+  retained in `/tmp/br-4e2n1-evidence-20260912/`; canonical archives and original
+  DSR run records remain on the Mac under this campaign's private paths.
+
 - Registry inventory checked against `Cargo.lock`: all direct dependencies already resolve to latest stable except `fastmcp-rust` 0.8.1 → 0.9.0, `asupersync` 0.4.9 → 0.4.11, and `toml` 1.1.4 → 1.1.6. FrankenSQLite remains current at 0.3.18; no engine bump is needed.
 - Published FastMCP 0.9.0 requires `asupersync =0.4.10` and its client requires `toml =1.1.5`. These three manifest changes are one indivisible compatibility update: changing any one independently makes Cargo resolution fail. Newer asupersync 0.4.11 and TOML 1.1.6 remain excluded by these upstream exact pins.
 - Research: [FastMCP published dependencies](https://crates.io/api/v1/crates/fastmcp-rust/0.9.0/dependencies), [client dependencies](https://crates.io/api/v1/crates/fastmcp-client/0.9.0/dependencies), [v0.9.0 changelog](https://github.com/Dicklesworthstone/fastmcp_rust/blob/v0.9.0/CHANGELOG.md). Stable tag `fd440f3d361a58e5578c02f306e0dcf80cf8e479` preserves the caller-owned-context transport API br uses. Removed context-free stdio and synchronous HTTP APIs are not used here; feature selection remains unchanged. Runtime `current_thread`, `block_on`, and `request_cx_with_budget` bodies are unchanged in [asupersync 0.4.10](https://github.com/Dicklesworthstone/asupersync/blob/v0.4.10/src/runtime/builder.rs); scheduler changes still require storage regression coverage. [TOML 1.1.5](https://github.com/toml-rs/toml/blob/toml-v1.1.6/crates/toml/CHANGELOG.md) fixes owned integer/float conversion.
@@ -67,20 +101,21 @@
 - [x] Qualify the expanded native release canary against the Linux development binary.
 - [x] Update changelog from verified commits; select and bump the next available release version after the test gate.
 - [x] Freeze source, version, features and lockfile.
-- [ ] Build Linux GNU amd64/arm64, Linux musl amd64/arm64, macOS amd64/arm64, and Windows amd64 through RCH using the established DSR release flow.
-- [ ] Verify canonical archive contents, seven-target size budgets, SHA sidecars, Minisign signatures and SBOMs.
-- [ ] Run native CLI/migration canaries, Unix PTY checks and doctor selftests on all seven release binaries; verify GNU ABI floors, static musl linkage and Windows DLL imports.
-- [ ] Stage the GitHub draft, download/verify all 24 assets and exercise the downloaded binaries before publication.
-- [ ] Publish GitHub and verify all 24 assets again through unauthenticated public downloads.
+- [x] Build Linux GNU amd64/arm64, Linux musl amd64/arm64, macOS amd64/arm64, and Windows amd64 through RCH using the established DSR release flow. The resumed musl run completed 2/2 with post-build source validation at 2026-09-12 03:56 UTC.
+- [x] Verify canonical archive contents, seven-target size budgets, SHA sidecars, Minisign signatures and SBOMs.
+- [x] Run CLI/migration canaries, Unix PTY checks and doctor selftests on all seven release binaries; verify GNU ABI floors, static musl linkage and Windows DLL imports. Intel macOS execution used Rosetta; all other target execution was native.
+- [x] Stage the GitHub draft, download/verify all 24 assets and exercise the downloaded binaries before publication.
+- [x] Review qualification claims before publication: source tests and raw-binary gates passed without new ignores or weaker assertions; documented existing doctest ignores, Windows warnings and bind-mount migration failure. Infrastructure refusals/timeouts are not passes. Intel execution is Rosetta, and its first full compiler log was not retained. These are operator-run checks, not independent certification.
+- [x] Publish GitHub and verify all 24 assets again through unauthenticated public downloads.
 - [x] Package the frozen crate and byte-compare all 1,080 extracted files.
 - [x] Compile the exact package's default and all-feature binaries through RCH; pass CLI, migration, PTY, doctor, and MCP protocol checks.
-- [ ] Publish that exact package and verify the crates.io registry checksum.
-- [ ] Update and verify the Homebrew tap and real installation.
-- [ ] Update and verify the Scoop bucket and real Windows installation.
-- [ ] Build both Arch binary packages and verify native amd64 installation/integrity before AUR publication.
+- [x] Publish that exact package and verify the crates.io registry checksum.
+- [x] Update and verify the Homebrew tap and real installation.
+- [x] Update and verify the Scoop bucket and real Windows installation.
+- [x] Build both Arch binary packages and verify native amd64 installation/integrity before AUR publication.
 - [ ] Publish and read back AUR when an authorized SSH identity is available; retain the explicit blocker meanwhile.
-- [ ] Exercise the public installer and an actual old-to-new self-update.
-- [ ] Commit publication metadata and evidence summaries; close only fulfilled obligations. Historical AUR blockers stay separate.
+- [x] Exercise the public installer and an actual old-to-new self-update.
+- [x] Commit publication metadata and evidence summaries; close only fulfilled obligations. Historical AUR blockers stay separate.
 
 ---
 

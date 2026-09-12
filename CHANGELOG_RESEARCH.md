@@ -1,5 +1,24 @@
 # Changelog research — 2026-09-08
 
+## 2026-09-12 — v0.6.0 publication verified
+
+GitHub release `387447968` was published at 04:05:02 UTC from frozen commit
+`b1cfebe05437463e91a353cf2bedafac27266f5b`. Its 24 assets passed authenticated
+draft and unauthenticated public download verification: exact names, hashes,
+sizes, all seven Minisign signatures, aggregate checksums and archive payloads.
+All seven downloaded binaries passed CLI/migration canaries. The crate's
+registry checksum matches the separately qualified upload payload. Homebrew
+and Scoop updates are live and passed real installation checks; public
+installers and 0.5.12 upgrades passed on Linux amd64 and Apple Silicon.
+
+All source tests, seven-target build/runtime evidence, source-byte comparisons,
+retained failed attempts and existing limitations are recorded in
+[UPGRADE_LOG.md](UPGRADE_LOG.md). No GitHub Actions were run. Intel macOS ran
+under Rosetta, not physical Intel hardware. Both Arch packages are prepared
+and amd64 installation passed, but AUR SSH authentication remains unavailable;
+the release bead remains open and AUR publication is not claimed. The
+chronological preparation entries below retain their historical pending states.
+
 ## 2026-09-11 — dependency update and next release preparation
 
 Qualification update, 2026-09-12 03:43 UTC: source is frozen at

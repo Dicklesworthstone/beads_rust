@@ -5,7 +5,7 @@
 # To install from AUR: yay -S br-bin
 
 pkgname=br-bin
-pkgver=0.5.12
+pkgver=0.6.0
 pkgrel=1
 pkgdesc="Agent-first issue tracker (SQLite + JSONL)"
 arch=('x86_64' 'aarch64')
@@ -20,8 +20,8 @@ options=('!strip' '!debug')
 source_x86_64=("${pkgname}-${pkgver}-x86_64.tar.gz::https://github.com/Dicklesworthstone/beads_rust/releases/download/v${pkgver}/br-${pkgver}-linux_amd64.tar.gz")
 source_aarch64=("${pkgname}-${pkgver}-aarch64.tar.gz::https://github.com/Dicklesworthstone/beads_rust/releases/download/v${pkgver}/br-${pkgver}-linux_arm64.tar.gz")
 
-sha256sums_x86_64=('a1e16a1dab6fe203730edd3a7b3ca1ac7419bfaaff079c3af51dafa42b83139e')
-sha256sums_aarch64=('3cd626182774c85eb163e4f40d8dbb3c2c9a90e560b8b66a8cb5eaae1f1845f9')
+sha256sums_x86_64=('f6f9a1663bae31e94d2dcfec62163f15b17f822711c486e860183a654784829b')
+sha256sums_aarch64=('dd865e02f05a5efa84aca25e70c4f054b358cb71e42580af97cf41fda52b46f5')
 
 package() {
     install -Dm755 "${srcdir}/br" "${pkgdir}/usr/bin/br"

@@ -14,9 +14,8 @@ This changelog is organized by capability rather than diff order. Each version s
 - Release links: `https://github.com/Dicklesworthstone/beads_rust/releases/tag/<TAG>`
 
 **Scope window:** every version from inception (v0.1.0, 2026-01-18) through the current
-release (v0.5.12, 2026-09-09), including the source frozen at
-[366c69a6](https://github.com/Dicklesworthstone/beads_rust/commit/366c69a6),
-plus the post-freeze changes prepared for v0.6.0 below.
+release (v0.6.0, 2026-09-12), including the source frozen at
+[b1cfebe0](https://github.com/Dicklesworthstone/beads_rust/commit/b1cfebe0).
 The full per-version detail is in the sections below; the timeline names the
 recent line and the milestone anchors. The September 8 audit examined all 79
 commits in `v0.5.10..v0.5.11` and six subsequent commits against Git diffs,
@@ -25,7 +24,7 @@ sections retain their prior research; see [research notes](CHANGELOG_RESEARCH.md
 
 ## Version Timeline
 
-Recent line (0.5.x — storage-safety and the multi-process corruption program):
+Recent releases:
 
 Dates in these tables use UTC publication dates for Releases and UTC tag
 creation dates for tags. Earlier sections retain their original dates unless
@@ -33,6 +32,7 @@ explicitly corrected during this audit.
 
 | Version | Date | Kind | Headline |
 |---|---|---|---|
+| [v0.6.0](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.6.0) | 2026-09-12 | Release | Prerequisite checklists, class-specific workflow routes, typed dependencies, reviewed migrations, claim/admission guards, bounded ready output; seven-platform DSR release |
 | [v0.5.12](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.12) | 2026-09-09 | Release | Closed-claim refusal; bounded search page loading; terminal color controls; namespace diagnostics; Nix source repair; seven-platform DSR release |
 | [v0.5.11](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.11) | 2026-09-08 | Release | Checkpoints before diagnostic exits; FrankenSQLite 0.3.18 grouped-count fix; migration preflight and typed admission failures; seven-platform DSR release |
 | [v0.5.10](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.10) | 2026-09-04 | Release | Six silent-loss fixes (#466–#477, #487); acceptance checklist edits; `doctor --bundle`; FrankenSQLite 0.3.15; linearizability, model-based, README, and Go-bd proof suites; schema-witness fast open |
@@ -83,10 +83,11 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
-## v0.6.0 — pending release
+## v0.6.0 — 2026-09-12
 
-Prepared from the changes since v0.5.12. Binary builds and publication are
-pending; this section does not claim that release artifacts are available.
+[Release](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.6.0),
+published at 04:05:02 UTC from
+[b1cfebe0](https://github.com/Dicklesworthstone/beads_rust/commit/b1cfebe0).
 
 ### Ready work and write contention
 
@@ -200,6 +201,28 @@ pending; this section does not claim that release artifacts are available.
   and transport API remains in use; default features are unchanged.
   FrankenSQLite remains at 0.3.18. See the
   [dependency research and validation log](UPGRADE_LOG.md).
+
+### Distribution and verification
+
+- Seven default-feature binaries were built through RCH using strict DSR
+  snapshots: Linux GNU and musl on amd64/arm64, macOS on amd64/arm64, and
+  Windows GNU amd64. CLI/migration checks and doctor selftests passed on every
+  binary; Unix PTY checks passed too. Intel macOS ran under Rosetta on Apple
+  Silicon. Both GNU binaries require at most GLIBC 2.28; both musl binaries
+  are static, and Windows imports only system DLLs.
+- The 24 published assets comprise seven archives, seven SHA-256 sidecars,
+  seven Minisign signatures, aggregate checksums, and SPDX/CycloneDX SBOMs.
+  Authenticated draft and unauthenticated public downloads passed exact hash,
+  signature, size and payload checks. All seven draft-downloaded binaries
+  passed the CLI/migration canary. GitHub Actions were not used.
+- The [crates.io package](https://crates.io/crates/beads_rust/0.6.0) matches
+  the separately built and tested package checksum. Homebrew and Scoop are
+  updated, with real installation checks. Both Arch binary packages built;
+  amd64 installation/integrity and doctor checks passed. AUR publication
+  remains blocked by SSH authentication and is not claimed complete.
+- Public installers and upgrades from 0.5.12 passed on Linux amd64 and Apple
+  Silicon, preserving the expected release binary hashes. Detailed evidence
+  and existing limitations are recorded in [UPGRADE_LOG.md](UPGRADE_LOG.md).
 
 ## v0.5.12 — 2026-09-09
 
