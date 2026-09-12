@@ -2458,6 +2458,92 @@ impl ConditionalJsonlPublication {
     }
 }
 
+/// Check disposable siblings through the retained parent before risking a
+/// published generation. Some shared mounts silently ignore exchange flags.
+/// This observation does not replace the publication's generation witnesses.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn verify_jsonl_exchange_support<Exchange>(
+    output_name: &PinnedJsonlName,
+    exchange: Exchange,
+) -> Result<bool>
+where
+    Exchange: FnOnce(&PinnedJsonlName, &PinnedJsonlName) -> rustix::io::Result<()>,
+{
+    use rustix::fs::{FlockOperation, flock};
+    use std::os::unix::fs::MetadataExt;
+
+    let outcome = (|| -> Result<bool> {
+        output_name.parent().verify_route()?;
+        let mut probes = Vec::with_capacity(2);
+        for attempt in 0..MAX_JSONL_TEMP_PATH_ATTEMPTS {
+            let path = export_temp_path_for_attempt(output_name.display_path(), attempt);
+            let name = output_name.with_sibling_path(&path)?;
+            let Some(file) = name.create_new_regular_if_absent()? else {
+                continue;
+            };
+            flock(&file, FlockOperation::NonBlockingLockExclusive).map_err(std::io::Error::from)?;
+            let source = name
+                .open_optional_regular()?
+                .ok_or_else(|| BeadsError::SyncConflict {
+                    message: "JSONL exchange probe disappeared after creation".into(),
+                })?;
+            let identity = source.identity();
+            let metadata = file.metadata()?;
+            if (metadata.dev(), metadata.ino()) != (identity.device_id(), identity.inode()) {
+                return Err(BeadsError::SyncConflict {
+                    message: "JSONL exchange probe changed after creation".into(),
+                });
+            }
+            probes.push((name, file, identity));
+            if probes.len() == 2 {
+                break;
+            }
+        }
+        if probes.len() != 2 || probes[0].2 == probes[1].2 {
+            return Err(BeadsError::SyncConflict {
+                message: "Could not establish two distinct JSONL exchange probes".into(),
+            });
+        }
+        let supported = match exchange(&probes[0].0, &probes[1].0) {
+            Ok(()) => true,
+            Err(error) if flagged_rename_unsupported(error) => false,
+            Err(error) => return Err(BeadsError::Io(error.into())),
+        };
+        let expected = if supported {
+            [probes[1].2, probes[0].2]
+        } else {
+            [probes[0].2, probes[1].2]
+        };
+        for ((name, file, original), expected) in probes.iter().zip(expected) {
+            let observed =
+                name.open_optional_regular()?
+                    .ok_or_else(|| BeadsError::SyncConflict {
+                        message: "JSONL exchange probe disappeared during exchange".into(),
+                    })?;
+            let metadata = file.metadata()?;
+            if observed.identity() != expected
+                || (metadata.dev(), metadata.ino()) != (original.device_id(), original.inode())
+            {
+                return Err(BeadsError::SyncConflict {
+                    message: "JSONL exchange probe did not preserve both file identities".into(),
+                });
+            }
+        }
+        for ((name, _, _), expected) in probes.iter().zip(expected) {
+            name.remove_regular_if_identity(expected)?;
+        }
+        Ok(supported)
+    })();
+    outcome.map_err(|error| BeadsError::SyncConflict {
+        message: format!(
+            "JSONL filesystem exchange preflight failed ({error}); publication refused before \
+             output replacement. \
+             Any remaining probe files were retained beside the output. Use the native host \
+             filesystem or a native Linux volume instead of this shared mount."
+        ),
+    })
+}
+
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn perform_conditional_namespace_change(
     staged_name: &PinnedJsonlName,
@@ -2472,6 +2558,24 @@ fn perform_conditional_namespace_change(
                 "Conditional JSONL publication names do not share one retained parent capability"
                     .to_string(),
         });
+    }
+
+    if matches!(
+        expected_previous_state,
+        JsonlSourceStateWitness::Present { .. }
+    ) && !verify_jsonl_exchange_support(output_name, |first, second| {
+        if flagged_rename_forced_unsupported() {
+            return Err(rustix::io::Errno::INVAL);
+        }
+        renameat_with(
+            first.parent().as_file(),
+            first.leaf(),
+            second.parent().as_file(),
+            second.leaf(),
+            RenameFlags::EXCHANGE,
+        )
+    })? {
+        return replace_jsonl_under_authority(staged_name, output_name, expected_previous_state);
     }
 
     let (flags, change) = match expected_previous_state {
@@ -19585,6 +19689,82 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     #[test]
+    fn jsonl_exchange_preflight_verifies_real_exchange_and_explicit_unsupported() {
+        use rustix::fs::{RenameFlags, renameat_with};
+
+        for unsupported in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let output = temp.path().join("issues.jsonl");
+            fs::write(&output, b"original").unwrap();
+            let authority = blocking_jsonl_family_write_lock_with_timeout(&output, None).unwrap();
+            let name = authority.pinned_name_for_target(&output).unwrap();
+            let before = name.capture().unwrap().state_witness();
+            let supported = verify_jsonl_exchange_support(&name, |first, second| {
+                if unsupported {
+                    Err(rustix::io::Errno::INVAL)
+                } else {
+                    renameat_with(
+                        first.parent().as_file(),
+                        first.leaf(),
+                        second.parent().as_file(),
+                        second.leaf(),
+                        RenameFlags::EXCHANGE,
+                    )
+                }
+            })
+            .unwrap();
+            assert_eq!(supported, !unsupported);
+            assert_eq!(name.capture().unwrap().state_witness(), before);
+            assert!(fs::read_dir(temp.path()).unwrap().all(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_none_or(|extension| extension != "tmp")
+            }));
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn jsonl_exchange_preflight_refuses_lying_success_and_preserves_output_and_stage() {
+        for ordinary_rename in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let output = temp.path().join("issues.jsonl");
+            let staged = export_temp_path(&output);
+            fs::write(&output, b"original").unwrap();
+            fs::write(&staged, b"candidate").unwrap();
+            let authority = blocking_jsonl_family_write_lock_with_timeout(&output, None).unwrap();
+            let name = authority.pinned_name_for_target(&output).unwrap();
+            let stage_name = authority.pinned_sibling(&staged).unwrap();
+            let before = name.capture().unwrap().state_witness();
+            let stage_before = stage_name.capture().unwrap().state_witness();
+            let error = verify_jsonl_exchange_support(&name, |first, second| {
+                if ordinary_rename {
+                    rustix::fs::renameat(
+                        first.parent().as_file(),
+                        first.leaf(),
+                        second.parent().as_file(),
+                        second.leaf(),
+                    )
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("filesystem exchange preflight failed")
+            );
+            assert_eq!(name.capture().unwrap().state_witness(), before);
+            assert_eq!(stage_name.capture().unwrap().state_witness(), stage_before);
+            assert!(export_temp_path_for_attempt(&output, 2).is_file());
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
     fn conditional_publication_creates_missing_target_without_replace_race() {
         let temp = TempDir::new().unwrap();
         let output_path = temp.path().join("issues.jsonl");
@@ -19741,10 +19921,20 @@ mod tests {
         );
 
         assert!(replaced.get(), "requested phase hook did not run");
-        assert!(matches!(
-            result,
-            Err(BeadsError::JsonlPublishedButUnwitnessed { .. })
-        ));
+        let refused_before_publication = cfg!(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple"
+        )) && replacement_phase
+            == ConditionalPublicationHookPhase::PreCommit;
+        if refused_before_publication {
+            assert!(matches!(result, Err(BeadsError::SyncConflict { .. })));
+        } else {
+            assert!(matches!(
+                result,
+                Err(BeadsError::JsonlPublishedButUnwitnessed { .. })
+            ));
+        }
         assert_eq!(
             fs::read(&output_path).unwrap(),
             b"{\"id\":\"attacker-target\"}\n",
@@ -19757,12 +19947,20 @@ mod tests {
         );
         assert_eq!(
             fs::read(displaced_parent.join("issues.jsonl")).unwrap(),
-            b"{\"id\":\"new\"}\n",
+            if refused_before_publication {
+                b"{\"id\":\"old\"}\n"
+            } else {
+                b"{\"id\":\"new\"}\n"
+            },
             "the namespace change remains confined to the pinned parent"
         );
         assert_eq!(
             fs::read(displaced_parent.join(temp_path.file_name().unwrap())).unwrap(),
-            b"{\"id\":\"old\"}\n",
+            if refused_before_publication {
+                b"{\"id\":\"new\"}\n"
+            } else {
+                b"{\"id\":\"old\"}\n"
+            },
             "the displaced generation is retained under the pinned parent"
         );
     }
