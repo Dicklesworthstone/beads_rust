@@ -2,6 +2,26 @@
 
 ## 2026-09-11 — dependency update and next release preparation
 
+Qualification update, 2026-09-12 03:43 UTC: source is frozen at
+`b1cfebe05437463e91a353cf2bedafac27266f5b`. The 625 version-sensitive checks
+passed through RCH. Six raw release targets have passed CLI/migration and
+doctor qualification; Unix targets also passed real-PTY checks. Intel macOS
+ran under Rosetta on Apple Silicon. ARM musl is still building, and no 0.6.0
+venue is published. The exact packaged crate passed default/all-feature builds,
+22 MCP protocol tests and default-binary runtime checks; its publication dry
+run preserved SHA-256
+`0d0fbac9a6c83b1ee48ab585f3d5f3fe9c8005a05cab7e039502d9293ed1cecf`.
+
+Release canaries found an existing schema-migration limitation on writable
+Docker Desktop macOS bind mounts. The published 0.5.12 Linux arm64 binary and
+the candidate both refused migration with a locked-file identity change; the
+candidate passed the same migration checks on a native Docker volume.
+`beads_rust-q93wv` tracks this unresolved issue. Evidence is retained in
+`/tmp/br-4e2n1-evidence-20260912/linux-arm64-runtime.log`,
+`bindmount-baseline-0512.log`, and `linux-arm64-native-volume-runtime.log`.
+The changelog distinguishes the supported migration routes from this unfixed
+mount-specific failure. No claim of a regression fix is made.
+
 The release campaign is tracked by `beads_rust-4e2n1`. Live release metadata
 still identifies v0.5.12 (published 2026-09-09 02:07:08 UTC) as the latest
 release. Reviewed the complete `v0.5.12..a22c251b` commit range against the

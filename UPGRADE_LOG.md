@@ -44,6 +44,12 @@
 
 ### Execution checklist
 
+- Five of seven raw release binaries are accepted and runtime-qualified. Windows GNU amd64 passed 92 CLI/migration commands and 45 doctor steps; Linux GNU arm64 and Intel macOS each passed 95 CLI/migration commands, 29 PTY commands and 45 doctor steps. Intel execution used Rosetta on Apple Silicon, not physical Intel hardware. GNU arm64's maximum required GLIBC is 2.28.
+- The first Intel DSR attempt returned 137 without a valid result, although its underlying RCH job subsequently returned zero. That artifact was not selected. The resumed DSR attempt succeeded. DSR reused its compiler-log pathname; the attempted archive raced with truncation and contains early retry output. The original result and orchestration logs remain, but the original full compiler log does not. `darwin-amd64-log-retention-note.txt` documents this limitation.
+- The Linux arm64 migration canary failed on a writable macOS Docker bind mount with a database-identity change. The published 0.5.12 binary reproduces the same failure; the 0.6.0 binary passes the entire canary on a native Docker volume. Open P1 bead `beads_rust-q93wv` tracks the limitation. Retained both failed workspaces; no migration repair is claimed. Release notes identify native macOS or native Linux storage as the qualified migration routes.
+- Musl amd64 compilation returned zero at 2026-09-12 03:39 UTC; DSR artifact collection remains pending. Musl arm64 was refused before compilation by RCH's active-project exclusion, despite available slots. Its original refusal/result were archived before resuming; subsequent builds will run sequentially without bypassing that exclusion.
+- The exact crates.io publication dry run passed and its actual upload payload (`package/tmp-crate/beads_rust-0.6.0.crate`) matches the qualified SHA-256. Nothing has been published. Both DSR-verified SBOMs cover all 633 locked packages.
+
 - [x] Read project and skill instructions; check clean tracked source and previous release records.
 - [x] Inventory every direct dependency against the registry and lockfile.
 - [x] Claim release bead and reserve manifest, lockfile, and upgrade logs.

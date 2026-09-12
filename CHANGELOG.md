@@ -150,6 +150,12 @@ pending; this section does not claim that release artifacts are available.
   ordinary opens refuse the older schema. Migration preserves existing data,
   and undo restores the saved database family unless later writes make the
   undo stale.
+- Reviewed schema migration can refuse with a database-identity error on a
+  writable Docker Desktop macOS bind mount. Release qualification reproduced
+  this with both 0.5.12 and 0.6.0; the same 0.6.0 Linux binary passed on a native
+  Docker volume. Run migrations using the native macOS binary or native Linux
+  storage. Shared bind-mount migration support remains open as
+  `beads_rust-q93wv`; this release does not fix it.
 - `br capabilities` correctly identifies stdout as the structured error
   stream, with diagnostics on stderr. Gate and capacity commands now expose
   their read/write operations, workspace requirement, and supported
