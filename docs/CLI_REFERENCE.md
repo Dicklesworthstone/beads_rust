@@ -2119,6 +2119,15 @@ rewrite or retire those files without changing database semantics. `apply`
 captures and verifies a fresh byte-exact family backup after logical-token
 validation and before migration.
 
+On Linux and macOS, `apply` and non-dry-run `undo` first test the filesystem's
+exchange-rename behavior using temporary locked files beside the database.
+Some shared mounts report a successful exchange while replacing one file
+instead of swapping both. Such a mount is refused before migration or recovery
+can replace the live database; the diagnostic retains the probe directory.
+Use the native macOS binary or a native Linux volume for those migrations.
+The installation's database-identity witnesses remain mandatory after this
+preflight. `plan` and dry-run `undo` do not create probe files.
+
 The version stamp alone does not establish eligibility. Planning also checks
 the core table declarations and index names. Historical layouts with extra
 columns, incompatible keys or constraints, or operator indexes on core tables

@@ -83,6 +83,19 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
+## Unreleased
+
+- **Refuse unsafe schema migration exchanges on shared filesystems.**
+  `doctor migrate-schema apply` (including recovery) and non-dry-run `undo`
+  verify exchange-rename behavior on locked temporary files before replacing
+  the database. This catches the Docker Desktop macOS bind-mount behavior
+  where an exchange reports success but replaces one file, which previously
+  left migration in an uncertain state. Failed probes are retained for
+  inspection; existing database authority checks remain enforced. Use the
+  native host binary or a native Linux volume for migration on affected
+  installations. See the [migration reference](docs/CLI_REFERENCE.md#reviewed-schema-migration)
+  and workstream `beads_rust-q93wv`.
+
 ## v0.6.0 — 2026-09-12
 
 [Release](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.6.0),
