@@ -32,6 +32,14 @@
 - Once ovh-a's other gates finished, moved the unchanged 50-target storage shard to its warm all-feature cache. Gracefully cancelled only owned ts2 build `30017382718111748` at 2026-09-12 02:16 UTC; the cancellation released both slots, the Cargo PID was absent and the isolated queue was empty. No tests ran in that cancelled retry. Retained both ts2 build directories. Fresh ts2 health: load 3.97 on 128 CPUs, 192 GiB available memory and 1.8 TiB disk free. The dedicated release scheduler will advertise eight slots for sequential Linux/Windows cross builds; Mac native builds remain two jobs.
 - The full 50-target storage/property/regression/workflow shard passed on ovh-a at 2026-09-12 02:20 UTC: 4,066 test invocations, zero failures, two existing ignores, outer exit zero. The dependency test gate is complete across all-feature library/integration shards, default and no-default library configurations, binary/ordinary benchmark targets, all-target checks and Clippy, formatting and security audit. The doc command executed no cases, as recorded above. Proceeding to 0.6.0 metadata and focused version-sensitive checks; no release binaries or publication yet.
 
+- Release preparation committed as `b1cfebe05437463e91a353cf2bedafac27266f5b`, with local annotated `v0.6.0` tag (not pushed). Focused version-sensitive checks passed through RCH at 2026-09-12 02:25 UTC: 625 tests, zero failures or ignores. The clean Mac release checkout preserves all 4,169 tracked entries. Primary strict DSR build started at 02:30 UTC for five targets; the two musl targets require a separate completed DSR run because the pinned validator accepts canonical Linux platform keys. No release venue is published yet.
+
+- First DSR attempt stopped before compilation because its locked offline source-closure check lacked FastMCP 0.9.0 in the command hosts' ambient registry caches. Fetched the unchanged locked dependencies on Mac and ts2. A retry correctly refused reusing the first output directory; the next attempt uses a fresh output path and retains both refusals. Its two-target concurrency is bounded by one DSR slot per command host, mapping to one RCH build per actual worker; Mac compilation stays at two jobs and ts2 at eight.
+- The exact crates.io package contains 1,080 files and has SHA-256 `0d0fbac9a6c83b1ee48ab585f3d5f3fe9c8005a05cab7e039502d9293ed1cecf`. Every extracted file was byte-compared to the archive; a temporary verification-only Git index explicitly includes packaged files ignored by the repository's normal ignore rules. Its default-feature binary compiled through RCH on ovh-a at 2026-09-12 02:39 UTC. Runtime qualification and the optional-feature package build are pending. SPDX and CycloneDX inventories both include all 633 frozen lockfile packages; these are source inventories, not claims that every optional dependency is compiled into each binary.
+
+- Exact extracted-package qualification is complete: default binary passed 95 CLI/migration commands, 29 PTY commands, and all 45 doctor selftest steps; its first doctor invocation failed because the requested parent directory did not exist, then passed after creating that directory. The all-feature package build passed at 02:45 UTC, and all 22 packaged MCP protocol tests passed at 02:52 UTC, with zero failures or ignores. The package SHA remains unchanged. This is focused package qualification, not a claim that fixture-dependent repository tests all run from the published archive.
+- DSR run `4659395f-e8d0-4516-8760-d0767213f8cb` now compiles Linux/Windows through RCH. Its two Mac attempts failed before compilation because the dedicated route used Linux's `/data` staging path; corrected only that route's `transfer.remote_base` to `/Users/Shared/dsr-sources/br-4e2n1-rch-mac`. Separate Mac run `5aa83804-8eef-4cbe-939e-f5feb467fff9` is compiling on Apple Silicon. Packaging will explicitly select three successful Linux/Windows results, two successful Mac results, and two successful musl results from their actual run records; no failed target is selected or reclassified.
+
 ### Execution checklist
 
 - [x] Read project and skill instructions; check clean tracked source and previous release records.
@@ -49,14 +57,16 @@
 - [x] Pass binary tests and ordinary non-ignored benchmark targets; run the doc gate and explicitly record its zero executable cases.
 - [x] Pass all-target Cargo check and Clippy with warnings denied; verify formatting.
 - [x] Qualify the expanded native release canary against the Linux development binary.
-- [ ] Update changelog from verified commits; select and bump the next available release version after the test gate.
-- [ ] Freeze source, version, features and lockfile.
+- [x] Update changelog from verified commits; select and bump the next available release version after the test gate.
+- [x] Freeze source, version, features and lockfile.
 - [ ] Build Linux GNU amd64/arm64, Linux musl amd64/arm64, macOS amd64/arm64, and Windows amd64 through RCH using the established DSR release flow.
 - [ ] Verify canonical archive contents, seven-target size budgets, SHA sidecars, Minisign signatures and SBOMs.
 - [ ] Run native CLI/migration canaries, Unix PTY checks and doctor selftests on all seven release binaries; verify GNU ABI floors, static musl linkage and Windows DLL imports.
 - [ ] Stage the GitHub draft, download/verify all 24 assets and exercise the downloaded binaries before publication.
 - [ ] Publish GitHub and verify all 24 assets again through unauthenticated public downloads.
-- [ ] Package the frozen crate, compile and exercise the extracted package through RCH, then publish/read back crates.io.
+- [x] Package the frozen crate and byte-compare all 1,080 extracted files.
+- [x] Compile the exact package's default and all-feature binaries through RCH; pass CLI, migration, PTY, doctor, and MCP protocol checks.
+- [ ] Publish that exact package and verify the crates.io registry checksum.
 - [ ] Update and verify the Homebrew tap and real installation.
 - [ ] Update and verify the Scoop bucket and real Windows installation.
 - [ ] Build both Arch binary packages and verify native amd64 installation/integrity before AUR publication.
