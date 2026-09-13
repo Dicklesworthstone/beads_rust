@@ -1,5 +1,248 @@
 # Changelog research — 2026-09-08
 
+## 2026-09-12 — unreleased JSONL exchange guard (qualification in progress)
+
+`beads_rust-og86t` addresses the separate export failure reproduced in
+`/tmp/br-q93wv-sync-observation.jsonl`. The implementation in `src/sync/mod.rs`
+probes disposable siblings through the retained parent capability before
+exchanging an existing export. It rejects lying success and mutating errors;
+explicit unsupported errors permit the existing fallback only after both
+probe identities are verified unchanged. Failed probes and the staged export
+are retained. No path allowlist or live-generation witness was loosened.
+
+The initial implementation was committed as `e97ce12c` by a concurrent session
+before this qualification finished. Current source includes the concurrent
+FrankenSQLite 0.4.0 / Asupersync 0.5.0 dependency update and Git-pinned FastMCP.
+RCH all-target/all-feature check and Clippy with warnings denied passed on
+those dependencies; formatting passed. A remote snapshot comparison matched
+all 4,169 tracked files at capture. The earlier 544-test sync pass used
+FrankenSQLite 0.3.18 and is preliminary evidence only. The current-dependency
+sync unit run subsequently passed 544 tests with zero failures and one
+intentionally ignored scale-timing probe, including all three new probe
+regressions and the sync source/direct-runtime dependency safety tests.
+Evidence: `/tmp/br-og86t-current-{check,clippy,sync-unit}.log`.
+
+The current ARM64 GNU binary was built through RCH and its worker/Mac SHA-256
+matched: `bbf965f78331e6ab6be291b029e54e519099c7e3e5cc4785e80b70f90ae7964d`.
+On native aarch64 Docker, replacing a nonempty export passed on a native Linux
+volume and cleaned the probes. The writable macOS bind-mount run refused
+before publication, preserving the old export's SHA-256, inode, device and
+size, retaining the staged update, and preserving the database update.
+Evidence: `/tmp/br-og86t-{native,bind}-runtime.jsonl`; assertion harness:
+`/tmp/br-og86t-export-canary.py`.
+
+The release-mode all-feature library run passed 3,144 tests with nine existing
+ignored probes/tests. The binary suite passed 66 tests and failed
+`fast_open_import_reprobe_reopens_the_canonical_database_inode` with
+`Database(BusyRecovery)`; the failure also reproduced in isolation. This is
+tracked as `beads_rust-1khz0`, not hidden by the successful sync checks. The
+resolved all-feature normal dependency tree had no forbidden Git authority
+packages (RCH `exec --job`; ordinary `exec` rejected this non-compilation
+command).
+
+Follow-up, 2026-09-13: the startup fixture constructed its replacement at the
+still-open canonical path; the old reader's opener lease prevented the new
+family from checkpointing there. Moving the omitted migration-state sidecar
+alone did not fix it. Independently staging and closing the replacement,
+then publishing the complete family, passed while retaining the old handle.
+The corrected test also asserts that the canonical inode changes and the
+displaced original inode remains available. All 67 release-mode binary tests
+then passed. Final all-target/all-feature check and Clippy passed after
+removing temporary diagnostic code; no production startup code was changed.
+Evidence: `/tmp/br-1khz0-release-bin.log`, `/tmp/br-og86t-final-check.log`,
+`/tmp/br-og86t-final-clippy2.log`. The original failed family survives on ts2
+under `/tmp/br-1khz0-reprobe-evidence/.tmpjurUqP`, with a controller manifest
+at `/tmp/br-1khz0-family-manifest.jsonl`. The separate central sidecar inventory
+omission is tracked as `beads_rust-c2klf`.
+
+The release-mode Git-authority integration gate passed all 174 tests. The
+reconciliation target initially passed 188 tests and failed the source-repo
+path migration test. Its inspection handle remained alive across later CLI
+writes; releasing it after reading the owned issue records fixed the fixture
+without changing production locking. The complete reconciliation rerun passed
+all 189 tests (`beads_rust-0fk9j`, commit `0b241050`). Evidence:
+`/tmp/br-og86t-release-sync-gates.log` and
+`/tmp/br-og86t-release-sync-gates2.log`.
+Post-edit RCH all-target/all-feature check and Clippy with warnings denied
+also passed, as did formatting and whitespace checks. The fixture bead is
+closed; logs are `/tmp/br-0fk9j-{check,clippy}.log`.
+
+The following status-health target passed 169 tests but failed three fixture
+catalog tests: its cached binary embeds a removed RCH clean-overlay source
+directory, `/data/tmp/rch/br-q93wv-20260912/2c9af36118d80c04`. That missing
+directory was independently verified. Restoring the unchanged fixtures there
+resolved all three failures; all 120 copied files matched the source snapshot,
+and the fixture tree had no changes from the original build baseline. The
+rerun passed 172 status-health tests and 181 VCS tests with zero failures.
+Evidence: `/tmp/br-og86t-restored-fixtures.json` and
+`/tmp/br-og86t-release-sync-gates3.log`. Remaining integration targets and the
+full release suite remain pending. No release artifact has been replaced and
+the JSONL exchange bead remains open.
+
+The remaining sync targets subsequently passed: artifacts 173, failure
+injection 183, fuzz/edge cases 175, needs-flush guard 166, and preflight 174.
+The failure-injection target initially failed its post-export crash probe
+because the fixture kept the direct exporter open while invoking the CLI.
+Moving its existing `drop(storage)` before the probe models the exited
+exporter; dirty-state and recovery assertions remain unchanged and pass.
+This does not establish a new live-peer concurrency guarantee. Evidence:
+`/tmp/br-og86t-release-sync-remaining.log` (initial failure) and
+`/tmp/br-og86t-release-sync-remaining2.log` (passing rerun). The nine sync/VCS
+integration targets total 1,587 passing cases, including shared harness tests
+compiled into multiple targets. Broader release-suite qualification is still
+pending. Post-edit all-target/all-feature check and Clippy with warnings
+denied passed through RCH; formatting and whitespace checks passed too.
+Compiler evidence: `/tmp/br-og86t-crash-fixture-{check,clippy}.log`.
+
+## 2026-09-12 — unreleased shared-mount migration guard
+
+Narrow follow-up scope: `beads_rust-q93wv`, after v0.6.0. Git history through
+`5c4ea26b` contains only release records and the bug claim after the frozen
+release source. GitHub still reports v0.6.0 published at 04:05:02 UTC.
+
+A real `renameat2(RENAME_EXCHANGE)` probe on the affected macOS Docker bind
+mount returned success while removing the source pathname and replacing the
+destination; the native Linux volume swapped both files correctly. Both
+original failed migration backups were independently checked against every
+raw-family presence, length and SHA-256 entry in their prepared receipts.
+Evidence: `/tmp/br-q93wv-{bind,native}-identity.jsonl` and
+`/tmp/br-q93wv-original-backup-verification.jsonl` on the controller.
+The guard probes locked disposable files before apply/resume and
+non-dry-run undo; the existing live authority witnesses are unchanged.
+Clippy caught standard-library lock calls newer than the manifest's declared
+MSRV; the final patch uses the existing Rustix nonblocking exclusive lock.
+Final-source RCH gates passed: all-target/all-feature check and Clippy with
+warnings denied, 177 schema unit tests (including all 40 migration tests),
+and five schema CLI tests. Earlier broader CLI/doctor suites passed 350 tests
+with one pre-existing ignored doctor repair dry-run test.
+
+The final ARM64 GNU binary was built through RCH and executed on native
+aarch64 Docker. On the writable macOS bind mount, apply and undo refused
+before changing database-family/JSONL bytes, inode identities or device IDs;
+the failed probes remained available. Undo dry-run succeeded without a probe.
+On a native Linux volume, schema 15 → 19 migration and byte-exact undo passed.
+Binary SHA-256:
+`4f8bcd2bfda2f715a3b4869d12c7c3fbb59da98f50cc6c49b10a1461f032ca7b`.
+Runtime records: `/tmp/br-q93wv-{bind,native,undo}-runtime.jsonl`; assertion
+harnesses: `/tmp/br-q93wv-{migration,undo}-canary.py`. The changelog entry is
+explicitly Unreleased; no v0.6.0 artifact was replaced.
+
+The separate JSONL publication caller also reproduces the shared-mount
+failure: `sync --flush-only` changes the output, then reports an uncertified
+publication and a nonexistent recovery path. `beads_rust-og86t` tracks that
+unfixed sync issue with `/tmp/br-q93wv-sync-observation.jsonl`; this migration
+fix does not claim to qualify general JSONL publication on that mount.
+
+## 2026-09-12 — v0.6.0 publication verified
+
+GitHub release `387447968` was published at 04:05:02 UTC from frozen commit
+`b1cfebe05437463e91a353cf2bedafac27266f5b`. Its 24 assets passed authenticated
+draft and unauthenticated public download verification: exact names, hashes,
+sizes, all seven Minisign signatures, aggregate checksums and archive payloads.
+All seven downloaded binaries passed CLI/migration canaries. The crate's
+registry checksum matches the separately qualified upload payload. Homebrew
+and Scoop updates are live and passed real installation checks; public
+installers and 0.5.12 upgrades passed on Linux amd64 and Apple Silicon.
+
+All source tests, seven-target build/runtime evidence, source-byte comparisons,
+retained failed attempts and existing limitations are recorded in
+[UPGRADE_LOG.md](UPGRADE_LOG.md). No GitHub Actions were run. Intel macOS ran
+under Rosetta, not physical Intel hardware. Both Arch packages are prepared
+and amd64 installation passed, but AUR SSH authentication remains unavailable;
+the release bead remains open and AUR publication is not claimed. The
+chronological preparation entries below retain their historical pending states.
+
+## 2026-09-11 — dependency update and next release preparation
+
+Qualification update, 2026-09-12 03:43 UTC: source is frozen at
+`b1cfebe05437463e91a353cf2bedafac27266f5b`. The 625 version-sensitive checks
+passed through RCH. Six raw release targets have passed CLI/migration and
+doctor qualification; Unix targets also passed real-PTY checks. Intel macOS
+ran under Rosetta on Apple Silicon. ARM musl is still building, and no 0.6.0
+venue is published. The exact packaged crate passed default/all-feature builds,
+22 MCP protocol tests and default-binary runtime checks; its publication dry
+run preserved SHA-256
+`0d0fbac9a6c83b1ee48ab585f3d5f3fe9c8005a05cab7e039502d9293ed1cecf`.
+
+Release canaries found an existing schema-migration limitation on writable
+Docker Desktop macOS bind mounts. The published 0.5.12 Linux arm64 binary and
+the candidate both refused migration with a locked-file identity change; the
+candidate passed the same migration checks on a native Docker volume.
+`beads_rust-q93wv` tracks this unresolved issue. Evidence is retained in
+`/tmp/br-4e2n1-evidence-20260912/linux-arm64-runtime.log`,
+`bindmount-baseline-0512.log`, and `linux-arm64-native-volume-runtime.log`.
+The changelog distinguishes the supported migration routes from this unfixed
+mount-specific failure. No claim of a regression fix is made.
+
+The release campaign is tracked by `beads_rust-4e2n1`. Live release metadata
+still identifies v0.5.12 (published 2026-09-09 02:07:08 UTC) as the latest
+release. Reviewed the complete `v0.5.12..a22c251b` commit range against the
+Unreleased section: prerequisites, class-specific workflow routes, typed
+relationships/schema 19, reviewed legacy migration, claim guards, ordered
+writer admission, expired-lock refusal and bounded ready output are covered.
+The section is now assigned to pending v0.6.0, which has no remote tag,
+GitHub release or crates.io version at the availability check. Source changes
+and passing Linux tests do not establish seven-platform release qualification.
+
+The dependency inventory and published-source research are recorded in
+[UPGRADE_LOG.md](UPGRADE_LOG.md). FastMCP 0.9.0, asupersync 0.4.10 and TOML
+1.1.5 form one resolvable update because FastMCP pins the latter two exactly.
+FrankenSQLite stays at 0.3.18. Baseline and candidate each passed 3,138 active
+library tests with the same nine ignores through RCH. The full integration
+shards, default/no-default libraries, binary/ordinary benchmark targets,
+all-target check and Clippy subsequently passed; the doc command had zero
+executable cases and ten existing ignores. Version-sensitive checks and actual
+release binaries remain pending. Fresh RustSec audit found zero vulnerabilities,
+including without project exclusions. No speedup, Windows qualification or
+publication is inferred from these results.
+
+## 2026-09-11 — bounded ready output follow-through
+
+Implementation `16cb8245` connects positive JSON/TOON ready limits to the
+existing bounded storage query. External dependency filtering still precedes
+truncation, and text output retains the complete total. Complete-row regression
+comparisons cover hybrid, priority and oldest ordering at limits 1, 2, 3, 5
+and 10, plus an externally blocked leading row with an independent survivor.
+
+Strict RCH validation on hz4 passed all-feature/all-target `cargo check` and
+Clippy with warnings denied. Four release test targets (`e2e_ready`,
+`e2e_ready_limit`, `storage_ready`, `snapshots`) passed 810 test invocations,
+with no failures or ignores. The tested source, manifest, lockfile and
+toolchain hashes match committed tree `9591dd1b`. These are targeted checks,
+not a new whole-suite or native Windows qualification.
+
+Receipts are retained under
+`/data/tmp/br-3dzbd-ready-limit-20260911-w60hpYP2/`. The retrieved default
+release candidate is 27,713,440 bytes, SHA-256
+`ccea777c07cd440bdae2aeecb2110722f78cb02f62b0a51ebf257e1bb4b5804d`.
+Its matched pre-change release baseline is retained separately. The bounded
+before/after comparison completed but failed its qualification criteria;
+no speedup is claimed. Static UBS
+scanning of the two changed Rust files reports zero critical findings, 293
+warnings and 27 informational findings; this is not a warning-free audit.
+Changed-hunk review found test assertions and diagnostic-name allocations;
+the existing production indexing warning is guarded by a length check.
+Bead `beads_rust-3dzbd` is closed for its original implementation, regression
+and comparison-report scope. Qualified performance evidence remains under
+the existing calibration bead `beads_rust-zxfz.1`; the failed timing
+qualification is unchanged and no performance benefit is accepted.
+
+The prospectively fixed A-B-B-A comparison ran through strict RCH on
+vmi1167313, with one copied workspace per block, three warmups and 40 measured
+calls per block. All 160 measured calls matched the 7,243-byte expected output
+and preserved database-family hashes. Only the first baseline block passed
+both quietness and stability requirements. Foreign compiler processes appeared
+during both candidate blocks; the final baseline block also exceeded the
+1.10 p95 epoch-ratio threshold. No block was retried or dropped.
+
+Descriptive pooled results (80 calls per binary) were baseline/candidate
+median 161.11/152.90 ms, p95 232.81/237.20 ms, and median peak RSS
+73,252/69,144 KiB. These contaminated, unstable samples do not establish a
+latency or memory improvement. Full receipts are retained in `abba-retained/`
+under the directory above; the compressed receipt archive SHA-256 is
+`acdca6429856dc52082216abb9563e4b6409be9a4ee62f1000a6326e313c7dd9`.
+The original held-out performance-calibration data was not opened.
+
 Requested scope: audit the latest release using `changelog-md-workmanship`.
 The existing earlier history is retained; this is not a full-history re-audit.
 

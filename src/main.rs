@@ -3221,6 +3221,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn fast_open_import_reprobe_reopens_the_canonical_database_inode() {
+        use std::os::unix::fs::MetadataExt;
+
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).expect("create beads dir");
@@ -3235,11 +3237,26 @@ mod tests {
         let paths = bootstrap.paths.clone();
         drop(bootstrap);
 
+        let original_inode = fs::metadata(&paths.db_path)
+            .expect("original metadata")
+            .ino();
         let fast_overrides = build_cli_overrides(&Cli::parse_from(["br", "ready"]));
         let mut fast_storage = Some(
             config::open_storage_with_cli(&beads_dir, &fast_overrides)
                 .expect("open original database read-only"),
         );
+
+        // Prepare the new family independently before publishing it over the
+        // old generation, as the production repair and rebuild paths do.
+        let replacement_dir = temp.path().join("replacement");
+        fs::create_dir(&replacement_dir).expect("create replacement directory");
+        let mut replacement =
+            beads_rust::storage::SqliteStorage::open(&replacement_dir.join("beads.db"))
+                .expect("create staged replacement");
+        replacement
+            .set_metadata("fast_open_inode_marker", "replacement")
+            .expect("mark replacement database");
+        drop(replacement);
 
         // Displace the whole database family, not just the main file: since
         // fsqlite 0.3.15 every open leaves `-shm` (and `-wal`, `-wal-cert`)
@@ -3250,21 +3267,36 @@ mod tests {
         for entry in fs::read_dir(&beads_dir).expect("list beads dir") {
             let entry = entry.expect("dir entry");
             let name = entry.file_name().to_string_lossy().to_string();
-            if let Some(suffix) = name.strip_prefix("beads.db-") {
+            if let Some(suffix) = name.strip_prefix("beads.db").filter(|s| !s.is_empty()) {
                 fs::rename(
                     entry.path(),
-                    beads_dir.join(format!("beads.displaced.db-{suffix}")),
+                    beads_dir.join(format!("beads.displaced.db{suffix}")),
                 )
                 .expect("displace database sidecar");
             }
         }
         fs::rename(&paths.db_path, &displaced_path).expect("displace original database");
-        let mut replacement = beads_rust::storage::SqliteStorage::open(&paths.db_path)
-            .expect("create canonical replacement");
-        replacement
-            .set_metadata("fast_open_inode_marker", "replacement")
-            .expect("mark replacement database");
-        drop(replacement);
+        for entry in fs::read_dir(&replacement_dir).expect("list replacement directory") {
+            let entry = entry.expect("replacement entry");
+            if entry.file_name().to_string_lossy().starts_with("beads.db") {
+                fs::rename(entry.path(), beads_dir.join(entry.file_name()))
+                    .expect("publish replacement family member");
+            }
+        }
+        assert_ne!(
+            fs::metadata(&paths.db_path)
+                .expect("replacement metadata")
+                .ino(),
+            original_inode,
+            "the canonical pathname must name a different inode"
+        );
+        assert_eq!(
+            fs::metadata(&displaced_path)
+                .expect("displaced metadata")
+                .ino(),
+            original_inode,
+            "the original inode must remain available"
+        );
 
         let authority = Arc::new(
             beads_rust::sync::blocking_database_family_write_lock_with_timeout(

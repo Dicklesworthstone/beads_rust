@@ -183,13 +183,13 @@ dependencies = [
 
 [[package]]
 name = "argon2"
-version = "0.5.3"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
+checksum = "134c52ddac6d63c576bef8168db10c83c49c26444ecbc68060fef078925a901c"
 dependencies = [
  "base64ct",
  "blake2",
- "cpufeatures 0.2.17",
+ "cpufeatures 0.3.0",
  "password-hash",
 ]
 
@@ -261,9 +261,9 @@ dependencies = [
 
 [[package]]
 name = "asupersync"
-version = "0.4.9"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be81588a09a28a312b09d4af71e8aa8c6736e1d670a69a42e6779e874fbad1bd"
+checksum = "f34b1a19ffd6b74570339a156912436335bb09c594c675c62ea164b19a1f2511"
 dependencies = [
  "aes-gcm",
  "asupersync-macros",
@@ -291,7 +291,6 @@ dependencies = [
  "prost",
  "rmp-serde",
  "rustls",
- "rustls-pemfile",
  "rustls-pki-types",
  "semver",
  "serde",
@@ -323,13 +322,13 @@ dependencies = [
 
 [[package]]
 name = "asupersync-macros"
-version = "0.4.9"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a14f9f162d8418e4e347f4965f42f41ca970f8e81be496e04ab4f79c94818c8"
+checksum = "7b00d5ceff520908bcb2fa6efacf2ab6a0ae45639e87eb1de70b78df13acf636"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.3",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -402,7 +401,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "beads_rust"
-version = "0.5.12"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -521,11 +520,11 @@ dependencies = [
 
 [[package]]
 name = "blake2"
-version = "0.10.6"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+checksum = "5b5d4d889834ee8ecfc0f8426ad30faf7cdcb10f741a8e6d7224d95325479f6f"
 dependencies = [
- "digest 0.10.7",
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -806,7 +805,7 @@ dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn 3.0.3",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -1320,7 +1319,6 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer 0.10.4",
  "crypto-common 0.1.7",
- "subtle",
 ]
 
 [[package]]
@@ -1375,7 +1373,7 @@ checksum = "c6232dd377dcc64799954cbd3a9bb882e9cdc1308ccd87b1c098f1fb2eaf82a8"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.3",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -1484,9 +1482,8 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-client"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "663af09335d89498c68d1ae4a2ea7df4899412c22374ce4f9d7106474e02d99b"
+version = "0.9.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88890705217bb8e202d19555adabf24187"
 dependencies = [
  "asupersync",
  "dirs",
@@ -1502,9 +1499,8 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-console"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07b1a38fbb1fdeb1e5d5bd519fba51cb25b1b6e6fc3e6024bb87a0793ea67796"
+version = "0.9.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88890705217bb8e202d19555adabf24187"
 dependencies = [
  "fastmcp-core",
  "fastmcp-protocol",
@@ -1521,9 +1517,8 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-core"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb88baf72f387e013dd18558d5547a4e428c1c3676117176e26393d980103b51"
+version = "0.9.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88890705217bb8e202d19555adabf24187"
 dependencies = [
  "asupersync",
  "getrandom 0.4.3",
@@ -1538,22 +1533,20 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-derive"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64e04efda15fc2a57d55adb4e6acdba4cc96e9ba662168ee345103fc1fca546b"
+version = "0.9.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88890705217bb8e202d19555adabf24187"
 dependencies = [
  "fastmcp-protocol",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
- "syn 3.0.3",
+ "syn 3.0.5",
 ]
 
 [[package]]
 name = "fastmcp-protocol"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8437a7fe797e232bce8fe706c0b252e6e1cd5dd9bb46646afb9930699359fbea"
+version = "0.9.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88890705217bb8e202d19555adabf24187"
 dependencies = [
  "base64 0.23.1",
  "fastmcp-core",
@@ -1564,9 +1557,8 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-rust"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41cff7a2d6406936a62dbee1daf30b6693d511527cc8dd33f92966c33ba5e433"
+version = "0.9.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88890705217bb8e202d19555adabf24187"
 dependencies = [
  "asupersync",
  "fastmcp-client",
@@ -1582,9 +1574,8 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-server"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4aa35dc8554642369f6e22bfa36fff1cf76e81593d520ebd37b060e40e5c405b"
+version = "0.9.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88890705217bb8e202d19555adabf24187"
 dependencies = [
  "asupersync",
  "base64 0.23.1",
@@ -1605,9 +1596,8 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-transport"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3afc9662f17c833623eee327d51604d3765a88796e029614aaaff61eca8b067a"
+version = "0.9.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88890705217bb8e202d19555adabf24187"
 dependencies = [
  "asupersync",
  "fastmcp-core",
@@ -1688,9 +1678,9 @@ dependencies = [
 
 [[package]]
 name = "franken-decision"
-version = "0.4.9"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3645a3f60a4e63b19feac3121871cd5599fe46a10c4e90cabaee9fd6d27a030"
+checksum = "b01c92bbc04816e42bc68dbf697777e83d87fc00e9ad5cec70a5c86331d834b3"
 dependencies = [
  "franken-evidence",
  "franken-kernel",
@@ -1699,9 +1689,9 @@ dependencies = [
 
 [[package]]
 name = "franken-evidence"
-version = "0.4.9"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad9d4f7ad2461e03e792809d98c9f02dc816ab3b3766493a0b0bf6a07d7effc0"
+checksum = "ccdd9e8e38746aa524dd8b22a35aa7c1485379156d3a145d077521e80ce429de"
 dependencies = [
  "serde",
  "serde_json",
@@ -1709,9 +1699,9 @@ dependencies = [
 
 [[package]]
 name = "franken-kernel"
-version = "0.4.9"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92263c58ff55e6f171441ce40efb70ed26a2588d38a793435f2aeef456246696"
+checksum = "dbe470e8d7f35572ff1571ac02cb14486a77bc8a98ac6830eb8756ba4a869c0a"
 dependencies = [
  "serde",
 ]
@@ -1735,9 +1725,9 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsqlite"
-version = "0.3.18"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08fec08ab10876b67a132b9c6eaa3eeaea62b58b4ebb3370684bcbb2333875c8"
+checksum = "3d119c5e541892931d86b8a895addab18fc8545324f3aabe47174d45e0edcbef"
 dependencies = [
  "asupersync",
  "fsqlite-core",
@@ -1754,9 +1744,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ast"
-version = "0.3.18"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1778525c27addb7225e26bd76b294dd775005257043a65dd823100f9afc1e794"
+checksum = "8edb6d4a2c88dffcba4d4503867f6ace11095e970d5cb40f66d627c086664009"
 dependencies = [
  "fsqlite-types",
  "smallvec",
@@ -1764,9 +1754,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-btree"
-version = "0.3.18"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1899d0d276e4a4f4e930bca4dc9901b78dda5cb7944ba2beaf9216f253035eb"
+checksum = "6b9bd31a7932bac062ff47da926386d42c7ba18376726b4bf20df8a50381aec0"
 dependencies = [
  "foldhash",
  "fsqlite-error",
@@ -1782,9 +1772,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-core"
-version = "0.3.18"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e852b4dc7b6d643cddd29d4ba52915e79ba7fce373b6cac33d65bea3b3ac6a2"
+checksum = "0958adc5af4f027d783b9175ee79573f8da3b81ee1a95eae29a16eb491de5397"
 dependencies = [
  "asupersync",
  "blake3",
@@ -1822,18 +1812,18 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-error"
-version = "0.3.18"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "159b84a266836f9fc76790d0761bdf3a638182732ebefb8bf3952318f3ac285a"
+checksum = "74bb8223e9e59c22c9e5b73dd9e6f6f2f5c23b02aa77d2f0705def4212bd041f"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "fsqlite-ext-fts5"
-version = "0.3.18"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2db7d770b1fa8e955c1a9e8177aca5eb1ee2bfdd84112dbf4bb5dbcfc62041cf"
+checksum = "c0d6920e4b1c95e50b6fd9bbf8c40df232e377b2c0e87a9390748eb0375bf91a"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1844,9 +1834,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-icu"
-version = "0.3.18"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04be8473a03c7ffe4c555b3f499dbe2470ff6f395f350bb854296fae43543497"
+checksum = "21621e0db02a2ba76e478c69885304be736e7c3510dc095cafed27bd24c66390"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1856,9 +1846,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-json"
-version = "0.3.18"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34d0ba5139aaef2d4cbf3e902be2aa7e317e1bf1c28ea19ad762cefc218d8cf1"
+checksum = "c1416e1ffd329b82190f8b3b6f252197e46c443b3e4a1ddfef66e0ee5000dbd3"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1869,9 +1859,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-misc"
-version = "0.3.18"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "005075254e984e4f43ed4926181fe1b703b29f25eba403cdd82e88003280f0a6"
+checksum = "73c0090af7778c7ca7fef13e3279751c06cb784ba5632a688a2ba9f1da2c188a"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1883,9 +1873,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-rtree"
-version = "0.3.18"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5c2c04c82fd2ed5e23189bb3b991c7ee345ae9044560eef08feaab6e2bd557b"
+checksum = "6e4807af058533085628a752cdeffac1c88cdad41d3bb05977bc2b576f6a240d"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1894,9 +1884,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-func"
-version = "0.3.18"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b628232be3ba21224daaad69b0dbfad7b1d97ed814d02a0c2009f496b7c3c29c"
+checksum = "cf2ec642f3c62e0185df22194b07248014e61fecfb4c48c8b4a7dc59d254a9f1"
 dependencies = [
  "chrono",
  "fsqlite-error",
@@ -1906,9 +1896,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-mvcc"
-version = "0.3.18"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0db34e12732af792d19b8c75255649078503a45c7f0633a8fba18b6021e5b1c0"
+checksum = "293e18a14b3ca775037bb4cea2b61d62d9e1fb9175f635481b234f5c88291147"
 dependencies = [
  "asupersync",
  "blake3",
@@ -1932,9 +1922,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-observability"
-version = "0.3.18"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "271e7a469a2a15777487c3a0bafe3ede4c28fe8e6034482af6ef9bf55ecdd695"
+checksum = "4f89fd980ceec37ce02aa5742844af12fc7f07edc7273f6e2509714c1a9ebea3"
 dependencies = [
  "fsqlite-types",
  "parking_lot",
@@ -1944,9 +1934,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-pager"
-version = "0.3.18"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "357ac1292256ea0603db2c59b9ec75f0b0d53d00d55dc9c81934d307044388f3"
+checksum = "1e8f5f200865b978bb4e81b2211da4bea559d058404fc3657c0c0b6d09c30219"
 dependencies = [
  "argon2",
  "asupersync",
@@ -1970,9 +1960,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-parser"
-version = "0.3.18"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0dde794db1cf4cef6a93805042ef92bbcc0f597478b93fb1180ec3a9fbf4aa64"
+checksum = "5287baa9d51c0f7850e76e76f2dae2c9a96ac86a2485f2f25bb62edc338b19e8"
 dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
@@ -1984,9 +1974,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-planner"
-version = "0.3.18"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76a0508f07c9b8f0bc52075db32bb7affa9e14993f0c5ce75cde7fafcfdd6e3c"
+checksum = "b216b1377361bbf52f38b1c35a8bf7d770f6974d0547de3d225482a37d2e0cf3"
 dependencies = [
  "blake3",
  "fsqlite-ast",
@@ -2002,9 +1992,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-types"
-version = "0.3.18"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9974dce756642291b9b81abcb20ecc14d2fde963ceb719843ed9bc27d848f343"
+checksum = "02883a258e6036a1742d5ee9649a375dbb6eb26d038467d93f7091c45d9090d6"
 dependencies = [
  "asupersync",
  "bitflags 2.13.1",
@@ -2022,9 +2012,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vdbe"
-version = "0.3.18"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85012bf442126ead3abe0da3a91e6b87896f864c0a0b29ae7c89e461ace9f3dd"
+checksum = "390c8892d28abb60de36af3f8f9d6221e7d5d3e0d16a937dc8cdcf34b77bc1c4"
 dependencies = [
  "asupersync",
  "crossbeam-deque",
@@ -2046,9 +2036,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vfs"
-version = "0.3.18"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37fda6518a5db34e159568c226e6a880b51cc4a6487bdbcfe98593ca1c7bf82b"
+checksum = "cf1ef3f31f79873090e03954adbf5183faed01502bb445186699196529ded50e"
 dependencies = [
  "advisory-lock",
  "asupersync",
@@ -2065,9 +2055,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-wal"
-version = "0.3.18"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2621e7ad33d12159369166277e26143720635bfbf3272996eb6600b421efc6e6"
+checksum = "e6186ac7cd883ea8bfaa8ced4e48b462953cbc7a1b002fcedf624dd227389e24"
 dependencies = [
  "asupersync",
  "blake3",
@@ -4164,13 +4154,12 @@ dependencies = [
 
 [[package]]
 name = "password-hash"
-version = "0.5.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
+checksum = "aab41826031698d6ffcd9cff78ef56ef998e39dc7e5067cdfebe373842d4723b"
 dependencies = [
- "base64ct",
- "rand_core 0.6.4",
- "subtle",
+ "getrandom 0.4.3",
+ "phc",
 ]
 
 [[package]]
@@ -4193,6 +4182,17 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "phc"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44dc769b75f93afdddd8c7fa12d685292ddeff1e66f7f0f3a234cf1818afe892"
+dependencies = [
+ "base64ct",
+ "ctutils",
+ "getrandom 0.4.3",
+]
 
 [[package]]
 name = "pin-project"
@@ -4720,7 +4720,7 @@ checksum = "2c9283685feec7d69af75fb0e858d5e7378f33fe4fc699383b2916ab9273e03c"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.3",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -4932,15 +4932,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustls-pemfile"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
-dependencies = [
- "rustls-pki-types",
-]
-
-[[package]]
 name = "rustls-pki-types"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5054,7 +5045,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "serde_derive_internals",
- "syn 3.0.3",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -5158,7 +5149,7 @@ checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.3",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -5169,7 +5160,7 @@ checksum = "f852137cce035d6a4df67ccce505ff6b3e9fd3a10e3e52b24dc71e650bb1a9bd"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.3",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -5489,9 +5480,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "3.0.3"
+version = "3.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53e9bae58849f64dfa4f5d5ae372c8341f7305f82a3868709269343628b659a3"
+checksum = "12df2e0110f65b775f769bb17ef989067a1d931b2eb822bd4346631eeada89f9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5580,7 +5571,7 @@ checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.3",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -5700,9 +5691,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.1.4+spec-1.1.0"
+version = "1.1.6+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3aace63f4bbcdfc2c965b059de67119c89c4017a70d633be6c104910f67056f5"
+checksum = "920602543f0911ab71da12c50d59701da54c196d1a2bf5cb4b75667f137a406a"
 dependencies = [
  "indexmap",
  "serde_core",
@@ -6757,7 +6748,7 @@ checksum = "47402523226a02bfe5230160dc3ccc089aa6f6f19e7fcbb4e6f824bbb1b4aa62"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.3",
+ "syn 3.0.5",
 ]
 
 [[package]]

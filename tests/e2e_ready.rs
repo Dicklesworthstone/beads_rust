@@ -425,7 +425,11 @@ fn ready_respects_external_dependencies() {
     let external_config_path = external.root.join(".beads/config.yaml");
     fs::write(&external_config_path, "issue_prefix: bd\n").expect("write ext config");
 
-    let issue = run_br(&workspace, ["create", "Main issue"], "create_main_issue");
+    let issue = run_br(
+        &workspace,
+        ["create", "Main issue", "--priority", "0"],
+        "create_main_issue",
+    );
     assert!(issue.status.success(), "create failed: {}", issue.stderr);
     let issue_id = parse_created_id(&issue.stdout);
 
@@ -451,6 +455,26 @@ fn ready_respects_external_dependencies() {
     assert!(
         !ready_json.iter().any(|item| item["id"] == issue_id),
         "issue should be blocked by external dependency"
+    );
+
+    let unblocked = run_br(
+        &workspace,
+        ["create", "Independent work", "--priority", "2"],
+        "create_unblocked_issue",
+    );
+    assert!(unblocked.status.success(), "{}", unblocked.stderr);
+    let unblocked_id = parse_created_id(&unblocked.stdout);
+    let limited = run_br(
+        &workspace,
+        ["ready", "--sort", "priority", "--limit", "1", "--json"],
+        "ready_limited_external_blocker",
+    );
+    assert!(limited.status.success(), "{}", limited.stderr);
+    let limited_issues = extract_issues_array(&limited.stdout);
+    assert_eq!(limited_issues.len(), 1);
+    assert_eq!(
+        limited_issues[0]["id"], unblocked_id,
+        "filter the higher-priority external blocker before applying the limit"
     );
 
     let blocked_before = run_br(&workspace, ["blocked", "--json"], "blocked_before");
@@ -837,17 +861,31 @@ fn ready_cli_respects_limit() {
     let _log = common::test_log("ready_cli_respects_limit");
     let (workspace, _ids) = setup_workspace_with_issues();
 
-    let result = run_br(
-        &workspace,
-        ["ready", "--limit", "2", "--json"],
-        "ready_limit",
-    );
-    assert!(result.status.success(), "ready failed: {}", result.stderr);
+    for sort in ["hybrid", "priority", "oldest"] {
+        let all = run_br(
+            &workspace,
+            ["ready", "--sort", sort, "--limit", "0", "--json"],
+            &format!("ready_unlimited_{sort}"),
+        );
+        assert!(all.status.success(), "{}", all.stderr);
+        let all_issues = extract_issues_array(&all.stdout);
+        assert_eq!(all_issues.len(), 5);
 
-    let payload = extract_json_payload(&result.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("valid json");
-
-    assert_eq!(issues.len(), 2);
+        // Cover a full high-priority bucket, crossing into the lower bucket,
+        // and limits that cover the entire result. Compare every output field,
+        // including hydrated labels, rather than just the number of rows.
+        for limit in [1_usize, 2, 3, 5, 10] {
+            let limit_arg = limit.to_string();
+            let result = run_br(
+                &workspace,
+                ["ready", "--sort", sort, "--limit", &limit_arg, "--json"],
+                &format!("ready_{sort}_limit_{limit}"),
+            );
+            assert!(result.status.success(), "ready failed: {}", result.stderr);
+            let issues = extract_issues_array(&result.stdout);
+            assert_eq!(issues, all_issues[..limit.min(all_issues.len())]);
+        }
+    }
 }
 
 #[test]

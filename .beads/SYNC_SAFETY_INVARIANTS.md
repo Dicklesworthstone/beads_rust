@@ -42,9 +42,10 @@ These are explicit design exclusions. br sync is intentionally less invasive tha
 |----|------|-----------|---------------|
 | AW-1 | HIGH | Export uses temp file → rename pattern (never in-place modification) | Code inspection + unit test for temp file existence |
 | AW-2 | HIGH | Temp file is flushed and synced before rename | Code inspection: verify `flush()` and `sync_all()` calls |
-| AW-3 | MEDIUM | On any error during export, temp file is cleaned up | Unit test: inject error, verify no temp file remains |
+| AW-3 | MEDIUM | Clean up only verified owned temp generations; retain staged files and remaining probes when conditional publication fails or namespace ownership is uncertain | Unit tests: exact-identity cleanup and retained recovery/probe files on refusal |
 | AW-4 | CRITICAL | Partial writes never corrupt the target JSONL | Unit test: crash simulation, verify original file intact |
 | AW-5 | CRITICAL | Missing-database recovery installs a pre-locked candidate with an atomic no-replace operation, and database authority compares stable OS file IDs (Unix device/inode; Windows volume serial/file index), never timestamps | Unit tests: an existing destination remains byte-identical; a Windows replacement with equal creation time is rejected |
+| AW-6 | CRITICAL | Before exchanging an existing JSONL generation, verify exchange semantics on disposable siblings through the pinned parent; lying success must fail before output replacement. Explicit unsupported errors admit the existing checked fallback only after unchanged probe identities are verified | Real-filesystem exchange/refusal tests, parent-route substitution tests, and native/bind-mount runtime canaries |
 
 ### 2.3 Data Loss Prevention Invariants
 
@@ -224,7 +225,7 @@ The following dangerous operations require explicit user intent:
 | ID | Category | Invariant |
 |----|----------|-----------|
 | PC-4 | Path Confinement | Temp files in same directory as target |
-| AW-3 | Atomic Write | Cleanup temp files on error |
+| AW-3 | Atomic Write | Exact-identity cleanup; retain uncertain generations and failed probes |
 | DL-5 | Data Loss | Log warnings for data-affecting ops |
 | IV-2 | Input Validation | Validate JSON schema |
 | IV-4 | Input Validation | 4-phase collision detection |
