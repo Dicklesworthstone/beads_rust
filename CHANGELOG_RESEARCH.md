@@ -55,7 +55,28 @@ under `/tmp/br-1khz0-reprobe-evidence/.tmpjurUqP`, with a controller manifest
 at `/tmp/br-1khz0-family-manifest.jsonl`. The separate central sidecar inventory
 omission is tracked as `beads_rust-c2klf`.
 
-Integration gates remain pending. No release artifact has been replaced and
+The release-mode Git-authority integration gate passed all 174 tests. The
+reconciliation target initially passed 188 tests and failed the source-repo
+path migration test. Its inspection handle remained alive across later CLI
+writes; releasing it after reading the owned issue records fixed the fixture
+without changing production locking. The complete reconciliation rerun passed
+all 189 tests (`beads_rust-0fk9j`, commit `0b241050`). Evidence:
+`/tmp/br-og86t-release-sync-gates.log` and
+`/tmp/br-og86t-release-sync-gates2.log`.
+Post-edit RCH all-target/all-feature check and Clippy with warnings denied
+also passed, as did formatting and whitespace checks. The fixture bead is
+closed; logs are `/tmp/br-0fk9j-{check,clippy}.log`.
+
+The following status-health target passed 169 tests but failed three fixture
+catalog tests: its cached binary embeds a removed RCH clean-overlay source
+directory, `/data/tmp/rch/br-q93wv-20260912/2c9af36118d80c04`. That missing
+directory was independently verified. Restoring the unchanged fixtures there
+resolved all three failures; all 120 copied files matched the source snapshot,
+and the fixture tree had no changes from the original build baseline. The
+rerun passed 172 status-health tests and 181 VCS tests with zero failures.
+Evidence: `/tmp/br-og86t-restored-fixtures.json` and
+`/tmp/br-og86t-release-sync-gates3.log`. Remaining integration targets and the
+full release suite remain pending. No release artifact has been replaced and
 the JSONL exchange bead remains open.
 
 ## 2026-09-12 — unreleased shared-mount migration guard
