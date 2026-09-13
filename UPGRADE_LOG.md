@@ -49,6 +49,13 @@
   receipts remain on ts2 under `/tmp/br-otrgz-real-family-041/migrated/`;
   RCH log: `/tmp/br-otrgz-041-migration.log`. Concurrency success alone does
   not resolve this separate release gate.
+- A traced rerun shows no failed lock acquisitions: namespace, database and
+  SHM read locks all succeed before the immediate refusal. The source has a
+  32-byte WAL header with no frames and a 32,768-byte SHM file. This narrows
+  the next investigation to read-only empty-WAL admission, including the
+  unpublished `683a241b` lease changes; it does not prove that commit fixes
+  this family. Retained trace log: `/tmp/br-otrgz-041-migration-traced.log`;
+  worker syscall traces: `/tmp/br-otrgz-041-migration-trace.*`.
 
 ## In progress: 2026-09-11 (beads_rust-4e2n1)
 
