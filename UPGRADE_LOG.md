@@ -43,6 +43,12 @@
   qualify migration and 60/90-second real-family stress; complete compiler,
   Clippy, formatting and remaining release tests. Prior 0.4.0 results do not
   qualify 0.4.1. No new release has been published.
+- The retained real schema-17 family still fails `doctor migrate-schema plan`
+  with `DATABASE_ERROR` / `BusyRecovery` on the isolated 0.4.1 binary (exit 2).
+  No migration or stress workload ran. The fresh failed copy and command
+  receipts remain on ts2 under `/tmp/br-otrgz-real-family-041/migrated/`;
+  RCH log: `/tmp/br-otrgz-041-migration.log`. Concurrency success alone does
+  not resolve this separate release gate.
 
 ## In progress: 2026-09-11 (beads_rust-4e2n1)
 
