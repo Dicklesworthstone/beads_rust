@@ -2575,6 +2575,11 @@ fn perform_conditional_namespace_change(
             RenameFlags::EXCHANGE,
         )
     })? {
+        tracing::warn!(
+            output_path = %output_name.display_path().display(),
+            "filesystem rejects exchange; publishing with a witness-checked plain rename \
+             under held authority (non-atomic against foreign writers; recorded in receipt)"
+        );
         return replace_jsonl_under_authority(staged_name, output_name, expected_previous_state);
     }
 
@@ -19727,8 +19732,9 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     #[test]
-    fn jsonl_exchange_preflight_refuses_lying_success_and_preserves_output_and_stage() {
-        for ordinary_rename in [false, true] {
+    fn jsonl_exchange_preflight_refuses_broken_exchange_and_preserves_output_and_stage() {
+        for (ordinary_rename, reported_unsupported) in [(false, false), (true, false), (true, true)]
+        {
             let temp = TempDir::new().unwrap();
             let output = temp.path().join("issues.jsonl");
             let staged = export_temp_path(&output);
@@ -19746,7 +19752,10 @@ mod tests {
                         first.leaf(),
                         second.parent().as_file(),
                         second.leaf(),
-                    )
+                    )?;
+                }
+                if reported_unsupported {
+                    Err(rustix::io::Errno::INVAL)
                 } else {
                     Ok(())
                 }
@@ -19761,6 +19770,46 @@ mod tests {
             assert_eq!(stage_name.capture().unwrap().state_witness(), stage_before);
             assert!(export_temp_path_for_attempt(&output, 2).is_file());
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn jsonl_exchange_preflight_route_replacement_keeps_probes_under_pinned_parent() {
+        use rustix::fs::{RenameFlags, renameat_with};
+
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("live");
+        let retained = temp.path().join("retained");
+        fs::create_dir(&parent).unwrap();
+        let output = parent.join("issues.jsonl");
+        fs::write(&output, b"original").unwrap();
+        let authority = blocking_jsonl_family_write_lock_with_timeout(&output, None).unwrap();
+        let name = authority.pinned_name_for_target(&output).unwrap();
+        let error = verify_jsonl_exchange_support(&name, |first, second| {
+            fs::rename(&parent, &retained).unwrap();
+            fs::create_dir(&parent).unwrap();
+            fs::write(&output, b"foreign").unwrap();
+            renameat_with(
+                first.parent().as_file(),
+                first.leaf(),
+                second.parent().as_file(),
+                second.leaf(),
+                RenameFlags::EXCHANGE,
+            )
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("filesystem exchange preflight failed")
+        );
+        assert_eq!(fs::read(&output).unwrap(), b"foreign");
+        assert_eq!(
+            fs::read(retained.join("issues.jsonl")).unwrap(),
+            b"original"
+        );
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 1);
+        assert!(export_temp_path(&retained.join("issues.jsonl")).is_file());
     }
 
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]

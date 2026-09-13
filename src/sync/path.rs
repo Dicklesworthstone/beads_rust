@@ -1804,8 +1804,8 @@ impl PinnedJsonlName {
     /// `expected`.
     ///
     /// This is deliberately narrower than a general cleanup primitive. It is
-    /// used only after a successful atomic exchange has moved a verified
-    /// displaced JSONL generation to an allocator-owned staging leaf.
+    /// used for verified disposable publication probes and after an atomic
+    /// exchange has moved a verified displaced generation to a staging leaf.
     pub(crate) fn remove_regular_if_identity(&self, expected: JsonlFileIdentity) -> Result<()> {
         use rustix::fs::{AtFlags, unlinkat};
 
