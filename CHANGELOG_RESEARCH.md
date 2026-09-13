@@ -1,5 +1,63 @@
 # Changelog research — 2026-09-08
 
+## 2026-09-12 — unreleased JSONL exchange guard (qualification in progress)
+
+`beads_rust-og86t` addresses the separate export failure reproduced in
+`/tmp/br-q93wv-sync-observation.jsonl`. The implementation in `src/sync/mod.rs`
+probes disposable siblings through the retained parent capability before
+exchanging an existing export. It rejects lying success and mutating errors;
+explicit unsupported errors permit the existing fallback only after both
+probe identities are verified unchanged. Failed probes and the staged export
+are retained. No path allowlist or live-generation witness was loosened.
+
+The initial implementation was committed as `e97ce12c` by a concurrent session
+before this qualification finished. Current source includes the concurrent
+FrankenSQLite 0.4.0 / Asupersync 0.5.0 dependency update and Git-pinned FastMCP.
+RCH all-target/all-feature check and Clippy with warnings denied passed on
+those dependencies; formatting passed. A remote snapshot comparison matched
+all 4,169 tracked files at capture. The earlier 544-test sync pass used
+FrankenSQLite 0.3.18 and is preliminary evidence only. The current-dependency
+sync unit run subsequently passed 544 tests with zero failures and one
+intentionally ignored scale-timing probe, including all three new probe
+regressions and the sync source/direct-runtime dependency safety tests.
+Evidence: `/tmp/br-og86t-current-{check,clippy,sync-unit}.log`.
+
+The current ARM64 GNU binary was built through RCH and its worker/Mac SHA-256
+matched: `bbf965f78331e6ab6be291b029e54e519099c7e3e5cc4785e80b70f90ae7964d`.
+On native aarch64 Docker, replacing a nonempty export passed on a native Linux
+volume and cleaned the probes. The writable macOS bind-mount run refused
+before publication, preserving the old export's SHA-256, inode, device and
+size, retaining the staged update, and preserving the database update.
+Evidence: `/tmp/br-og86t-{native,bind}-runtime.jsonl`; assertion harness:
+`/tmp/br-og86t-export-canary.py`.
+
+The release-mode all-feature library run passed 3,144 tests with nine existing
+ignored probes/tests. The binary suite passed 66 tests and failed
+`fast_open_import_reprobe_reopens_the_canonical_database_inode` with
+`Database(BusyRecovery)`; the failure also reproduced in isolation. This is
+tracked as `beads_rust-1khz0`, not hidden by the successful sync checks. The
+resolved all-feature normal dependency tree had no forbidden Git authority
+packages (RCH `exec --job`; ordinary `exec` rejected this non-compilation
+command).
+
+Follow-up, 2026-09-13: the startup fixture constructed its replacement at the
+still-open canonical path; the old reader's opener lease prevented the new
+family from checkpointing there. Moving the omitted migration-state sidecar
+alone did not fix it. Independently staging and closing the replacement,
+then publishing the complete family, passed while retaining the old handle.
+The corrected test also asserts that the canonical inode changes and the
+displaced original inode remains available. All 67 release-mode binary tests
+then passed. Final all-target/all-feature check and Clippy passed after
+removing temporary diagnostic code; no production startup code was changed.
+Evidence: `/tmp/br-1khz0-release-bin.log`, `/tmp/br-og86t-final-check.log`,
+`/tmp/br-og86t-final-clippy2.log`. The original failed family survives on ts2
+under `/tmp/br-1khz0-reprobe-evidence/.tmpjurUqP`, with a controller manifest
+at `/tmp/br-1khz0-family-manifest.jsonl`. The separate central sidecar inventory
+omission is tracked as `beads_rust-c2klf`.
+
+Integration gates remain pending. No release artifact has been replaced and
+the JSONL exchange bead remains open.
+
 ## 2026-09-12 — unreleased shared-mount migration guard
 
 Narrow follow-up scope: `beads_rust-q93wv`, after v0.6.0. Git history through

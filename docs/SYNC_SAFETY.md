@@ -450,6 +450,26 @@ This incident motivated every design decision in `br`'s safety model.
 | **Checked publication and transactions** | JSONL/base/manifest publication uses checked temporary replacement; database mutations use transactions and operation-specific rollback | Prevents partial publication and partial database mutation |
 | **Safety guards** | Empty DB and stale DB guards require `--force` to override | Makes destructive operations explicit and intentional |
 
+### Shared filesystems and JSONL exchange
+
+Before replacing an existing JSONL generation on Linux or macOS, publication
+tests exchange-rename behavior on two disposable files created through the
+already-retained parent directory handle. Some shared mounts, including the
+observed Docker Desktop macOS bind mount, report a successful exchange while
+performing an ordinary replacement. That behavior now causes an early refusal:
+the output and staged candidate remain unchanged, and remaining probes are
+retained beside the output using the existing temporary-file naming scheme.
+Use the native host filesystem or a native Linux volume for publication on
+affected installations.
+
+A filesystem that explicitly rejects exchange still uses the existing
+witness-checked plain-rename fallback under held write authority, recorded as
+`replace-under-authority` in the publication receipt. Probe identities must
+remain unchanged before that fallback is admitted. Successful exchange probes
+do not replace the live-generation witnesses, retained-parent checks, or
+durability checks. Probes are cleaned up only through their pinned names after
+exact identity verification; a substituted parent route cannot redirect them.
+
 ### How Tests Enforce Safety
 
 The safety model is backed by an extensive test suite that ensures these guarantees cannot regress:

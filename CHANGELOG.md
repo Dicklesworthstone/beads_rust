@@ -85,6 +85,15 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ## Unreleased
 
+- **Preserve the current JSONL export on broken exchange filesystems.**
+  Before replacing an existing export, `sync` checks that disposable sibling
+  files really exchange identities through the pinned parent directory. A
+  shared mount that reports success while replacing one file now triggers a
+  refusal before the published export changes; the staged export and failed
+  probes remain available. Explicitly unsupported exchange calls retain the
+  existing witness-checked fallback and its `replace-under-authority` receipt.
+  See [sync safety](docs/SYNC_SAFETY.md) and workstream `beads_rust-og86t`.
+
 - **Refuse unsafe schema migration exchanges on shared filesystems.**
   `doctor migrate-schema apply` (including recovery) and non-dry-run `undo`
   verify exchange-rename behavior on locked temporary files before replacing
