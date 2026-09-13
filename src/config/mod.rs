@@ -1179,7 +1179,7 @@ pub(crate) fn quarantine_truncated_wal_sidecar(db_path: &Path, beads_dir: &Path)
 
 /// Engine sidecar suffixes that only mean something next to a database file
 /// (`docs/reliability/ENGINE_OPERATING_MODEL.md` §4).
-const DATABASE_SIDECAR_SUFFIXES: [&str; 7] = [
+const DATABASE_SIDECAR_SUFFIXES: [&str; 8] = [
     "-wal",
     "-shm",
     "-journal",
@@ -1187,6 +1187,7 @@ const DATABASE_SIDECAR_SUFFIXES: [&str; 7] = [
     "-wal-cert-head",
     "-fsqlite-ns-gate",
     "-fsqlite-ns-use",
+    ".fsqlite-migration-state",
 ];
 
 /// beads_rust-avhq: quarantine engine sidecars left behind when the database
@@ -3032,12 +3033,9 @@ pub(crate) const FSQLITE_NAMESPACE_SIDECAR_SUFFIXES: &[&str] =
 /// next to the classic `-wal` file.
 pub(crate) const FSQLITE_WAL_CERT_SIDECAR_SUFFIXES: &[&str] = &["-wal-cert", "-wal-cert-head"];
 
-/// The classic SQLite sidecars.
-pub(crate) const CLASSIC_SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm", "-journal"];
-
 /// The engine-managed sidecar suffixes produced by br's fsqlite
 /// configuration — the classic `-wal`/`-shm`/`-journal` set plus the
-/// namespace-admission and WAL-durability-certificate sidecars.
+/// namespace-admission, WAL-durability-certificate and migration-state sidecars.
 ///
 /// This is deliberately scoped to the sidecars br can actually create: it
 /// does not enumerate fsqlite suffixes gated behind features br never
@@ -3046,10 +3044,7 @@ pub(crate) const CLASSIC_SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm", "-journal
 /// of those features, add its suffix here and to the coverage tests so the
 /// temp-file reaper (#299) keeps up.
 pub(crate) fn db_sidecar_suffixes() -> impl Iterator<Item = &'static &'static str> {
-    CLASSIC_SIDECAR_SUFFIXES
-        .iter()
-        .chain(FSQLITE_NAMESPACE_SIDECAR_SUFFIXES.iter())
-        .chain(FSQLITE_WAL_CERT_SIDECAR_SUFFIXES.iter())
+    DATABASE_SIDECAR_SUFFIXES.iter()
 }
 
 /// Compact a database at `db_path` by writing a fresh copy via `VACUUM
@@ -10931,8 +10926,10 @@ routing:
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
         let sidecar_path = PathBuf::from(format!("{}-wal-cert", db_path.display()));
+        let marker_path = PathBuf::from(format!("{}.fsqlite-migration-state", db_path.display()));
         fs::create_dir_all(&beads_dir).expect("create beads dir");
         fs::write(&sidecar_path, b"orphaned sidecar").expect("write orphaned sidecar");
+        fs::write(&marker_path, b"original migration marker").expect("write migration marker");
         let authority = crate::sync::blocking_database_family_write_lock_with_timeout(
             &beads_dir,
             &db_path,
@@ -10945,7 +10942,14 @@ routing:
             &beads_dir,
             &authority,
             SuccessfulRecoveryDisposition::FinalizeImmediately,
-            |_| -> Result<()> { Err(BeadsError::Config("forced rebuild failure".to_string())) },
+            |_| -> Result<()> {
+                assert!(
+                    !marker_path.exists(),
+                    "old marker must leave the fresh family"
+                );
+                fs::write(&marker_path, b"failed replacement marker")?;
+                Err(BeadsError::Config("forced rebuild failure".to_string()))
+            },
         )
         .expect_err("forced rebuild must fail");
 
@@ -10954,6 +10958,10 @@ routing:
         assert_eq!(
             fs::read(sidecar_path).expect("read restored sidecar"),
             b"orphaned sidecar"
+        );
+        assert_eq!(
+            fs::read(marker_path).expect("read restored migration marker"),
+            b"original migration marker"
         );
         authority
             .verify_database_authority()
@@ -11711,6 +11719,28 @@ routing:
     }
 
     #[test]
+    #[cfg(unix)]
+    fn database_snapshot_refuses_symlinked_migration_marker() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let marker_path = temp.path().join("beads.db.fsqlite-migration-state");
+        let external_path = temp.path().join("external-marker");
+        fs::write(&db_path, b"database sentinel").expect("write database sentinel");
+        fs::write(&external_path, b"external marker").expect("write external marker");
+        std::os::unix::fs::symlink(&external_path, &marker_path).expect("symlink marker");
+
+        let error = with_database_family_snapshot(&db_path, |_| -> Result<()> {
+            panic!("snapshot callback must not observe a symlinked family")
+        })
+        .expect_err("symlinked migration marker must be refused");
+
+        assert!(error.to_string().contains("must not be a symlink"));
+        assert_eq!(fs::read(&db_path).unwrap(), b"database sentinel");
+        assert_eq!(fs::read(&external_path).unwrap(), b"external marker");
+        assert_eq!(fs::read_link(marker_path).unwrap(), external_path);
+    }
+
+    #[test]
     fn database_snapshot_keeps_live_sidecars_absent() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
@@ -11731,7 +11761,17 @@ routing:
         let _ = fs::remove_file(&shm_path);
         let _ = fs::remove_file(&journal_path);
 
+        let marker_path = PathBuf::from(format!("{}.fsqlite-migration-state", db_path.display()));
+        let marker_before = fs::read(&marker_path).expect("read engine migration marker");
         let prefix = with_database_family_snapshot(&db_path, |snapshot_db_path| {
+            let snapshot_marker = PathBuf::from(format!(
+                "{}.fsqlite-migration-state",
+                snapshot_db_path.display()
+            ));
+            assert_eq!(
+                fs::read(snapshot_marker).expect("snapshot must carry the migration marker"),
+                marker_before
+            );
             let conn = crate::franken_sync::Connection::open(
                 snapshot_db_path.to_string_lossy().into_owned(),
             )?;
@@ -11744,6 +11784,10 @@ routing:
         .expect("read snapshot");
 
         assert_eq!(prefix.as_deref(), Some("bd"));
+        assert_eq!(
+            fs::read(marker_path).expect("read live migration marker after snapshot"),
+            marker_before
+        );
         assert!(
             !wal_path.exists() && !shm_path.exists() && !journal_path.exists(),
             "snapshot reads must not create live sidecar files"
@@ -12207,10 +12251,11 @@ routing:
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
         fs::create_dir_all(&beads_dir).expect("create beads dir");
-        let planted: [(&str, &[u8]); 3] = [
+        let planted: [(&str, &[u8]); 4] = [
             ("-wal-cert", b"stale certificate"),
             ("-fsqlite-ns-gate", b"stale namespace gate"),
             ("-wal", b"stale frames"),
+            (".fsqlite-migration-state", b"stale migration marker"),
         ];
         for (suffix, bytes) in planted {
             fs::write(format!("{}{suffix}", db_path.to_string_lossy()), bytes)

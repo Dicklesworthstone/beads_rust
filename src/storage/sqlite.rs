@@ -16599,9 +16599,6 @@ fn remove_temp_db_files(path: &Path) {
         for &suffix in crate::config::db_sidecar_suffixes() {
             targets.push(path.with_file_name(format!("{name}{suffix}")));
         }
-        // The migration-state sidecar is `.`-separated and is not part of
-        // `db_sidecar_suffixes()`, so append it explicitly.
-        targets.push(path.with_file_name(format!("{name}.fsqlite-migration-state")));
     }
     for target in targets {
         match std::fs::remove_file(&target) {

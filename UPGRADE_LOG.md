@@ -1,5 +1,49 @@
 # Dependency Upgrade Log
 
+## In progress: 2026-09-13 (beads_rust-otrgz)
+
+- Investigate the published FrankenSQLite 0.4.1 patch against 0.4.0.
+  The 0.4.0 release concurrency gate completed only nine operations in its
+  30-second, eight-process workload (minimum 100); an isolated rerun completed
+  18. Both failed. The planted-success-without-writing negative control also
+  failed during setup. These failures block engine qualification.
+- A retained syscall trace shows two read-only CLI opens holding shared database
+  locks while competing for exclusive maintenance: one owns RESERVED/PENDING
+  and waits for the shared range, while the other retains a shared lock and
+  waits for RESERVED. Disabling the read-only fast-open path did not make the
+  original gate pass. Evidence is retained under `/tmp/br-otrgz-strace/` and
+  `/tmp/br-og86t-linearizability-failed/`; no timeout or throughput assertion
+  was weakened.
+- Published 0.4.1 records source revision
+  `a8b76fb810ff0e26bb49c81add43c7709e1e7302`. Its parent
+  [4f073081](https://github.com/Dicklesworthstone/frankensqlite/commit/4f0730819d6bfdc7aca813a51b8e3ea88a365395)
+  lets a read-only constructor adopt an already validated WAL without exclusive
+  maintenance. The later
+  [683a241b](https://github.com/Dicklesworthstone/frankensqlite/commit/683a241bc3830a500bfcb8f9e5380e57fdebcf9c)
+  changes another read-only WAL binding path and is **not** in 0.4.1. The exact
+  retained concurrency gate must establish whether the published patch suffices.
+- Registry inspection found 0.4.1 releases only for `fsqlite`, `fsqlite-core`
+  and `fsqlite-pager`; the other twelve direct engine crates remain at 0.4.0.
+  A synchronized 0.4.1 manifest fails resolution. The main checkout retains
+  its original manifest and lockfile. An isolated release checkout tests the
+  published combination for diagnosis; it is not an approved dependency update.
+- Experimental lockfile resolution changed only those three crates and their
+  checksums. Core/pager archive hashes match the registry lockfile. The original
+  eight-process, 30-second gate passed through RCH with default settings:
+  **305 operations, zero failed calls**, 28 issues checked against the model and
+  published JSONL. Receipt: `/tmp/br-otrgz-published-041-concurrency.log`,
+  overlay `443c04c8dcece30a7752580dbc4ae76ac7247f3a0f4231f5614492d190981b4a`.
+- The complete concurrency target also passed: **25 tests, zero failures**,
+  including the planted-liar negative control; its workload completed 304
+  operations with zero failed calls. Evidence:
+  `/tmp/br-otrgz-published-041-full-concurrency.log`. Retained candidate binary
+  on ts2: `/tmp/br-otrgz-published-041-br`, SHA-256
+  `baaba3a90b9e38062655ea08ebae14d58dc92ef5841900415057486b7952593f`.
+- Pending: run storage/model gates;
+  qualify migration and 60/90-second real-family stress; complete compiler,
+  Clippy, formatting and remaining release tests. Prior 0.4.0 results do not
+  qualify 0.4.1. No new release has been published.
+
 ## In progress: 2026-09-11 (beads_rust-4e2n1)
 
 **Release outcome (2026-09-12):** v0.6.0 is published on GitHub and crates.io;

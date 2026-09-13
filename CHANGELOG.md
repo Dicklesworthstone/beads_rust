@@ -85,6 +85,10 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ## Unreleased
 
+- **Preserve engine migration state during database recovery.** Snapshots,
+  recovery backups, failed-rebuild restoration and orphan quarantine now carry
+  `.fsqlite-migration-state` with its database family.
+
 - **Preserve the current JSONL export on broken exchange filesystems.**
   Before replacing an existing export, `sync` checks that disposable sibling
   files really exchange identities through the pinned parent directory. A

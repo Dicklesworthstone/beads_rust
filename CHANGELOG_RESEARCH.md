@@ -1,5 +1,38 @@
 # Changelog research — 2026-09-08
 
+## 2026-09-13 — migration marker and concurrency qualification
+
+`beads_rust-c2klf` adds `.fsqlite-migration-state` to the central config
+database-family inventory. Doctor and temporary-database cleanup already had
+explicit handling; config snapshot, recovery and orphan paths omitted it.
+Cleanup now uses the central inventory without its duplicate append. Tests
+cover marker bytes in snapshots, original-marker restoration after a failed
+replacement, orphan quarantine, symlink refusal and existing complete cleanup.
+Through RCH on the original 0.4.0 dependency set, all six targeted release-mode
+tests passed, followed by all 209 configuration tests with no failures or
+ignores. Source and manifest/lockfile hashes matched the controller checkout.
+Evidence: `/tmp/br-c2klf-{targeted-tests,config-tests}.log`, overlay
+`a83f7b923259ec94614d42e1d5d7ca19fdce7920c915c34e81832fe464f713f2`.
+All-target/all-feature compiler and Clippy checks passed through RCH with
+warnings denied; formatting and diff checks passed. Evidence:
+`/tmp/br-c2klf-{check,clippy}.log`. This is unreleased work.
+
+`beads_rust-otrgz` records a separate real concurrency failure on FrankenSQLite
+0.4.0: nine operations in the eight-process/30-second gate and 18 in isolation,
+both below its unchanged minimum of 100. Syscall traces retained under
+`/tmp/br-otrgz-strace/` show a shared-to-exclusive maintenance lock cycle during
+read-only opens. Published 0.4.1 fixes constructor WAL adoption. An isolated
+candidate passed the original gate with 305 operations and no failed calls;
+the full target then passed all 25 tests, including its planted-liar negative
+control, with 304 operations and no failed calls. Evidence:
+`/tmp/br-otrgz-published-041-{concurrency,full-concurrency}.log`.
+
+Only `fsqlite`, `fsqlite-core` and `fsqlite-pager` have published 0.4.1 packages;
+the remaining engine packages are 0.4.0. Main retains its original dependency
+pins. This mixed-version experiment is not a completed engine upgrade or
+release qualification. See `UPGRADE_LOG.md` for upstream commits and remaining
+gates. No new release or replacement of v0.6.0 assets is claimed.
+
 ## 2026-09-12 — unreleased JSONL exchange guard (qualification in progress)
 
 `beads_rust-og86t` addresses the separate export failure reproduced in
