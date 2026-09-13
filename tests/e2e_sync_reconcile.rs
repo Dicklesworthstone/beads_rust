@@ -590,6 +590,7 @@ fn source_repo_path_migration_reconciles_and_is_idempotent() {
         .get_issue("br-pathnew1")
         .expect("read source-only")
         .expect("source-only exists");
+    drop(storage);
     for issue in [&database_newer, &source_newer, &imported] {
         assert_eq!(
             issue.source_repo_path.as_deref(),
@@ -702,7 +703,8 @@ fn source_repo_path_migration_reconciles_and_is_idempotent() {
     );
     assert!(
         drift.status.success(),
-        "drift update failed: {}",
+        "drift update failed: stdout={} stderr={}",
+        drift.stdout,
         drift.stderr
     );
     let stale_apply = run_br(
