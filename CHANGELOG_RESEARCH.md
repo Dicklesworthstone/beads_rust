@@ -79,6 +79,21 @@ Evidence: `/tmp/br-og86t-restored-fixtures.json` and
 full release suite remain pending. No release artifact has been replaced and
 the JSONL exchange bead remains open.
 
+The remaining sync targets subsequently passed: artifacts 173, failure
+injection 183, fuzz/edge cases 175, needs-flush guard 166, and preflight 174.
+The failure-injection target initially failed its post-export crash probe
+because the fixture kept the direct exporter open while invoking the CLI.
+Moving its existing `drop(storage)` before the probe models the exited
+exporter; dirty-state and recovery assertions remain unchanged and pass.
+This does not establish a new live-peer concurrency guarantee. Evidence:
+`/tmp/br-og86t-release-sync-remaining.log` (initial failure) and
+`/tmp/br-og86t-release-sync-remaining2.log` (passing rerun). The nine sync/VCS
+integration targets total 1,587 passing cases, including shared harness tests
+compiled into multiple targets. Broader release-suite qualification is still
+pending. Post-edit all-target/all-feature check and Clippy with warnings
+denied passed through RCH; formatting and whitespace checks passed too.
+Compiler evidence: `/tmp/br-og86t-crash-fixture-{check,clippy}.log`.
+
 ## 2026-09-12 — unreleased shared-mount migration guard
 
 Narrow follow-up scope: `beads_rust-q93wv`, after v0.6.0. Git history through

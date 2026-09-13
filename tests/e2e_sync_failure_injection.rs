@@ -1115,12 +1115,12 @@ fn cli_sync_crash_boundary_matrix_preserves_artifacts() {
     let direct_export = export_to_jsonl(&storage, &jsonl_path, &config)
         .expect("direct export simulates post-rename crash point");
     artifacts.log("direct_export_hash", &direct_export.content_hash);
+    drop(storage);
     let dirty_after_direct_export = sync_status_json(&workspace, "sync_matrix_after_direct_export");
     assert_dirty_status(
         &dirty_after_direct_export,
         "after rename before dirty-clear simulation",
     );
-    drop(storage);
     flush_and_assert_clean(&workspace, "sync_matrix_clear_dirty_after_direct_export");
 
     let recovered_jsonl = fs::read_to_string(&jsonl_path).expect("read recovered jsonl");
