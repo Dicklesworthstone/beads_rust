@@ -31,6 +31,48 @@
   admission reports `SharedHeaderInvalid` before reaching the new empty-WAL
   slot logic. The remaining problem needs explicit engine recovery under the
   correct database-family authority; no sidecars or validation were bypassed.
+- A direct probe using main's unchanged 0.4.0 pins now proves that the engine's
+  existing writable recovery can admit this legacy family. On a fresh complete
+  copy, the initial read-only open returned `BusyRecovery`; a writable
+  existing-only open changed only `beads.db-shm`, reported integrity `ok`, and
+  found schema 17 with all 1,086 issues. The following read-only open changed no
+  bytes, and normal migration planning became eligible. The original snapshot's
+  hashes, inodes, modification times and change times remained identical.
+  Worker evidence: `/tmp/br-otrgz-recovery-probe-5l1y5div/receipt.json` and
+  per-step outputs; controller log: `/tmp/br-otrgz-recovery-probe-run.log`.
+  Probe SHA-256:
+  `8914cce67f40348a1865aaa3d158a584e9dcd884ab95cfec1127fe2f334e9df1`.
+  RCH compilation succeeded; artifact delivery reported E327/exit 102 because
+  the Linux binaries are foreign to the Mac dispatcher. The diagnostic then
+  ran successfully on the Linux worker through an RCH job.
+- On another complete copy of that recovered family, the retained `683a241b`
+  candidate completed migration 17→19 and `ready`. Doctor reported zero error
+  findings: integrity, read-only observation, sidecars and DB/JSONL counts
+  passed. Its exit 1 records warnings, including retained historical recovery
+  artifacts; the helper therefore stopped after doctor rather than reporting
+  an entirely clean run. Family and full receipts remain at
+  `/tmp/br-otrgz-migrated-recovered-luevu8q_/`; log:
+  `/tmp/br-otrgz-migrate-recovered.log`. This proves recovery plus migration on
+  private copies, not an implemented live recovery command in br.
+- Both required retained-family stress gates now pass on that experimental
+  candidate through RCH. Eight workers × 60 seconds produced 194 acknowledged
+  commands and 37 nonzero outcomes, ending with 1,120 DB/JSONL records; eight
+  workers × 90 seconds produced 295 acknowledged commands and 58 nonzero
+  outcomes, ending with 1,143 records. Both retained clean integrity, zero bad
+  JSONL lines, zero doctor errors, zero new recovery artifacts, and zero
+  unexpected error signatures. The 60-second nonzero outcomes were 30 closed
+  claims, two already-assigned claims, and five protected note overwrites.
+  The 90-second outcomes were 53 closed claims and five protected note
+  overwrites; all 95 nonzero commands returned `VALIDATION_FAILED`/exit 4.
+  Logs: `/tmp/br-otrgz-recovered-stress60.log` and
+  `/tmp/br-otrgz-recovered-stress90.log`. Full command receipts and families are
+  retained on ts2 below
+  `/Users/Shared/dsr-sources/br-q93wv-20260912/.rch-tmp/` in
+  `br-stress-h6kN3F` and `br-stress-NIBKwd`, respectively.
+- Remaining: implement guarded live recovery (`beads_rust-otrgz.1`), complete
+  the candidate's remaining engine/suite gates, and resolve the published
+  engine-family and FastMCP dependency constraints before release. These
+  successful experiments do not qualify unchanged main's 0.4.0 engine.
 
 ## In progress: 2026-09-13 (beads_rust-otrgz)
 

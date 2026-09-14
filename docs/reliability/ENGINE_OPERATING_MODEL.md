@@ -1,6 +1,9 @@
 # Storage Engine Operating Model
 
-**Status:** reviewed 2026-09-08 (main and released br v0.5.11 pin fsqlite 0.3.18)
+**Status:** reviewed 2026-09-14. Released br v0.6.0 uses fsqlite 0.3.18;
+post-release main uses 0.4.0 and remains unqualified for release. The isolated
+0.4.1 experiments and outstanding gates are recorded in `UPGRADE_LOG.md`
+under `beads_rust-otrgz`.
 **Owner bead:** `beads_rust-dk45` (Track B of the 2026-09-01 bridge plan)
 
 This document is the record of how `br` relates to its storage engine, what
