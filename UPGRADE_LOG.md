@@ -1,5 +1,37 @@
 # Dependency Upgrade Log
 
+## In progress: 2026-09-14 (beads_rust-otrgz)
+
+- The registry still has no newer published engine patch. An isolated candidate
+  uses published 0.4.1 core/pager packages with exactly the four source files
+  changed by upstream `683a241bc3830a500bfcb8f9e5380e57fdebcf9c`. Git blob IDs
+  match the upstream patch, and all 474 staged dependency files match the
+  worker copy. The normalized published manifests are retained. Main's
+  `Cargo.toml` and `Cargo.lock` remain unchanged.
+- The private lockfile replaces only fsqlite/core/pager relative to main.
+  Core and pager use isolated path dependencies. Initial resolution attempts
+  preceded a complete transfer and failed; a complete copy and hash comparison
+  preceded successful resolution (`/tmp/br-otrgz-683-resolve3.log`).
+- RCH release/all-feature concurrency passed all 25 tests, with 297 operations
+  and zero failed calls in the eight-process workload. Binary SHA-256:
+  `565d196faf11a63be347b2930d3f30c0131c8ef86e2b4a98d9c0dadd9c887d12`;
+  retained on ts2 as `/tmp/br-otrgz-683-br`. Log:
+  `/tmp/br-otrgz-683-concurrency.log`. The br overlay fingerprint is
+  `3af58ea824e608cd2f8b09c174004fc2da9e7b6186279e258d7ee803056d454a`;
+  external path-dependency hashes are recorded separately in
+  `/tmp/br-otrgz-683-{source,worker}-hashes.json`.
+- The original real-family migration preflight still fails with `BusyRecovery`
+  (exit 2), so no migration or stress ran. Evidence:
+  `/tmp/br-otrgz-683-migration.log`; preserved worker copy:
+  `/tmp/br-otrgz-real-family-683/migrated/`. The unpublished follow-up does not
+  resolve this blocker. The candidate remains diagnostic, not a release bump.
+- The retained SHM header has `is_init=1`, page size zero, no frames/pages and
+  zero salts; the database and WAL use 4096-byte pages and WAL salts are nonzero.
+  `SharedWalIndexHeader::validate` rejects the zero page size. Pager reader
+  admission reports `SharedHeaderInvalid` before reaching the new empty-WAL
+  slot logic. The remaining problem needs explicit engine recovery under the
+  correct database-family authority; no sidecars or validation were bypassed.
+
 ## In progress: 2026-09-13 (beads_rust-otrgz)
 
 - Investigate the published FrankenSQLite 0.4.1 patch against 0.4.0.

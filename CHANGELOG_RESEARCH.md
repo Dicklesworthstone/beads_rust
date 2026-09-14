@@ -1,5 +1,31 @@
 # Changelog research — 2026-09-08
 
+## 2026-09-14 — routed-claim regression and engine follow-up
+
+`beads_rust-ls72r` is now reproduced: a routed claim exits 4 for an explicitly
+deferred external issue but changes the earlier local issue from `open` to
+`in_progress`. The incoming `bb51b8a4` change narrowed lifecycle preflight to
+closed issues. Restoring `SqliteStorage::validate_claim_target` during route
+preparation catches deferred status and future deferral dates before any route
+writes, while retaining the closed-claim refusal. Existing regression coverage
+checks both route orders, `--force`, exports, labels and audit events.
+Original runtime evidence: `/tmp/br-ls72r-claim-canary.log`. The full routing
+target passed 216 tests first on the isolated engine candidate, then 216 tests
+on the unchanged project dependency pins. The explicit-deferred runtime canary
+now exits 4 with both issues unchanged (`open`, `deferred`). Evidence:
+`/tmp/br-ls72r-pinned-routing-tests.log` and `/tmp/br-ls72r-fixed-canary.log`;
+pinned-source overlay:
+`baa3371c4d5db5224ff384e54a6e950a79f5effa365b31b5a274b75de4c6fb59`.
+All-target/all-feature compiler and Clippy checks passed through RCH with
+warnings denied (`/tmp/br-ls72r-final-checks.log`); formatting and diff checks
+passed. This is unreleased work.
+
+The isolated engine follow-up at upstream `683a241b` passes all 25 concurrency
+tests but still fails the retained real-family migration preflight. The SHM
+header has `is_init=1` and `sz_page=0`, which engine validation rejects before
+the new empty-WAL reader handling. Main dependency pins remain unchanged;
+see `UPGRADE_LOG.md` for source hashes, receipts and remaining qualification.
+
 ## 2026-09-13 — migration marker and concurrency qualification
 
 `beads_rust-c2klf` adds `.fsqlite-migration-state` to the central config

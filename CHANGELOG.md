@@ -85,6 +85,10 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ## Unreleased
 
+- **Refuse deferred claims before writing to any routed workspace.** A mixed
+  claim containing a deferred target no longer claims earlier valid issues
+  before returning an error. This also applies with `--force`.
+
 - **Preserve engine migration state during database recovery.** Snapshots,
   recovery backups, failed-rebuild restoration and orphan quarantine now carry
   `.fsqlite-migration-state` with its database family.
