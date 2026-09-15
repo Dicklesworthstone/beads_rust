@@ -1584,9 +1584,13 @@ impl DatabaseOpenerLease {
     /// preventing any checkpoint from overlooking this still-live opener.
     #[allow(clippy::incompatible_msrv)]
     pub fn try_exclusive(&mut self) -> Option<DatabaseOpenerExclusiveHold> {
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.shared.as_ref()?;
-        let transition = match open_lock_sidecar(&self.transition_path, "opener transition barrier") {
+        let transition = match open_lock_sidecar(&self.transition_path, "opener transition barrier")
+        {
             Ok(file) => file,
             Err(error) => {
                 tracing::warn!(%error, "Skipping checkpoint: transition barrier unavailable");
@@ -1597,7 +1601,10 @@ impl DatabaseOpenerLease {
             return None;
         }
         let file = state.shared.take().expect("checked shared registration");
-        state.exclusive = Some(OpenerExclusiveState { file, _transition: transition });
+        state.exclusive = Some(OpenerExclusiveState {
+            file,
+            _transition: transition,
+        });
         let exclusive = state.exclusive.as_ref().expect("installed transition");
         let admitted = exclusive.file.unlock().is_ok() && exclusive.file.try_lock().is_ok();
         if !admitted {
@@ -1606,7 +1613,10 @@ impl DatabaseOpenerLease {
             }
             return None;
         }
-        Some(DatabaseOpenerExclusiveHold { state: Arc::clone(&self.state), active: true })
+        Some(DatabaseOpenerExclusiveHold {
+            state: Arc::clone(&self.state),
+            active: true,
+        })
     }
 
     /// Return an exclusive hold obtained from [`Self::try_exclusive`] and
@@ -26427,5 +26437,132 @@ mod tests {
         writer
             .checkpoint_full()
             .expect("the sole opener checkpoints normally");
+    }
+
+    #[test]
+    fn opener_lease_timeout_refuses_registration_and_storage_open_then_recovers() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .set_metadata("lease_sentinel", "retained committed value")
+            .unwrap();
+        storage.checkpoint_full().unwrap();
+        drop(storage);
+        let family_bytes = || {
+            std::iter::once("")
+                .chain(config::db_sidecar_suffixes().copied())
+                .map(|suffix| {
+                    let mut path = db_path.as_os_str().to_os_string();
+                    path.push(suffix);
+                    let path = PathBuf::from(path);
+                    match fs::read(&path) {
+                        Ok(bytes) => Some((bytes, fs::metadata(path).unwrap().permissions())),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => panic!("snapshot failed: {error}"),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = family_bytes();
+        let mut holder = DatabaseOpenerLease::register(&db_path).unwrap();
+        let hold = holder.try_exclusive().expect("sole opener");
+        let registration_path = db_path.clone();
+        let registration = thread::spawn(move || {
+            let started = Instant::now();
+            let error = DatabaseOpenerLease::register(&registration_path).unwrap_err();
+            (error.to_string(), started.elapsed())
+        });
+        let open_path = db_path.clone();
+        let opener = thread::spawn(move || {
+            let started = Instant::now();
+            let error = SqliteStorage::open(&open_path).unwrap_err();
+            (error.to_string(), started.elapsed())
+        });
+        for (error, waited) in [registration.join().unwrap(), opener.join().unwrap()] {
+            assert!(error.contains("opener admission timed out"), "{error}");
+            assert!(waited >= Duration::from_millis(OPENER_LEASE_WAIT_MS));
+        }
+        assert_eq!(
+            family_bytes(),
+            before,
+            "refused newcomer must not open the engine"
+        );
+        drop(hold); // Accidental hold drop must restore, not discard, registration.
+        assert!(holder.is_registered());
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(
+            reopened.get_metadata("lease_sentinel").unwrap().as_deref(),
+            Some("retained committed value")
+        );
+    }
+
+    #[test]
+    fn opener_lease_simultaneous_live_peers_never_gain_exclusive_admission() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let first = DatabaseOpenerLease::register(&db_path).unwrap();
+        let second = DatabaseOpenerLease::register(&db_path).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles = [first, second].map(|mut lease| {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                for _ in 0..128 {
+                    barrier.wait();
+                    let hold = lease.try_exclusive();
+                    let admitted = hold.is_some();
+                    drop(hold);
+                    // Both peers remain alive until both attempts finish.
+                    barrier.wait();
+                    assert!(!admitted, "a live peer was overlooked during upgrade");
+                    assert!(lease.is_registered());
+                }
+                lease
+            })
+        });
+        let [first, second] = handles.map(|handle| handle.join().unwrap());
+        drop(second);
+        let mut first = first;
+        let hold = first
+            .try_exclusive()
+            .expect("sole opener after peer closes");
+        drop(hold);
+        assert!(first.is_registered());
+    }
+
+    #[test]
+    fn opener_lease_restoration_failure_retains_transition_protection() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut lease = DatabaseOpenerLease::register(&db_path).unwrap();
+        let hold = lease.try_exclusive().unwrap();
+        // An external lock user that does not implement our transition protocol
+        // can contend during restoration. Use real locks to exercise this error.
+        lease
+            .state
+            .lock()
+            .unwrap()
+            .exclusive
+            .as_ref()
+            .unwrap()
+            .file
+            .unlock()
+            .unwrap();
+        let external =
+            open_lock_sidecar(&database_opener_lease_path(&db_path).unwrap(), "test peer").unwrap();
+        external.try_lock().unwrap();
+        assert!(lease.release_exclusive(hold).is_err());
+        drop(external);
+        let mut peer = DatabaseOpenerLease::register(&db_path).unwrap();
+        assert!(
+            peer.try_exclusive().is_none(),
+            "failed restoration must still veto checkpoints"
+        );
+        drop(lease);
+        let hold = peer
+            .try_exclusive()
+            .expect("barrier released only at lease teardown");
+        peer.release_exclusive(hold).unwrap();
+        assert!(peer.is_registered());
     }
 }
