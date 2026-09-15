@@ -74,9 +74,28 @@
   copy path. Source review caught that copying creates owned, single-link
   files and could otherwise hide the live source's unsafe topology. Add a
   real hardlink refusal regression, then recheck the final implementation.
-- [ ] Investigate the remaining live-peer database-busy failure in
+- [x] Investigate the remaining live-peer database-busy failure in
   `e2e_sync_flush_only_succeeds_with_large_mixed_prefix_export_hash_rewrite`;
-  do not classify it as pre-existing without a focused comparison.
+  the unchanged case fails identically on `b41234d0`, before this work. All
+  1,156 tracked source/test/build-input hashes matched that revision. The
+  remote test returned 101 (one failed, 209 filtered, 6.90s); the outer SSH
+  session subsequently ended 255. Log: `/tmp/br-otrgz2-baseline-busy.log`.
+  The parent engine blocker remains open; no test expectation was relaxed.
+- [x] Complete the broad private-snapshot run: 4,462 target cases passed,
+  one pre-existing lifecycle case failed, and nine existing cases remained
+  ignored. Library: 3,156 passed. These are target counts including repeated
+  harness cases, on the pre-namespace-admission-finalization overlay above.
+- [ ] Fix initial opener registration's five-second fail-open and serialize
+  shared/exclusive transitions. A long recovery must not admit unregistered
+  newcomers; concurrent checkpoint attempts must retain peer protection.
+- [ ] Verify real timeout refusal, concurrent upgrades, protected restoration,
+  and successful opening after release. Keep the recovery bead open until
+  these safety conditions pass.
+- [ ] Close the separate doctor index-repair bypass (`otrgz.3`): hold the
+  corrected exclusive opener guard through checkpoint, REINDEX, close and
+  restore; prove peer refusal and later successful repair with WAL-only data.
+- [ ] Run sync structural/runtime safety checks for the lease changes, plus
+  compiler, denied-warning Clippy, focused recovery/doctor and storage tests.
 - [ ] Pass all-target/all-feature check and denied-warning Clippy, formatting,
   existing migration/recovery/pending-merge tests and unchanged replay tests.
 - [ ] Rerun the unchanged replay target and remaining release gates after
