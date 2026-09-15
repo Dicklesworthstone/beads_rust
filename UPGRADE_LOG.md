@@ -102,6 +102,12 @@
   shared opener registration plus non-checkpointing close for rollback-only
   write probes and partial REINDEX; sole-opener admission for WAL truncation.
   Added real committed-WAL regression with peer and successful final checkpoint.
+- [ ] Qualify commit-time automatic-checkpoint exclusion in the two raw
+  shared-lease doctor paths. Source review caught default engine automatic
+  checkpoints during REINDEX, beyond the already-fixed close-time checkpoint.
+  Require successful `wal_autocheckpoint=0`; the real regression now creates
+  at least 4,000 WAL frames, crossing the engine's urgent adaptive threshold.
+  Earlier release build `b8bb3b02` predates this final addition.
 - [ ] Rerun sync filesystem safety after correcting its omitted existing
   `db.fsqlite-migration-state` family member. The first full target passed
   173 and failed one exact file-inventory assertion during import. Added only
