@@ -1,5 +1,45 @@
 # Dependency Upgrade Log
 
+## In progress: 2026-09-15 remaining storage qualification (og86t / otrgz.2)
+
+- [x] Run the four previously unexecuted storage targets through RCH with
+  release/all-feature settings on main's current dependency set. CRUD passed
+  200 cases, atomic export 176, and storage invariants 193. Workspace failure
+  replay passed 164 and failed three; totals include repeated harness cases.
+  Log: `/tmp/br-og86t-storage-followup.log`; RCH exit 101. Compilation took
+  11m26s; replay ran 191.85s. No tests, timeouts or expectations were changed.
+- [x] Trace all three failures to `sidecar_wal_without_shm`: a valid current
+  import-generated WAL with its matching SHM archived. Reads fail with
+  `DATABASE_ERROR`/`BusyRecovery`; create fails during pending-merge inspection
+  with `SYNC_CONFLICT`. The experimental `683a241b` reader fix still requires
+  a shared index, so its earlier passing suites do not qualify this case.
+  New child `beads_rust-otrgz.2` retains the original positive startup contract;
+  neither the engine parent nor the broader sync qualification is closed.
+- [x] Exercise existing explicit recovery on a retained private workspace.
+  Removing SHM from the active family (archiving it without deletion) made
+  `show` fail. `doctor migrate-schema recover` then restored `show`, retaining
+  the issue and exact main/WAL bytes. This probe's WAL is header-only (32
+  bytes), so it does not establish WAL-only committed-data preservation.
+  Log: `/tmp/br-wal-missing-shm-probe.log`; worker receipt:
+  `/tmp/br-missing-shm-pokfx09q/receipt.json`; binary SHA-256
+  `52e672b8f7d687b7ed10db6bc7471eaa48c4b916c4595fd5fa53dc35f861c6ff`.
+  All 1,155 tracked source/test/build-input files in the dispatcher checkout
+  match main; inventory SHA-256
+  `6f3b1154a0fc54ceca2d60d88736b55a5f45f72a4274c7ca58cfccb896331b3a`.
+- [ ] Prove recovery with a committed sentinel and pending-merge receipt
+  present only in WAL, plus corrupt/mismatched-WAL and live-peer refusals.
+- [ ] Restore ordinary startup safely under verified write and sole-opener
+  authority, then inspect the recovered pending receipt. Never interpret
+  `BusyRecovery` as absence or replace WAL-backed data using JSONL.
+- [ ] Rerun the unchanged replay target and remaining release gates after
+  the recovery fix and published engine update; preserve this failed baseline.
+
+The separate Windows capacity recheck could not authenticate: direct IPv6
+and the Mac-dispatcher route timed out during SSH banner exchange; explicit
+IPv4 reset during key exchange. No fresh RAM/disk or native-build pass is
+claimed. Existing `46zqi` remains open; shared services and host-key checks
+were unchanged.
+
 ## Completed: 2026-09-15 CLI dependency patches (beads_rust-zdnl9)
 
 - [x] Recheck registry availability. The engine family remains unchanged;
