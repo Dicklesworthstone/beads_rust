@@ -8,8 +8,15 @@
 - [x] Update clap/builder/derive together to 4.6.7, preserving all features.
   The lock changes only these three package versions and checksums.
   Upstream deferred command initialization is opt-in and is not enabled.
-- [ ] Pass the unchanged library, schema and completion targets through RCH.
-- [ ] Review the exact published completion 4.6.11 source and update separately.
+- [x] Pass the unchanged library, schema and completion targets through RCH:
+  3,151 library cases (nine existing ignores), 185 completion-target cases and
+  180 schema-target cases. Log `/tmp/br-zdnl9-clap-tests.log`; overlay
+  `71c61ba499dc8e148872bf054a929f201d45d3057973fafa3662d2e0d9f6a746`.
+- [x] Review the exact published completion 4.6.11 source and update separately.
+  Archive/tag revision `2cb76fdf385396f86f37af49784504da560b6e47` fixes static
+  Zsh value escaping (upstream #6526); br uses dynamic registration, so that
+  fix is not claimed as changed br behavior. The 4.6.10 debug logging changes
+  are also included; APIs, selected features and defaults remain compatible.
 - [ ] Pass completion and CLI regression tests on the final dependency set.
 - [ ] Pass all-target/all-feature compiler and denied-warning Clippy checks;
   check formatting and security advisories.
