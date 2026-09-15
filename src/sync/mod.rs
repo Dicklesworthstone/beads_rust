@@ -1624,6 +1624,7 @@ impl DatabaseOpenerLease {
             }
             return None;
         }
+        drop(state);
         Some(DatabaseOpenerExclusiveHold {
             state: Arc::clone(&self.state),
             active: true,
@@ -26563,6 +26564,7 @@ mod tests {
             let exclusive = state.exclusive.as_mut().unwrap();
             exclusive.file.unlock().unwrap();
             exclusive.locked = false;
+            drop(state);
         }
         let external =
             open_lock_sidecar(&database_opener_lease_path(&db_path).unwrap(), "test peer").unwrap();
