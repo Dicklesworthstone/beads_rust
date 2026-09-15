@@ -22861,10 +22861,22 @@ mod tests {
             &[SqliteValue::from(sentinel)],
         )
         .unwrap();
+        let wal_path = sqlite_wal_sidecar_path(&db_path);
+        let initial_wal = fs::read(&wal_path).unwrap();
+        let page_size =
+            usize::try_from(u32::from_be_bytes(initial_wal[8..12].try_into().unwrap())).unwrap();
+        // The engine's urgent adaptive threshold is 4,000 frames. Exercise
+        // commit-time automatic checkpointing as well as connection teardown.
+        let backlog = "x".repeat(4_100 * page_size);
+        conn.execute_with_params(
+            "INSERT INTO metadata (key, value) VALUES ('raw_repair_backlog', ?)",
+            &[SqliteValue::from(backlog.as_str())],
+        )
+        .unwrap();
         drop(conn);
         let main_before = fs::read(&db_path).unwrap();
-        let wal_path = sqlite_wal_sidecar_path(&db_path);
         let wal_before = fs::read(&wal_path).unwrap();
+        assert!((wal_before.len() - 32) / (page_size + 24) >= 4_000);
         assert!(
             !main_before
                 .windows(sentinel.len())
@@ -22901,6 +22913,13 @@ mod tests {
                 .get_issue("__doctor_write_probe__")
                 .unwrap()
                 .is_none()
+        );
+        assert_eq!(
+            storage
+                .get_metadata("raw_repair_backlog")
+                .unwrap()
+                .map(|value| value.len()),
+            Some(backlog.len())
         );
     }
 
