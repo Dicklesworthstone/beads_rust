@@ -70,7 +70,7 @@
   atomic export (176) and invariants (193) also pass. Current run:
   `/tmp/br-otrgz2-private-runtime.log`, build overlay
   `2a2c128a4ff9ab7bd8edd5501ef4f18596245cf72a7bbdd93200460743f868e3`.
-- [ ] Preserve original namespace owner/link-count admission in the private
+- [x] Preserve original namespace owner/link-count admission in the private
   copy path. Source review caught that copying creates owned, single-link
   files and could otherwise hide the live source's unsafe topology. Add a
   real hardlink refusal regression, then recheck the final implementation.
@@ -85,12 +85,27 @@
   one pre-existing lifecycle case failed, and nine existing cases remained
   ignored. Library: 3,156 passed. These are target counts including repeated
   harness cases, on the pre-namespace-admission-finalization overlay above.
-- [ ] Fix initial opener registration's five-second fail-open and serialize
+- [x] Fix initial opener registration's five-second fail-open and serialize
   shared/exclusive transitions. A long recovery must not admit unregistered
   newcomers; concurrent checkpoint attempts must retain peer protection.
-- [ ] Verify real timeout refusal, concurrent upgrades, protected restoration,
+- [x] Verify real timeout refusal, concurrent upgrades, protected restoration,
   and successful opening after release. Keep the recovery bead open until
   these safety conditions pass.
+- [x] Pass the focused final lease (six), peer checkpoint (one), WAL (three),
+  private snapshot (three), structural sync safety (19), doctor index repair
+  (one), and missing-SHM CLI (seven) cases on overlay `16a69c65`. The first
+  standalone doctor invocation failed because `CARGO_BIN_EXE_br` was unset;
+  rerunning with the compiled binary's path passed. Logs:
+  `/tmp/br-otrgz-opener-runtime{,-v2}.log`. These are selected cases, not a
+  full-suite result. All-target/all-feature check and Clippy also pass.
+- [ ] Qualify the additional raw doctor paths found by the close audit:
+  shared opener registration plus non-checkpointing close for rollback-only
+  write probes and partial REINDEX; sole-opener admission for WAL truncation.
+  Added real committed-WAL regression with peer and successful final checkpoint.
+- [ ] Rerun sync filesystem safety after correcting its omitted existing
+  `db.fsqlite-migration-state` family member. The first full target passed
+  173 and failed one exact file-inventory assertion during import. Added only
+  that canonical suffix; runtime JSONL publication paths remain unchanged.
 - [ ] Close the separate doctor index-repair bypass (`otrgz.3`): hold the
   corrected exclusive opener guard through checkpoint, REINDEX, close and
   restore; prove peer refusal and later successful repair with WAL-only data.

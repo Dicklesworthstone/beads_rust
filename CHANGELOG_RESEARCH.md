@@ -35,10 +35,35 @@ A private snapshot fallback restored positive reads without live repair; all
 167 unchanged workspace replay and 172 migration cases then passed, along with
 CRUD, export atomicity, invariants and sync reconciliation. One health fixture
 needed an explicit checkpoint for its raw header mutation; its original
-assertions remain. The separate live-peer lifecycle failure remains under
-investigation. Final snapshot admission checks reject foreign-owned or
+assertions remain. The separate live-peer lifecycle failure also reproduces
+on pre-change revision `b41234d0`, with all 1,156 tracked build inputs verified
+against that revision; it remains an open engine blocker. Final snapshot
+admission checks reject foreign-owned or
 multiply linked namespace sources before copying; their final verification
 is tracked in `UPGRADE_LOG.md`. Retained failed runs are not counted as passes.
+
+Follow-up review found that opener registration formerly proceeded without a
+lease after five seconds, and competing upgrades could drop both shared
+registrations. Registration now fails closed; an additional transition lock
+serializes upgrades and remains held if shared restoration fails. Doctor index
+repair also retains sole-opener admission through connection teardown and
+rollback. All-target/all-feature check and Clippy pass; runtime qualification
+of these additions remains pending. The sync filesystem witness now recognizes
+only the exact new transition-lock filename shape; JSONL publication's runtime
+path allowlist is unchanged.
+
+The final debug qualification on overlay `16a69c65` passed 4,047 target cases
+and failed one filesystem-inventory assertion, with ten existing ignores.
+The library contributed 3,160 passes; doctor chokepoint 186, unchanged replay
+167, migration 172, reconciliation 189, and sync Git safety 173. Counts include
+repeated harness cases. The failed inventory omitted the existing
+`beads.db.fsqlite-migration-state` engine-family member; its exact suffix was
+added without changing runtime JSONL publication permissions. Further raw-close
+review added shared registration and non-checkpointing close to partial REINDEX
+and the rollback-only write probe, and sole-opener admission to explicit WAL
+truncation. A committed-WAL regression covers these paths. All-target/all-feature
+check and Clippy pass on overlay `b8bb3b02`; final release-mode execution remains
+pending. Current Windows-worker SSH probes timed out before authentication.
 
 ## 2026-09-15 — CLI patch maintenance
 
