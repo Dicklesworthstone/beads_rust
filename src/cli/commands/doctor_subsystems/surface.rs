@@ -2405,8 +2405,12 @@ mod tests {
         fs::create_dir_all(&beads).unwrap();
         let db_path = beads.join("beads.db");
         {
-            let storage = crate::storage::SqliteStorage::open(&db_path).unwrap();
+            let mut storage = crate::storage::SqliteStorage::open(&db_path).unwrap();
             storage.execute_raw("PRAGMA user_version = 15").unwrap();
+            // Health intentionally reads the checkpointed header only. Raw
+            // fixture writes do not increment storage's mutation counter, and
+            // teardown must no longer rely on an implicit engine checkpoint.
+            storage.checkpoint_full().unwrap();
         }
         fs::write(beads.join("issues.jsonl"), b"").unwrap();
 
