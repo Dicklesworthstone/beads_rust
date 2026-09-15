@@ -11879,13 +11879,16 @@ fn execute_repair_indexes(
     // The write authority excludes writers, not readers. Keep sole-opener
     // admission through checkpoint, repair, connection teardown and restore.
     let mut opener_lease = crate::sync::DatabaseOpenerLease::register(&paths.db_path)?;
-    let _exclusive_opener = opener_lease.try_exclusive().ok_or_else(|| {
-        BeadsError::SyncConflict {
+    let _exclusive_opener =
+        opener_lease
+            .try_exclusive()
+            .ok_or_else(|| {
+                BeadsError::SyncConflict {
             message:
                 "index repair requires a verified sole opener; close peer br processes and retry"
                     .to_string(),
         }
-    })?;
+            })?;
     checkpoint_and_snapshot_repair_indexes(&paths.db_path, &snapshot_path, &write_authority)?;
 
     // Open the DB and enumerate every user-defined index so we don't
