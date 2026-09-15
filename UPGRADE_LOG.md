@@ -1,6 +1,6 @@
 # Dependency Upgrade Log
 
-## In progress: 2026-09-15 CLI dependency patches (beads_rust-zdnl9)
+## Completed: 2026-09-15 CLI dependency patches (beads_rust-zdnl9)
 
 - [x] Recheck registry availability. The engine family remains unchanged;
   clap 4.6.7 is current, and clap_complete 4.6.11 supersedes the researched
@@ -17,11 +17,27 @@
   Zsh value escaping (upstream #6526); br uses dynamic registration, so that
   fix is not claimed as changed br behavior. The 4.6.10 debug logging changes
   are also included; APIs, selected features and defaults remain compatible.
-- [ ] Pass completion and CLI regression tests on the final dependency set.
-- [ ] Pass all-target/all-feature compiler and denied-warning Clippy checks;
-  check formatting and security advisories.
-- [ ] Review the final diff against the original acceptance criteria, record
-  exact results and remaining engine limitations, then close this bead.
+- [x] Pass completion and CLI regression tests on the final dependency set:
+  3,151 library cases (nine existing ignores), 185 completion-target cases and
+  180 schema-target cases, all unchanged. Log `/tmp/br-zdnl9-final-tests.log`;
+  overlay `d2b0189f13e6b6992f0c70f8677a2d4bb88a25e18d8277ae1465b8aa4966a9e5`.
+  Target totals include shared harness tests; they are not counts of distinct
+  completion scenarios. Four actual dynamic-completion probes also passed:
+  status prefix `in` returns `in_progress`, option prefix `--sta` returns
+  `--status` and `--stats`, and nonexistent value/option prefixes return no
+  candidates. All exit zero with empty stderr. Log `/tmp/br-zdnl9-dynamic.log`;
+  binary SHA-256
+  `a40c52afe505a73ca0b0ee828aa22bb00ee8a1e33882605f8c60cfb0a51ff664`.
+- [x] Pass all-target/all-feature compiler and denied-warning Clippy checks
+  on the same final overlay (`/tmp/br-zdnl9-{check,clippy}.log`). Formatting
+  and diff checks pass. The final advisory audit reports zero vulnerabilities
+  and warnings (`/tmp/br-zdnl9-audit.json`).
+- [x] Review the final diff against the original acceptance criteria. Only
+  the four intended package records changed; no application, test, workflow,
+  fixture, feature or gate changes. Separate source review informed the update;
+  runtime qualification was author-run through RCH, not independently repeated.
+  This completes CLI dependency maintenance, not full release qualification.
+  Main's existing engine startup blocker remains tracked by `otrgz`/`nx2sh`.
 
 ## In progress: 2026-09-15 MCP startup admission (beads_rust-nx2sh / otrgz)
 
@@ -105,7 +121,7 @@
 - [x] Run eight-worker 60- and 90-second stress against complete private copies of the retained migrated family; inspect every nonzero outcome.
 - [x] Restore the disposable build checkout's main lockfile after qualification; its SHA-256 matches main (`081e281d9cd228c85919c11bbdbc2e73af5682d7f1698411cff6f28a4b5de30c`). The isolated lock and binaries remain retained separately.
 - [ ] Adopt a suitable published engine family and qualify the final dependency pins; keep `otrgz` and `nx2sh` open until their gates pass on main.
-- [ ] Qualify the researched clap family and completion patches (`zdnl9`).
+- [x] Qualify the researched clap family and completion patches (`zdnl9`).
 - [ ] Finish release preparation, cross-platform DSR builds and venue verification on frozen final source; GitHub Actions remain disabled.
 
 ## Completed security patch: 2026-09-15 (beads_rust-njkug)
