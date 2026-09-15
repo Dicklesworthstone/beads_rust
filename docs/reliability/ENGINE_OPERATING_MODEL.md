@@ -94,7 +94,9 @@ no-follow descriptors, and checks source identities, metadata and full content
 hashes before and after recovery. The private WAL passes the same strict
 validation, private recovery must preserve main/WAL/journal bytes, and integrity
 must pass before returning a read handle. The live shared index remains absent;
-changed or unsafe source files cause refusal. This permits doctor and
+changed or unsafe source files cause refusal. Original namespace sidecars must
+still satisfy the engine's ownership and single-link rules; copying must not
+hide unsafe source topology. This permits doctor and
 observational sync to inspect committed rows and pending receipts without
 repairing the live family.
 

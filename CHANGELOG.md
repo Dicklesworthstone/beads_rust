@@ -93,8 +93,9 @@ this repo): commits `55c186682` + `5946b3b7c` in
   writes can reopen valid WAL-backed databases whose `-shm` index is missing.
   Recovery requires a sole opener, validates the complete WAL, preserves a
   backup, and verifies unchanged database/WAL/journal bytes before startup
-  checks the actual pending-merge receipt. Explicit read-only and observational
-  sync modes remain non-mutating. Workstream `beads_rust-otrgz.2`.
+  checks the actual pending-merge receipt. Doctor, explicit read-only commands,
+  and observational sync can inspect a verified private snapshot while leaving
+  the live database family unchanged. Workstream `beads_rust-otrgz.2`.
   ([startup recovery](https://github.com/Dicklesworthstone/beads_rust/commit/868d658d),
   [WAL validation](https://github.com/Dicklesworthstone/beads_rust/commit/db088c21))
 - **Refresh CLI parsing and completion dependencies.** Update the coupled

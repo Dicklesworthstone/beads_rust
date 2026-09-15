@@ -8,8 +8,9 @@ WAL validation; `868d658d` connects the existing backed-up, privately rehearsed
 recovery to startup before the pending-merge inspection. Follow-up changes
 preserve explicit read-only and observational sync contracts. Six focused CLI
 tests passed through RCH, including WAL-only committed data and a legacy pending
-receipt that must still block writes. Broader regression and compiler checks
-remain pending; no release or parent engine-workstream completion is claimed.
+receipt that must still block writes. Subsequent all-target/all-feature compiler
+and denied-warning Clippy checks passed. No release or parent engine-workstream
+completion is claimed.
 
 The initial focused run failed its fixture oracle because explicit engine close
 checkpointed the sentinel. Setup now uses the facade's non-checkpointing drop;
@@ -23,7 +24,21 @@ oracle for a different reason: `SqliteStorage::drop` skipped its TRUNCATE for
 peers but called `close_in_place`, whose engine implementation runs a passive
 checkpoint. The fix uses `close_without_checkpoint_in_place` after the existing
 admitted checkpoint. Both validator unit tests passed in that run; the valid
-receipt test and broader storage regressions must be rerun on this correction.
+receipt test subsequently passed with whole-main equality against the
+receipt-free baseline and exact recovered receipt equality. The original
+contiguous-byte receipt search was invalid because a serialized receipt can
+span WAL frames; that fixture oracle correction is recorded in `68bdc0b8`.
+
+The next broad run passed 4,457 target cases and failed three. Doctor still
+could not inspect missing-SHM families through its live read-only engine path.
+A private snapshot fallback restored positive reads without live repair; all
+167 unchanged workspace replay and 172 migration cases then passed, along with
+CRUD, export atomicity, invariants and sync reconciliation. One health fixture
+needed an explicit checkpoint for its raw header mutation; its original
+assertions remain. The separate live-peer lifecycle failure remains under
+investigation. Final snapshot admission checks reject foreign-owned or
+multiply linked namespace sources before copying; their final verification
+is tracked in `UPGRADE_LOG.md`. Retained failed runs are not counted as passes.
 
 ## 2026-09-15 — CLI patch maintenance
 
