@@ -153,9 +153,10 @@ fn missing_wal_index_explicit_read_only_remains_nonmutating() {
     let list = run_br(
         &workspace,
         ["list", "--json", "--no-auto-import", "--no-auto-flush"],
-        "readonly_refusal",
+        "readonly_snapshot",
     );
-    assert!(!list.status.success());
+    assert!(list.status.success(), "{} {}", list.stdout, list.stderr);
+    assert!(list.stdout.contains(WAL_ONLY_TITLE));
     assert!(!workspace.root.join(".beads/beads.db-shm").exists());
     assert_eq!(fs::read(main_path).unwrap(), main_before);
     assert_eq!(fs::read(wal_path).unwrap(), wal_before);
@@ -172,8 +173,13 @@ fn missing_wal_index_observational_sync_remains_nonmutating() {
         let wal_path = workspace.root.join(".beads/beads.db-wal");
         let main_before = fs::read(&db_path).unwrap();
         let wal_before = fs::read(&wal_path).unwrap();
-        let result = run_br(&workspace, args, "observational_refusal");
-        assert!(!result.status.success());
+        let result = run_br(&workspace, args, "observational_snapshot");
+        assert!(
+            result.status.success(),
+            "{} {}",
+            result.stdout,
+            result.stderr
+        );
         assert!(!workspace.root.join(".beads/beads.db-shm").exists());
         assert!(
             !workspace
@@ -184,6 +190,32 @@ fn missing_wal_index_observational_sync_remains_nonmutating() {
         assert_eq!(fs::read(db_path).unwrap(), main_before);
         assert_eq!(fs::read(wal_path).unwrap(), wal_before);
     }
+}
+
+#[test]
+fn missing_wal_index_doctor_reads_pending_receipt_without_live_repair() {
+    let workspace = current_workspace_without_wal_index(true);
+    let db_path = workspace.root.join(".beads/beads.db");
+    let wal_path = workspace.root.join(".beads/beads.db-wal");
+    let main_before = fs::read(&db_path).unwrap();
+    let wal_before = fs::read(&wal_path).unwrap();
+    let doctor = run_br(&workspace, ["doctor", "--json"], "doctor_snapshot");
+    let report: Value = serde_json::from_str(&extract_json_payload(&doctor.stdout)).unwrap();
+    let checks = report["checks"].as_array().unwrap();
+    let pending = checks
+        .iter()
+        .find(|check| check["name"] == "sync.merge_pending")
+        .unwrap();
+    assert_eq!(pending["details"]["pending"], true);
+    assert!(pending["message"].as_str().unwrap().contains("legacy"));
+    let observational = checks
+        .iter()
+        .find(|check| check["name"] == "db.read_only_open_observational")
+        .unwrap();
+    assert_eq!(observational["status"], "ok");
+    assert!(!workspace.root.join(".beads/beads.db-shm").exists());
+    assert_eq!(fs::read(db_path).unwrap(), main_before);
+    assert_eq!(fs::read(wal_path).unwrap(), wal_before);
 }
 
 #[test]
