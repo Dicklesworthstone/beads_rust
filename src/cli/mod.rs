@@ -3551,12 +3551,22 @@ pub struct DoctorMigrateSchemaArgs {
 /// Explicit schema-migration lifecycle.
 #[derive(Subcommand, Debug, Clone)]
 pub enum DoctorMigrateSchemaCommand {
+    /// Back up the complete family and recover engine read admission without changing schema.
+    Recover(DoctorMigrateSchemaRecoverArgs),
     /// Inspect the live database and emit a token bound to its exact file-family state.
     Plan(DoctorMigrateSchemaPlanArgs),
     /// Apply the reviewed migration only when the live state still matches a plan token.
     Apply(DoctorMigrateSchemaApplyArgs),
     /// Restore the exact pre-migration database family from a completed run.
     Undo(DoctorMigrateSchemaUndoArgs),
+}
+
+/// Arguments for `br doctor migrate-schema recover`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct DoctorMigrateSchemaRecoverArgs {
+    /// Emit the machine-readable recovery receipt.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `br doctor migrate-schema plan`.

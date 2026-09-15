@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 
 use crate::cli::{
     DoctorMigrateSchemaApplyArgs, DoctorMigrateSchemaArgs, DoctorMigrateSchemaCommand,
-    DoctorMigrateSchemaPlanArgs, DoctorMigrateSchemaUndoArgs,
+    DoctorMigrateSchemaPlanArgs, DoctorMigrateSchemaRecoverArgs, DoctorMigrateSchemaUndoArgs,
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -284,6 +284,7 @@ pub fn execute(
 ) -> Result<()> {
     let migration = resolve_context(cli)?;
     match &args.command {
+        DoctorMigrateSchemaCommand::Recover(recover) => execute_recover(recover, &migration),
         DoctorMigrateSchemaCommand::Plan(plan) => execute_plan(plan, &migration),
         DoctorMigrateSchemaCommand::Apply(apply) => execute_apply(apply, &migration),
         DoctorMigrateSchemaCommand::Undo(undo) => execute_undo(undo, &migration),
@@ -320,6 +321,172 @@ fn execute_plan(args: &DoctorMigrateSchemaPlanArgs, migration: &MigrationContext
     let plan = build_plan(&migration.db_path)?;
     emit_plan(&plan, args.json)?;
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct EngineRecoveryReceipt {
+    schema_version: &'static str,
+    database_path: String,
+    backup_path: String,
+    stage: String,
+    raw_before: RawFamilyWitness,
+    raw_after: Option<RawFamilyWitness>,
+    logical_after: Option<LogicalDatabaseWitness>,
+    error: Option<String>,
+}
+
+/// Recovery is deliberately explicit: planning must never bootstrap a writer.
+/// Rehearse on a complete private copy and refuse recovery that changes the
+/// main image, WAL, or rollback journal before admitting any live engine open.
+fn execute_recover(
+    args: &DoctorMigrateSchemaRecoverArgs,
+    migration: &MigrationContext,
+) -> Result<()> {
+    let mut lease = crate::sync::DatabaseOpenerLease::register(&migration.db_path)?;
+    let exclusive = lease
+        .try_exclusive()
+        .ok_or_else(|| BeadsError::SyncConflict {
+            message:
+                "engine recovery requires a verified sole opener; close peer br processes and retry"
+                    .to_string(),
+        })?;
+    let result = recover_engine_admission(migration);
+    lease.release_exclusive(exclusive);
+    let receipt = result?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&receipt)?);
+    } else {
+        println!(
+            "Recovered engine read admission for {}",
+            receipt.database_path
+        );
+        println!("Pre-recovery family retained at {}", receipt.backup_path);
+        println!("Run `br doctor migrate-schema plan` to review the schema migration.");
+    }
+    Ok(())
+}
+
+fn recovery_family_witness(path: &Path) -> Result<RawFamilyWitness> {
+    raw_family_witness_for_suffixes(
+        path,
+        std::iter::once("").chain(config::db_sidecar_suffixes().copied()),
+    )
+}
+
+fn require_recovery_payload_unchanged(
+    before: &RawFamilyWitness,
+    after: &RawFamilyWitness,
+) -> Result<()> {
+    for suffix in ["", "-wal", "-journal"] {
+        if component_for_suffix(before, suffix)? != component_for_suffix(after, suffix)? {
+            return Err(BeadsError::internal(format!(
+                "engine admission recovery changed protected database component {suffix:?}; \
+                 retained the complete pre-state and recovery evidence"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn recover_existing_family(path: &Path) -> Result<()> {
+    let metadata = secure_file_metadata(path)?
+        .ok_or_else(|| BeadsError::internal("recovery database disappeared"))?;
+    let retained = File::open(path)?;
+    if !same_file_identity(&metadata, &retained.metadata()?) {
+        return Err(BeadsError::internal(
+            "recovery database changed before identity binding",
+        ));
+    }
+    let identity = fsqlite_vfs::FileIdentity::from_file(&retained)?
+        .ok_or_else(|| BeadsError::internal("recovery database identity is unavailable"))?;
+    let conn = Connection::open_existing_with_expected_identity(
+        path.to_string_lossy().into_owned(),
+        identity,
+    )?;
+    close_connection(conn)?;
+    // Keep the identity descriptor alive through engine close.
+    if !same_file_identity(&retained.metadata()?, &fs::symlink_metadata(path)?) {
+        return Err(BeadsError::internal(
+            "recovery database identity changed during open",
+        ));
+    }
+    Ok(())
+}
+
+fn recover_engine_admission(migration: &MigrationContext) -> Result<EngineRecoveryReceipt> {
+    migration.write_authority.verify_database_authority()?;
+    refuse_non_regular_component(&migration.db_path)?;
+    let raw_before = recovery_family_witness(&migration.db_path)?;
+    let run_id = allocate_run_id(&migration.beads_dir)?;
+    let run_dir = migration_runs_root(&migration.beads_dir).join(run_id);
+    let before_dir = run_dir.join("recovery-before");
+    ensure_new_directory(&before_dir)?;
+    copy_family_to_backup(&migration.db_path, &before_dir, &raw_before)?;
+    verify_backup_family(&migration.db_path, &before_dir, &raw_before)?;
+    let mut receipt = EngineRecoveryReceipt {
+        schema_version: "br.doctor.schema_migration.recovery.v1",
+        database_path: migration.db_path.display().to_string(),
+        backup_path: before_dir.display().to_string(),
+        stage: "private-recovery".to_string(),
+        raw_before,
+        raw_after: None,
+        logical_after: None,
+        error: None,
+    };
+    write_json_new(&run_dir.join("recovery-prepared.json"), &receipt)?;
+    let operation = (|| -> Result<()> {
+        let probe_dir = run_dir.join("recovery-probe");
+        ensure_new_directory(&probe_dir)?;
+        let backup_db = backup_component_path(&before_dir, &migration.db_path, "")?;
+        copy_family_to_backup(&backup_db, &probe_dir, &receipt.raw_before)?;
+        verify_backup_family(&backup_db, &probe_dir, &receipt.raw_before)?;
+        let probe_db = backup_component_path(&probe_dir, &migration.db_path, "")?;
+        let probe_before = recovery_family_witness(&probe_db)?;
+        recover_existing_family(&probe_db)?;
+        require_recovery_payload_unchanged(&probe_before, &recovery_family_witness(&probe_db)?)?;
+        let expected = logical_witness(&probe_db)?;
+        if !integrity_check_is_clean(&expected.integrity_check) {
+            return Err(BeadsError::internal(
+                "private engine recovery did not produce clean integrity",
+            ));
+        }
+        receipt.stage = "live-preflight".to_string();
+        migration.write_authority.verify_database_authority()?;
+        if recovery_family_witness(&migration.db_path)? != receipt.raw_before {
+            return Err(BeadsError::internal(
+                "database family changed during recovery rehearsal",
+            ));
+        }
+        verify_backup_family(&migration.db_path, &before_dir, &receipt.raw_before)?;
+        receipt.stage = "live-recovery".to_string();
+        recover_existing_family(&migration.db_path)?;
+        migration.write_authority.verify_database_authority()?;
+        let raw_after = recovery_family_witness(&migration.db_path)?;
+        require_recovery_payload_unchanged(&receipt.raw_before, &raw_after)?;
+        receipt.raw_after = Some(raw_after);
+        receipt.logical_after = Some(logical_witness(&migration.db_path)?);
+        if receipt.logical_after.as_ref() != Some(&expected) {
+            return Err(BeadsError::internal(
+                "live engine recovery differs from the private witness",
+            ));
+        }
+        receipt.stage = "complete".to_string();
+        Ok(())
+    })();
+    if let Err(error) = operation {
+        receipt.error = Some(error.to_string());
+        write_json_new(&run_dir.join("recovery-failed.json"), &receipt)?;
+        return Err(BeadsError::WithContext {
+            context: format!(
+                "engine recovery failed at {}; complete pre-state retained at {}",
+                receipt.stage,
+                before_dir.display()
+            ),
+            source: Box::new(error),
+        });
+    }
+    write_json_new(&run_dir.join("recovery-complete.json"), &receipt)?;
+    Ok(receipt)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3600,14 +3767,21 @@ fn hash_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
 }
 
 fn raw_family_witness(db_path: &Path) -> Result<RawFamilyWitness> {
+    raw_family_witness_for_suffixes(db_path, FAMILY_SUFFIXES.iter().copied())
+}
+
+fn raw_family_witness_for_suffixes<'a>(
+    db_path: &Path,
+    suffixes: impl Iterator<Item = &'a str>,
+) -> Result<RawFamilyWitness> {
     let mut components = Vec::with_capacity(FAMILY_SUFFIXES.len());
-    for suffix in FAMILY_SUFFIXES {
+    for suffix in suffixes {
         let path = family_component_path(db_path, suffix);
         match secure_file_metadata(&path)? {
             Some(metadata) => {
                 let (length, sha256) = hash_regular_file(&path, &metadata)?;
                 components.push(RawComponentWitness {
-                    suffix: (*suffix).to_string(),
+                    suffix: suffix.to_string(),
                     present: true,
                     length: Some(length),
                     sha256: Some(sha256),
@@ -3615,7 +3789,7 @@ fn raw_family_witness(db_path: &Path) -> Result<RawFamilyWitness> {
                 });
             }
             None => components.push(RawComponentWitness {
-                suffix: (*suffix).to_string(),
+                suffix: suffix.to_string(),
                 present: false,
                 length: None,
                 sha256: None,
@@ -4593,6 +4767,92 @@ mod tests {
 
     fn reviewed_v14_migration_context() -> (TempDir, MigrationContext) {
         reviewed_v14_migration_context_with_database_name("beads.db")
+    }
+
+    #[test]
+    fn engine_recovery_preserves_wal_rows_and_complete_backup() {
+        let (_temp, migration) = reviewed_source_migration_context("beads.db", 17);
+        let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("UPDATE issues SET title='committed WAL recovery row'")
+            .unwrap();
+        close_connection(conn).unwrap();
+        let expected = logical_witness(&migration.db_path).unwrap();
+        let shm = family_component_path(&migration.db_path, "-shm");
+        fs::write(&shm, vec![0_u8; 32_768]).unwrap();
+        assert!(open_read_only(&migration.db_path).is_err());
+        let before = recovery_family_witness(&migration.db_path).unwrap();
+        execute_recover(&DoctorMigrateSchemaRecoverArgs { json: true }, &migration).unwrap();
+        let after = logical_witness(&migration.db_path).unwrap();
+        assert_eq!(after, expected);
+        require_recovery_payload_unchanged(
+            &before,
+            &recovery_family_witness(&migration.db_path).unwrap(),
+        )
+        .unwrap();
+        let run = fs::read_dir(migration_runs_root(&migration.beads_dir))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        verify_backup_family(&migration.db_path, &run.join("recovery-before"), &before).unwrap();
+        assert_eq!(
+            before.components.len(),
+            1 + config::db_sidecar_suffixes().count()
+        );
+        assert!(run.join("recovery-complete.json").is_file());
+        assert!(build_plan(&migration.db_path).unwrap().eligible);
+    }
+
+    #[test]
+    fn engine_recovery_refuses_peer_before_creating_backup() {
+        let (_temp, migration) = reviewed_v14_migration_context();
+        let peer = crate::sync::DatabaseOpenerLease::register(&migration.db_path).unwrap();
+        assert!(peer.is_registered());
+        let before = recovery_family_witness(&migration.db_path).unwrap();
+        let error =
+            execute_recover(&DoctorMigrateSchemaRecoverArgs::default(), &migration).unwrap_err();
+        assert!(error.to_string().contains("sole opener"));
+        assert_eq!(before, recovery_family_witness(&migration.db_path).unwrap());
+        assert!(!migration_runs_root(&migration.beads_dir).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn engine_recovery_refuses_engine_sidecar_symlink() {
+        let (_temp, migration) = reviewed_v14_migration_context();
+        let outside = migration.beads_dir.join("outside-marker");
+        fs::write(&outside, b"untouched").unwrap();
+        let marker = family_component_path(&migration.db_path, ".fsqlite-migration-state");
+        if marker.exists() {
+            fs::rename(&marker, migration.beads_dir.join("retained-marker")).unwrap();
+        }
+        std::os::unix::fs::symlink(&outside, &marker).unwrap();
+        let error =
+            execute_recover(&DoctorMigrateSchemaRecoverArgs::default(), &migration).unwrap_err();
+        assert!(error.to_string().contains("symlink"));
+        assert_eq!(fs::read(&outside).unwrap(), b"untouched");
+        assert!(!migration_runs_root(&migration.beads_dir).exists());
+    }
+
+    #[test]
+    fn engine_recovery_preserves_prestate_when_private_open_fails() {
+        let (_temp, migration) = reviewed_v14_migration_context();
+        fs::write(&migration.db_path, b"not a database").unwrap();
+        let before = recovery_family_witness(&migration.db_path).unwrap();
+        let error =
+            execute_recover(&DoctorMigrateSchemaRecoverArgs::default(), &migration).unwrap_err();
+        assert!(error.to_string().contains("private-recovery"));
+        assert_eq!(before, recovery_family_witness(&migration.db_path).unwrap());
+        let run = fs::read_dir(migration_runs_root(&migration.beads_dir))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        verify_backup_family(&migration.db_path, &run.join("recovery-before"), &before).unwrap();
+        assert!(run.join("recovery-failed.json").is_file());
     }
 
     fn legacy_v15_migration_context() -> (TempDir, MigrationContext) {
