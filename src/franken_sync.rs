@@ -185,6 +185,17 @@ impl std::fmt::Debug for Connection {
 }
 
 impl Connection {
+    /// Open an existing database only when its VFS handle matches the retained identity.
+    pub fn open_existing_with_expected_identity(
+        path: impl Into<String>,
+        identity: fsqlite_vfs::FileIdentity,
+    ) -> Result<Self, FrankenError> {
+        let inner = drive(fsqlite::Connection::open_existing_with_expected_identity(
+            path, identity,
+        ))?;
+        Self::from_inner(inner, true)
+    }
+
     /// Open (or create) a database at `path`.
     pub fn open(path: impl Into<String>) -> Result<Self, FrankenError> {
         let inner = drive(fsqlite::Connection::open(path))?;
