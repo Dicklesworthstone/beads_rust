@@ -1464,6 +1464,7 @@ struct OpenerLeaseState {
 #[derive(Debug)]
 struct OpenerExclusiveState {
     file: File,
+    locked: bool,
     // Kept even if shared restoration fails: all checkpoint contenders must
     // acquire this barrier before relinquishing their own shared registration.
     _transition: File,
@@ -1479,12 +1480,15 @@ pub struct DatabaseOpenerExclusiveHold {
 impl OpenerLeaseState {
     #[allow(clippy::incompatible_msrv)]
     fn restore_shared(&mut self) -> Result<()> {
-        let Some(exclusive) = self.exclusive.as_ref() else {
+        let Some(exclusive) = self.exclusive.as_mut() else {
             return Ok(());
         };
         // Do not rely on platform-specific atomic lock conversion. The
         // transition barrier excludes all other upgrades across this gap.
-        exclusive.file.unlock()?;
+        if exclusive.locked {
+            exclusive.file.unlock()?;
+            exclusive.locked = false;
+        }
         exclusive.file.try_lock_shared().map_err(|error| {
             BeadsError::Config(format!(
                 "Cannot restore database opener registration; retaining checkpoint transition barrier: {error}"
@@ -1600,13 +1604,20 @@ impl DatabaseOpenerLease {
         if transition.try_lock().is_err() {
             return None;
         }
-        let file = state.shared.take().expect("checked shared registration");
+        let file = state.shared.take()?;
         state.exclusive = Some(OpenerExclusiveState {
             file,
+            locked: true,
             _transition: transition,
         });
-        let exclusive = state.exclusive.as_ref().expect("installed transition");
-        let admitted = exclusive.file.unlock().is_ok() && exclusive.file.try_lock().is_ok();
+        let exclusive = state.exclusive.as_mut()?;
+        if let Err(error) = exclusive.file.unlock() {
+            tracing::warn!(%error, "Retaining opener transition barrier after unlock failed");
+            return None;
+        }
+        exclusive.locked = false;
+        let admitted = exclusive.file.try_lock().is_ok();
+        exclusive.locked = admitted;
         if !admitted {
             if let Err(error) = state.restore_shared() {
                 tracing::warn!(%error, "Retaining opener transition barrier after refused checkpoint");
@@ -1626,6 +1637,11 @@ impl DatabaseOpenerLease {
     /// On restoration failure the lease retains its transition barrier, so
     /// this live opener still prevents peer checkpoints until it is dropped.
     pub fn release_exclusive(&mut self, exclusive: DatabaseOpenerExclusiveHold) -> Result<()> {
+        if !Arc::ptr_eq(&self.state, &exclusive.state) {
+            return Err(BeadsError::internal(
+                "Exclusive opener hold belongs to a different lease",
+            ));
+        }
         exclusive.release()
     }
 }
@@ -26534,6 +26550,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::incompatible_msrv)]
     fn opener_lease_restoration_failure_retains_transition_protection() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("beads.db");
@@ -26541,16 +26558,12 @@ mod tests {
         let hold = lease.try_exclusive().unwrap();
         // An external lock user that does not implement our transition protocol
         // can contend during restoration. Use real locks to exercise this error.
-        lease
-            .state
-            .lock()
-            .unwrap()
-            .exclusive
-            .as_ref()
-            .unwrap()
-            .file
-            .unlock()
-            .unwrap();
+        {
+            let mut state = lease.state.lock().unwrap();
+            let exclusive = state.exclusive.as_mut().unwrap();
+            exclusive.file.unlock().unwrap();
+            exclusive.locked = false;
+        }
         let external =
             open_lock_sidecar(&database_opener_lease_path(&db_path).unwrap(), "test peer").unwrap();
         external.try_lock().unwrap();
