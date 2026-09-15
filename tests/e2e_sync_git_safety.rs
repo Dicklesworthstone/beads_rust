@@ -1237,6 +1237,16 @@ fn is_allowed_sync_file(rel_path: &str) -> bool {
     if filename.ends_with(".jsonl.tmp") {
         return true;
     }
+    // Storage checkpoint admission may create this canonical sibling lock.
+    // Admit its exact digest shape, not arbitrary .lock files or payloads.
+    if let Some(digest) = filename
+        .strip_prefix(".br-db-openers-")
+        .and_then(|name| name.strip_suffix(".transition.lock"))
+        && digest.len() == 24
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return true;
+    }
     for prefix in [".br-db-write-", ".br-jsonl-write-"] {
         if let Some(digest) = filename
             .strip_prefix(prefix)
