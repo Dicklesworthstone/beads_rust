@@ -1,5 +1,21 @@
 # Dependency Upgrade Log
 
+## In progress: 2026-09-15 CLI dependency patches (beads_rust-zdnl9)
+
+- [x] Recheck registry availability. The engine family remains unchanged;
+  clap 4.6.7 is current, and clap_complete 4.6.11 supersedes the researched
+  4.6.10 patch.
+- [x] Update clap/builder/derive together to 4.6.7, preserving all features.
+  The lock changes only these three package versions and checksums.
+  Upstream deferred command initialization is opt-in and is not enabled.
+- [ ] Pass the unchanged library, schema and completion targets through RCH.
+- [ ] Review the exact published completion 4.6.11 source and update separately.
+- [ ] Pass completion and CLI regression tests on the final dependency set.
+- [ ] Pass all-target/all-feature compiler and denied-warning Clippy checks;
+  check formatting and security advisories.
+- [ ] Review the final diff against the original acceptance criteria, record
+  exact results and remaining engine limitations, then close this bead.
+
 ## In progress: 2026-09-15 MCP startup admission (beads_rust-nx2sh / otrgz)
 
 - A standalone RCH runtime probe reproduced the protocol suite's failure:
