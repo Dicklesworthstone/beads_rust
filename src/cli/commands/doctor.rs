@@ -1756,6 +1756,10 @@ fn write_probe_after_repair(
     let Ok(mut conn) = Connection::open(db_path.to_string_lossy().into_owned()) else {
         return false;
     };
+    if let Err(err) = conn.execute("PRAGMA wal_autocheckpoint=0") {
+        tracing::warn!(%err, "Post-repair write probe could not disable automatic checkpoints");
+        return false;
+    }
     let _ = conn.execute("PRAGMA busy_timeout=5000");
 
     // Use a probe ID that cannot collide with real issues.
@@ -3780,6 +3784,10 @@ fn repair_partial_indexes_under_write_authority(
         };
         match Connection::open(db_path.to_string_lossy().into_owned()) {
             Ok(mut conn) => {
+                if let Err(err) = conn.execute("PRAGMA wal_autocheckpoint=0") {
+                    tracing::warn!(%err, "Skipping REINDEX: could not disable automatic checkpoints");
+                    return;
+                }
                 let _ = conn.execute("PRAGMA busy_timeout=30000");
                 match conn.execute("REINDEX") {
                     Ok(_) => {
