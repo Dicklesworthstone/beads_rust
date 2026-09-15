@@ -70,7 +70,9 @@ Implemented in `src/sync/mod.rs` (`DatabaseOpenerLease`) and
   REINDEX, connection close and any failure restore. Doctor's oversized-WAL
   truncation also requires sole-opener admission. Partial REINDEX and the
   rollback-only post-repair write probe retain shared opener registration
-  and use non-checkpointing connection close.
+  and use non-checkpointing connection close. They must successfully disable
+  `wal_autocheckpoint` before running SQL: a large REINDEX can otherwise
+  trigger an engine checkpoint during commit while peers still hold leases.
 
 Consequence for operators: under a busy swarm the WAL can grow because
 checkpoints are skipped while peers are present; `br doctor` reports `wal_size`

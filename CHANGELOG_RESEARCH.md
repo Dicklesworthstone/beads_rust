@@ -65,6 +65,21 @@ truncation. A committed-WAL regression covers these paths. All-target/all-featur
 check and Clippy pass on overlay `b8bb3b02`; final release-mode execution remains
 pending. Current Windows-worker SSH probes timed out before authentication.
 
+That release run subsequently passed all nine targets: 4,618 target cases,
+zero failures and ten existing ignores, qualifying and closing `otrgz.2`.
+Log: `/tmp/br-otrgz-release-runtime-pre-auto.log`. A separate source review
+then found raw REINDEX's commit-time automatic checkpoint, so this result is
+not evidence for the final doctor patch. `8785215b` explicitly disables
+automatic checkpoints; `af2bd3f0` expands the real fixture beyond the engine's
+4,000-frame urgent threshold. The new case and all 3,161 library cases pass
+(nine existing ignores) on overlay `5f43c9a3`, with all-target/all-feature check
+and Clippy passing as well. Log: `/tmp/br-otrgz-autocheckpoint-runtime.log`.
+Final release doctor CLI qualification also passed: 186 tests, zero failures,
+one existing ignore on the same `5f43c9a3` overlay, closing `otrgz.3`.
+Log: `/tmp/br-otrgz-autocheckpoint-release-runtime.log`. Verification is root
+re-execution; collaborator review is source evidence, not independent runtime
+verification. No engine-parent closure or release publication is claimed.
+
 ## 2026-09-15 — CLI patch maintenance
 
 Commits `3d0eb2dd` and `ae5b95bd` update clap/builder/derive to 4.6.7 and

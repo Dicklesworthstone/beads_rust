@@ -26,7 +26,7 @@
   All 1,155 tracked source/test/build-input files in the dispatcher checkout
   match main; inventory SHA-256
   `6f3b1154a0fc54ceca2d60d88736b55a5f45f72a4274c7ca58cfccb896331b3a`.
-- [ ] Prove recovery with a committed sentinel and pending-merge receipt
+- [x] Prove recovery with a committed sentinel and pending-merge receipt
   present only in WAL, plus corrupt/mismatched-WAL and live-peer refusals.
 - [x] Implement ordinary startup recovery under verified write and sole-opener
   authority, then inspect the recovered pending receipt. Never interpret
@@ -36,7 +36,7 @@
   and synthetic header/frame checksum, salt, partial-tail and page-size cases.
 - [x] Add CLI regressions for WAL-only rows and legacy pending receipts,
   explicit read-only behavior, live peer exclusion and corrupt-WAL refusal.
-- [ ] Pass the new unit and CLI cases through RCH; source implementation and
+- [x] Pass the new unit and CLI cases through RCH; source implementation and
   test construction alone do not establish successful recovery.
 - [x] Pass all six focused CLI cases (seven command scenarios). The first
   attempt correctly rejected checkpointed fixture data; setup now uses the
@@ -48,7 +48,7 @@
   still copied WAL into main. Use non-checkpointing engine close after the
   existing admitted TRUNCATE. The valid-current-receipt unit test caught this
   with its main-absence assertion; its oracle remains unchanged.
-- [ ] Requalify the final teardown fix, including the valid WAL-only receipt,
+- [x] Requalify the final teardown fix, including the valid WAL-only receipt,
   existing checkpoint tests and storage regressions.
 - [x] Run the broad pre-snapshot regression set after restoring tracked source
   fixtures for cached RCH binaries: 4,457 passing target cases, three failures
@@ -63,7 +63,7 @@
 - [x] Correct the checkpointed-header health fixture by explicitly checkpointing
   its raw user-version write. It formerly depended on the implicit close
   checkpoint removed by the peer-safety fix. All original assertions remain.
-- [ ] Rerun the health fixture and unchanged replay with private snapshots.
+- [x] Rerun the health fixture and unchanged replay with private snapshots.
 - [x] Pass the private-snapshot focused cases: three WAL-index units, two
   source-change/symlink units, the health fixture and seven CLI cases. The
   unchanged replay passes all 167 cases; migration passes all 172. CRUD (200),
@@ -98,27 +98,45 @@
   rerunning with the compiled binary's path passed. Logs:
   `/tmp/br-otrgz-opener-runtime{,-v2}.log`. These are selected cases, not a
   full-suite result. All-target/all-feature check and Clippy also pass.
-- [ ] Qualify the additional raw doctor paths found by the close audit:
+- [x] Qualify the additional raw doctor paths found by the close audit:
   shared opener registration plus non-checkpointing close for rollback-only
   write probes and partial REINDEX; sole-opener admission for WAL truncation.
   Added real committed-WAL regression with peer and successful final checkpoint.
-- [ ] Qualify commit-time automatic-checkpoint exclusion in the two raw
+- [x] Qualify commit-time automatic-checkpoint exclusion in the two raw
   shared-lease doctor paths. Source review caught default engine automatic
   checkpoints during REINDEX, beyond the already-fixed close-time checkpoint.
   Require successful `wal_autocheckpoint=0`; the real regression now creates
   at least 4,000 WAL frames, crossing the engine's urgent adaptive threshold.
   Earlier release build `b8bb3b02` predates this final addition.
-- [ ] Rerun sync filesystem safety after correcting its omitted existing
+  Final overlay `5f43c9a3` passes the large-WAL regression, all 3,161 library
+  cases (nine existing ignores), and all 186 release doctor cases (one
+  existing ignore), with zero failures. All-target/all-feature check and
+  denied-warning Clippy pass. Logs:
+  `/tmp/br-otrgz-autocheckpoint-runtime.log` and
+  `/tmp/br-otrgz-autocheckpoint-release-runtime.log`.
+- [x] Rerun sync filesystem safety after correcting its omitted existing
   `db.fsqlite-migration-state` family member. The first full target passed
   173 and failed one exact file-inventory assertion during import. Added only
   that canonical suffix; runtime JSONL publication paths remain unchanged.
-- [ ] Close the separate doctor index-repair bypass (`otrgz.3`): hold the
+- [x] Close `beads_rust-otrgz.2` after nine RCH release targets pass: 4,618
+  target cases, zero failures, ten existing ignores (repeated harness cases
+  included). Original replay 167, migration 172, CRUD 200, atomic export 176,
+  invariants 193, reconciliation 189, Git safety 174, doctor chokepoint 186,
+  library 3,161. Log `/tmp/br-otrgz-release-runtime-pre-auto.log`, overlay
+  `b8bb3b025f881e6b38d3fe1dabb6b40f87e40f5bac3ceab680ac6ae235d36ec1`.
+  Runtime dependency graph also contains no Git library. Root re-execution,
+  not independent runtime verification; bounded honesty audit is bead comment
+  1682. This run predates the final doctor automatic-checkpoint change, which
+  is separately qualified above; engine and Windows/release blockers stay open.
+- [x] Close the separate doctor index-repair bypass (`otrgz.3`): hold the
   corrected exclusive opener guard through checkpoint, REINDEX, close and
   restore; prove peer refusal and later successful repair with WAL-only data.
-- [ ] Run sync structural/runtime safety checks for the lease changes, plus
+- [x] Run sync structural/runtime safety checks for the lease changes, plus
   compiler, denied-warning Clippy, focused recovery/doctor and storage tests.
-- [ ] Pass all-target/all-feature check and denied-warning Clippy, formatting,
+- [x] Pass all-target/all-feature check and denied-warning Clippy, formatting,
   existing migration/recovery/pending-merge tests and unchanged replay tests.
+  Recovery overlay `b8bb3b02` is qualified; the later doctor addition remains
+  explicitly tracked above.
 - [ ] Rerun the unchanged replay target and remaining release gates after
   the recovery fix and published engine update; preserve this failed baseline.
 

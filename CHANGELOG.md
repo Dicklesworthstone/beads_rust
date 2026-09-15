@@ -99,9 +99,10 @@ this repo): commits `55c186682` + `5946b3b7c` in
   [regressions](https://github.com/Dicklesworthstone/beads_rust/commit/238f2300))
 - **Protect doctor repairs from peer checkpoints.** Index repair and explicit
   WAL truncation require sole-opener admission. Partial REINDEX and the
-  rollback-only write probe retain shared opener registration and close
-  without an implicit checkpoint. Workstream `beads_rust-otrgz.3`.
-  ([index repair](https://github.com/Dicklesworthstone/beads_rust/commit/b74ad74f))
+  rollback-only write probe retain shared opener registration and disable
+  automatic checkpoints during commit and close. Workstream `beads_rust-otrgz.3`.
+  ([index repair](https://github.com/Dicklesworthstone/beads_rust/commit/b74ad74f),
+  [automatic checkpoint exclusion](https://github.com/Dicklesworthstone/beads_rust/commit/8785215b))
 - **Recover a missing WAL shared index during ordinary startup.** Reads and
   writes can reopen valid WAL-backed databases whose `-shm` index is missing.
   Recovery requires a sole opener, validates the complete WAL, preserves a
