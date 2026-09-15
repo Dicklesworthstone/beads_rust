@@ -416,8 +416,8 @@ fn recover_engine_admission_with_lease(
                     .to_string(),
         })?;
     let result = recover_engine_admission(migration, strict_wal);
-    lease.release_exclusive(exclusive);
-    result
+    let released = lease.release_exclusive(exclusive);
+    result.and_then(|receipt| released.map(|()| receipt))
 }
 
 fn recovery_family_witness(path: &Path) -> Result<RawFamilyWitness> {

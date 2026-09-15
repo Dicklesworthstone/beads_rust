@@ -1453,7 +1453,7 @@ enum CheckpointAdmission {
     /// This process is the only opener; the exclusive opener hold (if the
     /// database is persistent) must be returned through
     /// [`SqliteStorage::release_checkpoint_admission`].
-    Sole(Option<std::fs::File>),
+    Sole(Option<crate::sync::DatabaseOpenerExclusiveHold>),
     /// Another process has the database open; no checkpoint may run.
     PeersPresent,
 }
@@ -3841,9 +3841,11 @@ impl SqliteStorage {
 
     /// Hand back the exclusive opener hold taken by [`Self::admit_checkpoint`]
     /// and rejoin the shared opener registration.
-    fn release_checkpoint_admission(&mut self, hold: Option<std::fs::File>) {
-        if let (Some(lease), Some(hold)) = (self.opener_lease.as_mut(), hold) {
-            lease.release_exclusive(hold);
+    fn release_checkpoint_admission(&mut self, hold: Option<crate::sync::DatabaseOpenerExclusiveHold>) {
+        if let (Some(lease), Some(hold)) = (self.opener_lease.as_mut(), hold)
+            && let Err(error) = lease.release_exclusive(hold)
+        {
+            tracing::warn!(%error, "Checkpoint complete; retaining opener transition barrier until storage closes");
         }
     }
 

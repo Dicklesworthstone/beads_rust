@@ -1405,8 +1405,8 @@ fn database_opener_lease_path(database_path: &Path) -> Result<PathBuf> {
 }
 
 /// Upper bound on waiting for a peer's exclusive (checkpointing) hold of the
-/// opener lease. A checkpoint is short; a longer wait means the lease is
-/// degraded and the caller proceeds without it rather than hanging br.
+/// opener lease. A longer wait refuses the open before an engine connection
+/// can observe a database family undergoing maintenance.
 const OPENER_LEASE_WAIT_MS: u64 = 5_000;
 
 /// Open a dedicated lock sidecar (create if missing) without following
@@ -1446,13 +1446,78 @@ fn open_lock_sidecar(path: &Path, role: &str) -> Result<File> {
 /// While that exclusive hold lasts, new openers wait, so no process starts
 /// reading a WAL that is about to be reset.
 ///
-/// The lease is advisory and never blocks br from working: if it cannot be
-/// registered within [`OPENER_LEASE_WAIT_MS`] it degrades to "peers unknown",
-/// which simply disables checkpointing for that handle.
+/// Registration fails closed after [`OPENER_LEASE_WAIT_MS`]. Upgrades are
+/// serialized while the shared registration is still held, so simultaneous
+/// contenders cannot mistake each other's transition gaps for absent peers.
 #[derive(Debug)]
 pub struct DatabaseOpenerLease {
-    path: PathBuf,
+    transition_path: PathBuf,
+    state: Arc<std::sync::Mutex<OpenerLeaseState>>,
+}
+
+#[derive(Debug)]
+struct OpenerLeaseState {
     shared: Option<File>,
+    exclusive: Option<OpenerExclusiveState>,
+}
+
+#[derive(Debug)]
+struct OpenerExclusiveState {
+    file: File,
+    // Kept even if shared restoration fails: all checkpoint contenders must
+    // acquire this barrier before relinquishing their own shared registration.
+    _transition: File,
+}
+
+/// A sole-opener hold that restores shared protection even when simply dropped.
+#[derive(Debug)]
+pub struct DatabaseOpenerExclusiveHold {
+    state: Arc<std::sync::Mutex<OpenerLeaseState>>,
+    active: bool,
+}
+
+impl OpenerLeaseState {
+    #[allow(clippy::incompatible_msrv)]
+    fn restore_shared(&mut self) -> Result<()> {
+        let Some(exclusive) = self.exclusive.as_ref() else {
+            return Ok(());
+        };
+        // Do not rely on platform-specific atomic lock conversion. The
+        // transition barrier excludes all other upgrades across this gap.
+        exclusive.file.unlock()?;
+        exclusive.file.try_lock_shared().map_err(|error| {
+            BeadsError::Config(format!(
+                "Cannot restore database opener registration; retaining checkpoint transition barrier: {error}"
+            ))
+        })?;
+        let exclusive = self.exclusive.take().expect("retained exclusive state");
+        self.shared = Some(exclusive.file);
+        Ok(())
+    }
+}
+
+impl DatabaseOpenerExclusiveHold {
+    fn release(mut self) -> Result<()> {
+        self.active = false;
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .restore_shared()
+    }
+}
+
+impl Drop for DatabaseOpenerExclusiveHold {
+    fn drop(&mut self) {
+        if self.active
+            && let Err(error) = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .restore_shared()
+        {
+            tracing::warn!(%error, "Retaining opener transition barrier after hold teardown");
+        }
+    }
 }
 
 impl DatabaseOpenerLease {
@@ -1460,45 +1525,52 @@ impl DatabaseOpenerLease {
     ///
     /// # Errors
     ///
-    /// Returns an error only when the lease sidecar path cannot be derived or
-    /// is unsafe (symlink / special file); lock contention degrades instead.
+    /// Returns an error for unsafe paths, locking errors, or admission timeout.
     #[allow(clippy::incompatible_msrv)]
     pub fn register(database_path: &Path) -> Result<Self> {
         let path = database_opener_lease_path(database_path)?;
         let shared = Self::acquire_shared(&path)?;
-        Ok(Self { path, shared })
+        let transition_path = path.with_extension("transition.lock");
+        Ok(Self {
+            transition_path,
+            state: Arc::new(std::sync::Mutex::new(OpenerLeaseState {
+                shared: Some(shared),
+                exclusive: None,
+            })),
+        })
     }
 
     /// Whether this handle currently holds its shared registration.
     #[must_use]
     pub fn is_registered(&self) -> bool {
-        self.shared.is_some()
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shared
+            .is_some()
     }
 
     #[allow(clippy::incompatible_msrv)]
-    fn acquire_shared(path: &Path) -> Result<Option<File>> {
+    fn acquire_shared(path: &Path) -> Result<File> {
         let file = open_lock_sidecar(path, "database opener lease")?;
         let started = Instant::now();
         let timeout = Duration::from_millis(OPENER_LEASE_WAIT_MS);
         loop {
             match file.try_lock_shared() {
-                Ok(()) => return Ok(Some(file)),
+                Ok(()) => return Ok(file),
                 Err(TryLockError::WouldBlock) => {}
                 Err(TryLockError::Error(error)) => {
-                    tracing::warn!(
-                        error = %error,
-                        lease = %path.display(),
-                        "database opener lease unavailable; checkpoints are disabled for this handle"
-                    );
-                    return Ok(None);
+                    return Err(BeadsError::Config(format!(
+                        "Database opener admission failed at {}: {error}",
+                        path.display()
+                    )));
                 }
             }
             if started.elapsed() >= timeout {
-                tracing::warn!(
-                    lease = %path.display(),
-                    "a peer held the database opener lease exclusively for too long; proceeding unregistered with checkpoints disabled"
-                );
-                return Ok(None);
+                return Err(BeadsError::Config(format!(
+                    "Database opener admission timed out after {OPENER_LEASE_WAIT_MS}ms at {}; a peer is performing exclusive maintenance",
+                    path.display()
+                )));
             }
             thread::sleep(WRITE_LOCK_POLL_INTERVAL);
         }
@@ -1507,56 +1579,44 @@ impl DatabaseOpenerLease {
     /// Try to become the sole opener.
     ///
     /// Returns the exclusive hold when no other process has the database
-    /// open. Returns `None` — with the shared registration restored — when a
-    /// peer is present or the lease is degraded. Callers must hand the hold
-    /// back through [`Self::release_exclusive`] once the checkpoint is done.
+    /// open. Returns `None` while a peer or another transition is present.
+    /// Restoration failures retain the transition barrier until lease teardown,
+    /// preventing any checkpoint from overlooking this still-live opener.
     #[allow(clippy::incompatible_msrv)]
-    pub fn try_exclusive(&mut self) -> Option<File> {
-        // Whole-file locks are per open file description, so this handle's
-        // own shared registration must be released before probing.
-        self.shared.take()?;
-        let exclusive = match open_lock_sidecar(&self.path, "database opener lease") {
+    pub fn try_exclusive(&mut self) -> Option<DatabaseOpenerExclusiveHold> {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.shared.as_ref()?;
+        let transition = match open_lock_sidecar(&self.transition_path, "opener transition barrier") {
             Ok(file) => file,
             Err(error) => {
-                tracing::warn!(error = %error, "database opener lease reopen failed");
-                self.restore_shared();
+                tracing::warn!(%error, "Skipping checkpoint: transition barrier unavailable");
                 return None;
             }
         };
-        match exclusive.try_lock() {
-            Ok(()) => Some(exclusive),
-            Err(TryLockError::WouldBlock) => {
-                drop(exclusive);
-                self.restore_shared();
-                None
-            }
-            Err(TryLockError::Error(error)) => {
-                tracing::warn!(error = %error, "database opener lease exclusive probe failed");
-                drop(exclusive);
-                self.restore_shared();
-                None
-            }
+        if transition.try_lock().is_err() {
+            return None;
         }
+        let file = state.shared.take().expect("checked shared registration");
+        state.exclusive = Some(OpenerExclusiveState { file, _transition: transition });
+        let exclusive = state.exclusive.as_ref().expect("installed transition");
+        let admitted = exclusive.file.unlock().is_ok() && exclusive.file.try_lock().is_ok();
+        if !admitted {
+            if let Err(error) = state.restore_shared() {
+                tracing::warn!(%error, "Retaining opener transition barrier after refused checkpoint");
+            }
+            return None;
+        }
+        Some(DatabaseOpenerExclusiveHold { state: Arc::clone(&self.state), active: true })
     }
 
     /// Return an exclusive hold obtained from [`Self::try_exclusive`] and
-    /// re-register this handle as an ordinary shared opener.
-    pub fn release_exclusive(&mut self, exclusive: File) {
-        drop(exclusive);
-        self.restore_shared();
-    }
-
-    fn restore_shared(&mut self) {
-        match Self::acquire_shared(&self.path) {
-            Ok(shared) => self.shared = shared,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "database opener lease could not be re-registered; checkpoints stay disabled"
-                );
-                self.shared = None;
-            }
-        }
+    /// re-register the handle as an ordinary shared opener.
+    ///
+    /// # Errors
+    /// On restoration failure the lease retains its transition barrier, so
+    /// this live opener still prevents peer checkpoints until it is dropped.
+    pub fn release_exclusive(&mut self, exclusive: DatabaseOpenerExclusiveHold) -> Result<()> {
+        exclusive.release()
     }
 }
 
@@ -26305,7 +26365,7 @@ mod tests {
             .try_exclusive()
             .expect("the sole opener takes the exclusive hold");
         assert!(!first.is_registered());
-        first.release_exclusive(hold);
+        first.release_exclusive(hold).unwrap();
         assert!(first.is_registered());
     }
 
@@ -26330,7 +26390,7 @@ mod tests {
         // spent waiting to start that thread does not test lease contention.
         started_rx.recv().unwrap();
         thread::sleep(Duration::from_millis(200));
-        holder.release_exclusive(hold);
+        holder.release_exclusive(hold).unwrap();
 
         let (registered, waited) = newcomer.join().unwrap();
         assert!(
