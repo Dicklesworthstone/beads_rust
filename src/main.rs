@@ -110,10 +110,13 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     // index under write + sole-opener authority, with a verified private
     // rehearsal and unchanged durable payloads, before classifying the real
     // pending receipt. Explicit read-only opens never take this repair path.
+    let observational_startup = (ctx.overrides.read_only_fast_open
+        && cli.no_auto_import
+        && cli.no_auto_flush)
+        || matches!(cli.command, Commands::Doctor(_))
+        || matches!(&cli.command, Commands::Sync(args) if args.status || (args.reconcile && args.dry_run));
     let startup_recovery_lock = if storage_enabled
-        && !(ctx.overrides.read_only_fast_open && cli.no_auto_import && cli.no_auto_flush)
-        && !matches!(cli.command, Commands::Doctor(_))
-        && !matches!(&cli.command, Commands::Sync(args) if args.status || (args.reconcile && args.dry_run))
+        && !observational_startup
         && (command_needs_write_lock
             || should_preopen_storage
             || pending_merge_disposition == PendingMergeStartupDisposition::Refuse)
