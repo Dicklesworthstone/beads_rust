@@ -1418,6 +1418,8 @@ pub struct SqliteStorage {
     /// cleanup the files accumulate in `TMPDIR` (#299). `None` for persistent
     /// databases, which must never be deleted on drop.
     temp_db_path: Option<PathBuf>,
+    /// Private recovered read snapshot; outlives the connection's teardown.
+    read_snapshot_dir: Option<tempfile::TempDir>,
     /// Tier 1 attribution to stamp onto the audit events of the NEXT mutation
     /// (issue #312, Layer 3 capture-only). Set via
     /// [`SqliteStorage::set_pending_event_attribution`] immediately before a
@@ -2500,6 +2502,7 @@ impl SqliteStorage {
             write_authority: None,
             mutation_count: 0,
             temp_db_path: None,
+            read_snapshot_dir: None,
             pending_event_attribution: None,
             opener_lease,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
@@ -2570,6 +2573,10 @@ impl SqliteStorage {
     }
 
     pub(crate) fn open_current_read_only(path: &Path) -> Result<Option<Self>> {
+        Self::open_current_read_only_inner(path, true)
+    }
+
+    fn open_current_read_only_inner(path: &Path, allow_snapshot: bool) -> Result<Option<Self>> {
         let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
         // Cheap header pre-filter: only reject when the file is definitively not
         // a SQLite database (no valid header magic). A low header *version* must
@@ -2588,6 +2595,9 @@ impl SqliteStorage {
             return Ok(None);
         }
         let opener_lease = Some(crate::sync::DatabaseOpenerLease::register(path)?);
+        if allow_snapshot && missing_read_only_wal_index(path)? {
+            return Self::open_private_wal_snapshot(path, opener_lease);
+        }
         // The mode preflight above only sees group/other bits. A sidecar the
         // engine refuses for another reason — foreign owner, extra hard link
         // — surfaces here as a bare `CannotOpen`, and this lane is the first
@@ -2608,12 +2618,59 @@ impl SqliteStorage {
             write_authority: None,
             mutation_count: 0,
             temp_db_path: None,
+            read_snapshot_dir: None,
             pending_event_attribution: None,
             opener_lease,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
             workflow_transition_policy: crate::close_policy::Workflow::default(),
             last_capacity_warnings: Vec::new(),
         }))
+    }
+
+    fn open_private_wal_snapshot(
+        path: &Path,
+        source_lease: Option<crate::sync::DatabaseOpenerLease>,
+    ) -> Result<Option<Self>> {
+        let directory = tempfile::tempdir()?;
+        let copy_path = directory.path().join("snapshot.db");
+        let mut family = capture_read_snapshot_family(path)?;
+        for member in &mut family {
+            member.copy_to(&copy_path)?;
+        }
+        verify_read_snapshot_family(&mut family)?;
+        if !missing_read_only_wal_index(&copy_path)? {
+            return Err(BeadsError::SyncConflict {
+                message: "WAL index topology changed during private snapshot capture".to_string(),
+            });
+        }
+        validate_wal_for_index_recovery(&copy_path)?;
+        let mut recovery = Connection::open(copy_path.to_string_lossy().into_owned())?;
+        recovery.close_without_checkpoint_in_place()?;
+        drop(recovery);
+        // Engine recovery may rebuild private indexes, but may not discard WAL
+        // frames, checkpoint main, or replay a journal before our read verdict.
+        for member in &family {
+            if matches!(member.suffix, "" | "-wal" | "-journal") {
+                member.verify_copy(&copy_path)?;
+            }
+        }
+        let mut storage = Self::open_current_read_only_inner(&copy_path, false)?;
+        if let Some(storage) = storage.as_ref() {
+            let integrity = storage.conn.query("PRAGMA integrity_check")?;
+            if integrity.len() != 1
+                || integrity[0].get(0).and_then(SqliteValue::as_text) != Some("ok")
+            {
+                return Err(BeadsError::SyncConflict {
+                    message: "Private WAL snapshot failed integrity validation".to_string(),
+                });
+            }
+        }
+        verify_read_snapshot_family(&mut family)?;
+        if let Some(storage) = storage.as_mut() {
+            storage.opener_lease = source_lease;
+            storage.read_snapshot_dir = Some(directory);
+        }
+        Ok(storage)
     }
 
     pub(crate) fn fast_open_runtime_schema_is_compatible(&self) -> bool {
@@ -2680,6 +2737,7 @@ impl SqliteStorage {
             write_authority: None,
             mutation_count: 0,
             temp_db_path: None,
+            read_snapshot_dir: None,
             pending_event_attribution: None,
             opener_lease,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
@@ -2751,6 +2809,7 @@ impl SqliteStorage {
             write_authority: None,
             mutation_count: 0,
             temp_db_path: Some(path.to_path_buf()),
+            read_snapshot_dir: None,
             pending_event_attribution: None,
             opener_lease: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
@@ -16957,6 +17016,180 @@ fn future_schema_error(version: u32, current_schema_version: u32) -> BeadsError 
         "Database schema version {version} is newer than this br binary supports \
          ({current_schema_version}); refusing to modify or downgrade it"
     ))
+}
+
+/// Retained source and content witness for one private read-snapshot component.
+#[derive(Debug)]
+struct ReadSnapshotMember {
+    path: PathBuf,
+    suffix: &'static str,
+    source: Option<StableSchemaSource>,
+    metadata: Option<std::fs::Metadata>,
+    digest: Option<[u8; 32]>,
+}
+
+fn snapshot_digest(file: &mut std::fs::File) -> Result<[u8; 32]> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    Ok(hash.finalize().into())
+}
+
+fn snapshot_metadata_matches(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    let same = before.len() == after.len()
+        && before.permissions() == after.permissions()
+        && before.modified().ok() == after.modified().ok();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        same && before.ctime() == after.ctime() && before.ctime_nsec() == after.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        same
+    }
+}
+
+impl ReadSnapshotMember {
+    fn verify_source(&mut self) -> Result<()> {
+        if let Some(source) = self.source.as_mut() {
+            source.verify_path(&self.path, "read snapshot component")?;
+            if self.metadata.as_ref().is_none_or(|before| {
+                source
+                    .file
+                    .metadata()
+                    .map_or(true, |after| !snapshot_metadata_matches(before, &after))
+            }) || Some(snapshot_digest(&mut source.file)?) != self.digest
+            {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Database family changed during read snapshot: {}",
+                        self.path.display()
+                    ),
+                });
+            }
+            source.verify_path(&self.path, "read snapshot component")?;
+        } else if StableSchemaSource::open_optional(&self.path, "read snapshot component")?
+            .is_some()
+        {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Database family component appeared during read snapshot: {}",
+                    self.path.display()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn copy_to(&mut self, db_path: &Path) -> Result<()> {
+        let Some(source) = self.source.as_mut() else {
+            return Ok(());
+        };
+        let destination = database_sidecar_path(db_path, self.suffix);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(destination)?;
+        source.file.seek(SeekFrom::Start(0))?;
+        std::io::copy(&mut source.file, &mut file)?;
+        drop(file);
+        self.verify_copy(db_path)
+    }
+
+    fn verify_copy(&self, db_path: &Path) -> Result<()> {
+        let path = database_sidecar_path(db_path, self.suffix);
+        let mut copy = StableSchemaSource::open_optional(&path, "private snapshot component")?;
+        let digest = copy
+            .as_mut()
+            .map(|source| snapshot_digest(&mut source.file))
+            .transpose()?;
+        if digest != self.digest {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Private recovery changed database payload {}",
+                    path.display()
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn capture_read_snapshot_family(path: &Path) -> Result<Vec<ReadSnapshotMember>> {
+    std::iter::once("")
+        .chain(crate::config::db_sidecar_suffixes().copied())
+        .map(|suffix| {
+            let member_path = database_sidecar_path(path, suffix);
+            let mut source =
+                StableSchemaSource::open_optional(&member_path, "read snapshot component")?;
+            let metadata = source
+                .as_ref()
+                .map(|source| source.file.metadata())
+                .transpose()?;
+            // Copying would turn a foreign-owned or multiply linked namespace
+            // file into an owned, single-link file and hide engine admission
+            // failures. Classify the retained original before private recovery.
+            #[cfg(unix)]
+            if crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES.contains(&suffix)
+                && let Some(metadata) = metadata.as_ref()
+            {
+                use std::os::unix::fs::MetadataExt;
+
+                if metadata.uid() != effective_uid() || metadata.nlink() != 1 {
+                    return Err(BeadsError::SyncConflict {
+                        message: format!(
+                            "Refusing unsafe fsqlite namespace sidecar {}: uid {} and {} hard links; expected current uid {} and exactly one link",
+                            member_path.display(),
+                            metadata.uid(),
+                            metadata.nlink(),
+                            effective_uid(),
+                        ),
+                    });
+                }
+            }
+            let digest = source
+                .as_mut()
+                .map(|source| snapshot_digest(&mut source.file))
+                .transpose()?;
+            Ok(ReadSnapshotMember {
+                path: member_path,
+                suffix,
+                source,
+                metadata,
+                digest,
+            })
+        })
+        .collect()
+}
+
+fn verify_read_snapshot_family(family: &mut [ReadSnapshotMember]) -> Result<()> {
+    for member in family {
+        member.verify_source()?;
+    }
+    Ok(())
+}
+
+fn missing_read_only_wal_index(path: &Path) -> Result<bool> {
+    let shm = StableSchemaSource::open_optional(&database_sidecar_path(path, "-shm"), "SHM")?;
+    if shm.is_some() {
+        return Ok(false);
+    }
+    Ok(
+        StableSchemaSource::open_optional(&database_sidecar_path(path, "-wal"), "WAL")?
+            .is_some_and(|source| source.initial_len > 0),
+    )
 }
 
 /// A regular schema-family file held open through byte inspection.
@@ -33335,6 +33568,23 @@ required_fields:
                 .any(|bytes| bytes == sentinel.as_bytes())
         );
         fs::rename(&shm_path, temp.path().join("retained-matching-shm")).unwrap();
+        let mut source_witness = capture_read_snapshot_family(&db_path).unwrap();
+        let readonly = SqliteStorage::open_current_read_only(&db_path)
+            .expect("private recovered read snapshot")
+            .expect("current schema snapshot");
+        assert_eq!(readonly.inspect_pending_sync_merge().unwrap(), expected);
+        assert_eq!(
+            readonly.get_issue("bd-wal-pending").unwrap().unwrap().title,
+            sentinel
+        );
+        assert!(readonly.read_snapshot_dir.is_some());
+        assert!(
+            !shm_path.exists(),
+            "private reads must not rebuild the live index"
+        );
+        verify_read_snapshot_family(&mut source_witness).unwrap();
+        drop(readonly);
+        verify_read_snapshot_family(&mut source_witness).unwrap();
         let authority = Arc::new(
             crate::sync::blocking_database_family_write_lock_with_timeout(
                 temp.path(),
@@ -33358,6 +33608,91 @@ required_fields:
         );
         assert_eq!(fs::read(&db_path).unwrap(), main_before);
         assert_eq!(fs::read(&wal_path).unwrap(), wal_before);
+    }
+
+    #[test]
+    fn private_read_snapshot_refuses_changed_family() {
+        for change in ["bytes", "appeared", "replaced"] {
+            let temp = TempDir::new().unwrap();
+            let db_path = temp.path().join("snapshot.db");
+            fs::write(&db_path, b"original bytes").unwrap();
+            let mut captured = capture_read_snapshot_family(&db_path).unwrap();
+            match change {
+                "bytes" => fs::write(&db_path, b"modified bytes").unwrap(),
+                "appeared" => {
+                    fs::write(database_sidecar_path(&db_path, "-shm"), b"new index").unwrap();
+                }
+                "replaced" => {
+                    fs::rename(&db_path, temp.path().join("retained-original")).unwrap();
+                    fs::write(&db_path, b"original bytes").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                verify_read_snapshot_family(&mut captured).is_err(),
+                "{change}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_read_snapshot_refuses_hardlinked_namespace_with_missing_shm() {
+        use std::os::unix::fs::MetadataExt;
+
+        for suffix in crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES {
+            let temp = TempDir::new().unwrap();
+            let db_path = temp.path().join("snapshot.db");
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .conn
+                .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            storage.conn.execute("PRAGMA wal_autocheckpoint=0").unwrap();
+            let main_before_write = fs::read(&db_path).unwrap();
+            storage.conn.execute("INSERT INTO metadata (key, value) VALUES ('snapshot_sentinel', 'committed WAL-only value')").unwrap();
+            drop(storage);
+            assert_eq!(fs::read(&db_path).unwrap(), main_before_write);
+            assert!(
+                sqlite_wal_schema_preflight(&db_path)
+                    .unwrap()
+                    .has_committed_frames
+            );
+            validate_wal_for_index_recovery(&db_path).unwrap();
+            let shm_path = database_sidecar_path(&db_path, "-shm");
+            fs::rename(&shm_path, temp.path().join("retained-shm")).unwrap();
+            let namespace_path = database_sidecar_path(&db_path, suffix);
+            let alias = temp.path().join("namespace-alias");
+            fs::hard_link(&namespace_path, &alias).unwrap();
+            let metadata = fs::metadata(&namespace_path).unwrap();
+            assert_eq!(metadata.nlink(), 2);
+            let family_before = directory_bytes_and_modes(temp.path());
+
+            let error = SqliteStorage::open_current_read_only(&db_path)
+                .expect_err("private copying must not bypass namespace admission");
+            assert!(error.to_string().contains("2 hard links"), "{error}");
+            assert!(!shm_path.exists());
+            assert_eq!(directory_bytes_and_modes(temp.path()), family_before);
+            for path in [&namespace_path, &alias] {
+                let after = fs::metadata(path).unwrap();
+                assert_eq!((after.dev(), after.ino()), (metadata.dev(), metadata.ino()));
+                assert_eq!(after.nlink(), 2);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_read_snapshot_refuses_namespace_symlink() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("snapshot.db");
+        fs::write(&db_path, b"original bytes").unwrap();
+        let target = temp.path().join("external");
+        fs::write(&target, b"do not touch").unwrap();
+        let suffix = crate::config::db_sidecar_suffixes().last().unwrap();
+        std::os::unix::fs::symlink(&target, database_sidecar_path(&db_path, suffix)).unwrap();
+        assert!(capture_read_snapshot_family(&db_path).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"do not touch");
     }
 
     #[test]
@@ -37377,6 +37712,7 @@ required_fields:
             write_authority: None,
             mutation_count: 0,
             temp_db_path: None,
+            read_snapshot_dir: None,
             pending_event_attribution: None,
             opener_lease: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
