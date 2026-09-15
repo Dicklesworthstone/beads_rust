@@ -106,6 +106,35 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     // command itself is the sole mutation allowed to resume that state; doctor
     // owns a richer dedicated finding/refusal surface.
     let pending_merge_disposition = pending_merge_startup_disposition(&cli.command);
+    // A valid WAL may outlive its regenerable SHM index. Restore only that
+    // index under write + sole-opener authority, with a verified private
+    // rehearsal and unchanged durable payloads, before classifying the real
+    // pending receipt. Explicit read-only opens never take this repair path.
+    let startup_recovery_lock = if storage_enabled
+        && !ctx.overrides.read_only_fast_open
+        && !matches!(cli.command, Commands::Doctor(_))
+        && (command_needs_write_lock
+            || should_preopen_storage
+            || pending_merge_disposition == PendingMergeStartupDisposition::Refuse)
+        && let Some((beads_dir, paths)) = ctx.beads_dir.as_deref().zip(ctx.paths.as_ref())
+        && commands::doctor_subsystems::schema_migration::missing_wal_index(&paths.db_path)?
+    {
+        let authority = Arc::new(
+            beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+                beads_dir,
+                &paths.db_path,
+                ctx.startup_write_lock_timeout(&cli.command),
+            )?,
+        );
+        commands::doctor_subsystems::schema_migration::recover_missing_wal_index(
+            beads_dir,
+            &paths.db_path,
+            &authority,
+        )?;
+        Some(authority)
+    } else {
+        None
+    };
     let mut pending_merge_warning_emitted = false;
     if ctx.is_initialized()
         && !ctx.no_db()
@@ -164,7 +193,9 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
         no_db_jsonl_write,
         pending_merge_mutation_gate_required,
     );
-    let write_lock = if startup_database_authority_required && ctx.is_initialized() {
+    let write_lock = if let Some(authority) = startup_recovery_lock {
+        Some(authority)
+    } else if startup_database_authority_required && ctx.is_initialized() {
         let lock_timeout = ctx.startup_write_lock_timeout(&cli.command);
         match ctx
             .beads_dir

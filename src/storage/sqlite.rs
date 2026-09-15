@@ -17145,9 +17145,6 @@ fn wal_checksum(bytes: &[u8], mut s1: u32, mut s2: u32, big_endian_words: bool) 
 /// after the last commit are ignored. Header and valid page-one corruption are
 /// still hard failures because accepting either would manufacture schema
 /// authority that SQLite itself does not provide.
-// Keep the complete fail-closed recovery scan together so its retained-handle
-// verification and schema-authority transitions remain auditable in order.
-#[allow(clippy::too_many_lines)]
 fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
     scan_wal_schema_preflight(db_path, None)
 }
@@ -17164,13 +17161,18 @@ pub(crate) fn validate_wal_for_index_recovery(db_path: &Path) -> Result<()> {
     let mut header = [0_u8; 100];
     source.file.read_exact(&mut header)?;
     let encoded_size = u16::from_be_bytes([header[16], header[17]]);
-    let page_size = if encoded_size == 1 { 65_536 } else { u32::from(encoded_size) };
+    let page_size = if encoded_size == 1 {
+        65_536
+    } else {
+        u32::from(encoded_size)
+    };
     if &header[..16] != b"SQLite format 3\0"
         || !(512..=65_536).contains(&page_size)
         || !page_size.is_power_of_two()
     {
         return Err(BeadsError::SyncConflict {
-            message: "WAL index recovery requires a valid database header and page size".to_string(),
+            message: "WAL index recovery requires a valid database header and page size"
+                .to_string(),
         });
     }
     scan_wal_schema_preflight(db_path, Some(page_size))?;
@@ -17185,8 +17187,13 @@ pub(crate) fn validate_wal_for_index_recovery(db_path: &Path) -> Result<()> {
     source.verify_path(db_path, "database")
 }
 
+// Keep the complete fail-closed recovery scan together so its retained-handle
+// verification and schema-authority transitions remain auditable in order.
 #[allow(clippy::too_many_lines)]
-fn scan_wal_schema_preflight(db_path: &Path, recovery_page_size: Option<u32>) -> Result<WalSchemaPreflight> {
+fn scan_wal_schema_preflight(
+    db_path: &Path,
+    recovery_page_size: Option<u32>,
+) -> Result<WalSchemaPreflight> {
     let wal_path = database_sidecar_path(db_path, "-wal");
     let Some(mut wal_source) = StableSchemaSource::open_optional(&wal_path, "WAL")? else {
         if recovery_page_size.is_some() {
@@ -17259,7 +17266,8 @@ fn scan_wal_schema_preflight(db_path: &Path, recovery_page_size: Option<u32>) ->
     if let Some(expected_size) = recovery_page_size {
         if expected_size != page_size {
             return Err(BeadsError::SyncConflict {
-                message: "WAL page size disagrees with the database during index recovery".to_string(),
+                message: "WAL page size disagrees with the database during index recovery"
+                    .to_string(),
             });
         }
         if frame_bytes % frame_size != 0 {
@@ -17296,7 +17304,9 @@ fn scan_wal_schema_preflight(db_path: &Path, recovery_page_size: Option<u32>) ->
         if frame_salts != header_salts {
             if recovery_page_size.is_some() {
                 return Err(BeadsError::SyncConflict {
-                    message: format!("WAL index recovery refuses frame {frame_index} with mismatched salts"),
+                    message: format!(
+                        "WAL index recovery refuses frame {frame_index} with mismatched salts"
+                    ),
                 });
             }
             break;
@@ -17320,7 +17330,9 @@ fn scan_wal_schema_preflight(db_path: &Path, recovery_page_size: Option<u32>) ->
         if stored_frame_checksum != expected_frame_checksum {
             if recovery_page_size.is_some() {
                 return Err(BeadsError::SyncConflict {
-                    message: format!("WAL index recovery refuses frame {frame_index} with invalid checksum"),
+                    message: format!(
+                        "WAL index recovery refuses frame {frame_index} with invalid checksum"
+                    ),
                 });
             }
             break;
@@ -33266,9 +33278,53 @@ required_fields:
     }
 
     #[test]
+    fn wal_index_recovery_accepts_engine_committed_wal() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("engine_wal.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        storage.conn.execute("PRAGMA wal_autocheckpoint=0").unwrap();
+        storage
+            .conn
+            .execute("CREATE TABLE recovery_sentinel(value TEXT)")
+            .unwrap();
+        storage
+            .conn
+            .execute("INSERT INTO recovery_sentinel VALUES ('committed WAL row')")
+            .unwrap();
+        let wal_path = database_sidecar_path(&db_path, "-wal");
+        let before_main = fs::read(&db_path).unwrap();
+        let before_wal = fs::read(&wal_path).unwrap();
+        assert!(before_wal.len() > 32, "fixture must include WAL frames");
+        validate_wal_for_index_recovery(&db_path).unwrap();
+        assert!(
+            sqlite_wal_schema_preflight(&db_path)
+                .unwrap()
+                .has_committed_frames
+        );
+        assert_eq!(fs::read(&db_path).unwrap(), before_main);
+        assert_eq!(fs::read(&wal_path).unwrap(), before_wal);
+        assert_eq!(
+            storage
+                .conn
+                .query_row("SELECT value FROM recovery_sentinel")
+                .unwrap()
+                .get(0),
+            Some(&SqliteValue::Text("committed WAL row".into())),
+        );
+    }
+
+    #[test]
     fn wal_index_recovery_validates_complete_family_without_mutation() {
         let salts = (0x1020_3040, 0x5060_7080);
-        for case in ["header", "committed", "header_checksum", "frame_checksum", "salts", "partial", "page_size"] {
+        for case in [
+            "header",
+            "committed",
+            "header_checksum",
+            "frame_checksum",
+            "salts",
+            "partial",
+            "page_size",
+        ] {
             let temp = TempDir::new().unwrap();
             let db_path = temp.path().join("validation.db");
             let wal_path = database_sidecar_path(&db_path, "-wal");
@@ -33311,7 +33367,9 @@ required_fields:
             } else {
                 result.expect(case);
                 assert_eq!(
-                    sqlite_wal_schema_preflight(&db_path).unwrap().committed_user_version,
+                    sqlite_wal_schema_preflight(&db_path)
+                        .unwrap()
+                        .committed_user_version,
                     if case == "committed" { Some(73) } else { None },
                 );
             }

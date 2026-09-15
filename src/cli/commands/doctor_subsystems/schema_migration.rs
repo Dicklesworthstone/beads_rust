@@ -342,17 +342,7 @@ fn execute_recover(
     args: &DoctorMigrateSchemaRecoverArgs,
     migration: &MigrationContext,
 ) -> Result<()> {
-    let mut lease = crate::sync::DatabaseOpenerLease::register(&migration.db_path)?;
-    let exclusive = lease
-        .try_exclusive()
-        .ok_or_else(|| BeadsError::SyncConflict {
-            message:
-                "engine recovery requires a verified sole opener; close peer br processes and retry"
-                    .to_string(),
-        })?;
-    let result = recover_engine_admission(migration);
-    lease.release_exclusive(exclusive);
-    let receipt = result?;
+    let receipt = recover_engine_admission_with_lease(migration, false)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&receipt)?);
     } else {
@@ -364,6 +354,63 @@ fn execute_recover(
         println!("Run `br doctor migrate-schema plan` to review the schema migration.");
     }
     Ok(())
+}
+
+/// Whether an existing WAL family lacks its regenerable shared index.
+/// This is only an advisory probe; recovery repeats it under family authority.
+pub fn missing_wal_index(db_path: &Path) -> Result<bool> {
+    if secure_file_metadata(db_path)?.is_none()
+        || secure_file_metadata(&family_component_path(db_path, "-shm"))?.is_some()
+    {
+        return Ok(false);
+    }
+    Ok(secure_file_metadata(&family_component_path(db_path, "-wal"))?
+        .is_some_and(|metadata| metadata.len() > 0))
+}
+
+/// Restore a missing index before startup inspects the actual pending receipt.
+/// Main/WAL/journal bytes are preserved; this never imports or migrates data.
+pub fn recover_missing_wal_index(
+    beads_dir: &Path,
+    db_path: &Path,
+    authority: &Arc<DatabaseFamilyWriteLock>,
+) -> Result<()> {
+    if crate::sync::database_write_authority_sha256(db_path)?
+        != authority.authority_path_sha256()
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "WAL index recovery path does not match the held database-family authority"
+                .to_string(),
+        });
+    }
+    authority.verify_database_authority()?;
+    if !missing_wal_index(db_path)? {
+        return Ok(());
+    }
+    let migration = MigrationContext {
+        beads_dir: beads_dir.to_path_buf(),
+        db_path: db_path.to_path_buf(),
+        write_authority: Arc::clone(authority),
+    };
+    recover_engine_admission_with_lease(&migration, true)?;
+    Ok(())
+}
+
+fn recover_engine_admission_with_lease(
+    migration: &MigrationContext,
+    strict_wal: bool,
+) -> Result<EngineRecoveryReceipt> {
+    let mut lease = crate::sync::DatabaseOpenerLease::register(&migration.db_path)?;
+    let exclusive = lease
+        .try_exclusive()
+        .ok_or_else(|| BeadsError::SyncConflict {
+            message:
+                "engine recovery requires a verified sole opener; close peer br processes and retry"
+                    .to_string(),
+        })?;
+    let result = recover_engine_admission(migration, strict_wal);
+    lease.release_exclusive(exclusive);
+    result
 }
 
 fn recovery_family_witness(path: &Path) -> Result<RawFamilyWitness> {
@@ -418,7 +465,10 @@ fn recover_existing_family(path: &Path, authority: Option<&DatabaseFamilyWriteLo
     Ok(())
 }
 
-fn recover_engine_admission(migration: &MigrationContext) -> Result<EngineRecoveryReceipt> {
+fn recover_engine_admission(
+    migration: &MigrationContext,
+    strict_wal: bool,
+) -> Result<EngineRecoveryReceipt> {
     migration.write_authority.verify_database_authority()?;
     refuse_non_regular_component(&migration.db_path)?;
     let raw_before = recovery_family_witness(&migration.db_path)?;
@@ -447,6 +497,9 @@ fn recover_engine_admission(migration: &MigrationContext) -> Result<EngineRecove
         verify_backup_family(&backup_db, &probe_dir, &receipt.raw_before)?;
         let probe_db = backup_component_path(&probe_dir, &migration.db_path, "")?;
         let probe_before = recovery_family_witness(&probe_db)?;
+        if strict_wal {
+            crate::storage::sqlite::validate_wal_for_index_recovery(&probe_db)?;
+        }
         recover_existing_family(&probe_db, None)?;
         require_recovery_payload_unchanged(&probe_before, &recovery_family_witness(&probe_db)?)?;
         let expected = logical_witness(&probe_db)?;
