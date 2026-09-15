@@ -57,11 +57,17 @@ Implemented in `src/sync/mod.rs` (`DatabaseOpenerLease`) and
   the exit-time TRUNCATE (`SqliteStorage::drop`, only when the handle made
   mutations, #270) first **upgrade to the exclusive hold** and are **skipped
   when another process has the database open** (`CheckpointAdmission::PeersPresent`).
-- New openers wait out an in-flight exclusive hold, so no process starts
-  reading a WAL that is being reset.
-- The lease is advisory. It degrades to "checkpoints disabled", never to a
-  blocked command. Read-only commands leave `mutation_count` at zero and never
-  checkpoint on teardown.
+- New openers wait out an in-flight exclusive hold and refuse admission after
+  five seconds; they never proceed without registration.
+- A sibling `.br-db-openers-<hash>.transition.lock` serializes upgrades before
+  the contender releases its shared registration. A losing contender keeps
+  its shared hold, so concurrent upgrades cannot overlook each other.
+- The typed exclusive hold restores shared protection on drop. If restoration
+  fails, the lease retains the transition barrier until engine teardown,
+  preventing other checkpoint attempts from overlooking the live handle.
+  Read-only commands leave `mutation_count` at zero and never checkpoint on
+  teardown. Index repair retains exclusive admission through checkpoint,
+  REINDEX, connection close and any failure restore.
 
 Consequence for operators: under a busy swarm the WAL can grow because
 checkpoints are skipped while peers are present; `br doctor` reports `wal_size`
@@ -113,7 +119,7 @@ the suffix lists; `doctor`'s family walk reads the same constants):
 | `beads.db-wal-cert`, `-wal-cert-head` | engine (0.2+) | parallel-WAL durability certificates | derived state; a certificate written by a different engine generation makes every cert-regenerating write fail while reads stay healthy (GH #441); br quarantines it into `.br_recovery/` so the engine regenerates it |
 | `beads.db-fsqlite-ns-gate`, `-fsqlite-ns-use` | engine (0.1.18+) | multi-process namespace admission | `db.namespace_identity` compares the recorded generation with the main file before any live engine open; distinguishes a mismatch from unavailable evidence and absent sidecars. `permissions.db_sidecars` flags group/other exposure beyond what the linked engine admits; namespace identity diagnosis preserves the files and offers no namespace fixer |
 | `beads.db.fsqlite-migration-state` | engine | migration bookkeeping | carried with the family |
-| `.br-db-write-<hash>.lock`, `.br-db-openers-<hash>.lock` | br | write authority and opener lease | `write_lock`, engine block |
+| `.br-db-write-<hash>.lock`, `.br-db-openers-<hash>.lock`, `.br-db-openers-<hash>.transition.lock` | br | write authority, opener registration and serialized checkpoint admission | `write_lock`, engine block |
 | `.br_recovery/` | br | forensic backups taken before recovery rebuilds (whole family) | `db.recovery_artifacts` (info), `db.recovery_artifacts.aged` (warn past `RECOVERY_AGED_TTL_DAYS = 30`), `db.foreign_recovery_debris` |
 | `.br_history/` | br | bounded JSONL snapshots (`br history`) | `br_history.size` |
 

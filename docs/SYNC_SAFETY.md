@@ -165,6 +165,15 @@ separately before applying when VCS state is part of the operator's review.
 
 ### Workspace write admission
 
+Persistent database opens also acquire a shared opener lease. Exclusive
+maintenance, including WAL recovery and index repair, excludes new readers;
+an opener that cannot register within five seconds returns an error before
+opening the engine. The sibling `.br-db-openers-<hash>.transition.lock`
+serializes checkpoint upgrades while their shared registrations are still
+held. Failed shared restoration retains that barrier until the engine closes.
+These lock files use the same canonical database authority directory; they
+do not widen the JSONL publication path allowlist.
+
 The OS lock on `.beads/.write.lock` grants write authority. When contended,
 writers publish locked registrations in `.beads/.write-waiters.lock/`; the
 earliest live registration retries the authority lock. New callers inspect

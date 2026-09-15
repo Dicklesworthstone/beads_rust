@@ -46,6 +46,7 @@ These are explicit design exclusions. br sync is intentionally less invasive tha
 | AW-4 | CRITICAL | Partial writes never corrupt the target JSONL | Unit test: crash simulation, verify original file intact |
 | AW-5 | CRITICAL | Missing-database recovery installs a pre-locked candidate with an atomic no-replace operation, and database authority compares stable OS file IDs (Unix device/inode; Windows volume serial/file index), never timestamps | Unit tests: an existing destination remains byte-identical; a Windows replacement with equal creation time is rejected |
 | AW-6 | CRITICAL | Before exchanging an existing JSONL generation, verify exchange semantics on disposable siblings through the pinned parent; lying success must fail before output replacement. Explicit unsupported errors admit the existing checked fallback only after unchanged probe identities are verified | Real-filesystem exchange/refusal tests, parent-route substitution tests, and native/bind-mount runtime canaries |
+| AW-7 | CRITICAL | Persistent engine opens require shared opener admission; timeout never admits an unregistered reader. A canonical sibling transition lock serializes upgrades before shared registration is released, and restoration failure retains checkpoint exclusion until engine teardown | Real five-second registration/storage timeout with unchanged family, eventual data-bearing reopen, simultaneous live-peer upgrades, restoration-error barrier, and index-repair peer refusal/success tests |
 
 ### 2.3 Data Loss Prevention Invariants
 
