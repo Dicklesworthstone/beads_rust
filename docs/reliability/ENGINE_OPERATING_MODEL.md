@@ -68,6 +68,26 @@ checkpoints are skipped while peers are present; `br doctor` reports `wal_size`
 and the sole-opener state (`beads_rust-dk45.5` adds an `engine` block with the
 lease holder).
 
+### Missing shared WAL index at startup
+
+Ordinary startup can reconstruct a missing `-shm` index for an existing WAL
+family before inspecting pending sync-merge metadata. It holds database-family
+write authority and an exclusive opener lease, retains a complete backup, and
+rehearses recovery on a private copy. The automatic path validates every physical
+WAL frame, including salts, checksums, page sizes and complete frame boundaries.
+It refuses damaged or ambiguous tails rather than accepting only a valid prefix.
+Checksums establish internal consistency; they cannot prove that an otherwise
+valid foreign WAL belongs to this database.
+
+Recovery must preserve the main database, WAL and rollback journal bytes and
+produce the same logical state as the private rehearsal. Startup then inspects
+the actual recovered pending-merge receipt; it never treats unavailable metadata
+as absent or reconstructs these committed rows from JSONL. A live peer prevents
+this recovery. Explicit read-only fast opens (`--no-auto-import --no-auto-flush`)
+observational sync modes (`--status`, `--reconcile --dry-run`), and diagnostic
+doctor commands do not enter the automatic repair path. Recovery
+receipts and original bytes remain under `.br_recovery/schema-migrations/`.
+
 ## 4. Database family and sidecar inventory
 
 FrankenSQLite creates these beside any database path it opens, including

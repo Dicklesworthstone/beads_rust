@@ -85,6 +85,18 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ## Unreleased
 
+- **Honor peer-opener checkpoint exclusion during storage teardown.** Closing
+  a storage handle no longer invokes an implicit engine checkpoint after br
+  has declined checkpointing because peers are present. The existing
+  sole-opener check continues to govern exit-time checkpoints.
+- **Recover a missing WAL shared index during ordinary startup.** Reads and
+  writes can reopen valid WAL-backed databases whose `-shm` index is missing.
+  Recovery requires a sole opener, validates the complete WAL, preserves a
+  backup, and verifies unchanged database/WAL/journal bytes before startup
+  checks the actual pending-merge receipt. Explicit read-only and observational
+  sync modes remain non-mutating. Workstream `beads_rust-otrgz.2`.
+  ([startup recovery](https://github.com/Dicklesworthstone/beads_rust/commit/868d658d),
+  [WAL validation](https://github.com/Dicklesworthstone/beads_rust/commit/db088c21))
 - **Refresh CLI parsing and completion dependencies.** Update the coupled
   clap packages to 4.6.7 and clap_complete to 4.6.11, preserving the existing
   CLI features and dynamic completion defaults. This does not enable clap's

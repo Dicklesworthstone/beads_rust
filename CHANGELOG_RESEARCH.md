@@ -1,5 +1,30 @@
 # Changelog research — 2026-09-08
 
+## 2026-09-15 — missing WAL shared-index startup recovery
+
+Workstream `beads_rust-otrgz.2` addresses the three unchanged workspace replay
+failures documented in `UPGRADE_LOG.md`. `db088c21` adds strict automatic-recovery
+WAL validation; `868d658d` connects the existing backed-up, privately rehearsed
+recovery to startup before the pending-merge inspection. Follow-up changes
+preserve explicit read-only and observational sync contracts. Six focused CLI
+tests passed through RCH, including WAL-only committed data and a legacy pending
+receipt that must still block writes. Broader regression and compiler checks
+remain pending; no release or parent engine-workstream completion is claimed.
+
+The initial focused run failed its fixture oracle because explicit engine close
+checkpointed the sentinel. Setup now uses the facade's non-checkpointing drop;
+the assertion that the sentinel is absent from main and present in WAL remains.
+The broader first run failed six fixture lookups because cached RCH binaries
+referenced removed temporary source trees. Exact tracked fixture restoration
+and a rerun are required; those failures are not counted as successful tests.
+
+The added valid-current-receipt unit case then failed the same main-absence
+oracle for a different reason: `SqliteStorage::drop` skipped its TRUNCATE for
+peers but called `close_in_place`, whose engine implementation runs a passive
+checkpoint. The fix uses `close_without_checkpoint_in_place` after the existing
+admitted checkpoint. Both validator unit tests passed in that run; the valid
+receipt test and broader storage regressions must be rerun on this correction.
+
 ## 2026-09-15 — CLI patch maintenance
 
 Commits `3d0eb2dd` and `ae5b95bd` update clap/builder/derive to 4.6.7 and

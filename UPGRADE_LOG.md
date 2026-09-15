@@ -28,9 +28,30 @@
   `6f3b1154a0fc54ceca2d60d88736b55a5f45f72a4274c7ca58cfccb896331b3a`.
 - [ ] Prove recovery with a committed sentinel and pending-merge receipt
   present only in WAL, plus corrupt/mismatched-WAL and live-peer refusals.
-- [ ] Restore ordinary startup safely under verified write and sole-opener
+- [x] Implement ordinary startup recovery under verified write and sole-opener
   authority, then inspect the recovered pending receipt. Never interpret
   `BusyRecovery` as absence or replace WAL-backed data using JSONL.
+- [x] Add strict automatic-recovery WAL validation without changing existing
+  tolerant scanner callers. Include engine-generated committed-WAL coverage
+  and synthetic header/frame checksum, salt, partial-tail and page-size cases.
+- [x] Add CLI regressions for WAL-only rows and legacy pending receipts,
+  explicit read-only behavior, live peer exclusion and corrupt-WAL refusal.
+- [ ] Pass the new unit and CLI cases through RCH; source implementation and
+  test construction alone do not establish successful recovery.
+- [x] Pass all six focused CLI cases (seven command scenarios). The first
+  attempt correctly rejected checkpointed fixture data; setup now uses the
+  facade's non-checkpointing drop with the WAL-only assertions unchanged.
+  `/tmp/br-otrgz2-startup-tests-v2.log`, overlay
+  `f6e171d0f7e332a04ca9e4486e93c84b9c473acf91bda440b292765a547859e3`.
+- [x] Identify and fix storage teardown's implicit engine checkpoint: peer
+  admission skipped br's explicit checkpoint, but the following engine close
+  still copied WAL into main. Use non-checkpointing engine close after the
+  existing admitted TRUNCATE. The valid-current-receipt unit test caught this
+  with its main-absence assertion; its oracle remains unchanged.
+- [ ] Requalify the final teardown fix, including the valid WAL-only receipt,
+  existing checkpoint tests and storage regressions.
+- [ ] Pass all-target/all-feature check and denied-warning Clippy, formatting,
+  existing migration/recovery/pending-merge tests and unchanged replay tests.
 - [ ] Rerun the unchanged replay target and remaining release gates after
   the recovery fix and published engine update; preserve this failed baseline.
 
