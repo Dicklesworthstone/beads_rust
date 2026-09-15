@@ -299,6 +299,11 @@ impl Connection {
     pub fn close_in_place(&mut self) -> Result<(), FrankenError> {
         drive(self.inner.close_in_place())
     }
+
+    /// Close without checkpointing; the caller controls checkpoint admission.
+    pub fn close_without_checkpoint_in_place(&mut self) -> Result<(), FrankenError> {
+        drive(self.inner.close_without_checkpoint_in_place())
+    }
 }
 
 impl Drop for Connection {
