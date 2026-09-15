@@ -1,5 +1,15 @@
 # Changelog research — 2026-09-08
 
+## 2026-09-15 — CLI patch maintenance
+
+Commits `3d0eb2dd` and `ae5b95bd` update clap/builder/derive to 4.6.7 and
+clap_complete to 4.6.11. The final lockfile changes exactly those four package
+records; engine, runtime and feature selections remain unchanged. Upstream
+clap's deferred initialization is not enabled. Completion 4.6.11's static Zsh
+escaping fix is outside br's dynamic registration path, so the changelog does
+not claim a new escaping behavior in br. Exact upstream revisions, separate
+dependency gates and final qualification results are recorded in `UPGRADE_LOG.md`.
+
 ## 2026-09-15 — isolated engine qualification
 
 The current br source with the isolated upstream `683a241b` engine candidate

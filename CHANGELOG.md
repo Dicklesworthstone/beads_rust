@@ -85,6 +85,12 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ## Unreleased
 
+- **Refresh CLI parsing and completion dependencies.** Update the coupled
+  clap packages to 4.6.7 and clap_complete to 4.6.11, preserving the existing
+  CLI features and dynamic completion defaults. This does not enable clap's
+  opt-in deferred command initialization.
+  ([clap update](https://github.com/Dicklesworthstone/beads_rust/commit/3d0eb2dd),
+  [completion update](https://github.com/Dicklesworthstone/beads_rust/commit/ae5b95bd))
 - **Patch TLS handshake validation.** Rustls 0.23.45 addresses
   [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html)
   without changing the engine or Asupersync versions.
