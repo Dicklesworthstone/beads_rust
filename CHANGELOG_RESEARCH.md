@@ -1,5 +1,28 @@
 # Changelog research — 2026-09-08
 
+## 2026-09-15 — isolated engine qualification
+
+The current br source with the isolated upstream `683a241b` engine candidate
+passed 3,561 test invocations through RCH: 3,151 library cases (nine existing
+ignores), 191 concurrency cases, all 22 MCP protocol cases, 25 multiprocess
+linearizability cases and 172 model-based cases. The latter includes all 120
+generated sequences and the full historical 300-issue/264-removal regression.
+No tests, timeouts or assertions changed. All three MCP startup failures on
+the published 0.4.0 engine passed on this candidate, with FastMCP 0.10.0 and
+Rustls 0.23.45 fixed. Exact source receipt and logs are in `UPGRADE_LOG.md`.
+The same-current-source standalone startup probe then passed 10/20 rounds on
+main's engine and 20/20 on the candidate. All baseline failures were the same
+pre-dispatch database-busy refusal; every concurrent CLI observer succeeded.
+Both eight-worker real-family stress gates also passed: 160 acknowledged
+commands over 60 seconds and 244 over 90 seconds. All 75 nonzero outcomes
+were expected validation refusals; integrity, database/JSONL equality, doctor
+and recovery-artifact checks passed on both complete private copies.
+
+This is experimental qualification evidence, not an adopted dependency update
+or a release. Main's manifest and lockfile remain unchanged. The fix still
+needs an aligned published engine family and qualification on the final pins;
+`beads_rust-otrgz` and dependent `beads_rust-nx2sh` remain open.
+
 ## 2026-09-15 — published MCP dependencies and TLS patch
 
 The FastMCP change at

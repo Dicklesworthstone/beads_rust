@@ -1,5 +1,90 @@
 # Dependency Upgrade Log
 
+## In progress: 2026-09-15 MCP startup admission (beads_rust-nx2sh / otrgz)
+
+- A standalone RCH runtime probe reproduced the protocol suite's failure:
+  start `serve`, immediately run `list --all --json`, then send an actual MCP
+  resource request and close stdin. On 20 fresh private workspaces, the current
+  release-mode binary succeeded 13 times and exited from the pending-sync
+  startup inspection with database busy seven times; the observer succeeded.
+  Binary SHA-256:
+  `458476c042f02007aa991fc167aa8fe8c156cfde9d8e40950508df161cdb5520`.
+  Log: `/tmp/br-nx2sh-startup-current.log`; worker receipts:
+  `/tmp/br-nx2sh-startup-24bgspyz/`.
+- The previously retained `683a241b` engine candidate succeeded in all 20
+  identical probe rounds, including actual MCP responses. Log:
+  `/tmp/br-nx2sh-startup-candidate.log`; worker receipts:
+  `/tmp/br-nx2sh-startup-w2dztqyr/`. Its SHA-256 remains
+  `565d196faf11a63be347b2930d3f30c0131c8ef86e2b4a98d9c0dadd9c887d12`.
+  This initial comparison uses different build snapshots; it supports the
+  hypothesis but does not isolate an engine-only change.
+- Source review found a matching admission defect: fsqlite 0.4.0's read-only
+  bootstrap installs an existing WAL then calls `set_journal_mode(Wal)` outside
+  its initial-open retry. Pager treats that local adoption as whole-image
+  maintenance and requests exclusive authority against peer readers. Candidate
+  `683a241b` adopts the mode locally and validates a shared snapshot instead.
+  Adding another br-side retry would not correct that exclusive-lock request;
+  no retry, startup barrier or test relaxation was added.
+- The current-source candidate passed all 3,561 invocations: 3,151 library
+  tests (nine existing ignores), 191 concurrency tests, all 22 MCP protocol
+  tests, 25 multiprocess linearizability tests and 172 model-based tests.
+  This includes all three previously failing MCP startup cases, all 120
+  generated model sequences and the 300-issue/264-removal regression. Tests,
+  timeouts and assertions were unchanged. The model target took 801.26 seconds;
+  the whole RCH job completed successfully within its original 1,800-second
+  cap. Log: `/tmp/br-nx2sh-candidate-tests.log`; source overlay:
+  `a119686778919ebbd89977960d845e978540bd9adf52451753b8908db3f44a7a`.
+  Its isolated lock differs from main in only fsqlite/core/pager;
+  FastMCP 0.10.0 and Rustls 0.23.45 remain fixed. All 474 external engine files
+  match the prior source inventory (aggregate SHA-256
+  `3bf55bcf3b2c6adabc2e91c64684a5e05d368e251122b81c55f974dbcf6be120`).
+  Main's manifest and lock remain unchanged. Registry checks still find only
+  facade/core/pager 0.4.1, with WAL/types 0.4.0; no aligned release is available.
+- Same-current-source startup A/B is complete: main's engine passed 10/20
+  rounds, while the candidate passed 20/20. All ten baseline failures were
+  pending-sync startup database-busy refusals; every observer succeeded.
+  The baseline binary SHA-256 is
+  `e9477827f10afc9579e6225b7d27c197bca72834f4a01bfdcf5448611679f0eb`;
+  candidate SHA-256 is
+  `54869c85911bbcd3944d011e1343bd0e12fe9a6f8cd9a081db25ac0913507a2a`.
+  Logs: `/tmp/br-nx2sh-startup-{main,candidate}-current-source.log`.
+  Retained worker rounds: `/tmp/br-nx2sh-startup-6bv11mbo/` (baseline) and
+  `/tmp/br-nx2sh-startup-q2odd0eq/` (candidate). This comparison fixes br source,
+  FastMCP and Rustls versions; it isolates the engine candidate as a whole,
+  not an individual upstream hunk. Twenty passing rounds are bounded evidence,
+  not a guarantee that every possible startup interleaving is safe.
+- Both current-candidate real-family stress gates passed on complete copies
+  of the retained recovered/migrated family. Eight workers for 60 seconds:
+  160 acknowledged commands, 28 validation refusals (26 closed claims, two
+  protected-note updates), database/JSONL both 1,113 records. Eight workers for
+  90 seconds: 244 acknowledged commands, 47 validation refusals (42 closed
+  claims, five protected-note updates), database/JSONL both 1,133 records.
+  Every nonzero result was exit 4 / `VALIDATION_FAILED`. Both runs ended with
+  integrity `ok`, zero malformed JSONL lines, doctor errors, new recovery
+  artifacts or unexpected error signatures. Source copy witnesses matched.
+  Logs: `/tmp/br-nx2sh-candidate-stress{60,90}.log`; worker receipts under
+  `/Users/Shared/dsr-sources/br-q93wv-20260912/.rch-tmp/`:
+  `br-stress-HXAJAs` and `br-stress-yhH2xN`. Existing recovery history was
+  preserved. These integrity stress runs complement, not replace, the
+  separate passing linearizability target.
+- Follow-on CLI patch research is complete and tracked in `beads_rust-zdnl9`:
+  clap 4.6.7 plus its coupled derive/builder packages, then independently
+  clap_complete 4.6.10. Existing feature selections should be preserved;
+  opt-in deferred initialization is outside dependency maintenance.
+
+### Current qualification checklist
+
+- [x] Reproduce MCP startup failure with actual overlapping CLI and MCP requests.
+- [x] Trace read-only WAL adoption and review the upstream admission fix.
+- [x] Verify all external candidate source files and isolate its three lock changes.
+- [x] Run the unchanged library, concurrency, MCP, linearizability and model suites.
+- [x] Finish same-current-source startup A/B and retain both binary hashes.
+- [x] Run eight-worker 60- and 90-second stress against complete private copies of the retained migrated family; inspect every nonzero outcome.
+- [x] Restore the disposable build checkout's main lockfile after qualification; its SHA-256 matches main (`081e281d9cd228c85919c11bbdbc2e73af5682d7f1698411cff6f28a4b5de30c`). The isolated lock and binaries remain retained separately.
+- [ ] Adopt a suitable published engine family and qualify the final dependency pins; keep `otrgz` and `nx2sh` open until their gates pass on main.
+- [ ] Qualify the researched clap family and completion patches (`zdnl9`).
+- [ ] Finish release preparation, cross-platform DSR builds and venue verification on frozen final source; GitHub Actions remain disabled.
+
 ## Completed security patch: 2026-09-15 (beads_rust-njkug)
 
 - Updated Rustls 0.23.43→0.23.45 for RUSTSEC-2026-0285. All eight reverse
