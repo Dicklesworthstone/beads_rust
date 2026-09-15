@@ -1750,7 +1750,10 @@ fn write_probe_after_repair(
     if write_authority.verify_database_authority().is_err() {
         return false;
     }
-    let Ok(conn) = Connection::open(db_path.to_string_lossy().into_owned()) else {
+    let Ok(_opener_lease) = crate::sync::DatabaseOpenerLease::register(db_path) else {
+        return false;
+    };
+    let Ok(mut conn) = Connection::open(db_path.to_string_lossy().into_owned()) else {
         return false;
     };
     let _ = conn.execute("PRAGMA busy_timeout=5000");
@@ -1811,7 +1814,7 @@ fn write_probe_after_repair(
         }
     };
 
-    if let Err(err) = conn.close() {
+    if let Err(err) = conn.close_without_checkpoint_in_place() {
         tracing::warn!(error = %err, "Post-repair write probe connection close failed");
         return false;
     }
@@ -3768,8 +3771,15 @@ fn repair_partial_indexes_under_write_authority(
             );
             return;
         }
+        let _opener_lease = match crate::sync::DatabaseOpenerLease::register(db_path) {
+            Ok(lease) => lease,
+            Err(err) => {
+                tracing::warn!(%err, "Skipping REINDEX: database opener admission failed");
+                return;
+            }
+        };
         match Connection::open(db_path.to_string_lossy().into_owned()) {
-            Ok(conn) => {
+            Ok(mut conn) => {
                 let _ = conn.execute("PRAGMA busy_timeout=30000");
                 match conn.execute("REINDEX") {
                     Ok(_) => {
@@ -3787,7 +3797,7 @@ fn repair_partial_indexes_under_write_authority(
                         );
                     }
                 }
-                if let Err(err) = conn.close() {
+                if let Err(err) = conn.close_without_checkpoint_in_place() {
                     tracing::warn!(
                         path = %db_path.display(),
                         error = %err,
@@ -4710,6 +4720,17 @@ fn checkpoint_wal_truncate(
     write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
 ) -> Result<()> {
     write_authority.verify_database_authority()?;
+    let mut opener_lease = crate::sync::DatabaseOpenerLease::register(db_path)?;
+    let _exclusive_opener =
+        opener_lease
+            .try_exclusive()
+            .ok_or_else(|| {
+                BeadsError::SyncConflict {
+            message:
+                "WAL truncation requires a verified sole opener; close peer br processes and retry"
+                    .to_string(),
+        }
+            })?;
     let conn = Connection::open(db_path.to_string_lossy().into_owned())?;
     let checkpoint_complete = match wal_checkpoint_truncate_complete(&conn) {
         Ok(complete) => complete,
@@ -22807,6 +22828,71 @@ mod tests {
         assert_eq!(
             fs::read(session.run.root.join("backups/.beads/beads.db-journal")).unwrap(),
             b"journal-before-vacuum"
+        );
+    }
+
+    #[test]
+    fn doctor_raw_repairs_preserve_peer_wal_and_checkpoint_only_when_alone() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        drop(SqliteStorage::open(&db_path).unwrap());
+        let write_authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                temp.path(),
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+        write_authority.bind_database_inode_for_mutation().unwrap();
+        let sentinel = "doctor raw repair committed WAL sentinel";
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("PRAGMA wal_autocheckpoint=0").unwrap();
+        conn.execute_with_params(
+            "INSERT INTO metadata (key, value) VALUES ('raw_repair_sentinel', ?)",
+            &[SqliteValue::from(sentinel)],
+        )
+        .unwrap();
+        drop(conn);
+        let main_before = fs::read(&db_path).unwrap();
+        let wal_path = sqlite_wal_sidecar_path(&db_path);
+        let wal_before = fs::read(&wal_path).unwrap();
+        assert!(
+            !main_before
+                .windows(sentinel.len())
+                .any(|b| b == sentinel.as_bytes())
+        );
+        assert!(
+            wal_before
+                .windows(sentinel.len())
+                .any(|b| b == sentinel.as_bytes())
+        );
+        let peer = crate::sync::DatabaseOpenerLease::register(&db_path).unwrap();
+        let error = checkpoint_wal_truncate(&db_path, &write_authority).unwrap_err();
+        assert!(error.to_string().contains("sole opener"));
+        assert_eq!(fs::read(&db_path).unwrap(), main_before);
+        assert_eq!(fs::read(&wal_path).unwrap(), wal_before);
+        assert!(write_probe_after_repair(&db_path, &write_authority));
+        assert_eq!(fs::read(&db_path).unwrap(), main_before);
+        let mut repair = LocalRepairResult::default();
+        repair_partial_indexes_under_write_authority(&db_path, &mut repair, None, &write_authority);
+        assert!(repair.indexes_reindexed);
+        assert_eq!(fs::read(&db_path).unwrap(), main_before);
+        drop(peer);
+        checkpoint_wal_truncate(&db_path, &write_authority).unwrap();
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(
+            storage
+                .get_metadata("raw_repair_sentinel")
+                .unwrap()
+                .as_deref(),
+            Some(sentinel)
+        );
+        assert!(
+            storage
+                .get_issue("__doctor_write_probe__")
+                .unwrap()
+                .is_none()
         );
     }
 
