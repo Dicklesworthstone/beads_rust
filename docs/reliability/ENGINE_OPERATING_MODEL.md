@@ -83,10 +83,20 @@ Recovery must preserve the main database, WAL and rollback journal bytes and
 produce the same logical state as the private rehearsal. Startup then inspects
 the actual recovered pending-merge receipt; it never treats unavailable metadata
 as absent or reconstructs these committed rows from JSONL. A live peer prevents
-this recovery. Explicit read-only fast opens (`--no-auto-import --no-auto-flush`)
+this recovery. Explicit read-only fast opens (`--no-auto-import --no-auto-flush`),
 observational sync modes (`--status`, `--reconcile --dry-run`), and diagnostic
 doctor commands do not enter the automatic repair path. Recovery
 receipts and original bytes remain under `.br_recovery/schema-migrations/`.
+
+Read-only inspection of a missing-index family uses a private snapshot. It
+retains the original opener lease, copies the complete family through retained
+no-follow descriptors, and checks source identities, metadata and full content
+hashes before and after recovery. The private WAL passes the same strict
+validation, private recovery must preserve main/WAL/journal bytes, and integrity
+must pass before returning a read handle. The live shared index remains absent;
+changed or unsafe source files cause refusal. This permits doctor and
+observational sync to inspect committed rows and pending receipts without
+repairing the live family.
 
 ## 4. Database family and sidecar inventory
 

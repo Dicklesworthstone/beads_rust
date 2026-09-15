@@ -50,6 +50,33 @@
   with its main-absence assertion; its oracle remains unchanged.
 - [ ] Requalify the final teardown fix, including the valid WAL-only receipt,
   existing checkpoint tests and storage regressions.
+- [x] Run the broad pre-snapshot regression set after restoring tracked source
+  fixtures for cached RCH binaries: 4,457 passing target cases, three failures
+  and nine existing ignores. The focused three WAL-index unit cases passed,
+  including the exact valid pending receipt. Log:
+  `/tmp/br-otrgz2-final-runtime.log`. Totals include repeated harness cases.
+- [x] Preserve the remaining original replay failure: doctor cannot inspect a
+  valid missing-SHM family through the live read-only engine. Implement a
+  verified private snapshot fallback, leaving live files untouched. Add
+  source-change/symlink refusal tests and positive read-only/status/doctor
+  coverage; runtime qualification of this addition remains pending.
+- [x] Correct the checkpointed-header health fixture by explicitly checkpointing
+  its raw user-version write. It formerly depended on the implicit close
+  checkpoint removed by the peer-safety fix. All original assertions remain.
+- [ ] Rerun the health fixture and unchanged replay with private snapshots.
+- [x] Pass the private-snapshot focused cases: three WAL-index units, two
+  source-change/symlink units, the health fixture and seven CLI cases. The
+  unchanged replay passes all 167 cases; migration passes all 172. CRUD (200),
+  atomic export (176) and invariants (193) also pass. Current run:
+  `/tmp/br-otrgz2-private-runtime.log`, build overlay
+  `2a2c128a4ff9ab7bd8edd5501ef4f18596245cf72a7bbdd93200460743f868e3`.
+- [ ] Preserve original namespace owner/link-count admission in the private
+  copy path. Source review caught that copying creates owned, single-link
+  files and could otherwise hide the live source's unsafe topology. Add a
+  real hardlink refusal regression, then recheck the final implementation.
+- [ ] Investigate the remaining live-peer database-busy failure in
+  `e2e_sync_flush_only_succeeds_with_large_mixed_prefix_export_hash_rewrite`;
+  do not classify it as pre-existing without a focused comparison.
 - [ ] Pass all-target/all-feature check and denied-warning Clippy, formatting,
   existing migration/recovery/pending-merge tests and unchanged replay tests.
 - [ ] Rerun the unchanged replay target and remaining release gates after
