@@ -1,5 +1,37 @@
 # Dependency Upgrade Log
 
+## Completed security patch: 2026-09-15 (beads_rust-njkug)
+
+- Updated Rustls 0.23.43→0.23.45 for RUSTSEC-2026-0285. All eight reverse
+  dependency constraints permit this patch; the new aws-lc-rs and webpki floors
+  already match the lockfile. No engine, runtime, feature or API edits needed.
+  The resolver also selected an older `getrandom` for tempfile; that unrelated
+  edge was restored to 0.4.3 and full locked Cargo metadata resolution passed.
+  The final lockfile diff changes only Rustls version and checksum.
+- `cargo audit` now reports zero vulnerabilities and zero warnings against
+  advisory database `e2e640471715167f73e22eaf761f2e547adafeec`.
+  Logs: `/tmp/br-njkug-{resolve.log,audit.json,metadata.stderr}`.
+  RCH all-target/all-feature compiler and denied-warning Clippy checks passed.
+  Normal-profile all-feature tests passed 3,151 library cases (nine existing
+  ignores), the shutdown case and all ten package-manifest cases. Logs:
+  `/tmp/br-njkug-{check,clippy,tests}.log`. All three runs used overlay
+  `3df607525f75f553a75aa3d8ae1848a0a1d0e7dc1e46d7e1d532f13660ad9689`.
+  The separate MCP startup failures below are not claimed resolved by this
+  security patch; this is not full release qualification.
+- Final package construction and inspection passed: 745 members, 3,200,357
+  bytes, SHA-256
+  `f696fa03c2d21987ff435809837687e39123c7702d2df7cf68a351b5f9a266a3`.
+  The archive contains patched Rustls, one Asupersync runtime and no Git
+  dependencies or local test-evidence artifacts. Construction used
+  `--no-verify`; no separate packaged-source build is claimed.
+- Bounded self-audit of this work since `d9685fcc`: no implementation, test,
+  fixture, snapshot, workflow or gate changes; no new ignores or weakened
+  assertions. A separate agent reviewed dependency constraints and the diff;
+  runtime execution was author-run through RCH, not independently repeated.
+  The failed protocol run, UBS non-result and package-verification limit remain
+  recorded. This patch is a release enabler exercised by real tests; tracker
+  and research updates are supporting records, not additional capabilities.
+
 ## In progress: 2026-09-15 (beads_rust-nx2sh)
 
 - Replaced Git FastMCP 0.9.0 at `180a7c88890705217bb8e202d19555adabf24187`
@@ -19,14 +51,23 @@
   metadata and retained source/build inputs. No evidence files were deleted.
   Logs: `/tmp/br-nx2sh-package{,-clean}.log`. These commands used `--no-verify`;
   they establish package construction, not compilation of the packaged source.
-- RCH all-target/all-feature check passed. Release/all-feature library, MCP
-  protocol/shutdown and package-manifest tests are running; Clippy is pending.
+- RCH all-target/all-feature check and denied-warning Clippy passed.
+  Release/all-feature library tests passed 3,151 cases with nine existing
+  ignores. MCP protocol tests passed 19 and failed three; the separate shutdown
+  test and all ten package-manifest tests passed. Logs:
+  `/tmp/br-nx2sh-{check,clippy,tests,shutdown,manifest-tests}.log`.
+  The three failures exit from main's pending-sync startup inspection with
+  database busy, before dispatch reaches FastMCP. Their immediate CLI/raw
+  observations overlap server startup. This is consistent with the existing
+  engine read-admission issue, but the exact engine cause is not isolated.
+  The tests remain unchanged and full qualification stays open.
   The existing shutdown test covers idle server interruption and reopenability,
   not cancellation during an active handler. No tests were weakened or added
   merely to mirror the dependency edit.
 - Fresh `cargo audit` found the pre-existing `rustls` 0.23.43 vulnerability
-  RUSTSEC-2026-0285 (patched in 0.23.45). This remains a release gate tracked
-  separately in `beads_rust-njkug`. Audit evidence: `/tmp/br-nx2sh-audit.json`.
+  RUSTSEC-2026-0285 (patched in 0.23.45). The separate qualified security patch
+  above closes `beads_rust-njkug`; the initial failed audit remains at
+  `/tmp/br-nx2sh-audit.json`.
   UBS on the two changed manifest files exited 2 without scanning Rust source;
   it is not a clean scanner result. Log: `/tmp/br-nx2sh-ubs.log`.
 

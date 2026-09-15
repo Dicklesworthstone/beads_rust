@@ -85,6 +85,10 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ## Unreleased
 
+- **Patch TLS handshake validation.** Rustls 0.23.45 addresses
+  [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html)
+  without changing the engine or Asupersync versions.
+
 - **Use published dependencies for MCP-enabled installations.** FastMCP
   0.10.0 replaces the Git-only pin, retaining the existing Asupersync runtime
   version and incorporating upstream cancellation-drain fixes. Published

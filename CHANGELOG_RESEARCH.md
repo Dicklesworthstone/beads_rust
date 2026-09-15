@@ -1,5 +1,33 @@
 # Changelog research — 2026-09-08
 
+## 2026-09-15 — published MCP dependencies and TLS patch
+
+The FastMCP change at
+[806819f9](https://github.com/Dicklesworthstone/beads_rust/commit/806819f9)
+replaces eight Git-source 0.9.0 crates with published 0.10.0 packages and their
+required `dirs` 7.0.0 dependency. Exact prior Git revision and upstream tag
+research are recorded in `UPGRADE_LOG.md`; br's existing Asupersync 0.5.0 pin
+already matches the new release. Package inspection exposed local evidence
+archives in Cargo's file set. Excluding `tests/artifacts/` shrank the package
+from 96.2 MiB to 3.1 MiB without deleting evidence or excluding source inputs.
+
+RCH compiler and Clippy checks passed, as did 3,151 library cases (nine existing
+ignores), the shutdown test and ten manifest tests. MCP protocol results were
+19 passing and three failing startup database-admission cases, before FastMCP
+dispatch. These failures remain a qualification gate; no test was weakened.
+
+The fresh advisory audit identified Rustls 0.23.43 as affected by
+[RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html).
+Upstream [0.23.45](https://github.com/rustls/rustls/releases/tag/v/0.23.45)
+fits all eight reverse-dependency constraints without engine/runtime upgrades.
+The separate Rustls-only lock update clears the advisory audit. RCH compiler
+and Clippy checks passed, followed by 3,151 library cases (nine existing
+ignores), the shutdown test and ten package-manifest tests in the normal test
+profile. Source overlay:
+`3df607525f75f553a75aa3d8ae1848a0a1d0e7dc1e46d7e1d532f13660ad9689`.
+Neither change is a published br release. The startup failures remain open;
+full evidence and outstanding work remain in `UPGRADE_LOG.md`.
+
 ## 2026-09-15 — explicit engine admission recovery
 
 The retained schema-17 family failed read-only admission because its legacy
