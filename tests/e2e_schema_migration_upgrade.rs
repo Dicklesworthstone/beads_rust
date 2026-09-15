@@ -36,6 +36,189 @@ fn fixture_dir() -> PathBuf {
         .join("schema_migration")
 }
 
+const WAL_ONLY_TITLE: &str = "committed sentinel present only in WAL";
+
+fn current_workspace_without_wal_index(pending_merge: bool) -> BrWorkspace {
+    let workspace = BrWorkspace::new();
+    let init = run_br(
+        &workspace,
+        ["init", "--prefix", "wal", "--json"],
+        "wal_init",
+    );
+    assert!(init.status.success(), "{} {}", init.stdout, init.stderr);
+    let create = run_br(
+        &workspace,
+        ["create", "checkpointed title", "--json"],
+        "wal_create",
+    );
+    assert!(
+        create.status.success(),
+        "{} {}",
+        create.stdout,
+        create.stderr
+    );
+    let db_path = workspace.root.join(".beads/beads.db");
+    let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    conn.execute("PRAGMA journal_mode=WAL").unwrap();
+    conn.execute("PRAGMA wal_autocheckpoint=0").unwrap();
+    conn.execute(&format!("UPDATE issues SET title='{WAL_ONLY_TITLE}'"))
+        .unwrap();
+    if pending_merge {
+        conn.execute("INSERT INTO metadata (key, value) VALUES ('sync_merge_pending_v1', 'wal-only-pending-receipt')").unwrap();
+    }
+    // The facade's Drop closes without checkpointing, retaining committed
+    // frames. Explicit close() would copy the sentinel into the main file.
+    drop(conn);
+    let main = fs::read(&db_path).unwrap();
+    let wal = fs::read(workspace.root.join(".beads/beads.db-wal")).unwrap();
+    for sentinel in
+        std::iter::once(WAL_ONLY_TITLE).chain(pending_merge.then_some("wal-only-pending-receipt"))
+    {
+        assert!(
+            !main
+                .windows(sentinel.len())
+                .any(|bytes| bytes == sentinel.as_bytes())
+        );
+        assert!(
+            wal.windows(sentinel.len())
+                .any(|bytes| bytes == sentinel.as_bytes())
+        );
+    }
+    fs::rename(
+        workspace.root.join(".beads/beads.db-shm"),
+        workspace.root.join("retained-matching-shm"),
+    )
+    .unwrap();
+    workspace
+}
+
+#[test]
+fn missing_wal_index_startup_preserves_committed_rows() {
+    let workspace = current_workspace_without_wal_index(false);
+    let list = run_br(&workspace, ["list", "--all", "--json"], "recovered_list");
+    assert!(list.status.success(), "{} {}", list.stdout, list.stderr);
+    assert!(list.stdout.contains(WAL_ONLY_TITLE));
+    assert!(workspace.root.join(".beads/beads.db-shm").is_file());
+    let create = run_br(
+        &workspace,
+        ["create", "after index recovery", "--json"],
+        "recovered_create",
+    );
+    assert!(
+        create.status.success(),
+        "{} {}",
+        create.stdout,
+        create.stderr
+    );
+}
+
+#[test]
+fn missing_wal_index_startup_preserves_pending_merge_gate() {
+    let workspace = current_workspace_without_wal_index(true);
+    let main_path = workspace.root.join(".beads/beads.db");
+    let wal_path = workspace.root.join(".beads/beads.db-wal");
+    let main_before = fs::read(&main_path).unwrap();
+    let wal_before = fs::read(&wal_path).unwrap();
+    let create = run_br(
+        &workspace,
+        ["create", "must never be created", "--json"],
+        "pending_refusal",
+    );
+    assert!(
+        !create.status.success(),
+        "{} {}",
+        create.stdout,
+        create.stderr
+    );
+    assert!(
+        workspace.root.join(".beads/beads.db-shm").is_file(),
+        "recovery must precede the real pending-receipt refusal"
+    );
+    let error = format!("{}{}", create.stdout, create.stderr);
+    assert!(
+        error.contains("legacy") && error.contains("pending"),
+        "{error}"
+    );
+    assert_eq!(fs::read(main_path).unwrap(), main_before);
+    assert_eq!(fs::read(wal_path).unwrap(), wal_before);
+}
+
+#[test]
+fn missing_wal_index_explicit_read_only_remains_nonmutating() {
+    let workspace = current_workspace_without_wal_index(false);
+    let main_path = workspace.root.join(".beads/beads.db");
+    let wal_path = workspace.root.join(".beads/beads.db-wal");
+    let main_before = fs::read(&main_path).unwrap();
+    let wal_before = fs::read(&wal_path).unwrap();
+    let list = run_br(
+        &workspace,
+        ["list", "--json", "--no-auto-import", "--no-auto-flush"],
+        "readonly_refusal",
+    );
+    assert!(!list.status.success());
+    assert!(!workspace.root.join(".beads/beads.db-shm").exists());
+    assert_eq!(fs::read(main_path).unwrap(), main_before);
+    assert_eq!(fs::read(wal_path).unwrap(), wal_before);
+}
+
+#[test]
+fn missing_wal_index_observational_sync_remains_nonmutating() {
+    for args in [
+        vec!["sync", "--status", "--json"],
+        vec!["sync", "--reconcile", "--dry-run", "--json"],
+    ] {
+        let workspace = current_workspace_without_wal_index(false);
+        let db_path = workspace.root.join(".beads/beads.db");
+        let wal_path = workspace.root.join(".beads/beads.db-wal");
+        let main_before = fs::read(&db_path).unwrap();
+        let wal_before = fs::read(&wal_path).unwrap();
+        let result = run_br(&workspace, args, "observational_refusal");
+        assert!(!result.status.success());
+        assert!(!workspace.root.join(".beads/beads.db-shm").exists());
+        assert!(
+            !workspace
+                .root
+                .join(".beads/.br_recovery/schema-migrations")
+                .exists()
+        );
+        assert_eq!(fs::read(db_path).unwrap(), main_before);
+        assert_eq!(fs::read(wal_path).unwrap(), wal_before);
+    }
+}
+
+#[test]
+fn missing_wal_index_live_peer_prevents_recovery() {
+    let workspace = current_workspace_without_wal_index(false);
+    let db_path = workspace.root.join(".beads/beads.db");
+    let wal_path = workspace.root.join(".beads/beads.db-wal");
+    let main_before = fs::read(&db_path).unwrap();
+    let wal_before = fs::read(&wal_path).unwrap();
+    let _peer = beads_rust::sync::DatabaseOpenerLease::register(&db_path).unwrap();
+    let list = run_br(&workspace, ["list", "--json"], "peer_refusal");
+    assert!(!list.status.success());
+    assert!(format!("{}{}", list.stdout, list.stderr).contains("sole opener"));
+    assert!(!workspace.root.join(".beads/beads.db-shm").exists());
+    assert_eq!(fs::read(db_path).unwrap(), main_before);
+    assert_eq!(fs::read(wal_path).unwrap(), wal_before);
+}
+
+#[test]
+fn missing_wal_index_corrupt_wal_refuses_without_live_mutation() {
+    let workspace = current_workspace_without_wal_index(false);
+    let db_path = workspace.root.join(".beads/beads.db");
+    let wal_path = workspace.root.join(".beads/beads.db-wal");
+    let main_before = fs::read(&db_path).unwrap();
+    let mut wal_before = fs::read(&wal_path).unwrap();
+    wal_before[48] ^= 1; // First frame's checksum; a tolerant scan would ignore it.
+    fs::write(&wal_path, &wal_before).unwrap();
+    let list = run_br(&workspace, ["list", "--json"], "corrupt_refusal");
+    assert!(!list.status.success());
+    assert!(format!("{}{}", list.stdout, list.stderr).contains("checksum"));
+    assert!(!workspace.root.join(".beads/beads.db-shm").exists());
+    assert_eq!(fs::read(db_path).unwrap(), main_before);
+    assert_eq!(fs::read(wal_path).unwrap(), wal_before);
+}
+
 fn install_fixture_workspace(workspace: &BrWorkspace, db_gz: &str, issues: &str, config: &str) {
     let beads_dir = workspace.root.join(".beads");
     fs::create_dir_all(&beads_dir).expect("create .beads");
