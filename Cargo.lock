@@ -1336,9 +1336,9 @@ dependencies = [
 
 [[package]]
 name = "dirs"
-version = "6.0.0"
+version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
 dependencies = [
  "dirs-sys",
 ]
@@ -1482,8 +1482,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-client"
-version = "0.9.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88890705217bb8e202d19555adabf24187"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d60560bddd591b960f255ead49f6deed34eaff5314b7a1baaac24c04dc2170f"
 dependencies = [
  "asupersync",
  "dirs",
@@ -1499,8 +1500,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-console"
-version = "0.9.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88890705217bb8e202d19555adabf24187"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71e6cdeb7bbec9b08174d0be3de2ede523e1ae4e2e285a74b188b47c7cc14ad0"
 dependencies = [
  "fastmcp-core",
  "fastmcp-protocol",
@@ -1517,8 +1519,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-core"
-version = "0.9.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88890705217bb8e202d19555adabf24187"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2acbf2bce54484af1882fb9212a9505ebaef21708754b41cbc60a887ce94caf7"
 dependencies = [
  "asupersync",
  "getrandom 0.4.3",
@@ -1533,8 +1536,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-derive"
-version = "0.9.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88890705217bb8e202d19555adabf24187"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5c6d1b75488ea2faf336bf5ff60160c148dfcb0bd47c487ff3df4dcb9effc8d"
 dependencies = [
  "fastmcp-protocol",
  "proc-macro-crate",
@@ -1545,8 +1549,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-protocol"
-version = "0.9.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88890705217bb8e202d19555adabf24187"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0938af1f3cff85e94b508b6847c92ba83d2f385b3caa370d13f6c485fef4e0ab"
 dependencies = [
  "base64 0.23.1",
  "fastmcp-core",
@@ -1557,8 +1562,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-rust"
-version = "0.9.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88890705217bb8e202d19555adabf24187"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c87b9be042ea7af3cefeeea424d35cec8d8a5e6d2b17fb4036d3ec51690caab1"
 dependencies = [
  "asupersync",
  "fastmcp-client",
@@ -1574,8 +1580,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-server"
-version = "0.9.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88890705217bb8e202d19555adabf24187"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6357f5384b51a10f12a2c7c7251fe13326f7bdf9a7b6e21ead2ab7368b8c1430"
 dependencies = [
  "asupersync",
  "base64 0.23.1",
@@ -1596,8 +1603,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-transport"
-version = "0.9.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88890705217bb8e202d19555adabf24187"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d86ba0eface593b5693c8a1bef191ab0f78162fecab3ac5d5da4def9b676a0f"
 dependencies = [
  "asupersync",
  "fastmcp-core",
