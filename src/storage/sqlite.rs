@@ -17149,15 +17149,58 @@ fn wal_checksum(bytes: &[u8], mut s1: u32, mut s2: u32, big_endian_words: bool) 
 // verification and schema-authority transitions remain auditable in order.
 #[allow(clippy::too_many_lines)]
 fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
+    scan_wal_schema_preflight(db_path, None)
+}
+
+/// Validate every physical WAL frame before rebuilding a missing shared index.
+/// The caller must retain database-family authority throughout validation and
+/// recovery. Checksums establish internal consistency, not foreign-WAL ownership.
+pub(crate) fn validate_wal_for_index_recovery(db_path: &Path) -> Result<()> {
+    let mut source = StableSchemaSource::open_optional(db_path, "database")?.ok_or_else(|| {
+        BeadsError::SyncConflict {
+            message: "WAL index recovery requires an existing database".to_string(),
+        }
+    })?;
+    let mut header = [0_u8; 100];
+    source.file.read_exact(&mut header)?;
+    let encoded_size = u16::from_be_bytes([header[16], header[17]]);
+    let page_size = if encoded_size == 1 { 65_536 } else { u32::from(encoded_size) };
+    if &header[..16] != b"SQLite format 3\0"
+        || !(512..=65_536).contains(&page_size)
+        || !page_size.is_power_of_two()
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "WAL index recovery requires a valid database header and page size".to_string(),
+        });
+    }
+    scan_wal_schema_preflight(db_path, Some(page_size))?;
+    source.file.seek(SeekFrom::Start(0))?;
+    let mut after = [0_u8; 100];
+    source.file.read_exact(&mut after)?;
+    if after != header {
+        return Err(BeadsError::SyncConflict {
+            message: "Database header changed during WAL index recovery validation".to_string(),
+        });
+    }
+    source.verify_path(db_path, "database")
+}
+
+#[allow(clippy::too_many_lines)]
+fn scan_wal_schema_preflight(db_path: &Path, recovery_page_size: Option<u32>) -> Result<WalSchemaPreflight> {
     let wal_path = database_sidecar_path(db_path, "-wal");
     let Some(mut wal_source) = StableSchemaSource::open_optional(&wal_path, "WAL")? else {
+        if recovery_page_size.is_some() {
+            return Err(BeadsError::SyncConflict {
+                message: "WAL index recovery requires an existing WAL".to_string(),
+            });
+        }
         return Ok(WalSchemaPreflight {
             committed_user_version: None,
             has_committed_frames: false,
         });
     };
     let wal_len = wal_source.initial_len;
-    if wal_len == 0 {
+    if wal_len == 0 && recovery_page_size.is_none() {
         wal_source.verify_path(&wal_path, "WAL")?;
         return Ok(WalSchemaPreflight {
             committed_user_version: None,
@@ -17213,6 +17256,18 @@ fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
 
     let frame_size = u64::from(page_size) + 24;
     let frame_bytes = wal_len - 32;
+    if let Some(expected_size) = recovery_page_size {
+        if expected_size != page_size {
+            return Err(BeadsError::SyncConflict {
+                message: "WAL page size disagrees with the database during index recovery".to_string(),
+            });
+        }
+        if frame_bytes % frame_size != 0 {
+            return Err(BeadsError::SyncConflict {
+                message: "WAL index recovery refuses a partial frame tail".to_string(),
+            });
+        }
+    }
     let page_size_usize = usize::try_from(page_size).map_err(|_| BeadsError::SyncConflict {
         message: "WAL page size does not fit this platform".to_string(),
     })?;
@@ -17239,6 +17294,11 @@ fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
             u32::from_be_bytes(frame[12..16].try_into().unwrap_or([0; 4])),
         );
         if frame_salts != header_salts {
+            if recovery_page_size.is_some() {
+                return Err(BeadsError::SyncConflict {
+                    message: format!("WAL index recovery refuses frame {frame_index} with mismatched salts"),
+                });
+            }
             break;
         }
         let checksum_after_header = wal_checksum(
@@ -17258,6 +17318,11 @@ fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
             u32::from_be_bytes(frame[20..24].try_into().unwrap_or([0; 4])),
         );
         if stored_frame_checksum != expected_frame_checksum {
+            if recovery_page_size.is_some() {
+                return Err(BeadsError::SyncConflict {
+                    message: format!("WAL index recovery refuses frame {frame_index} with invalid checksum"),
+                });
+            }
             break;
         }
         running_checksum = expected_frame_checksum;
@@ -33198,6 +33263,62 @@ required_fields:
             family_before,
             "invalid header-only WAL refusal must be byte and mode neutral"
         );
+    }
+
+    #[test]
+    fn wal_index_recovery_validates_complete_family_without_mutation() {
+        let salts = (0x1020_3040, 0x5060_7080);
+        for case in ["header", "committed", "header_checksum", "frame_checksum", "salts", "partial", "page_size"] {
+            let temp = TempDir::new().unwrap();
+            let db_path = temp.path().join("validation.db");
+            let wal_path = database_sidecar_path(&db_path, "-wal");
+            let mut main = vec![0_u8; 512];
+            main[..16].copy_from_slice(b"SQLite format 3\0");
+            main[16..18].copy_from_slice(&512_u16.to_be_bytes());
+            let (mut wal, mut checksum) = synthetic_wal_header(salts);
+            if case != "header" {
+                append_synthetic_wal_frame(&mut wal, &mut checksum, 1, 1, salts, Some(73));
+            }
+            let expected_error = match case {
+                "header_checksum" => {
+                    wal[24] ^= 1;
+                    Some("header checksum")
+                }
+                "frame_checksum" => {
+                    wal[32 + 24 + 100] ^= 1;
+                    Some("invalid checksum")
+                }
+                "salts" => {
+                    wal[32 + 8] ^= 1;
+                    Some("mismatched salts")
+                }
+                "partial" => {
+                    wal.push(0);
+                    Some("partial frame")
+                }
+                "page_size" => {
+                    main[16..18].copy_from_slice(&1024_u16.to_be_bytes());
+                    Some("page size disagrees")
+                }
+                _ => None,
+            };
+            fs::write(&db_path, &main).unwrap();
+            fs::write(&wal_path, &wal).unwrap();
+            let result = validate_wal_for_index_recovery(&db_path);
+            if let Some(expected) = expected_error {
+                let error = result.expect_err(case);
+                assert!(error.to_string().contains(expected), "{case}: {error}");
+            } else {
+                result.expect(case);
+                assert_eq!(
+                    sqlite_wal_schema_preflight(&db_path).unwrap().committed_user_version,
+                    if case == "committed" { Some(73) } else { None },
+                );
+            }
+            assert_eq!(fs::read(&db_path).unwrap(), main, "{case}: main changed");
+            assert_eq!(fs::read(&wal_path).unwrap(), wal, "{case}: WAL changed");
+            assert!(!database_sidecar_path(&db_path, "-shm").exists());
+        }
     }
 
     #[test]
