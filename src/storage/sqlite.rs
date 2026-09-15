@@ -21233,8 +21233,10 @@ impl Drop for SqliteStorage {
                 }
             }
         }
-        // Explicitly close the connection to avoid fsqlite drop_close warnings.
-        let _ = self.conn.close_in_place();
+        // Engine close normally performs its own passive checkpoint. It must
+        // not bypass the sole-opener admission above or checkpoint a read-only
+        // command's handle. Transaction cleanup still runs without a checkpoint.
+        let _ = self.conn.close_without_checkpoint_in_place();
         drop(exit_hold);
         // Ephemeral temp databases (open_memory) are unlinked here, after the
         // connection is closed, so the file and its WAL/SHM/journal sidecars are
@@ -33275,6 +33277,84 @@ required_fields:
             family_before,
             "invalid header-only WAL refusal must be byte and mode neutral"
         );
+    }
+
+    #[test]
+    fn missing_wal_index_recovery_preserves_valid_wal_only_pending_receipt() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("pending_wal_only.db");
+        let wal_path = database_sidecar_path(&db_path, "-wal");
+        let shm_path = database_sidecar_path(&db_path, "-shm");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .conn
+            .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        storage.conn.execute("PRAGMA wal_autocheckpoint=0").unwrap();
+        let sentinel = "valid pending merge committed only in WAL";
+        let issue = make_issue(
+            "bd-wal-pending",
+            sentinel,
+            Status::Open,
+            2,
+            None,
+            Utc.with_ymd_and_hms(2026, 7, 27, 7, 0, 0).unwrap(),
+            None,
+        );
+        let kept = [issue];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &intent)
+            .unwrap();
+        let expected = storage.inspect_pending_sync_merge().unwrap();
+        assert!(matches!(&expected, PendingSyncMergeInspection::Valid(_)));
+        let receipt_bytes = storage
+            .get_metadata(METADATA_SYNC_MERGE_PENDING)
+            .unwrap()
+            .unwrap();
+        let peer = crate::sync::DatabaseOpenerLease::register(&db_path).unwrap();
+        drop(storage);
+        drop(peer);
+        let main_before = fs::read(&db_path).unwrap();
+        let wal_before = fs::read(&wal_path).unwrap();
+        for value in [sentinel.as_bytes(), receipt_bytes.as_bytes()] {
+            assert!(
+                !main_before
+                    .windows(value.len())
+                    .any(|window| window == value),
+                "fixture must not checkpoint the sentinel or receipt into main"
+            );
+            assert!(
+                wal_before
+                    .windows(value.len())
+                    .any(|window| window == value),
+                "fixture must retain the exact sentinel and receipt in WAL"
+            );
+        }
+        fs::rename(&shm_path, temp.path().join("retained-matching-shm")).unwrap();
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                temp.path(),
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+        crate::cli::commands::doctor_subsystems::schema_migration::recover_missing_wal_index(
+            temp.path(),
+            &db_path,
+            &authority,
+        )
+        .unwrap();
+        assert!(shm_path.is_file());
+        assert_eq!(
+            SqliteStorage::inspect_pending_sync_merge_under_authority(&db_path, &authority)
+                .unwrap(),
+            expected,
+            "index recovery must preserve the exact valid pending receipt",
+        );
+        assert_eq!(fs::read(&db_path).unwrap(), main_before);
+        assert_eq!(fs::read(&wal_path).unwrap(), wal_before);
     }
 
     #[test]
