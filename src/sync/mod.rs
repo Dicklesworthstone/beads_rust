@@ -26451,7 +26451,7 @@ mod tests {
         drop(storage);
         let family_bytes = || {
             std::iter::once("")
-                .chain(config::db_sidecar_suffixes().copied())
+                .chain(crate::config::db_sidecar_suffixes().copied())
                 .map(|suffix| {
                     let mut path = db_path.as_os_str().to_os_string();
                     path.push(suffix);
@@ -26507,16 +26507,19 @@ mod tests {
         let handles = [first, second].map(|mut lease| {
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
+                let mut admitted_any = false;
+                let mut lost_registration = false;
                 for _ in 0..128 {
                     barrier.wait();
                     let hold = lease.try_exclusive();
-                    let admitted = hold.is_some();
+                    admitted_any |= hold.is_some();
                     drop(hold);
                     // Both peers remain alive until both attempts finish.
                     barrier.wait();
-                    assert!(!admitted, "a live peer was overlooked during upgrade");
-                    assert!(lease.is_registered());
+                    lost_registration |= !lease.is_registered();
                 }
+                assert!(!admitted_any, "a live peer was overlooked during upgrade");
+                assert!(!lost_registration, "live peer registration was lost");
                 lease
             })
         });
