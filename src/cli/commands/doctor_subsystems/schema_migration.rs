@@ -358,26 +358,33 @@ fn execute_recover(
 
 /// Whether an existing WAL family lacks its regenerable shared index.
 /// This is only an advisory probe; recovery repeats it under family authority.
+///
+/// # Errors
+/// Returns an error for unsafe paths or failed filesystem inspection.
 pub fn missing_wal_index(db_path: &Path) -> Result<bool> {
     if secure_file_metadata(db_path)?.is_none()
         || secure_file_metadata(&family_component_path(db_path, "-shm"))?.is_some()
     {
         return Ok(false);
     }
-    Ok(secure_file_metadata(&family_component_path(db_path, "-wal"))?
-        .is_some_and(|metadata| metadata.len() > 0))
+    Ok(
+        secure_file_metadata(&family_component_path(db_path, "-wal"))?
+            .is_some_and(|metadata| metadata.len() > 0),
+    )
 }
 
 /// Restore a missing index before startup inspects the actual pending receipt.
 /// Main/WAL/journal bytes are preserved; this never imports or migrates data.
+///
+/// # Errors
+/// Refuses changed authority, peer openers, invalid WALs, or recovery whose
+/// durable bytes and logical contents cannot be verified unchanged.
 pub fn recover_missing_wal_index(
     beads_dir: &Path,
     db_path: &Path,
     authority: &Arc<DatabaseFamilyWriteLock>,
 ) -> Result<()> {
-    if crate::sync::database_write_authority_sha256(db_path)?
-        != authority.authority_path_sha256()
-    {
+    if crate::sync::database_write_authority_sha256(db_path)? != authority.authority_path_sha256() {
         return Err(BeadsError::SyncConflict {
             message: "WAL index recovery path does not match the held database-family authority"
                 .to_string(),
