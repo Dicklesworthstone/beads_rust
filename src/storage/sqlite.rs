@@ -3841,7 +3841,10 @@ impl SqliteStorage {
 
     /// Hand back the exclusive opener hold taken by [`Self::admit_checkpoint`]
     /// and rejoin the shared opener registration.
-    fn release_checkpoint_admission(&mut self, hold: Option<crate::sync::DatabaseOpenerExclusiveHold>) {
+    fn release_checkpoint_admission(
+        &mut self,
+        hold: Option<crate::sync::DatabaseOpenerExclusiveHold>,
+    ) {
         if let (Some(lease), Some(hold)) = (self.opener_lease.as_mut(), hold)
             && let Err(error) = lease.release_exclusive(hold)
         {
