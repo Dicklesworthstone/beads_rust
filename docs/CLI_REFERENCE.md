@@ -2077,6 +2077,24 @@ commands; `br doctor explain --list` enumerates the finding ids.
 
 #### Reviewed schema migration
 
+If read-only planning fails because legacy WAL-index state requires engine
+recovery, run the explicit admission recovery first:
+
+```bash
+br doctor migrate-schema recover --json
+```
+
+`recover` requires exclusive database-family write authority and a sole-opener
+lease. It preserves and verifies every known engine sidecar in a private backup,
+rehearses the engine's existing-only writable open on a separate copy, and
+requires unchanged main database, WAL and journal bytes before touching the
+live family. The live open is bound to a retained database identity and must
+produce the same complete logical witness as the rehearsal. Recovery never
+changes the schema or imports JSONL. Success reports `backup_path`; failure
+reports the stage and retained pre-state location. All rehearsal and failure
+artifacts remain available. Run `plan` again after successful recovery; `plan`
+itself remains read-only.
+
 Ordinary commands never upgrade an existing database across a schema-version
 boundary. If the database is on a supported older version, use the explicit
 receipt-bound lifecycle:

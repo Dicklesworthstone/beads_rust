@@ -388,7 +388,7 @@ fn require_recovery_payload_unchanged(
     Ok(())
 }
 
-fn recover_existing_family(path: &Path) -> Result<()> {
+fn recover_existing_family(path: &Path, authority: Option<&DatabaseFamilyWriteLock>) -> Result<()> {
     let metadata = secure_file_metadata(path)?
         .ok_or_else(|| BeadsError::internal("recovery database disappeared"))?;
     let retained = File::open(path)?;
@@ -399,6 +399,11 @@ fn recover_existing_family(path: &Path) -> Result<()> {
     }
     let identity = fsqlite_vfs::FileIdentity::from_file(&retained)?
         .ok_or_else(|| BeadsError::internal("recovery database identity is unavailable"))?;
+    // Verify the leased live generation after capturing the descriptor, so a
+    // replacement before capture cannot become the engine's accepted identity.
+    if let Some(authority) = authority {
+        authority.verify_database_authority()?;
+    }
     let conn = Connection::open_existing_with_expected_identity(
         path.to_string_lossy().into_owned(),
         identity,
@@ -442,7 +447,7 @@ fn recover_engine_admission(migration: &MigrationContext) -> Result<EngineRecove
         verify_backup_family(&backup_db, &probe_dir, &receipt.raw_before)?;
         let probe_db = backup_component_path(&probe_dir, &migration.db_path, "")?;
         let probe_before = recovery_family_witness(&probe_db)?;
-        recover_existing_family(&probe_db)?;
+        recover_existing_family(&probe_db, None)?;
         require_recovery_payload_unchanged(&probe_before, &recovery_family_witness(&probe_db)?)?;
         let expected = logical_witness(&probe_db)?;
         if !integrity_check_is_clean(&expected.integrity_check) {
@@ -459,7 +464,7 @@ fn recover_engine_admission(migration: &MigrationContext) -> Result<EngineRecove
         }
         verify_backup_family(&migration.db_path, &before_dir, &receipt.raw_before)?;
         receipt.stage = "live-recovery".to_string();
-        recover_existing_family(&migration.db_path)?;
+        recover_existing_family(&migration.db_path, Some(&migration.write_authority))?;
         migration.write_authority.verify_database_authority()?;
         let raw_after = recovery_family_witness(&migration.db_path)?;
         require_recovery_payload_unchanged(&receipt.raw_before, &raw_after)?;
@@ -4771,12 +4776,32 @@ mod tests {
 
     #[test]
     fn engine_recovery_preserves_wal_rows_and_complete_backup() {
+        assert_engine_recovery_preserves_family(false);
+    }
+
+    #[test]
+    fn engine_recovery_admits_legacy_empty_wal_before_migration() {
+        assert_engine_recovery_preserves_family(true);
+    }
+
+    fn assert_engine_recovery_preserves_family(checkpoint: bool) {
         let (_temp, migration) = reviewed_source_migration_context("beads.db", 17);
         let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
         conn.execute("PRAGMA journal_mode=WAL").unwrap();
         conn.execute("UPDATE issues SET title='committed WAL recovery row'")
             .unwrap();
+        if checkpoint {
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
         close_connection(conn).unwrap();
+        let wal_size = fs::metadata(family_component_path(&migration.db_path, "-wal"))
+            .unwrap()
+            .len();
+        if checkpoint {
+            assert!(wal_size <= 32, "checkpointed fixture has no WAL frames");
+        } else {
+            assert!(wal_size > 32, "fixture must retain committed WAL frames");
+        }
         let expected = logical_witness(&migration.db_path).unwrap();
         let shm = family_component_path(&migration.db_path, "-shm");
         fs::write(&shm, vec![0_u8; 32_768]).unwrap();
@@ -4802,7 +4827,24 @@ mod tests {
             1 + config::db_sidecar_suffixes().count()
         );
         assert!(run.join("recovery-complete.json").is_file());
-        assert!(build_plan(&migration.db_path).unwrap().eligible);
+        let plan = build_plan(&migration.db_path).unwrap();
+        assert!(plan.eligible);
+        if checkpoint {
+            execute_apply(
+                &DoctorMigrateSchemaApplyArgs {
+                    plan_token: plan.plan_token.unwrap(),
+                    json: true,
+                },
+                &migration,
+            )
+            .unwrap();
+            let migrated = logical_witness(&migration.db_path).unwrap();
+            assert_eq!(
+                migrated.user_version,
+                u32::try_from(CURRENT_SCHEMA_VERSION).unwrap()
+            );
+            assert_eq!(migrated.integrity_check, "ok");
+        }
     }
 
     #[test]

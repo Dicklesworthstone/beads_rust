@@ -422,6 +422,33 @@ mod tests {
     }
 
     #[test]
+    fn engine_recovery_refuses_replaced_database_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.db");
+        let conn = Connection::open(path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("CREATE TABLE original (value TEXT)").unwrap();
+        conn.close().unwrap();
+        let retained = std::fs::File::open(&path).unwrap();
+        let identity = fsqlite_vfs::FileIdentity::from_file(&retained)
+            .unwrap()
+            .unwrap();
+        std::fs::rename(&path, temp.path().join("retained-original.db")).unwrap();
+        std::fs::write(&path, b"replacement must not be opened").unwrap();
+        assert!(
+            Connection::open_existing_with_expected_identity(
+                path.to_string_lossy().into_owned(),
+                identity,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"replacement must not be opened"
+        );
+        assert!(retained.metadata().unwrap().len() > 0);
+    }
+
+    #[test]
     fn string_in_list_predicates_match_equality_forms() {
         let conn = Connection::open(":memory:").expect("open in-memory database");
         conn.execute("CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT)")

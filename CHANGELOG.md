@@ -85,6 +85,15 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ## Unreleased
 
+- **Recover legacy engine read admission before schema migration.**
+  `doctor migrate-schema recover` preserves the complete database family,
+  rehearses recovery on a private copy, and performs an identity-bound live
+  open only under write authority and a sole-opener lease. The main database,
+  WAL, and journal must remain unchanged; the recovered logical state must
+  match the rehearsal. Planning remains read-only. See the
+  [migration reference](docs/CLI_REFERENCE.md#reviewed-schema-migration)
+  and workstream `beads_rust-otrgz.1`.
+
 - **Refuse deferred claims before writing to any routed workspace.** A mixed
   claim containing a deferred target no longer claims earlier valid issues
   before returning an error. This also applies with `--force`.

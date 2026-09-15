@@ -1,5 +1,35 @@
 # Changelog research — 2026-09-08
 
+## 2026-09-15 — explicit engine admission recovery
+
+The retained schema-17 family failed read-only admission because its legacy
+SHM header had a zero page size. The September 14 private probe established
+that the engine's existing-only writable open repairs SHM while preserving
+main/WAL/journal bytes and all 1,086 issue rows; subsequent schema migration
+and both real-family stress gates passed on the experimental engine candidate.
+See `UPGRADE_LOG.md` for the evidence and remaining release gates.
+
+The new `doctor migrate-schema recover` exposes that operation with complete
+engine-family backup, private rehearsal, sole-opener admission, retained VFS
+identity binding, protected-file byte checks, and a full logical comparison.
+Initial implementation commits:
+[e4c772af](https://github.com/Dicklesworthstone/beads_rust/commit/e4c772af)
+and [eaadcbe0](https://github.com/Dicklesworthstone/beads_rust/commit/eaadcbe0).
+Validation completed under `beads_rust-otrgz.1`: RCH all-target/all-feature
+compiler and denied-warning Clippy checks passed. Release/all-feature testing
+passed 3,151 library tests (nine existing ignores) and all 165 schema-migration
+end-to-end tests. The final source overlay fingerprint is
+`0cd8eac713e217ced6b10cae21894d967cec64f13ed39afab36bf16fceeb41fe`.
+The actual CLI then recovered a complete private copy of the retained family:
+planning changed from `BusyRecovery` to eligible, all 1,086 issues remained,
+and the original snapshot's bytes and filesystem identity remained unchanged.
+Logs: `/tmp/br-otrgz1-{check,clippy,final-tests,cli-canary}.log`.
+Formatting, diff checks and changelog structural validation passed. UBS exited
+1 on whole-file findings; reviewed critical reports concern test assertions,
+an existing filename nonce and non-secret witness comparisons, not a clean
+scanner result. This is unreleased and does not qualify the dependency
+candidate or change version pins.
+
 ## 2026-09-14 — routed-claim regression and engine follow-up
 
 `beads_rust-ls72r` is now reproduced: a routed claim exits 4 for an explicitly

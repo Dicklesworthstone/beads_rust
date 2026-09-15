@@ -1,5 +1,40 @@
 # Dependency Upgrade Log
 
+## Completed recovery capability: 2026-09-15 (beads_rust-otrgz.1)
+
+- `br doctor migrate-schema recover` now performs explicit engine admission
+  recovery using the unchanged main dependency pins. It requires exclusive
+  opener and write authority, backs up all nine engine-family components,
+  rehearses on a complete private copy, binds the live open to retained VFS
+  identity, and verifies protected main/WAL/journal bytes and logical contents.
+  It records prepared, complete or failed receipts and leaves schema migration
+  as a separate operation. Failure retains the complete prestate backup.
+- RCH all-target/all-feature check and denied-warning Clippy passed. The final
+  release/all-feature run passed 3,151 library tests with nine existing ignores
+  and all 165 schema-migration end-to-end tests. Coverage includes committed WAL
+  rows, empty-WAL recovery followed by migration, peer refusal, symlink refusal,
+  failed private recovery and database-identity replacement. Overlay:
+  `0cd8eac713e217ced6b10cae21894d967cec64f13ed39afab36bf16fceeb41fe`.
+  Logs: `/tmp/br-otrgz1-{check,clippy,final-tests}.log`.
+- The actual CLI recovered a complete 33-file private copy of the retained
+  schema-17 family. Planning initially failed with `BusyRecovery`, recovery
+  completed, and planning became eligible with all 1,086 issues preserved.
+  The original source hashes, inodes, modification times and change times
+  remained identical. Worker receipts: `/tmp/br-otrgz1-cli-0q6lb0tk/`;
+  controller log: `/tmp/br-otrgz1-cli-canary.log`. Binary SHA-256:
+  `8d269b15c44f07727279d680168f7f025c50a21d8aba95d3f29ac9ce077a3bc9`.
+- Formatting and diff checks passed. UBS whole-file scanning exited 1; reviewed
+  critical reports were test assertions, an existing temporary-name nonce and
+  comparisons of non-secret recovery witnesses. No tests were weakened or
+  scanner findings suppressed. This closes the recovery capability, not the
+  parent engine qualification or release gates.
+- A fresh official-registry inventory found published FastMCP 0.10.0, which
+  requires the existing asupersync 0.5.0 and may remove the Git-only publishing
+  blocker. Its custom task-store trait changes have no implementation in br.
+  Qualification remains open in `beads_rust-nx2sh`, including clap 4.6.7 and
+  clap_complete 4.6.10 patch review. The fsqlite family still lacks an aligned
+  published update. No dependency pins changed in this recovery work.
+
 ## In progress: 2026-09-14 (beads_rust-otrgz)
 
 - The registry still has no newer published engine patch. An isolated candidate

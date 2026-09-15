@@ -3921,6 +3921,16 @@ mod tests {
 
     #[test]
     fn test_doctor_migrate_schema_lifecycle_parses() {
+        let recover = Cli::parse_from(["br", "doctor", "migrate-schema", "recover", "--json"]);
+        let Commands::Doctor(recover_args) = recover.command else {
+            panic!("expected doctor command");
+        };
+        assert!(matches!(
+            recover_args.subcommand,
+            Some(DoctorSubcommand::MigrateSchema(DoctorMigrateSchemaArgs {
+                command: DoctorMigrateSchemaCommand::Recover(recovery)
+            })) if recovery.json
+        ));
         let plan = Cli::parse_from(["br", "doctor", "migrate-schema", "plan", "--json"]);
         let Commands::Doctor(plan_args) = plan.command else {
             panic!("expected doctor command");
