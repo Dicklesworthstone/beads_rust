@@ -87,6 +87,79 @@ fn isolated_tempdir() -> TempDir {
     TempDir::new_in(common::cli::isolated_temp_root()).expect("create isolated tempdir")
 }
 
+#[test]
+fn repair_indexes_excludes_registered_peer_and_preserves_committed_wal() {
+    let temp = isolated_tempdir();
+    br_init(temp.path());
+    let beads_dir = temp.path().join(".beads");
+    let db_path = beads_dir.join("beads.db");
+    let sentinel = "index repair must preserve this WAL-only value";
+    let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    conn.execute("PRAGMA journal_mode=WAL").unwrap();
+    conn.execute("PRAGMA wal_autocheckpoint=0").unwrap();
+    conn.execute(&format!(
+        "INSERT INTO metadata (key, value) VALUES ('index_repair_sentinel', '{sentinel}')"
+    ))
+    .unwrap();
+    drop(conn);
+    assert!(
+        !fs::read(&db_path)
+            .unwrap()
+            .windows(sentinel.len())
+            .any(|bytes| bytes == sentinel.as_bytes())
+    );
+    assert!(
+        fs::read(beads_dir.join("beads.db-wal"))
+            .unwrap()
+            .windows(sentinel.len())
+            .any(|bytes| bytes == sentinel.as_bytes())
+    );
+    let peer = beads_rust::sync::DatabaseOpenerLease::register(&db_path).unwrap();
+    let before: Vec<_> = fs::read_dir(&beads_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("beads.db")
+        })
+        .map(|path| {
+            let bytes = fs::read(&path).unwrap();
+            let permissions = fs::metadata(&path).unwrap().permissions();
+            (path, bytes, permissions)
+        })
+        .collect();
+    let refused = br_cmd(temp.path())
+        .args(["doctor", "--repair-indexes", "--json"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(message.contains("sole opener"), "{message}");
+    assert!(!db_path.with_extension("db.pre-repair-indexes").exists());
+    for (path, bytes, permissions) in before {
+        assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+        assert_eq!(fs::metadata(path).unwrap().permissions(), permissions);
+    }
+    drop(peer);
+    let repaired = br_cmd(temp.path())
+        .args(["doctor", "--repair-indexes", "--json"])
+        .output()
+        .unwrap();
+    assert!(repaired.status.success(), "{repaired:?}");
+    assert!(db_path.with_extension("db.pre-repair-indexes").is_file());
+    let storage = beads_rust::storage::SqliteStorage::open(&db_path).unwrap();
+    assert_eq!(
+        storage.get_metadata("index_repair_sentinel").unwrap(),
+        Some(sentinel.to_string())
+    );
+}
+
 /// Plant the `gitignore.beads_inner` failure: a root `.gitignore` whose
 /// `.beads/` line shadows br's own ignore rules.
 fn corrupt_root_gitignore(cwd: &Path) {
