@@ -67,7 +67,10 @@ Implemented in `src/sync/mod.rs` (`DatabaseOpenerLease`) and
   preventing other checkpoint attempts from overlooking the live handle.
   Read-only commands leave `mutation_count` at zero and never checkpoint on
   teardown. Index repair retains exclusive admission through checkpoint,
-  REINDEX, connection close and any failure restore.
+  REINDEX, connection close and any failure restore. Doctor's oversized-WAL
+  truncation also requires sole-opener admission. Partial REINDEX and the
+  rollback-only post-repair write probe retain shared opener registration
+  and use non-checkpointing connection close.
 
 Consequence for operators: under a busy swarm the WAL can grow because
 checkpoints are skipped while peers are present; `br doctor` reports `wal_size`

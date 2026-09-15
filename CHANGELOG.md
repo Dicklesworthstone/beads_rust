@@ -89,6 +89,19 @@ this repo): commits `55c186682` + `5946b3b7c` in
   a storage handle no longer invokes an implicit engine checkpoint after br
   has declined checkpointing because peers are present. The existing
   sole-opener check continues to govern exit-time checkpoints.
+- **Keep opener protection during long recovery and competing checkpoints.**
+  New opens now fail safely after the five-second admission deadline instead
+  of entering an exclusively held database without a lease. Competing
+  checkpoint attempts retain peer protection, and an exclusive hold restores
+  shared registration when dropped. If restoration fails, a retained
+  transition lock continues to prevent peer checkpoints.
+  ([lease ownership](https://github.com/Dicklesworthstone/beads_rust/commit/3015fb0f),
+  [regressions](https://github.com/Dicklesworthstone/beads_rust/commit/238f2300))
+- **Protect doctor repairs from peer checkpoints.** Index repair and explicit
+  WAL truncation require sole-opener admission. Partial REINDEX and the
+  rollback-only write probe retain shared opener registration and close
+  without an implicit checkpoint. Workstream `beads_rust-otrgz.3`.
+  ([index repair](https://github.com/Dicklesworthstone/beads_rust/commit/b74ad74f))
 - **Recover a missing WAL shared index during ordinary startup.** Reads and
   writes can reopen valid WAL-backed databases whose `-shm` index is missing.
   Recovery requires a sole opener, validates the complete WAL, preserves a
