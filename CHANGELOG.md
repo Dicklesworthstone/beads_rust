@@ -85,6 +85,12 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ## Unreleased
 
+- **Use published dependencies for MCP-enabled installations.** FastMCP
+  0.10.0 replaces the Git-only pin, retaining the existing Asupersync runtime
+  version and incorporating upstream cancellation-drain fixes. Published
+  crate archives now exclude local test-evidence artifacts.
+  [806819f9](https://github.com/Dicklesworthstone/beads_rust/commit/806819f9)
+
 - **Recover legacy engine read admission before schema migration.**
   `doctor migrate-schema recover` preserves the complete database family,
   rehearses recovery on a private copy, and performs an identity-bound live

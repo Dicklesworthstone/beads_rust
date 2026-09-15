@@ -1,5 +1,35 @@
 # Dependency Upgrade Log
 
+## In progress: 2026-09-15 (beads_rust-nx2sh)
+
+- Replaced Git FastMCP 0.9.0 at `180a7c88890705217bb8e202d19555adabf24187`
+  with the eight published 0.10.0 crates. The only additional lockfile change
+  is the required `dirs` 6.0.0→7.0.0 dependency. Asupersync remains a single
+  registry package at 0.5.0, and the lockfile has no Git dependencies.
+- Reviewed upstream tag `v0.10.0` at
+  `5f1b2ef7155e5823f563fce476112f31ebc3554f` against the exact prior Git pin.
+  The new `FinalTaskStore` retention methods affect no br implementation;
+  handler/builder APIs and selected ModernOnly protocol defaults are unchanged.
+  Upstream fixes cancelled blocking drains and child cancellation reporting.
+  A separate source-review agent found no required application changes. Its
+  source analysis is not an independent runtime test result.
+- Package creation initially included local test-evidence tarballs, producing
+  a 96.2 MiB compressed crate. Excluding `tests/artifacts/` reduced this to
+  3.1 MiB with 745 members; archive inspection confirmed registry-only FastMCP
+  metadata and retained source/build inputs. No evidence files were deleted.
+  Logs: `/tmp/br-nx2sh-package{,-clean}.log`. These commands used `--no-verify`;
+  they establish package construction, not compilation of the packaged source.
+- RCH all-target/all-feature check passed. Release/all-feature library, MCP
+  protocol/shutdown and package-manifest tests are running; Clippy is pending.
+  The existing shutdown test covers idle server interruption and reopenability,
+  not cancellation during an active handler. No tests were weakened or added
+  merely to mirror the dependency edit.
+- Fresh `cargo audit` found the pre-existing `rustls` 0.23.43 vulnerability
+  RUSTSEC-2026-0285 (patched in 0.23.45). This remains a release gate tracked
+  separately in `beads_rust-njkug`. Audit evidence: `/tmp/br-nx2sh-audit.json`.
+  UBS on the two changed manifest files exited 2 without scanning Rust source;
+  it is not a clean scanner result. Log: `/tmp/br-nx2sh-ubs.log`.
+
 ## Completed recovery capability: 2026-09-15 (beads_rust-otrgz.1)
 
 - `br doctor migrate-schema recover` now performs explicit engine admission
