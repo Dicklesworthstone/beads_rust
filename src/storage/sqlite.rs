@@ -33291,6 +33291,8 @@ required_fields:
             .execute("PRAGMA wal_checkpoint(TRUNCATE)")
             .unwrap();
         storage.conn.execute("PRAGMA wal_autocheckpoint=0").unwrap();
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+        let checkpointed_main = fs::read(&db_path).unwrap();
         let sentinel = "valid pending merge committed only in WAL";
         let issue = make_issue(
             "bd-wal-pending",
@@ -33308,29 +33310,30 @@ required_fields:
             .unwrap();
         let expected = storage.inspect_pending_sync_merge().unwrap();
         assert!(matches!(&expected, PendingSyncMergeInspection::Valid(_)));
-        let receipt_bytes = storage
-            .get_metadata(METADATA_SYNC_MERGE_PENDING)
-            .unwrap()
-            .unwrap();
         let peer = crate::sync::DatabaseOpenerLease::register(&db_path).unwrap();
         drop(storage);
         drop(peer);
         let main_before = fs::read(&db_path).unwrap();
         let wal_before = fs::read(&wal_path).unwrap();
-        for value in [sentinel.as_bytes(), receipt_bytes.as_bytes()] {
-            assert!(
-                !main_before
-                    .windows(value.len())
-                    .any(|window| window == value),
-                "fixture must not checkpoint the sentinel or receipt into main"
-            );
-            assert!(
-                wal_before
-                    .windows(value.len())
-                    .any(|window| window == value),
-                "fixture must retain the exact sentinel and receipt in WAL"
-            );
-        }
+        // A receipt can span several database pages and WAL frame headers, so
+        // its serialized bytes need not be contiguous in the WAL. Equality of
+        // the entire main file with its receipt-free pre-state proves neither
+        // the new issue nor receipt was checkpointed; recovery must yield the
+        // exact valid receipt below, including every field and witness.
+        assert_eq!(
+            main_before, checkpointed_main,
+            "peer presence must prevent every exit-time checkpoint"
+        );
+        assert!(
+            !main_before
+                .windows(sentinel.len())
+                .any(|bytes| bytes == sentinel.as_bytes())
+        );
+        assert!(
+            wal_before
+                .windows(sentinel.len())
+                .any(|bytes| bytes == sentinel.as_bytes())
+        );
         fs::rename(&shm_path, temp.path().join("retained-matching-shm")).unwrap();
         let authority = Arc::new(
             crate::sync::blocking_database_family_write_lock_with_timeout(
