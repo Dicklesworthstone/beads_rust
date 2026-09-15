@@ -1293,16 +1293,17 @@ fn is_allowed_sync_file(rel_path: &str) -> bool {
 
     // Check extension matches
     const ALLOWED_EXTENSIONS: &[&str] = &[
-        "db",                 // SQLite database
-        "db-journal",         // SQLite rollback journal
-        "db-wal",             // SQLite WAL
-        "db-wal-cert",        // fsqlite parallel-WAL durability certificate
-        "db-wal-cert-head",   // fsqlite checkpoint hand-off head
-        "db-shm",             // SQLite shared memory
-        "db-fsqlite-ns-gate", // fsqlite multi-process namespace gate
-        "db-fsqlite-ns-use",  // fsqlite multi-process namespace use-count
-        "jsonl",              // JSONL export
-        "jsonl.tmp",          // Atomic write temp files
+        "db",                         // SQLite database
+        "db-journal",                 // SQLite rollback journal
+        "db-wal",                     // SQLite WAL
+        "db-wal-cert",                // fsqlite parallel-WAL durability certificate
+        "db-wal-cert-head",           // fsqlite checkpoint hand-off head
+        "db-shm",                     // SQLite shared memory
+        "db-fsqlite-ns-gate",         // fsqlite multi-process namespace gate
+        "db-fsqlite-ns-use",          // fsqlite multi-process namespace use-count
+        "db.fsqlite-migration-state", // fsqlite database-family migration marker
+        "jsonl",                      // JSONL export
+        "jsonl.tmp",                  // Atomic write temp files
     ];
 
     for ext in ALLOWED_EXTENSIONS {
