@@ -179,6 +179,81 @@ fn wait_for_workspace_waiters(root: &Path, count: usize) -> Vec<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
+fn wait_for_child_owned_workspace_registration(root: &Path, child: &mut std::process::Child) {
+    let deadline = Instant::now() + WRITE_LOCK_WAIT_OBSERVATION_TIMEOUT;
+    let queue = root.join(".beads/.write-waiters.lock");
+    let process = PathBuf::from(format!("/proc/{}", child.id()));
+    let pid = child.id().to_string();
+    loop {
+        assert!(child.try_wait().unwrap().is_none(), "waiter exited early");
+        for entry in fs::read_dir(process.join("fd")).unwrap() {
+            let entry = entry.unwrap();
+            let Ok(target) = fs::read_link(entry.path()) else {
+                continue;
+            };
+            if target.parent() != Some(queue.as_path()) {
+                continue;
+            }
+            let Ok(info) = fs::read_to_string(process.join("fdinfo").join(entry.file_name()))
+            else {
+                continue;
+            };
+            // A filename alone precedes liveness. fdinfo identifies a lock
+            // owned by this child's descriptor, not a scanner's brief probe.
+            if info.lines().any(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                fields.first() == Some(&"lock:")
+                    && fields.get(2..6) == Some(&["FLOCK", "ADVISORY", "WRITE", pid.as_str()])
+            }) {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child never owned its registration"
+        );
+        thread::sleep(WRITE_LOCK_WAIT_POLL_INTERVAL);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn collect_replenishing_comments(
+    root: &Path,
+    issue_id: &str,
+    stream: &str,
+    first: std::process::Child,
+    first_started: Instant,
+    epoch: Instant,
+    calls: usize,
+) -> Vec<serde_json::Value> {
+    let mut child = first;
+    let mut started = first_started;
+    let mut attempts = Vec::new();
+    for attempt in 0..calls {
+        let message = format!("{stream}-{attempt}");
+        let output = child.wait_with_output().unwrap();
+        attempts.push(serde_json::json!({
+            "stream": stream, "attempt": attempt,
+            "argv": ["comments", "add", issue_id, &message, "--json"],
+            "started_seconds": started.duration_since(epoch).as_secs_f64(),
+            "returned_seconds": epoch.elapsed().as_secs_f64(),
+            "exit": output.status.code(),
+            "stdout": String::from_utf8_lossy(&output.stdout),
+            "stderr": String::from_utf8_lossy(&output.stderr),
+        }));
+        if attempt + 1 == calls {
+            break;
+        }
+        // Replenish immediately, even after a failed call; retain every
+        // outcome rather than stopping a stream at its first failure.
+        let next = format!("{stream}-{}", attempt + 1);
+        started = Instant::now();
+        child = spawn_br_child_in_dir(root, ["comments", "add", issue_id, &next, "--json"]);
+    }
+    attempts
+}
+
+#[cfg(target_os = "linux")]
 fn run_paused_write_lock_waiter(
     root: &Path,
     budget_ms: u64,
@@ -683,6 +758,113 @@ fn e2e_later_writer_waits_for_registered_earlier_waiter() {
     assert_eq!(issues.len(), 1);
     assert_eq!(issues[0]["title"], "Later writer");
     assert_upstream_sqlite_integrity_ok(&root, "ordered workspace waiters");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_registered_writer_progresses_before_replenishing_short_writes() {
+    let _log =
+        common::test_log("e2e_registered_writer_progresses_before_replenishing_short_writes");
+    let root = isolated_temp_dir("replenishing workspace writers").keep();
+    eprintln!("retained contention evidence: {}", root.display());
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "{init:?}");
+    let created = run_br_in_dir(&root, ["create", "Ordered comments", "--json"]);
+    assert!(created.success, "{created:?}");
+    let issue: serde_json::Value = serde_json::from_str(&created.stdout).unwrap();
+    let id = issue["id"].as_str().unwrap();
+    let owner = beads_rust::sync::blocking_write_lock(&root.join(".beads")).unwrap();
+    let epoch = Instant::now();
+    let mut peers = Vec::new();
+    for index in 0..7 {
+        let stream = format!("peer{index}");
+        let message = format!("{stream}-0");
+        let started = Instant::now();
+        let mut child = spawn_br_child_in_dir(&root, ["comments", "add", id, &message, "--json"]);
+        wait_for_child_owned_workspace_registration(&root, &mut child);
+        peers.push((stream, child, started));
+    }
+    let victim_started = Instant::now();
+    let mut victim = spawn_br_child_in_dir(&root, ["comments", "add", id, "victim-0", "--json"]);
+    wait_for_child_owned_workspace_registration(&root, &mut victim);
+    assert_eq!(wait_for_workspace_waiters(&root, 8).len(), 8);
+    let attempts = thread::scope(|scope| {
+        let handles: Vec<_> = peers
+            .into_iter()
+            .map(|(stream, child, started)| {
+                let root = &root;
+                scope.spawn(move || {
+                    collect_replenishing_comments(root, id, &stream, child, started, epoch, 8)
+                })
+            })
+            .collect();
+        drop(owner);
+        let mut attempts =
+            collect_replenishing_comments(&root, id, "victim", victim, victim_started, epoch, 1);
+        for handle in handles {
+            attempts.extend(handle.join().unwrap());
+        }
+        attempts
+    });
+    fs::write(
+        root.join("attempts.json"),
+        serde_json::to_vec_pretty(&attempts).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(attempts.len(), 57);
+    assert!(
+        attempts.iter().all(|call| call["exit"] == 0),
+        "{attempts:#?}"
+    );
+    assert!(wait_for_workspace_waiters(&root, 0).is_empty());
+    let conn = beads_rust::franken_sync::compat::open_with_flags(
+        &root.join(".beads/beads.db").to_string_lossy(),
+        beads_rust::franken_sync::compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let rows = conn.query("SELECT text FROM comments ORDER BY id").unwrap();
+    let texts: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            row.get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    drop(conn);
+    assert_eq!(texts.len(), 57);
+    assert_eq!(
+        &texts[..7],
+        &(0..7)
+            .map(|index| format!("peer{index}-0"))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        texts[7], "victim-0",
+        "later writers bypassed the queued victim: {texts:?}"
+    );
+    let expected: std::collections::BTreeSet<_> = (0..7)
+        .flat_map(|stream| (0..8).map(move |attempt| format!("peer{stream}-{attempt}")))
+        .chain(std::iter::once("victim-0".to_owned()))
+        .collect();
+    assert_eq!(
+        texts.into_iter().collect::<std::collections::BTreeSet<_>>(),
+        expected
+    );
+    let exported: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.join(".beads/issues.jsonl")).unwrap())
+            .unwrap();
+    let comments = exported["comments"].as_array().unwrap();
+    assert_eq!(comments.len(), 57);
+    assert_eq!(
+        comments
+            .iter()
+            .map(|comment| comment["text"].as_str().unwrap().to_owned())
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected
+    );
+    assert_upstream_sqlite_integrity_ok(&root, "replenishing workspace writers");
 }
 
 #[test]
