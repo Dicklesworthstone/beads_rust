@@ -16,6 +16,22 @@
   Of 48 files at least 64 MiB and older than September 4, 44 already have the
   compressed attribute. Only 396,611,412 logical bytes are uncompressed;
   compressing these cannot resolve the capacity deficit. No files changed.
+- [x] Complete a bounded lossless compression pass on older April–July
+  toolchain binaries/symbols. The initial broad scan timed out after 55 seconds;
+  the narrower inventory selected 14 files totaling 1,678,332,416 bytes.
+  The normal compressed attribute missed existing WOF compression. The first
+  compact invocation only listed files because Git Bash translated `/C`;
+  explicit argument-conversion control made the next invocation compress six
+  additional symbol files, saving 147,177,472 bytes per compact accounting.
+  All 14 before/after SHA-256 values match. The active August 31 toolchain was
+  untouched; no files were deleted. Two PowerShell verification wrappers were
+  guard-blocked; direct `sha256sum` completed without changing guard settings.
+  Receipts: `/tmp/br-native-old-toolchain-before-20260916.json`,
+  `/tmp/br-native-old-toolchain-after-sha256-20260916.txt`, and
+  `/tmp/br-native-old-toolchain-compact-20260916-v2.log`.
+  Latest free space is 15,856,779,264 bytes, still 9,677,985,997 below the floor.
+  Other disk activity explains part of the free-space increase; only the
+  measured compression savings are attributed to this work. No build pass.
 - [ ] Obtain sufficient native disk capacity, then run current-source queue
   and CLI qualification through strict RCH. Successful SSH is not a build pass.
 - [ ] Adopt and qualify a suitable published engine family before release.
