@@ -1,6 +1,6 @@
 # Dependency Upgrade Log
 
-## In progress: current-source Windows qualification
+## Blocked on native capacity: current-source Windows qualification
 
 - [x] Freeze source `a42db752784e86690956a2518aef00580c4be2d6`; leave
   preserved untracked incident artifacts out of the clean-overlay build.
@@ -10,6 +10,71 @@
 - [ ] Execute the three cross-platform `workspace_waiter` library tests.
   Command uses `--locked --target x86_64-pc-windows-msvc --jobs 1`; keep the
   existing 1,800-second cap. Log `/tmp/br-native-current-queue-20260916.log`.
+  First cold-cache attempt ended with RCH-E104 at 02:56:01 UTC September 16:
+  SSH timeout after 1,830 seconds including transport grace, outer exit 1,
+  no observed tests. Windows cleanup reported no remote PGID; the exact owned
+  Cargo process (16756) and compiler child (10696) remained alive. Drain the
+  isolated worker while these finish; their post-timeout work is cache warming,
+  not qualification. Restore normal disk admission before any fresh attempt.
+  By 03:09 UTC both owned processes had exited and the native library-test
+  executable existed (42,331,648 bytes); no outcome was captured after timeout.
+  Lossless compression preserved all 197 inactive August metadata/symbol hashes
+  and all 1,937 idle host-target file hashes, saving approximately 482 MB and
+  255 MB respectively. An inactive-library pass added negligible space and
+  also preserved hashes. Unattributed concurrent disk growth kept the host below
+  admission (24,990,834,688 bytes free). No additional deletion was performed.
+  Receipts: `/tmp/br-native-inactive-aug-{before,after}-20260916.sha256`,
+  `/tmp/br-native-inactive-aug-rlib-{before,after}-20260916.sha256`, and
+  `/tmp/br-native-host-target-{before,after}-20260916.sha256` plus matching
+  `compact` logs.
+- [x] Complete bounded documentation compression: interrupt the slow full-tree
+  pass, verify all 2,804 captured sample hashes in two overlapping checks, then
+  compress 3,126 larger files whose complete before/after hashes match. Direct
+  short SSH calls succeed where long streaming/xargs calls stall; an oversized
+  direct command failed shell parsing and was retained. The selected-file pass
+  reports 587,837,394 bytes saved. Receipts are
+  `/tmp/br-native-docs-direct-verified-{compact-20260916.log,after-20260916.sha256}`
+  and `/tmp/br-native-docs-large-before-20260916.sha256`. This is not verification
+  of every file in the interrupted full-tree pass: only the captured sample.
+- [x] Correct an operator mistake: attributes 8192/8224 mean not-content-indexed,
+  not compressed (the compressed bit is 2048). Earlier claims that the native
+  dependency cache and downloaded sources were already compressed were wrong.
+  Compress the idle native target: all 3,343 hashes match, 537,872,623 bytes saved.
+  Receipts: `/tmp/br-native-target-{before,after}-20260916.sha256` and compact log.
+- [x] Preserve hashes while compressing 106 undated-nightly metadata/symbol files
+  (225,533,028 bytes saved), 81 unused August 31 Linux/GNU target metadata files
+  (162,585,667 bytes saved), and 22 copied database fixtures (94,232,576 bytes
+  saved). Stable libraries were already compressed; their hashes also match.
+  The August 31 compiler executable and native MSVC target files were untouched.
+  Receipts use `/tmp/br-native-{undated,cross-metadata,fixture-db,stable}-...`.
+- [x] Retain the unsuccessful warm retry separately:
+  `/tmp/br-native-current-queue-warm-20260916.log`. It was admitted at 03:41 UTC
+  but clean-overlay creates a nonce-specific root and Cargo download cache.
+  Stop the verified owned Cargo PID 13708 before another cold compilation;
+  remote and outer exit 127, no tests observed. Do not call this a warm pass.
+  The shared target pool survived, but the registry cache did not carry over.
+- [x] Retrieve the actual native test executable after the original timeout:
+  `/tmp/br-native-a42db752-libtests-20260916.exe`, 42,331,648 bytes, SHA-256
+  `2bb3ea54c130548dfbb61bc567fa09f26f93cfea4306b39898d0772e7887de54`.
+  Remote/local hashes match; remote Cargo.lock and src/sync/mod.rs also match.
+  `/tmp/br-native-current-binary-source-20260916.sha256` binds these receipts.
+- [ ] Once capacity is restored, run the retained executable through RCH
+  `exec --job` for `workspace_waiter` (three cross-platform cases), then
+  `opener_lease` (five cases). Use the tiny frozen canary checkout as the job's
+  transfer envelope to avoid another unnecessary full-source copy. The tested
+  executable remains the hash-bound a42db752 build, not the canary binary.
+- [ ] For the later CLI build, explicitly reuse the original worker Cargo cache
+  at `C:/rch/beads_rust/52468a6c306e9db8/.rch-tmp/rch-cargo-cache-surfacebookje`
+  and the existing target pool; preserve the frozen source and unchanged cap.
+- [x] Leave no observed cargo/rustc/compact process and drain the isolated worker.
+  Latest measured free space is 25,057,210,368 bytes, below the unchanged
+  25,534,765,261-byte floor; RCH reports critical pressure. About 2.35 GB of
+  reported compression savings did not establish durable headroom. Do not
+  attribute all concurrent growth to unrelated activity without evidence.
+- [ ] Obtain separate authorization before removing any additional toolchains.
+  The earlier approval covers only the seven April–July toolchains already
+  uninstalled. A proposed next removal is August 4, 13, and 20, retaining stable,
+  default nightly, August 25 and the qualified August 31 build toolchain.
 - [ ] Execute the current opener-lease regressions on the same native source.
 - [ ] Execute exact `e2e_basic_lifecycle`, including real CLI mutations and reads.
 - [ ] Bind results to source and executable hashes, retain failed attempts
