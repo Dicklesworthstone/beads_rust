@@ -34,6 +34,18 @@
   measured compression savings are attributed to this work. No build pass.
 - [ ] Obtain sufficient native disk capacity, then run current-source queue
   and CLI qualification through strict RCH. Successful SSH is not a build pass.
+- [x] On explicit user authorization (`yes`, then `confirmed` after the exact
+  command and effects were restated), run `rustup toolchain uninstall` on
+  SurfaceBookJE for the seven `nightly-2026-{04-22,04-30,06-06,06-07,07-05,07-11,07-20}-x86_64-pc-windows-msvc`
+  toolchains. Started 2026-09-16 01:42:41 UTC; exit zero observed by 01:44:45.
+  Exact command and authorization are in bead comment 1688; output is
+  `/tmp/br-native-approved-uninstall-20260916.log`. Installed-list readback
+  confirms all seven absent and August toolchains, stable and undated nightly
+  retained. August 31 rustc, clippy and rustfmt remain installed and rustc runs.
+  Free disk is 28,285,370,368 bytes, above the unchanged 25,534,765,261 floor.
+  First RCH probe overlapped removal and rejected the changing inventory;
+  the post-removal probe reports `ok`. Daemon admission and native execution
+  still need fresh telemetry; no native test pass is inferred from this cleanup.
 - [ ] Adopt and qualify a suitable published engine family before release.
   This follow-through adds operational evidence, not a shipped capability or
   a reason to close `otrgz`, `46zqi`, or the release bead.
