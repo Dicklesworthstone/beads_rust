@@ -1,5 +1,32 @@
 # Dependency Upgrade Log
 
+## Follow-through at 04:46 UTC September 16: native capacity still blocked
+
+- [x] Recheck the original worker: 25,058,439,168 bytes free at 04:38 UTC,
+  still below the unchanged 25,534,765,261-byte admission floor. No additional
+  toolchain deletion authorization was received; none were removed.
+- [x] Compress the idle original Cargo registry cache with Windows `compact`.
+  It completed with exit zero: 678,228,416 logical bytes stored in 342,421,799
+  bytes, a reported saving of 335,806,617 bytes. Log:
+  `/tmp/br-native-registry-old-compact-20260916T0439.log`. This is reversible
+  filesystem compression of downloaded cache data, not a full per-file checksum
+  audit or a successful Cargo test. The second registry cache was not changed.
+- [x] Investigate the concurrent roughly 2 GB free-space drop without changing
+  system services or databases: no Cargo/rustc process, zero allocated VSS
+  storage, 16 GiB allocated pagefile with 65 MiB reported current usage.
+  Windows Search's 1,453,490,176-byte database was modified around the drop,
+  but one timestamp and a short process-write sample do not prove causation.
+- [x] Recheck the remote native test executable: SHA-256 remains
+  `2bb3ea54c130548dfbb61bc567fa09f26f93cfea4306b39898d0772e7887de54`, matching
+  the preserved local executable. Leave the worker drained with an empty RCH
+  queue and no observed Cargo/rustc/compact process.
+- [ ] Restore capacity: latest free space is 23,229,202,432 bytes, now
+  2,305,562,829 below the floor. The proposed August 4/13/20 toolchain removal
+  still requires explicit authorization under AGENTS.md. No admission bypass.
+- [ ] Run the retained queue and opener-lease tests through RCH job mode, then
+  complete the CLI lifecycle qualification using the pinned original Cargo
+  cache. These tasks remain unexecuted; no native qualification or release pass.
+
 ## Blocked on native capacity: current-source Windows qualification
 
 - [x] Freeze source `a42db752784e86690956a2518aef00580c4be2d6`; leave
