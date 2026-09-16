@@ -46,6 +46,21 @@
   First RCH probe overlapped removal and rejected the changing inventory;
   the post-removal probe reports `ok`. Daemon admission and native execution
   still need fresh telemetry; no native test pass is inferred from this cleanup.
+- [x] Restart the idle isolated daemon with its existing verified binary and
+  unchanged one-job/pressure settings; fresh admission offers one slot. Run
+  the unchanged RCH native fixture through strict Windows clean-overlay mode:
+  11 passed, zero failed, three existing ignores, remote Cargo and outer exit
+  zero at 01:50:23 UTC. Fixture commit
+  `10fc2b5b09c9c44063d11d99832ba929c2e237ae`, overlay
+  `fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195`.
+  Log: `/tmp/br-native-capacity-clean-canary-20260916-v2.log`.
+  Ordinary shared-source dispatch first failed because Git Bash lacks `flock`;
+  clean-overlay owns isolated source roots and requires no shared-source lock.
+  The first overlay attempt omitted required `--no-overlay` and was rejected
+  before dispatch. Retain both failures. Artifact retrieval warned that remote
+  tar exited 2 and returned zero files; remote test execution passed, artifact
+  delivery is not qualified. Current br queue/lifecycle tests remain pending.
+  After the empty-queue check, drain the isolated worker; shared fleet unchanged.
 - [ ] Adopt and qualify a suitable published engine family before release.
   This follow-through adds operational evidence, not a shipped capability or
   a reason to close `otrgz`, `46zqi`, or the release bead.
