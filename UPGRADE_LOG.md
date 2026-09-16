@@ -1,5 +1,22 @@
 # Dependency Upgrade Log
 
+## In progress: current-source Windows qualification
+
+- [x] Freeze source `a42db752784e86690956a2518aef00580c4be2d6`; leave
+  preserved untracked incident artifacts out of the clean-overlay build.
+- [x] Confirm native disk admission (28,272,914,432 bytes free), enable only
+  the isolated one-slot SurfaceBookJE worker, and submit the release/default
+  feature build through strict RCH with nightly August 31 and MSVC 14.44.
+- [ ] Execute the three cross-platform `workspace_waiter` library tests.
+  Command uses `--locked --target x86_64-pc-windows-msvc --jobs 1`; keep the
+  existing 1,800-second cap. Log `/tmp/br-native-current-queue-20260916.log`.
+- [ ] Execute the current opener-lease regressions on the same native source.
+- [ ] Execute exact `e2e_basic_lifecycle`, including real CLI mutations and reads.
+- [ ] Bind results to source and executable hashes, retain failed attempts
+  and warnings, then drain the isolated worker. These selected tests do not
+  establish universal fairness, full-suite release qualification, or artifact
+  delivery. Unix-only queue tests are excluded from native proof counts.
+
 ## Follow-through: alternate Windows capacity and engine publication
 
 - [x] Recheck all 15 direct engine crates against crates.io. Facade/core/pager
