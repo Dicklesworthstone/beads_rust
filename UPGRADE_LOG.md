@@ -1,5 +1,42 @@
 # Dependency Upgrade Log
 
+## In progress: September 16 published engine qualification (`otrgz` / `nx2sh`)
+
+- [x] Recheck the registry instead of continuing to wait on the earlier
+  publication inventory. Published facade/core 0.4.2 and pager 0.4.3 contain
+  the previously isolated read-only WAL admission fix. Upstream intentionally
+  retains unchanged family members at 0.4.0 and requires btree/vdbe 0.4.1.
+  Equal patch numbers across every member are not an upstream requirement.
+- [x] Independently review archive source correspondence: facade/pager match
+  `78134a656`, core/btree/vdbe match `50972bf7c`; core's WAL adapter and vacuum
+  source match the earlier `683a241b` candidate. Only pager's archive includes
+  VCS metadata; the other provenance claims come from complete source-file
+  byte comparisons. This review is not independent runtime qualification.
+- [x] Resolve a registry-only candidate through RCH. Preserve the initial
+  resolver result, which also reselected unrelated Windows, hashbrown and
+  getrandom edges. The corrected candidate changes only five package records,
+  keeps those original edges, and retains one Asupersync 0.5.0. Candidate lock
+  SHA-256: `665f9fd7ca001beb2bf2f047572ceb4268914feb4904f12ab2990ee66884276a`.
+  Main's dependency files remain unchanged pending qualification.
+- [ ] Run all-target/all-feature check and denied-warning Clippy on the corrected
+  candidate, then unchanged library, MCP, model, linearizability, concurrency,
+  observational-open and recovery tests. The first check uses the initial
+  resolver result and cannot qualify the corrected final lock.
+- [ ] Run startup admission and both retained real-family stress gates (eight
+  workers, 60 and 90 seconds). New pager freelist-repair and checkpoint changes
+  require fresh proof; earlier private-candidate passes do not qualify them.
+- [ ] Adopt qualified pins and correct the engine-version documentation, then
+  continue frozen-source release preparation and all seven native targets.
+  Published vdbe 0.4.1 does not include upstream's later `725e31ee7` rowid-discard
+  fix; preserve this limitation when assessing test results.
+
+OldSurface is reachable again with 28,821,237,760 bytes free. The retained native
+test executable transferred with matching SHA-256 `2bb3ea54c130548dfbb61bc567fa09f26f93cfea4306b39898d0772e7887de54`.
+Direct RCH job execution refused because its OS classifier recognizes native
+targets only on compilation commands; a normal frozen-source Cargo test request
+was admitted instead. No native test pass is claimed yet. SurfaceBookJE remains
+below its disk floor; no additional deletion or admission relaxation occurred.
+
 ## Follow-through at 04:46 UTC September 16: native capacity still blocked
 
 - [x] Recheck the original worker: 25,058,439,168 bytes free at 04:38 UTC,
