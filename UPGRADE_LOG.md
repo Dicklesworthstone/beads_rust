@@ -1,5 +1,27 @@
 # Dependency Upgrade Log
 
+## Follow-through: alternate Windows capacity and engine publication
+
+- [x] Recheck all 15 direct engine crates against crates.io. Facade/core/pager
+  remain at 0.4.1; the other twelve remain at 0.4.0. No aligned published
+  family containing the qualified reader fix is available. Pins stay unchanged.
+- [x] Authenticate to `surfacebookje.tail1f21e.ts.net` using its existing
+  trusted host identity and fleet key. Direct IP strict checking refused the
+  unrecorded alias; the trusted DNS name succeeds without changing host keys.
+- [x] Measure alternate native capacity: 7,873,960 KiB free RAM, no observed
+  cargo/rustc/link/compact processes, and 12,368,343,040 bytes free on the sole
+  510,695,305,216-byte NTFS volume. The unchanged five-percent disk floor is
+  25,534,765,261 bytes, leaving about 13.2 GB additional headroom required.
+- [x] Inspect older HFDT/wincheck artifacts before attempting compression.
+  Of 48 files at least 64 MiB and older than September 4, 44 already have the
+  compressed attribute. Only 396,611,412 logical bytes are uncompressed;
+  compressing these cannot resolve the capacity deficit. No files changed.
+- [ ] Obtain sufficient native disk capacity, then run current-source queue
+  and CLI qualification through strict RCH. Successful SSH is not a build pass.
+- [ ] Adopt and qualify a suitable published engine family before release.
+  This follow-through adds operational evidence, not a shipped capability or
+  a reason to close `otrgz`, `46zqi`, or the release bead.
+
 ## In progress: 2026-09-15 remaining storage qualification (og86t / otrgz.2)
 
 - [x] Run the four previously unexecuted storage targets through RCH with
