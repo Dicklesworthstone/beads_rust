@@ -48,7 +48,7 @@ clap_complete = { version = "4.6.11", features = ["unstable-dynamic"] }
 # depends on fsqlite-ext-json internally, but the 0.3.9+ extension enables
 # only serde_json's `preserve_order`; the old viral `arbitrary_precision`
 # feature no longer affects br's JSON/TOON serializers.
-fsqlite = { version = "0.4.2", default-features = false, features = [
+fsqlite = { version = "0.4.4", default-features = false, features = [
     "native",
     "linux-asupersync-uring",
     "fts5",
@@ -56,20 +56,20 @@ fsqlite = { version = "0.4.2", default-features = false, features = [
     "icu",
     "misc",
 ] }
-fsqlite-types = "0.4.0"
-fsqlite-error = "0.4.0"
-fsqlite-core = "0.4.2"
-fsqlite-func = "0.4.0"
-fsqlite-vdbe = "0.4.1"
-fsqlite-vfs = "0.4.0"
-fsqlite-pager = "0.4.3"
-fsqlite-parser = "0.4.0"
-fsqlite-planner = "0.4.0"
-fsqlite-wal = "0.4.0"
-fsqlite-btree = "0.4.1"
-fsqlite-ast = "0.4.0"
-fsqlite-mvcc = "0.4.0"
-fsqlite-observability = "0.4.0"
+fsqlite-types = "0.4.4"
+fsqlite-error = "0.4.4"
+fsqlite-core = "0.4.4"
+fsqlite-func = "0.4.4"
+fsqlite-vdbe = "0.4.4"
+fsqlite-vfs = "0.4.4"
+fsqlite-pager = "0.4.4"
+fsqlite-parser = "0.4.4"
+fsqlite-planner = "0.4.4"
+fsqlite-wal = "0.4.4"
+fsqlite-btree = "0.4.4"
+fsqlite-ast = "0.4.4"
+fsqlite-mvcc = "0.4.4"
+fsqlite-observability = "0.4.4"
 
 # Current-thread runtime that drives fsqlite 0.4's async (!Send) futures to
 # completion behind the synchronous `franken_sync::Connection` bridge.
@@ -93,7 +93,7 @@ sha2 = "0.11.0"
 
 # Error handling
 anyhow = "1.0.104"
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 
 # Logging
 tracing = "0.1.44"
@@ -118,7 +118,7 @@ dunce = "1.0.5"
 once_cell = "1.21"
 regex = "1.13"
 shell-words = "1.1.1"
-similar = "3.1.2"
+similar = "3.2.0"
 tempfile = "3.27"
 unicode-width = "0.2.2"
 
@@ -139,8 +139,9 @@ flate2 = "1.1"
 # Cooperative shutdown so SIGINT/SIGTERM/SIGHUP unwind through main and let
 # SqliteStorage::Drop flush the WAL instead of stranding frames on disk (#270).
 [target.'cfg(unix)'.dependencies]
-libc = "0.2.185"
-rustix = { version = "1.1.4", features = ["fs", "process"] }
+libc = "0.2.189"
+# fastmcp-client 0.10.0 requires this exact version, including with MCP disabled.
+rustix = { version = "=1.1.4", features = ["fs", "process"] }
 signal-hook = "0.4.4"
 
 [target.'cfg(windows)'.dependencies]
