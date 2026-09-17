@@ -1,6 +1,6 @@
 # Dependency Upgrade Log
 
-## September 17: FrankenSQLite 0.4.4 uniform family + stable catch-ups (`beads_rust-0edxa`)
+## September 17: FrankenSQLite 0.4.4 uniform family + stable catch-ups (`beads_rust-0edxa`) — COMPLETE
 
 - [x] Research the tagged v0.4.4 release (commit `9d3d98778a372aba95d76d05c5c974ac0238c96a`,
   published uniform 0.4.4 family). Confirmed deltas over the previously
@@ -31,17 +31,33 @@
   stack. `cargo audit` exits 0, zero vulnerabilities, zero warnings.
 - [x] `cargo metadata --locked --offline` consistent; `cargo fmt --check`
   clean.
-- [ ] Engine checklist gates on the 0.4.4 tree (RCH, source-content
-  receipt, hash `3004952d4a7174ca…`): `--lib`, `model_based_storage`,
-  `linearizability_multiprocess`, `repro_avhq`,
-  `e2e_schema_migration_upgrade` — run in flight; record results here.
-  Two earlier submissions died pre-compilation from RCH worker
-  exclusion/SSH resets (no compiler output existed to diagnose).
-- [ ] Retained-real-family stress gates 8×60 and 8×90
-  (`scripts/br-stress.sh`, source_kind=retained_database_family) plus
-  stressed-copy doctor `db.read_only_open_observational`/`db.sidecars`.
-- [ ] Final locked all-target check and Clippy, plus all-feature MCP
-  protocol qualification. Prior-engine receipts do not qualify 0.4.4.
+- [x] Engine checklist gates on the 0.4.4 tree (RCH source-content receipt,
+  hash `3004952d4a7174ca…`, warm hz3 target): `--lib` 3,092 passed / 0 failed
+  / 2 ignored (542.63s); `model_based_storage` 172 passed / 0 failed with the
+  default 120-case property campaign and the GH426 chain regression
+  (1,457.39s); `linearizability_multiprocess` 25 passed / 0 failed — 8
+  processes, 375 mixed operations, 30s window, failed=0, dropped_creates=0;
+  `repro_avhq` 164 passed / 0 failed (4.27s); `e2e_schema_migration_upgrade`
+  green in the same batch (batch exit=0, 69.5s). Two earlier submissions
+  died pre-compilation from RCH worker exclusion/SSH resets (no compiler
+  output existed to diagnose); one model rerun was killed by the outer
+  300s tool deadline, not by any test failure.
+- [x] Retained-real-family stress gates 8×60 and 8×90 passed
+  (receipts `/data/tmp/br-stress-0150Ny` and `/data/tmp/br-stress-vTbmId`:
+  acknowledged=295/443, DB rows == JSONL records 1188/1218, integrity ok,
+  zero bad-JSONL/doctor errors/unexpected stderr signatures, no new
+  `.br_recovery/` artifacts); stressed-copy doctor
+  `db.read_only_open_observational` and `db.sidecars` both ok.
+- [x] Final locked all-target all-features `cargo check` exit=0
+  (`Finished dev … 24m 50s`, RCH run 30023023201354071; first attempt hit
+  RCH's 1,800s wall cap mid cold-compile with zero diagnostics and was
+  resumed on the warm target). Clippy with `-D warnings` passed in the
+  split form on vmi1153651: `--lib --bins` (26m 33s) and `--tests`
+  (25m 26s), both exit=0. All-feature MCP qualification on hz3:
+  `e2e_mcp_protocol` 22 passed / 0 failed (75.48s) and
+  `e2e_mcp_shutdown` 1 passed / 0 failed (6.06s) under the `mcp` feature
+  build (`Finished test profile … 23m 07s`). Prior-engine receipts are
+  retired; 0.4.4 now carries its own receipts.
 
 ## In progress: September 16 published engine qualification (`otrgz` / `nx2sh`)
 

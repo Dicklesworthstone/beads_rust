@@ -10,8 +10,11 @@ pager 0.4.3, btree/vdbe 0.4.1, others 0.4.0) qualified under `beads_rust-otrgz`;
 bd-u2kmg) and the INSERT-conflict provisional-rowid cleanup
 ([`725e31ee7`](https://github.com/Dicklesworthstone/frankensqlite/commit/725e31ee7),
 bd-55kh5) noted under §7's `beads_rust-f3r4` rowid-discard limitation.
-Asupersync stays exactly 0.5.0 across br, engine and FastMCP. Qualification
-receipts live in `UPGRADE_LOG.md` under `beads_rust-0edxa`.
+Asupersync stays exactly 0.5.0 across br, engine and FastMCP. Full 0.4.4
+qualification receipts (lib 3,092, model 172, linearizability 25, repro 164,
+schema-migration suite, all-target/all-features check, denied-warning clippy
+lib/bins+tests, MCP 22+1, retained-family stress 8×60/8×90) live in
+`UPGRADE_LOG.md` under `beads_rust-0edxa` — the upgrade is complete.
 
 **Owner bead:** `beads_rust-dk45` (Track B of the 2026-09-01 bridge plan)
 
