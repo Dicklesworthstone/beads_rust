@@ -134,6 +134,9 @@ this repo): commits `55c186682` + `5946b3b7c` in
   version and incorporating upstream cancellation-drain fixes. Published
   crate archives now exclude local test-evidence artifacts.
   [806819f9](https://github.com/Dicklesworthstone/beads_rust/commit/806819f9)
+  All-feature Clippy and compilation of an extracted crate passed on the
+  0.4.4 engine tree; see [qualification receipts](UPGRADE_LOG.md). This is
+  source qualification, not a new package publication or native release proof.
 
 - **Recover legacy engine read admission before schema migration.**
   `doctor migrate-schema recover` preserves the complete database family,

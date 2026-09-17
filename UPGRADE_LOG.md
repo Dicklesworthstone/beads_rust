@@ -629,6 +629,28 @@ were unchanged.
 
 ## In progress: 2026-09-15 (beads_rust-nx2sh)
 
+- September 17 follow-through on the current 0.4.4 engine tree: locked
+  all-feature Clippy passed with `-D warnings` through RCH on hz4, split into
+  `--lib --bins` (6m18s) and `--tests --benches --examples` (8m43s).
+  Both runs reported input hash `7a4b9b67b85f88fc` and exited 0. These receipts
+  cover the optional MCP code omitted by the default-feature September 17
+  engine-upgrade Clippy runs.
+- `rch exec -- cargo package --locked --all-features` then assembled and
+  **compiled the extracted package**, including FastMCP 0.10.0 and engine
+  0.4.4, on vmi1152480. Verification finished in 14m09s, exit 0; RCH retrieved
+  one 3,275,381-byte archive. The worker packaged 716 files, whereas the earlier
+  local `--no-verify` archive contained 747: these are distinct artifacts, not
+  a byte-identical release receipt. No package was published.
+- The earlier local archive inspection found no Git dependencies, exactly one
+  Asupersync 0.5.0, no `tests/artifacts/` evidence, and retained source plus both
+  historical schema fixtures. The current-tree `package_manifests` target
+  passed all ten tests through RCH. See bead comments 1732, 1733 and 1735.
+- The original three MCP startup failures below are historical: the current
+  0.4.4 tree passed all 22 unchanged MCP protocol tests and the shutdown test
+  in the completed `0edxa` section above. No additional source fix was needed
+  for this qualification. `nx2sh` remains dependency-blocked by `otrgz`;
+  reassignment was refused and no dependency or closure gate was bypassed.
+
 - Replaced Git FastMCP 0.9.0 at `180a7c88890705217bb8e202d19555adabf24187`
   with the eight published 0.10.0 crates. The only additional lockfile change
   is the required `dirs` 6.0.0→7.0.0 dependency. Asupersync remains a single
