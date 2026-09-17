@@ -1,5 +1,48 @@
 # Dependency Upgrade Log
 
+## September 17: FrankenSQLite 0.4.4 uniform family + stable catch-ups (`beads_rust-0edxa`)
+
+- [x] Research the tagged v0.4.4 release (commit `9d3d98778a372aba95d76d05c5c974ac0238c96a`,
+  published uniform 0.4.4 family). Confirmed deltas over the previously
+  qualified mixed family: native-WAL abandoned-page durable reclamation
+  ([`e21d008b4`](https://github.com/Dicklesworthstone/frankensqlite/commit/e21d008b4),
+  bd-u2kmg) and INSERT-index-conflict provisional-rowid cleanup
+  ([`725e31ee7`](https://github.com/Dicklesworthstone/frankensqlite/commit/725e31ee7),
+  bd-55kh5; resolves the vdbe rowid-discard limitation noted in the
+  `otrgz` section below). Much of the tagged changelog was already
+  present in the 0.4.2/0.4.3/0.4.1/0.4.0 mix. The source review found
+  no basis to remove br's opener leases, sole-opener checkpoints, or
+  recovery validation; public cross-process MVCC remains incomplete.
+- [x] Move all 15 explicit `fsqlite*` manifest floors and all 20 resolved
+  engine packages to 0.4.4 (commit `f78c8fe0`). Targeted `cargo update`
+  changed exactly the 20 engine records; unrelated edges preserved; one
+  Asupersync 0.5.0 across br, engine and FastMCP.
+- [x] Catch up remaining direct deps to fresh-verified latest stable:
+  thiserror 2.0.20, similar 3.2.0 (insta keeps transitive 2.7.0), libc
+  0.2.189. rustix stays pinned `=1.1.4`: fastmcp-client 0.10.0
+  exact-pins it on unix (docs.rs source verified); a higher br floor
+  deadlocks the resolver, and no fastmcp release permitting newer rustix
+  exists. Constraint documented inline in Cargo.toml. All other direct
+  deps were already at latest stable (crates.io API re-verified with the
+  required User-Agent).
+- [x] Security: dropped the stale RUSTSEC-2025-0134 (rustls-pemfile)
+  ignore from `.cargo/audit.toml` — the crate vanished from the lock
+  when asupersync 0.5.0 / fastmcp-rust 0.10.0 replaced the 0.4.x/0.9.x
+  stack. `cargo audit` exits 0, zero vulnerabilities, zero warnings.
+- [x] `cargo metadata --locked --offline` consistent; `cargo fmt --check`
+  clean.
+- [ ] Engine checklist gates on the 0.4.4 tree (RCH, source-content
+  receipt, hash `3004952d4a7174ca…`): `--lib`, `model_based_storage`,
+  `linearizability_multiprocess`, `repro_avhq`,
+  `e2e_schema_migration_upgrade` — run in flight; record results here.
+  Two earlier submissions died pre-compilation from RCH worker
+  exclusion/SSH resets (no compiler output existed to diagnose).
+- [ ] Retained-real-family stress gates 8×60 and 8×90
+  (`scripts/br-stress.sh`, source_kind=retained_database_family) plus
+  stressed-copy doctor `db.read_only_open_observational`/`db.sidecars`.
+- [ ] Final locked all-target check and Clippy, plus all-feature MCP
+  protocol qualification. Prior-engine receipts do not qualify 0.4.4.
+
 ## In progress: September 16 published engine qualification (`otrgz` / `nx2sh`)
 
 - [x] Recheck the registry instead of continuing to wait on the earlier

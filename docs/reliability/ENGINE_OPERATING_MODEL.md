@@ -1,11 +1,18 @@
 # Storage Engine Operating Model
 
-**Status:** reviewed 2026-09-16. Released br v0.6.0 uses fsqlite 0.3.18;
-post-release main uses published facade/core 0.4.2, pager 0.4.3 and
-btree/vdbe 0.4.1, with unchanged family members at 0.4.0. Upstream intentionally
-uses different compatible patch versions. The engine qualification passed;
-remaining whole-release and native-artifact gates are recorded in
-`UPGRADE_LOG.md` under `beads_rust-otrgz` and the release workstreams.
+**Status:** reviewed 2026-09-17. Post-0.4.4-cutover main uses the uniform
+published FrankenSQLite 0.4.4 family (all 20 consumed members at 0.4.4,
+commit `9d3d98778a372aba95d76d05c5c974ac0238c96a`), adopted per the
+`beads_rust-0edxa` upgrade. The prior mixed family (facade/core 0.4.2,
+pager 0.4.3, btree/vdbe 0.4.1, others 0.4.0) qualified under `beads_rust-otrgz`;
+0.4.4 additionally carries the native-WAL abandoned-page reclamation fix
+([`e21d008b4`](https://github.com/Dicklesworthstone/frankensqlite/commit/e21d008b4),
+bd-u2kmg) and the INSERT-conflict provisional-rowid cleanup
+([`725e31ee7`](https://github.com/Dicklesworthstone/frankensqlite/commit/725e31ee7),
+bd-55kh5) noted under §7's `beads_rust-f3r4` rowid-discard limitation.
+Asupersync stays exactly 0.5.0 across br, engine and FastMCP. Qualification
+receipts live in `UPGRADE_LOG.md` under `beads_rust-0edxa`.
+
 **Owner bead:** `beads_rust-dk45` (Track B of the 2026-09-01 bridge plan)
 
 This document is the record of how `br` relates to its storage engine, what
