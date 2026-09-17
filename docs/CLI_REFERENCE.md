@@ -458,9 +458,9 @@ not reach it; the distinguishing fact is whether the writer's base was
 current, which lives in the record rather than in either value.
 
 ```bash
-read=$(br show bd-abc123 --json | jq -r '.[0].updated_at')
+token=$(br show bd-abc123 --json | jq -r '.[0].updated_at')
 # ... revise the text ...
-br update bd-abc123 --description "$revised" --if-unchanged "$read"
+br update bd-abc123 --description "$revised" --if-unchanged "$token"
 ```
 
 - **Match** — proceeds exactly as today, including the overwrite guard, which
@@ -479,6 +479,13 @@ cannot go stale between the check and the write. It applies to the whole
 record, not one field, and to one issue per invocation: a single `updated_at`
 cannot describe two issues, so passing several IDs is refused rather than
 checked against only the first.
+
+It also guards edits that are not field writes — `--add-label`,
+`--remove-label`, `--set-labels`, `--parent` and the acceptance-checklist
+flags — so `br update <id> --add-label urgent --if-unchanged "$token"` refuses
+on a stale token instead of applying the label. Passing the flag with no edit
+at all is a verified no-op: a current token exits 0 and writes nothing (not
+even `updated_at`), a stale one still exits 6.
 
 ---
 

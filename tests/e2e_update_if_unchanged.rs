@@ -193,6 +193,95 @@ fn e2e_if_unchanged_matching_token_applies_and_returns_a_usable_next_token() {
     );
 }
 
+/// Labels, parent and acceptance edits are applied outside `IssueUpdate`, so
+/// a label-only change left the field update empty and skipped the
+/// transaction the precondition is checked in — the label landed while the
+/// token was never looked at. That is exactly the write the caller asked to
+/// make conditional.
+#[test]
+fn e2e_if_unchanged_guards_a_label_only_update() {
+    let _log = common::test_log("e2e_if_unchanged_label");
+    let workspace = BrWorkspace::new();
+    init(&workspace, "e2e_if_unchanged_label");
+    let (id, base_token) = seed(&workspace, "e2e_if_unchanged_label");
+
+    // Someone else moves the record.
+    let moved = run_br(
+        &workspace,
+        ["update", id.as_str(), "-p", "1"],
+        "e2e_if_unchanged_label",
+    );
+    assert!(moved.status.success(), "{}", moved.stderr);
+
+    let refused = run_br(
+        &workspace,
+        [
+            "update",
+            id.as_str(),
+            "--add-label",
+            "urgent",
+            "--if-unchanged",
+            base_token.as_str(),
+        ],
+        "e2e_if_unchanged_label",
+    );
+    assert_eq!(
+        refused.status.code(),
+        Some(6),
+        "a stale token must refuse a label-only update (stdout: {}, stderr: {})",
+        refused.stdout,
+        refused.stderr
+    );
+
+    let shown = run_br(
+        &workspace,
+        ["show", id.as_str(), "--json"],
+        "e2e_if_unchanged_label",
+    );
+    let value: Value = serde_json::from_str(&extract_json_payload(&shown.stdout)).unwrap();
+    let labels = value[0]["labels"].to_string();
+    assert!(
+        !labels.contains("urgent"),
+        "the refused label was applied anyway: {labels}"
+    );
+
+    // With the current token it goes through.
+    let current = value[0]["updated_at"].as_str().expect("updated_at");
+    let ok = run_br(
+        &workspace,
+        [
+            "update",
+            id.as_str(),
+            "--add-label",
+            "urgent",
+            "--if-unchanged",
+            current,
+        ],
+        "e2e_if_unchanged_label",
+    );
+    assert!(
+        ok.status.success(),
+        "a current token must allow a label-only update: {} {}",
+        ok.stdout,
+        ok.stderr
+    );
+
+    // Proves the absence check above was not vacuous: `labels` is a field this
+    // output really carries, and "urgent" really does show up in it once the
+    // update is allowed through.
+    let after = run_br(
+        &workspace,
+        ["show", id.as_str(), "--json"],
+        "e2e_if_unchanged_label",
+    );
+    let after_value: Value = serde_json::from_str(&extract_json_payload(&after.stdout)).unwrap();
+    assert!(
+        after_value[0]["labels"].to_string().contains("urgent"),
+        "label missing after an allowed update: {}",
+        after_value[0]["labels"]
+    );
+}
+
 #[test]
 fn e2e_if_unchanged_json_error_is_machine_actionable() {
     let _log = common::test_log("e2e_if_unchanged_json");

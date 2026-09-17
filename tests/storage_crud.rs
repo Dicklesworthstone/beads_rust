@@ -1105,23 +1105,28 @@ fn expect_updated_at_stale_refuses_and_writes_nothing() {
 }
 
 #[test]
-fn expect_updated_at_is_a_precondition_not_a_mutation() {
-    // The flag alone changes nothing, so it must not count as an update: a
-    // caller passing only a token should get a no-op, not a phantom write.
+fn expect_updated_at_alone_is_checked_but_writes_nothing() {
+    // A precondition changes no field, but it must still be *checked*, and the
+    // only place that happens is inside the write transaction that `is_empty`
+    // gates. Reporting it as empty skipped the check entirely — which mattered
+    // because labels, parent and acceptance edits are applied outside
+    // `IssueUpdate` and would have gone ahead unchecked.
     let mut storage = test_db();
     let issue = fixtures::issue("precondition-alone");
     storage.create_issue(&issue, "tester").unwrap();
     let read = storage.get_issue(&issue.id).unwrap().expect("exists");
 
     assert!(
-        IssueUpdate {
+        !IssueUpdate {
             expect_updated_at: Some(read.updated_at),
             ..IssueUpdate::default()
         }
         .is_empty(),
-        "a precondition on its own is not a field change"
+        "a precondition must reach the transaction that checks it"
     );
 
+    // Current token: succeeds, and writes nothing — no field changed, so
+    // `updated_at` must not move either.
     storage
         .update_issue(
             &issue.id,
@@ -1131,9 +1136,29 @@ fn expect_updated_at_is_a_precondition_not_a_mutation() {
             },
             "writer",
         )
-        .expect("no-op update succeeds");
+        .expect("a current token with no fields is a verified no-op");
     let after = storage.get_issue(&issue.id).unwrap().expect("exists");
     assert_eq!(after.updated_at, read.updated_at, "no-op must not bump");
+
+    // Stale token: refused, rather than silently reporting success.
+    let stale = read.updated_at - chrono::Duration::seconds(1);
+    let err = storage
+        .update_issue(
+            &issue.id,
+            &IssueUpdate {
+                expect_updated_at: Some(stale),
+                ..IssueUpdate::default()
+            },
+            "writer",
+        )
+        .expect_err("a stale token must be refused even with no fields");
+    assert!(
+        matches!(
+            err,
+            beads_rust::error::BeadsError::UpdatePreconditionFailed { .. }
+        ),
+        "{err:?}"
+    );
 }
 
 #[test]
