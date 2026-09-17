@@ -18462,6 +18462,14 @@ impl IssueUpdate {
             && self.transition_comment.is_none()
             && self.workflow_policy_bypass_reason.is_none()
             && !self.expect_unassigned
+            // A precondition is not a field change, but it must still be
+            // *checked*, and the only place that happens is inside the write
+            // transaction this flag gates (GitHub #500). Reporting such an
+            // update as empty skipped the check while a label, parent or
+            // acceptance edit — which are applied outside `IssueUpdate` —
+            // went ahead anyway, which is precisely the write the caller
+            // asked to make conditional.
+            && self.expect_updated_at.is_none()
     }
 }
 

@@ -18245,7 +18245,49 @@ mod tests {
             StalledMigrationHint::probe(&garbage),
             StalledMigrationHint::Indeterminate
         );
+
+        // Truncated below a full header — a real state for a damaged file,
+        // and the header reader cannot answer for it.
+        let truncated = temp.path().join("truncated.db");
+        fs::write(&truncated, b"SQLite format 3\0short").unwrap();
+        assert_eq!(
+            StalledMigrationHint::probe(&truncated),
+            StalledMigrationHint::Indeterminate
+        );
+
         assert!(StalledMigrationHint::Indeterminate.remediation().is_none());
+    }
+
+    /// The reviewed range is a closed interval, so both ends and the versions
+    /// either side of them decide which advice an operator gets.
+    #[test]
+    fn stalled_migration_hint_classifies_the_range_boundaries() {
+        let temp = TempDir::new().unwrap();
+        let probe_at = |version: u32| {
+            let path = temp.path().join(format!("v{version}.db"));
+            write_db_header_with_user_version(&path, version);
+            StalledMigrationHint::probe(&path)
+        };
+
+        let lowest = *REVIEWED_MIGRATION_SOURCE_VERSIONS.iter().min().unwrap();
+        let highest = *REVIEWED_MIGRATION_SOURCE_VERSIONS.iter().max().unwrap();
+
+        assert_eq!(probe_at(lowest), StalledMigrationHint::Migratable(lowest));
+        assert_eq!(probe_at(highest), StalledMigrationHint::Migratable(highest));
+        assert_eq!(
+            probe_at(lowest - 1),
+            StalledMigrationHint::TooOld(lowest - 1),
+            "one below the range must not be sent to the migrator"
+        );
+        // One above the highest reviewed source is the current version, which
+        // has nothing to migrate; this pins that the two constants stay
+        // adjacent rather than silently growing a gap.
+        assert_eq!(
+            i64::from(highest) + 1,
+            i64::from(CURRENT_SCHEMA_VERSION),
+            "a gap between the reviewed range and the current version would \
+             leave a schema with no advice at all"
+        );
     }
 
     #[test]
