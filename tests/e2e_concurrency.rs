@@ -830,6 +830,7 @@ fn e2e_later_writer_waits_for_registered_earlier_waiter() {
 
 #[test]
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_lines)]
 fn e2e_registered_writer_progresses_before_replenishing_short_writes() {
     use rustix::process::{Pid, Signal, kill_process};
 

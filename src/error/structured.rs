@@ -100,6 +100,8 @@ pub enum ErrorCode {
     ImportCollision,
     /// Conflict detected between local database changes and newer JSONL
     SyncConflict,
+    /// An `--if-unchanged` precondition did not hold (GitHub #500)
+    UpdatePreconditionFailed,
     /// Conflict markers in JSONL
     ConflictMarkers,
     /// Path traversal attempt blocked
@@ -174,6 +176,7 @@ impl ErrorCode {
             Self::PrefixMismatch => "PREFIX_MISMATCH",
             Self::ImportCollision => "IMPORT_COLLISION",
             Self::SyncConflict => "SYNC_CONFLICT",
+            Self::UpdatePreconditionFailed => "UPDATE_PRECONDITION_FAILED",
             Self::ConflictMarkers => "CONFLICT_MARKERS",
             Self::PathTraversal => "PATH_TRAVERSAL",
             // Config
@@ -213,6 +216,8 @@ impl ErrorCode {
                 | Self::RequiredField
                 | Self::AmbiguousId
                 | Self::WorkflowCapacityExceeded
+                // Nothing was written; re-read and recompose succeeds.
+                | Self::UpdatePreconditionFailed
                 | Self::ShuttingDown
         )
     }
@@ -266,6 +271,7 @@ impl ErrorCode {
             | Self::PrefixMismatch
             | Self::ImportCollision
             | Self::SyncConflict
+            | Self::UpdatePreconditionFailed
             | Self::ConflictMarkers
             | Self::PathTraversal => 6,
             // Config (7)
@@ -747,6 +753,19 @@ impl StructuredError {
             BeadsError::SyncConflict { message } => {
                 (ErrorCode::SyncConflict, Some(json!({"message": message})))
             }
+            BeadsError::UpdatePreconditionFailed {
+                id,
+                expected,
+                actual,
+            } => (
+                ErrorCode::UpdatePreconditionFailed,
+                Some(json!({
+                    "issue_id": id,
+                    "expected_updated_at": expected,
+                    "actual_updated_at": actual,
+                    "written": false,
+                })),
+            ),
             BeadsError::CommittedStateUnwitnessed { operation, source } => {
                 let source_context = source.downcast_ref::<BeadsError>().and_then(|error| {
                     let (_, context) = Self::extract_code_and_context(error);
@@ -1009,6 +1028,10 @@ impl StructuredError {
                 }
                 Some(format!("Use --force to delete '{id}' anyway."))
             }
+            BeadsError::UpdatePreconditionFailed { id, .. } => Some(format!(
+                "Re-read it (`br show {id} --json`), reapply your edit to the current value, and \
+                 retry with the new --if-unchanged token."
+            )),
             BeadsError::NothingToDo { reason } => Some(skip_reason_hint(reason)),
             BeadsError::CloseIncomplete { summary, .. } => Some(skip_reason_hint(summary)),
             BeadsError::ShuttingDown => {

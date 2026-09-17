@@ -1325,6 +1325,21 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub claim: bool,
 
+    /// Only apply this update if the issue has not changed since you read it
+    /// (GitHub #500).
+    ///
+    /// Pass the `updated_at` that `br show <id> --json` reported. If the
+    /// record has moved since, nothing is written and the command exits 6
+    /// naming both timestamps, so a caller can re-read and retry instead of
+    /// silently discarding the other writer's revision. Omitting the flag
+    /// keeps today's behaviour.
+    ///
+    /// This complements `--force`'s magnitude guard rather than duplicating
+    /// it: that one asks whether a value is destructive on its face, this one
+    /// asks whether the writer was looking at the current record.
+    #[arg(long, value_name = "UPDATED_AT")]
+    pub if_unchanged: Option<String>,
+
     /// Force update even if issue is blocked, and allow a destructive
     /// rewrite of a non-empty description/design/acceptance-criteria/prerequisites/
     /// notes/agent-context value: clearing it, or replacing it with content
