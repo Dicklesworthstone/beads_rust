@@ -1006,3 +1006,175 @@ fn data_persists_across_connections() {
         .expect("issue exists");
     assert_eq!(retrieved.title, issue.title);
 }
+
+// === Lost-update precondition (GitHub #500) ===
+//
+// `description`, `design` and `notes` are rewritten whole, so the normal edit
+// is read-modify-write. Two writers against one store lose the first one's
+// revision: the second writer's base is stale, but its value is a legitimate
+// revision of the same text, so no comparison of the two values can tell the
+// difference. `expect_updated_at` asks the question the values cannot answer
+// -- was this writer looking at the current record -- and is checked inside
+// the write transaction so it cannot go stale between check and write.
+
+#[test]
+fn expect_updated_at_matching_applies_the_update() {
+    let mut storage = test_db();
+    let issue = fixtures::issue("precondition-match");
+    storage.create_issue(&issue, "tester").unwrap();
+    let read = storage.get_issue(&issue.id).unwrap().expect("exists");
+
+    let updated = storage
+        .update_issue(
+            &issue.id,
+            &IssueUpdate {
+                description: Some(Some("revised".to_string())),
+                expect_updated_at: Some(read.updated_at),
+                ..IssueUpdate::default()
+            },
+            "writer-a",
+        )
+        .expect("a current base must be accepted");
+    assert_eq!(updated.description.as_deref(), Some("revised"));
+}
+
+#[test]
+fn expect_updated_at_stale_refuses_and_writes_nothing() {
+    let mut storage = test_db();
+    let issue = fixtures::issue("precondition-stale");
+    storage.create_issue(&issue, "tester").unwrap();
+
+    // Both writers read the same base, as two agents would.
+    let base = storage.get_issue(&issue.id).unwrap().expect("exists");
+    let base_updated_at = base.updated_at;
+
+    // Writer A lands first and moves the record.
+    storage
+        .update_issue(
+            &issue.id,
+            &IssueUpdate {
+                description: Some(Some("A's paragraph".to_string())),
+                ..IssueUpdate::default()
+            },
+            "writer-a",
+        )
+        .expect("first write succeeds");
+    let after_a = storage.get_issue(&issue.id).unwrap().expect("exists");
+    assert_ne!(
+        after_a.updated_at, base_updated_at,
+        "A's write must move updated_at, or the precondition has nothing to detect"
+    );
+
+    // Writer B is still holding the base it read before A wrote.
+    let err = storage
+        .update_issue(
+            &issue.id,
+            &IssueUpdate {
+                description: Some(Some("B's paragraph".to_string())),
+                expect_updated_at: Some(base_updated_at),
+                ..IssueUpdate::default()
+            },
+            "writer-b",
+        )
+        .expect_err("a stale base must be refused");
+
+    match &err {
+        beads_rust::error::BeadsError::UpdatePreconditionFailed { id, .. } => {
+            assert_eq!(id, &issue.id);
+        }
+        other => panic!("expected UpdatePreconditionFailed, got {other:?}"),
+    }
+    // The message has to name both timestamps: a caller that cannot see what
+    // it expected versus what is there cannot decide whether to retry.
+    let rendered = err.to_string();
+    assert!(rendered.contains("changed since you read it"), "{rendered}");
+    assert!(rendered.contains("Nothing was written"), "{rendered}");
+
+    // And nothing was written: A's revision survives intact, byte for byte,
+    // and the record did not move at all.
+    let after = storage.get_issue(&issue.id).unwrap().expect("exists");
+    assert_eq!(
+        after.description.as_deref(),
+        Some("A's paragraph"),
+        "the refused write must not have landed"
+    );
+    assert_eq!(
+        after.updated_at, after_a.updated_at,
+        "a refused write must not bump updated_at"
+    );
+}
+
+#[test]
+fn expect_updated_at_is_a_precondition_not_a_mutation() {
+    // The flag alone changes nothing, so it must not count as an update: a
+    // caller passing only a token should get a no-op, not a phantom write.
+    let mut storage = test_db();
+    let issue = fixtures::issue("precondition-alone");
+    storage.create_issue(&issue, "tester").unwrap();
+    let read = storage.get_issue(&issue.id).unwrap().expect("exists");
+
+    assert!(
+        IssueUpdate {
+            expect_updated_at: Some(read.updated_at),
+            ..IssueUpdate::default()
+        }
+        .is_empty(),
+        "a precondition on its own is not a field change"
+    );
+
+    storage
+        .update_issue(
+            &issue.id,
+            &IssueUpdate {
+                expect_updated_at: Some(read.updated_at),
+                ..IssueUpdate::default()
+            },
+            "writer",
+        )
+        .expect("no-op update succeeds");
+    let after = storage.get_issue(&issue.id).unwrap().expect("exists");
+    assert_eq!(after.updated_at, read.updated_at, "no-op must not bump");
+}
+
+#[test]
+fn expect_updated_at_guards_every_field_not_just_prose() {
+    // The precondition is about the record, so a stale base is refused
+    // whichever field the writer is changing.
+    let mut storage = test_db();
+    let issue = fixtures::issue("precondition-any-field");
+    storage.create_issue(&issue, "tester").unwrap();
+    let stale = storage.get_issue(&issue.id).unwrap().unwrap().updated_at;
+
+    storage
+        .update_issue(
+            &issue.id,
+            &IssueUpdate {
+                notes: Some(Some("moved".to_string())),
+                ..IssueUpdate::default()
+            },
+            "writer-a",
+        )
+        .unwrap();
+
+    let err = storage.update_issue(
+        &issue.id,
+        &IssueUpdate {
+            priority: Some(Priority(0)),
+            expect_updated_at: Some(stale),
+            ..IssueUpdate::default()
+        },
+        "writer-b",
+    );
+    assert!(
+        matches!(
+            err,
+            Err(beads_rust::error::BeadsError::UpdatePreconditionFailed { .. })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        storage.get_issue(&issue.id).unwrap().unwrap().priority,
+        Priority::MEDIUM,
+        "the refused priority change must not have landed"
+    );
+}

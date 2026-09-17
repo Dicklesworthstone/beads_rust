@@ -123,6 +123,20 @@ pub enum BeadsError {
     #[error("Sync conflict: {message}")]
     SyncConflict { message: String },
 
+    /// An `--if-unchanged` precondition did not hold: the record moved
+    /// between the caller's read and its write (GitHub #500).
+    ///
+    /// Retryable by re-reading and recomposing the update; nothing was
+    /// written.
+    #[error(
+        "{id} changed since you read it: expected updated_at {expected}, found {actual}. Nothing was written — re-read the issue and reapply your edit to the current value."
+    )]
+    UpdatePreconditionFailed {
+        id: String,
+        expected: String,
+        actual: String,
+    },
+
     /// A mutation committed, but the process lost authority to witness the
     /// committed database inode before it could report ordinary success.
     ///

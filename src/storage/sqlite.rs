@@ -22,7 +22,7 @@ use crate::sync::{
 };
 use crate::util::id::{normalize_prefix, parse_id};
 use crate::validation::{CommentValidator, ISSUE_LABEL_MAX_COUNT, IssueValidator, LabelValidator};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat, TimeZone, Utc};
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use sha2::{Digest, Sha256};
@@ -7496,6 +7496,22 @@ impl SqliteStorage {
             return Err(BeadsError::Validation {
                 field: "issue_id".to_string(),
                 reason: format!("cannot update tombstone issue: {id}"),
+            });
+        }
+
+        // Optimistic-concurrency precondition (GitHub #500). Compared as
+        // instants rather than strings so a caller may hand back the
+        // timestamp in any equivalent RFC 3339 spelling, and inside the write
+        // transaction so the answer cannot go stale between check and write.
+        if let Some(expected) = updates.expect_updated_at
+            && issue.updated_at != expected
+        {
+            return Err(BeadsError::UpdatePreconditionFailed {
+                id: id.to_string(),
+                expected: expected.to_rfc3339_opts(SecondsFormat::AutoSi, true),
+                actual: issue
+                    .updated_at
+                    .to_rfc3339_opts(SecondsFormat::AutoSi, true),
             });
         }
 
@@ -18400,6 +18416,20 @@ pub struct IssueUpdate {
     pub claim_exclusive: bool,
     /// The actor performing the claim (used for idempotent same-actor check).
     pub claim_actor: Option<String>,
+    /// Optimistic-concurrency precondition: the `updated_at` the caller read
+    /// before composing this update (GitHub #500).
+    ///
+    /// `description`, `design` and `notes` are prose fields that callers
+    /// rewrite whole, so the normal edit is read-modify-write. Two of those
+    /// against one store lose the first writer's revision: the second writer's
+    /// base is stale, and its value is a legitimate-looking revision of the
+    /// same text, so no comparison of the two values can tell the difference.
+    /// The distinguishing fact is whether the writer's base was current, which
+    /// lives in the record rather than in either value.
+    ///
+    /// Checked inside the write transaction, alongside `expect_unassigned`.
+    /// Doing it before the transaction would leave the same window open.
+    pub expect_updated_at: Option<DateTime<Utc>>,
 }
 
 impl IssueUpdate {

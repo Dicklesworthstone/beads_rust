@@ -396,6 +396,7 @@ br update [OPTIONS] [IDS]...
 | `--assignee <NAME>` | Assign (empty string clears) |
 | `--owner <EMAIL>` | Set owner (empty string clears) |
 | `--claim` | Atomic claim (assignee=actor + status=in_progress) |
+| `--if-unchanged <UPDATED_AT>` | Apply only if the issue still carries this `updated_at` (see [lost updates](#if-unchanged-lost-updates) below); one issue at a time |
 | `--force` | Force update even if issue is blocked; also required for a destructive rewrite of a non-empty description/design/acceptance-criteria/prerequisites/notes/agent-context value (see the overwrite guard below); never bypasses workflow requirements or capacity |
 | `--due <DATE>` | Set due date (empty string clears) |
 | `--defer <DATE>` | Set the `br ready` time gate; empty string clears it ([scheduled work](#defer--undefer)) |
@@ -445,6 +446,39 @@ the current length the incoming value keeps; in `--json` mode the `hint`
 field carries the fix. `--force` unlocks every guarded field for that call, so
 prefer the in-place flags that never need it: `--append-notes`,
 `--add-acceptance`, `--check-acceptance`, `--uncheck-acceptance`.
+
+<a id="if-unchanged-lost-updates"></a>
+**`--if-unchanged`: lost updates (#500).** The guard above asks whether a
+value is destructive *on its face*. It cannot see the other failure: two
+writers read the same field, each revises it, and the second write discards
+the first — its value is nearly the same length and shares nearly all the same
+words, because both derive from the same base, so on every axis it looks like
+a legitimate revision and is written silently. Tightening the thresholds does
+not reach it; the distinguishing fact is whether the writer's base was
+current, which lives in the record rather than in either value.
+
+```bash
+read=$(br show bd-abc123 --json | jq -r '.[0].updated_at')
+# ... revise the text ...
+br update bd-abc123 --description "$revised" --if-unchanged "$read"
+```
+
+- **Match** — proceeds exactly as today, including the overwrite guard, which
+  still runs in front of it. If a value would trip that guard *and* the token
+  is stale, you hear about the guard first; both refusals are accurate and
+  neither writes anything.
+- **Mismatch** — nothing is written; exits **6** with
+  `UPDATE_PRECONDITION_FAILED`, naming both timestamps so a caller can
+  re-read and reapply rather than guess. The JSON error carries
+  `expected_updated_at`, `actual_updated_at` and `written: false`, and is
+  marked retryable.
+- **Omitted** — today's behaviour, unchanged.
+
+The token is checked inside the same write transaction as the update, so it
+cannot go stale between the check and the write. It applies to the whole
+record, not one field, and to one issue per invocation: a single `updated_at`
+cannot describe two issues, so passing several IDs is refused rather than
+checked against only the first.
 
 ---
 
@@ -2405,7 +2439,7 @@ source ~/.bashrc
 | 3 | Issue | Issue error (not found, ambiguous ID) |
 | 4 | Validation | Validation error (invalid input) |
 | 5 | Dependency | Dependency error (cycle detected, self-dependency) |
-| 6 | Sync/JSONL | Sync error (parse error, conflict markers) |
+| 6 | Sync/JSONL | Sync error (parse error, conflict markers), or an `--if-unchanged` precondition that no longer holds |
 | 7 | Config | Configuration error |
 | 8 | I/O | I/O error (file not found, permission denied) |
 
