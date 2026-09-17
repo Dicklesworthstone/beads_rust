@@ -22,6 +22,8 @@
 # nonzero exit has an unknown commit outcome; this integrity stress does not
 # replace the separate linearizability checker. JSONL-only source copies are
 # identified explicitly and do not prove retained-database migration safety.
+# Recovery inventories use bytewise sorting and are retained as pre-recovery.txt,
+# post-recovery.txt, and new-recovery.txt. Inventory/comparison errors fail the gate.
 set -u -o pipefail
 
 BR="${1:?usage: br-stress.sh <br-binary> <src-.beads-dir> [workers] [seconds]}"
@@ -167,9 +169,12 @@ if [[ "$NIDS" -eq 0 ]]; then
 fi
 # Artifacts written while warming the copy (for example a rebuild's own
 # pre-compaction backup) are not stress findings; only new ones count.
-recovery_files() { if [[ -d .beads/.br_recovery ]]; then find .beads/.br_recovery -type f | sort; fi; }
-BASELINE_REC="$(recovery_files)"
-echo "[stress] pre-run recovery artifacts: $(printf '%s' "$BASELINE_REC" | grep -c . || true)"
+recovery_files() { if [[ -d .beads/.br_recovery ]]; then find .beads/.br_recovery -type f | LC_ALL=C sort; fi; }
+if ! recovery_files >pre-recovery.txt; then
+    echo "[stress] FAIL: cannot inventory baseline recovery artifacts ($WORK)" >&2
+    exit 1
+fi
+echo "[stress] pre-run recovery artifacts: $(wc -l <pre-recovery.txt)"
 family_inventory >pre-family.json || exit 1
 
 worker() {
@@ -270,11 +275,19 @@ DOCTOR_ERR="$(python3 -c 'import json,sys
 d=json.load(sys.stdin)
 checks=d.get("checks") or d.get("results") or []
 print(sum(1 for c in checks if isinstance(c,dict) and str(c.get("status","")).lower()=="error"))' <post-doctor.json 2>post-doctor-parse.err || echo "unavailable")"
-NEW_REC="$(comm -13 <(printf '%s\n' "$BASELINE_REC" | grep .) <(recovery_files))"
-REC="$(printf '%s' "$NEW_REC" | grep -c . || true)"
+# Materialize both operands: pipefail cannot observe process-substitution errors.
+if ! recovery_files >post-recovery.txt; then
+    echo "[stress] FAIL: cannot inventory post-run recovery artifacts ($WORK)" >&2
+    exit 1
+fi
+if ! LC_ALL=C comm -13 pre-recovery.txt post-recovery.txt >new-recovery.txt; then
+    echo "[stress] FAIL: cannot compare recovery inventories ($WORK)" >&2
+    exit 1
+fi
+REC="$(wc -l <new-recovery.txt)"
 if [[ "$REC" -gt 0 ]]; then
     echo "[stress] new recovery artifacts:"
-    printf '%s\n' "$NEW_REC"
+    cat new-recovery.txt
 fi
 
 echo "[stress] integrity=$IC db_rows=$DB jsonl_records=$JL bad_jsonl_lines=$BADJSON doctor_errors=$DOCTOR_ERR recovery_artifacts=$REC unexpected_error_lines=$UNEXPECTED"

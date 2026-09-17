@@ -629,6 +629,84 @@ fn verify_checksums_fragment_fails_on_corrupt_checksum() -> Result<(), String> {
 }
 
 #[test]
+fn stress_recovery_inventory_preserves_history_and_fails_closed() -> Result<(), String> {
+    let source =
+        read_to_string(&Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/br-stress.sh"))?;
+    let baseline_start = source
+        .find("recovery_files()")
+        .ok_or("missing recovery helper")?;
+    let baseline_end = source
+        .find("family_inventory >pre-family.json")
+        .ok_or("missing baseline end")?;
+    let comparison_start = source
+        .find("# Materialize both operands")
+        .ok_or("missing comparison")?;
+    let baseline = &source[baseline_start..baseline_end];
+    let comparison = &source[comparison_start..];
+    for (before, between, succeeds, expected) in [
+        ("", "", true, "recovery_artifacts=0"),
+        (
+            "",
+            "touch .beads/.br_recovery/new",
+            false,
+            "recovery_artifacts=1",
+        ),
+        (
+            "",
+            "comm() { echo injected-comm >&2; return 73; }",
+            false,
+            "injected-comm",
+        ),
+        (
+            "find() { echo injected-find >&2; return 73; }",
+            "",
+            false,
+            "injected-find",
+        ),
+        (
+            "",
+            "find() { echo injected-find >&2; return 73; }",
+            false,
+            "injected-find",
+        ),
+        (
+            "sort() { echo injected-sort >&2; return 73; }",
+            "",
+            false,
+            "injected-sort",
+        ),
+        (
+            "",
+            "sort() { echo injected-sort >&2; return 73; }",
+            false,
+            "injected-sort",
+        ),
+    ] {
+        let fixture = WorkflowFixture::new()?;
+        // Match the production shell: errexit would conceal missing checks.
+        let script = format!(
+            "set +e; set -u -o pipefail\nWORK=$PWD\n\
+             mkdir -p .beads/.br_recovery/nested\n\
+             touch .beads/.br_recovery/Z .beads/.br_recovery/a \
+             '.beads/.br_recovery/nested/old recovery'\n\
+             family_inventory() {{ :; }}\n\
+             FLUSH_RC=0 INTEGRITY_RC=0 DOCTOR_RC=0 IC=ok DB=1 JL=1 BADJSON=0 DOCTOR_ERR=0 UNEXPECTED=0\n\
+             {before}\n{baseline}\n{between}\n{comparison}"
+        );
+        let output = run_bash_step(&script, fixture.root(), &[])?;
+        if succeeds {
+            require_success(&output)?;
+            require_contains(&output.stdout, "[stress] PASS")?;
+        } else {
+            require_failure(&output, expected)?;
+            require_not_contains(&output.stdout, "[stress] PASS")?;
+        }
+        require_contains(&format!("{}{}", output.stdout, output.stderr), expected)?;
+    }
+    Ok(())
+}
+
+#[test]
 fn linux_minisign_install_uses_authenticated_distribution_package() -> Result<(), String> {
     let script = release_step_script("Install minisign (Linux)")?;
 
