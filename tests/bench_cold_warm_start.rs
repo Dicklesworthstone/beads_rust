@@ -22,6 +22,10 @@
 //! - Cold/warm ratio for each command
 //! - Comparison between br and bd for cold and warm scenarios
 //!
+//! The legacy "cold" field means the first post-setup observation. Setup has
+//! already executed the CLI; without cache control it cannot qualify cold-cache
+//! startup objectives.
+//!
 //! # Commands Tested
 //!
 //! - list --json
@@ -122,14 +126,6 @@ pub struct ColdWarmSummary {
 // Command Runner
 // =============================================================================
 
-/// Result of a single command run.
-struct RunResult {
-    duration: Duration,
-    success: bool,
-    #[allow(dead_code)]
-    stdout: Vec<u8>,
-}
-
 /// Captured command output for performance artifact bundles.
 struct CapturedCommandRun {
     duration: Duration,
@@ -137,28 +133,6 @@ struct CapturedCommandRun {
     success: bool,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
-}
-
-/// Run a command and measure execution time.
-fn run_command(binary_path: &Path, args: &[&str], cwd: &Path) -> RunResult {
-    let start = Instant::now();
-
-    let output = Command::new(binary_path)
-        .args(args)
-        .current_dir(cwd)
-        .env("NO_COLOR", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("Failed to run command");
-
-    let duration = start.elapsed();
-
-    RunResult {
-        duration,
-        success: output.status.success(),
-        stdout: output.stdout,
-    }
 }
 
 /// Run a command for the startup matrix and keep enough raw evidence for a bundle.
@@ -205,6 +179,27 @@ fn run_startup_matrix_command(
     })
 }
 
+/// Failed setup or measured commands invalidate the benchmark, with both
+/// output channels retained in the diagnostic (robot errors use stdout).
+fn required_benchmark_command(
+    binary_path: &Path,
+    args: &[&str],
+    cwd: &Path,
+) -> std::io::Result<CapturedCommandRun> {
+    let run = run_startup_matrix_command(binary_path, args, cwd, &[])?;
+    if !run.success {
+        return Err(std::io::Error::other(format!(
+            "{} {args:?} failed in {} (exit {}): stdout={} stderr={}",
+            binary_path.display(),
+            cwd.display(),
+            run.exit_code,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr),
+        )));
+    }
+    Ok(run)
+}
+
 /// Measure cold and warm start for a single command.
 fn measure_cold_warm(
     binary_path: &Path,
@@ -215,7 +210,8 @@ fn measure_cold_warm(
     warm_runs: usize,
 ) -> ColdWarmMetrics {
     // Cold start: first run
-    let cold_result = run_command(binary_path, args, cwd);
+    let cold_result = required_benchmark_command(binary_path, args, cwd)
+        .expect("initial benchmark command failed");
     let cold_start_ms = cold_result.duration.as_millis();
 
     // Warm starts: subsequent runs
@@ -223,7 +219,8 @@ fn measure_cold_warm(
     let mut all_success = cold_result.success;
 
     for _ in 0..warm_runs {
-        let result = run_command(binary_path, args, cwd);
+        let result = required_benchmark_command(binary_path, args, cwd)
+            .expect("repeated benchmark command failed");
         warm_runs_ms.push(result.duration.as_millis());
         all_success = all_success && result.success;
     }
@@ -280,34 +277,22 @@ fn create_br_workspace(br_path: &Path, issue_count: usize) -> std::io::Result<(T
     fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n")?;
 
     // Initialize beads
-    let init_output = Command::new(br_path)
-        .args(["init"])
-        .current_dir(&root)
-        .output()?;
-
-    if !init_output.status.success() {
-        return Err(std::io::Error::other(format!(
-            "br init failed: {}",
-            String::from_utf8_lossy(&init_output.stderr)
-        )));
-    }
+    required_benchmark_command(br_path, &["init"], &root)?;
 
     // Create issues
     for i in 0..issue_count {
         let title = format!("Benchmark issue {i}");
         let priority = (i % 5).to_string();
 
-        let _ = Command::new(br_path)
-            .args(["create", "--title", &title, "--priority", &priority])
-            .current_dir(&root)
-            .output()?;
+        required_benchmark_command(
+            br_path,
+            &["create", "--title", &title, "--priority", &priority],
+            &root,
+        )?;
     }
 
     // Flush to JSONL for consistent state
-    let _ = Command::new(br_path)
-        .args(["sync", "--flush-only"])
-        .current_dir(&root)
-        .output()?;
+    required_benchmark_command(br_path, &["sync", "--flush-only"], &root)?;
 
     Ok((temp_dir, root))
 }
@@ -331,17 +316,7 @@ fn copy_workspace_for_bd(br_root: &Path, bd_path: &Path) -> std::io::Result<(Tem
     let _ = fs::remove_file(root.join(".beads").join("beads.db-journal"));
 
     // Import into bd's database
-    let import_output = Command::new(bd_path)
-        .args(["sync", "--import-only"])
-        .current_dir(&root)
-        .output()?;
-
-    if !import_output.status.success() {
-        return Err(std::io::Error::other(format!(
-            "bd sync import failed: {}",
-            String::from_utf8_lossy(&import_output.stderr)
-        )));
-    }
+    required_benchmark_command(bd_path, &["sync", "--import-only"], &root)?;
 
     Ok((temp_dir, root))
 }
@@ -365,23 +340,15 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 /// Get a valid issue ID from the workspace.
 fn get_first_issue_id(br_path: &Path, workspace: &Path) -> Option<String> {
-    let output = Command::new(br_path)
-        .args(["list", "--limit=1", "--json"])
-        .current_dir(workspace)
-        .output()
-        .ok()?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Parse JSON array and extract first id
-    for line in stdout.lines() {
-        if let Ok(issues) = serde_json::from_str::<Vec<serde_json::Value>>(line)
-            && let Some(first) = issues.first()
-            && let Some(id) = first.get("id").and_then(|v| v.as_str())
-        {
-            return Some(id.to_string());
-        }
-    }
-    None
+    let output = required_benchmark_command(br_path, &["list", "--limit=1", "--json"], workspace)
+        .expect("benchmark issue lookup failed");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("benchmark issue list JSON");
+    payload["issues"]
+        .as_array()
+        .expect("paginated issue list")
+        .first()
+        .map(|issue| issue["id"].as_str().expect("issue ID").to_owned())
 }
 
 // =============================================================================
@@ -426,16 +393,11 @@ fn prepare_startup_matrix_workspace(
 
     match state {
         "stale" => {
-            let output = Command::new(br_path)
-                .args(["create", "Startup matrix stale marker", "--no-auto-flush"])
-                .current_dir(&root)
-                .output()?;
-            if !output.status.success() {
-                return Err(std::io::Error::other(format!(
-                    "startup matrix stale setup failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                )));
-            }
+            required_benchmark_command(
+                br_path,
+                &["create", "Startup matrix stale marker", "--no-auto-flush"],
+                &root,
+            )?;
         }
         "recovery_anomaly" => {
             let recovery_dir = root.join(".beads").join(".br_recovery");
@@ -1116,6 +1078,37 @@ fn write_results_json(benchmarks: &[ColdWarmBenchmark], output_path: &Path) -> s
 // Tests
 // =============================================================================
 
+#[test]
+fn benchmark_setup_populates_and_flushes_requested_issues() {
+    let binary = assert_cmd::cargo::cargo_bin!("br");
+    let (_temp, root) = create_br_workspace(binary, 2).unwrap();
+    let exported = fs::read_to_string(root.join(".beads/issues.jsonl")).unwrap();
+    assert_eq!(exported.lines().count(), 2);
+    let id = get_first_issue_id(binary, &root).expect("show workload must have an issue");
+    required_benchmark_command(binary, &["show", &id, "--json"], &root).unwrap();
+}
+
+#[test]
+fn benchmark_rejects_failed_commands_with_robot_diagnostics() {
+    let binary = assert_cmd::cargo::cargo_bin!("br");
+    let (_temp, root) = create_br_workspace(binary, 0).unwrap();
+    assert!(get_first_issue_id(binary, &root).is_none());
+    let error = required_benchmark_command(binary, &["create", "", "--json"], &root)
+        .err()
+        .expect("empty issue title must invalidate setup");
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("stdout="), "{diagnostic}");
+    assert!(diagnostic.contains("stderr="), "{diagnostic}");
+    assert!(diagnostic.contains("error"), "{diagnostic}");
+    assert!(
+        std::panic::catch_unwind(|| {
+            measure_cold_warm(binary, &["create", "", "--json"], &root, "br", "invalid", 1)
+        })
+        .is_err(),
+        "failed timed commands must not yield benchmark metrics"
+    );
+}
+
 /// Cold vs warm benchmark with small dataset (50 issues).
 #[test]
 #[ignore = "manual benchmark: cargo test --test bench_cold_warm_start -- --ignored --nocapture"]
@@ -1147,7 +1140,7 @@ fn cold_warm_small() {
             println!("Results written to: {}", output_path.display());
         }
         Err(e) => {
-            eprintln!("Benchmark failed: {e}");
+            panic!("Benchmark failed: {e}");
         }
     }
 }
@@ -1182,7 +1175,7 @@ fn cold_warm_medium() {
             println!("Results written to: {}", output_path.display());
         }
         Err(e) => {
-            eprintln!("Benchmark failed: {e}");
+            panic!("Benchmark failed: {e}");
         }
     }
 }
@@ -1217,7 +1210,7 @@ fn cold_warm_large() {
             println!("Results written to: {}", output_path.display());
         }
         Err(e) => {
-            eprintln!("Benchmark failed: {e}");
+            panic!("Benchmark failed: {e}");
         }
     }
 }
@@ -1259,7 +1252,7 @@ fn cold_warm_all() {
                 all_benchmarks.push(benchmark);
             }
             Err(e) => {
-                eprintln!("Benchmark failed for {issue_count} issues: {e}");
+                panic!("Benchmark failed for {issue_count} issues: {e}");
             }
         }
     }
@@ -1344,16 +1337,14 @@ fn cold_warm_real_datasets() {
         let br_isolated = match IsolatedDataset::from_dataset(*dataset) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("Failed to create br workspace: {e}");
-                continue;
+                panic!("Failed to create br workspace: {e}");
             }
         };
 
         let bd_isolated = match IsolatedDataset::from_dataset(*dataset) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("Failed to create bd workspace: {e}");
-                continue;
+                panic!("Failed to create bd workspace: {e}");
             }
         };
 

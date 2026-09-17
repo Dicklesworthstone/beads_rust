@@ -3015,6 +3015,70 @@ mod release_abba {
         stderr: String,
         load_before: String,
         invocations: usize,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        extra_work: Vec<ExtraWork>,
+    }
+
+    #[derive(Serialize)]
+    struct ExtraWork {
+        args: Vec<String>,
+        elapsed_ms: f64,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    }
+
+    fn extra_version_count(value: &str, ready_invocations: usize) -> Result<usize, String> {
+        let extra = count(value, 0)?;
+        if extra > 0 && ready_invocations > 1 {
+            return Err(
+                "extra version calls and repeated ready calls are separate controls".into(),
+            );
+        }
+        Ok(extra)
+    }
+
+    fn capture_extra_work(binary: &Path, root: &Path, args: Vec<String>) -> ExtraWork {
+        let mut command = isolated_command(binary, root, &args);
+        let started = Instant::now();
+        let output = command.output();
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        let (exit_code, stdout, stderr) = match output {
+            Ok(output) => (
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ),
+            Err(error) => (
+                -1,
+                String::new(),
+                format!("failed to launch extra work: {error}"),
+            ),
+        };
+        ExtraWork {
+            args,
+            elapsed_ms,
+            exit_code,
+            stdout,
+            stderr,
+        }
+    }
+
+    fn capture_extra_versions(binary: &Path, root: &Path, calls: usize) -> Vec<ExtraWork> {
+        (0..calls)
+            .map(|_| capture_extra_work(binary, root, vec!["version".into(), "--json".into()]))
+            .collect()
+    }
+
+    fn sample_exit_code(outputs: &[Output], extra_work: &[ExtraWork]) -> i32 {
+        assert!(!outputs.is_empty(), "sample must execute its workload");
+        if let Some(output) = outputs.iter().find(|output| !output.status.success()) {
+            return output.status.code().unwrap_or(-1);
+        }
+        extra_work
+            .iter()
+            .find(|call| call.exit_code != 0)
+            .map_or(0, |call| call.exit_code)
     }
 
     struct Artifact {
@@ -3341,6 +3405,13 @@ mod release_abba {
         for invalid in ["0", "9", "-1", "", "garbage"] {
             assert!(count(invalid, 10).is_err(), "accepted {invalid:?}");
         }
+        assert_eq!(extra_version_count("0", 1), Ok(0));
+        assert_eq!(extra_version_count("0", 20), Ok(0));
+        assert_eq!(extra_version_count("2", 1), Ok(2));
+        assert!(extra_version_count("1", 2).is_err());
+        for invalid in ["-1", "", "1.5", "garbage"] {
+            assert!(extra_version_count(invalid, 1).is_err());
+        }
         assert!(
             arguments("update", "syn-1", false)
                 .iter()
@@ -3372,6 +3443,62 @@ mod release_abba {
         ] {
             assert!(workload_budgets(invalid).is_err(), "accepted {invalid}");
         }
+    }
+
+    #[test]
+    fn release_measurement_extra_versions_are_real_separate_calls_and_fail_closed() {
+        let binary = assert_cmd::cargo::cargo_bin!("br");
+        let workspace = TempDir::new_in(common::cli::isolated_temp_root()).unwrap();
+        let init = isolated_command(binary, workspace.path(), &["init".into()])
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "{init:?}");
+        let args = vec!["ready".into(), "--json".into()];
+        let ready = isolated_command(binary, workspace.path(), &args)
+            .output()
+            .unwrap();
+        let expected = parsed(&ready);
+        assert!(expected.is_array());
+        let outputs = vec![ready];
+        let default = capture_extra_versions(binary, workspace.path(), 0);
+        assert!(default.is_empty());
+        assert_eq!(sample_exit_code(&outputs, &default), 0);
+
+        let started = Instant::now();
+        let extra = capture_extra_versions(binary, workspace.path(), 2);
+        let total_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        assert_eq!(extra.len(), 2);
+        assert!(extra.iter().map(|call| call.elapsed_ms).sum::<f64>() <= total_ms);
+        for call in &extra {
+            assert_eq!(call.args, ["version", "--json"]);
+            assert_eq!(call.exit_code, 0, "{}", call.stderr);
+            assert!(call.elapsed_ms > 0.0);
+            let value: Value = serde_json::from_str(&call.stdout).unwrap();
+            assert!(value["version"].is_string(), "{value}");
+        }
+        assert_eq!(sample_exit_code(&outputs, &extra), 0);
+        assert_eq!(
+            parsed(&outputs[0]),
+            expected,
+            "extra JSON must not contaminate ready output"
+        );
+
+        let failed = capture_extra_work(
+            binary,
+            workspace.path(),
+            vec!["not-a-br-command".into(), "--json".into()],
+        );
+        assert_ne!(failed.exit_code, 0);
+        assert!(!failed.stdout.is_empty() || !failed.stderr.is_empty());
+        assert_ne!(sample_exit_code(&outputs, &[failed]), 0);
+        let absent = capture_extra_work(
+            binary,
+            &workspace.path().join("absent-working-directory"),
+            vec!["version".into(), "--json".into()],
+        );
+        assert_eq!(absent.exit_code, -1);
+        assert!(absent.stderr.contains("failed to launch extra work"));
+        assert_ne!(sample_exit_code(&outputs, &[absent]), 0);
     }
 
     #[test]
@@ -3424,6 +3551,7 @@ mod release_abba {
                     stderr: String::new(),
                     load_before: String::new(),
                     invocations: 1,
+                    extra_work: Vec::new(),
                 };
                 retain_sample(&mut runs[side], &sample);
             }
@@ -3480,6 +3608,15 @@ mod release_abba {
             1,
         )
         .expect("positive real invocation count");
+        let extra_versions = extra_version_count(
+            &std::env::var("BR_PERF_NEGATIVE_EXTRA_VERSION_CALLS").unwrap_or_else(|_| "0".into()),
+            repeats,
+        )
+        .expect("nonnegative version-call count and unambiguous extra-work control");
+        assert!(
+            extra_versions == 0 || selected.is_none_or(|(name, _)| name.contains("-ready-")),
+            "extra version-call control requires a selected ready workload or the full matrix"
+        );
         let budget = std::env::var("BR_PERF_BUDGET_PCT")
             .ok()
             .map(|value| value.parse::<f64>().expect("numeric budget"));
@@ -3531,7 +3668,7 @@ mod release_abba {
                 artifact("BASELINE", &datasets[0].root),
                 artifact("CANDIDATE", &datasets[1].root),
             ];
-            if repeats > 1 {
+            if repeats > 1 || extra_versions > 0 {
                 assert_eq!(
                     artifacts[0].metadata["binary_sha256"], artifacts[1].metadata["binary_sha256"],
                     "the planted slowdown is an A/A control using one artifact"
@@ -3637,14 +3774,17 @@ mod release_abba {
                             for invocation in &mut commands {
                                 outputs.push(invocation.output().expect("measured CLI invocation"));
                             }
+                            let extra_work = capture_extra_versions(
+                                &artifacts[side].binary,
+                                workspace.path(),
+                                if side == 1 && command == "ready" {
+                                    extra_versions
+                                } else {
+                                    0
+                                },
+                            );
                             let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
-                            let exit_code = outputs
-                                .iter()
-                                .find(|output| !output.status.success())
-                                .unwrap_or_else(|| outputs.last().unwrap())
-                                .status
-                                .code()
-                                .unwrap_or(-1);
+                            let exit_code = sample_exit_code(&outputs, &extra_work);
                             samples.push(Sample {
                                 side,
                                 block,
@@ -3665,6 +3805,7 @@ mod release_abba {
                                     .join("\n"),
                                 load_before,
                                 invocations,
+                                extra_work,
                             });
                             write_json_pretty(
                                 &output_dir.join(format!("{name}-raw.json")),
@@ -3699,6 +3840,19 @@ mod release_abba {
                                     &value,
                                 );
                             }
+                            for extra in &samples.last().unwrap().extra_work {
+                                assert_eq!(
+                                    extra.exit_code, 0,
+                                    "failed extra work: {}",
+                                    extra.stderr
+                                );
+                                let value: Value = serde_json::from_str(&extra.stdout)
+                                    .expect("extra version call must produce its own JSON value");
+                                assert!(
+                                    value["version"].is_string(),
+                                    "extra version output: {value}"
+                                );
+                            }
                             retain_sample(&mut runs[side], samples.last().unwrap());
                         }
                     }
@@ -3721,6 +3875,7 @@ mod release_abba {
                             "candidate": summarize_matched_samples(&runs[1].samples_ms).unwrap(),
                             "comparison": comparison, "gate_exit": comparison.exit_code(),
                             "negative_control_ready_invocations": repeats,
+                            "negative_control_extra_version_calls": extra_versions,
                             "budget_origin": if budgets.contains_key(&name) {
                                 "operator-supplied per-workload budget"
                             } else if budget.is_some() {
@@ -3734,7 +3889,7 @@ mod release_abba {
                         }),
                     )
                     .unwrap();
-                    if repeats > 1 && command == "ready" {
+                    if (repeats > 1 || extra_versions > 0) && command == "ready" {
                         assert_eq!(
                             comparison.state,
                             MatchedState::Regression,
@@ -3760,7 +3915,7 @@ mod release_abba {
             "workload_budgets": budgets,
             "budget_status": if budget.is_some() { "operator-supplied diagnostic budget; not an accepted SLO" } else if budgets.is_empty() { "inconclusive: no calibrated budget supplied" } else { "operator-supplied per-workload budgets; missing entries remain inconclusive" }
         })).unwrap();
-        if budget.is_some() && repeats == 1 {
+        if budget.is_some() && repeats == 1 && extra_versions == 0 {
             assert!(
                 gate_exits.iter().all(|code| *code == 0),
                 "regression or inconclusive comparison; inspect retained receipts"

@@ -21,8 +21,10 @@
 //!
 //! Knobs: `BR_LINEARIZABILITY_PROCESSES` (default 8),
 //! `BR_LINEARIZABILITY_SECONDS` (default 30), and
-//! `BR_LINEARIZABILITY_ARTIFACT_DIR` (retained workload and binary identity;
-//! also the merged history and failing partition on a violation). Failed
+//! `BR_LINEARIZABILITY_ARTIFACT_DIR` (a new directory under an existing parent;
+//! retained workload and binary identity;
+//! successful runs also retain their workspace, checked history and oracle
+//! result; violations retain the merged history and failing partition). Failed
 //! workloads retain their temporary workspace even without an explicit path.
 //! `BR_BINARY` selects an explicit baseline or release binary for the same
 //! oracle; the default remains Cargo's compiled `br`, never a PATH fallback.
@@ -1006,6 +1008,12 @@ fn describe(entry: &Entry) -> String {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn concurrent_br_histories_are_linearizable_and_match_the_published_jsonl() {
+    let requested_artifact_dir = std::env::var_os("BR_LINEARIZABILITY_ARTIFACT_DIR");
+    if let Some(path) = &requested_artifact_dir {
+        // Refuse reuse before starting: a failed rerun must never inherit a
+        // previous run's successful oracle receipt.
+        fs::create_dir(path).expect("artifact directory must be fresh");
+    }
     let processes =
         usize::try_from(knob("BR_LINEARIZABILITY_PROCESSES", DEFAULT_PROCESSES)).unwrap_or(8);
     let seconds = knob("BR_LINEARIZABILITY_SECONDS", DEFAULT_SECONDS);
@@ -1037,10 +1045,12 @@ fn concurrent_br_histories_are_linearizable_and_match_the_published_jsonl() {
         || entries
             .iter()
             .any(|entry| matches!(entry.outcome, Outcome::Failed(_)));
-    let requested_artifact_dir = std::env::var_os("BR_LINEARIZABILITY_ARTIFACT_DIR");
     if workload_failed || requested_artifact_dir.is_some() {
-        temp.disable_cleanup(workload_failed);
+        // An explicitly requested evidence bundle must not point at a deleted
+        // workspace after a successful run.
+        temp.disable_cleanup(true);
         let artifact_dir = requested_artifact_dir
+            .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| temp.path().join("linearizability"));
         fs::create_dir_all(&artifact_dir).expect("workload artifact dir");
@@ -1058,7 +1068,7 @@ fn concurrent_br_histories_are_linearizable_and_match_the_published_jsonl() {
             "minimum_operations": MIN_OPERATIONS,
             "dropped_creates": dropped_creates,
             "workspace": temp.path(),
-            "workspace_retained": workload_failed,
+            "workspace_retained": true,
         });
         fs::write(
             artifact_dir.join("workload-context.json"),
@@ -1217,10 +1227,34 @@ fn concurrent_br_histories_are_linearizable_and_match_the_published_jsonl() {
     );
     let live_keys = finals.values().filter(|state| state.exists).count();
     assert_eq!(
+        published.len(),
+        live_keys,
+        "published JSONL must contain exactly the linearized live issues"
+    );
+    assert_eq!(
         usize::try_from(facts.issue_rows).unwrap_or(0),
         live_keys,
         "every linearized issue is a row and nothing else was inserted"
     );
+    if let Some(artifact_dir) = requested_artifact_dir {
+        let artifact_dir = PathBuf::from(artifact_dir);
+        persist_history(&artifact_dir.join("checked-history.jsonl"), &entries);
+        let result = serde_json::json!({
+            "status": "passed",
+            "workload_operations": entries.len() - final_keys.len(),
+            "quiescent_observations": final_keys.len(),
+            "linearized_live_issues": live_keys,
+            "database_rows": facts.issue_rows,
+            "database_max_rowid": facts.max_rowid,
+            "integrity": facts.integrity,
+            "jsonl_matches_linearized_state": true,
+        });
+        fs::write(
+            artifact_dir.join("oracle-result.json"),
+            serde_json::to_vec_pretty(&result).expect("serialize oracle result"),
+        )
+        .expect("write oracle result after all checks pass");
+    }
 }
 
 /// The live planted negative: one process stream claims a successful close it

@@ -217,38 +217,106 @@ fn wait_for_child_owned_workspace_registration(root: &Path, child: &mut std::pro
 }
 
 #[cfg(target_os = "linux")]
+struct RecordedWriter {
+    child: Option<std::process::Child>,
+    receipt: serde_json::Value,
+    path: PathBuf,
+    epoch: Instant,
+}
+
+#[cfg(target_os = "linux")]
+impl RecordedWriter {
+    fn spawn(root: &Path, id: &str, stream: &str, attempt: usize, epoch: Instant) -> Self {
+        let message = format!("{stream}-{attempt}");
+        let argv = ["comments", "add", id, &message, "--json"];
+        let mut writer = Self {
+            child: None,
+            receipt: serde_json::json!({
+                "stream": stream, "attempt": attempt, "argv": argv,
+                "started_seconds": epoch.elapsed().as_secs_f64(),
+            }),
+            path: root.join(format!("attempt-{message}.json")),
+            epoch,
+        };
+        writer.persist();
+        writer.child = Some(spawn_br_child_in_dir(root, argv));
+        writer
+    }
+
+    fn persist(&self) {
+        fs::write(
+            &self.path,
+            serde_json::to_vec_pretty(&self.receipt).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn registered(&mut self, root: &Path) {
+        wait_for_child_owned_workspace_registration(root, self.child.as_mut().unwrap());
+        self.receipt["registered_seconds"] = self.epoch.elapsed().as_secs_f64().into();
+        self.persist();
+    }
+
+    fn finish(mut self) -> serde_json::Value {
+        // A broken lock deadline must fail the test rather than hang it.
+        let deadline = Instant::now() + Duration::from_secs(35);
+        while self.child.as_mut().unwrap().try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "writer exceeded process deadline"
+            );
+            thread::sleep(WRITE_LOCK_WAIT_POLL_INTERVAL);
+        }
+        let output = self.child.take().unwrap().wait_with_output().unwrap();
+        self.receipt["returned_seconds"] = self.epoch.elapsed().as_secs_f64().into();
+        self.receipt["exit"] = output.status.code().into();
+        self.receipt["stdout"] = String::from_utf8_lossy(&output.stdout).into_owned().into();
+        self.receipt["stderr"] = String::from_utf8_lossy(&output.stderr).into_owned().into();
+        self.persist();
+        self.receipt.clone()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for RecordedWriter {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            if let Ok(output) = child.wait_with_output() {
+                self.receipt["aborted"] = true.into();
+                self.receipt["returned_seconds"] = self.epoch.elapsed().as_secs_f64().into();
+                self.receipt["exit"] = output.status.code().into();
+                self.receipt["stdout"] =
+                    String::from_utf8_lossy(&output.stdout).into_owned().into();
+                self.receipt["stderr"] =
+                    String::from_utf8_lossy(&output.stderr).into_owned().into();
+                if let Ok(bytes) = serde_json::to_vec_pretty(&self.receipt) {
+                    let _ = fs::write(&self.path, bytes);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn collect_replenishing_comments(
     root: &Path,
     issue_id: &str,
     stream: &str,
-    first: std::process::Child,
-    first_started: Instant,
+    first: RecordedWriter,
     epoch: Instant,
     calls: usize,
 ) -> Vec<serde_json::Value> {
     let mut child = first;
-    let mut started = first_started;
     let mut attempts = Vec::new();
-    for attempt in 0..calls {
-        let message = format!("{stream}-{attempt}");
-        let output = child.wait_with_output().unwrap();
-        attempts.push(serde_json::json!({
-            "stream": stream, "attempt": attempt,
-            "argv": ["comments", "add", issue_id, &message, "--json"],
-            "started_seconds": started.duration_since(epoch).as_secs_f64(),
-            "returned_seconds": epoch.elapsed().as_secs_f64(),
-            "exit": output.status.code(),
-            "stdout": String::from_utf8_lossy(&output.stdout),
-            "stderr": String::from_utf8_lossy(&output.stderr),
-        }));
+    for attempt in 1..calls {
+        attempts.push(child.finish());
         if attempt + 1 == calls {
             break;
         }
         // Replenish immediately, even after a failed call; retain every
         // outcome rather than stopping a stream at its first failure.
-        let next = format!("{stream}-{}", attempt + 1);
-        started = Instant::now();
-        child = spawn_br_child_in_dir(root, ["comments", "add", issue_id, &next, "--json"]);
+        child = RecordedWriter::spawn(root, issue_id, stream, attempt + 1, epoch);
     }
     attempts
 }
@@ -763,6 +831,8 @@ fn e2e_later_writer_waits_for_registered_earlier_waiter() {
 #[test]
 #[cfg(target_os = "linux")]
 fn e2e_registered_writer_progresses_before_replenishing_short_writes() {
+    use rustix::process::{Pid, Signal, kill_process};
+
     let _log =
         common::test_log("e2e_registered_writer_progresses_before_replenishing_short_writes");
     let root = isolated_temp_dir("replenishing workspace writers").keep();
@@ -778,29 +848,54 @@ fn e2e_registered_writer_progresses_before_replenishing_short_writes() {
     let mut peers = Vec::new();
     for index in 0..7 {
         let stream = format!("peer{index}");
-        let message = format!("{stream}-0");
-        let started = Instant::now();
-        let mut child = spawn_br_child_in_dir(&root, ["comments", "add", id, &message, "--json"]);
-        wait_for_child_owned_workspace_registration(&root, &mut child);
-        peers.push((stream, child, started));
+        let mut child = RecordedWriter::spawn(&root, id, &stream, 0, epoch);
+        child.registered(&root);
+        peers.push((stream, child));
     }
-    let victim_started = Instant::now();
-    let mut victim = spawn_br_child_in_dir(&root, ["comments", "add", id, "victim-0", "--json"]);
-    wait_for_child_owned_workspace_registration(&root, &mut victim);
+    let mut victim = RecordedWriter::spawn(&root, id, "victim", 0, epoch);
+    victim.registered(&root);
     assert_eq!(wait_for_workspace_waiters(&root, 8).len(), 8);
+    let pid = Pid::from_raw(i32::try_from(victim.child.as_ref().unwrap().id()).unwrap()).unwrap();
+    kill_process(pid, Signal::STOP).unwrap();
+    let stopped_deadline = Instant::now() + WRITE_LOCK_WAIT_OBSERVATION_TIMEOUT;
+    loop {
+        let status = fs::read_to_string(format!(
+            "/proc/{}/status",
+            victim.child.as_ref().unwrap().id()
+        ))
+        .unwrap();
+        if status.lines().any(|line| line.starts_with("State:\tT")) {
+            break;
+        }
+        assert!(Instant::now() < stopped_deadline, "victim did not stop");
+        thread::sleep(WRITE_LOCK_WAIT_POLL_INTERVAL);
+    }
+    drop(owner);
+    let mut initial = Vec::new();
+    let mut replacements = Vec::new();
+    for (stream, child) in peers {
+        initial.push(child.finish());
+        let mut next = RecordedWriter::spawn(&root, id, &stream, 1, epoch);
+        next.registered(&root);
+        replacements.push((stream, next));
+    }
+    // All seven replacement calls now own live registrations behind the
+    // still-registered victim. Resume within the original 30-second budget.
+    victim.registered(&root);
+    assert!(epoch.elapsed() < Duration::from_secs(25));
+    kill_process(pid, Signal::CONT).unwrap();
     let attempts = thread::scope(|scope| {
-        let handles: Vec<_> = peers
+        let handles: Vec<_> = replacements
             .into_iter()
-            .map(|(stream, child, started)| {
+            .map(|(stream, child)| {
                 let root = &root;
                 scope.spawn(move || {
-                    collect_replenishing_comments(root, id, &stream, child, started, epoch, 8)
+                    collect_replenishing_comments(root, id, &stream, child, epoch, 8)
                 })
             })
             .collect();
-        drop(owner);
-        let mut attempts =
-            collect_replenishing_comments(&root, id, "victim", victim, victim_started, epoch, 1);
+        let mut attempts = initial;
+        attempts.push(victim.finish());
         for handle in handles {
             attempts.extend(handle.join().unwrap());
         }
@@ -817,6 +912,11 @@ fn e2e_registered_writer_progresses_before_replenishing_short_writes() {
         "{attempts:#?}"
     );
     assert!(wait_for_workspace_waiters(&root, 0).is_empty());
+    assert_replenishing_comment_order(&root);
+}
+
+#[cfg(target_os = "linux")]
+fn assert_replenishing_comment_order(root: &Path) {
     let conn = beads_rust::franken_sync::compat::open_with_flags(
         &root.join(".beads/beads.db").to_string_lossy(),
         beads_rust::franken_sync::compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -864,7 +964,7 @@ fn e2e_registered_writer_progresses_before_replenishing_short_writes() {
             .collect::<std::collections::BTreeSet<_>>(),
         expected
     );
-    assert_upstream_sqlite_integrity_ok(&root, "replenishing workspace writers");
+    assert_upstream_sqlite_integrity_ok(root, "replenishing workspace writers");
 }
 
 #[test]
