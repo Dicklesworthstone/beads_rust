@@ -2,13 +2,7 @@
 # https://docs.rs/cargo-audit/latest/cargo_audit/config/index.html
 
 [advisories]
-# Ignore specific advisories that don't affect our use case
-ignore = [
-    # rustls-pemfile 2.2.0: unmaintained (superseded by rustls-pki-types'
-    # PemObject API). Pulled through asupersync =0.4.10, pinned exactly
-    # by fastmcp-rust 0.9.0 and accepted by fsqlite's >=0.4.3,<0.5 range;
-    # br never parses PEM itself. Drop this entry when asupersync stops
-    # depending on rustls-pemfile. Recorded 2026-09-02 (beads_rust-uze9.1).
-    # https://rustsec.org/advisories/RUSTSEC-2025-0134
-    "RUSTSEC-2025-0134",
-]
+# No active exceptions. The former RUSTSEC-2025-0134 (rustls-pemfile,
+# unmaintained) ignore was dropped on 2026-09-17: rustls-pemfile no longer
+# appears in Cargo.lock — asupersync 0.5.0 / fastmcp-rust 0.10.0 no longer
+# depend on it (beads_rust-0edxa).
