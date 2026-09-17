@@ -497,6 +497,18 @@ const EARLY_CHOKEPOINT_FIXER_ROWS: &[FixerRow] = &[
         &["gitignore.beads_inner_present"],
         &["fm-configs-gitignore-leaking-beads"],
     ),
+    // Same detector and filter id as the append fixer, but a distinct
+    // chokepoint op: the append path adds lines to an operator's file, while
+    // this one writes the canonical `br init` template when the file is gone
+    // entirely (GitHub #501).
+    (
+        "doctor.inner_gitignore_create",
+        "configs",
+        true,
+        true,
+        &["gitignore.beads_inner_present"],
+        &["fm-configs-gitignore-leaking-beads"],
+    ),
     (
         "doctor.dirty_bitmap_orphan_prune",
         "caches_indexes",
@@ -819,6 +831,7 @@ mod tests {
                 "doctor.config_yaml_secret_chmod",
                 "doctor.db_sidecar_mode_chmod",
                 "doctor.inner_gitignore_append",
+                "doctor.inner_gitignore_create",
                 "doctor.dirty_bitmap_orphan_prune",
                 "doctor.comments_orphan_prune",
                 "doctor.labels_orphan_prune",

@@ -15,7 +15,8 @@ use crate::franken_sync::{Connection, Row};
 use crate::health::{AnomalyClass, ReliabilityAuditRecord, WorkspaceClassification};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
-use crate::storage::sqlite::PendingSyncMergeInspection;
+use crate::storage::schema::{CURRENT_SCHEMA_VERSION, REVIEWED_MIGRATION_SOURCE_VERSIONS};
+use crate::storage::sqlite::{PendingSyncMergeInspection, database_header_user_version};
 #[cfg(test)]
 use crate::sync::METADATA_SYNC_MERGE_PENDING_LEGACY;
 use crate::sync::{
@@ -720,17 +721,33 @@ fn refuse_doctor_mutation_if_merge_pending(
             (reason, evidence)
         }
         Err(error) => {
-            let reason = format!(
-                "could not prove that no sync merge is pending ({error}); doctor mutation fails closed"
-            );
-            let evidence = serde_json::json!({
+            // GitHub #504 asks that a refusal either route to the recovery
+            // path or say why it will not. An unfinished schema migration is
+            // the case where the generic "restore read-only access" advice is
+            // actively misleading, so name `migrate-schema` and say plainly
+            // that repair is the wrong tool for it.
+            let hint = StalledMigrationHint::probe(db_path);
+            let schema_remediation = hint.remediation();
+            let reason = if schema_remediation.is_some() {
+                format!(
+                    "could not prove that no sync merge is pending ({error}); doctor mutation \
+                     fails closed, and this database's schema version says repair is not the \
+                     command that clears it"
+                )
+            } else {
+                format!(
+                    "could not prove that no sync merge is pending ({error}); doctor mutation fails closed"
+                )
+            };
+            let mut evidence = serde_json::json!({
                 "gate": "sync.merge_pending",
                 "finding": "sync.merge_pending",
                 "pending": "unknown",
                 "database_path": db_path.display().to_string(),
                 "inspection_error": error.to_string(),
-                "remediation": "Restore read-only access to the database family and rerun `br doctor` before attempting repair."
+                "remediation": schema_remediation.unwrap_or_else(|| "Restore read-only access to the database family and rerun `br doctor` before attempting repair.".to_string()),
             });
+            merge_json_object(&mut evidence, hint.json_details());
             (reason, evidence)
         }
     };
@@ -1116,6 +1133,113 @@ pub fn inspect_pending_sync_merge_under_authority(
     ))
 }
 
+/// What a lock-free database-header read says about an unclassifiable family.
+///
+/// GitHub #504: an interrupted schema migration writes its first page and a
+/// WAL certificate, then stops. Every later write fails with "database is busy
+/// (recovery in progress)" while reads keep working, and the pending-merge
+/// inspection cannot classify the family — so doctor fell into its generic arm
+/// and told operators to "restore read-only access to the database family".
+/// Read access was never the problem, and the one command that recovers the
+/// tracker (`br doctor migrate-schema`) was named nowhere; it had to be found
+/// by reading `--help`. The checkpointed header still carries the
+/// pre-migration version, because the new one is in the WAL that never got
+/// checkpointed, so a single engine-free header read separates the cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StalledMigrationHint {
+    /// Header version sits in the migrator's reviewed source range.
+    Migratable(u32),
+    /// Header version predates the reviewed range; the migrator refuses it.
+    TooOld(u32),
+    /// Header version is newer than this binary supports.
+    NewerThanBinary(u32),
+    /// Version matches, is unstamped, or is unreadable — no schema story.
+    Indeterminate,
+}
+
+impl StalledMigrationHint {
+    /// Classify from the database header alone: no engine open, no lock, and
+    /// no dependency on the write authority the caller just failed to obtain.
+    fn probe(db_path: &Path) -> Self {
+        let Some(found) = database_header_user_version(db_path) else {
+            return Self::Indeterminate;
+        };
+        // 0 means `user_version` was never stamped, which is indeterminate
+        // rather than a mismatch — same reading as the `health` tripwire.
+        if found == 0 || i64::from(found) == i64::from(CURRENT_SCHEMA_VERSION) {
+            return Self::Indeterminate;
+        }
+        if i64::from(found) > i64::from(CURRENT_SCHEMA_VERSION) {
+            return Self::NewerThanBinary(found);
+        }
+        if REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&found) {
+            Self::Migratable(found)
+        } else {
+            Self::TooOld(found)
+        }
+    }
+
+    /// The version the header carries, when one was readable.
+    fn found_version(self) -> Option<u32> {
+        match self {
+            Self::Migratable(v) | Self::TooOld(v) | Self::NewerThanBinary(v) => Some(v),
+            Self::Indeterminate => None,
+        }
+    }
+
+    /// A remediation naming the command that actually recovers this state, or
+    /// `None` when the header says nothing and the generic one still applies.
+    fn remediation(self) -> Option<String> {
+        match self {
+            Self::Migratable(found) => Some(format!(
+                "The checkpointed database header is still at schema {found} while this binary \
+                 expects {CURRENT_SCHEMA_VERSION}, so a schema migration is unfinished — read \
+                 access is not the problem. Run `br doctor migrate-schema plan`, then \
+                 `br doctor migrate-schema apply --plan-token <token>` using the token that plan \
+                 prints; `plan` re-reads the effective version and says so if no migration is \
+                 actually needed. Do not run generic `br doctor --repair` first: it rebuilds from \
+                 JSONL and cannot finish a migration."
+            )),
+            Self::TooOld(found) => Some(format!(
+                "The database header is at schema {found}, which predates the reviewed migration \
+                 range ({}), so `br doctor migrate-schema` will refuse it. Recreate the workspace \
+                 from its JSONL export instead: `br init` in a fresh directory, then `br import`.",
+                reviewed_migration_source_versions_display()
+            )),
+            Self::NewerThanBinary(found) => Some(format!(
+                "The database header is at schema {found}, newer than the \
+                 {CURRENT_SCHEMA_VERSION} this binary supports, so it was written by a newer \
+                 `br`. Upgrade with `br upgrade` rather than repairing — an older binary must not \
+                 migrate a newer database."
+            )),
+            Self::Indeterminate => None,
+        }
+    }
+
+    /// Machine-readable companion to [`Self::remediation`] for JSON consumers.
+    fn json_details(self) -> serde_json::Value {
+        serde_json::json!({
+            "schema_user_version": self.found_version(),
+            "schema_expected": CURRENT_SCHEMA_VERSION,
+            "schema_state": match self {
+                Self::Migratable(_) => "migration_unfinished",
+                Self::TooOld(_) => "older_than_reviewed_range",
+                Self::NewerThanBinary(_) => "newer_than_binary",
+                Self::Indeterminate => "indeterminate",
+            },
+        })
+    }
+}
+
+/// The reviewed migration source range, rendered for operator-facing text.
+fn reviewed_migration_source_versions_display() -> String {
+    REVIEWED_MIGRATION_SOURCE_VERSIONS
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn check_pending_sync_merge(db_path: &Path, checks: &mut Vec<CheckResult>) {
     match inspect_pending_sync_merge_at_path(db_path) {
         Ok(None) => push_check(
@@ -1146,19 +1270,42 @@ fn check_pending_sync_merge(db_path: &Path, checks: &mut Vec<CheckResult>) {
                 })),
             );
         }
-        Err(error) => push_check(
-            checks,
-            "sync.merge_pending",
-            CheckStatus::Error,
-            Some(format!(
-                "Could not prove that no sync merge is pending: {error}"
-            )),
-            Some(serde_json::json!({
+        Err(error) => {
+            // GitHub #504: the generic remediation below assumes the family
+            // could not be read. An unfinished schema migration lands here
+            // too, with reads working perfectly — so when the header proves
+            // that is what happened, name the command that recovers it.
+            let hint = StalledMigrationHint::probe(db_path);
+            let mut details = serde_json::json!({
                 "pending": "unknown",
                 "database_path": db_path.display().to_string(),
-                "remediation": "Restore read-only access to the database family, then rerun `br doctor`. Mutating commands must remain disabled until pending merge state can be inspected."
-            })),
-        ),
+                "remediation": hint.remediation().unwrap_or_else(|| "Restore read-only access to the database family, then rerun `br doctor`. Mutating commands must remain disabled until pending merge state can be inspected.".to_string()),
+            });
+            merge_json_object(&mut details, hint.json_details());
+            push_check(
+                checks,
+                "sync.merge_pending",
+                CheckStatus::Error,
+                Some(format!(
+                    "Could not prove that no sync merge is pending: {error}"
+                )),
+                Some(details),
+            );
+        }
+    }
+}
+
+/// Fold the key/value pairs of `extra` into the object `target`.
+///
+/// Both sides are built by this module from `serde_json::json!` object
+/// literals; a non-object on either side would be a construction bug, so the
+/// merge is simply skipped rather than papered over with a panic.
+fn merge_json_object(target: &mut serde_json::Value, extra: serde_json::Value) {
+    let (Some(target), serde_json::Value::Object(extra)) = (target.as_object_mut(), extra) else {
+        return;
+    };
+    for (key, value) in extra {
+        target.insert(key, value);
     }
 }
 
@@ -2110,6 +2257,19 @@ fn repair_outcome_message_from_parts(
     }
 }
 
+/// Which repair `fix_inner_gitignore_if_warned` applied.
+///
+/// The two cases are genuinely different on disk — one writes a whole file
+/// that was not there, the other adds lines to a file the operator wrote — so
+/// they are reported separately rather than both as "appended" (GitHub #501).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InnerGitignoreFix {
+    /// The file was absent; written from the canonical `br init` template.
+    Created,
+    /// The file existed but lacked patterns, which were appended.
+    Appended,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct EarlyRepairSummary {
     gitignore: bool,
@@ -2125,7 +2285,7 @@ struct EarlyRepairSummary {
     jsonl_crlf: bool,
     jsonl_world_writable: bool,
     config_yaml_secret_mode: bool,
-    inner_gitignore: bool,
+    inner_gitignore: Option<InnerGitignoreFix>,
     dirty_bitmap_orphans: bool,
     comments_orphans: bool,
     labels_orphans: bool,
@@ -2150,7 +2310,7 @@ impl EarlyRepairSummary {
             || self.jsonl_crlf
             || self.jsonl_world_writable
             || self.config_yaml_secret_mode
-            || self.inner_gitignore
+            || self.inner_gitignore.is_some()
             || self.dirty_bitmap_orphans
             || self.comments_orphans
             || self.labels_orphans
@@ -2201,8 +2361,14 @@ impl EarlyRepairSummary {
         if self.config_yaml_secret_mode {
             actions.push("config_yaml_secret_mode_chmod".to_string());
         }
-        if self.inner_gitignore {
-            actions.push("inner_gitignore_appended".to_string());
+        match self.inner_gitignore {
+            Some(InnerGitignoreFix::Created) => {
+                actions.push("inner_gitignore_created".to_string());
+            }
+            Some(InnerGitignoreFix::Appended) => {
+                actions.push("inner_gitignore_appended".to_string());
+            }
+            None => {}
         }
         if self.dirty_bitmap_orphans {
             actions.push("dirty_bitmap_orphans_pruned".to_string());
@@ -2276,8 +2442,15 @@ impl EarlyRepairSummary {
                     .to_string(),
             );
         }
-        if self.inner_gitignore {
-            messages.push("Appended canonical patterns to `.beads/.gitignore`.".to_string());
+        match self.inner_gitignore {
+            Some(InnerGitignoreFix::Created) => {
+                messages
+                    .push("Created `.beads/.gitignore` from the canonical template.".to_string());
+            }
+            Some(InnerGitignoreFix::Appended) => {
+                messages.push("Appended canonical patterns to `.beads/.gitignore`.".to_string());
+            }
+            None => {}
         }
         if self.dirty_bitmap_orphans {
             messages.push("Pruned orphan rows from dirty_issues table.".to_string());
@@ -6075,6 +6248,20 @@ const INNER_GITIGNORE_EXPECTATIONS: &[InnerGitignoreExpectation] = &[
         append_pattern: ".write.lock",
         probes: &[".write.lock"],
     },
+    // The whole-command write lock above is only one of the lock sidecars a
+    // live workspace keeps. Every open also leaves a per-database opener lease
+    // and write lock named after a content hash, so no fixed filename can
+    // cover them — `*.lock` (which the canonical `br init` template already
+    // carries) is what actually keeps them out of git. Without this
+    // expectation a `.gitignore` holding only the other rules passes the check
+    // while both lock families sit in `git status` (GitHub #501).
+    InnerGitignoreExpectation {
+        append_pattern: "*.lock",
+        probes: &[
+            ".br-db-openers-28272a3cbb944240034e2559.lock",
+            ".br-db-write-18f36030f755a8a72324b23f.lock",
+        ],
+    },
     InnerGitignoreExpectation {
         append_pattern: "*.tmp",
         probes: &["probe.tmp"],
@@ -6165,13 +6352,13 @@ fn fix_inner_gitignore_if_warned(
     report: &DoctorReport,
     ctx: &OutputContext,
     session: Option<&mut DoctorRepairSession>,
-) -> bool {
+) -> Option<InnerGitignoreFix> {
     let has_warning = report
         .checks
         .iter()
         .any(|c| c.name == "gitignore.beads_inner_present" && c.status == CheckStatus::Warn);
     if !has_warning {
-        return false;
+        return None;
     }
     let Some(session) = session else {
         if !ctx.is_json() {
@@ -6179,21 +6366,55 @@ fn fix_inner_gitignore_if_warned(
                 "Skipping inner-gitignore repair: no doctor repair session (run-dir creation failed)",
             );
         }
-        return false;
+        return None;
     };
     let path = beads_dir.join(".gitignore");
-    let existing = match fs::symlink_metadata(&path) {
+    // `None` here means the file is absent, which needs a different repair
+    // from an incomplete file — see below.
+    let existing: Option<String> = match fs::symlink_metadata(&path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             // Refuse to convert a symlink into a regular file.
-            return false;
+            return None;
         }
-        Ok(_) => fs::read_to_string(&path).unwrap_or_default(),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(_) => return false,
+        Ok(_) => Some(fs::read_to_string(&path).unwrap_or_default()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(_) => return None,
+    };
+    // A file that is not there is not an incomplete file. Appending only the
+    // patterns doctor maintains would create a `.gitignore` covering database
+    // artifacts and nothing else — no `.br_history/`, `.br_recovery/`, sync
+    // state, merge artifacts or daemon runtime files — so a repository that had
+    // lost the file would start showing those as untracked, which is the very
+    // problem this check exists to prevent (GitHub #501). Write the canonical
+    // file `br init` writes instead.
+    let Some(existing) = existing else {
+        session.set_fixer("doctor.inner_gitignore_create");
+        let op = Op::WriteFile {
+            content: super::init::BEADS_GITIGNORE.as_bytes().to_vec(),
+            mode: None,
+        };
+        return match chokepoint::mutate(&session.ctx, &path, op) {
+            Ok(result) if result.ok => {
+                if !ctx.is_json() {
+                    ctx.info(&format!(
+                        "Created {} from the canonical template",
+                        path.display()
+                    ));
+                }
+                Some(InnerGitignoreFix::Created)
+            }
+            Ok(_) => None,
+            Err(err) => {
+                if !ctx.is_json() {
+                    ctx.warning(&format!("Failed to create {}: {err}", path.display()));
+                }
+                None
+            }
+        };
     };
     let missing = inner_gitignore_missing_patterns(&existing);
     if missing.is_empty() {
-        return false;
+        return None;
     }
     let mut content: Vec<u8> = Vec::new();
     if !existing.is_empty() && !existing.ends_with('\n') {
@@ -6213,9 +6434,9 @@ fn fix_inner_gitignore_if_warned(
                     missing.join(", ")
                 ));
             }
-            true
+            Some(InnerGitignoreFix::Appended)
         }
-        Ok(_) => false,
+        Ok(_) => None,
         Err(err) => {
             if !ctx.is_json() {
                 ctx.warning(&format!(
@@ -6223,7 +6444,7 @@ fn fix_inner_gitignore_if_warned(
                     path.display()
                 ));
             }
-            false
+            None
         }
     }
 }
@@ -13732,17 +13953,18 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     let _ = db_sidecar_mode_repaired;
 
     // Pass-5 cycle 27: append missing canonical patterns to .beads/.gitignore
-    // via Op::AppendFile.
+    // via Op::AppendFile, or write the canonical file when it is absent
+    // entirely via Op::WriteFile.
     let inner_gitignore_repaired =
         if args.repair && fixer_filter.allows("fm-configs-gitignore-leaking-beads") {
             let repaired =
                 fix_inner_gitignore_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
-            if repaired {
+            if repaired.is_some() {
                 initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
             }
             repaired
         } else {
-            false
+            None
         };
     let _ = inner_gitignore_repaired;
 
@@ -17911,6 +18133,135 @@ mod tests {
         assert_eq!(found.len(), 1, "canonical dedup expected: {found:?}");
     }
 
+    /// Write a file that is a valid SQLite header for the purposes of
+    /// [`database_header_user_version`]: the magic string, 100 bytes, and the
+    /// requested `user_version` big-endian at offset 60.
+    fn write_db_header_with_user_version(path: &Path, version: u32) {
+        let mut header = [0_u8; 100];
+        header[..16].copy_from_slice(b"SQLite format 3\0");
+        header[60..64].copy_from_slice(&version.to_be_bytes());
+        fs::write(path, header).unwrap();
+    }
+
+    /// GitHub #504: an interrupted 17→19 migration wedges every write while
+    /// reads keep working. Doctor could not classify the family and told
+    /// operators to "restore read-only access", which describes a fault that
+    /// had not happened; the command that recovers the tracker was named
+    /// nowhere. The header read has to separate those cases.
+    #[test]
+    fn stalled_migration_hint_names_migrate_schema_for_a_reviewed_source() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join("beads.db");
+        write_db_header_with_user_version(&db, 17);
+
+        let hint = StalledMigrationHint::probe(&db);
+        assert_eq!(hint, StalledMigrationHint::Migratable(17));
+        let remediation = hint.remediation().expect("a reviewed source remediates");
+        assert!(
+            remediation.contains("br doctor migrate-schema plan"),
+            "{remediation}"
+        );
+        assert!(
+            remediation.contains("--plan-token"),
+            "the apply step needs its token named: {remediation}"
+        );
+        assert!(
+            remediation.contains("cannot finish a migration"),
+            "must say why --repair is the wrong tool: {remediation}"
+        );
+        assert!(
+            !remediation.contains("Restore read-only access"),
+            "the misleading generic advice must not survive: {remediation}"
+        );
+        assert_eq!(hint.json_details()["schema_user_version"], 17);
+        assert_eq!(
+            hint.json_details()["schema_expected"],
+            CURRENT_SCHEMA_VERSION
+        );
+        assert_eq!(hint.json_details()["schema_state"], "migration_unfinished");
+    }
+
+    #[test]
+    fn stalled_migration_hint_classifies_versions_outside_the_reviewed_range() {
+        let temp = TempDir::new().unwrap();
+
+        // Older than the migrator accepts: pointing at migrate-schema would
+        // send the operator to a command that refuses them.
+        let ancient = temp.path().join("ancient.db");
+        write_db_header_with_user_version(&ancient, 4);
+        let hint = StalledMigrationHint::probe(&ancient);
+        assert_eq!(hint, StalledMigrationHint::TooOld(4));
+        let remediation = hint.remediation().expect("too-old remediates");
+        assert!(remediation.contains("br import"), "{remediation}");
+        assert!(
+            !remediation.contains("migrate-schema plan"),
+            "must not send an unsupported schema to the migrator: {remediation}"
+        );
+
+        // Newer than this binary: repairing would be an older `br` writing a
+        // newer database.
+        let future = temp.path().join("future.db");
+        let newer = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap() + 1;
+        write_db_header_with_user_version(&future, newer);
+        let hint = StalledMigrationHint::probe(&future);
+        assert_eq!(hint, StalledMigrationHint::NewerThanBinary(newer));
+        assert!(
+            hint.remediation()
+                .expect("newer remediates")
+                .contains("br upgrade"),
+            "{hint:?}"
+        );
+    }
+
+    #[test]
+    fn stalled_migration_hint_stays_silent_without_a_schema_story() {
+        let temp = TempDir::new().unwrap();
+
+        // Current version: nothing to say, so the generic remediation stands.
+        let current = temp.path().join("current.db");
+        write_db_header_with_user_version(&current, u32::try_from(CURRENT_SCHEMA_VERSION).unwrap());
+        assert_eq!(
+            StalledMigrationHint::probe(&current),
+            StalledMigrationHint::Indeterminate
+        );
+
+        // Never stamped.
+        let unstamped = temp.path().join("unstamped.db");
+        write_db_header_with_user_version(&unstamped, 0);
+        assert_eq!(
+            StalledMigrationHint::probe(&unstamped),
+            StalledMigrationHint::Indeterminate
+        );
+
+        // Absent, and not a database at all — the probe must not panic or
+        // invent a version for either.
+        assert_eq!(
+            StalledMigrationHint::probe(&temp.path().join("missing.db")),
+            StalledMigrationHint::Indeterminate
+        );
+        let garbage = temp.path().join("garbage.db");
+        fs::write(&garbage, vec![0_u8; 200]).unwrap();
+        assert_eq!(
+            StalledMigrationHint::probe(&garbage),
+            StalledMigrationHint::Indeterminate
+        );
+        assert!(StalledMigrationHint::Indeterminate.remediation().is_none());
+    }
+
+    #[test]
+    fn merge_json_object_folds_and_tolerates_non_objects() {
+        let mut target = serde_json::json!({"a": 1});
+        merge_json_object(&mut target, serde_json::json!({"b": 2, "a": 3}));
+        assert_eq!(target, serde_json::json!({"a": 3, "b": 2}));
+
+        // A non-object on either side is a construction bug, not a panic.
+        merge_json_object(&mut target, serde_json::Value::from(7));
+        assert_eq!(target, serde_json::json!({"a": 3, "b": 2}));
+        let mut scalar = serde_json::Value::from(1);
+        merge_json_object(&mut scalar, serde_json::json!({"a": 1}));
+        assert_eq!(scalar, serde_json::Value::from(1));
+    }
+
     #[test]
     fn test_check_inner_gitignore_present_missing_warns() {
         // Pass-5 cycle 13: no .beads/.gitignore at all → warn kind="missing".
@@ -17947,6 +18298,63 @@ mod tests {
         check_inner_gitignore_present(&beads_dir, &mut checks);
         let check = find_check(&checks, "gitignore.beads_inner_present").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+    }
+
+    /// GitHub #501: `br init` writes the canonical template and doctor judges
+    /// `.beads/.gitignore` against the expectation table. If the two ever
+    /// disagree, a freshly initialised workspace fails its own doctor check —
+    /// so the template must satisfy every expectation, every probe.
+    #[test]
+    fn canonical_init_gitignore_satisfies_every_expectation() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(
+            beads_dir.join(".gitignore"),
+            crate::cli::commands::init::BEADS_GITIGNORE,
+        )
+        .unwrap();
+
+        assert!(
+            inner_gitignore_missing_patterns(crate::cli::commands::init::BEADS_GITIGNORE)
+                .is_empty(),
+            "the canonical `br init` template must cover every expectation"
+        );
+        let mut checks = Vec::new();
+        check_inner_gitignore_present(&beads_dir, &mut checks);
+        let check = find_check(&checks, "gitignore.beads_inner_present").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+    }
+
+    /// GitHub #501: every database open leaves a per-database opener lease and
+    /// write lock named after a content hash. `.write.lock` does not cover
+    /// them, so a `.gitignore` carrying the other rules used to pass while both
+    /// families sat in `git status`.
+    #[test]
+    fn test_check_inner_gitignore_flags_uncovered_db_lock_sidecars() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        // Everything the pre-#501 append set covered — and nothing else.
+        fs::write(
+            beads_dir.join(".gitignore"),
+            b"*.db\n*.db-journal\n*.db-shm\n*.db-wal*\n*-fsqlite-ns-gate\n\
+              *-fsqlite-ns-use\n*.vacuum-wal-cert*\n*.fsqlite-migration-state\n\
+              .write.lock\n*.tmp\n"
+                .as_slice(),
+        )
+        .unwrap();
+
+        let mut checks = Vec::new();
+        check_inner_gitignore_present(&beads_dir, &mut checks);
+        let check = find_check(&checks, "gitignore.beads_inner_present").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        assert_eq!(
+            inner_gitignore_missing_patterns(
+                &fs::read_to_string(beads_dir.join(".gitignore")).unwrap()
+            ),
+            vec!["*.lock"]
+        );
     }
 
     #[test]
@@ -18897,7 +19305,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
-        // No .gitignore at all → fixer creates it with both canonical patterns.
+        // No .gitignore at all → fixer writes the canonical `br init` file,
+        // not just the handful of patterns doctor knows how to append
+        // (GitHub #501).
 
         let mut report = DoctorReport {
             ok: false,
@@ -18910,18 +19320,38 @@ mod tests {
         let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
             .expect("session must build");
         let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
-        assert!(fix_inner_gitignore_if_warned(
-            &beads_dir,
-            &report,
-            &ctx,
-            Some(&mut session),
-        ));
-        let after = fs::read_to_string(beads_dir.join(".gitignore")).unwrap();
-        assert!(
-            after.lines().any(|l| l.trim() == ".write.lock"),
-            "{after:?}"
+        assert_eq!(
+            fix_inner_gitignore_if_warned(&beads_dir, &report, &ctx, Some(&mut session)),
+            Some(InnerGitignoreFix::Created)
         );
-        assert!(after.lines().any(|l| l.trim() == "*.tmp"), "{after:?}");
+        let after = fs::read_to_string(beads_dir.join(".gitignore")).unwrap();
+        assert_eq!(
+            after,
+            crate::cli::commands::init::BEADS_GITIGNORE,
+            "a missing file must be restored to the canonical template"
+        );
+        // The patterns that make this more than the append path: history and
+        // recovery directories, sync state, merge artifacts, daemon runtime.
+        for pattern in [
+            ".br_history/",
+            ".br_recovery/",
+            "sync_base.jsonl",
+            "beads.base.jsonl",
+            "daemon.pid",
+            ".bv.lock",
+        ] {
+            assert!(
+                after.lines().any(|l| l.trim() == pattern),
+                "missing {pattern} in {after:?}"
+            );
+        }
+        // And re-running doctor on the result must find nothing to do.
+        let mut recheck = Vec::new();
+        check_inner_gitignore_present(&beads_dir, &mut recheck);
+        assert!(
+            recheck.iter().all(|c| c.status != CheckStatus::Warn),
+            "{recheck:?}"
+        );
     }
 
     #[test]
@@ -18947,12 +19377,10 @@ mod tests {
         let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
             .expect("session must build");
         let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
-        assert!(fix_inner_gitignore_if_warned(
-            &beads_dir,
-            &report,
-            &ctx,
-            Some(&mut session),
-        ));
+        assert_eq!(
+            fix_inner_gitignore_if_warned(&beads_dir, &report, &ctx, Some(&mut session)),
+            Some(InnerGitignoreFix::Appended)
+        );
         let after = fs::read_to_string(beads_dir.join(".gitignore")).unwrap();
         // Existing operator lines preserved verbatim.
         assert!(after.contains("# operator custom"), "{after:?}");
@@ -18991,12 +19419,10 @@ mod tests {
                 OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
             // Detector warned for symlink, but fixer must refuse — operator
             // intent (compliance, vendored share) cannot be stomped.
-            assert!(!fix_inner_gitignore_if_warned(
-                &beads_dir,
-                &report,
-                &ctx,
-                Some(&mut session),
-            ));
+            assert_eq!(
+                fix_inner_gitignore_if_warned(&beads_dir, &report, &ctx, Some(&mut session)),
+                None
+            );
             // Symlink still in place pointing at the same target.
             let after_meta = fs::symlink_metadata(beads_dir.join(".gitignore")).unwrap();
             assert!(after_meta.file_type().is_symlink());
@@ -20429,7 +20855,7 @@ mod tests {
             jsonl_crlf: false,
             jsonl_world_writable: false,
             config_yaml_secret_mode: false,
-            inner_gitignore: false,
+            inner_gitignore: None,
             dirty_bitmap_orphans: false,
             comments_orphans: false,
             labels_orphans: false,
@@ -20491,7 +20917,7 @@ mod tests {
             jsonl_crlf: false,
             jsonl_world_writable: false,
             config_yaml_secret_mode: false,
-            inner_gitignore: false,
+            inner_gitignore: None,
             dirty_bitmap_orphans: false,
             comments_orphans: false,
             labels_orphans: false,
@@ -20532,7 +20958,7 @@ mod tests {
             jsonl_crlf: false,
             jsonl_world_writable: false,
             config_yaml_secret_mode: false,
-            inner_gitignore: false,
+            inner_gitignore: None,
             dirty_bitmap_orphans: false,
             comments_orphans: false,
             labels_orphans: false,
@@ -20576,7 +21002,7 @@ mod tests {
             jsonl_crlf: false,
             jsonl_world_writable: false,
             config_yaml_secret_mode: false,
-            inner_gitignore: false,
+            inner_gitignore: None,
             dirty_bitmap_orphans: false,
             comments_orphans: false,
             labels_orphans: false,
@@ -20620,7 +21046,7 @@ mod tests {
             jsonl_crlf: false,
             jsonl_world_writable: false,
             config_yaml_secret_mode: false,
-            inner_gitignore: false,
+            inner_gitignore: None,
             dirty_bitmap_orphans: false,
             comments_orphans: false,
             labels_orphans: false,
@@ -20664,7 +21090,7 @@ mod tests {
             jsonl_crlf: false,
             jsonl_world_writable: false,
             config_yaml_secret_mode: false,
-            inner_gitignore: false,
+            inner_gitignore: None,
             dirty_bitmap_orphans: false,
             comments_orphans: false,
             labels_orphans: false,
