@@ -18,10 +18,25 @@
 /.rustup/
 /.rustup/**
 
-# Local issue databases and coordination sidecars are not Cargo inputs. The
-# tracked .beads/issues.jsonl remains visible unless excluded by a narrower
-# command-specific closure.
-/.beads/*.db
+# .rch/config.toml removes RCH's default .beads/ parent exclusion. Keep tracked
+# JSONL/docs visible while excluding live database families and runtime state.
+/.beads/*.db*
+/.beads/.*.db*
+/.beads/*-fsqlite-ns-*
+/.beads/*.lock
+/.beads/*.lock/
+/.beads/*.tmp
+/.beads/*.log
+/.beads/*.pid
+/.beads/*.sock
+/.beads/.local_version
+/.beads/last-touched
+/.beads/redirect
+/.beads/sync-state.json
+/.beads/sync_base.jsonl
+/.beads/beads.base.*
+/.beads/beads.left.*
+/.beads/beads.right.*
 /.beads/*db-shm
 /.beads/*db-wal
 /.beads/*db-journal
@@ -29,6 +44,9 @@
 /.beads/.br_history/**
 /.beads/.br_recovery/
 /.beads/.br_recovery/**
+/.beads/recovery_*/
+/.beads/recovery_*/**
+/.beads/.DS_Store
 /.beads.snapshot_*/
 /.beads.snapshot_*/**
 
@@ -88,12 +106,29 @@
 ./.cargo/.package-cache
 ./.cargo/.package-cache-mutate
 ./.rustup
-./.beads/*.db
+./.beads/*.db*
+./.beads/.*.db*
+./.beads/*-fsqlite-ns-*
+./.beads/*.lock
+./.beads/*.tmp
+./.beads/*.log
+./.beads/*.pid
+./.beads/*.sock
+./.beads/.local_version
+./.beads/last-touched
+./.beads/redirect
+./.beads/sync-state.json
+./.beads/sync_base.jsonl
+./.beads/beads.base.*
+./.beads/beads.left.*
+./.beads/beads.right.*
 ./.beads/*db-shm
 ./.beads/*db-wal
 ./.beads/*db-journal
 ./.beads/.br_history
 ./.beads/.br_recovery
+./.beads/recovery_*
+./.beads/.DS_Store
 ./.beads.snapshot_*
 ./.ub-exorcism
 ./.unsafe-audit

@@ -1,0 +1,13 @@
+[transfer]
+# Replace RCH's default list: this repository's layout contract needs .beads/.
+# Keep every default artifact/credential exclusion, replacing only .beads/ with
+# runtime-state exclusions in .rchignore. Tracked JSONL/docs remain build inputs.
+exclude_patterns = [
+    "target/", "*.rlib", "*.rmeta", ".git/", "node_modules/", ".bun/",
+    ".npm/", ".pnpm-store/", "dist/", "build/", ".next/", ".nuxt/",
+    ".turbo/", ".parcel-cache/", ".doctor/", "coverage/", ".nyc_output/",
+    ".cargo/credentials", ".cargo/credentials.toml", ".env", ".env.*",
+    "*.pem", "*.key", "credentials.json", "secrets.json", "secrets.yaml",
+    "secrets.yml", "secrets.toml", "secrets.env", "secrets.txt", "secrets.conf",
+    "secrets.cfg", "secrets.properties", "secrets.xml",
+]
