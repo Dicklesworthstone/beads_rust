@@ -1,9 +1,11 @@
 # Storage Engine Operating Model
 
-**Status:** reviewed 2026-09-15. Released br v0.6.0 uses fsqlite 0.3.18;
-post-release main uses 0.4.0 and remains unqualified for release. The isolated
-0.4.1 experiments and outstanding gates are recorded in `UPGRADE_LOG.md`
-under `beads_rust-otrgz`.
+**Status:** reviewed 2026-09-16. Released br v0.6.0 uses fsqlite 0.3.18;
+post-release main uses published facade/core 0.4.2, pager 0.4.3 and
+btree/vdbe 0.4.1, with unchanged family members at 0.4.0. Upstream intentionally
+uses different compatible patch versions. The engine qualification passed;
+remaining whole-release and native-artifact gates are recorded in
+`UPGRADE_LOG.md` under `beads_rust-otrgz` and the release workstreams.
 **Owner bead:** `beads_rust-dk45` (Track B of the 2026-09-01 bridge plan)
 
 This document is the record of how `br` relates to its storage engine, what
@@ -194,7 +196,7 @@ A release without these receipts is not a release.
 
 | Bead | Symptom in br | Upstream |
 |---|---|---|
-| `beads_rust-otrgz`, `beads_rust-nx2sh` | Concurrent CLI reads can make MCP startup's authority-bound pending-sync inspection fail with database busy before FastMCP dispatch. The same-current-source startup probe failed 10/20 rounds on the 0.4.0 engine and passed 20/20 on the candidate. | The read-only WAL bootstrap requests exclusive maintenance while adopting an existing WAL locally. The isolated [`683a241b` fix](https://github.com/Dicklesworthstone/frankensqlite/commit/683a241bc3830a500bfcb8f9e5380e57fdebcf9c) uses local mode adoption and shared-snapshot validation. Current-source candidate qualification passed 3,561 tests, including all 22 MCP protocol cases, 25 multiprocess linearizability cases and 172 model-based cases, plus both real-family stress gates; receipts are in `UPGRADE_LOG.md`. The fix is not yet adopted or available as an aligned published family. |
+| `beads_rust-otrgz`, `beads_rust-nx2sh` (published engine fix adopted) | Concurrent CLI reads could make MCP startup's authority-bound pending-sync inspection fail with database busy before FastMCP dispatch. The same-current-source startup probe failed 10/20 rounds on 0.4.0 and passed 20/20 with the published fix. | The read-only WAL bootstrap formerly requested exclusive maintenance while adopting an existing WAL locally. The [`683a241b` fix](https://github.com/Dicklesworthstone/frankensqlite/commit/683a241bc3830a500bfcb8f9e5380e57fdebcf9c) uses local mode adoption and shared-snapshot validation; published facade/core 0.4.2 and pager 0.4.3 carry it. Qualification passed 3,161 library cases, all 22 MCP protocol cases, 25 multiprocess linearizability cases and 172 model-based cases, plus both real-family stress gates and the full concurrency/replay targets. Exact inputs, ignores and receipts are in `UPGRADE_LOG.md`; these passes do not replace release qualification. |
 | `beads_rust-ro3m` (engine fix verified) | Grouped/HAVING IN-subquery counts returned NULL with bound parameters and trailing predicates on 0.3.15/0.3.16. All four original `grouped_having_in_subquery_count_with_bound_params` variants pass on 0.3.18 (2026-09-07); the probe is now a normal regression test and the multi-label AND count detour is removed. `multi_label_and_count_matches_list` guards the public result. | [frankensqlite#407](https://github.com/Dicklesworthstone/frankensqlite/issues/407), fixed after the v0.3.16 tag; the pinned 0.3.18 release carries the correction |
 | `beads_rust-f3r4` | B-tree rowid-order corruption after 264 sequential dep-remove writes (GH #426) | not filed: the #426 sequence passes on fsqlite 0.3.15; `gh426_sequential_dependency_removals_keep_projections_and_integrity` (tests/model_based_storage.rs) guards it |
 | `beads_rust-ajui` | migrate-schema 16→17 reports success but leaves the DB failing `integrity_check` (GH #428) | not filed: br-side fix landed (migration requires a clean fresh-connection integrity witness, `doctor_subsystems/schema_migration.rs`; `tests/e2e_schema_migration_upgrade.rs`); bead closed |

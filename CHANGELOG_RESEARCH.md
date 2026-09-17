@@ -1,5 +1,37 @@
 # Changelog research — 2026-09-08
 
+## 2026-09-16 — published engine startup fix and final concurrency proofs
+
+The qualified registry-only lock changes exactly five package records:
+fsqlite/core 0.4.2, pager 0.4.3, btree/vdbe 0.4.1. Other family members remain
+0.4.0 and Asupersync remains 0.5.0. Lock SHA-256:
+`665f9fd7ca001beb2bf2f047572ceb4268914feb4904f12ab2990ee66884276a`.
+Full archive-source comparisons link facade/pager to upstream `78134a656`
+and core/btree/vdbe to `50972bf7c`. The core WAL adapter and vacuum source
+match the previously isolated `683a241b` fix. This establishes publication
+provenance, not runtime correctness by itself. Published vdbe 0.4.1 does not
+include upstream's later `725e31ee7` discarded-rowid fix.
+
+Current application source `a42db752` with these engine records passed
+all-target/all-feature check and denied-warning Clippy, 3,161 library cases
+(nine existing ignores), 22 MCP protocol cases, one shutdown case, 25
+linearizability cases, 192 concurrency cases, 166 observational-open cases
+(one existing ignore), 167 recovery replay cases and all 172 model cases.
+The model suite includes all 120 generated sequences and the historical
+300-issue/264-removal regression. The final model/concurrency/startup-benchmark
+batch used overlay `2c7712a4367795eed49ea21eb11f480f8373d95bf73ae8c4d3ce1154f477ba79`.
+Counts include shared test helpers and are not unique product scenarios.
+Logs and real-family 8×60/8×90 stress receipts are indexed in `UPGRADE_LOG.md`.
+Twenty startup-race rounds passed, versus ten failures in the twenty-round
+0.4.0 comparison. The pins are adopted; no new release is claimed here.
+
+The retained original-engine Windows executable separately passed three
+workspace-waiter and five opener-lease tests through a natively compiled RCH
+launcher. This is not evidence for the newer engine or a current CLI lifecycle.
+The new replenishing-writer test records 57 real calls, their live registrations
+and exact durable comment order; its passing result establishes observed bounded
+progress, not strict arrival-time FIFO or universal scheduler liveness.
+
 ## 2026-09-15 — missing WAL shared-index startup recovery
 
 Workstream `beads_rust-otrgz.2` addresses the three unchanged workspace replay

@@ -17,25 +17,80 @@
   getrandom edges. The corrected candidate changes only five package records,
   keeps those original edges, and retains one Asupersync 0.5.0. Candidate lock
   SHA-256: `665f9fd7ca001beb2bf2f047572ceb4268914feb4904f12ab2990ee66884276a`.
-  Main's dependency files remain unchanged pending qualification.
-- [ ] Run all-target/all-feature check and denied-warning Clippy on the corrected
-  candidate, then unchanged library, MCP, model, linearizability, concurrency,
-  observational-open and recovery tests. The first check uses the initial
-  resolver result and cannot qualify the corrected final lock.
-- [ ] Run startup admission and both retained real-family stress gates (eight
-  workers, 60 and 90 seconds). New pager freelist-repair and checkpoint changes
-  require fresh proof; earlier private-candidate passes do not qualify them.
-- [ ] Adopt qualified pins and correct the engine-version documentation, then
-  continue frozen-source release preparation and all seven native targets.
+  The qualified candidate is now applied to main's dependency files.
+- [x] Run all-target/all-feature check and denied-warning Clippy on the corrected
+  candidate. Both passed, followed by 22 MCP protocol tests and one shutdown
+  test. Source overlay: `532eea2c00ca349672ebb0d88b47feb1eb2056aeb77ac5ac7ba218c1349a24b6`.
+  Logs: `/tmp/br-otrgz-isolated-{check,clippy,mcp}-20260916.log`.
+- [x] Run library, model, linearizability, concurrency, observational-open and
+  recovery tests on the corrected candidate: 3,161 library passes (nine existing
+  ignores), 172 model cases, 25 linearizability cases, 192 concurrency cases,
+  166 observational-open cases (one existing ignore) and 167 recovery replay
+  cases. The model run includes all 120 generated sequences and the unchanged
+  historical 300-issue/264-removal regression. Logs:
+  `/tmp/br-otrgz-fair-runtime-20260916.log` and
+  `/tmp/br-otrgz-model-startup-tests-20260916.log`.
+- [x] Run startup admission and both retained real-family stress gates: 20/20
+  startup rounds; eight workers for 60 seconds acknowledged 194 commands with
+  52 validation refusals, and 90 seconds acknowledged 305 with 68 validation
+  refusals. Every nonzero exit was 4 / `VALIDATION_FAILED`; both independent
+  integrity checks passed, DB/JSONL counts matched (1111 and 1134), and no new
+  recovery artifacts or unexpected error signatures appeared. Raw archive:
+  `/tmp/br-otrgz-published-runtime-evidence-20260916.tar.gz`, SHA-256
+  `883290e3dd5d6ca4cf5d8def1537f083504842cb060629407aa3ef0d7c254c78`.
+- [x] Adopt qualified pins and correct the engine-version documentation.
+- [ ] Continue frozen-source release preparation and all seven native targets.
   Published vdbe 0.4.1 does not include upstream's later `725e31ee7` rowid-discard
   fix; preserve this limitation when assessing test results.
 
 OldSurface is reachable again with 28,821,237,760 bytes free. The retained native
 test executable transferred with matching SHA-256 `2bb3ea54c130548dfbb61bc567fa09f26f93cfea4306b39898d0772e7887de54`.
 Direct RCH job execution refused because its OS classifier recognizes native
-targets only on compilation commands; a normal frozen-source Cargo test request
-was admitted instead. No native test pass is claimed yet. SurfaceBookJE remains
-below its disk floor; no additional deletion or admission relaxation occurred.
+targets only on compilation commands. The normal product Cargo attempt then
+timed out downloading dependencies, before tests. A dependency-free Rust launcher
+compiled natively through strict RCH and ran the retained verified executable:
+all three workspace-waiter tests passed (1.42 seconds) and all five opener-lease
+tests passed (87.07 seconds). Logs:
+`/tmp/br-native-launcher-{queue,opener}-retry-20260916.log`.
+Launcher source: `/data/tmp/br-native-test-launcher-20260916-f5Bcv5`.
+These native results qualify source `a42db752` and its original engine, not the
+new published engine candidate. Native CLI lifecycle and final release artifacts
+remain outstanding. SurfaceBookJE remains below its disk floor; no additional
+deletion or admission relaxation occurred.
+
+Concurrent follow-through on existing beads:
+
+- [x] Implement the `46zqi` replenishing-writer regression: seven initial peers,
+  a registered victim and seven replacement streams; prove overlapping live
+  registrations before resuming the victim, retain each call, and check all 57
+  durable comments plus their order. Source review and the full 192-test
+  concurrency target passed. Raw archive:
+  `/tmp/br-46zqi-replenishment-20260916.tar.gz`.
+- [x] Repair `zxfz.1` startup measurement false successes: reject failed setup
+  and timed calls, retain both error channels, parse the paginated issue list
+  so `show` participates, and add real-command regressions. These changes do
+  not qualify cold-cache timing or change performance budgets.
+- [x] Finish whole-target check/Clippy for both test changes.
+  The first Clippy run caught an overlong test; its durable-result assertions
+  were extracted into a helper, without suppressing the lint. Final check and
+  Clippy passed on overlay `2c7712a4367795eed49ea21eb11f480f8373d95bf73ae8c4d3ce1154f477ba79`.
+- [x] Finish the final startup benchmark regressions: 168 passing cases and
+  five existing ignored measurement jobs. Both new real-command controls
+  passed; the final concurrency target passed all 192 cases as well.
+- [x] Finish all 172 model-based storage cases, including generated sequences
+  and the long historical dependency-removal regression (803.18 seconds).
+- [x] Tighten retained linearizability evidence: preserve the tested workspace,
+  refuse reused artifact directories before collection, and require exact
+  JSONL issue count before recording a successful full-state oracle. Source
+  review identified and corrected stale-success and extra-row blind spots.
+- [ ] Execute the unchanged eight-process, 120-second contention workload on
+  the published candidate, with its complete attempted-call history retained.
+- [ ] Verify the new smaller real-work benchmark control through RCH. It adds
+  opt-in version calls to candidate ready measurements, retains their separate
+  outputs and durations, and makes failed extra calls invalidate the sample.
+  No measured sensitivity or accepted latency budget is claimed yet.
+- [ ] Complete original sustained-contention/native qualification, calibrated
+  performance and release obligations before closing their parent beads.
 
 ## Follow-through at 04:46 UTC September 16: native capacity still blocked
 

@@ -83,7 +83,7 @@ Every crate named here is a real `[dependencies]` entry (`tests/agents_md_contra
 | Crate | Purpose |
 |-------|---------|
 | `clap` + `clap_complete` | CLI parsing with derive macros + shell completions |
-| `fsqlite` + `fsqlite-types` + `fsqlite-error` | FrankenSQLite engine facade plus shared storage types/errors (the whole `fsqlite-*` family is pinned to one version; see `docs/reliability/ENGINE_OPERATING_MODEL.md`) |
+| `fsqlite` + `fsqlite-types` + `fsqlite-error` | FrankenSQLite engine facade plus shared storage types/errors (compatible published family versions are locked together; patch numbers can differ; see `docs/reliability/ENGINE_OPERATING_MODEL.md`) |
 | `serde` + `serde_json` + `serde_yml` | Issue serialization, JSONL export, YAML config |
 | `schemars` | JSON Schema generation for robot output |
 | `chrono` | Timestamp parsing and RFC3339 formatting |

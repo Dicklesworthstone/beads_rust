@@ -85,6 +85,13 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ## Unreleased
 
+- **Restore concurrent startup with the published storage engine.** Upgrade
+  FrankenSQLite facade/core to 0.4.2, pager to 0.4.3 and btree/vdbe to 0.4.1.
+  Read-only WAL admission now avoids the exclusive maintenance conflict that
+  could stall CLI reads and refuse MCP startup during pending-sync inspection.
+  The existing br opener leases and checkpoint containment remain in force.
+  Workstreams `beads_rust-otrgz` and `beads_rust-nx2sh`; qualification and
+  remaining release gates are recorded in [the upgrade log](UPGRADE_LOG.md).
 - **Honor peer-opener checkpoint exclusion during storage teardown.** Closing
   a storage handle no longer invokes an implicit engine checkpoint after br
   has declined checkpointing because peers are present. The existing
