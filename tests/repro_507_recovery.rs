@@ -396,7 +396,6 @@ fn mutating_command_auto_recovers_poisoned_index_before_pending_gate() {
     }
     let workspace = current_workspace(false);
     let poisoned = poison_index(&workspace);
-    let before = protected_payload(&workspace);
 
     let create = run_br(
         &workspace,
@@ -409,9 +408,9 @@ fn mutating_command_auto_recovers_poisoned_index_before_pending_gate() {
             || fs::read(workspace.root.join(".beads/beads.db-shm")).unwrap() != poisoned,
         "startup recovery must replace or rebuild the poisoned derived index"
     );
-    assert_eq!(fs::read(workspace.root.join(".beads/beads.db")).unwrap(), before[0]);
-    assert_eq!(fs::read(workspace.root.join(".beads/beads.db-wal")).unwrap(), before[1]);
-
+    // The command itself now commits a new issue, so WAL bytes are expected
+    // to change. Verify the old WAL-only logical data survived recovery and
+    // the new mutation instead of asserting byte neutrality after a write.
     let list = run_br(
         &workspace,
         ["list", "--all", "--json", "--no-auto-import", "--no-auto-flush"],
