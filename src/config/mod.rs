@@ -3140,7 +3140,7 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
         .open(&private_source_path)
         .and_then(|file| file.sync_all())
         .map_err(BeadsError::Io)?;
-    sync_directory(private_source_dir.path())?;
+    crate::util::sync_parent_directory(&private_source_path).map_err(BeadsError::Io)?;
 
     let mut private_storage = SqliteStorage::open(&private_source_path)?;
     if let Err(err) = private_storage.execute_raw("VACUUM") {
