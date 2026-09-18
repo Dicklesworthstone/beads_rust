@@ -3010,19 +3010,19 @@ pub(crate) fn db_sidecar_suffixes() -> impl Iterator<Item = &'static &'static st
 /// Passing mismatched storage and db_path would copy the storage's actual
 /// DB contents over db_path.
 ///
-/// Failure handling: on any failure (VACUUM INTO error, rename error, or
-/// reopen error after a successful rename) the helper returns either the
-/// best-available working handle or an error before the caller can continue:
+/// Failure handling: candidate construction now runs only on a private source.
+/// Any checkpoint or VACUUM-INTO failure is surfaced while the live family is
+/// still unchanged; reporting success would otherwise falsely claim maintenance
+/// that no longer ran in place. Installation keeps the existing recovery rules:
 ///
-/// * VACUUM INTO failed — returns the unchanged pre-compaction connection.
+/// * Candidate construction failed — returns an error before live mutation.
 /// * Rename failed — returns a connection reopened against the still-intact
 ///   original `db_path`; the compacted temp file is removed.
 /// * Reopen failed after replacing the handle — returns an error, ensuring
 ///   live code cannot continue on a throwaway placeholder connection.
 ///
-/// Cosmetic compaction failures remain non-fatal when the original handle is
-/// still usable. Failures after the original connection has been closed are
-/// surfaced because the caller no longer has a valid persistent storage handle.
+/// Failures after the original connection has been closed remain surfaced
+/// because the caller no longer has a valid persistent storage handle.
 ///
 /// This is called only in rebuild/force-import paths where the DB is
 /// known to have just been fully populated from JSONL.
@@ -3089,12 +3089,12 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
     // VACUUM source-side teardown can rewrite WAL-index state (#507), so an
     // interrupted compaction must be able to damage only a private copy.
     if let Err(err) = storage.checkpoint_full() {
-        tracing::debug!(
+        tracing::warn!(
             error = %err,
             db_path = %db_path.display(),
-            "Pre-compaction WAL checkpoint failed; skipping cosmetic compaction so committed WAL frames cannot be omitted"
+            "Pre-compaction WAL checkpoint failed; refusing to report compaction success"
         );
-        return Ok(storage);
+        return Err(err);
     }
     write_authority.verify_database_authority()?;
     reject_symlinked_database_path_for_recovery(db_path)?;
@@ -3161,9 +3161,9 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
         tracing::warn!(
             error = %err,
             db_path = %db_path.display(),
-            "Private compaction source WAL checkpoint failed; keeping the unchanged live family"
+            "Private compaction source WAL checkpoint failed; live family is unchanged"
         );
-        return Ok(storage);
+        return Err(err);
     }
 
     let escaped_path = temp_path.display().to_string().replace('\'', "''");
@@ -3174,11 +3174,12 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
         tracing::warn!(
             error = %err,
             db_path = %db_path.display(),
-            "`VACUUM INTO` on private compaction source failed; keeping the unchanged live family"
+            "`VACUUM INTO` on private compaction source failed; live family is unchanged"
         );
         // A failed operation has not established an inode witness. Preserve
-        // every resulting candidate path instead of guessing ownership.
-        return Ok(storage);
+        // every resulting candidate path instead of guessing ownership, and
+        // surface the failure because no live maintenance has run.
+        return Err(err);
     }
 
     // Re-verify after every private maintenance step. No live-family
