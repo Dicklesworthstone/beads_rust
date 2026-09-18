@@ -726,9 +726,15 @@ fn refuse_doctor_mutation_if_merge_pending(
             // the case where the generic "restore read-only access" advice is
             // actively misleading, so name `migrate-schema` and say plainly
             // that repair is the wrong tool for it.
-            let hint = StalledMigrationHint::probe(db_path);
-            let schema_remediation = hint.remediation();
-            let reason = if schema_remediation.is_some() {
+            let hint = DatabaseAdmissionHint::probe(db_path);
+            let remediation = hint.remediation();
+            let reason = if hint.is_poisoned_wal_index() {
+                format!(
+                    "could not prove that no sync merge is pending ({error}); doctor mutation \
+                     fails closed because the derived WAL index is poisoned. Preserve the WAL \
+                     and run `br doctor migrate-schema recover`"
+                )
+            } else if hint.is_specific() {
                 format!(
                     "could not prove that no sync merge is pending ({error}); doctor mutation \
                      fails closed, and this database's schema version says repair is not the \
@@ -745,7 +751,7 @@ fn refuse_doctor_mutation_if_merge_pending(
                 "pending": "unknown",
                 "database_path": db_path.display().to_string(),
                 "inspection_error": error.to_string(),
-                "remediation": schema_remediation.unwrap_or_else(|| "Restore read-only access to the database family and rerun `br doctor` before attempting repair.".to_string()),
+                "remediation": remediation.unwrap_or_else(|| "Restore read-only access to the database family and rerun `br doctor` before attempting repair.".to_string()),
             });
             merge_json_object(&mut evidence, hint.json_details());
             (reason, evidence)
@@ -1231,6 +1237,63 @@ impl StalledMigrationHint {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatabaseAdmissionHint {
+    PoisonedWalIndex,
+    Schema(StalledMigrationHint),
+    Indeterminate,
+}
+
+impl DatabaseAdmissionHint {
+    fn probe(db_path: &Path) -> Self {
+        if crate::franken_sync::wal_index::poisoned_index_present(db_path).unwrap_or(false) {
+            return Self::PoisonedWalIndex;
+        }
+        match StalledMigrationHint::probe(db_path) {
+            StalledMigrationHint::Indeterminate => Self::Indeterminate,
+            hint => Self::Schema(hint),
+        }
+    }
+
+    fn remediation(self) -> Option<String> {
+        match self {
+            Self::PoisonedWalIndex => Some(
+                "The database and WAL are present, but the derived WAL index is in the known \
+                 initialized-zero-page poison state from GitHub #507. Preserve the complete \
+                 database family and run `br doctor migrate-schema recover`; that command \
+                 rehearses recovery on a private copy and retains the poisoned index as evidence \
+                 before live admission. Do not run generic `br doctor --repair` or delete the \
+                 WAL: committed records may exist only in WAL."
+                    .to_string(),
+            ),
+            Self::Schema(hint) => hint.remediation(),
+            Self::Indeterminate => None,
+        }
+    }
+
+    fn json_details(self) -> serde_json::Value {
+        match self {
+            Self::PoisonedWalIndex => serde_json::json!({
+                "wal_index_state": "initialized_zero_page_poison",
+                "wal_index_recovery": "explicit",
+                "recovery_command": "br doctor migrate-schema recover",
+                "generic_repair_safe": false,
+                "schema_state": "independent_of_schema_version",
+            }),
+            Self::Schema(hint) => hint.json_details(),
+            Self::Indeterminate => StalledMigrationHint::Indeterminate.json_details(),
+        }
+    }
+
+    fn is_specific(self) -> bool {
+        !matches!(self, Self::Indeterminate)
+    }
+
+    fn is_poisoned_wal_index(self) -> bool {
+        matches!(self, Self::PoisonedWalIndex)
+    }
+}
+
 /// The reviewed migration source range, rendered for operator-facing text.
 fn reviewed_migration_source_versions_display() -> String {
     REVIEWED_MIGRATION_SOURCE_VERSIONS
@@ -1275,20 +1338,26 @@ fn check_pending_sync_merge(db_path: &Path, checks: &mut Vec<CheckResult>) {
             // could not be read. An unfinished schema migration lands here
             // too, with reads working perfectly — so when the header proves
             // that is what happened, name the command that recovers it.
-            let hint = StalledMigrationHint::probe(db_path);
+            let hint = DatabaseAdmissionHint::probe(db_path);
             let mut details = serde_json::json!({
                 "pending": "unknown",
                 "database_path": db_path.display().to_string(),
                 "remediation": hint.remediation().unwrap_or_else(|| "Restore read-only access to the database family, then rerun `br doctor`. Mutating commands must remain disabled until pending merge state can be inspected.".to_string()),
             });
             merge_json_object(&mut details, hint.json_details());
+            let message = if hint.is_poisoned_wal_index() {
+                format!(
+                    "Could not inspect pending sync-merge state because the derived WAL index is \
+                     in the initialized-zero-page poison state: {error}"
+                )
+            } else {
+                format!("Could not prove that no sync merge is pending: {error}")
+            };
             push_check(
                 checks,
                 "sync.merge_pending",
                 CheckStatus::Error,
-                Some(format!(
-                    "Could not prove that no sync merge is pending: {error}"
-                )),
+                Some(message),
                 Some(details),
             );
         }

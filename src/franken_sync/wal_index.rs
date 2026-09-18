@@ -164,6 +164,10 @@ fn probe(path: &Path) -> io::Result<bool> {
     Ok(poisoned_headers(&wal, &shm))
 }
 
+pub(crate) fn poisoned_index_present(path: &Path) -> io::Result<bool> {
+    probe(path)
+}
+
 pub(super) fn warn_if_poisoned(path: &str) {
     if probe(Path::new(path)).unwrap_or(false) {
         tracing::warn!(

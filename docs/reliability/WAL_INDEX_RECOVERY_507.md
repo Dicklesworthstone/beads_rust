@@ -143,3 +143,8 @@ Classify and retain or clean only demonstrably owned private candidates after
 all handles close. Do not sweep live sidecars or rely solely on Drop: process
 kill and the release panic-abort profile bypass normal Rust cleanup. No VACUUM
 artifact sweep or upstream dependency change is part of this containment.
+
+
+## Doctor routing
+
+`br doctor` and generic doctor mutation refusal detect #507's exact bounded WAL/index signature without opening the engine. They report `wal_index_state=initialized_zero_page_poison`, name `br doctor migrate-schema recover`, and explicitly keep generic `doctor --repair` fail-closed so WAL-only data cannot be replaced from stale JSONL.

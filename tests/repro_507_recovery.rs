@@ -312,6 +312,84 @@ fn missing_index_recovery_is_restartable_without_checkpointing() {
 }
 
 #[test]
+fn doctor_names_poisoned_index_and_routes_to_explicit_recovery() {
+    if isolated_test("doctor_names_poisoned_index_and_routes_to_explicit_recovery") {
+        return;
+    }
+    let workspace = current_workspace(false);
+    let poisoned = poison_index(&workspace);
+    let before = protected_payload(&workspace);
+
+    let doctor = run_br(
+        &workspace,
+        [
+            "doctor",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "poisoned_doctor",
+    );
+    assert!(!doctor.status.success());
+    let report: Value =
+        serde_json::from_str(&extract_json_payload(&doctor.stdout)).expect("doctor JSON");
+    let pending = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "sync.merge_pending")
+        .expect("sync.merge_pending check");
+    assert_eq!(
+        pending["details"]["wal_index_state"],
+        "initialized_zero_page_poison"
+    );
+    assert_eq!(
+        pending["details"]["recovery_command"],
+        "br doctor migrate-schema recover"
+    );
+    let remediation = pending["details"]["remediation"].as_str().unwrap();
+    assert!(remediation.contains("migrate-schema recover"), "{remediation}");
+    assert!(remediation.contains("Do not run generic"), "{remediation}");
+    assert_eq!(protected_payload(&workspace), before);
+    assert_eq!(
+        fs::read(workspace.root.join(".beads/beads.db-shm")).unwrap(),
+        poisoned
+    );
+
+    let repair = run_br(
+        &workspace,
+        [
+            "doctor",
+            "--repair",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "poisoned_generic_repair_refused",
+    );
+    assert!(!repair.status.success());
+    let refusal: Value =
+        serde_json::from_str(&extract_json_payload(&repair.stdout)).expect("repair refusal JSON");
+    assert_eq!(
+        refusal["evidence"]["wal_index_state"],
+        "initialized_zero_page_poison"
+    );
+    assert_eq!(
+        refusal["evidence"]["recovery_command"],
+        "br doctor migrate-schema recover"
+    );
+    assert_eq!(refusal["evidence"]["generic_repair_safe"], false);
+    assert_eq!(protected_payload(&workspace), before);
+    assert_eq!(
+        fs::read(workspace.root.join(".beads/beads.db-shm")).unwrap(),
+        poisoned
+    );
+
+    recover(&workspace, "doctor_named_recovery");
+    assert_eq!(protected_payload(&workspace), before);
+}
+
+#[test]
 fn corrupt_wal_and_live_peer_refuse_before_live_index_quarantine() {
     if isolated_test("corrupt_wal_and_live_peer_refuse_before_live_index_quarantine") {
         return;
