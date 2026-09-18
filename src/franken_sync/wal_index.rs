@@ -369,11 +369,15 @@ pub(super) fn quarantine_poisoned_index(
         shm.sync_all()?;
         sync_directory(&retained)?;
         sync_directory(&parent)?;
+        #[cfg(test)]
+        tests::crash_at_recovery_boundary("prepared");
         verify_name(&path, &locked.file)?;
         verify_name(&wal_path, &wal)?;
         verify_name(&shm_path, &shm)?;
         // Even inside this call's private directory, never clobber an entry.
         quarantine_name(&shm_path, &destination)?;
+        #[cfg(test)]
+        tests::crash_at_recovery_boundary("renamed");
         sync_directory(&retained)?;
         sync_directory(&parent)?;
         verify_name(&destination, &shm)?;
@@ -385,6 +389,8 @@ pub(super) fn quarantine_poisoned_index(
                 "recovery payload changed; inspect retained evidence before retrying",
             ));
         }
+        #[cfg(test)]
+        tests::crash_at_recovery_boundary("durable");
         Ok(())
     })();
     operation.map_err(|error| {
@@ -406,6 +412,19 @@ mod tests {
     use super::*;
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
     use crate::franken_sync::{Connection, SqliteValue, compat};
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    use crate::franken_sync::tests::run_recovery_test_in_subprocess;
+
+    const CRASH_STAGE_ENV: &str = "BR_TEST_507_CRASH_STAGE";
+
+    // Only compiled into the unit-test binary. exit() intentionally bypasses
+    // every Rust destructor: this tests restart after process loss, not an
+    // ordinary error return with a conveniently running cleanup path.
+    pub(super) fn crash_at_recovery_boundary(stage: &str) {
+        if std::env::var(CRASH_STAGE_ENV).as_deref() == Ok(stage) {
+            std::process::exit(86);
+        }
+    }
 
     fn wal_header(page_size: u32, big_endian: bool) -> [u8; 32] {
         let mut header = [0; 32];
@@ -610,8 +629,7 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
-    #[test]
-    fn identity_bound_recovery_preserves_unexported_rows_and_pending_metadata() {
+    fn tracker_with_uncheckpointed_rows() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         let db = temp.path().join("tracker.db");
         let mut connection = Connection::open(db.to_string_lossy().into_owned()).unwrap();
@@ -628,10 +646,48 @@ mod tests {
         connection.close_without_checkpoint_in_place().unwrap();
         drop(connection);
         assert!(fs::metadata(sidecar(&db, "-wal")).unwrap().len() > 32);
-        let mut shm = open_regular(&sidecar(&db, "-shm"), true).unwrap();
+        (temp, db)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    fn poison_tracker(db: &Path) {
+        let mut shm = open_regular(&sidecar(db, "-shm"), true).unwrap();
         shm.write_all(&poison()).unwrap();
         shm.sync_all().unwrap();
-        drop(shm);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    fn assert_tracker_contents(connection: &Connection) {
+        assert_eq!(connection.query("SELECT id FROM issues").unwrap().len(), 3);
+        assert_eq!(connection.query("SELECT source FROM dependencies").unwrap().len(), 2);
+        let row = connection.query_row("SELECT value FROM metadata WHERE key = 'sync_merge_pending'").unwrap();
+        assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some("must-remain-blocking"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    fn recover_and_close_without_payload_changes(db: &Path) {
+        let main_before = fs::read(db).unwrap();
+        let wal_before = fs::read(sidecar(db, "-wal")).unwrap();
+        let retained = File::open(db).unwrap();
+        let recovered = Connection::open_existing_with_expected_identity(
+            db.to_string_lossy().into_owned(), identity(&retained).unwrap(),
+        ).unwrap();
+        assert_tracker_contents(&recovered);
+        recovered.close().unwrap();
+        assert_eq!(fs::read(db).unwrap(), main_before);
+        assert_eq!(fs::read(sidecar(db, "-wal")).unwrap(), wal_before);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn identity_bound_recovery_preserves_unexported_rows_and_pending_metadata() {
+        if run_recovery_test_in_subprocess(
+            "franken_sync::wal_index::tests::identity_bound_recovery_preserves_unexported_rows_and_pending_metadata",
+        ) {
+            return;
+        }
+        let (_temp, db) = tracker_with_uncheckpointed_rows();
+        poison_tracker(&db);
         let before = payload(&db);
         // Read-only admission must never quarantine or modify the family.
         match compat::open_with_flags(db.to_str().unwrap(), compat::OpenFlags::SQLITE_OPEN_READ_ONLY) {
@@ -661,5 +717,92 @@ mod tests {
         let mut writer = Connection::open(db.to_string_lossy().into_owned()).unwrap();
         writer.execute("INSERT INTO issues VALUES ('writes-work-again')").unwrap();
         writer.close_without_checkpoint_in_place().unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn missing_and_healthy_index_recovery_preserve_wal_on_every_close() {
+        if run_recovery_test_in_subprocess(
+            "franken_sync::wal_index::tests::missing_and_healthy_index_recovery_preserve_wal_on_every_close",
+        ) {
+            return;
+        }
+        for missing in [false, true] {
+            let (_temp, db) = tracker_with_uncheckpointed_rows();
+            if missing {
+                fs::rename(sidecar(&db, "-shm"), db.with_file_name("retained-shm")).unwrap();
+            }
+            // This invocation did not quarantine anything. A second recovery
+            // also must not checkpoint the WAL merely because the first one
+            // successfully rebuilt the index.
+            recover_and_close_without_payload_changes(&db);
+            recover_and_close_without_payload_changes(&db);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    #[test]
+    #[ignore = "subprocess worker for recovery_survives_abrupt_process_exit"]
+    fn recovery_crash_worker() {
+        let db = PathBuf::from(std::env::var_os("BR_TEST_507_CRASH_DATABASE").unwrap());
+        let retained = File::open(&db).unwrap();
+        let recovered = Connection::open_existing_with_expected_identity(
+            db.to_string_lossy().into_owned(), identity(&retained).unwrap(),
+        ).unwrap();
+        assert_tracker_contents(&recovered);
+        crash_at_recovery_boundary("admitted");
+        recovered.close().unwrap();
+        panic!("requested crash boundary was not reached");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn recovery_survives_abrupt_process_exit() {
+        if run_recovery_test_in_subprocess(
+            "franken_sync::wal_index::tests::recovery_survives_abrupt_process_exit",
+        ) {
+            return;
+        }
+        const WORKER: &str = "franken_sync::wal_index::tests::recovery_crash_worker";
+        for stage in ["prepared", "renamed", "durable", "admitted"] {
+            let (_temp, db) = tracker_with_uncheckpointed_rows();
+            poison_tracker(&db);
+            let before = payload(&db);
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", WORKER, "--ignored", "--nocapture", "--test-threads=1"])
+                .env("BR_TEST_507_CRASH_DATABASE", &db)
+                .env(CRASH_STAGE_ENV, stage)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(), Some(86),
+                "worker did not reach {stage}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert_eq!(fs::read(&db).unwrap(), before[0], "main at {stage}");
+            assert_eq!(fs::read(sidecar(&db, "-wal")).unwrap(), before[1], "WAL at {stage}");
+            match stage {
+                "prepared" => assert_eq!(fs::read(sidecar(&db, "-shm")).unwrap(), before[2]),
+                "renamed" | "durable" => assert!(!sidecar(&db, "-shm").exists()),
+                "admitted" => assert!(!probe(&db).unwrap()),
+                _ => unreachable!(),
+            }
+            let retained = fs::read_dir(db.parent().unwrap()).unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.file_name().unwrap().to_string_lossy().starts_with(".br-wal-index-"))
+                .unwrap();
+            assert!(retained.join("prepared.json").is_file());
+            if stage != "prepared" {
+                assert_eq!(fs::read(retained.join("poisoned-shm")).unwrap(), before[2]);
+            }
+            // Both the restart and a repeated recovery must preserve WAL-only
+            // rows. The old per-invocation quarantine flag failed this check
+            // after "renamed", "durable", and "admitted".
+            recover_and_close_without_payload_changes(&db);
+            recover_and_close_without_payload_changes(&db);
+            assert_eq!(fs::read(&db).unwrap(), before[0]);
+            assert_eq!(fs::read(sidecar(&db, "-wal")).unwrap(), before[1]);
+        }
     }
 }

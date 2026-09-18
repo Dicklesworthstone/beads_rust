@@ -331,6 +331,10 @@ impl Connection {
 
     /// Close in place, retaining the handle on error so callers can retry.
     pub fn close_in_place(&mut self) -> Result<(), FrankenError> {
+        #[cfg(test)]
+        if tests::FAIL_NEXT_CLOSE.with(|fault| fault.replace(false)) {
+            return Err(FrankenError::BusyRecovery);
+        }
         if self.checkpoint_on_close {
             drive(self.inner.close_in_place())
         } else {
@@ -339,8 +343,11 @@ impl Connection {
     }
 
     /// Close without checkpointing; the caller controls checkpoint admission.
+    /// This decision is sticky even when close fails: a later close retry must
+    /// not silently regain permission to checkpoint a live peer's WAL.
     pub fn close_without_checkpoint_in_place(&mut self) -> Result<(), FrankenError> {
-        drive(self.inner.close_without_checkpoint_in_place())
+        self.checkpoint_on_close = false;
+        self.close_in_place()
     }
 }
 
@@ -429,7 +436,48 @@ pub mod compat {
 mod tests {
     use super::*;
 
-    fn run_recovery_test_in_subprocess(name: &str) -> bool {
+    thread_local! {
+        pub(super) static FAIL_NEXT_CLOSE: std::cell::Cell<bool> = const {
+            std::cell::Cell::new(false)
+        };
+    }
+
+    #[test]
+    fn failed_no_checkpoint_close_keeps_its_policy_on_retry() {
+        if run_recovery_test_in_subprocess(
+            "franken_sync::tests::failed_no_checkpoint_close_keeps_its_policy_on_retry",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("close-retry.db");
+        let mut connection = Connection::open(path.to_string_lossy().into_owned()).unwrap();
+        connection.execute("PRAGMA journal_mode = WAL").unwrap();
+        connection.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+        connection.execute("CREATE TABLE t (value TEXT)").unwrap();
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        connection
+            .execute("INSERT INTO t VALUES ('WAL-only close retry')")
+            .unwrap();
+        let wal_path = temp.path().join("close-retry.db-wal");
+        let main_before = std::fs::read(&path).unwrap();
+        let wal_before = std::fs::read(&wal_path).unwrap();
+        assert!(wal_before.len() > 32);
+
+        FAIL_NEXT_CLOSE.with(|fault| fault.set(true));
+        assert!(matches!(
+            connection.close_without_checkpoint_in_place(),
+            Err(FrankenError::BusyRecovery)
+        ));
+        assert!(!connection.checkpoint_on_close);
+        // A caller may use ordinary close() to retry. It must not recover the
+        // checkpoint authority explicitly declined by the first close call.
+        connection.close().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), main_before);
+        assert_eq!(std::fs::read(&wal_path).unwrap(), wal_before);
+    }
+
+    pub(super) fn run_recovery_test_in_subprocess(name: &str) -> bool {
         // As in #506, do not create a fixture whose leases can be inherited
         // by unrelated tests' children in the parallel parent process.
         const CHILD_ENV: &str = "BR_TEST_ISOLATED_RECOVERY_CLOSE";
