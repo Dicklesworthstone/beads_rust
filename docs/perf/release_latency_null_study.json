@@ -1,0 +1,254 @@
+[
+  {
+    "workload": "10000-close-default-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 2.528,
+    "null_p50": 2.521,
+    "null_p95": 2.935,
+    "null_p99": 3.115,
+    "null_bonferroni": 3.329
+  },
+  {
+    "workload": "10000-ready-default-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 3.682,
+    "null_p50": 3.502,
+    "null_p95": 4.017,
+    "null_p99": 4.165,
+    "null_bonferroni": 4.263
+  },
+  {
+    "workload": "10000-ready-diagnostic-no-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 5.443,
+    "null_p50": 4.703,
+    "null_p95": 5.227,
+    "null_p99": 5.501,
+    "null_bonferroni": 5.679
+  },
+  {
+    "workload": "10000-list-default-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 5.512,
+    "null_p50": 6.079,
+    "null_p95": 7.084,
+    "null_p99": 7.568,
+    "null_bonferroni": 7.838
+  },
+  {
+    "workload": "10000-list-diagnostic-no-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 6.426,
+    "null_p50": 6.496,
+    "null_p95": 7.683,
+    "null_p99": 8.086,
+    "null_bonferroni": 8.405
+  },
+  {
+    "workload": "10000-show-diagnostic-no-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 8.277,
+    "null_p50": 7.693,
+    "null_p95": 8.761,
+    "null_p99": 9.209,
+    "null_bonferroni": 9.532
+  },
+  {
+    "workload": "10000-show-default-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 8.011,
+    "null_p50": 8.408,
+    "null_p95": 9.493,
+    "null_p99": 10.469,
+    "null_bonferroni": 11.578
+  },
+  {
+    "workload": "10000-close-diagnostic-no-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 10.053,
+    "null_p50": 8.946,
+    "null_p95": 11.005,
+    "null_p99": 11.647,
+    "null_bonferroni": 12.255
+  },
+  {
+    "workload": "1000-ready-diagnostic-no-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 8.813,
+    "null_p50": 9.887,
+    "null_p95": 11.517,
+    "null_p99": 11.971,
+    "null_bonferroni": 12.343
+  },
+  {
+    "workload": "10000-create-default-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 12.222,
+    "null_p50": 11.938,
+    "null_p95": 13.07,
+    "null_p99": 13.617,
+    "null_bonferroni": 13.993
+  },
+  {
+    "workload": "1000-version-diagnostic-no-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 11.161,
+    "null_p50": 10.79,
+    "null_p95": 12.49,
+    "null_p99": 13.364,
+    "null_bonferroni": 14.155
+  },
+  {
+    "workload": "1000-list-diagnostic-no-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 14.692,
+    "null_p50": 14.228,
+    "null_p95": 16.229,
+    "null_p99": 16.918,
+    "null_bonferroni": 17.506
+  },
+  {
+    "workload": "1000-ready-default-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 16.746,
+    "null_p50": 17.111,
+    "null_p95": 18.868,
+    "null_p99": 19.393,
+    "null_bonferroni": 19.831
+  },
+  {
+    "workload": "1000-close-default-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 19.035,
+    "null_p50": 15.004,
+    "null_p95": 18.34,
+    "null_p99": 19.721,
+    "null_bonferroni": 20.799
+  },
+  {
+    "workload": "1000-show-diagnostic-no-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 16.969,
+    "null_p50": 17.503,
+    "null_p95": 19.799,
+    "null_p99": 20.425,
+    "null_bonferroni": 21.16
+  },
+  {
+    "workload": "10000-version-default-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 19.771,
+    "null_p50": 19.087,
+    "null_p95": 21.504,
+    "null_p99": 22.174,
+    "null_bonferroni": 22.617
+  },
+  {
+    "workload": "1000-close-diagnostic-no-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 19.275,
+    "null_p50": 17.668,
+    "null_p95": 21.66,
+    "null_p99": 22.732,
+    "null_bonferroni": 23.642
+  },
+  {
+    "workload": "1000-show-default-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 18.901,
+    "null_p50": 20.963,
+    "null_p95": 23.048,
+    "null_p99": 23.98,
+    "null_bonferroni": 24.416
+  },
+  {
+    "workload": "1000-list-default-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 21.832,
+    "null_p50": 21.416,
+    "null_p95": 24.097,
+    "null_p99": 25.127,
+    "null_bonferroni": 25.747
+  },
+  {
+    "workload": "10000-version-diagnostic-no-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 24.441,
+    "null_p50": 21.967,
+    "null_p95": 24.445,
+    "null_p99": 25.424,
+    "null_bonferroni": 26.287
+  },
+  {
+    "workload": "10000-update-diagnostic-no-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 12.995,
+    "null_p50": 15.649,
+    "null_p95": 20.129,
+    "null_p99": 23.606,
+    "null_bonferroni": 26.634
+  },
+  {
+    "workload": "10000-update-default-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 20.977,
+    "null_p50": 21.252,
+    "null_p95": 24.783,
+    "null_p99": 27.003,
+    "null_bonferroni": 27.61
+  },
+  {
+    "workload": "1000-version-default-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 35.07,
+    "null_p50": 36.556,
+    "null_p95": 39.824,
+    "null_p99": 40.94,
+    "null_bonferroni": 42.289
+  },
+  {
+    "workload": "1000-create-default-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 32.859,
+    "null_p50": 34.934,
+    "null_p95": 41.46,
+    "null_p99": 43.503,
+    "null_bonferroni": 45.285
+  },
+  {
+    "workload": "10000-create-diagnostic-no-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 28.873,
+    "null_p50": 32.232,
+    "null_p95": 40.232,
+    "null_p99": 42.13,
+    "null_bonferroni": 46.391
+  },
+  {
+    "workload": "1000-update-default-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 34.957,
+    "null_p50": 34.401,
+    "null_p95": 44.286,
+    "null_p99": 49.374,
+    "null_bonferroni": 51.146
+  },
+  {
+    "workload": "1000-create-diagnostic-no-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 32.871,
+    "null_p50": 38.386,
+    "null_p95": 52.751,
+    "null_p99": 58.027,
+    "null_bonferroni": 61.614
+  },
+  {
+    "workload": "1000-update-diagnostic-no-auto-flush",
+    "blocks": 99,
+    "observed_median_upper_pct": 55.313,
+    "null_p50": 56.637,
+    "null_p95": 72.533,
+    "null_p99": 81.578,
+    "null_bonferroni": 84.869
+  }
+]
