@@ -23309,6 +23309,34 @@ mod tests {
 
     #[test]
     fn doctor_raw_repairs_preserve_peer_wal_and_checkpoint_only_when_alone() {
+        // Like config's run_compaction_test_in_subprocess, isolate the fixture
+        // before opening any leases: a parallel test's child can inherit a
+        // lease and keep it alive after drop(peer) (GitHub #506).
+        const CHILD_ENV: &str = "BR_TEST_ISOLATED_DOCTOR_RAW_REPAIRS";
+        const TEST_NAME: &str = "cli::commands::doctor::tests::doctor_raw_repairs_preserve_peer_wal_and_checkpoint_only_when_alone";
+        if std::env::var(CHILD_ENV).as_deref() != Ok(TEST_NAME) {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    TEST_NAME,
+                    "--nocapture",
+                    "--test-threads=1",
+                    "--format=pretty",
+                    "--color=never",
+                ])
+                .env(CHILD_ENV, TEST_NAME)
+                .output()
+                .expect("run isolated doctor raw repair test");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains(&format!("test {TEST_NAME} ... ok")),
+                "isolated doctor raw repair test failed: {}\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("beads.db");
         drop(SqliteStorage::open(&db_path).unwrap());
@@ -23366,6 +23394,12 @@ mod tests {
         repair_partial_indexes_under_write_authority(&db_path, &mut repair, None, &write_authority);
         assert!(repair.indexes_reindexed);
         assert_eq!(fs::read(&db_path).unwrap(), main_before);
+        // Raw repair connections must not release the live peer's protection.
+        let wal_after_repairs = fs::read(&wal_path).unwrap();
+        let error = checkpoint_wal_truncate(&db_path, &write_authority).unwrap_err();
+        assert!(matches!(error, BeadsError::SyncConflict { .. }));
+        assert_eq!(fs::read(&db_path).unwrap(), main_before);
+        assert_eq!(fs::read(&wal_path).unwrap(), wal_after_repairs);
         drop(peer);
         checkpoint_wal_truncate(&db_path, &write_authority).unwrap();
         let storage = SqliteStorage::open(&db_path).unwrap();
