@@ -3536,6 +3536,48 @@ mod release_abba {
         let parsed = workload_budgets(&document["budgets_pct"].to_string())
             .expect("harness must accept the committed budgets");
         assert_eq!(parsed.len(), 28);
+
+        // Every budget must still clear the null it was derived from, and the
+        // real A/A run it was calibrated against must still pass under it.
+        // Without this, someone could tighten a budget by hand and only find
+        // out when the next campaign reported a regression that was actually
+        // measurement noise.
+        let study: Value = serde_json::from_str(
+            &fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/docs/perf/release_latency_null_study.json"
+            ))
+            .expect("committed null study"),
+        )
+        .expect("null study parses");
+        let rows = study.as_array().expect("null study array");
+        assert_eq!(rows.len(), 28, "the null study must cover every workload");
+        for row in rows {
+            let name = row["workload"].as_str().expect("study workload name");
+            let budget = budgets[name].as_f64().expect("budget for studied workload");
+            let blocks = row["blocks"].as_u64().expect("study block count");
+            let bonferroni = row["null_bonferroni"]
+                .as_f64()
+                .expect("study family-wise null quantile");
+            let observed = row["observed_median_upper_pct"]
+                .as_f64()
+                .expect("study observed A/A bound");
+
+            assert_eq!(
+                blocks, 99,
+                "{name}: the null was estimated at 99 blocks, matching min_gating_blocks"
+            );
+            assert!(
+                budget >= bonferroni,
+                "{name}: budget {budget} is below its family-wise null quantile {bonferroni}, \
+                 so an A/A run would report a false regression"
+            );
+            assert!(
+                observed <= budget,
+                "{name}: the calibration A/A run measured {observed}% against a {budget}% \
+                 budget, so a known-good result would fail its own gate"
+            );
+        }
     }
 
     #[test]
