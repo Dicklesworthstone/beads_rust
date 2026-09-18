@@ -19,6 +19,7 @@ or numbers that never shipped or have since changed.
 | [GH384_ACCEPTANCE_MATRIX.md](GH384_ACCEPTANCE_MATRIX.md) | Workflow capacity acceptance matrix | `tests/e2e_workflow_capacity_scopes.rs` |
 | [TEST_HARNESS.md](TEST_HARNESS.md), [TESTING_GUIDELINES.md](TESTING_GUIDELINES.md), [SNAPSHOT_TESTING.md](SNAPSHOT_TESTING.md), [E2E_COVERAGE_MATRIX.md](E2E_COVERAGE_MATRIX.md) | How to run and extend the suites; RCH time caps; coverage matrix | manual (matrix regeneration tracked in `beads_rust-wqmw.4`) |
 | [CI_SUPPLY_CHAIN.md](CI_SUPPLY_CHAIN.md) | Workflow action pin policy and proof commands | `tests/workflow_*.rs` |
+| [perf/](perf/) | Release-latency budget calibration: the A/A precision analysis behind gating on the median alone, the permutation null study, and the 28 frozen per-workload budgets | `tests/bench_synthetic_scale.rs::the_frozen_release_latency_budgets_cover_the_canonical_matrix` cross-checks the budgets against the committed null study |
 | [INSTALLING.md](INSTALLING.md), [VCS_INTEGRATION.md](VCS_INTEGRATION.md), [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Install, non-git VCS, troubleshooting | manual |
 | [SWARM_SCALE_TUNING.md](SWARM_SCALE_TUNING.md), [operations/](operations/) | Lock timeouts, swarm topology, runbooks | manual |
 | [ARTIFACT_LOG_SCHEMA.md](ARTIFACT_LOG_SCHEMA.md), [WRITE_COMBINING_QUEUE_DESIGN.md](WRITE_COMBINING_QUEUE_DESIGN.md) | Artifact log schema; write-combining design (dormant module, see ARCHITECTURE.md) | manual |
