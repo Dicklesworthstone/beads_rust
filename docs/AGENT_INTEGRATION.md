@@ -793,6 +793,26 @@ MCP serve uses the same local storage contract as the CLI:
 - Handlers open fresh SQLite connections rather than sharing one long-lived
   connection across MCP calls.
 
+#### Conditional writes (`if_unchanged`)
+
+`update_issue` takes `if_unchanged`, the CLI's `--if-unchanged` precondition
+(see [`--if-unchanged`: lost updates](CLI_REFERENCE.md#if-unchanged-lost-updates)):
+pass the `updated_at` you read and the write applies only if the record has not
+moved since.
+
+```json
+{"id": "bd-abc123", "description": "...revised...", "if_unchanged": "2026-09-17T02:22:26.950413390Z"}
+```
+
+Read the value from `show_issue` and pass it verbatim; it is compared as an
+instant, so any equivalent RFC 3339 spelling of the same moment is accepted. On
+a mismatch nothing is written and the tool returns `UPDATE_PRECONDITION_FAILED`
+with `expected_updated_at` and `actual_updated_at`, marked retryable, so the
+caller can re-read and reapply. It covers label-only and comment-only updates
+as well as field writes. Use it for every read-decide-write sequence: without
+it, two agents revising the same issue overwrite each other silently, because
+each revision derives from the same base and looks legitimate on its own.
+
 ### When to Prefer MCP
 
 Use MCP when an agent is already MCP-native, needs to discover available actions

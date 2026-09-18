@@ -1901,25 +1901,43 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
 /// tool which normalises the offset or trims trailing zeros should not be
 /// told the record moved when it did not.
 fn parse_if_unchanged(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
+    parse_if_unchanged_surface(value, "--if-unchanged", "`br show <id> --json`")
+}
+
+/// The same parse for a caller whose surface is not the CLI flag (GitHub #505).
+///
+/// The MCP `update_issue` tool takes `if_unchanged` as a field and its readers
+/// call `show_issue`, so a message naming `--if-unchanged` and `br show` sends
+/// an agent looking for a flag it cannot pass. `surface` is the spelling the
+/// caller used and `read_with` names where the value comes from; the structured
+/// error's field is `surface` without its leading dashes.
+pub(crate) fn parse_if_unchanged_surface(
+    value: Option<&str>,
+    surface: &str,
+    read_with: &str,
+) -> Result<Option<DateTime<Utc>>> {
     let Some(raw) = value else {
         return Ok(None);
     };
+    let field = surface.trim_start_matches('-');
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(BeadsError::validation_with_hint(
-            "if-unchanged",
-            "--if-unchanged needs the updated_at you read; it was empty",
-            "Take it from `br show <id> --json` (the `updated_at` field).",
+            field,
+            format!("{surface} needs the updated_at you read; it was empty"),
+            format!("Take it from {read_with} (the `updated_at` field)."),
         ));
     }
     DateTime::parse_from_rfc3339(trimmed)
         .map(|parsed| Some(parsed.with_timezone(&Utc)))
         .map_err(|err| {
             BeadsError::validation_with_hint(
-                "if-unchanged",
-                format!("--if-unchanged value {trimmed:?} is not an RFC 3339 timestamp: {err}"),
-                "Pass the `updated_at` from `br show <id> --json` verbatim, e.g. \
-                 2026-09-17T02:22:26.950413390Z.",
+                field,
+                format!("{surface} value {trimmed:?} is not an RFC 3339 timestamp: {err}"),
+                format!(
+                    "Pass the `updated_at` from {read_with} verbatim, e.g. \
+                     2026-09-17T02:22:26.950413390Z."
+                ),
             )
         })
 }
