@@ -785,6 +785,7 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
         &forecast,
         &marked_at,
         &run_dir,
+        &plan.raw_witness,
         &migration.write_authority,
         &mut failed_stage,
     );
@@ -1467,6 +1468,7 @@ fn apply_reviewed_migration(
     forecast: &MigrationForecast,
     marked_at: &str,
     run_dir: &Path,
+    raw_before: &RawFamilyWitness,
     write_authority: &Arc<DatabaseFamilyWriteLock>,
     failed_stage: &mut Option<String>,
 ) -> Result<ReviewedSchemaMigrationEffectsReceipt> {
@@ -1475,6 +1477,7 @@ fn apply_reviewed_migration(
         forecast,
         marked_at,
         run_dir,
+        raw_before,
         write_authority,
         failed_stage,
     )
@@ -1537,12 +1540,53 @@ fn canonical_index_name(statement: &str) -> Result<&str> {
     Ok(name)
 }
 
+/// Build the VACUUM candidate from a disposable copy of the verified recovery
+/// snapshot, never from the live database family.
+///
+/// FrankenSQLite's VACUUM path can rewrite WAL/index state on the source
+/// connection. Running it against the authority-held live family made an
+/// interrupted migration capable of poisoning the very source it was supposed
+/// to preserve (#507). The immutable `before/` bundle remains the rollback
+/// authority; a second private copy absorbs every source-side VACUUM mutation.
+fn vacuum_candidate_from_private_source(
+    db_path: &Path,
+    candidate_path: &Path,
+    run_dir: &Path,
+    raw_before: &RawFamilyWitness,
+) -> Result<()> {
+    let before_dir = run_dir.join("before");
+    verify_backup_family(db_path, &before_dir, raw_before)?;
+
+    let retained_source = backup_component_path(&before_dir, db_path, "")?;
+    let private_source_dir = run_dir.join("maintenance-vacuum-source");
+    ensure_new_directory(&private_source_dir)?;
+    copy_family_to_backup(&retained_source, &private_source_dir, raw_before)?;
+    verify_backup_family(&retained_source, &private_source_dir, raw_before)?;
+    sync_directory(&private_source_dir)?;
+    sync_directory(run_dir)?;
+
+    let private_source =
+        backup_component_path(&private_source_dir, &retained_source, "")?;
+    let source_conn = Connection::open(private_source.to_string_lossy().into_owned())?;
+    let escaped_path = candidate_path.to_string_lossy().replace('\'', "''");
+    let candidate_result = source_conn
+        .execute(&format!("VACUUM INTO '{escaped_path}'"))
+        .map(|_| ())
+        .map_err(BeadsError::Database);
+    let close_result = close_connection(source_conn);
+    match (candidate_result, close_result) {
+        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_post_migration_maintenance(
     db_path: &Path,
     forecast: &MigrationForecast,
     marked_at: &str,
     run_dir: &Path,
+    raw_before: &RawFamilyWitness,
     write_authority: &Arc<DatabaseFamilyWriteLock>,
     failed_stage: &mut Option<String>,
 ) -> Result<ReviewedSchemaMigrationEffectsReceipt> {
@@ -1560,17 +1604,7 @@ fn run_post_migration_maintenance(
     mark_stage(failed_stage, "vacuum-candidate");
     let candidate_path = maintenance_candidate_path(db_path, run_dir)?;
     require_absent_family(&candidate_path)?;
-    let source_conn = Connection::open(db_path.to_string_lossy().into_owned())?;
-    let escaped_path = candidate_path.to_string_lossy().replace('\'', "''");
-    let candidate_result = source_conn
-        .execute(&format!("VACUUM INTO '{escaped_path}'"))
-        .map(|_| ())
-        .map_err(BeadsError::Database);
-    let close_result = close_connection(source_conn);
-    match (candidate_result, close_result) {
-        (Err(error), _) | (Ok(()), Err(error)) => return Err(error),
-        (Ok(()), Ok(())) => {}
-    }
+    vacuum_candidate_from_private_source(db_path, &candidate_path, run_dir, raw_before)?;
 
     let effects = if from == to {
         ReviewedSchemaMigrationEffectsReceipt {
@@ -4832,6 +4866,61 @@ mod tests {
 
     fn reviewed_v14_migration_context() -> (TempDir, MigrationContext) {
         reviewed_v14_migration_context_with_database_name("beads.db")
+    }
+
+    #[test]
+    fn vacuum_candidate_never_opens_or_rewrites_live_wal_family() {
+        let (_temp, migration) = reviewed_source_migration_context("beads.db", 17);
+        let mut writer =
+            Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
+        writer.execute("PRAGMA journal_mode = WAL").unwrap();
+        writer.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+        writer
+            .execute("UPDATE issues SET title = 'private vacuum source sentinel'")
+            .unwrap();
+        writer.close_without_checkpoint_in_place().unwrap();
+        drop(writer);
+
+        let logical_before = logical_witness(&migration.db_path).unwrap();
+        let raw_before = raw_family_witness(&migration.db_path).unwrap();
+        let wal_path = family_component_path(&migration.db_path, "-wal");
+        assert!(
+            fs::metadata(&wal_path).unwrap().len() > 32,
+            "fixture must retain committed WAL frames"
+        );
+
+        let run_dir = migration.beads_dir.join("private-vacuum-source-test");
+        let before_dir = run_dir.join("before");
+        ensure_new_directory(&run_dir).unwrap();
+        ensure_new_directory(&before_dir).unwrap();
+        copy_family_to_backup(&migration.db_path, &before_dir, &raw_before).unwrap();
+        verify_backup_family(&migration.db_path, &before_dir, &raw_before).unwrap();
+
+        let candidate = maintenance_candidate_path(&migration.db_path, &run_dir).unwrap();
+        require_absent_family(&candidate).unwrap();
+        vacuum_candidate_from_private_source(
+            &migration.db_path,
+            &candidate,
+            &run_dir,
+            &raw_before,
+        )
+        .unwrap();
+
+        assert_eq!(
+            raw_family_witness(&migration.db_path).unwrap(),
+            raw_before,
+            "VACUUM candidate construction must not touch any live family byte"
+        );
+        assert_eq!(logical_witness(&migration.db_path).unwrap(), logical_before);
+
+        let candidate_logical = logical_witness(&candidate).unwrap();
+        assert_eq!(candidate_logical.user_version, logical_before.user_version);
+        assert_eq!(candidate_logical.contents_sha256, logical_before.contents_sha256);
+        assert_eq!(candidate_logical.tables, logical_before.tables);
+        assert!(
+            run_dir.join("maintenance-vacuum-source").join("beads.db").is_file(),
+            "the disposable source is retained for interrupted-migration diagnosis"
+        );
     }
 
     #[test]
