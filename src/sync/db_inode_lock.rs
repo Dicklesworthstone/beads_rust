@@ -74,6 +74,61 @@ use std::fs::{File, TryLockError};
 ///   intersect actual data I/O.
 pub const DATABASE_INODE_LOCK_OFFSET: i64 = i64::MAX - 1;
 
+// Keep the platform-specific implementation of the recovery guard in this
+// sanctioned syscall module. Unlike the write-authority byte above, this
+// guard MUST conflict with SQLite's pending/reserved/shared byte ranges:
+// replacing -shm while even an idle SQLite reader retains a mapping is unsafe.
+impl crate::franken_sync::wal_index::RecoveryLock {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[allow(unsafe_code)]
+    pub(crate) fn acquire(file: File) -> Result<Self, TryLockError> {
+        use std::os::fd::AsRawFd;
+
+        let lock = libc::flock {
+            l_type: libc::c_short::try_from(libc::F_WRLCK).unwrap_or(1),
+            l_whence: libc::c_short::try_from(libc::SEEK_SET).unwrap_or(0),
+            l_start: 0x4000_0000,
+            l_len: 512,
+            l_pid: 0,
+        };
+        // SAFETY: file owns a live descriptor and lock is a fully initialized
+        // flock borrowed only for this synchronous call. An OFD lock survives
+        // unrelated closes and is released with the guard's owned File.
+        let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &lock) };
+        if rc == 0 {
+            return Ok(Self { file });
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(code) if code == libc::EAGAIN || code == libc::EACCES => {
+                Err(TryLockError::WouldBlock)
+            }
+            _ => Err(TryLockError::Error(error)),
+        }
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    pub(crate) fn acquire(_file: File) -> Result<Self, TryLockError> {
+        // Never substitute flock: it does not exclude SQLite's POSIX locks
+        // on Linux. Other platforms need a qualified byte-range guard and
+        // durable quarantine primitive before enabling this repair.
+        Err(TryLockError::Error(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "WAL-index quarantine is not supported on this platform",
+        )))
+    }
+}
+
 /// Try to acquire the exclusive database-inode authority lock, non-blocking.
 ///
 /// Returns `Err(TryLockError::WouldBlock)` when another open file description
@@ -256,6 +311,8 @@ pub fn try_lock_database_inode(file: &File) -> Result<(), TryLockError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    use std::fs::OpenOptions;
     use std::io::Write;
 
     fn temp_file(dir: &std::path::Path) -> File {
@@ -300,6 +357,47 @@ mod tests {
         let file = temp_file(dir.path());
         try_lock_database_inode(&file).expect("initial lock");
         try_lock_database_inode(&file).expect("re-lock on the same open file description");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn recovery_lock_excludes_sqlite_range_but_not_br_authority() {
+        use crate::franken_sync::wal_index::RecoveryLock;
+        let dir = tempfile::tempdir().unwrap();
+        let authority = temp_file(dir.path());
+        try_lock_database_inode(&authority).unwrap();
+        let open = || OpenOptions::new().read(true).write(true)
+            .open(dir.path().join("inode-lock-test.db")).unwrap();
+        let first = RecoveryLock::acquire(open()).unwrap();
+        assert!(matches!(RecoveryLock::acquire(open()), Err(TryLockError::WouldBlock)));
+        // Opening and closing an unrelated descriptor cannot drop the OFD lock.
+        drop(open());
+        assert!(matches!(RecoveryLock::acquire(open()), Err(TryLockError::WouldBlock)));
+        drop(first);
+        assert!(RecoveryLock::acquire(open()).is_ok());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn recovery_lock_conflicts_with_sqlite_posix_reader() {
+        use crate::franken_sync::wal_index::RecoveryLock;
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let reader = temp_file(dir.path());
+        let lock = libc::flock {
+            l_type: libc::c_short::try_from(libc::F_RDLCK).unwrap(),
+            l_whence: libc::c_short::try_from(libc::SEEK_SET).unwrap(),
+            l_start: 0x4000_0002,
+            l_len: 510,
+            l_pid: 0,
+        };
+        // SAFETY: live descriptor and fully initialized flock, borrowed only
+        // for this synchronous syscall, matching the production guard above.
+        assert_eq!(unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETLK, &lock) }, 0);
+        let candidate = OpenOptions::new().read(true).write(true)
+            .open(dir.path().join("inode-lock-test.db")).unwrap();
+        assert!(matches!(RecoveryLock::acquire(candidate), Err(TryLockError::WouldBlock)));
     }
 
     /// The database-inode authority must not conflict with SQLite-engine

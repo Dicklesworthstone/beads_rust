@@ -33,6 +33,8 @@ use asupersync::runtime::{Runtime, RuntimeBuilder};
 
 pub use fsqlite::{FrankenError, Row, SqliteValue};
 
+pub(crate) mod wal_index;
+
 // ---------------------------------------------------------------------------
 // Bridge driver
 // ---------------------------------------------------------------------------
@@ -154,7 +156,7 @@ fn retry_transient<T>(
 macro_rules! with_engine_retries {
     ($conn:expr, $sql:expr, $attempt:expr) => {{
         let first = retry_transient(&$conn, || $attempt);
-        match first {
+        let result = match first {
             Err(ref err) if schema_stale(err) => {
                 // `prepare` refreshes the schema image from the shared
                 // publication plane even when it ultimately fails to resolve.
@@ -162,7 +164,11 @@ macro_rules! with_engine_retries {
                 retry_transient(&$conn, || $attempt)
             }
             other => other,
+        };
+        if matches!(&result, Err(FrankenError::BusyRecovery)) {
+            wal_index::warn_if_poisoned($conn.path());
         }
+        result
     }};
 }
 
@@ -174,6 +180,7 @@ macro_rules! with_engine_retries {
 /// blocking method signatures.
 pub struct Connection {
     inner: fsqlite::Connection,
+    checkpoint_on_close: bool,
 }
 
 impl std::fmt::Debug for Connection {
@@ -186,24 +193,47 @@ impl std::fmt::Debug for Connection {
 
 impl Connection {
     /// Open an existing database only when its VFS handle matches the retained identity.
+    ///
+    /// The explicit recovery workflow rehearses this open on a private copy
+    /// before using it on the live family. Before admitting #507's exact
+    /// poisoned-index signature to the engine, quarantine only the derived
+    /// index under independent engine and SQLite exclusion. Ordinary and
+    /// read-only opens never take this filesystem-recovery path.
     pub fn open_existing_with_expected_identity(
         path: impl Into<String>,
         identity: fsqlite_vfs::FileIdentity,
     ) -> Result<Self, FrankenError> {
+        let path = path.into();
+        let quarantined = wal_index::quarantine_poisoned_index(&path, identity)?;
         let inner = drive(fsqlite::Connection::open_existing_with_expected_identity(
             path, identity,
         ))?;
-        Self::from_inner(inner, true)
+        let mut connection = Self::from_inner(inner, true)?;
+        if quarantined {
+            // Admission reconstructed only a cache. The doctor's raw witness
+            // contract forbids checkpointing its protected WAL into the main
+            // image when this recovery handle is closed.
+            connection.checkpoint_on_close = false;
+        }
+        Ok(connection)
     }
 
     /// Open (or create) a database at `path`.
     pub fn open(path: impl Into<String>) -> Result<Self, FrankenError> {
-        let inner = drive(fsqlite::Connection::open(path))?;
+        let path = path.into();
+        let inner = drive(fsqlite::Connection::open(path.clone())).inspect_err(|error| {
+            if matches!(error, FrankenError::BusyRecovery) {
+                wal_index::warn_if_poisoned(&path);
+            }
+        })?;
         Self::from_inner(inner, true)
     }
 
     fn from_inner(inner: fsqlite::Connection, serialized: bool) -> Result<Self, FrankenError> {
-        let connection = Self { inner };
+        let connection = Self {
+            inner,
+            checkpoint_on_close: true,
+        };
         if !serialized {
             return Ok(connection);
         }
@@ -290,14 +320,18 @@ impl Connection {
     }
 
     /// Close the connection (rolls back any active transaction, then runs the
-    /// final passive WAL checkpoint).
+    /// final passive WAL checkpoint, except for cache-recovery handles).
     pub fn close(mut self) -> Result<(), FrankenError> {
-        drive(self.inner.close_in_place())
+        self.close_in_place()
     }
 
     /// Close in place, retaining the handle on error so callers can retry.
     pub fn close_in_place(&mut self) -> Result<(), FrankenError> {
-        drive(self.inner.close_in_place())
+        if self.checkpoint_on_close {
+            drive(self.inner.close_in_place())
+        } else {
+            drive(self.inner.close_without_checkpoint_in_place())
+        }
     }
 
     /// Close without checkpointing; the caller controls checkpoint admission.
@@ -370,7 +404,7 @@ impl PreparedStatement<'_> {
 // ---------------------------------------------------------------------------
 
 pub mod compat {
-    use super::{Connection, FrankenError, drive};
+    use super::{Connection, FrankenError, drive, wal_index};
 
     pub use fsqlite::compat::OpenFlags;
 
@@ -378,7 +412,11 @@ pub mod compat {
     /// [`fsqlite::compat::open_with_flags`]).
     pub fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection, FrankenError> {
         let serialized = flags.contains(OpenFlags::SQLITE_OPEN_READ_WRITE);
-        let inner = drive(fsqlite::compat::open_with_flags(path, flags))?;
+        let inner = drive(fsqlite::compat::open_with_flags(path, flags)).inspect_err(|error| {
+            if matches!(error, FrankenError::BusyRecovery) {
+                wal_index::warn_if_poisoned(path);
+            }
+        })?;
         Connection::from_inner(inner, serialized)
     }
 }
