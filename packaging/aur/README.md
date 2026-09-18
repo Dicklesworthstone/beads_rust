@@ -15,28 +15,39 @@ A push needs **both** of the following. Earlier sessions identified only the
 first, which is why the publish never succeeded:
 
 1. **An AUR account and registered SSH key.** `ssh aur@aur.archlinux.org` must
-   authenticate. Every host tried so far (controller, Mac, ts2, trj) is denied,
-   and no AUR-specific identity is selected by any of their SSH configs. This
-   needs an account name, host and key from the operator; `br` itself never
-   performs this step.
+   authenticate. Every host tried so far (controller, Mac, ts2, trj) is denied
+   with exactly `aur@aur.archlinux.org: Permission denied (publickey).`, and no
+   AUR-specific identity is selected by any of their SSH configs. This needs an
+   account name, host and key from the operator; `br` itself never performs this
+   step.
 
 2. **A `.SRCINFO` committed beside the `PKGBUILD`.** AUR's server-side hook
    rejects any push whose repository root lacks one, so credentials alone would
    not have been enough.
 
-## `.SRCINFO` status
+## `.SRCINFO` status — validated against a `makepkg` run
 
-The `.SRCINFO` here was written by hand from `PKGBUILD`, because `makepkg` is
-not available on this machine. It is expected to be correct, but it has **not**
-been produced or verified by `makepkg`.
+This file was written by hand from `PKGBUILD` (no `makepkg` on the authoring
+machine), then checked against a `.SRCINFO` produced during the 2026-09-12
+Arch packaging session and found **byte-identical**.
 
-**Regenerate it on an Arch host before pushing**, and commit the result if it
-differs:
+That session really did run `makepkg` on this exact recipe — its log opens with
+`==> Making package: br-bin 0.6.0-1` and reports
+`Validating source_x86_64 files with sha256sums... Passed` — so the comparison
+is against a genuine Arch-environment artifact, not another hand transcription.
+
+The evidence lived only in `/tmp` and was never committed, which is why it was
+described as "retained" on `beads_rust-phm7n` while no `.SRCINFO` existed in
+this repository. It is now preserved at
+`/data/tmp/br-4e2n1-aur-evidence-20260918/` with `SHA256SUMS.txt`.
+
+Regenerating before a push is still the cheap confirmation, since `PKGBUILD`
+may have moved on:
 
 ```bash
 cd packaging/aur
 makepkg --printsrcinfo > .SRCINFO
-git diff --exit-code .SRCINFO   # empty means the hand-written file was right
+git diff --exit-code .SRCINFO   # empty means this file is still correct
 ```
 
 ## Source checksums
