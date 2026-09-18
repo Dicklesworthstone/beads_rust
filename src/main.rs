@@ -106,10 +106,12 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     // command itself is the sole mutation allowed to resume that state; doctor
     // owns a richer dedicated finding/refusal surface.
     let pending_merge_disposition = pending_merge_startup_disposition(&cli.command);
-    // A valid WAL may outlive its regenerable SHM index. Restore only that
-    // index under write + sole-opener authority, with a verified private
-    // rehearsal and unchanged durable payloads, before classifying the real
-    // pending receipt. Explicit read-only opens never take this repair path.
+    // A valid WAL may outlive its regenerable SHM index, or #507's exact
+    // initialized-zero-page poison may leave that index permanently unusable.
+    // Recover either derived-cache state under write + sole-opener authority,
+    // with a verified private rehearsal and unchanged durable payloads, before
+    // classifying the real pending receipt. Explicit read-only opens never take
+    // this repair path.
     let observational_startup = (ctx.overrides.read_only_fast_open
         && cli.no_auto_import
         && cli.no_auto_flush)
@@ -121,7 +123,7 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
             || should_preopen_storage
             || pending_merge_disposition == PendingMergeStartupDisposition::Refuse)
         && let Some((beads_dir, paths)) = ctx.beads_dir.as_deref().zip(ctx.paths.as_ref())
-        && commands::doctor_subsystems::schema_migration::missing_wal_index(&paths.db_path)?
+        && commands::doctor_subsystems::schema_migration::wal_index_needs_recovery(&paths.db_path)?
     {
         let authority = Arc::new(
             beads_rust::sync::blocking_database_family_write_lock_with_timeout(
@@ -130,7 +132,7 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
                 ctx.startup_write_lock_timeout(&cli.command),
             )?,
         );
-        commands::doctor_subsystems::schema_migration::recover_missing_wal_index(
+        commands::doctor_subsystems::schema_migration::recover_wal_index_for_startup(
             beads_dir,
             &paths.db_path,
             &authority,

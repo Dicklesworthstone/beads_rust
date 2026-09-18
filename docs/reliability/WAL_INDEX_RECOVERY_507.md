@@ -148,3 +148,8 @@ artifact sweep or upstream dependency change is part of this containment.
 ## Doctor routing
 
 `br doctor` and generic doctor mutation refusal detect #507's exact bounded WAL/index signature without opening the engine. They report `wal_index_state=initialized_zero_page_poison`, name `br doctor migrate-schema recover`, and explicitly keep generic `doctor --repair` fail-closed so WAL-only data cannot be replaced from stale JSONL.
+
+
+## Automatic writable startup recovery
+
+Writable startup now treats the exact initialized-zero-page poison the same way it already treats a missing WAL index: before pending-merge inspection or storage open, it acquires database-family authority and a verified sole-opener lease, runs the full private recovery rehearsal, preserves main/WAL/journal bytes, and then re-runs the actual pending-merge gate. Observational read-only commands remain non-mutating. A recovered index never clears or bypasses pending merge metadata; the mutation is still refused when that durable gate is present.

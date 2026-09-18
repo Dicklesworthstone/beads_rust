@@ -373,13 +373,18 @@ pub fn missing_wal_index(db_path: &Path) -> Result<bool> {
     )
 }
 
+pub fn wal_index_needs_recovery(db_path: &Path) -> Result<bool> {
+    Ok(missing_wal_index(db_path)?
+        || crate::franken_sync::wal_index::poisoned_index_present(db_path)?)
+}
+
 /// Restore a missing index before startup inspects the actual pending receipt.
 /// Main/WAL/journal bytes are preserved; this never imports or migrates data.
 ///
 /// # Errors
 /// Refuses changed authority, peer openers, invalid WALs, or recovery whose
 /// durable bytes and logical contents cannot be verified unchanged.
-pub fn recover_missing_wal_index(
+pub fn recover_wal_index_for_startup(
     beads_dir: &Path,
     db_path: &Path,
     authority: &Arc<DatabaseFamilyWriteLock>,
@@ -391,7 +396,7 @@ pub fn recover_missing_wal_index(
         });
     }
     authority.verify_database_authority()?;
-    if !missing_wal_index(db_path)? {
+    if !wal_index_needs_recovery(db_path)? {
         return Ok(());
     }
     let migration = MigrationContext {

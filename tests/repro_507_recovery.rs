@@ -390,6 +390,65 @@ fn doctor_names_poisoned_index_and_routes_to_explicit_recovery() {
 }
 
 #[test]
+fn mutating_command_auto_recovers_poisoned_index_before_pending_gate() {
+    if isolated_test("mutating_command_auto_recovers_poisoned_index_before_pending_gate") {
+        return;
+    }
+    let workspace = current_workspace(false);
+    let poisoned = poison_index(&workspace);
+    let before = protected_payload(&workspace);
+
+    let create = run_br(
+        &workspace,
+        ["create", "after automatic poisoned-index recovery", "--json"],
+        "auto_poison_recovery",
+    );
+    assert!(create.status.success(), "{} {}", create.stdout, create.stderr);
+    assert!(
+        !workspace.root.join(".beads/beads.db-shm").exists()
+            || fs::read(workspace.root.join(".beads/beads.db-shm")).unwrap() != poisoned,
+        "startup recovery must replace or rebuild the poisoned derived index"
+    );
+    assert_eq!(fs::read(workspace.root.join(".beads/beads.db")).unwrap(), before[0]);
+    assert_eq!(fs::read(workspace.root.join(".beads/beads.db-wal")).unwrap(), before[1]);
+
+    let list = run_br(
+        &workspace,
+        ["list", "--all", "--json", "--no-auto-import", "--no-auto-flush"],
+        "auto_poison_recovery_list",
+    );
+    assert!(list.status.success(), "{} {}", list.stdout, list.stderr);
+    for title in ["db-only-a", "db-only-b", "db-only-c", "after automatic poisoned-index recovery"] {
+        assert!(list.stdout.contains(title), "{title} missing from {}", list.stdout);
+    }
+}
+
+#[test]
+fn mutating_command_auto_recovers_poison_but_preserves_pending_merge_refusal() {
+    if isolated_test("mutating_command_auto_recovers_poison_but_preserves_pending_merge_refusal") {
+        return;
+    }
+    let workspace = current_workspace(true);
+    let poisoned = poison_index(&workspace);
+    let before = protected_payload(&workspace);
+    let create = run_br(
+        &workspace,
+        ["create", "must remain refused", "--json"],
+        "auto_poison_pending_refusal",
+    );
+    assert!(!create.status.success(), "{} {}", create.stdout, create.stderr);
+    let error = format!("{}{}", create.stdout, create.stderr);
+    assert!(error.contains("pending"), "{error}");
+    assert_eq!(fs::read(workspace.root.join(".beads/beads.db")).unwrap(), before[0]);
+    assert_eq!(fs::read(workspace.root.join(".beads/beads.db-wal")).unwrap(), before[1]);
+    assert!(
+        !workspace.root.join(".beads/beads.db-shm").exists()
+            || fs::read(workspace.root.join(".beads/beads.db-shm")).unwrap() != poisoned,
+        "derived index should recover before the real pending-merge gate refuses mutation"
+    );
+}
+
+#[test]
 fn corrupt_wal_and_live_peer_refuse_before_live_index_quarantine() {
     if isolated_test("corrupt_wal_and_live_peer_refuse_before_live_index_quarantine") {
         return;
