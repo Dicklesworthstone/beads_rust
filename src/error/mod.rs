@@ -488,8 +488,18 @@ impl BeadsError {
             Self::InvalidType { .. } => {
                 Some("Valid types: task, bug, feature, epic, chore, docs, question")
             }
+            // The bypass flags exist on `close` only, and this variant is
+            // raised for planning transitions too (#503): pointing a blocked
+            // `br update` at flags that subcommand does not have sent a
+            // reporter looking for an escape hatch that was not there, and past
+            // the one that was. Name where the flags live, then name the scope
+            // that actually resolves a transition gate.
             Self::PolicyViolation { .. } => Some(
-                "Fix the violation(s) above, or pass --bypass-policy --bypass-reason \"<text>\" if your project's policy.yaml allows bypass.",
+                "Fix the violation(s) above. For a transition gate, scope the requirement in .beads/policy.yaml: \
+                 workflow.required_fields takes \"from -> to\" and bare target-status keys, and \
+                 acceptance_criteria_present requires the field without requiring its checklist to be complete \
+                 (acceptance_criteria requires both). `br close` additionally accepts \
+                 --bypass-policy --bypass-reason \"<text>\" when the policy allows bypass; those flags are close-only.",
             ),
             Self::WorkflowCapacityExceeded { .. } => Some(
                 "Drain the named queue before admitting fresh work; inspect it with `br list --status <status>`.",
@@ -611,6 +621,32 @@ mod tests {
 
         assert_eq!(structured.code, ErrorCode::IoError);
         assert_eq!(err.exit_code(), 8);
+    }
+
+    /// #503: the suggestion on a policy refusal used to point every caller at
+    /// `--bypass-policy --bypass-reason`, which exist only on `br close`. A
+    /// blocked `br update` transition was therefore told to pass flags that
+    /// subcommand does not have, and not told about the scoping that actually
+    /// resolves a transition gate.
+    #[test]
+    fn policy_violation_suggestion_names_the_scope_and_marks_bypass_close_only() {
+        let err = BeadsError::PolicyViolation {
+            issue_id: "bd-abc123".to_string(),
+            summary: "transition 'draft -> in_planning' requires all acceptance criteria \
+                      to be satisfied for bd-abc123; 4 unchecked item(s) remain"
+                .to_string(),
+            violations: Vec::new(),
+        };
+        let suggestion = err.suggestion().expect("policy violations carry guidance");
+        assert!(
+            suggestion.contains("workflow.required_fields")
+                && suggestion.contains("acceptance_criteria_present"),
+            "the scope that resolves a transition gate must be named: {suggestion}"
+        );
+        assert!(
+            suggestion.contains("close-only"),
+            "the bypass flags must be marked as close-only: {suggestion}"
+        );
     }
 
     #[test]
