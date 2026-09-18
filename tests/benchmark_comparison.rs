@@ -2013,6 +2013,99 @@ mod matched_arithmetic {
         assert!(uncertainty.p95.lower.is_none());
     }
 
+    /// A degraded candidate must fail with a diagnostic a human can act on
+    /// (bead `beads_rust-azxef.10`: "require a nonzero failure with a
+    /// diagnostic naming command, budget and measured delta").
+    ///
+    /// Asserted on the actual receipt string rather than only on the exit code,
+    /// because an exit code alone does not let anyone reproduce or argue with
+    /// the verdict. The diagnostic must also state which leg decided, so a
+    /// reader never infers that a `Pass` covered tail latency.
+    #[test]
+    fn a_degraded_candidate_fails_with_a_diagnostic_naming_command_budget_and_delta() {
+        let baseline = control(vec![100.0; 198]);
+        let candidate = control(vec![150.0; 198]);
+        let result = compare_matched_runs(Some(&baseline), &candidate, 20.0);
+
+        assert_eq!(result.state, MatchedState::Regression);
+        assert_eq!(
+            result.exit_code(),
+            1,
+            "a degraded candidate must exit nonzero"
+        );
+
+        let diagnostic = &result.diagnostic;
+        // The command under measurement.
+        assert!(
+            diagnostic.contains("list --json"),
+            "diagnostic must name the command: {diagnostic}"
+        );
+        // The budget it was judged against.
+        assert!(
+            diagnostic.contains("budget 20.000%"),
+            "diagnostic must name the budget: {diagnostic}"
+        );
+        // The measured delta, in absolute and relative terms.
+        assert!(
+            diagnostic.contains("median delta +50.000000 ms (+50.000%)"),
+            "diagnostic must name the measured median delta: {diagnostic}"
+        );
+        // The verdict, and which leg produced it.
+        assert!(
+            diagnostic.contains("Regression"),
+            "diagnostic must state the verdict: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("MEDIAN leg only"),
+            "diagnostic must say which leg decided: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("tail latency ungated"),
+            "diagnostic must not let a reader assume the tail was covered: {diagnostic}"
+        );
+        // Enough provenance to reproduce the comparison from the receipt.
+        let uncertainty = result.uncertainty.as_ref().unwrap();
+        assert_eq!(uncertainty.block_count, 99);
+        assert!(uncertainty.gating_scope.contains("median leg only"));
+    }
+
+    /// A known-good result must pass with the same machinery that fails the
+    /// degraded one, so the gate is not simply always-red (bead
+    /// `beads_rust-azxef.10`: "actual known-good result passes, degraded result
+    /// fails, unknown/mismatched result cannot pass").
+    #[test]
+    fn a_known_good_candidate_passes_and_an_unknown_one_cannot() {
+        let baseline = control(vec![100.0; 198]);
+
+        // Known-good: a 5% slowdown against a 20% budget.
+        let good = control(vec![105.0; 198]);
+        let pass = compare_matched_runs(Some(&baseline), &good, 20.0);
+        assert_eq!(pass.state, MatchedState::Pass);
+        assert_eq!(pass.exit_code(), 0);
+        assert!(pass.diagnostic.contains("median delta +5.000000 ms"));
+
+        // Unknown: no budget at all can never be green, only inconclusive.
+        let unknown = compare_matched_runs(Some(&baseline), &good, f64::NAN);
+        assert_eq!(unknown.state, MatchedState::Inconclusive);
+        assert_eq!(unknown.exit_code(), 2);
+        assert!(unknown.budget_pct.is_none());
+        assert!(
+            unknown.diagnostic.contains("budget unavailable"),
+            "{}",
+            unknown.diagnostic
+        );
+
+        // Missing baseline: refusal, never green.
+        let absent = compare_matched_runs(None, &good, 20.0);
+        assert_eq!(absent.state, MatchedState::Inconclusive);
+        assert_eq!(absent.exit_code(), 2);
+        assert!(
+            absent.diagnostic.contains("missing baseline receipt"),
+            "{}",
+            absent.diagnostic
+        );
+    }
+
     /// The same regression at the gating floor is ruled on, and the median leg
     /// alone decides it even though the p95 leg is finite and available.
     #[test]

@@ -1104,9 +1104,16 @@ impl QuantileUncertainty {
 /// Compare raw timings without filtering outliers. Median averages the middle
 /// two values for even counts; p95 uses nearest rank (ceil(0.95*n), one-based).
 /// Source/lockfile/binary provenance may differ intentionally; all other metadata
-/// must match. Conditional IID-block quantile bounds decide the gate: both
-/// upper bounds must meet budget to pass; either lower bound can prove a
-/// regression. Extrema remain descriptive and never substitute for uncertainty.
+/// must match. Conditional IID-block quantile bounds decide the gate, and since
+/// `beads_rust-zxfz.1` only the **median** leg does so: its upper bound must
+/// meet budget to pass and its lower bound can prove a regression. The p95 leg
+/// is still computed, reported and serialized, but does not decide anything —
+/// at 99 blocks its upper endpoint is the candidate's largest observation, so
+/// gating on it made a uniform A/A-clean budget cost 185%. **Tail latency is
+/// therefore not gated.** See `P95_NON_GATING_RATIONALE` and
+/// `docs/perf/AA_PRECISION_ANALYSIS.md`. A verdict also requires at least
+/// `MIN_GATING_BLOCKS` blocks, the regime the committed budgets were calibrated
+/// in. Extrema remain descriptive and never substitute for uncertainty.
 /// An invalid/absent budget retains descriptive deltas but cannot pass the gate.
 pub fn compare_matched_runs(
     baseline: Option<&MatchedRun>,
@@ -1162,8 +1169,13 @@ pub fn compare_matched_runs(
     let inference_diagnostic = match inference {
         Ok(uncertainty) => {
             comparison.state = uncertainty.classify(budget_pct);
+            let gated = if uncertainty.block_count >= MIN_GATING_BLOCKS {
+                "verdict from the MEDIAN leg only (p95 reported, not gated; tail latency ungated)"
+            } else {
+                "no verdict: fewer than MIN_GATING_BLOCKS blocks, so the calibrated budgets do not apply"
+            };
             let diagnostic = format!(
-                "conditional IID-block 95% joint median/p95 bounds for this comparison only; {} blocks; median ranks [{}, {}], p95 ranks [{}, {}]; unbounded endpoints remain null",
+                "conditional IID-block 95% bounds for this comparison only; {gated}; {} blocks; median ranks [{}, {}], p95 ranks [{}, {}]; unbounded endpoints remain null",
                 uncertainty.block_count,
                 uncertainty.median.lower_rank,
                 uncertainty.median.upper_rank,
