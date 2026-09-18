@@ -237,7 +237,7 @@ fn hash_file(file: &mut File) -> io::Result<String> {
     loop {
         let count = file.read(&mut buffer)?;
         if count == 0 {
-            return Ok(format!("{:x}", hash.finalize()));
+            return Ok(crate::util::hex_encode(&hash.finalize()));
         }
         hash.update(&buffer[..count]);
     }
