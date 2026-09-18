@@ -81,11 +81,7 @@ fn succeeds(workspace: &BrWorkspace, args: &[&str], label: &str) -> Value {
 
 fn current_workspace(pending: bool) -> BrWorkspace {
     let workspace = BrWorkspace::new();
-    succeeds(
-        &workspace,
-        &["init", "--prefix", "wal", "--json"],
-        "init",
-    );
+    succeeds(&workspace, &["init", "--prefix", "wal", "--json"], "init");
     let mut ids = Vec::new();
     for ordinal in 0..3 {
         let title = format!("unexported issue {ordinal}");
@@ -131,7 +127,9 @@ fn current_workspace(pending: bool) -> BrWorkspace {
     let mut connection = Connection::open(db.to_string_lossy().into_owned()).unwrap();
     connection.execute("PRAGMA journal_mode = WAL").unwrap();
     connection.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
-    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    connection
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
     connection
         .execute_with_params(
             "UPDATE issues SET title = ?1",
@@ -322,12 +320,7 @@ fn doctor_names_poisoned_index_and_routes_to_explicit_recovery() {
 
     let doctor = run_br(
         &workspace,
-        [
-            "doctor",
-            "--json",
-            "--no-auto-import",
-            "--no-auto-flush",
-        ],
+        ["doctor", "--json", "--no-auto-import", "--no-auto-flush"],
         "poisoned_doctor",
     );
     assert!(!doctor.status.success());
@@ -348,7 +341,10 @@ fn doctor_names_poisoned_index_and_routes_to_explicit_recovery() {
         "br doctor migrate-schema recover"
     );
     let remediation = pending["details"]["remediation"].as_str().unwrap();
-    assert!(remediation.contains("migrate-schema recover"), "{remediation}");
+    assert!(
+        remediation.contains("migrate-schema recover"),
+        "{remediation}"
+    );
     assert!(remediation.contains("Do not run generic"), "{remediation}");
     assert_eq!(protected_payload(&workspace), before);
     assert_eq!(
@@ -399,10 +395,19 @@ fn mutating_command_auto_recovers_poisoned_index_before_pending_gate() {
 
     let create = run_br(
         &workspace,
-        ["create", "after automatic poisoned-index recovery", "--json"],
+        [
+            "create",
+            "after automatic poisoned-index recovery",
+            "--json",
+        ],
         "auto_poison_recovery",
     );
-    assert!(create.status.success(), "{} {}", create.stdout, create.stderr);
+    assert!(
+        create.status.success(),
+        "{} {}",
+        create.stdout,
+        create.stderr
+    );
     assert!(
         !workspace.root.join(".beads/beads.db-shm").exists()
             || fs::read(workspace.root.join(".beads/beads.db-shm")).unwrap() != poisoned,
@@ -413,12 +418,27 @@ fn mutating_command_auto_recovers_poisoned_index_before_pending_gate() {
     // the new mutation instead of asserting byte neutrality after a write.
     let list = run_br(
         &workspace,
-        ["list", "--all", "--json", "--no-auto-import", "--no-auto-flush"],
+        [
+            "list",
+            "--all",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
         "auto_poison_recovery_list",
     );
     assert!(list.status.success(), "{} {}", list.stdout, list.stderr);
-    for title in ["db-only-a", "db-only-b", "db-only-c", "after automatic poisoned-index recovery"] {
-        assert!(list.stdout.contains(title), "{title} missing from {}", list.stdout);
+    for title in [
+        "db-only-a",
+        "db-only-b",
+        "db-only-c",
+        "after automatic poisoned-index recovery",
+    ] {
+        assert!(
+            list.stdout.contains(title),
+            "{title} missing from {}",
+            list.stdout
+        );
     }
 }
 
@@ -435,11 +455,22 @@ fn mutating_command_auto_recovers_poison_but_preserves_pending_merge_refusal() {
         ["create", "must remain refused", "--json"],
         "auto_poison_pending_refusal",
     );
-    assert!(!create.status.success(), "{} {}", create.stdout, create.stderr);
+    assert!(
+        !create.status.success(),
+        "{} {}",
+        create.stdout,
+        create.stderr
+    );
     let error = format!("{}{}", create.stdout, create.stderr);
     assert!(error.contains("pending"), "{error}");
-    assert_eq!(fs::read(workspace.root.join(".beads/beads.db")).unwrap(), before[0]);
-    assert_eq!(fs::read(workspace.root.join(".beads/beads.db-wal")).unwrap(), before[1]);
+    assert_eq!(
+        fs::read(workspace.root.join(".beads/beads.db")).unwrap(),
+        before[0]
+    );
+    assert_eq!(
+        fs::read(workspace.root.join(".beads/beads.db-wal")).unwrap(),
+        before[1]
+    );
     assert!(
         !workspace.root.join(".beads/beads.db-shm").exists()
             || fs::read(workspace.root.join(".beads/beads.db-shm")).unwrap() != poisoned,
