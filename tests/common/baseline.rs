@@ -812,6 +812,10 @@ pub struct QuantileUncertainty {
     pub confidence_level: f64,
     pub one_sided_error_probability: f64,
     pub block_count: usize,
+    /// Which legs decide the verdict, and why the other one does not. Carried
+    /// in every receipt so a reader cannot mistake a `Pass` for a statement
+    /// about tail latency. See [`P95_NON_GATING_RATIONALE`].
+    pub gating_scope: String,
     pub median: QuantileInterval,
     pub p95: QuantileInterval,
 }
@@ -1019,29 +1023,77 @@ fn infer_quantiles(
         confidence_level: 0.95,
         one_sided_error_probability: QUANTILE_TAIL_ALPHA,
         block_count: baseline_extrema.0.len(),
+        gating_scope: P95_NON_GATING_RATIONALE.to_string(),
         median: quantile_interval(&baseline_extrema, &candidate_extrema, 1, 2)?,
         p95: quantile_interval(&baseline_extrema, &candidate_extrema, 19, 20)?,
     })
 }
 
+/// Why the p95 interval is reported but does not gate (bead `beads_rust-zxfz.1`).
+///
+/// `quantile_ranks` is an exact binomial order-statistic construction, and at
+/// the 99 ABBA blocks this harness collects it answers honestly that 99 blocks
+/// cannot bound a 0.95 quantile from above at `QUANTILE_TAIL_ALPHA`: the p95
+/// rank interval is `[88, 99]`, so the upper endpoint is rank 99 of 99 — the
+/// largest block maximum, i.e. the single largest observation on the candidate
+/// side. Comparing a sample maximum against the 88th-smallest baseline block
+/// minimum is not a p95 comparison, and the measured consequence on real A/A
+/// data (identical binaries, so the true effect is zero) was p95 upper bounds
+/// from 8.7% to 1029.0% across the 28 canonical workloads. Since `Pass`
+/// previously required both legs, that leg alone made a uniform budget
+/// admitting 27 of 28 workloads under A/A cost 185%, which is not a
+/// performance contract.
+///
+/// Getting the p95 upper endpoint off the sample maximum needs 199 blocks, and
+/// reaching an effective quantile near 0.976 needs 495 blocks — a five-fold
+/// sampling increase, roughly 10 to 20 hours of measurement per candidate. The
+/// median leg needs no such increase: its interval at 99 blocks is `[37, 63]`,
+/// and its A/A upper bounds ran 2.5% to 55.3%, each sitting inside its own
+/// permutation null.
+///
+/// So the p95 interval stays computed, serialized and retained as evidence —
+/// dropping the computation would destroy tail information that a future
+/// higher-sample campaign needs — but it does not decide the gate. Tail
+/// latency is consequently NOT gated by this comparator today.
+const P95_NON_GATING_RATIONALE: &str = "p95 interval retained as evidence only: at 99 ABBA blocks its exact binomial upper endpoint is rank 99 of 99, the candidate's largest observation, which bounds nothing useful (measured A/A range 8.7%-1029.0% at a true zero effect). Gating on the median leg only, and only at or above MIN_GATING_BLOCKS. Tail latency is not gated; a 199-block campaign is required before p95 can gate.";
+
+/// The smallest block count whose verdict this comparator will state.
+///
+/// Before the p95 leg was dropped it supplied this bound as a side effect: its
+/// upper rank exceeds the block count below 99 blocks, leaving `p95.upper`
+/// unbounded and forcing `Inconclusive`. Gating on the median leg alone removes
+/// that accident — the median interval is bounded from 10 blocks up — so a
+/// 20-sample run would otherwise start returning `Pass`.
+///
+/// Keeping the floor explicit preserves the sampling discipline and ties the
+/// verdict to the regime the budgets were calibrated in: the per-workload
+/// budgets in `docs/perf/release_latency_budgets.json` were derived from a
+/// 99-block A/A permutation null, and they do not transfer to a smaller
+/// sample. Below this floor the comparator reports its measurements and
+/// refuses to render a verdict.
+const MIN_GATING_BLOCKS: usize = 99;
+
 impl QuantileUncertainty {
+    /// The median leg decides; the p95 leg is evidence. See
+    /// [`P95_NON_GATING_RATIONALE`] and [`MIN_GATING_BLOCKS`].
     fn classify(&self, budget_pct: f64) -> MatchedState {
-        if !budget_pct.is_finite() || budget_pct < 0.0 {
+        if !budget_pct.is_finite() || budget_pct < 0.0 || self.block_count < MIN_GATING_BLOCKS {
             return MatchedState::Inconclusive;
         }
-        let intervals = [&self.median, &self.p95];
         let budget_ms = |delta: &TimingDelta| delta.baseline_ms * (budget_pct / 100.0);
-        if intervals.iter().any(|interval| {
-            interval.lower.as_ref().is_some_and(|delta| {
-                budget_ms(delta).is_finite() && delta.delta_ms > budget_ms(delta)
-            })
-        }) {
+        if self
+            .median
+            .lower
+            .as_ref()
+            .is_some_and(|delta| budget_ms(delta).is_finite() && delta.delta_ms > budget_ms(delta))
+        {
             MatchedState::Regression
-        } else if intervals.iter().all(|interval| {
-            interval.upper.as_ref().is_some_and(|delta| {
-                budget_ms(delta).is_finite() && delta.delta_ms <= budget_ms(delta)
-            })
-        }) {
+        } else if self
+            .median
+            .upper
+            .as_ref()
+            .is_some_and(|delta| budget_ms(delta).is_finite() && delta.delta_ms <= budget_ms(delta))
+        {
             MatchedState::Pass
         } else {
             MatchedState::Inconclusive
