@@ -3873,37 +3873,13 @@ fn execute_import(
         && (args.force || args.rebuild || import_rewrote_storage)
         && !skip_heavy_import_maintenance
     {
-        // Drain the WAL before VACUUM/REINDEX so the snapshot they operate
-        // on matches what's actually on disk. Without this, fsqlite's
-        // post-import MVCC state lags behind and VACUUM fails silently with
-        // "database is busy (snapshot conflict on pages)", leaving the
-        // free-space / partial-index corruption that triggered issue #248
-        // and frankentorch-dbp.
-        if let Err(e) = storage.checkpoint_full() {
-            warn!(
-                error = %e,
-                db_path = %db_path.display(),
-                "Full WAL checkpoint after JSONL import failed (non-fatal)"
-            );
-        }
-        if let Err(e) = storage.execute_raw("VACUUM") {
-            warn!(error = %e, "VACUUM after JSONL import failed (non-fatal); DB may still contain free-space corruption");
-        }
-        if let Err(e) = storage.execute_raw("REINDEX") {
-            warn!(error = %e, "REINDEX after JSONL import failed (non-fatal); partial-index entries may be inconsistent");
-        }
-        // Final compaction via `VACUUM INTO` + atomic rename. fsqlite's
-        // in-place VACUUM does not truncate the trailing pages that its
-        // REINDEX leaves orphaned, so upstream sqlite3's `PRAGMA
-        // integrity_check` reports `Page N: never used` on the rebuilt
-        // file (issue #248). `VACUUM INTO` sidesteps the bug because it
-        // writes a brand-new compacted file from the reachable page set,
-        // page count and layout matching what `sqlite3 "VACUUM INTO"`
-        // would produce. The helper runs its own pre-VACUUM-INTO WAL
-        // checkpoint to drain the frames the VACUUM/REINDEX above just
-        // wrote. Once it closes the old handle, reopen failures must abort
-        // this import rather than letting subsequent metadata updates run
-        // against a throwaway placeholder.
+        // Final maintenance is isolated from the live tracker. The compaction
+        // helper checkpoints once, copies the main database into a private
+        // recovery-directory source, and runs VACUUM/REINDEX/VACUUM INTO
+        // there. Only the attested candidate crosses the existing atomic
+        // installation boundary, so an interrupted source VACUUM cannot
+        // poison the live WAL-index (#507). Reopen failures still abort this
+        // import rather than letting metadata updates use a placeholder.
         let placeholder = crate::storage::SqliteStorage::open_memory()?;
         let original_storage = std::mem::replace(storage, placeholder);
         match config::compact_database_via_vacuum_into_in_place(

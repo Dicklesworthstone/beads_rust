@@ -726,9 +726,15 @@ fn refuse_doctor_mutation_if_merge_pending(
             // the case where the generic "restore read-only access" advice is
             // actively misleading, so name `migrate-schema` and say plainly
             // that repair is the wrong tool for it.
-            let hint = StalledMigrationHint::probe(db_path);
-            let schema_remediation = hint.remediation();
-            let reason = if schema_remediation.is_some() {
+            let hint = DatabaseAdmissionHint::probe(db_path);
+            let remediation = hint.remediation();
+            let reason = if hint.is_poisoned_wal_index() {
+                format!(
+                    "could not prove that no sync merge is pending ({error}); doctor mutation \
+                     fails closed because the derived WAL index is poisoned. Preserve the WAL \
+                     and run `br doctor migrate-schema recover`"
+                )
+            } else if hint.is_specific() {
                 format!(
                     "could not prove that no sync merge is pending ({error}); doctor mutation \
                      fails closed, and this database's schema version says repair is not the \
@@ -745,7 +751,7 @@ fn refuse_doctor_mutation_if_merge_pending(
                 "pending": "unknown",
                 "database_path": db_path.display().to_string(),
                 "inspection_error": error.to_string(),
-                "remediation": schema_remediation.unwrap_or_else(|| "Restore read-only access to the database family and rerun `br doctor` before attempting repair.".to_string()),
+                "remediation": remediation.unwrap_or_else(|| "Restore read-only access to the database family and rerun `br doctor` before attempting repair.".to_string()),
             });
             merge_json_object(&mut evidence, hint.json_details());
             (reason, evidence)
@@ -1231,6 +1237,63 @@ impl StalledMigrationHint {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatabaseAdmissionHint {
+    PoisonedWalIndex,
+    Schema(StalledMigrationHint),
+    Indeterminate,
+}
+
+impl DatabaseAdmissionHint {
+    fn probe(db_path: &Path) -> Self {
+        if crate::franken_sync::wal_index::poisoned_index_present(db_path).unwrap_or(false) {
+            return Self::PoisonedWalIndex;
+        }
+        match StalledMigrationHint::probe(db_path) {
+            StalledMigrationHint::Indeterminate => Self::Indeterminate,
+            hint => Self::Schema(hint),
+        }
+    }
+
+    fn remediation(self) -> Option<String> {
+        match self {
+            Self::PoisonedWalIndex => Some(
+                "The database and WAL are present, but the derived WAL index is in the known \
+                 initialized-zero-page poison state from GitHub #507. Preserve the complete \
+                 database family and run `br doctor migrate-schema recover`; that command \
+                 rehearses recovery on a private copy and retains the poisoned index as evidence \
+                 before live admission. Do not run generic `br doctor --repair` or delete the \
+                 WAL: committed records may exist only in WAL."
+                    .to_string(),
+            ),
+            Self::Schema(hint) => hint.remediation(),
+            Self::Indeterminate => None,
+        }
+    }
+
+    fn json_details(self) -> serde_json::Value {
+        match self {
+            Self::PoisonedWalIndex => serde_json::json!({
+                "wal_index_state": "initialized_zero_page_poison",
+                "wal_index_recovery": "explicit",
+                "recovery_command": "br doctor migrate-schema recover",
+                "generic_repair_safe": false,
+                "schema_state": "independent_of_schema_version",
+            }),
+            Self::Schema(hint) => hint.json_details(),
+            Self::Indeterminate => StalledMigrationHint::Indeterminate.json_details(),
+        }
+    }
+
+    fn is_specific(self) -> bool {
+        !matches!(self, Self::Indeterminate)
+    }
+
+    fn is_poisoned_wal_index(self) -> bool {
+        matches!(self, Self::PoisonedWalIndex)
+    }
+}
+
 /// The reviewed migration source range, rendered for operator-facing text.
 fn reviewed_migration_source_versions_display() -> String {
     REVIEWED_MIGRATION_SOURCE_VERSIONS
@@ -1275,20 +1338,26 @@ fn check_pending_sync_merge(db_path: &Path, checks: &mut Vec<CheckResult>) {
             // could not be read. An unfinished schema migration lands here
             // too, with reads working perfectly — so when the header proves
             // that is what happened, name the command that recovers it.
-            let hint = StalledMigrationHint::probe(db_path);
+            let hint = DatabaseAdmissionHint::probe(db_path);
             let mut details = serde_json::json!({
                 "pending": "unknown",
                 "database_path": db_path.display().to_string(),
                 "remediation": hint.remediation().unwrap_or_else(|| "Restore read-only access to the database family, then rerun `br doctor`. Mutating commands must remain disabled until pending merge state can be inspected.".to_string()),
             });
             merge_json_object(&mut details, hint.json_details());
+            let message = if hint.is_poisoned_wal_index() {
+                format!(
+                    "Could not inspect pending sync-merge state because the derived WAL index is \
+                     in the initialized-zero-page poison state: {error}"
+                )
+            } else {
+                format!("Could not prove that no sync merge is pending: {error}")
+            };
             push_check(
                 checks,
                 "sync.merge_pending",
                 CheckStatus::Error,
-                Some(format!(
-                    "Could not prove that no sync merge is pending: {error}"
-                )),
+                Some(message),
                 Some(details),
             );
         }
@@ -1777,9 +1846,10 @@ fn report_has_page_corruption(report: &DoctorReport) -> bool {
 /// orphaned pages, B-tree malformation) that arise from frankensqlite's B-tree
 /// layer.
 ///
-/// Run in-place VACUUM first, then try to install a compacted copy via VACUUM
-/// INTO. If upstream sqlite3 still reports `Page N: never used` afterward,
-/// the caller escalates to a JSONL rebuild.
+/// Build the VACUUM/REINDEX/VACUUM-INTO candidate from a private checkpointed
+/// source and install it atomically. Heavy maintenance never runs against the
+/// live family (#507). If upstream sqlite3 still reports `Page N: never used`
+/// afterward, the caller escalates to a JSONL rebuild.
 fn acquire_doctor_database_write_authority(
     beads_dir: &Path,
     db_path: &Path,
@@ -1832,24 +1902,25 @@ fn repair_via_vacuum(
         }
         match open_doctor_storage_under_write_authority(db_path, write_authority) {
             Ok(storage) => {
-                if let Err(err) = storage.execute_raw("VACUUM") {
-                    tracing::warn!(path = %db_path.display(), error = %err, "VACUUM failed");
-                    return;
-                }
-
-                repair.vacuumed = true;
+                // #507: never run source-side VACUUM against the live family.
+                // The shared compaction helper checkpoints once, copies the
+                // resulting main database into .br_recovery, and performs
+                // VACUUM/REINDEX/VACUUM INTO only on that private source.
+                // The live namespace changes only at its attested atomic
+                // candidate-install boundary.
                 match config::compact_database_via_vacuum_into_in_place(storage, db_path, None) {
                     Ok(_storage) => {
+                        repair.vacuumed = true;
                         tracing::info!(
                             path = %db_path.display(),
-                            "VACUUM plus VACUUM INTO compaction completed successfully"
+                            "Private-source VACUUM compaction completed successfully"
                         );
                     }
                     Err(err) => {
                         tracing::warn!(
                             path = %db_path.display(),
                             error = %err,
-                            "VACUUM INTO compaction failed after VACUUM"
+                            "Private-source VACUUM compaction failed; live family retained"
                         );
                     }
                 }
@@ -23309,6 +23380,34 @@ mod tests {
 
     #[test]
     fn doctor_raw_repairs_preserve_peer_wal_and_checkpoint_only_when_alone() {
+        // Like config's run_compaction_test_in_subprocess, isolate the fixture
+        // before opening any leases: a parallel test's child can inherit a
+        // lease and keep it alive after drop(peer) (GitHub #506).
+        const CHILD_ENV: &str = "BR_TEST_ISOLATED_DOCTOR_RAW_REPAIRS";
+        const TEST_NAME: &str = "cli::commands::doctor::tests::doctor_raw_repairs_preserve_peer_wal_and_checkpoint_only_when_alone";
+        if std::env::var(CHILD_ENV).as_deref() != Ok(TEST_NAME) {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    TEST_NAME,
+                    "--nocapture",
+                    "--test-threads=1",
+                    "--format=pretty",
+                    "--color=never",
+                ])
+                .env(CHILD_ENV, TEST_NAME)
+                .output()
+                .expect("run isolated doctor raw repair test");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains(&format!("test {TEST_NAME} ... ok")),
+                "isolated doctor raw repair test failed: {}\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("beads.db");
         drop(SqliteStorage::open(&db_path).unwrap());
@@ -23366,6 +23465,12 @@ mod tests {
         repair_partial_indexes_under_write_authority(&db_path, &mut repair, None, &write_authority);
         assert!(repair.indexes_reindexed);
         assert_eq!(fs::read(&db_path).unwrap(), main_before);
+        // Raw repair connections must not release the live peer's protection.
+        let wal_after_repairs = fs::read(&wal_path).unwrap();
+        let error = checkpoint_wal_truncate(&db_path, &write_authority).unwrap_err();
+        assert!(matches!(error, BeadsError::SyncConflict { .. }));
+        assert_eq!(fs::read(&db_path).unwrap(), main_before);
+        assert_eq!(fs::read(&wal_path).unwrap(), wal_after_repairs);
         drop(peer);
         checkpoint_wal_truncate(&db_path, &write_authority).unwrap();
         let storage = SqliteStorage::open(&db_path).unwrap();

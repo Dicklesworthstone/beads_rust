@@ -630,6 +630,7 @@ fn serve_speaks_mcp_over_stdio_and_mutations_reach_the_workspace() {
         "resources/read beads://issue/{new_id}: {resource}"
     );
     exercise_acceptance_over_mcp(&mut client, root, &new_id);
+    exercise_if_unchanged_over_mcp(&mut client, &new_id);
 
     client.call_tool(
         "close_issue",
@@ -730,6 +731,84 @@ fn mcp_fixed_resources_and_issue_template_are_all_reachable() {
         "{status}: {stderr}"
     );
     assert!(!stderr.contains("Failed to register resource"), "{stderr}");
+}
+
+/// `update_issue`'s lost-update precondition over MCP (GitHub #505).
+///
+/// The CLI has had `--if-unchanged` since #500; the MCP tool is what agents
+/// actually write through, and read-decide-write is its normal shape. Both
+/// application paths are exercised, because they enforce the precondition in
+/// different places: a field update is checked inside `update_issue`'s write
+/// transaction, while a label-only update never calls it.
+fn exercise_if_unchanged_over_mcp(client: &mut McpClient, id: &str) {
+    let read = client.call_tool("show_issue", json!({"id": id}));
+    let stamp = read["updated_at"]
+        .as_str()
+        .unwrap_or_else(|| panic!("show_issue must expose updated_at: {read}"))
+        .to_string();
+
+    // The value just read still matches, so the write applies.
+    let applied = client.call_tool(
+        "update_issue",
+        json!({"id": id, "priority": "2", "if_unchanged": stamp}),
+    );
+    assert!(!applied.is_null(), "conditional update returned nothing");
+
+    // That write moved updated_at, so replaying the same precondition — the
+    // stale read every lost update starts from — must now be refused.
+    let error = client.tool_error(
+        "update_issue",
+        json!({"id": id, "priority": "3", "if_unchanged": stamp}),
+    );
+    assert_eq!(
+        error["data"]["error_type"], "UPDATE_PRECONDITION_FAILED",
+        "a stale if_unchanged must refuse the write: {error}"
+    );
+
+    // A label-only update takes the path that never reaches `update_issue`, so
+    // it needs its own check; without one, `if_unchanged` was silently ignored
+    // for exactly the edits that are easiest to make concurrently.
+    let label_error = client.tool_error(
+        "update_issue",
+        json!({"id": id, "labels_add": ["stale-write"], "if_unchanged": stamp}),
+    );
+    assert_eq!(
+        label_error["data"]["error_type"], "UPDATE_PRECONDITION_FAILED",
+        "a stale if_unchanged must refuse a label-only write too: {label_error}"
+    );
+    let after = client.call_tool("show_issue", json!({"id": id}));
+    assert!(
+        !contains_text(&after, "stale-write"),
+        "a refused label write must not have been applied: {after}"
+    );
+
+    // A fresh read makes the same label edit legal, so the precondition is not
+    // simply rejecting label updates.
+    let fresh = client.call_tool("show_issue", json!({"id": id}))["updated_at"]
+        .as_str()
+        .expect("updated_at")
+        .to_string();
+    client.call_tool(
+        "update_issue",
+        json!({"id": id, "labels_add": ["stale-write"], "if_unchanged": fresh}),
+    );
+    let labelled = client.call_tool("show_issue", json!({"id": id}));
+    assert!(
+        contains_text(&labelled, "stale-write"),
+        "a current if_unchanged must let the label write through: {labelled}"
+    );
+
+    // An unusable value is a usage error, and the message has to name the field
+    // the caller can actually pass rather than the CLI flag.
+    let malformed = client.tool_error(
+        "update_issue",
+        json!({"id": id, "priority": "2", "if_unchanged": "yesterday"}),
+    );
+    let text = malformed.to_string();
+    assert!(
+        text.contains("if_unchanged") && !text.contains("--if-unchanged"),
+        "the refusal must name the MCP field, not the CLI flag: {malformed}"
+    );
 }
 
 fn assert_policy_refusal_unchanged(

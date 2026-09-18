@@ -2625,58 +2625,11 @@ fn rebuild_database_family(
         fresh_witness,
     )?;
 
-    // Drain the WAL to the main DB file so the follow-up maintenance (VACUUM,
-    // REINDEX, VACUUM INTO) operates against what is actually on disk.
-    // Without this, fsqlite's post-import MVCC state can lag behind and
-    // maintenance silently fails with "database is busy (snapshot conflict
-    // on pages: page N > snapshot db_size M)", leaving the corruption it
-    // was supposed to clean up in place.
-    if let Err(e) = storage.checkpoint_full() {
-        tracing::warn!(
-            error = %e,
-            db_path = %db_path.display(),
-            "Full WAL checkpoint after rebuild failed (non-fatal)"
-        );
-    }
-
-    // Post-rebuild VACUUM to eliminate freeblock accounting anomalies that
-    // frankensqlite's B-tree layer may leave behind during bulk import.
-    // Without this, C sqlite3's `PRAGMA integrity_check` can report
-    // "free space corruption" even though the data is intact (issue #237).
-    if let Err(e) = storage.execute_raw("VACUUM") {
-        tracing::warn!(
-            error = %e,
-            db_path = %db_path.display(),
-            "VACUUM after rebuild failed (non-fatal); on-disk DB may still contain free-space corruption"
-        );
-    }
-
-    // Post-rebuild REINDEX to fix partial-index row mismatches that
-    // frankensqlite's B-tree layer can introduce during bulk insert.
-    // VACUUM rewrites pages but does not rebuild index entries; without
-    // REINDEX, `PRAGMA integrity_check` reports "row N missing from index"
-    // for partial indexes like idx_issues_list_active_order (issue #246).
-    if let Err(e) = storage.execute_raw("REINDEX") {
-        tracing::warn!(
-            error = %e,
-            db_path = %db_path.display(),
-            "REINDEX after rebuild failed (non-fatal); partial-index entries may be inconsistent"
-        );
-    }
-
-    // Compact the rebuilt DB via `VACUUM INTO` and atomic rename. This is
-    // the only reliable way to make upstream sqlite3's
-    // `PRAGMA integrity_check` report `ok` on a file produced by fsqlite's
-    // bulk-insert + REINDEX path (issue #248). In-place VACUUM alone —
-    // even called twice after a fresh checkpoint — does not truncate the
-    // trailing pages that fsqlite's REINDEX leaves orphaned: those pages
-    // exist in the file but are neither on the freelist nor referenced
-    // from any B-tree root. `VACUUM INTO` sidesteps fsqlite's in-place
-    // truncation bug because it writes a brand-new compacted file from
-    // the reachable page set — page count matches exactly what sqlite3's
-    // own `VACUUM INTO` produces. The subsequent atomic rename is
-    // crash-safe on POSIX (within a filesystem) and keeps the database
-    // family consistent with its sidecars, which we drop first.
+    // Run VACUUM, REINDEX, and VACUUM INTO only on the compaction helper's
+    // private checkpointed source. The live rebuilt family remains untouched
+    // until the attested candidate reaches the existing atomic install
+    // boundary, preserving the #237/#246/#248 maintenance while removing
+    // #507's source-side VACUUM interruption hazard.
     storage = compact_database_via_vacuum_into_in_place_under_write_authority(
         storage,
         db_path,
@@ -3057,19 +3010,19 @@ pub(crate) fn db_sidecar_suffixes() -> impl Iterator<Item = &'static &'static st
 /// Passing mismatched storage and db_path would copy the storage's actual
 /// DB contents over db_path.
 ///
-/// Failure handling: on any failure (VACUUM INTO error, rename error, or
-/// reopen error after a successful rename) the helper returns either the
-/// best-available working handle or an error before the caller can continue:
+/// Failure handling: candidate construction now runs only on a private source.
+/// Any checkpoint or VACUUM-INTO failure is surfaced while the live family is
+/// still unchanged; reporting success would otherwise falsely claim maintenance
+/// that no longer ran in place. Installation keeps the existing recovery rules:
 ///
-/// * VACUUM INTO failed — returns the unchanged pre-compaction connection.
+/// * Candidate construction failed — returns an error before live mutation.
 /// * Rename failed — returns a connection reopened against the still-intact
 ///   original `db_path`; the compacted temp file is removed.
 /// * Reopen failed after replacing the handle — returns an error, ensuring
 ///   live code cannot continue on a throwaway placeholder connection.
 ///
-/// Cosmetic compaction failures remain non-fatal when the original handle is
-/// still usable. Failures after the original connection has been closed are
-/// surfaced because the caller no longer has a valid persistent storage handle.
+/// Failures after the original connection has been closed remain surfaced
+/// because the caller no longer has a valid persistent storage handle.
 ///
 /// This is called only in rebuild/force-import paths where the DB is
 /// known to have just been fully populated from JSONL.
@@ -3131,58 +3084,112 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
     after_candidate_adoption: impl FnOnce() -> Result<()>,
     sync_candidate_install: impl FnOnce(&Path, &Path) -> Result<()>,
 ) -> Result<SqliteStorage> {
-    // Drain any WAL frames the prior VACUUM/REINDEX (run by the caller)
-    // left behind, so `VACUUM INTO` sees the fully-committed on-disk
-    // state instead of having to reach into a WAL that fsqlite's own
-    // `VACUUM INTO` may or may not consult. Keeping this inside the
-    // helper means every caller gets the same guarantee regardless of
-    // whether they remembered to checkpoint themselves.
+    // Drain every committed frame into the live main file once, then stop
+    // running heavy maintenance against that live family. FrankenSQLite's
+    // VACUUM source-side teardown can rewrite WAL-index state (#507), so an
+    // interrupted compaction must be able to damage only a private copy.
     if let Err(err) = storage.checkpoint_full() {
-        tracing::debug!(
+        tracing::warn!(
             error = %err,
             db_path = %db_path.display(),
-            "Pre-VACUUM-INTO WAL checkpoint failed; skipping cosmetic compaction so committed WAL frames cannot be omitted"
+            "Pre-compaction WAL checkpoint failed; refusing to report compaction success"
         );
-        return Ok(storage);
+        return Err(err);
     }
+    write_authority.verify_database_authority()?;
+    reject_symlinked_database_path_for_recovery(db_path)?;
 
-    // Unique temp path next to the real DB so the subsequent rename is on
-    // the same filesystem (atomic) and so parallel rebuilds of different
-    // DBs don't collide.
+    // The candidate stays beside the real DB so installation remains a
+    // same-filesystem rename. Its source lives in a private temp directory
+    // under .br_recovery. Normal teardown removes that private directory;
+    // process abort leaves it behind as diagnostic evidence.
     let stem = db_path
         .file_stem()
         .and_then(|s| s.to_str())
         .map_or_else(|| "beads".to_string(), str::to_string);
-    let temp_path = db_path.with_file_name(format!(
-        ".{stem}.vacuum.{}.{}.tmp",
+    let nonce = format!(
+        "{}.{}",
         std::process::id(),
         Utc::now().format("%Y%m%d_%H%M%S_%f")
-    ));
+    );
+    let temp_path = db_path.with_file_name(format!(".{stem}.vacuum.{nonce}.tmp"));
+    let recovery_parent = recovery_dir_for_db_path(
+        db_path,
+        db_path.parent().unwrap_or_else(|| Path::new(".")),
+    );
+    fs::create_dir_all(&recovery_parent)?;
+    let private_source_dir = tempfile::Builder::new()
+        .prefix(".vacuum-source-")
+        .tempdir_in(&recovery_parent)
+        .map_err(BeadsError::Io)?;
+    let private_source_path = private_source_dir.path().join(
+        db_path
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new(DEFAULT_DB_FILENAME)),
+    );
+    fs::copy(db_path, &private_source_path).with_context(|| {
+        format!(
+            "Failed to copy checkpointed database '{}' to private compaction source '{}'",
+            db_path.display(),
+            private_source_path.display()
+        )
+    })?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&private_source_path)
+        .and_then(|file| file.sync_all())
+        .map_err(BeadsError::Io)?;
+    crate::util::sync_parent_directory(&private_source_path).map_err(BeadsError::Io)?;
 
-    let temp_path_display = temp_path.display().to_string();
-    // Escape single quotes the SQL way (doubling) for the literal path
-    // embedded in the `VACUUM INTO` statement. The temp path is
-    // constructed from the DB path + our own PID suffix, so in practice
-    // it never contains a quote, but the doubling keeps us safe against
-    // unusual filesystem names.
-    let escaped_path = temp_path_display.replace('\'', "''");
-    let vacuum_into_sql = format!("VACUUM INTO '{escaped_path}'");
-    if let Err(err) = storage.execute_raw(&vacuum_into_sql) {
+    let mut private_storage = SqliteStorage::open(&private_source_path)?;
+    if let Err(err) = private_storage.execute_raw("VACUUM") {
         tracing::warn!(
             error = %err,
             db_path = %db_path.display(),
-            "`VACUUM INTO` compaction failed; keeping the in-place rebuild which may still show unused tail pages under upstream sqlite3"
+            "VACUUM on private compaction source failed (non-fatal); candidate may retain free-space anomalies"
         );
-        // `VACUUM INTO` creates its destination with no-clobber semantics, but
-        // a failed operation has not established an inode witness. Preserve
-        // every resulting path instead of guessing that it is ours to delete.
-        return Ok(storage);
     }
+    if let Err(err) = private_storage.execute_raw("REINDEX") {
+        tracing::warn!(
+            error = %err,
+            db_path = %db_path.display(),
+            "REINDEX on private compaction source failed (non-fatal); candidate may retain partial-index anomalies"
+        );
+    }
+    if let Err(err) = private_storage.checkpoint_full() {
+        tracing::warn!(
+            error = %err,
+            db_path = %db_path.display(),
+            "Private compaction source WAL checkpoint failed; live family is unchanged"
+        );
+        return Err(err);
+    }
+
+    let escaped_path = temp_path.display().to_string().replace('\'', "''");
+    let vacuum_into_sql = format!("VACUUM INTO '{escaped_path}'");
+    let candidate_result = private_storage.execute_raw(&vacuum_into_sql);
+    drop(private_storage);
+    if let Err(err) = candidate_result {
+        tracing::warn!(
+            error = %err,
+            db_path = %db_path.display(),
+            "`VACUUM INTO` on private compaction source failed; live family is unchanged"
+        );
+        // A failed operation has not established an inode witness. Preserve
+        // every resulting candidate path instead of guessing ownership, and
+        // surface the failure because no live maintenance has run.
+        return Err(err);
+    }
+
+    // Re-verify after every private maintenance step. No live-family
+    // namespace mutation is permitted before this point.
+    write_authority.verify_database_authority()?;
     let replacement_lock = write_authority.lock_database_replacement_candidate(&temp_path)?;
 
-    // Close the on-disk connection before swapping its file under our own
-    // feet. This helper consumes and returns the storage handle so callers
-    // cannot keep using a throwaway placeholder if reopening fails.
+    // Close the live connection only after a complete candidate exists and is
+    // locked for installation. The existing install/rollback protocol below
+    // remains the sole live-family mutation boundary.
     drop(storage);
 
     if let Err(error) = replacement_lock.sync_all() {
@@ -9878,6 +9885,83 @@ routing:
             String::from_utf8_lossy(&output.stderr)
         );
         true
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vacuum_into_private_maintenance_leaves_live_family_unchanged_before_install() {
+        use std::os::unix::fs::MetadataExt;
+
+        if run_compaction_test_in_subprocess(
+            "config::tests::vacuum_into_private_maintenance_leaves_live_family_unchanged_before_install",
+        ) {
+            return;
+        }
+
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let sidecar_path = PathBuf::from(format!("{}-wal-cert", db_path.display()));
+        let mut storage = SqliteStorage::open(&db_path).expect("create storage");
+        storage
+            .set_config("issue_prefix", "private-source")
+            .expect("seed database");
+        storage
+            .checkpoint_full()
+            .expect("establish checkpointed live baseline");
+        fs::write(&sidecar_path, b"live-sidecar-must-not-change").unwrap();
+
+        let main_before = fs::read(&db_path).unwrap();
+        let inode_before = fs::metadata(&db_path).unwrap().ino();
+        let write_authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                temp.path(),
+                &db_path,
+                Some(1_000),
+            )
+            .expect("acquire compaction authority"),
+        );
+        write_authority
+            .bind_database_inode_for_mutation()
+            .expect("bind compaction database inode");
+        storage.attach_write_authority(Arc::clone(&write_authority));
+
+        let error = compact_database_via_vacuum_into_in_place_with_reopener(
+            storage,
+            &db_path,
+            Some(50),
+            &write_authority,
+            SqliteStorage::open_with_timeout,
+            || {
+                assert_eq!(fs::read(&db_path).unwrap(), main_before);
+                assert_eq!(fs::metadata(&db_path).unwrap().ino(), inode_before);
+                assert_eq!(
+                    fs::read(&sidecar_path).unwrap(),
+                    b"live-sidecar-must-not-change"
+                );
+                Err(BeadsError::Config(
+                    "stop after private maintenance, before installation".to_string(),
+                ))
+            },
+            || Ok(()),
+            |from, to| {
+                crate::util::sync_rename_parent_directories(from, to).map_err(BeadsError::Io)
+            },
+        )
+        .expect_err("test hook must stop before live-family installation");
+
+        assert!(error.to_string().contains("stop after private maintenance"));
+        assert_eq!(fs::read(&db_path).unwrap(), main_before);
+        assert_eq!(fs::metadata(&db_path).unwrap().ino(), inode_before);
+        assert_eq!(
+            fs::read(&sidecar_path).unwrap(),
+            b"live-sidecar-must-not-change"
+        );
+        assert_eq!(
+            write_authority
+                .database_target_authority_state()
+                .expect("classify unchanged live generation"),
+            crate::sync::DatabaseTargetAuthorityState::Held
+        );
     }
 
     #[test]

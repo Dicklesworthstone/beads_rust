@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use fastmcp_rust::{
     CompleteResult, Content, ContentBlock, FinalCallToolResult, McpContext, McpError, McpErrorCode,
     McpResult, ResultMeta, Tool, ToolAnnotations, ToolHandler,
@@ -965,6 +966,16 @@ fn parse_update_fields(
         }
     }
     updates.external_ref = nullable_str(args, "external_ref")?;
+    // Optimistic concurrency, same contract as the CLI's `--if-unchanged`
+    // (#500, #505). The precondition is checked inside the write transaction
+    // by `update_issue`; `apply_update_issue_json` checks it for the paths that
+    // never reach that call.
+    updates.expect_updated_at = crate::cli::commands::update::parse_if_unchanged_surface(
+        optional_str_arg(args, "if_unchanged")?.as_deref(),
+        "if_unchanged",
+        "`show_issue`",
+    )
+    .map_err(beads_to_mcp)?;
 
     Ok((updates, coercions))
 }
@@ -2096,6 +2107,36 @@ fn mcp_event_attribution(args: &Value) -> McpResult<crate::storage::EventAttribu
     ))
 }
 
+/// Enforce `if_unchanged` on the update paths that never call `update_issue`
+/// (#505).
+///
+/// A field update carries the precondition into `storage.update_issue`, which
+/// checks it inside its own write transaction. A label-only or comment-only
+/// update makes no such call, so without this the precondition would be
+/// silently ignored for exactly the edits that are easiest to make
+/// concurrently. It is still atomic against other beads writers, because
+/// `with_mutation` holds the cross-process database-family write lock around
+/// the whole handler.
+fn ensure_update_precondition(
+    id: &str,
+    issue: &Issue,
+    expected: Option<DateTime<Utc>>,
+) -> McpResult<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if issue.updated_at == expected {
+        return Ok(());
+    }
+    Err(beads_to_mcp(BeadsError::UpdatePreconditionFailed {
+        id: id.to_string(),
+        expected: expected.to_rfc3339_opts(SecondsFormat::AutoSi, true),
+        actual: issue
+            .updated_at
+            .to_rfc3339_opts(SecondsFormat::AutoSi, true),
+    }))
+}
+
 fn apply_update_issue_json(
     storage: &mut SqliteStorage,
     state: &BeadsState,
@@ -2164,7 +2205,10 @@ fn apply_update_issue_json(
             .get_issue_details(&id, false, false, 0)
             .map_err(beads_to_mcp)?
         {
-            Some(details) => details.issue,
+            Some(details) => {
+                ensure_update_precondition(&id, &details.issue, updates.expect_updated_at)?;
+                details.issue
+            }
             None => return Err(issue_not_found_err(storage, &id)?),
         }
     } else {
@@ -2320,7 +2364,8 @@ impl ToolHandler for UpdateIssueTool {
                  Don't: Set status to 'closed' — you'll be redirected to close_issue.\n\
                  Inputs auto-corrected: 'wip' → in_progress, 'urgent' → critical, etc.\n\
                  Batch semantics: updates[] uses one write lock/storage open/auto-flush and returns {items,count,ok_count,error_count}; each item has ok:true with the legacy result or ok:false with a structured error.\n\
-                 Idempotency: Comments and appended acceptance items can repeat on retry. Inspect mutation_committed, retry_mutation, and request_result in errors before retrying."
+                 Idempotency: Comments and appended acceptance items can repeat on retry. Inspect mutation_committed, retry_mutation, and request_result in errors before retrying.\n\
+                 Lost updates: pass if_unchanged with the updated_at you read to make the write conditional on nobody having edited the issue since."
                     .into(),
             ),
             input_schema: json!({
@@ -2349,6 +2394,10 @@ impl ToolHandler for UpdateIssueTool {
                     "force": {
                         "type": "boolean",
                         "description": "Allow destructive whole-field text replacements. Never bypasses workflow policy, prerequisite requirements, or capacity limits."
+                    },
+                    "if_unchanged": {
+                        "type": "string",
+                        "description": "Apply only if the issue's updated_at still equals this value; otherwise fail with UPDATE_PRECONDITION_FAILED and change nothing. Pass the updated_at you read with show_issue, verbatim. Use it whenever you read, decided, and are now writing back — without it, two agents editing the same issue silently overwrite each other."
                     },
                     "status": {
                         "type": "string",
@@ -3441,7 +3490,7 @@ impl ToolHandler for ProjectOverviewTool {
 mod tests {
     use super::{
         CloseIssueTool, CreateIssueTool, ListIssuesTool, ManageDependenciesTool,
-        ProjectOverviewTool, ShowIssueTool, UpdateIssueTool, build_list_filters,
+        ProjectOverviewTool, ShowIssueTool, UPDATE_FIELD_KEYS, UpdateIssueTool, build_list_filters,
         generate_issue_id_with_checked_lookup, issue_not_found_err, list_issues_batch_json,
         list_issues_json, next_available_child_id, optional_label_array_arg,
         optional_string_array_arg, parse_update_fields, project_overview_json,
@@ -5211,6 +5260,66 @@ mod tests {
                 "last_batch_ok_count": last_batch["ok_count"],
                 "equality": "batch dependency adds verified by final storage state and per-item ok counts",
             })
+        );
+    }
+
+    /// #505: the precondition has to be discoverable where an MCP agent looks,
+    /// which is the schema, not the CLI reference.
+    #[test]
+    fn update_issue_schema_advertises_the_if_unchanged_precondition() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        let tool = UpdateIssueTool::new(state).definition();
+
+        let field = &tool.input_schema["properties"]["if_unchanged"];
+        assert_eq!(
+            field["type"].as_str(),
+            Some("string"),
+            "update_issue must accept if_unchanged: {}",
+            tool.input_schema["properties"]
+        );
+        let description = field["description"].as_str().unwrap_or_default();
+        assert!(
+            description.contains("UPDATE_PRECONDITION_FAILED")
+                && description.contains("show_issue"),
+            "if_unchanged must name the refusal and where to read the value: {description}"
+        );
+    }
+
+    /// The parse is shared with the CLI, and the message must name the surface
+    /// the caller actually used (#505).
+    #[test]
+    fn if_unchanged_parse_errors_name_the_mcp_field() {
+        let err = parse_update_fields(
+            "beads_rust-1234",
+            &json!({"if_unchanged": "yesterday"}),
+            &crate::close_policy::Workflow::default(),
+        )
+        .expect_err("an unparseable timestamp must be refused");
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("if_unchanged") && !text.contains("--if-unchanged"),
+            "the refusal must name the MCP field, not the CLI flag: {text}"
+        );
+    }
+
+    #[test]
+    fn parse_update_fields_accepts_an_rfc3339_if_unchanged() {
+        let (updates, _) = parse_update_fields(
+            "beads_rust-1234",
+            &json!({"if_unchanged": "2026-09-17T02:22:26.950413390Z"}),
+            &crate::close_policy::Workflow::default(),
+        )
+        .expect("a well-formed timestamp parses");
+        assert!(
+            updates.expect_updated_at.is_some(),
+            "if_unchanged must reach IssueUpdate::expect_updated_at"
+        );
+        // A precondition alone is not a field write, so it must not make an
+        // otherwise empty update look like one.
+        assert!(
+            !UPDATE_FIELD_KEYS.contains(&"if_unchanged"),
+            "if_unchanged is a precondition, not a field update"
         );
     }
 

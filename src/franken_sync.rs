@@ -33,6 +33,8 @@ use asupersync::runtime::{Runtime, RuntimeBuilder};
 
 pub use fsqlite::{FrankenError, Row, SqliteValue};
 
+pub(crate) mod wal_index;
+
 // ---------------------------------------------------------------------------
 // Bridge driver
 // ---------------------------------------------------------------------------
@@ -154,7 +156,7 @@ fn retry_transient<T>(
 macro_rules! with_engine_retries {
     ($conn:expr, $sql:expr, $attempt:expr) => {{
         let first = retry_transient(&$conn, || $attempt);
-        match first {
+        let result = match first {
             Err(ref err) if schema_stale(err) => {
                 // `prepare` refreshes the schema image from the shared
                 // publication plane even when it ultimately fails to resolve.
@@ -162,7 +164,11 @@ macro_rules! with_engine_retries {
                 retry_transient(&$conn, || $attempt)
             }
             other => other,
+        };
+        if matches!(&result, Err(FrankenError::BusyRecovery)) {
+            wal_index::warn_if_poisoned($conn.path());
         }
+        result
     }};
 }
 
@@ -174,6 +180,7 @@ macro_rules! with_engine_retries {
 /// blocking method signatures.
 pub struct Connection {
     inner: fsqlite::Connection,
+    checkpoint_on_close: bool,
 }
 
 impl std::fmt::Debug for Connection {
@@ -186,24 +193,51 @@ impl std::fmt::Debug for Connection {
 
 impl Connection {
     /// Open an existing database only when its VFS handle matches the retained identity.
+    ///
+    /// The explicit recovery workflow rehearses this open on a private copy
+    /// before using it on the live family. Before admitting #507's exact
+    /// poisoned-index signature to the engine, quarantine only the derived
+    /// index under independent engine and SQLite exclusion. Ordinary and
+    /// read-only opens never take this filesystem-recovery path.
+    ///
+    /// Every handle returned here closes without checkpointing, including
+    /// retries after quarantine or missing-index reconstruction. Recovery may
+    /// rebuild caches, but it must not rewrite the protected main/WAL payload.
     pub fn open_existing_with_expected_identity(
         path: impl Into<String>,
         identity: fsqlite_vfs::FileIdentity,
     ) -> Result<Self, FrankenError> {
+        let path = path.into();
+        wal_index::quarantine_poisoned_index(&path, identity)?;
         let inner = drive(fsqlite::Connection::open_existing_with_expected_identity(
             path, identity,
         ))?;
-        Self::from_inner(inner, true)
+        // #507: after an interruption the index may already be absent or
+        // healthy, so quarantine is not a reliable signal for close policy.
+        // Set the policy at construction, before any initialization SQL.
+        Self::from_inner(inner, true, false)
     }
 
     /// Open (or create) a database at `path`.
     pub fn open(path: impl Into<String>) -> Result<Self, FrankenError> {
-        let inner = drive(fsqlite::Connection::open(path))?;
-        Self::from_inner(inner, true)
+        let path = path.into();
+        let inner = drive(fsqlite::Connection::open(path.clone())).inspect_err(|error| {
+            if matches!(error, FrankenError::BusyRecovery) {
+                wal_index::warn_if_poisoned(&path);
+            }
+        })?;
+        Self::from_inner(inner, true, true)
     }
 
-    fn from_inner(inner: fsqlite::Connection, serialized: bool) -> Result<Self, FrankenError> {
-        let connection = Self { inner };
+    fn from_inner(
+        inner: fsqlite::Connection,
+        serialized: bool,
+        checkpoint_on_close: bool,
+    ) -> Result<Self, FrankenError> {
+        let connection = Self {
+            inner,
+            checkpoint_on_close,
+        };
         if !serialized {
             return Ok(connection);
         }
@@ -290,19 +324,30 @@ impl Connection {
     }
 
     /// Close the connection (rolls back any active transaction, then runs the
-    /// final passive WAL checkpoint).
+    /// final passive WAL checkpoint, except for cache-recovery handles).
     pub fn close(mut self) -> Result<(), FrankenError> {
-        drive(self.inner.close_in_place())
+        self.close_in_place()
     }
 
     /// Close in place, retaining the handle on error so callers can retry.
     pub fn close_in_place(&mut self) -> Result<(), FrankenError> {
-        drive(self.inner.close_in_place())
+        #[cfg(test)]
+        if tests::FAIL_NEXT_CLOSE.with(|fault| fault.replace(false)) {
+            return Err(FrankenError::BusyRecovery);
+        }
+        if self.checkpoint_on_close {
+            drive(self.inner.close_in_place())
+        } else {
+            drive(self.inner.close_without_checkpoint_in_place())
+        }
     }
 
     /// Close without checkpointing; the caller controls checkpoint admission.
+    /// This decision is sticky even when close fails: a later close retry must
+    /// not silently regain permission to checkpoint a live peer's WAL.
     pub fn close_without_checkpoint_in_place(&mut self) -> Result<(), FrankenError> {
-        drive(self.inner.close_without_checkpoint_in_place())
+        self.checkpoint_on_close = false;
+        self.close_in_place()
     }
 }
 
@@ -370,7 +415,7 @@ impl PreparedStatement<'_> {
 // ---------------------------------------------------------------------------
 
 pub mod compat {
-    use super::{Connection, FrankenError, drive};
+    use super::{Connection, FrankenError, drive, wal_index};
 
     pub use fsqlite::compat::OpenFlags;
 
@@ -378,14 +423,167 @@ pub mod compat {
     /// [`fsqlite::compat::open_with_flags`]).
     pub fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection, FrankenError> {
         let serialized = flags.contains(OpenFlags::SQLITE_OPEN_READ_WRITE);
-        let inner = drive(fsqlite::compat::open_with_flags(path, flags))?;
-        Connection::from_inner(inner, serialized)
+        let inner = drive(fsqlite::compat::open_with_flags(path, flags)).inspect_err(|error| {
+            if matches!(error, FrankenError::BusyRecovery) {
+                wal_index::warn_if_poisoned(path);
+            }
+        })?;
+        Connection::from_inner(inner, serialized, true)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        pub(super) static FAIL_NEXT_CLOSE: std::cell::Cell<bool> = const {
+            std::cell::Cell::new(false)
+        };
+    }
+
+    #[test]
+    fn failed_no_checkpoint_close_keeps_its_policy_on_retry() {
+        if run_recovery_test_in_subprocess(
+            "franken_sync::tests::failed_no_checkpoint_close_keeps_its_policy_on_retry",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("close-retry.db");
+        let mut connection = Connection::open(path.to_string_lossy().into_owned()).unwrap();
+        connection.execute("PRAGMA journal_mode = WAL").unwrap();
+        connection.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+        connection.execute("CREATE TABLE t (value TEXT)").unwrap();
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        connection
+            .execute("INSERT INTO t VALUES ('WAL-only close retry')")
+            .unwrap();
+        let wal_path = temp.path().join("close-retry.db-wal");
+        let main_before = std::fs::read(&path).unwrap();
+        let wal_before = std::fs::read(&wal_path).unwrap();
+        assert!(wal_before.len() > 32);
+
+        FAIL_NEXT_CLOSE.with(|fault| fault.set(true));
+        assert!(matches!(
+            connection.close_without_checkpoint_in_place(),
+            Err(FrankenError::BusyRecovery)
+        ));
+        assert!(!connection.checkpoint_on_close);
+        // A caller may use ordinary close() to retry. It must not recover the
+        // checkpoint authority explicitly declined by the first close call.
+        connection.close().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), main_before);
+        assert_eq!(std::fs::read(&wal_path).unwrap(), wal_before);
+    }
+
+    pub(super) fn run_recovery_test_in_subprocess(name: &str) -> bool {
+        // As in #506, do not create a fixture whose leases can be inherited
+        // by unrelated tests' children in the parallel parent process.
+        const CHILD_ENV: &str = "BR_TEST_ISOLATED_RECOVERY_CLOSE";
+        if std::env::var(CHILD_ENV).as_deref() == Ok(name) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                name,
+                "--test-threads=1",
+                "--format=pretty",
+                "--color=never",
+            ])
+            .env(CHILD_ENV, name)
+            .env_remove("RUST_TEST_NOCAPTURE")
+            .output()
+            .expect("run isolated recovery close test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let passed = format!("test {name} ... ok");
+        assert!(
+            output.status.success() && stdout.lines().any(|line| line == passed),
+            "isolated recovery test failed or did not run: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    #[test]
+    fn engine_recovery_preserves_wal_across_repeated_closes() {
+        if run_recovery_test_in_subprocess(
+            "franken_sync::tests::engine_recovery_preserves_wal_across_repeated_closes",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("recovery.db");
+        let path = db.to_string_lossy().into_owned();
+        let wal = temp.path().join("recovery.db-wal");
+        let shm = temp.path().join("recovery.db-shm");
+        let sentinel = "recovery must preserve this committed WAL-only row";
+        let mut writer = Connection::open(path.clone()).unwrap();
+        assert!(
+            writer.checkpoint_on_close,
+            "ordinary open keeps its close policy"
+        );
+        writer.execute("PRAGMA journal_mode = WAL").unwrap();
+        writer.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+        writer.execute("CREATE TABLE t (v TEXT)").unwrap();
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        writer
+            .execute_with_params("INSERT INTO t VALUES (?1)", &[SqliteValue::from(sentinel)])
+            .unwrap();
+        writer.close_without_checkpoint_in_place().unwrap();
+        drop(writer);
+        let main_before = std::fs::read(&db).unwrap();
+        let wal_before = std::fs::read(&wal).unwrap();
+        assert!(wal_before.len() > 32);
+        assert!(
+            !main_before
+                .windows(sentinel.len())
+                .any(|b| b == sentinel.as_bytes())
+        );
+        assert!(
+            wal_before
+                .windows(sentinel.len())
+                .any(|b| b == sentinel.as_bytes())
+        );
+        let retained = std::fs::File::open(&db).unwrap();
+        let identity = fsqlite_vfs::FileIdentity::from_file(&retained)
+            .unwrap()
+            .unwrap();
+
+        // Both states skip quarantine: an already rebuilt index and the
+        // missing index left by interruption immediately after quarantine.
+        // Repeat against the same committed WAL, not an empty no-op fixture.
+        for close_mode in 0..3 {
+            for missing_index in [false, true] {
+                if missing_index {
+                    std::fs::rename(
+                        &shm,
+                        temp.path().join(format!("retained-index-{close_mode}")),
+                    )
+                    .unwrap();
+                }
+                let mut recovered =
+                    Connection::open_existing_with_expected_identity(path.clone(), identity)
+                        .unwrap();
+                let row = recovered.query_row("SELECT v FROM t").unwrap();
+                assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some(sentinel));
+                assert_eq!(std::fs::read(&db).unwrap(), main_before);
+                assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
+                match close_mode {
+                    0 => recovered.close().unwrap(),
+                    1 => {
+                        recovered.close_in_place().unwrap();
+                        drop(recovered);
+                    }
+                    _ => drop(recovered),
+                }
+                assert_eq!(std::fs::read(&db).unwrap(), main_before);
+                assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
+            }
+        }
+    }
 
     #[test]
     fn open_execute_query_roundtrip() {
