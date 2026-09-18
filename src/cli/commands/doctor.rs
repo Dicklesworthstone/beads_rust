@@ -1846,9 +1846,10 @@ fn report_has_page_corruption(report: &DoctorReport) -> bool {
 /// orphaned pages, B-tree malformation) that arise from frankensqlite's B-tree
 /// layer.
 ///
-/// Run in-place VACUUM first, then try to install a compacted copy via VACUUM
-/// INTO. If upstream sqlite3 still reports `Page N: never used` afterward,
-/// the caller escalates to a JSONL rebuild.
+/// Build the VACUUM/REINDEX/VACUUM-INTO candidate from a private checkpointed
+/// source and install it atomically. Heavy maintenance never runs against the
+/// live family (#507). If upstream sqlite3 still reports `Page N: never used`
+/// afterward, the caller escalates to a JSONL rebuild.
 fn acquire_doctor_database_write_authority(
     beads_dir: &Path,
     db_path: &Path,
@@ -1901,24 +1902,25 @@ fn repair_via_vacuum(
         }
         match open_doctor_storage_under_write_authority(db_path, write_authority) {
             Ok(storage) => {
-                if let Err(err) = storage.execute_raw("VACUUM") {
-                    tracing::warn!(path = %db_path.display(), error = %err, "VACUUM failed");
-                    return;
-                }
-
-                repair.vacuumed = true;
+                // #507: never run source-side VACUUM against the live family.
+                // The shared compaction helper checkpoints once, copies the
+                // resulting main database into .br_recovery, and performs
+                // VACUUM/REINDEX/VACUUM INTO only on that private source.
+                // The live namespace changes only at its attested atomic
+                // candidate-install boundary.
                 match config::compact_database_via_vacuum_into_in_place(storage, db_path, None) {
                     Ok(_storage) => {
+                        repair.vacuumed = true;
                         tracing::info!(
                             path = %db_path.display(),
-                            "VACUUM plus VACUUM INTO compaction completed successfully"
+                            "Private-source VACUUM compaction completed successfully"
                         );
                     }
                     Err(err) => {
                         tracing::warn!(
                             path = %db_path.display(),
                             error = %err,
-                            "VACUUM INTO compaction failed after VACUUM"
+                            "Private-source VACUUM compaction failed; live family retained"
                         );
                     }
                 }
