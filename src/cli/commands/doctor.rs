@@ -23379,6 +23379,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn doctor_raw_repairs_preserve_peer_wal_and_checkpoint_only_when_alone() {
         // Like config's run_compaction_test_in_subprocess, isolate the fixture
         // before opening any leases: a parallel test's child can inherit a

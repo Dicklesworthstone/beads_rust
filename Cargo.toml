@@ -2,7 +2,7 @@
 name = "beads_rust"
 version = "0.6.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 autobenches = false
 description = "Agent-first issue tracker (SQLite + JSONL)"
 license-file = "LICENSE"

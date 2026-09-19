@@ -6889,6 +6889,7 @@ mod tests {
             &forecast,
             &marked_at,
             &run_dir,
+            &prepared.raw_before,
             &migration.write_authority,
             &mut failed_stage,
         )

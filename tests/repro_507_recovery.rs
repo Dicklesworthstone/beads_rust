@@ -464,11 +464,11 @@ fn mutating_command_auto_recovers_poison_but_preserves_pending_merge_refusal() {
     let error = format!("{}{}", create.stdout, create.stderr);
     assert!(error.contains("pending"), "{error}");
     assert_eq!(
-        fs::read(workspace.root.join(".beads/beads.db")).unwrap(),
+        read_optional(&workspace.root.join(".beads/beads.db")),
         before[0]
     );
     assert_eq!(
-        fs::read(workspace.root.join(".beads/beads.db-wal")).unwrap(),
+        read_optional(&workspace.root.join(".beads/beads.db-wal")),
         before[1]
     );
     assert!(

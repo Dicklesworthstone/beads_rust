@@ -1408,6 +1408,7 @@ fn concurrent_br_histories_are_linearizable_and_match_the_published_jsonl() {
 /// arithmetic is the thing under test, and a real workload cannot be made to
 /// starve a worker on demand without weakening the mechanism under test.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn the_fairness_oracle_separates_even_streams_from_a_starved_one() {
     // Entries are a millisecond apart and never overlap, so peer bypass is
     // zero throughout and only the per-stream counts vary.
