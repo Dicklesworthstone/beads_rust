@@ -172,25 +172,36 @@ macro_rules! with_engine_retries {
     }};
 }
 
-/// Recognize the actual PRAGMA, not a substring in a comment or SQL value.
-/// Ordinary statements avoid the extra parse; checkpoint spelling, quoting,
-/// schema qualification and comments are handled by the engine's own parser.
-fn is_wal_checkpoint_pragma(sql: &str) -> bool {
+/// Classify a standalone checkpoint, refusing mixed batches before execution.
+/// The engine accepts multi-statement SQL on its execute path. Treating a batch
+/// as an ordinary statement would bypass completion checking and could execute
+/// later writes after an incomplete checkpoint. Query APIs retain raw status.
+/// Ordinary statements avoid the extra parse; the engine parser distinguishes
+/// real PRAGMAs from names occurring in comments, identifiers, or SQL values.
+fn is_wal_checkpoint_pragma(sql: &str) -> Result<bool, FrankenError> {
     const NAME: &[u8] = b"wal_checkpoint";
     if !sql
         .as_bytes()
         .windows(NAME.len())
         .any(|window| window.eq_ignore_ascii_case(NAME))
     {
-        return false;
+        return Ok(false);
     }
     let (statements, errors) = fsqlite_parser::Parser::from_sql(sql).parse_all();
-    errors.is_empty()
-        && matches!(
-            statements.as_slice(),
-            [fsqlite_ast::Statement::Pragma(pragma)]
+    let has_checkpoint = statements.iter().any(|statement| {
+        matches!(
+            statement,
+            fsqlite_ast::Statement::Pragma(pragma)
                 if pragma.name.name.eq_ignore_ascii_case("wal_checkpoint")
         )
+    });
+    if has_checkpoint && (statements.len() != 1 || !errors.is_empty()) {
+        return Err(FrankenError::Internal(
+            "WAL checkpoint must be a standalone statement so completion can be verified; no statements were executed"
+                .to_string(),
+        ));
+    }
+    Ok(has_checkpoint)
 }
 
 /// A checkpoint issued through execute() must not silently discard an
@@ -331,7 +342,7 @@ impl Connection {
     /// Checkpoint PRAGMAs return zero only after their status proves completion;
     /// use query() to observe a partial checkpoint without treating it as failure.
     pub fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
-        if is_wal_checkpoint_pragma(sql) {
+        if is_wal_checkpoint_pragma(sql)? {
             return checkpoint_execute_result(self.query(sql));
         }
         with_engine_retries!(self.inner, sql, drive(self.inner.execute(sql)))
@@ -343,7 +354,7 @@ impl Connection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<usize, FrankenError> {
-        if is_wal_checkpoint_pragma(sql) {
+        if is_wal_checkpoint_pragma(sql)? {
             return checkpoint_execute_result(self.query_with_params(sql, params));
         }
         with_engine_retries!(
@@ -355,6 +366,13 @@ impl Connection {
 
     /// Query, returning all rows.
     pub fn query(&self, sql: &str) -> Result<Vec<Row>, FrankenError> {
+        #[cfg(test)]
+        if let Some(status) = checkpoint_fault::take(self.inner.path(), sql) {
+            return self.query_with_params(
+                "SELECT ?1, ?2, ?3",
+                &status.map(SqliteValue::Integer),
+            );
+        }
         with_engine_retries!(self.inner, sql, drive(self.inner.query(sql)))
     }
 
@@ -364,6 +382,13 @@ impl Connection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<Vec<Row>, FrankenError> {
+        #[cfg(test)]
+        if let Some(status) = checkpoint_fault::take(self.inner.path(), sql) {
+            return self.query_with_params(
+                "SELECT ?1, ?2, ?3",
+                &status.map(SqliteValue::Integer),
+            );
+        }
         with_engine_retries!(
             self.inner,
             sql,
@@ -391,9 +416,11 @@ impl Connection {
 
     /// Prepare a statement for repeated execution.
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_>, FrankenError> {
+        // Preflight before entering the engine: prepare may process PRAGMAs.
+        let checkpoint_pragma = is_wal_checkpoint_pragma(sql)?;
         Ok(PreparedStatement {
             inner: retry_busy_recovery(|| drive(self.inner.prepare(sql)))?,
-            checkpoint_pragma: is_wal_checkpoint_pragma(sql),
+            checkpoint_pragma,
         })
     }
 
@@ -516,6 +543,74 @@ pub mod compat {
             }
         })?;
         Connection::from_inner(inner, serialized, true)
+    }
+}
+
+/// Query-result faults exercise the real execute/checkpoint/compaction chain.
+/// They are thread-local, path-bound, ordered, and absent from production.
+#[cfg(test)]
+pub(crate) mod checkpoint_fault {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    struct State {
+        path: String,
+        results: VecDeque<(&'static str, [i64; 3])>,
+    }
+
+    thread_local! {
+        static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    }
+
+    struct ClearOnDrop;
+
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            STATE.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    pub(super) fn take(path: &str, sql: &str) -> Option<[i64; 3]> {
+        STATE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let state = slot.as_mut()?;
+            let (expected_sql, status) = state.results.front()?;
+            if state.path != path || *expected_sql != sql {
+                return None;
+            }
+            let status = *status;
+            state.results.pop_front();
+            Some(status)
+        })
+    }
+
+    pub(crate) fn with_results<T>(
+        path: &str,
+        results: Vec<(&'static str, [i64; 3])>,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        STATE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            assert!(slot.is_none(), "checkpoint fault scopes must not nest");
+            *slot = Some(State {
+                path: path.to_string(),
+                results: results.into(),
+            });
+        });
+        let clear = ClearOnDrop;
+        let result = action();
+        STATE.with(|slot| {
+            let slot = slot.borrow();
+            let remaining = &slot.as_ref().expect("active checkpoint fault scope").results;
+            assert!(
+                remaining.is_empty(),
+                "checkpoint path skipped results: {remaining:?}"
+            );
+        });
+        drop(clear);
+        result
     }
 }
 
@@ -839,17 +934,64 @@ mod tests {
             "-- maintenance\nPRAGMA WAL_CHECKPOINT(RESTART)",
             ";; PRAGMA [wal_checkpoint];",
         ] {
-            assert!(is_wal_checkpoint_pragma(sql), "{sql}");
+            assert!(is_wal_checkpoint_pragma(sql).unwrap(), "{sql}");
         }
         for sql in [
             "SELECT 'PRAGMA wal_checkpoint(TRUNCATE)'",
             "SELECT 1 /* wal_checkpoint */",
             "PRAGMA wal_autocheckpoint = 0",
             "PRAGMA wal_checkpoint_extra",
-            "PRAGMA wal_checkpoint(TRUNCATE); SELECT 1",
             "PRAGMA wal_checkpoint(",
         ] {
-            assert!(!is_wal_checkpoint_pragma(sql), "{sql}");
+            assert!(!is_wal_checkpoint_pragma(sql).unwrap(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn checkpoint_batches_fail_before_any_statement_or_prepare_side_effect() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE guarded (value TEXT)").unwrap();
+        for sql in [
+            "INSERT INTO guarded VALUES ('before'); PRAGMA wal_checkpoint(TRUNCATE)",
+            "PRAGMA wal_checkpoint(PASSIVE); INSERT INTO guarded VALUES ('after')",
+            "PRAGMA wal_checkpoint; PRAGMA wal_checkpoint",
+            "SELECT 1; /* boundary */ PRAGMA main.\"WAL_CHECKPOINT\"(FULL)",
+        ] {
+            for error in [
+                conn.execute(sql).expect_err("mixed execute must fail"),
+                conn.execute_with_params(sql, &[])
+                    .expect_err("mixed parameterized execute must fail"),
+            ] {
+                assert!(
+                    matches!(error, FrankenError::Internal(ref detail) if detail.contains("standalone")),
+                    "{sql}: {error:?}"
+                );
+            }
+            assert!(conn.prepare(sql).is_err(), "mixed prepare must fail: {sql}");
+            assert!(conn.query("SELECT value FROM guarded").unwrap().is_empty());
+        }
+        // Merely mentioning the PRAGMA in data must not prevent a real write.
+        conn.execute("INSERT INTO guarded VALUES ('PRAGMA wal_checkpoint; SELECT 1')")
+            .unwrap();
+        assert_eq!(conn.query("SELECT value FROM guarded").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn checkpoint_execute_rejects_partial_query_rows_but_queries_keep_them() {
+        let conn = Connection::open(":memory:").unwrap();
+        let sql = "PRAGMA wal_checkpoint(TRUNCATE)";
+        for status in [[1, 23, 0], [0, 23, 7], [1, 23, 23]] {
+            checkpoint_fault::with_results(conn.inner.path(), vec![(sql, status); 3], || {
+                assert!(matches!(conn.execute(sql), Err(FrankenError::Busy)));
+                assert!(matches!(
+                    conn.execute_with_params(sql, &[]),
+                    Err(FrankenError::Busy)
+                ));
+                assert_eq!(
+                    conn.query(sql).unwrap()[0].values(),
+                    &status.map(SqliteValue::Integer)
+                );
+            });
         }
     }
 
