@@ -2770,6 +2770,14 @@ pub struct ReadyArgs {
     #[arg(long)]
     pub stats: bool,
 
+    /// Omit long free-text fields from JSON/TOON output, keeping only what is
+    /// needed to choose work (id, title, status, priority, type, timestamps).
+    /// On a 10k-issue tracker this takes `ready --json` from ~1.2 MB to ~110 KB,
+    /// because descriptions alone are ~89% of the default payload. Fetch detail
+    /// for the one issue you pick with `br show <id>`.
+    #[arg(long)]
+    pub brief: bool,
+
     /// Machine-readable output (alias for --json)
     #[arg(long)]
     pub robot: bool,

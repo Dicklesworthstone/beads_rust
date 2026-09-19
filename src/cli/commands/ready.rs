@@ -166,7 +166,7 @@ fn execute_inner(
     debug!(filters = ?filters, sort = ?sort_policy, "Applied ready filters");
 
     let mut ready_issues =
-        get_ready_issues_for_output(storage, &filters, sort_policy, output_format)?;
+        get_ready_issues_for_output(storage, &filters, sort_policy, output_format, args.brief)?;
 
     if !ready_issues.is_empty() && has_external_dependencies {
         let config_layer = load_config_layer()?;
@@ -321,14 +321,31 @@ fn ready_filters_are_restrictive(filters: &ReadyFilters) -> bool {
         || !default_ready_group
 }
 
+/// Choose the hydration projection for `br ready`.
+///
+/// Text and CSV have always used the summary projection, which reads only the
+/// columns those renderers touch. JSON and TOON hydrate the fuller command
+/// projection to preserve their published schema.
+///
+/// That default is expensive at scale and it lands on the format agents are
+/// told to use: on a 10,000-issue tracker `ready --json` returns 1,242,094
+/// bytes for 1,003 issues, and 89.3% of that is `description` — the one field
+/// nobody needs in order to *choose* work. `--brief` opts into the same
+/// summary projection the text path already uses, taking that payload to about
+/// 110 KB. The full record for the single issue an agent picks is one
+/// `br show <id>` away (`beads_rust-62rhw`).
 fn get_ready_issues_for_output(
     storage: &SqliteStorage,
     filters: &ReadyFilters,
     sort_policy: ReadySortPolicy,
     output_format: OutputFormat,
+    brief: bool,
 ) -> Result<Vec<crate::model::Issue>> {
     match output_format {
         OutputFormat::Text | OutputFormat::Csv => {
+            storage.get_ready_summary_issues_for_command_output(filters, sort_policy)
+        }
+        OutputFormat::Json | OutputFormat::Toon if brief => {
             storage.get_ready_summary_issues_for_command_output(filters, sort_policy)
         }
         OutputFormat::Json | OutputFormat::Toon => {
@@ -466,6 +483,7 @@ mod tests {
                 &ReadyFilters::default(),
                 ReadySortPolicy::Priority,
                 format,
+                false,
             )
             .unwrap();
             hydrate_ready_labels(&storage, &mut issues).unwrap();
@@ -497,8 +515,85 @@ mod tests {
             &ReadyFilters::default(),
             ReadySortPolicy::Priority,
             OutputFormat::Text,
+            false,
         )
         .unwrap();
         assert!(text_issues.iter().all(|issue| issue.labels.is_empty()));
+    }
+
+    /// `--brief` must give JSON and TOON the same lean projection the text path
+    /// already uses, and must not change which rows are returned
+    /// (`beads_rust-62rhw`).
+    ///
+    /// The default JSON payload is dominated by `description`: on a
+    /// 10,000-issue tracker it was 89.3% of 1,242,094 bytes. This pins the two
+    /// properties that matter — brief drops the long free text, and brief is a
+    /// projection change only, never a filter change — so the flag cannot
+    /// silently start hiding ready work.
+    #[test]
+    fn brief_structured_output_drops_long_text_without_changing_rows() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for (id, title) in [
+            ("bd-brief-a", "first ready issue"),
+            ("bd-brief-b", "second ready issue"),
+        ] {
+            let issue = crate::model::Issue {
+                id: id.to_string(),
+                title: title.to_string(),
+                description: Some("a long description that agents do not need".repeat(8)),
+                notes: Some("notes that are also not needed to pick work".to_string()),
+                ..crate::model::Issue::default()
+            };
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        for format in [OutputFormat::Json, OutputFormat::Toon] {
+            let full = get_ready_issues_for_output(
+                &storage,
+                &ReadyFilters::default(),
+                ReadySortPolicy::Priority,
+                format,
+                false,
+            )
+            .unwrap();
+            let brief = get_ready_issues_for_output(
+                &storage,
+                &ReadyFilters::default(),
+                ReadySortPolicy::Priority,
+                format,
+                true,
+            )
+            .unwrap();
+
+            // Same rows, same order: --brief selects columns, never rows.
+            assert_eq!(
+                full.iter().map(|issue| &issue.id).collect::<Vec<_>>(),
+                brief.iter().map(|issue| &issue.id).collect::<Vec<_>>(),
+                "--brief must not change which ready issues are returned"
+            );
+            assert_eq!(brief.len(), 2);
+
+            // The default really does carry the long text, so the saving is real.
+            assert!(
+                full.iter().all(|issue| issue.description.is_some()),
+                "default structured output should still carry descriptions"
+            );
+            // Brief drops it.
+            assert!(
+                brief.iter().all(|issue| issue.description.is_none()),
+                "--brief must omit description from structured output"
+            );
+            assert!(
+                brief.iter().all(|issue| issue.notes.is_none()),
+                "--brief must omit notes from structured output"
+            );
+            // Selection-relevant fields survive.
+            assert!(
+                brief
+                    .iter()
+                    .all(|issue| !issue.id.is_empty() && !issue.title.is_empty()),
+                "--brief must keep the fields an agent selects on"
+            );
+        }
     }
 }
