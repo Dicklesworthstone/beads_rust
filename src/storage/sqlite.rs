@@ -36230,6 +36230,11 @@ required_fields:
     /// silently disagree again: it asserts the *set* of matching closed issues
     /// found by the result query equals the *number* reported by the count
     /// query, over a corpus that exercises every arm of the predicate.
+    // The length is the point: this builds one closed issue per predicate arm
+    // plus multi-match and no-match controls, so splitting it would separate
+    // the corpus from the assertions that give it meaning. Same remedy the
+    // rest of this file already uses for table-style tests.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn test_search_result_and_closed_count_predicates_agree() {
         let mut storage = SqliteStorage::open_memory().unwrap();
