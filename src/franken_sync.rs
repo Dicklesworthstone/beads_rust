@@ -172,6 +172,72 @@ macro_rules! with_engine_retries {
     }};
 }
 
+/// Recognize the actual PRAGMA, not a substring in a comment or SQL value.
+/// Ordinary statements avoid the extra parse; checkpoint spelling, quoting,
+/// schema qualification and comments are handled by the engine's own parser.
+fn is_wal_checkpoint_pragma(sql: &str) -> bool {
+    const NAME: &[u8] = b"wal_checkpoint";
+    if !sql
+        .as_bytes()
+        .windows(NAME.len())
+        .any(|window| window.eq_ignore_ascii_case(NAME))
+    {
+        return false;
+    }
+    let (statements, errors) = fsqlite_parser::Parser::from_sql(sql).parse_all();
+    errors.is_empty()
+        && matches!(
+            statements.as_slice(),
+            [fsqlite_ast::Statement::Pragma(pragma)]
+                if pragma.name.name.eq_ignore_ascii_case("wal_checkpoint")
+        )
+}
+
+/// A checkpoint issued through execute() must not silently discard an
+/// incomplete result. Query APIs deliberately retain the raw SQLite status
+/// tuple for callers that want to inspect partial progress themselves.
+fn checkpoint_execute_result(result: Result<Vec<Row>, FrankenError>) -> Result<usize, FrankenError> {
+    let rows = result?;
+    completed_checkpoint_affected_rows(rows.iter().map(Row::values))
+}
+
+fn completed_checkpoint_affected_rows<'a>(
+    rows: impl IntoIterator<Item = &'a [SqliteValue]>,
+) -> Result<usize, FrankenError> {
+    let mut rows = rows.into_iter();
+    let Some(row) = rows.next() else {
+        return Err(FrankenError::Internal(
+            "WAL checkpoint returned no completion result".to_string(),
+        ));
+    };
+    if rows.next().is_some() {
+        return Err(FrankenError::Internal(
+            "WAL checkpoint returned more than one completion result".to_string(),
+        ));
+    }
+    let [SqliteValue::Integer(busy), SqliteValue::Integer(frames), SqliteValue::Integer(backfilled)] =
+        row
+    else {
+        return Err(FrankenError::Internal(
+            "WAL checkpoint completion result must contain three integers".to_string(),
+        ));
+    };
+    // (0, -1, -1) is the non-WAL sentinel. All other successful results
+    // require equal nonnegative log/backfill counts and no busy indication.
+    if *busy == 0 && *frames >= -1 && frames == backfilled {
+        return Ok(0);
+    }
+    if (0..=1).contains(busy) && *frames >= 0 && (0..=*frames).contains(backfilled) {
+        tracing::debug!(busy, frames, backfilled, "WAL checkpoint did not complete");
+        // Do not turn contention or partial backfill into a corruption error:
+        // callers must not respond by rebuilding from potentially stale JSONL.
+        return Err(FrankenError::Busy);
+    }
+    Err(FrankenError::Internal(format!(
+        "WAL checkpoint returned invalid completion values: busy={busy}, log={frames}, checkpointed={backfilled}"
+    )))
+}
+
 // ---------------------------------------------------------------------------
 // Connection
 // ---------------------------------------------------------------------------
@@ -257,7 +323,12 @@ impl Connection {
     }
 
     /// Execute a single SQL statement, returning the affected row count.
+    /// Checkpoint PRAGMAs return zero only after their status proves completion;
+    /// use query() to observe a partial checkpoint without treating it as failure.
     pub fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
+        if is_wal_checkpoint_pragma(sql) {
+            return checkpoint_execute_result(self.query(sql));
+        }
         with_engine_retries!(self.inner, sql, drive(self.inner.execute(sql)))
     }
 
@@ -267,6 +338,9 @@ impl Connection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<usize, FrankenError> {
+        if is_wal_checkpoint_pragma(sql) {
+            return checkpoint_execute_result(self.query_with_params(sql, params));
+        }
         with_engine_retries!(
             self.inner,
             sql,
@@ -314,6 +388,7 @@ impl Connection {
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_>, FrankenError> {
         Ok(PreparedStatement {
             inner: retry_busy_recovery(|| drive(self.inner.prepare(sql)))?,
+            checkpoint_pragma: is_wal_checkpoint_pragma(sql),
         })
     }
 
@@ -370,6 +445,7 @@ impl Drop for Connection {
 /// Synchronous wrapper over [`fsqlite::PreparedStatement`].
 pub struct PreparedStatement<'conn> {
     inner: fsqlite::PreparedStatement<'conn>,
+    checkpoint_pragma: bool,
 }
 
 impl PreparedStatement<'_> {
@@ -401,11 +477,17 @@ impl PreparedStatement<'_> {
 
     /// Execute, returning the affected row count.
     pub fn execute(&self) -> Result<usize, FrankenError> {
+        if self.checkpoint_pragma {
+            return checkpoint_execute_result(self.query());
+        }
         drive(self.inner.execute())
     }
 
     /// Execute with positional parameters, returning the affected row count.
     pub fn execute_with_params(&self, params: &[SqliteValue]) -> Result<usize, FrankenError> {
+        if self.checkpoint_pragma {
+            return checkpoint_execute_result(self.query_with_params(params));
+        }
         drive(self.inner.execute_with_params(params))
     }
 }
@@ -741,5 +823,110 @@ mod tests {
         });
 
         assert_eq!(row_count, 1);
+    }
+
+    #[test]
+    fn checkpoint_detection_uses_sql_structure() {
+        for sql in [
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+            "pragma main.wal_checkpoint = PASSIVE;",
+            "/* maintenance */ PRAGMA \"main\".\"wal_checkpoint\"(FULL); -- done",
+            "-- maintenance\nPRAGMA WAL_CHECKPOINT(RESTART)",
+            ";; PRAGMA [wal_checkpoint];",
+        ] {
+            assert!(is_wal_checkpoint_pragma(sql), "{sql}");
+        }
+        for sql in [
+            "SELECT 'PRAGMA wal_checkpoint(TRUNCATE)'",
+            "SELECT 1 /* wal_checkpoint */",
+            "PRAGMA wal_autocheckpoint = 0",
+            "PRAGMA wal_checkpoint_extra",
+            "PRAGMA wal_checkpoint(TRUNCATE); SELECT 1",
+            "PRAGMA wal_checkpoint(",
+        ] {
+            assert!(!is_wal_checkpoint_pragma(sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn checkpoint_completion_requires_complete_wal_or_non_wal_status() {
+        for busy in -1..=2 {
+            for frames in -2..=7 {
+                for backfilled in -2..=8 {
+                    let values = [busy, frames, backfilled].map(SqliteValue::Integer);
+                    let result = completed_checkpoint_affected_rows([values.as_slice()]);
+                    let complete = busy == 0 && frames >= -1 && frames == backfilled;
+                    assert_eq!(result.is_ok(), complete, "{values:?}: {result:?}");
+                    if complete {
+                        assert_eq!(result.unwrap(), 0, "a PRAGMA affects no table rows");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_checkpoint_is_contention_not_corruption() {
+        for values in [[1, 23, 0], [1, 23, 23], [0, 23, 7]] {
+            let values = values.map(SqliteValue::Integer);
+            assert!(matches!(
+                completed_checkpoint_affected_rows([values.as_slice()]),
+                Err(FrankenError::Busy)
+            ));
+        }
+    }
+
+    #[test]
+    fn checkpoint_completion_rejects_malformed_rows() {
+        let malformed = [
+            Vec::new(),
+            vec![vec![SqliteValue::Integer(0); 3]; 2],
+            vec![Vec::new()],
+            vec![vec![SqliteValue::Integer(0); 2]],
+            vec![vec![SqliteValue::Integer(0); 4]],
+            vec![vec![SqliteValue::Null; 3]],
+            vec![vec![
+                SqliteValue::Integer(0),
+                SqliteValue::from("0"),
+                SqliteValue::Integer(0),
+            ]],
+        ];
+        for rows in malformed {
+            let result = completed_checkpoint_affected_rows(rows.iter().map(Vec::as_slice));
+            assert!(matches!(result, Err(FrankenError::Internal(_))), "{rows:?}");
+        }
+    }
+
+    #[test]
+    fn checkpoint_execution_preserves_engine_certificate_error() {
+        let detail = "parallel WAL certificate suffix does not start at a record boundary";
+        let error = checkpoint_execute_result(Err(FrankenError::WalCorrupt {
+            detail: detail.to_string(),
+        }))
+        .expect_err("the engine error must not become a successful checkpoint");
+        assert!(matches!(
+            error,
+            FrankenError::WalCorrupt { detail: actual } if actual == detail
+        ));
+    }
+
+    #[test]
+    fn checkpoint_execute_and_prepared_paths_keep_query_status_available() {
+        let conn = Connection::open(":memory:").expect("open non-WAL database");
+        let sql = "PRAGMA wal_checkpoint(TRUNCATE)";
+        assert_eq!(conn.execute(sql).unwrap(), 0);
+        assert_eq!(conn.execute_with_params(sql, &[]).unwrap(), 0);
+        let rows = conn.query(sql).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].values(),
+            &[0, -1, -1].map(SqliteValue::Integer)
+        );
+        let statement = conn.prepare(sql).unwrap();
+        assert!(statement.checkpoint_pragma);
+        assert_eq!(statement.execute().unwrap(), 0);
+        assert_eq!(statement.execute_with_params(&[]).unwrap(), 0);
+        assert_eq!(statement.query().unwrap()[0].values(), rows[0].values());
+        assert!(!conn.prepare("SELECT 1").unwrap().checkpoint_pragma);
     }
 }
