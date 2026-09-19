@@ -231,7 +231,17 @@ mod tests {
 
     #[test]
     fn selection_is_strict_and_deduplicates_in_requested_order() {
-        for raw in ["", " ", ",", "id,", ",id", "id,,title", "titel", "type", "ID"] {
+        for raw in [
+            "",
+            " ",
+            ",",
+            "id,",
+            ",id",
+            "id,,title",
+            "titel",
+            "type",
+            "ID",
+        ] {
             assert!(
                 matches!(
                     FieldSelection::parse(raw),
@@ -363,16 +373,32 @@ mod tests {
                 .unwrap();
         }
         let fields = FieldSelection::parse("id,title,status,priority,issue_type").unwrap();
+        // `include_deferred: true` is load-bearing, not incidental.
+        // `list_text_issues_for_command_output` falls back to `list_issues`
+        // whenever the filter shape leaves its narrow path, and
+        // `!filters.include_deferred` is one of those conditions: the narrow
+        // SQL filters only closed and tombstone rows, so it would wrongly keep
+        // deferred issues when the caller asked to exclude them. With the
+        // `ListFilters::default()` value of `false`, both cases below take the
+        // fallback and return fully hydrated rows, so the projection this test
+        // exists to check is never exercised and the assertion below fails on
+        // the hydrated `description`.
         for filters in [
-            ListFilters::default(),
+            ListFilters {
+                include_deferred: true,
+                ..ListFilters::default()
+            },
             ListFilters {
                 limit: Some(1),
                 offset: Some(1),
+                include_deferred: true,
                 ..ListFilters::default()
             },
         ] {
             let full = storage.list_issues(&filters).unwrap();
-            let narrow = storage.list_text_issues_for_command_output(&filters).unwrap();
+            let narrow = storage
+                .list_text_issues_for_command_output(&filters)
+                .unwrap();
             assert!(
                 narrow
                     .iter()
