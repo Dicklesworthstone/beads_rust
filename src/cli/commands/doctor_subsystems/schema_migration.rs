@@ -6878,6 +6878,17 @@ mod tests {
             logical_before: plan.logical_witness,
         };
         write_json_new(&run_dir.join("prepared.json"), &prepared).expect("write prepared receipt");
+        // The retained `before/` family is part of the prepared state the real
+        // pipeline lays down before it applies anything (see the prepare path),
+        // and `vacuum-candidate` verifies it to build its private VACUUM source.
+        // Without it the run fails at `vacuum-candidate` and never reaches the
+        // stage this test is about.
+        let before_dir = run_dir.join("before");
+        ensure_new_directory(&before_dir).expect("create before backup dir");
+        copy_family_to_backup(&migration.db_path, &before_dir, &prepared.raw_before)
+            .expect("retain the before family");
+        verify_backup_family(&migration.db_path, &before_dir, &prepared.raw_before)
+            .expect("verify the retained before family");
         // Occupy the marker path so the pipeline fails exactly when it tries
         // to persist the commit-ready marker: the candidate is fully built and
         // attested, and no earlier stage has any reason to fail.

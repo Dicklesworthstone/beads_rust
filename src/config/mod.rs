@@ -9947,7 +9947,10 @@ routing:
         )
         .expect_err("test hook must stop before live-family installation");
 
-        assert!(error.to_string().contains("stop after private maintenance"));
+        assert!(
+            error.to_string().contains("stop after private maintenance"),
+            "expected the injected post-maintenance hook to be the failure, got: {error}"
+        );
         assert_eq!(fs::read(&db_path).unwrap(), main_before);
         assert_eq!(fs::metadata(&db_path).unwrap().ino(), inode_before);
         assert_eq!(
