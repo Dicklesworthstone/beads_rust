@@ -346,6 +346,8 @@ beads_rust/
 │   ├── health.rs                  # Workspace health vocabulary
 │   ├── inheritance.rs             # Inherited context (BR_INHERITED_CONTEXT)
 │   ├── franken_sync.rs            # Synchronous facade over the async FrankenSQLite engine API
+│   ├── franken_sync/
+│   │   └── wal_index.rs           # Narrow containment for the initialized zero-page WAL index (#507)
 │   ├── shutdown.rs                # Cooperative shutdown and exit_process
 │   ├── logging.rs                 # tracing-subscriber setup
 │   ├── cache.rs                   # DORMANT (zero references)
