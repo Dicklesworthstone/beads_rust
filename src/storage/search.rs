@@ -104,7 +104,12 @@ impl SqliteStorage {
     }
 }
 
-pub(crate) fn unicode_issue_fields_match(issue: &Issue, matcher: &Regex) -> bool {
+// `pub`, not `pub(crate)`: `mod search` is private (src/storage/mod.rs:18) and
+// the only way out is the `pub(crate) use` re-export on line 22, so this stays
+// crate-visible either way and `pub(crate)` here is what
+// `clippy::redundant_pub_crate` rejects. Widen the re-export, not this, if the
+// function ever needs to leave the crate.
+pub fn unicode_issue_fields_match(issue: &Issue, matcher: &Regex) -> bool {
     matcher.is_match(&issue.id)
         || matcher.is_match(&issue.title)
         || issue
