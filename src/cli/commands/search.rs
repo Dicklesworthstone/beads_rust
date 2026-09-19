@@ -22,6 +22,9 @@ use std::io::IsTerminal;
 use std::str::FromStr;
 
 #[cfg(test)]
+use crate::storage::unicode_issue_fields_match;
+
+#[cfg(test)]
 #[path = "search/unicode_tests.rs"]
 mod unicode_tests;
 
@@ -200,61 +203,13 @@ fn collect_search_results_with_projection(
     Ok(issues)
 }
 
-/// Match a literal Unicode query over the filtered, unpaginated corpus.
-/// Use the same Unicode case folding as --desc-contains, without first losing
-/// candidates to SQLite's ASCII-only lower(). ASCII queries retain their SQL
-/// fast path. This is a command-level fallback, not a new storage collation.
+/// Match before client filtering/pagination, hydrating only matching issues.
 fn search_unicode_issues(
     storage: &SqliteStorage,
     query: &str,
     filters: &ListFilters,
 ) -> Result<Vec<Issue>> {
-    let matcher = RegexBuilder::new(&regex::escape(query.trim()))
-        .case_insensitive(true)
-        .build()
-        .map_err(|error| BeadsError::Validation {
-            field: "query".to_string(),
-            reason: format!("cannot compile Unicode search query: {error}"),
-        })?;
-    // Pagination belongs after matching. Clear it defensively here as well as
-    // in the caller, so future callers cannot silently inspect only one page.
-    let mut candidates = filters.clone();
-    candidates.limit = None;
-    candidates.offset = None;
-    let mut issues = storage.list_issues(&candidates)?;
-    let mut matched_ids = HashSet::new();
-    for batch in issues.chunks(256) {
-        let mut comment_ids = Vec::new();
-        for issue in batch {
-            if unicode_issue_fields_match(issue, &matcher) {
-                matched_ids.insert(issue.id.clone());
-            } else {
-                comment_ids.push(issue.id.clone());
-            }
-        }
-        // Search every comment, not merely the latest one. Batch the existing
-        // parameterized API and avoid fetching comments for direct field hits.
-        // Comment rows remain internal; do not alter the result payload.
-        for (id, comments) in storage.get_comments_for_issues(&comment_ids)? {
-            if comments
-                .iter()
-                .any(|comment| matcher.is_match(&comment.body))
-            {
-                matched_ids.insert(id);
-            }
-        }
-    }
-    issues.retain(|issue| matched_ids.contains(&issue.id));
-    Ok(issues)
-}
-
-fn unicode_issue_fields_match(issue: &Issue, matcher: &Regex) -> bool {
-    matcher.is_match(&issue.id)
-        || matcher.is_match(&issue.title)
-        || issue
-            .description
-            .as_deref()
-            .is_some_and(|description| matcher.is_match(description))
+    storage.search_unicode_issues_unpaginated(query, filters)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -471,6 +426,9 @@ fn count_hidden_closed_matches(
         // for hidden history as for the visible result set, before pagination.
         filters.statuses = Some(vec![Status::Closed]);
         filters.include_closed = true;
+        if !query.is_ascii() && !needs_client_filters(list_args) {
+            return storage.count_unicode_search_matches_unpaginated(query, &filters);
+        }
         let issues = if query.is_ascii() {
             storage.search_issues(query, &filters)?
         } else {

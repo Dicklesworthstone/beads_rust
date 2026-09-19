@@ -15,8 +15,11 @@
 pub mod events;
 mod lint;
 pub mod schema;
+mod search;
 pub mod sqlite;
 
+#[cfg(test)]
+pub(crate) use search::unicode_issue_fields_match;
 pub(crate) use sqlite::{BulkDependencyInsert, ChangelogIssueRow};
 pub use sqlite::{
     CloseMetadataRow, EventAttribution, IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy,
