@@ -21,6 +21,10 @@ use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::str::FromStr;
 
+#[cfg(test)]
+#[path = "search/unicode_tests.rs"]
+mod unicode_tests;
+
 /// Execute the search command.
 ///
 /// # Errors
@@ -146,7 +150,11 @@ fn collect_search_results_with_projection(
 ) -> Result<Vec<Issue>> {
     let mut filters = build_filters(list_args)?;
     let client_filters = needs_client_filters(list_args);
-    let needs_post_query_ordering = requires_post_query_ordering(list_args, client_filters);
+    // SQLite lower() folds ASCII only. Unicode queries must be matched before
+    // applying any page boundary, just like the existing client-side filters.
+    let unicode_query = !query.is_ascii();
+    let needs_post_query_ordering =
+        requires_post_query_ordering(list_args, client_filters || unicode_query);
     let (offset, limit) = if needs_post_query_ordering {
         (filters.offset.take(), filters.limit.take())
     } else {
@@ -157,7 +165,9 @@ fn collect_search_results_with_projection(
         filters.reverse = false;
     }
 
-    let issues = if use_text_projection && !client_filters {
+    let issues = if unicode_query {
+        search_unicode_issues(storage, query, &filters)?
+    } else if use_text_projection && !client_filters {
         storage.search_issues_for_command_output(query, &filters)?
     } else {
         storage.search_issues(query, &filters)?
@@ -188,6 +198,60 @@ fn collect_search_results_with_projection(
     }
 
     Ok(issues)
+}
+
+/// Match a literal Unicode query over the filtered, unpaginated corpus.
+/// Use the same Unicode case folding as --desc-contains, without first losing
+/// candidates to SQLite's ASCII-only lower(). ASCII queries retain their SQL
+/// fast path. This is a command-level fallback, not a new storage collation.
+fn search_unicode_issues(
+    storage: &SqliteStorage,
+    query: &str,
+    filters: &ListFilters,
+) -> Result<Vec<Issue>> {
+    let matcher = RegexBuilder::new(&regex::escape(query.trim()))
+        .case_insensitive(true)
+        .build()
+        .map_err(|error| BeadsError::Validation {
+            field: "query".to_string(),
+            reason: format!("cannot compile Unicode search query: {error}"),
+        })?;
+    // Pagination belongs after matching. Clear it defensively here as well as
+    // in the caller, so future callers cannot silently inspect only one page.
+    let mut candidates = filters.clone();
+    candidates.limit = None;
+    candidates.offset = None;
+    let mut issues = storage.list_issues(&candidates)?;
+    let mut matched_ids = HashSet::new();
+    for batch in issues.chunks(256) {
+        let mut comment_ids = Vec::new();
+        for issue in batch {
+            if unicode_issue_fields_match(issue, &matcher) {
+                matched_ids.insert(issue.id.clone());
+            } else {
+                comment_ids.push(issue.id.clone());
+            }
+        }
+        // Search every comment, not merely the latest one. Batch the existing
+        // parameterized API and avoid fetching comments for direct field hits.
+        // Comment rows remain internal; do not alter the result payload.
+        for (id, comments) in storage.get_comments_for_issues(&comment_ids)? {
+            if comments.iter().any(|comment| matcher.is_match(&comment.body)) {
+                matched_ids.insert(id);
+            }
+        }
+    }
+    issues.retain(|issue| matched_ids.contains(&issue.id));
+    Ok(issues)
+}
+
+fn unicode_issue_fields_match(issue: &Issue, matcher: &Regex) -> bool {
+    matcher.is_match(&issue.id)
+        || matcher.is_match(&issue.title)
+        || issue
+            .description
+            .as_deref()
+            .is_some_and(|description| matcher.is_match(description))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -399,13 +463,16 @@ fn count_hidden_closed_matches(
     filters.offset = None;
     filters.sort = None;
     filters.reverse = false;
-    if needs_client_filters(list_args) {
-        // Client-side filters (id, priority bounds, desc/notes contains)
-        // cannot run in SQL; count by filtering the closed matches the same
-        // way the visible set was filtered.
+    if needs_client_filters(list_args) || !query.is_ascii() {
+        // Client-side filters and Unicode matching must use the same predicate
+        // for hidden history as for the visible result set, before pagination.
         filters.statuses = Some(vec![Status::Closed]);
         filters.include_closed = true;
-        let issues = storage.search_issues(query, &filters)?;
+        let issues = if query.is_ascii() {
+            storage.search_issues(query, &filters)?
+        } else {
+            search_unicode_issues(storage, query, &filters)?
+        };
         return Ok(apply_client_filters(issues, list_args)?.len());
     }
     storage.count_closed_search_matches(query, &filters)
