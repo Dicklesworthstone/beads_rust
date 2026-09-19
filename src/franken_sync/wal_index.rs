@@ -51,14 +51,14 @@ fn open_regular(path: &Path, writable: bool) -> io::Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(
-            windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
-        );
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = options.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
-        return Err(invalid("WAL-index recovery descriptor is not a regular file"));
+        return Err(invalid(
+            "WAL-index recovery descriptor is not a regular file",
+        ));
     }
     #[cfg(unix)]
     {
@@ -116,8 +116,12 @@ fn checksum(bytes: &[u8], mut state: [u32; 2], big_endian: bool) -> [u32; 2] {
                 u32::from_le_bytes(bytes)
             }
         };
-        state[0] = state[0].wrapping_add(word(&pair[..4])).wrapping_add(state[1]);
-        state[1] = state[1].wrapping_add(word(&pair[4..])).wrapping_add(state[0]);
+        state[0] = state[0]
+            .wrapping_add(word(&pair[..4]))
+            .wrapping_add(state[1]);
+        state[1] = state[1]
+            .wrapping_add(word(&pair[4..]))
+            .wrapping_add(state[0]);
     }
     state
 }
@@ -133,10 +137,11 @@ fn wal_layout(header: &[u8; 32]) -> io::Result<(u32, bool)> {
         return Err(invalid("invalid WAL header; refusing index quarantine"));
     }
     let big_endian = magic & 1 != 0;
-    if checksum(&header[..24], [0, 0], big_endian)
-        != [be32(&header[24..28]), be32(&header[28..32])]
+    if checksum(&header[..24], [0, 0], big_endian) != [be32(&header[24..28]), be32(&header[28..32])]
     {
-        return Err(invalid("invalid WAL header checksum; refusing index quarantine"));
+        return Err(invalid(
+            "invalid WAL header checksum; refusing index quarantine",
+        ));
     }
     Ok((page_size, big_endian))
 }
@@ -215,12 +220,16 @@ fn validate_wal(main: &mut File, wal: &mut File) -> io::Result<()> {
     for _ in 0..(length - 32) / frame_size {
         wal.read_exact(&mut frame)?;
         if frame[8..16] != header[16..24] || matches!(be32(&frame[..4]), 0 | u32::MAX) {
-            return Err(invalid("invalid WAL frame binding; refusing index quarantine"));
+            return Err(invalid(
+                "invalid WAL frame binding; refusing index quarantine",
+            ));
         }
         state = checksum(&frame[..8], state, big_endian);
         state = checksum(&frame[24..], state, big_endian);
         if state != [be32(&frame[16..20]), be32(&frame[20..24])] {
-            return Err(invalid("invalid WAL frame checksum; refusing index quarantine"));
+            return Err(invalid(
+                "invalid WAL frame checksum; refusing index quarantine",
+            ));
         }
         committed = be32(&frame[4..8]) != 0;
     }
@@ -414,10 +423,20 @@ pub(super) fn quarantine_poisoned_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
-    use crate::franken_sync::{Connection, SqliteValue, compat};
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     use crate::franken_sync::tests::run_recovery_test_in_subprocess;
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    use crate::franken_sync::{Connection, SqliteValue, compat};
 
     const CRASH_STAGE_ENV: &str = "BR_TEST_507_CRASH_STAGE";
 
@@ -492,7 +511,11 @@ mod tests {
         for size in [512_u32, 4096, 65_536] {
             let wal = wal_header(size, false);
             let mut shm = poison();
-            let encoded = if size == 65_536 { 1 } else { u16::try_from(size).unwrap() };
+            let encoded = if size == 65_536 {
+                1
+            } else {
+                u16::try_from(size).unwrap()
+            };
             for offset in [0, 48] {
                 shm[offset + 14..offset + 16].copy_from_slice(&encoded.to_ne_bytes());
                 // Salts must retain the WAL byte order, not native scalar order.
@@ -501,7 +524,10 @@ mod tests {
             assert!(!poisoned_headers(&wal, &shm));
             shm[32] ^= 1;
             shm[80] ^= 1;
-            assert!(!poisoned_headers(&wal, &shm), "salt mismatch alone is not authority");
+            assert!(
+                !poisoned_headers(&wal, &shm),
+                "salt mismatch alone is not authority"
+            );
         }
     }
 
@@ -540,7 +566,11 @@ mod tests {
         frame[..4].copy_from_slice(&1_u32.to_be_bytes());
         frame[4..8].copy_from_slice(&u32::from(commit).to_be_bytes());
         frame[8..16].copy_from_slice(&header[16..24]);
-        let state = checksum(&frame[..8], [be32(&header[24..28]), be32(&header[28..32])], big_endian);
+        let state = checksum(
+            &frame[..8],
+            [be32(&header[24..28]), be32(&header[28..32])],
+            big_endian,
+        );
         let state = checksum(&frame[24..], state, big_endian);
         frame[16..20].copy_from_slice(&state[0].to_be_bytes());
         frame[20..24].copy_from_slice(&state[1].to_be_bytes());
@@ -554,20 +584,42 @@ mod tests {
         for big_endian in [false, true] {
             let valid = one_frame_wal(true, big_endian);
             fs::write(&wal_path, &valid).unwrap();
-            assert!(validate_wal(&mut File::open(&db).unwrap(), &mut File::open(&wal_path).unwrap()).is_ok());
+            assert!(
+                validate_wal(
+                    &mut File::open(&db).unwrap(),
+                    &mut File::open(&wal_path).unwrap()
+                )
+                .is_ok()
+            );
             let mut corrupt = valid.clone();
             corrupt[56] ^= 1;
             let mut wrong_salt = valid.clone();
             wrong_salt[40] ^= 1;
             let partial = valid[..valid.len() - 1].to_vec();
-            for invalid in [corrupt, wrong_salt, partial, one_frame_wal(false, big_endian)] {
+            for invalid in [
+                corrupt,
+                wrong_salt,
+                partial,
+                one_frame_wal(false, big_endian),
+            ] {
                 fs::write(&wal_path, &invalid).unwrap();
-                assert!(validate_wal(&mut File::open(&db).unwrap(), &mut File::open(&wal_path).unwrap()).is_err());
+                assert!(
+                    validate_wal(
+                        &mut File::open(&db).unwrap(),
+                        &mut File::open(&wal_path).unwrap()
+                    )
+                    .is_err()
+                );
             }
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     fn quarantine_retains_cache_and_preserves_every_payload_byte() {
         let (_temp, db, id) = fixture();
@@ -576,12 +628,19 @@ mod tests {
         assert_eq!(fs::read(&db).unwrap(), before[0]);
         assert_eq!(fs::read(sidecar(&db, "-wal")).unwrap(), before[1]);
         assert!(!sidecar(&db, "-shm").exists());
-        let retained = fs::read_dir(db.parent().unwrap()).unwrap()
+        let retained = fs::read_dir(db.parent().unwrap())
+            .unwrap()
             .map(|entry| entry.unwrap().path())
-            .find(|path| path.file_name().unwrap().to_string_lossy().starts_with(".br-wal-index-"))
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".br-wal-index-")
+            })
             .unwrap();
         assert_eq!(fs::read(retained.join("poisoned-shm")).unwrap(), before[2]);
-        let receipt: serde_json::Value = serde_json::from_slice(&fs::read(retained.join("prepared.json")).unwrap()).unwrap();
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(retained.join("prepared.json")).unwrap()).unwrap();
         assert_eq!(receipt["schema_version"], "br.wal_index.quarantine.v1");
         // Crash after quarantine is restartable: no second quarantine is needed.
         assert!(!quarantine_poisoned_index(db.to_str().unwrap(), id).unwrap());
@@ -591,7 +650,8 @@ mod tests {
     fn replacement_identity_and_live_engine_namespace_refuse_without_payload_changes() {
         let (_temp, db, id) = fixture();
         let before = payload(&db);
-        let peer = PendingNamespaceOpen::begin(&db, NamespaceOpenIntent::ReservedExclusive).unwrap();
+        let peer =
+            PendingNamespaceOpen::begin(&db, NamespaceOpenIntent::ReservedExclusive).unwrap();
         assert!(quarantine_poisoned_index(db.to_str().unwrap(), id).is_err());
         assert_eq!(payload(&db), before);
         drop(peer);
@@ -620,7 +680,12 @@ mod tests {
         assert_eq!(fs::read(&retained).unwrap(), poison());
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     fn invalid_wal_tail_refuses_before_quarantining_index() {
         let (_temp, db, id) = fixture();
@@ -632,57 +697,107 @@ mod tests {
         assert_eq!(payload(&db), before);
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     fn tracker_with_uncheckpointed_rows() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         let db = temp.path().join("tracker.db");
         let mut connection = Connection::open(db.to_string_lossy().into_owned()).unwrap();
         connection.execute("PRAGMA journal_mode = WAL").unwrap();
         connection.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
-        connection.execute("CREATE TABLE issues (id TEXT PRIMARY KEY)").unwrap();
-        connection.execute("CREATE TABLE dependencies (source TEXT, target TEXT)").unwrap();
-        connection.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)").unwrap();
+        connection
+            .execute("CREATE TABLE issues (id TEXT PRIMARY KEY)")
+            .unwrap();
+        connection
+            .execute("CREATE TABLE dependencies (source TEXT, target TEXT)")
+            .unwrap();
+        connection
+            .execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
         connection.execute("PRAGMA user_version = 19").unwrap();
-        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-        connection.execute("INSERT INTO issues VALUES ('db-only-a'), ('db-only-b'), ('db-only-c')").unwrap();
+        connection
+            .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO issues VALUES ('db-only-a'), ('db-only-b'), ('db-only-c')")
+            .unwrap();
         connection.execute("INSERT INTO dependencies VALUES ('db-only-a', 'db-only-b'), ('db-only-b', 'db-only-c')").unwrap();
-        connection.execute("INSERT INTO metadata VALUES ('sync_merge_pending', 'must-remain-blocking')").unwrap();
+        connection
+            .execute("INSERT INTO metadata VALUES ('sync_merge_pending', 'must-remain-blocking')")
+            .unwrap();
         connection.close_without_checkpoint_in_place().unwrap();
         drop(connection);
         assert!(fs::metadata(sidecar(&db, "-wal")).unwrap().len() > 32);
         (temp, db)
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     fn poison_tracker(db: &Path) {
         let mut shm = open_regular(&sidecar(db, "-shm"), true).unwrap();
         shm.write_all(&poison()).unwrap();
         shm.sync_all().unwrap();
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     fn assert_tracker_contents(connection: &Connection) {
         assert_eq!(connection.query("SELECT id FROM issues").unwrap().len(), 3);
-        assert_eq!(connection.query("SELECT source FROM dependencies").unwrap().len(), 2);
-        let row = connection.query_row("SELECT value FROM metadata WHERE key = 'sync_merge_pending'").unwrap();
-        assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some("must-remain-blocking"));
+        assert_eq!(
+            connection
+                .query("SELECT source FROM dependencies")
+                .unwrap()
+                .len(),
+            2
+        );
+        let row = connection
+            .query_row("SELECT value FROM metadata WHERE key = 'sync_merge_pending'")
+            .unwrap();
+        assert_eq!(
+            row.get(0).and_then(SqliteValue::as_text),
+            Some("must-remain-blocking")
+        );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     fn recover_and_close_without_payload_changes(db: &Path) {
         let main_before = fs::read(db).unwrap();
         let wal_before = fs::read(sidecar(db, "-wal")).unwrap();
         let retained = File::open(db).unwrap();
         let recovered = Connection::open_existing_with_expected_identity(
-            db.to_string_lossy().into_owned(), identity(&retained).unwrap(),
-        ).unwrap();
+            db.to_string_lossy().into_owned(),
+            identity(&retained).unwrap(),
+        )
+        .unwrap();
         assert_tracker_contents(&recovered);
         recovered.close().unwrap();
         assert_eq!(fs::read(db).unwrap(), main_before);
         assert_eq!(fs::read(sidecar(db, "-wal")).unwrap(), wal_before);
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     fn identity_bound_recovery_preserves_unexported_rows_and_pending_metadata() {
         if run_recovery_test_in_subprocess(
@@ -694,10 +809,16 @@ mod tests {
         poison_tracker(&db);
         let before = payload(&db);
         // Read-only admission must never quarantine or modify the family.
-        match compat::open_with_flags(db.to_str().unwrap(), compat::OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        match compat::open_with_flags(
+            db.to_str().unwrap(),
+            compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) {
             Err(FrankenError::BusyRecovery) => {}
             Ok(mut readonly) => {
-                assert!(matches!(readonly.query("SELECT id FROM issues"), Err(FrankenError::BusyRecovery)));
+                assert!(matches!(
+                    readonly.query("SELECT id FROM issues"),
+                    Err(FrankenError::BusyRecovery)
+                ));
                 readonly.close_without_checkpoint_in_place().unwrap();
             }
             Err(error) => panic!("unexpected read-only error: {error}"),
@@ -705,12 +826,25 @@ mod tests {
         assert_eq!(payload(&db), before);
         let retained = File::open(&db).unwrap();
         let recovered = Connection::open_existing_with_expected_identity(
-            db.to_string_lossy().into_owned(), identity(&retained).unwrap(),
-        ).unwrap();
+            db.to_string_lossy().into_owned(),
+            identity(&retained).unwrap(),
+        )
+        .unwrap();
         assert_eq!(recovered.query("SELECT id FROM issues").unwrap().len(), 3);
-        assert_eq!(recovered.query("SELECT source FROM dependencies").unwrap().len(), 2);
-        let row = recovered.query_row("SELECT value FROM metadata WHERE key = 'sync_merge_pending'").unwrap();
-        assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some("must-remain-blocking"));
+        assert_eq!(
+            recovered
+                .query("SELECT source FROM dependencies")
+                .unwrap()
+                .len(),
+            2
+        );
+        let row = recovered
+            .query_row("SELECT value FROM metadata WHERE key = 'sync_merge_pending'")
+            .unwrap();
+        assert_eq!(
+            row.get(0).and_then(SqliteValue::as_text),
+            Some("must-remain-blocking")
+        );
         assert_eq!(fs::read(&db).unwrap(), before[0]);
         assert_eq!(fs::read(sidecar(&db, "-wal")).unwrap(), before[1]);
         // Doctor calls close(), not the special no-checkpoint method. A
@@ -719,11 +853,18 @@ mod tests {
         assert_eq!(fs::read(&db).unwrap(), before[0]);
         assert_eq!(fs::read(sidecar(&db, "-wal")).unwrap(), before[1]);
         let mut writer = Connection::open(db.to_string_lossy().into_owned()).unwrap();
-        writer.execute("INSERT INTO issues VALUES ('writes-work-again')").unwrap();
+        writer
+            .execute("INSERT INTO issues VALUES ('writes-work-again')")
+            .unwrap();
         writer.close_without_checkpoint_in_place().unwrap();
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     fn missing_and_healthy_index_recovery_preserve_wal_on_every_close() {
         if run_recovery_test_in_subprocess(
@@ -744,22 +885,34 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     #[ignore = "subprocess worker for recovery_survives_abrupt_process_exit"]
     fn recovery_crash_worker() {
         let db = PathBuf::from(std::env::var_os("BR_TEST_507_CRASH_DATABASE").unwrap());
         let retained = File::open(&db).unwrap();
         let recovered = Connection::open_existing_with_expected_identity(
-            db.to_string_lossy().into_owned(), identity(&retained).unwrap(),
-        ).unwrap();
+            db.to_string_lossy().into_owned(),
+            identity(&retained).unwrap(),
+        )
+        .unwrap();
         assert_tracker_contents(&recovered);
         crash_at_recovery_boundary("admitted");
         recovered.close().unwrap();
         panic!("requested crash boundary was not reached");
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     fn recovery_survives_abrupt_process_exit() {
         const WORKER: &str = "franken_sync::wal_index::tests::recovery_crash_worker";
@@ -773,28 +926,45 @@ mod tests {
             poison_tracker(&db);
             let before = payload(&db);
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", WORKER, "--ignored", "--nocapture", "--test-threads=1"])
+                .args([
+                    "--exact",
+                    WORKER,
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
                 .env("BR_TEST_507_CRASH_DATABASE", &db)
                 .env(CRASH_STAGE_ENV, stage)
                 .output()
                 .unwrap();
             assert_eq!(
-                output.status.code(), Some(86),
+                output.status.code(),
+                Some(86),
                 "worker did not reach {stage}: {}\n{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr),
             );
             assert_eq!(fs::read(&db).unwrap(), before[0], "main at {stage}");
-            assert_eq!(fs::read(sidecar(&db, "-wal")).unwrap(), before[1], "WAL at {stage}");
+            assert_eq!(
+                fs::read(sidecar(&db, "-wal")).unwrap(),
+                before[1],
+                "WAL at {stage}"
+            );
             match stage {
                 "prepared" => assert_eq!(fs::read(sidecar(&db, "-shm")).unwrap(), before[2]),
                 "renamed" | "durable" => assert!(!sidecar(&db, "-shm").exists()),
                 "admitted" => assert!(!probe(&db).unwrap()),
                 _ => unreachable!(),
             }
-            let retained = fs::read_dir(db.parent().unwrap()).unwrap()
+            let retained = fs::read_dir(db.parent().unwrap())
+                .unwrap()
                 .map(|entry| entry.unwrap().path())
-                .find(|path| path.file_name().unwrap().to_string_lossy().starts_with(".br-wal-index-"))
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(".br-wal-index-")
+                })
                 .unwrap();
             assert!(retained.join("prepared.json").is_file());
             if stage != "prepared" {

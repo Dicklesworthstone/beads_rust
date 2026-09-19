@@ -65,7 +65,9 @@ fn fixture() -> Fixture {
         .bind_database_inode_for_mutation()
         .expect("bind original database inode");
     storage.attach_write_authority(Arc::clone(&authority));
-    storage.checkpoint_full().expect("checkpoint healthy fixture");
+    storage
+        .checkpoint_full()
+        .expect("checkpoint healthy fixture");
     assert_eq!(storage.get_dirty_issue_count().expect("dirty count"), 1);
     Fixture {
         storage,
@@ -260,7 +262,9 @@ fn private_main_only_copy_does_not_inherit_malformed_live_certificate() {
     let vacuum = private.execute_raw("VACUUM");
     let reindex = private.execute_raw("REINDEX");
     eprintln!("private preliminary maintenance: VACUUM={vacuum:?}; REINDEX={reindex:?}");
-    private.checkpoint_full().expect("checkpoint private source");
+    private
+        .checkpoint_full()
+        .expect("checkpoint private source");
     let escaped = candidate.display().to_string().replace('\'', "''");
     private
         .execute_raw(&format!("VACUUM INTO '{escaped}'"))
@@ -287,7 +291,9 @@ fn healthy_compaction_preserves_logical_state_without_jsonl() {
     }
     let fixture = fixture();
     let expected = logical_state(&fixture.storage);
-    let original_inode = fs::metadata(&fixture.path).expect("original metadata").ino();
+    let original_inode = fs::metadata(&fixture.path)
+        .expect("original metadata")
+        .ino();
     let jsonl = fixture.path.with_file_name("issues.jsonl");
     assert_eq!(
         fs::symlink_metadata(&jsonl)

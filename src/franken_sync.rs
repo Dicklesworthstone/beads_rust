@@ -196,7 +196,9 @@ fn is_wal_checkpoint_pragma(sql: &str) -> bool {
 /// A checkpoint issued through execute() must not silently discard an
 /// incomplete result. Query APIs deliberately retain the raw SQLite status
 /// tuple for callers that want to inspect partial progress themselves.
-fn checkpoint_execute_result(result: Result<Vec<Row>, FrankenError>) -> Result<usize, FrankenError> {
+fn checkpoint_execute_result(
+    result: Result<Vec<Row>, FrankenError>,
+) -> Result<usize, FrankenError> {
     let rows = result?;
     completed_checkpoint_affected_rows(rows.iter().map(Row::values))
 }
@@ -215,8 +217,11 @@ fn completed_checkpoint_affected_rows<'a>(
             "WAL checkpoint returned more than one completion result".to_string(),
         ));
     }
-    let [SqliteValue::Integer(busy), SqliteValue::Integer(frames), SqliteValue::Integer(backfilled)] =
-        row
+    let [
+        SqliteValue::Integer(busy),
+        SqliteValue::Integer(frames),
+        SqliteValue::Integer(backfilled),
+    ] = row
     else {
         return Err(FrankenError::Internal(
             "WAL checkpoint completion result must contain three integers".to_string(),
@@ -918,10 +923,7 @@ mod tests {
         assert_eq!(conn.execute_with_params(sql, &[]).unwrap(), 0);
         let rows = conn.query(sql).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].values(),
-            &[0, -1, -1].map(SqliteValue::Integer)
-        );
+        assert_eq!(rows[0].values(), &[0, -1, -1].map(SqliteValue::Integer));
         let statement = conn.prepare(sql).unwrap();
         assert!(statement.checkpoint_pragma);
         assert_eq!(statement.execute().unwrap(), 0);
