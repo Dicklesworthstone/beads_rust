@@ -42,7 +42,9 @@ fn unicode_case_variants_match_fields_and_all_comment_history_in_every_format() 
     ] {
         storage.create_issue(&item, "tester").unwrap();
     }
-    storage.add_comment("bd-d", "tester", "CAFÉ handoff").unwrap();
+    storage
+        .add_comment("bd-d", "tester", "CAFÉ handoff")
+        .unwrap();
     storage
         .add_comment("bd-d", "tester", "café duplicate hit")
         .unwrap();
@@ -153,7 +155,11 @@ fn unicode_matching_precedes_sort_offset_limit_and_truncation_probe() {
             for format in [OutputFormat::Text, OutputFormat::Json] {
                 let page =
                     collect_search_results_for_output(&storage, "CAFÉ", &args, format).unwrap();
-                let expected_ids = expected.get(offset).copied().into_iter().collect::<Vec<_>>();
+                let expected_ids = expected
+                    .get(offset)
+                    .copied()
+                    .into_iter()
+                    .collect::<Vec<_>>();
                 assert_eq!(
                     ids(&page.issues),
                     expected_ids,
@@ -202,9 +208,8 @@ fn unicode_search_crosses_comment_batches_and_preserves_default_page_size() {
     .unwrap();
     assert_eq!(page.issues.len(), DEFAULT_SEARCH_LIMIT);
     assert!(page.has_more);
-    let all =
-        collect_search_results_for_output(&storage, "CAFÉ", &unlimited(), OutputFormat::Json)
-            .unwrap();
+    let all = collect_search_results_for_output(&storage, "CAFÉ", &unlimited(), OutputFormat::Json)
+        .unwrap();
     assert_eq!(all.issues.len(), DEFAULT_SEARCH_LIMIT + 2);
     assert_eq!(all.issues.last().unwrap().id, "bd-0257");
     assert!(!all.has_more);
@@ -232,7 +237,11 @@ fn unicode_hidden_closed_counts_include_comment_hits_and_respect_filters() {
         .add_comment("bd-comment", "tester", "CAFÉ archived evidence")
         .unwrap();
     storage
-        .add_comment("bd-comment", "tester", "café another hit, not another issue")
+        .add_comment(
+            "bd-comment",
+            "tester",
+            "café another hit, not another issue",
+        )
         .unwrap();
     for id in ["bd-field", "bd-comment"] {
         storage.add_label(id, "chosen", "tester").unwrap();
@@ -248,14 +257,26 @@ fn unicode_hidden_closed_counts_include_comment_hits_and_respect_filters() {
             offset: Some(99),
             ..ListArgs::default()
         };
-        assert_eq!(count_hidden_closed_matches(&storage, query, &args).unwrap(), 2);
+        assert_eq!(
+            count_hidden_closed_matches(&storage, query, &args).unwrap(),
+            2
+        );
         args.desc_contains = Some("café".to_string());
-        assert_eq!(count_hidden_closed_matches(&storage, query, &args).unwrap(), 1);
+        assert_eq!(
+            count_hidden_closed_matches(&storage, query, &args).unwrap(),
+            1
+        );
         args.all = true;
-        assert_eq!(count_hidden_closed_matches(&storage, query, &args).unwrap(), 0);
+        assert_eq!(
+            count_hidden_closed_matches(&storage, query, &args).unwrap(),
+            0
+        );
         args.all = false;
         args.overdue = true;
-        assert_eq!(count_hidden_closed_matches(&storage, query, &args).unwrap(), 0);
+        assert_eq!(
+            count_hidden_closed_matches(&storage, query, &args).unwrap(),
+            0
+        );
         let all = collect_search_results(
             &storage,
             query,

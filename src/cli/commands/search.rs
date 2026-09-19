@@ -236,7 +236,10 @@ fn search_unicode_issues(
         // parameterized API and avoid fetching comments for direct field hits.
         // Comment rows remain internal; do not alter the result payload.
         for (id, comments) in storage.get_comments_for_issues(&comment_ids)? {
-            if comments.iter().any(|comment| matcher.is_match(&comment.body)) {
+            if comments
+                .iter()
+                .any(|comment| matcher.is_match(&comment.body))
+            {
                 matched_ids.insert(id);
             }
         }

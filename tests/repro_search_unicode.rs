@@ -16,7 +16,14 @@ fn workspace() -> BrWorkspace {
 fn create(workspace: &BrWorkspace, title: &str, description: &str) -> String {
     let created = run_br(
         workspace,
-        ["create", title, "--type", "task", "--description", description],
+        [
+            "create",
+            title,
+            "--type",
+            "task",
+            "--description",
+            description,
+        ],
         "create_unicode_issue",
     );
     assert!(created.status.success(), "{created:?}");
@@ -65,8 +72,16 @@ fn unicode_cli_finds_case_variants_and_old_comment_evidence() {
     let lower = create(&workspace, "Lowercase record", "café");
     let handoff = create(&workspace, "Historical handoff", "Other text");
     let control = create(&workspace, "Unrelated record", "cafe without an accent");
-    comment(&workspace, &handoff, "CAFÉ is mentioned only in this older handoff");
-    comment(&workspace, &handoff, "The latest handoff has no matching word");
+    comment(
+        &workspace,
+        &handoff,
+        "CAFÉ is mentioned only in this older handoff",
+    );
+    comment(
+        &workspace,
+        &handoff,
+        "The latest handoff has no matching word",
+    );
 
     for (index, query) in ["café", "CAFÉ"].into_iter().enumerate() {
         let output = search(
@@ -122,7 +137,11 @@ fn unicode_cli_pages_matching_records_and_discloses_hidden_history() {
     let closed_comment = create(&workspace, "Archived handoff", "Other text");
     comment(&workspace, &closed_comment, "CAFÉ archived comment");
     for id in [&closed, &closed_comment] {
-        let result = run_br(&workspace, ["close", id, "--reason", "Completed"], "close_unicode");
+        let result = run_br(
+            &workspace,
+            ["close", id, "--reason", "Completed"],
+            "close_unicode",
+        );
         assert!(result.status.success(), "{result:?}");
     }
 
@@ -142,15 +161,20 @@ fn unicode_cli_pages_matching_records_and_discloses_hidden_history() {
         assert_eq!(output["limit"], 1);
         assert_eq!(output["hidden_closed_count"], 2);
     }
-    let all = search(&workspace, "café", &["--all", "--limit", "0"], "unicode_all");
+    let all = search(
+        &workspace,
+        "café",
+        &["--all", "--limit", "0"],
+        "unicode_all",
+    );
     assert_ids(&all, &[&alpha, &beta, &gamma, &closed, &closed_comment]);
     assert_eq!(all["hidden_closed_count"], 0);
     assert_eq!(all["has_more"], false);
     let csv = run_br(
         &workspace,
         [
-            "search", "café", "--format", "csv", "--fields", "id,title",
-            "--sort", "title", "--limit", "1", "--offset", "1",
+            "search", "café", "--format", "csv", "--fields", "id,title", "--sort", "title",
+            "--limit", "1", "--offset", "1",
         ],
         "unicode_csv_page",
     );
@@ -163,14 +187,20 @@ fn unicode_cli_pages_matching_records_and_discloses_hidden_history() {
 
 #[test]
 fn unicode_cli_search_observes_updates_and_treats_punctuation_literally() {
-    let _log = common::test_log("unicode_cli_search_observes_updates_and_treats_punctuation_literally");
+    let _log =
+        common::test_log("unicode_cli_search_observes_updates_and_treats_punctuation_literally");
     let workspace = workspace();
     let target = create(&workspace, "Mutable record", "Ordinary text");
     let before = search(&workspace, "café.[x]%_", &[], "unicode_before_update");
     assert_ids(&before, &[]);
     let update = run_br(
         &workspace,
-        ["update", &target, "--description", "prefix CAFÉ.[X]%_ suffix"],
+        [
+            "update",
+            &target,
+            "--description",
+            "prefix CAFÉ.[X]%_ suffix",
+        ],
         "unicode_update",
     );
     assert!(update.status.success(), "{update:?}");

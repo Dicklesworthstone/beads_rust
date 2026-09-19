@@ -1575,12 +1575,34 @@ enum SearchIssueProjection {
     CommandText,
 }
 
-/// Shared case-insensitive needle match used by every `br search` query path.
+/// Shared **ASCII**-case-insensitive needle match used by every `br search`
+/// SQL query path.
 ///
 /// Matches the issue's title, description, and id, plus the bodies of its
 /// comments (beads_rust#416): agent workflows put durable handoffs and
 /// decisions in comments, so a comment-only token must still be findable.
 /// Binds four identical lowercase needle parameters.
+///
+/// **Folding is ASCII-only on both sides, deliberately** (`beads_rust-whnbi`).
+/// The engine's `lower()` folds ASCII only, and the needle is bound as
+/// `to_ascii_lowercase()`, so the two agree and non-ASCII letters compare
+/// case-*sensitively*. Folding only the needle with `to_lowercase()` would
+/// break the agreement and match strictly less than today: `CAFÉ` currently
+/// finds `CAFÉ` because both sides leave `É` alone.
+///
+/// Making this predicate Unicode-aware is not a one-line change. Measured on
+/// installed `br` 0.6.0, `br search café` returns only the lowercase row and
+/// `br search CAFÉ` only the uppercase row, which is what proves the engine's
+/// `lower()` is ASCII-only even though `fsqlite` is built with the `icu`
+/// feature. A Unicode SQL path would need a registered custom collation or
+/// function, i.e. new machinery in the hot query path.
+///
+/// Users do not see this boundary: `search_unicode_issues` in
+/// `src/cli/commands/search.rs` routes non-ASCII needles through the same
+/// Unicode-aware `Regex` matcher `--desc-contains` already used, before any
+/// pagination. ASCII needles keep this SQL fast path.
+/// `test_search_issues_matches_ascii_case_insensitive_literal_substrings`
+/// pins the boundary from this side.
 ///
 /// The comment arm is deliberately **uncorrelated**. The correlated
 /// `EXISTS (... WHERE comments.issue_id = issues.id ...)` form it replaced
@@ -36021,8 +36043,23 @@ required_fields:
         assert_eq!(results[0].id, "bd-s1");
     }
 
+    /// Pin what the SQL needle path actually folds, from the storage side.
+    ///
+    /// Renamed from `test_search_issues_matches_case_insensitive_literal_substrings`
+    /// for `beads_rust-whnbi`: the old name claimed plain case-insensitivity,
+    /// which is false for non-ASCII and had no assertion covering it. This
+    /// layer folds ASCII only, on both the column (`lower()`) and the needle
+    /// (`to_ascii_lowercase`), and the non-ASCII assertions below hold it to
+    /// exactly that. Unicode needles never reach here: the command layer
+    /// diverts them to a `Regex` matcher (`search_unicode_issues`), which is
+    /// what `tests/repro_search_unicode.rs` covers end to end.
+    ///
+    /// The `É` case matters beyond bookkeeping. Both sides leaving `É` alone is
+    /// what makes an uppercase needle find uppercase-stored text today, so
+    /// folding only the needle to `to_lowercase()` would match strictly less
+    /// than the status quo, not more. That trap is why this is pinned.
     #[test]
-    fn test_search_issues_matches_case_insensitive_literal_substrings() {
+    fn test_search_issues_matches_ascii_case_insensitive_literal_substrings() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 9, 1, 0, 0, 0).unwrap();
 
@@ -36045,21 +36082,69 @@ required_fields:
             None,
         );
         description_issue.description = Some("Uppercase AUTHENTICATION token".to_string());
+        let mut lower_accent_issue = make_issue(
+            "bd-s-accent-lower",
+            "lower café stored",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        lower_accent_issue.description = Some("desc has café lowercase".to_string());
+        let mut upper_accent_issue = make_issue(
+            "bd-s-accent-upper",
+            "UPPER CAFÉ STORED",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        upper_accent_issue.description = Some("desc has CAFÉ uppercase".to_string());
 
         storage.create_issue(&literal_issue, "tester").unwrap();
         storage.create_issue(&description_issue, "tester").unwrap();
+        storage.create_issue(&lower_accent_issue, "tester").unwrap();
+        storage.create_issue(&upper_accent_issue, "tester").unwrap();
 
         let filters = ListFilters::default();
-        let wildcard_results = storage.search_issues("%_", &filters).unwrap();
-        let wildcard_ids: Vec<_> = wildcard_results
-            .iter()
-            .map(|issue| issue.id.as_str())
-            .collect();
-        assert_eq!(wildcard_ids, vec!["bd-s-literal"]);
+        let ids_for = |storage: &SqliteStorage, needle: &str| -> Vec<String> {
+            storage
+                .search_issues(needle, &filters)
+                .unwrap()
+                .iter()
+                .map(|issue| issue.id.clone())
+                .collect()
+        };
 
-        let case_results = storage.search_issues("authentication", &filters).unwrap();
-        let case_ids: Vec<_> = case_results.iter().map(|issue| issue.id.as_str()).collect();
-        assert_eq!(case_ids, vec!["bd-s-description"]);
+        assert_eq!(ids_for(&storage, "%_"), vec!["bd-s-literal".to_string()]);
+
+        // ASCII folds on both sides, so either casing finds the stored text.
+        assert_eq!(
+            ids_for(&storage, "authentication"),
+            vec!["bd-s-description".to_string()]
+        );
+        assert_eq!(
+            ids_for(&storage, "AUTHENTICATION"),
+            vec!["bd-s-description".to_string()],
+            "ASCII needles must fold regardless of the needle's own casing"
+        );
+
+        // Non-ASCII does NOT fold here. Each accented needle finds only the row
+        // stored in that same case; neither finds the other.
+        assert_eq!(
+            ids_for(&storage, "café"),
+            vec!["bd-s-accent-lower".to_string()],
+            "SQL path folds ASCII only, so a lowercase accented needle must not \
+             reach the uppercase-stored row; Unicode is handled in search.rs"
+        );
+        assert_eq!(
+            ids_for(&storage, "CAFÉ"),
+            vec!["bd-s-accent-upper".to_string()],
+            "the uppercase accented needle must keep working: both sides leave \
+             É alone, and Unicode-folding the needle alone would break this"
+        );
     }
 
     #[test]
