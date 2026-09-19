@@ -352,6 +352,7 @@ beads_rust/
 │   ├── logging.rs                 # tracing-subscriber setup
 │   ├── cache.rs                   # DORMANT (zero references)
 │   ├── write_combining.rs         # DORMANT (design artifact; bench-only)
+│   ├── compaction_certificate_tests.rs # Differential controls for the #508 private-compaction failure (test-only module)
 │   └── release_public_key.bin     # Tracked Minisign public key; no code references it as of 2026-09-02 (release.yml carries the key inline)
 ├── tests/                         # Integration, conformance, property, regression, e2e_scripts/
 ├── benches/                       # Criterion benchmarks
