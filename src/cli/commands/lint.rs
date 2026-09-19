@@ -63,30 +63,41 @@ impl LintSummary {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum SectionSource {
+    Description,
+    AcceptanceCriteria,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct RequiredSection {
     heading: &'static str,
     hint: &'static str,
+    source: SectionSource,
 }
 
 const BUG_SECTIONS: [RequiredSection; 2] = [
     RequiredSection {
         heading: "## Steps to Reproduce",
         hint: "Describe how to reproduce the bug",
+        source: SectionSource::Description,
     },
     RequiredSection {
         heading: "## Acceptance Criteria",
         hint: "Define criteria to verify the fix",
+        source: SectionSource::AcceptanceCriteria,
     },
 ];
 
 const TASK_SECTIONS: [RequiredSection; 1] = [RequiredSection {
     heading: "## Acceptance Criteria",
     hint: "Define criteria to verify completion",
+    source: SectionSource::AcceptanceCriteria,
 }];
 
 const EPIC_SECTIONS: [RequiredSection; 1] = [RequiredSection {
     heading: "## Success Criteria",
     hint: "Define high-level success criteria",
+    source: SectionSource::Description,
 }];
 
 /// Execute the lint command.
@@ -136,7 +147,9 @@ pub fn execute_with_storage_ctx(
 
 fn lint_issues_with_storage(args: &LintArgs, storage: &SqliteStorage) -> Result<Vec<Issue>> {
     let filters = build_filters(args)?;
-    storage.list_lint_issues_for_command_output(&filters)
+    // The description-only lint projection drops acceptance_criteria. Read the
+    // complete issue fields so workspace scans agree with explicit-ID linting.
+    storage.list_issues(&filters)
 }
 
 fn render_lint_output(summary: LintSummary, ctx: &OutputContext) {
@@ -274,7 +287,7 @@ fn render_lint_rich(summary: &LintSummary, ctx: &OutputContext) {
         }
 
         content.append_styled(
-            "Tip: Add the missing sections to issue descriptions to clear warnings.\n",
+            "Tip: Set --acceptance-criteria or add the missing sections to issue descriptions.\n",
             theme.dimmed.clone(),
         );
     }
@@ -428,8 +441,7 @@ fn lint_issue(issue: &Issue) -> Option<LintResult> {
         return None;
     }
 
-    let description = issue.description.as_deref().unwrap_or("");
-    let missing = missing_sections(description, required);
+    let missing = missing_sections(issue, required);
     if missing.is_empty() {
         return None;
     }
@@ -465,19 +477,21 @@ const fn required_sections(issue_type: &IssueType) -> &'static [RequiredSection]
     }
 }
 
-fn missing_sections(description: &str, required: &[RequiredSection]) -> Vec<RequiredSection> {
-    let desc_lower = description.to_lowercase();
-    let mut missing = Vec::new();
-
-    for section in required {
-        let heading_text = strip_heading_prefix(section.heading);
-        let heading_lower = heading_text.to_lowercase();
-        if !desc_lower.contains(&heading_lower) {
-            missing.push(*section);
-        }
-    }
-
-    missing
+fn missing_sections(issue: &Issue, required: &[RequiredSection]) -> Vec<RequiredSection> {
+    let description = issue.description.as_deref().unwrap_or("");
+    required
+        .iter()
+        .filter(|section| {
+            let field_present = matches!(section.source, SectionSource::AcceptanceCriteria)
+                && issue
+                    .acceptance_criteria
+                    .as_deref()
+                    .is_some_and(|criteria| !criteria.trim().is_empty());
+            !field_present
+                && !description_has_section(description, strip_heading_prefix(section.heading))
+        })
+        .copied()
+        .collect()
 }
 
 fn strip_heading_prefix(heading: &str) -> &str {
@@ -486,6 +500,78 @@ fn strip_heading_prefix(heading: &str) -> &str {
         .strip_prefix("## ")
         .or_else(|| trimmed.strip_prefix("# "))
         .unwrap_or(trimmed)
+}
+
+/// Recognize a complete ATX heading, not prose containing a section name.
+/// Markdown permits up to three leading spaces and optional closing hashes.
+fn markdown_heading(line: &str) -> Option<(usize, &str)> {
+    let trimmed = line.trim_start_matches(' ');
+    if line.len() - trimmed.len() > 3 {
+        return None;
+    }
+    let level = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+    let rest = &trimmed[level..];
+    if !rest.starts_with(' ') && !rest.starts_with('\t') {
+        return None;
+    }
+    let title = rest.trim();
+    let without_hashes = title.trim_end_matches('#');
+    let title = if without_hashes.ends_with(' ') || without_hashes.ends_with('\t') {
+        without_hashes.trim_end()
+    } else {
+        title
+    };
+    Some((level, title.strip_suffix(':').unwrap_or(title).trim_end()))
+}
+
+/// Legacy descriptions must contain a named heading and a non-blank body.
+/// Ignore headings in fenced examples, quotes, and indented code. A section
+/// ends at the next heading of the same or a higher level.
+fn description_has_section(description: &str, expected: &str) -> bool {
+    let mut section_level = None;
+    let mut fence: Option<(u8, usize)> = None;
+
+    for raw_line in description.lines() {
+        let line = raw_line.trim_start_matches(' ');
+        let indented = raw_line.len() - line.len() > 3;
+        if let Some((marker, width)) = fence {
+            let run = line.bytes().take_while(|byte| *byte == marker).count();
+            if !indented && run >= width && line[run..].trim().is_empty() {
+                fence = None;
+            } else if section_level.is_some() && !line.trim().is_empty() {
+                return true;
+            }
+            continue;
+        }
+
+        if !indented
+            && let Some(marker @ (b'`' | b'~')) = line.bytes().next()
+        {
+            let width = line.bytes().take_while(|byte| *byte == marker).count();
+            if width >= 3 {
+                fence = Some((marker, width));
+                continue;
+            }
+        }
+
+        if let Some((level, title)) = markdown_heading(raw_line) {
+            if title.eq_ignore_ascii_case(expected) {
+                section_level = Some(level);
+            } else if section_level.is_some_and(|current| level <= current) {
+                section_level = None;
+            }
+            continue;
+        }
+
+        if section_level.is_some() && !line.trim().is_empty() {
+            return true;
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -577,53 +663,189 @@ mod tests {
     }
 
     #[test]
-    fn lint_issues_with_storage_matches_full_hydration_results() {
+    fn acceptance_field_satisfies_tasks_and_features_without_description() {
+        for issue_type in [IssueType::Task, IssueType::Feature] {
+            let mut issue = make_issue(issue_type, None);
+            issue.acceptance_criteria = Some(" \n- [ ] the thing works\t".to_string());
+            assert!(lint_issue(&issue).is_none(), "{}", issue.issue_type);
+            issue.description = Some("## Acceptance Criteria\n".to_string());
+            assert!(lint_issue(&issue).is_none(), "field takes precedence");
+        }
+    }
+
+    #[test]
+    fn acceptance_field_does_not_replace_bug_steps_or_epic_success_criteria() {
+        let mut bug = make_issue(IssueType::Bug, None);
+        bug.acceptance_criteria = Some("The fix works".to_string());
+        assert_eq!(
+            lint_issue(&bug).unwrap().missing,
+            vec!["## Steps to Reproduce"]
+        );
+        bug.description = Some("## Steps to Reproduce\n1. Trigger the bug".to_string());
+        assert!(lint_issue(&bug).is_none());
+
+        let mut epic = make_issue(IssueType::Epic, None);
+        epic.acceptance_criteria = Some("The fix works".to_string());
+        assert_eq!(
+            lint_issue(&epic).unwrap().missing,
+            vec!["## Success Criteria"]
+        );
+        epic.description = Some("## Success Criteria\nThe project succeeds".to_string());
+        assert!(lint_issue(&epic).is_none());
+    }
+
+    #[test]
+    fn blank_acceptance_field_requires_a_real_legacy_section() {
+        for criteria in [None, Some(""), Some(" \t\r\n\u{2003}")] {
+            let mut issue = make_issue(
+                IssueType::Task,
+                Some("We will add acceptance criteria later."),
+            );
+            issue.acceptance_criteria = criteria.map(str::to_string);
+            assert_eq!(
+                lint_issue(&issue).unwrap().missing,
+                vec!["## Acceptance Criteria"],
+                "criteria: {criteria:?}"
+            );
+            issue.description = Some("## Acceptance Criteria\n- [ ] Done".to_string());
+            assert!(lint_issue(&issue).is_none(), "criteria: {criteria:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_sections_accept_complete_case_insensitive_markdown_headings() {
+        for description in [
+            "# acceptance criteria\n- Done",
+            "## Acceptance Criteria:\r\n- Done",
+            "   ### ACCEPTANCE CRITERIA ###\n- Done",
+            "###### Acceptance Criteria\n- Done",
+            "##\tAcceptance Criteria\t\n- Done",
+            "## Acceptance Criteria\n### Verification\n- Done",
+            "## Acceptance Criteria\n```text\nThe thing works\n```",
+        ] {
+            let issue = make_issue(IssueType::Task, Some(description));
+            assert!(lint_issue(&issue).is_none(), "{description:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_sections_reject_prose_lookalikes_and_empty_bodies() {
+        for description in [
+            "We will add acceptance criteria later.",
+            "Acceptance Criteria\n- No heading",
+            "Text before ## Acceptance Criteria\n- Done",
+            "## Acceptance Criteria backlog\n- Done",
+            "## No Acceptance Criteria\n- Done",
+            "##Acceptance Criteria\n- Done",
+            "####### Acceptance Criteria\n- Done",
+            "    ## Acceptance Criteria\n    - Example",
+            "> ## Acceptance Criteria\n> - Quoted example",
+            "## Acceptance Criteria",
+            "## Acceptance Criteria\n \t\n",
+            "## Acceptance Criteria\n## Notes\nUnrelated content",
+            "## Acceptance Criteria\n# Notes\nUnrelated content",
+            "## Acceptance Criteria\n```\n```",
+        ] {
+            let issue = make_issue(IssueType::Task, Some(description));
+            assert_eq!(
+                lint_issue(&issue).unwrap().missing,
+                vec!["## Acceptance Criteria"],
+                "{description:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fenced_examples_do_not_supply_legacy_headings() {
+        for description in [
+            "```markdown\n## Acceptance Criteria\n- Example\n```",
+            "~~~markdown\n## Acceptance Criteria\n- Example\n~~~",
+            "````markdown\n```\n## Acceptance Criteria\n- Example\n````",
+            "```markdown\n## Acceptance Criteria\n- Unclosed example",
+            "```markdown\n```not-a-close\n## Acceptance Criteria\n- Example\n```",
+        ] {
+            assert!(
+                lint_issue(&make_issue(IssueType::Task, Some(description))).is_some(),
+                "{description:?}"
+            );
+        }
+        for marker in ["```", "~~~", "````"] {
+            let description = format!(
+                "{marker}markdown\n## Acceptance Criteria\n- Example\n{marker}\n\n\
+                 ## Acceptance Criteria\n- Actual criterion"
+            );
+            assert!(
+                lint_issue(&make_issue(IssueType::Task, Some(&description))).is_none(),
+                "{description:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prose_does_not_supply_other_required_sections() {
+        let mut bug = make_issue(IssueType::Bug, Some("We need steps to reproduce this bug."));
+        bug.acceptance_criteria = Some("The fix works".to_string());
+        assert_eq!(
+            lint_issue(&bug).unwrap().missing,
+            vec!["## Steps to Reproduce"]
+        );
+        let epic = make_issue(IssueType::Epic, Some("We will define success criteria later."));
+        assert_eq!(
+            lint_issue(&epic).unwrap().missing,
+            vec!["## Success Criteria"]
+        );
+    }
+
+    #[test]
+    fn lint_issues_with_storage_preserves_acceptance_and_matches_explicit_ids() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let now = Utc.with_ymd_and_hms(2026, 5, 3, 12, 0, 0).unwrap();
-
-        let mut missing = make_issue(IssueType::Task, Some("Needs a real section"));
+        let mut missing = make_issue(
+            IssueType::Task,
+            Some("We will add acceptance criteria later."),
+        );
         missing.id = "bd-lint-missing".to_string();
-        missing.title = "Lint missing section".to_string();
-        missing.created_at = now;
-        missing.updated_at = now;
-        missing.design = Some("unused design".repeat(512));
-        missing.acceptance_criteria = Some("unused criteria".repeat(512));
-        missing.notes = Some("unused notes".repeat(512));
-        missing.owner = Some("owner".to_string());
-        missing.sender = Some("cli".to_string());
-
-        let mut complete = make_issue(
+        let mut blank = make_issue(IssueType::Task, Some("No criteria supplied"));
+        blank.id = "bd-lint-blank".to_string();
+        blank.acceptance_criteria = Some(" \t\n".to_string());
+        let mut field = make_issue(IssueType::Task, None);
+        field.id = "bd-lint-field".to_string();
+        field.acceptance_criteria = Some("- [ ] the thing works".to_string());
+        let mut legacy = make_issue(
             IssueType::Task,
             Some("## Acceptance Criteria\n- Already present"),
         );
-        complete.id = "bd-lint-complete".to_string();
-        complete.title = "Lint complete section".to_string();
-        complete.created_at = now;
-        complete.updated_at = now;
+        legacy.id = "bd-lint-legacy".to_string();
+        for issue in [&mut missing, &mut blank, &mut field, &mut legacy] {
+            issue.created_at = now;
+            issue.updated_at = now;
+            storage.create_issue(issue, "tester").unwrap();
+        }
 
-        storage.create_issue(&missing, "tester").unwrap();
-        storage.create_issue(&complete, "tester").unwrap();
-
-        let args = LintArgs::default();
-        let filters = build_filters(&args).unwrap();
-        let full_summary = lint_issues(&storage.list_issues(&filters).unwrap());
-        let projected_raw = lint_issues_with_storage(&args, &storage).unwrap();
-        let projected_issue = projected_raw
-            .iter()
-            .find(|issue| issue.id == "bd-lint-missing")
-            .unwrap();
-        assert!(projected_issue.design.is_none());
-        assert!(projected_issue.acceptance_criteria.is_none());
-        assert!(projected_issue.notes.is_none());
-        assert!(projected_issue.owner.is_none());
-        assert!(projected_issue.sender.is_none());
-
-        let projected_summary = lint_issues(&projected_raw);
-        assert_eq!(projected_summary.checked, full_summary.checked);
-        assert_eq!(projected_summary.warnings, full_summary.warnings);
+        let scanned = lint_issues_with_storage(&LintArgs::default(), &storage).unwrap();
+        assert_eq!(scanned.len(), 4);
         assert_eq!(
-            serde_json::to_value(projected_summary.results).unwrap(),
-            serde_json::to_value(full_summary.results).unwrap()
+            scanned
+                .iter()
+                .find(|issue| issue.id == field.id)
+                .unwrap()
+                .acceptance_criteria,
+            field.acceptance_criteria
+        );
+        let ids = scanned
+            .iter()
+            .map(|issue| issue.id.clone())
+            .collect::<Vec<_>>();
+        let explicit = fetch_issues_in_resolved_order(&storage, &ids).unwrap();
+        let summary = lint_issues(&scanned);
+        assert_eq!(summary.checked, 4);
+        assert_eq!(summary.warnings, 2);
+        assert_eq!(summary.results.len(), 2);
+        assert!(summary.results.iter().any(|result| result.id == missing.id));
+        assert!(summary.results.iter().any(|result| result.id == blank.id));
+        assert_eq!(
+            serde_json::to_value(summary.results).unwrap(),
+            serde_json::to_value(lint_issues(&explicit).results).unwrap()
         );
     }
 
