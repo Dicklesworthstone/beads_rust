@@ -1,5 +1,34 @@
 # Dependency Upgrade Log
 
+## September 18: the `otrgz` pending-merge-inspection reproducer closes on 0.4.4 — COMPLETE
+
+`otrgz` opened on a real failure: the eight-process/30-second linearizability
+gate managed 9 operations against a floor of 100, with `show` calls taking
+30–35s, `label`/`reopen` refused "pending sync-merge inspection with database
+busy", and `close` timing out on the workspace write lock. The 0.4.4 family
+receipts in the section below already cover the gate that failed
+(`linearizability_multiprocess` 25 passed, 8 processes, 375 operations,
+failed=0, dropped_creates=0).
+
+The one named reproducer no 0.4.4 receipt covered was the discriminator
+recorded on the bead on 2026-09-15: `e2e_sync_flush_only_succeeds_with_large_
+mixed_prefix_export_hash_rewrite` (`tests/e2e_basic_lifecycle.rs:3479`), which
+on source `b41234d0` failed with the same pending-inspection `DatabaseBusy` and
+a poisoned checkpoint lock.
+
+- [x] `rch exec -- cargo test --locked --test e2e_basic_lifecycle` on hz4
+  against the 0.4.4 tree: **210 passed / 0 failed / 0 ignored**, exit 0, tests
+  finished in 12.68s after a 1,765s cold compile. The named reproducer is
+  listed `ok`, and the log contains no `DatabaseBusy`, "database busy" or
+  "poisoned" occurrence anywhere. Log:
+  `/data/tmp/claude-1000/-data-projects-beads-rust/153ddb59-baa4-4a96-8e54-8cd420dee580/scratchpad/otrgz-e2e-basic-lifecycle.log`.
+
+The whole 66-test binary was run rather than the single filter, because the
+cold compile dominates and the broader result is free. This closes `otrgz`'s
+own evidence gap and therefore unblocks `nx2sh`. It does not discharge the
+release, native-target or AUR obligations, which stay with `4e2n1` / `phm7n` /
+`vq1xl`.
+
 ## September 17: FrankenSQLite 0.4.4 uniform family + stable catch-ups (`beads_rust-0edxa`) — COMPLETE
 
 - [x] Research the tagged v0.4.4 release (commit `9d3d98778a372aba95d76d05c5c974ac0238c96a`,

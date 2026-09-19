@@ -311,7 +311,12 @@ pub fn try_lock_database_inode(file: &File) -> Result<(), TryLockError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     use std::fs::OpenOptions;
     use std::io::Write;
 
@@ -359,25 +364,46 @@ mod tests {
         try_lock_database_inode(&file).expect("re-lock on the same open file description");
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     fn recovery_lock_excludes_sqlite_range_but_not_br_authority() {
         use crate::franken_sync::wal_index::RecoveryLock;
         let dir = tempfile::tempdir().unwrap();
         let authority = temp_file(dir.path());
         try_lock_database_inode(&authority).unwrap();
-        let open = || OpenOptions::new().read(true).write(true)
-            .open(dir.path().join("inode-lock-test.db")).unwrap();
+        let open = || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(dir.path().join("inode-lock-test.db"))
+                .unwrap()
+        };
         let first = RecoveryLock::acquire(open()).unwrap();
-        assert!(matches!(RecoveryLock::acquire(open()), Err(TryLockError::WouldBlock)));
+        assert!(matches!(
+            RecoveryLock::acquire(open()),
+            Err(TryLockError::WouldBlock)
+        ));
         // Opening and closing an unrelated descriptor cannot drop the OFD lock.
         drop(open());
-        assert!(matches!(RecoveryLock::acquire(open()), Err(TryLockError::WouldBlock)));
+        assert!(matches!(
+            RecoveryLock::acquire(open()),
+            Err(TryLockError::WouldBlock)
+        ));
         drop(first);
         assert!(RecoveryLock::acquire(open()).is_ok());
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     #[allow(unsafe_code)]
     fn recovery_lock_conflicts_with_sqlite_posix_reader() {
@@ -394,10 +420,19 @@ mod tests {
         };
         // SAFETY: live descriptor and fully initialized flock, borrowed only
         // for this synchronous syscall, matching the production guard above.
-        assert_eq!(unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETLK, &lock) }, 0);
-        let candidate = OpenOptions::new().read(true).write(true)
-            .open(dir.path().join("inode-lock-test.db")).unwrap();
-        assert!(matches!(RecoveryLock::acquire(candidate), Err(TryLockError::WouldBlock)));
+        assert_eq!(
+            unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETLK, &lock) },
+            0
+        );
+        let candidate = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join("inode-lock-test.db"))
+            .unwrap();
+        assert!(matches!(
+            RecoveryLock::acquire(candidate),
+            Err(TryLockError::WouldBlock)
+        ));
     }
 
     /// The database-inode authority must not conflict with SQLite-engine

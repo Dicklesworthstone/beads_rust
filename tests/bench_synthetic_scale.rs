@@ -3445,6 +3445,141 @@ mod release_abba {
         }
     }
 
+    /// The frozen per-workload budgets are a committed input, not an
+    /// uncommitted CI repository variable (bead `beads_rust-zxfz.1`).
+    ///
+    /// `vars.BR_PERF_BUDGETS_JSON` being empty is what made CI run 34047413559
+    /// exit 2, and nothing in the tree could detect that. This checks the
+    /// committed replacement is complete, well formed, and accepted by the same
+    /// `workload_budgets` parser the harness uses — so the calibration cannot
+    /// silently drift away from the canonical 28-workload matrix.
+    #[test]
+    fn the_frozen_release_latency_budgets_cover_the_canonical_matrix() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/docs/perf/release_latency_budgets.json"
+        );
+        let document: Value = serde_json::from_str(
+            &fs::read_to_string(path).expect("committed release latency budgets"),
+        )
+        .expect("budgets document parses");
+
+        assert_eq!(
+            document["schema"], "br.perf.release_latency_budgets.v1",
+            "budget schema must be explicit"
+        );
+        assert_eq!(
+            document["gated_statistic"], "median",
+            "these budgets were calibrated for the median leg only"
+        );
+        assert_eq!(
+            document["min_gating_blocks"], 99,
+            "budgets were derived from a 99-block null and do not transfer"
+        );
+        for key in [
+            "derivation",
+            "source_evidence",
+            "validation",
+            "power_warning",
+            "gating_scope",
+        ] {
+            assert!(
+                document[key].as_str().is_some_and(|text| text.len() > 40),
+                "{key} must record how these numbers were obtained"
+            );
+        }
+
+        let budgets = document["budgets_pct"]
+            .as_object()
+            .expect("budgets_pct object");
+
+        // Rebuild the canonical 28 names independently of the budget file, so a
+        // renamed or dropped workload fails here instead of passing silently.
+        let mut expected: Vec<String> = Vec::new();
+        for issue_count in [1_000, 10_000] {
+            for command in [
+                "version", "ready", "list", "show", "create", "update", "close",
+            ] {
+                for flush in ["default-auto-flush", "diagnostic-no-auto-flush"] {
+                    expected.push(format!("{issue_count}-{command}-{flush}"));
+                }
+            }
+        }
+        assert_eq!(expected.len(), 28);
+        let mut missing: Vec<&String> = expected
+            .iter()
+            .filter(|name| !budgets.contains_key(name.as_str()))
+            .collect();
+        missing.sort();
+        assert!(missing.is_empty(), "budgets missing workloads: {missing:?}");
+        assert_eq!(
+            budgets.len(),
+            expected.len(),
+            "budgets carry workloads outside the canonical matrix"
+        );
+        for name in &expected {
+            assert!(
+                workload_issue_count(name).is_some(),
+                "{name} is not a workload the harness recognizes"
+            );
+            let value = budgets[name.as_str()]
+                .as_f64()
+                .unwrap_or_else(|| panic!("{name} budget must be a number"));
+            assert!(
+                value.is_finite() && value > 0.0,
+                "{name} budget must be positive and finite, got {value}"
+            );
+        }
+
+        // The harness's own parser must accept the committed document, since
+        // that is how it will be supplied through BR_PERF_BUDGETS_JSON.
+        let parsed = workload_budgets(&document["budgets_pct"].to_string())
+            .expect("harness must accept the committed budgets");
+        assert_eq!(parsed.len(), 28);
+
+        // Every budget must still clear the null it was derived from, and the
+        // real A/A run it was calibrated against must still pass under it.
+        // Without this, someone could tighten a budget by hand and only find
+        // out when the next campaign reported a regression that was actually
+        // measurement noise.
+        let study: Value = serde_json::from_str(
+            &fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/docs/perf/release_latency_null_study.json"
+            ))
+            .expect("committed null study"),
+        )
+        .expect("null study parses");
+        let rows = study.as_array().expect("null study array");
+        assert_eq!(rows.len(), 28, "the null study must cover every workload");
+        for row in rows {
+            let name = row["workload"].as_str().expect("study workload name");
+            let budget = budgets[name].as_f64().expect("budget for studied workload");
+            let blocks = row["blocks"].as_u64().expect("study block count");
+            let bonferroni = row["null_bonferroni"]
+                .as_f64()
+                .expect("study family-wise null quantile");
+            let observed = row["observed_median_upper_pct"]
+                .as_f64()
+                .expect("study observed A/A bound");
+
+            assert_eq!(
+                blocks, 99,
+                "{name}: the null was estimated at 99 blocks, matching min_gating_blocks"
+            );
+            assert!(
+                budget >= bonferroni,
+                "{name}: budget {budget} is below its family-wise null quantile {bonferroni}, \
+                 so an A/A run would report a false regression"
+            );
+            assert!(
+                observed <= budget,
+                "{name}: the calibration A/A run measured {observed}% against a {budget}% \
+                 budget, so a known-good result would fail its own gate"
+            );
+        }
+    }
+
     #[test]
     fn release_measurement_extra_versions_are_real_separate_calls_and_fail_closed() {
         let binary = assert_cmd::cargo::cargo_bin!("br");

@@ -65,6 +65,18 @@ const LABELS: [&str; 4] = ["alpha", "beta", "gamma", "delta"];
 /// (about 230 before the schema-witness fast open, about 330 after); the
 /// floor only rules out a run that barely started.
 const MIN_OPERATIONS: usize = 100;
+/// `MIN_OPERATIONS` is a sum over every stream, so seven busy workers hide an
+/// eighth that never reached the write lock: the aggregate floor cannot see
+/// starvation. This is the per-stream share of the mean that each worker must
+/// reach (bead `beads_rust-46zqi`). It is deliberately generous. Admission is
+/// documented as a non-strict queue rather than arrival-time FIFO
+/// (`docs/SYNC_SAFETY.md`), the three family locks below `.write.lock` have no
+/// queue at all, and 100–200 ms of per-operation process start alone spreads
+/// stream throughput — so a stream running four times slower than the mean is
+/// within the mechanism's stated behavior. A stream below that has not been
+/// scheduled unluckily; it has been starved, and a stream at zero fails for
+/// any workload size or process count without pinning a magic absolute count.
+const MIN_FAIRNESS_SHARE: f64 = 0.25;
 
 // ---------------------------------------------------------------------------
 // Sequential model
@@ -1005,6 +1017,96 @@ fn describe(entry: &Entry) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Sustained-contention fairness oracle (bead beads_rust-46zqi)
+// ---------------------------------------------------------------------------
+
+/// Per-stream progress and peer-bypass evidence for one workload.
+///
+/// The linearizability checker below answers "was every history admissible";
+/// this answers the separate question "did every stream actually get served".
+/// They are independent: a run in which one worker is starved to zero
+/// operations is perfectly linearizable.
+#[derive(Clone, Debug, Serialize)]
+struct Fairness {
+    /// Operations completed per worker pid, including workers that completed
+    /// none — the point of the oracle is that a starved stream is visible.
+    per_process: BTreeMap<usize, usize>,
+    min_operations: usize,
+    max_operations: usize,
+    mean_operations: f64,
+    /// `min_operations` as a share of `mean_operations`. 1.0 is perfectly
+    /// even; 0.0 is a stream that never completed an operation.
+    min_share: f64,
+    /// The largest number of `Applied` peer calls that both began and returned
+    /// wholly inside one call's own invoke/return window. This is the bypass
+    /// count the original evidence on this bead reported; it is retained
+    /// evidence, not an assertion, because the queue's own contract does not
+    /// promise a bound on it.
+    max_peer_bypass: usize,
+    /// The call that observed `max_peer_bypass`, in `describe` form.
+    max_peer_bypass_call: Option<String>,
+}
+
+impl Fairness {
+    /// `entries` must be the worker history with dropped creates already
+    /// removed and before the quiescent read pass appends its own pid.
+    fn measure(entries: &[Entry], processes: usize) -> Self {
+        let mut per_process: BTreeMap<usize, usize> = (0..processes).map(|pid| (pid, 0)).collect();
+        for entry in entries {
+            *per_process.entry(entry.pid).or_default() += 1;
+        }
+        let counts: Vec<usize> = per_process.values().copied().collect();
+        let min_operations = counts.iter().copied().min().unwrap_or(0);
+        let max_operations = counts.iter().copied().max().unwrap_or(0);
+        let mean_operations = if counts.is_empty() {
+            0.0
+        } else {
+            counts.iter().sum::<usize>() as f64 / counts.len() as f64
+        };
+        // A workload that produced nothing at all is already caught by
+        // `MIN_OPERATIONS`; reporting share 0.0 here keeps this oracle from
+        // dividing by zero and from claiming fairness it did not observe.
+        let min_share = if mean_operations > 0.0 {
+            min_operations as f64 / mean_operations
+        } else {
+            0.0
+        };
+        let mut max_peer_bypass = 0;
+        let mut max_peer_bypass_call = None;
+        for entry in entries {
+            let bypassed = entries
+                .iter()
+                .filter(|peer| {
+                    peer.pid != entry.pid
+                        && matches!(peer.outcome, Outcome::Applied)
+                        && peer.invoke_ns > entry.invoke_ns
+                        && peer.return_ns < entry.return_ns
+                })
+                .count();
+            if bypassed > max_peer_bypass {
+                max_peer_bypass = bypassed;
+                max_peer_bypass_call = Some(describe(entry));
+            }
+        }
+        Self {
+            per_process,
+            min_operations,
+            max_operations,
+            mean_operations,
+            min_share,
+            max_peer_bypass,
+            max_peer_bypass_call,
+        }
+    }
+
+    /// Whether every stream reached its share of the mean. A single-stream
+    /// workload has no fairness question to answer.
+    fn starved(&self, processes: usize) -> bool {
+        processes > 1 && self.min_share < MIN_FAIRNESS_SHARE
+    }
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn concurrent_br_histories_are_linearizable_and_match_the_published_jsonl() {
@@ -1040,8 +1142,19 @@ fn concurrent_br_histories_are_linearizable_and_match_the_published_jsonl() {
     entries.sort_by_key(|entry| (entry.invoke_ns, entry.pid, entry.seq));
 
     let dropped_creates = entries.iter().filter(|entry| entry.key.is_empty()).count();
+    // Measured over the worker streams only: dropped creates carry no key and
+    // the quiescent read pass has not appended its own pid yet.
+    let fairness = Fairness::measure(
+        &entries
+            .iter()
+            .filter(|entry| !entry.key.is_empty())
+            .cloned()
+            .collect::<Vec<Entry>>(),
+        processes,
+    );
     let workload_failed = entries.len().saturating_sub(dropped_creates) < MIN_OPERATIONS
         || dropped_creates != 0
+        || fairness.starved(processes)
         || entries
             .iter()
             .any(|entry| matches!(entry.outcome, Outcome::Failed(_)));
@@ -1067,6 +1180,8 @@ fn concurrent_br_histories_are_linearizable_and_match_the_published_jsonl() {
             "seconds": seconds,
             "minimum_operations": MIN_OPERATIONS,
             "dropped_creates": dropped_creates,
+            "minimum_fairness_share": MIN_FAIRNESS_SHARE,
+            "fairness": fairness,
             "workspace": temp.path(),
             "workspace_retained": true,
         });
@@ -1125,6 +1240,34 @@ fn concurrent_br_histories_are_linearizable_and_match_the_published_jsonl() {
     assert_eq!(
         dropped_creates, 0,
         "every create must succeed and return an observable issue id"
+    );
+
+    // Sustained-contention fairness (bead beads_rust-46zqi). Every assertion
+    // above is an aggregate, so none of them can see one stream starved by the
+    // other seven. This one can, and it neither raises a deadline nor lowers a
+    // workload floor: it only adds a requirement the run must also meet.
+    eprintln!(
+        "[linearizability] fairness: min={} max={} mean={:.1} min_share={:.3} (floor {MIN_FAIRNESS_SHARE:.2}) max_peer_bypass={} per_process={:?}",
+        fairness.min_operations,
+        fairness.max_operations,
+        fairness.mean_operations,
+        fairness.min_share,
+        fairness.max_peer_bypass,
+        fairness.per_process
+    );
+    assert!(
+        !fairness.starved(processes),
+        "a worker stream was starved: the slowest of {processes} completed {} operations against a mean of {:.1} (share {:.3}, floor {MIN_FAIRNESS_SHARE:.2}); busiest stream {}. Per-stream counts: {:?}. Largest peer bypass observed: {} during {}",
+        fairness.min_operations,
+        fairness.mean_operations,
+        fairness.min_share,
+        fairness.max_operations,
+        fairness.per_process,
+        fairness.max_peer_bypass,
+        fairness
+            .max_peer_bypass_call
+            .as_deref()
+            .unwrap_or("no enclosing call")
     );
 
     // Quiescent read pass: one `show` per issue after every worker has
@@ -1255,6 +1398,170 @@ fn concurrent_br_histories_are_linearizable_and_match_the_published_jsonl() {
         )
         .expect("write oracle result after all checks pass");
     }
+}
+
+/// Hand-checked sensitivity control for the fairness oracle (bead
+/// `beads_rust-46zqi`). An oracle nothing can fail proves nothing, and the
+/// starvation it must catch is exactly the shape the aggregate floor admits:
+/// a history large enough to pass `MIN_OPERATIONS` in which one stream is
+/// served far below its share. These traces are synthetic on purpose — the
+/// arithmetic is the thing under test, and a real workload cannot be made to
+/// starve a worker on demand without weakening the mechanism under test.
+#[test]
+fn the_fairness_oracle_separates_even_streams_from_a_starved_one() {
+    // Entries are a millisecond apart and never overlap, so peer bypass is
+    // zero throughout and only the per-stream counts vary.
+    let trace = |counts: &[usize]| -> Vec<Entry> {
+        let mut entries = Vec::new();
+        let mut clock = 0_u64;
+        for (pid, count) in counts.iter().enumerate() {
+            for seq in 0..*count {
+                entries.push(Entry {
+                    pid,
+                    seq,
+                    key: format!("br-{pid}-{seq}"),
+                    invoke_ns: clock,
+                    return_ns: clock + 1_000_000,
+                    op: Op::CommentAdd,
+                    outcome: Outcome::Applied,
+                });
+                clock += 2_000_000;
+            }
+        }
+        entries
+    };
+
+    // Even: eight streams of 40. mean 40, min 40, share exactly 1.0.
+    let even = Fairness::measure(&trace(&[40; 8]), 8);
+    assert_eq!(even.min_operations, 40);
+    assert_eq!(even.max_operations, 40);
+    assert!((even.min_share - 1.0).abs() < 1e-9, "{:?}", even);
+    assert!(!even.starved(8), "an even workload is not starvation");
+
+    // Starved: seven streams of 40 plus one of 2. Total 282, so the aggregate
+    // MIN_OPERATIONS floor of 100 passes and every other assertion in the
+    // main test is satisfied. mean = 282/8 = 35.25, share = 2/35.25 ≈ 0.0567,
+    // below the 0.25 floor.
+    let mut counts = [40_usize; 8];
+    counts[3] = 2;
+    let starved = Fairness::measure(&trace(&counts), 8);
+    assert!(
+        starved.min_operations + starved.max_operations > 0
+            && starved.per_process.values().sum::<usize>() >= MIN_OPERATIONS,
+        "the starved trace must still clear the aggregate floor: {:?}",
+        starved
+    );
+    assert_eq!(starved.min_operations, 2);
+    assert!(
+        (starved.mean_operations - 35.25).abs() < 1e-9,
+        "{:?}",
+        starved
+    );
+    assert!(starved.min_share < MIN_FAIRNESS_SHARE, "{:?}", starved);
+    assert!(
+        starved.starved(8),
+        "a stream at 5.7% of the mean is starved"
+    );
+
+    // A stream that completed nothing must fail for any process count, and a
+    // worker that produced no entries at all must still appear in the report.
+    counts[3] = 0;
+    let silent = Fairness::measure(&trace(&counts), 8);
+    assert_eq!(silent.per_process.get(&3), Some(&0));
+    assert!(silent.min_share.abs() < 1e-9, "{:?}", silent);
+    assert!(silent.starved(8), "a stream at zero is starvation");
+
+    // The boundary is checked in both directions rather than assumed: four
+    // streams of 40 and one of 13 give mean 34.6 and share 0.3757 (pass),
+    // while one of 8 gives mean 33.6 and share 0.2381 (fail).
+    let admitted = Fairness::measure(&trace(&[40, 40, 40, 40, 13]), 5);
+    assert!(admitted.min_share > MIN_FAIRNESS_SHARE, "{:?}", admitted);
+    assert!(!admitted.starved(5));
+    let refused = Fairness::measure(&trace(&[40, 40, 40, 40, 8]), 5);
+    assert!(refused.min_share < MIN_FAIRNESS_SHARE, "{:?}", refused);
+    assert!(refused.starved(5));
+
+    // One stream has no fairness question to answer, so the oracle must not
+    // manufacture a verdict for a single-process run.
+    let single = Fairness::measure(&trace(&[40]), 1);
+    assert!(!single.starved(1), "one stream cannot starve itself");
+
+    // Peer bypass counts only `Applied` calls from other pids that both began
+    // and returned inside the enclosing call. Hand-built: p0's call spans
+    // 0..100 ms; two p1 calls land wholly inside it, one p2 call straddles the
+    // end, and one p0 call inside it is its own stream.
+    let enclosing = vec![
+        Entry {
+            pid: 0,
+            seq: 0,
+            key: "br-slow".into(),
+            invoke_ns: 0,
+            return_ns: 100_000_000,
+            op: Op::Close,
+            outcome: Outcome::Applied,
+        },
+        Entry {
+            pid: 1,
+            seq: 0,
+            key: "br-a".into(),
+            invoke_ns: 10_000_000,
+            return_ns: 20_000_000,
+            op: Op::CommentAdd,
+            outcome: Outcome::Applied,
+        },
+        Entry {
+            pid: 1,
+            seq: 1,
+            key: "br-b".into(),
+            invoke_ns: 30_000_000,
+            return_ns: 40_000_000,
+            op: Op::CommentAdd,
+            outcome: Outcome::Applied,
+        },
+        Entry {
+            pid: 2,
+            seq: 0,
+            key: "br-c".into(),
+            invoke_ns: 90_000_000,
+            return_ns: 110_000_000,
+            op: Op::CommentAdd,
+            outcome: Outcome::Applied,
+        },
+        Entry {
+            pid: 0,
+            seq: 1,
+            key: "br-d".into(),
+            invoke_ns: 50_000_000,
+            return_ns: 60_000_000,
+            op: Op::CommentAdd,
+            outcome: Outcome::Applied,
+        },
+    ];
+    let bypass = Fairness::measure(&enclosing, 3);
+    assert_eq!(
+        bypass.max_peer_bypass, 2,
+        "only the two enclosed peer calls count: {:?}",
+        bypass
+    );
+    assert!(
+        bypass
+            .max_peer_bypass_call
+            .as_deref()
+            .is_some_and(|call| call.starts_with("p0 #0 close")),
+        "{:?}",
+        bypass
+    );
+
+    // A non-`Applied` enclosed peer call is not a bypass: it never took the
+    // lock, so it is not evidence that someone overtook the enclosing caller.
+    let mut refused_peer = enclosing;
+    refused_peer[1].outcome = Outcome::Failed("database is locked".into());
+    let bypass = Fairness::measure(&refused_peer, 3);
+    assert_eq!(
+        bypass.max_peer_bypass, 1,
+        "a failed peer call is not a bypass: {:?}",
+        bypass
+    );
 }
 
 /// The live planted negative: one process stream claims a successful close it

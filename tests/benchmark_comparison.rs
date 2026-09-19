@@ -1941,7 +1941,8 @@ mod matched_arithmetic {
         let result = compare_matched_runs(Some(&baseline), &candidate, 20.0);
         assert_eq!(result.state, MatchedState::Inconclusive);
         assert_eq!(result.exit_code(), 2);
-        // The empirical p95 is unchanged, but ten blocks cannot bound its tail.
+        // Ten blocks is below MIN_GATING_BLOCKS, so no verdict is rendered. The
+        // empirical p95 is unchanged and ten blocks also cannot bound its tail.
         close(result.p95.unwrap().delta_ms, 0.0);
         close(result.observed_support.unwrap().upper_ms, 990.0);
         assert!(result.uncertainty.unwrap().p95.upper.is_none());
@@ -1968,6 +1969,9 @@ mod matched_arithmetic {
         ] {
             let run = control(vec![100.0; blocks * 2]);
             let result = compare_matched_runs(Some(&run), &run, 0.0);
+            // A verdict only at or above MIN_GATING_BLOCKS (99). Note the p95
+            // upper rank equals the block count at 98 and 99 alike, which is
+            // why that leg no longer gates: its endpoint is the sample maximum.
             assert_eq!(result.exit_code(), if blocks >= 99 { 0 } else { 2 });
             let uncertainty = result.uncertainty.unwrap();
             assert_eq!(uncertainty.block_count, blocks);
@@ -1986,20 +1990,157 @@ mod matched_arithmetic {
         }
     }
 
+    /// Below the gating floor the comparator measures but refuses to rule.
+    ///
+    /// A 50% median regression is unmistakable in the arithmetic here, and the
+    /// point is that it is still reported as `Inconclusive` at 10 blocks: the
+    /// per-workload budgets were calibrated from a 99-block A/A null and do not
+    /// transfer to a smaller sample. Before the p95 leg was dropped this floor
+    /// was supplied accidentally, by `p95.upper` being unbounded below 99
+    /// blocks; `MIN_GATING_BLOCKS` now states it.
     #[test]
-    fn median_regression_does_not_require_a_finite_p95_upper_bound() {
+    fn a_median_regression_below_the_gating_floor_is_measured_but_not_ruled_on() {
         let baseline = control(vec![10.0; 20]);
         let candidate = control(vec![15.0; 20]);
         let result = compare_matched_runs(Some(&baseline), &candidate, 20.0);
-        assert_eq!(result.state, MatchedState::Regression);
+        assert_eq!(result.state, MatchedState::Inconclusive);
+        assert_eq!(result.exit_code(), 2);
         let uncertainty = result.uncertainty.unwrap();
+        assert_eq!(uncertainty.block_count, 10);
+        // The measurement is intact and still says 50%; only the verdict is withheld.
         close(uncertainty.median.lower.unwrap().delta_pct, 50.0);
         assert!(uncertainty.p95.upper.is_none());
         assert!(uncertainty.p95.lower.is_none());
     }
 
+    /// A degraded candidate must fail with a diagnostic a human can act on
+    /// (bead `beads_rust-azxef.10`: "require a nonzero failure with a
+    /// diagnostic naming command, budget and measured delta").
+    ///
+    /// Asserted on the actual receipt string rather than only on the exit code,
+    /// because an exit code alone does not let anyone reproduce or argue with
+    /// the verdict. The diagnostic must also state which leg decided, so a
+    /// reader never infers that a `Pass` covered tail latency.
     #[test]
-    fn median_and_tail_regressions_are_decided_separately() {
+    fn a_degraded_candidate_fails_with_a_diagnostic_naming_command_budget_and_delta() {
+        let baseline = control(vec![100.0; 198]);
+        let candidate = control(vec![150.0; 198]);
+        let result = compare_matched_runs(Some(&baseline), &candidate, 20.0);
+
+        assert_eq!(result.state, MatchedState::Regression);
+        assert_eq!(
+            result.exit_code(),
+            1,
+            "a degraded candidate must exit nonzero"
+        );
+
+        let diagnostic = &result.diagnostic;
+        // The command under measurement.
+        assert!(
+            diagnostic.contains("list --json"),
+            "diagnostic must name the command: {diagnostic}"
+        );
+        // The budget it was judged against.
+        assert!(
+            diagnostic.contains("budget 20.000%"),
+            "diagnostic must name the budget: {diagnostic}"
+        );
+        // The measured delta, in absolute and relative terms.
+        assert!(
+            diagnostic.contains("median delta +50.000000 ms (+50.000%)"),
+            "diagnostic must name the measured median delta: {diagnostic}"
+        );
+        // The verdict, and which leg produced it.
+        assert!(
+            diagnostic.contains("Regression"),
+            "diagnostic must state the verdict: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("MEDIAN leg only"),
+            "diagnostic must say which leg decided: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("tail latency ungated"),
+            "diagnostic must not let a reader assume the tail was covered: {diagnostic}"
+        );
+        // Enough provenance to reproduce the comparison from the receipt.
+        let uncertainty = result.uncertainty.as_ref().unwrap();
+        assert_eq!(uncertainty.block_count, 99);
+        assert!(uncertainty.gating_scope.contains("median leg only"));
+    }
+
+    /// A known-good result must pass with the same machinery that fails the
+    /// degraded one, so the gate is not simply always-red (bead
+    /// `beads_rust-azxef.10`: "actual known-good result passes, degraded result
+    /// fails, unknown/mismatched result cannot pass").
+    #[test]
+    fn a_known_good_candidate_passes_and_an_unknown_one_cannot() {
+        let baseline = control(vec![100.0; 198]);
+
+        // Known-good: a 5% slowdown against a 20% budget.
+        let good = control(vec![105.0; 198]);
+        let pass = compare_matched_runs(Some(&baseline), &good, 20.0);
+        assert_eq!(pass.state, MatchedState::Pass);
+        assert_eq!(pass.exit_code(), 0);
+        assert!(pass.diagnostic.contains("median delta +5.000000 ms"));
+
+        // Unknown: no budget at all can never be green, only inconclusive.
+        let unknown = compare_matched_runs(Some(&baseline), &good, f64::NAN);
+        assert_eq!(unknown.state, MatchedState::Inconclusive);
+        assert_eq!(unknown.exit_code(), 2);
+        assert!(unknown.budget_pct.is_none());
+        assert!(
+            unknown.diagnostic.contains("budget unavailable"),
+            "{}",
+            unknown.diagnostic
+        );
+
+        // Missing baseline: refusal, never green.
+        let absent = compare_matched_runs(None, &good, 20.0);
+        assert_eq!(absent.state, MatchedState::Inconclusive);
+        assert_eq!(absent.exit_code(), 2);
+        assert!(
+            absent.diagnostic.contains("missing baseline receipt"),
+            "{}",
+            absent.diagnostic
+        );
+    }
+
+    /// The same regression at the gating floor is ruled on, and the median leg
+    /// alone decides it even though the p95 leg is finite and available.
+    #[test]
+    fn a_median_regression_at_the_gating_floor_is_a_regression() {
+        let baseline = control(vec![10.0; 198]);
+        let candidate = control(vec![15.0; 198]);
+        let result = compare_matched_runs(Some(&baseline), &candidate, 20.0);
+        assert_eq!(result.state, MatchedState::Regression);
+        assert_eq!(result.exit_code(), 1);
+        let uncertainty = result.uncertainty.unwrap();
+        assert_eq!(uncertainty.block_count, 99);
+        close(uncertainty.median.lower.unwrap().delta_pct, 50.0);
+        // p95 is computed and retained, and did not need consulting.
+        assert!(uncertainty.p95.upper.is_some());
+        assert!(
+            uncertainty.gating_scope.contains("median leg only"),
+            "every receipt must carry why p95 does not gate: {}",
+            uncertainty.gating_scope
+        );
+    }
+
+    /// THE ACCEPTED COST OF GATING ON THE MEDIAN ALONE: a tail-only regression
+    /// is fully measured, reported in the p95 evidence, and still passes.
+    ///
+    /// This candidate is 40% slower on its slowest 10% of blocks and identical
+    /// everywhere else. The empirical p95 delta is +40 ms and the p95 lower
+    /// bound proves the tail moved, so the regression is not hidden — it is in
+    /// the receipt. But `classify` consults only the median leg, so the verdict
+    /// is `Pass`. That is the deliberate consequence of the `zxfz.1` decision
+    /// to drop a p95 leg whose upper endpoint at 99 blocks is the sample
+    /// maximum, and it is asserted here rather than left to be discovered:
+    /// **this comparator does not gate tail latency.** Restoring tail gating
+    /// needs 199+ blocks, at which point `classify` should consult p95 again.
+    #[test]
+    fn a_tail_only_regression_is_reported_in_evidence_but_does_not_fail_the_gate() {
         let baseline = control(vec![100.0; 400]);
         let tail = control(
             (0..200)
@@ -2007,13 +2148,25 @@ mod matched_arithmetic {
                 .collect(),
         );
         let result = compare_matched_runs(Some(&baseline), &tail, 20.0);
-        assert_eq!(result.state, MatchedState::Regression);
+        assert_eq!(result.state, MatchedState::Pass);
+        assert_eq!(result.exit_code(), 0);
+        // The tail movement is measured and retained, not discarded.
         close(result.median.unwrap().delta_ms, 0.0);
         close(result.p95.unwrap().delta_ms, 40.0);
         let uncertainty = result.uncertainty.unwrap();
         close(uncertainty.median.upper.unwrap().delta_pct, 0.0);
         close(uncertainty.p95.lower.unwrap().delta_pct, 40.0);
+        assert!(
+            uncertainty
+                .gating_scope
+                .contains("Tail latency is not gated"),
+            "the receipt must say tail latency is ungated: {}",
+            uncertainty.gating_scope
+        );
+    }
 
+    #[test]
+    fn a_median_regression_behind_an_unchanged_tail_still_fails_the_gate() {
         let baseline = control(
             (0..200)
                 .flat_map(|block| [if block < 180 { 100.0 } else { 200.0 }; 2])

@@ -3113,10 +3113,8 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
         Utc::now().format("%Y%m%d_%H%M%S_%f")
     );
     let temp_path = db_path.with_file_name(format!(".{stem}.vacuum.{nonce}.tmp"));
-    let recovery_parent = recovery_dir_for_db_path(
-        db_path,
-        db_path.parent().unwrap_or_else(|| Path::new(".")),
-    );
+    let recovery_parent =
+        recovery_dir_for_db_path(db_path, db_path.parent().unwrap_or_else(|| Path::new(".")));
     fs::create_dir_all(&recovery_parent)?;
     let private_source_dir = tempfile::Builder::new()
         .prefix(".vacuum-source-")

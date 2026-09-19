@@ -455,7 +455,9 @@ mod tests {
         connection.execute("PRAGMA journal_mode = WAL").unwrap();
         connection.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
         connection.execute("CREATE TABLE t (value TEXT)").unwrap();
-        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        connection
+            .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
         connection
             .execute("INSERT INTO t VALUES ('WAL-only close retry')")
             .unwrap();
