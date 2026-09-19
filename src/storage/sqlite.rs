@@ -1581,19 +1581,34 @@ enum SearchIssueProjection {
 /// comments (beads_rust#416): agent workflows put durable handoffs and
 /// decisions in comments, so a comment-only token must still be findable.
 /// Binds four identical lowercase needle parameters.
+///
+/// The comment arm is deliberately **uncorrelated**. The correlated
+/// `EXISTS (... WHERE comments.issue_id = issues.id ...)` form it replaced
+/// re-ran the comment scan once per outer issue row, which is invisible on the
+/// default visible corpus and crippling on a whole-corpus search: on this
+/// repository's own tracker (1,097 issues, 1,756 comments, 1.70 MiB of comment
+/// text) `br search <term> --all` cost **5.9-7.2s** even for a needle matching
+/// nothing, against **0.05s** with the comments stripped. Materializing the
+/// matching comment issue ids once made the same search **0.05s**, a ~120x
+/// improvement, while `br search <term>` on the default corpus was already
+/// fast and is unchanged (`beads_rust-mwxp`).
+///
+/// This is the same shape `SEARCH_COUNT_NEEDLE_PREDICATE` has always used for
+/// whole-corpus counts, which is why the hidden-closed count was fast while
+/// the result query it accompanies was not.
 const SEARCH_NEEDLE_PREDICATE: &str = "(instr(lower(title), ?) > 0 \
      OR instr(lower(description), ?) > 0 \
      OR instr(lower(id), ?) > 0 \
-     OR EXISTS (SELECT 1 FROM comments \
-                WHERE comments.issue_id = issues.id \
-                  AND instr(lower(comments.text), ?) > 0))";
+     OR issues.id IN (SELECT comments.issue_id FROM comments \
+                      WHERE instr(lower(comments.text), ?) > 0))";
 
 /// Equivalent search predicate for whole-corpus counts.
 ///
-/// Unlike the result query, the hidden-closed count must inspect every eligible
-/// closed issue. Materializing the matching comment issue IDs once avoids
-/// rerunning the comment lookup for every outer issue while preserving the
-/// exact substring and deduplication semantics of `SEARCH_NEEDLE_PREDICATE`.
+/// Identical to `SEARCH_NEEDLE_PREDICATE`; retained as its own constant because
+/// the count query builds a different surrounding statement. Materializing the
+/// matching comment issue IDs once avoids rerunning the comment lookup for
+/// every outer issue while preserving exact substring and deduplication
+/// semantics.
 const SEARCH_COUNT_NEEDLE_PREDICATE: &str = "(instr(lower(title), ?) > 0 \
      OR instr(lower(description), ?) > 0 \
      OR instr(lower(id), ?) > 0 \
@@ -36091,6 +36106,170 @@ required_fields:
                 .unwrap(),
             2,
             "each closed issue must be counted once regardless of how many fields or comments match"
+        );
+    }
+
+    /// The result query and the count query must agree, because they are two
+    /// spellings of one predicate (`beads_rust-mwxp`).
+    ///
+    /// `SEARCH_NEEDLE_PREDICATE` used a correlated `EXISTS (... WHERE
+    /// comments.issue_id = issues.id ...)` that re-ran the comment scan for
+    /// every outer issue row, while `SEARCH_COUNT_NEEDLE_PREDICATE` already
+    /// used the uncorrelated `issues.id IN (SELECT ...)` form. De-correlating
+    /// the result query took `br search <needle> --all` on this repository's
+    /// own tracker from ~5.9s to ~0.05s. This test exists so the two can never
+    /// silently disagree again: it asserts the *set* of matching closed issues
+    /// found by the result query equals the *number* reported by the count
+    /// query, over a corpus that exercises every arm of the predicate.
+    #[test]
+    fn test_search_result_and_closed_count_predicates_agree() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2025, 9, 1, 0, 0, 0).unwrap();
+
+        // One closed issue per predicate arm, plus multi-match and no-match
+        // controls, so a regression in any single arm shows up as a mismatch.
+        let mut by_title = make_issue(
+            "bd-agree-title",
+            "needle in the title",
+            Status::Closed,
+            2,
+            None,
+            created_at,
+            None,
+        );
+        by_title.closed_at = Some(created_at);
+
+        let mut by_description = make_issue(
+            "bd-agree-desc",
+            "nothing here",
+            Status::Closed,
+            2,
+            None,
+            created_at,
+            None,
+        );
+        by_description.description = Some("buried NEEDLE in the body".to_string());
+        by_description.closed_at = Some(created_at);
+
+        // Matches only on id, via the substring "needle" inside the id itself.
+        let mut by_id = make_issue(
+            "bd-agree-needle-id",
+            "nothing here either",
+            Status::Closed,
+            2,
+            None,
+            created_at,
+            None,
+        );
+        by_id.closed_at = Some(created_at);
+
+        let mut by_comment = make_issue(
+            "bd-agree-comment",
+            "nothing here at all",
+            Status::Closed,
+            2,
+            None,
+            created_at,
+            None,
+        );
+        by_comment.closed_at = Some(created_at);
+
+        // Matches on several arms and on several comments at once: the count
+        // must still be one, and the result set must still hold it once.
+        let mut multi = make_issue(
+            "bd-agree-needle-multi",
+            "needle everywhere",
+            Status::Closed,
+            2,
+            None,
+            created_at,
+            None,
+        );
+        multi.description = Some("needle again".to_string());
+        multi.closed_at = Some(created_at);
+
+        let mut absent = make_issue(
+            "bd-agree-absent",
+            "no token at all",
+            Status::Closed,
+            2,
+            None,
+            created_at,
+            None,
+        );
+        absent.closed_at = Some(created_at);
+
+        // An OPEN comment match must be excluded from the closed count while
+        // remaining findable by an include-closed result query.
+        let open_comment = make_issue(
+            "bd-agree-open",
+            "open and quiet",
+            Status::Open,
+            2,
+            None,
+            created_at,
+            None,
+        );
+
+        for issue in [
+            by_title,
+            by_description,
+            by_id,
+            by_comment,
+            multi,
+            absent,
+            open_comment,
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .add_comment("bd-agree-comment", "tester", "handoff mentions NEEDLE once")
+            .unwrap();
+        for text in ["NEEDLE first", "needle second", "NeEdLe third"] {
+            storage
+                .add_comment("bd-agree-needle-multi", "tester", text)
+                .unwrap();
+        }
+        storage
+            .add_comment("bd-agree-open", "tester", "open issue needle comment")
+            .unwrap();
+        storage
+            .add_comment("bd-agree-absent", "tester", "unrelated remark")
+            .unwrap();
+
+        let mut closed_only = ListFilters {
+            statuses: Some(vec![Status::Closed]),
+            include_closed: true,
+            ..ListFilters::default()
+        };
+        closed_only.limit = None;
+
+        let matched: BTreeSet<String> = storage
+            .search_issues("NeEdLe", &closed_only)
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.id)
+            .collect();
+
+        assert_eq!(
+            matched,
+            BTreeSet::from([
+                "bd-agree-title".to_string(),
+                "bd-agree-desc".to_string(),
+                "bd-agree-needle-id".to_string(),
+                "bd-agree-comment".to_string(),
+                "bd-agree-needle-multi".to_string(),
+            ]),
+            "every predicate arm must match, case-insensitively, and only once each"
+        );
+
+        let counted = storage
+            .count_closed_search_matches("NeEdLe", &ListFilters::default())
+            .unwrap();
+        assert_eq!(
+            counted,
+            matched.len(),
+            "the count query and the result query are one predicate and must agree"
         );
     }
 
