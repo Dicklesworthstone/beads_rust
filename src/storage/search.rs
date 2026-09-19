@@ -94,7 +94,10 @@ impl SqliteStorage {
                             .to_string(),
                     });
                 }
-                if comments.iter().any(|comment| matcher.is_match(&comment.body)) {
+                if comments
+                    .iter()
+                    .any(|comment| matcher.is_match(&comment.body))
+                {
                     matched_ids.insert(id);
                 }
             }
@@ -124,7 +127,10 @@ fn hydrate_matches(
 ) -> Result<Vec<Issue>> {
     let mut result = Vec::with_capacity(candidates.len());
     for batch in candidates.chunks(SEARCH_BATCH_SIZE) {
-        let ids = batch.iter().map(|issue| issue.id.clone()).collect::<Vec<_>>();
+        let ids = batch
+            .iter()
+            .map(|issue| issue.id.clone())
+            .collect::<Vec<_>>();
         let mut hydrated = HashMap::with_capacity(batch.len());
         for issue in read(&ids)? {
             if !ids.contains(&issue.id) {
@@ -139,9 +145,12 @@ fn hydrate_matches(
             }
         }
         for candidate in batch {
-            let issue = hydrated.remove(&candidate.id).ok_or_else(|| BeadsError::IssueNotFound {
-                id: candidate.id.clone(),
-            })?;
+            let issue =
+                hydrated
+                    .remove(&candidate.id)
+                    .ok_or_else(|| BeadsError::IssueNotFound {
+                        id: candidate.id.clone(),
+                    })?;
             // These are the fields the narrow projection actually preserves;
             // do not compare its synthetic/default values for unrelated fields.
             if issue.title != candidate.title || issue.description != candidate.description {

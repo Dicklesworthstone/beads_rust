@@ -52,9 +52,7 @@ fn narrow_candidates_skip_unrelated_fields_but_results_preserve_full_records() {
         .unwrap();
 
     let filters = ListFilters::default();
-    let candidates = storage
-        .unicode_search_candidates("café", &filters)
-        .unwrap();
+    let candidates = storage.unicode_search_candidates("café", &filters).unwrap();
     assert_eq!(ids(&candidates), vec!["bd-a", "bd-b", "bd-c"]);
     for candidate in &candidates {
         assert!(candidate.design.is_none());
@@ -210,10 +208,7 @@ fn hydration_is_bounded_restores_order_and_skips_empty_input() {
 
 #[test]
 fn failed_or_inconsistent_hydration_never_becomes_a_successful_partial_page() {
-    let candidates = vec![
-        issue("bd-a", "CAFÉ", None),
-        issue("bd-b", "CAFÉ", None),
-    ];
+    let candidates = vec![issue("bd-a", "CAFÉ", None), issue("bd-b", "CAFÉ", None)];
     assert!(
         hydrate_matches(&candidates, |_| {
             Err(BeadsError::Internal {
