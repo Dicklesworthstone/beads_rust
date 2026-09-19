@@ -106,7 +106,11 @@ fn payload_witness(path: &Path) -> Vec<(PathBuf, Option<PayloadWitness>)> {
         let member = sidecar(path, suffix);
         let witness = match fs::symlink_metadata(&member) {
             Ok(metadata) => {
-                assert!(metadata.is_file(), "non-file fixture member: {member:?}");
+                assert!(
+                    metadata.is_file(),
+                    "non-file fixture member: {}",
+                    member.display()
+                );
                 Some(PayloadWitness {
                     device: metadata.dev(),
                     inode: metadata.ino(),
@@ -114,7 +118,10 @@ fn payload_witness(path: &Path) -> Vec<(PathBuf, Option<PayloadWitness>)> {
                 })
             }
             Err(error) if error.kind() == ErrorKind::NotFound => None,
-            Err(error) => panic!("cannot inspect fixture member {member:?}: {error}"),
+            Err(error) => panic!(
+                "cannot inspect fixture member {}: {error}",
+                member.display()
+            ),
         };
         (member, witness)
     })
@@ -342,13 +349,7 @@ fn checkpoint_row_refusal(status: [i64; 3]) -> BeadsError {
             ("PRAGMA wal_checkpoint(TRUNCATE)", status),
             ("PRAGMA wal_checkpoint(PASSIVE)", status),
         ],
-        || {
-            compact_database_via_vacuum_into_in_place(
-                fixture.storage,
-                &fixture.path,
-                Some(50),
-            )
-        },
+        || compact_database_via_vacuum_into_in_place(fixture.storage, &fixture.path, Some(50)),
     )
     .expect_err("an incomplete checkpoint must not authorize a main-only copy");
 
@@ -419,13 +420,7 @@ fn compaction_partial_truncate_requires_a_real_completed_passive_fallback() {
     let compacted = crate::franken_sync::checkpoint_fault::with_results(
         &path,
         vec![("PRAGMA wal_checkpoint(TRUNCATE)", [1, 23, 0])],
-        || {
-            compact_database_via_vacuum_into_in_place(
-                fixture.storage,
-                &fixture.path,
-                Some(50),
-            )
-        },
+        || compact_database_via_vacuum_into_in_place(fixture.storage, &fixture.path, Some(50)),
     )
     .expect("a genuinely completed PASSIVE fallback must permit compaction");
     assert_eq!(logical_state(&compacted), expected);

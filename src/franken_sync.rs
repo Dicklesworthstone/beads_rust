@@ -368,10 +368,7 @@ impl Connection {
     pub fn query(&self, sql: &str) -> Result<Vec<Row>, FrankenError> {
         #[cfg(test)]
         if let Some(status) = checkpoint_fault::take(self.inner.path(), sql) {
-            return self.query_with_params(
-                "SELECT ?1, ?2, ?3",
-                &status.map(SqliteValue::Integer),
-            );
+            return self.query_with_params("SELECT ?1, ?2, ?3", &status.map(SqliteValue::Integer));
         }
         with_engine_retries!(self.inner, sql, drive(self.inner.query(sql)))
     }
@@ -384,10 +381,7 @@ impl Connection {
     ) -> Result<Vec<Row>, FrankenError> {
         #[cfg(test)]
         if let Some(status) = checkpoint_fault::take(self.inner.path(), sql) {
-            return self.query_with_params(
-                "SELECT ?1, ?2, ?3",
-                &status.map(SqliteValue::Integer),
-            );
+            return self.query_with_params("SELECT ?1, ?2, ?3", &status.map(SqliteValue::Integer));
         }
         with_engine_retries!(
             self.inner,
@@ -586,7 +580,11 @@ pub(crate) mod checkpoint_fault {
         })
     }
 
-    pub(crate) fn with_results<T>(
+    // `pub`, not `pub(crate)`: the enclosing `checkpoint_fault` module is
+    // `#[cfg(test)] pub(crate) mod` (line 552), so this stays crate-visible
+    // through that module and does not exist at all in a non-test build.
+    // `pub(crate)` here is what `clippy::redundant_pub_crate` rejects.
+    pub fn with_results<T>(
         path: &str,
         results: Vec<(&'static str, [i64; 3])>,
         action: impl FnOnce() -> T,
@@ -603,7 +601,10 @@ pub(crate) mod checkpoint_fault {
         let result = action();
         STATE.with(|slot| {
             let slot = slot.borrow();
-            let remaining = &slot.as_ref().expect("active checkpoint fault scope").results;
+            let remaining = &slot
+                .as_ref()
+                .expect("active checkpoint fault scope")
+                .results;
             assert!(
                 remaining.is_empty(),
                 "checkpoint path skipped results: {remaining:?}"
