@@ -587,12 +587,33 @@ br ready [OPTIONS]
 | `--wrap` | Wrap long lines instead of truncating in text output |
 | `--format <FMT>` | Output format: text, json, toon |
 | `--stats` | Show token savings stats when using TOON output |
+| `--brief` | Omit long free-text fields from JSON/TOON output (see below) |
 | `--robot` | Machine-readable output |
+
+**`--brief` (agent work selection):**
+
+JSON and TOON output hydrates the full issue record, including `description`,
+`design`, `acceptance_criteria` and `notes`. On a large tracker those dominate
+the payload: with 1,003 ready issues on a 10,000-issue workspace,
+`br ready --json` returned 1,242,094 bytes and `description` alone accounted
+for 1,002,000 of the 1,121,836 bytes of field content (89.3%).
+
+`--brief` selects the same projection the text renderer already uses — `id`,
+`title`, `status`, `priority`, `issue_type`, `created_at`, `updated_at` — which
+is everything needed to *choose* work. Read the detail of the issue you picked
+with `br show <id>`.
+
+`--brief` changes which **columns** are hydrated, never which **rows** are
+returned: the ready set, its order, and every filter behave identically. Note
+`--robot` is an alias for `--json` and does not by itself reduce payload size.
 
 **Examples:**
 ```bash
 # My ready work
 br ready --assignee $(whoami)
+
+# Agent work selection: same rows, without the long free text
+br ready --brief --json
 
 # Unassigned high-priority
 br ready --unassigned -p 0 -p 1

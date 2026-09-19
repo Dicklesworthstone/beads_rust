@@ -477,9 +477,16 @@ format defaults and `TOON_DEFAULT_FORMAT` examples.
 br list --json | jq '.issues[0]'
 br ready --robot
 
+# BETTER for work selection - same rows, without the long free text
+br ready --brief --json
+
 # WRONG - output format may vary based on terminal state
 br list | head -1
 ```
+
+Note that `--robot` is an alias for `--json` and does not reduce payload size.
+For `br ready`, add `--brief` when you are choosing what to work on rather
+than reading issue bodies.
 
 JSON mode guarantees:
 - Stable schema (changes are versioned and documented)
@@ -557,8 +564,16 @@ The label tells the doctor check + future audits that the closure has been triag
 
 1. **Pick ready work (Beads):**
    ```bash
-   br ready --json  # Choose highest priority, no blockers
+   br ready --brief --json  # Choose highest priority, no blockers
    ```
+
+   Use `--brief` for selection. It keeps id, title, status, priority, type and
+   timestamps and drops the long free-text fields, then you read the detail of
+   the one issue you picked with `br show <id>`. Without it, `description`
+   alone is about 89% of the payload: on a 10k-issue tracker
+   `br ready --json` returns roughly 1.2 MB, which is more tokens than most
+   agent contexts hold. `--brief` changes columns only, never which issues
+   come back, so it cannot hide ready work from you.
 
 2. **Reserve edit surface (Mail):**
    ```

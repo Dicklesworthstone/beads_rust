@@ -201,7 +201,8 @@ Every command supports `--json` for AI coding agents:
 
 ```bash
 br list --json | jq '.issues[] | select(.priority <= 1)'
-br ready --json  # Structured output for agents
+br ready --json          # Structured output for agents
+br ready --brief --json  # Same rows, without the long free-text fields
 br show br-abc123 --json
 br capabilities --format json
 br capabilities --format json --command "create"
@@ -547,6 +548,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `list` | List issues | `br list --status open --priority 0-1` |
 | `list --tree` | Group children under their parents with tree connectors | `br list --tree` |
 | `ready` | Actionable work | `br ready` |
+| `ready --brief` | Actionable work without long free-text fields (for agents selecting work) | `br ready --brief --json` |
 | `blocked` | Blocked issues | `br blocked --json \| jq '.issues[]'` |
 | `search` | Full-text search | `br search "authentication"` |
 | `stale` | Stale issues | `br stale --days 30` |
