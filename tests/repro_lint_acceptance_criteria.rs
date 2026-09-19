@@ -83,7 +83,10 @@ fn lint_accepts_documented_fields_for_tasks_features_and_bugs() {
         );
         let specific = run_br(&workspace, ["lint", &id, "--no-color"], "lint_field_id");
         assert!(specific.status.success(), "{specific:?}");
-        assert_eq!(lint_json(&workspace, &[&id], "lint_field_id_json")["total"], 0);
+        assert_eq!(
+            lint_json(&workspace, &[&id], "lint_field_id_json")["total"],
+            0
+        );
     }
 
     let all = run_br(&workspace, ["lint", "--no-color"], "lint_fields_all");
@@ -167,7 +170,10 @@ fn lint_bug_control_requires_the_field_and_accepts_update_criteria() {
     assert_eq!(issue[0]["acceptance_criteria"], criteria);
     assert_eq!(issue[0]["description"], description);
     assert_eq!(lint_json(&workspace, &[], "lint_after_update")["total"], 0);
-    assert_eq!(lint_json(&workspace, &[&id], "lint_id_after_update")["total"], 0);
+    assert_eq!(
+        lint_json(&workspace, &[&id], "lint_id_after_update")["total"],
+        0
+    );
     let text = run_br(&workspace, ["lint", "--no-color"], "lint_update_text");
     assert!(text.status.success(), "{text:?}");
 }
@@ -187,9 +193,18 @@ fn lint_legacy_fallback_requires_a_real_heading_and_body() {
 
     let mut invalid_ids = Vec::new();
     for (title, description) in [
-        ("Fenced example", "```markdown\n## Acceptance Criteria\n- Example\n```"),
-        ("Empty section", "## Acceptance Criteria\n\n## Notes\nUnrelated content"),
-        ("Heading lookalike", "## Acceptance Criteria backlog\n- Not a criteria section"),
+        (
+            "Fenced example",
+            "```markdown\n## Acceptance Criteria\n- Example\n```",
+        ),
+        (
+            "Empty section",
+            "## Acceptance Criteria\n\n## Notes\nUnrelated content",
+        ),
+        (
+            "Heading lookalike",
+            "## Acceptance Criteria backlog\n- Not a criteria section",
+        ),
     ] {
         let id = create_issue(&workspace, title, "task", Some(description), None);
         assert_missing_acceptance(&lint_json(&workspace, &[&id], "lint_invalid_legacy"), &id);

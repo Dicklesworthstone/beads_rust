@@ -917,7 +917,11 @@ mod tests {
             };
             let expected = storage.list_issues(&build_filters(&args).unwrap()).unwrap();
             let actual = lint_issues_with_storage(&args, &storage).unwrap();
-            assert_eq!(actual.len(), expected_count, "{type_filter:?}/{status_filter:?}");
+            assert_eq!(
+                actual.len(),
+                expected_count,
+                "{type_filter:?}/{status_filter:?}"
+            );
             assert_eq!(
                 actual
                     .iter()
