@@ -671,6 +671,11 @@ proptest! {
 /// export writes it, `read_issues_from_jsonl` reads it back identically, import
 /// restores it into a fresh database identically, and the content hash is
 /// unchanged across the round trip.
+// The length is the payload table: each entry is a distinct character class
+// that can break a line-delimited format, and they share one round-trip body.
+// Splitting it would either duplicate that body or separate the payloads from
+// the assertions about them. Same remedy the rest of the tree uses.
+#[allow(clippy::too_many_lines)]
 #[test]
 fn adversarial_text_payloads_survive_the_jsonl_round_trip() {
     let payloads: &[(&str, &str)] = &[
@@ -737,7 +742,7 @@ fn adversarial_text_payloads_survive_the_jsonl_round_trip() {
             )
             .unwrap();
 
-        export_to_jsonl(&mut storage, &export_path, &ExportConfig::default())
+        export_to_jsonl(&storage, &export_path, &ExportConfig::default())
             .unwrap_or_else(|error| panic!("{name}: export failed: {error}"));
 
         // The file must still be one record per line.
@@ -811,7 +816,7 @@ fn adversarial_text_payloads_survive_the_jsonl_round_trip() {
 
         // Re-exporting the restored database must reproduce the same bytes.
         let second_path = temp.path().join("adversarial-again.jsonl");
-        export_to_jsonl(&mut restored, &second_path, &ExportConfig::default())
+        export_to_jsonl(&restored, &second_path, &ExportConfig::default())
             .unwrap_or_else(|error| panic!("{name}: second export failed: {error}"));
         assert_eq!(
             fs::read_to_string(&second_path).unwrap(),
