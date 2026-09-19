@@ -272,18 +272,19 @@ Agent Mail, MCP clients, or fixture update modes.
 | Storage | SQLite + JSONL | Dolt/SQLite |
 | Background daemon | **No** | Yes |
 | Hook installation | **Manual** | Automatic |
-| Binary size | ~26 MiB stripped executable, ~11 MiB compressed (v0.5.11, x86_64 Linux GNU; dynamically linked) | ~30+ MB |
+| Binary size | ~26 MiB stripped executable, ~11 MiB compressed (v0.6.0, x86_64 Linux GNU; dynamically linked) | ~30+ MB |
 | Scope | Local CLI, sync, recovery, and agent workflows | Feature-rich ecosystem |
 
 **When to use br:** You want a stable, local-first issue tracker with explicit sync, dependency-aware planning, and machine-readable output.
 
 **When to use beads:** You want advanced features like Linear/Jira sync, RPC daemon, automatic hooks.
 
-Linux releases include GNU and musl targets. The v0.5.11 x86_64 GNU executable
-is 27,673,760 bytes and its archive is 11,735,518 bytes; the musl executable is
-26,579,176 bytes and its archive is 11,691,141 bytes. The musl executable is
+Linux releases include GNU and musl targets. The v0.6.0 x86_64 GNU executable
+is 27,772,512 bytes and its archive is 11,732,979 bytes; the musl executable is
+26,657,512 bytes and its archive is 11,684,734 bytes. The musl executable is
 statically linked; the GNU executable needs the system's glibc loader. Sizes
-vary with the target, version, and enabled features.
+vary with the target, version, and enabled features. These figures were read
+from the published v0.6.0 archives, whose `.sha256` sidecars both verified.
 
 ### br vs GitHub Issues
 
