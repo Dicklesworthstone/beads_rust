@@ -23,6 +23,9 @@ use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use unicode_width::UnicodeWidthStr;
 
+#[path = "list_fields.rs"]
+mod fields;
+
 // Large default-visible structured pages are faster through the existing full
 // scan/relation path; smaller pages keep the medium-page relation queries.
 const LARGE_STRUCTURED_LIST_FULL_SCAN_THRESHOLD: usize = 96;
@@ -80,17 +83,28 @@ fn execute_inner(
         false,
     );
     let is_json_output = matches!(output_format, OutputFormat::Json | OutputFormat::Toon);
+    // Explicit column selection is additive: no change to default rows/schema,
+    // CSV semantics or text rendering. Validate even when the corpus is empty.
+    let selected_fields = if is_json_output {
+        args.fields
+            .as_deref()
+            .map(fields::FieldSelection::parse)
+            .transpose()?
+    } else {
+        None
+    };
 
     // The effective limit and offset from the user's request.
     let user_limit = args.limit.unwrap_or(DEFAULT_LIST_LIMIT);
     let user_offset = args.offset.unwrap_or(DEFAULT_LIST_OFFSET);
-    let use_full_default_visible_structured_scan = should_use_full_default_visible_structured_scan(
-        args,
-        client_filters,
-        is_json_output,
-        user_limit,
-        user_offset,
-    );
+    let use_full_default_visible_structured_scan = selected_fields.is_none()
+        && should_use_full_default_visible_structured_scan(
+            args,
+            client_filters,
+            is_json_output,
+            user_limit,
+            user_offset,
+        );
     if use_full_default_visible_structured_scan {
         filters.limit = Some(0);
         filters.offset = Some(0);
@@ -139,10 +153,11 @@ fn execute_inner(
     // Validate sort key before query
     validate_sort_key(args.sort.as_deref())?;
 
-    let use_projected_text_rows = matches!(output_format, OutputFormat::Text)
-        && !args.long
-        && !args.pretty
-        && !client_filters;
+    let use_projected_text_rows = !client_filters
+        && ((matches!(output_format, OutputFormat::Text) && !args.long && !args.pretty)
+            || selected_fields
+                .as_ref()
+                .is_some_and(fields::FieldSelection::can_use_text_rows));
 
     // Query issues
     let mut issues = if use_projected_text_rows {
@@ -230,6 +245,17 @@ fn execute_inner(
                 offset: user_offset,
                 has_more,
             };
+
+            if let Some(selection) = selected_fields.as_ref() {
+                return selection.render(
+                    &ctx,
+                    storage,
+                    issues,
+                    page_meta,
+                    matches!(output_format, OutputFormat::Toon),
+                    args.stats,
+                );
+            }
 
             if matches!(output_format, OutputFormat::Toon) {
                 let issues_with_counts =
