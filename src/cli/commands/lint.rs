@@ -147,9 +147,7 @@ pub fn execute_with_storage_ctx(
 
 fn lint_issues_with_storage(args: &LintArgs, storage: &SqliteStorage) -> Result<Vec<Issue>> {
     let filters = build_filters(args)?;
-    // The description-only lint projection drops acceptance_criteria. Read the
-    // complete issue fields so workspace scans agree with explicit-ID linting.
-    storage.list_issues(&filters)
+    storage.list_lint_issues_with_acceptance(&filters)
 }
 
 fn render_lint_output(summary: LintSummary, ctx: &OutputContext) {
@@ -811,7 +809,12 @@ mod tests {
         blank.acceptance_criteria = Some(" \t\n".to_string());
         let mut field = make_issue(IssueType::Task, None);
         field.id = "bd-lint-field".to_string();
-        field.acceptance_criteria = Some("- [ ] the thing works".to_string());
+        field.acceptance_criteria = Some("- [ ] the thing works\r\n".repeat(512));
+        field.design = Some("Unused design".repeat(512));
+        field.prerequisites = Some("Unused prerequisites".repeat(512));
+        field.notes = Some("Unused notes".repeat(512));
+        field.owner = Some("owner".to_string());
+        field.sender = Some("cli".to_string());
         let mut legacy = make_issue(
             IssueType::Task,
             Some("## Acceptance Criteria\n- Already present"),
@@ -825,6 +828,13 @@ mod tests {
 
         let scanned = lint_issues_with_storage(&LintArgs::default(), &storage).unwrap();
         assert_eq!(scanned.len(), 4);
+        for issue in &scanned {
+            assert!(issue.design.is_none());
+            assert!(issue.prerequisites.is_none());
+            assert!(issue.notes.is_none());
+            assert!(issue.owner.is_none());
+            assert!(issue.sender.is_none());
+        }
         assert_eq!(
             scanned
                 .iter()
@@ -838,6 +848,19 @@ mod tests {
             .map(|issue| issue.id.clone())
             .collect::<Vec<_>>();
         let explicit = fetch_issues_in_resolved_order(&storage, &ids).unwrap();
+        let full_field = explicit.iter().find(|issue| issue.id == field.id).unwrap();
+        assert_eq!(full_field.design, field.design);
+        assert_eq!(full_field.notes, field.notes);
+        assert_eq!(
+            scanned
+                .iter()
+                .map(|issue| &issue.acceptance_criteria)
+                .collect::<Vec<_>>(),
+            explicit
+                .iter()
+                .map(|issue| &issue.acceptance_criteria)
+                .collect::<Vec<_>>()
+        );
         let summary = lint_issues(&scanned);
         assert_eq!(summary.checked, 4);
         assert_eq!(summary.warnings, 2);
@@ -848,6 +871,68 @@ mod tests {
             serde_json::to_value(summary.results).unwrap(),
             serde_json::to_value(lint_issues(&explicit).results).unwrap()
         );
+    }
+
+    #[test]
+    fn acceptance_projection_preserves_lint_filters_and_order() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for (index, (issue_type, status, template, criteria)) in [
+            (
+                IssueType::Task,
+                Status::Open,
+                false,
+                Some("- [ ] Field criterion"),
+            ),
+            (IssueType::Bug, Status::Open, false, None),
+            (IssueType::Feature, Status::Closed, false, Some("")),
+            (IssueType::Task, Status::Deferred, false, Some(" \t\n")),
+            (IssueType::Task, Status::Open, true, Some("Template only")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut issue = make_issue(issue_type, Some("No template sections"));
+            issue.id = format!("bd-lint-filter-{index}");
+            issue.status = status;
+            issue.is_template = template;
+            issue.acceptance_criteria = criteria.map(str::to_string);
+            if issue.status == Status::Closed {
+                issue.closed_at = Some(issue.updated_at);
+            }
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        for (type_filter, status_filter, expected_count) in [
+            (None, None, 2),
+            (Some("task"), None, 1),
+            (Some("epic"), None, 0),
+            (None, Some("all"), 4),
+            (None, Some("closed"), 1),
+            (None, Some("deferred"), 1),
+        ] {
+            let args = LintArgs {
+                type_: type_filter.map(str::to_string),
+                status: status_filter.map(str::to_string),
+                ..LintArgs::default()
+            };
+            let expected = storage.list_issues(&build_filters(&args).unwrap()).unwrap();
+            let actual = lint_issues_with_storage(&args, &storage).unwrap();
+            assert_eq!(actual.len(), expected_count, "{type_filter:?}/{status_filter:?}");
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|issue| (&issue.id, &issue.acceptance_criteria))
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|issue| (&issue.id, &issue.acceptance_criteria))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                serde_json::to_value(lint_issues(&actual).results).unwrap(),
+                serde_json::to_value(lint_issues(&expected).results).unwrap()
+            );
+        }
     }
 
     #[test]

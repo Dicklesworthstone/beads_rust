@@ -13,6 +13,7 @@
 //! - [`sqlite`] - Main `SQLite` storage implementation
 
 pub mod events;
+mod lint;
 pub mod schema;
 pub mod sqlite;
 
