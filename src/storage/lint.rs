@@ -21,10 +21,16 @@ impl SqliteStorage {
     ///
     /// Returns an error on query failure, malformed rows, or an issue disappearing
     /// during hydration. Missing rows must not silently become missing criteria.
-    pub(crate) fn list_lint_issues_with_acceptance(&self, filters: &ListFilters) -> Result<Vec<Issue>> {
+    pub(crate) fn list_lint_issues_with_acceptance(
+        &self,
+        filters: &ListFilters,
+    ) -> Result<Vec<Issue>> {
         let mut issues = self.list_lint_issues_for_command_output(filters)?;
         hydrate_acceptance(&mut issues, |batch| {
-            let ids = batch.iter().map(|issue| issue.id.as_str()).collect::<Vec<_>>();
+            let ids = batch
+                .iter()
+                .map(|issue| issue.id.as_str())
+                .collect::<Vec<_>>();
             let query = acceptance_query(&ids);
             decode_acceptance_rows(self.execute_raw_query(&query)?)
         })?;
@@ -40,13 +46,15 @@ fn hydrate_acceptance(
         let mut criteria = read(batch)?;
         for issue in batch {
             issue.acceptance_criteria =
-                criteria.remove(&issue.id).ok_or_else(|| BeadsError::IssueNotFound {
-                    id: issue.id.clone(),
-                })?;
+                criteria
+                    .remove(&issue.id)
+                    .ok_or_else(|| BeadsError::IssueNotFound {
+                        id: issue.id.clone(),
+                    })?;
         }
         if !criteria.is_empty() {
-            return Err(BeadsError::Other(
-                "Lint acceptance query returned unexpected issue IDs".to_string(),
+            return Err(BeadsError::internal(
+                "Lint acceptance query returned unexpected issue IDs",
             ));
         }
     }
@@ -69,12 +77,12 @@ fn decode_acceptance_rows(rows: Vec<Vec<SqliteValue>>) -> Result<AcceptanceById>
     let mut criteria = HashMap::with_capacity(rows.len());
     for row in rows {
         let [id, value] = row.as_slice() else {
-            return Err(BeadsError::Other(
-                "Lint acceptance query returned an invalid column count".to_string(),
+            return Err(BeadsError::internal(
+                "Lint acceptance query returned an invalid column count",
             ));
         };
         let id = id.as_text().ok_or_else(|| {
-            BeadsError::Other("Lint acceptance query returned a non-text issue ID".to_string())
+            BeadsError::internal("Lint acceptance query returned a non-text issue ID")
         })?;
         let value = match value {
             SqliteValue::Null => None,
@@ -82,7 +90,7 @@ fn decode_acceptance_rows(rows: Vec<Vec<SqliteValue>>) -> Result<AcceptanceById>
                 value
                     .as_text()
                     .ok_or_else(|| {
-                        BeadsError::Other(format!(
+                        BeadsError::internal(format!(
                             "Lint acceptance query returned non-text criteria for {id}"
                         ))
                     })?
@@ -90,7 +98,7 @@ fn decode_acceptance_rows(rows: Vec<Vec<SqliteValue>>) -> Result<AcceptanceById>
             ),
         };
         if criteria.insert(id.to_string(), value).is_some() {
-            return Err(BeadsError::Other(format!(
+            return Err(BeadsError::internal(format!(
                 "Lint acceptance query returned duplicate issue ID {id}"
             )));
         }
@@ -121,14 +129,22 @@ mod tests {
                 .rev()
                 .map(|index| issue(&format!("bd-{index}")))
                 .collect::<Vec<_>>();
-            let expected_ids = issues.iter().map(|issue| issue.id.clone()).collect::<Vec<_>>();
+            let expected_ids = issues
+                .iter()
+                .map(|issue| issue.id.clone())
+                .collect::<Vec<_>>();
             let mut batches = Vec::new();
             hydrate_acceptance(&mut issues, |batch| {
                 batches.push(batch.len());
                 Ok(batch
                     .iter()
                     .rev()
-                    .map(|issue| (issue.id.clone(), Some(format!("criterion for {}", issue.id))))
+                    .map(|issue| {
+                        (
+                            issue.id.clone(),
+                            Some(format!("criterion for {}", issue.id)),
+                        )
+                    })
                     .collect())
             })
             .unwrap();
@@ -190,7 +206,7 @@ mod tests {
         let mut issues = vec![issue("bd-1")];
         assert!(
             hydrate_acceptance(&mut issues, |_| {
-                Err(BeadsError::Other("read failed".to_string()))
+                Err(BeadsError::internal("read failed"))
             })
             .is_err()
         );
