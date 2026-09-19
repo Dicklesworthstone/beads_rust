@@ -655,3 +655,168 @@ proptest! {
         prop_assert_eq!(&original_source.comments, &permuted_source.comments);
     }
 }
+
+/// Adversarial text payloads through the full JSONL boundary.
+///
+/// The property strategies in this file are strictly ASCII —
+/// `[A-Za-z0-9][A-Za-z0-9 _.,:;!?/-]{0,79}` — so until now nothing here
+/// exercised the characters that can actually break a line-delimited format.
+/// A literal newline in a description is the sharpest case: JSONL is one record
+/// per line, so a field that escapes badly does not merely corrupt one value,
+/// it splits a record into two and the rest of the file shifts.
+///
+/// Every payload below was confirmed working end to end against the shipped
+/// 0.6.0 CLI before this test was written, so this pins behavior that is
+/// already correct rather than asserting an aspiration. It covers, per payload:
+/// export writes it, `read_issues_from_jsonl` reads it back identically, import
+/// restores it into a fresh database identically, and the content hash is
+/// unchanged across the round trip.
+#[test]
+fn adversarial_text_payloads_survive_the_jsonl_round_trip() {
+    let payloads: &[(&str, &str)] = &[
+        // The dangerous one for a line-delimited format.
+        ("newline", "line one\nline two"),
+        ("crlf", "crlf one\r\ntwo"),
+        ("tab", "col1\tcol2"),
+        ("vertical_tab", "a\u{0b}b"),
+        // JSON escaping.
+        ("dquote", "he said \"hi\""),
+        ("backslash", "path\\to\\thing"),
+        ("nested_json", "{\"looks\":\"like json\"}"),
+        // Unicode: multibyte, astral plane, combining marks, RTL, NBSP.
+        ("unicode", "café 日本語 😀"),
+        ("combining", "cafe\u{301} combining"),
+        ("rtl", "עברית hebrew"),
+        ("nbsp", "a\u{a0}b nbsp"),
+        // Whitespace that a careless trim would eat.
+        ("trailing_ws", "trailing spaces   "),
+        ("leading_ws", "   leading spaces"),
+    ];
+
+    for (index, (name, payload)) in payloads.iter().enumerate() {
+        let temp = TempDir::new().unwrap();
+        let export_path = temp.path().join("adversarial.jsonl");
+
+        // Put the payload in every free-text field, not just the description:
+        // each is serialized independently and could escape differently.
+        let issue = make_issue(
+            format!("bd-adv-{index:02}"),
+            format!("adversarial {name}"),
+            Some((*payload).to_string()),
+            Some((*payload).to_string()),
+            Some((*payload).to_string()),
+            Some((*payload).to_string()),
+            Status::Open,
+            Priority::MEDIUM,
+            IssueType::Task,
+            None,
+            None,
+            None,
+            Some("proptest".to_string()),
+            None,
+            None,
+            false,
+            false,
+            0,
+            0,
+        );
+
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage.create_issue(&issue, "proptest").unwrap();
+        // A comment body is a separate table and a separate serialization path.
+        storage
+            .sync_comments_for_import(
+                &issue.id,
+                &[Comment {
+                    id: 1,
+                    issue_id: issue.id.clone(),
+                    author: "proptest".to_string(),
+                    body: (*payload).to_string(),
+                    created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                }],
+            )
+            .unwrap();
+
+        export_to_jsonl(&mut storage, &export_path, &ExportConfig::default())
+            .unwrap_or_else(|error| panic!("{name}: export failed: {error}"));
+
+        // The file must still be one record per line.
+        let raw = fs::read_to_string(&export_path).unwrap();
+        let record_lines = raw.lines().filter(|line| !line.trim().is_empty()).count();
+        assert_eq!(
+            record_lines, 1,
+            "{name}: export produced {record_lines} record lines; a payload leaked a raw newline"
+        );
+
+        let exported = read_issues_from_jsonl(&export_path)
+            .unwrap_or_else(|error| panic!("{name}: re-read failed: {error}"));
+        let read_back = find_issue(&exported, &issue.id);
+        for (field, value) in [
+            ("description", &read_back.description),
+            ("design", &read_back.design),
+            ("acceptance_criteria", &read_back.acceptance_criteria),
+            ("notes", &read_back.notes),
+        ] {
+            assert_eq!(
+                value.as_deref(),
+                Some(*payload),
+                "{name}: {field} changed on export/read-back"
+            );
+        }
+        assert_eq!(
+            read_back
+                .comments
+                .first()
+                .map(|comment| comment.body.as_str()),
+            Some(*payload),
+            "{name}: comment body changed on export/read-back"
+        );
+
+        // Import into a fresh database and confirm the same bytes land.
+        let mut restored = SqliteStorage::open_memory().unwrap();
+        import_from_jsonl(&mut restored, &export_path, &ImportConfig::default(), None)
+            .unwrap_or_else(|error| panic!("{name}: import failed: {error}"));
+        let imported = restored
+            .get_issue(&issue.id)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{name}: imported issue missing"));
+        assert_eq!(
+            imported.description.as_deref(),
+            Some(*payload),
+            "{name}: description changed through import"
+        );
+        assert_eq!(
+            imported.notes.as_deref(),
+            Some(*payload),
+            "{name}: notes changed through import"
+        );
+
+        // Content hash must be stable across the boundary, or dedup would treat
+        // the same issue as new on every sync. Compare the two STORED hashes:
+        // `read_issues_from_jsonl` returns raw records whose `content_hash` is
+        // not populated, so it is not the right side of this comparison.
+        let original_hash = storage
+            .get_issue(&issue.id)
+            .unwrap()
+            .expect("original issue present")
+            .content_hash;
+        assert!(
+            original_hash.is_some(),
+            "{name}: stored issue has no content hash to compare"
+        );
+        assert_eq!(
+            original_hash, imported.content_hash,
+            "{name}: content hash changed through the JSONL round trip"
+        );
+
+        // Re-exporting the restored database must reproduce the same bytes.
+        let second_path = temp.path().join("adversarial-again.jsonl");
+        export_to_jsonl(&mut restored, &second_path, &ExportConfig::default())
+            .unwrap_or_else(|error| panic!("{name}: second export failed: {error}"));
+        assert_eq!(
+            fs::read_to_string(&second_path).unwrap(),
+            raw,
+            "{name}: export is not byte-identical after a round trip"
+        );
+    }
+}
