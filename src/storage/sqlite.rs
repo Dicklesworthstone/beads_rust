@@ -1586,16 +1586,24 @@ enum SearchIssueProjection {
 /// `EXISTS (... WHERE comments.issue_id = issues.id ...)` form it replaced
 /// re-ran the comment scan once per outer issue row, which is invisible on the
 /// default visible corpus and crippling on a whole-corpus search: on this
-/// repository's own tracker (1,097 issues, 1,756 comments, 1.70 MiB of comment
-/// text) `br search <term> --all` cost **5.9-7.2s** even for a needle matching
-/// nothing, against **0.05s** with the comments stripped. Materializing the
-/// matching comment issue ids once made the same search **0.05s**, a ~120x
-/// improvement, while `br search <term>` on the default corpus was already
+/// repository's own tracker (1,096 issues, 1,756 comments, 1.70 MiB of comment
+/// text) `br search <term> --all` cost 4.5-5.8s even for a needle matching
+/// nothing, while the default corpus answered in 0.14s.
+///
+/// The controlled evidence is one binary, one host, one corpus:
+/// `count_closed_search_matches`, which already used this uncorrelated form,
+/// answered in 0.12s over the same 1,077 closed issues the correlated result
+/// query took 5.9s to scan. After the change the same searches measured
+/// 0.067-0.111s (41x-85x, cross-host so indicative rather than controlled);
+/// `--all` is now faster than the default corpus because it skips the extra
+/// hidden-closed count. `br search <term>` on the default corpus was already
 /// fast and is unchanged (`beads_rust-mwxp`).
 ///
 /// This is the same shape `SEARCH_COUNT_NEEDLE_PREDICATE` has always used for
 /// whole-corpus counts, which is why the hidden-closed count was fast while
 /// the result query it accompanies was not.
+/// `test_search_result_and_closed_count_predicates_agree` holds the two
+/// spellings to the same results.
 const SEARCH_NEEDLE_PREDICATE: &str = "(instr(lower(title), ?) > 0 \
      OR instr(lower(description), ?) > 0 \
      OR instr(lower(id), ?) > 0 \
