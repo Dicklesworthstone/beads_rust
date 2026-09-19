@@ -325,3 +325,123 @@ fn healthy_compaction_preserves_logical_state_without_jsonl() {
         ErrorKind::NotFound
     );
 }
+
+/// Feed successful SQL result rows through the real storage checkpoint and
+/// compaction entry point, rather than injecting a precomputed error. Reverting
+/// execute() to discard those rows must make these controls fail.
+fn checkpoint_row_refusal(status: [i64; 3]) -> BeadsError {
+    let fixture = fixture();
+    let expected = logical_state(&fixture.storage);
+    let before = payload_witness(&fixture.path);
+    assert_no_candidate_build(&fixture.path);
+    let path = fixture.path.to_string_lossy().into_owned();
+
+    let error = crate::franken_sync::checkpoint_fault::with_results(
+        &path,
+        vec![
+            ("PRAGMA wal_checkpoint(TRUNCATE)", status),
+            ("PRAGMA wal_checkpoint(PASSIVE)", status),
+        ],
+        || {
+            compact_database_via_vacuum_into_in_place(
+                fixture.storage,
+                &fixture.path,
+                Some(50),
+            )
+        },
+    )
+    .expect_err("an incomplete checkpoint must not authorize a main-only copy");
+
+    // Both result rows must have been consumed, proving that the production
+    // TRUNCATE-to-PASSIVE fallback, not an earlier fixture error, refused.
+    assert_eq!(payload_witness(&fixture.path), before);
+    fixture
+        .authority
+        .verify_database_authority()
+        .expect("checkpoint refusal must preserve original authority");
+    assert_no_candidate_build(&fixture.path);
+    let reopened = SqliteStorage::open_with_timeout_under_write_authority(
+        &fixture.path,
+        Some(50),
+        &fixture.authority,
+    )
+    .expect("original database must remain reopenable");
+    assert_eq!(logical_state(&reopened), expected);
+    error
+}
+
+#[test]
+fn compaction_rejects_incomplete_checkpoint_rows_before_candidate_build() {
+    if run_isolated(
+        "compaction_certificate_tests::compaction_rejects_incomplete_checkpoint_rows_before_candidate_build",
+    ) {
+        return;
+    }
+    for status in [[1, 23, 0], [0, 23, 7], [1, 23, 23]] {
+        let error = checkpoint_row_refusal(status);
+        assert!(
+            matches!(error, BeadsError::Database(FrankenError::Busy)),
+            "incomplete progress must remain contention, not corruption: {status:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn compaction_rejects_invalid_checkpoint_values_before_candidate_build() {
+    if run_isolated(
+        "compaction_certificate_tests::compaction_rejects_invalid_checkpoint_values_before_candidate_build",
+    ) {
+        return;
+    }
+    for status in [[0, -1, 0], [2, 23, 0], [0, 1, 2]] {
+        let error = checkpoint_row_refusal(status);
+        assert!(
+            matches!(error, BeadsError::Database(FrankenError::Internal(ref detail))
+                if detail.contains("invalid completion values")),
+            "malformed completion status must fail closed: {status:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn compaction_partial_truncate_requires_a_real_completed_passive_fallback() {
+    if run_isolated(
+        "compaction_certificate_tests::compaction_partial_truncate_requires_a_real_completed_passive_fallback",
+    ) {
+        return;
+    }
+    let fixture = fixture();
+    let expected = logical_state(&fixture.storage);
+    let original_inode = fs::metadata(&fixture.path).unwrap().ino();
+    let path = fixture.path.to_string_lossy().into_owned();
+    // Fault only TRUNCATE. PASSIVE and all private-source maintenance must run
+    // against the real engine and complete before installation can succeed.
+    let compacted = crate::franken_sync::checkpoint_fault::with_results(
+        &path,
+        vec![("PRAGMA wal_checkpoint(TRUNCATE)", [1, 23, 0])],
+        || {
+            compact_database_via_vacuum_into_in_place(
+                fixture.storage,
+                &fixture.path,
+                Some(50),
+            )
+        },
+    )
+    .expect("a genuinely completed PASSIVE fallback must permit compaction");
+    assert_eq!(logical_state(&compacted), expected);
+    assert_ne!(
+        fs::metadata(&fixture.path).unwrap().ino(),
+        original_inode,
+        "successful fallback must install a candidate rather than skip maintenance"
+    );
+    fixture
+        .authority
+        .verify_database_authority()
+        .expect("installed candidate must retain authority");
+    assert_eq!(
+        fs::symlink_metadata(fixture.path.with_file_name("issues.jsonl"))
+            .expect_err("compaction must not require or create a JSONL fallback")
+            .kind(),
+        ErrorKind::NotFound
+    );
+}
