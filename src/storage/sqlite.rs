@@ -33636,7 +33636,7 @@ required_fields:
             )
             .unwrap(),
         );
-        crate::cli::commands::doctor_subsystems::schema_migration::recover_missing_wal_index(
+        crate::cli::commands::doctor_subsystems::schema_migration::recover_wal_index_for_startup(
             temp.path(),
             &db_path,
             &authority,

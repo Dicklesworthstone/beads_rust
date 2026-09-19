@@ -1570,8 +1570,7 @@ fn vacuum_candidate_from_private_source(
     sync_directory(&private_source_dir)?;
     sync_directory(run_dir)?;
 
-    let private_source =
-        backup_component_path(&private_source_dir, &retained_source, "")?;
+    let private_source = backup_component_path(&private_source_dir, &retained_source, "")?;
     let source_conn = Connection::open(private_source.to_string_lossy().into_owned())?;
     let escaped_path = candidate_path.to_string_lossy().replace('\'', "''");
     let candidate_result = source_conn
@@ -4903,13 +4902,8 @@ mod tests {
 
         let candidate = maintenance_candidate_path(&migration.db_path, &run_dir).unwrap();
         require_absent_family(&candidate).unwrap();
-        vacuum_candidate_from_private_source(
-            &migration.db_path,
-            &candidate,
-            &run_dir,
-            &raw_before,
-        )
-        .unwrap();
+        vacuum_candidate_from_private_source(&migration.db_path, &candidate, &run_dir, &raw_before)
+            .unwrap();
 
         assert_eq!(
             raw_family_witness(&migration.db_path).unwrap(),
@@ -4920,10 +4914,16 @@ mod tests {
 
         let candidate_logical = logical_witness(&candidate).unwrap();
         assert_eq!(candidate_logical.user_version, logical_before.user_version);
-        assert_eq!(candidate_logical.contents_sha256, logical_before.contents_sha256);
+        assert_eq!(
+            candidate_logical.contents_sha256,
+            logical_before.contents_sha256
+        );
         assert_eq!(candidate_logical.tables, logical_before.tables);
         assert!(
-            run_dir.join("maintenance-vacuum-source").join("beads.db").is_file(),
+            run_dir
+                .join("maintenance-vacuum-source")
+                .join("beads.db")
+                .is_file(),
             "the disposable source is retained for interrupted-migration diagnosis"
         );
     }
@@ -6889,6 +6889,7 @@ mod tests {
             &forecast,
             &marked_at,
             &run_dir,
+            &prepared.raw_before,
             &migration.write_authority,
             &mut failed_stage,
         )
