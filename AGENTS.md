@@ -504,13 +504,13 @@ RUST_LOG=error "$MCP_TARGET/release/br" serve --actor "${AGENT_NAME:-mcp}"
 Transport is stdio. Configure the MCP client to launch `br serve`; do not expect
 a TCP port or background daemon. Available tools are `list_issues`, `show_issue`,
 `create_issue`, `update_issue`, `close_issue`, `manage_dependencies`, and
-`project_overview`. Resources include `beads://project/info`,
+`project_overview`. Resources are `beads://project/info`,
 `beads://issue/{id}`, `beads://schema`, `beads://labels`,
 `beads://issues/ready`, `beads://issues/blocked`,
-`beads://issues/in_progress`, `beads://issues/deferred`,
-`beads://issues/bottlenecks`, `beads://graph/health`, and
-`beads://events/recent`. Guided prompts are `triage`, `status_report`,
-`plan_next_work`, and `polish_backlog`.
+`beads://issues/in_progress`, `beads://coordination/status`,
+`beads://issues/deferred`, `beads://issues/bottlenecks`,
+`beads://graph/health`, and `beads://events/recent`. Guided prompts are
+`triage`, `status_report`, `plan_next_work`, and `polish_backlog`.
 
 Safety model: MCP serve uses the same local SQLite/JSONL workspace as the CLI,
 never runs git, and does not listen on the network. Mutating tools acquire the

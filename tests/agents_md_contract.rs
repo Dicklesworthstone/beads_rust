@@ -189,3 +189,92 @@ fn unsafe_code_lint_level_matches_the_doc() {
         "AGENTS.md still mentions #![{other}(unsafe_code)]"
     );
 }
+
+/// The MCP surface AGENTS.md advertises must be the surface `br serve` serves.
+///
+/// AGENTS.md is what an agent reads before deciding whether to use MCP at all,
+/// so a resource missing from its list is a capability the agent never learns
+/// exists. That had already happened: AGENTS.md enumerated eleven resources
+/// while `src/mcp/resources.rs` registered twelve, omitting
+/// `beads://coordination/status` — the one an agent needs when `br ready` is
+/// empty and work is hidden behind stale claims. README.md and
+/// docs/AGENT_INTEGRATION.md both listed it, so the three documents disagreed.
+///
+/// Compares against the registered URI templates rather than a hand-kept list,
+/// so adding a resource without documenting it fails here. Concrete example
+/// URIs in tests and doc comments (`beads://issue/br-resource-issue`) are not
+/// templates and are excluded by requiring a `{` for any parameterized form.
+#[test]
+fn mcp_resource_and_prompt_surface_matches_agents_md() {
+    let text = agents_md();
+    let resources =
+        fs::read_to_string(repo_root().join("src/mcp/resources.rs")).expect("read resources.rs");
+    let prompts =
+        fs::read_to_string(repo_root().join("src/mcp/prompts.rs")).expect("read prompts.rs");
+
+    // Registered URIs: `beads://` followed by path segments, where a segment is
+    // either literal lowercase/underscore text or a `{param}` placeholder.
+    let mut registered: BTreeSet<String> = BTreeSet::new();
+    for raw in resources.split('"') {
+        let candidate = raw.trim();
+        if !candidate.starts_with("beads://") || candidate.len() <= "beads://".len() {
+            continue;
+        }
+        let tail = &candidate["beads://".len()..];
+        let templated = tail.split('/').all(|segment| {
+            (segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2)
+                || (!segment.is_empty()
+                    && segment.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+        });
+        if templated {
+            registered.insert(candidate.to_string());
+        }
+    }
+    assert!(
+        registered.len() >= 10,
+        "expected to find the registered beads:// resource templates, found {registered:?}"
+    );
+
+    let undocumented: Vec<&String> = registered
+        .iter()
+        .filter(|uri| !text.contains(uri.as_str()))
+        .collect();
+    assert!(
+        undocumented.is_empty(),
+        "src/mcp/resources.rs registers resources that AGENTS.md does not list: {undocumented:?}"
+    );
+
+    // Prompt names are registered as `name: "..."` alongside their arguments,
+    // so take only the ones AGENTS.md claims are prompts and require each to be
+    // registered — this catches a documented prompt that was renamed or removed.
+    for prompt in [
+        "triage",
+        "status_report",
+        "plan_next_work",
+        "polish_backlog",
+    ] {
+        assert!(
+            text.contains(prompt),
+            "AGENTS.md no longer documents the {prompt} prompt"
+        );
+        assert!(
+            prompts.contains(&format!("\"{prompt}\"")),
+            "AGENTS.md documents a {prompt} prompt that src/mcp/prompts.rs does not register"
+        );
+    }
+
+    for tool in [
+        "list_issues",
+        "show_issue",
+        "create_issue",
+        "update_issue",
+        "close_issue",
+        "manage_dependencies",
+        "project_overview",
+    ] {
+        assert!(
+            text.contains(tool),
+            "AGENTS.md no longer documents the {tool} MCP tool"
+        );
+    }
+}
