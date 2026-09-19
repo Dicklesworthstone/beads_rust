@@ -45,12 +45,21 @@ fn hydrate_acceptance(
     for batch in issues.chunks_mut(ACCEPTANCE_BATCH_SIZE) {
         let mut criteria = read(batch)?;
         for issue in batch {
-            issue.acceptance_criteria =
-                criteria
-                    .remove(&issue.id)
-                    .ok_or_else(|| BeadsError::IssueNotFound {
-                        id: issue.id.clone(),
-                    })?;
+            // Match the canonical row reader, which maps this column through
+            // `get_non_empty_str` and so never yields `Some("")`. Writes store
+            // a missing value as "" rather than NULL
+            // (`acceptance_criteria.as_deref().unwrap_or("")`), so without this
+            // filter the narrow lint projection reports `Some("")` where
+            // `list_issues` reports `None`, and lint stops seeing those issues
+            // as missing acceptance criteria. `decode_acceptance_rows` stays
+            // deliberately faithful to what SQL returned; the Issue-level
+            // contract is applied here.
+            issue.acceptance_criteria = criteria
+                .remove(&issue.id)
+                .ok_or_else(|| BeadsError::IssueNotFound {
+                    id: issue.id.clone(),
+                })?
+                .filter(|text| !text.is_empty());
         }
         if !criteria.is_empty() {
             return Err(BeadsError::internal(
