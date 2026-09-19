@@ -48,6 +48,9 @@ pub mod util;
 pub mod validation;
 pub mod write_combining;
 
+#[cfg(all(test, unix))]
+mod compaction_certificate_tests;
+
 #[cfg(feature = "mcp")]
 pub mod mcp;
 
