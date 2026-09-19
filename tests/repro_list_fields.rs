@@ -16,7 +16,14 @@ fn workspace() -> BrWorkspace {
 fn create(workspace: &BrWorkspace, title: &str, description: &str) -> String {
     let result = run_br(
         workspace,
-        ["create", title, "--type", "task", "--description", description],
+        [
+            "create",
+            title,
+            "--type",
+            "task",
+            "--description",
+            description,
+        ],
         "create_list_fields_issue",
     );
     assert!(result.status.success(), "{result:?}");
@@ -130,7 +137,14 @@ fn list_fields_apply_client_filters_before_offset_and_limit() {
     let gamma = create(&workspace, "Gamma", "NEEDLE");
     for (index, offset) in ["0", "1", "2", "99"].into_iter().enumerate() {
         let extra = [
-            "--desc-contains", "needle", "--sort", "title", "--limit", "1", "--offset", offset,
+            "--desc-contains",
+            "needle",
+            "--sort",
+            "title",
+            "--limit",
+            "1",
+            "--offset",
+            offset,
         ];
         let full = page(
             &workspace,
@@ -159,7 +173,13 @@ fn list_fields_apply_client_filters_before_offset_and_limit() {
     let selected = page(
         &workspace,
         &[
-            "--desc-contains", "needle", "--sort", "title", "--reverse", "--fields", "id",
+            "--desc-contains",
+            "needle",
+            "--sort",
+            "title",
+            "--reverse",
+            "--fields",
+            "id",
         ],
         "list_fields_reverse",
     );
@@ -186,7 +206,11 @@ fn list_fields_retain_relations_and_support_toon_without_changing_text_or_csv() 
         "list_fields_dependency",
     );
     assert!(dep.status.success(), "{dep:?}");
-    let full = page(&workspace, &["--sort", "title"], "list_fields_relations_full");
+    let full = page(
+        &workspace,
+        &["--sort", "title"],
+        "list_fields_relations_full",
+    );
     for (index, fields) in ["id,labels", "id,dependency_count,dependent_count"]
         .into_iter()
         .enumerate()
@@ -203,7 +227,9 @@ fn list_fields_retain_relations_and_support_toon_without_changing_text_or_csv() 
     assert_eq!(full["issues"][1]["dependent_count"], 1);
     let toon = run_br(
         &workspace,
-        ["list", "--format", "toon", "--fields", "id,title", "--sort", "title"],
+        [
+            "list", "--format", "toon", "--fields", "id,title", "--sort", "title",
+        ],
         "list_fields_toon",
     );
     assert!(toon.status.success(), "{toon:?}");
@@ -222,19 +248,38 @@ fn list_fields_retain_relations_and_support_toon_without_changing_text_or_csv() 
     assert_eq!(plain.stdout, ignored.stdout);
     let csv = run_br(
         &workspace,
-        ["list", "--format", "csv", "--fields", "id,title", "--sort", "title"],
+        [
+            "list", "--format", "csv", "--fields", "id,title", "--sort", "title",
+        ],
         "list_fields_csv",
     );
     assert!(csv.status.success(), "{csv:?}");
     assert!(csv.stdout.contains(&first) && csv.stdout.contains(&second));
     assert!(!csv.stdout.contains("UNSELECTED_LONG_BODY"));
+    // `--json` outranks `--quiet`: the documented mode-detection order checks
+    // `--json`/`--robot` before `--quiet` (AGENTS.md "Mode Detection", README
+    // "Output Modes"), and shipped br 0.6.0 behaves that way — `br list --json
+    // --quiet` prints the page while `br list --quiet` prints nothing.
+    //
+    // So this combination cannot print nothing, and asserting that it does was
+    // unsatisfiable rather than merely wrong: `--fields` is only applied in
+    // Json/Toon mode (src/cli/commands/list.rs:88), so the very flag that makes
+    // `--fields` meaningful is the one that suppresses quiet. Pin the real
+    // contract instead — the page is still emitted, and still projected.
     let quiet = run_br(
         &workspace,
         ["list", "--json", "--fields", "id", "--quiet"],
         "list_fields_quiet",
     );
     assert!(quiet.status.success(), "{quiet:?}");
-    assert!(quiet.stdout.is_empty(), "{quiet:?}");
+    assert!(
+        quiet.stdout.contains(&first) && quiet.stdout.contains(&second),
+        "--json outranks --quiet, so the selected page must still be printed: {quiet:?}"
+    );
+    assert!(
+        !quiet.stdout.contains("UNSELECTED_LONG_BODY"),
+        "--fields must still project when --quiet is also passed: {quiet:?}"
+    );
 }
 
 #[test]
@@ -281,10 +326,18 @@ fn list_fields_do_not_hide_work_at_the_large_page_threshold() {
     .into_iter()
     .enumerate()
     {
-        let full = page(&workspace, &extra, &format!("list_fields_large_full_{index}"));
+        let full = page(
+            &workspace,
+            &extra,
+            &format!("list_fields_large_full_{index}"),
+        );
         let mut projected = extra;
         projected.extend(["--fields", "id,title"]);
-        let selected = page(&workspace, &projected, &format!("list_fields_large_{index}"));
+        let selected = page(
+            &workspace,
+            &projected,
+            &format!("list_fields_large_{index}"),
+        );
         assert_projection(&full, &selected, &["id", "title"]);
         assert_eq!(selected["total"], 101);
     }
