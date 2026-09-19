@@ -547,9 +547,7 @@ fn description_has_section(description: &str, expected: &str) -> bool {
             continue;
         }
 
-        if !indented
-            && let Some(marker @ (b'`' | b'~')) = line.bytes().next()
-        {
+        if !indented && let Some(marker @ (b'`' | b'~')) = line.bytes().next() {
             let width = line.bytes().take_while(|byte| *byte == marker).count();
             if width >= 3 {
                 fence = Some((marker, width));
@@ -789,7 +787,10 @@ mod tests {
             lint_issue(&bug).unwrap().missing,
             vec!["## Steps to Reproduce"]
         );
-        let epic = make_issue(IssueType::Epic, Some("We will define success criteria later."));
+        let epic = make_issue(
+            IssueType::Epic,
+            Some("We will define success criteria later."),
+        );
         assert_eq!(
             lint_issue(&epic).unwrap().missing,
             vec!["## Success Criteria"]
