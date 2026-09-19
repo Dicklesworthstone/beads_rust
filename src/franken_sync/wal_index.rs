@@ -23,7 +23,7 @@ use super::FrankenError;
 /// Owns a SQLite-compatible exclusive main-file range lock. Its platform
 /// constructor lives in sync::db_inode_lock, the existing syscall boundary.
 /// Closing this owned descriptor releases its OFD lock; unrelated closes do not.
-pub(crate) struct RecoveryLock {
+pub struct RecoveryLock {
     pub(crate) file: File,
 }
 
@@ -107,7 +107,7 @@ fn be32(bytes: &[u8]) -> u32 {
 }
 
 fn checksum(bytes: &[u8], mut state: [u32; 2], big_endian: bool) -> [u32; 2] {
-    for pair in bytes.chunks_exact(8) {
+    for pair in bytes.as_chunks::<8>().0 {
         let word = |bytes: &[u8]| {
             let bytes = bytes.try_into().expect("fixed-width checksum word");
             if big_endian {
@@ -164,7 +164,7 @@ fn probe(path: &Path) -> io::Result<bool> {
     Ok(poisoned_headers(&wal, &shm))
 }
 
-pub(crate) fn poisoned_index_present(path: &Path) -> io::Result<bool> {
+pub fn poisoned_index_present(path: &Path) -> io::Result<bool> {
     probe(path)
 }
 
@@ -237,7 +237,7 @@ fn hash_file(file: &mut File) -> io::Result<String> {
     loop {
         let count = file.read(&mut buffer)?;
         if count == 0 {
-            return Ok(format!("{:x}", hash.finalize()));
+            return Ok(crate::util::hex_encode(&hash.finalize()));
         }
         hash.update(&buffer[..count]);
     }
@@ -762,12 +762,12 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
     #[test]
     fn recovery_survives_abrupt_process_exit() {
+        const WORKER: &str = "franken_sync::wal_index::tests::recovery_crash_worker";
         if run_recovery_test_in_subprocess(
             "franken_sync::wal_index::tests::recovery_survives_abrupt_process_exit",
         ) {
             return;
         }
-        const WORKER: &str = "franken_sync::wal_index::tests::recovery_crash_worker";
         for stage in ["prepared", "renamed", "durable", "admitted"] {
             let (_temp, db) = tracker_with_uncheckpointed_rows();
             poison_tracker(&db);
