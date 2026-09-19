@@ -1596,8 +1596,24 @@ enum SearchIssueProjection {
 /// query took 5.9s to scan. After the change the same searches measured
 /// 0.067-0.111s (41x-85x, cross-host so indicative rather than controlled);
 /// `--all` is now faster than the default corpus because it skips the extra
-/// hidden-closed count. `br search <term>` on the default corpus was already
-/// fast and is unchanged (`beads_rust-mwxp`).
+/// hidden-closed count. Plain `br search <term>` was always fast and is
+/// unchanged (`beads_rust-mwxp`).
+///
+/// `--all` was never the common case, though. Any filter that
+/// `needs_client_filters` recognises — `--priority-min`, `--desc-contains`,
+/// `--notes-contains`, `--id` — sends `count_hidden_closed_matches` down its
+/// client-side branch, which searches the whole closed corpus to count what
+/// the default view hid. So one ordinary flag put a *default* search on this
+/// slow path: `br search engine --priority-min 1` measured **5.62s** against
+/// **0.15s** unfiltered, and **0.190s** after this change. Same story for
+/// `--desc-contains` (5.71s -> 0.114s) and `--id` (5.55s -> 0.096s).
+///
+/// Note `append_label_or_membership_exists` keeps a correlated `EXISTS` over
+/// `labels` on purpose: it was measured at 0.069-0.113s on the same tracker
+/// and needs no change. The difference is not correlation alone but
+/// correlation over an unindexable predicate — `instr(lower(comments.text), ?)`
+/// substring-scans every comment body per outer row, while a label membership
+/// test is an indexable equality over 1,121 short rows.
 ///
 /// This is the same shape `SEARCH_COUNT_NEEDLE_PREDICATE` has always used for
 /// whole-corpus counts, which is why the hidden-closed count was fast while
