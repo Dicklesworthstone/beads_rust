@@ -480,6 +480,16 @@ pub struct PreparedStatement<'conn> {
     inner: PreparedStatementInner<'conn>,
 }
 
+// `clippy::large_enum_variant` wants the big variant boxed. Do not: the big
+// variant is `Engine`, which carries the engine's own prepared statement and is
+// what every ordinary `prepare()` in the storage layer produces. The small
+// variant is `Checkpoint`, added by 57104d61 for the rare deferred
+// `PRAGMA wal_checkpoint` path — a pointer plus a String. Boxing `Engine` would
+// put a heap allocation on every prepared statement across the whole hot path
+// so that a rarely-constructed variant looks tidier, which is a pessimisation,
+// not a fix. This annotation changes no codegen. If the engine owner would
+// rather box it, that is their call to make deliberately.
+#[allow(clippy::large_enum_variant)]
 enum PreparedStatementInner<'conn> {
     Engine(fsqlite::PreparedStatement<'conn>),
     Checkpoint {
