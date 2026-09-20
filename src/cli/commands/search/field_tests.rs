@@ -160,7 +160,7 @@ fn search_fields_preserve_client_filters_sort_and_pagination() {
                 assert_eq!(selected["has_more"], offset < 3);
                 assert_eq!(
                     selected["issues"].as_array().unwrap().len(),
-                    if offset < 4 { 1 } else { 0 }
+                    usize::from(offset < 4)
                 );
             }
         }
@@ -210,7 +210,7 @@ fn search_fields_preserve_unicode_history_and_literal_punctuation() {
                 OutputFormat::Json,
             );
             assert_projection(&full, &selected, "id,status,description");
-            assert_eq!(selected["hidden_closed_count"], if all { 0 } else { 1 });
+            assert_eq!(selected["hidden_closed_count"], u64::from(!all));
             if all {
                 let ids = selected["issues"]
                     .as_array()

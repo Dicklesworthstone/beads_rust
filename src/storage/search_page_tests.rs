@@ -1,5 +1,15 @@
 //! Page-before-hydration regressions and bounded-read fault controls.
 
+// `clippy::trivial_regex` fires on the `Regex::new("CAFÉ")` matchers below and
+// suggests `str::contains`. Do not take that suggestion. The function under
+// test, `select_matching_window`, takes a `&Regex` — a plain substring check
+// cannot be passed to it — and the `RegexBuilder::new("café")
+// .case_insensitive(true)` matcher exists precisely to fold `café` onto stored
+// `CAFÉ`, which `contains` cannot do at all. Rewriting these to `contains`
+// would compile and silently delete the Unicode case-folding coverage these
+// tests exist to hold (beads_rust-whnbi).
+#![allow(clippy::trivial_regex)]
+
 use super::*;
 use crate::model::{IssueType, Priority, Status};
 use chrono::{Duration, TimeZone, Utc};
