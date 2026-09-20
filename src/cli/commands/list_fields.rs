@@ -1,4 +1,4 @@
-//! Explicit column selection for structured list output.
+//! Shared column selection for structured discovery output.
 //!
 //! Selection changes columns, never the matching corpus or page boundaries.
 //! Values use the model's serializers; selected absent optional fields are null.
@@ -58,7 +58,7 @@ impl FieldSelection {
                 .ok_or_else(|| BeadsError::Validation {
                     field: "fields".to_string(),
                     reason: format!(
-                        "unknown or empty list field '{token}'; choose from: {}",
+                        "unknown or empty issue field '{token}'; choose from: {}",
                         ALLOWED_FIELDS.join(",")
                     ),
                 })?;
@@ -102,17 +102,14 @@ impl FieldSelection {
         }
     }
 
-    pub(super) fn render(
+    /// Prepare selected rows independently of a command's output envelope.
+    /// All requested relation reads finish before the caller writes stdout.
+    /// The iterator owns the page and metadata; it never borrows storage.
+    pub(super) fn rows(
         &self,
-        ctx: &OutputContext,
         storage: &SqliteStorage,
         issues: Vec<Issue>,
-        meta: JsonArrayPageMeta,
-        toon: bool,
-        stats: bool,
-    ) -> Result<()> {
-        // Read all requested relation metadata before starting stdout. Failures
-        // must not leave a successful-looking partially serialized page.
+    ) -> Result<SelectedRows<'_>> {
         let mut labels = HashMap::new();
         let mut dependencies = HashMap::new();
         let mut dependents = HashMap::new();
@@ -128,18 +125,25 @@ impl FieldSelection {
                 (dependencies, dependents) = storage.count_relation_counts_for_issues(&ids)?;
             }
         }
-        let rows = issues.into_iter().map(|mut issue| {
-            if self.needs_labels() {
-                issue.labels = labels.remove(&issue.id).unwrap_or_default();
-            }
-            let dependency_count = dependencies.get(&issue.id).copied().unwrap_or(0);
-            let dependent_count = dependents.get(&issue.id).copied().unwrap_or(0);
-            self.project(IssueWithCounts {
-                issue,
-                dependency_count,
-                dependent_count,
-            })
-        });
+        Ok(SelectedRows {
+            selection: self,
+            issues: issues.into_iter(),
+            labels,
+            dependencies,
+            dependents,
+        })
+    }
+
+    pub(super) fn render(
+        &self,
+        ctx: &OutputContext,
+        storage: &SqliteStorage,
+        issues: Vec<Issue>,
+        meta: JsonArrayPageMeta,
+        toon: bool,
+        stats: bool,
+    ) -> Result<()> {
+        let rows = self.rows(storage, issues)?;
         if toon {
             let page = SelectedPage {
                 issues: rows.collect(),
@@ -158,6 +162,41 @@ impl FieldSelection {
     }
 }
 
+/// Owned prepared rows let list keep its streaming JSON writer while search
+/// retains its different envelope (hidden history, not a list total).
+pub(super) struct SelectedRows<'a> {
+    selection: &'a FieldSelection,
+    issues: std::vec::IntoIter<Issue>,
+    labels: HashMap<String, Vec<String>>,
+    dependencies: HashMap<String, usize>,
+    dependents: HashMap<String, usize>,
+}
+
+impl<'a> Iterator for SelectedRows<'a> {
+    type Item = SelectedIssue<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut issue = self.issues.next()?;
+        if self.selection.needs_labels() {
+            issue.labels = self.labels.remove(&issue.id).unwrap_or_default();
+        }
+        let dependency_count = self.dependencies.get(&issue.id).copied().unwrap_or(0);
+        let dependent_count = self.dependents.get(&issue.id).copied().unwrap_or(0);
+        Some(self.selection.project(IssueWithCounts {
+            issue,
+            dependency_count,
+            dependent_count,
+        }))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.issues.size_hint()
+    }
+}
+
+impl ExactSizeIterator for SelectedRows<'_> {}
+impl std::iter::FusedIterator for SelectedRows<'_> {}
+
 #[derive(Serialize)]
 struct SelectedPage<'a> {
     issues: Vec<SelectedIssue<'a>>,
@@ -167,7 +206,7 @@ struct SelectedPage<'a> {
     has_more: bool,
 }
 
-struct SelectedIssue<'a> {
+pub(super) struct SelectedIssue<'a> {
     selection: &'a FieldSelection,
     issue: IssueWithCounts,
 }
@@ -207,7 +246,7 @@ impl Serialize for SelectedIssue<'_> {
                 "labels" => map.serialize_entry(field, &issue.labels)?,
                 "dependency_count" => map.serialize_entry(field, &self.issue.dependency_count)?,
                 "dependent_count" => map.serialize_entry(field, &self.issue.dependent_count)?,
-                _ => return Err(serde::ser::Error::custom("invalid list projection field")),
+                _ => return Err(serde::ser::Error::custom("invalid issue projection field")),
             }
         }
         map.end()

@@ -37,6 +37,7 @@ pub mod init;
 pub mod label;
 pub mod lint;
 pub mod list;
+mod list_fields;
 pub mod orphans;
 pub mod q;
 pub mod query;

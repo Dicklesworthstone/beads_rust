@@ -3,6 +3,7 @@
 //! Classic bd-style substring search across title/description/id — plus
 //! comment bodies (beads_rust#416) — with list-like filters.
 
+use super::list_fields::{FieldSelection, SelectedIssue};
 use crate::cli::{
     DEFAULT_LIST_OFFSET, DEFAULT_SEARCH_LIMIT, ListArgs, OutputFormat, SearchArgs,
     resolve_output_format_with_outer_mode,
@@ -27,6 +28,10 @@ use crate::storage::unicode_issue_fields_match;
 #[cfg(test)]
 #[path = "search/unicode_tests.rs"]
 mod unicode_tests;
+
+#[cfg(test)]
+#[path = "search/field_tests.rs"]
+mod field_tests;
 
 /// Execute the search command.
 ///
@@ -111,6 +116,17 @@ fn collect_search_results_for_output(
     list_args: &ListArgs,
     output_format: OutputFormat,
 ) -> Result<SearchPage> {
+    // Validate once, even for an empty result or quiet output. Text and CSV
+    // keep their existing field behavior. Selection never changes the query.
+    let selection = if matches!(output_format, OutputFormat::Json | OutputFormat::Toon) {
+        list_args
+            .fields
+            .as_deref()
+            .map(FieldSelection::parse)
+            .transpose()?
+    } else {
+        None
+    };
     let limit = list_args.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
     let offset = list_args.offset.unwrap_or(DEFAULT_LIST_OFFSET);
     let mut probe_args = list_args.clone();
@@ -124,7 +140,10 @@ fn collect_search_results_for_output(
         storage,
         query,
         &probe_args,
-        matches!(output_format, OutputFormat::Text),
+        matches!(output_format, OutputFormat::Text)
+            || selection
+                .as_ref()
+                .is_some_and(FieldSelection::can_use_text_rows),
     )?;
     let has_more = limit > 0 && issues.len() > limit;
     if has_more {
@@ -135,6 +154,7 @@ fn collect_search_results_for_output(
         limit,
         offset,
         has_more,
+        selection,
     })
 }
 
@@ -143,6 +163,7 @@ struct SearchPage {
     limit: usize,
     offset: usize,
     has_more: bool,
+    selection: Option<FieldSelection>,
 }
 
 fn collect_search_results_with_projection(
@@ -238,6 +259,7 @@ fn render_search_results(
         limit,
         offset,
         has_more,
+        selection,
     } = page;
     let quiet = cli.quiet.unwrap_or(false);
     let early_ctx = OutputContext::from_output_format(output_format, quiet, true);
@@ -254,6 +276,25 @@ fn render_search_results(
     } else {
         count_hidden_closed_matches(storage, query, list_args)?
     };
+
+    if let Some(selection) = selection {
+        // Prepare only requested relations, after filtering and pagination.
+        // Keep search's envelope rather than manufacturing a list total or
+        // losing hidden-history evidence when the visible page is empty.
+        let selected = SelectedSearchResults {
+            issues: selection.rows(storage, issues)?.collect(),
+            hidden_closed_count,
+            limit,
+            offset,
+            has_more,
+        };
+        if matches!(output_format, OutputFormat::Toon) {
+            early_ctx.toon_with_stats(&selected, list_args.stats);
+        } else {
+            early_ctx.json(&selected);
+        }
+        return Ok(());
+    }
 
     match output_format {
         OutputFormat::Json => {
@@ -377,6 +418,16 @@ fn render_search_results(
 #[derive(serde::Serialize)]
 struct SearchResults<'a> {
     issues: &'a [IssueWithCounts],
+    hidden_closed_count: usize,
+    limit: usize,
+    offset: usize,
+    has_more: bool,
+}
+
+/// Same search metadata as full rows; only the issue columns are selected.
+#[derive(serde::Serialize)]
+struct SelectedSearchResults<'a> {
+    issues: Vec<SelectedIssue<'a>>,
     hidden_closed_count: usize,
     limit: usize,
     offset: usize,

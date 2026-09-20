@@ -23,8 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use unicode_width::UnicodeWidthStr;
 
-#[path = "list_fields.rs"]
-mod fields;
+use super::list_fields as fields;
 
 // Large default-visible structured pages are faster through the existing full
 // scan/relation path; smaller pages keep the medium-page relation queries.
