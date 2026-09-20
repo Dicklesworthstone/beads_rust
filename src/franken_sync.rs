@@ -34,6 +34,7 @@ use asupersync::runtime::{Runtime, RuntimeBuilder};
 pub use fsqlite::{FrankenError, Row, SqliteValue};
 
 mod prepared;
+mod retry;
 pub(crate) mod wal_index;
 
 // ---------------------------------------------------------------------------
@@ -89,37 +90,12 @@ fn schema_stale(err: &FrankenError) -> bool {
     )
 }
 
-/// Bounded retry for `FrankenError::BusyRecovery`.
-///
-/// fsqlite 0.2+ ns-lifecycle opens can put a database into a short
-/// "recovery in progress" window; statements admitted during that window
-/// fail with `BusyRecovery` immediately instead of waiting out the
-/// connection's busy timeout. C SQLite's busy handler covers
-/// `SQLITE_BUSY_RECOVERY`, and the 0.1.x line had no recovery windows at
-/// all, so a bounded caller-side retry restores the pre-0.2 observable
-/// behavior. Plain `Busy` is deliberately NOT retried here: br classifies
-/// ordinary lock contention itself and the engine owns that timeout.
-fn retry_busy_recovery<T>(
-    mut attempt: impl FnMut() -> Result<T, FrankenError>,
-) -> Result<T, FrankenError> {
-    const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-    const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(250);
-    // ubs:ignore — this monotonic clock bounds retries; it generates no token or randomness.
-    let start = std::time::Instant::now();
-    let mut backoff = std::time::Duration::from_millis(5);
-    loop {
-        match attempt() {
-            Err(FrankenError::BusyRecovery) if start.elapsed() < RETRY_BUDGET => {
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(BACKOFF_CAP);
-            }
-            other => return other,
-        }
-    }
-}
-
 /// Bounded retry for the engine's transient errors on one statement.
 ///
+/// Replay requires one query/DML statement and unchanged autocommit state.
+/// Batches can commit a prefix or change transaction identity without changing
+/// that boolean; schema, transaction-control and maintenance SQL require caller-owned
+/// recovery. The SQL proof is computed only after a retryable failure.
 /// `BusyRecovery` is retried only while autocommit state is unchanged.
 /// A failed statement that entered or left a transaction must reach its owner
 /// rather than being replayed in a different transaction context.
@@ -131,6 +107,7 @@ fn retry_busy_recovery<T>(
 /// re-run its transaction body.
 fn retry_transient<T>(
     conn: &fsqlite::Connection,
+    retry_safety: &retry::ReplaySafety<'_>,
     mut attempt: impl FnMut() -> Result<T, FrankenError>,
 ) -> Result<T, FrankenError> {
     const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
@@ -145,7 +122,7 @@ fn retry_transient<T>(
                 let retryable = was_autocommit == is_autocommit
                     && (matches!(error, FrankenError::BusyRecovery)
                         || (matches!(error, FrankenError::BusySnapshot { .. }) && was_autocommit));
-                if !retryable || start.elapsed() >= RETRY_BUDGET {
+                if !retryable || !retry_safety.allows_replay() || start.elapsed() >= RETRY_BUDGET {
                     return Err(error);
                 }
                 std::thread::sleep(backoff);
@@ -158,16 +135,29 @@ fn retry_transient<T>(
 
 macro_rules! with_engine_retries {
     ($conn:expr, $sql:expr, $attempt:expr) => {{
+        let retry_safety = retry::ReplaySafety::new($sql);
         let was_in_transaction = $conn.in_transaction();
-        let first = retry_transient(&$conn, || $attempt);
+        let first = retry_transient(&$conn, &retry_safety, || $attempt);
         let result = match first {
-            Err(ref err)
-                if schema_stale(err) && was_in_transaction == $conn.in_transaction() =>
+            Err(err)
+                if schema_stale(&err)
+                    && was_in_transaction == $conn.in_transaction()
+                    && retry_safety.allows_replay() =>
             {
-                // `prepare` refreshes the schema image from the shared
-                // publication plane even when it ultimately fails to resolve.
-                let _ = drive($conn.prepare($sql));
-                retry_transient(&$conn, || $attempt)
+                // Recompilation is allowed only for one ordinary statement.
+                // Never prepare a batch/PRAGMA as a "refresh": prepare itself
+                // can execute maintenance, and a batch may have applied a prefix.
+                match retry_transient(&$conn, &retry_safety, || drive($conn.prepare($sql))) {
+                    Ok(refreshed) => {
+                        drop(refreshed);
+                        if was_in_transaction == $conn.in_transaction() {
+                            retry_transient(&$conn, &retry_safety, || $attempt)
+                        } else {
+                            Err(err)
+                        }
+                    }
+                    Err(refresh_error) => Err(refresh_error),
+                }
             }
             other => other,
         };
@@ -177,6 +167,9 @@ macro_rules! with_engine_retries {
         result
     }};
 }
+
+#[cfg(test)]
+mod retry_tests;
 
 /// Classify a standalone checkpoint, refusing mixed batches before execution.
 /// The engine accepts multi-statement SQL on its execute path. Treating a batch

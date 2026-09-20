@@ -6,7 +6,7 @@
 
 use std::cell::RefCell;
 
-use super::{FrankenError, Row, SqliteValue, drive, retry_busy_recovery, retry_transient};
+use super::{FrankenError, Row, SqliteValue, drive, retry, retry_transient};
 
 pub(super) struct EngineStatement<'conn> {
     connection: &'conn fsqlite::Connection,
@@ -19,7 +19,10 @@ impl<'conn> EngineStatement<'conn> {
         connection: &'conn fsqlite::Connection,
         sql: &str,
     ) -> Result<Self, FrankenError> {
-        let statement = retry_busy_recovery(|| drive(connection.prepare(sql)))?;
+        let retry_safety = retry::ReplaySafety::new(sql);
+        let statement = retry_transient(connection, &retry_safety, || {
+            drive(connection.prepare(sql))
+        })?;
         Ok(Self {
             connection,
             sql: sql.to_string(),
@@ -36,20 +39,31 @@ impl<'conn> EngineStatement<'conn> {
         &self,
         mut action: impl FnMut(&fsqlite::PreparedStatement<'conn>) -> Result<T, FrankenError>,
     ) -> Result<T, FrankenError> {
+        let retry_safety = retry::ReplaySafety::new(&self.sql);
         let was_in_transaction = self.connection.in_transaction();
-        let result = retry_transient(self.connection, || action(&self.statement.borrow()))
-            .or_else(|error| {
-                if !super::schema_stale(&error)
-                    || was_in_transaction != self.connection.in_transaction()
-                {
-                    return Err(error);
-                }
-                let refreshed = retry_busy_recovery(|| drive(self.connection.prepare(&self.sql)))?;
-                // No statement borrow or engine future survives an attempt.
-                // Drop the stale program before driving the replacement.
-                drop(self.statement.replace(refreshed));
-                retry_transient(self.connection, || action(&self.statement.borrow()))
-            });
+        let result = retry_transient(self.connection, &retry_safety, || {
+            action(&self.statement.borrow())
+        })
+        .or_else(|error| {
+            if !super::schema_stale(&error)
+                || was_in_transaction != self.connection.in_transaction()
+                || !retry_safety.allows_replay()
+            {
+                return Err(error);
+            }
+            let refreshed = retry_transient(self.connection, &retry_safety, || {
+                drive(self.connection.prepare(&self.sql))
+            })?;
+            if was_in_transaction != self.connection.in_transaction() {
+                return Err(error);
+            }
+            // No statement borrow or engine future survives an attempt.
+            // Drop the stale program before driving the replacement.
+            drop(self.statement.replace(refreshed));
+            retry_transient(self.connection, &retry_safety, || {
+                action(&self.statement.borrow())
+            })
+        });
         if matches!(&result, Err(FrankenError::BusyRecovery)) {
             super::wal_index::warn_if_poisoned(self.connection.path());
         }
@@ -282,5 +296,39 @@ mod tests {
         assert!(conn.as_async().in_transaction());
         conn.execute("ROLLBACK").unwrap();
         assert!(query.query().unwrap().is_empty());
+    }
+
+    #[test]
+    fn prepared_maintenance_errors_cannot_replay_or_recompile_the_pragma() {
+        for stale_schema in [false, true] {
+            let conn = Connection::open(":memory:").unwrap();
+            let statement =
+                EngineStatement::new(conn.as_async(), "PRAGMA user_version = 42").unwrap();
+            // Initial preparation may itself process a PRAGMA. A later schema
+            // refresh must not reset a newer value by preparing it again.
+            conn.execute("PRAGMA user_version = 17").unwrap();
+            let mut calls = 0;
+            let result = statement.run(|_| {
+                calls += 1;
+                if calls == 1 {
+                    Err(if stale_schema {
+                        FrankenError::SchemaChanged
+                    } else {
+                        FrankenError::BusyRecovery
+                    })
+                } else {
+                    Ok(0usize)
+                }
+            });
+            assert!(matches!(
+                result,
+                Err(FrankenError::SchemaChanged | FrankenError::BusyRecovery)
+            ));
+            assert_eq!(calls, 1);
+            assert_eq!(
+                conn.query_row("PRAGMA user_version").unwrap().values(),
+                &[SqliteValue::Integer(17)]
+            );
+        }
     }
 }
