@@ -1,0 +1,221 @@
+name: Compaction certificate validation
+
+# A bounded #508 investigation: do not run or edit source on ordinary pushes.
+# The fixture repair is published only after the differential controls and the
+# complete release gate pass on exactly the tree being published.
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/compaction-certificate-validation.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compaction-certificate-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: '2'
+  RUST_BACKTRACE: '1'
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  BR_508_CONFIG_BLOB: b51514a7b44aa7f63edd4e37425cf2f28ef60c3a
+  BR_508_TEST: config::tests::vacuum_into_private_maintenance_leaves_live_family_unchanged_before_install
+
+jobs:
+  validate-and-repair:
+    if: github.repository == 'Dicklesworthstone/beads_rust' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # The token is exposed only in the final publication step. Compilation and
+    # tests receive no token. No release, tag, PR, or force-update is performed.
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the exact revision without persisted credentials
+        run: |
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD:src/config/mod.rs)" = "$BR_508_CONFIG_BLOB"
+          command -v rustup
+          command -v gh
+          command -v jq
+          printf 'CARGO_TARGET_DIR=%s/br-508-target\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'BR_508_EVIDENCE=%s/br-508-evidence\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/br-508-evidence"
+          printf 'Tested base: %s\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          sha256sum Cargo.lock src/config/mod.rs src/compaction_certificate_tests.rs src/franken_sync.rs
+
+      - name: Install the repository-pinned Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+          test "$(git rev-parse HEAD:rust-toolchain.toml)" = 45da545f8b47809154191d5c34e50da349c0ae9d
+          rustc --version
+          cargo --version
+
+      - name: Run the differential controls before any repair
+        run: |
+          cargo test --locked --lib -- --list 2>&1 | tee "$BR_508_EVIDENCE/test-list.log"
+          grep -Fx "$BR_508_TEST: test" "$BR_508_EVIDENCE/test-list.log"
+          cat > "$BR_508_EVIDENCE/required-controls" <<'CONTROLS'
+          checkpoint_rejects_malformed_live_certificate
+          compaction_rejects_malformed_live_certificate_before_candidate_build
+          private_main_only_copy_does_not_inherit_malformed_live_certificate
+          healthy_compaction_preserves_logical_state_without_jsonl
+          compaction_rejects_incomplete_checkpoint_rows_before_candidate_build
+          compaction_rejects_invalid_checkpoint_values_before_candidate_build
+          compaction_partial_truncate_requires_a_real_completed_passive_fallback
+          CONTROLS
+          while IFS= read -r name; do
+            grep -Fx "compaction_certificate_tests::$name: test" "$BR_508_EVIDENCE/test-list.log"
+          done < "$BR_508_EVIDENCE/required-controls"
+          cargo test --locked --lib compaction_certificate_tests:: -- --nocapture --test-threads=1 2>&1 | tee "$BR_508_EVIDENCE/controls-before.log"
+          while IFS= read -r name; do
+            grep -F "test compaction_certificate_tests::$name ... ok" "$BR_508_EVIDENCE/controls-before.log"
+          done < "$BR_508_EVIDENCE/required-controls"
+
+      - name: Require the original named malformed-certificate failure
+        run: |
+          set +e
+          cargo test --locked --lib -- --exact "$BR_508_TEST" --nocapture --test-threads=1 2>&1 | tee "$BR_508_EVIDENCE/original-failure.log"
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          test "${statuses[0]}" -eq 101
+          test "${statuses[1]}" -eq 0
+          grep -F 'expected the injected post-maintenance hook to be the failure, got: Database error: WAL file is corrupt: parallel WAL certificate suffix does not start at a record boundary' "$BR_508_EVIDENCE/original-failure.log"
+          grep -F 'test result: FAILED. 0 passed; 1 failed;' "$BR_508_EVIDENCE/original-failure.log"
+          printf 'Baseline: all seven controls passed; original fixture failed with the expected record-boundary corruption.\n' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply only the reviewed healthy-certificate fixture repair
+        run: |
+          test "$(git hash-object src/config/mod.rs)" = "$BR_508_CONFIG_BLOB"
+          cat > "$BR_508_EVIDENCE/fixture-repair.patch" <<'PATCH'
+          diff --git a/src/config/mod.rs b/src/config/mod.rs
+          --- a/src/config/mod.rs
+          +++ b/src/config/mod.rs
+          @@ -9906,7 +9906,26 @@
+                   storage
+                       .checkpoint_full()
+                       .expect("establish checkpointed live baseline");
+          -        fs::write(&sidecar_path, b"live-sidecar-must-not-change").unwrap();
+          +        // The certificate is engine input, not an opaque sentinel. Preserve
+          +        // its checkpointed bytes (or absence) in this successful-build test.
+          +        // Malformed input remains covered by compaction_certificate_tests;
+          +        // accepting it or broadening certificate quarantine is not a repair.
+          +        let certificate_snapshot = || match fs::symlink_metadata(&sidecar_path) {
+          +            Ok(metadata) => {
+          +                assert!(
+          +                    metadata.is_file(),
+          +                    "certificate fixture must be a regular file"
+          +                );
+          +                Some((
+          +                    metadata.dev(),
+          +                    metadata.ino(),
+          +                    fs::read(&sidecar_path).expect("read engine certificate fixture"),
+          +                ))
+          +            }
+          +            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+          +            Err(error) => panic!("cannot inspect engine certificate fixture: {error}"),
+          +        };
+          +        let certificate_before = certificate_snapshot();
+           
+                   let main_before = fs::read(&db_path).unwrap();
+                   let inode_before = fs::metadata(&db_path).unwrap().ino();
+          @@ -9932,10 +9951,7 @@
+                       || {
+                           assert_eq!(fs::read(&db_path).unwrap(), main_before);
+                           assert_eq!(fs::metadata(&db_path).unwrap().ino(), inode_before);
+          -                assert_eq!(
+          -                    fs::read(&sidecar_path).unwrap(),
+          -                    b"live-sidecar-must-not-change"
+          -                );
+          +                assert_eq!(certificate_snapshot(), certificate_before);
+                           Err(BeadsError::Config(
+                               "stop after private maintenance, before installation".to_string(),
+                           ))
+          @@ -9954,10 +9970,7 @@
+                   );
+                   assert_eq!(fs::read(&db_path).unwrap(), main_before);
+                   assert_eq!(fs::metadata(&db_path).unwrap().ino(), inode_before);
+          -        assert_eq!(
+          -            fs::read(&sidecar_path).unwrap(),
+          -            b"live-sidecar-must-not-change"
+          -        );
+          +        assert_eq!(certificate_snapshot(), certificate_before);
+                   assert_eq!(
+                       write_authority
+                           .database_target_authority_state()
+          PATCH
+          git apply --check --recount "$BR_508_EVIDENCE/fixture-repair.patch"
+          git apply --recount "$BR_508_EVIDENCE/fixture-repair.patch"
+          git diff --check
+          test "$(git diff --name-only)" = src/config/mod.rs
+          git diff -- src/config/mod.rs
+
+      - name: Prove the repaired hook and all refusal controls
+        run: |
+          cargo test --locked --lib -- --exact "$BR_508_TEST" --nocapture --test-threads=1 2>&1 | tee "$BR_508_EVIDENCE/repaired-hook.log"
+          grep -F "test $BR_508_TEST ... ok" "$BR_508_EVIDENCE/repaired-hook.log"
+          cargo test --locked --lib compaction_certificate_tests:: -- --nocapture --test-threads=1 2>&1 | tee "$BR_508_EVIDENCE/controls-after.log"
+          while IFS= read -r name; do
+            grep -F "test compaction_certificate_tests::$name ... ok" "$BR_508_EVIDENCE/controls-after.log"
+          done < "$BR_508_EVIDENCE/required-controls"
+          cargo test --locked --lib franken_sync:: -- --nocapture 2>&1 | tee "$BR_508_EVIDENCE/checkpoint-regressions.log"
+          printf 'Repaired fixture reached the hook; all seven differential controls still pass.\n' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Require the complete release gate
+        run: |
+          cargo fmt --all -- --check 2>&1 | tee "$BR_508_EVIDENCE/fmt.log"
+          cargo check --locked --all-targets 2>&1 | tee "$BR_508_EVIDENCE/check.log"
+          cargo clippy --locked --workspace --all-targets --keep-going -- -D warnings 2>&1 | tee "$BR_508_EVIDENCE/clippy.log"
+          cargo test --locked --no-fail-fast 2>&1 | tee "$BR_508_EVIDENCE/full-tests.log"
+          git diff --check
+          test "$(git diff --name-only)" = src/config/mod.rs
+          printf 'Gate: rustfmt, all-target check, all-target Clippy (-D warnings), and full cargo test passed.\n' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit the tested repair directly to main without rebasing or force
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git diff --name-only)" = src/config/mod.rs
+          current=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+          if test "$current" != "$GITHUB_SHA"; then
+            echo '::error::main advanced during validation; refusing an untested rebase or force-update.'
+            exit 1
+          fi
+          blob=$(jq -n --rawfile content src/config/mod.rs '{content: $content, encoding: "utf-8"}' |
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" --input - --jq '.sha')
+          test "$blob" = "$(git hash-object src/config/mod.rs)"
+          base_tree=$(git rev-parse 'HEAD^{tree}')
+          tree=$(jq -n --arg base "$base_tree" --arg blob "$blob" \
+            '{base_tree: $base, tree: [{path: "src/config/mod.rs", mode: "100644", type: "blob", sha: $blob}]}' |
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/trees" --input - --jq '.sha')
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          message=$(printf 'test(config): retain engine certificate in private-compaction fixture\n\nAll seven differential controls passed before and after the repair. The\noriginal fixture reproduced the named record-boundary WalCorrupt failure;\nthe repaired fixture reached its pre-install hook and retained certificate\nbytes, presence, device and inode plus the original main and authority.\n\nNo production recovery, quarantine or checkpoint policy changed.\nValidation: rustfmt, cargo check --all-targets, all-target Clippy with\n-D warnings and full cargo test --no-fail-fast, all with the locked dependencies.\nTested base: %s\nRuntime evidence: %s\n\nRefs #508' "$GITHUB_SHA" "$run_url")
+          commit=$(jq -n --arg message "$message" --arg tree "$tree" --arg parent "$GITHUB_SHA" \
+            '{message: $message, tree: $tree, parents: [$parent]}' |
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/commits" --input - --jq '.sha')
+          # The non-forced update also rejects a race after the earlier read.
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/main" -f sha="$commit" -F force=false
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$commit"
+          printf 'Published repair: `%s`\nRuntime evidence: %s\n' "$commit" "$run_url" >> "$GITHUB_STEP_SUMMARY"
+          printf 'PUBLISHED_REPAIR_COMMIT=%s\n' "$commit"
+
+      - name: Record the exact source and log digests even on failure
+        if: always()
+        run: |
+          if test -d "${BR_508_EVIDENCE:-}"; then
+            find "$BR_508_EVIDENCE" -maxdepth 1 -type f -print0 | sort -z | xargs -0 -r sha256sum
+          fi
+          git status --short
+          git diff --stat
