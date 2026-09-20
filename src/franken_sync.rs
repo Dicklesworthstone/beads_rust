@@ -33,6 +33,7 @@ use asupersync::runtime::{Runtime, RuntimeBuilder};
 
 pub use fsqlite::{FrankenError, Row, SqliteValue};
 
+mod prepared;
 pub(crate) mod wal_index;
 
 // ---------------------------------------------------------------------------
@@ -119,7 +120,9 @@ fn retry_busy_recovery<T>(
 
 /// Bounded retry for the engine's transient errors on one statement.
 ///
-/// `BusyRecovery` is always retried (see [`retry_busy_recovery`]).
+/// `BusyRecovery` is retried only while autocommit state is unchanged.
+/// A failed statement that entered or left a transaction must reach its owner
+/// rather than being replayed in a different transaction context.
 /// `BusySnapshot` is first-committer-wins loss at commit; the engine
 /// contract says "retry the whole transaction". When the connection was in
 /// autocommit before the statement ran, the statement IS the whole
@@ -138,10 +141,10 @@ fn retry_transient<T>(
     loop {
         match attempt() {
             Err(error) => {
-                let retryable = matches!(error, FrankenError::BusyRecovery)
-                    || (matches!(error, FrankenError::BusySnapshot { .. })
-                        && was_autocommit
-                        && !conn.in_transaction());
+                let is_autocommit = !conn.in_transaction();
+                let retryable = was_autocommit == is_autocommit
+                    && (matches!(error, FrankenError::BusyRecovery)
+                        || (matches!(error, FrankenError::BusySnapshot { .. }) && was_autocommit));
                 if !retryable || start.elapsed() >= RETRY_BUDGET {
                     return Err(error);
                 }
@@ -155,9 +158,12 @@ fn retry_transient<T>(
 
 macro_rules! with_engine_retries {
     ($conn:expr, $sql:expr, $attempt:expr) => {{
+        let was_in_transaction = $conn.in_transaction();
         let first = retry_transient(&$conn, || $attempt);
         let result = match first {
-            Err(ref err) if schema_stale(err) => {
+            Err(ref err)
+                if schema_stale(err) && was_in_transaction == $conn.in_transaction() =>
+            {
                 // `prepare` refreshes the schema image from the shared
                 // publication plane even when it ultimately fails to resolve.
                 let _ = drive($conn.prepare($sql));
@@ -419,7 +425,7 @@ impl Connection {
                 sql: sql.to_string(),
             }
         } else {
-            PreparedStatementInner::Engine(retry_busy_recovery(|| drive(self.inner.prepare(sql)))?)
+            PreparedStatementInner::Engine(prepared::EngineStatement::new(&self.inner, sql)?)
         };
         Ok(PreparedStatement { inner })
     }
@@ -491,7 +497,7 @@ pub struct PreparedStatement<'conn> {
 // rather box it, that is their call to make deliberately.
 #[allow(clippy::large_enum_variant)]
 enum PreparedStatementInner<'conn> {
-    Engine(fsqlite::PreparedStatement<'conn>),
+    Engine(prepared::EngineStatement<'conn>),
     Checkpoint {
         connection: &'conn Connection,
         sql: String,
@@ -514,7 +520,7 @@ impl PreparedStatement<'_> {
     /// Query, returning all rows. Checkpoints expose fresh raw status rows.
     pub fn query(&self) -> Result<Vec<Row>, FrankenError> {
         match &self.inner {
-            PreparedStatementInner::Engine(statement) => drive(statement.query()),
+            PreparedStatementInner::Engine(statement) => statement.query(),
             PreparedStatementInner::Checkpoint { connection, sql } => connection.query(sql),
         }
     }
@@ -522,7 +528,7 @@ impl PreparedStatement<'_> {
     /// Query with positional parameters, returning all rows.
     pub fn query_with_params(&self, params: &[SqliteValue]) -> Result<Vec<Row>, FrankenError> {
         match &self.inner {
-            PreparedStatementInner::Engine(statement) => drive(statement.query_with_params(params)),
+            PreparedStatementInner::Engine(statement) => statement.query_with_params(params),
             PreparedStatementInner::Checkpoint { connection, sql } => {
                 connection.query_with_params(sql, params)
             }
@@ -532,7 +538,7 @@ impl PreparedStatement<'_> {
     /// Query, returning exactly one row.
     pub fn query_row(&self) -> Result<Row, FrankenError> {
         match &self.inner {
-            PreparedStatementInner::Engine(statement) => drive(statement.query_row()),
+            PreparedStatementInner::Engine(statement) => statement.query_row(),
             PreparedStatementInner::Checkpoint { connection, sql } => connection.query_row(sql),
         }
     }
@@ -540,9 +546,7 @@ impl PreparedStatement<'_> {
     /// Query with positional parameters, returning exactly one row.
     pub fn query_row_with_params(&self, params: &[SqliteValue]) -> Result<Row, FrankenError> {
         match &self.inner {
-            PreparedStatementInner::Engine(statement) => {
-                drive(statement.query_row_with_params(params))
-            }
+            PreparedStatementInner::Engine(statement) => statement.query_row_with_params(params),
             PreparedStatementInner::Checkpoint { connection, sql } => {
                 connection.query_row_with_params(sql, params)
             }
@@ -553,7 +557,7 @@ impl PreparedStatement<'_> {
     /// when this invocation's fresh status proves completion.
     pub fn execute(&self) -> Result<usize, FrankenError> {
         match &self.inner {
-            PreparedStatementInner::Engine(statement) => drive(statement.execute()),
+            PreparedStatementInner::Engine(statement) => statement.execute(),
             PreparedStatementInner::Checkpoint { connection, sql } => {
                 checkpoint_execute_result(connection.query(sql))
             }
@@ -563,9 +567,7 @@ impl PreparedStatement<'_> {
     /// Execute with positional parameters, returning the affected row count.
     pub fn execute_with_params(&self, params: &[SqliteValue]) -> Result<usize, FrankenError> {
         match &self.inner {
-            PreparedStatementInner::Engine(statement) => {
-                drive(statement.execute_with_params(params))
-            }
+            PreparedStatementInner::Engine(statement) => statement.execute_with_params(params),
             PreparedStatementInner::Checkpoint { connection, sql } => {
                 checkpoint_execute_result(connection.query_with_params(sql, params))
             }
