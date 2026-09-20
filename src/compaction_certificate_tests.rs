@@ -604,7 +604,14 @@ fn compaction_checkpoint_refusal_preserves_committed_wal_only_state() {
             || compact_database_via_vacuum_into_in_place(fixture.storage, &fixture.path, Some(50)),
         )
         .expect_err("partial or invalid checkpoint cannot consume WAL-only state");
-        if matches!(status, [1, 23, 0] | [0, 23, 7] | [1, 23, 23]) {
+        // `clippy::unnested_or_patterns` wants these folded into something like
+        // `[1, 23, 0 | 23] | [0, 23, 7]`. Keep them flat: each triple is one
+        // named (busy, frames, backfilled) checkpoint status from the table
+        // above, and nesting them stops the reader matching a row here against
+        // a row there.
+        #[allow(clippy::unnested_or_patterns)]
+        let busy_status = matches!(status, [1, 23, 0] | [0, 23, 7] | [1, 23, 23]);
+        if busy_status {
             assert!(matches!(error, BeadsError::Database(FrankenError::Busy)));
         } else {
             assert!(matches!(
