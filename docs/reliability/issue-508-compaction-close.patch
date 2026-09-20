@@ -1,0 +1,246 @@
+UNAPPLIED SOURCE REPAIR FOR beads_rust #508
+
+Recorded against main e6faabc73de1af6ce657c285407eb0c63e5c5582.
+Expected input blobs:
+  src/storage/sqlite.rs  b81de67662561de867288bcf3dc92505517bfb67
+  src/config/mod.rs      b51514a7b44aa7f63edd4e37425cf2f28ef60c3a
+
+This file does not alter the compiled Rust source. No runtime pass is claimed.
+Apply and compile in a complete checkout before publishing an active repair.
+
+There are two distinct failure mechanisms:
+* The positive pre-install fixture supplies malformed bytes as a real engine
+  certificate; preserve healthy engine-created metadata there. Keep the
+  separate malformed-certificate refusal controls unchanged.
+* On an incomplete/invalid checkpoint result, consumed SqliteStorage runs a
+  new real TRUNCATE in Drop because prior mutations remain counted. Disable
+  only this implicit checkpoint for the consumed live compaction handle,
+  before the explicit checkpoint. Do not falsify mutation accounting, skip
+  the explicit checkpoint, broaden certificate quarantine, or weaken witnesses.
+
+The patch adds a handle-local teardown policy, keeps ordinary opens on their
+existing policy, and leaves the installed/reopened handle and private source
+on their normal paths. Explicit checkpoint admission, completion validation,
+TRUNCATE-to-PASSIVE fallback, lease cleanup, installation and rollback remain.
+
+Validation here: reviewed source hunks, checked patch syntax and whitespace.
+Not performed: full-file patch application, Rust compilation, rustfmt, Clippy,
+Rust tests, or release qualification. Verify all struct initializers compile.
+
+Suggested application in a clean, complete checkout:
+  git apply --check docs/reliability/issue-508-compaction-close.patch
+  git apply docs/reliability/issue-508-compaction-close.patch
+  cargo fmt --check
+  rch exec -- cargo check --all-targets
+  rch exec -- cargo clippy --all-targets -- -D warnings
+  rch exec -- env TMPDIR=/tmp cargo test --lib compaction_certificate
+  rch exec -- env TMPDIR=/tmp cargo test --lib vacuum_into_private_maintenance
+  rch exec -- env TMPDIR=/tmp cargo test --lib test_drop_checkpoint_gate_tracks_mutation_count
+  rch exec -- env TMPDIR=/tmp cargo test --lib
+
+The final default-feature integration/release gates are still required.
+Read actual test result lines and remote statuses, not only wrapper exit codes.
+Do not tag a release from an unverified tree.
+
+diff --git a/src/storage/sqlite.rs b/src/storage/sqlite.rs
+--- a/src/storage/sqlite.rs
++++ b/src/storage/sqlite.rs
+@@ -1326,6 +1326,10 @@ pub struct SqliteStorage {
+     write_authority: Option<Arc<crate::sync::DatabaseFamilyWriteLock>>,
+     /// Track mutations to trigger periodic WAL checkpoints.
+     mutation_count: u32,
++    /// Whether teardown may attempt a checkpoint for this handle's mutations.
++    /// Compaction owns its explicit checkpoint boundary and disables only this
++    /// implicit retry; committed WAL contents and mutation accounting stay intact.
++    checkpoint_on_drop: bool,
+     /// Shared registration as an opener of the persistent database. Held for
+     /// the lifetime of this handle so any br process can tell whether it is
+     /// the sole opener before running a WAL checkpoint (see
+@@ -2395,6 +2399,7 @@
+             conn,
+             write_authority: None,
+             mutation_count: 0,
++            checkpoint_on_drop: true,
+             temp_db_path: None,
+             read_snapshot_dir: None,
+             pending_event_attribution: None,
+@@ -2504,6 +2509,7 @@
+             conn,
+             write_authority: None,
+             mutation_count: 0,
++            checkpoint_on_drop: true,
+             temp_db_path: None,
+             read_snapshot_dir: None,
+             pending_event_attribution: None,
+@@ -2618,6 +2624,7 @@
+             conn,
+             write_authority: None,
+             mutation_count: 0,
++            checkpoint_on_drop: true,
+             temp_db_path: None,
+             read_snapshot_dir: None,
+             pending_event_attribution: None,
+@@ -2685,6 +2692,7 @@
+             conn,
+             write_authority: None,
+             mutation_count: 0,
++            checkpoint_on_drop: true,
+             temp_db_path: Some(path.to_path_buf()),
+             read_snapshot_dir: None,
+             pending_event_attribution: None,
+@@ -3677,6 +3685,19 @@
+-    /// Force a full WAL checkpoint that drains every pending frame back into
++    /// Keep teardown from retrying a checkpoint outside a caller-owned boundary.
++    ///
++    /// Compaction consumes this handle. After an explicit checkpoint refuses,
++    /// dropping it must not issue a fresh TRUNCATE and change the live payload.
++    /// This policy is sticky for the handle, including on unwind. It does not
++    /// clear dirty issues, change mutation accounting, weaken opener admission,
++    /// or prevent a subsequent explicit checkpoint (including PASSIVE fallback).
++    /// Drop still follows its existing non-checkpointing close path with the
++    /// opener lease retained through that close attempt.
++    pub(crate) const fn disable_checkpoint_on_drop(&mut self) {
++        self.checkpoint_on_drop = false;
++    }
++
++    /// Force a full WAL checkpoint that drains every pending frame back into
+     /// the main database file.
+     ///
+     /// Called at quiescent points (post-rebuild, before VACUUM/REINDEX) where
+     /// we hold the `.write.lock` exclusively and can safely take the DB's
+     /// internal exclusive lock that TRUNCATE mode requires. The passive
+@@ -20317,7 +20338,7 @@ impl Drop for SqliteStorage {
+         // opener; the exclusive opener hold is kept until the connection is
+         // closed so no peer starts reading a WAL this teardown is resetting.
+         let mut exit_hold = None;
+-        if self.mutation_count > 0 {
++        if self.checkpoint_on_drop && self.mutation_count > 0 {
+             match self.admit_checkpoint() {
+                 CheckpointAdmission::Sole(hold) => {
+                     exit_hold = hold;
+@@ -35675,6 +35696,7 @@
+             conn,
+             write_authority: None,
+             mutation_count: 0,
++            checkpoint_on_drop: true,
+             temp_db_path: None,
+             read_snapshot_dir: None,
+             pending_event_attribution: None,
+diff --git a/src/config/mod.rs b/src/config/mod.rs
+--- a/src/config/mod.rs
++++ b/src/config/mod.rs
+@@ -3084,6 +3084,12 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
+     after_candidate_adoption: impl FnOnce() -> Result<()>,
+     sync_candidate_install: impl FnOnce(&Path, &Path) -> Result<()>,
+ ) -> Result<SqliteStorage> {
++    // This consumed live handle has exactly the explicit checkpoint boundary
++    // below. A refusal or later private-source failure must not trigger a new
++    // checkpoint during Drop. The installed/reopened handle has its own normal
++    // teardown policy; the private source is unaffected.
++    storage.disable_checkpoint_on_drop();
++
+     // Drain every committed frame into the live main file once, then stop
+     // running heavy maintenance against that live family. FrankenSQLite's
+     // VACUUM source-side teardown can rewrite WAL-index state (#507), so an
+@@ -9898,18 +9904,10 @@
+ 
+         let temp = TempDir::new().expect("tempdir");
+         let db_path = temp.path().join("beads.db");
+-        let sidecar_path = PathBuf::from(format!("{}-wal-cert", db_path.display()));
+         let mut storage = SqliteStorage::open(&db_path).expect("create storage");
+         storage
+             .set_config("issue_prefix", "private-source")
+             .expect("seed database");
+-        storage
+-            .checkpoint_full()
+-            .expect("establish checkpointed live baseline");
+-        fs::write(&sidecar_path, b"live-sidecar-must-not-change").unwrap();
+-
+-        let main_before = fs::read(&db_path).unwrap();
+-        let inode_before = fs::metadata(&db_path).unwrap().ino();
+         let write_authority = Arc::new(
+             crate::sync::blocking_database_family_write_lock_with_timeout(
+                 temp.path(),
+@@ -9922,7 +9920,44 @@
+             .bind_database_inode_for_mutation()
+             .expect("bind compaction database inode");
+         storage.attach_write_authority(Arc::clone(&write_authority));
++        storage
++            .checkpoint_full()
++            .expect("establish checkpointed live baseline");
+ 
++        // Use the healthy engine-created family, not arbitrary -wal-cert bytes.
++        // The malformed-certificate controls in compaction_certificate_tests
++        // must still reject corruption before any private candidate is built.
++        // SHM and namespace admission files are derived coordination state;
++        // pin durable payload presence, identity and bytes, including both certs.
++        let payload_witness = || {
++            [
++                "",
++                "-wal",
++                "-wal-cert",
++                "-wal-cert-head",
++                ".fsqlite-migration-state",
++            ]
++            .map(|suffix| {
++                let mut member = db_path.as_os_str().to_os_string();
++                member.push(suffix);
++                let member = PathBuf::from(member);
++                match fs::symlink_metadata(&member) {
++                    Ok(metadata) => {
++                        assert!(metadata.is_file(), "non-file payload: {}", member.display());
++                        Some((
++                            metadata.dev(),
++                            metadata.ino(),
++                            fs::read(&member).expect("read live payload"),
++                        ))
++                    }
++                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
++                    Err(error) => panic!("inspect live payload {}: {error}", member.display()),
++                }
++            })
++        };
++        let before = payload_witness();
++        assert!(before[0].is_some(), "checkpointed main must exist");
++        let hook_reached = std::cell::Cell::new(false);
+         let error = compact_database_via_vacuum_into_in_place_with_reopener(
+             storage,
+             &db_path,
+@@ -9930,12 +9965,8 @@
+             &write_authority,
+             SqliteStorage::open_with_timeout,
+             || {
+-                assert_eq!(fs::read(&db_path).unwrap(), main_before);
+-                assert_eq!(fs::metadata(&db_path).unwrap().ino(), inode_before);
+-                assert_eq!(
+-                    fs::read(&sidecar_path).unwrap(),
+-                    b"live-sidecar-must-not-change"
+-                );
++                hook_reached.set(true);
++                assert_eq!(payload_witness(), before);
+                 Err(BeadsError::Config(
+                     "stop after private maintenance, before installation".to_string(),
+                 ))
+@@ -9948,15 +9979,15 @@
+         .expect_err("test hook must stop before live-family installation");
+ 
+         assert!(
+-            error.to_string().contains("stop after private maintenance"),
++            hook_reached.get(),
++            "private maintenance failed before the hook: {error}"
++        );
++        assert!(
++            matches!(&error, BeadsError::Config(message)
++                if message == "stop after private maintenance, before installation"),
+             "expected the injected post-maintenance hook to be the failure, got: {error}"
+         );
+-        assert_eq!(fs::read(&db_path).unwrap(), main_before);
+-        assert_eq!(fs::metadata(&db_path).unwrap().ino(), inode_before);
+-        assert_eq!(
+-            fs::read(&sidecar_path).unwrap(),
+-            b"live-sidecar-must-not-change"
+-        );
++        assert_eq!(payload_witness(), before);
+         assert_eq!(
+             write_authority
+                 .database_target_authority_state()
