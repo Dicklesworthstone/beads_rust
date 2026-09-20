@@ -13,15 +13,16 @@ use crate::error::{BeadsError, Result};
 use crate::format::{
     IssueWithCounts, TextFormatOptions, csv, format_issue_line_with, terminal_width,
 };
-use crate::model::{Issue, IssueType, Priority, Status};
+use crate::model::{Issue, IssueType, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
 use regex::{Regex, RegexBuilder};
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
-use std::str::FromStr;
 
+#[cfg(test)]
+use crate::model::Priority;
 #[cfg(test)]
 use crate::storage::unicode_issue_fields_match;
 
@@ -32,6 +33,10 @@ mod unicode_tests;
 #[cfg(test)]
 #[path = "search/field_tests.rs"]
 mod field_tests;
+
+#[cfg(test)]
+#[path = "search/filter_tests.rs"]
+mod filter_tests;
 
 /// Execute the search command.
 ///
@@ -674,14 +679,12 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         )
     };
 
+    // Search inherits ListArgs, so accept the same ranges, comma lists and
+    // repeated priority selectors as list, ready, blocked and count.
     let priorities = if args.priority.is_empty() {
         None
     } else {
-        let mut parsed = Vec::new();
-        for p in &args.priority {
-            parsed.push(Priority::from_str(p)?);
-        }
-        Some(parsed)
+        Some(crate::validation::parse_priority_filter(&args.priority)?)
     };
 
     let include_closed = args.all
@@ -761,6 +764,20 @@ fn apply_client_filters(
     issues: Vec<crate::model::Issue>,
     args: &ListArgs,
 ) -> Result<Vec<crate::model::Issue>> {
+    apply_client_filters_with_compiler(issues, args, |pattern| {
+        RegexBuilder::new(pattern).case_insensitive(true).build()
+    })
+}
+
+// Inject only the compiler, not the predicate or filter application. Tests can
+// exercise a real resource-limit refusal with a small pattern without forcing
+// the suite to allocate an oversized user query. Production keeps the regex
+// engine's default limits and Unicode case-folding behavior.
+fn apply_client_filters_with_compiler(
+    issues: Vec<crate::model::Issue>,
+    args: &ListArgs,
+    mut compile: impl FnMut(&str) -> std::result::Result<Regex, regex::Error>,
+) -> Result<Vec<crate::model::Issue>> {
     let id_filter: Option<HashSet<&str>> = if args.id.is_empty() {
         None
     } else {
@@ -772,19 +789,22 @@ fn apply_client_filters(
     let min_priority = args.priority_min.map(i32::from);
     let max_priority = args.priority_max.map(i32::from);
 
-    // Use Regex for efficient case-insensitive search without full description allocations
-    let desc_regex = args.desc_contains.as_deref().and_then(|needle| {
-        RegexBuilder::new(&regex::escape(needle))
-            .case_insensitive(true)
-            .build()
-            .ok()
-    });
-    let notes_regex = args.notes_contains.as_deref().and_then(|needle| {
-        RegexBuilder::new(&regex::escape(needle))
-            .case_insensitive(true)
-            .build()
-            .ok()
-    });
+    // A supplied predicate is mandatory. Converting a compiler error to None
+    // would silently widen the result set, including hidden-history counts.
+    // Compile even when issues is empty so an invalid filter cannot masquerade
+    // as a successful zero-result query. Preserve literal (not regex) syntax.
+    let mut text_filter = |field: &str, value: Option<&str>| -> Result<Option<Regex>> {
+        value
+            .map(|needle| {
+                compile(&regex::escape(needle)).map_err(|error| BeadsError::Validation {
+                    field: field.to_string(),
+                    reason: format!("cannot compile case-insensitive literal filter: {error}"),
+                })
+            })
+            .transpose()
+    };
+    let desc_regex = text_filter("desc_contains", args.desc_contains.as_deref())?;
+    let notes_regex = text_filter("notes_contains", args.notes_contains.as_deref())?;
 
     // Deferred issues are included by default when no status filter is specified,
     // except `--overdue` keeps deferred work hidden unless requested.
