@@ -44,7 +44,11 @@ fn fixture() -> SqliteStorage {
         storage.create_issue(&item, "tester").unwrap();
         storage.add_label(id, "selected", "tester").unwrap();
     }
-    for body in ["CAFÉ old evidence", "café duplicate hit", "Newest unrelated note"] {
+    for body in [
+        "CAFÉ old evidence",
+        "café duplicate hit",
+        "Newest unrelated note",
+    ] {
         storage.add_comment("bd-c", "tester", body).unwrap();
     }
     storage
@@ -92,7 +96,10 @@ fn default_unicode_pages_match_full_records_after_matching_and_ordering() {
             "offset={offset}, limit={limit:?}"
         );
         assert!(page.iter().all(|item| item.comments.is_empty()));
-        assert!(page.iter().all(|item| item.notes.is_some() && item.design.is_some()));
+        assert!(
+            page.iter()
+                .all(|item| item.notes.is_some() && item.design.is_some())
+        );
     }
 }
 
@@ -133,7 +140,12 @@ fn explicit_default_sort_and_sql_filter_fallbacks_preserve_page_membership() {
                     },
                 )
                 .unwrap();
-            let expected = full.iter().skip(offset).take(2).cloned().collect::<Vec<_>>();
+            let expected = full
+                .iter()
+                .skip(offset)
+                .take(2)
+                .cloned()
+                .collect::<Vec<_>>();
             assert_eq!(
                 serde_json::to_value(page).unwrap(),
                 serde_json::to_value(expected).unwrap()
@@ -144,7 +156,10 @@ fn explicit_default_sort_and_sql_filter_fallbacks_preserve_page_membership() {
 
 #[test]
 fn page_hydrates_only_selected_rows_and_stops_later_comment_batches() {
-    let matcher = RegexBuilder::new("café").case_insensitive(true).build().unwrap();
+    let matcher = RegexBuilder::new("café")
+        .case_insensitive(true)
+        .build()
+        .unwrap();
     let candidates = (0..SEARCH_BATCH_SIZE * 3)
         .map(|index| {
             issue(
@@ -173,9 +188,14 @@ fn page_hydrates_only_selected_rows_and_stops_later_comment_batches() {
     })
     .unwrap();
     assert_eq!(ids(&hydrated), ids(&selected));
-    assert_eq!(hydration_reads, vec![vec![
-        "bd-0280".to_string(), "bd-0284".to_string(), "bd-0288".to_string(),
-    ]]);
+    assert_eq!(
+        hydration_reads,
+        vec![vec![
+            "bd-0280".to_string(),
+            "bd-0284".to_string(),
+            "bd-0288".to_string(),
+        ]]
+    );
 }
 
 #[test]
@@ -183,7 +203,11 @@ fn unlimited_and_out_of_range_windows_do_not_overflow_or_invent_rows() {
     let matcher = Regex::new("CAFÉ").unwrap();
     for (offset, limit, expected) in [(1, 0, 2), (0, usize::MAX, 3), (usize::MAX, 1, 0)] {
         let selected = select_matching_window(
-            vec![issue("bd-a", "CAFÉ"), issue("bd-b", "CAFÉ"), issue("bd-c", "CAFÉ")],
+            vec![
+                issue("bd-a", "CAFÉ"),
+                issue("bd-b", "CAFÉ"),
+                issue("bd-c", "CAFÉ"),
+            ],
             &matcher,
             offset,
             limit,
@@ -196,19 +220,31 @@ fn unlimited_and_out_of_range_windows_do_not_overflow_or_invent_rows() {
         panic!("empty corpus must not read comments")
     })
     .unwrap();
-    assert!(hydrate_matches(&empty, |_| panic!("empty page must not hydrate")).unwrap().is_empty());
+    assert!(
+        hydrate_matches(&empty, |_| panic!("empty page must not hydrate"))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
 fn comment_failures_and_unexpected_rows_fail_before_a_page_is_returned() {
     let matcher = Regex::new("CAFÉ").unwrap();
     let candidates = vec![issue("bd-a", "CAFÉ"), issue("bd-b", "Needs comments")];
-    assert!(select_matching_window(candidates.clone(), &matcher, 0, 2, |_| {
-        Err(BeadsError::Internal { message: "comment read failed".to_string() })
-    }).is_err());
-    assert!(select_matching_window(candidates, &matcher, 0, 2, |_| {
-        Ok(HashMap::from([("bd-unrequested".to_string(), Vec::new())]))
-    }).is_err());
+    assert!(
+        select_matching_window(candidates.clone(), &matcher, 0, 2, |_| {
+            Err(BeadsError::Internal {
+                message: "comment read failed".to_string(),
+            })
+        })
+        .is_err()
+    );
+    assert!(
+        select_matching_window(candidates, &matcher, 0, 2, |_| {
+            Ok(HashMap::from([("bd-unrequested".to_string(), Vec::new())]))
+        })
+        .is_err()
+    );
 }
 
 #[test]
@@ -222,9 +258,13 @@ fn hydration_rejects_changed_ranking_or_membership_fields() {
             2 => changed.status = Status::Deferred,
             _ => changed.issue_type = IssueType::Bug,
         }
-        assert!(hydrate_matches(std::slice::from_ref(&candidate), |_| {
-            Ok(vec![changed.clone()])
-        }).is_err(), "changed field {change}");
+        assert!(
+            hydrate_matches(std::slice::from_ref(&candidate), |_| {
+                Ok(vec![changed.clone()])
+            })
+            .is_err(),
+            "changed field {change}"
+        );
     }
 }
 
@@ -232,8 +272,14 @@ fn hydration_rejects_changed_ranking_or_membership_fields() {
 fn default_page_api_rejects_unsupported_order_and_invalid_queries() {
     let storage = SqliteStorage::open_memory().unwrap();
     for filters in [
-        ListFilters { reverse: true, ..ListFilters::default() },
-        ListFilters { sort: Some("title".to_string()), ..ListFilters::default() },
+        ListFilters {
+            reverse: true,
+            ..ListFilters::default()
+        },
+        ListFilters {
+            sort: Some("title".to_string()),
+            ..ListFilters::default()
+        },
     ] {
         assert!(matches!(
             storage.search_unicode_issues_default_page("café", &filters),

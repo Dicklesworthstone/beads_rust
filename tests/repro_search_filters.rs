@@ -15,7 +15,16 @@ fn workspace() -> BrWorkspace {
 fn create(workspace: &BrWorkspace, title: &str, description: &str, priority: &str) -> String {
     let result = run_br(
         workspace,
-        ["create", title, "--type", "task", "--description", description, "--priority", priority],
+        [
+            "create",
+            title,
+            "--type",
+            "task",
+            "--description",
+            description,
+            "--priority",
+            priority,
+        ],
         "search_filters_create",
     );
     assert!(result.status.success(), "{result:?}");
@@ -78,7 +87,16 @@ fn search_priority_ranges_match_explicit_sets_with_comment_only_and_closed_match
         let expected = page(
             &workspace,
             query,
-            &["--priority", "0", "--priority", "1", "--sort", "title", "--limit", "0"],
+            &[
+                "--priority",
+                "0",
+                "--priority",
+                "1",
+                "--sort",
+                "title",
+                "--limit",
+                "0",
+            ],
             &format!("search_priority_explicit_{query_index}"),
         );
         assert_eq!(expected["issues"].as_array().unwrap().len(), 2);
@@ -96,7 +114,10 @@ fn search_priority_ranges_match_explicit_sets_with_comment_only_and_closed_match
         {
             args.extend(["--sort", "title", "--limit", "0"]);
             let actual = page(
-                &workspace, query, &args, &format!("search_priority_range_{query_index}_{index}"),
+                &workspace,
+                query,
+                &args,
+                &format!("search_priority_range_{query_index}_{index}"),
             );
             assert_eq!(actual, expected);
         }
@@ -113,25 +134,40 @@ fn search_priority_ranges_match_explicit_sets_with_comment_only_and_closed_match
 
 #[test]
 fn search_priority_ranges_compose_with_text_filters_before_pagination() {
-    let _log = common::test_log("search_priority_ranges_compose_with_text_filters_before_pagination");
+    let _log =
+        common::test_log("search_priority_ranges_compose_with_text_filters_before_pagination");
     let workspace = workspace();
     populate(&workspace);
     for (query_index, query) in ["needle", "café"].into_iter().enumerate() {
         let common = [
-            "--priority", "P0-P1", "--desc-contains", "keep", "--notes-contains", "café",
-            "--sort", "title", "--fields", "id,title",
+            "--priority",
+            "P0-P1",
+            "--desc-contains",
+            "keep",
+            "--notes-contains",
+            "café",
+            "--sort",
+            "title",
+            "--fields",
+            "id,title",
         ];
         let mut unlimited_args = common.to_vec();
         unlimited_args.extend(["--limit", "0"]);
         let unlimited = page(
-            &workspace, query, &unlimited_args, &format!("search_priority_unlimited_{query_index}"),
+            &workspace,
+            query,
+            &unlimited_args,
+            &format!("search_priority_unlimited_{query_index}"),
         );
         assert_eq!(unlimited["issues"].as_array().unwrap().len(), 2);
         for (offset, text) in [(0_usize, "0"), (1, "1"), (2, "2"), (99, "99")] {
             let mut args = common.to_vec();
             args.extend(["--limit", "1", "--offset", text]);
             let actual = page(
-                &workspace, query, &args, &format!("search_priority_page_{query_index}_{offset}"),
+                &workspace,
+                query,
+                &args,
+                &format!("search_priority_page_{query_index}_{offset}"),
             );
             let mut expected = unlimited.clone();
             expected["issues"] = Value::Array(
@@ -161,13 +197,23 @@ fn search_rejects_malformed_priorities_in_every_format_even_on_an_empty_workspac
         for format in ["text", "json", "toon", "csv"] {
             let result = run_br(
                 &workspace,
-                ["search", "needle", "--format", format, "--priority", priority],
+                [
+                    "search",
+                    "needle",
+                    "--format",
+                    format,
+                    "--priority",
+                    priority,
+                ],
                 &format!("search_priority_invalid_{format}_{index}"),
             );
             assert_eq!(result.status.code(), Some(4), "{result:?}");
             let diagnostic = format!("{} {}", result.stdout, result.stderr).to_lowercase();
             assert!(diagnostic.contains("priority"), "{result:?}");
-            assert!(!result.stdout.contains("\"issues\""), "no successful page: {result:?}");
+            assert!(
+                !result.stdout.contains("\"issues\""),
+                "no successful page: {result:?}"
+            );
         }
     }
 }
@@ -181,8 +227,15 @@ fn search_priority_ranges_work_in_text_toon_csv_and_quiet_output() {
         let result = run_br(
             &workspace,
             [
-                "search", "needle", "--priority", "0-1", "--format", format,
-                "--fields", "id,title", "--no-color",
+                "search",
+                "needle",
+                "--priority",
+                "0-1",
+                "--format",
+                format,
+                "--fields",
+                "id,title",
+                "--no-color",
             ],
             &format!("search_priority_format_{format}"),
         );

@@ -169,7 +169,10 @@ fn select_matching_window(
                             .to_string(),
                     });
                 }
-                if comments.iter().any(|comment| matcher.is_match(&comment.body)) {
+                if comments
+                    .iter()
+                    .any(|comment| matcher.is_match(&comment.body))
+                {
                     matched_ids.insert(id);
                 }
             }

@@ -419,9 +419,7 @@ impl Connection {
                 sql: sql.to_string(),
             }
         } else {
-            PreparedStatementInner::Engine(retry_busy_recovery(|| {
-                drive(self.inner.prepare(sql))
-            })?)
+            PreparedStatementInner::Engine(retry_busy_recovery(|| drive(self.inner.prepare(sql)))?)
         };
         Ok(PreparedStatement { inner })
     }
@@ -555,7 +553,9 @@ impl PreparedStatement<'_> {
     /// Execute with positional parameters, returning the affected row count.
     pub fn execute_with_params(&self, params: &[SqliteValue]) -> Result<usize, FrankenError> {
         match &self.inner {
-            PreparedStatementInner::Engine(statement) => drive(statement.execute_with_params(params)),
+            PreparedStatementInner::Engine(statement) => {
+                drive(statement.execute_with_params(params))
+            }
             PreparedStatementInner::Checkpoint { connection, sql } => {
                 checkpoint_execute_result(connection.query_with_params(sql, params))
             }
@@ -1207,7 +1207,10 @@ mod tests {
             .unwrap();
         let main_before = std::fs::read(&db).unwrap();
         let wal_before = std::fs::read(&wal).unwrap();
-        assert!(wal_before.len() > 32, "the fixture must contain real WAL frames");
+        assert!(
+            wal_before.len() > 32,
+            "the fixture must contain real WAL frames"
+        );
         let statement = conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
         assert!(statement.explain().contains("Deferred WAL checkpoint"));
         assert_eq!(std::fs::read(&db).unwrap(), main_before);
@@ -1247,23 +1250,29 @@ mod tests {
             let certificate = db.with_file_name(format!("prepared-cert-{call}.db-wal-cert"));
             std::fs::write(&certificate, b"live-sidecar-must-not-change").unwrap();
             let witness = || {
-                ["", "-wal", "-wal-cert", "-wal-cert-head", ".fsqlite-migration-state"]
-                    .map(|suffix| {
-                        let mut path = db.as_os_str().to_os_string();
-                        path.push(suffix);
-                        match std::fs::symlink_metadata(&path) {
-                            Ok(metadata) => {
-                                assert!(metadata.is_file());
-                                Some((
-                                    metadata.dev(),
-                                    metadata.ino(),
-                                    std::fs::read(&path).unwrap(),
-                                ))
-                            }
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                            Err(error) => panic!("inspect checkpoint payload: {error}"),
+                [
+                    "",
+                    "-wal",
+                    "-wal-cert",
+                    "-wal-cert-head",
+                    ".fsqlite-migration-state",
+                ]
+                .map(|suffix| {
+                    let mut path = db.as_os_str().to_os_string();
+                    path.push(suffix);
+                    match std::fs::symlink_metadata(&path) {
+                        Ok(metadata) => {
+                            assert!(metadata.is_file());
+                            Some((
+                                metadata.dev(),
+                                metadata.ino(),
+                                std::fs::read(&path).unwrap(),
+                            ))
                         }
-                    })
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => panic!("inspect checkpoint payload: {error}"),
+                    }
+                })
             };
             let before = witness();
             let result = match call {

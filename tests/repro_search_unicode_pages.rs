@@ -17,8 +17,14 @@ fn create(workspace: &BrWorkspace, title: &str, description: &str, priority: &st
     let created = run_br(
         workspace,
         [
-            "create", title, "--type", "task", "--description", description,
-            "--priority", priority,
+            "create",
+            title,
+            "--type",
+            "task",
+            "--description",
+            description,
+            "--priority",
+            priority,
         ],
         "create_unicode_page_issue",
     );
@@ -55,7 +61,11 @@ fn fixture() -> Fixture {
     let middle = create(&workspace, "Middle description", "CAFÉ keep", "1");
     create(&workspace, "Nonmatching control", "No accented word", "0");
     let archived = create(&workspace, "Archived handoff", "Archived evidence", "0");
-    for body in ["CAFÉ old evidence", "café duplicate evidence", "Newest unrelated note"] {
+    for body in [
+        "CAFÉ old evidence",
+        "café duplicate evidence",
+        "Newest unrelated note",
+    ] {
         comment(&workspace, &high, body);
     }
     comment(&workspace, &archived, "CAFÉ historical evidence");
@@ -86,7 +96,13 @@ fn fixture() -> Fixture {
         "unicode_page_dependency",
     );
     assert!(dependency.status.success(), "{dependency:?}");
-    Fixture { workspace, high, middle, low, archived }
+    Fixture {
+        workspace,
+        high,
+        middle,
+        low,
+        archived,
+    }
 }
 
 fn search(workspace: &BrWorkspace, extra: &[&str], step: &str) -> Value {
@@ -106,7 +122,11 @@ fn assert_page(full: &Value, page: &Value, offset: usize, limit: usize) {
         .take(if limit == 0 { usize::MAX } else { limit })
         .cloned()
         .collect::<Vec<_>>();
-    assert_eq!(page["issues"], Value::Array(expected), "complete ordered rows");
+    assert_eq!(
+        page["issues"],
+        Value::Array(expected),
+        "complete ordered rows"
+    );
     assert_eq!(page["limit"], serde_json::json!(limit));
     assert_eq!(page["offset"], serde_json::json!(offset));
     assert_eq!(
@@ -140,7 +160,12 @@ fn unicode_default_pages_preserve_full_rows_and_history_counts() {
         let offset_arg = offset.to_string();
         let limit_arg = limit.to_string();
         for explicit_sort in [false, true] {
-            let mut args = vec!["--offset", offset_arg.as_str(), "--limit", limit_arg.as_str()];
+            let mut args = vec![
+                "--offset",
+                offset_arg.as_str(),
+                "--limit",
+                limit_arg.as_str(),
+            ];
             if explicit_sort {
                 args.extend(["--sort", "priority"]);
             }
@@ -152,10 +177,20 @@ fn unicode_default_pages_preserve_full_rows_and_history_counts() {
             assert_page(&full, &page, offset, limit);
         }
     }
-    let all = search(&f.workspace, &["--all", "--limit", "0"], "unicode_all_history");
+    let all = search(
+        &f.workspace,
+        &["--all", "--limit", "0"],
+        "unicode_all_history",
+    );
     assert_eq!(all["issues"].as_array().unwrap().len(), 4);
     assert_eq!(all["hidden_closed_count"], 0);
-    assert!(all["issues"].as_array().unwrap().iter().any(|row| row["id"] == f.archived));
+    assert!(
+        all["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == f.archived)
+    );
 }
 
 #[test]
@@ -175,7 +210,11 @@ fn unicode_page_fallbacks_filter_and_sort_before_selecting_rows() {
     for (case, filters) in cases.iter().enumerate() {
         let mut args = filters.to_vec();
         args.extend(["--limit", "0"]);
-        let full = search(&f.workspace, &args, &format!("unicode_fallback_full_{case}"));
+        let full = search(
+            &f.workspace,
+            &args,
+            &format!("unicode_fallback_full_{case}"),
+        );
         if case <= 3 {
             assert_eq!(full["issues"].as_array().unwrap().len(), 2);
         }
@@ -195,16 +234,29 @@ fn unicode_page_fallbacks_filter_and_sort_before_selecting_rows() {
 
 #[test]
 fn unicode_default_page_formats_disclose_truncation_without_extra_rows() {
-    let _log = common::test_log("unicode_default_page_formats_disclose_truncation_without_extra_rows");
+    let _log =
+        common::test_log("unicode_default_page_formats_disclose_truncation_without_extra_rows");
     let f = fixture();
     for format in ["text", "toon", "csv"] {
         let mut args = vec![
-            "search", "café", "--format", format, "--limit", "1", "--offset", "1", "--no-color",
+            "search",
+            "café",
+            "--format",
+            format,
+            "--limit",
+            "1",
+            "--offset",
+            "1",
+            "--no-color",
         ];
         if format == "csv" {
             args.extend(["--fields", "id,title"]);
         }
-        let result = run_br(&f.workspace, args, &format!("unicode_default_format_{format}"));
+        let result = run_br(
+            &f.workspace,
+            args,
+            &format!("unicode_default_format_{format}"),
+        );
         assert!(result.status.success(), "{result:?}");
         assert!(result.stdout.contains(&f.middle), "{result:?}");
         for absent in [&f.high, &f.low, &f.archived] {
@@ -213,12 +265,18 @@ fn unicode_default_page_formats_disclose_truncation_without_extra_rows() {
         match format {
             "toon" => {
                 assert!(result.stdout.contains("has_more: true"), "{result:?}");
-                assert!(result.stdout.contains("hidden_closed_count: 1"), "{result:?}");
+                assert!(
+                    result.stdout.contains("hidden_closed_count: 1"),
+                    "{result:?}"
+                );
             }
             "csv" => assert!(result.stderr.contains("more matches exist"), "{result:?}"),
             _ => {
                 assert!(result.stdout.contains("more matches exist"), "{result:?}");
-                assert!(result.stdout.contains("1 closed match(es) hidden"), "{result:?}");
+                assert!(
+                    result.stdout.contains("1 closed match(es) hidden"),
+                    "{result:?}"
+                );
             }
         }
     }
