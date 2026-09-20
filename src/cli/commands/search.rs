@@ -156,6 +156,17 @@ fn collect_search_results_with_projection(
     // SQLite lower() folds ASCII only. Unicode queries must be matched before
     // applying any page boundary, just like the existing client-side filters.
     let unicode_query = !query.is_ascii();
+    if unicode_query
+        && !client_filters
+        && !list_args.reverse
+        && matches!(list_args.sort.as_deref(), None | Some("priority"))
+    {
+        // The narrow candidate query already has the final default order.
+        // Apply the matching page (including the caller's look-ahead row)
+        // before hydration, not after loading every full matching record.
+        // Other sorts and client-only filters retain the full-record path.
+        return storage.search_unicode_issues_default_page(query, &filters);
+    }
     let needs_post_query_ordering =
         requires_post_query_ordering(list_args, client_filters || unicode_query);
     let (offset, limit) = if needs_post_query_ordering {
