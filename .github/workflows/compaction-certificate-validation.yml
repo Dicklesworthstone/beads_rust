@@ -107,6 +107,7 @@ jobs:
                        .checkpoint_full()
                        .expect("establish checkpointed live baseline");
           -        fs::write(&sidecar_path, b"live-sidecar-must-not-change").unwrap();
+          -
           +        // The certificate is engine input, not an opaque sentinel. Preserve
           +        // its checkpointed bytes (or absence) in this successful-build test.
           +        // Malformed input remains covered by compaction_certificate_tests;
@@ -127,7 +128,7 @@ jobs:
           +            Err(error) => panic!("cannot inspect engine certificate fixture: {error}"),
           +        };
           +        let certificate_before = certificate_snapshot();
-           
+          +
                    let main_before = fs::read(&db_path).unwrap();
                    let inode_before = fs::metadata(&db_path).unwrap().ino();
           @@ -9932,10 +9951,7 @@
@@ -157,12 +158,16 @@ jobs:
           PATCH
           git apply --check --recount "$BR_508_EVIDENCE/fixture-repair.patch"
           git apply --recount "$BR_508_EVIDENCE/fixture-repair.patch"
-          git diff --check
-          test "$(git diff --name-only)" = src/config/mod.rs
+          git diff --check HEAD
+          test "$(git diff --name-only HEAD)" = src/config/mod.rs
+          # Pin the exact candidate before compilation. Tests must not change
+          # the bytes that the final step publishes, even within this path.
+          printf 'BR_508_REPAIRED_BLOB=%s\n' "$(git hash-object src/config/mod.rs)" >> "$GITHUB_ENV"
           git diff -- src/config/mod.rs
 
       - name: Prove the repaired hook and all refusal controls
         run: |
+          test "$(git hash-object src/config/mod.rs)" = "$BR_508_REPAIRED_BLOB"
           cargo test --locked --lib -- --exact "$BR_508_TEST" --nocapture --test-threads=1 2>&1 | tee "$BR_508_EVIDENCE/repaired-hook.log"
           grep -F "test $BR_508_TEST ... ok" "$BR_508_EVIDENCE/repaired-hook.log"
           cargo test --locked --lib compaction_certificate_tests:: -- --nocapture --test-threads=1 2>&1 | tee "$BR_508_EVIDENCE/controls-after.log"
@@ -174,12 +179,14 @@ jobs:
 
       - name: Require the complete release gate
         run: |
+          test "$(git hash-object src/config/mod.rs)" = "$BR_508_REPAIRED_BLOB"
           cargo fmt --all -- --check 2>&1 | tee "$BR_508_EVIDENCE/fmt.log"
           cargo check --locked --all-targets 2>&1 | tee "$BR_508_EVIDENCE/check.log"
           cargo clippy --locked --workspace --all-targets --keep-going -- -D warnings 2>&1 | tee "$BR_508_EVIDENCE/clippy.log"
           cargo test --locked --no-fail-fast 2>&1 | tee "$BR_508_EVIDENCE/full-tests.log"
-          git diff --check
-          test "$(git diff --name-only)" = src/config/mod.rs
+          git diff --check HEAD
+          test "$(git diff --name-only HEAD)" = src/config/mod.rs
+          test "$(git hash-object src/config/mod.rs)" = "$BR_508_REPAIRED_BLOB"
           printf 'Gate: rustfmt, all-target check, all-target Clippy (-D warnings), and full cargo test passed.\n' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Commit the tested repair directly to main without rebasing or force
@@ -187,7 +194,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(git diff --name-only)" = src/config/mod.rs
+          test "$(git diff --name-only HEAD)" = src/config/mod.rs
+          test "$(git hash-object src/config/mod.rs)" = "$BR_508_REPAIRED_BLOB"
           current=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
           if test "$current" != "$GITHUB_SHA"; then
             echo '::error::main advanced during validation; refusing an untested rebase or force-update.'
@@ -195,7 +203,7 @@ jobs:
           fi
           blob=$(jq -n --rawfile content src/config/mod.rs '{content: $content, encoding: "utf-8"}' |
             gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" --input - --jq '.sha')
-          test "$blob" = "$(git hash-object src/config/mod.rs)"
+          test "$blob" = "$BR_508_REPAIRED_BLOB"
           base_tree=$(git rev-parse 'HEAD^{tree}')
           tree=$(jq -n --arg base "$base_tree" --arg blob "$blob" \
             '{base_tree: $base, tree: [{path: "src/config/mod.rs", mode: "100644", type: "blob", sha: $blob}]}' |
