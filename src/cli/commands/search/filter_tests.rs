@@ -87,11 +87,9 @@ fn notes_compilation_failure_is_not_hidden_by_a_valid_description_filter() {
 #[test]
 fn absent_filters_skip_compilation_but_empty_literals_are_still_predicates() {
     let rows = vec![issue("bd-empty", None, None)];
-    let unfiltered = apply_client_filters_with_compiler(
-        rows.clone(),
-        &ListArgs::default(),
-        |_| panic!("absent filters must not invoke the compiler"),
-    )
+    let unfiltered = apply_client_filters_with_compiler(rows.clone(), &ListArgs::default(), |_| {
+        panic!("absent filters must not invoke the compiler")
+    })
     .unwrap();
     assert_eq!(ids(&unfiltered), vec!["bd-empty"]);
 
@@ -150,7 +148,12 @@ fn priority_ranges_lists_and_repeated_values_use_the_shared_queue_parser() {
         .unwrap();
         assert_eq!(filters.priorities, Some(vec![Priority(0), Priority(1)]));
     }
-    assert!(build_filters(&ListArgs::default()).unwrap().priorities.is_none());
+    assert!(
+        build_filters(&ListArgs::default())
+            .unwrap()
+            .priorities
+            .is_none()
+    );
 }
 
 #[test]
@@ -182,7 +185,11 @@ fn priority_ranges_preserve_comment_matches_pagination_and_hidden_history() {
     for priority in 0..=4 {
         for closed in [false, true] {
             let id = format!("bd-{}{priority}", if closed { "c" } else { "o" });
-            let body = if priority == 1 { "KEEP" } else { "needle CAFÉ KEEP" };
+            let body = if priority == 1 {
+                "KEEP"
+            } else {
+                "needle CAFÉ KEEP"
+            };
             let mut record = issue(&id, Some(body), Some("CAFÉ notes"));
             record.priority = Priority(priority);
             if closed {
@@ -191,8 +198,12 @@ fn priority_ranges_preserve_comment_matches_pagination_and_hidden_history() {
             }
             storage.create_issue(&record, "tester").unwrap();
             if priority == 1 {
-                storage.add_comment(&id, "tester", "needle CAFÉ older evidence").unwrap();
-                storage.add_comment(&id, "tester", "unrelated newest handoff").unwrap();
+                storage
+                    .add_comment(&id, "tester", "needle CAFÉ older evidence")
+                    .unwrap();
+                storage
+                    .add_comment(&id, "tester", "unrelated newest handoff")
+                    .unwrap();
             }
         }
     }
@@ -219,20 +230,28 @@ fn priority_ranges_preserve_comment_matches_pagination_and_hidden_history() {
                     ..explicit.clone()
                 };
                 let expected = collect_search_results_for_output(
-                    &storage, query, &explicit, OutputFormat::Json,
+                    &storage,
+                    query,
+                    &explicit,
+                    OutputFormat::Json,
                 )
                 .unwrap();
-                let actual = collect_search_results_for_output(
-                    &storage, query, &range, OutputFormat::Json,
-                )
-                .unwrap();
+                let actual =
+                    collect_search_results_for_output(&storage, query, &range, OutputFormat::Json)
+                        .unwrap();
                 assert_eq!(
                     serde_json::to_value(&actual.issues).unwrap(),
                     serde_json::to_value(&expected.issues).unwrap()
                 );
                 assert_eq!(actual.issues.len(), shown);
-                assert_eq!((actual.limit, actual.offset, actual.has_more), (limit, offset, more));
-                assert_eq!(count_hidden_closed_matches(&storage, query, &range).unwrap(), 2);
+                assert_eq!(
+                    (actual.limit, actual.offset, actual.has_more),
+                    (limit, offset, more)
+                );
+                assert_eq!(
+                    count_hidden_closed_matches(&storage, query, &range).unwrap(),
+                    2
+                );
                 if offset == 1 {
                     assert_eq!(ids(&actual.issues), vec!["bd-o1"]);
                 }
@@ -244,9 +263,12 @@ fn priority_ranges_preserve_comment_matches_pagination_and_hidden_history() {
             limit: Some(0),
             ..ListArgs::default()
         };
-        let page = collect_search_results_for_output(&storage, query, &args, OutputFormat::Json)
-            .unwrap();
+        let page =
+            collect_search_results_for_output(&storage, query, &args, OutputFormat::Json).unwrap();
         assert_eq!(ids(&page.issues), vec!["bd-c0", "bd-o0", "bd-c1", "bd-o1"]);
-        assert_eq!(count_hidden_closed_matches(&storage, query, &args).unwrap(), 0);
+        assert_eq!(
+            count_hidden_closed_matches(&storage, query, &args).unwrap(),
+            0
+        );
     }
 }
