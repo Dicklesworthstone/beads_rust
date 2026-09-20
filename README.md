@@ -203,6 +203,7 @@ Every command supports `--json` for AI coding agents:
 br list --json | jq '.issues[] | select(.priority <= 1)'
 br ready --json          # Structured output for agents
 br ready --brief --json  # Same rows, without the long free-text fields
+br list --json --fields id,title,status,priority   # Same rows, only these keys
 br show br-abc123 --json
 br capabilities --format json
 br capabilities --format json --command "create"
@@ -547,6 +548,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 |---------|-------------|---------|
 | `list` | List issues | `br list --status open --priority 0-1` |
 | `list --tree` | Group children under their parents with tree connectors | `br list --tree` |
+| `list --fields` | Select which keys appear in each JSON/TOON row (columns only, never rows) | `br list --json --fields id,title,priority` |
 | `ready` | Actionable work | `br ready` |
 | `ready --brief` | Actionable work without long free-text fields (for agents selecting work) | `br ready --brief --json` |
 | `blocked` | Blocked issues | `br blocked --json \| jq '.issues[]'` |

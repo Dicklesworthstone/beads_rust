@@ -317,7 +317,44 @@ br list [OPTIONS]
 | `--wrap` | Wrap long lines instead of truncating in text output |
 | `--format <FMT>` | Output format: text, json, csv, toon |
 | `--stats` | Show token savings stats when using TOON output |
-| `--fields <FIELDS>` | CSV fields (comma-separated) |
+| `--fields <FIELDS>` | Comma-separated column selection. Picks CSV columns for `--format csv`, and selects which keys appear in each row for `--json`/`--format toon` (see below) |
+
+**`--fields` with JSON/TOON (agent payload control):**
+
+`--fields` selects **columns**, never **rows**. The matching issues, the page
+metadata (`total`, `limit`, `offset`, `has_more`) and the paging boundaries are
+identical with and without it; only the keys present in each row change.
+Unselected long text is never serialized — the row is built from the selection
+rather than serialized in full and then trimmed.
+
+Selectable keys: `id`, `title`, `status`, `priority`, `issue_type`, `assignee`,
+`owner`, `created_at`, `updated_at`, `created_by`, `description`, `design`,
+`acceptance_criteria`, `prerequisites`, `notes`, `closed_at`, `close_reason`,
+`due_at`, `defer_until`, `estimated_minutes`, `external_ref`, `source_repo`,
+`source_repo_path`, `labels`, `dependency_count`, `dependent_count`.
+
+Selecting only `id`, `title`, `status`, `priority`, `issue_type`, `labels`,
+`dependency_count` or `dependent_count` additionally lets `br list` read the
+narrow projection instead of hydrating full records, the same projection the
+plain text renderer already uses. Selecting any other key still projects the
+output but reads full rows.
+
+This is the `br list` counterpart to `br ready --brief`. `br list --json` has no
+default limit (`DEFAULT_LIST_LIMIT` is 0), so on a large tracker it returns the
+whole matching set with every long field; `--fields` is how an agent asks for a
+payload proportional to the decision it is making.
+
+```bash
+# Lean rows for work selection, then read the one issue you pick
+br list --json --fields id,title,status,priority,issue_type
+br show <id>
+
+# Relations without the long text
+br list --json --fields id,title,labels,dependency_count,dependent_count
+```
+
+Unknown or empty selectors are rejected with the allowed list, and are
+validated even when the result set is empty.
 
 **Examples:**
 ```bash

@@ -489,6 +489,21 @@ Note that `--robot` is an alias for `--json` and does not reduce payload size.
 For `br ready`, add `--brief` when you are choosing what to work on rather
 than reading issue bodies.
 
+For `br list`, the equivalent is `--fields`, which names the keys you want:
+
+```bash
+br list --json --fields id,title,status,priority,issue_type
+```
+
+`br list --json` has **no default limit**, so on a large tracker it returns
+every matching issue with every long field. `--fields` selects columns and
+never rows — same issues, same `total`/`has_more`, same page boundaries — and
+unselected long text is never serialized. Selecting only `id`, `title`,
+`status`, `priority`, `issue_type`, `labels`, `dependency_count` or
+`dependent_count` also lets `br list` read the narrow projection instead of
+hydrating full records. See `docs/CLI_REFERENCE.md` (the `list` command) for
+the full selectable-key list.
+
 JSON mode guarantees:
 - Stable schema (changes are versioned and documented)
 - No ANSI escape codes
