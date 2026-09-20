@@ -637,7 +637,13 @@ fn compaction_certificate_refusal_preserves_committed_wal_only_state() {
         return;
     }
     let fixture = wal_only_fixture();
-    assert!(fixture.storage.get_issue(WAL_ONLY_ISSUE_ID).unwrap().is_some());
+    assert!(
+        fixture
+            .storage
+            .get_issue(WAL_ONLY_ISSUE_ID)
+            .unwrap()
+            .is_some()
+    );
     fs::write(sidecar(&fixture.path, "-wal-cert"), MALFORMED_CERTIFICATE)
         .expect("corrupt certificate after committing WAL-only work");
     let before = payload_witness(&fixture.path);
