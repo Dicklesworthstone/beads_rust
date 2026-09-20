@@ -410,12 +410,20 @@ impl Connection {
 
     /// Prepare a statement for repeated execution.
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_>, FrankenError> {
-        // Preflight before entering the engine: prepare may process PRAGMAs.
-        let checkpoint_pragma = is_wal_checkpoint_pragma(sql)?;
-        Ok(PreparedStatement {
-            inner: retry_busy_recovery(|| drive(self.inner.prepare(sql)))?,
-            checkpoint_pragma,
-        })
+        // A checkpoint row is a receipt for one execution, not reusable data.
+        // Do not hand it to engine prepare, which may process the PRAGMA here.
+        // Retain validated SQL and issue it afresh on every subsequent call.
+        let inner = if is_wal_checkpoint_pragma(sql)? {
+            PreparedStatementInner::Checkpoint {
+                connection: self,
+                sql: sql.to_string(),
+            }
+        } else {
+            PreparedStatementInner::Engine(retry_busy_recovery(|| {
+                drive(self.inner.prepare(sql))
+            })?)
+        };
+        Ok(PreparedStatement { inner })
     }
 
     /// Last-inserted rowid on this connection.
@@ -468,53 +476,90 @@ impl Drop for Connection {
 // Prepared statements
 // ---------------------------------------------------------------------------
 
-/// Synchronous wrapper over [`fsqlite::PreparedStatement`].
+/// Synchronous prepared statement. Checkpoints retain SQL rather than a
+/// compiled result so every execution observes the current WAL generation.
 pub struct PreparedStatement<'conn> {
-    inner: fsqlite::PreparedStatement<'conn>,
-    checkpoint_pragma: bool,
+    inner: PreparedStatementInner<'conn>,
+}
+
+enum PreparedStatementInner<'conn> {
+    Engine(fsqlite::PreparedStatement<'conn>),
+    Checkpoint {
+        connection: &'conn Connection,
+        sql: String,
+    },
 }
 
 impl PreparedStatement<'_> {
-    /// Render the compiled program for diagnostics (sync in fsqlite).
+    /// Render the compiled program, or describe a deferred checkpoint without
+    /// running it. Checkpoint diagnostics are not an engine completion receipt.
     #[must_use]
     pub fn explain(&self) -> String {
-        self.inner.explain()
+        match &self.inner {
+            PreparedStatementInner::Engine(statement) => statement.explain(),
+            PreparedStatementInner::Checkpoint { sql, .. } => {
+                format!("Deferred WAL checkpoint (fresh execution on each call): {sql}")
+            }
+        }
     }
 
-    /// Query, returning all rows.
+    /// Query, returning all rows. Checkpoints expose fresh raw status rows.
     pub fn query(&self) -> Result<Vec<Row>, FrankenError> {
-        drive(self.inner.query())
+        match &self.inner {
+            PreparedStatementInner::Engine(statement) => drive(statement.query()),
+            PreparedStatementInner::Checkpoint { connection, sql } => connection.query(sql),
+        }
     }
 
     /// Query with positional parameters, returning all rows.
     pub fn query_with_params(&self, params: &[SqliteValue]) -> Result<Vec<Row>, FrankenError> {
-        drive(self.inner.query_with_params(params))
+        match &self.inner {
+            PreparedStatementInner::Engine(statement) => drive(statement.query_with_params(params)),
+            PreparedStatementInner::Checkpoint { connection, sql } => {
+                connection.query_with_params(sql, params)
+            }
+        }
     }
 
     /// Query, returning exactly one row.
     pub fn query_row(&self) -> Result<Row, FrankenError> {
-        drive(self.inner.query_row())
+        match &self.inner {
+            PreparedStatementInner::Engine(statement) => drive(statement.query_row()),
+            PreparedStatementInner::Checkpoint { connection, sql } => connection.query_row(sql),
+        }
     }
 
     /// Query with positional parameters, returning exactly one row.
     pub fn query_row_with_params(&self, params: &[SqliteValue]) -> Result<Row, FrankenError> {
-        drive(self.inner.query_row_with_params(params))
+        match &self.inner {
+            PreparedStatementInner::Engine(statement) => {
+                drive(statement.query_row_with_params(params))
+            }
+            PreparedStatementInner::Checkpoint { connection, sql } => {
+                connection.query_row_with_params(sql, params)
+            }
+        }
     }
 
-    /// Execute, returning the affected row count.
+    /// Execute, returning the affected row count. A checkpoint succeeds only
+    /// when this invocation's fresh status proves completion.
     pub fn execute(&self) -> Result<usize, FrankenError> {
-        if self.checkpoint_pragma {
-            return checkpoint_execute_result(self.query());
+        match &self.inner {
+            PreparedStatementInner::Engine(statement) => drive(statement.execute()),
+            PreparedStatementInner::Checkpoint { connection, sql } => {
+                checkpoint_execute_result(connection.query(sql))
+            }
         }
-        drive(self.inner.execute())
     }
 
     /// Execute with positional parameters, returning the affected row count.
     pub fn execute_with_params(&self, params: &[SqliteValue]) -> Result<usize, FrankenError> {
-        if self.checkpoint_pragma {
-            return checkpoint_execute_result(self.query_with_params(params));
+        match &self.inner {
+            PreparedStatementInner::Engine(statement) => drive(statement.execute_with_params(params)),
+            PreparedStatementInner::Checkpoint { connection, sql } => {
+                checkpoint_execute_result(connection.query_with_params(sql, params))
+            }
         }
-        drive(self.inner.execute_with_params(params))
     }
 }
 
@@ -1068,10 +1113,177 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values(), &[0, -1, -1].map(SqliteValue::Integer));
         let statement = conn.prepare(sql).unwrap();
-        assert!(statement.checkpoint_pragma);
+        assert!(matches!(
+            &statement.inner,
+            PreparedStatementInner::Checkpoint { .. }
+        ));
         assert_eq!(statement.execute().unwrap(), 0);
         assert_eq!(statement.execute_with_params(&[]).unwrap(), 0);
         assert_eq!(statement.query().unwrap()[0].values(), rows[0].values());
-        assert!(!conn.prepare("SELECT 1").unwrap().checkpoint_pragma);
+        assert_eq!(statement.query_row().unwrap().values(), rows[0].values());
+        assert_eq!(
+            statement.query_row_with_params(&[]).unwrap().values(),
+            rows[0].values()
+        );
+        assert!(matches!(
+            conn.prepare("SELECT 1").unwrap().inner,
+            PreparedStatementInner::Engine(_)
+        ));
+    }
+
+    #[test]
+    fn prepared_checkpoint_completion_is_checked_on_every_execution() {
+        let conn = Connection::open(":memory:").unwrap();
+        let sql = "PRAGMA wal_checkpoint(TRUNCATE)";
+        checkpoint_fault::with_results(
+            conn.inner.path(),
+            vec![
+                (sql, [0, 9, 9]),
+                (sql, [0, 10, 9]),
+                (sql, [0, 10, 10]),
+                (sql, [1, 10, 10]),
+                (sql, [0, 11, 12]),
+                (sql, [0, -1, -1]),
+            ],
+            || {
+                let statement = conn.prepare(sql).unwrap();
+                assert!(statement.explain().contains("Deferred WAL checkpoint"));
+                assert_eq!(statement.execute().unwrap(), 0);
+                assert!(matches!(
+                    statement.execute_with_params(&[]),
+                    Err(FrankenError::Busy)
+                ));
+                assert_eq!(statement.execute_with_params(&[]).unwrap(), 0);
+                assert!(matches!(statement.execute(), Err(FrankenError::Busy)));
+                assert!(matches!(
+                    statement.execute_with_params(&[]),
+                    Err(FrankenError::Internal(_))
+                ));
+                assert_eq!(statement.execute().unwrap(), 0);
+            },
+        );
+    }
+
+    #[test]
+    fn prepared_checkpoint_queries_keep_fresh_partial_status() {
+        let conn = Connection::open(":memory:").unwrap();
+        let sql = "PRAGMA wal_checkpoint(PASSIVE)";
+        let statement = conn.prepare(sql).unwrap();
+        for status in [[0, 23, 7], [1, 23, 0], [1, 23, 23]] {
+            checkpoint_fault::with_results(conn.inner.path(), vec![(sql, status); 4], || {
+                assert_eq!(
+                    statement.query().unwrap()[0].values(),
+                    &status.map(SqliteValue::Integer)
+                );
+                assert_eq!(
+                    statement.query_with_params(&[]).unwrap()[0].values(),
+                    &status.map(SqliteValue::Integer)
+                );
+                assert!(matches!(statement.execute(), Err(FrankenError::Busy)));
+                assert!(matches!(
+                    statement.execute_with_params(&[]),
+                    Err(FrankenError::Busy)
+                ));
+            });
+        }
+    }
+
+    #[test]
+    fn prepared_checkpoint_is_inert_until_executed_and_rechecks_new_writes() {
+        if run_recovery_test_in_subprocess(
+            "franken_sync::tests::prepared_checkpoint_is_inert_until_executed_and_rechecks_new_writes",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("prepared.db");
+        let wal = temp.path().join("prepared.db-wal");
+        let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        conn.execute("PRAGMA journal_mode = WAL").unwrap();
+        conn.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+        conn.execute("CREATE TABLE t (value TEXT)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("INSERT INTO t VALUES ('first uncheckpointed write')")
+            .unwrap();
+        let main_before = std::fs::read(&db).unwrap();
+        let wal_before = std::fs::read(&wal).unwrap();
+        assert!(wal_before.len() > 32, "the fixture must contain real WAL frames");
+        let statement = conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        assert!(statement.explain().contains("Deferred WAL checkpoint"));
+        assert_eq!(std::fs::read(&db).unwrap(), main_before);
+        assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
+        assert_eq!(statement.execute().unwrap(), 0);
+        let first_checkpoint = std::fs::read(&db).unwrap();
+        assert_ne!(first_checkpoint, main_before);
+        conn.execute("INSERT INTO t VALUES ('second uncheckpointed write')")
+            .unwrap();
+        assert_eq!(std::fs::read(&db).unwrap(), first_checkpoint);
+        assert_eq!(statement.execute_with_params(&[]).unwrap(), 0);
+        assert_ne!(std::fs::read(&db).unwrap(), first_checkpoint);
+        assert_eq!(conn.query("SELECT value FROM t").unwrap().len(), 2);
+        drop(statement);
+        conn.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_checkpoint_rejects_new_certificate_corruption_on_every_call_path() {
+        use std::os::unix::fs::MetadataExt;
+
+        if run_recovery_test_in_subprocess(
+            "franken_sync::tests::prepared_checkpoint_rejects_new_certificate_corruption_on_every_call_path",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        for call in 0..6 {
+            let db = temp.path().join(format!("prepared-cert-{call}.db"));
+            let mut conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+            conn.execute("PRAGMA journal_mode = WAL").unwrap();
+            conn.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+            conn.execute("CREATE TABLE t (value TEXT)").unwrap();
+            let statement = conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            assert_eq!(statement.execute().unwrap(), 0);
+            let certificate = db.with_file_name(format!("prepared-cert-{call}.db-wal-cert"));
+            std::fs::write(&certificate, b"live-sidecar-must-not-change").unwrap();
+            let witness = || {
+                ["", "-wal", "-wal-cert", "-wal-cert-head", ".fsqlite-migration-state"]
+                    .map(|suffix| {
+                        let mut path = db.as_os_str().to_os_string();
+                        path.push(suffix);
+                        match std::fs::symlink_metadata(&path) {
+                            Ok(metadata) => {
+                                assert!(metadata.is_file());
+                                Some((
+                                    metadata.dev(),
+                                    metadata.ino(),
+                                    std::fs::read(&path).unwrap(),
+                                ))
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                            Err(error) => panic!("inspect checkpoint payload: {error}"),
+                        }
+                    })
+            };
+            let before = witness();
+            let result = match call {
+                0 => statement.execute().map(|_| ()),
+                1 => statement.execute_with_params(&[]).map(|_| ()),
+                2 => statement.query().map(|_| ()),
+                3 => statement.query_with_params(&[]).map(|_| ()),
+                4 => statement.query_row().map(|_| ()),
+                _ => statement.query_row_with_params(&[]).map(|_| ()),
+            };
+            assert!(
+                matches!(result, Err(FrankenError::WalCorrupt { ref detail })
+                    if detail.contains("parallel WAL certificate suffix does not start at a record boundary")),
+                "prepared checkpoint path {call} reused success or changed the error: {result:?}"
+            );
+            assert_eq!(witness(), before, "refusal must preserve payload evidence");
+            drop(statement);
+            conn.close_without_checkpoint_in_place().unwrap();
+            drop(conn);
+            assert_eq!(witness(), before, "close must preserve payload evidence");
+        }
     }
 }
