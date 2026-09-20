@@ -22,6 +22,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 const ISSUE_ID: &str = "bd-private-cert";
+const WAL_ONLY_ISSUE_ID: &str = "bd-wal-only";
 const MALFORMED_CERTIFICATE: &[u8] = b"live-sidecar-must-not-change";
 const RECORD_BOUNDARY_ERROR: &str =
     "parallel WAL certificate suffix does not start at a record boundary";
@@ -139,6 +140,88 @@ fn logical_state(storage: &SqliteStorage) -> serde_json::Value {
         storage.get_config("issue_prefix").expect("read config"),
     ))
     .expect("serialize logical state")
+}
+
+fn wal_only_state(storage: &SqliteStorage) -> serde_json::Value {
+    let events = storage
+        .get_events(WAL_ONLY_ISSUE_ID, 0)
+        .expect("read WAL-only audit events");
+    assert!(
+        !events.is_empty(),
+        "the WAL-only issue must have an audit event"
+    );
+    serde_json::to_value((
+        logical_state(storage),
+        storage
+            .get_issue(WAL_ONLY_ISSUE_ID)
+            .expect("read WAL-only issue")
+            .expect("committed WAL-only issue exists"),
+        events,
+    ))
+    .expect("serialize WAL-only logical state")
+}
+
+/// Keep committed work out of both the main file and JSONL. A main-only copy
+/// made without the live checkpoint must demonstrably lose this issue, its
+/// event, its dirty marker, and the newer configuration value.
+fn wal_only_fixture() -> Fixture {
+    let mut fixture = fixture();
+    fixture
+        .storage
+        .execute_raw("PRAGMA wal_autocheckpoint = 0")
+        .expect("disable automatic checkpoints");
+    let checkpointed_main = fs::read(&fixture.path).expect("read checkpointed main");
+    let checkpointed_state = logical_state(&fixture.storage);
+    let now = Utc::now();
+    fixture
+        .storage
+        .create_issue(
+            &Issue {
+                id: WAL_ONLY_ISSUE_ID.to_string(),
+                title: "Committed work absent from the main-only snapshot".to_string(),
+                created_at: now,
+                updated_at: now,
+                ..Issue::default()
+            },
+            "wal-only-compaction-test",
+        )
+        .expect("commit the WAL-only issue");
+    fixture
+        .storage
+        .set_config("issue_prefix", "wal-only")
+        .expect("commit WAL-only configuration");
+    assert_eq!(fixture.storage.get_dirty_issue_count().unwrap(), 2);
+    assert_eq!(fs::read(&fixture.path).unwrap(), checkpointed_main);
+    assert!(
+        fs::metadata(sidecar(&fixture.path, "-wal")).unwrap().len() > 32,
+        "the fixture must retain real WAL frames"
+    );
+    assert_ne!(logical_state(&fixture.storage), checkpointed_state);
+
+    // Counterfactual control: a copy of just the current main really is stale.
+    // Opening this independent copy must not checkpoint the live source.
+    let before = payload_witness(&fixture.path);
+    let private_directory = TempDir::new().expect("main-only control directory");
+    let stale_path = private_directory.path().join("stale-main.db");
+    fs::copy(&fixture.path, &stale_path).expect("copy uncheckpointed main only");
+    let stale = SqliteStorage::open(&stale_path).expect("open main-only control");
+    assert_eq!(logical_state(&stale), checkpointed_state);
+    assert!(stale.get_issue(WAL_ONLY_ISSUE_ID).unwrap().is_none());
+    assert!(stale.get_events(WAL_ONLY_ISSUE_ID, 0).unwrap().is_empty());
+    drop(stale);
+    assert_eq!(payload_witness(&fixture.path), before);
+    assert_no_candidate_build(&fixture.path);
+    assert_no_jsonl(&fixture.path);
+    fixture
+}
+
+fn assert_no_jsonl(path: &Path) {
+    assert_eq!(
+        fs::symlink_metadata(path.with_file_name("issues.jsonl"))
+            .expect_err("no JSONL may supply or replace the committed WAL-only state")
+            .kind(),
+        ErrorKind::NotFound
+    );
 }
 
 fn assert_malformed_certificate(error: &BeadsError) {
@@ -439,4 +522,130 @@ fn compaction_partial_truncate_requires_a_real_completed_passive_fallback() {
             .kind(),
         ErrorKind::NotFound
     );
+}
+
+fn compact_wal_only_state(passive_fallback: bool) {
+    let fixture = wal_only_fixture();
+    let expected = wal_only_state(&fixture.storage);
+    let original_inode = fs::metadata(&fixture.path).unwrap().ino();
+    let path = fixture.path.to_string_lossy().into_owned();
+    let faults = if passive_fallback {
+        vec![("PRAGMA wal_checkpoint(TRUNCATE)", [1, 23, 0])]
+    } else {
+        Vec::new()
+    };
+    // Only TRUNCATE may be faulted. Every successful checkpoint, private
+    // source build, installation, and reopen runs against the actual engine.
+    let compacted = crate::franken_sync::checkpoint_fault::with_results(&path, faults, || {
+        compact_database_via_vacuum_into_in_place(fixture.storage, &fixture.path, Some(50))
+    })
+    .expect("compaction must include committed WAL-only work");
+    assert_eq!(wal_only_state(&compacted), expected);
+    assert_ne!(fs::metadata(&fixture.path).unwrap().ino(), original_inode);
+    fixture.authority.verify_database_authority().unwrap();
+    drop(compacted);
+
+    // A returned handle's in-memory view alone is not durable success.
+    let reopened = SqliteStorage::open_with_timeout_under_write_authority(
+        &fixture.path,
+        Some(50),
+        &fixture.authority,
+    )
+    .expect("reopen installed candidate independently");
+    assert_eq!(wal_only_state(&reopened), expected);
+    assert_no_jsonl(&fixture.path);
+}
+
+#[test]
+fn compaction_checkpoints_committed_wal_only_state_before_copying_main() {
+    if run_isolated(
+        "compaction_certificate_tests::compaction_checkpoints_committed_wal_only_state_before_copying_main",
+    ) {
+        return;
+    }
+    compact_wal_only_state(false);
+}
+
+#[test]
+fn compaction_passive_fallback_checkpoints_committed_wal_only_state() {
+    if run_isolated(
+        "compaction_certificate_tests::compaction_passive_fallback_checkpoints_committed_wal_only_state",
+    ) {
+        return;
+    }
+    compact_wal_only_state(true);
+}
+
+#[test]
+fn compaction_checkpoint_refusal_preserves_committed_wal_only_state() {
+    if run_isolated(
+        "compaction_certificate_tests::compaction_checkpoint_refusal_preserves_committed_wal_only_state",
+    ) {
+        return;
+    }
+    for status in [
+        [1, 23, 0],
+        [0, 23, 7],
+        [1, 23, 23],
+        [0, -1, 0],
+        [2, 23, 0],
+        [0, 1, 2],
+    ] {
+        let fixture = wal_only_fixture();
+        let expected = wal_only_state(&fixture.storage);
+        let before = payload_witness(&fixture.path);
+        let path = fixture.path.to_string_lossy().into_owned();
+        let error = crate::franken_sync::checkpoint_fault::with_results(
+            &path,
+            vec![
+                ("PRAGMA wal_checkpoint(TRUNCATE)", status),
+                ("PRAGMA wal_checkpoint(PASSIVE)", status),
+            ],
+            || compact_database_via_vacuum_into_in_place(fixture.storage, &fixture.path, Some(50)),
+        )
+        .expect_err("partial or invalid checkpoint cannot consume WAL-only state");
+        if matches!(status, [1, 23, 0] | [0, 23, 7] | [1, 23, 23]) {
+            assert!(matches!(error, BeadsError::Database(FrankenError::Busy)));
+        } else {
+            assert!(matches!(
+                error,
+                BeadsError::Database(FrankenError::Internal(ref detail))
+                    if detail.contains("invalid completion values")
+            ));
+        }
+        // Check after ownership-consuming compaction has dropped its handle,
+        // before reopening can perform any engine recovery or checkpoint.
+        assert_eq!(payload_witness(&fixture.path), before, "status {status:?}");
+        fixture.authority.verify_database_authority().unwrap();
+        assert_no_candidate_build(&fixture.path);
+        assert_no_jsonl(&fixture.path);
+        let reopened = SqliteStorage::open_with_timeout_under_write_authority(
+            &fixture.path,
+            Some(50),
+            &fixture.authority,
+        )
+        .expect("refused compaction must leave WAL-only work recoverable");
+        assert_eq!(wal_only_state(&reopened), expected);
+    }
+}
+
+#[test]
+fn compaction_certificate_refusal_preserves_committed_wal_only_state() {
+    if run_isolated(
+        "compaction_certificate_tests::compaction_certificate_refusal_preserves_committed_wal_only_state",
+    ) {
+        return;
+    }
+    let fixture = wal_only_fixture();
+    assert!(fixture.storage.get_issue(WAL_ONLY_ISSUE_ID).unwrap().is_some());
+    fs::write(sidecar(&fixture.path, "-wal-cert"), MALFORMED_CERTIFICATE)
+        .expect("corrupt certificate after committing WAL-only work");
+    let before = payload_witness(&fixture.path);
+    let error = compact_database_via_vacuum_into_in_place(fixture.storage, &fixture.path, Some(50))
+        .expect_err("malformed certificate must not authorize a stale main-only replacement");
+    assert_malformed_certificate(&error);
+    assert_eq!(payload_witness(&fixture.path), before);
+    fixture.authority.verify_database_authority().unwrap();
+    assert_no_candidate_build(&fixture.path);
+    assert_no_jsonl(&fixture.path);
 }
