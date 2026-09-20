@@ -1,12 +1,12 @@
 //! Structured view of the `acceptance_criteria` checklist (GitHub #477).
 //!
-//! `acceptance_criteria` is stored as free-form markdown. The checklist
-//! grammar recognised here is the one the close policy already uses to find
-//! unchecked items (`close_policy::find_unchecked_acceptance_criteria`): a
-//! line whose first non-blank characters are a list bullet (`-`, `*`, `+`),
-//! optional whitespace, `[`, exactly one marker character, `]`. A whitespace
-//! marker is unchecked, `x`/`X` is checked, and anything else (`[-]`, `[/]`)
-//! is not a checklist item. Lines inside fenced code blocks are ignored.
+//! `acceptance_criteria` is stored as free-form markdown. A checklist item
+//! starts with a list bullet (`-`, `*`, `+`), optional whitespace, `[`,
+//! exactly one marker character, and `]`. A whitespace marker is unchecked,
+//! `x`/`X` is checked, and anything else (`[-]`, `[/]`) is not a checklist
+//! item. Lines inside fenced code blocks are ignored. Fence length and
+//! closing-line syntax matter: embedded examples must not become editable
+//! requirements or count as completed prerequisite evidence.
 //!
 //! Every edit is byte-preserving: ticking or unticking an item rewrites only
 //! that item's marker character, and appending adds one line while leaving
@@ -98,7 +98,7 @@ pub struct AcceptanceEdit {
     pub checked: Vec<usize>,
     /// 1-based indexes that were requested to be unchecked (validated).
     pub unchecked: Vec<usize>,
-    /// 1-based indexes of the appended items, in the resulting checklist.
+    /// 1-based indexes of the items this call appended, in the resulting checklist.
     pub added: Vec<usize>,
 }
 
@@ -217,7 +217,7 @@ impl AcceptanceChecklist {
     #[must_use]
     pub fn parse(body: &str) -> Self {
         let mut entries = Vec::new();
-        let mut fence_marker: Option<char> = None;
+        let mut fence_marker: Option<CodeFence> = None;
         let mut offset = 0_usize;
         for line in body.split_inclusive('\n') {
             let line_start = offset;
@@ -487,25 +487,51 @@ fn parse_checklist_line(trimmed: &str) -> Option<(char, Range<usize>, bool, &str
     Some((bullet, marker_start..close_start, checked, text))
 }
 
-/// Track fenced code blocks (``` or ~~~, three or more, same marker closes).
-/// Mirrors the close policy's fence handling so both agree on which lines
-/// are checklist items.
-fn update_code_fence(line: &str, fence_marker: &mut Option<char>) -> bool {
-    let trimmed = line.trim_start();
-    let Some(marker @ ('`' | '~')) = trimmed.chars().next() else {
+#[derive(Debug, Clone, Copy)]
+struct CodeFence {
+    marker: u8,
+    width: usize,
+}
+
+/// Track code fences without promoting their examples into checklist items.
+/// A closer must use the opener's character, be at least as long, and have
+/// only spaces/tabs after it. Backticks in a backtick opener's info string
+/// make it an inline-code candidate, not a fence. Retain the existing
+/// permissive leading indentation and checklist grammar; this is not a
+/// general Markdown block parser.
+fn update_code_fence(line: &str, fence: &mut Option<CodeFence>) -> bool {
+    let trimmed = line.trim_end_matches(['\n', '\r']).trim_start();
+    let Some(marker @ (b'`' | b'~')) = trimmed.as_bytes().first().copied() else {
         return false;
     };
-    let marker_len = trimmed.chars().take_while(|ch| *ch == marker).count();
-    if marker_len < 3 {
+    let width = trimmed.bytes().take_while(|byte| *byte == marker).count();
+    if width < 3 {
         return false;
     }
-    if fence_marker.is_some_and(|open_marker| open_marker == marker) {
-        *fence_marker = None;
-    } else if fence_marker.is_none() {
-        *fence_marker = Some(marker);
+    // The run consists of ASCII markers, so width is a UTF-8 boundary.
+    let suffix = &trimmed[width..];
+    if let Some(open) = fence.as_ref() {
+        if open.marker == marker
+            && width >= open.width
+            && suffix.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
+        {
+            *fence = None;
+            return true;
+        }
+        // A shorter run, another marker, or an opener-looking line is code,
+        // not a close-and-reopen operation. Keep the original fence intact.
+        return false;
     }
+    if marker == b'`' && suffix.contains('`') {
+        return false;
+    }
+    *fence = Some(CodeFence { marker, width });
     true
 }
+
+#[cfg(test)]
+#[path = "acceptance/fence_tests.rs"]
+mod fence_tests;
 
 #[cfg(test)]
 mod tests {
