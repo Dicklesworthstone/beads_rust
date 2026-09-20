@@ -95,63 +95,112 @@ jobs:
           grep -F 'test result: FAILED. 0 passed; 1 failed;' "$BR_508_EVIDENCE/original-failure.log"
           printf 'Baseline: all seven controls passed; original fixture failed with the expected record-boundary corruption.\n' >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Apply only the reviewed healthy-certificate fixture repair
+      - name: Apply only the reviewed healthy-family fixture repair
         run: |
           test "$(git hash-object src/config/mod.rs)" = "$BR_508_CONFIG_BLOB"
           cat > "$BR_508_EVIDENCE/fixture-repair.patch" <<'PATCH'
           diff --git a/src/config/mod.rs b/src/config/mod.rs
           --- a/src/config/mod.rs
           +++ b/src/config/mod.rs
-          @@ -9906,7 +9906,26 @@
+          @@ -9898,18 +9898,10 @@
+
+                   let temp = TempDir::new().expect("tempdir");
+                   let db_path = temp.path().join("beads.db");
+          -        let sidecar_path = PathBuf::from(format!("{}-wal-cert", db_path.display()));
+                   let mut storage = SqliteStorage::open(&db_path).expect("create storage");
                    storage
-                       .checkpoint_full()
-                       .expect("establish checkpointed live baseline");
+                       .set_config("issue_prefix", "private-source")
+                       .expect("seed database");
+          -        storage
+          -            .checkpoint_full()
+          -            .expect("establish checkpointed live baseline");
           -        fs::write(&sidecar_path, b"live-sidecar-must-not-change").unwrap();
           -
-          +        // The certificate is engine input, not an opaque sentinel. Preserve
-          +        // its checkpointed bytes (or absence) in this successful-build test.
-          +        // Malformed input remains covered by compaction_certificate_tests;
-          +        // accepting it or broadening certificate quarantine is not a repair.
-          +        let certificate_snapshot = || match fs::symlink_metadata(&sidecar_path) {
-          +            Ok(metadata) => {
-          +                assert!(
-          +                    metadata.is_file(),
-          +                    "certificate fixture must be a regular file"
-          +                );
-          +                Some((
-          +                    metadata.dev(),
-          +                    metadata.ino(),
-          +                    fs::read(&sidecar_path).expect("read engine certificate fixture"),
-          +                ))
-          +            }
-          +            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-          +            Err(error) => panic!("cannot inspect engine certificate fixture: {error}"),
+          -        let main_before = fs::read(&db_path).unwrap();
+          -        let inode_before = fs::metadata(&db_path).unwrap().ino();
+                   let write_authority = Arc::new(
+                       crate::sync::blocking_database_family_write_lock_with_timeout(
+                           temp.path(),
+          @@ -9922,7 +9914,44 @@
+                       .bind_database_inode_for_mutation()
+                       .expect("bind compaction database inode");
+                   storage.attach_write_authority(Arc::clone(&write_authority));
+          +        storage
+          +            .checkpoint_full()
+          +            .expect("establish checkpointed live baseline");
+
+          +        // Use the healthy engine-created family, not arbitrary -wal-cert bytes.
+          +        // The malformed-certificate controls in compaction_certificate_tests
+          +        // must still reject corruption before any private candidate is built.
+          +        // SHM and namespace admission files are derived coordination state;
+          +        // pin durable payload presence, identity and bytes, including both certs.
+          +        let payload_witness = || {
+          +            [
+          +                "",
+          +                "-wal",
+          +                "-wal-cert",
+          +                "-wal-cert-head",
+          +                ".fsqlite-migration-state",
+          +            ]
+          +            .map(|suffix| {
+          +                let mut member = db_path.as_os_str().to_os_string();
+          +                member.push(suffix);
+          +                let member = PathBuf::from(member);
+          +                match fs::symlink_metadata(&member) {
+          +                    Ok(metadata) => {
+          +                        assert!(metadata.is_file(), "non-file payload: {}", member.display());
+          +                        Some((
+          +                            metadata.dev(),
+          +                            metadata.ino(),
+          +                            fs::read(&member).expect("read live payload"),
+          +                        ))
+          +                    }
+          +                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+          +                    Err(error) => panic!("inspect live payload {}: {error}", member.display()),
+          +                }
+          +            })
           +        };
-          +        let certificate_before = certificate_snapshot();
-          +
-                   let main_before = fs::read(&db_path).unwrap();
-                   let inode_before = fs::metadata(&db_path).unwrap().ino();
-          @@ -9932,10 +9951,7 @@
+          +        let before = payload_witness();
+          +        assert!(before[0].is_some(), "checkpointed main must exist");
+          +        let hook_reached = std::cell::Cell::new(false);
+                   let error = compact_database_via_vacuum_into_in_place_with_reopener(
+                       storage,
+                       &db_path,
+          @@ -9930,12 +9959,8 @@
+                       &write_authority,
+                       SqliteStorage::open_with_timeout,
                        || {
-                           assert_eq!(fs::read(&db_path).unwrap(), main_before);
-                           assert_eq!(fs::metadata(&db_path).unwrap().ino(), inode_before);
+          -                assert_eq!(fs::read(&db_path).unwrap(), main_before);
+          -                assert_eq!(fs::metadata(&db_path).unwrap().ino(), inode_before);
           -                assert_eq!(
           -                    fs::read(&sidecar_path).unwrap(),
           -                    b"live-sidecar-must-not-change"
           -                );
-          +                assert_eq!(certificate_snapshot(), certificate_before);
+          +                hook_reached.set(true);
+          +                assert_eq!(payload_witness(), before);
                            Err(BeadsError::Config(
                                "stop after private maintenance, before installation".to_string(),
                            ))
-          @@ -9954,10 +9970,7 @@
+          @@ -9948,15 +9973,15 @@
+                   .expect_err("test hook must stop before live-family installation");
+
+                   assert!(
+          -            error.to_string().contains("stop after private maintenance"),
+          +            hook_reached.get(),
+          +            "private maintenance failed before the hook: {error}"
+          +        );
+          +        assert!(
+          +            matches!(&error, BeadsError::Config(message)
+          +                if message == "stop after private maintenance, before installation"),
+                       "expected the injected post-maintenance hook to be the failure, got: {error}"
                    );
-                   assert_eq!(fs::read(&db_path).unwrap(), main_before);
-                   assert_eq!(fs::metadata(&db_path).unwrap().ino(), inode_before);
+          -        assert_eq!(fs::read(&db_path).unwrap(), main_before);
+          -        assert_eq!(fs::metadata(&db_path).unwrap().ino(), inode_before);
           -        assert_eq!(
           -            fs::read(&sidecar_path).unwrap(),
           -            b"live-sidecar-must-not-change"
           -        );
-          +        assert_eq!(certificate_snapshot(), certificate_before);
+          +        assert_eq!(payload_witness(), before);
                    assert_eq!(
                        write_authority
                            .database_target_authority_state()
@@ -209,7 +258,7 @@ jobs:
             '{base_tree: $base, tree: [{path: "src/config/mod.rs", mode: "100644", type: "blob", sha: $blob}]}' |
             gh api --method POST "repos/$GITHUB_REPOSITORY/git/trees" --input - --jq '.sha')
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          message=$(printf 'test(config): retain engine certificate in private-compaction fixture\n\nAll seven differential controls passed before and after the repair. The\noriginal fixture reproduced the named record-boundary WalCorrupt failure;\nthe repaired fixture reached its pre-install hook and retained certificate\nbytes, presence, device and inode plus the original main and authority.\n\nNo production recovery, quarantine or checkpoint policy changed.\nValidation: rustfmt, cargo check --all-targets, all-target Clippy with\n-D warnings and full cargo test --no-fail-fast, all with the locked dependencies.\nTested base: %s\nRuntime evidence: %s\n\nRefs #508' "$GITHUB_SHA" "$run_url")
+          message=$(printf 'test(config): preserve the full live family in private-compaction fixture\n\nAll seven differential controls passed before and after the repair. The\noriginal fixture reproduced the named record-boundary WalCorrupt failure;\nthe healthy fixture explicitly reached its pre-install hook and returned\nthe exact injected Config error. Main, WAL, both certificates and migration\nmarker retained their bytes, presence, device and inode at the hook and\nafter failure; original database authority remained held.\n\nNo production recovery, quarantine or checkpoint policy changed.\nValidation: rustfmt, cargo check --all-targets, all-target Clippy with\n-D warnings and full cargo test --no-fail-fast, all with the locked dependencies.\nTested base: %s\nRuntime evidence: %s\n\nRefs #508' "$GITHUB_SHA" "$run_url")
           commit=$(jq -n --arg message "$message" --arg tree "$tree" --arg parent "$GITHUB_SHA" \
             '{message: $message, tree: $tree, parents: [$parent]}' |
             gh api --method POST "repos/$GITHUB_REPOSITORY/git/commits" --input - --jq '.sha')
