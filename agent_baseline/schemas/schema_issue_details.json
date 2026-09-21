@@ -18,38 +18,23 @@
         },
         "description": {
           "description": "Detailed description.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "design": {
           "description": "Technical design notes.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "acceptance_criteria": {
           "description": "Acceptance criteria.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "prerequisites": {
           "description": "Per-issue prerequisite checklist, separate from acceptance criteria\nand dependency edges. Policy decides which transitions require it.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "notes": {
           "description": "Additional notes.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "status": {
           "description": "Workflow status.",
@@ -68,24 +53,15 @@
         },
         "assignee": {
           "description": "Assigned user.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "owner": {
           "description": "Issue owner.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "estimated_minutes": {
           "description": "Estimated effort in minutes.",
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "format": "int32"
         },
         "created_at": {
@@ -95,10 +71,7 @@
         },
         "created_by": {
           "description": "Creator username.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "updated_at": {
           "description": "Last update timestamp.",
@@ -107,159 +80,93 @@
         },
         "closed_at": {
           "description": "Closure timestamp.",
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "format": "date-time"
         },
         "close_reason": {
           "description": "Reason for closure.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "closed_by_session": {
           "description": "Session ID that closed this issue.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "bypassed_policy": {
           "description": "Close-policy bypass audit trail (GitHub #474). Serialized into the\nJSONL export only when the close bypassed policy so a bypassed close\nis reviewable off-machine; absent means \"not bypassed\" (pre-change\nexports stay valid). Backed by the DB-only `close_metadata` table;\nexcluded from `content_hash` and from `sync_equals`.",
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "bypass_reason": {
           "description": "Operator-supplied reason for the policy bypass (GitHub #474).",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "policy_gates_fired": {
           "description": "Names of the close-policy gates the bypass overrode (GitHub #474).",
-          "type": [
-            "array",
-            "null"
-          ],
+          "type": ["array", "null"],
           "items": {
             "type": "string"
           }
         },
         "due_at": {
           "description": "Due date.",
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "format": "date-time"
         },
         "defer_until": {
           "description": "Defer until date.",
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "format": "date-time"
         },
         "external_ref": {
           "description": "External reference (e.g., JIRA-123).",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "source_system": {
           "description": "Source system for imported issues.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "source_repo": {
           "description": "Source repository for multi-repo support — basename of the\ncanonicalized parent of `.beads/`. Stable across clones of the\nsame repo on different machines (different absolute paths\nproduce the same basename). See [`canonical_source_repo`] in\n`cli::commands::create`.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "source_repo_path": {
           "description": "Absolute canonical path of the source repository. Distinct from\n`source_repo`: this field uniquely identifies the workspace on\nthe machine that produced the issue, which is what multi-repo\nfleet automation needs to route beads back to the right\ndirectory (see beads_rust#289). Two clones of the same repo\nunder `~/Developer/foo` vs `~/Developer/scratch/foo` collide on\n`source_repo` but disagree here. Optional — older databases and\nhand-edited JSONL records without this field are valid.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "agent_context": {
           "description": "Canonical-JSON governing instructions inherited by descendant\nbeads (beads_rust#297). When set on an ancestor and the project\nhas `inherited_context.enabled = true` in `.beads/config.yaml`,\n`br update --status in_progress` / `--claim` and `br show` emit\nthe ancestor's `agent_context` alongside the child's normal\noutput so the working agent sees the constraints regardless of\ncontext compaction or cold-start lookups.\n\nStorage: TEXT column holding a JSON document (typically an\nobject with `skills`, `constraints`, `references`, `workflow`,\n`metadata` fields, but the schema is intentionally open).\n`None` means \"no inherited context\"; emission for descendants\nsilently skips ancestors with `None` (no error, no noise).\n\nNot displayed in `br list` / `br search` — this is per-bead\ngovernance metadata, not browsable content.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "deleted_at": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "format": "date-time"
         },
         "deleted_by": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "delete_reason": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "original_type": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "compaction_level": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "format": "int32",
           "default": 0
         },
         "compacted_at": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "format": "date-time"
         },
         "compacted_at_commit": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "original_size": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "format": "int32"
         },
         "sender": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "ephemeral": {
           "type": "boolean"
@@ -301,10 +208,7 @@
           }
         },
         "parent": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "rollup": {
           "description": "Derived parent-child subtree rollup; present only when the issue has\nlocal parent-child children (GitHub #384 phase 3).",
@@ -374,15 +278,7 @@
           "anyOf": [
             {
               "type": "string",
-              "enum": [
-                "task",
-                "bug",
-                "feature",
-                "epic",
-                "chore",
-                "docs",
-                "question"
-              ]
+              "enum": ["task", "bug", "feature", "epic", "chore", "docs", "question"]
             },
             {
               "type": "string"
@@ -412,32 +308,18 @@
             },
             "created_by": {
               "description": "Creator.",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "metadata": {
               "description": "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`].",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "thread_id": {
               "description": "Thread ID for conversation linking.",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             }
           },
-          "required": [
-            "issue_id",
-            "depends_on_id",
-            "type",
-            "created_at"
-          ]
+          "required": ["issue_id", "depends_on_id", "type", "created_at"]
         },
         "DependencyType": {
           "description": "Dependency relationship type.",
@@ -486,13 +368,7 @@
               "format": "date-time"
             }
           },
-          "required": [
-            "id",
-            "issue_id",
-            "author",
-            "text",
-            "created_at"
-          ]
+          "required": ["id", "issue_id", "author", "text", "created_at"]
         },
         "IssueWithDependencyMetadata": {
           "type": "object",
@@ -513,13 +389,7 @@
               "type": "string"
             }
           },
-          "required": [
-            "id",
-            "title",
-            "status",
-            "priority",
-            "dependency_type"
-          ]
+          "required": ["id", "title", "status", "priority", "dependency_type"]
         },
         "Event": {
           "description": "An event in the issue's history (audit log).",
@@ -539,22 +409,13 @@
               "type": "string"
             },
             "old_value": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "new_value": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "comment": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "created_at": {
               "type": "string",
@@ -562,33 +423,18 @@
             },
             "agent_name": {
               "description": "Tier 1 attribution: self-reported agent name (issue #312, Layer 3\ncapture-only). Recorded as an audit trail; never gated/enforced on.\n`None` when the mutating command supplied no attribution.",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "harness": {
               "description": "Tier 1 attribution: self-reported harness identifier (capture-only).",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "model": {
               "description": "Tier 1 attribution: self-reported model identifier (capture-only).",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             }
           },
-          "required": [
-            "id",
-            "issue_id",
-            "event_type",
-            "actor",
-            "created_at"
-          ]
+          "required": ["id", "issue_id", "event_type", "actor", "created_at"]
         },
         "EventType": {
           "type": "string"
@@ -611,10 +457,7 @@
               }
             }
           },
-          "required": [
-            "status",
-            "descendants"
-          ]
+          "required": ["status", "descendants"]
         },
         "AcceptanceItem": {
           "description": "One checklist item of an acceptance-criteria field.",
@@ -635,11 +478,7 @@
               "type": "boolean"
             }
           },
-          "required": [
-            "index",
-            "text",
-            "checked"
-          ]
+          "required": ["index", "text", "checked"]
         },
         "InheritedBlock": {
           "description": "One ancestor block in the inherited-context emission.",
@@ -666,13 +505,7 @@
               "type": "string"
             }
           },
-          "required": [
-            "source_id",
-            "source_role",
-            "source_title",
-            "field_used",
-            "content"
-          ]
+          "required": ["source_id", "source_role", "source_title", "field_used", "content"]
         }
       }
     }

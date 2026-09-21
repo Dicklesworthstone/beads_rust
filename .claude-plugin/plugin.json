@@ -20,7 +20,5 @@
     "jsonl",
     "agent-workflow"
   ],
-  "skills": [
-    "./.claude/skills/"
-  ]
+  "skills": ["./.claude/skills/"]
 }

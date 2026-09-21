@@ -3,7 +3,5 @@
   "build": "<build>",
   "rust_version": "<rust_version>",
   "target": "<target>",
-  "features": [
-    "self_update"
-  ]
+  "features": ["self_update"]
 }

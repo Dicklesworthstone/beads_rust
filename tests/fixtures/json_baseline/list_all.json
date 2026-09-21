@@ -11,9 +11,7 @@
     "updated_at": "2026-01-19T22:12:49.050007668Z",
     "compaction_level": 0,
     "original_size": 0,
-    "labels": [
-      "auth"
-    ],
+    "labels": ["auth"],
     "dependency_count": 1,
     "dependent_count": 1
   },
@@ -28,9 +26,7 @@
     "updated_at": "2026-01-19T22:12:49.022237331Z",
     "compaction_level": 0,
     "original_size": 0,
-    "labels": [
-      "critical"
-    ],
+    "labels": ["critical"],
     "dependency_count": 0,
     "dependent_count": 1
   },
@@ -46,9 +42,7 @@
     "updated_at": "2026-01-19T22:12:49.031608121Z",
     "compaction_level": 0,
     "original_size": 0,
-    "labels": [
-      "ux"
-    ],
+    "labels": ["ux"],
     "dependency_count": 1,
     "dependent_count": 0
   },

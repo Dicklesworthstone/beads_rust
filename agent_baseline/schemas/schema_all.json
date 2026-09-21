@@ -48,10 +48,7 @@
           "type": "string"
         },
         "database_identity_sha256": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "write_lock_authority": {
           "type": "string"
@@ -60,34 +57,19 @@
           "type": "string"
         },
         "database_authority_preserved_after_commit": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "database_poststate_preserved_after_commit": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "workspace_authority_preserved_after_commit": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "source_preserved_after_commit": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "foreign_keys_restored_after_commit": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "postcommit_failures": {
           "type": "array",
@@ -101,10 +83,7 @@
           "minimum": 0
         },
         "project_prefix": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "source_raw_sha256": {
           "description": "SHA-256 of the exact source bytes.",
@@ -718,28 +697,16 @@
               "$ref": "#/$defs/AdditiveTableWitness"
             },
             "stored_jsonl_content_hash": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "stored_jsonl_mtime": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "stored_jsonl_size": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "needs_flush": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             }
           },
           "required": [
@@ -793,11 +760,7 @@
               "minimum": 0
             }
           },
-          "required": [
-            "labels",
-            "dependencies",
-            "comments"
-          ]
+          "required": ["labels", "dependencies", "comments"]
         },
         "AdditiveTableWitness": {
           "description": "Count and canonical payload digest for one complete database table.",
@@ -812,10 +775,7 @@
               "type": "string"
             }
           },
-          "required": [
-            "rows",
-            "payload_sha256"
-          ]
+          "required": ["rows", "payload_sha256"]
         },
         "AdditiveDatabaseHealth": {
           "description": "Database-health gates captured before and after additive reconciliation.",
@@ -837,10 +797,7 @@
               }
             }
           },
-          "required": [
-            "integrity_messages",
-            "foreign_key_violations"
-          ]
+          "required": ["integrity_messages", "foreign_key_violations"]
         },
         "AdditiveScalarUpdateWitness": {
           "description": "Hash-bound scalar-only repair for a shared issue ID.",
@@ -884,10 +841,7 @@
         "AdditiveScalarResolution": {
           "description": "Evidence-backed reason a shared issue's scalar fields may be updated.",
           "type": "string",
-          "enum": [
-            "monotonic_closure",
-            "explicit_source_resolution"
-          ]
+          "enum": ["monotonic_closure", "explicit_source_resolution"]
         },
         "AdditiveContentHashRepairWitness": {
           "description": "Exact before/after witness for a repaired persisted content hash.",
@@ -897,19 +851,13 @@
               "type": "string"
             },
             "before": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "after": {
               "type": "string"
             }
           },
-          "required": [
-            "issue_id",
-            "after"
-          ]
+          "required": ["issue_id", "after"]
         },
         "AdditiveConflictWitness": {
           "description": "Complete deterministic issue-to-reason conflict witness.",
@@ -931,11 +879,7 @@
               }
             }
           },
-          "required": [
-            "issue_id",
-            "reasons",
-            "details"
-          ]
+          "required": ["issue_id", "reasons", "details"]
         },
         "AdditiveConflictDetailWitness": {
           "description": "Privacy-preserving, actionable evidence for one rejected source element.\n\nEmbedded relation values are not assumed to be validated issue IDs: an\nexternal target or malformed source can contain terminal control bytes or\na local path. All such related values, labels, external refs, dependency\nmetadata, and comment payloads are represented only by SHA-256.",
@@ -948,10 +892,7 @@
               "type": "string"
             },
             "ordinal": {
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": ["integer", "null"],
               "format": "uint",
               "minimum": 0
             },
@@ -968,20 +909,13 @@
               }
             },
             "value_sha256": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "detail_sha256": {
               "type": "string"
             }
           },
-          "required": [
-            "reason",
-            "detail_kind",
-            "detail_sha256"
-          ]
+          "required": ["reason", "detail_kind", "detail_sha256"]
         },
         "AdditiveConflictScalarDiffWitness": {
           "description": "Complete hash-bound scalar difference for a shared issue that was refused.\n\nPayload bodies remain private; field names and before/after/diff hashes let\nan operator prove exactly which reviewed scalar conflict a token covered.",
@@ -1086,12 +1020,7 @@
               "type": "string"
             }
           },
-          "required": [
-            "issue_id",
-            "old_id",
-            "new_id",
-            "logical_payload_sha256"
-          ]
+          "required": ["issue_id", "old_id", "new_id", "logical_payload_sha256"]
         }
       }
     },
@@ -1117,16 +1046,10 @@
           "format": "date-time"
         },
         "created_by": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "description": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "id": {
           "type": "string"
@@ -1165,15 +1088,7 @@
           "anyOf": [
             {
               "type": "string",
-              "enum": [
-                "task",
-                "bug",
-                "feature",
-                "epic",
-                "chore",
-                "docs",
-                "question"
-              ]
+              "enum": ["task", "bug", "feature", "epic", "chore", "docs", "question"]
             },
             {
               "type": "string"
@@ -1239,13 +1154,7 @@
           "type": "boolean"
         }
       },
-      "required": [
-        "issues",
-        "total",
-        "limit",
-        "offset",
-        "has_more"
-      ],
+      "required": ["issues", "total", "limit", "offset", "has_more"],
       "$defs": {
         "BlockedIssueOutput": {
           "description": "Minimal issue output for blocked command (bd parity).\n\nContains only the fields that bd's blocked command outputs, plus `blocked_by` info.\nDoes NOT include: `compaction_level`, `original_size`",
@@ -1267,16 +1176,10 @@
               "format": "date-time"
             },
             "created_by": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "description": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "id": {
               "type": "string"
@@ -1315,15 +1218,7 @@
           "anyOf": [
             {
               "type": "string",
-              "enum": [
-                "task",
-                "bug",
-                "feature",
-                "epic",
-                "chore",
-                "docs",
-                "question"
-              ]
+              "enum": ["task", "bug", "feature", "epic", "chore", "docs", "question"]
             },
             {
               "type": "string"
@@ -1490,15 +1385,7 @@
           "anyOf": [
             {
               "type": "string",
-              "enum": [
-                "task",
-                "bug",
-                "feature",
-                "epic",
-                "chore",
-                "docs",
-                "question"
-              ]
+              "enum": ["task", "bug", "feature", "epic", "chore", "docs", "question"]
             },
             {
               "type": "string"
@@ -1520,11 +1407,7 @@
               "format": "date-time"
             }
           },
-          "required": [
-            "author",
-            "text",
-            "created_at"
-          ]
+          "required": ["author", "text", "created_at"]
         },
         "AgentMailAgentSnapshot": {
           "description": "Minimal offline agent-liveness snapshot row exported from Agent Mail.",
@@ -1544,22 +1427,14 @@
               "type": "string"
             }
           },
-          "required": [
-            "name",
-            "task_description",
-            "last_active_ts",
-            "contact_policy"
-          ]
+          "required": ["name", "task_description", "last_active_ts", "contact_policy"]
         },
         "ClaimAssessment": {
           "description": "Deterministic assessment for one in-progress claim.",
           "type": "object",
           "properties": {
             "assignee": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "owner_kind": {
               "$ref": "#/$defs/ClaimOwnerKind"
@@ -1640,9 +1515,7 @@
                   "const": "no_snapshot"
                 }
               },
-              "required": [
-                "state"
-              ]
+              "required": ["state"]
             },
             {
               "description": "A snapshot was supplied and no matching reservation was found.",
@@ -1653,9 +1526,7 @@
                   "const": "no_reservation"
                 }
               },
-              "required": [
-                "state"
-              ]
+              "required": ["state"]
             },
             {
               "description": "A matching active reservation exists.",
@@ -1672,10 +1543,7 @@
                       "type": "string"
                     },
                     "expires_at": {
-                      "type": [
-                        "string",
-                        "null"
-                      ],
+                      "type": ["string", "null"],
                       "format": "date-time"
                     },
                     "provenance": {
@@ -1689,15 +1557,10 @@
                       ]
                     }
                   },
-                  "required": [
-                    "holder"
-                  ]
+                  "required": ["holder"]
                 }
               },
-              "required": [
-                "state",
-                "detail"
-              ]
+              "required": ["state", "detail"]
             },
             {
               "description": "A matching reservation exists but is no longer active.",
@@ -1714,10 +1577,7 @@
                       "type": "string"
                     },
                     "released_at": {
-                      "type": [
-                        "string",
-                        "null"
-                      ],
+                      "type": ["string", "null"],
                       "format": "date-time"
                     },
                     "provenance": {
@@ -1731,15 +1591,10 @@
                       ]
                     }
                   },
-                  "required": [
-                    "holder"
-                  ]
+                  "required": ["holder"]
                 }
               },
-              "required": [
-                "state",
-                "detail"
-              ]
+              "required": ["state", "detail"]
             },
             {
               "description": "Snapshot data was supplied but could not be trusted.",
@@ -1756,15 +1611,10 @@
                       "type": "string"
                     }
                   },
-                  "required": [
-                    "reason"
-                  ]
+                  "required": ["reason"]
                 }
               },
-              "required": [
-                "state",
-                "detail"
-              ]
+              "required": ["state", "detail"]
             }
           ]
         },
@@ -1779,27 +1629,18 @@
               "type": "boolean"
             },
             "reason": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "expires_ts": {
               "type": "string",
               "format": "date-time"
             },
             "released_ts": {
-              "type": [
-                "string",
-                "null"
-              ],
+              "type": ["string", "null"],
               "format": "date-time"
             },
             "thread_id": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "matched_on": {
               "type": "array",
@@ -1808,12 +1649,7 @@
               }
             }
           },
-          "required": [
-            "path_pattern",
-            "exclusive",
-            "expires_ts",
-            "matched_on"
-          ]
+          "required": ["path_pattern", "exclusive", "expires_ts", "matched_on"]
         },
         "ReservationSnapshotMatchReason": {
           "description": "Why an Agent Mail reservation snapshot was associated with an issue.",
@@ -1941,10 +1777,7 @@
               "type": "string"
             }
           },
-          "required": [
-            "purpose",
-            "command"
-          ]
+          "required": ["purpose", "command"]
         },
         "CoordinationSuggestedCommandPurpose": {
           "description": "Role for a suggested coordination command.",
@@ -1993,12 +1826,7 @@
           }
         }
       },
-      "required": [
-        "schema_version",
-        "generated_at",
-        "summary",
-        "claims"
-      ],
+      "required": ["schema_version", "generated_at", "summary", "claims"],
       "$defs": {
         "CoordinationSummary": {
           "description": "Count summary for coordination status output.",
@@ -2095,14 +1923,7 @@
               "minimum": 0
             }
           },
-          "required": [
-            "open",
-            "ready",
-            "blocked",
-            "in_progress",
-            "deferred",
-            "closed"
-          ]
+          "required": ["open", "ready", "blocked", "in_progress", "deferred", "closed"]
         },
         "CoordinationClaimRow": {
           "description": "One in-progress issue plus its deterministic coordination assessment.",
@@ -2234,15 +2055,7 @@
           "anyOf": [
             {
               "type": "string",
-              "enum": [
-                "task",
-                "bug",
-                "feature",
-                "epic",
-                "chore",
-                "docs",
-                "question"
-              ]
+              "enum": ["task", "bug", "feature", "epic", "chore", "docs", "question"]
             },
             {
               "type": "string"
@@ -2264,11 +2077,7 @@
               "format": "date-time"
             }
           },
-          "required": [
-            "author",
-            "text",
-            "created_at"
-          ]
+          "required": ["author", "text", "created_at"]
         },
         "AgentMailAgentSnapshot": {
           "description": "Minimal offline agent-liveness snapshot row exported from Agent Mail.",
@@ -2288,22 +2097,14 @@
               "type": "string"
             }
           },
-          "required": [
-            "name",
-            "task_description",
-            "last_active_ts",
-            "contact_policy"
-          ]
+          "required": ["name", "task_description", "last_active_ts", "contact_policy"]
         },
         "ClaimAssessment": {
           "description": "Deterministic assessment for one in-progress claim.",
           "type": "object",
           "properties": {
             "assignee": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "owner_kind": {
               "$ref": "#/$defs/ClaimOwnerKind"
@@ -2384,9 +2185,7 @@
                   "const": "no_snapshot"
                 }
               },
-              "required": [
-                "state"
-              ]
+              "required": ["state"]
             },
             {
               "description": "A snapshot was supplied and no matching reservation was found.",
@@ -2397,9 +2196,7 @@
                   "const": "no_reservation"
                 }
               },
-              "required": [
-                "state"
-              ]
+              "required": ["state"]
             },
             {
               "description": "A matching active reservation exists.",
@@ -2416,10 +2213,7 @@
                       "type": "string"
                     },
                     "expires_at": {
-                      "type": [
-                        "string",
-                        "null"
-                      ],
+                      "type": ["string", "null"],
                       "format": "date-time"
                     },
                     "provenance": {
@@ -2433,15 +2227,10 @@
                       ]
                     }
                   },
-                  "required": [
-                    "holder"
-                  ]
+                  "required": ["holder"]
                 }
               },
-              "required": [
-                "state",
-                "detail"
-              ]
+              "required": ["state", "detail"]
             },
             {
               "description": "A matching reservation exists but is no longer active.",
@@ -2458,10 +2247,7 @@
                       "type": "string"
                     },
                     "released_at": {
-                      "type": [
-                        "string",
-                        "null"
-                      ],
+                      "type": ["string", "null"],
                       "format": "date-time"
                     },
                     "provenance": {
@@ -2475,15 +2261,10 @@
                       ]
                     }
                   },
-                  "required": [
-                    "holder"
-                  ]
+                  "required": ["holder"]
                 }
               },
-              "required": [
-                "state",
-                "detail"
-              ]
+              "required": ["state", "detail"]
             },
             {
               "description": "Snapshot data was supplied but could not be trusted.",
@@ -2500,15 +2281,10 @@
                       "type": "string"
                     }
                   },
-                  "required": [
-                    "reason"
-                  ]
+                  "required": ["reason"]
                 }
               },
-              "required": [
-                "state",
-                "detail"
-              ]
+              "required": ["state", "detail"]
             }
           ]
         },
@@ -2523,27 +2299,18 @@
               "type": "boolean"
             },
             "reason": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "expires_ts": {
               "type": "string",
               "format": "date-time"
             },
             "released_ts": {
-              "type": [
-                "string",
-                "null"
-              ],
+              "type": ["string", "null"],
               "format": "date-time"
             },
             "thread_id": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "matched_on": {
               "type": "array",
@@ -2552,12 +2319,7 @@
               }
             }
           },
-          "required": [
-            "path_pattern",
-            "exclusive",
-            "expires_ts",
-            "matched_on"
-          ]
+          "required": ["path_pattern", "exclusive", "expires_ts", "matched_on"]
         },
         "ReservationSnapshotMatchReason": {
           "description": "Why an Agent Mail reservation snapshot was associated with an issue.",
@@ -2685,10 +2447,7 @@
               "type": "string"
             }
           },
-          "required": [
-            "purpose",
-            "command"
-          ]
+          "required": ["purpose", "command"]
         },
         "CoordinationSuggestedCommandPurpose": {
           "description": "Role for a suggested coordination command.",
@@ -2723,10 +2482,7 @@
             },
             "scope_key": {
               "description": "Partition key within a non-repository scope.",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "counted": {
               "description": "Occupancy excluding exemptions (and hierarchy aggregates).",
@@ -2736,46 +2492,31 @@
             },
             "aggregate_parents_excluded": {
               "description": "Active issues excluded as hierarchy aggregates (`leaf_work`/`roots`).",
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": ["integer", "null"],
               "format": "uint32",
               "minimum": 0
             },
             "exempt": {
               "description": "Occupancy excluded by active, authorized exemptions.",
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": ["integer", "null"],
               "format": "uint32",
               "minimum": 0
             },
             "soft_limit": {
               "description": "Advisory threshold, if configured.",
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": ["integer", "null"],
               "format": "uint32",
               "minimum": 0
             },
             "hard_limit": {
               "description": "Enforced threshold, if configured.",
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": ["integer", "null"],
               "format": "uint32",
               "minimum": 0
             },
             "remaining": {
               "description": "`hard_limit - counted`, clamped at zero; absent without a hard limit.",
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": ["integer", "null"],
               "format": "uint32",
               "minimum": 0
             },
@@ -2792,15 +2533,7 @@
               "type": "string"
             }
           },
-          "required": [
-            "name",
-            "kind",
-            "scope",
-            "counted",
-            "state",
-            "counting_mode",
-            "policy_path"
-          ]
+          "required": ["name", "kind", "scope", "counted", "state", "counting_mode", "policy_path"]
         }
       }
     },
@@ -2821,10 +2554,7 @@
           "minimum": 0
         }
       },
-      "required": [
-        "group",
-        "count"
-      ]
+      "required": ["group", "count"]
     },
     "ErrorEnvelope": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2835,9 +2565,7 @@
           "$ref": "#/$defs/ErrorBody"
         }
       },
-      "required": [
-        "error"
-      ],
+      "required": ["error"],
       "$defs": {
         "ErrorBody": {
           "type": "object",
@@ -2852,10 +2580,7 @@
             },
             "hint": {
               "description": "Optional hint for remediation",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "retryable": {
               "description": "Whether the operation can be retried",
@@ -2865,13 +2590,7 @@
               "description": "Additional context for debugging (arbitrary JSON)"
             }
           },
-          "required": [
-            "code",
-            "message",
-            "hint",
-            "retryable",
-            "context"
-          ]
+          "required": ["code", "message", "hint", "retryable", "context"]
         }
       }
     },
@@ -2900,13 +2619,7 @@
           "$ref": "#/$defs/InitFiles"
         }
       },
-      "required": [
-        "initialized",
-        "beads_dir",
-        "database_path",
-        "prefix",
-        "files"
-      ],
+      "required": ["initialized", "beads_dir", "database_path", "prefix", "files"],
       "$defs": {
         "InitFiles": {
           "type": "object",
@@ -2931,22 +2644,11 @@
               "$ref": "#/$defs/InitStepStatus"
             }
           },
-          "required": [
-            "directory",
-            "database",
-            "metadata",
-            "config",
-            "gitignore",
-            "jsonl"
-          ]
+          "required": ["directory", "database", "metadata", "config", "gitignore", "jsonl"]
         },
         "InitStepStatus": {
           "type": "string",
-          "enum": [
-            "created",
-            "updated",
-            "existing"
-          ]
+          "enum": ["created", "updated", "existing"]
         }
       }
     },
@@ -2966,38 +2668,23 @@
         },
         "description": {
           "description": "Detailed description.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "design": {
           "description": "Technical design notes.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "acceptance_criteria": {
           "description": "Acceptance criteria.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "prerequisites": {
           "description": "Per-issue prerequisite checklist, separate from acceptance criteria\nand dependency edges. Policy decides which transitions require it.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "notes": {
           "description": "Additional notes.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "status": {
           "description": "Workflow status.",
@@ -3016,24 +2703,15 @@
         },
         "assignee": {
           "description": "Assigned user.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "owner": {
           "description": "Issue owner.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "estimated_minutes": {
           "description": "Estimated effort in minutes.",
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "format": "int32"
         },
         "created_at": {
@@ -3043,10 +2721,7 @@
         },
         "created_by": {
           "description": "Creator username.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "updated_at": {
           "description": "Last update timestamp.",
@@ -3055,159 +2730,93 @@
         },
         "closed_at": {
           "description": "Closure timestamp.",
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "format": "date-time"
         },
         "close_reason": {
           "description": "Reason for closure.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "closed_by_session": {
           "description": "Session ID that closed this issue.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "bypassed_policy": {
           "description": "Close-policy bypass audit trail (GitHub #474). Serialized into the\nJSONL export only when the close bypassed policy so a bypassed close\nis reviewable off-machine; absent means \"not bypassed\" (pre-change\nexports stay valid). Backed by the DB-only `close_metadata` table;\nexcluded from `content_hash` and from `sync_equals`.",
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "bypass_reason": {
           "description": "Operator-supplied reason for the policy bypass (GitHub #474).",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "policy_gates_fired": {
           "description": "Names of the close-policy gates the bypass overrode (GitHub #474).",
-          "type": [
-            "array",
-            "null"
-          ],
+          "type": ["array", "null"],
           "items": {
             "type": "string"
           }
         },
         "due_at": {
           "description": "Due date.",
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "format": "date-time"
         },
         "defer_until": {
           "description": "Defer until date.",
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "format": "date-time"
         },
         "external_ref": {
           "description": "External reference (e.g., JIRA-123).",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "source_system": {
           "description": "Source system for imported issues.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "source_repo": {
           "description": "Source repository for multi-repo support — basename of the\ncanonicalized parent of `.beads/`. Stable across clones of the\nsame repo on different machines (different absolute paths\nproduce the same basename). See [`canonical_source_repo`] in\n`cli::commands::create`.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "source_repo_path": {
           "description": "Absolute canonical path of the source repository. Distinct from\n`source_repo`: this field uniquely identifies the workspace on\nthe machine that produced the issue, which is what multi-repo\nfleet automation needs to route beads back to the right\ndirectory (see beads_rust#289). Two clones of the same repo\nunder `~/Developer/foo` vs `~/Developer/scratch/foo` collide on\n`source_repo` but disagree here. Optional — older databases and\nhand-edited JSONL records without this field are valid.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "agent_context": {
           "description": "Canonical-JSON governing instructions inherited by descendant\nbeads (beads_rust#297). When set on an ancestor and the project\nhas `inherited_context.enabled = true` in `.beads/config.yaml`,\n`br update --status in_progress` / `--claim` and `br show` emit\nthe ancestor's `agent_context` alongside the child's normal\noutput so the working agent sees the constraints regardless of\ncontext compaction or cold-start lookups.\n\nStorage: TEXT column holding a JSON document (typically an\nobject with `skills`, `constraints`, `references`, `workflow`,\n`metadata` fields, but the schema is intentionally open).\n`None` means \"no inherited context\"; emission for descendants\nsilently skips ancestors with `None` (no error, no noise).\n\nNot displayed in `br list` / `br search` — this is per-bead\ngovernance metadata, not browsable content.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "deleted_at": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "format": "date-time"
         },
         "deleted_by": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "delete_reason": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "original_type": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "compaction_level": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "format": "int32",
           "default": 0
         },
         "compacted_at": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "format": "date-time"
         },
         "compacted_at_commit": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "original_size": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "format": "int32"
         },
         "sender": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "ephemeral": {
           "type": "boolean"
@@ -3279,15 +2888,7 @@
           "anyOf": [
             {
               "type": "string",
-              "enum": [
-                "task",
-                "bug",
-                "feature",
-                "epic",
-                "chore",
-                "docs",
-                "question"
-              ]
+              "enum": ["task", "bug", "feature", "epic", "chore", "docs", "question"]
             },
             {
               "type": "string"
@@ -3317,32 +2918,18 @@
             },
             "created_by": {
               "description": "Creator.",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "metadata": {
               "description": "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`].",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "thread_id": {
               "description": "Thread ID for conversation linking.",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             }
           },
-          "required": [
-            "issue_id",
-            "depends_on_id",
-            "type",
-            "created_at"
-          ]
+          "required": ["issue_id", "depends_on_id", "type", "created_at"]
         },
         "DependencyType": {
           "description": "Dependency relationship type.",
@@ -3391,13 +2978,7 @@
               "format": "date-time"
             }
           },
-          "required": [
-            "id",
-            "issue_id",
-            "author",
-            "text",
-            "created_at"
-          ]
+          "required": ["id", "issue_id", "author", "text", "created_at"]
         }
       }
     },
@@ -3417,38 +2998,23 @@
         },
         "description": {
           "description": "Detailed description.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "design": {
           "description": "Technical design notes.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "acceptance_criteria": {
           "description": "Acceptance criteria.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "prerequisites": {
           "description": "Per-issue prerequisite checklist, separate from acceptance criteria\nand dependency edges. Policy decides which transitions require it.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "notes": {
           "description": "Additional notes.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "status": {
           "description": "Workflow status.",
@@ -3467,24 +3033,15 @@
         },
         "assignee": {
           "description": "Assigned user.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "owner": {
           "description": "Issue owner.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "estimated_minutes": {
           "description": "Estimated effort in minutes.",
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "format": "int32"
         },
         "created_at": {
@@ -3494,10 +3051,7 @@
         },
         "created_by": {
           "description": "Creator username.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "updated_at": {
           "description": "Last update timestamp.",
@@ -3506,159 +3060,93 @@
         },
         "closed_at": {
           "description": "Closure timestamp.",
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "format": "date-time"
         },
         "close_reason": {
           "description": "Reason for closure.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "closed_by_session": {
           "description": "Session ID that closed this issue.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "bypassed_policy": {
           "description": "Close-policy bypass audit trail (GitHub #474). Serialized into the\nJSONL export only when the close bypassed policy so a bypassed close\nis reviewable off-machine; absent means \"not bypassed\" (pre-change\nexports stay valid). Backed by the DB-only `close_metadata` table;\nexcluded from `content_hash` and from `sync_equals`.",
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "bypass_reason": {
           "description": "Operator-supplied reason for the policy bypass (GitHub #474).",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "policy_gates_fired": {
           "description": "Names of the close-policy gates the bypass overrode (GitHub #474).",
-          "type": [
-            "array",
-            "null"
-          ],
+          "type": ["array", "null"],
           "items": {
             "type": "string"
           }
         },
         "due_at": {
           "description": "Due date.",
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "format": "date-time"
         },
         "defer_until": {
           "description": "Defer until date.",
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "format": "date-time"
         },
         "external_ref": {
           "description": "External reference (e.g., JIRA-123).",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "source_system": {
           "description": "Source system for imported issues.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "source_repo": {
           "description": "Source repository for multi-repo support — basename of the\ncanonicalized parent of `.beads/`. Stable across clones of the\nsame repo on different machines (different absolute paths\nproduce the same basename). See [`canonical_source_repo`] in\n`cli::commands::create`.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "source_repo_path": {
           "description": "Absolute canonical path of the source repository. Distinct from\n`source_repo`: this field uniquely identifies the workspace on\nthe machine that produced the issue, which is what multi-repo\nfleet automation needs to route beads back to the right\ndirectory (see beads_rust#289). Two clones of the same repo\nunder `~/Developer/foo` vs `~/Developer/scratch/foo` collide on\n`source_repo` but disagree here. Optional — older databases and\nhand-edited JSONL records without this field are valid.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "agent_context": {
           "description": "Canonical-JSON governing instructions inherited by descendant\nbeads (beads_rust#297). When set on an ancestor and the project\nhas `inherited_context.enabled = true` in `.beads/config.yaml`,\n`br update --status in_progress` / `--claim` and `br show` emit\nthe ancestor's `agent_context` alongside the child's normal\noutput so the working agent sees the constraints regardless of\ncontext compaction or cold-start lookups.\n\nStorage: TEXT column holding a JSON document (typically an\nobject with `skills`, `constraints`, `references`, `workflow`,\n`metadata` fields, but the schema is intentionally open).\n`None` means \"no inherited context\"; emission for descendants\nsilently skips ancestors with `None` (no error, no noise).\n\nNot displayed in `br list` / `br search` — this is per-bead\ngovernance metadata, not browsable content.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "deleted_at": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "format": "date-time"
         },
         "deleted_by": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "delete_reason": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "original_type": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "compaction_level": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "format": "int32",
           "default": 0
         },
         "compacted_at": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "format": "date-time"
         },
         "compacted_at_commit": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "original_size": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "format": "int32"
         },
         "sender": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "ephemeral": {
           "type": "boolean"
@@ -3700,10 +3188,7 @@
           }
         },
         "parent": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "rollup": {
           "description": "Derived parent-child subtree rollup; present only when the issue has\nlocal parent-child children (GitHub #384 phase 3).",
@@ -3773,15 +3258,7 @@
           "anyOf": [
             {
               "type": "string",
-              "enum": [
-                "task",
-                "bug",
-                "feature",
-                "epic",
-                "chore",
-                "docs",
-                "question"
-              ]
+              "enum": ["task", "bug", "feature", "epic", "chore", "docs", "question"]
             },
             {
               "type": "string"
@@ -3811,32 +3288,18 @@
             },
             "created_by": {
               "description": "Creator.",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "metadata": {
               "description": "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`].",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "thread_id": {
               "description": "Thread ID for conversation linking.",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             }
           },
-          "required": [
-            "issue_id",
-            "depends_on_id",
-            "type",
-            "created_at"
-          ]
+          "required": ["issue_id", "depends_on_id", "type", "created_at"]
         },
         "DependencyType": {
           "description": "Dependency relationship type.",
@@ -3885,13 +3348,7 @@
               "format": "date-time"
             }
           },
-          "required": [
-            "id",
-            "issue_id",
-            "author",
-            "text",
-            "created_at"
-          ]
+          "required": ["id", "issue_id", "author", "text", "created_at"]
         },
         "IssueWithDependencyMetadata": {
           "type": "object",
@@ -3912,13 +3369,7 @@
               "type": "string"
             }
           },
-          "required": [
-            "id",
-            "title",
-            "status",
-            "priority",
-            "dependency_type"
-          ]
+          "required": ["id", "title", "status", "priority", "dependency_type"]
         },
         "Event": {
           "description": "An event in the issue's history (audit log).",
@@ -3938,22 +3389,13 @@
               "type": "string"
             },
             "old_value": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "new_value": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "comment": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "created_at": {
               "type": "string",
@@ -3961,33 +3403,18 @@
             },
             "agent_name": {
               "description": "Tier 1 attribution: self-reported agent name (issue #312, Layer 3\ncapture-only). Recorded as an audit trail; never gated/enforced on.\n`None` when the mutating command supplied no attribution.",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "harness": {
               "description": "Tier 1 attribution: self-reported harness identifier (capture-only).",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "model": {
               "description": "Tier 1 attribution: self-reported model identifier (capture-only).",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             }
           },
-          "required": [
-            "id",
-            "issue_id",
-            "event_type",
-            "actor",
-            "created_at"
-          ]
+          "required": ["id", "issue_id", "event_type", "actor", "created_at"]
         },
         "EventType": {
           "type": "string"
@@ -4010,10 +3437,7 @@
               }
             }
           },
-          "required": [
-            "status",
-            "descendants"
-          ]
+          "required": ["status", "descendants"]
         },
         "AcceptanceItem": {
           "description": "One checklist item of an acceptance-criteria field.",
@@ -4034,11 +3458,7 @@
               "type": "boolean"
             }
           },
-          "required": [
-            "index",
-            "text",
-            "checked"
-          ]
+          "required": ["index", "text", "checked"]
         },
         "InheritedBlock": {
           "description": "One ancestor block in the inherited-context emission.",
@@ -4065,13 +3485,7 @@
               "type": "string"
             }
           },
-          "required": [
-            "source_id",
-            "source_role",
-            "source_title",
-            "field_used",
-            "content"
-          ]
+          "required": ["source_id", "source_role", "source_title", "field_used", "content"]
         }
       }
     },
@@ -4091,38 +3505,23 @@
         },
         "description": {
           "description": "Detailed description.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "design": {
           "description": "Technical design notes.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "acceptance_criteria": {
           "description": "Acceptance criteria.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "prerequisites": {
           "description": "Per-issue prerequisite checklist, separate from acceptance criteria\nand dependency edges. Policy decides which transitions require it.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "notes": {
           "description": "Additional notes.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "status": {
           "description": "Workflow status.",
@@ -4141,24 +3540,15 @@
         },
         "assignee": {
           "description": "Assigned user.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "owner": {
           "description": "Issue owner.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "estimated_minutes": {
           "description": "Estimated effort in minutes.",
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "format": "int32"
         },
         "created_at": {
@@ -4168,10 +3558,7 @@
         },
         "created_by": {
           "description": "Creator username.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "updated_at": {
           "description": "Last update timestamp.",
@@ -4180,159 +3567,93 @@
         },
         "closed_at": {
           "description": "Closure timestamp.",
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "format": "date-time"
         },
         "close_reason": {
           "description": "Reason for closure.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "closed_by_session": {
           "description": "Session ID that closed this issue.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "bypassed_policy": {
           "description": "Close-policy bypass audit trail (GitHub #474). Serialized into the\nJSONL export only when the close bypassed policy so a bypassed close\nis reviewable off-machine; absent means \"not bypassed\" (pre-change\nexports stay valid). Backed by the DB-only `close_metadata` table;\nexcluded from `content_hash` and from `sync_equals`.",
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "bypass_reason": {
           "description": "Operator-supplied reason for the policy bypass (GitHub #474).",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "policy_gates_fired": {
           "description": "Names of the close-policy gates the bypass overrode (GitHub #474).",
-          "type": [
-            "array",
-            "null"
-          ],
+          "type": ["array", "null"],
           "items": {
             "type": "string"
           }
         },
         "due_at": {
           "description": "Due date.",
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "format": "date-time"
         },
         "defer_until": {
           "description": "Defer until date.",
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "format": "date-time"
         },
         "external_ref": {
           "description": "External reference (e.g., JIRA-123).",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "source_system": {
           "description": "Source system for imported issues.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "source_repo": {
           "description": "Source repository for multi-repo support — basename of the\ncanonicalized parent of `.beads/`. Stable across clones of the\nsame repo on different machines (different absolute paths\nproduce the same basename). See [`canonical_source_repo`] in\n`cli::commands::create`.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "source_repo_path": {
           "description": "Absolute canonical path of the source repository. Distinct from\n`source_repo`: this field uniquely identifies the workspace on\nthe machine that produced the issue, which is what multi-repo\nfleet automation needs to route beads back to the right\ndirectory (see beads_rust#289). Two clones of the same repo\nunder `~/Developer/foo` vs `~/Developer/scratch/foo` collide on\n`source_repo` but disagree here. Optional — older databases and\nhand-edited JSONL records without this field are valid.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "agent_context": {
           "description": "Canonical-JSON governing instructions inherited by descendant\nbeads (beads_rust#297). When set on an ancestor and the project\nhas `inherited_context.enabled = true` in `.beads/config.yaml`,\n`br update --status in_progress` / `--claim` and `br show` emit\nthe ancestor's `agent_context` alongside the child's normal\noutput so the working agent sees the constraints regardless of\ncontext compaction or cold-start lookups.\n\nStorage: TEXT column holding a JSON document (typically an\nobject with `skills`, `constraints`, `references`, `workflow`,\n`metadata` fields, but the schema is intentionally open).\n`None` means \"no inherited context\"; emission for descendants\nsilently skips ancestors with `None` (no error, no noise).\n\nNot displayed in `br list` / `br search` — this is per-bead\ngovernance metadata, not browsable content.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "deleted_at": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "format": "date-time"
         },
         "deleted_by": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "delete_reason": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "original_type": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "compaction_level": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "format": "int32",
           "default": 0
         },
         "compacted_at": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "format": "date-time"
         },
         "compacted_at_commit": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "original_size": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "format": "int32"
         },
         "sender": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "ephemeral": {
           "type": "boolean"
@@ -4416,15 +3737,7 @@
           "anyOf": [
             {
               "type": "string",
-              "enum": [
-                "task",
-                "bug",
-                "feature",
-                "epic",
-                "chore",
-                "docs",
-                "question"
-              ]
+              "enum": ["task", "bug", "feature", "epic", "chore", "docs", "question"]
             },
             {
               "type": "string"
@@ -4454,32 +3767,18 @@
             },
             "created_by": {
               "description": "Creator.",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "metadata": {
               "description": "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`].",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "thread_id": {
               "description": "Thread ID for conversation linking.",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             }
           },
-          "required": [
-            "issue_id",
-            "depends_on_id",
-            "type",
-            "created_at"
-          ]
+          "required": ["issue_id", "depends_on_id", "type", "created_at"]
         },
         "DependencyType": {
           "description": "Dependency relationship type.",
@@ -4528,13 +3827,7 @@
               "format": "date-time"
             }
           },
-          "required": [
-            "id",
-            "issue_id",
-            "author",
-            "text",
-            "created_at"
-          ]
+          "required": ["id", "issue_id", "author", "text", "created_at"]
         }
       }
     },
@@ -4545,44 +3838,26 @@
       "type": "object",
       "properties": {
         "acceptance_criteria": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "prerequisites": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "assignee": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "created_at": {
           "type": "string",
           "format": "date-time"
         },
         "created_by": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "description": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "estimated_minutes": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "format": "int32"
         },
         "id": {
@@ -4599,16 +3874,10 @@
           }
         },
         "notes": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "owner": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "priority": {
           "$ref": "#/$defs/Priority"
@@ -4640,15 +3909,7 @@
           "anyOf": [
             {
               "type": "string",
-              "enum": [
-                "task",
-                "bug",
-                "feature",
-                "epic",
-                "chore",
-                "docs",
-                "question"
-              ]
+              "enum": ["task", "bug", "feature", "epic", "chore", "docs", "question"]
             },
             {
               "type": "string"
@@ -4776,10 +4037,7 @@
           }
         },
         "receipt_id": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         }
       },
       "required": [
@@ -4813,10 +4071,7 @@
               "type": "string"
             },
             "from_status": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "to_status": {
               "type": "string"
@@ -4832,29 +4087,20 @@
             },
             "scope_key": {
               "description": "Partition key within a non-repository scope (GitHub #384 phase 5).\nAbsent for repository-scope evidence, keeping the pre-scope shape\nbyte-stable.",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "counting_mode": {
               "type": "string"
             },
             "aggregate_parents_excluded": {
               "description": "Prospective active issues excluded from the count as hierarchy\naggregates (`leaf_work`/`roots` only; absent under `all`/`weighted`).",
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": ["integer", "null"],
               "format": "uint32",
               "minimum": 0
             },
             "exempt": {
               "description": "Prospective occupancy excluded because the issues hold active,\nauthorized exemptions for this capacity (absent when zero, keeping\nthe pre-exemption evidence shape byte-stable). Same unit as\n`current`/`prospective`: issue counts, or weights under `weighted`.",
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": ["integer", "null"],
               "format": "uint32",
               "minimum": 0
             },
@@ -4874,10 +4120,7 @@
               "minimum": 0
             },
             "hard_limit": {
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": ["integer", "null"],
               "format": "uint32",
               "minimum": 0
             },
@@ -4932,36 +4175,17 @@
           "format": "date-time"
         },
         "assignee": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         }
       },
-      "required": [
-        "created_at",
-        "id",
-        "issue_type",
-        "priority",
-        "status",
-        "title",
-        "updated_at"
-      ],
+      "required": ["created_at", "id", "issue_type", "priority", "status", "title", "updated_at"],
       "$defs": {
         "IssueType": {
           "description": "Issue type category.",
           "anyOf": [
             {
               "type": "string",
-              "enum": [
-                "task",
-                "bug",
-                "feature",
-                "epic",
-                "chore",
-                "docs",
-                "question"
-              ]
+              "enum": ["task", "bug", "feature", "epic", "chore", "docs", "question"]
             },
             {
               "type": "string"
@@ -5029,9 +4253,7 @@
           }
         }
       },
-      "required": [
-        "summary"
-      ],
+      "required": ["summary"],
       "$defs": {
         "StatsSummary": {
           "description": "Summary statistics for the project.",
@@ -5093,10 +4315,7 @@
               "minimum": 0
             },
             "average_lead_time_hours": {
-              "type": [
-                "number",
-                "null"
-              ],
+              "type": ["number", "null"],
               "format": "double"
             }
           },
@@ -5128,10 +4347,7 @@
               }
             }
           },
-          "required": [
-            "dimension",
-            "counts"
-          ]
+          "required": ["dimension", "counts"]
         },
         "BreakdownEntry": {
           "description": "A single entry in a breakdown.",
@@ -5146,10 +4362,7 @@
               "minimum": 0
             }
           },
-          "required": [
-            "key",
-            "count"
-          ]
+          "required": ["key", "count"]
         },
         "RecentActivity": {
           "description": "Recent activity statistics from git history.",
@@ -5219,10 +4432,7 @@
             },
             "scope_key": {
               "description": "Partition key within a non-repository scope.",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "counted": {
               "description": "Occupancy excluding exemptions (and hierarchy aggregates).",
@@ -5232,46 +4442,31 @@
             },
             "aggregate_parents_excluded": {
               "description": "Active issues excluded as hierarchy aggregates (`leaf_work`/`roots`).",
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": ["integer", "null"],
               "format": "uint32",
               "minimum": 0
             },
             "exempt": {
               "description": "Occupancy excluded by active, authorized exemptions.",
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": ["integer", "null"],
               "format": "uint32",
               "minimum": 0
             },
             "soft_limit": {
               "description": "Advisory threshold, if configured.",
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": ["integer", "null"],
               "format": "uint32",
               "minimum": 0
             },
             "hard_limit": {
               "description": "Enforced threshold, if configured.",
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": ["integer", "null"],
               "format": "uint32",
               "minimum": 0
             },
             "remaining": {
               "description": "`hard_limit - counted`, clamped at zero; absent without a hard limit.",
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": ["integer", "null"],
               "format": "uint32",
               "minimum": 0
             },
@@ -5288,15 +4483,7 @@
               "type": "string"
             }
           },
-          "required": [
-            "name",
-            "kind",
-            "scope",
-            "counted",
-            "state",
-            "counting_mode",
-            "policy_path"
-          ]
+          "required": ["name", "kind", "scope", "counted", "state", "counting_mode", "policy_path"]
         }
       }
     },
@@ -5411,13 +4598,7 @@
               "minimum": 0
             }
           },
-          "required": [
-            "record_count",
-            "ephemeral_skipped",
-            "content_hash",
-            "mtime",
-            "size_bytes"
-          ]
+          "required": ["record_count", "ephemeral_skipped", "content_hash", "mtime", "size_bytes"]
         },
         "ReconcileTargetWitness": {
           "description": "Database-side witness in a reconcile receipt.",
@@ -5434,10 +4615,7 @@
               "type": "boolean"
             }
           },
-          "required": [
-            "db_issue_count",
-            "stored_hash_matches_jsonl"
-          ]
+          "required": ["db_issue_count", "stored_hash_matches_jsonl"]
         },
         "ReconcilePlanCounts": {
           "description": "Row classification counts in a reconcile receipt.",
@@ -5528,12 +4706,7 @@
               "minimum": 0
             }
           },
-          "required": [
-            "created_ids",
-            "updated_ids",
-            "db_only_ids",
-            "preview_limit"
-          ]
+          "required": ["created_ids", "updated_ids", "db_only_ids", "preview_limit"]
         },
         "ReconcileRelationCounts": {
           "description": "Relation rows carried by planned create/update rows.",
@@ -5558,11 +4731,7 @@
               "minimum": 0
             }
           },
-          "required": [
-            "labels",
-            "dependencies",
-            "comments"
-          ]
+          "required": ["labels", "dependencies", "comments"]
         },
         "ReconcileApplyReceipt": {
           "description": "Apply-only block of a reconcile receipt.",
@@ -5641,10 +4810,7 @@
         },
         "parent_id": {
           "description": "Parent node issue ID, or null for the root.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "priority": {
           "description": "Numeric issue priority used for sibling sorting.",
@@ -5660,15 +4826,7 @@
           "type": "boolean"
         }
       },
-      "required": [
-        "id",
-        "title",
-        "depth",
-        "parent_id",
-        "priority",
-        "status",
-        "truncated"
-      ]
+      "required": ["id", "title", "depth", "parent_id", "priority", "status", "truncated"]
     },
     "VcsExportStatus": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -5709,10 +4867,7 @@
           "minimum": 0
         },
         "reason": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "object_format": {
           "anyOf": [
@@ -5725,10 +4880,7 @@
           ]
         },
         "tracked": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "head": {
           "anyOf": [
@@ -5751,19 +4903,13 @@
           ]
         },
         "unmerged_index_stages": {
-          "type": [
-            "array",
-            "null"
-          ],
+          "type": ["array", "null"],
           "items": {
             "$ref": "#/$defs/GitIndexStage"
           }
         },
         "index_clean": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "worktree_state": {
           "anyOf": [
@@ -5776,28 +4922,16 @@
           ]
         },
         "worktree_clean": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "worktree_comparison_reason": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "worktree_raw_git_blob_hash": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "worktree_raw_sha256": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         }
       },
       "required": [
@@ -5815,10 +4949,7 @@
         "GitObjectFormat": {
           "description": "Object format used by the selected Git repository.",
           "type": "string",
-          "enum": [
-            "sha1",
-            "sha256"
-          ]
+          "enum": ["sha1", "sha256"]
         },
         "GitPathIdentity": {
           "description": "Exact identity of one path in a Git tree or stage-zero index entry.",
@@ -5834,11 +4965,7 @@
               "type": "string"
             }
           },
-          "required": [
-            "mode",
-            "object_type",
-            "object_id"
-          ]
+          "required": ["mode", "object_type", "object_id"]
         },
         "GitIndexStage": {
           "description": "Exact identity of one unmerged index stage.",
@@ -5860,12 +4987,7 @@
               "type": "string"
             }
           },
-          "required": [
-            "stage",
-            "mode",
-            "object_type",
-            "object_id"
-          ]
+          "required": ["stage", "mode", "object_type", "object_id"]
         },
         "WorktreeState": {
           "description": "Relationship between the securely captured JSONL leaf and the Git index.",

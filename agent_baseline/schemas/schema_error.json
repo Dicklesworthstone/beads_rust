@@ -11,9 +11,7 @@
           "$ref": "#/$defs/ErrorBody"
         }
       },
-      "required": [
-        "error"
-      ],
+      "required": ["error"],
       "$defs": {
         "ErrorBody": {
           "type": "object",
@@ -28,10 +26,7 @@
             },
             "hint": {
               "description": "Optional hint for remediation",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "retryable": {
               "description": "Whether the operation can be retried",
@@ -41,13 +36,7 @@
               "description": "Additional context for debugging (arbitrary JSON)"
             }
           },
-          "required": [
-            "code",
-            "message",
-            "hint",
-            "retryable",
-            "context"
-          ]
+          "required": ["code", "message", "hint", "retryable", "context"]
         }
       }
     }

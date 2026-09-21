@@ -11,9 +11,7 @@
     "updated_at": "2026-01-19T22:12:49.050007668Z",
     "compaction_level": 0,
     "original_size": 0,
-    "labels": [
-      "auth"
-    ],
+    "labels": ["auth"],
     "dependencies": [
       {
         "id": "bd-2h0",
@@ -60,9 +58,7 @@
     "updated_at": "2026-01-19T22:12:49.022237331Z",
     "compaction_level": 0,
     "original_size": 0,
-    "labels": [
-      "critical"
-    ],
+    "labels": ["critical"],
     "dependents": [
       {
         "id": "bd-2cr",

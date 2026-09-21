@@ -18,9 +18,7 @@
       "homepage": "https://github.com/Dicklesworthstone/beads_rust#readme",
       "repository": "https://github.com/Dicklesworthstone/beads_rust",
       "license": "MIT",
-      "skills": [
-        "./.claude/skills/"
-      ],
+      "skills": ["./.claude/skills/"],
       "category": "productivity",
       "keywords": [
         "beads",
@@ -31,11 +29,7 @@
         "jsonl",
         "agent-workflow"
       ],
-      "tags": [
-        "issue-tracking",
-        "task-management",
-        "agent-workflow"
-      ]
+      "tags": ["issue-tracking", "task-management", "agent-workflow"]
     }
   ]
 }

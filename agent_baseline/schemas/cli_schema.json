@@ -12,10 +12,7 @@
       "docs/agent/ERRORS.md",
       "docs/agent/EXAMPLES.md"
     ],
-    "deep_docs": [
-      "docs/CLI_REFERENCE.md",
-      "docs/AGENT_INTEGRATION.md"
-    ]
+    "deep_docs": ["docs/CLI_REFERENCE.md", "docs/AGENT_INTEGRATION.md"]
   },
   "global_flags": [
     {
@@ -36,21 +33,11 @@
   ],
   "format_env": {
     "BR_OUTPUT_FORMAT": {
-      "values": [
-        "text",
-        "json",
-        "toon",
-        "csv"
-      ],
+      "values": ["text", "json", "toon", "csv"],
       "notes": "Highest precedence default output format when --format/--json not provided."
     },
     "TOON_DEFAULT_FORMAT": {
-      "values": [
-        "text",
-        "json",
-        "toon",
-        "csv"
-      ],
+      "values": ["text", "json", "toon", "csv"],
       "notes": "Fallback default output format when BR_OUTPUT_FORMAT is not set."
     }
   },

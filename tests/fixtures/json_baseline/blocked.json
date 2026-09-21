@@ -1,8 +1,6 @@
 [
   {
-    "blocked_by": [
-      "bd-2h0"
-    ],
+    "blocked_by": ["bd-2h0"],
     "blocked_by_count": 1,
     "created_at": "2026-01-19T22:12:48.942352085Z",
     "created_by": "ubuntu",
@@ -15,9 +13,7 @@
     "updated_at": "2026-01-19T22:12:49.050007668Z"
   },
   {
-    "blocked_by": [
-      "bd-2cr"
-    ],
+    "blocked_by": ["bd-2cr"],
     "blocked_by_count": 1,
     "created_at": "2026-01-19T22:12:48.947742183Z",
     "created_by": "ubuntu",
