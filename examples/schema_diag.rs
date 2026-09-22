@@ -30,7 +30,9 @@ fn rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
 }
 
 fn main() {
-    let db = std::env::args().nth(1).expect("usage: schema_diag <db-copy>");
+    let db = std::env::args()
+        .nth(1)
+        .expect("usage: schema_diag <db-copy>");
     let conn = Connection::open(&db).expect("open");
 
     println!("==== versions ====");
@@ -42,5 +44,8 @@ fn main() {
     }
 
     println!("==== runtime index contract diagnostics ====");
-    print!("{}", beads_rust::storage::schema::runtime_index_diagnostics(&conn));
+    print!(
+        "{}",
+        beads_rust::storage::schema::runtime_index_diagnostics(&conn)
+    );
 }
