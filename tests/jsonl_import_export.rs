@@ -589,8 +589,10 @@ fn import_deduplicates_export_hash_rebuild_when_multiple_records_target_same_iss
     by_external_ref.updated_at = base_time + Duration::minutes(10);
     by_external_ref.external_ref = Some("EXT-1".to_string());
 
+    // A later version of the existing issue keeps its creation time; a
+    // different `created_at` under the same id is a different issue (#512).
     let mut by_id = issue_with_id("test-existing", "Final update");
-    by_id.created_at = base_time + Duration::minutes(15);
+    by_id.created_at = base_time;
     by_id.updated_at = base_time + Duration::minutes(20);
 
     let json = format!(

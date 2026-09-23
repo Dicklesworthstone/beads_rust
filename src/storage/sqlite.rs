@@ -8244,7 +8244,8 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_all_issues_metadata(&self) -> Result<Vec<IssueMetadata>> {
-        let sql = "SELECT id, external_ref, content_hash, updated_at, status FROM issues";
+        let sql =
+            "SELECT id, external_ref, content_hash, updated_at, status, created_at FROM issues";
         let rows = self.conn.query(sql)?;
         let mut metas = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -8263,6 +8264,9 @@ impl SqliteStorage {
                 .map(str::to_string);
             let updated_at = parse_datetime_value(row.get(3))?;
             let status = parse_status(row.get(4).and_then(SqliteValue::as_text));
+            // Only used to tell two issues sharing an id apart (GitHub #512);
+            // an unparseable legacy value just disables that check.
+            let created_at = parse_datetime_value(row.get(5)).ok();
 
             metas.push(IssueMetadata {
                 id,
@@ -8270,6 +8274,7 @@ impl SqliteStorage {
                 content_hash,
                 updated_at,
                 status,
+                created_at,
             });
         }
         Ok(metas)
@@ -18580,6 +18585,8 @@ pub struct IssueMetadata {
     pub content_hash: Option<String>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub status: crate::model::Status,
+    /// Creation time; `None` when the stored value cannot be parsed.
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Sort policy for ready issues.

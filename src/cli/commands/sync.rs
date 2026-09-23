@@ -1396,9 +1396,13 @@ fn render_deferred_sync_output(output: DeferredSyncOutput, ctx: &OutputContext) 
                     "conflicts": report.conflicts.len(),
                     "resolution": resolution,
                     "notes": report.notes,
+                    "id_collisions": report.id_collisions,
                     "warnings": capacity_warnings,
                 }));
             } else if should_render_human_sync_output(ctx, use_json) {
+                for collision in &report.id_collisions {
+                    ctx.warning(&id_collision_warning(collision));
+                }
                 if ctx.is_rich() {
                     render_merge_result_rich(&report, ctx);
                 } else {
@@ -5556,6 +5560,28 @@ fn render_merge_conflicts_rich(
         .title(Text::new("Merge Conflicts"))
         .box_style(theme.box_style);
     console.print_renderable(&panel);
+}
+
+/// One loud line per id that two clones minted for different issues (#512).
+fn id_collision_warning(collision: &crate::sync::IdCollision) -> String {
+    let side = |side: crate::sync::MergeSide| match side {
+        crate::sync::MergeSide::Local => "local database",
+        crate::sync::MergeSide::External => "JSONL",
+    };
+    let id = &collision.id;
+    let kept = side(collision.kept_side);
+    let moved = side(collision.relocated_side);
+    let title = sanitize_terminal_inline(&collision.relocated_title);
+    let new_id = &collision.relocated_id;
+    if collision.already_relocated {
+        format!(
+            "ID collision: {id} named two different issues. Kept the {kept} issue as {id}; the {moved} issue \"{title}\" was already renumbered to {new_id} by another clone and was merged there."
+        )
+    } else {
+        format!(
+            "ID collision: {id} named two different issues. Kept the {kept} issue as {id} and renumbered the {moved} issue \"{title}\" to {new_id}; update any external references to {id} that meant it."
+        )
+    }
 }
 
 /// Render merge result with rich formatting.

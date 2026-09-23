@@ -13723,6 +13723,11 @@ pub enum MatchType {
     ContentHash,
     /// Matched by ID.
     Id,
+    /// The ID is taken locally by a different issue (different `created_at`)
+    /// that the JSONL carries under another ID: another clone already
+    /// relocated it after an ID collision (GitHub #512), so the JSONL row
+    /// replaces the local row at this ID.
+    DisplacedId,
 }
 
 /// Result of collision detection.
@@ -13793,6 +13798,88 @@ fn detect_collision(
     CollisionResult::NewIssue
 }
 
+/// `detect_collision` plus the issue-identity checks an import needs when
+/// two clones minted the same ID for different issues (GitHub #512).
+///
+/// An issue's `created_at` never changes, so a JSONL row whose ID matches a
+/// local row with a different `created_at` is a different issue:
+/// - if the JSONL also carries the local issue (same creation time, creator,
+///   and title) under another ID, the collision was already resolved
+///   elsewhere and the JSONL row replaces the local one
+///   ([`MatchType::DisplacedId`]);
+/// - otherwise importing would discard one of the two issues, so the import
+///   is refused and `br sync --merge` (which keeps both) is suggested.
+///
+/// A content-hash match is also dropped when the JSONL gives the matched ID
+/// to a different issue, so a relocated issue is not folded back onto its
+/// old ID.
+fn detect_import_collision(
+    incoming: &Issue,
+    metadata: &ImportMetadataMaps,
+    computed_hash: &str,
+) -> Result<CollisionResult> {
+    let collision = detect_collision(
+        incoming,
+        &metadata.id_by_ext_ref,
+        &metadata.id_by_hash,
+        &metadata.meta_by_id,
+        computed_hash,
+    );
+    let Some(identity) = metadata.incoming_identity.as_ref() else {
+        return Ok(collision);
+    };
+    let CollisionResult::Match {
+        existing_id,
+        match_type,
+        ..
+    } = &collision
+    else {
+        return Ok(collision);
+    };
+    let Some(local_created_at) = metadata
+        .meta_by_id
+        .get(existing_id)
+        .and_then(|meta| meta.created_at)
+    else {
+        return Ok(collision);
+    };
+
+    match match_type {
+        MatchType::Id if local_created_at != incoming.created_at => {
+            if identity
+                .displaced
+                .get(existing_id)
+                .copied()
+                .unwrap_or(false)
+            {
+                return Ok(CollisionResult::Match {
+                    existing_id: existing_id.clone(),
+                    match_type: MatchType::DisplacedId,
+                    phase: 2,
+                });
+            }
+            Err(BeadsError::SyncConflict {
+                message: format!(
+                    "ID collision: JSONL issue {id} (created {incoming_created}) is a different issue than local {id} (created {local_created}), and the JSONL does not contain the local one. Importing would discard one of them; run `br sync --merge` to keep both.",
+                    id = existing_id,
+                    incoming_created = incoming.created_at.to_rfc3339(),
+                    local_created = local_created_at.to_rfc3339(),
+                ),
+            })
+        }
+        MatchType::ContentHash
+            if existing_id != &incoming.id
+                && identity
+                    .created_at_by_id
+                    .get(existing_id)
+                    .is_some_and(|jsonl_created_at| *jsonl_created_at != local_created_at) =>
+        {
+            Ok(CollisionResult::NewIssue)
+        }
+        _ => Ok(collision),
+    }
+}
+
 /// Determine the action to take based on collision result.
 fn determine_action(
     collision: &CollisionResult,
@@ -13802,6 +13889,13 @@ fn determine_action(
 ) -> Result<CollisionAction> {
     match collision {
         CollisionResult::NewIssue => Ok(CollisionAction::Insert),
+        CollisionResult::Match {
+            existing_id,
+            match_type: MatchType::DisplacedId,
+            ..
+        } => Ok(CollisionAction::Update {
+            existing_id: existing_id.clone(),
+        }),
         CollisionResult::Match { existing_id, .. } => {
             let existing_meta =
                 meta_by_id
@@ -13981,12 +14075,112 @@ struct ImportValidationPlan {
     record_count: usize,
     prefix_mismatches: Vec<PrefixRenameSeed>,
     occupied_ids: HashSet<String>,
+    identity: IncomingIssueIdentity,
+}
+
+/// What the JSONL says about issue identity, used to tell two issues that
+/// share an ID apart (GitHub #512).
+#[derive(Debug, Default)]
+struct IncomingIssueIdentity {
+    /// `created_at` of every JSONL row, by ID.
+    created_at_by_id: HashMap<String, DateTime<Utc>>,
+    /// [`issue_identity_fingerprint`] of every JSONL row -> the first ID
+    /// carrying it.
+    fingerprints: HashMap<u64, String>,
+    /// Local IDs that the JSONL gives to a different issue, mapped to whether
+    /// the JSONL still carries the unchanged local issue under another ID.
+    displaced: HashMap<String, bool>,
+}
+
+impl IncomingIssueIdentity {
+    /// Classify every local ID the JSONL assigns to a different issue. Only
+    /// those (rare) rows are loaded in full, and the JSONL is re-read only
+    /// when one of them may have been relocated.
+    fn resolve_displaced(
+        &mut self,
+        storage: &SqliteStorage,
+        meta_by_id: &HashMap<String, crate::storage::sqlite::IssueMetadata>,
+        source: &JsonlSourceSnapshot,
+    ) -> Result<()> {
+        let mut suspects = self
+            .created_at_by_id
+            .iter()
+            .filter(|(id, jsonl_created_at)| {
+                meta_by_id
+                    .get(*id)
+                    .and_then(|meta| meta.created_at)
+                    .is_some_and(|local_created_at| local_created_at != **jsonl_created_at)
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        suspects.sort();
+
+        // Local ID -> (JSONL ID with the same identity, local content hash).
+        let mut candidates = HashMap::new();
+        for id in suspects {
+            self.displaced.insert(id.clone(), false);
+            let Some(local) = storage.get_issue(&id)? else {
+                continue;
+            };
+            let fingerprint = issue_identity_fingerprint(
+                local.created_at,
+                local.created_by.as_deref(),
+                &local.title,
+            );
+            if let Some(jsonl_id) = self.fingerprints.get(&fingerprint) {
+                candidates.insert(id, (jsonl_id.clone(), crate::util::content_hash(&local)));
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        // Only an unchanged copy may replace the local row; a copy that
+        // differs is left to `br sync --merge`, which merges the two.
+        let wanted = candidates
+            .values()
+            .map(|(jsonl_id, _)| jsonl_id.clone())
+            .collect::<HashSet<_>>();
+        let mut jsonl_hashes = HashMap::new();
+        for_each_jsonl_import_issue(source, |_line_num, issue, _| {
+            if wanted.contains(&issue.id) {
+                jsonl_hashes.insert(issue.id.clone(), crate::util::content_hash(&issue));
+            }
+            Ok(())
+        })?;
+        for (id, (jsonl_id, local_hash)) in candidates {
+            if jsonl_hashes.get(&jsonl_id) == Some(&local_hash) {
+                self.displaced.insert(id, true);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Identity of an issue independent of its ID: bulk creation can give many
+/// issues one `created_at`, so the creator and title are included.
+fn issue_identity_fingerprint(
+    created_at: DateTime<Utc>,
+    created_by: Option<&str>,
+    title: &str,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    created_at.hash(&mut hasher);
+    created_by
+        .filter(|creator| !creator.is_empty())
+        .hash(&mut hasher);
+    title.hash(&mut hasher);
+    hasher.finish()
 }
 
 struct ImportMetadataMaps {
     meta_by_id: HashMap<String, crate::storage::sqlite::IssueMetadata>,
     id_by_ext_ref: HashMap<String, String>,
     id_by_hash: HashMap<String, String>,
+    /// `Some` for imports; enables the ID-collision checks in
+    /// `detect_import_collision`.
+    incoming_identity: Option<IncomingIssueIdentity>,
 }
 
 #[derive(Debug, Default)]
@@ -14081,6 +14275,19 @@ fn collect_import_validation_plan(
         // Same-issue duplicates are still rejected by
         // `validate_import_comments_for_issue`.
 
+        plan.identity
+            .fingerprints
+            .entry(issue_identity_fingerprint(
+                issue.created_at,
+                issue.created_by.as_deref(),
+                &issue.title,
+            ))
+            .or_insert_with(|| issue.id.clone());
+        if !prefix_mismatch {
+            plan.identity
+                .created_at_by_id
+                .insert(issue.id.clone(), issue.created_at);
+        }
         if prefix_mismatch {
             plan.prefix_mismatches.push(PrefixRenameSeed {
                 old_id: issue.id,
@@ -14261,6 +14468,7 @@ fn load_import_metadata_maps(storage: &SqliteStorage) -> Result<ImportMetadataMa
         meta_by_id,
         id_by_ext_ref,
         id_by_hash,
+        incoming_identity: None,
     })
 }
 
@@ -14315,13 +14523,7 @@ fn scan_import_collision_renames(
         handle_duplicate_external_ref(&mut issue, &mut seen_external_refs, config)?;
 
         let computed_hash = crate::util::content_hash(&issue);
-        let collision = detect_collision(
-            &issue,
-            &metadata.id_by_ext_ref,
-            &metadata.id_by_hash,
-            &metadata.meta_by_id,
-            &computed_hash,
-        );
+        let collision = detect_import_collision(&issue, metadata, &computed_hash)?;
         let action = determine_action(
             &collision,
             &issue,
@@ -14489,13 +14691,7 @@ fn stream_import_actions_in_tx(
             handle_duplicate_external_ref(&mut issue, &mut seen_external_refs, config)?;
 
             let computed_hash = crate::util::content_hash(&issue);
-            let collision = detect_collision(
-                &issue,
-                &metadata.id_by_ext_ref,
-                &metadata.id_by_hash,
-                &metadata.meta_by_id,
-                &computed_hash,
-            );
+            let collision = detect_import_collision(&issue, metadata, &computed_hash)?;
             let action = determine_action(
                 &collision,
                 &issue,
@@ -14849,7 +15045,10 @@ fn import_from_jsonl_snapshot_impl(
     };
 
     // Preload metadata for O(1) collision detection while streaming the input.
-    let metadata = load_import_metadata_maps(storage)?;
+    let mut metadata = load_import_metadata_maps(storage)?;
+    let mut identity = validation_plan.identity;
+    identity.resolve_displaced(storage, &metadata.meta_by_id, source)?;
+    metadata.incoming_identity = Some(identity);
 
     // Phase 1: Scan and Resolve IDs
     let collision_plan = scan_import_collision_renames(
@@ -15812,6 +16011,44 @@ pub struct MergeReport {
     pub tombstone_protected: Vec<String>,
     /// Notes about merge decisions.
     pub notes: Vec<(String, String)>,
+    /// Issue ids that two clones minted independently for different issues.
+    /// Both issues are kept; see [`IdCollision`] (GitHub #512).
+    pub id_collisions: Vec<IdCollision>,
+}
+
+/// Which side of a three-way merge an issue version came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeSide {
+    /// The local `SQLite` database.
+    Local,
+    /// The external JSONL file.
+    External,
+}
+
+/// One issue id that the local database and the JSONL use for two different
+/// issues (different `created_at`), typically `<parent>.N` child ids minted
+/// by two clones from their own per-database child counters (GitHub #512).
+///
+/// The merge never picks one of them: the issue created first keeps the id and
+/// the other one is kept under `relocated_id`, together with its labels,
+/// dependencies, and comments.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IdCollision {
+    /// The id both issues were published under.
+    pub id: String,
+    /// Side whose issue keeps `id` (the earlier `created_at`).
+    pub kept_side: MergeSide,
+    /// Side whose issue moved to `relocated_id`.
+    pub relocated_side: MergeSide,
+    /// The id that now holds the relocated issue.
+    pub relocated_id: String,
+    /// Title of the relocated issue.
+    pub relocated_title: String,
+    /// True when the other side already carried the relocated issue under
+    /// `relocated_id` (another clone resolved the same collision first), so
+    /// no new id was minted and the two copies were merged instead.
+    pub already_relocated: bool,
 }
 
 impl MergeReport {
@@ -16045,13 +16282,70 @@ pub fn three_way_merge(
     let empty_tombstones: HashSet<String, RandomState> = HashSet::new();
     let tombstones = tombstones.unwrap_or(&empty_tombstones);
 
+    // Two issues published under one id are two issues, not two versions of
+    // one issue (GitHub #512). Re-key the loser before merging so neither side
+    // can silently replace the other.
+    let plan = plan_id_collisions(context);
+    let rekeyed;
+    let remapped_tombstones: HashSet<String, RandomState>;
+    let (context, tombstones) = if let Some(plan) = plan {
+        remapped_tombstones = tombstones
+            .iter()
+            .map(|id| plan.local_renames.get(id).unwrap_or(id).clone())
+            .collect();
+        rekeyed = plan.rekey(context);
+        report.id_collisions = plan.collisions;
+        report.conflicts.extend(plan.unresolved);
+        (&rekeyed, &remapped_tombstones)
+    } else {
+        (context, tombstones)
+    };
+    let collided_ids = report
+        .id_collisions
+        .iter()
+        .map(|collision| collision.id.clone())
+        .collect::<HashSet<_>>();
+    // Ids no free id could be minted for stay reported as conflicts; never
+    // let a strategy pick one of the two issues.
+    let unresolved_ids = report
+        .conflicts
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<HashSet<_>>();
+
     for id in context.all_issue_ids() {
+        if unresolved_ids.contains(&id) {
+            continue;
+        }
         let base = context.base.get(&id);
         let left = context.left.get(&id);
         let right = context.right.get(&id);
 
-        // Check tombstone protection: if issue is tombstoned and trying to resurrect
-        if tombstones.contains(&id) {
+        // Comments are append-only, so a comment present on either side is
+        // kept: a side that lacks it never saw it rather than deleted it.
+        let with_union = left
+            .zip(right)
+            .and_then(|(left, right)| union_comments_if_diverged(base, left, right));
+        // A record whose comments were combined is a new revision of both
+        // inputs. Make it strictly newer than either so a clone that later
+        // imports the merged JSONL (last-write-wins) takes it instead of
+        // keeping its own copy that lacks the other side's comments.
+        let union_revision_at = with_union.as_ref().and_then(|_| {
+            let (left, right) = left.zip(right)?;
+            left.updated_at
+                .max(right.updated_at)
+                .checked_add_signed(chrono::Duration::microseconds(1))
+        });
+        let (base, left, right) = with_union
+            .as_ref()
+            .map_or((base, left, right), |(base, left, right)| {
+                (base.as_ref(), Some(left), Some(right))
+            });
+
+        // Check tombstone protection: if issue is tombstoned and trying to resurrect.
+        // A collided id holds a different issue than the tombstone that
+        // moved away, so it is not a resurrection.
+        if tombstones.contains(&id) && !collided_ids.contains(&id) {
             let local_tombstone =
                 left.is_some_and(|issue| issue.status == crate::model::Status::Tombstone);
             let external_non_tombstone =
@@ -16075,15 +16369,21 @@ pub fn three_way_merge(
         }
 
         let result = merge_issue(base, left, right, strategy);
+        let revised = |mut issue: Issue| {
+            if let Some(revision_at) = union_revision_at {
+                issue.updated_at = issue.updated_at.max(revision_at);
+            }
+            issue
+        };
 
         match result {
             MergeResult::NoAction => {}
             MergeResult::Keep(issue) => {
-                report.kept.push(issue);
+                report.kept.push(revised(issue));
             }
             MergeResult::KeepWithNote(issue, note) => {
                 report.notes.push((issue.id.clone(), note));
-                report.kept.push(issue);
+                report.kept.push(revised(issue));
             }
             MergeResult::Delete => {
                 report.deleted.push(id.clone());
@@ -16095,6 +16395,270 @@ pub fn three_way_merge(
     }
 
     report
+}
+
+/// Keep every comment either side has (multiset union by
+/// [`Comment::sync_key`]) when the two sides' comment sets diverge.
+///
+/// Returns `None` when both sides already carry the same comments, so the
+/// common path does not clone anything. Otherwise returns base, left, and
+/// right with the union applied to all three, which makes comment-only
+/// differences invisible to the merge decision.
+fn union_comments_if_diverged(
+    base: Option<&Issue>,
+    left: &Issue,
+    right: &Issue,
+) -> Option<(Option<Issue>, Issue, Issue)> {
+    let mut remaining: HashMap<_, usize> = HashMap::new();
+    for comment in &left.comments {
+        *remaining.entry(comment.sync_key()).or_default() += 1;
+    }
+    let mut extra = Vec::new();
+    for comment in &right.comments {
+        match remaining.get_mut(&comment.sync_key()) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => extra.push(comment.clone()),
+        }
+    }
+    let left_has_extra = remaining.values().any(|count| *count > 0);
+    if extra.is_empty() && !left_has_extra {
+        return None;
+    }
+
+    let mut union = left.comments.clone();
+    union.extend(extra);
+    // Deterministic across clones regardless of which side is "local".
+    union.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.author.cmp(&b.author))
+            .then_with(|| a.body.cmp(&b.body))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    // Comment ids are database-local rowids; two clones reuse them. Keep the
+    // first holder of each id and let the database mint fresh ids for the rest.
+    let mut seen_ids = HashSet::new();
+    for comment in &mut union {
+        if comment.id > 0 && !seen_ids.insert(comment.id) {
+            comment.id = 0;
+        }
+    }
+
+    let with_union = |issue: &Issue| {
+        let mut issue = issue.clone();
+        issue.comments.clone_from(&union);
+        issue
+    };
+    Some((base.map(with_union), with_union(left), with_union(right)))
+}
+
+/// How a three-way merge re-keys issues whose id collided (GitHub #512).
+struct IdCollisionPlan {
+    collisions: Vec<IdCollision>,
+    /// Collided ids no new id could be minted for; reported as conflicts.
+    unresolved: Vec<(String, ConflictType)>,
+    /// Old id -> new id for issues of the local side.
+    local_renames: HashMap<String, String>,
+    /// Old id -> new id for issues of the external side.
+    external_renames: HashMap<String, String>,
+    /// Old id -> new id for base references to a relocated issue.
+    base_renames: HashMap<String, String>,
+    /// Base entries moved to the relocated id (base copy of a relocated issue).
+    base_moves: HashSet<String>,
+    /// Every collided id; its base entry belonged to only one of the two issues.
+    collided: HashSet<String>,
+}
+
+impl IdCollisionPlan {
+    fn rekey(&self, context: &MergeContext) -> MergeContext {
+        let rekey_side = |side: &HashMap<String, Issue>, renames: &HashMap<String, String>| {
+            side.values()
+                .map(|issue| {
+                    let mut issue = issue.clone();
+                    apply_collision_renames(&mut issue, renames);
+                    (issue.id.clone(), issue)
+                })
+                .collect::<HashMap<_, _>>()
+        };
+        let base = context
+            .base
+            .values()
+            .filter(|issue| {
+                !self.collided.contains(&issue.id) || self.base_moves.contains(&issue.id)
+            })
+            .map(|issue| {
+                let mut issue = issue.clone();
+                apply_collision_renames(&mut issue, &self.base_renames);
+                (issue.id.clone(), issue)
+            })
+            .collect();
+        MergeContext::new(
+            base,
+            rekey_side(&context.left, &self.local_renames),
+            rekey_side(&context.right, &self.external_renames),
+        )
+    }
+}
+
+/// Find ids that name two different issues on the two sides and decide,
+/// deterministically, where each issue ends up.
+///
+/// Two versions of one issue always share `created_at` (it is written once at
+/// creation and never updated), so a differing `created_at` means two issues.
+/// The earlier issue keeps the id. The other one moves to the id the opposite
+/// side already uses for it, when another clone resolved the same collision
+/// first; otherwise it gets the next free child number under the same parent
+/// (or a fresh hash id for a root id). The choice only depends on the merged
+/// issue sets, so clones that merge the same data pick the same ids.
+fn plan_id_collisions(context: &MergeContext) -> Option<IdCollisionPlan> {
+    let collided_ids = context
+        .left
+        .iter()
+        .filter_map(|(id, left)| {
+            let right = context.right.get(id)?;
+            (left.created_at != right.created_at).then(|| id.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    if collided_ids.is_empty() {
+        return None;
+    }
+
+    let mut taken = context.all_issue_ids().into_iter().collect::<HashSet<_>>();
+    let mut plan = IdCollisionPlan {
+        collisions: Vec::new(),
+        unresolved: Vec::new(),
+        local_renames: HashMap::new(),
+        external_renames: HashMap::new(),
+        base_renames: HashMap::new(),
+        base_moves: HashSet::new(),
+        collided: HashSet::new(),
+    };
+
+    for id in collided_ids {
+        let left = &context.left[&id];
+        let right = &context.right[&id];
+        let (kept_side, relocated_side, loser, loser_side_issues, winner_side_issues) =
+            if left.created_at < right.created_at {
+                (
+                    MergeSide::Local,
+                    MergeSide::External,
+                    right,
+                    &context.right,
+                    &context.left,
+                )
+            } else {
+                (
+                    MergeSide::External,
+                    MergeSide::Local,
+                    left,
+                    &context.left,
+                    &context.right,
+                )
+            };
+
+        // Did another clone already relocate this very issue?
+        let existing = winner_side_issues
+            .values()
+            .filter(|candidate| {
+                // Bulk creation shares one `created_at`, so match more than
+                // the timestamp before treating two ids as one issue.
+                candidate.id != id
+                    && candidate.created_at == loser.created_at
+                    && candidate.created_by == loser.created_by
+                    && candidate.title == loser.title
+                    && !loser_side_issues.contains_key(&candidate.id)
+            })
+            .map(|candidate| candidate.id.clone())
+            .min();
+        let already_relocated = existing.is_some();
+        let Some(relocated_id) = existing.or_else(|| mint_relocated_issue_id(&id, loser, &taken))
+        else {
+            plan.unresolved
+                .push((id.clone(), ConflictType::ConvergentCreation));
+            continue;
+        };
+        taken.insert(relocated_id.clone());
+
+        let renames = match relocated_side {
+            MergeSide::Local => &mut plan.local_renames,
+            MergeSide::External => &mut plan.external_renames,
+        };
+        renames.insert(id.clone(), relocated_id.clone());
+        if let Some(base) = context.base.get(&id)
+            && base.created_at == loser.created_at
+        {
+            // Base references to `id` meant the relocated issue.
+            plan.base_renames.insert(id.clone(), relocated_id.clone());
+            if already_relocated && !context.base.contains_key(&relocated_id) {
+                plan.base_moves.insert(id.clone());
+            }
+        }
+        plan.collided.insert(id.clone());
+        plan.collisions.push(IdCollision {
+            id,
+            kept_side,
+            relocated_side,
+            relocated_id,
+            relocated_title: loser.title.clone(),
+            already_relocated,
+        });
+    }
+
+    if plan.collisions.is_empty() && plan.unresolved.is_empty() {
+        None
+    } else {
+        Some(plan)
+    }
+}
+
+/// Mint a free id for an issue that lost an id collision: the next child
+/// number under the same parent for `<parent>.N`, or a new hash id with the
+/// same prefix and length for a root id.
+fn mint_relocated_issue_id(
+    original: &str,
+    issue: &Issue,
+    taken: &HashSet<String>,
+) -> Option<String> {
+    let parsed = parse_id(original).ok()?;
+    if let Some(parent) = parsed.parent() {
+        let child_prefix = format!("{parent}.");
+        let highest = taken
+            .iter()
+            .filter_map(|id| {
+                id.strip_prefix(&child_prefix)?
+                    .split('.')
+                    .next()?
+                    .parse::<u32>()
+                    .ok()
+            })
+            .max()
+            .unwrap_or(0);
+        let mut number = highest.checked_add(1)?;
+        loop {
+            let candidate = crate::util::id::child_id(&parent, number);
+            if !taken.contains(&candidate) {
+                return Some(candidate);
+            }
+            number = number.checked_add(1)?;
+        }
+    }
+
+    let length = parsed.hash.len().max(3);
+    (0..10_000u32).find_map(|nonce| {
+        let seed = crate::util::id::generate_id_seed(
+            &issue.title,
+            issue.description.as_deref(),
+            issue.created_by.as_deref(),
+            issue.created_at,
+            nonce,
+        );
+        let candidate = format!(
+            "{}-{}",
+            parsed.prefix,
+            crate::util::id::compute_id_hash(&seed, length)
+        );
+        (!taken.contains(&candidate)).then_some(candidate)
+    })
 }
 
 /// Configuration for a 3-way merge operation.
@@ -17667,7 +18231,9 @@ mod tests {
     }
 
     fn make_issue_at(id: &str, title: &str, updated_at: chrono::DateTime<Utc>) -> Issue {
-        let created_at = updated_at - chrono::Duration::seconds(60);
+        // Every version of an issue shares one creation time; a different
+        // `created_at` means a different issue (GitHub #512).
+        let created_at = chrono::DateTime::UNIX_EPOCH;
         Issue {
             id: id.to_string(),
             content_hash: None,
@@ -22395,6 +22961,117 @@ mod tests {
         }
     }
 
+    fn issue_created_at(id: &str, title: &str, created: i64, updated: i64) -> Issue {
+        let mut issue = make_test_issue(id, title);
+        issue.created_at = chrono::DateTime::from_timestamp(1_700_000_000 + created, 0).unwrap();
+        issue.updated_at = chrono::DateTime::from_timestamp(1_700_000_000 + updated, 0).unwrap();
+        issue
+    }
+
+    fn write_jsonl_issues(path: &Path, issues: &[&Issue]) {
+        let body = issues
+            .iter()
+            .map(|issue| serde_json::to_string(issue).unwrap() + "\n")
+            .collect::<String>();
+        fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn import_replaces_a_local_issue_that_another_clone_relocated_after_an_id_collision() {
+        // GitHub #512: this clone minted bd-p.1 for "child from B"; another
+        // clone resolved the collision with its own bd-p.1 by moving this
+        // clone's child to bd-p.2. Importing that ledger must end with both
+        // children, even though the local row is newer than the JSONL one.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let local_child = issue_created_at("bd-p.1", "child from B", 25, 100);
+        storage.create_issue(&local_child, "tester").unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+        let child_a = issue_created_at("bd-p.1", "child from A", 20, 20);
+        let mut relocated_b = local_child.clone();
+        relocated_b.id = "bd-p.2".to_string();
+        write_jsonl_issues(&jsonl_path, &[&child_a, &relocated_b]);
+
+        import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .expect("a relocated collision imports cleanly");
+
+        let at_1 = storage.get_issue("bd-p.1").unwrap().expect("bd-p.1");
+        let at_2 = storage.get_issue("bd-p.2").unwrap().expect("bd-p.2");
+        assert_eq!(at_1.title, "child from A");
+        assert_eq!(at_1.created_at, child_a.created_at);
+        assert_eq!(at_2.title, "child from B");
+        assert_eq!(at_2.created_at, local_child.created_at);
+    }
+
+    #[test]
+    fn import_leaves_a_relocated_issue_with_local_edits_to_sync_merge() {
+        // GitHub #512: the JSONL carries this clone's issue under a new id, but
+        // the local copy has changed since. Replacing the local row would drop
+        // that change, so the import is refused in favour of `br sync --merge`.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut local_child = issue_created_at("bd-p.1", "child from B", 25, 100);
+        local_child.description = Some("edited locally".to_string());
+        storage.create_issue(&local_child, "tester").unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+        let child_a = issue_created_at("bd-p.1", "child from A", 20, 20);
+        let mut relocated_b = local_child.clone();
+        relocated_b.id = "bd-p.2".to_string();
+        relocated_b.description = None;
+        write_jsonl_issues(&jsonl_path, &[&child_a, &relocated_b]);
+
+        let err = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .expect_err("a changed local copy must not be overwritten");
+        assert!(err.to_string().contains("br sync --merge"), "{err}");
+        let kept = storage.get_issue("bd-p.1").unwrap().expect("bd-p.1");
+        assert_eq!(kept.description.as_deref(), Some("edited locally"));
+    }
+
+    #[test]
+    fn import_refuses_an_id_collision_that_would_discard_a_local_issue() {
+        // GitHub #512: the JSONL (for example a git merge that took the other
+        // side's ledger) holds a different issue under a local id and does not
+        // carry the local issue at all. Last-write-wins would silently keep
+        // one of them; refuse and point at `br sync --merge` instead.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let local_child = issue_created_at("bd-p.1", "child from A", 20, 100);
+        storage.create_issue(&local_child, "tester").unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+        let other_child = issue_created_at("bd-p.1", "child from B", 25, 200);
+        // Bulk creation gives many issues one `created_at`; sharing it does
+        // not make an unrelated issue the relocated local one.
+        let bulk_sibling = issue_created_at("bd-q", "bulk sibling", 20, 20);
+        write_jsonl_issues(&jsonl_path, &[&other_child, &bulk_sibling]);
+
+        let err = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .expect_err("an unresolved id collision must not import");
+        let message = err.to_string();
+        assert!(message.contains("ID collision"), "{message}");
+        assert!(message.contains("br sync --merge"), "{message}");
+
+        let kept = storage.get_issue("bd-p.1").unwrap().expect("bd-p.1");
+        assert_eq!(kept.title, "child from A");
+    }
+
     #[test]
     fn test_import_verifier_accepts_reassigned_comment_id_for_skipped_local_owner() {
         // GitHub #486 step 7: this clone's own issue already holds comment id
@@ -22937,8 +23614,10 @@ mod tests {
         existing.updated_at = Utc::now() - chrono::Duration::hours(1);
         storage.create_issue(&existing, "test").unwrap();
 
-        // Create JSONL with same ID but newer timestamp and new title
+        // Create JSONL with same ID but newer timestamp and new title. A new
+        // version of an issue keeps its creation time (GitHub #512).
         let mut incoming = make_test_issue("test-001", "New title");
+        incoming.created_at = existing.created_at;
         incoming.updated_at = Utc::now();
         let json = serde_json::to_string(&incoming).unwrap();
         fs::write(&path, format!("{json}\n")).unwrap();
@@ -22963,12 +23642,14 @@ mod tests {
 
         // Create existing issue in DB with newer timestamp
         let mut existing = make_test_issue("test-001", "Newer title");
+        existing.created_at = Utc::now() - chrono::Duration::hours(2);
         existing.updated_at = Utc::now();
         storage.create_issue(&existing, "test").unwrap();
 
-        // Create JSONL with same ID but older timestamp
+        // Create JSONL with same ID but older timestamp (an older version of
+        // the same issue, so the same creation time).
         let mut incoming = make_test_issue("test-001", "Older title");
-        incoming.created_at = Utc::now() - chrono::Duration::hours(2); // Fix timestamp to be valid
+        incoming.created_at = existing.created_at;
         incoming.updated_at = Utc::now() - chrono::Duration::hours(1);
         let json = serde_json::to_string(&incoming).unwrap();
         fs::write(&path, format!("{json}\n")).unwrap();
@@ -23537,6 +24218,8 @@ mod tests {
         // relation tables are no longer empty, so the sync path runs and
         // replaces rather than appends.
         let mut changed = make_test_issue("bd-00007", "Task 7 revised");
+        // A revision keeps the issue's creation time (GitHub #512).
+        changed.created_at = storage.get_issue("bd-00007").unwrap().unwrap().created_at;
         changed.labels = vec!["renamed".to_string()];
         changed.updated_at += chrono::Duration::seconds(60);
         changed.dependencies = vec![Dependency {
@@ -25504,7 +26187,9 @@ mod tests {
         updated_at: chrono::DateTime<Utc>,
         hash: Option<&str>,
     ) -> Issue {
-        let created_at = updated_at - chrono::Duration::seconds(60);
+        // Every version of an issue shares one creation time; a different
+        // `created_at` means a different issue (GitHub #512).
+        let created_at = chrono::DateTime::UNIX_EPOCH;
         Issue {
             id: id.to_string(),
             content_hash: hash.map(str::to_string),
@@ -26080,6 +26765,303 @@ mod tests {
         assert_eq!(report.kept.len(), 1);
         assert_eq!(report.notes.len(), 1);
         assert!(report.notes[0].1.contains("Both modified"));
+    }
+
+    // ========================================================================
+    // GitHub #512: the same id minted by two clones for different issues
+    // ========================================================================
+
+    fn created_issue(id: &str, title: &str, created: i64) -> Issue {
+        let mut issue = make_issue_with_hash(id, title, fixed_time_merge(created), None);
+        issue.created_at = fixed_time_merge(created);
+        issue
+    }
+
+    fn child_of(mut issue: Issue, parent: &str) -> Issue {
+        issue.dependencies.push(Dependency {
+            issue_id: issue.id.clone(),
+            depends_on_id: parent.to_string(),
+            dep_type: DependencyType::ParentChild,
+            created_at: issue.created_at,
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        });
+        issue
+    }
+
+    fn with_comment(mut issue: Issue, rowid: i64, body: &str, at: i64) -> Issue {
+        issue.comments.push(Comment {
+            id: rowid,
+            issue_id: issue.id.clone(),
+            author: "agent".to_string(),
+            body: body.to_string(),
+            created_at: fixed_time_merge(at),
+        });
+        issue
+    }
+
+    fn issue_map(issues: &[&Issue]) -> HashMap<String, Issue> {
+        issues
+            .iter()
+            .map(|issue| (issue.id.clone(), (*issue).clone()))
+            .collect()
+    }
+
+    fn kept_titles(report: &MergeReport) -> std::collections::BTreeMap<String, String> {
+        report
+            .kept
+            .iter()
+            .map(|issue| (issue.id.clone(), issue.title.clone()))
+            .collect()
+    }
+
+    fn kept<'a>(report: &'a MergeReport, id: &str) -> &'a Issue {
+        report
+            .kept
+            .iter()
+            .find(|issue| issue.id == id)
+            .unwrap_or_else(|| panic!("{id} not kept: {:?}", kept_titles(report)))
+    }
+
+    fn comment_bodies(issue: &Issue) -> Vec<&str> {
+        let mut bodies = issue
+            .comments
+            .iter()
+            .map(|comment| comment.body.as_str())
+            .collect::<Vec<_>>();
+        bodies.sort_unstable();
+        bodies
+    }
+
+    /// The reported scenario: base is this clone's last flush, the JSONL is
+    /// the other clone's ledger, both minted `bd-p.1` and both commented on
+    /// the parent.
+    #[test]
+    fn id_collision_keeps_both_children_and_both_parent_comments() {
+        let parent = created_issue("bd-p", "parent", 10);
+        let parent_a = with_comment(parent.clone(), 1, "comment from A", 30);
+        let parent_b = with_comment(parent, 1, "comment from B", 40);
+        let child_a = child_of(created_issue("bd-p.1", "child from A", 20), "bd-p");
+        let child_b = child_of(created_issue("bd-p.1", "child from B", 25), "bd-p");
+
+        let context = MergeContext::new(
+            issue_map(&[&parent_a, &child_a]),
+            issue_map(&[&parent_a, &child_a]),
+            issue_map(&[&parent_b, &child_b]),
+        );
+        let report = three_way_merge(&context, ConflictResolution::Manual, None);
+
+        assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+        assert!(report.deleted.is_empty(), "{:?}", report.deleted);
+        assert_eq!(
+            kept_titles(&report),
+            std::collections::BTreeMap::from([
+                ("bd-p".to_string(), "parent".to_string()),
+                ("bd-p.1".to_string(), "child from A".to_string()),
+                ("bd-p.2".to_string(), "child from B".to_string()),
+            ])
+        );
+        assert_eq!(
+            comment_bodies(kept(&report, "bd-p")),
+            ["comment from A", "comment from B"]
+        );
+        // Colliding rowids: one keeps its id, the other gets a fresh one.
+        let rowids = kept(&report, "bd-p")
+            .comments
+            .iter()
+            .map(|comment| comment.id)
+            .collect::<Vec<_>>();
+        assert_eq!(rowids, [1, 0]);
+
+        let relocated = kept(&report, "bd-p.2");
+        assert_eq!(relocated.created_at, fixed_time_merge(25));
+        assert_eq!(relocated.dependencies.len(), 1);
+        assert_eq!(relocated.dependencies[0].issue_id, "bd-p.2");
+        assert_eq!(relocated.dependencies[0].depends_on_id, "bd-p");
+
+        assert_eq!(
+            report.id_collisions,
+            vec![IdCollision {
+                id: "bd-p.1".to_string(),
+                kept_side: MergeSide::Local,
+                relocated_side: MergeSide::External,
+                relocated_id: "bd-p.2".to_string(),
+                relocated_title: "child from B".to_string(),
+                already_relocated: false,
+            }]
+        );
+    }
+
+    /// Whichever clone runs the merge, the same issue ends up under the same
+    /// id, and a local issue that loses the id is moved (not overwritten).
+    #[test]
+    fn id_collision_resolution_is_the_same_from_both_clones() {
+        let parent = created_issue("bd-p", "parent", 10);
+        let child_a = child_of(created_issue("bd-p.1", "child from A", 20), "bd-p");
+        let child_b = child_of(created_issue("bd-p.1", "child from B", 25), "bd-p");
+        let base = issue_map(&[&parent]);
+
+        let in_a = three_way_merge(
+            &MergeContext::new(
+                base.clone(),
+                issue_map(&[&parent, &child_a]),
+                issue_map(&[&parent, &child_b]),
+            ),
+            ConflictResolution::Manual,
+            None,
+        );
+        let in_b = three_way_merge(
+            &MergeContext::new(
+                base,
+                issue_map(&[&parent, &child_b]),
+                issue_map(&[&parent, &child_a]),
+            ),
+            ConflictResolution::Manual,
+            None,
+        );
+
+        assert!(in_a.conflicts.is_empty() && in_b.conflicts.is_empty());
+        assert_eq!(kept_titles(&in_a), kept_titles(&in_b));
+        assert_eq!(kept(&in_b, "bd-p.2").title, "child from B");
+        assert_eq!(in_b.id_collisions[0].relocated_side, MergeSide::Local);
+        assert_eq!(in_b.id_collisions[0].kept_side, MergeSide::External);
+    }
+
+    /// The other clone merges the already-resolved ledger: its own child is
+    /// found at the relocated id, so nothing new is minted and nothing is
+    /// deleted; edits made to the relocated copy are merged as usual.
+    #[test]
+    fn id_collision_already_relocated_by_another_clone_is_not_duplicated() {
+        let parent = created_issue("bd-p", "parent", 10);
+        let child_a = child_of(created_issue("bd-p.1", "child from A", 20), "bd-p");
+        let child_b = child_of(created_issue("bd-p.1", "child from B", 25), "bd-p");
+        let mut relocated_b = child_of(created_issue("bd-p.2", "child from B", 25), "bd-p");
+        relocated_b.status = Status::Closed;
+        relocated_b.closed_at = Some(fixed_time_merge(50));
+
+        let context = MergeContext::new(
+            issue_map(&[&parent, &child_b]),
+            issue_map(&[&parent, &child_b]),
+            issue_map(&[&parent, &child_a, &relocated_b]),
+        );
+        let report = three_way_merge(&context, ConflictResolution::Manual, None);
+
+        assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+        assert!(report.deleted.is_empty(), "{:?}", report.deleted);
+        assert_eq!(
+            kept_titles(&report),
+            std::collections::BTreeMap::from([
+                ("bd-p".to_string(), "parent".to_string()),
+                ("bd-p.1".to_string(), "child from A".to_string()),
+                ("bd-p.2".to_string(), "child from B".to_string()),
+            ])
+        );
+        assert_eq!(kept(&report, "bd-p.2").status, Status::Closed);
+        assert!(report.id_collisions[0].already_relocated);
+        assert_eq!(report.id_collisions[0].relocated_id, "bd-p.2");
+    }
+
+    /// An unrelated issue that merely shares the loser's creation time (bulk
+    /// creation) is not mistaken for an earlier relocation of it.
+    #[test]
+    fn id_collision_does_not_merge_into_a_bulk_created_sibling() {
+        let parent = created_issue("bd-p", "parent", 10);
+        let child_a = child_of(created_issue("bd-p.1", "child from A", 20), "bd-p");
+        let child_b = child_of(created_issue("bd-p.1", "child from B", 25), "bd-p");
+        let sibling_a = child_of(created_issue("bd-p.2", "sibling from A", 25), "bd-p");
+
+        let context = MergeContext::new(
+            issue_map(&[&parent]),
+            issue_map(&[&parent, &child_a, &sibling_a]),
+            issue_map(&[&parent, &child_b]),
+        );
+        let report = three_way_merge(&context, ConflictResolution::Manual, None);
+
+        assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+        assert_eq!(
+            kept_titles(&report),
+            std::collections::BTreeMap::from([
+                ("bd-p".to_string(), "parent".to_string()),
+                ("bd-p.1".to_string(), "child from A".to_string()),
+                ("bd-p.2".to_string(), "sibling from A".to_string()),
+                ("bd-p.3".to_string(), "child from B".to_string()),
+            ])
+        );
+        assert!(!report.id_collisions[0].already_relocated);
+    }
+
+    /// Issues that only the relocated side has and that point at the moved id
+    /// follow it: a grandchild keeps its parent.
+    #[test]
+    fn id_collision_rewrites_references_from_the_relocated_side() {
+        let parent = created_issue("bd-p", "parent", 10);
+        let child_a = child_of(created_issue("bd-p.1", "child from A", 20), "bd-p");
+        let child_b = child_of(created_issue("bd-p.1", "child from B", 25), "bd-p");
+        let grandchild_b = child_of(created_issue("bd-p.1.1", "grandchild from B", 26), "bd-p.1");
+
+        let context = MergeContext::new(
+            issue_map(&[&parent]),
+            issue_map(&[&parent, &child_a]),
+            issue_map(&[&parent, &child_b, &grandchild_b]),
+        );
+        let report = three_way_merge(&context, ConflictResolution::Manual, None);
+
+        assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+        let grandchild = kept(&report, "bd-p.1.1");
+        assert_eq!(grandchild.dependencies[0].depends_on_id, "bd-p.2");
+        assert_eq!(kept(&report, "bd-p.2").title, "child from B");
+    }
+
+    /// A root (hash) id collision gets a fresh hash id with the same prefix,
+    /// even under a strategy that would otherwise pick one side.
+    #[test]
+    fn id_collision_on_a_root_id_mints_a_new_hash_id() {
+        let local = created_issue("bd-abc", "local issue", 20);
+        let external = created_issue("bd-abc", "external issue", 25);
+        let context = MergeContext::new(
+            HashMap::new(),
+            issue_map(&[&local]),
+            issue_map(&[&external]),
+        );
+        let report = three_way_merge(&context, ConflictResolution::PreferExternal, None);
+
+        assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+        assert_eq!(report.kept.len(), 2);
+        assert_eq!(kept(&report, "bd-abc").title, "local issue");
+        let relocated_id = &report.id_collisions[0].relocated_id;
+        assert_ne!(relocated_id, "bd-abc");
+        assert!(relocated_id.starts_with("bd-"), "{relocated_id}");
+        assert_eq!(relocated_id.len(), "bd-abc".len());
+        assert!(parse_id(relocated_id).is_ok(), "{relocated_id}");
+        assert_eq!(kept(&report, relocated_id).title, "external issue");
+    }
+
+    /// Comments are append-only: a comment on one side is never dropped
+    /// because the other side's version of the issue was chosen, and
+    /// comment-only divergence is not a conflict.
+    #[test]
+    fn three_way_merge_unions_comments_added_on_both_sides() {
+        let base = created_issue("bd-1", "issue", 10);
+        let mut left = with_comment(base.clone(), 1, "from local", 30);
+        left.title = "retitled locally".to_string();
+        let right = with_comment(base.clone(), 1, "from external", 40);
+
+        let context = MergeContext::new(
+            issue_map(&[&base]),
+            issue_map(&[&left]),
+            issue_map(&[&right]),
+        );
+        let report = three_way_merge(&context, ConflictResolution::Manual, None);
+
+        assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+        let merged = kept(&report, "bd-1");
+        assert_eq!(merged.title, "retitled locally");
+        assert_eq!(comment_bodies(merged), ["from external", "from local"]);
+        assert!(
+            merged.updated_at > left.updated_at && merged.updated_at > right.updated_at,
+            "the combined record must be newer than both inputs"
+        );
     }
 
     #[test]
