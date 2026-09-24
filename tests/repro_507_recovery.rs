@@ -238,7 +238,9 @@ fn poisoned_current_schema_recovers_without_jsonl_rebuild_and_is_repeatable() {
         ],
         "recovered_list",
     );
-    let issues = list.as_array().unwrap();
+    let issues = list["issues"]
+        .as_array()
+        .expect("list --json returns an issues array");
     assert_eq!(issues.len(), 3);
     assert!(issues.iter().all(|issue| issue["title"] == WAL_ONLY_TITLE));
     assert_eq!(protected_payload(&workspace), before);
@@ -428,18 +430,35 @@ fn mutating_command_auto_recovers_poisoned_index_before_pending_gate() {
         "auto_poison_recovery_list",
     );
     assert!(list.status.success(), "{} {}", list.stdout, list.stderr);
-    for title in [
-        "db-only-a",
-        "db-only-b",
-        "db-only-c",
-        "after automatic poisoned-index recovery",
-    ] {
-        assert!(
-            list.stdout.contains(title),
-            "{title} missing from {}",
-            list.stdout
-        );
-    }
+    // The fixture's three issues exist only in the database family (never
+    // exported to JSONL), and their current titles exist only in committed
+    // WAL frames. Recovery must keep every one of them, plus the new issue.
+    let listed: Value =
+        serde_json::from_str(&extract_json_payload(&list.stdout)).expect("list JSON");
+    let issues = listed["issues"]
+        .as_array()
+        .expect("list --json returns an issues array");
+    let titles: Vec<&str> = issues
+        .iter()
+        .map(|issue| issue["title"].as_str().expect("issue title"))
+        .collect();
+    assert_eq!(
+        titles
+            .iter()
+            .filter(|title| **title == WAL_ONLY_TITLE)
+            .count(),
+        3,
+        "every database-only issue must survive automatic recovery: {titles:?}"
+    );
+    assert_eq!(
+        titles
+            .iter()
+            .filter(|title| **title == "after automatic poisoned-index recovery")
+            .count(),
+        1,
+        "{titles:?}"
+    );
+    assert_eq!(issues.len(), 4, "{titles:?}");
 }
 
 #[test]
