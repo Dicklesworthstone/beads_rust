@@ -5562,7 +5562,7 @@ gates:
             (&["restricted"], 0, 8),
         ];
         for (labels, priority, required) in cases {
-            let labels: Vec<String> = labels.iter().map(|label| label.to_string()).collect();
+            let labels: Vec<String> = labels.iter().map(ToString::to_string).collect();
             assert_eq!(
                 workflow.required_gates_for("in_review", "closed", &labels, *priority),
                 vec![GateSpec::MinReviewers(*required)],

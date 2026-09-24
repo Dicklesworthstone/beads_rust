@@ -144,13 +144,14 @@ fn assert_payload_preserved_after_checkpoint_refusal(
         assert_eq!(before_path, after_path);
         if index == 1 {
             assert!(before_path.to_string_lossy().ends_with("-wal"));
-            if let (Some(before_wal), Some(after_wal)) = (before_member, after_member) {
-                if before_wal.bytes.len() == 32 && after_wal.bytes.len() == 32 {
-                    assert_eq!(before_wal.device, after_wal.device);
-                    assert_eq!(before_wal.inode, after_wal.inode);
-                    assert_eq!(&before_wal.bytes[..12], &after_wal.bytes[..12]);
-                    continue;
-                }
+            if let (Some(before_wal), Some(after_wal)) = (before_member, after_member)
+                && before_wal.bytes.len() == 32
+                && after_wal.bytes.len() == 32
+            {
+                assert_eq!(before_wal.device, after_wal.device);
+                assert_eq!(before_wal.inode, after_wal.inode);
+                assert_eq!(&before_wal.bytes[..12], &after_wal.bytes[..12]);
+                continue;
             }
         }
         assert_eq!(before_member, after_member, "{}", before_path.display());

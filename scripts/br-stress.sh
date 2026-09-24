@@ -174,7 +174,7 @@ if ! recovery_files >pre-recovery.txt; then
     echo "[stress] FAIL: cannot inventory baseline recovery artifacts ($WORK)" >&2
     exit 1
 fi
-echo "[stress] pre-run recovery artifacts: $(wc -l <pre-recovery.txt)"
+echo "[stress] pre-run recovery artifacts: $(wc -l <pre-recovery.txt | tr -d '[:space:]')"
 family_inventory >pre-family.json || exit 1
 
 worker() {
@@ -284,7 +284,8 @@ if ! LC_ALL=C comm -13 pre-recovery.txt post-recovery.txt >new-recovery.txt; the
     echo "[stress] FAIL: cannot compare recovery inventories ($WORK)" >&2
     exit 1
 fi
-REC="$(wc -l <new-recovery.txt)"
+# BSD wc pads its count with spaces; keep the reported field a bare integer.
+REC="$(wc -l <new-recovery.txt | tr -d '[:space:]')"
 if [[ "$REC" -gt 0 ]]; then
     echo "[stress] new recovery artifacts:"
     cat new-recovery.txt
