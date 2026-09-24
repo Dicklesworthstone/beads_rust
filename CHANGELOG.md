@@ -14,8 +14,7 @@ This changelog is organized by capability rather than diff order. Each version s
 - Release links: `https://github.com/Dicklesworthstone/beads_rust/releases/tag/<TAG>`
 
 **Scope window:** every version from inception (v0.1.0, 2026-01-18) through the current
-release (v0.6.0, 2026-09-12), including the source frozen at
-[b1cfebe0](https://github.com/Dicklesworthstone/beads_rust/commit/b1cfebe0).
+release (v0.7.0, 2026-09-24).
 The full per-version detail is in the sections below; the timeline names the
 recent line and the milestone anchors. The September 8 audit examined all 79
 commits in `v0.5.10..v0.5.11` and six subsequent commits against Git diffs,
@@ -32,6 +31,7 @@ explicitly corrected during this audit.
 
 | Version | Date | Kind | Headline |
 |---|---|---|---|
+| [v0.7.0](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.0) | 2026-09-24 | Release | FrankenSQLite 0.4.4 engine; id-collision-safe `sync --merge` and import refusal (#512); empty-JSONL merge guard; `update --if-unchanged` (#500/#505); poisoned WAL-index recovery (#507); Unicode-correct search; `ready --brief`, `list/search --fields` |
 | [v0.6.0](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.6.0) | 2026-09-12 | Release | Prerequisite checklists, class-specific workflow routes, typed dependencies, reviewed migrations, claim/admission guards, bounded ready output; seven-platform DSR release |
 | [v0.5.12](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.12) | 2026-09-09 | Release | Closed-claim refusal; bounded search page loading; terminal color controls; namespace diagnostics; Nix source repair; seven-platform DSR release |
 | [v0.5.11](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.11) | 2026-09-08 | Release | Checkpoints before diagnostic exits; FrankenSQLite 0.3.18 grouped-count fix; migration preflight and typed admission failures; seven-platform DSR release |
@@ -83,10 +83,125 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
-## Unreleased
+## v0.7.0 — 2026-09-24
 
-- **Restore concurrent startup with the published storage engine.** Upgrade
-  FrankenSQLite facade/core to 0.4.2, pager to 0.4.3 and btree/vdbe to 0.4.1.
+[Release](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.0).
+A minor version because the storage engine moves to a new FrankenSQLite
+generation (0.3.18 → 0.4.4), the minimum Rust version rises to 1.89, and JSONL
+import now refuses some inputs it used to accept (below). The database schema
+is unchanged at 19, so no `doctor migrate-schema` step is needed from 0.6.0.
+
+### Behaviour changes to know before upgrading
+
+- **Import refuses an id that names a different issue.** Previously
+  `br sync --import-only` (and auto-import) resolved a JSONL row by id with
+  last-write-wins, so when two clones had minted the same id — typically a
+  child id `<parent>.N`, which comes from each database's own counter — one
+  of the two issues was silently replaced. A JSONL row whose id is held
+  locally by an issue with a **different `created_at`** is now treated as a
+  different issue: the import is refused with an `ID collision` error that
+  points at `br sync --merge`. The one accepted case is the merged ledger
+  coming back (the JSONL carries the unchanged local issue under another id).
+  A relocated issue is also no longer folded back onto its old id through a
+  content-hash match. Because ordinary commands auto-import, reads such as
+  `br show`, `br list` and `br ready` report the same `ID collision`
+  (`SYNC_CONFLICT`, exit 6) while the colliding JSONL is present, until
+  `br sync --merge` has run; `--no-auto-import` still reads the local
+  database. Tooling that rewrites JSONL rows and changes
+  `created_at` for an existing id will now hit this refusal; keep
+  `created_at` stable for the life of an issue
+  ([583807e6](https://github.com/Dicklesworthstone/beads_rust/commit/583807e6), [#512](https://github.com/Dicklesworthstone/beads_rust/issues/512)).
+- **`br sync --merge` keeps both issues on an id collision.** A different
+  `created_at` under one id now means two issues. The earlier-created issue
+  keeps the id; the other is re-keyed, with its labels, dependencies and
+  comments, to the next free child number (or a fresh hash id for a root id),
+  and references from its own side follow it. The choice depends only on the
+  merged data, so clones converge on the same ids, including when three or
+  more clones resolved the collisions in different orders. Every collision is
+  reported as an `ID collision` warning on stderr and in `id_collisions` in
+  `--json`; one that cannot be re-keyed stays a conflict under every
+  strategy. Comments are append-only, so comment sets are now unioned by sync
+  identity instead of one side's list winning, and comment-only divergence is
+  no longer a conflict ([583807e6](https://github.com/Dicklesworthstone/beads_rust/commit/583807e6), [63e908aa](https://github.com/Dicklesworthstone/beads_rust/commit/63e908aa), [#512](https://github.com/Dicklesworthstone/beads_rust/issues/512)).
+- **`br sync --merge` refuses an empty JSONL.** A JSONL with no issues (a
+  truncated file, an empty checkout) was read as the other side deleting
+  everything, and every issue shared with the last sync was deleted under
+  every strategy. The merge now refuses unless `--force-jsonl` explicitly
+  accepts the deletion, and points at restoring the file or
+  `br sync --flush-only --force` ([63e908aa](https://github.com/Dicklesworthstone/beads_rust/commit/63e908aa)).
+- **Minimum supported Rust is 1.89** for source builds ([4fafa4e7](https://github.com/Dicklesworthstone/beads_rust/commit/4fafa4e7)).
+
+### Concurrent edits and agent-facing output
+
+- `br update --if-unchanged <UPDATED_AT>` makes a read-modify-write
+  conditional: if the issue's `updated_at` has moved since the caller read
+  it, nothing is written and the command exits 6 naming both timestamps.
+  Label, parent and checklist edits are covered too. Without the flag,
+  behaviour is unchanged ([f2b3cec9](https://github.com/Dicklesworthstone/beads_rust/commit/f2b3cec9), [4f08338d](https://github.com/Dicklesworthstone/beads_rust/commit/4f08338d), [#500](https://github.com/Dicklesworthstone/beads_rust/issues/500)). The MCP
+  `update_issue` tool takes the same precondition as `if_unchanged`
+  ([314ae3e3](https://github.com/Dicklesworthstone/beads_rust/commit/314ae3e3), [#505](https://github.com/Dicklesworthstone/beads_rust/issues/505)).
+- `br ready --brief` omits long text fields from JSON/TOON output so an agent
+  can choose work without loading every description ([e4a24098](https://github.com/Dicklesworthstone/beads_rust/commit/e4a24098)).
+- `br list --fields` and `br search --fields` select JSON/TOON fields without
+  changing which issues match, their order or page metadata; unknown or empty
+  selectors are refused ([51f7fe5b](https://github.com/Dicklesworthstone/beads_rust/commit/51f7fe5b), [597ffd0a](https://github.com/Dicklesworthstone/beads_rust/commit/597ffd0a)).
+- `br search` matches non-ASCII queries case-insensitively across ids,
+  titles, descriptions and comment history *before* pagination and
+  hidden-history counts; supplied text filters stay mandatory, and priority
+  ranges parse like `list`/`ready` ([8370be25](https://github.com/Dicklesworthstone/beads_rust/commit/8370be25), [0724b3f9](https://github.com/Dicklesworthstone/beads_rust/commit/0724b3f9)). Searches
+  over the whole corpus no longer re-scan comments once per issue
+  ([86b4b641](https://github.com/Dicklesworthstone/beads_rust/commit/86b4b641)).
+- `br lint` reads the `acceptance_criteria` field, and legacy description
+  sections must be real headings with non-empty bodies ([3e5ca281](https://github.com/Dicklesworthstone/beads_rust/commit/3e5ca281),
+  [#509](https://github.com/Dicklesworthstone/beads_rust/issues/509)). The rich-output tip recommends `--acceptance-criteria` only for a
+  missing Acceptance Criteria section, not for an epic's Success Criteria or a
+  bug's Steps to Reproduce ([a361c855](https://github.com/Dicklesworthstone/beads_rust/commit/a361c855), [#511](https://github.com/Dicklesworthstone/beads_rust/issues/511)).
+- Acceptance-checklist edits and `prerequisites_complete` ignore checkboxes
+  inside fenced code examples ([45038719](https://github.com/Dicklesworthstone/beads_rust/commit/45038719)).
+- A `require_if` gate that raises `min_reviewers` above the base
+  `require_all` threshold now takes the higher threshold instead of the first
+  one listed ([65f3dfa2](https://github.com/Dicklesworthstone/beads_rust/commit/65f3dfa2),
+  [#513](https://github.com/Dicklesworthstone/beads_rust/issues/513)).
+- A policy refusal now names `workflow.required_fields` and its
+  presence-only variant, and marks the bypass flags as `br close`-only
+  ([b02a4453](https://github.com/Dicklesworthstone/beads_rust/commit/b02a4453)).
+- `br doctor --repair` writes the same canonical `.beads/.gitignore` as
+  `br init` when the file is missing ([71a39f0f](https://github.com/Dicklesworthstone/beads_rust/commit/71a39f0f), [#501](https://github.com/Dicklesworthstone/beads_rust/issues/501)).
+
+### Storage recovery and maintenance
+
+- A torn WAL sidecar (shorter than its 32-byte header, as a crash can leave
+  it) no longer locks the workspace. Such a WAL cannot hold a committed
+  frame, so schema preflight treats it as empty, as SQLite does, and startup
+  moves it and its shared index into `.br_recovery/` under database-family
+  authority, as the sole opener, with a `torn_wal_quarantined` warning. Empty
+  and complete header-only WALs are untouched. Pre-release builds with the
+  new startup index recovery refused every command on such a WAL.
+- A refused automatic WAL-index recovery keeps one retained pre-state per
+  incident. Repeating a command over the same byte-identical database family
+  now reports the retained copy instead of copying the whole family into a
+  new `.br_recovery` run each time; `br doctor migrate-schema recover` still
+  retries explicitly.
+- A poisoned WAL shared index (initialized header, zero page size) next to a
+  live WAL is diagnosed by `doctor`, routed to
+  `br doctor migrate-schema recover`, and recovered automatically by writable
+  commands under database-family authority and sole-opener admission.
+  Read-only commands stay byte-neutral ([fe191201](https://github.com/Dicklesworthstone/beads_rust/commit/fe191201), [4c6a1383](https://github.com/Dicklesworthstone/beads_rust/commit/4c6a1383),
+  [c5229b59](https://github.com/Dicklesworthstone/beads_rust/commit/c5229b59), [#507](https://github.com/Dicklesworthstone/beads_rust/issues/507)).
+- Schema migration, post-import compaction and doctor's page-corruption
+  repair run VACUUM only on a private copy under `.br_recovery`; the live
+  database family is untouched until the attested atomic install
+  ([7447f1fb](https://github.com/Dicklesworthstone/beads_rust/commit/7447f1fb), [52affd1a](https://github.com/Dicklesworthstone/beads_rust/commit/52affd1a), [de1e863e](https://github.com/Dicklesworthstone/beads_rust/commit/de1e863e), [#507](https://github.com/Dicklesworthstone/beads_rust/issues/507)).
+- Compaction refuses a checkpoint that reports busy or partial backfill
+  instead of treating it as complete, and a failed multi-statement SQL batch
+  is never replayed automatically ([3f29531d](https://github.com/Dicklesworthstone/beads_rust/commit/3f29531d), [efeec0b0](https://github.com/Dicklesworthstone/beads_rust/commit/efeec0b0),
+  [41df183e](https://github.com/Dicklesworthstone/beads_rust/commit/41df183e), [#508](https://github.com/Dicklesworthstone/beads_rust/issues/508)).
+
+### Storage engine, startup and dependencies
+
+- **Restore concurrent startup with the published storage engine.** The whole
+  FrankenSQLite family moves to the published 0.4.4 release, with Asupersync
+  0.5.0 ([f78c8fe0](https://github.com/Dicklesworthstone/beads_rust/commit/f78c8fe0)).
   Read-only WAL admission now avoids the exclusive maintenance conflict that
   could stall CLI reads and refuse MCP startup during pending-sync inspection.
   The existing br opener leases and checkpoint containment remain in force.
