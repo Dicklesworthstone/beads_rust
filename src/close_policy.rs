@@ -1048,8 +1048,10 @@ impl Workflow {
     /// Compute the set of gates required to move `from -> to` for an issue with
     /// the given `labels` and `priority`. Combines `require_all` (always) with
     /// any matching `require_if` entries. Returns an empty vec when no rule
-    /// guards the transition. De-duplicated by gate id, preserving source
-    /// order (require_all first, then require_if).
+    /// guards the transition. De-duplicated by gate id, preserving first-seen
+    /// order (require_all first, then require_if). Repeated `min_reviewers`
+    /// thresholds take their maximum, independent of declaration order; a
+    /// matching condition can strengthen, but never lower, the baseline.
     #[must_use]
     pub fn required_gates_for(
         &self,
@@ -1062,20 +1064,26 @@ impl Workflow {
             return Vec::new();
         };
         let mut out: Vec<GateSpec> = Vec::new();
-        let push_unique = |spec: &GateSpec, out: &mut Vec<GateSpec>| {
-            if !out
-                .iter()
-                .any(|seen| seen.id().eq_ignore_ascii_case(spec.id()))
+        let merge_required = |spec: &GateSpec, out: &mut Vec<GateSpec>| {
+            if let Some(existing) = out
+                .iter_mut()
+                .find(|seen| seen.id().eq_ignore_ascii_case(spec.id()))
             {
+                if let (GateSpec::MinReviewers(current), GateSpec::MinReviewers(required)) =
+                    (existing, spec)
+                {
+                    *current = (*current).max(*required);
+                }
+            } else {
                 out.push(spec.clone());
             }
         };
         for spec in &rule.require_all {
-            push_unique(spec, &mut out);
+            merge_required(spec, &mut out);
         }
         for conditional in &rule.require_if {
             if conditional_matches(conditional, labels, priority) {
-                push_unique(&conditional.gate, &mut out);
+                merge_required(&conditional.gate, &mut out);
             }
         }
         out
@@ -5514,6 +5522,205 @@ gates:
         gate: p0_sign_off
 "#;
         serde_yml::from_str(yaml).expect("parse gate workflow")
+    }
+
+    fn reviewer_escalation_workflow() -> Workflow {
+        let yaml = r#"
+strict: true
+gates:
+  "in_review -> closed":
+    require_all:
+      - min_reviewers: 1
+    require_if:
+      - label: auth
+        gate: {min_reviewers: 2}
+      - label: security
+        gate: {min_reviewers: 3}
+      - priority: [0, 1]
+        gate: {min_reviewers: 4}
+      - label: restricted
+        priority: [0]
+        gate: {min_reviewers: 8}
+"#;
+        serde_yml::from_str(yaml).expect("parse reviewer escalation workflow")
+    }
+
+    #[test]
+    fn required_gates_min_reviewers_only_matching_rules_escalate() {
+        let workflow = reviewer_escalation_workflow();
+        let cases: &[(&[&str], i32, u32)] = &[
+            (&[], 2, 1),
+            (&["unrelated"], 2, 1),
+            (&["auth"], 2, 2),
+            (&["SECURITY"], 2, 3),
+            (&["auth", "security"], 2, 3),
+            (&[], 0, 4),
+            (&["security"], 1, 4),
+            (&["auth", "security"], 0, 4),
+            (&["restricted"], 2, 1),
+            (&["restricted"], 1, 4),
+            (&["restricted"], 0, 8),
+        ];
+        for (labels, priority, required) in cases {
+            let labels: Vec<String> = labels.iter().map(|label| label.to_string()).collect();
+            assert_eq!(
+                workflow.required_gates_for("in_review", "closed", &labels, *priority),
+                vec![GateSpec::MinReviewers(*required)],
+                "labels={labels:?}, priority={priority}"
+            );
+        }
+        assert!(
+            workflow
+                .required_gates_for("open", "closed", &["security".to_string()], 0)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn required_gates_min_reviewers_is_order_independent() {
+        let labels = vec!["auth".to_string(), "security".to_string()];
+        let permutations = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        for baseline in [None, Some(0), Some(1), Some(4), Some(5), Some(u32::MAX)] {
+            for order in permutations {
+                let mut workflow = reviewer_escalation_workflow();
+                let rule = workflow.gates.get_mut("in_review -> closed").unwrap();
+                let conditionals = rule.require_if.clone();
+                rule.require_all = baseline.into_iter().map(GateSpec::MinReviewers).collect();
+                rule.require_if = order
+                    .into_iter()
+                    .map(|index| conditionals[index].clone())
+                    .collect();
+                // This stronger rule must not count: its label does not match.
+                rule.require_if.push(conditionals[3].clone());
+                assert_eq!(
+                    workflow.required_gates_for("in_review", "closed", &labels, 0),
+                    vec![GateSpec::MinReviewers(baseline.unwrap_or(0).max(4))],
+                    "baseline={baseline:?}, conditional order={order:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn required_gates_min_reviewers_merges_unconditional_thresholds_in_place() {
+        for counts in [
+            [0, 0, 0],
+            [1, 3, 2],
+            [3, 2, 1],
+            [2, 1, 3],
+            [2, 2, 2],
+            [0, u32::MAX, 1],
+            [u32::MAX, 1, 0],
+        ] {
+            let [first, second, third] = counts;
+            let workflow = Workflow {
+                gates: std::collections::BTreeMap::from([(
+                    "in_review -> closed".to_string(),
+                    GateRule {
+                        require_all: vec![
+                            GateSpec::Named("CI_GREEN".to_string()),
+                            GateSpec::MinReviewers(first),
+                            GateSpec::Named("docs_ready".to_string()),
+                            GateSpec::MinReviewers(second),
+                            GateSpec::Named("ci_green".to_string()),
+                            GateSpec::MinReviewers(third),
+                        ],
+                        require_if: vec![
+                            ConditionalGate {
+                                gate: GateSpec::Named("DOCS_READY".to_string()),
+                                ..Default::default()
+                            },
+                            ConditionalGate {
+                                gate: GateSpec::Named("security_sign_off".to_string()),
+                                ..Default::default()
+                            },
+                        ],
+                    },
+                )]),
+                ..Default::default()
+            };
+            assert_eq!(
+                workflow.required_gates_for("in_review", "closed", &[], 2),
+                vec![
+                    GateSpec::Named("CI_GREEN".to_string()),
+                    GateSpec::MinReviewers(first.max(second).max(third)),
+                    GateSpec::Named("docs_ready".to_string()),
+                    GateSpec::Named("security_sign_off".to_string()),
+                ],
+                "thresholds={counts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_gates_min_reviewers_enforces_escalated_threshold() {
+        let workflow = reviewer_escalation_workflow();
+        let labels = vec!["auth".to_string(), "security".to_string()];
+        let results: Vec<GateResult> = ["reviewer:alice", "reviewer:bob", "reviewer:carol"]
+            .into_iter()
+            .map(|provider| GateResult {
+                gate: GATE_MIN_REVIEWERS.to_string(),
+                provider: provider.to_string(),
+                passed: true,
+                note: None,
+            })
+            .collect();
+        for count in 0..=results.len() {
+            let violations = evaluate_gates(
+                &workflow,
+                "bd-513",
+                "in_review",
+                "closed",
+                &labels,
+                2,
+                &results[..count],
+            );
+            if count == 3 {
+                assert!(violations.is_empty(), "{violations:?}");
+            } else {
+                assert_eq!(violations.len(), 1, "{count} reviewers: {violations:?}");
+                assert_eq!(violations[0].gate, "gate_min_reviewers");
+                let detail = violations[0].detail.as_ref().unwrap();
+                assert_eq!(detail["required"], serde_json::json!(3));
+                assert_eq!(detail["actual"], serde_json::json!(count));
+            }
+        }
+        // Without either sensitive label, one reviewer still satisfies the baseline.
+        assert!(
+            evaluate_gates(
+                &workflow,
+                "bd-513",
+                "in_review",
+                "closed",
+                &[],
+                2,
+                &results[..1],
+            )
+            .is_empty()
+        );
+        // Repeated reports are not an extra reviewer toward the escalated gate.
+        let duplicates = [results[0].clone(), results[0].clone(), results[1].clone()];
+        let violations = evaluate_gates(
+            &workflow,
+            "bd-513",
+            "in_review",
+            "closed",
+            &labels,
+            2,
+            &duplicates,
+        );
+        assert_eq!(violations.len(), 1);
+        assert_eq!(
+            violations[0].detail.as_ref().unwrap()["actual"],
+            serde_json::json!(2)
+        );
     }
 
     #[test]
