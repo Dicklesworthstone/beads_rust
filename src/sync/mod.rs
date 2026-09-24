@@ -16017,7 +16017,7 @@ pub struct MergeReport {
 }
 
 /// Which side of a three-way merge an issue version came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MergeSide {
     /// The local `SQLite` database.
@@ -16461,12 +16461,12 @@ struct IdCollisionPlan {
     local_renames: HashMap<String, String>,
     /// Old id -> new id for issues of the external side.
     external_renames: HashMap<String, String>,
-    /// Old id -> new id for base references to a relocated issue.
+    /// Old id -> new id for base entries and base references to them.
     base_renames: HashMap<String, String>,
-    /// Base entries moved to the relocated id (base copy of a relocated issue).
-    base_moves: HashSet<String>,
-    /// Every collided id; its base entry belonged to only one of the two issues.
-    collided: HashSet<String>,
+    /// Base entries left out of the merge: they belong to an issue only one
+    /// side carries (a base copy would read as a deletion on the other side)
+    /// or to no issue either side still has under a contested id.
+    base_drops: HashSet<String>,
 }
 
 impl IdCollisionPlan {
@@ -16483,9 +16483,7 @@ impl IdCollisionPlan {
         let base = context
             .base
             .values()
-            .filter(|issue| {
-                !self.collided.contains(&issue.id) || self.base_moves.contains(&issue.id)
-            })
+            .filter(|issue| !self.base_drops.contains(&issue.id))
             .map(|issue| {
                 let mut issue = issue.clone();
                 apply_collision_renames(&mut issue, &self.base_renames);
@@ -16500,16 +16498,309 @@ impl IdCollisionPlan {
     }
 }
 
+/// What makes two records one issue regardless of id: `created_at` is written
+/// once at creation, and the creator narrows bulk creation that shares it.
+type IssueIdentityKey<'a> = (DateTime<Utc>, Option<&'a str>);
+
+fn issue_identity_key(issue: &Issue) -> IssueIdentityKey<'_> {
+    (
+        issue.created_at,
+        issue
+            .created_by
+            .as_deref()
+            .filter(|creator| !creator.is_empty()),
+    )
+}
+
+/// One issue involved in an id collision, as each side carries it: under the
+/// same id, under two ids (a clone already relocated it), or on one side only.
+#[derive(Default)]
+struct CollisionGroup<'a> {
+    local: Option<&'a Issue>,
+    external: Option<&'a Issue>,
+}
+
+impl<'a> CollisionGroup<'a> {
+    fn issues(&self) -> impl Iterator<Item = &'a Issue> {
+        self.local.into_iter().chain(self.external)
+    }
+
+    fn created_at(&self) -> DateTime<Utc> {
+        self.issues()
+            .map(|issue| issue.created_at)
+            .min()
+            .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+    }
+
+    /// Ids this issue already has on either side, smallest first.
+    fn claimed_ids(&self) -> BTreeSet<&'a str> {
+        self.issues().map(|issue| issue.id.as_str()).collect()
+    }
+
+    fn holds(&self, id: &str) -> bool {
+        self.issues().any(|issue| issue.id == id)
+    }
+
+    /// The same record whichever side is local, so every clone mints and
+    /// reports alike.
+    fn representative(&self) -> &'a Issue {
+        self.issues()
+            .min_by(|a, b| {
+                a.title
+                    .cmp(&b.title)
+                    .then_with(|| a.description.cmp(&b.description))
+                    .then_with(|| a.id.cmp(&b.id))
+            })
+            .expect("a collision group holds at least one issue")
+    }
+}
+
+/// Finds the record the other side keeps for an issue under any id.
+struct CounterpartIndex<'a> {
+    local: &'a HashMap<String, Issue>,
+    external: &'a HashMap<String, Issue>,
+    /// Issues not already matched by id (same id, same `created_at`), by
+    /// identity key, per side.
+    local_unpaired: HashMap<IssueIdentityKey<'a>, Vec<&'a Issue>>,
+    external_unpaired: HashMap<IssueIdentityKey<'a>, Vec<&'a Issue>>,
+}
+
+impl<'a> CounterpartIndex<'a> {
+    fn new(context: &'a MergeContext) -> Self {
+        let unpaired = |side: &'a HashMap<String, Issue>, other: &'a HashMap<String, Issue>| {
+            let mut index: HashMap<IssueIdentityKey<'a>, Vec<&'a Issue>> = HashMap::new();
+            for issue in side.values() {
+                let paired_by_id = other
+                    .get(&issue.id)
+                    .is_some_and(|twin| twin.created_at == issue.created_at);
+                if !paired_by_id {
+                    index
+                        .entry(issue_identity_key(issue))
+                        .or_default()
+                        .push(issue);
+                }
+            }
+            index
+        };
+        Self {
+            local: &context.left,
+            external: &context.right,
+            local_unpaired: unpaired(&context.left, &context.right),
+            external_unpaired: unpaired(&context.right, &context.left),
+        }
+    }
+
+    /// The other side's record of `issue`: the same id with the same
+    /// `created_at`, or else the one record under another id with the same
+    /// creation time, creator and title (bulk creation shares timestamps, so
+    /// the title must agree too). A retitled copy is not matched: two records
+    /// that stay apart are safer than two issues merged into one. The
+    /// relation is symmetric, so both clones pair the same records.
+    fn counterpart(&self, side: MergeSide, issue: &Issue) -> Option<&'a Issue> {
+        let (other, own_index, other_index) = match side {
+            MergeSide::Local => (self.external, &self.local_unpaired, &self.external_unpaired),
+            MergeSide::External => (self.local, &self.external_unpaired, &self.local_unpaired),
+        };
+        if let Some(twin) = other.get(&issue.id)
+            && twin.created_at == issue.created_at
+        {
+            return Some(twin);
+        }
+        let key = issue_identity_key(issue);
+        let same_title = |issues: &[&'a Issue]| {
+            issues
+                .iter()
+                .filter(|candidate| candidate.title == issue.title)
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        let matches = same_title(other_index.get(&key)?);
+        let own_matches = own_index.get(&key).map_or(0, |own| same_title(own).len());
+        if matches.len() == 1 && own_matches == 1 {
+            matches.first().copied()
+        } else {
+            None
+        }
+    }
+}
+
+/// Every issue touching a contested id, grouped with the other side's
+/// record of it and followed to the ids those records sit under.
+struct CollisionGroups<'a> {
+    groups: Vec<CollisionGroup<'a>>,
+    group_of: HashMap<(MergeSide, &'a str), usize>,
+    component_ids: BTreeSet<&'a str>,
+}
+
+impl<'a> CollisionGroups<'a> {
+    fn build(context: &'a MergeContext, collided_ids: &BTreeSet<String>) -> Self {
+        // Group every issue under a contested id with the other side's record of
+        // it, following relocated records to the ids they claim.
+        let index = CounterpartIndex::new(context);
+        let mut groups: Vec<CollisionGroup<'_>> = Vec::new();
+        let mut group_of: HashMap<(MergeSide, &str), usize> = HashMap::new();
+        let mut component_ids = BTreeSet::new();
+        let mut queue = collided_ids
+            .iter()
+            .filter_map(|id| context.left.get_key_value(id).map(|(id, _)| id.as_str()))
+            .collect::<Vec<_>>();
+        queue.reverse();
+        while let Some(id) = queue.pop() {
+            if !component_ids.insert(id) {
+                continue;
+            }
+            for (side, issues) in [
+                (MergeSide::Local, &context.left),
+                (MergeSide::External, &context.right),
+            ] {
+                let Some(issue) = issues.get(id) else {
+                    continue;
+                };
+                if group_of.contains_key(&(side, id)) {
+                    continue;
+                }
+                let other_side = match side {
+                    MergeSide::Local => MergeSide::External,
+                    MergeSide::External => MergeSide::Local,
+                };
+                let partner = index
+                    .counterpart(side, issue)
+                    .filter(|partner| !group_of.contains_key(&(other_side, partner.id.as_str())));
+                let group_index = groups.len();
+                group_of.insert((side, id), group_index);
+                let mut group = CollisionGroup::default();
+                match side {
+                    MergeSide::Local => group.local = Some(issue),
+                    MergeSide::External => group.external = Some(issue),
+                }
+                if let Some(partner) = partner {
+                    group_of.insert((other_side, partner.id.as_str()), group_index);
+                    match other_side {
+                        MergeSide::Local => group.local = Some(partner),
+                        MergeSide::External => group.external = Some(partner),
+                    }
+                    queue.push(partner.id.as_str());
+                }
+                groups.push(group);
+            }
+        }
+        Self {
+            groups,
+            group_of,
+            component_ids,
+        }
+    }
+
+    /// Earliest-created first, each issue takes an id it already has
+    /// (preferring one no later issue has), or else a newly minted one.
+    /// `None` when no free id can be minted.
+    fn assign_ids(&self, context: &MergeContext) -> Option<Vec<String>> {
+        let groups = &self.groups;
+        let mut order = (0..groups.len()).collect::<Vec<_>>();
+        order.sort_by(|&a, &b| {
+            groups[a]
+                .created_at()
+                .cmp(&groups[b].created_at())
+                .then_with(|| groups[a].claimed_ids().cmp(&groups[b].claimed_ids()))
+        });
+        let mut taken = context.all_issue_ids().into_iter().collect::<HashSet<_>>();
+        let mut assigned_claims: HashSet<&str> = HashSet::new();
+        let mut assigned: Vec<Option<String>> = vec![None; groups.len()];
+        for (position, &group_index) in order.iter().enumerate() {
+            let group = &groups[group_index];
+            let free = group
+                .claimed_ids()
+                .into_iter()
+                .filter(|id| !assigned_claims.contains(id))
+                .collect::<Vec<_>>();
+            let later_claims = |id: &str| {
+                order[position + 1..]
+                    .iter()
+                    .any(|&later| groups[later].holds(id))
+            };
+            let choice = free
+                .iter()
+                .find(|id| !later_claims(id))
+                .or_else(|| free.first())
+                .copied();
+            let new_id = if let Some(id) = choice {
+                assigned_claims.insert(id);
+                id.to_string()
+            } else {
+                let original = group
+                    .claimed_ids()
+                    .into_iter()
+                    .next()
+                    .expect("a collision group holds at least one id");
+                mint_relocated_issue_id(original, group.representative(), &taken)?
+            };
+            taken.insert(new_id.clone());
+            assigned[group_index] = Some(new_id);
+        }
+        assigned.into_iter().collect()
+    }
+
+    /// A base entry under a contested id is the ancestor of the issue it was
+    /// created as. It only stays an ancestor when both sides still carry that
+    /// issue; otherwise it would read as a deletion on the side that never had
+    /// the issue under that id.
+    fn plan_base(&self, context: &MergeContext, assigned: &[String], plan: &mut IdCollisionPlan) {
+        let (groups, group_of) = (&self.groups, &self.group_of);
+        let mut base_targets = HashSet::new();
+        for id in &self.component_ids {
+            let Some(base) = context.base.get(*id) else {
+                continue;
+            };
+            let owner = [MergeSide::Local, MergeSide::External]
+                .into_iter()
+                .filter_map(|side| group_of.get(&(side, *id)).copied())
+                .find(|&group_index| {
+                    groups[group_index]
+                        .issues()
+                        .any(|issue| issue.id == *id && issue.created_at == base.created_at)
+                })
+                .or_else(|| {
+                    (0..groups.len()).find(|&group_index| {
+                        groups[group_index].issues().any(|issue| {
+                            issue_identity_key(issue) == issue_identity_key(base)
+                                && issue.title == base.title
+                        })
+                    })
+                });
+            // Base references to this id meant its owner, wherever it moves,
+            // even when the entry itself is left out.
+            if let Some(owner) = owner
+                && assigned[owner] != *id
+            {
+                plan.base_renames
+                    .insert((*id).to_string(), assigned[owner].clone());
+            }
+            let keep = owner.is_some_and(|group_index| {
+                groups[group_index].local.is_some()
+                    && groups[group_index].external.is_some()
+                    && base_targets.insert(assigned[group_index].clone())
+            });
+            if !keep {
+                plan.base_drops.insert((*id).to_string());
+            }
+        }
+    }
+}
+
 /// Find ids that name two different issues on the two sides and decide,
 /// deterministically, where each issue ends up.
 ///
 /// Two versions of one issue always share `created_at` (it is written once at
 /// creation and never updated), so a differing `created_at` means two issues.
-/// The earlier issue keeps the id. The other one moves to the id the opposite
-/// side already uses for it, when another clone resolved the same collision
-/// first; otherwise it gets the next free child number under the same parent
-/// (or a fresh hash id for a root id). The choice only depends on the merged
-/// issue sets, so clones that merge the same data pick the same ids.
+/// Every issue touching a contested id is paired with the other side's record
+/// of it, which may sit under another id when a clone already resolved the
+/// collision. Then, earliest-created first, each issue takes one of the ids it
+/// already has (preferring one no later issue also has), and only an issue
+/// left without one gets a new id: the next free child number under the same
+/// parent, or a fresh hash id for a root id. The outcome depends only on the
+/// merged issue sets, so clones that merge the same data pick the same ids,
+/// and clones that resolved the same collisions in different orders converge
+/// instead of duplicating issues.
 fn plan_id_collisions(context: &MergeContext) -> Option<IdCollisionPlan> {
     let collided_ids = context
         .left
@@ -16523,92 +16814,74 @@ fn plan_id_collisions(context: &MergeContext) -> Option<IdCollisionPlan> {
         return None;
     }
 
-    let mut taken = context.all_issue_ids().into_iter().collect::<HashSet<_>>();
+    let collision_groups = CollisionGroups::build(context, &collided_ids);
+    let Some(assigned) = collision_groups.assign_ids(context) else {
+        // Never let a strategy pick one of two issues: leave every contested
+        // id to the user.
+        return Some(IdCollisionPlan {
+            collisions: Vec::new(),
+            unresolved: collided_ids
+                .into_iter()
+                .map(|id| (id, ConflictType::ConvergentCreation))
+                .collect(),
+            local_renames: HashMap::new(),
+            external_renames: HashMap::new(),
+            base_renames: HashMap::new(),
+            base_drops: HashSet::new(),
+        });
+    };
+    let CollisionGroups {
+        groups, group_of, ..
+    } = &collision_groups;
+
     let mut plan = IdCollisionPlan {
         collisions: Vec::new(),
         unresolved: Vec::new(),
         local_renames: HashMap::new(),
         external_renames: HashMap::new(),
         base_renames: HashMap::new(),
-        base_moves: HashSet::new(),
-        collided: HashSet::new(),
+        base_drops: HashSet::new(),
     };
+    for (group, new_id) in groups.iter().zip(&assigned) {
+        if let Some(local) = group.local.filter(|issue| &issue.id != new_id) {
+            plan.local_renames.insert(local.id.clone(), new_id.clone());
+        }
+        if let Some(external) = group.external.filter(|issue| &issue.id != new_id) {
+            plan.external_renames
+                .insert(external.id.clone(), new_id.clone());
+        }
+    }
+
+    collision_groups.plan_base(context, &assigned, &mut plan);
 
     for id in collided_ids {
-        let left = &context.left[&id];
-        let right = &context.right[&id];
-        let (kept_side, relocated_side, loser, loser_side_issues, winner_side_issues) =
-            if left.created_at < right.created_at {
-                (
-                    MergeSide::Local,
-                    MergeSide::External,
-                    right,
-                    &context.right,
-                    &context.left,
-                )
-            } else {
-                (
-                    MergeSide::External,
-                    MergeSide::Local,
-                    left,
-                    &context.left,
-                    &context.right,
-                )
-            };
-
-        // Did another clone already relocate this very issue?
-        let existing = winner_side_issues
-            .values()
-            .filter(|candidate| {
-                // Bulk creation shares one `created_at`, so match more than
-                // the timestamp before treating two ids as one issue.
-                candidate.id != id
-                    && candidate.created_at == loser.created_at
-                    && candidate.created_by == loser.created_by
-                    && candidate.title == loser.title
-                    && !loser_side_issues.contains_key(&candidate.id)
-            })
-            .map(|candidate| candidate.id.clone())
-            .min();
-        let already_relocated = existing.is_some();
-        let Some(relocated_id) = existing.or_else(|| mint_relocated_issue_id(&id, loser, &taken))
-        else {
-            plan.unresolved
-                .push((id.clone(), ConflictType::ConvergentCreation));
-            continue;
-        };
-        taken.insert(relocated_id.clone());
-
-        let renames = match relocated_side {
-            MergeSide::Local => &mut plan.local_renames,
-            MergeSide::External => &mut plan.external_renames,
-        };
-        renames.insert(id.clone(), relocated_id.clone());
-        if let Some(base) = context.base.get(&id)
-            && base.created_at == loser.created_at
+        let local_group = group_of[&(MergeSide::Local, id.as_str())];
+        let external_group = group_of[&(MergeSide::External, id.as_str())];
+        let (kept_side, relocated_group) = if assigned[local_group] == id {
+            (MergeSide::Local, external_group)
+        } else if assigned[external_group] == id
+            || groups[external_group].created_at() < groups[local_group].created_at()
         {
-            // Base references to `id` meant the relocated issue.
-            plan.base_renames.insert(id.clone(), relocated_id.clone());
-            if already_relocated && !context.base.contains_key(&relocated_id) {
-                plan.base_moves.insert(id.clone());
-            }
-        }
-        plan.collided.insert(id.clone());
+            (MergeSide::External, local_group)
+        } else {
+            (MergeSide::Local, external_group)
+        };
+        let relocated_side = match kept_side {
+            MergeSide::Local => MergeSide::External,
+            MergeSide::External => MergeSide::Local,
+        };
+        let relocated_id = assigned[relocated_group].clone();
         plan.collisions.push(IdCollision {
+            already_relocated: groups[relocated_group].holds(&relocated_id),
+            relocated_title: groups[relocated_group].representative().title.clone(),
             id,
             kept_side,
             relocated_side,
             relocated_id,
-            relocated_title: loser.title.clone(),
-            already_relocated,
         });
     }
 
-    if plan.collisions.is_empty() && plan.unresolved.is_empty() {
-        None
-    } else {
-        Some(plan)
-    }
+    Some(plan)
 }
 
 /// Mint a free id for an issue that lost an id collision: the next child
@@ -27062,6 +27335,138 @@ mod tests {
             merged.updated_at > left.updated_at && merged.updated_at > right.updated_at,
             "the combined record must be newer than both inputs"
         );
+    }
+
+    /// Three clones minted the same child id. Two clones resolved the
+    /// collisions in different orders, so each holds the same two issues
+    /// under swapped ids. Merging them must keep one copy of each issue, not
+    /// relocate every copy again.
+    #[test]
+    fn id_collision_swapped_relocations_converge_without_duplicates() {
+        let parent = created_issue("bd-p", "parent", 10);
+        let child_a = child_of(created_issue("bd-p.1", "child from A", 20), "bd-p");
+        let b_at_2 = child_of(created_issue("bd-p.2", "child from B", 25), "bd-p");
+        let c_at_3 = child_of(created_issue("bd-p.3", "child from C", 30), "bd-p");
+        let c_at_2 = child_of(created_issue("bd-p.2", "child from C", 30), "bd-p");
+        let b_at_3 = child_of(created_issue("bd-p.3", "child from B", 25), "bd-p");
+        let blocked_by_c = {
+            let mut issue = created_issue("bd-x", "blocked by C", 40);
+            issue.dependencies.push(Dependency {
+                issue_id: "bd-x".to_string(),
+                depends_on_id: "bd-p.2".to_string(),
+                dep_type: DependencyType::Blocks,
+                created_at: fixed_time_merge(40),
+                created_by: None,
+                metadata: None,
+                thread_id: None,
+            });
+            issue
+        };
+
+        let local = issue_map(&[&parent, &child_a, &b_at_2, &c_at_3]);
+        let external = issue_map(&[&parent, &child_a, &c_at_2, &b_at_3, &blocked_by_c]);
+        let expected = std::collections::BTreeMap::from([
+            ("bd-p".to_string(), "parent".to_string()),
+            ("bd-p.1".to_string(), "child from A".to_string()),
+            ("bd-p.2".to_string(), "child from B".to_string()),
+            ("bd-p.3".to_string(), "child from C".to_string()),
+            ("bd-x".to_string(), "blocked by C".to_string()),
+        ]);
+        // Each side's last sync already held its own layout of B and C.
+        let base_of = |side: &HashMap<String, Issue>| {
+            side.iter()
+                .filter(|(id, _)| id.as_str() != "bd-x")
+                .map(|(id, issue)| (id.clone(), issue.clone()))
+                .collect::<HashMap<_, _>>()
+        };
+        for (left, right) in [(&local, &external), (&external, &local)] {
+            let report = three_way_merge(
+                &MergeContext::new(base_of(left), left.clone(), right.clone()),
+                ConflictResolution::Manual,
+                None,
+            );
+            assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+            assert!(report.deleted.is_empty(), "{:?}", report.deleted);
+            assert_eq!(kept_titles(&report), expected);
+            assert!(
+                report
+                    .id_collisions
+                    .iter()
+                    .all(|collision| collision.already_relocated),
+                "{:?}",
+                report.id_collisions
+            );
+            // The reference to C's old id follows C.
+            assert_eq!(
+                kept(&report, "bd-x").dependencies[0].depends_on_id,
+                "bd-p.3"
+            );
+        }
+    }
+
+    /// A base reference to the id the local issue loses keeps meaning that
+    /// issue, so an issue that only references it is unchanged on the local
+    /// side and a deletion on the other side stays a clean deletion.
+    #[test]
+    fn id_collision_rewrites_base_references_to_the_relocated_issue() {
+        let parent = created_issue("bd-p", "parent", 10);
+        let child_a = child_of(created_issue("bd-p.1", "child from A", 20), "bd-p");
+        let child_b = child_of(created_issue("bd-p.1", "child from B", 25), "bd-p");
+        let blocked = {
+            let mut issue = created_issue("bd-x", "blocked by B child", 30);
+            issue.dependencies.push(Dependency {
+                issue_id: "bd-x".to_string(),
+                depends_on_id: "bd-p.1".to_string(),
+                dep_type: DependencyType::Blocks,
+                created_at: fixed_time_merge(30),
+                created_by: None,
+                metadata: None,
+                thread_id: None,
+            });
+            issue
+        };
+
+        let context = MergeContext::new(
+            issue_map(&[&parent, &child_b, &blocked]),
+            issue_map(&[&parent, &child_b, &blocked]),
+            issue_map(&[&parent, &child_a]),
+        );
+        let report = three_way_merge(&context, ConflictResolution::Manual, None);
+
+        assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+        assert_eq!(report.deleted, ["bd-x".to_string()]);
+        assert_eq!(kept(&report, "bd-p.2").title, "child from B");
+    }
+
+    /// An issue that one side has under the contested id and the other side
+    /// only under another id takes the id it already holds uncontested, so
+    /// the later issue keeps its id instead of being renumbered.
+    #[test]
+    fn id_collision_prefers_ids_no_later_issue_claims() {
+        let parent = created_issue("bd-p", "parent", 10);
+        let child_b = child_of(created_issue("bd-p.1", "child from B", 25), "bd-p");
+        let early_at_1 = child_of(created_issue("bd-p.1", "early child", 20), "bd-p");
+        let early_at_5 = child_of(created_issue("bd-p.5", "early child", 20), "bd-p");
+
+        let context = MergeContext::new(
+            issue_map(&[&parent]),
+            issue_map(&[&parent, &early_at_1]),
+            issue_map(&[&parent, &child_b, &early_at_5]),
+        );
+        let report = three_way_merge(&context, ConflictResolution::Manual, None);
+
+        assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+        assert_eq!(
+            kept_titles(&report),
+            std::collections::BTreeMap::from([
+                ("bd-p".to_string(), "parent".to_string()),
+                ("bd-p.1".to_string(), "child from B".to_string()),
+                ("bd-p.5".to_string(), "early child".to_string()),
+            ])
+        );
+        assert_eq!(report.id_collisions[0].kept_side, MergeSide::External);
+        assert_eq!(report.id_collisions[0].relocated_id, "bd-p.5");
+        assert!(report.id_collisions[0].already_relocated);
     }
 
     #[test]

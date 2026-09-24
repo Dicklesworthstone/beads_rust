@@ -84,6 +84,52 @@ fn parent_of(workspace: &BrWorkspace, id: &str) -> String {
         .to_string()
 }
 
+/// Ids an issue depends on, as `br show --json` reports them.
+fn dependency_targets(workspace: &BrWorkspace, id: &str) -> Vec<String> {
+    let run = ok(
+        run_br(workspace, ["show", id, "--json"], "show_deps"),
+        "show",
+    );
+    let value: Value = serde_json::from_str(run.stdout.trim()).expect("show JSON");
+    let issue = value.get(0).unwrap_or(&value);
+    issue["dependencies"]
+        .as_array()
+        .expect("dependencies")
+        .iter()
+        .map(|dep| {
+            dep["id"]
+                .as_str()
+                .or_else(|| dep["depends_on_id"].as_str())
+                .expect("dependency id")
+                .to_string()
+        })
+        .collect()
+}
+
+/// `target` merges `source`'s ledger and ends with the same ledger; merging
+/// it once more is a no-op.
+fn assert_takes_back_and_converges(target: &BrWorkspace, source: &BrWorkspace) {
+    fs::copy(jsonl(source), jsonl(target)).expect("publish merged");
+    ok(
+        run_br(target, ["sync", "--merge"], "merge_back"),
+        "merge back",
+    );
+    assert_eq!(ledger(target), ledger(source));
+    // Idempotent: merging the same ledger again changes nothing.
+    let before = fs::read_to_string(jsonl(target)).unwrap();
+    let again = ok(
+        run_br(target, ["--json", "sync", "--merge"], "merge_back_again"),
+        "merge again",
+    );
+    let again: Value = serde_json::from_str(again.stdout.trim()).unwrap();
+    assert_eq!(
+        again["id_collisions"].as_array().map(Vec::len),
+        Some(0),
+        "{again}"
+    );
+    assert_eq!(fs::read_to_string(jsonl(target)).unwrap(), before);
+}
+
 /// Two initialized clones that share one published parent issue.
 fn two_clones_sharing_a_parent() -> (BrWorkspace, BrWorkspace, String) {
     let clone_a = BrWorkspace::new();
@@ -211,4 +257,164 @@ fn e2e_import_refuses_a_ledger_that_would_drop_a_local_child() {
     let titles = ledger(&clone_a).into_values().collect::<Vec<_>>();
     assert!(titles.contains(&"child from A".to_string()), "{titles:?}");
     assert!(titles.contains(&"child from B".to_string()), "{titles:?}");
+}
+
+/// The clone whose own child loses the id runs the merge: its child, with
+/// its labels, comments and incoming references, moves to the new id.
+#[test]
+fn e2e_sync_merge_relocates_the_local_child_with_its_relations() {
+    let _log = common::test_log("e2e_sync_merge_relocates_the_local_child_with_its_relations");
+    let (clone_a, clone_b, parent) = two_clones_sharing_a_parent();
+    let child_a = add_child(&clone_a, &parent, "child from A", Some("comment from A"));
+    ok(
+        run_br(
+            &clone_a,
+            ["comments", "add", &child_a, "note on A child"],
+            "comment_a_child",
+        ),
+        "comment A child",
+    );
+    ok(
+        run_br(&clone_a, ["sync", "--flush-only"], "flush_a"),
+        "flush A",
+    );
+
+    let child_b = add_child(&clone_b, &parent, "child from B", Some("comment from B"));
+    assert_eq!(child_a, child_b);
+    ok(
+        run_br(
+            &clone_b,
+            ["comments", "add", &child_b, "note on B child"],
+            "comment_b_child",
+        ),
+        "comment B child",
+    );
+    ok(
+        run_br(
+            &clone_b,
+            ["label", "add", &child_b, "b-label"],
+            "label_b_child",
+        ),
+        "label B child",
+    );
+    ok(
+        run_br(&clone_b, ["sync", "--flush-only"], "flush_b"),
+        "flush B",
+    );
+    // An issue B has not published yet references B's child.
+    let blocker = created_id(&ok(
+        run_br(
+            &clone_b,
+            ["create", "blocked by B child", "--json"],
+            "create_blocker",
+        ),
+        "create blocked",
+    ));
+    ok(
+        run_br(&clone_b, ["dep", "add", &blocker, &child_b], "dep_b"),
+        "dep add",
+    );
+
+    // B takes A's ledger and merges: B's child (created later) is relocated.
+    fs::copy(jsonl(&clone_a), jsonl(&clone_b)).expect("take A's ledger");
+    let merge = ok(
+        run_br(&clone_b, ["--json", "sync", "--merge"], "merge_b"),
+        "merge in B",
+    );
+    let report: Value = serde_json::from_str(merge.stdout.trim()).expect("merge JSON");
+    let relocated = report["id_collisions"][0]["relocated_id"]
+        .as_str()
+        .expect("relocated id")
+        .to_string();
+    assert_eq!(relocated, format!("{parent}.2"));
+
+    let titles = ledger(&clone_b);
+    assert_eq!(titles[&child_a], "child from A");
+    assert_eq!(titles[&relocated], "child from B");
+    assert_eq!(comment_texts(&clone_b, &child_a), ["note on A child"]);
+    assert_eq!(comment_texts(&clone_b, &relocated), ["note on B child"]);
+    assert_eq!(
+        comment_texts(&clone_b, &parent),
+        ["comment from A", "comment from B"]
+    );
+    assert_eq!(parent_of(&clone_b, &relocated), parent);
+    assert_eq!(parent_of(&clone_b, &child_a), parent);
+
+    let show = ok(
+        run_br(&clone_b, ["show", &relocated, "--json"], "show_relocated"),
+        "show relocated",
+    );
+    assert!(show.stdout.contains("b-label"), "{}", show.stdout);
+    let show_a = ok(
+        run_br(&clone_b, ["show", &child_a, "--json"], "show_a_child"),
+        "show A child",
+    );
+    assert!(!show_a.stdout.contains("b-label"), "{}", show_a.stdout);
+    assert_eq!(dependency_targets(&clone_b, &blocker), vec![relocated]);
+
+    // A takes B's merged ledger back and converges on the same ids.
+    assert_takes_back_and_converges(&clone_a, &clone_b);
+}
+
+/// An empty issues.jsonl (a truncated file, an empty checkout) must not make
+/// `br sync --merge` delete every issue: deletions leave tombstones, so an
+/// empty ledger is refused unless the deletion is explicitly accepted.
+#[test]
+fn e2e_sync_merge_refuses_an_empty_jsonl_that_would_delete_everything() {
+    let _log = common::test_log("e2e_sync_merge_refuses_an_empty_jsonl");
+    let workspace = BrWorkspace::new();
+    ok(
+        run_br(&workspace, ["init", "--prefix", "t"], "init"),
+        "init",
+    );
+    for title in ["one", "two"] {
+        ok(run_br(&workspace, ["create", title], "create"), "create");
+    }
+    ok(
+        run_br(&workspace, ["sync", "--flush-only"], "flush"),
+        "flush",
+    );
+    let published = ledger(&workspace);
+    assert_eq!(published.len(), 2);
+    fs::write(jsonl(&workspace), "").expect("truncate");
+
+    for strategy in [None, Some("--force-db"), Some("--force")] {
+        let mut args = vec!["sync", "--merge"];
+        args.extend(strategy);
+        let merge = run_br(&workspace, &args, "merge_empty");
+        assert!(
+            !merge.status.success(),
+            "{args:?} must refuse: stdout={} stderr={}",
+            merge.stdout,
+            merge.stderr
+        );
+        assert!(
+            merge.stderr.contains("contains no issues"),
+            "stderr={}",
+            merge.stderr
+        );
+    }
+
+    // Nothing was deleted, and the suggested flush restores the ledger.
+    ok(
+        run_br(&workspace, ["sync", "--flush-only", "--force"], "reflush"),
+        "reflush",
+    );
+    assert_eq!(ledger(&workspace), published);
+
+    // Accepting the deletion explicitly still works.
+    fs::write(jsonl(&workspace), "").expect("truncate again");
+    ok(
+        run_br(
+            &workspace,
+            ["sync", "--merge", "--force-jsonl"],
+            "merge_forced",
+        ),
+        "forced merge",
+    );
+    let list = ok(
+        run_br(&workspace, ["list", "--json"], "list_after_forced"),
+        "list",
+    );
+    assert!(!list.stdout.contains("\"one\""), "{}", list.stdout);
 }

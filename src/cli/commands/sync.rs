@@ -5365,6 +5365,24 @@ fn execute_merge(
                     .to_string(),
         });
     }
+    // A JSONL with no issues at all (a truncated file, an empty checkout)
+    // reads as "the other side deleted everything" and would delete every
+    // issue the database still shares with the last sync, under every
+    // strategy (an unchanged issue deleted on one side is not a conflict).
+    // Deletions normally leave tombstones, so refuse unless the deletion is
+    // explicitly accepted, as the export guard does for an empty database
+    // over a non-empty JSONL.
+    if source.is_some()
+        && right.is_empty()
+        && !args.force_jsonl
+        && base.keys().any(|id| left.contains_key(id))
+    {
+        return Err(BeadsError::SyncConflict {
+            message:
+                "issues.jsonl contains no issues, so merging it would delete every issue the database shares with the last sync. Restore issues.jsonl (for example from git) or rewrite it from the database with `br sync --flush-only --force`; pass --force-jsonl to accept deleting them"
+                    .to_string(),
+        });
+    }
     if base_source.is_none() && left != right && !args.force_db && !args.force_jsonl {
         return Err(BeadsError::SyncConflict {
             message:
