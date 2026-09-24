@@ -123,8 +123,10 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
             || should_preopen_storage
             || pending_merge_disposition == PendingMergeStartupDisposition::Refuse)
         && let Some((beads_dir, paths)) = ctx.beads_dir.as_deref().zip(ctx.paths.as_ref())
-        && commands::doctor_subsystems::schema_migration::wal_index_needs_recovery(&paths.db_path)?
-    {
+        && (commands::doctor_subsystems::schema_migration::torn_wal_present(&paths.db_path)?
+            || commands::doctor_subsystems::schema_migration::wal_index_needs_recovery(
+                &paths.db_path,
+            )?) {
         let authority = Arc::new(
             beads_rust::sync::blocking_database_family_write_lock_with_timeout(
                 beads_dir,
@@ -132,6 +134,17 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
                 ctx.startup_write_lock_timeout(&cli.command),
             )?,
         );
+        // A WAL shorter than its header holds no frames; set it aside before
+        // any index recovery or engine open so it can never wedge startup.
+        if let Some(quarantine) =
+            commands::doctor_subsystems::schema_migration::quarantine_torn_wal_for_startup(
+                beads_dir,
+                &paths.db_path,
+                &authority,
+            )?
+        {
+            emit_torn_wal_quarantine_warning(&quarantine, json_error_mode);
+        }
         commands::doctor_subsystems::schema_migration::recover_wal_index_for_startup(
             beads_dir,
             &paths.db_path,
@@ -1509,6 +1522,39 @@ fn apply_fast_open_auto_import_reprobe(
             force_pending_merge_read_only_overrides(startup_overrides);
             false
         }
+    }
+}
+
+fn emit_torn_wal_quarantine_warning(
+    quarantine: &commands::doctor_subsystems::schema_migration::TornWalQuarantine,
+    json_mode: bool,
+) {
+    let message = format!(
+        "Moved a torn {}-byte WAL sidecar (shorter than its 32-byte header, so it held no \
+         committed frames) out of the database family; the database file is intact",
+        quarantine.wal_length
+    );
+    let retained: Vec<String> = quarantine
+        .quarantined_paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    if json_mode {
+        let payload = serde_json::json!({
+            "level": "warning",
+            "code": "torn_wal_quarantined",
+            "message": message,
+            "retained_paths": retained,
+        });
+        eprintln!(
+            "{}",
+            serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string())
+        );
+    } else {
+        eprintln!(
+            "warning: {message}. Original bytes retained at: {}",
+            retained.join(", ")
+        );
     }
 }
 
