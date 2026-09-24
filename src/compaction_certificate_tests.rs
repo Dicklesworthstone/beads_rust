@@ -84,7 +84,7 @@ fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PayloadWitness {
     device: u64,
     inode: u64,
@@ -127,6 +127,78 @@ fn payload_witness(path: &Path) -> Vec<(PathBuf, Option<PayloadWitness>)> {
         (member, witness)
     })
     .collect()
+}
+
+/// A refused checkpoint can still reset the header of an empty WAL when its
+/// storage handle drops. That header has no frames: bytes 12..32 are the
+/// checkpoint sequence, salts and checksums. Require every other durable byte
+/// and every member identity to stay exact, including a WAL with any frames.
+fn assert_payload_preserved_after_checkpoint_refusal(
+    before: &[(PathBuf, Option<PayloadWitness>)],
+    after: &[(PathBuf, Option<PayloadWitness>)],
+) {
+    assert_eq!(before.len(), after.len());
+    for (index, ((before_path, before_member), (after_path, after_member))) in
+        before.iter().zip(after).enumerate()
+    {
+        assert_eq!(before_path, after_path);
+        if index == 1 {
+            assert!(before_path.to_string_lossy().ends_with("-wal"));
+            if let (Some(before_wal), Some(after_wal)) = (before_member, after_member) {
+                if before_wal.bytes.len() == 32 && after_wal.bytes.len() == 32 {
+                    assert_eq!(before_wal.device, after_wal.device);
+                    assert_eq!(before_wal.inode, after_wal.inode);
+                    assert_eq!(&before_wal.bytes[..12], &after_wal.bytes[..12]);
+                    continue;
+                }
+            }
+        }
+        assert_eq!(before_member, after_member, "{}", before_path.display());
+    }
+}
+
+#[test]
+fn checkpoint_refusal_witness_only_tolerates_an_empty_wal_header_reset() {
+    let database = PathBuf::from("beads.db");
+    let wal = sidecar(&database, "-wal");
+    let before = vec![
+        (
+            database,
+            Some(PayloadWitness {
+                device: 1,
+                inode: 2,
+                bytes: vec![7],
+            }),
+        ),
+        (
+            wal,
+            Some(PayloadWitness {
+                device: 1,
+                inode: 3,
+                bytes: vec![0; 32],
+            }),
+        ),
+    ];
+    let mut after = before.clone();
+    after[1].1.as_mut().unwrap().bytes[15] = 1;
+    assert_payload_preserved_after_checkpoint_refusal(&before, &after);
+
+    after[0].1.as_mut().unwrap().bytes[0] = 8;
+    assert!(
+        std::panic::catch_unwind(|| {
+            assert_payload_preserved_after_checkpoint_refusal(&before, &after);
+        })
+        .is_err()
+    );
+    after[0] = before[0].clone();
+
+    after[1].1.as_mut().unwrap().bytes.push(1);
+    assert!(
+        std::panic::catch_unwind(|| {
+            assert_payload_preserved_after_checkpoint_refusal(&before, &after);
+        })
+        .is_err()
+    );
 }
 
 fn logical_state(storage: &SqliteStorage) -> serde_json::Value {
@@ -438,7 +510,7 @@ fn checkpoint_row_refusal(status: [i64; 3]) -> BeadsError {
 
     // Both result rows must have been consumed, proving that the production
     // TRUNCATE-to-PASSIVE fallback, not an earlier fixture error, refused.
-    assert_eq!(payload_witness(&fixture.path), before);
+    assert_payload_preserved_after_checkpoint_refusal(&before, &payload_witness(&fixture.path));
     fixture
         .authority
         .verify_database_authority()
@@ -593,7 +665,7 @@ fn compaction_checkpoint_refusal_preserves_committed_wal_only_state() {
     ] {
         let fixture = wal_only_fixture();
         let expected = wal_only_state(&fixture.storage);
-        let before = payload_witness(&fixture.path);
+        let original_main = fs::metadata(&fixture.path).expect("original main file");
         let path = fixture.path.to_string_lossy().into_owned();
         let error = crate::franken_sync::checkpoint_fault::with_results(
             &path,
@@ -620,9 +692,13 @@ fn compaction_checkpoint_refusal_preserves_committed_wal_only_state() {
                     if detail.contains("invalid completion values")
             ));
         }
-        // Check after ownership-consuming compaction has dropped its handle,
-        // before reopening can perform any engine recovery or checkpoint.
-        assert_eq!(payload_witness(&fixture.path), before, "status {status:?}");
+        // The consumed storage handle can checkpoint committed WAL frames on
+        // drop, legitimately changing main-file and WAL bytes after refusal.
+        // It must not install a different database; the exact committed state
+        // is checked again through the reopened storage below.
+        let current_main = fs::metadata(&fixture.path).expect("live main file");
+        assert_eq!(current_main.dev(), original_main.dev(), "status {status:?}");
+        assert_eq!(current_main.ino(), original_main.ino(), "status {status:?}");
         fixture.authority.verify_database_authority().unwrap();
         assert_no_candidate_build(&fixture.path);
         assert_no_jsonl(&fixture.path);
