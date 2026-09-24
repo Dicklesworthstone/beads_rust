@@ -197,6 +197,28 @@ is unchanged at 19, so no `doctor migrate-schema` step is needed from 0.6.0.
   is never replayed automatically ([3f29531d](https://github.com/Dicklesworthstone/beads_rust/commit/3f29531d), [efeec0b0](https://github.com/Dicklesworthstone/beads_rust/commit/efeec0b0),
   [41df183e](https://github.com/Dicklesworthstone/beads_rust/commit/41df183e), [#508](https://github.com/Dicklesworthstone/beads_rust/issues/508)).
 
+### Distribution and verification
+
+- Seven default-feature binaries were built with dsr from
+  [2fbc2b7e](https://github.com/Dicklesworthstone/beads_rust/commit/2fbc2b7e):
+  Linux GNU (glibc 2.28 floor, cargo-zigbuild) and static musl on amd64/arm64,
+  macOS amd64/arm64, and Windows amd64 using the GNU toolchain. The MSVC
+  build overflowed its 1 MiB main-thread stack on `br dep add`; the GNU
+  build reserves 2 MiB, as v0.6.0 did. A fleet-wide `/.cargo/config.toml`
+  kept dsr from staging builds on the Linux hosts, so the Linux and Windows
+  targets were cross-built on Apple Silicon. GitHub Actions were not used.
+- The 24 assets are seven archives, seven SHA-256 sidecars, seven Minisign
+  signatures (key `36B847D11BA5A0D0`), aggregate checksums, and SPDX/CycloneDX
+  source SBOMs. Draft and unauthenticated public downloads matched the staged
+  bytes, checksums and signatures. Every archived binary reports commit
+  2fbc2b7e and passed a create/sync/clone round trip plus the #512 collision
+  and empty-JSONL refusals, on native Linux amd64, macOS arm64 and Intel
+  (Rosetta), Windows, and arm64 Linux under qemu-user. The public installer
+  installed byte-identical binaries on Linux amd64 and Apple Silicon.
+- The full test suite at 2fbc2b7e passed as a non-root user on Linux: 26,716
+  passed, 0 failed, 115 existing ignores. Clippy with `-D warnings` passed for
+  default and all features.
+
 ### Storage engine, startup and dependencies
 
 - **Restore concurrent startup with the published storage engine.** The whole
