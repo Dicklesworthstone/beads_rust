@@ -20,9 +20,8 @@ impl<'conn> EngineStatement<'conn> {
         sql: &str,
     ) -> Result<Self, FrankenError> {
         let retry_safety = retry::ReplaySafety::new(sql);
-        let statement = retry_transient(connection, &retry_safety, || {
-            drive(connection.prepare(sql))
-        })?;
+        let statement =
+            retry_transient(connection, &retry_safety, || drive(connection.prepare(sql)))?;
         Ok(Self {
             connection,
             sql: sql.to_string(),
@@ -140,7 +139,10 @@ mod tests {
     fn prepared_recovery_and_schema_refresh_keep_current_bindings() {
         let conn = Connection::open(":memory:").unwrap();
         let statement = EngineStatement::new(conn.as_async(), "SELECT ?1, ?2").unwrap();
-        let params = [SqliteValue::from("current binding"), SqliteValue::Integer(23)];
+        let params = [
+            SqliteValue::from("current binding"),
+            SqliteValue::Integer(23),
+        ];
         let mut attempts = 0;
         let row = statement
             .run(|engine| {
@@ -154,8 +156,14 @@ mod tests {
             .unwrap();
         assert_eq!(attempts, 3);
         assert_eq!(row.values(), &params);
-        let next = [SqliteValue::from("next invocation"), SqliteValue::Integer(42)];
-        assert_eq!(statement.query_row_with_params(&next).unwrap().values(), &next);
+        let next = [
+            SqliteValue::from("next invocation"),
+            SqliteValue::Integer(42),
+        ];
+        assert_eq!(
+            statement.query_row_with_params(&next).unwrap().values(),
+            &next
+        );
     }
 
     #[test]
@@ -166,7 +174,8 @@ mod tests {
         let statement = EngineStatement::new(conn.as_async(), "SELECT * FROM t").unwrap();
         assert_eq!(statement.query_row().unwrap().values().len(), 1);
         conn.execute("DROP TABLE t").unwrap();
-        conn.execute("CREATE TABLE t (value TEXT, extra INTEGER)").unwrap();
+        conn.execute("CREATE TABLE t (value TEXT, extra INTEGER)")
+            .unwrap();
         conn.execute("INSERT INTO t VALUES ('new', 7)").unwrap();
         let mut attempts = 0;
         let row = statement
@@ -179,7 +188,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(attempts, 2);
-        assert_eq!(row.values(), &[SqliteValue::from("new"), SqliteValue::Integer(7)]);
+        assert_eq!(
+            row.values(),
+            &[SqliteValue::from("new"), SqliteValue::Integer(7)]
+        );
         assert_eq!(statement.query_row().unwrap().values(), row.values());
     }
 
@@ -203,7 +215,10 @@ mod tests {
             Err(FrankenError::SchemaChanged)
         });
         assert!(matches!(result, Err(FrankenError::NoSuchTable { .. })));
-        assert_eq!(attempts, 1, "failed recompilation must not execute a stale plan");
+        assert_eq!(
+            attempts, 1,
+            "failed recompilation must not execute a stale plan"
+        );
     }
 
     #[test]
@@ -253,7 +268,11 @@ mod tests {
                         // Model an engine failure that changed transaction state.
                         // Replaying after ROLLBACK would commit outside the
                         // caller's transaction; after BEGIN it would join a new one.
-                        conn.execute(if explicit { "ROLLBACK" } else { "BEGIN IMMEDIATE" })?;
+                        conn.execute(if explicit {
+                            "ROLLBACK"
+                        } else {
+                            "BEGIN IMMEDIATE"
+                        })?;
                         return Err(if stale_schema {
                             FrankenError::SchemaChanged
                         } else {
@@ -266,7 +285,10 @@ mod tests {
                     result,
                     Err(FrankenError::SchemaChanged | FrankenError::BusyRecovery)
                 ));
-                assert_eq!(attempts, 1, "transaction-changing failures must reach the owner");
+                assert_eq!(
+                    attempts, 1,
+                    "transaction-changing failures must reach the owner"
+                );
                 assert!(conn.query("SELECT value FROM t").unwrap().is_empty());
                 assert_eq!(conn.as_async().in_transaction(), !explicit);
                 if !explicit {
@@ -284,15 +306,31 @@ mod tests {
         let first = conn.prepare("INSERT INTO t VALUES (1)").unwrap();
         assert_eq!(first.execute().unwrap(), 1);
         let second = conn.prepare("INSERT INTO t VALUES (?1)").unwrap();
-        assert_eq!(second.execute_with_params(&[SqliteValue::Integer(2)]).unwrap(), 1);
+        assert_eq!(
+            second
+                .execute_with_params(&[SqliteValue::Integer(2)])
+                .unwrap(),
+            1
+        );
         let query = conn.prepare("SELECT value FROM t ORDER BY value").unwrap();
         assert_eq!(query.query().unwrap().len(), 2);
-        let bound = conn.prepare("SELECT value FROM t WHERE value = ?1").unwrap();
+        let bound = conn
+            .prepare("SELECT value FROM t WHERE value = ?1")
+            .unwrap();
         let params = [SqliteValue::Integer(2)];
-        assert_eq!(bound.query_with_params(&params).unwrap()[0].values(), &params);
-        assert_eq!(bound.query_row_with_params(&params).unwrap().values(), &params);
+        assert_eq!(
+            bound.query_with_params(&params).unwrap()[0].values(),
+            &params
+        );
+        assert_eq!(
+            bound.query_row_with_params(&params).unwrap().values(),
+            &params
+        );
         let single = conn.prepare("SELECT value FROM t WHERE value = 1").unwrap();
-        assert_eq!(single.query_row().unwrap().values(), &[SqliteValue::Integer(1)]);
+        assert_eq!(
+            single.query_row().unwrap().values(),
+            &[SqliteValue::Integer(1)]
+        );
         assert!(conn.as_async().in_transaction());
         conn.execute("ROLLBACK").unwrap();
         assert!(query.query().unwrap().is_empty());

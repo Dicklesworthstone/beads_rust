@@ -114,7 +114,10 @@ fn direct_maintenance_errors_neither_retry_nor_prepare_as_a_schema_refresh() {
 fn ordinary_bound_sql_retains_recovery_and_one_schema_refresh() {
     let conn = Connection::open(":memory:").unwrap();
     let sql = "SELECT ?1, ?2";
-    let params = [SqliteValue::from("keep; this binding"), SqliteValue::Integer(23)];
+    let params = [
+        SqliteValue::from("keep; this binding"),
+        SqliteValue::Integer(23),
+    ];
     let mut calls = 0;
     let result = with_engine_retries!(conn.inner, sql, {
         calls += 1;
@@ -133,7 +136,10 @@ fn ordinary_bound_sql_retains_recovery_and_one_schema_refresh() {
         Err(FrankenError::SchemaChanged)
     });
     assert!(matches!(result, Err(FrankenError::SchemaChanged)));
-    assert_eq!(calls, 2, "persistent schema errors must not recompile forever");
+    assert_eq!(
+        calls, 2,
+        "persistent schema errors must not recompile forever"
+    );
 }
 
 #[test]
@@ -162,8 +168,12 @@ fn direct_retries_still_stop_when_one_statement_changes_transaction_state() {
             let result: Result<(), FrankenError> = with_engine_retries!(conn.inner, sql, {
                 calls += 1;
                 if calls == 1 {
-                    conn.execute(if explicit { "ROLLBACK" } else { "BEGIN IMMEDIATE" })
-                        .unwrap();
+                    conn.execute(if explicit {
+                        "ROLLBACK"
+                    } else {
+                        "BEGIN IMMEDIATE"
+                    })
+                    .unwrap();
                     Err(if stale_schema {
                         FrankenError::SchemaChanged
                     } else {
