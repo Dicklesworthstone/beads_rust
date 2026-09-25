@@ -18362,7 +18362,7 @@ pub(crate) fn probe_read_only_open_is_observational(db_path: &Path) -> Result<Re
     })
 }
 
-fn effective_database_user_version(path: &Path) -> Result<Option<u32>> {
+pub(crate) fn effective_database_user_version(path: &Path) -> Result<Option<u32>> {
     if checked_database_header_user_version(path)?.is_none() {
         return Ok(None);
     }
@@ -33729,7 +33729,7 @@ required_fields:
         // and must not be sent through recovery for its absence (GH #520).
         assert_eq!(
             shm_path.is_file(),
-            crate::franken_sync::wal_index::ENGINE_READS_ON_DISK_WAL_INDEX
+            crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY
         );
         assert_eq!(
             SqliteStorage::inspect_pending_sync_merge_under_authority(&db_path, &authority)

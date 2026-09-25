@@ -344,9 +344,10 @@ impl BeadsError {
     #[must_use]
     pub fn reviewed_schema_migration_required(self) -> Self {
         Self::WithContext {
-            context: "ordinary commands never migrate an existing tracker database; run \
-                      `br doctor migrate-schema plan` and review its receipt before applying the \
-                      explicit migration"
+            context: "this command does not upgrade the tracker database; run \
+                      `br doctor migrate-schema heal` (backs up the database, then migrates or \
+                      rebuilds it from issues.jsonl, keeping database-only issues), or review \
+                      `br doctor migrate-schema plan` first"
                 .to_string(),
             source: Box::new(self),
         }

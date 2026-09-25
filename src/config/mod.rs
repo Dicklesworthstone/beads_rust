@@ -2761,7 +2761,11 @@ fn verify_rebuilt_issue_semantics(
         .map(|issue| (issue.id.clone(), issue))
         .collect::<HashMap<_, _>>();
 
+    // Dangling dependency edges are dropped by the import's orphan cleanup;
+    // compare against the same normalization.
+    let dangling = crate::sync::dangling_dependency_targets(storage, expected_issues.iter())?;
     for expected in expected_issues {
+        let expected = &crate::sync::without_dangling_dependencies(expected, &dangling);
         // These two legacy columns are NOT NULL in the on-disk schema and
         // therefore materialize their historical defaults even when an older
         // JSONL record omits them. Compare against that persisted canonical

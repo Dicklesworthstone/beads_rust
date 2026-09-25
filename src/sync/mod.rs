@@ -14577,7 +14577,16 @@ fn apply_collision_renames(issue: &mut Issue, renames: &HashMap<String, String>)
     }
 }
 
+#[cfg(test)]
 fn cleanup_import_orphans_in_tx(storage: &SqliteStorage) -> Result<usize> {
+    cleanup_import_orphans_counting_dependencies_in_tx(storage).map(|(total, _)| total)
+}
+
+/// Orphan cleanup that also reports how many `dependencies` rows it dropped,
+/// so the import's dependency count describes the rows it actually persisted.
+fn cleanup_import_orphans_counting_dependencies_in_tx(
+    storage: &SqliteStorage,
+) -> Result<(usize, usize)> {
     let orphan_tables = &[
         ("dependencies", "issue_id"),
         ("dependencies", "depends_on_id"),
@@ -14589,6 +14598,7 @@ fn cleanup_import_orphans_in_tx(storage: &SqliteStorage) -> Result<usize> {
         ("child_counters", "parent_id"),
     ];
     let mut orphans_cleaned = 0usize;
+    let mut dependency_rows_removed = 0usize;
 
     for (table, col) in orphan_tables {
         let external_dependency_filter = match (*table, *col) {
@@ -14599,10 +14609,14 @@ fn cleanup_import_orphans_in_tx(storage: &SqliteStorage) -> Result<usize> {
         let sql = format!(
             "DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues){external_dependency_filter}"
         );
-        orphans_cleaned += storage.execute_raw_count(&sql)?;
+        let removed = storage.execute_raw_count(&sql)?;
+        orphans_cleaned += removed;
+        if *table == "dependencies" {
+            dependency_rows_removed += removed;
+        }
     }
 
-    Ok(orphans_cleaned)
+    Ok((orphans_cleaned, dependency_rows_removed))
 }
 
 fn skipped_import_matches_stored_issue(
@@ -14751,7 +14765,12 @@ fn stream_import_actions_in_tx(
         "Import phase: issue rows, relations, and export hashes written"
     );
 
-    let orphans_cleaned = cleanup_import_orphans_in_tx(storage)?;
+    let (orphans_cleaned, dangling_dependencies_removed) =
+        cleanup_import_orphans_counting_dependencies_in_tx(storage)?;
+    // Dangling dependency edges were counted as imported but not persisted.
+    tx_result.dependencies_imported = tx_result
+        .dependencies_imported
+        .saturating_sub(dangling_dependencies_removed);
     if orphans_cleaned > 0 {
         tracing::info!(
             count = orphans_cleaned,
@@ -14870,6 +14889,48 @@ pub(crate) fn persisted_import_issue_equals(actual: &Issue, expected: &Issue) ->
         && actual.agent_context == expected.agent_context
 }
 
+/// Dependency targets named by `issues` that exist neither among `issues` nor
+/// in the database (external references excepted).
+///
+/// `cleanup_import_orphans_in_tx` deliberately drops dependency rows whose
+/// local target does not exist (a JSONL can legitimately carry an edge to an
+/// issue that was purged or never shared), so a persisted row can only match
+/// its JSONL payload after the same normalization. Comparing the raw payload
+/// made every import of such a JSONL fail, including the rebuild that
+/// recovers a stale database.
+pub(crate) fn dangling_dependency_targets<'a>(
+    storage: &SqliteStorage,
+    issues: impl Iterator<Item = &'a Issue> + Clone,
+) -> Result<HashSet<String>> {
+    let imported: HashSet<&str> = issues.clone().map(|issue| issue.id.as_str()).collect();
+    let mut dangling = HashSet::new();
+    for issue in issues {
+        for dependency in &issue.dependencies {
+            let target = dependency.depends_on_id.as_str();
+            if target.starts_with("external:")
+                || imported.contains(target)
+                || dangling.contains(target)
+            {
+                continue;
+            }
+            if storage.get_issue(target)?.is_none() {
+                dangling.insert(target.to_string());
+            }
+        }
+    }
+    Ok(dangling)
+}
+
+/// `issue` with the dependencies on `dangling` targets removed, as the import
+/// orphan cleanup persists it.
+pub(crate) fn without_dangling_dependencies(issue: &Issue, dangling: &HashSet<String>) -> Issue {
+    let mut normalized = issue.clone();
+    normalized
+        .dependencies
+        .retain(|dependency| !dangling.contains(&dependency.depends_on_id));
+    normalized
+}
+
 fn verify_applied_import_issue_semantics(
     storage: &SqliteStorage,
     expected_issues: &[Issue],
@@ -14897,7 +14958,15 @@ fn verify_applied_import_issue_semantics(
         .map(|issue| (issue.id.clone(), issue))
         .collect::<HashMap<_, _>>();
 
+    let dangling_targets = dangling_dependency_targets(storage, expected_by_id.values().copied())?;
+
     for expected in expected_by_id.into_values() {
+        let expected = if dangling_targets.is_empty() {
+            std::borrow::Cow::Borrowed(expected)
+        } else {
+            std::borrow::Cow::Owned(without_dangling_dependencies(expected, &dangling_targets))
+        };
+        let expected = expected.as_ref();
         let actual = actual_by_id.get(&expected.id).ok_or_else(|| {
             BeadsError::SyncConflict {
                 message: format!(

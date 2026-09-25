@@ -306,21 +306,30 @@ fn upgrade_fixture_end_to_end(
         "{label}: fixture must genuinely be at schema {expected_from}"
     );
 
-    // 1. Ordinary commands refuse and print the reviewed-migration remediation.
+    // 1. An explicitly read-only command never upgrades the database; it reads
+    //    the JSONL instead and names the heal command on stderr.
     let stats = run_br(
         &workspace,
         ["stats", "--json", "--no-auto-flush", "--no-auto-import"],
         "stats_schema_mismatch",
     );
     assert!(
-        !stats.status.success(),
-        "{label}: stats must refuse on an old schema; stdout: {}",
-        stats.stdout
+        stats.status.success(),
+        "{label}: read-only stats must fall back to the JSONL on an old schema; stdout: {} stderr: {}",
+        stats.stdout,
+        stats.stderr
     );
-    let refusal = format!("{}{}", stats.stdout, stats.stderr);
     assert!(
-        refusal.contains("migrate-schema plan"),
-        "{label}: SCHEMA_MISMATCH remediation must name `br doctor migrate-schema plan`; got: {refusal}"
+        stats.stderr.contains("migrate-schema heal"),
+        "{label}: the fallback warning must name `br doctor migrate-schema heal`; got: {}",
+        stats.stderr
+    );
+    serde_json::from_str::<Value>(&extract_json_payload(&stats.stdout))
+        .expect("stdout stays clean JSON");
+    assert_eq!(
+        u64::from(header_user_version(&db_path)),
+        expected_from,
+        "{label}: a read-only fallback must not touch the database"
     );
 
     // 2. Follow the remediation: plan must accept the fixture.

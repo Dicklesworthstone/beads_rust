@@ -2194,9 +2194,36 @@ reports the stage and retained pre-state location. All rehearsal and failure
 artifacts remain available. Run `plan` again after successful recovery; `plan`
 itself remains read-only.
 
-Ordinary commands never upgrade an existing database across a schema-version
-boundary. If the database is on a supported older version, use the explicit
-receipt-bound lifecycle:
+**Stale-schema self-heal.** When a command meets a database on an older schema
+(including the unversioned schema 0 of early `br` and Go `bd`), it first audits
+the database against `issues.jsonl`. An issue row counts as represented when the
+JSONL carries it as a tombstone, carries equivalent content, or carries a copy
+at least as new while the row was never marked dirty. If every row is
+represented, the command upgrades the database and continues, printing one
+`br: tracker database was on schema N ...` line on stderr: schemas 13-18 go
+through the reviewed migration below (recovery bundle and undo command
+retained), older schemas are rebuilt from the JSONL with the old family kept in
+`.beads/.br_recovery`. Explicitly read-only invocations
+(`--no-auto-import --no-auto-flush`) never upgrade.
+
+If any row exists only in the database (absent from the JSONL, an unflushed
+edit, or newer than its JSONL copy), mutations refuse and name those issues,
+and read-only commands read the JSONL directly (as with `--no-db`). Resolve it
+with:
+
+```bash
+br doctor migrate-schema heal --dry-run   # show the audit, change nothing
+br doctor migrate-schema heal             # upgrade, keeping database-only issues
+```
+
+`heal` migrates schemas 13-18 in place (every row kept). For older schemas it
+rebuilds from the JSONL and re-adds the database-only issues as unflushed
+changes, so the next `br sync --flush-only` exports them; unflushed edits that a
+newer JSONL edit already superseded stay only in the backup.
+`--discard-db-only` skips the re-add.
+
+The explicit receipt-bound lifecycle remains available for supported older
+versions:
 
 ```bash
 # Read-only inspection. Save and review the complete JSON receipt.

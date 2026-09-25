@@ -59,9 +59,9 @@ Safety:
   Avoid bare bv in automated sessions; use bv --robot-* flags.
   Use RUST_LOG=error for routine br runs to suppress dependency logs.
   br sync does not commit, push, pull, or install hooks.
-  Existing databases are never schema-migrated implicitly. Run
-  br doctor migrate-schema plan --json, review the receipt, then apply its
-  exact token.
+  A database on an older schema is upgraded automatically (backup kept) only
+  when it holds nothing the JSONL lacks. Otherwise mutations refuse; run
+  br doctor migrate-schema heal --dry-run, then br doctor migrate-schema heal.
 "#;
 
 #[derive(Debug, Serialize)]

@@ -78,7 +78,13 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
         }
     };
 
-    let storage_enabled = ctx.is_initialized() && !ctx.no_db();
+    // The last-touched file records who touched the issue so an id-less
+    // mutation never silently acts on another actor's work (GitHub #518).
+    if let Some(layer) = ctx.config.as_ref() {
+        beads_rust::util::set_process_actor(&config::resolve_actor(layer));
+    }
+
+    let mut storage_enabled = ctx.is_initialized() && !ctx.no_db();
     let mut should_auto_import_now =
         command_supports_auto_import && !cli.allow_stale && !ctx.no_auto_import();
     let should_auto_flush_now = is_mutating && !ctx.no_auto_flush();
@@ -117,7 +123,7 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
         && cli.no_auto_flush)
         || matches!(cli.command, Commands::Doctor(_))
         || matches!(&cli.command, Commands::Sync(args) if args.status || (args.reconcile && args.dry_run));
-    let startup_recovery_lock = if storage_enabled
+    let mut startup_recovery_lock = if storage_enabled
         && !observational_startup
         && (command_needs_write_lock
             || should_preopen_storage
@@ -154,6 +160,83 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     } else {
         None
     };
+    // A database left on an older schema refuses every ordinary command.
+    // When the audit proves nothing lives only in the database, upgrade it
+    // here (reviewed migration or JSONL rebuild, backup retained) and carry
+    // on; otherwise mutations refuse with the one command that resolves it,
+    // and read-only commands fall back to reading the JSONL directly.
+    if storage_enabled
+        && !matches!(cli.command, Commands::Doctor(_) | Commands::Init { .. })
+        && (command_needs_write_lock
+            || should_preopen_storage
+            || command_supports_auto_import
+            || supports_read_only_fast_open(&cli.command))
+        && let Some((beads_dir, paths)) = ctx.beads_dir.clone().zip(ctx.paths.clone())
+        && let Ok(Some(found)) =
+            commands::doctor_subsystems::schema_heal::stale_schema_version(&paths.db_path)
+    {
+        let refusal = if observational_startup {
+            // Explicitly read-only invocations never rewrite the database.
+            Some(stale_schema_observational_refusal(found))
+        } else {
+            let authority = match startup_recovery_lock.as_ref() {
+                Some(authority) => Arc::clone(authority),
+                None => Arc::new(
+                    beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+                        &beads_dir,
+                        &paths.db_path,
+                        ctx.startup_write_lock_timeout(&cli.command),
+                    )?,
+                ),
+            };
+            let heal_ctx = commands::doctor_subsystems::schema_heal::HealContext {
+                beads_dir: &beads_dir,
+                cli: &overrides,
+                write_authority: &authority,
+            };
+            let result = commands::doctor_subsystems::schema_heal::heal_stale_schema(
+                &heal_ctx,
+                commands::doctor_subsystems::schema_heal::HealMode::Automatic,
+            );
+            // A fresh authority must be released before the ordinary startup
+            // lock below: flock is per open file description, so the same
+            // process would block on itself.
+            drop(authority);
+            match result {
+                Ok(commands::doctor_subsystems::schema_heal::HealResult::NotNeeded) => None,
+                Ok(commands::doctor_subsystems::schema_heal::HealResult::Healed(outcome)) => {
+                    eprintln!("{}", outcome.notice());
+                    None
+                }
+                Ok(commands::doctor_subsystems::schema_heal::HealResult::Refused(audit)) => Some(
+                    commands::doctor_subsystems::schema_heal::refusal_error(&audit),
+                ),
+                // A failed upgrade leaves the old family in place; read-only
+                // commands still fall back to the JSONL below.
+                Err(error) => Some(error),
+            }
+        };
+        if let Some(refusal) = refusal {
+            if !supports_read_only_fast_open(&cli.command) {
+                return Err(refusal);
+            }
+            eprintln!(
+                "warning: {refusal}. This read-only command reads issues.jsonl directly instead \
+                 (as with --no-db)."
+            );
+            overrides.no_db = Some(true);
+            ctx.overrides.no_db = Some(true);
+            overrides.read_only_fast_open = false;
+            ctx.overrides.read_only_fast_open = false;
+            if let Some(layer) = ctx.config.as_mut() {
+                layer.merge_from(&overrides.as_layer());
+            }
+            storage_enabled = false;
+            should_auto_import_now = false;
+            should_preopen_storage = false;
+            startup_recovery_lock = None;
+        }
+    }
     let mut pending_merge_warning_emitted = false;
     if ctx.is_initialized()
         && !ctx.no_db()
@@ -1397,6 +1480,23 @@ fn pending_sync_merge_refusal_error(state: &commands::doctor::PendingSyncMergeSt
 
 fn reviewed_schema_migration_required(source: BeadsError) -> BeadsError {
     source.reviewed_schema_migration_required()
+}
+
+/// Refusal for an explicitly read-only invocation that found a stale schema:
+/// such invocations never rewrite the database, so name the heal instead.
+fn stale_schema_observational_refusal(found: u32) -> BeadsError {
+    BeadsError::WithContext {
+        context: format!(
+            "the tracker database is on schema {found} and explicitly read-only invocations \
+             never upgrade it; any ordinary br command upgrades it automatically when nothing \
+             exists only in the database, or run `{}`",
+            commands::doctor_subsystems::schema_heal::HEAL_COMMAND
+        ),
+        source: Box::new(BeadsError::SchemaMismatch {
+            expected: beads_rust::storage::schema::CURRENT_SCHEMA_VERSION,
+            found: i32::try_from(found).unwrap_or(i32::MAX),
+        }),
+    }
 }
 
 fn pending_sync_merge_no_db_refusal_error(

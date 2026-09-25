@@ -3583,6 +3583,33 @@ pub enum DoctorMigrateSchemaCommand {
     Apply(DoctorMigrateSchemaApplyArgs),
     /// Restore the exact pre-migration database family from a completed run.
     Undo(DoctorMigrateSchemaUndoArgs),
+    /// Upgrade a database left on an older schema (any version, including the
+    /// unversioned schema 0 of early br and Go bd), keeping a backup.
+    ///
+    /// Schemas 13-18 use the reviewed in-place migration. Older schemas are
+    /// rebuilt from issues.jsonl; issues that exist only in the database are
+    /// re-added as unflushed changes so the next flush exports them. Ordinary
+    /// commands do this automatically when the database holds nothing the
+    /// JSONL lacks; this command is for the case they refuse.
+    Heal(DoctorMigrateSchemaHealArgs),
+}
+
+/// Arguments for `br doctor migrate-schema heal`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct DoctorMigrateSchemaHealArgs {
+    /// Print the audit (database-only issues and the planned action) without
+    /// changing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Do not re-add database-only issues after a rebuild; they remain only
+    /// in the retained backup.
+    #[arg(long)]
+    pub discard_db_only: bool,
+
+    /// Emit a machine-readable receipt.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `br doctor migrate-schema recover`.

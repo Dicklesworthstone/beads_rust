@@ -265,10 +265,10 @@ struct PlanTokenMaterial<'a> {
     forecast: &'a MigrationForecast,
 }
 
-struct MigrationContext {
-    beads_dir: PathBuf,
-    db_path: PathBuf,
-    write_authority: Arc<DatabaseFamilyWriteLock>,
+pub(super) struct MigrationContext {
+    pub(super) beads_dir: PathBuf,
+    pub(super) db_path: PathBuf,
+    pub(super) write_authority: Arc<DatabaseFamilyWriteLock>,
 }
 
 /// Execute `br doctor migrate-schema ...`.
@@ -288,6 +288,12 @@ pub fn execute(
         DoctorMigrateSchemaCommand::Plan(plan) => execute_plan(plan, &migration),
         DoctorMigrateSchemaCommand::Apply(apply) => execute_apply(apply, &migration),
         DoctorMigrateSchemaCommand::Undo(undo) => execute_undo(undo, &migration),
+        DoctorMigrateSchemaCommand::Heal(heal) => super::schema_heal::execute_heal(
+            heal,
+            cli,
+            &migration.beads_dir,
+            &migration.write_authority,
+        ),
     }
 }
 
@@ -371,7 +377,7 @@ const WAL_HEADER_BYTES: u64 = 32;
 pub fn missing_wal_index(db_path: &Path) -> Result<bool> {
     missing_wal_index_for_engine(
         db_path,
-        crate::franken_sync::wal_index::ENGINE_READS_ON_DISK_WAL_INDEX,
+        crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY,
     )
 }
 
@@ -485,13 +491,15 @@ pub fn quarantine_torn_wal_for_startup(
 /// trusted to admit this family. Always false where the engine never reads
 /// the on-disk index (Windows): there is nothing to recover, and attempting it
 /// would wedge every command on an unsupported quarantine (GH #520).
+/// Also false on Unix targets without the quarantine primitive, where
+/// entering recovery could only fail as unsupported.
 ///
 /// # Errors
 /// Returns an error for unsafe paths or failed filesystem inspection.
 pub fn wal_index_needs_recovery(db_path: &Path) -> Result<bool> {
     wal_index_needs_recovery_for_engine(
         db_path,
-        crate::franken_sync::wal_index::ENGINE_READS_ON_DISK_WAL_INDEX,
+        crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY,
     )
 }
 
@@ -826,7 +834,9 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     if !REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         return Err(BeadsError::internal(format!(
             "reviewed schema migration is available only from source schemas 13, 14, 15, 16, 17, and 18 \
-             to {target}; observed unsupported source version {from}"
+             to {target}; observed unsupported source version {from}. Run \
+             `br doctor migrate-schema heal` instead: it rebuilds this database from issues.jsonl, \
+             keeps database-only issues, and retains the old database as a backup"
         )));
     }
     if !integrity_clean && !integrity_check_is_repairable(&logical_witness.integrity_check) {
@@ -922,9 +932,33 @@ fn emit_plan(plan: &MigrationPlanReceipt, json: bool) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationContext) -> Result<()> {
-    if args.plan_token.trim().is_empty() {
+    let (applied, before_dir) = apply_with_plan_token(args.plan_token.trim(), migration)?;
+    emit_applied(&applied, args.json, &before_dir)
+}
+
+/// Plan and immediately apply the reviewed migration for the database the
+/// caller already holds authority over, returning the verified pre-migration
+/// recovery bundle directory. Used by the stale-schema heal, which has
+/// already audited the upgrade; the plan is still recomputed and token-bound
+/// exactly as an operator-driven `plan` + `apply` pair would be.
+pub(super) fn plan_and_apply(migration: &MigrationContext) -> Result<PathBuf> {
+    let plan = build_plan(&migration.db_path)?;
+    let token = plan.plan_token.ok_or_else(|| {
+        BeadsError::internal(format!(
+            "schema migration is not eligible for this database: {}",
+            plan.note
+        ))
+    })?;
+    apply_with_plan_token(&token, migration).map(|(_, before_dir)| before_dir)
+}
+
+#[allow(clippy::too_many_lines)]
+fn apply_with_plan_token(
+    plan_token: &str,
+    migration: &MigrationContext,
+) -> Result<(AppliedMigrationReceipt, PathBuf)> {
+    if plan_token.is_empty() {
         return Err(BeadsError::internal(
             "schema migration apply requires a non-empty --plan-token",
         ));
@@ -933,8 +967,8 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
     // filesystem before either a fresh migration or a recovery path can write.
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     verify_migration_exchange_support(&migration.db_path, exchange_database_paths)?;
-    if let Some((applied, before_dir)) = resume_commit_ready_migration(args, migration)? {
-        return emit_applied(&applied, args.json, &before_dir);
+    if let Some(resumed) = resume_commit_ready_migration(plan_token, migration)? {
+        return Ok(resumed);
     }
     let plan = build_plan(&migration.db_path)?;
     let Some(recomputed_token) = plan.plan_token.as_deref() else {
@@ -942,12 +976,11 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
             "schema migration apply refused because no migration is currently eligible",
         ));
     };
-    if !constant_time_text_eq(recomputed_token, args.plan_token.trim()) {
+    if !constant_time_text_eq(recomputed_token, plan_token) {
         return Err(BeadsError::internal(format!(
             "schema migration plan token is stale or belongs to a different database state \
-             (provided {}, recomputed {}); run `br doctor migrate-schema plan` again",
-            args.plan_token.trim(),
-            recomputed_token
+             (provided {plan_token}, recomputed {recomputed_token}); run \
+             `br doctor migrate-schema plan` again"
         )));
     }
     let forecast = plan
@@ -1132,7 +1165,7 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
         )));
     }
 
-    emit_applied(&applied, args.json, &before_dir)
+    Ok((applied, before_dir))
 }
 
 fn emit_applied(applied: &AppliedMigrationReceipt, json: bool, before_dir: &Path) -> Result<()> {
@@ -1262,7 +1295,7 @@ fn validate_commit_ready_marker(
 
 #[allow(clippy::too_many_lines)]
 fn resume_commit_ready_migration(
-    args: &DoctorMigrateSchemaApplyArgs,
+    plan_token: &str,
     migration: &MigrationContext,
 ) -> Result<Option<(AppliedMigrationReceipt, PathBuf)>> {
     let root = migration_runs_root(&migration.beads_dir);
@@ -1287,7 +1320,7 @@ fn resume_commit_ready_migration(
         let marker: CommitReadyMigrationReceipt = read_json(&marker_path)?;
         validate_commit_ready_marker(&marker, &run_dir)?;
         if marker.database_path != database_path
-            || !constant_time_text_eq(&marker.plan_token, args.plan_token.trim())
+            || !constant_time_text_eq(&marker.plan_token, plan_token)
         {
             continue;
         }
@@ -4742,7 +4775,10 @@ mod tests {
         crate::franken_sync::wal_index::tests::write_stock_header_only_family(&db);
         assert!(wal_index_needs_recovery_for_engine(&db, true).unwrap());
         assert!(!wal_index_needs_recovery_for_engine(&db, false).unwrap());
-        assert_eq!(wal_index_needs_recovery(&db).unwrap(), cfg!(unix));
+        assert_eq!(
+            wal_index_needs_recovery(&db).unwrap(),
+            crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY
+        );
 
         // Same split for a complete WAL whose index file is absent.
         let shm = family_component_path(&db, "-shm");
@@ -4751,7 +4787,10 @@ mod tests {
         assert!(!missing_wal_index_for_engine(&db, false).unwrap());
         assert!(wal_index_needs_recovery_for_engine(&db, true).unwrap());
         assert!(!wal_index_needs_recovery_for_engine(&db, false).unwrap());
-        assert_eq!(missing_wal_index(&db).unwrap(), cfg!(unix));
+        assert_eq!(
+            missing_wal_index(&db).unwrap(),
+            crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
@@ -6550,15 +6589,9 @@ mod tests {
             beads_dir,
             db_path,
         };
-        let (applied, resumed_before_dir) = resume_commit_ready_migration(
-            &DoctorMigrateSchemaApplyArgs {
-                plan_token,
-                json: false,
-            },
-            &migration,
-        )
-        .expect("resume commit-ready migration")
-        .expect("committed generation must materialize applied receipt");
+        let (applied, resumed_before_dir) = resume_commit_ready_migration(&plan_token, &migration)
+            .expect("resume commit-ready migration")
+            .expect("committed generation must materialize applied receipt");
         assert_eq!(resumed_before_dir, before_dir);
         assert!(applied.attested);
         assert!(run_dir.join("applied.json").is_file());
@@ -6626,14 +6659,8 @@ mod tests {
         )
         .expect("persist pre-install commit-ready marker");
 
-        let resumed = resume_commit_ready_migration(
-            &DoctorMigrateSchemaApplyArgs {
-                plan_token,
-                json: false,
-            },
-            &migration,
-        )
-        .expect("classify interrupted pre-install intent");
+        let resumed = resume_commit_ready_migration(&plan_token, &migration)
+            .expect("classify interrupted pre-install intent");
         assert!(
             resumed.is_none(),
             "an unchanged original generation must be retried, never called applied"

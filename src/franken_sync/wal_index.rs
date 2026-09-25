@@ -171,6 +171,26 @@ fn poisoned_headers(wal: &[u8; 32], shm: &[u8; 96]) -> bool {
 /// missing one can affect admission, so nothing may be "recovered" (GH #520).
 pub const ENGINE_READS_ON_DISK_WAL_INDEX: bool = cfg!(unix);
 
+/// Whether this target can perform the identity-bound WAL-index quarantine:
+/// the POSIX open-file-description byte-range guard in
+/// `RecoveryLock::acquire` exists only on these targets (keep the two cfg
+/// lists identical). Elsewhere acquisition always fails as unsupported.
+pub const WAL_INDEX_QUARANTINE_SUPPORTED: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+));
+
+/// Whether ordinary startup may enter automatic WAL-index recovery. Both the
+/// engine must read the on-disk index *and* the quarantine must be possible;
+/// on other Unix targets (FreeBSD, NetBSD, ...) entering recovery could only
+/// fail as unsupported and wedge every command, so startup leaves the family
+/// to the engine and `br doctor migrate-schema recover` reports the
+/// limitation explicitly (GH #520 follow-up).
+pub const STARTUP_WAL_INDEX_RECOVERY: bool =
+    ENGINE_READS_ON_DISK_WAL_INDEX && WAL_INDEX_QUARANTINE_SUPPORTED;
+
 fn probe(path: &Path) -> io::Result<bool> {
     probe_for_engine(path, ENGINE_READS_ON_DISK_WAL_INDEX)
 }
@@ -594,6 +614,52 @@ pub mod tests {
         fs::write(db, main).unwrap();
         fs::write(sidecar(db, "-wal"), wal_header(4096, false)).unwrap();
         fs::write(sidecar(db, "-shm"), stock_sqlite_header_only_index()).unwrap();
+    }
+
+    /// The engine's reaction to the index stock SQLite writes beside a
+    /// header-only WAL, on a real database. A read-write open rebuilds it and
+    /// reads the data; read-only admission reports `BusyRecovery` on fsqlite
+    /// 0.4.4 (Dicklesworthstone/frankensqlite#431), which is why startup
+    /// carries its own detector and quarantine for this shape. When the
+    /// engine starts accepting it read-only, this test still passes and the
+    /// recovery path becomes removable.
+    #[cfg(unix)]
+    #[test]
+    fn engine_reaction_to_stock_header_only_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("stock.db");
+        let path = db.to_string_lossy().into_owned();
+        let conn = crate::franken_sync::Connection::open(path.clone()).unwrap();
+        conn.execute("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.close().unwrap();
+        let install_stock_family = || {
+            fs::write(sidecar(&db, "-wal"), wal_header(4096, false)).unwrap();
+            fs::write(sidecar(&db, "-shm"), stock_sqlite_header_only_index()).unwrap();
+        };
+        let count = |conn: &crate::franken_sync::Connection| {
+            conn.query_row("SELECT count(*) FROM t")
+                .map(|row| row.get(0).and_then(SqliteValue::as_integer))
+        };
+
+        install_stock_family();
+        match crate::franken_sync::compat::open_with_flags(
+            &path,
+            crate::franken_sync::compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .and_then(|conn| count(&conn))
+        {
+            Ok(rows) => assert_eq!(rows, Some(1)),
+            Err(error) => assert!(
+                matches!(error, FrankenError::BusyRecovery),
+                "read-only admission failed other than BusyRecovery: {error:?}"
+            ),
+        }
+
+        install_stock_family();
+        let conn = crate::franken_sync::Connection::open(path).unwrap();
+        assert_eq!(count(&conn).unwrap(), Some(1));
     }
 
     #[test]

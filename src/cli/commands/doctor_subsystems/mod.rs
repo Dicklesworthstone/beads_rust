@@ -33,6 +33,7 @@ pub mod exit_codes;
 pub mod mutate;
 pub mod refuse_gates;
 pub mod run_dir;
+pub mod schema_heal;
 pub mod schema_migration;
 pub mod selftest;
 pub mod surface;

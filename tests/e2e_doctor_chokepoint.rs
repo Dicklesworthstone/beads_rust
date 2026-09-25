@@ -1995,13 +1995,22 @@ fn e2e_reviewed_schema_migration_plan_apply_barrier_and_non_deleting_undo() {
     }
     let source_bytes = fs::read(&db_path).expect("read v14 source bytes");
 
+    // The seeded issue exists only in the database, so the automatic upgrade
+    // must refuse: mutations fail, and a read-only command reads the JSONL
+    // instead, naming the heal command, without touching the database.
     let refused = br_cmd(&root)
-        .args(["--no-auto-import", "--allow-stale", "list", "--json"])
+        .args([
+            "--no-auto-import",
+            "--allow-stale",
+            "create",
+            "blocked",
+            "--json",
+        ])
         .output()
-        .expect("ordinary command spawned");
+        .expect("ordinary mutation spawned");
     assert!(
         !refused.status.success(),
-        "ordinary storage open must refuse an implicit schema migration"
+        "a mutation must refuse an implicit upgrade that could drop database-only data"
     );
     assert_eq!(db_user_version(&db_path), 14);
     let refusal_text = format!(
@@ -2010,9 +2019,21 @@ fn e2e_reviewed_schema_migration_plan_apply_barrier_and_non_deleting_undo() {
         String::from_utf8_lossy(&refused.stderr)
     );
     assert!(
-        refusal_text.contains("br doctor migrate-schema plan"),
-        "refusal must route the operator to the reviewed workflow: {refusal_text}"
+        refusal_text.contains("br doctor migrate-schema heal")
+            && refusal_text.contains("bd-e2e-schema"),
+        "refusal must name the heal command and the database-only issue: {refusal_text}"
     );
+    let read_only = br_cmd(&root)
+        .args(["--no-auto-import", "--allow-stale", "list", "--json"])
+        .output()
+        .expect("read-only command spawned");
+    assert!(
+        read_only.status.success(),
+        "a read-only command must fall back to the JSONL: {}",
+        String::from_utf8_lossy(&read_only.stderr)
+    );
+    assert!(String::from_utf8_lossy(&read_only.stderr).contains("migrate-schema heal"));
+    assert_eq!(db_user_version(&db_path), 14);
 
     let plan = br_cmd(&root)
         .args(["doctor", "migrate-schema", "plan", "--json"])
