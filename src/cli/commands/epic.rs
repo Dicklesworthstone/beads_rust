@@ -2,7 +2,7 @@
 
 use crate::cli::{EpicCloseEligibleArgs, EpicCommands, EpicStatusArgs};
 use crate::config;
-use crate::error::Result;
+use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
 use crate::model::{EpicStatus, IssueType, Status};
 use crate::output::{OutputContext, OutputMode};
@@ -179,7 +179,8 @@ fn execute_close_eligible(
     }
 
     let now = Utc::now();
-    let reason = "All children completed";
+    let reason = ELIGIBLE_EPIC_CLOSE_REASON;
+    enforce_close_policy_for_epics(&beads_dir, storage, &epics, &actor, args)?;
     let closed_ids = close_eligible_epics_atomically(
         storage,
         &epics,
@@ -220,6 +221,59 @@ fn execute_close_eligible(
         }
         for warning in &capacity_warnings {
             ctx.warning(&warning.to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Close reason recorded on every epic `br epic close-eligible` closes.
+const ELIGIBLE_EPIC_CLOSE_REASON: &str = "All children completed";
+
+/// Evaluate `.beads/policy.yaml` close-policy gates for every epic the batch
+/// would close, exactly as `br close` does (GH #517). The storage chokepoint
+/// in [`close_eligible_epics_atomically`] enforces transition gates, required
+/// fields and capacity, but the close-policy gates (close reason, acceptance
+/// criteria, self-close, typed references, deferred dependents) live only in
+/// `evaluate_close_policy`, so skipping it let this command close epics that
+/// `br close` refuses. There is no bypass flag here, so any violation refuses
+/// the whole batch before anything is mutated, like a `br close` batch.
+fn enforce_close_policy_for_epics(
+    beads_dir: &std::path::Path,
+    storage: &SqliteStorage,
+    epics: &[EpicStatus],
+    actor: &str,
+    args: &EpicCloseEligibleArgs,
+) -> Result<()> {
+    let policy_doc = crate::close_policy::load_for_beads_dir(beads_dir)?;
+    let policy_active = policy_doc.close_policy.is_active()
+        || policy_doc.workflow.gates_enforced()
+        || !policy_doc.workflow.required_fields.is_empty();
+    if !policy_active {
+        return Ok(());
+    }
+    for epic_status in epics {
+        let epic = &epic_status.epic;
+        let close_args = crate::cli::commands::close::CloseArgs {
+            ids: vec![epic.id.clone()],
+            reason: Some(ELIGIBLE_EPIC_CLOSE_REASON.to_string()),
+            transition_comment: args.transition_comment.clone(),
+            ..Default::default()
+        };
+        let evaluated = crate::cli::commands::close::evaluate_close_policy(
+            &policy_doc.close_policy,
+            &policy_doc.workflow,
+            storage,
+            &epic.id,
+            epic,
+            &close_args,
+            actor,
+        )?;
+        if !evaluated.violations.is_empty() {
+            return Err(BeadsError::PolicyViolation {
+                issue_id: epic.id.clone(),
+                summary: crate::cli::commands::close::summarize_violations(&evaluated.violations),
+                violations: evaluated.violations,
+            });
         }
     }
     Ok(())

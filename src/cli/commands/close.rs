@@ -226,7 +226,7 @@ fn collect_deferred_blocks_dependents(
         .collect())
 }
 
-fn summarize_violations(violations: &[PolicyViolation]) -> String {
+pub(crate) fn summarize_violations(violations: &[PolicyViolation]) -> String {
     if let [single] = violations {
         return single.message.clone();
     }

@@ -895,3 +895,103 @@ fn e2e_epic_deleted_child_removes_dependency() {
         "childless epic should not be eligible"
     );
 }
+
+/// GH #517: `br epic close-eligible` must evaluate `close_policy` like
+/// `br close` does. An epic whose close the policy rejects must not be closed
+/// through this path, and the batch stays all-or-nothing.
+#[test]
+fn e2e_epic_close_eligible_enforces_close_policy() {
+    let _log = common::test_log("e2e_epic_close_eligible_enforces_close_policy");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let mut epic_ids = Vec::new();
+    for n in 1..=2 {
+        let create_epic = run_br(
+            &workspace,
+            ["create", &format!("Policy epic {n}"), "--type", "epic"],
+            &format!("create_epic_{n}"),
+        );
+        assert!(create_epic.status.success(), "{}", create_epic.stderr);
+        let epic_id = parse_created_id(&create_epic.stdout);
+        let create_child = run_br(
+            &workspace,
+            [
+                "create",
+                &format!("Policy child {n}"),
+                "--type",
+                "task",
+                "--parent",
+                &epic_id,
+            ],
+            &format!("create_child_{n}"),
+        );
+        assert!(create_child.status.success(), "{}", create_child.stderr);
+        let child_id = parse_created_id(&create_child.stdout);
+        let close_child = run_br(
+            &workspace,
+            [
+                "close",
+                &child_id,
+                "--reason",
+                "Fix: child closed properly with a long enough reason",
+            ],
+            &format!("close_child_{n}"),
+        );
+        assert!(close_child.status.success(), "{}", close_child.stderr);
+        epic_ids.push(epic_id);
+    }
+
+    std::fs::write(
+        workspace.root.join(".beads").join("policy.yaml"),
+        "allow_bypass: false\nclose_policy:\n  require_close_reason: {enabled: true, min_length: 40}\n",
+    )
+    .expect("write policy");
+
+    let refused = run_br(
+        &workspace,
+        ["epic", "close-eligible", "--json"],
+        "close_eligible_refused",
+    );
+    assert_eq!(
+        refused.status.code(),
+        Some(4),
+        "close-eligible must refuse a close the policy rejects; stdout: {} stderr: {}",
+        refused.stdout,
+        refused.stderr
+    );
+    let payload = extract_json_payload(&refused.stdout);
+    let error: Value = serde_json::from_str(&payload).expect("structured error JSON");
+    assert_eq!(error["error"]["code"], "POLICY_VIOLATION", "{error}");
+
+    // All-or-nothing: neither epic was closed.
+    for epic_id in &epic_ids {
+        let show = run_br(
+            &workspace,
+            ["show", epic_id, "--json"],
+            "show_after_refusal",
+        );
+        assert!(show.status.success(), "{}", show.stderr);
+        let shown: Vec<Value> =
+            serde_json::from_str(&extract_json_payload(&show.stdout)).expect("show JSON");
+        assert_eq!(shown[0]["status"], "open", "{epic_id} must stay open");
+    }
+
+    // A policy the generated reason satisfies lets the batch through.
+    std::fs::write(
+        workspace.root.join(".beads").join("policy.yaml"),
+        "allow_bypass: false\nclose_policy:\n  require_close_reason: {enabled: true, min_length: 10}\n",
+    )
+    .expect("rewrite policy");
+    let allowed = run_br(
+        &workspace,
+        ["epic", "close-eligible", "--json"],
+        "close_eligible_allowed",
+    );
+    assert!(allowed.status.success(), "{}", allowed.stderr);
+    let result: Value =
+        serde_json::from_str(&extract_json_payload(&allowed.stdout)).expect("result JSON");
+    assert_eq!(result["count"], 2, "{result}");
+}
