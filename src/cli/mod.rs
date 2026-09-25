@@ -974,10 +974,11 @@ EXAMPLES:
     /// Undefer issues (make ready again)
     Undefer(UndeferArgs),
 
+    // Boxed: `UpdateArgs` is the largest argument struct by a wide margin,
+    // and keeping it inline would size every `Commands` value to it. This is
+    // a plain `//` comment on purpose: clap turns every `///` paragraph into
+    // `--help` text (GH #516).
     /// Update an issue
-    ///
-    /// Boxed: `UpdateArgs` is the largest argument struct by a wide margin,
-    /// and keeping it inline would size every `Commands` value to it.
     Update(Box<UpdateArgs>),
 
     /// Explicitly inspect Git visibility for the configured JSONL export
@@ -3828,6 +3829,47 @@ mod tests {
     use tempfile::TempDir;
 
     const CLI_REFERENCE: &str = include_str!("../../docs/CLI_REFERENCE.md");
+
+    /// GitHub #516: clap turns every `///` paragraph on a subcommand variant
+    /// into `--help` text, so implementation notes about the `Commands` enum
+    /// layout leaked into `br update --help`. Guard every (sub)command's
+    /// about/long-about against developer-only notes.
+    #[test]
+    fn test_help_text_has_no_internal_code_notes() {
+        fn walk(cmd: &clap::Command, path: &str, offenders: &mut Vec<String>) {
+            for text in [cmd.get_about(), cmd.get_long_about()]
+                .into_iter()
+                .flatten()
+            {
+                let text = text.to_string();
+                let leaks =
+                    text.contains("Boxed") || text.contains("`Commands`") || text.contains("Args`");
+                if leaks {
+                    offenders.push(format!("{path}: {text}"));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), offenders);
+            }
+        }
+
+        let cmd = Cli::command();
+        let mut offenders = Vec::new();
+        walk(&cmd, "br", &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "help text leaks internal code notes:\n{}",
+            offenders.join("\n")
+        );
+        let update = cmd
+            .find_subcommand("update")
+            .expect("update subcommand exists");
+        assert!(
+            update.get_long_about().is_none(),
+            "`br update --help` should have no long description, got {:?}",
+            update.get_long_about().map(ToString::to_string)
+        );
+    }
 
     #[test]
     fn test_list_limit_is_none_when_omitted() {
