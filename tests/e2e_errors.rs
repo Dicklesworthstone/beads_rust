@@ -5770,3 +5770,61 @@ fn e2e_docs_shaped_mistakes_have_actionable_hints() {
     assert!(message.contains("--flush-only"), "message: {message}");
     assert_hint_flags_exist(&workspace, &["sync"], message, "sync_help");
 }
+
+/// GH #515: a misspelled `policy.yaml` key is ignored (beads_rust#302 keeps
+/// the load non-fatal), which silently disables the rule it was meant to
+/// configure. The notice used to be a `tracing::warn!` that release builds
+/// filter out at default verbosity (`run_br` pins `RUST_LOG=error` to match),
+/// so it must be printed on stderr directly, while `--json` stdout stays
+/// parseable and the command still succeeds.
+#[test]
+fn e2e_unknown_policy_key_warns_on_stderr_at_default_verbosity() {
+    let _log = common::test_log("e2e_unknown_policy_key_warns_on_stderr_at_default_verbosity");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "unknown_policy_key_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let issue = run_br(
+        &workspace,
+        ["create", "Typo probe"],
+        "unknown_policy_key_create",
+    );
+    assert!(issue.status.success(), "create failed: {}", issue.stderr);
+    let id = parse_created_id(&issue.stdout);
+
+    fs::write(
+        workspace.root.join(".beads").join("policy.yaml"),
+        "close_policy:\n  require_close_reasn: {enabled: true, min_length: 40}\nworkflow:\n  strickt: true\n",
+    )
+    .expect("write policy with misspelled keys");
+
+    let close = run_br(
+        &workspace,
+        ["close", &id, "--reason", "ok", "--json"],
+        "unknown_policy_key_close",
+    );
+    assert!(
+        close.status.success(),
+        "unknown keys must stay non-fatal (beads_rust#302): {}",
+        close.stderr
+    );
+    let payload = extract_json_payload(&close.stdout);
+    serde_json::from_str::<Value>(&payload).expect("stdout stays parseable JSON");
+    for key in ["close_policy.require_close_reasn", "workflow.strickt"] {
+        assert!(
+            close.stderr.contains(key),
+            "stderr must name the unknown key {key}, got: {}",
+            close.stderr
+        );
+    }
+    assert!(
+        !close.stdout.contains("require_close_reasn"),
+        "the warning must not leak into JSON stdout: {}",
+        close.stdout
+    );
+    assert_eq!(
+        close.stderr.matches("require_close_reasn").count(),
+        1,
+        "the warning is printed once per invocation, got: {}",
+        close.stderr
+    );
+}

@@ -33,6 +33,7 @@ invocation (env override or flag) to pin the finding/check contract;
 | fm-concurrency_primitives-orphaned-write-lock | orphaned_write_lock, mcp_serve_stale_write_lock, write_lock_symlink_node | assert: the probe contract (GH #395) classifies a free stale-mtime lock as ok via a non-blocking flock probe under `BR_DOCTOR_STALE_LOCK_THRESHOLD_SECS=0`; the warn path (`stale_unprobed`) is unreachable on a workspace whose doctor startup succeeds, because an unopenable lock degrades startup first (see permissions_write_lock_unwritable). write_lock_symlink_node (beads_rust-5sej) pins the fail-closed startup refusal for a symlinked lock node and that no stage touches the node or its target; the directory shape is covered by unit tests plus tests/e2e_doctor_write_lock_shapes.rs |
 | fm-configs-gitignore-leaking-beads | gitignore_leaking_beads, gitignore_bare_pattern, inner_gitignore_append | detect |
 | fm-configs-metadata-json-stale | metadata_json_drift, metadata_json_malformed | detect |
+| fm-configs-policy-unknown-keys | policy_unknown_keys | detect |
 | fm-configs-startup-cache-poisoned | startup_cache_poisoned | detect |
 | fm-configs-unknown-keys | config_unknown_keys | detect |
 | fm-configs-yaml-malformed | config_yaml_malformed | detect |

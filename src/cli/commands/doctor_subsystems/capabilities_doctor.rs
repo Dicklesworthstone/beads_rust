@@ -257,6 +257,7 @@ const DETECTOR_ROWS: &[DetectorRow] = &[
     ("permissions.beads_dir", "permissions", "warn", true),
     ("config.yaml", "configs", "warn", true),
     ("config.unknown_keys", "configs", "warn", true),
+    ("policy.unknown_keys", "configs", "warn", true),
     ("metadata.json", "configs", "warn", true),
     ("binary_version", "external_artifacts", "warn", true),
     ("write_lock", "concurrency_primitives", "warn", true),

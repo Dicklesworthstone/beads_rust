@@ -975,6 +975,7 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
     ("gitignore.root", "fm-configs-gitignore-leaking-beads"),
     ("config.yaml", "fm-configs-yaml-malformed"),
     ("config.unknown_keys", "fm-configs-unknown-keys"),
+    ("policy.unknown_keys", "fm-configs-policy-unknown-keys"),
     // agent_coordination
     (
         "audit.suspect_close_reasons",
@@ -9578,6 +9579,42 @@ fn check_config_unknown_keys(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     );
 }
 
+/// `policy.unknown_keys` (GH #515): every key in `.beads/policy.yaml` that
+/// the typed policy schema does not recognise. Since beads_rust#302 such keys
+/// are ignored rather than failing the load, so a misspelled
+/// `close_policy`/`workflow` key silently disables the rule it was meant to
+/// configure. Detect-only; emitted only when `policy.yaml` exists so
+/// workspaces without a policy see no new output. A parse failure is left to
+/// the commands that load the policy (they refuse with the parse error).
+fn check_policy_unknown_keys(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    const NAME: &str = "policy.unknown_keys";
+    let policy_path = beads_dir.join(crate::close_policy::POLICY_FILE_NAME);
+    let Ok(body) = fs::read_to_string(&policy_path) else {
+        return;
+    };
+    let Ok(parsed) = serde_yml::from_str::<serde_yml::Value>(&body) else {
+        return;
+    };
+    let unknown = crate::close_policy::detect_unknown_policy_fields(&parsed);
+    if unknown.is_empty() {
+        push_check(checks, NAME, CheckStatus::Ok, None, None);
+        return;
+    }
+    push_check(
+        checks,
+        NAME,
+        CheckStatus::Warn,
+        Some(crate::close_policy::unknown_policy_fields_message(
+            &policy_path,
+            &unknown,
+        )),
+        Some(serde_json::json!({
+            "path": policy_path.display().to_string(),
+            "unknown_keys": unknown,
+        })),
+    );
+}
+
 /// Detector: `.beads/config.yaml` parses cleanly as YAML. Pass-1
 /// archaeology filed `fm-configs-yaml-malformed` (P1): a malformed
 /// project config short-circuits every `br` invocation at startup
@@ -12726,6 +12763,7 @@ fn collect_doctor_report_with_mode_and_db_override(
     check_permissions_beads_dir(beads_dir, &mut checks);
     check_config_yaml(beads_dir, &mut checks);
     check_config_unknown_keys(beads_dir, &mut checks);
+    check_policy_unknown_keys(beads_dir, &mut checks);
     check_metadata_json(beads_dir, &mut checks);
     check_binary_version_mismatch(beads_dir, &mut checks);
     check_orphaned_write_lock(beads_dir, &mut checks);
@@ -17285,6 +17323,48 @@ mod tests {
             offenders[0].get("status").and_then(|v| v.as_str()),
             Some("completed")
         );
+    }
+
+    /// GH #515: a misspelled `policy.yaml` key is ignored at load time, so
+    /// doctor must name it; a clean policy is Ok and no policy emits nothing.
+    #[test]
+    fn test_check_policy_unknown_keys() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path();
+        let policy_path = beads_dir.join(crate::close_policy::POLICY_FILE_NAME);
+
+        let mut checks = Vec::new();
+        check_policy_unknown_keys(beads_dir, &mut checks);
+        assert!(
+            find_check(&checks, "policy.unknown_keys").is_none(),
+            "no check without a policy.yaml"
+        );
+
+        fs::write(
+            &policy_path,
+            "close_policy:\n  require_close_reason: {enabled: true, min_length: 40}\n",
+        )
+        .unwrap();
+        let mut checks = Vec::new();
+        check_policy_unknown_keys(beads_dir, &mut checks);
+        let check = find_check(&checks, "policy.unknown_keys").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+
+        fs::write(
+            &policy_path,
+            "close_policy:\n  require_close_reasn: {enabled: true}\nworkflow:\n  strickt: true\n",
+        )
+        .unwrap();
+        let mut checks = Vec::new();
+        check_policy_unknown_keys(beads_dir, &mut checks);
+        let check = find_check(&checks, "policy.unknown_keys").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let details = check.details.as_ref().expect("details");
+        assert_eq!(
+            details["unknown_keys"],
+            serde_json::json!(["close_policy.require_close_reasn", "workflow.strickt"])
+        );
+        assert_eq!(details["finding_id"], "fm-configs-policy-unknown-keys");
     }
 
     /// issue #311: when every issue conforms, the detector reports Ok.

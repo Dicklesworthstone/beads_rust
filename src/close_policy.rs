@@ -21,7 +21,7 @@ use crate::error::{BeadsError, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Default file name for the policy document inside `.beads/`.
 pub const POLICY_FILE_NAME: &str = "policy.yaml";
@@ -2818,11 +2818,14 @@ fn parse_unchecked_box(line: &str) -> Option<String> {
 /// is loss of typo-at-parse-time detection, but the cost (full project
 /// close-pathway outage from one typo) was much worse.
 ///
-/// Unknown fields are surfaced exactly once per load via
-/// [`detect_unknown_policy_fields`] and emitted as a `tracing::warn!`
-/// event. The warning lists every unknown path with a dotted scope
+/// Unknown fields are detected on every load via
+/// [`detect_unknown_policy_fields`] and printed as a `warning:` line on
+/// stderr, once per distinct unknown-key set per process (GH #515: a `tracing::warn!` event was
+/// filtered out of release builds at default verbosity, so typos went
+/// unnoticed). The warning lists every unknown path with a dotted scope
 /// (e.g. `close_policy.require_new_experimental_field`) so operators
-/// can find typos without re-reading the file.
+/// can find typos without re-reading the file; `br doctor` reports the
+/// same list as the `policy.unknown_keys` check.
 ///
 /// # Errors
 ///
@@ -2849,18 +2852,52 @@ pub fn load_for_beads_dir(beads_dir: &Path) -> Result<PolicyDocument> {
     if let Ok(raw_value) = serde_yml::from_str::<serde_yml::Value>(&raw) {
         let unknown = detect_unknown_policy_fields(&raw_value);
         if !unknown.is_empty() {
-            tracing::warn!(
-                policy_path = %path.display(),
-                unknown_fields = ?unknown,
-                "policy.yaml contains {} unknown field(s) under close_policy structs; \
-                 these were ignored (beads_rust#302). Check for typos: {}",
-                unknown.len(),
-                unknown.join(", "),
-            );
+            warn_unknown_policy_fields_once(&path, &unknown);
         }
     }
 
     Ok(document)
+}
+
+/// Render the operator-facing notice for unknown `policy.yaml` keys.
+#[must_use]
+pub fn unknown_policy_fields_message(policy_path: &Path, unknown: &[String]) -> String {
+    format!(
+        "{} has {} unknown key(s) that br ignores, so the rules they were meant to \
+         configure are NOT enforced: {}. Check for typos (run `br doctor` for details).",
+        policy_path.display(),
+        unknown.len(),
+        unknown.join(", "),
+    )
+}
+
+/// Surface unknown `policy.yaml` keys on stderr at default verbosity
+/// (GH #515). The #302 notice used `tracing::warn!`, which release builds
+/// filter out unless `-v` is given, so a misspelled key silently disabled
+/// its rule. stderr keeps `--json`/`--format toon` stdout parseable. Printed
+/// once per distinct (policy file, unknown-key set) per process: commands
+/// load the policy several times per invocation, and a long-running MCP
+/// server should re-warn only when the set of unknown keys changes.
+fn warn_unknown_policy_fields_once(policy_path: &Path, unknown: &[String]) {
+    type Seen = std::collections::HashSet<(PathBuf, Vec<String>)>;
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<Seen>> = std::sync::OnceLock::new();
+    let first_time = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .map_or(true, |mut warned| {
+            warned.insert((policy_path.to_path_buf(), unknown.to_vec()))
+        });
+    tracing::debug!(
+        policy_path = %policy_path.display(),
+        unknown_fields = ?unknown,
+        "policy.yaml contains unknown field(s) (beads_rust#302, #515)"
+    );
+    if first_time {
+        eprintln!(
+            "warning: {}",
+            unknown_policy_fields_message(policy_path, unknown)
+        );
+    }
 }
 
 /// Walk a parsed `policy.yaml` value tree and collect dotted paths to any
