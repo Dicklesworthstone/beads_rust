@@ -8244,7 +8244,8 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_all_issues_metadata(&self) -> Result<Vec<IssueMetadata>> {
-        let sql = "SELECT id, external_ref, content_hash, updated_at, status FROM issues";
+        let sql =
+            "SELECT id, external_ref, content_hash, updated_at, status, created_at FROM issues";
         let rows = self.conn.query(sql)?;
         let mut metas = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -8263,6 +8264,9 @@ impl SqliteStorage {
                 .map(str::to_string);
             let updated_at = parse_datetime_value(row.get(3))?;
             let status = parse_status(row.get(4).and_then(SqliteValue::as_text));
+            // Only used to tell two issues sharing an id apart (GitHub #512);
+            // an unparseable legacy value just disables that check.
+            let created_at = parse_datetime_value(row.get(5)).ok();
 
             metas.push(IssueMetadata {
                 id,
@@ -8270,6 +8274,7 @@ impl SqliteStorage {
                 content_hash,
                 updated_at,
                 status,
+                created_at,
             });
         }
         Ok(metas)
@@ -17268,9 +17273,11 @@ fn missing_read_only_wal_index(path: &Path) -> Result<bool> {
     if shm.is_some() {
         return Ok(false);
     }
+    // A WAL shorter than its 32-byte header holds no frames and therefore has
+    // no index to rebuild; the ordinary open path handles it.
     Ok(
         StableSchemaSource::open_optional(&database_sidecar_path(path, "-wal"), "WAL")?
-            .is_some_and(|source| source.initial_len > 0),
+            .is_some_and(|source| source.initial_len >= 32),
     )
 }
 
@@ -17530,10 +17537,23 @@ fn scan_wal_schema_preflight(
         });
     }
     if wal_len < 32 {
+        // SQLite's WAL recovery reads nothing from a file shorter than its
+        // 32-byte header: without the header's salts no frame can validate, so
+        // such a WAL carries no committed state and the main database header is
+        // authoritative. Observational preflight therefore treats it exactly
+        // like an empty WAL. Index recovery still refuses it: there is no index
+        // to rebuild, and startup quarantines the torn sidecar under authority
+        // instead (`quarantine_torn_wal_for_startup`).
+        if recovery_page_size.is_none() {
+            wal_source.verify_path(&wal_path, "WAL")?;
+            return Ok(WalSchemaPreflight {
+                committed_user_version: None,
+                has_committed_frames: false,
+            });
+        }
         return Err(BeadsError::SyncConflict {
             message: format!(
-                "Refusing schema preflight because the {}-byte WAL header is truncated",
-                wal_len
+                "Refusing WAL index recovery because the {wal_len}-byte WAL header is truncated"
             ),
         });
     }
@@ -18580,6 +18600,8 @@ pub struct IssueMetadata {
     pub content_hash: Option<String>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub status: crate::model::Status,
+    /// Creation time; `None` when the stored value cannot be parsed.
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Sort policy for ready issues.
@@ -33980,6 +34002,64 @@ required_fields:
             None,
             "without any valid commit the database header remains authoritative"
         );
+    }
+
+    /// A WAL shorter than its 32-byte header is frameless under SQLite's
+    /// recovery rule, so observational preflight must treat it like an empty
+    /// WAL (no committed state, main header authoritative) without touching it,
+    /// while index recovery still refuses to rebuild an index for it. A full
+    /// 32-byte header keeps the existing validation in both directions.
+    #[test]
+    fn test_wal_preflight_treats_torn_header_as_frameless_without_rewriting_it() {
+        for length in [1_usize, 20, 31] {
+            let temp = TempDir::new().unwrap();
+            let db_path = temp.path().join(format!("torn_{length}.db"));
+            let wal_path = database_sidecar_path(&db_path, "-wal");
+            let torn = vec![0xA5_u8; length];
+            fs::write(&wal_path, &torn).unwrap();
+
+            let preflight = sqlite_wal_schema_preflight(&db_path)
+                .unwrap_or_else(|error| panic!("{length}-byte torn WAL refused: {error}"));
+            assert!(
+                !preflight.has_committed_frames,
+                "{length}-byte torn WAL cannot hold a committed frame"
+            );
+            assert_eq!(preflight.committed_user_version, None);
+            assert_eq!(
+                fs::read(&wal_path).unwrap(),
+                torn,
+                "preflight rewrote the WAL"
+            );
+
+            let error = scan_wal_schema_preflight(&db_path, Some(512))
+                .expect_err("index recovery has no index to rebuild for a torn WAL");
+            assert!(
+                error.to_string().contains("header is truncated"),
+                "unexpected {length}-byte recovery refusal: {error}"
+            );
+            assert_eq!(
+                fs::read(&wal_path).unwrap(),
+                torn,
+                "recovery rewrote the WAL"
+            );
+        }
+
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("header_only.db");
+        let wal_path = database_sidecar_path(&db_path, "-wal");
+        let (header, _) = synthetic_wal_header((0x0BAD_F00D, 0x1234_5678));
+        assert_eq!(header.len(), 32);
+        fs::write(&wal_path, &header).unwrap();
+        let preflight = sqlite_wal_schema_preflight(&db_path).unwrap();
+        assert!(!preflight.has_committed_frames);
+        assert_eq!(preflight.committed_user_version, None);
+
+        let mut garbage = header;
+        garbage[0] ^= 0xFF;
+        fs::write(&wal_path, &garbage).unwrap();
+        let error = sqlite_wal_schema_preflight(&db_path)
+            .expect_err("a complete header with invalid magic is still refused");
+        assert!(error.to_string().contains("magic"), "{error}");
     }
 
     #[test]

@@ -609,8 +609,25 @@ fn verify_checksums_fragment_accepts_spaces_and_leading_dashes() -> Result<(), S
 
     let result = run_bash_step(&script, fixture.root(), &[])?;
     require_success(&result)?;
-    require_contains(&result.stdout, "artifact with spaces.tar.gz: OK")?;
-    require_contains(&result.stdout, "--leading-artifact.tar.gz: OK")
+    require_checksum_ok_line(&result.stdout, "artifact with spaces.tar.gz")?;
+    require_checksum_ok_line(&result.stdout, "--leading-artifact.tar.gz")?;
+    require_not_contains(&result.stdout, "FAILED")
+}
+
+/// `sha256sum -c` reports each verified file as `<name>: OK`. GNU coreutils
+/// 9.x shell-quotes names containing spaces or other special characters
+/// (`'<name>': OK`), so both spellings are the same verdict. Require a whole
+/// line in one of exactly those two forms, never a substring of another name.
+fn require_checksum_ok_line(stdout: &str, name: &str) -> Result<(), String> {
+    let plain = format!("{name}: OK");
+    let quoted = format!("'{name}': OK");
+    if stdout.lines().any(|line| line == plain || line == quoted) {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected a `{plain}` or `{quoted}` line in:\n{stdout}"
+        ))
+    }
 }
 
 #[test]

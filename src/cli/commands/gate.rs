@@ -698,6 +698,79 @@ mod tests {
     }
 
     #[test]
+    fn list_min_reviewers_uses_maximum_matching_threshold() {
+        let yaml = r#"
+strict: true
+gates:
+  "in_review -> closed":
+    require_all:
+      - min_reviewers: 1
+    require_if:
+      - label: auth
+        gate: {min_reviewers: 2}
+      - label: security
+        gate: {min_reviewers: 3}
+"#;
+        let labels = vec!["auth".to_string(), "security".to_string()];
+        let reviews: Vec<GateResult> = ["reviewer:alice", "reviewer:bob", "reviewer:carol"]
+            .into_iter()
+            .map(|provider| GateResult {
+                gate: "min_reviewers".to_string(),
+                provider: provider.to_string(),
+                passed: true,
+                note: None,
+            })
+            .collect();
+        for reverse in [false, true] {
+            let mut workflow: Workflow = serde_yml::from_str(yaml).unwrap();
+            if reverse {
+                workflow
+                    .gates
+                    .get_mut("in_review -> closed")
+                    .unwrap()
+                    .require_if
+                    .reverse();
+            }
+            for count in 0..=reviews.len() {
+                let results_by_target =
+                    BTreeMap::from([("closed".to_string(), reviews[..count].to_vec())]);
+                let transitions = compute_gated_transitions(
+                    &workflow,
+                    "bd-513",
+                    Some("in_review"),
+                    &labels,
+                    2,
+                    &results_by_target,
+                );
+                assert_eq!(transitions.len(), 1);
+                let transition = &transitions[0];
+                assert_eq!(transition.from, "in_review");
+                assert_eq!(transition.to, "closed");
+                assert_eq!(transition.gates.len(), 1);
+                assert_eq!(transition.gates[0].gate, "min_reviewers");
+                assert_eq!(
+                    transition.gates[0].satisfied,
+                    count == 3,
+                    "{count} reviewers, reversed rules={reverse}"
+                );
+                assert_eq!(transition.satisfied, count == 3);
+            }
+            let baseline_results = BTreeMap::from([("closed".to_string(), reviews[..1].to_vec())]);
+            let baseline = compute_gated_transitions(
+                &workflow,
+                "bd-513",
+                Some("in_review"),
+                &[],
+                2,
+                &baseline_results,
+            );
+            assert_eq!(baseline.len(), 1);
+            assert!(baseline[0].gates[0].satisfied);
+            assert!(baseline[0].satisfied);
+        }
+    }
+
+    #[test]
     fn list_is_empty_without_gate_config() {
         let workflow = Workflow::default();
         let transitions = compute_gated_transitions(

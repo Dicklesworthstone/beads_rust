@@ -9906,7 +9906,10 @@ routing:
         storage
             .checkpoint_full()
             .expect("establish checkpointed live baseline");
-        fs::write(&sidecar_path, b"live-sidecar-must-not-change").unwrap();
+        // Keep the engine's valid certificate: replacing it with arbitrary
+        // bytes makes the next checkpoint correctly fail before this test's
+        // injected post-maintenance hook can observe the live family.
+        let sidecar_before = fs::read(&sidecar_path).expect("read live WAL certificate");
 
         let main_before = fs::read(&db_path).unwrap();
         let inode_before = fs::metadata(&db_path).unwrap().ino();
@@ -9932,10 +9935,7 @@ routing:
             || {
                 assert_eq!(fs::read(&db_path).unwrap(), main_before);
                 assert_eq!(fs::metadata(&db_path).unwrap().ino(), inode_before);
-                assert_eq!(
-                    fs::read(&sidecar_path).unwrap(),
-                    b"live-sidecar-must-not-change"
-                );
+                assert_eq!(fs::read(&sidecar_path).unwrap(), sidecar_before);
                 Err(BeadsError::Config(
                     "stop after private maintenance, before installation".to_string(),
                 ))
@@ -9953,10 +9953,7 @@ routing:
         );
         assert_eq!(fs::read(&db_path).unwrap(), main_before);
         assert_eq!(fs::metadata(&db_path).unwrap().ino(), inode_before);
-        assert_eq!(
-            fs::read(&sidecar_path).unwrap(),
-            b"live-sidecar-must-not-change"
-        );
+        assert_eq!(fs::read(&sidecar_path).unwrap(), sidecar_before);
         assert_eq!(
             write_authority
                 .database_target_authority_state()

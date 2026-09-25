@@ -32,7 +32,9 @@ fn make_issue(id: &str, description: &str, offset_secs: i64) -> Issue {
         status: Status::Open,
         priority: Priority::MEDIUM,
         issue_type: IssueType::Task,
-        created_at: timestamp,
+        // Every version of an issue shares its creation time; only
+        // `updated_at` moves (a different `created_at` is a different issue).
+        created_at: fixed_time(0),
         updated_at: timestamp,
         created_by: Some("determinism-test".to_string()),
         source_repo: Some(".".to_string()),

@@ -438,7 +438,7 @@ The resource surface is `beads://project/info`, `beads://issue/{id}`,
 
 ```bash
 br --version
-# br 0.6.0
+# br 0.7.0
 ```
 
 ### Verify Release Signatures
@@ -1179,6 +1179,15 @@ br doctor
 same issue changed on both sides, br stops and asks for an explicit policy:
 `--force-db` keeps the local SQLite version, `--force-jsonl` keeps the JSONL
 version, and `--force` keeps the newer timestamp.
+
+Comments are append-only, so the merge keeps every comment either side added.
+Two clones can also mint the same id for different issues (child ids such as
+`<parent>.1` come from each database's own counter). The merge treats a
+different `created_at` as a different issue: the earlier one keeps the id, the
+other is renumbered (for example to `<parent>.2`) with its relations, and br
+prints an `ID collision` warning (`id_collisions` in `--json`). `br sync
+--import-only` refuses a JSONL that would drop a local issue this way and
+points at `br sync --merge`.
 
 ### Command Output is Garbled
 

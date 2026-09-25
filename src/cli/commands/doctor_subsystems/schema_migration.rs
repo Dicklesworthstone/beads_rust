@@ -356,8 +356,15 @@ fn execute_recover(
     Ok(())
 }
 
+/// Bytes in a SQLite WAL header. A WAL shorter than this cannot hold a frame.
+const WAL_HEADER_BYTES: u64 = 32;
+
 /// Whether an existing WAL family lacks its regenerable shared index.
 /// This is only an advisory probe; recovery repeats it under family authority.
+///
+/// A torn WAL (shorter than its header) is not an index-recovery case: it holds
+/// no frames, so there is no index to rebuild. [`torn_wal_present`] and
+/// [`quarantine_torn_wal_for_startup`] handle it instead.
 ///
 /// # Errors
 /// Returns an error for unsafe paths or failed filesystem inspection.
@@ -369,8 +376,98 @@ pub fn missing_wal_index(db_path: &Path) -> Result<bool> {
     }
     Ok(
         secure_file_metadata(&family_component_path(db_path, "-wal"))?
-            .is_some_and(|metadata| metadata.len() > 0),
+            .is_some_and(|metadata| metadata.len() >= WAL_HEADER_BYTES),
     )
+}
+
+/// Whether the live WAL is torn: present, non-empty, and shorter than its
+/// 32-byte header. SQLite reads such a WAL as containing no frames (a crash
+/// before the header was fully written), so the main database file alone is
+/// the complete committed state. An empty WAL is the normal post-truncate
+/// state and is not torn.
+///
+/// # Errors
+/// Returns an error for unsafe paths or failed filesystem inspection.
+pub fn torn_wal_present(db_path: &Path) -> Result<bool> {
+    if secure_file_metadata(db_path)?.is_none() {
+        return Ok(false);
+    }
+    Ok(
+        secure_file_metadata(&family_component_path(db_path, "-wal"))?
+            .is_some_and(|metadata| is_torn_wal_length(metadata.len())),
+    )
+}
+
+const fn is_torn_wal_length(length: u64) -> bool {
+    length > 0 && length < WAL_HEADER_BYTES
+}
+
+/// A torn WAL moved out of the live family by [`quarantine_torn_wal_for_startup`].
+#[derive(Debug, Clone)]
+pub struct TornWalQuarantine {
+    /// Size of the torn WAL, always below the 32-byte header size.
+    pub wal_length: u64,
+    /// Where the WAL (and its shared index, if one existed) now live.
+    pub quarantined_paths: Vec<PathBuf>,
+}
+
+/// Move a torn WAL, and the shared index that described it, out of the live
+/// database family before startup opens the database.
+///
+/// A WAL shorter than its header holds no committed frame, so nothing is lost:
+/// the engine recreates both sidecars on the next write. The original bytes are
+/// kept under `.br_recovery/` rather than deleted. This runs only under the
+/// held database-family write authority and only as the verified sole opener;
+/// with live peers it leaves the family untouched and returns `None`, so a
+/// torn WAL can never lock the workspace by itself.
+///
+/// # Errors
+/// Refuses mismatched authority, unsafe paths, or a failed verified rename.
+pub fn quarantine_torn_wal_for_startup(
+    beads_dir: &Path,
+    db_path: &Path,
+    authority: &Arc<DatabaseFamilyWriteLock>,
+) -> Result<Option<TornWalQuarantine>> {
+    if crate::sync::database_write_authority_sha256(db_path)? != authority.authority_path_sha256() {
+        return Err(BeadsError::SyncConflict {
+            message: "Torn WAL quarantine path does not match the held database-family authority"
+                .to_string(),
+        });
+    }
+    authority.verify_database_authority()?;
+    if !torn_wal_present(db_path)? {
+        return Ok(None);
+    }
+    let mut lease = crate::sync::DatabaseOpenerLease::register(db_path)?;
+    let Some(exclusive) = lease.try_exclusive() else {
+        return Ok(None);
+    };
+    let result = (|| -> Result<Option<TornWalQuarantine>> {
+        authority.verify_database_authority()?;
+        let wal_path = family_component_path(db_path, "-wal");
+        // Re-read under sole-opener admission: a peer may have finished
+        // writing the header between the advisory probe and the lease.
+        let Some(metadata) = secure_file_metadata(&wal_path)? else {
+            return Ok(None);
+        };
+        let wal_length = metadata.len();
+        if !is_torn_wal_length(wal_length) {
+            return Ok(None);
+        }
+        let quarantined_paths = config::quarantine_database_artifacts(
+            db_path,
+            beads_dir,
+            [wal_path, family_component_path(db_path, "-shm")],
+            "truncated-wal",
+        )?;
+        authority.verify_database_authority()?;
+        Ok(Some(TornWalQuarantine {
+            wal_length,
+            quarantined_paths,
+        }))
+    })();
+    let released = lease.release_exclusive(exclusive);
+    result.and_then(|quarantine| released.map(|()| quarantine))
 }
 
 pub fn wal_index_needs_recovery(db_path: &Path) -> Result<bool> {
@@ -399,6 +496,25 @@ pub fn recover_wal_index_for_startup(
     if !wal_index_needs_recovery(db_path)? {
         return Ok(());
     }
+    // Every automatic attempt copies the complete family into a new
+    // `.br_recovery` run before rehearsing. Rehearsal over identical bytes is
+    // deterministic, so once it has failed for this exact family, repeating it
+    // on every command only accumulates copies. Keep one snapshot per incident
+    // and report the retained one instead.
+    let raw_before = recovery_family_witness(db_path)?;
+    if let Some(prior) = prior_failed_recovery(beads_dir, &raw_before)? {
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "automatic WAL index recovery already failed for this exact database family \
+                 at stage {} ({}); its complete pre-state is retained at {}. The database was \
+                 not copied again. Run `br doctor migrate-schema recover` to retry explicitly, \
+                 or `br doctor` for diagnosis.",
+                prior.stage,
+                prior.error.as_deref().unwrap_or("no recorded error"),
+                prior.backup_path
+            ),
+        });
+    }
     let migration = MigrationContext {
         beads_dir: beads_dir.to_path_buf(),
         db_path: db_path.to_path_buf(),
@@ -406,6 +522,51 @@ pub fn recover_wal_index_for_startup(
     };
     recover_engine_admission_with_lease(&migration, true)?;
     Ok(())
+}
+
+/// The fields of a `recovery-failed.json` receipt that identify its incident.
+#[derive(Debug, Deserialize)]
+struct PriorRecoveryFailure {
+    backup_path: String,
+    stage: String,
+    raw_before: RawFamilyWitness,
+    error: Option<String>,
+}
+
+/// Find an earlier failed recovery run whose pre-state is byte-identical
+/// (same components, lengths, SHA-256 digests and modes) to `raw_before`.
+fn prior_failed_recovery(
+    beads_dir: &Path,
+    raw_before: &RawFamilyWitness,
+) -> Result<Option<PriorRecoveryFailure>> {
+    let root = migration_runs_root(beads_dir);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        // Runs are directories; anything else in the root is not a receipt.
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let receipt_path = entry.path().join("recovery-failed.json");
+        let bytes = match fs::read(&receipt_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        // A receipt this binary cannot parse is not evidence of the same
+        // incident; ignore it rather than blocking recovery on it.
+        let Ok(prior) = serde_json::from_slice::<PriorRecoveryFailure>(&bytes) else {
+            continue;
+        };
+        if &prior.raw_before == raw_before {
+            return Ok(Some(prior));
+        }
+    }
+    Ok(None)
 }
 
 fn recover_engine_admission_with_lease(

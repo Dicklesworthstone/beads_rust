@@ -65,8 +65,10 @@ fn make_issue(
     issue_type: IssueType,
     offset_secs: i64,
 ) -> Issue {
-    let created_at =
-        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap() + Duration::seconds(offset_secs);
+    // Versions of one issue always share `created_at` (a different creation
+    // time means a different issue, GitHub #512); only `updated_at` varies.
+    let created_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let updated_at = created_at + Duration::seconds(offset_secs);
     Issue {
         id: id.to_string(),
         title: title.to_string(),
@@ -74,7 +76,7 @@ fn make_issue(
         priority,
         issue_type,
         created_at,
-        updated_at: created_at,
+        updated_at,
         created_by: Some("test".to_string()),
         source_repo: Some(".".to_string()),
         ..Issue::default()

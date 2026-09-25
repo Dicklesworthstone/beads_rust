@@ -36,6 +36,10 @@ struct LintResult {
 struct LintSuggestion {
     section: String,
     hint: String,
+    /// Whether a non-blank `--acceptance-criteria` field would clear this
+    /// warning. Only the rich tip uses it; the JSON contract is unchanged.
+    #[serde(skip)]
+    field_satisfiable: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -284,10 +288,7 @@ fn render_lint_rich(summary: &LintSummary, ctx: &OutputContext) {
             content.append("\n");
         }
 
-        content.append_styled(
-            "Tip: Set --acceptance-criteria or add the missing sections to issue descriptions.\n",
-            theme.dimmed.clone(),
-        );
+        content.append_styled(lint_tip(&summary.results), theme.dimmed.clone());
     }
 
     let panel = Panel::from_rich_text(&content, ctx.width())
@@ -296,6 +297,31 @@ fn render_lint_rich(summary: &LintSummary, ctx: &OutputContext) {
         .border_style(theme.panel_border.clone());
 
     ctx.render(&panel);
+}
+
+/// Pick the rich-output tip so it only recommends `--acceptance-criteria`
+/// when that field can actually clear one of the reported warnings (#511).
+fn lint_tip(results: &[LintResult]) -> &'static str {
+    let suggestions = results.iter().flat_map(|result| &result.suggestions);
+    let (mut field, mut description_only) = (false, false);
+    for suggestion in suggestions {
+        if suggestion.field_satisfiable {
+            field = true;
+        } else {
+            description_only = true;
+        }
+    }
+    match (field, description_only) {
+        (true, false) => {
+            "Tip: Set --acceptance-criteria or add the missing sections to issue descriptions.\n"
+        }
+        (true, true) => {
+            "Tip: Set --acceptance-criteria for missing Acceptance Criteria; add the other missing sections as headings in issue descriptions.\n"
+        }
+        _ => {
+            "Tip: Add the missing sections as headings in issue descriptions (--acceptance-criteria does not satisfy them).\n"
+        }
+    }
 }
 
 fn issue_type_style(theme: &crate::output::Theme, issue_type: &str) -> Style {
@@ -453,6 +479,7 @@ fn lint_issue(issue: &Issue) -> Option<LintResult> {
         .map(|section| LintSuggestion {
             section: section.heading.to_string(),
             hint: section.hint.to_string(),
+            field_satisfiable: matches!(section.source, SectionSource::AcceptanceCriteria),
         })
         .collect();
 
@@ -955,6 +982,33 @@ mod tests {
         assert_eq!(issues.len(), 2);
         assert_eq!(issues[0].id, "bd-123");
         assert_eq!(issues[1].id, "bd-123");
+    }
+
+    #[test]
+    fn tip_only_recommends_acceptance_field_when_it_can_clear_a_warning() {
+        let field_hint = "Set --acceptance-criteria";
+
+        let mut epic = make_issue(IssueType::Epic, Some("plain description"));
+        epic.acceptance_criteria = Some("- [ ] all children closed".to_string());
+        let mut bug = make_issue(IssueType::Bug, Some("plain description"));
+        bug.acceptance_criteria = Some("- [ ] fixed".to_string());
+        let description_only = lint_issues(&[epic.clone(), bug.clone()]);
+        let tip = lint_tip(&description_only.results);
+        assert!(!tip.contains(field_hint), "{tip}");
+        assert!(tip.contains("does not satisfy"), "{tip}");
+
+        let task = make_issue(IssueType::Task, Some("plain description"));
+        let tip = lint_tip(&lint_issues(std::slice::from_ref(&task)).results);
+        assert!(
+            tip.starts_with("Tip: Set --acceptance-criteria or add"),
+            "{tip}"
+        );
+
+        let bare_bug = make_issue(IssueType::Bug, Some("plain description"));
+        let tip = lint_tip(&lint_issues(&[bare_bug]).results);
+        assert!(tip.contains("for missing Acceptance Criteria"), "{tip}");
+        let tip = lint_tip(&lint_issues(&[epic, task]).results);
+        assert!(tip.contains("for missing Acceptance Criteria"), "{tip}");
     }
 
     #[test]
