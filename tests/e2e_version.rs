@@ -125,3 +125,49 @@ fn e2e_version_check_json() {
         );
     }
 }
+
+/// GitHub #514: `build.rs` stamps `VERGEN_GIT_SHA` from `git rev-parse HEAD`
+/// but did not tell Cargo to watch the git files, so after a commit or pull an
+/// incremental rebuild reused the old stamp and `br version` reported a stale
+/// commit. When the tests run from a git checkout, the binary built for them
+/// must report the checkout's current `HEAD`.
+#[test]
+fn e2e_version_commit_matches_checkout_head() {
+    let _log = common::test_log("e2e_version_commit_matches_checkout_head");
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(manifest_dir)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    // Source trees synced without `.git` (or unreadable by this user) take
+    // build.rs's environment fallback path; nothing to compare against.
+    if git(&["rev-parse", "--is-inside-work-tree"]).as_deref() != Some("true") {
+        eprintln!("skipping: {manifest_dir} is not a readable git checkout");
+        return;
+    }
+    let Some(head) = git(&["rev-parse", "HEAD"]) else {
+        eprintln!("skipping: git rev-parse HEAD failed");
+        return;
+    };
+
+    let workspace = BrWorkspace::new();
+    let version = run_br(&workspace, ["version", "--json"], "version_commit_head");
+    assert!(
+        version.status.success(),
+        "version --json failed: {}",
+        version.stderr
+    );
+    let payload = extract_json_payload(&version.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("valid JSON");
+    assert_eq!(
+        json.get("commit").and_then(Value::as_str),
+        Some(head.as_str()),
+        "br version must report the HEAD it was built from; a stale value means \
+         build.rs did not rerun after HEAD moved"
+    );
+}

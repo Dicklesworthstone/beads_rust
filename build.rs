@@ -3,7 +3,7 @@
 //! Uses vergen-gix for stable build/rustc metadata and quiet git probes for
 //! optional repository metadata.
 
-use std::{env, process::Command};
+use std::{env, path::Path, process::Command};
 use vergen_gix::{Build, Cargo, Emitter, Rustc};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -28,6 +28,7 @@ fn emit_git_metadata() {
     if git_output(&["rev-parse", "--is-inside-work-tree"]).as_deref() == Some("true")
         && let Some(sha) = git_output(&["rev-parse", "HEAD"])
     {
+        emit_git_rerun_triggers();
         emit_env("VERGEN_GIT_SHA", &sha);
 
         if let Some(branch) = git_output(&["rev-parse", "--abbrev-ref", "HEAD"]) {
@@ -65,6 +66,53 @@ fn emit_git_metadata() {
     if let Some(branch) = first_env(&["VERGEN_GIT_BRANCH", "GITHUB_REF_NAME", "CI_COMMIT_REF_NAME"])
     {
         emit_env("VERGEN_GIT_BRANCH", &branch);
+    }
+}
+
+/// Tell Cargo which git files the stamped metadata depends on (GH #514).
+///
+/// vergen emits `rerun-if-changed=build.rs`, which switches off Cargo's
+/// default "rerun on any package file change", so without these triggers the
+/// build script never reruns after a commit or pull and `br version` keeps
+/// reporting the commit of an earlier build. Paths come from
+/// `git rev-parse --git-path`, which resolves linked worktrees (per-worktree
+/// `HEAD`/`index`, shared refs) correctly.
+///
+/// - `HEAD`: branch switches and detached-HEAD commits.
+/// - the ref `HEAD` points at (e.g. `refs/heads/main`): new commits, pulls.
+/// - `packed-refs`: refs that were packed by `git gc` / `git pack-refs`.
+/// - `index`: staging and commits, which move the dirty flag.
+/// - `reftable/`: ref storage for repositories using the reftable backend.
+///
+/// Edits to tracked files that are not yet staged do not touch any of these,
+/// so the dirty flag stays best-effort for those; SHA, branch and commit
+/// timestamp are always refreshed.
+fn emit_git_rerun_triggers() {
+    for name in ["HEAD", "packed-refs", "index", "reftable"] {
+        watch_git_path(name);
+    }
+    if let Some(head_ref) = git_output(&["symbolic-ref", "-q", "HEAD"])
+        && let Some(path) = git_output(&["rev-parse", "--git-path", &head_ref])
+    {
+        let path = Path::new(&path);
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        } else if let Some(parent) = path.parent().filter(|parent| parent.is_dir()) {
+            // The branch currently lives only in `packed-refs`; the next
+            // commit recreates the loose ref file inside this directory.
+            println!("cargo:rerun-if-changed={}", parent.display());
+        }
+    }
+}
+
+/// Emit `rerun-if-changed` for a git-internal path, but only when it exists:
+/// Cargo treats a missing path as always stale, which would rerun the build
+/// script (and recompile the crate) on every build.
+fn watch_git_path(name: &str) {
+    if let Some(path) = git_output(&["rev-parse", "--git-path", name])
+        && Path::new(&path).exists()
+    {
+        println!("cargo:rerun-if-changed={path}");
     }
 }
 
