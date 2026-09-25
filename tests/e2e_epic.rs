@@ -900,6 +900,7 @@ fn e2e_epic_deleted_child_removes_dependency() {
 /// `br close` does. An epic whose close the policy rejects must not be closed
 /// through this path, and the batch stays all-or-nothing.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_epic_close_eligible_enforces_close_policy() {
     let _log = common::test_log("e2e_epic_close_eligible_enforces_close_policy");
     let workspace = BrWorkspace::new();
@@ -949,6 +950,41 @@ fn e2e_epic_close_eligible_enforces_close_policy() {
         "allow_bypass: false\nclose_policy:\n  require_close_reason: {enabled: true, min_length: 40}\n",
     )
     .expect("write policy");
+
+    // --dry-run predicts the refusal per epic instead of promising closes.
+    let predicted = run_br(
+        &workspace,
+        ["epic", "close-eligible", "--dry-run", "--json"],
+        "close_eligible_dry_run_predicts_refusal",
+    );
+    assert!(predicted.status.success(), "{}", predicted.stderr);
+    let rows: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&predicted.stdout)).expect("dry-run JSON");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for row in &rows {
+        assert!(row["epic"]["id"].is_string(), "{row}");
+        assert!(
+            row["policy_summary"].is_string()
+                && !row["policy_violations"]
+                    .as_array()
+                    .expect("violations")
+                    .is_empty(),
+            "dry-run must name the predicted policy refusal: {row}"
+        );
+    }
+    let predicted_text = run_br(
+        &workspace,
+        ["epic", "close-eligible", "--dry-run"],
+        "close_eligible_dry_run_text",
+    );
+    assert!(predicted_text.status.success(), "{}", predicted_text.stderr);
+    assert!(
+        predicted_text
+            .stdout
+            .contains("would refuse the whole batch"),
+        "{}",
+        predicted_text.stdout
+    );
 
     let refused = run_br(
         &workspace,

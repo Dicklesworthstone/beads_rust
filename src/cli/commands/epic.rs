@@ -134,22 +134,8 @@ fn execute_close_eligible(
     epics.retain(|e| e.eligible_for_close);
 
     if args.dry_run {
-        if ctx.is_toon() {
-            ctx.toon(&epics);
-        } else if ctx.is_json() {
-            ctx.json_pretty(&epics);
-        } else if ctx.is_quiet() {
-            return Ok(());
-        } else if matches!(ctx.mode(), OutputMode::Rich) {
-            render_dry_run_rich(&epics, ctx);
-        } else {
-            println!("Would close {} epic(s):", epics.len());
-            for epic_status in &epics {
-                let id = format_epic_id(&epic_status.epic.id, false);
-                let title = format_epic_title(&epic_status.epic.title, false);
-                println!("  - {id}: {title}");
-            }
-        }
+        let refusals = close_policy_refusals_for_epics(&beads_dir, storage, &epics, &actor, args)?;
+        emit_close_eligible_dry_run(&epics, &refusals, ctx);
         return Ok(());
     }
 
@@ -226,6 +212,64 @@ fn execute_close_eligible(
     Ok(())
 }
 
+/// Report what `br epic close-eligible` would do, including the close-policy
+/// verdict the real run would reach: the real run refuses the whole batch on
+/// any violation, so a dry run that only listed epics promised closes that
+/// would never happen (GH #517 follow-up).
+fn emit_close_eligible_dry_run(
+    epics: &[EpicStatus],
+    refusals: &[EpicPolicyRefusal],
+    ctx: &OutputContext,
+) {
+    let rows: Vec<DryRunEpicRow<'_>> = epics
+        .iter()
+        .map(|epic_status| {
+            let refusal = refusals
+                .iter()
+                .find(|refusal| refusal.issue_id == epic_status.epic.id);
+            DryRunEpicRow {
+                status: epic_status,
+                policy_summary: refusal.map(|refusal| refusal.summary.clone()),
+                policy_violations: refusal
+                    .map(|refusal| refusal.violations.clone())
+                    .unwrap_or_default(),
+            }
+        })
+        .collect();
+    if ctx.is_toon() {
+        ctx.toon(&rows);
+    } else if ctx.is_json() {
+        ctx.json_pretty(&rows);
+    } else if ctx.is_quiet() {
+        return;
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
+        render_dry_run_rich(epics, ctx);
+        for refusal in refusals {
+            ctx.warning(&format!(
+                "close policy would refuse {}: {}",
+                refusal.issue_id, refusal.summary
+            ));
+        }
+    } else {
+        println!("Would close {} epic(s):", epics.len());
+        for epic_status in epics {
+            let id = format_epic_id(&epic_status.epic.id, false);
+            let title = format_epic_title(&epic_status.epic.title, false);
+            println!("  - {id}: {title}");
+        }
+        for refusal in refusals {
+            println!(
+                "Close policy would refuse {}: {}",
+                format_epic_id(&refusal.issue_id, false),
+                sanitize_terminal_inline(&refusal.summary)
+            );
+        }
+    }
+    if !refusals.is_empty() && !ctx.is_json() && !ctx.is_toon() && !ctx.is_quiet() {
+        println!("The real run would refuse the whole batch; nothing would be closed.");
+    }
+}
+
 /// Close reason recorded on every epic `br epic close-eligible` closes.
 const ELIGIBLE_EPIC_CLOSE_REASON: &str = "All children completed";
 
@@ -244,12 +288,55 @@ fn enforce_close_policy_for_epics(
     actor: &str,
     args: &EpicCloseEligibleArgs,
 ) -> Result<()> {
+    match close_policy_refusals_for_epics(beads_dir, storage, epics, actor, args)?
+        .into_iter()
+        .next()
+    {
+        Some(refusal) => Err(BeadsError::PolicyViolation {
+            issue_id: refusal.issue_id,
+            summary: refusal.summary,
+            violations: refusal.violations,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// One `--dry-run` row: the epic plus the close-policy verdict the real run
+/// would reach for it (GH #517 follow-up). The extra fields are omitted when
+/// the policy admits the epic, so the row is the plain epic status then.
+#[derive(Debug, Serialize)]
+struct DryRunEpicRow<'a> {
+    #[serde(flatten)]
+    status: &'a EpicStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_summary: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    policy_violations: Vec<crate::close_policy::PolicyViolation>,
+}
+
+/// A close-policy refusal predicted for one epic.
+struct EpicPolicyRefusal {
+    issue_id: String,
+    summary: String,
+    violations: Vec<crate::close_policy::PolicyViolation>,
+}
+
+/// Evaluate the close policy for every epic, returning each refusal in batch
+/// order (empty when the policy admits the whole batch).
+fn close_policy_refusals_for_epics(
+    beads_dir: &std::path::Path,
+    storage: &SqliteStorage,
+    epics: &[EpicStatus],
+    actor: &str,
+    args: &EpicCloseEligibleArgs,
+) -> Result<Vec<EpicPolicyRefusal>> {
     let policy_doc = crate::close_policy::load_for_beads_dir(beads_dir)?;
     let policy_active = policy_doc.close_policy.is_active()
         || policy_doc.workflow.gates_enforced()
         || !policy_doc.workflow.required_fields.is_empty();
+    let mut refusals = Vec::new();
     if !policy_active {
-        return Ok(());
+        return Ok(refusals);
     }
     for epic_status in epics {
         let epic = &epic_status.epic;
@@ -269,14 +356,14 @@ fn enforce_close_policy_for_epics(
             actor,
         )?;
         if !evaluated.violations.is_empty() {
-            return Err(BeadsError::PolicyViolation {
+            refusals.push(EpicPolicyRefusal {
                 issue_id: epic.id.clone(),
                 summary: crate::cli::commands::close::summarize_violations(&evaluated.violations),
                 violations: evaluated.violations,
             });
         }
     }
-    Ok(())
+    Ok(refusals)
 }
 
 fn close_eligible_epics_atomically(
