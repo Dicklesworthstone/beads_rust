@@ -41,8 +41,8 @@ pub const ENV_MODEL: &str = "BR_MODEL";
 /// path (even `--bypass-policy` couldn't help because the parse fires
 /// before bypass logic runs). See beads_rust#302.
 ///
-/// Unknown fields surface via [`load_for_beads_dir`], which emits a
-/// `tracing::warn!` listing every unknown key it discovered. Operators
+/// Unknown fields surface via [`load_for_beads_dir`], which prints a
+/// `warning:` line on stderr listing every unknown key it discovered (GH #515). Operators
 /// who want strict parsing back can wire up a future `--strict-policy`
 /// flag (out of scope for the #302 fix).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,8 +76,8 @@ const fn default_true() -> bool {
 
 /// Close-time policy gates.
 ///
-/// Unknown fields are tolerated and surfaced via `tracing::warn!` at load
-/// time (see `PolicyDocument` doc-comment and beads_rust#302).
+/// Unknown fields are tolerated and surfaced as a stderr warning at load
+/// time (see `PolicyDocument` doc-comment, beads_rust#302 and #515).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClosePolicy {
@@ -2941,6 +2941,16 @@ enum PolicyNode {
     Workflow,
     /// `workflow.status_groups:` block (issue #354).
     StatusGroups,
+    /// `workflow.gates:` map. Its keys are free-form `"from -> to"`
+    /// transitions, so every key is accepted and each value is a gate rule.
+    Gates,
+    /// One `workflow.gates."<from> -> <to>":` rule.
+    GateRule,
+    /// `require_if:` list inside a gate rule; each element is a conditional
+    /// gate.
+    ConditionalGateList,
+    /// One `require_if` entry.
+    ConditionalGate,
     /// Terminal scalar / list — descent stops here.
     Scalar,
 }
@@ -2978,11 +2988,12 @@ impl PolicyNode {
                 ("statuses", Self::Scalar),
                 ("transitions", Self::Scalar),
                 ("class_transitions", Self::Scalar),
-                // The gate rules are a free-form map of `"from -> to"` keys to
-                // gate specs; we don't descend into them for unknown-field
-                // detection (their shape is validated at parse time by the
-                // typed `GateRule`/`GateSpec` deserialisers).
-                ("gates", Self::Scalar),
+                // `GateRule` and `ConditionalGate` are `serde(default)` without
+                // `deny_unknown_fields`, so a misspelled `require_all` /
+                // `require_if` / `label` / `priority` / `gate` parses fine and
+                // silently drops the gate; descend so it is reported (GH #515).
+                // `GateSpec` itself rejects unknown map keys at parse time.
+                ("gates", Self::Gates),
                 ("required_fields", Self::Scalar),
                 ("status_groups", Self::StatusGroups),
                 // Capacity owns a strict typed schema with
@@ -2992,7 +3003,17 @@ impl PolicyNode {
                 ("capacity", Self::Scalar),
             ],
             Self::StatusGroups => &[("ready", Self::Scalar)],
-            Self::Scalar => &[],
+            Self::GateRule => &[
+                ("require_all", Self::Scalar),
+                ("require_if", Self::ConditionalGateList),
+            ],
+            Self::ConditionalGate => &[
+                ("label", Self::Scalar),
+                ("priority", Self::Scalar),
+                ("gate", Self::Scalar),
+            ],
+            // Free-form keys / sequences: handled directly by the walker.
+            Self::Gates | Self::ConditionalGateList | Self::Scalar => &[],
         }
     }
 }
@@ -3003,8 +3024,33 @@ fn walk_policy_node(
     scope: &str,
     out: &mut Vec<String>,
 ) {
-    if matches!(node, PolicyNode::Scalar) {
-        return;
+    match node {
+        PolicyNode::Scalar => return,
+        PolicyNode::ConditionalGateList => {
+            if let Some(items) = value.as_sequence() {
+                for (index, item) in items.iter().enumerate() {
+                    walk_policy_node(
+                        item,
+                        PolicyNode::ConditionalGate,
+                        &format!("{scope}[{index}]"),
+                        out,
+                    );
+                }
+            }
+            return;
+        }
+        PolicyNode::Gates => {
+            if let Some(map) = value.as_mapping() {
+                for (key, sub) in map {
+                    if let Some(key_str) = key.as_str() {
+                        let path = format!("{scope}.\"{key_str}\"");
+                        walk_policy_node(sub, PolicyNode::GateRule, &path, out);
+                    }
+                }
+            }
+            return;
+        }
+        _ => {}
     }
     let Some(map) = value.as_mapping() else {
         return;
@@ -4384,6 +4430,42 @@ workflow:
         let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
         let unknown = detect_unknown_policy_fields(&raw);
         assert_eq!(unknown, vec!["workflow.statusses".to_string()]);
+    }
+
+    /// GH #515: `GateRule` / `ConditionalGate` tolerate unknown keys, so a
+    /// typo inside `workflow.gates` silently drops the gate unless the walker
+    /// descends into the free-form transition map and the `require_if` list.
+    #[test]
+    fn detect_unknown_policy_fields_walks_workflow_gates() {
+        let yaml = r#"
+workflow:
+  gates:
+    "in_review -> closed":
+      require_al: [ci_green]        # typo: should be require_all
+      require_if:
+        - label: security-sensitive
+          gate: security_sign_off
+        - priorty: [0, 1]           # typo: should be priority
+          gat: security_sign_off    # typo: should be gate
+    "open -> in_progress":
+      require_all: [triage_ok]
+      require_if:
+        - label: urgent
+          priority: [0]
+          gate: {min_reviewers: 1}
+"#;
+        let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
+        // The typed parse accepts the typos (that is the silent failure).
+        serde_yml::from_str::<PolicyDocument>(yaml).expect("typos parse");
+        let unknown = detect_unknown_policy_fields(&raw);
+        assert_eq!(
+            unknown,
+            vec![
+                "workflow.gates.\"in_review -> closed\".require_al".to_string(),
+                "workflow.gates.\"in_review -> closed\".require_if[1].gat".to_string(),
+                "workflow.gates.\"in_review -> closed\".require_if[1].priorty".to_string(),
+            ]
+        );
     }
 
     #[test]
