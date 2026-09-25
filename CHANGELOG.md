@@ -215,6 +215,12 @@ is unchanged at 19, so no `doctor migrate-schema` step is needed from 0.6.0.
   and empty-JSONL refusals, on native Linux amd64, macOS arm64 and Intel
   (Rosetta), Windows, and arm64 Linux under qemu-user. The public installer
   installed byte-identical binaries on Linux amd64 and Apple Silicon.
+- The [crates.io package](https://crates.io/crates/beads_rust/0.7.0) was
+  published from the tagged tree after its verification build; the registry
+  checksum is `68f6685c7a35aac49ab65179afb5cd077917eedde22f24c569bfe7d8025decb8`.
+  Homebrew and Scoop point at the v0.7.0 assets, `br upgrade` moved a 0.6.0
+  Linux binary to the published 0.7.0 bytes, and AUR publication remains
+  blocked on credentials as for v0.6.0.
 - The full test suite at 2fbc2b7e passed as a non-root user on Linux: 26,716
   passed, 0 failed, 115 existing ignores. Clippy with `-D warnings` passed for
   default and all features.
