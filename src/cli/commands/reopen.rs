@@ -72,14 +72,11 @@ pub fn execute(
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut target_inputs = args.ids.clone();
     if target_inputs.is_empty() {
-        let last_touched = crate::util::get_last_touched_id(&beads_dir);
-        if last_touched.is_empty() {
-            return Err(BeadsError::validation(
-                "ids",
-                "no issue IDs provided and no last-touched issue",
-            ));
-        }
-        target_inputs.push(last_touched);
+        target_inputs.push(crate::util::idless_mutation_target(
+            &beads_dir,
+            "reopen",
+            use_structured_output,
+        )?);
     }
 
     let routed_batches = config::routing::group_issue_inputs_by_route(&target_inputs, &beads_dir)?;

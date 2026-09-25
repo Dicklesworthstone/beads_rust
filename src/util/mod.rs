@@ -79,10 +79,28 @@ pub fn db_path(beads_dir: &Path) -> PathBuf {
     resolve_cache_dir(beads_dir).join(DB_FILE)
 }
 
+static PROCESS_ACTOR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record the actor this process acts as, so the last-touched file can name
+/// who touched the issue (GitHub #518). Set once at startup; later calls are
+/// ignored.
+pub fn set_process_actor(actor: &str) {
+    let actor = actor.trim();
+    if !actor.is_empty() && !actor.contains(['\n', '\r']) {
+        let _ = PROCESS_ACTOR.set(actor.to_string());
+    }
+}
+
+fn process_actor() -> Option<&'static str> {
+    PROCESS_ACTOR.get().map(String::as_str)
+}
+
 /// Best-effort write of the last-touched issue ID.
 ///
 /// Errors are ignored to match classic bd behavior.
 /// If `BEADS_CACHE_DIR` is set, the cache directory will be created if needed.
+/// The second line records the process actor when one is known; readers that
+/// predate it only ever read the first line.
 pub fn set_last_touched_id(beads_dir: &Path, id: &str) {
     let path = last_touched_path(beads_dir);
 
@@ -101,7 +119,10 @@ pub fn set_last_touched_id(beads_dir: &Path, id: &str) {
     }
 
     if let Ok(mut file) = options.open(path) {
-        let _ = writeln!(file, "{id}");
+        let _ = match process_actor() {
+            Some(actor) => writeln!(file, "{id}\n{actor}"),
+            None => writeln!(file, "{id}"),
+        };
     }
 }
 
@@ -110,12 +131,89 @@ pub fn set_last_touched_id(beads_dir: &Path, id: &str) {
 /// Returns an empty string if the file is missing or unreadable.
 #[must_use]
 pub fn get_last_touched_id(beads_dir: &Path) -> String {
+    get_last_touched(beads_dir).0
+}
+
+/// Read the last-touched issue ID and the actor recorded with it, if any.
+#[must_use]
+pub fn get_last_touched(beads_dir: &Path) -> (String, Option<String>) {
     let path = last_touched_path(beads_dir);
     let Ok(metadata) = fs::metadata(&path) else {
-        return String::new();
+        return (String::new(), None);
     };
+    let content = read_last_touched_file_limited(&path, &metadata).unwrap_or_default();
+    let mut lines = content.lines();
+    let id = lines.next().unwrap_or_default().trim().to_string();
+    let actor = lines
+        .next()
+        .map(str::trim)
+        .filter(|actor| !actor.is_empty())
+        .map(str::to_string);
+    (id, actor)
+}
 
-    read_last_touched_file_limited(&path, &metadata).unwrap_or_default()
+/// Resolve the implicit target of an id-less mutation (`br close`,
+/// `br update`, `br reopen` with no ids) from the last-touched file.
+///
+/// The file is shared by every actor in the workspace, so the fallback is
+/// refused when it would act on another actor's last touch, and always in
+/// structured (`--json`/robot) mode, where the caller is automation and must
+/// name its target (GitHub #518). A file with no recorded actor (written by an
+/// older br) keeps the historical single-user behavior.
+///
+/// # Errors
+///
+/// Returns a validation error when there is no last-touched issue or the
+/// fallback is refused.
+pub fn idless_mutation_target(
+    beads_dir: &Path,
+    command: &str,
+    structured_output: bool,
+) -> crate::error::Result<String> {
+    let (id, recorded_actor) = get_last_touched(beads_dir);
+    idless_mutation_target_from(
+        &id,
+        recorded_actor.as_deref(),
+        process_actor(),
+        command,
+        structured_output,
+    )
+}
+
+fn idless_mutation_target_from(
+    id: &str,
+    recorded_actor: Option<&str>,
+    current_actor: Option<&str>,
+    command: &str,
+    structured_output: bool,
+) -> crate::error::Result<String> {
+    if id.is_empty() {
+        return Err(crate::error::BeadsError::validation(
+            "ids",
+            "no issue IDs provided and no last-touched issue",
+        ));
+    }
+    if structured_output {
+        return Err(crate::error::BeadsError::validation(
+            "ids",
+            format!(
+                "refusing id-less `br {command}` in --json/robot mode: automation must name its \
+                 target; pass the issue id explicitly (the last-touched issue is {id})"
+            ),
+        ));
+    }
+    if let (Some(recorded), Some(current)) = (recorded_actor, current_actor)
+        && recorded != current
+    {
+        return Err(crate::error::BeadsError::validation(
+            "ids",
+            format!(
+                "refusing id-less `br {command}`: the last-touched issue {id} was touched by \
+                 actor '{recorded}', not by you ('{current}'); pass the issue id explicitly"
+            ),
+        ));
+    }
+    Ok(id.to_string())
 }
 
 fn read_last_touched_file_limited(path: &Path, metadata: &fs::Metadata) -> io::Result<String> {
@@ -131,14 +229,7 @@ fn read_last_touched_file_limited(path: &Path, metadata: &fs::Metadata) -> io::R
         return Ok(String::new());
     }
 
-    let content =
-        String::from_utf8(content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok(content
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_string())
+    String::from_utf8(content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Best-effort delete of the last-touched file.
@@ -368,6 +459,31 @@ pub mod test_helpers {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn idless_mutation_target_guards_other_actors_and_automation() {
+        let target = |recorded, current, structured| {
+            super::idless_mutation_target_from("bd-1", recorded, current, "close", structured)
+        };
+        assert_eq!(target(Some("alice"), Some("alice"), false).unwrap(), "bd-1");
+        assert_eq!(target(None, Some("alice"), false).unwrap(), "bd-1");
+        assert_eq!(target(Some("bob"), None, false).unwrap(), "bd-1");
+        let other = target(Some("bob"), Some("alice"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            other.contains("'bob'") && other.contains("'alice'"),
+            "{other}"
+        );
+        let robot = target(Some("alice"), Some("alice"), true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            robot.contains("--json/robot") && robot.contains("bd-1"),
+            "{robot}"
+        );
+        assert!(super::idless_mutation_target_from("", None, None, "close", false).is_err());
+    }
     use super::*;
     use tempfile::TempDir;
 

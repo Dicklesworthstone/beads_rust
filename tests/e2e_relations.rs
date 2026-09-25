@@ -409,7 +409,7 @@ fn e2e_label_add_updates_last_touched_context() {
 
     let update = run_br(
         &workspace,
-        ["update", "--title", "Label-touched target", "--json"],
+        ["update", "--title", "Label-touched target"],
         "update_after_label_add_last_touched",
     );
     assert!(
@@ -486,7 +486,7 @@ fn e2e_comments_add_updates_last_touched_context() {
 
     let update = run_br(
         &workspace,
-        ["update", "--title", "Comment-touched target", "--json"],
+        ["update", "--title", "Comment-touched target"],
         "update_after_comments_add_last_touched",
     );
     assert!(
@@ -651,12 +651,7 @@ fn e2e_dep_add_updates_last_touched_context() {
 
     let update = run_br(
         &workspace,
-        [
-            "update",
-            "--title",
-            "Blocked renamed via last touched",
-            "--json",
-        ],
+        ["update", "--title", "Blocked renamed via last touched"],
         "update_last_touched_after_dep_add",
     );
     assert!(
@@ -743,12 +738,7 @@ fn e2e_dep_remove_updates_last_touched_context() {
 
     let update = run_br(
         &workspace,
-        [
-            "update",
-            "--title",
-            "Blocked renamed after dep remove",
-            "--json",
-        ],
+        ["update", "--title", "Blocked renamed after dep remove"],
         "update_last_touched_after_dep_remove",
     );
     assert!(

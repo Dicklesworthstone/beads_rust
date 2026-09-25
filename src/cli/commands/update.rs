@@ -378,14 +378,11 @@ pub fn execute_with_storage(
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut target_inputs = args.ids.clone();
     if target_inputs.is_empty() {
-        let last_touched = crate::util::get_last_touched_id(&beads_dir);
-        if last_touched.is_empty() {
-            return Err(BeadsError::validation(
-                "ids",
-                "no issue IDs provided and no last-touched issue",
-            ));
-        }
-        target_inputs.push(last_touched);
+        target_inputs.push(crate::util::idless_mutation_target(
+            &beads_dir,
+            "update",
+            ctx.is_json() || ctx.is_toon(),
+        )?);
     }
 
     // A single `updated_at` describes one record, so applying it to a batch
@@ -1534,14 +1531,9 @@ fn resolve_target_ids(
 ) -> Result<Vec<String>> {
     let mut ids = args.ids.clone();
     if ids.is_empty() {
-        let last_touched = crate::util::get_last_touched_id(beads_dir);
-        if last_touched.is_empty() {
-            return Err(BeadsError::validation(
-                "ids",
-                "no issue IDs provided and no last-touched issue",
-            ));
-        }
-        ids.push(last_touched);
+        ids.push(crate::util::idless_mutation_target(
+            beads_dir, "update", false,
+        )?);
     }
 
     resolve_issue_ids(storage, resolver, &ids)

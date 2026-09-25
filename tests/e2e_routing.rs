@@ -876,17 +876,29 @@ fn e2e_routing_update_sets_invoking_workspace_last_touched_for_follow_up_close()
     );
     assert!(update.status.success(), "update failed: {}", update.stderr);
 
-    let close = run_br(
+    // Automation must name its target: the id-less form refuses in --json
+    // mode (GH #518) and leaves the issue untouched.
+    let refused = run_br(
         &main_workspace,
         ["close", "--json"],
+        "close_follow_up_json_refused",
+    );
+    assert!(
+        !refused.status.success(),
+        "id-less --json close must refuse"
+    );
+    assert!(
+        refused.stdout.contains(&external_id),
+        "refusal names the last-touched id: {}",
+        refused.stdout
+    );
+
+    let close = run_br(
+        &main_workspace,
+        ["close"],
         "close_follow_up_using_routed_last_touched",
     );
     assert!(close.status.success(), "close failed: {}", close.stderr);
-    let closed: Value =
-        serde_json::from_str(&extract_json_payload(&close.stdout)).expect("close json");
-    let closed_array = closed.as_array().expect("closed array");
-    assert_eq!(closed_array.len(), 1);
-    assert_eq!(closed_array[0]["id"].as_str(), Some(external_id.as_str()));
 
     let show_external = run_br(
         &external_workspace,
@@ -1021,15 +1033,10 @@ fn e2e_routing_close_sets_invoking_workspace_last_touched_for_follow_up_reopen()
 
     let reopen = run_br(
         &main_workspace,
-        ["reopen", "--json"],
+        ["reopen"],
         "reopen_follow_up_using_routed_last_touched",
     );
     assert!(reopen.status.success(), "reopen failed: {}", reopen.stderr);
-    let reopened: Value =
-        serde_json::from_str(&extract_json_payload(&reopen.stdout)).expect("reopen json");
-    let reopened_array = reopened["reopened"].as_array().expect("reopened array");
-    assert_eq!(reopened_array.len(), 1);
-    assert_eq!(reopened_array[0]["id"].as_str(), Some(external_id.as_str()));
 
     let show_external = run_br(
         &external_workspace,
@@ -1466,15 +1473,10 @@ fn e2e_routing_label_add_sets_invoking_workspace_last_touched_for_follow_up_upda
 
     let update = run_br(
         &main_workspace,
-        ["update", "--status", "in_progress", "--json"],
+        ["update", "--status", "in_progress"],
         "update_follow_up_using_label_last_touched",
     );
     assert!(update.status.success(), "update failed: {}", update.stderr);
-    let updated: Value =
-        serde_json::from_str(&extract_json_payload(&update.stdout)).expect("update json");
-    let updated_array = updated.as_array().expect("update array");
-    assert_eq!(updated_array.len(), 1);
-    assert_eq!(updated_array[0]["id"].as_str(), Some(external_id.as_str()));
 
     let show_external = run_br(
         &external_workspace,
@@ -1705,15 +1707,10 @@ fn e2e_routing_comments_add_sets_invoking_workspace_last_touched_for_follow_up_u
 
     let update = run_br(
         &main_workspace,
-        ["update", "--status", "in_progress", "--json"],
+        ["update", "--status", "in_progress"],
         "update_follow_up_using_comment_last_touched",
     );
     assert!(update.status.success(), "update failed: {}", update.stderr);
-    let updated: Value =
-        serde_json::from_str(&extract_json_payload(&update.stdout)).expect("update json");
-    let updated_array = updated.as_array().expect("update array");
-    assert_eq!(updated_array.len(), 1);
-    assert_eq!(updated_array[0]["id"].as_str(), Some(external_id.as_str()));
 
     let show_external = run_br(
         &external_workspace,
@@ -1880,15 +1877,10 @@ fn e2e_routing_dep_add_sets_invoking_workspace_last_touched_for_follow_up_update
 
     let update = run_br(
         &main_workspace,
-        ["update", "--title", "Updated after routed dep", "--json"],
+        ["update", "--title", "Updated after routed dep"],
         "update_follow_up_using_dep_last_touched",
     );
     assert!(update.status.success(), "update failed: {}", update.stderr);
-    let updated: Value =
-        serde_json::from_str(&extract_json_payload(&update.stdout)).expect("update json");
-    let updated_array = updated.as_array().expect("update array");
-    assert_eq!(updated_array.len(), 1);
-    assert_eq!(updated_array[0]["id"].as_str(), Some(child_id.as_str()));
 
     let shown = show_issue_json(
         &external_workspace,
