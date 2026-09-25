@@ -33725,7 +33725,12 @@ required_fields:
             &authority,
         )
         .unwrap();
-        assert!(shm_path.is_file());
+        // An engine with a private in-memory index (Windows) needs no file
+        // and must not be sent through recovery for its absence (GH #520).
+        assert_eq!(
+            shm_path.is_file(),
+            crate::franken_sync::wal_index::ENGINE_READS_ON_DISK_WAL_INDEX
+        );
         assert_eq!(
             SqliteStorage::inspect_pending_sync_merge_under_authority(&db_path, &authority)
                 .unwrap(),

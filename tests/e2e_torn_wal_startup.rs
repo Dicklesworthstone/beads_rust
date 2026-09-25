@@ -230,6 +230,9 @@ fn empty_and_header_only_wals_are_left_alone() {
     );
 }
 
+// Missing-index recovery exists only where the engine reads the on-disk
+// index; Windows keeps it in private memory and never starts it (GH #520).
+#[cfg(unix)]
 #[test]
 fn refused_automatic_recovery_keeps_one_snapshot_per_incident() {
     let workspace = initialized_workspace();

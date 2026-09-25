@@ -369,7 +369,18 @@ const WAL_HEADER_BYTES: u64 = 32;
 /// # Errors
 /// Returns an error for unsafe paths or failed filesystem inspection.
 pub fn missing_wal_index(db_path: &Path) -> Result<bool> {
-    if secure_file_metadata(db_path)?.is_none()
+    missing_wal_index_for_engine(
+        db_path,
+        crate::franken_sync::wal_index::ENGINE_READS_ON_DISK_WAL_INDEX,
+    )
+}
+
+/// [`missing_wal_index`] for an engine that does (or does not) read the
+/// on-disk index. An engine that rebuilds its index privately on every open
+/// never needs the file, so its absence is not a recovery case (GH #520).
+fn missing_wal_index_for_engine(db_path: &Path, engine_reads_on_disk_index: bool) -> Result<bool> {
+    if !engine_reads_on_disk_index
+        || secure_file_metadata(db_path)?.is_none()
         || secure_file_metadata(&family_component_path(db_path, "-shm"))?.is_some()
     {
         return Ok(false);
@@ -470,9 +481,31 @@ pub fn quarantine_torn_wal_for_startup(
     result.and_then(|quarantine| released.map(|()| quarantine))
 }
 
+/// Whether the derived WAL index must be recovered before the engine can be
+/// trusted to admit this family. Always false where the engine never reads
+/// the on-disk index (Windows): there is nothing to recover, and attempting it
+/// would wedge every command on an unsupported quarantine (GH #520).
+///
+/// # Errors
+/// Returns an error for unsafe paths or failed filesystem inspection.
 pub fn wal_index_needs_recovery(db_path: &Path) -> Result<bool> {
-    Ok(missing_wal_index(db_path)?
-        || crate::franken_sync::wal_index::poisoned_index_present(db_path)?)
+    wal_index_needs_recovery_for_engine(
+        db_path,
+        crate::franken_sync::wal_index::ENGINE_READS_ON_DISK_WAL_INDEX,
+    )
+}
+
+fn wal_index_needs_recovery_for_engine(
+    db_path: &Path,
+    engine_reads_on_disk_index: bool,
+) -> Result<bool> {
+    Ok(
+        missing_wal_index_for_engine(db_path, engine_reads_on_disk_index)?
+            || crate::franken_sync::wal_index::poisoned_index_present_for_engine(
+                db_path,
+                engine_reads_on_disk_index,
+            )?,
+    )
 }
 
 /// Restore a missing index before startup inspects the actual pending receipt.
@@ -4697,6 +4730,29 @@ fn sync_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// GH #520: on Windows the engine keeps its WAL index in private memory,
+    /// so a stock-SQLite index beside a header-only WAL (or no index at all)
+    /// must never start automatic recovery, whose quarantine step cannot run
+    /// there and would otherwise fail every command before it did any work.
+    #[test]
+    fn private_index_engine_never_needs_wal_index_recovery_gh520() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join("beads.db");
+        crate::franken_sync::wal_index::tests::write_stock_header_only_family(&db);
+        assert!(wal_index_needs_recovery_for_engine(&db, true).unwrap());
+        assert!(!wal_index_needs_recovery_for_engine(&db, false).unwrap());
+        assert_eq!(wal_index_needs_recovery(&db).unwrap(), cfg!(unix));
+
+        // Same split for a complete WAL whose index file is absent.
+        let shm = family_component_path(&db, "-shm");
+        fs::rename(&shm, temp.path().join("retained-shm")).unwrap();
+        assert!(missing_wal_index_for_engine(&db, true).unwrap());
+        assert!(!missing_wal_index_for_engine(&db, false).unwrap());
+        assert!(wal_index_needs_recovery_for_engine(&db, true).unwrap());
+        assert!(!wal_index_needs_recovery_for_engine(&db, false).unwrap());
+        assert_eq!(missing_wal_index(&db).unwrap(), cfg!(unix));
+    }
 
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     #[test]

@@ -159,7 +159,26 @@ fn poisoned_headers(wal: &[u8; 32], shm: &[u8; 96]) -> bool {
         && shm[32..40].iter().all(|byte| *byte == 0)
 }
 
+/// Whether this target's storage engine admits the database through the
+/// on-disk `-shm` WAL index.
+///
+/// On Unix frankensqlite memory-maps `-shm`, so its bytes decide admission and
+/// #507's poison can latch `BusyRecovery`. On Windows the engine keeps the WAL
+/// index in process-private memory rebuilt from the WAL on every open, and
+/// uses `-shm` only as a lock sidecar: it never reads the file's bytes and
+/// recreates a missing file on demand. There, neither a poison-shaped `-shm`
+/// (stock SQLite writes exactly that shape beside a header-only WAL) nor a
+/// missing one can affect admission, so nothing may be "recovered" (GH #520).
+pub const ENGINE_READS_ON_DISK_WAL_INDEX: bool = cfg!(unix);
+
 fn probe(path: &Path) -> io::Result<bool> {
+    probe_for_engine(path, ENGINE_READS_ON_DISK_WAL_INDEX)
+}
+
+fn probe_for_engine(path: &Path, engine_reads_on_disk_index: bool) -> io::Result<bool> {
+    if !engine_reads_on_disk_index {
+        return Ok(false);
+    }
     let Some(wal) = prefix::<32>(&sidecar(path, "-wal"))? else {
         return Ok(false);
     };
@@ -171,6 +190,15 @@ fn probe(path: &Path) -> io::Result<bool> {
 
 pub fn poisoned_index_present(path: &Path) -> io::Result<bool> {
     probe(path)
+}
+
+/// [`poisoned_index_present`] for an engine that does (or does not) read the
+/// on-disk index, so both platform behaviors are testable on either host.
+pub fn poisoned_index_present_for_engine(
+    path: &Path,
+    engine_reads_on_disk_index: bool,
+) -> io::Result<bool> {
+    probe_for_engine(path, engine_reads_on_disk_index)
 }
 
 pub(super) fn warn_if_poisoned(path: &str) {
@@ -421,7 +449,7 @@ pub(super) fn quarantine_poisoned_index(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     #[cfg(any(
         target_os = "linux",
@@ -542,6 +570,47 @@ mod tests {
         for size in [0, 1, 256, 513, 131_072] {
             assert!(wal_layout(&wal_header(size, false)).is_err());
         }
+    }
+
+    /// The exact index header stock SQLite 3.51 writes after recovering a
+    /// header-only (32-byte, zero-frame) WAL: initialized, zero page size,
+    /// zero frames, zero salts, plus its own header checksum. It is the #507
+    /// byte pattern, produced by any stock SQLite reader of the family (GH #520).
+    fn stock_sqlite_header_only_index() -> [u8; 96] {
+        let mut shm = poison();
+        for offset in [0, 48] {
+            shm[offset + 40..offset + 48]
+                .copy_from_slice(&[0x38, 0x07, 0x18, 0x06, 0x35, 0x93, 0xdb, 0x09]);
+        }
+        shm
+    }
+
+    /// Lay out the GH #520 reporter's family at `db`: a main file, a 32-byte
+    /// header-only WAL, and the index stock SQLite leaves beside it.
+    pub fn write_stock_header_only_family(db: &Path) {
+        let mut main = vec![0; 4096];
+        main[..16].copy_from_slice(b"SQLite format 3\0");
+        main[16..18].copy_from_slice(&4096_u16.to_be_bytes());
+        fs::write(db, main).unwrap();
+        fs::write(sidecar(db, "-wal"), wal_header(4096, false)).unwrap();
+        fs::write(sidecar(db, "-shm"), stock_sqlite_header_only_index()).unwrap();
+    }
+
+    #[test]
+    fn private_index_engine_never_reports_or_quarantines_the_on_disk_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("beads.db");
+        write_stock_header_only_family(&db);
+        let before = payload(&db);
+        // An engine that maps -shm (Unix) reads these bytes: #507 unchanged.
+        assert!(probe_for_engine(&db, true).unwrap());
+        // An engine that keeps its index in private memory (Windows) never
+        // reads them, so they are neither evidence nor quarantine authority.
+        assert!(!probe_for_engine(&db, false).unwrap());
+        assert!(!poisoned_index_present_for_engine(&db, false).unwrap());
+        assert_eq!(poisoned_index_present(&db).unwrap(), cfg!(unix));
+        assert_eq!(payload(&db), before);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 3);
     }
 
     #[test]
