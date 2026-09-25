@@ -190,6 +190,67 @@ fn parse_toon_as_nested_json(toon: &str) -> Value {
     Value::from(parse_toon(toon.trim(), Some(decode_options)).expect("valid TOON"))
 }
 
+/// GitHub #519: a bead sent back to a ready-group status (`rework`) keeps its
+/// assignee and refuses other agents' claims, so coordination status must
+/// report it as a claim, and its `ready` count must honour the configured
+/// ready group exactly as `br ready` does.
+#[test]
+fn coordination_status_sees_assigned_rework_and_honours_ready_group() {
+    let _log = common::test_log("coordination_status_sees_assigned_rework_and_honours_ready_group");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    fs::write(
+        workspace.root.join(".beads/policy.yaml"),
+        "workflow:\n  statuses: [open, in_progress, in_review, rework, closed]\n  status_groups: {ready: [open, rework]}\n",
+    )
+    .expect("write policy");
+    let rework = json!({
+        "id": "bd-rework",
+        "title": "Rework probe",
+        "status": "rework",
+        "priority": 2,
+        "issue_type": "task",
+        "assignee": "alice",
+        "created_at": "2099-01-01T00:00:00Z",
+        "updated_at": "2099-01-01T00:00:00Z",
+    });
+    let unassigned = json!({
+        "id": "bd-free",
+        "title": "Unassigned open work",
+        "status": "open",
+        "priority": 2,
+        "issue_type": "task",
+        "created_at": "2099-01-01T00:00:00Z",
+        "updated_at": "2099-01-01T00:00:00Z",
+    });
+    fs::write(
+        workspace.root.join(".beads/issues.jsonl"),
+        format!("{rework}\n{unassigned}\n"),
+    )
+    .expect("write seed JSONL");
+    let import = run_br(&workspace, ["sync", "--import-only", "--json"], "import");
+    assert!(import.status.success(), "import failed: {}", import.stderr);
+
+    let ready = run_br(&workspace, ["ready", "--json"], "ready");
+    assert!(ready.status.success(), "ready failed: {}", ready.stderr);
+    let ready: Value =
+        serde_json::from_str(&extract_json_payload(&ready.stdout)).expect("ready json");
+    let ready_count = ready.as_array().expect("ready array").len();
+    assert_eq!(ready_count, 2, "br ready honours the rework ready group");
+
+    let json = coordination_json(
+        &workspace,
+        &["coordination", "status", "--json"],
+        "coordination_rework",
+    );
+    assert_eq!(json["summary"]["total_claims"], 1);
+    let rework = claim_by_id(&json, "bd-rework");
+    assert_eq!(rework["issue"]["status"], "rework");
+    assert_eq!(json["summary"]["workspace"]["ready"], ready_count);
+    assert_eq!(json["summary"]["workspace"]["in_progress"], 0);
+}
+
 #[test]
 fn coordination_status_json_reports_fresh_and_stale_claims() {
     let _log = common::test_log("coordination_status_json_reports_fresh_and_stale_claims");
@@ -464,11 +525,7 @@ fn coordination_status_text_is_concise_and_sanitized() {
     );
 
     assert!(result.status.success(), "text failed: {}", result.stderr);
-    assert!(
-        result
-            .stdout
-            .contains("Coordination status (2 in-progress claims):")
-    );
+    assert!(result.stdout.contains("Coordination status (2 claims):"));
     assert!(result.stdout.contains("bd-stale"));
     assert!(result.stdout.contains("classification: no_mail_snapshot"));
     assert!(result.stdout.contains("next_action: inspect_mail"));

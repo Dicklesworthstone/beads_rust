@@ -135,13 +135,22 @@ fn build_coordination_status_output(
     snapshots: &SnapshotContext,
     generated_at: DateTime<Utc>,
 ) -> Result<CoordinationStatusOutput> {
+    // A claim is any in-progress bead, plus any *assigned* bead that is still
+    // live work: a ready-group status such as `rework` keeps its assignee and
+    // refuses other agents' `--claim`, so it must be visible here or the
+    // reclaim protocol can never start for it (GitHub #519).
+    let workflow = storage.workflow_policy();
+    let ready_statuses = workflow.ready_status_group();
     let filters = ListFilters {
-        statuses: Some(vec![Status::InProgress]),
         include_deferred: true,
         sort: Some("updated_at".to_string()),
         ..ListFilters::default()
     };
-    let issues = storage.list_issues(&filters)?;
+    let issues: Vec<Issue> = storage
+        .list_issues(&filters)?
+        .into_iter()
+        .filter(is_coordination_claim)
+        .collect();
     let issue_ids = issues
         .iter()
         .map(|issue| issue.id.clone())
@@ -193,7 +202,7 @@ fn build_coordination_status_output(
             )
         })
         .collect();
-    let workspace = workspace_counts(storage, claims.len())?;
+    let workspace = workspace_counts(storage, &ready_statuses)?;
 
     let mut output = CoordinationStatusOutput::new(generated_at, workspace, claims);
     // GitHub #384 phase 6: capacity occupancy, absent when unconfigured.
@@ -422,20 +431,39 @@ fn latest_comments(comments: &[Comment], limit: usize) -> Vec<CoordinationCommen
         .collect()
 }
 
+/// Whether an issue is a claim to classify: in progress, or assigned while
+/// in any other non-terminal, non-deferred status (GitHub #519).
+fn is_coordination_claim(issue: &Issue) -> bool {
+    if issue.status == Status::InProgress {
+        return true;
+    }
+    let assigned = issue
+        .assignee
+        .as_deref()
+        .is_some_and(|assignee| !assignee.trim().is_empty());
+    assigned
+        && !matches!(
+            issue.status,
+            Status::Closed | Status::Tombstone | Status::Deferred | Status::Pinned
+        )
+}
+
 fn workspace_counts(
     storage: &SqliteStorage,
-    in_progress_count: usize,
+    ready_statuses: &[String],
 ) -> Result<CoordinationWorkspaceCounts> {
+    // Honour `workflow.status_groups.ready` exactly as `br ready` does.
+    let ready_filters = ReadyFilters {
+        ready_statuses: ready_statuses.to_vec(),
+        ..ReadyFilters::default()
+    };
     Ok(CoordinationWorkspaceCounts {
         open: status_count(storage, &Status::Open)?,
         ready: storage
-            .get_ready_issues_for_command_output(
-                &ReadyFilters::default(),
-                ReadySortPolicy::Priority,
-            )?
+            .get_ready_issues_for_command_output(&ready_filters, ReadySortPolicy::Priority)?
             .len(),
         blocked: storage.get_blocked_ids()?.len(),
-        in_progress: in_progress_count,
+        in_progress: status_count(storage, &Status::InProgress)?,
         deferred: status_count(storage, &Status::Deferred)?,
         closed: status_count(storage, &Status::Closed)?,
     })
@@ -460,7 +488,7 @@ const fn owner_kind_from_arg(arg: CoordinationOwnerKindArg) -> ClaimOwnerKind {
 
 fn print_text_output(output: &CoordinationStatusOutput) {
     println!(
-        "Coordination status ({} in-progress claim{}):",
+        "Coordination status ({} claim{}):",
         output.summary.total_claims,
         if output.summary.total_claims == 1 {
             ""
@@ -478,7 +506,7 @@ fn print_text_output(output: &CoordinationStatusOutput) {
     );
 
     if output.claims.is_empty() {
-        println!("No in-progress claims.");
+        println!("No claims.");
         return;
     }
 
