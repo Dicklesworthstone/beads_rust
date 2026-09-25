@@ -2951,6 +2951,12 @@ enum PolicyNode {
     ConditionalGateList,
     /// One `require_if` entry.
     ConditionalGate,
+    /// `require_all:` list; each element is a gate spec.
+    GateSpecList,
+    /// One gate spec. A bare name is a scalar; the map form accepts only
+    /// `min_reviewers`, and `GateSpec` silently drops any sibling key such
+    /// as `{min_reviewers: 2, label: security}`.
+    GateSpec,
     /// Terminal scalar / list — descent stops here.
     Scalar,
 }
@@ -3004,16 +3010,17 @@ impl PolicyNode {
             ],
             Self::StatusGroups => &[("ready", Self::Scalar)],
             Self::GateRule => &[
-                ("require_all", Self::Scalar),
+                ("require_all", Self::GateSpecList),
                 ("require_if", Self::ConditionalGateList),
             ],
             Self::ConditionalGate => &[
                 ("label", Self::Scalar),
                 ("priority", Self::Scalar),
-                ("gate", Self::Scalar),
+                ("gate", Self::GateSpec),
             ],
+            Self::GateSpec => &[(GATE_MIN_REVIEWERS, Self::Scalar)],
             // Free-form keys / sequences: handled directly by the walker.
-            Self::Gates | Self::ConditionalGateList | Self::Scalar => &[],
+            Self::Gates | Self::ConditionalGateList | Self::GateSpecList | Self::Scalar => &[],
         }
     }
 }
@@ -3026,15 +3033,15 @@ fn walk_policy_node(
 ) {
     match node {
         PolicyNode::Scalar => return,
-        PolicyNode::ConditionalGateList => {
+        PolicyNode::ConditionalGateList | PolicyNode::GateSpecList => {
+            let element = if matches!(node, PolicyNode::GateSpecList) {
+                PolicyNode::GateSpec
+            } else {
+                PolicyNode::ConditionalGate
+            };
             if let Some(items) = value.as_sequence() {
                 for (index, item) in items.iter().enumerate() {
-                    walk_policy_node(
-                        item,
-                        PolicyNode::ConditionalGate,
-                        &format!("{scope}[{index}]"),
-                        out,
-                    );
+                    walk_policy_node(item, element, &format!("{scope}[{index}]"), out);
                 }
             }
             return;
@@ -4448,11 +4455,11 @@ workflow:
         - priorty: [0, 1]           # typo: should be priority
           gat: security_sign_off    # typo: should be gate
     "open -> in_progress":
-      require_all: [triage_ok]
+      require_all: [triage_ok, {min_reviewers: 2, label: security}]
       require_if:
         - label: urgent
           priority: [0]
-          gate: {min_reviewers: 1}
+          gate: {min_reviewers: 1, lable: urgent}
 "#;
         let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
         // The typed parse accepts the typos (that is the silent failure).
@@ -4464,6 +4471,8 @@ workflow:
                 "workflow.gates.\"in_review -> closed\".require_al".to_string(),
                 "workflow.gates.\"in_review -> closed\".require_if[1].gat".to_string(),
                 "workflow.gates.\"in_review -> closed\".require_if[1].priorty".to_string(),
+                "workflow.gates.\"open -> in_progress\".require_all[1].label".to_string(),
+                "workflow.gates.\"open -> in_progress\".require_if[0].gate.lable".to_string(),
             ]
         );
     }
