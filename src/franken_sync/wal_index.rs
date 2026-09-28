@@ -486,13 +486,17 @@ pub(super) fn quarantine_poisoned_index(
     let main_hash = hash_file(&mut locked.file)?;
     let wal_hash = hash_file(&mut wal)?;
     let shm_hash = hash_file(&mut shm)?;
-    // Keep, rather than auto-delete, even if a later fsync/rename/open fails.
-    let retained = tempfile::Builder::new()
+    // Preparation owns no unique forensic state yet: an ordinary error must
+    // not accumulate .br-wal-index-* directories on each retry (GH #523).
+    let scratch = tempfile::Builder::new()
         .prefix(".br-wal-index-")
-        .tempdir_in(&parent)?
-        .keep();
+        .tempdir_in(&parent)?;
+    let retained = scratch.path().to_path_buf();
+    let mut temporary = Some(scratch);
     let destination = retained.join("poisoned-shm");
     let operation = (|| -> io::Result<()> {
+        #[cfg(test)]
+        tests::fail_at_recovery_boundary("allocated")?;
         let receipt = serde_json::json!({
             "schema_version": "br.wal_index.quarantine.v1",
             "database_path": path.display().to_string(),
@@ -516,12 +520,33 @@ pub(super) fn quarantine_poisoned_index(
         sync_directory(&retained)?;
         sync_directory(&parent)?;
         #[cfg(test)]
+        tests::fail_at_recovery_boundary("prepared")?;
+        #[cfg(test)]
         tests::crash_at_recovery_boundary("prepared");
         verify_name(&path, &locked.file)?;
         verify_name(&wal_path, &wal)?;
         verify_name(&shm_path, &shm)?;
         // Even inside this call's private directory, never clobber an entry.
-        quarantine_name(&shm_path, &destination)?;
+        let renamed = quarantine_name(&shm_path, &destination);
+        #[cfg(test)]
+        let renamed = renamed.and_then(|()| tests::fail_at_recovery_boundary("rename-result"));
+        // From the first possible transfer of evidence onward, retention is
+        // unconditional, even when rename reports an indeterminate failure.
+        // Only a definitely absent destination permits temporary cleanup.
+        if renamed.is_ok()
+            || !matches!(
+                fs::symlink_metadata(&destination),
+                Err(error) if error.kind() == io::ErrorKind::NotFound
+            )
+        {
+            let _ = temporary
+                .take()
+                .expect("quarantine preparation is owned")
+                .keep();
+        }
+        renamed?;
+        #[cfg(test)]
+        tests::fail_at_recovery_boundary("renamed")?;
         #[cfg(test)]
         tests::crash_at_recovery_boundary("renamed");
         sync_directory(&retained)?;
@@ -536,15 +561,27 @@ pub(super) fn quarantine_poisoned_index(
             ));
         }
         #[cfg(test)]
+        tests::fail_at_recovery_boundary("durable")?;
+        #[cfg(test)]
         tests::crash_at_recovery_boundary("durable");
         Ok(())
     })();
-    operation.map_err(|error| {
-        FrankenError::internal(format!(
-            "WAL-index quarantine did not complete: {error}; evidence retained at {}",
-            retained.display()
-        ))
-    })?;
+    if let Err(error) = operation {
+        let disposition = if let Some(scratch) = temporary {
+            match scratch.close() {
+                Ok(()) => "no index quarantined; temporary preparation removed".to_string(),
+                Err(cleanup) => format!(
+                    "no index quarantined; temporary preparation cleanup failed at {}: {cleanup}",
+                    retained.display()
+                ),
+            }
+        } else {
+            format!("evidence retained at {}", retained.display())
+        };
+        return Err(FrankenError::internal(format!(
+            "WAL-index quarantine did not complete: {error}; {disposition}"
+        )));
+    }
     tracing::warn!(
         database = %path.display(),
         retained = %retained.display(),
@@ -572,6 +609,18 @@ pub mod tests {
     use crate::franken_sync::{Connection, SqliteValue, compat};
 
     const CRASH_STAGE_ENV: &str = "BR_TEST_507_CRASH_STAGE";
+
+    thread_local! {
+        static FAILURE_STAGE: std::cell::Cell<Option<&'static str>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn fail_at_recovery_boundary(stage: &str) -> io::Result<()> {
+        if FAILURE_STAGE.get() == Some(stage) {
+            return Err(io::Error::other(format!("injected failure at {stage}")));
+        }
+        Ok(())
+    }
 
     // Only compiled into the unit-test binary. exit() intentionally bypasses
     // every Rust destructor: this tests restart after process loss, not an
@@ -1048,6 +1097,64 @@ pub mod tests {
         assert_eq!(receipt["schema_version"], "br.wal_index.quarantine.v1");
         // Crash after quarantine is restartable: no second quarantine is needed.
         assert!(!quarantine_poisoned_index(db.to_str().unwrap(), id).unwrap());
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn quarantine_failure_cleans_only_preparations_without_forensic_state() {
+        for stage in ["allocated", "prepared", "rename-result", "renamed", "durable"] {
+            let (temp, db, id) = fixture();
+            let before = payload(&db);
+            FAILURE_STAGE.set(Some(stage));
+            let result = quarantine_poisoned_index(db.to_str().unwrap(), id);
+            FAILURE_STAGE.set(None);
+            let error = result.expect_err("injected quarantine failure").to_string();
+            assert!(
+                error.contains(&format!("injected failure at {stage}")),
+                "{error}"
+            );
+            assert_eq!(fs::read(&db).unwrap(), before[0], "main at {stage}");
+            assert_eq!(
+                fs::read(sidecar(&db, "-wal")).unwrap(),
+                before[1],
+                "WAL at {stage}"
+            );
+            let preparations: Vec<_> = fs::read_dir(temp.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(".br-wal-index-")
+                })
+                .collect();
+            if matches!(stage, "allocated" | "prepared") {
+                assert_eq!(fs::read(sidecar(&db, "-shm")).unwrap(), before[2]);
+                assert!(preparations.is_empty(), "{stage}: {preparations:?}");
+                assert!(error.contains("temporary preparation removed"), "{error}");
+                assert!(!error.contains("evidence retained"), "{error}");
+                // A failed preparation leaves the original family available
+                // for a subsequent, fully validated recovery attempt.
+                assert!(quarantine_poisoned_index(db.to_str().unwrap(), id).unwrap());
+            } else {
+                assert!(!sidecar(&db, "-shm").exists(), "{stage}");
+                assert_eq!(preparations.len(), 1, "{stage}: {preparations:?}");
+                assert_eq!(
+                    fs::read(preparations[0].join("poisoned-shm")).unwrap(),
+                    before[2],
+                    "forensic bytes at {stage}"
+                );
+                assert!(preparations[0].join("prepared.json").is_file());
+                assert!(error.contains("evidence retained"), "{error}");
+                assert!(!error.contains("temporary preparation removed"), "{error}");
+            }
+        }
     }
 
     #[test]
