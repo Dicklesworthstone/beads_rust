@@ -2664,13 +2664,39 @@ impl SqliteStorage {
         // — surfaces here as a bare `CannotOpen`, and this lane is the first
         // open every read command and the pending-saga gate perform, so it
         // must carry the same explanation the writable open does.
-        let conn = open_engine_connection_explained(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        //
+        // The engine gets the first attempt, including its own transient
+        // retries, so a family it admits reads exactly as before. Only when
+        // it refuses with `BusyRecovery` and the index is settled-stale
+        // (GH #521) does the read move to a private snapshot.
+        let conn = match open_engine_connection_explained(path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Ok(conn) => conn,
+            Err(BeadsError::Database(FrankenError::BusyRecovery))
+                if allow_snapshot && stale_read_only_wal_index(path)? =>
+            {
+                return Self::open_private_wal_snapshot(path, opener_lease);
+            }
+            Err(error) => return Err(error),
+        };
         // Now that the connection is open, consult the effective schema version
         // (WAL-aware) and fall back to the header peek. Reviewed reconciliation
         // is intentionally exact-version only: a future schema may add columns,
         // triggers, or invariants that this binary cannot witness safely.
+        let probed_version = conn.query_row("PRAGMA user_version");
+        if allow_snapshot
+            && matches!(probed_version, Err(FrankenError::BusyRecovery))
+            && stale_read_only_wal_index(path)?
+        {
+            conn.close().map_err(BeadsError::Database)?;
+            return Self::open_private_wal_snapshot(path, opener_lease);
+        }
+        let connection_version = probed_version.ok().and_then(|row| {
+            row.get(0)
+                .and_then(SqliteValue::as_integer)
+                .and_then(|v| u32::try_from(v).ok())
+        });
         let header_version = checked_database_header_user_version(path)?;
-        if connection_user_version(&conn).or(header_version) != Some(current_schema_version) {
+        if connection_version.or(header_version) != Some(current_schema_version) {
             conn.close().map_err(BeadsError::Database)?;
             return Ok(None);
         }
@@ -2699,7 +2725,7 @@ impl SqliteStorage {
             member.copy_to(&copy_path)?;
         }
         verify_read_snapshot_family(&mut family)?;
-        if !missing_read_only_wal_index(&copy_path)? {
+        if !(missing_read_only_wal_index(&copy_path)? || stale_read_only_wal_index(&copy_path)?) {
             return Err(BeadsError::SyncConflict {
                 message: "WAL index topology changed during private snapshot capture".to_string(),
             });
@@ -17266,6 +17292,18 @@ fn verify_read_snapshot_family(family: &mut [ReadSnapshotMember]) -> Result<()> 
         member.verify_source()?;
     }
     Ok(())
+}
+
+/// Whether a read-only open that the engine just refused with `BusyRecovery`
+/// (after its own transient retries) is facing a stale WAL index (GH #521):
+/// an index left by br 0.6.0's engine, which never maintained it, or one from
+/// another WAL generation. Only a writable open can rebuild such an index, so
+/// the read goes through a private snapshot whose index is rebuilt off to the
+/// side, never touching the live family. #507's poison keeps its own explicit
+/// recovery and diagnosis.
+fn stale_read_only_wal_index(path: &Path) -> Result<bool> {
+    Ok(crate::franken_sync::wal_index::stale_index_present(path)?
+        && !crate::franken_sync::wal_index::poisoned_index_present(path)?)
 }
 
 fn missing_read_only_wal_index(path: &Path) -> Result<bool> {

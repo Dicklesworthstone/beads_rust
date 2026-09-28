@@ -221,6 +221,91 @@ pub fn poisoned_index_present_for_engine(
     probe_for_engine(path, engine_reads_on_disk_index)
 }
 
+/// Whether a settled `-shm` index can never admit a reader of this WAL: it
+/// was never initialized, or it describes another WAL generation or more
+/// frames than the WAL holds. The engine answers every one of these with
+/// "recovery required", which a read-only open cannot perform, so reads fail
+/// with `BusyRecovery` until a writable open rebuilds the index in place.
+///
+/// This is the state any engine that kept its index in process memory leaves
+/// behind: br 0.6.0 (fsqlite 0.3.x) never wrote the header, and when it runs
+/// against a family a newer br already opened, it restarts the WAL without
+/// updating the header the newer engine wrote (GH #521).
+///
+/// Only a quiescent header counts (both 48-byte copies identical); a torn or
+/// half-written header stays the engine's to classify.
+fn stale_headers(wal: &[u8; 32], shm: &[u8; 96], wal_frames: u64) -> bool {
+    let Ok((page_size, big_endian)) = wal_layout(wal) else {
+        return false;
+    };
+    if shm[..48] != shm[48..] {
+        return false;
+    }
+    match shm[12] {
+        0 => true,
+        1 => {
+            // szPage packs 65536 as 1; salts are raw big-endian WAL bytes.
+            let size_field = u16::from_ne_bytes([shm[14], shm[15]]);
+            let index_page_size = if size_field == 1 {
+                65_536
+            } else {
+                u32::from(size_field)
+            };
+            let max_frame = u32::from_ne_bytes(shm[16..20].try_into().expect("mxFrame field"));
+            index_page_size != page_size
+                || shm[13] != u8::from(big_endian)
+                || shm[32..40] != wal[16..24]
+                || u64::from(max_frame) > wal_frames
+        }
+        _ => false,
+    }
+}
+
+fn stale_probe_for_engine(path: &Path, engine_reads_on_disk_index: bool) -> io::Result<bool> {
+    if !engine_reads_on_disk_index {
+        return Ok(false);
+    }
+    let wal_path = sidecar(path, "-wal");
+    let Some(wal) = prefix::<32>(&wal_path)? else {
+        return Ok(false);
+    };
+    let Some(shm) = prefix::<96>(&sidecar(path, "-shm"))? else {
+        return Ok(false);
+    };
+    let Ok((page_size, _)) = wal_layout(&wal) else {
+        return Ok(false);
+    };
+    let wal_len = match fs::symlink_metadata(&wal_path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let wal_frames = wal_len.saturating_sub(32) / (u64::from(page_size) + 24);
+    Ok(stale_headers(&wal, &shm, wal_frames))
+}
+
+/// Whether the on-disk WAL index beside `path` is stale in a way only a
+/// writable open can repair (see [`stale_headers`]). Always false where the
+/// engine never reads the on-disk index (GH #520).
+///
+/// # Errors
+/// Returns an error when a family member exists but cannot be read.
+pub fn stale_index_present(path: &Path) -> io::Result<bool> {
+    stale_probe_for_engine(path, ENGINE_READS_ON_DISK_WAL_INDEX)
+}
+
+/// [`stale_index_present`] for an engine that does (or does not) read the
+/// on-disk index, so both platform behaviors are testable on either host.
+///
+/// # Errors
+/// Returns an error when a family member exists but cannot be read.
+pub fn stale_index_present_for_engine(
+    path: &Path,
+    engine_reads_on_disk_index: bool,
+) -> io::Result<bool> {
+    stale_probe_for_engine(path, engine_reads_on_disk_index)
+}
+
 pub(super) fn warn_if_poisoned(path: &str) {
     if probe(Path::new(path)).unwrap_or(false) {
         tracing::warn!(
@@ -677,6 +762,190 @@ pub mod tests {
         assert_eq!(poisoned_index_present(&db).unwrap(), cfg!(unix));
         assert_eq!(payload(&db), before);
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 3);
+    }
+
+    /// A settled index that describes `wal` exactly, as a maintaining engine
+    /// leaves it: initialized, matching page size, byte order and salts.
+    fn index_describing(wal: &[u8; 32], max_frame: u32) -> [u8; 96] {
+        let (page_size, big_endian) = wal_layout(wal).unwrap();
+        let encoded = if page_size == 65_536 {
+            1
+        } else {
+            u16::try_from(page_size).unwrap()
+        };
+        let mut header = [0; 48];
+        header[..4].copy_from_slice(&3_007_000_u32.to_ne_bytes());
+        header[8..12].copy_from_slice(&0x4a_u32.to_ne_bytes());
+        header[12] = 1;
+        header[13] = u8::from(big_endian);
+        header[14..16].copy_from_slice(&encoded.to_ne_bytes());
+        header[16..20].copy_from_slice(&max_frame.to_ne_bytes());
+        header[32..40].copy_from_slice(&wal[16..24]);
+        header[40..48].copy_from_slice(&[0xA5; 8]);
+        let mut both = [0; 96];
+        both[..48].copy_from_slice(&header);
+        both[48..].copy_from_slice(&header);
+        both
+    }
+
+    #[test]
+    fn stale_index_shapes_are_recognized_and_healthy_ones_are_not() {
+        for big_endian in [false, true] {
+            for size in [4096_u32, 65_536] {
+                let wal = wal_header(size, big_endian);
+                let healthy = index_describing(&wal, 0);
+                assert!(!stale_headers(&wal, &healthy, 0), "healthy {size}");
+                assert!(!stale_headers(&wal, &index_describing(&wal, 3), 3));
+                assert!(!stale_headers(&wal, &index_describing(&wal, 2), 3));
+
+                // br 0.6.0: the engine never wrote the header at all.
+                assert!(stale_headers(&wal, &[0; 96], 0), "never initialized");
+
+                // Another WAL generation: salts from a WAL since restarted.
+                let mut other_generation = healthy;
+                other_generation[32] ^= 1;
+                other_generation[80] ^= 1;
+                assert!(stale_headers(&wal, &other_generation, 0));
+
+                // More frames indexed than the WAL holds.
+                assert!(stale_headers(&wal, &index_describing(&wal, 4), 3));
+
+                // Page size or checksum byte order disagreeing with the WAL.
+                let mut wrong_size = healthy;
+                wrong_size[14..16].copy_from_slice(&512_u16.to_ne_bytes());
+                wrong_size[62..64].copy_from_slice(&512_u16.to_ne_bytes());
+                assert!(stale_headers(&wal, &wrong_size, 0));
+                let mut wrong_order = healthy;
+                wrong_order[13] ^= 1;
+                wrong_order[61] ^= 1;
+                assert!(stale_headers(&wal, &wrong_order, 0));
+
+                // #507's poison is also unusable read-only (zero page size).
+                assert!(stale_headers(&wal, &poison(), 0));
+            }
+        }
+    }
+
+    #[test]
+    fn torn_headers_and_invalid_wals_are_left_to_the_engine() {
+        let wal = wal_header(4096, false);
+        // A header mid-update (copies differ) is not a settled verdict.
+        let mut torn = [0; 96];
+        torn[48..].copy_from_slice(&index_describing(&wal, 0)[48..]);
+        assert!(!stale_headers(&wal, &torn, 0));
+        let mut torn_salt = index_describing(&wal, 0);
+        torn_salt[32] ^= 1;
+        assert!(!stale_headers(&wal, &torn_salt, 0));
+        // An unknown isInit value is not ours to classify.
+        let mut odd = index_describing(&wal, 0);
+        odd[12] = 2;
+        odd[60] = 2;
+        assert!(!stale_headers(&wal, &odd, 0));
+        // Without a valid WAL header there is nothing to compare against.
+        for offset in [0, 8, 24] {
+            let mut damaged = wal;
+            damaged[offset] ^= 1;
+            assert!(!stale_headers(&damaged, &[0; 96], 0));
+        }
+    }
+
+    #[test]
+    fn stale_probe_reads_the_real_family_and_never_mutates_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("beads.db");
+        let mut main = vec![0; 4096];
+        main[..16].copy_from_slice(b"SQLite format 3\0");
+        main[16..18].copy_from_slice(&4096_u16.to_be_bytes());
+        fs::write(&db, main).unwrap();
+        let wal = wal_header(4096, false);
+        fs::write(sidecar(&db, "-wal"), wal).unwrap();
+
+        // No index at all is the missing-index case, not a stale one.
+        assert!(!stale_probe_for_engine(&db, true).unwrap());
+
+        // br 0.6.0 leaves a 32 KiB -shm whose header was never written.
+        let mut legacy = vec![0_u8; 32 * 1024];
+        legacy[108..120].fill(0xFF);
+        fs::write(sidecar(&db, "-shm"), &legacy).unwrap();
+        let before = payload(&db);
+        assert!(stale_probe_for_engine(&db, true).unwrap());
+        assert_eq!(stale_index_present(&db).unwrap(), cfg!(unix));
+        // An engine with a private index never reads these bytes (GH #520).
+        assert!(!stale_probe_for_engine(&db, false).unwrap());
+        assert!(!stale_index_present_for_engine(&db, false).unwrap());
+        assert_eq!(payload(&db), before);
+
+        // The frame count comes from the WAL length: one full frame admits
+        // mxFrame = 1, a trailing partial frame does not count.
+        let mut healthy = index_describing(&wal, 1);
+        fs::write(sidecar(&db, "-shm"), healthy).unwrap();
+        let mut one_frame = wal.to_vec();
+        one_frame.extend(vec![0; 4096 + 24]);
+        fs::write(sidecar(&db, "-wal"), &one_frame).unwrap();
+        assert!(!stale_probe_for_engine(&db, true).unwrap());
+        one_frame.truncate(32 + 4096);
+        fs::write(sidecar(&db, "-wal"), &one_frame).unwrap();
+        assert!(stale_probe_for_engine(&db, true).unwrap());
+        healthy = index_describing(&wal, 0);
+        fs::write(sidecar(&db, "-shm"), healthy).unwrap();
+        assert!(!stale_probe_for_engine(&db, true).unwrap());
+
+        // A short WAL or index is never evidence.
+        fs::write(sidecar(&db, "-wal"), &wal[..31]).unwrap();
+        assert!(!stale_probe_for_engine(&db, true).unwrap());
+        fs::write(sidecar(&db, "-wal"), wal).unwrap();
+        fs::write(sidecar(&db, "-shm"), [0; 95]).unwrap();
+        assert!(!stale_probe_for_engine(&db, true).unwrap());
+    }
+
+    /// The engine's reaction to the index br 0.6.0 leaves (GH #521), on a
+    /// real database: read-only admission cannot use it, a writable open
+    /// rebuilds it in place, and afterwards the probe reports it healthy.
+    #[cfg(unix)]
+    #[test]
+    fn engine_rebuilds_the_legacy_index_on_a_writable_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("legacy.db");
+        let path = db.to_string_lossy().into_owned();
+        let conn = crate::franken_sync::Connection::open(path.clone()).unwrap();
+        conn.execute("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.close().unwrap();
+        // The settled family br 0.6.0 leaves: a header-only WAL beside an
+        // index whose header its engine never wrote.
+        fs::write(sidecar(&db, "-wal"), wal_header(4096, false)).unwrap();
+        let mut legacy = vec![0_u8; 32 * 1024];
+        legacy[108..120].fill(0xFF);
+        fs::write(sidecar(&db, "-shm"), &legacy).unwrap();
+        assert!(stale_probe_for_engine(&db, true).unwrap());
+
+        let count = |conn: &crate::franken_sync::Connection| {
+            conn.query_row("SELECT count(*) FROM t")
+                .map(|row| row.get(0).and_then(SqliteValue::as_integer))
+        };
+        // Whatever read-only admission does today, it must not succeed with
+        // wrong data; BusyRecovery is the fsqlite 0.4.4 answer.
+        match crate::franken_sync::compat::open_with_flags(
+            &path,
+            crate::franken_sync::compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .and_then(|conn| count(&conn))
+        {
+            Ok(rows) => assert_eq!(rows, Some(1)),
+            Err(error) => assert!(
+                matches!(error, FrankenError::BusyRecovery),
+                "read-only admission failed other than BusyRecovery: {error:?}"
+            ),
+        }
+
+        let conn = crate::franken_sync::Connection::open(path).unwrap();
+        assert_eq!(count(&conn).unwrap(), Some(1));
+        conn.close().unwrap();
+        assert!(
+            !stale_probe_for_engine(&db, true).unwrap(),
+            "a writable open must leave an index the probe accepts"
+        );
     }
 
     #[test]

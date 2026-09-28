@@ -734,6 +734,12 @@ fn refuse_doctor_mutation_if_merge_pending(
                      fails closed because the derived WAL index is poisoned. Preserve the WAL \
                      and run `br doctor migrate-schema recover`"
                 )
+            } else if hint.is_stale_wal_index() {
+                format!(
+                    "could not prove that no sync merge is pending ({error}); doctor mutation \
+                     fails closed because the derived WAL index is stale. Preserve the WAL and \
+                     run `br doctor migrate-schema recover`"
+                )
             } else if hint.is_specific() {
                 format!(
                     "could not prove that no sync merge is pending ({error}); doctor mutation \
@@ -1241,6 +1247,10 @@ impl StalledMigrationHint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DatabaseAdmissionHint {
     PoisonedWalIndex,
+    /// An index the engine must rebuild before any read-only open: left by
+    /// br 0.6.0, whose engine never maintained it, or by another WAL
+    /// generation (GH #521).
+    StaleWalIndex,
     Schema(StalledMigrationHint),
     Indeterminate,
 }
@@ -1249,6 +1259,9 @@ impl DatabaseAdmissionHint {
     fn probe(db_path: &Path) -> Self {
         if crate::franken_sync::wal_index::poisoned_index_present(db_path).unwrap_or(false) {
             return Self::PoisonedWalIndex;
+        }
+        if crate::franken_sync::wal_index::stale_index_present(db_path).unwrap_or(false) {
+            return Self::StaleWalIndex;
         }
         match StalledMigrationHint::probe(db_path) {
             StalledMigrationHint::Indeterminate => Self::Indeterminate,
@@ -1267,6 +1280,15 @@ impl DatabaseAdmissionHint {
                  WAL: committed records may exist only in WAL."
                     .to_string(),
             ),
+            Self::StaleWalIndex => Some(
+                "The database and WAL are intact, but the derived WAL index (`-shm`) was left by \
+                 an engine that did not maintain it (br 0.6.0 or earlier) and no read-only open \
+                 can use it. Any ordinary br command that writes or auto-imports rebuilds it \
+                 automatically; to do it explicitly, close other br processes and run \
+                 `br doctor migrate-schema recover`, which keeps the complete pre-recovery family \
+                 under .beads/.br_recovery. Do not delete the WAL."
+                    .to_string(),
+            ),
             Self::Schema(hint) => hint.remediation(),
             Self::Indeterminate => None,
         }
@@ -1277,6 +1299,13 @@ impl DatabaseAdmissionHint {
             Self::PoisonedWalIndex => serde_json::json!({
                 "wal_index_state": "initialized_zero_page_poison",
                 "wal_index_recovery": "explicit",
+                "recovery_command": "br doctor migrate-schema recover",
+                "generic_repair_safe": false,
+                "schema_state": "independent_of_schema_version",
+            }),
+            Self::StaleWalIndex => serde_json::json!({
+                "wal_index_state": "stale_foreign_engine_index",
+                "wal_index_recovery": "automatic",
                 "recovery_command": "br doctor migrate-schema recover",
                 "generic_repair_safe": false,
                 "schema_state": "independent_of_schema_version",
@@ -1292,6 +1321,10 @@ impl DatabaseAdmissionHint {
 
     fn is_poisoned_wal_index(self) -> bool {
         matches!(self, Self::PoisonedWalIndex)
+    }
+
+    fn is_stale_wal_index(self) -> bool {
+        matches!(self, Self::StaleWalIndex)
     }
 }
 
@@ -1350,6 +1383,11 @@ fn check_pending_sync_merge(db_path: &Path, checks: &mut Vec<CheckResult>) {
                 format!(
                     "Could not inspect pending sync-merge state because the derived WAL index is \
                      in the initialized-zero-page poison state: {error}"
+                )
+            } else if hint.is_stale_wal_index() {
+                format!(
+                    "Could not inspect pending sync-merge state because the derived WAL index \
+                     was left stale by an engine that did not maintain it: {error}"
                 )
             } else {
                 format!("Could not prove that no sync merge is pending: {error}")
@@ -2662,7 +2700,20 @@ fn inspect_database_sidecars(db_path: &Path) -> Result<SidecarInspection> {
         inspection.quarantine_candidates.push(shm_path);
     }
 
-    if shm_kind.is_regular_file() && wal_kind.is_regular_file() {
+    if shm_kind.is_regular_file()
+        && wal_kind.is_regular_file()
+        && crate::franken_sync::wal_index::stale_index_present(db_path).unwrap_or(false)
+        && !crate::franken_sync::wal_index::poisoned_index_present(db_path).unwrap_or(true)
+    {
+        // Where the engine maps `-shm` (Unix), an index left by an engine that
+        // never maintained it (br 0.6.0) blocks every read-only open until a
+        // writable open rebuilds it (GH #521). Ordinary commands do that on
+        // their own; say so instead of calling the file inert.
+        inspection.informational_findings.push(format!(
+            "SHM WAL index at {} is stale (left by an engine that did not maintain it, such as br 0.6.0); the next ordinary br command rebuilds it, or run `br doctor migrate-schema recover`",
+            PathBuf::from(format!("{}-shm", db_path.to_string_lossy())).display()
+        ));
+    } else if shm_kind.is_regular_file() && wal_kind.is_regular_file() {
         // frankensqlite never reads or writes the classic `-shm` index — the
         // WAL index lives in process-local memory — so an SHM beside a live
         // WAL is inert heritage (e.g. an orphan the engine's own open later

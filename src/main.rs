@@ -113,8 +113,10 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     // owns a richer dedicated finding/refusal surface.
     let pending_merge_disposition = pending_merge_startup_disposition(&cli.command);
     // A valid WAL may outlive its regenerable SHM index, or #507's exact
-    // initialized-zero-page poison may leave that index permanently unusable.
-    // Recover either derived-cache state under write + sole-opener authority,
+    // initialized-zero-page poison may leave that index permanently unusable,
+    // as does the never-initialized or other-generation index an engine that
+    // kept its index in memory leaves behind (br 0.6.0, GH #521).
+    // Recover any such derived-cache state under write + sole-opener authority,
     // with a verified private rehearsal and unchanged durable payloads, before
     // classifying the real pending receipt. Explicit read-only opens never take
     // this repair path.

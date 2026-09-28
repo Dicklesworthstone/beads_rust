@@ -512,6 +512,12 @@ fn wal_index_needs_recovery_for_engine(
             || crate::franken_sync::wal_index::poisoned_index_present_for_engine(
                 db_path,
                 engine_reads_on_disk_index,
+            )?
+            // An index left by an engine that never maintained it (br 0.6.0),
+            // or one describing another WAL generation (GH #521).
+            || crate::franken_sync::wal_index::stale_index_present_for_engine(
+                db_path,
+                engine_reads_on_disk_index,
             )?,
     )
 }
