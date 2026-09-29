@@ -1107,7 +1107,13 @@ pub mod tests {
     ))]
     #[test]
     fn quarantine_failure_cleans_only_preparations_without_forensic_state() {
-        for stage in ["allocated", "prepared", "rename-result", "renamed", "durable"] {
+        for stage in [
+            "allocated",
+            "prepared",
+            "rename-result",
+            "renamed",
+            "durable",
+        ] {
             let (temp, db, id) = fixture();
             let before = payload(&db);
             FAILURE_STAGE.set(Some(stage));
