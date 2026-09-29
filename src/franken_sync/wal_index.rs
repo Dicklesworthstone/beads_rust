@@ -1075,6 +1075,15 @@ pub mod tests {
     ))]
     #[test]
     fn quarantine_retains_cache_and_preserves_every_payload_byte() {
+        // The immediate second quarantine call must see the first call's
+        // namespace and OFD locks released. A child that another test thread
+        // spawns in between inherits those descriptors until its exec closes
+        // them, so run isolated from the parallel parent (BusyRecovery flake).
+        if run_recovery_test_in_subprocess(
+            "franken_sync::wal_index::tests::quarantine_retains_cache_and_preserves_every_payload_byte",
+        ) {
+            return;
+        }
         let (_temp, db, id) = fixture();
         let before = payload(&db);
         assert!(quarantine_poisoned_index(db.to_str().unwrap(), id).unwrap());
@@ -1107,6 +1116,15 @@ pub mod tests {
     ))]
     #[test]
     fn quarantine_failure_cleans_only_preparations_without_forensic_state() {
+        // The immediate second quarantine call must see the first call's
+        // namespace and OFD locks released. A child that another test thread
+        // spawns in between inherits those descriptors until its exec closes
+        // them, so run isolated from the parallel parent (BusyRecovery flake).
+        if run_recovery_test_in_subprocess(
+            "franken_sync::wal_index::tests::quarantine_failure_cleans_only_preparations_without_forensic_state",
+        ) {
+            return;
+        }
         for stage in [
             "allocated",
             "prepared",
