@@ -704,6 +704,26 @@ fn refuse_doctor_mutation_if_merge_pending(
     ctx: &OutputContext,
 ) {
     let refusal = match inspect_pending_sync_merge_under_authority(db_path, authority) {
+        // Read-only inspection now reads behind a #507 zero-page index through
+        // a private snapshot, so it can succeed while the live index is still
+        // in that state. Generic doctor mutation keeps failing closed there:
+        // the explicit, identity-bound `migrate-schema recover` owns it.
+        Ok(None) if DatabaseAdmissionHint::probe(db_path).is_poisoned_wal_index() => {
+            let hint = DatabaseAdmissionHint::PoisonedWalIndex;
+            let reason = "the derived WAL index is in the initialized-zero-page state (GH #507); \
+                          doctor mutation fails closed until `br doctor migrate-schema recover` \
+                          rebuilds it. Preserve the WAL"
+                .to_string();
+            let mut evidence = serde_json::json!({
+                "gate": "sync.merge_pending",
+                "finding": "db.sidecars",
+                "pending": false,
+                "database_path": db_path.display().to_string(),
+                "remediation": hint.remediation(),
+            });
+            merge_json_object(&mut evidence, hint.json_details());
+            (reason, evidence)
+        }
         Ok(None) => return,
         Ok(Some(state)) => {
             let reason = format!(
@@ -2705,6 +2725,17 @@ fn inspect_database_sidecars(db_path: &Path) -> Result<SidecarInspection> {
     }
 
     if shm_kind.is_regular_file()
+        && wal_kind.is_regular_file()
+        && crate::franken_sync::wal_index::poisoned_index_present(db_path).unwrap_or(false)
+    {
+        // Stock SQLite writes this shape whenever it is the first connection
+        // to a family whose WAL holds no frames (bv, the sqlite3 shell).
+        // Reads work through a private snapshot; say what rebuilds it.
+        inspection.informational_findings.push(format!(
+            "SHM WAL index at {} is in the initialized zero-page state (GH #507) that stock SQLite leaves after reading the tracker; read-only commands read a private snapshot, the next ordinary br command rebuilds it, or run `br doctor migrate-schema recover`",
+            PathBuf::from(format!("{}-shm", db_path.to_string_lossy())).display()
+        ));
+    } else if shm_kind.is_regular_file()
         && wal_kind.is_regular_file()
         && crate::franken_sync::wal_index::stale_index_present(db_path).unwrap_or(false)
         && !crate::franken_sync::wal_index::poisoned_index_present(db_path).unwrap_or(true)

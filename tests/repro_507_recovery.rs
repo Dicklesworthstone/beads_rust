@@ -426,29 +426,26 @@ fn doctor_names_poisoned_index_and_routes_to_explicit_recovery() {
         ["doctor", "--json", "--no-auto-import", "--no-auto-flush"],
         "poisoned_doctor",
     );
-    assert!(!doctor.status.success());
     let report: Value =
         serde_json::from_str(&extract_json_payload(&doctor.stdout)).expect("doctor JSON");
-    let pending = report["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|check| check["name"] == "sync.merge_pending")
-        .expect("sync.merge_pending check");
-    assert_eq!(
-        pending["details"]["wal_index_state"],
-        "initialized_zero_page_poison"
-    );
-    assert_eq!(
-        pending["details"]["recovery_command"],
-        "br doctor migrate-schema recover"
-    );
-    let remediation = pending["details"]["remediation"].as_str().unwrap();
-    assert!(
-        remediation.contains("migrate-schema recover"),
-        "{remediation}"
-    );
-    assert!(remediation.contains("Do not run generic"), "{remediation}");
+    let check = |name: &str| {
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == name)
+            .unwrap_or_else(|| panic!("{name} check"))
+            .clone()
+    };
+    // Read-only inspection reads the WAL-only state behind the index through
+    // a private snapshot, so the pending-merge verdict is reachable.
+    assert_eq!(check("sync.merge_pending")["status"], "ok");
+    let sidecars = check("db.sidecars")["message"]
+        .as_str()
+        .expect("db.sidecars message")
+        .to_owned();
+    assert!(sidecars.contains("zero-page"), "{sidecars}");
+    assert!(sidecars.contains("migrate-schema recover"), "{sidecars}");
     assert_eq!(protected_payload(&workspace), before);
     assert_eq!(
         fs::read(workspace.root.join(".beads/beads.db-shm")).unwrap(),
@@ -837,4 +834,88 @@ fn poisoned_index_with_rows_missing_from_their_table_warns_before_reindex() {
         .unwrap();
     assert_eq!(comments["row_count"], 1, "the table lost one of two rows");
     assert_eq!(protected_payload(&workspace), before);
+}
+
+/// Read-only commands cannot quarantine the live index, but they must still
+/// read committed WAL-only rows behind it: a private snapshot rebuilds its own
+/// index from the validated WAL. A WAL that fails validation is refused rather
+/// than read without its frames. Neither case may touch the live family.
+#[test]
+fn read_only_commands_read_wal_only_rows_behind_a_poisoned_index() {
+    if isolated_test("read_only_commands_read_wal_only_rows_behind_a_poisoned_index") {
+        return;
+    }
+    let workspace = current_workspace(false);
+    let poisoned = poison_index(&workspace);
+    let before = protected_payload(&workspace);
+    let list = succeeds(
+        &workspace,
+        &[
+            "list",
+            "--all",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "poisoned_read_only_list",
+    );
+    let issues = list["issues"]
+        .as_array()
+        .expect("list --json returns an issues array");
+    assert_eq!(issues.len(), 3);
+    assert!(issues.iter().all(|issue| issue["title"] == WAL_ONLY_TITLE));
+    let id = issues[0]["id"].as_str().expect("issue id").to_owned();
+    let db = workspace.root.join(".beads/beads.db");
+    let show = succeeds(
+        &workspace,
+        &[
+            "--db",
+            db.to_str().expect("utf-8 path"),
+            "--no-auto-import",
+            "--no-auto-flush",
+            "show",
+            "--json",
+            "--",
+            &id,
+        ],
+        "poisoned_read_only_show",
+    );
+    assert_eq!(show[0]["title"], WAL_ONLY_TITLE);
+    assert_eq!(protected_payload(&workspace), before);
+    assert_eq!(
+        fs::read(workspace.root.join(".beads/beads.db-shm")).unwrap(),
+        poisoned
+    );
+
+    let wal_path = workspace.root.join(".beads/beads.db-wal");
+    let mut wal = fs::read(&wal_path).unwrap();
+    wal[48] ^= 1; // First frame checksum, leaving the valid header intact.
+    fs::write(&wal_path, wal).unwrap();
+    let corrupt = protected_payload(&workspace);
+    let refused = run_br(
+        &workspace,
+        [
+            "list",
+            "--all",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "poisoned_corrupt_wal_read_only_list",
+    );
+    assert!(
+        !refused.status.success(),
+        "a corrupt WAL must not be read as if it had no frames: {}",
+        refused.stdout
+    );
+    assert!(
+        !refused.stdout.contains(WAL_ONLY_TITLE),
+        "{}",
+        refused.stdout
+    );
+    assert_eq!(protected_payload(&workspace), corrupt);
+    assert_eq!(
+        fs::read(workspace.root.join(".beads/beads.db-shm")).unwrap(),
+        poisoned
+    );
 }

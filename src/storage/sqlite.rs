@@ -2734,6 +2734,14 @@ impl SqliteStorage {
         let copy_path = directory.path().join("snapshot.db");
         let mut family = capture_read_snapshot_family(path)?;
         for member in &mut family {
+            // The live index is only a derived cache the engine refused. The
+            // private copy never inherits it: the engine rebuilds its own from
+            // the validated WAL, which a copied #507 zero-page index would
+            // otherwise latch into `BusyRecovery` again. The live `-shm` stays
+            // captured so a concurrent change still fails verification.
+            if member.suffix == "-shm" {
+                continue;
+            }
             member.copy_to(&copy_path)?;
         }
         verify_read_snapshot_family(&mut family)?;
@@ -17319,15 +17327,23 @@ fn verify_read_snapshot_family(family: &mut [ReadSnapshotMember]) -> Result<()> 
 }
 
 /// Whether a read-only open that the engine just refused with `BusyRecovery`
-/// (after its own transient retries) is facing a stale WAL index (GH #521):
-/// an index left by br 0.6.0's engine, which never maintained it, or one from
-/// another WAL generation. Only a writable open can rebuild such an index, so
-/// the read goes through a private snapshot whose index is rebuilt off to the
-/// side, never touching the live family. #507's poison keeps its own explicit
-/// recovery and diagnosis.
+/// (after its own transient retries) is facing a settled WAL index the engine
+/// can never admit read-only: one left by br 0.6.0's engine, which never
+/// maintained it, or one from another WAL generation (GH #521), or the
+/// initialized zero-page index of #507.
+///
+/// The zero-page shape is what stock SQLite writes whenever it is the first
+/// connection to open a family whose WAL holds no frames: it rebuilds the
+/// index and leaves `szPage` 0 because a header-only WAL has no frame to take
+/// a page size from. Any SQLite reader of the tracker (bv, the sqlite3 shell)
+/// therefore leaves it behind, and fsqlite 0.4.x refuses that header. Only a
+/// writable open can rebuild such an index, so the read goes through a
+/// private snapshot whose index is rebuilt off to the side, never touching
+/// the live family. Writable opens keep #507's identity-bound quarantine.
 fn stale_read_only_wal_index(path: &Path) -> Result<bool> {
-    Ok(crate::franken_sync::wal_index::stale_index_present(path)?
-        && !crate::franken_sync::wal_index::poisoned_index_present(path)?)
+    // A zero-page index (salts and szPage zero) also disagrees with any valid
+    // WAL header on page size, so the stale classifier covers #507 as well.
+    Ok(crate::franken_sync::wal_index::stale_index_present(path)?)
 }
 
 fn missing_read_only_wal_index(path: &Path) -> Result<bool> {
