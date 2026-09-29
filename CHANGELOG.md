@@ -14,7 +14,7 @@ This changelog is organized by capability rather than diff order. Each version s
 - Release links: `https://github.com/Dicklesworthstone/beads_rust/releases/tag/<TAG>`
 
 **Scope window:** every version from inception (v0.1.0, 2026-01-18) through the current
-release (v0.7.2, 2026-09-29).
+release (v0.7.3, 2026-09-29).
 The full per-version detail is in the sections below; the timeline names the
 recent line and the milestone anchors. The September 8 audit examined all 79
 commits in `v0.5.10..v0.5.11` and six subsequent commits against Git diffs,
@@ -31,6 +31,7 @@ explicitly corrected during this audit.
 
 | Version | Date | Kind | Headline |
 |---|---|---|---|
+| [v0.7.3](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.3) | 2026-09-29 | Release | Read-only commands (`--no-auto-import --no-auto-flush`, the form bv generates) no longer fail with "recovery in progress" after a SQLite reader such as bv opened the tracker |
 | [v0.7.2](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.2) | 2026-09-29 | Release | WAL-index recovery no longer locked out by pre-existing index damage, and warns when rows may be lost (#523); `br update` reports label changes (#527) |
 | [v0.7.1](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.1) | 2026-09-28 | Release | Workspaces upgraded from 0.6.0 no longer wedge on a stale WAL index (#521); Windows WAL-index recovery no longer blocks every command (#520); older-schema databases self-heal (`doctor migrate-schema heal`); id-less mutation, coordination, epic close-policy and `policy.yaml` unknown-key fixes |
 | [v0.7.0](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.0) | 2026-09-24 | Release | FrankenSQLite 0.4.4 engine; id-collision-safe `sync --merge` and import refusal (#512); empty-JSONL merge guard; `update --if-unchanged` (#500/#505); poisoned WAL-index recovery (#507); Unicode-correct search; `ready --brief`, `list/search --fields` |
@@ -84,6 +85,34 @@ this repo): commits `55c186682` + `5946b3b7c` in
 <https://github.com/Dicklesworthstone/frankensqlite>, shipped as fsqlite 0.3.12.
 
 ---
+
+## v0.7.3 — 2026-09-29
+
+[Release](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.3).
+A patch release. The database schema is unchanged at 19.
+
+### Read-only commands work after another SQLite program reads the tracker
+
+- **Since 0.7.0, a read-only command failed after bv, the `sqlite3` shell or
+  any other SQLite program had opened `.beads/beads.db`.** Commands run with
+  `--no-auto-import --no-auto-flush`, including the
+  `br --db <path> --no-auto-import --no-auto-flush show --json -- <id>` that
+  bv hands to agents, exited 2 with "database is busy (recovery in
+  progress)" until some command without those flags ran. When SQLite is the
+  first program to open a database whose WAL holds no frames, it rebuilds
+  the WAL index (`beads.db-shm`) and records a page size of zero, because an
+  empty WAL has no frame to take one from. That is the index shape from #507,
+  and FrankenSQLite 0.4.x refuses to read through it. Commands that write
+  already rebuilt it; read-only commands could not. They now read a private
+  copy whose index is rebuilt from the WAL, the same fallback 0.7.1 added for
+  indexes left by br 0.6.0 (#521). A WAL that fails its checksums is still
+  refused, and the live files are not changed. The read costs a copy of the
+  database until the next command that writes rebuilds the live index
+  ([7c12906d](https://github.com/Dicklesworthstone/beads_rust/commit/7c12906d)).
+- `br doctor` names this index state instead of calling `beads.db-shm`
+  inert, and `br doctor --repair` still refuses while it is present; run
+  `br doctor migrate-schema recover` or any ordinary command first
+  ([7c12906d](https://github.com/Dicklesworthstone/beads_rust/commit/7c12906d)).
 
 ## v0.7.2 — 2026-09-29
 

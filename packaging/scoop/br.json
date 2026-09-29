@@ -1,12 +1,12 @@
 {
   "$schema": "https://raw.githubusercontent.com/ScoopInstaller/Scoop/HEAD/schema.json",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "description": "Agent-first issue tracker (SQLite + JSONL)",
   "homepage": "https://github.com/Dicklesworthstone/beads_rust",
   "license": "https://github.com/Dicklesworthstone/beads_rust/blob/main/LICENSE",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/Dicklesworthstone/beads_rust/releases/download/v0.7.2/br-0.7.2-windows_amd64.zip",
+      "url": "https://github.com/Dicklesworthstone/beads_rust/releases/download/v0.7.3/br-0.7.3-windows_amd64.zip",
       "hash": "5dbefe29a3ccc46c1dfd81daea7e6082efa319b4a406cf83f56023ba537134ac"
     }
   },
