@@ -354,6 +354,11 @@ struct IndexCorruptionFinding {
     integrity_check: String,
     /// The command that repairs it.
     remediation: &'static str,
+    /// The diagnostics show index entries whose table row is missing. The
+    /// rebuild cannot tell a stale index entry from a row lost out of its
+    /// table: it drops the entry either way, so the operator should check
+    /// the JSONL export for the missing records first.
+    index_entries_without_table_rows: bool,
 }
 
 impl IndexCorruptionFinding {
@@ -363,6 +368,38 @@ impl IndexCorruptionFinding {
     fn summary(&self) -> String {
         integrity_summary(&self.integrity_check)
     }
+
+    /// Operator warning for [`Self::index_entries_without_table_rows`].
+    const MISSING_ROWS_WARNING: &'static str = "Some index entries point at rows that are \
+         missing from their table, so rows may have been lost from the table itself; \
+         rebuilding the indexes drops those entries. Before running it, check issues.jsonl for \
+         the missing records (the complete pre-recovery family is retained).";
+}
+
+/// Whether integrity diagnostics report index entries that have no table
+/// row: an index with more entries than its table requires, or a stale
+/// rowid. Rebuilding the indexes makes them agree with the table, so these
+/// entries are the only evidence of a row lost from the table (GH #523).
+fn integrity_reports_index_entries_without_table_rows(integrity_check: &str) -> bool {
+    integrity_check.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("no matching table row") {
+            return true;
+        }
+        // "index `i` contains N entries but table `t` requires exactly M"
+        let count_after = |marker: &str| {
+            lower.find(marker).and_then(|start| {
+                lower[start + marker.len()..]
+                    .split_whitespace()
+                    .next()
+                    .and_then(|number| number.parse::<u64>().ok())
+            })
+        };
+        matches!(
+            (count_after(" contains "), count_after(" requires exactly ")),
+            (Some(entries), Some(required)) if entries > required
+        )
+    })
 }
 
 /// What WAL-index recovery does when the recovered family's integrity check
@@ -406,6 +443,9 @@ fn execute_recover(
                 finding.summary(),
                 finding.remediation
             );
+            if finding.index_entries_without_table_rows {
+                println!("{}", IndexCorruptionFinding::MISSING_ROWS_WARNING);
+            }
         } else {
             println!("Run `br doctor migrate-schema plan` to review the schema migration.");
         }
@@ -4013,19 +4053,30 @@ fn admit_preexisting_index_damage(
              diagnosis"
         )));
     }
+    let finding = IndexCorruptionFinding {
+        integrity_check: expected.integrity_check.clone(),
+        remediation: IndexCorruptionFinding::REMEDIATION,
+        index_entries_without_table_rows: integrity_reports_index_entries_without_table_rows(
+            &expected.integrity_check,
+        ),
+    };
     match policy {
-        PreexistingIndexCorruption::Refuse => Err(BeadsError::internal(format!(
-            "private engine recovery did not produce clean integrity because the database \
-             already has corrupt indexes ({summary}). A private rehearsal showed that rebuilding \
-             them repairs it without changing any row. The live database was not touched. Run \
-             `br doctor migrate-schema recover` to restore the WAL index, then `{}` to rebuild \
-             the indexes",
-            IndexCorruptionFinding::REMEDIATION
-        ))),
-        PreexistingIndexCorruption::Admit => Ok(IndexCorruptionFinding {
-            integrity_check: expected.integrity_check.clone(),
-            remediation: IndexCorruptionFinding::REMEDIATION,
-        }),
+        PreexistingIndexCorruption::Refuse => {
+            let warning = if finding.index_entries_without_table_rows {
+                format!(" {}", IndexCorruptionFinding::MISSING_ROWS_WARNING)
+            } else {
+                String::new()
+            };
+            Err(BeadsError::internal(format!(
+                "private engine recovery did not produce clean integrity because the database \
+                 already has corrupt indexes ({summary}). A private rehearsal showed that \
+                 rebuilding them repairs it without changing any row. The live database was not \
+                 touched. Run `br doctor migrate-schema recover` to restore the WAL index, then \
+                 `{}` to rebuild the indexes.{warning}",
+                IndexCorruptionFinding::REMEDIATION
+            )))
+        }
+        PreexistingIndexCorruption::Admit => Ok(finding),
     }
 }
 
@@ -5209,6 +5260,41 @@ mod tests {
             stable_raw_eq(&before_probe, &after_probe),
             "post-open validation must explicitly exclude only the volatile shm component"
         );
+    }
+
+    #[test]
+    fn index_entries_without_table_rows_are_recognized() {
+        // GH #523 review: these diagnostics can mean a row was lost from its
+        // table, which an index rebuild would silently accept.
+        for lost in [
+            "database disk image is malformed: index `idx_comments_issue` contains stale rowid \
+             5 with no matching table row",
+            "database disk image is malformed: index `idx_events_issue` contains 7 entries but \
+             table `events` requires exactly 6",
+            "*** in database main ***\nindex `i` contains 12 entries but table `t` requires \
+             exactly 3",
+        ] {
+            assert!(
+                integrity_reports_index_entries_without_table_rows(lost),
+                "{lost}"
+            );
+        }
+        // An index missing entries, or structural index damage, is safe to rebuild.
+        for index_only in [
+            "database disk image is malformed: table `issues` rowid 30 is missing from index \
+             `idx_issues_updated_at`",
+            "database disk image is malformed: index `i` contains 5 entries but table `t` \
+             requires exactly 6",
+            "database disk image is malformed: index idx_issues_updated_at root: page 210 \
+             freeblocks invalid",
+            "wrong # of entries in index idx_issues_updated_at",
+            "ok",
+        ] {
+            assert!(
+                !integrity_reports_index_entries_without_table_rows(index_only),
+                "{index_only}"
+            );
+        }
     }
 
     #[test]

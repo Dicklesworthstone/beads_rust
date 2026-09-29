@@ -83,11 +83,21 @@ fn current_workspace(pending: bool) -> BrWorkspace {
     current_workspace_with_damage(pending, None)
 }
 
-/// [`current_workspace`], optionally damaging the single-page B-tree named
-/// `damaged_tree` in the main file afterwards: its leaf page drops its last
-/// cell. The WAL-only edit never rewrites these trees, so the damage stays
-/// visible through the WAL (GH #523).
-fn current_workspace_with_damage(pending: bool, damaged_tree: Option<&str>) -> BrWorkspace {
+/// Main-file damage for [`current_workspace_with_damage`]. The WAL-only edit
+/// never rewrites these pages, so the damage stays visible through the WAL
+/// (GH #523).
+#[derive(Clone, Copy)]
+enum Damage {
+    /// The single-page B-tree with this name drops the last cell of its leaf.
+    DropLastLeafCell(&'static str),
+    /// The comments table page reverts to its version before the second of
+    /// two comments was inserted, while both comments indexes keep that row:
+    /// a row lost from its table, indistinguishable from stale index entries.
+    LostCommentRow,
+}
+
+/// [`current_workspace`], optionally damaging the main file afterwards.
+fn current_workspace_with_damage(pending: bool, damage: Option<Damage>) -> BrWorkspace {
     let workspace = BrWorkspace::new();
     succeeds(&workspace, &["init", "--prefix", "wal", "--json"], "init");
     let mut ids = Vec::new();
@@ -138,7 +148,12 @@ fn current_workspace_with_damage(pending: bool, damaged_tree: Option<&str>) -> B
     connection
         .execute("PRAGMA wal_checkpoint(TRUNCATE)")
         .unwrap();
-    let damaged_page = damaged_tree.map(|name| tree_root_page(&connection, name));
+    let damaged_page = match damage {
+        Some(Damage::DropLastLeafCell(name)) => Some(tree_root_page(&connection, name)),
+        _ => None,
+    };
+    let stale_comments_page = matches!(damage, Some(Damage::LostCommentRow))
+        .then(|| stage_lost_comment_row(&connection, &db, &ids[0]));
     connection
         .execute_with_params(
             "UPDATE issues SET title = ?1",
@@ -161,6 +176,9 @@ fn current_workspace_with_damage(pending: bool, damaged_tree: Option<&str>) -> B
     if let Some((root, page_size)) = damaged_page {
         drop_last_leaf_cell(&db, root, page_size);
     }
+    if let Some((offset, page)) = stale_comments_page {
+        write_stale_page(&db, offset, &page);
+    }
 
     let main = fs::read(&db).unwrap();
     let wal = fs::read(workspace.root.join(".beads/beads.db-wal")).unwrap();
@@ -181,6 +199,39 @@ fn current_workspace_with_damage(pending: bool, damaged_tree: Option<&str>) -> B
         );
     }
     workspace
+}
+
+/// Checkpoint one comment on `issue_id` into the main file, capture the
+/// comments table page (offset and bytes), then checkpoint a second comment.
+/// Writing the captured page back loses that row from the table while both
+/// comments indexes still hold it ([`Damage::LostCommentRow`]).
+fn stage_lost_comment_row(connection: &Connection, db: &Path, issue_id: &str) -> (usize, Vec<u8>) {
+    let insert_comment = |text: &str| {
+        connection
+            .execute_with_params(
+                "INSERT INTO comments (issue_id, author, text) VALUES (?1, 'fixture', ?2)",
+                &[SqliteValue::from(issue_id), SqliteValue::from(text)],
+            )
+            .unwrap();
+        connection
+            .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+    };
+    insert_comment("kept comment");
+    let (root, page_size) = tree_root_page(connection, "comments");
+    let offset = (root - 1) * page_size;
+    let page = fs::read(db).unwrap()[offset..][..page_size].to_vec();
+    insert_comment("comment lost from its table");
+    (offset, page)
+}
+
+/// Put a page captured by [`stage_lost_comment_row`] back into the main file.
+fn write_stale_page(db: &Path, offset: usize, page: &[u8]) {
+    let mut main = fs::read(db).unwrap();
+    let current = &mut main[offset..][..page.len()];
+    assert_ne!(current, page, "the second comment must have reached main");
+    current.copy_from_slice(page);
+    fs::write(db, main).unwrap();
 }
 
 /// Root page number and page size of the B-tree named `name`.
@@ -622,7 +673,10 @@ fn poisoned_index_with_prior_index_damage_recovers_then_reindexes() {
     if isolated_test("poisoned_index_with_prior_index_damage_recovers_then_reindexes") {
         return;
     }
-    let workspace = current_workspace_with_damage(false, Some("idx_issues_updated_at"));
+    let workspace = current_workspace_with_damage(
+        false,
+        Some(Damage::DropLastLeafCell("idx_issues_updated_at")),
+    );
     let poisoned = poison_index(&workspace);
     let before = protected_payload(&workspace);
 
@@ -650,6 +704,10 @@ fn poisoned_index_with_prior_index_damage_recovers_then_reindexes() {
     assert_eq!(
         receipt["index_corruption"]["remediation"],
         "br doctor --repair-indexes"
+    );
+    assert_eq!(
+        receipt["index_corruption"]["index_entries_without_table_rows"],
+        false
     );
     assert!(
         !receipt["index_corruption"]["integrity_check"]
@@ -716,7 +774,8 @@ fn poisoned_index_with_table_damage_keeps_recovery_closed() {
     if isolated_test("poisoned_index_with_table_damage_keeps_recovery_closed") {
         return;
     }
-    let workspace = current_workspace_with_damage(false, Some("dependencies"));
+    let workspace =
+        current_workspace_with_damage(false, Some(Damage::DropLastLeafCell("dependencies")));
     let poisoned = poison_index(&workspace);
     let before = protected_payload(&workspace);
     let refused = run_br(
@@ -739,4 +798,43 @@ fn poisoned_index_with_table_damage_keeps_recovery_closed() {
         fs::read(workspace.root.join(".beads/beads.db-shm")).unwrap(),
         poisoned
     );
+}
+
+/// GH #523 review: index entries whose table row is missing may be the only
+/// trace of a row lost from its table, and rebuilding the indexes deletes
+/// them. Recovery still admits (refusing would recreate the lockout), but it
+/// must not present the damage as harmless: both the automatic refusal and
+/// the recovery receipt say rows may be missing and to check the JSONL first.
+#[test]
+fn poisoned_index_with_rows_missing_from_their_table_warns_before_reindex() {
+    if isolated_test("poisoned_index_with_rows_missing_from_their_table_warns_before_reindex") {
+        return;
+    }
+    let workspace = current_workspace_with_damage(false, Some(Damage::LostCommentRow));
+    poison_index(&workspace);
+    let before = protected_payload(&workspace);
+
+    let list = run_br(&workspace, ["list", "--json"], "lost_row_list_refused");
+    assert!(!list.status.success());
+    let error = format!("{}{}", list.stdout, list.stderr);
+    assert!(error.contains("br doctor --repair-indexes"), "{error}");
+    assert!(
+        error.contains("may have been lost from the table"),
+        "{error}"
+    );
+    assert_eq!(protected_payload(&workspace), before);
+
+    let receipt = recover(&workspace, "lost_row_recovery");
+    assert_eq!(
+        receipt["index_corruption"]["index_entries_without_table_rows"], true,
+        "{receipt}"
+    );
+    let comments = receipt["logical_after"]["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|witness| witness["name"] == "comments")
+        .unwrap();
+    assert_eq!(comments["row_count"], 1, "the table lost one of two rows");
+    assert_eq!(protected_payload(&workspace), before);
 }
