@@ -148,6 +148,28 @@ lost, compare against `issues.jsonl` first; then run
   test threads
   ([ab7a740f](https://github.com/Dicklesworthstone/beads_rust/commit/ab7a740f), [b4dbf9d6](https://github.com/Dicklesworthstone/beads_rust/commit/b4dbf9d6)).
 
+### Distribution and verification
+
+- Seven default-feature binaries were built from
+  [3ac74162](https://github.com/Dicklesworthstone/beads_rust/commit/3ac74162)
+  on Apple Silicon: macOS amd64/arm64 natively, Linux GNU (glibc 2.28 floor)
+  and static musl on amd64/arm64 with cargo-zigbuild, and Windows amd64 with
+  the GNU toolchain. GitHub Actions were not used.
+- The 24 assets are seven archives, seven SHA-256 sidecars, seven Minisign
+  signatures (key `36B847D11BA5A0D0`), aggregate checksums, and SPDX/CycloneDX
+  source SBOMs. Public downloads matched the staged bytes, checksums and
+  signatures on macOS and Linux, and the installer at the tag installed
+  byte-identical binaries on Apple Silicon and Linux amd64. Every binary
+  reports commit 3ac74162; the macOS (arm64 and Intel under Rosetta) and
+  Linux amd64 GNU and musl binaries passed a create, dependency, label,
+  close, sync and doctor round trip, and the arm64 Linux binaries ran under
+  qemu-user.
+- The in-repo Homebrew, Scoop and AUR manifests now point at these assets.
+  The v0.7.1 release left them at the v0.7.0 hashes.
+- The v0.7.1 bump also missed `agent_baseline/examples/version.json`, which
+  failed `e2e_schema`; v0.7.2 updates it
+  ([3ac74162](https://github.com/Dicklesworthstone/beads_rust/commit/3ac74162)).
+
 ## v0.7.1 — 2026-09-28
 
 [Release](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.1).
