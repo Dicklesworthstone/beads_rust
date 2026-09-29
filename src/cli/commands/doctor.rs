@@ -1276,8 +1276,10 @@ impl DatabaseAdmissionHint {
                  initialized-zero-page poison state from GitHub #507. Preserve the complete \
                  database family and run `br doctor migrate-schema recover`; that command \
                  rehearses recovery on a private copy and retains the poisoned index as evidence \
-                 before live admission. Do not run generic `br doctor --repair` or delete the \
-                 WAL: committed records may exist only in WAL."
+                 before live admission. If the database also has corrupt indexes, recovery \
+                 says so and `br doctor --repair-indexes` then rebuilds them. Do not run \
+                 generic `br doctor --repair` or delete the WAL: committed records may exist \
+                 only in WAL."
                     .to_string(),
             ),
             Self::StaleWalIndex => Some(
@@ -1286,7 +1288,9 @@ impl DatabaseAdmissionHint {
                  can use it. Any ordinary br command that writes or auto-imports rebuilds it \
                  automatically; to do it explicitly, close other br processes and run \
                  `br doctor migrate-schema recover`, which keeps the complete pre-recovery family \
-                 under .beads/.br_recovery. Do not delete the WAL."
+                 under .beads/.br_recovery. If the database also has corrupt indexes, recovery \
+                 says so and `br doctor --repair-indexes` then rebuilds them. Do not delete the \
+                 WAL."
                     .to_string(),
             ),
             Self::Schema(hint) => hint.remediation(),
@@ -4506,6 +4510,26 @@ fn required_schema_checks(conn: &Connection, checks: &mut Vec<CheckResult>) -> R
     Ok(())
 }
 
+/// Operator guidance appended to an integrity finding that names an index.
+const INDEX_INTEGRITY_REPAIR_HINT: &str = "if the damage is confined to indexes, `br doctor \
+     --repair-indexes` rebuilds them after taking a snapshot and restores it if the rebuild fails";
+
+/// The message for a failed integrity check: the diagnostics, plus the index
+/// repair command when a diagnostic reports index damage, the failures that
+/// command clears (GH #523). Descending-index ordering notices are a known
+/// engine artifact that a rebuild does not change, so they get no hint.
+fn integrity_check_message(messages: &[String]) -> String {
+    let joined = messages.join("; ");
+    if messages.iter().any(|message| {
+        let lower = message.to_ascii_lowercase();
+        lower.contains("index") && !lower.contains("out of order")
+    }) {
+        format!("{joined} ({INDEX_INTEGRITY_REPAIR_HINT})")
+    } else {
+        joined
+    }
+}
+
 /// Return true if all integrity check messages are benign frankensqlite artifacts
 /// (either "never used" pages, partial-index row mismatches, DESC index ordering
 /// differences, or a mix of these).
@@ -4539,7 +4563,7 @@ fn check_integrity(conn: &Connection, checks: &mut Vec<CheckResult>) {
                 checks,
                 "sqlite.integrity_check",
                 CheckStatus::Error,
-                Some(err.to_string()),
+                Some(integrity_check_message(&[err.to_string()])),
                 None,
             );
             return;
@@ -4564,7 +4588,7 @@ fn check_integrity(conn: &Connection, checks: &mut Vec<CheckResult>) {
             checks,
             "sqlite.integrity_check",
             CheckStatus::Warn,
-            Some(messages.join("; ")),
+            Some(integrity_check_message(&messages)),
             (messages.len() > 1).then(|| serde_json::json!({ "messages": messages })),
         );
     } else {
@@ -4572,7 +4596,7 @@ fn check_integrity(conn: &Connection, checks: &mut Vec<CheckResult>) {
             checks,
             "sqlite.integrity_check",
             CheckStatus::Error,
-            Some(messages.join("; ")),
+            Some(integrity_check_message(&messages)),
             (messages.len() > 1).then(|| serde_json::json!({ "messages": messages })),
         );
     }
@@ -8641,7 +8665,7 @@ fn check_sqlite_cli_integrity(db_path: &Path, checks: &mut Vec<CheckResult>) {
                 checks,
                 "sqlite3.integrity_check",
                 CheckStatus::Warn,
-                Some(messages.join("; ")),
+                Some(integrity_check_message(&messages)),
                 (messages.len() > 1).then(|| serde_json::json!({ "messages": messages })),
             );
         }
@@ -8650,7 +8674,7 @@ fn check_sqlite_cli_integrity(db_path: &Path, checks: &mut Vec<CheckResult>) {
                 checks,
                 "sqlite3.integrity_check",
                 CheckStatus::Error,
-                Some(messages.join("; ")),
+                Some(integrity_check_message(&messages)),
                 (messages.len() > 1).then(|| serde_json::json!({ "messages": messages })),
             );
         }
@@ -22040,6 +22064,31 @@ mod tests {
                 "row 2 missing from index idx_a".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn integrity_check_message_routes_index_damage_to_repair_indexes() {
+        // GH #523: index damage names the command that repairs it.
+        let damaged = integrity_check_message(&[
+            "*** in database main ***".to_string(),
+            "wrong # of entries in index idx_issues_updated_at".to_string(),
+        ]);
+        assert!(
+            damaged.starts_with(
+                "*** in database main ***; wrong # of entries in index idx_issues_updated_at ("
+            ),
+            "{damaged}"
+        );
+        assert!(damaged.contains("br doctor --repair-indexes"), "{damaged}");
+
+        // Damage outside indexes, and the descending-index ordering artifact a
+        // rebuild does not change, keep the plain diagnostics.
+        for plain in [
+            vec!["Page 7: never used".to_string()],
+            vec!["row 3 out of order in index idx_desc".to_string()],
+        ] {
+            assert_eq!(integrity_check_message(&plain), plain.join("; "));
+        }
     }
 
     #[test]

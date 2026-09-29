@@ -338,7 +338,47 @@ struct EngineRecoveryReceipt {
     raw_before: RawFamilyWitness,
     raw_after: Option<RawFamilyWitness>,
     logical_after: Option<LogicalDatabaseWitness>,
+    /// Set when the database already had corrupt secondary indexes: the
+    /// recovered family is byte-for-byte the durable pre-state, and a private
+    /// rehearsal proved `br doctor --repair-indexes` clears it (GH #523).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index_corruption: Option<IndexCorruptionFinding>,
     error: Option<String>,
+}
+
+/// Integrity damage that predates WAL-index recovery and that rebuilding the
+/// user indexes repairs without changing the schema or any row (GH #523).
+#[derive(Debug, Clone, Serialize)]
+struct IndexCorruptionFinding {
+    /// `PRAGMA integrity_check` output of the recovered family.
+    integrity_check: String,
+    /// The command that repairs it.
+    remediation: &'static str,
+}
+
+impl IndexCorruptionFinding {
+    const REMEDIATION: &'static str = "br doctor --repair-indexes";
+
+    /// One-line summary for operator-facing messages.
+    fn summary(&self) -> String {
+        integrity_summary(&self.integrity_check)
+    }
+}
+
+/// What WAL-index recovery does when the recovered family's integrity check
+/// fails only because of secondary-index damage that predates the recovery
+/// (GH #523). Damage anywhere else always fails recovery closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreexistingIndexCorruption {
+    /// Leave the live family untouched and fail naming the recovery path.
+    /// Automatic startup recovery uses this, so ordinary commands never run
+    /// against indexes known to be broken.
+    Refuse,
+    /// Restore engine admission (the durable bytes are unchanged) and report
+    /// the damage in the receipt. Explicit `migrate-schema recover` uses
+    /// this, so the damage can never lock the operator out of
+    /// `br doctor --repair-indexes`, which needs an admitted engine.
+    Admit,
 }
 
 /// Recovery is deliberately explicit: planning must never bootstrap a writer.
@@ -348,7 +388,8 @@ fn execute_recover(
     args: &DoctorMigrateSchemaRecoverArgs,
     migration: &MigrationContext,
 ) -> Result<()> {
-    let receipt = recover_engine_admission_with_lease(migration, false)?;
+    let receipt =
+        recover_engine_admission_with_lease(migration, false, PreexistingIndexCorruption::Admit)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&receipt)?);
     } else {
@@ -357,7 +398,17 @@ fn execute_recover(
             receipt.database_path
         );
         println!("Pre-recovery family retained at {}", receipt.backup_path);
-        println!("Run `br doctor migrate-schema plan` to review the schema migration.");
+        if let Some(finding) = &receipt.index_corruption {
+            println!(
+                "The database already had corrupt indexes ({}). A private rehearsal showed that \
+                 rebuilding them repairs it without changing any row. Run `{}` next; it keeps a \
+                 pre-repair snapshot.",
+                finding.summary(),
+                finding.remediation
+            );
+        } else {
+            println!("Run `br doctor migrate-schema plan` to review the schema migration.");
+        }
     }
     Ok(())
 }
@@ -567,7 +618,7 @@ pub fn recover_wal_index_for_startup(
         db_path: db_path.to_path_buf(),
         write_authority: Arc::clone(authority),
     };
-    recover_engine_admission_with_lease(&migration, true)?;
+    recover_engine_admission_with_lease(&migration, true, PreexistingIndexCorruption::Refuse)?;
     Ok(())
 }
 
@@ -619,6 +670,7 @@ fn prior_failed_recovery(
 fn recover_engine_admission_with_lease(
     migration: &MigrationContext,
     strict_wal: bool,
+    policy: PreexistingIndexCorruption,
 ) -> Result<EngineRecoveryReceipt> {
     let mut lease = crate::sync::DatabaseOpenerLease::register(&migration.db_path)?;
     let exclusive = lease
@@ -628,7 +680,7 @@ fn recover_engine_admission_with_lease(
                 "engine recovery requires a verified sole opener; close peer br processes and retry"
                     .to_string(),
         })?;
-    let result = recover_engine_admission(migration, strict_wal);
+    let result = recover_engine_admission(migration, strict_wal, policy);
     let released = lease.release_exclusive(exclusive);
     result.and_then(|receipt| released.map(|()| receipt))
 }
@@ -688,6 +740,7 @@ fn recover_existing_family(path: &Path, authority: Option<&DatabaseFamilyWriteLo
 fn recover_engine_admission(
     migration: &MigrationContext,
     strict_wal: bool,
+    policy: PreexistingIndexCorruption,
 ) -> Result<EngineRecoveryReceipt> {
     migration.write_authority.verify_database_authority()?;
     refuse_non_regular_component(&migration.db_path)?;
@@ -706,6 +759,7 @@ fn recover_engine_admission(
         raw_before,
         raw_after: None,
         logical_after: None,
+        index_corruption: None,
         error: None,
     };
     write_json_new(&run_dir.join("recovery-prepared.json"), &receipt)?;
@@ -724,9 +778,12 @@ fn recover_engine_admission(
         require_recovery_payload_unchanged(&probe_before, &recovery_family_witness(&probe_db)?)?;
         let expected = logical_witness(&probe_db)?;
         if !integrity_check_is_clean(&expected.integrity_check) {
-            return Err(BeadsError::internal(
-                "private engine recovery did not produce clean integrity",
-            ));
+            receipt.index_corruption = Some(admit_preexisting_index_damage(
+                &probe_db,
+                &run_dir.join("index-rehearsal"),
+                &expected,
+                policy,
+            )?);
         }
         receipt.stage = "live-preflight".to_string();
         migration.write_authority.verify_database_authority()?;
@@ -3930,6 +3987,117 @@ fn integrity_check_messages(conn: &Connection) -> Result<Vec<String>> {
 
 fn integrity_check_is_clean(integrity_check: &str) -> bool {
     integrity_check.trim().eq_ignore_ascii_case("ok")
+}
+
+/// Decide whether recovery may continue past a recovered private copy
+/// (`probe_db`, witnessed as `expected`) whose integrity check failed.
+///
+/// Recovery rebuilds only the derived index, and the probe's main/WAL/journal
+/// bytes were just proven unchanged, so the damage was already in the durable
+/// family. When rebuilding the user indexes on a further private copy clears
+/// it without changing the schema or any row, it is the damage
+/// `br doctor --repair-indexes` fixes, and refusing engine admission would only
+/// lock the operator out of that command (GH #523). Anything else refuses.
+fn admit_preexisting_index_damage(
+    probe_db: &Path,
+    rehearsal_dir: &Path,
+    expected: &LogicalDatabaseWitness,
+    policy: PreexistingIndexCorruption,
+) -> Result<IndexCorruptionFinding> {
+    let summary = integrity_summary(&expected.integrity_check);
+    if !index_rebuild_restores_integrity(probe_db, rehearsal_dir, expected)? {
+        return Err(BeadsError::internal(format!(
+            "private engine recovery did not produce clean integrity ({summary}), and \
+             rebuilding every index on a private copy did not repair it, so the damage is not \
+             confined to indexes. The live database was not touched; run `br doctor` for \
+             diagnosis"
+        )));
+    }
+    match policy {
+        PreexistingIndexCorruption::Refuse => Err(BeadsError::internal(format!(
+            "private engine recovery did not produce clean integrity because the database \
+             already has corrupt indexes ({summary}). A private rehearsal showed that rebuilding \
+             them repairs it without changing any row. The live database was not touched. Run \
+             `br doctor migrate-schema recover` to restore the WAL index, then `{}` to rebuild \
+             the indexes",
+            IndexCorruptionFinding::REMEDIATION
+        ))),
+        PreexistingIndexCorruption::Admit => Ok(IndexCorruptionFinding {
+            integrity_check: expected.integrity_check.clone(),
+            remediation: IndexCorruptionFinding::REMEDIATION,
+        }),
+    }
+}
+
+/// The first few diagnostics of an integrity report on one line.
+fn integrity_summary(integrity_check: &str) -> String {
+    const SHOWN: usize = 3;
+    let messages = integrity_check
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("*** in database"))
+        .collect::<Vec<_>>();
+    let mut summary = messages
+        .iter()
+        .take(SHOWN)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("; ");
+    if messages.len() > SHOWN {
+        summary = format!("{summary}; and {} more", messages.len() - SHOWN);
+    }
+    summary
+}
+
+/// Rehearse `br doctor --repair-indexes` on a private copy of `db_path`'s
+/// family made in the new directory `rehearsal_dir`: rebuild every user
+/// index, then require clean integrity with the schema and every row
+/// unchanged from `before`. `false` means the damage is not confined to
+/// what that command repairs (GH #523). Only the private copy is written.
+fn index_rebuild_restores_integrity(
+    db_path: &Path,
+    rehearsal_dir: &Path,
+    before: &LogicalDatabaseWitness,
+) -> Result<bool> {
+    ensure_new_directory(rehearsal_dir)?;
+    let family = recovery_family_witness(db_path)?;
+    copy_family_to_backup(db_path, rehearsal_dir, &family)?;
+    verify_backup_family(db_path, rehearsal_dir, &family)?;
+    let copy = backup_component_path(rehearsal_dir, db_path, "")?;
+    let conn = Connection::open(copy.to_string_lossy().into_owned())?;
+    let rebuilt = (|| -> Result<()> {
+        let names = conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type = 'index' \
+                 AND name NOT LIKE 'sqlite_autoindex_%' AND sql IS NOT NULL ORDER BY name",
+            )?
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
+            .collect::<Vec<_>>();
+        conn.execute("BEGIN IMMEDIATE")?;
+        for name in &names {
+            if let Err(error) = conn.execute(&format!("REINDEX {}", quote_identifier(name))) {
+                let _ = conn.execute("ROLLBACK");
+                return Err(error.into());
+            }
+        }
+        conn.execute("COMMIT")?;
+        Ok(())
+    })();
+    let closed = close_connection(conn);
+    let after = rebuilt.and(closed).and_then(|()| logical_witness(&copy));
+    match after {
+        Ok(after) => Ok(integrity_check_is_clean(&after.integrity_check)
+            && logical_witnesses_match_except_integrity(before, &after)),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                copy = %copy.display(),
+                "rebuilding indexes on a private recovery copy failed"
+            );
+            Ok(false)
+        }
+    }
 }
 
 fn integrity_check_is_repairable(integrity_check: &str) -> bool {

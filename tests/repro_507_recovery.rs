@@ -80,6 +80,14 @@ fn succeeds(workspace: &BrWorkspace, args: &[&str], label: &str) -> Value {
 }
 
 fn current_workspace(pending: bool) -> BrWorkspace {
+    current_workspace_with_damage(pending, None)
+}
+
+/// [`current_workspace`], optionally damaging the single-page B-tree named
+/// `damaged_tree` in the main file afterwards: its leaf page drops its last
+/// cell. The WAL-only edit never rewrites these trees, so the damage stays
+/// visible through the WAL (GH #523).
+fn current_workspace_with_damage(pending: bool, damaged_tree: Option<&str>) -> BrWorkspace {
     let workspace = BrWorkspace::new();
     succeeds(&workspace, &["init", "--prefix", "wal", "--json"], "init");
     let mut ids = Vec::new();
@@ -130,6 +138,7 @@ fn current_workspace(pending: bool) -> BrWorkspace {
     connection
         .execute("PRAGMA wal_checkpoint(TRUNCATE)")
         .unwrap();
+    let damaged_page = damaged_tree.map(|name| tree_root_page(&connection, name));
     connection
         .execute_with_params(
             "UPDATE issues SET title = ?1",
@@ -148,6 +157,10 @@ fn current_workspace(pending: bool) -> BrWorkspace {
     }
     connection.close_without_checkpoint_in_place().unwrap();
     drop(connection);
+
+    if let Some((root, page_size)) = damaged_page {
+        drop_last_leaf_cell(&db, root, page_size);
+    }
 
     let main = fs::read(&db).unwrap();
     let wal = fs::read(workspace.root.join(".beads/beads.db-wal")).unwrap();
@@ -168,6 +181,43 @@ fn current_workspace(pending: bool) -> BrWorkspace {
         );
     }
     workspace
+}
+
+/// Root page number and page size of the B-tree named `name`.
+fn tree_root_page(connection: &Connection, name: &str) -> (usize, usize) {
+    let integer = |row: beads_rust::franken_sync::Row| {
+        row.get(0)
+            .and_then(SqliteValue::as_integer)
+            .and_then(|value| usize::try_from(value).ok())
+            .expect("integer result")
+    };
+    let root = integer(
+        connection
+            .query_row_with_params(
+                "SELECT rootpage FROM sqlite_master WHERE name = ?1",
+                &[SqliteValue::from(name)],
+            )
+            .unwrap(),
+    );
+    (
+        root,
+        integer(connection.query_row("PRAGMA page_size").unwrap()),
+    )
+}
+
+/// Damage a single-leaf B-tree in the main file by dropping its last cell.
+fn drop_last_leaf_cell(db: &Path, root: usize, page_size: usize) {
+    let mut main = fs::read(db).unwrap();
+    let header = (root - 1) * page_size + if root == 1 { 100 } else { 0 };
+    assert!(
+        matches!(main[header], 0x0a | 0x0d),
+        "page {root} must be a single leaf page, found type {:#x}",
+        main[header]
+    );
+    let cells = u16::from_be_bytes([main[header + 3], main[header + 4]]);
+    assert!(cells >= 2, "page {root} has {cells} cells");
+    main[header + 3..header + 5].copy_from_slice(&(cells - 1).to_be_bytes());
+    fs::write(db, main).unwrap();
 }
 
 fn poison_index(workspace: &BrWorkspace) -> Vec<u8> {
@@ -541,4 +591,152 @@ fn corrupt_wal_and_live_peer_refuse_before_live_index_quarantine() {
         );
         drop(peer);
     }
+}
+
+fn integrity_status(workspace: &BrWorkspace, label: &str) -> Value {
+    let doctor = run_br(
+        workspace,
+        ["doctor", "--json", "--no-auto-import", "--no-auto-flush"],
+        label,
+    );
+    let report: Value =
+        serde_json::from_str(&extract_json_payload(&doctor.stdout)).expect("doctor JSON");
+    report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "sqlite.integrity_check")
+        .expect("sqlite.integrity_check")
+        .clone()
+}
+
+/// GH #523: a poisoned WAL index on a database whose secondary indexes were
+/// already damaged locked every path out. Ordinary commands refused (their
+/// recovery rehearsal failed integrity), `migrate-schema recover` refused for
+/// the same reason, and `--repair-indexes` refused behind the pending-merge
+/// gate that only recovery clears. Explicit recovery now restores admission
+/// when a private rehearsal proves the damage is index-only, and the index
+/// repair then clears it without losing the WAL-only records.
+#[test]
+fn poisoned_index_with_prior_index_damage_recovers_then_reindexes() {
+    if isolated_test("poisoned_index_with_prior_index_damage_recovers_then_reindexes") {
+        return;
+    }
+    let workspace = current_workspace_with_damage(false, Some("idx_issues_updated_at"));
+    let poisoned = poison_index(&workspace);
+    let before = protected_payload(&workspace);
+
+    // Automatic startup recovery (an ordinary command that may auto-import)
+    // still refuses to run on damaged indexes, but now names the path out
+    // and touches nothing live.
+    let list = run_br(&workspace, ["list", "--json"], "damaged_list_refused");
+    assert!(!list.status.success());
+    let error = format!("{}{}", list.stdout, list.stderr);
+    assert!(error.contains("corrupt indexes"), "{error}");
+    assert!(
+        error.contains("br doctor migrate-schema recover"),
+        "{error}"
+    );
+    assert!(error.contains("br doctor --repair-indexes"), "{error}");
+    assert_eq!(protected_payload(&workspace), before);
+    assert_eq!(
+        fs::read(workspace.root.join(".beads/beads.db-shm")).unwrap(),
+        poisoned
+    );
+
+    // Explicit recovery restores admission without changing a durable byte
+    // and reports the damage it found.
+    let receipt = recover(&workspace, "damaged_recovery");
+    assert_eq!(
+        receipt["index_corruption"]["remediation"],
+        "br doctor --repair-indexes"
+    );
+    assert!(
+        !receipt["index_corruption"]["integrity_check"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(protected_payload(&workspace), before);
+    let backup = Path::new(receipt["backup_path"].as_str().unwrap());
+    assert_eq!(fs::read(backup.join("beads.db-shm")).unwrap(), poisoned);
+
+    let damaged = integrity_status(&workspace, "damaged_doctor");
+    assert_ne!(damaged["status"], "ok", "{damaged}");
+    assert!(
+        damaged["message"]
+            .as_str()
+            .unwrap()
+            .contains("br doctor --repair-indexes"),
+        "{damaged}"
+    );
+
+    let repair = run_br(
+        &workspace,
+        [
+            "doctor",
+            "--repair-indexes",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "damaged_repair_indexes",
+    );
+    assert!(
+        repair.status.success(),
+        "{} {}",
+        repair.stdout,
+        repair.stderr
+    );
+    let repaired = integrity_status(&workspace, "repaired_doctor");
+    assert_eq!(repaired["status"], "ok", "{repaired}");
+
+    let list = succeeds(
+        &workspace,
+        &[
+            "list",
+            "--all",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "repaired_list",
+    );
+    let issues = list["issues"]
+        .as_array()
+        .expect("list --json returns an issues array");
+    assert_eq!(issues.len(), 3, "{issues:?}");
+    assert!(issues.iter().all(|issue| issue["title"] == WAL_ONLY_TITLE));
+}
+
+/// GH #523, the other side: damage that rebuilding the indexes cannot repair
+/// (a table page lost a row the indexes still hold) keeps recovery closed and
+/// the live family untouched.
+#[test]
+fn poisoned_index_with_table_damage_keeps_recovery_closed() {
+    if isolated_test("poisoned_index_with_table_damage_keeps_recovery_closed") {
+        return;
+    }
+    let workspace = current_workspace_with_damage(false, Some("dependencies"));
+    let poisoned = poison_index(&workspace);
+    let before = protected_payload(&workspace);
+    let refused = run_br(
+        &workspace,
+        [
+            "doctor",
+            "migrate-schema",
+            "recover",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "table_damage_refused",
+    );
+    assert!(!refused.status.success());
+    let error = format!("{}{}", refused.stdout, refused.stderr);
+    assert!(error.contains("not confined to indexes"), "{error}");
+    assert_eq!(protected_payload(&workspace), before);
+    assert_eq!(
+        fs::read(workspace.root.join(".beads/beads.db-shm")).unwrap(),
+        poisoned
+    );
 }
