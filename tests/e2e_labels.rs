@@ -1217,3 +1217,123 @@ fn e2e_label_add_multiple_issues_with_flag_labels() {
         assert!(labels.contains(&"extra".to_string()), "{id}: {labels:?}");
     }
 }
+
+/// GitHub #527: `br update` reports label changes the way it reports scalar
+/// field transitions, on both the bulk label-only route and the general
+/// route, and prints nothing for a label write that changed nothing.
+#[test]
+fn e2e_update_reports_label_changes() {
+    let _log = common::test_log("e2e_update_reports_label_changes");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let a = parse_created_id(&run_br(&workspace, ["create", "A"], "create a").stdout);
+    let b = parse_created_id(&run_br(&workspace, ["create", "B"], "create b").stdout);
+
+    let label_lines = |stdout: &str| -> Vec<String> {
+        stdout
+            .lines()
+            .filter(|line| line.trim_start().starts_with("labels:"))
+            .map(|line| line.trim().to_string())
+            .collect()
+    };
+
+    // Add-only on one issue takes the bulk label-only route.
+    let add = run_br(
+        &workspace,
+        ["update", &a, "--add-label", "needs-review"],
+        "add",
+    );
+    assert!(add.status.success(), "add failed: {}", add.stderr);
+    assert_eq!(label_lines(&add.stdout), vec!["labels: +needs-review"]);
+
+    // Adding a label the issue already has changes nothing and says nothing.
+    let again = run_br(
+        &workspace,
+        ["update", &a, "--add-label", "needs-review"],
+        "add again",
+    );
+    assert!(again.status.success(), "add again failed: {}", again.stderr);
+    assert!(label_lines(&again.stdout).is_empty(), "{}", again.stdout);
+
+    // Several issues at once: only the one that gained the label reports it.
+    let both = run_br(
+        &workspace,
+        ["update", &a, &b, "--add-label", "needs-review"],
+        "add both",
+    );
+    assert!(both.status.success(), "add both failed: {}", both.stderr);
+    let b_block = both
+        .stdout
+        .split("Updated ")
+        .find(|block| block.starts_with(&b))
+        .unwrap_or_else(|| panic!("no block for {b}: {}", both.stdout));
+    assert_eq!(label_lines(b_block), vec!["labels: +needs-review"]);
+    assert_eq!(label_lines(&both.stdout).len(), 1, "{}", both.stdout);
+
+    // Add and remove together take the general route.
+    let mixed = run_br(
+        &workspace,
+        [
+            "update",
+            &a,
+            "--add-label",
+            "backend",
+            "--remove-label",
+            "needs-review",
+            "--remove-label",
+            "never-there",
+        ],
+        "mixed",
+    );
+    assert!(mixed.status.success(), "mixed failed: {}", mixed.stderr);
+    assert_eq!(
+        label_lines(&mixed.stdout),
+        vec!["labels: +backend -needs-review"]
+    );
+
+    // Remove-only takes the bulk route again.
+    let remove = run_br(
+        &workspace,
+        ["update", &a, "--remove-label", "backend"],
+        "remove",
+    );
+    assert!(remove.status.success(), "remove failed: {}", remove.stderr);
+    assert_eq!(label_lines(&remove.stdout), vec!["labels: -backend"]);
+
+    // --set-labels reports the net replacement, next to scalar transitions.
+    let set = run_br(
+        &workspace,
+        [
+            "update",
+            &b,
+            "--priority",
+            "0",
+            "--set-labels",
+            "api,urgent",
+        ],
+        "set",
+    );
+    assert!(set.status.success(), "set failed: {}", set.stderr);
+    assert!(set.stdout.contains("priority: P2 → P0"), "{}", set.stdout);
+    assert_eq!(
+        label_lines(&set.stdout),
+        vec!["labels: +api +urgent -needs-review"]
+    );
+
+    // Re-setting the same labels is a no-op.
+    let reset = run_br(
+        &workspace,
+        ["update", &b, "--set-labels", "urgent,api"],
+        "reset",
+    );
+    assert!(reset.status.success(), "reset failed: {}", reset.stderr);
+    assert!(label_lines(&reset.stdout).is_empty(), "{}", reset.stdout);
+
+    let labels = labels_of(&workspace, &b, "list");
+    assert_eq!(
+        labels,
+        vec!["api".to_string(), "urgent".to_string()],
+        "labels: {labels:?}"
+    );
+}

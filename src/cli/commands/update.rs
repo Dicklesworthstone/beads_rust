@@ -15,7 +15,7 @@ use crate::format::{format_status_label, format_type_label, sanitize_terminal_in
 use crate::model::acceptance::{AcceptanceCriteriaOutput, AcceptanceEdit, plan_acceptance_edit};
 use crate::model::{Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
-use crate::storage::{EventAttribution, IssueUpdate, SqliteStorage};
+use crate::storage::{EventAttribution, IssueUpdate, LabelSetChanges, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::LabelValidator;
@@ -233,9 +233,62 @@ struct UpdateDiff {
     issue_type: Option<(IssueType, IssueType)>,
     assignee: Option<(Option<String>, Option<String>)>,
     owner: Option<(Option<String>, Option<String>)>,
+    /// Net label change (GitHub #527), taken from what the label writes
+    /// reported they changed rather than from a post-write re-read, for the
+    /// same #256 reason as the scalar fields.
+    labels_added: Vec<String>,
+    labels_removed: Vec<String>,
 }
 
 impl UpdateDiff {
+    /// Record that a write gave the issue `label`. A label removed earlier
+    /// in the same command and now re-added is a net no-op.
+    fn record_label_added(&mut self, label: &str) {
+        if let Some(position) = self.labels_removed.iter().position(|l| l == label) {
+            self.labels_removed.remove(position);
+        } else if !self.labels_added.iter().any(|l| l == label) {
+            self.labels_added.push(label.to_string());
+        }
+    }
+
+    /// Record that a write took `label` off the issue. A label added earlier
+    /// in the same command and now removed again is a net no-op.
+    fn record_label_removed(&mut self, label: &str) {
+        if let Some(position) = self.labels_added.iter().position(|l| l == label) {
+            self.labels_added.remove(position);
+        } else if !self.labels_removed.iter().any(|l| l == label) {
+            self.labels_removed.push(label.to_string());
+        }
+    }
+
+    fn record_label_set(&mut self, changes: &LabelSetChanges) {
+        for label in &changes.removed {
+            self.record_label_removed(label);
+        }
+        for label in &changes.added {
+            self.record_label_added(label);
+        }
+    }
+
+    /// `+added -removed` rendering of the net label change, or `None` when
+    /// the labels ended up where they started.
+    fn labels_line(&self) -> Option<String> {
+        if self.labels_added.is_empty() && self.labels_removed.is_empty() {
+            return None;
+        }
+        let parts = self
+            .labels_added
+            .iter()
+            .map(|label| format!("+{}", sanitize_terminal_inline(label)))
+            .chain(
+                self.labels_removed
+                    .iter()
+                    .map(|label| format!("-{}", sanitize_terminal_inline(label))),
+            )
+            .collect::<Vec<_>>();
+        Some(format!("  labels: {}", parts.join(" ")))
+    }
+
     fn from_before_and_update(before: &Issue, update: &IssueUpdate) -> Self {
         let mut diff = Self::default();
         if let Some(ref new_status) = update.status
@@ -888,6 +941,9 @@ fn execute_prepared_route_with_resources(
 
     for id in &prepared.resolved_ids {
         let issue_before = issues_before.remove(id).flatten();
+        // Net label change for the human receipt (GitHub #527), built from
+        // what each label write reports it actually changed.
+        let mut label_diff = UpdateDiff::default();
 
         // Apply labels
         for label in &prepared.add_labels {
@@ -898,12 +954,15 @@ fn execute_prepared_route_with_resources(
                 Some(id.as_str()),
                 |storage| storage.add_label(id, label, &prepared.actor),
             );
-            preserve_blocked_cache_on_error(
+            let added = preserve_blocked_cache_on_error(
                 &mut prepared.storage_ctx.storage,
                 blocked_cache_dirty,
                 "update",
                 add_label_result,
             )?;
+            if added {
+                label_diff.record_label_added(label);
+            }
             route_has_mutated = true;
         }
         for label in &prepared.remove_labels {
@@ -914,12 +973,15 @@ fn execute_prepared_route_with_resources(
                 Some(id.as_str()),
                 |storage| storage.remove_label(id, label, &prepared.actor),
             );
-            preserve_blocked_cache_on_error(
+            let removed = preserve_blocked_cache_on_error(
                 &mut prepared.storage_ctx.storage,
                 blocked_cache_dirty,
                 "update",
                 remove_label_result,
             )?;
+            if removed {
+                label_diff.record_label_removed(label);
+            }
             route_has_mutated = true;
         }
         if prepared.set_labels {
@@ -930,12 +992,13 @@ fn execute_prepared_route_with_resources(
                 Some(id.as_str()),
                 |storage| storage.set_labels(id, &prepared.valid_set_labels, &prepared.actor),
             );
-            preserve_blocked_cache_on_error(
+            let changes = preserve_blocked_cache_on_error(
                 &mut prepared.storage_ctx.storage,
                 blocked_cache_dirty,
                 "update",
                 set_labels_result,
             )?;
+            label_diff.record_label_set(&changes);
             route_has_mutated = true;
         }
 
@@ -1002,11 +1065,13 @@ fn execute_prepared_route_with_resources(
                 .or_else(|| issue_before.as_ref().map(|b| b.title.clone()))
                 .or_else(|| issue_after.as_ref().map(|i| i.title.clone()))
                 .unwrap_or_default();
-            let diff = issue_before
+            let mut diff = issue_before
                 .as_ref()
                 .map_or_else(UpdateDiff::default, |before| {
                     UpdateDiff::from_before_and_update(before, &prepared.update)
                 });
+            diff.labels_added = label_diff.labels_added;
+            diff.labels_removed = label_diff.labels_removed;
             render_items.push(UpdateRenderItem::Summary {
                 id: id.clone(),
                 title,
@@ -1074,6 +1139,9 @@ fn execute_bulk_label_only_route(
     let add_labels = prepared.add_labels.clone();
     let remove_labels = prepared.remove_labels.clone();
     let mut route_has_mutated = false;
+    // Per-issue net label change for the human receipt (GitHub #527). The
+    // bulk writes return exactly the IDs whose label set they changed.
+    let mut label_diffs: HashMap<String, UpdateDiff> = HashMap::new();
 
     for label in add_labels {
         let add_label_result = retry_mutation_with_jsonl_recovery(
@@ -1083,12 +1151,16 @@ fn execute_bulk_label_only_route(
             None,
             |storage| storage.add_label_to_issues_bulk(&resolved_ids, &label, &actor),
         );
-        let _changed_ids = preserve_blocked_cache_on_error(
+        let changed_ids = preserve_blocked_cache_on_error(
             &mut prepared.storage_ctx.storage,
             false,
             "update",
             add_label_result,
         )?;
+        for changed_id in changed_ids {
+            let diff: &mut UpdateDiff = label_diffs.entry(changed_id).or_default();
+            diff.record_label_added(&label);
+        }
         route_has_mutated = true;
     }
 
@@ -1100,12 +1172,16 @@ fn execute_bulk_label_only_route(
             None,
             |storage| storage.remove_label_from_issues_bulk(&resolved_ids, &label, &actor),
         );
-        let _changed_ids = preserve_blocked_cache_on_error(
+        let changed_ids = preserve_blocked_cache_on_error(
             &mut prepared.storage_ctx.storage,
             false,
             "update",
             remove_label_result,
         )?;
+        for changed_id in changed_ids {
+            let diff: &mut UpdateDiff = label_diffs.entry(changed_id).or_default();
+            diff.record_label_removed(&label);
+        }
         route_has_mutated = true;
     }
 
@@ -1133,7 +1209,7 @@ fn execute_bulk_label_only_route(
             render_items.push(UpdateRenderItem::Summary {
                 id: id.clone(),
                 title: issue.map_or_else(String::new, |issue| issue.title.clone()),
-                diff: Box::new(UpdateDiff::default()),
+                diff: Box::new(label_diffs.get(id).cloned().unwrap_or_default()),
                 acceptance: None,
                 notes: None,
             });
@@ -1346,6 +1422,9 @@ fn print_update_summary(id: &str, title: &str, diff: &UpdateDiff) {
             |value| sanitize_terminal_inline(value).into_owned(),
         );
         println!("  owner: {before_owner} → {after_owner}");
+    }
+    if let Some(line) = diff.labels_line() {
+        println!("{line}");
     }
 }
 
@@ -3297,6 +3376,47 @@ because downstream tooling links to them.\n\n- [ ] schema migration applied\n\
             assert_eq!(update_uses_machine_output(&ctx), expected_machine);
             assert_eq!(update_uses_human_output(&ctx), expected_human);
         }
+    }
+
+    #[test]
+    fn update_diff_label_line_reports_net_changes() {
+        // GitHub #527: label writes must show up in the human receipt.
+        let mut diff = UpdateDiff::default();
+        assert_eq!(diff.labels_line(), None, "no label writes, no line");
+
+        diff.record_label_added("needs-review");
+        assert_eq!(
+            diff.labels_line().as_deref(),
+            Some("  labels: +needs-review")
+        );
+
+        diff.record_label_removed("triage");
+        diff.record_label_added("needs-review");
+        assert_eq!(
+            diff.labels_line().as_deref(),
+            Some("  labels: +needs-review -triage"),
+            "a repeated add is reported once"
+        );
+
+        // Adding then removing the same label in one command nets out, and
+        // so does removing then re-adding one.
+        diff.record_label_removed("needs-review");
+        diff.record_label_added("triage");
+        assert_eq!(diff.labels_line(), None);
+
+        diff.record_label_set(&LabelSetChanges {
+            added: vec!["a".to_string(), "b".to_string()],
+            removed: vec!["old".to_string()],
+        });
+        assert_eq!(diff.labels_line().as_deref(), Some("  labels: +a +b -old"));
+    }
+
+    #[test]
+    fn update_diff_label_line_sanitizes_labels() {
+        let mut diff = UpdateDiff::default();
+        diff.record_label_added("x\x1b[2J");
+        let line = diff.labels_line().expect("line");
+        assert!(!line.contains('\x1b'), "{line:?}");
     }
 
     #[test]

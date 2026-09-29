@@ -223,6 +223,18 @@ struct CapacityOccupancyRow {
     session: Option<String>,
 }
 
+/// Net label change made by [`SqliteStorage::set_labels`] (GitHub #527).
+///
+/// `added` keeps the order of the requested labels; `removed` keeps the
+/// order the labels were stored in. A label never appears in both lists.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LabelSetChanges {
+    /// Labels the issue did not have before and has now.
+    pub added: Vec<String>,
+    /// Labels the issue had before and no longer has.
+    pub removed: Vec<String>,
+}
+
 /// Observed occupancy of one configured capacity (GitHub #384 phase 6).
 ///
 /// Produced by [`SqliteStorage::capacity_snapshot`] for the observability
@@ -13724,10 +13736,19 @@ impl SqliteStorage {
 
     /// Set all labels for an issue (replace existing).
     ///
+    /// Returns the labels the replacement actually added and removed, so
+    /// callers can report the change without a second read (GitHub #527).
+    /// Both lists are empty when the issue already carried exactly `labels`.
+    ///
     /// # Errors
     ///
     /// Returns an error if the database update fails.
-    pub fn set_labels(&mut self, issue_id: &str, labels: &[String], actor: &str) -> Result<()> {
+    pub fn set_labels(
+        &mut self,
+        issue_id: &str,
+        labels: &[String],
+        actor: &str,
+    ) -> Result<LabelSetChanges> {
         self.mutate("set_labels", actor, |conn, ctx| {
             Self::ensure_issue_mutable_in_tx(conn, issue_id, "set labels on")?;
 
@@ -13750,7 +13771,7 @@ impl SqliteStorage {
             let db_has_duplicate_labels = old_labels_raw.len() != old_labels.len();
 
             if old_matches_desired && !db_has_duplicate_labels {
-                return Ok(());
+                return Ok(LabelSetChanges::default());
             }
 
             conn.execute_with_params(
@@ -13823,7 +13844,10 @@ impl SqliteStorage {
                 )?;
             }
 
-            Ok(())
+            Ok(LabelSetChanges {
+                added: added.into_iter().cloned().collect(),
+                removed: removed.into_iter().cloned().collect(),
+            })
         })
     }
 
@@ -28562,7 +28586,7 @@ required_fields:
         let issue = make_issue("bd-l2", "Dedup labels", Status::Open, 2, None, t1, None);
         storage.create_issue(&issue, "tester").unwrap();
 
-        storage
+        let changes = storage
             .set_labels(
                 "bd-l2",
                 &[
@@ -28573,9 +28597,33 @@ required_fields:
                 "tester",
             )
             .unwrap();
+        assert_eq!(
+            changes,
+            LabelSetChanges {
+                added: vec!["backend".to_string(), "api".to_string()],
+                removed: Vec::new(),
+            }
+        );
 
         let labels = storage.get_labels("bd-l2").unwrap();
         assert_eq!(labels, vec!["api".to_string(), "backend".to_string()]);
+
+        // GitHub #527: the return value is the net change, and empty when
+        // the replacement matches what is stored.
+        let changes = storage
+            .set_labels("bd-l2", &["api".to_string(), "ui".to_string()], "tester")
+            .unwrap();
+        assert_eq!(
+            changes,
+            LabelSetChanges {
+                added: vec!["ui".to_string()],
+                removed: vec!["backend".to_string()],
+            }
+        );
+        let changes = storage
+            .set_labels("bd-l2", &["ui".to_string(), "api".to_string()], "tester")
+            .unwrap();
+        assert_eq!(changes, LabelSetChanges::default());
     }
 
     #[test]
