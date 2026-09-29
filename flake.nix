@@ -67,7 +67,7 @@
           inherit src;
 
           pname = "beads_rust";
-          version = "0.7.1";
+          version = "0.7.2";
 
           strictDeps = true;
 

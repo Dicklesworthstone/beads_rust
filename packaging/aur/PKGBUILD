@@ -6,7 +6,7 @@
 # The separately maintained beads-rust-bin package is not this recipe.
 
 pkgname=br-bin
-pkgver=0.7.1
+pkgver=0.7.2
 pkgrel=1
 pkgdesc="Agent-first issue tracker (SQLite + JSONL)"
 arch=('x86_64' 'aarch64')

@@ -14,7 +14,7 @@ This changelog is organized by capability rather than diff order. Each version s
 - Release links: `https://github.com/Dicklesworthstone/beads_rust/releases/tag/<TAG>`
 
 **Scope window:** every version from inception (v0.1.0, 2026-01-18) through the current
-release (v0.7.1, 2026-09-28).
+release (v0.7.2, 2026-09-29).
 The full per-version detail is in the sections below; the timeline names the
 recent line and the milestone anchors. The September 8 audit examined all 79
 commits in `v0.5.10..v0.5.11` and six subsequent commits against Git diffs,
@@ -31,6 +31,7 @@ explicitly corrected during this audit.
 
 | Version | Date | Kind | Headline |
 |---|---|---|---|
+| [v0.7.2](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.2) | 2026-09-29 | Release | WAL-index recovery no longer locked out by pre-existing index damage, and warns when rows may be lost (#523); `br update` reports label changes (#527) |
 | [v0.7.1](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.1) | 2026-09-28 | Release | Workspaces upgraded from 0.6.0 no longer wedge on a stale WAL index (#521); Windows WAL-index recovery no longer blocks every command (#520); older-schema databases self-heal (`doctor migrate-schema heal`); id-less mutation, coordination, epic close-policy and `policy.yaml` unknown-key fixes |
 | [v0.7.0](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.0) | 2026-09-24 | Release | FrankenSQLite 0.4.4 engine; id-collision-safe `sync --merge` and import refusal (#512); empty-JSONL merge guard; `update --if-unchanged` (#500/#505); poisoned WAL-index recovery (#507); Unicode-correct search; `ready --brief`, `list/search --fields` |
 | [v0.6.0](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.6.0) | 2026-09-12 | Release | Prerequisite checklists, class-specific workflow routes, typed dependencies, reviewed migrations, claim/admission guards, bounded ready output; seven-platform DSR release |
@@ -83,6 +84,69 @@ this repo): commits `55c186682` + `5946b3b7c` in
 <https://github.com/Dicklesworthstone/frankensqlite>, shipped as fsqlite 0.3.12.
 
 ---
+
+## v0.7.2 — 2026-09-29
+
+[Release](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.2).
+A patch release. The database schema is unchanged at 19.
+
+### Damaged indexes no longer lock you out of WAL-index recovery
+
+- **A workspace with a poisoned or stale WAL index (#507, #521) and indexes
+  that were already damaged had no way back in.** Every command ran startup
+  recovery, which rehearses on a private copy and requires a clean integrity
+  check; the old index damage failed that check, so recovery refused.
+  `br doctor migrate-schema recover` refused the same way, and
+  `br doctor --repair` and `--repair-indexes` refused behind the pending-merge
+  check, which needs recovery to have run first. Recovery only rebuilds the
+  WAL index and already proves the database and WAL bytes are unchanged, so
+  damage it finds was there before. When the check fails, recovery now tries
+  the index rebuild that `--repair-indexes` does on another private copy. If
+  that comes back clean with the schema and every row unchanged, the damage is
+  only in the indexes: `br doctor migrate-schema recover` restores access,
+  reports the damage and tells you to run `br doctor --repair-indexes` next.
+  Ordinary commands still refuse to run on indexes known to be broken, but the
+  error names those two commands. Damage the rebuild does not clear keeps
+  recovery closed and says it is not confined to indexes. The live database is
+  not changed by any refusal
+  ([c1d9ea6f](https://github.com/Dicklesworthstone/beads_rust/commit/c1d9ea6f), [#523](https://github.com/Dicklesworthstone/beads_rust/issues/523)).
+- **Recovery warns when the damage may have cost you a row.** If a table has
+  lost a row that its indexes still point to, rebuilding the indexes makes
+  the two agree again, so the check comes back clean, and
+  `--repair-indexes` would then delete the index entries that were the only
+  sign the row existed. When the integrity check shows index entries with no
+  matching table row, the recovery receipt sets
+  `index_corruption.index_entries_without_table_rows`, and both
+  `br doctor migrate-schema recover` and the startup error say rows may have
+  been lost and to check `issues.jsonl` for them before running
+  `--repair-indexes`. The complete pre-recovery files stay under
+  `.beads/.br_recovery/`
+  ([9ce4daa4](https://github.com/Dicklesworthstone/beads_rust/commit/9ce4daa4), [#523](https://github.com/Dicklesworthstone/beads_rust/issues/523)).
+- A failed WAL-index recovery no longer leaves `.br-wal-index-*` preparation
+  directories behind. The directory is kept only when it holds evidence of the
+  poisoned index, and a failure to clean up is reported separately from that
+  evidence
+  ([35c8f40a](https://github.com/Dicklesworthstone/beads_rust/commit/35c8f40a), [#523](https://github.com/Dicklesworthstone/beads_rust/issues/523)).
+- `br doctor` points integrity errors that name an index at
+  `br doctor --repair-indexes`.
+
+**Safe recovery path** for a workspace in this state: stop other `br`
+processes and copy `.beads/` somewhere safe; run
+`br doctor migrate-schema recover`; if it reports that rows may have been
+lost, compare against `issues.jsonl` first; then run
+`br doctor --repair-indexes` and `br doctor`.
+
+### Other fixes
+
+- `br update` reports label changes. `--add-label`, `--remove-label` and
+  `--set-labels` printed nothing, so a label change, a no-op and a mistyped
+  label looked the same. The receipt now has a line such as
+  `labels: +needs-review -triage` with the net change; a label that was
+  already present (or already absent) prints nothing
+  ([d653e423](https://github.com/Dicklesworthstone/beads_rust/commit/d653e423), [#527](https://github.com/Dicklesworthstone/beads_rust/issues/527)).
+- Test-suite fixes for two tests that failed intermittently under parallel
+  test threads
+  ([ab7a740f](https://github.com/Dicklesworthstone/beads_rust/commit/ab7a740f), [b4dbf9d6](https://github.com/Dicklesworthstone/beads_rust/commit/b4dbf9d6)).
 
 ## v0.7.1 — 2026-09-28
 

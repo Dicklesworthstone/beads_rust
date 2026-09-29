@@ -1,6 +1,6 @@
 [package]
 name = "beads_rust"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2024"
 rust-version = "1.89"
 autobenches = false
