@@ -106,13 +106,32 @@ A patch release. The database schema is unchanged at 19.
   already rebuilt it; read-only commands could not. They now read a private
   copy whose index is rebuilt from the WAL, the same fallback 0.7.1 added for
   indexes left by br 0.6.0 (#521). A WAL that fails its checksums is still
-  refused, and the live files are not changed. The read costs a copy of the
-  database until the next command that writes rebuilds the live index
+  refused, and the live files are not changed. Each such read costs a copy
+  of the database until the next ordinary command rebuilds the live index
   ([7c12906d](https://github.com/Dicklesworthstone/beads_rust/commit/7c12906d)).
 - `br doctor` names this index state instead of calling `beads.db-shm`
   inert, and `br doctor --repair` still refuses while it is present; run
   `br doctor migrate-schema recover` or any ordinary command first
   ([7c12906d](https://github.com/Dicklesworthstone/beads_rust/commit/7c12906d)).
+
+### Distribution and verification
+
+- Seven default-feature binaries were built from
+  [f925146d](https://github.com/Dicklesworthstone/beads_rust/commit/f925146d)
+  on Apple Silicon with the v0.7.2 recipe: macOS amd64/arm64 natively, Linux
+  GNU (glibc 2.28 floor) and static musl on amd64/arm64 with cargo-zigbuild,
+  and Windows amd64 with the GNU toolchain. GitHub Actions were not used.
+- The 24 assets are seven archives, seven SHA-256 sidecars, seven Minisign
+  signatures (key `36B847D11BA5A0D0`), aggregate checksums, and SPDX/CycloneDX
+  source SBOMs. Public downloads matched the checksums and signatures on
+  macOS and Linux, and the installer at the tag installed byte-identical
+  binaries on Apple Silicon and Linux amd64. Every binary reports commit
+  f925146d. The macOS (arm64 and Intel under Rosetta) and Linux amd64 GNU and
+  musl binaries passed a create, dependency, label, close, sync and doctor
+  round trip; the macOS arm64 and Linux amd64 binaries also passed the bv
+  read-only repro; and the arm64 Linux binaries ran under qemu-user. No Windows host was reachable, so the Windows binary was
+  not run.
+- The in-repo Homebrew, Scoop and AUR manifests point at these assets.
 
 ## v0.7.2 — 2026-09-29
 
