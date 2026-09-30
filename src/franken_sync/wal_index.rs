@@ -271,18 +271,6 @@ pub fn stock_empty_index_present(path: &Path) -> io::Result<bool> {
     stock_empty_probe(path, ENGINE_READS_ON_DISK_WAL_INDEX)
 }
 
-/// [`stock_empty_index_present`] for an engine that does (or does not) read
-/// the on-disk index, so both platform behaviors are testable.
-///
-/// # Errors
-/// Returns an error when a family member exists but cannot be read.
-pub fn stock_empty_index_present_for_engine(
-    path: &Path,
-    engine_reads_on_disk_index: bool,
-) -> io::Result<bool> {
-    stock_empty_probe(path, engine_reads_on_disk_index)
-}
-
 /// Whether a settled `-shm` index can never admit a reader of this WAL: it
 /// was never initialized, or it describes another WAL generation or more
 /// frames than the WAL holds. The engine answers every one of these with
@@ -988,13 +976,13 @@ pub mod tests {
         let (_temp, db, _) = fixture();
         // #507's poison fixture carries no checksum: still poison, not admitted.
         assert!(poisoned_index_present_for_engine(&db, true).unwrap());
-        assert!(!stock_empty_index_present_for_engine(&db, true).unwrap());
+        assert!(!stock_empty_probe(&db, true).unwrap());
 
         fs::write(sidecar(&db, "-shm"), stock_empty_index()).unwrap();
         assert!(poisoned_index_present_for_engine(&db, true).unwrap());
-        assert!(stock_empty_index_present_for_engine(&db, true).unwrap());
+        assert!(stock_empty_probe(&db, true).unwrap());
         // Where the engine keeps its index in memory, nothing is classified.
-        assert!(!stock_empty_index_present_for_engine(&db, false).unwrap());
+        assert!(!stock_empty_probe(&db, false).unwrap());
 
         for (offset, label) in [(0, "version"), (40, "checksum"), (48, "torn copy")] {
             let mut changed = stock_empty_index();
@@ -1003,10 +991,7 @@ pub mod tests {
                 changed[offset + 48] ^= 1;
             }
             fs::write(sidecar(&db, "-shm"), changed).unwrap();
-            assert!(
-                !stock_empty_index_present_for_engine(&db, true).unwrap(),
-                "{label}"
-            );
+            assert!(!stock_empty_probe(&db, true).unwrap(), "{label}");
         }
 
         // Any WAL byte past the header (a frame, or part of one) makes the
@@ -1016,9 +1001,9 @@ pub mod tests {
         wal.push(0);
         fs::write(sidecar(&db, "-wal"), &wal).unwrap();
         assert!(poisoned_index_present_for_engine(&db, true).unwrap());
-        assert!(!stock_empty_index_present_for_engine(&db, true).unwrap());
+        assert!(!stock_empty_probe(&db, true).unwrap());
         fs::remove_file(sidecar(&db, "-wal")).unwrap();
-        assert!(!stock_empty_index_present_for_engine(&db, true).unwrap());
+        assert!(!stock_empty_probe(&db, true).unwrap());
     }
 
     #[test]
