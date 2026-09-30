@@ -21,7 +21,7 @@
 
 mod common;
 
-use beads_rust::franken_sync::Connection;
+use beads_rust::franken_sync::{Connection, SqliteValue};
 use common::cli::{BrWorkspace, extract_json_payload, run_br};
 use flate2::read::GzDecoder;
 use serde_json::Value;
@@ -287,6 +287,84 @@ fn db_declares_table(db_path: &Path, table: &str) -> bool {
     })
 }
 
+type TableRows = std::collections::BTreeMap<String, (Vec<String>, Vec<Vec<String>>)>;
+
+/// Every table's columns and rows, read through the runtime engine from a
+/// private copy of the family (the live one is never opened here). With
+/// `columns` given, reads exactly those columns of those tables.
+fn engine_rows(db_path: &Path, columns: Option<&TableRows>) -> TableRows {
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let copy = scratch.path().join("copy.db");
+    fs::copy(db_path, &copy).expect("copy database");
+    let wal = PathBuf::from(format!("{}-wal", db_path.display()));
+    if wal.is_file() {
+        fs::copy(&wal, scratch.path().join("copy.db-wal")).expect("copy WAL");
+    }
+    let conn = Connection::open(copy.to_string_lossy().into_owned()).expect("open copy");
+    let text = |value: Option<&SqliteValue>| match value {
+        None => "<missing>".to_owned(),
+        Some(SqliteValue::Null) => "NULL".to_owned(),
+        Some(SqliteValue::Integer(value)) => format!("integer {value}"),
+        Some(SqliteValue::Float(value)) => format!("real {value:?}"),
+        Some(SqliteValue::Text(_)) => format!("text {:?}", value.and_then(SqliteValue::as_text)),
+        Some(SqliteValue::Blob(bytes)) => format!("blob {bytes:?}"),
+    };
+    let tables: Vec<(String, Vec<String>)> = match columns {
+        Some(columns) => columns
+            .iter()
+            .map(|(table, (names, _))| (table.clone(), names.clone()))
+            .collect(),
+        None => conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type = 'table' \
+                 AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .expect("list tables")
+            .iter()
+            .map(|row| {
+                let table = row
+                    .get(0)
+                    .and_then(SqliteValue::as_text)
+                    .expect("table name")
+                    .to_owned();
+                let names = conn
+                    .query(&format!("PRAGMA table_info(\"{table}\")"))
+                    .expect("table_info")
+                    .iter()
+                    .map(|info| {
+                        info.get(1)
+                            .and_then(SqliteValue::as_text)
+                            .expect("column name")
+                            .to_owned()
+                    })
+                    .collect();
+                (table, names)
+            })
+            .collect(),
+    };
+    let mut result = TableRows::new();
+    for (table, names) in tables {
+        let list = names
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let order = (1..=names.len())
+            .map(|index| index.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = conn
+            .query(&format!("SELECT {list} FROM \"{table}\" ORDER BY {order}"))
+            .unwrap_or_else(|error| panic!("read {table}: {error}"))
+            .iter()
+            .map(|row| (0..names.len()).map(|index| text(row.get(index))).collect())
+            .collect();
+        result.insert(table, (names, rows));
+    }
+    conn.close().expect("close copy");
+    result
+}
+
 #[allow(clippy::too_many_lines)]
 fn upgrade_fixture_end_to_end(
     label: &str,
@@ -330,6 +408,16 @@ fn upgrade_fixture_end_to_end(
         u64::from(header_user_version(&db_path)),
         expected_from,
         "{label}: a read-only fallback must not touch the database"
+    );
+
+    // Rows as they stand on the old schema, before any column is added.
+    let rows_before = engine_rows(&db_path, None);
+    assert!(
+        rows_before
+            .get("issues")
+            .is_some_and(|(names, rows)| !rows.is_empty()
+                && !names.iter().any(|name| name == "prerequisites")),
+        "{label}: fixture precondition: issues rows on a schema without prerequisites"
     );
 
     // 2. Follow the remediation: plan must accept the fixture.
@@ -443,6 +531,34 @@ fn upgrade_fixture_end_to_end(
         "{label}: list failed: {}",
         list.stderr
     );
+
+    // The migration appends columns with ALTER TABLE ADD COLUMN, leaving
+    // existing records shorter than the new table. Every pre-existing row
+    // must read back through the engine exactly as before, and the appended
+    // column must read as its default (not a neighbour's value): the shape
+    // of mcp_agent_mail's br-2hpuk, where short records decoded shifted.
+    let rows_after = engine_rows(&db_path, Some(&rows_before));
+    for (table, (names, before)) in &rows_before {
+        let (_, after) = &rows_after[table];
+        assert_eq!(
+            after, before,
+            "{label}: {table} rows ({names:?}) changed across the migration"
+        );
+    }
+    let prerequisites = engine_rows(&db_path, None)["issues"].clone();
+    let column = prerequisites
+        .0
+        .iter()
+        .position(|name| name == "prerequisites")
+        .expect("migrated issues has prerequisites");
+    assert_eq!(prerequisites.1.len(), rows_before["issues"].1.len());
+    for row in &prerequisites.1 {
+        assert_eq!(
+            row[column],
+            format!("text {:?}", Some("")),
+            "{label}: pre-existing issue must read the prerequisites default: {row:?}"
+        );
+    }
 
     // 5. The consumed receipt is stale: re-plan reports nothing to do, and
     //    re-applying the old token must be rejected without mutating.
@@ -669,4 +785,90 @@ fn e2e_migrate_schema_refuses_unsupported_core_shapes_before_issuing_a_token() {
             "planning must refuse before allocating migration recovery work"
         );
     }
+}
+
+/// mcp_agent_mail's br-2hpuk: after `ALTER TABLE ADD COLUMN` on a table whose
+/// first column aliases the rowid, FrankenSQLite decoded the shorter
+/// pre-existing records shifted by one column. br's migrations append
+/// columns the same way, so pin the engine's reading of such rows.
+#[test]
+fn engine_reads_rows_written_before_add_column() {
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let path = scratch.path().join("add_column.db");
+    let conn = Connection::open(path.to_string_lossy().into_owned()).expect("open");
+    conn.execute("PRAGMA journal_mode=WAL").expect("WAL");
+    conn.execute(
+        "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, \
+         sender TEXT NOT NULL, subject TEXT, body TEXT, importance TEXT DEFAULT 'normal', \
+         ack INTEGER DEFAULT 0, created_ts INTEGER, topic TEXT, thread TEXT, \
+         attachments TEXT DEFAULT '[]', extra BLOB)",
+    )
+    .expect("create");
+    for id in 1..=40 {
+        conn.execute(&format!(
+            "INSERT INTO messages VALUES ({id}, {}, 'agent{id}', 'subject {id}', 'body {id}', \
+             'high', {}, {}, NULL, 'thread-{id}', '[]', x'0102')",
+            id % 3 + 7,
+            id % 2,
+            1_000_000 + id
+        ))
+        .expect("insert");
+    }
+    conn.execute("ALTER TABLE messages ADD COLUMN archive_metadata_json TEXT")
+        .expect("add nullable column");
+    conn.execute("ALTER TABLE messages ADD COLUMN prerequisites TEXT NOT NULL DEFAULT ''")
+        .expect("add defaulted column");
+    let check = |conn: &Connection, label: &str| {
+        let rows = conn
+            .query(
+                "SELECT id, project_id, sender, subject, topic, thread, archive_metadata_json, \
+                 prerequisites FROM messages ORDER BY id",
+            )
+            .expect("select");
+        assert_eq!(rows.len(), 40, "{label}");
+        for (index, row) in rows.iter().enumerate() {
+            let id = i64::try_from(index + 1).unwrap();
+            let int = |column: usize| row.get(column).and_then(SqliteValue::as_integer);
+            let text = |column: usize| row.get(column).and_then(SqliteValue::as_text);
+            assert_eq!(int(0), Some(id), "{label} row {id}");
+            assert_eq!(int(1), Some(id % 3 + 7), "{label} row {id}");
+            assert_eq!(
+                text(2),
+                Some(format!("agent{id}").as_str()),
+                "{label} row {id}"
+            );
+            assert_eq!(
+                text(3),
+                Some(format!("subject {id}").as_str()),
+                "{label} row {id}"
+            );
+            assert!(
+                matches!(row.get(4), Some(SqliteValue::Null)),
+                "{label} row {id}"
+            );
+            assert_eq!(
+                text(5),
+                Some(format!("thread-{id}").as_str()),
+                "{label} row {id}"
+            );
+            assert!(
+                matches!(row.get(6), Some(SqliteValue::Null)),
+                "{label} row {id}"
+            );
+            assert_eq!(text(7), Some(""), "{label} row {id}");
+        }
+        let filtered = conn
+            .query("SELECT count(*) FROM messages WHERE project_id = 7")
+            .expect("filter");
+        assert_eq!(
+            filtered[0].get(0).and_then(SqliteValue::as_integer),
+            Some(13),
+            "{label}"
+        );
+    };
+    check(&conn, "same connection");
+    conn.close().expect("close");
+    let reopened = Connection::open(path.to_string_lossy().into_owned()).expect("reopen");
+    check(&reopened, "reopened");
+    reopened.close().expect("close");
 }
