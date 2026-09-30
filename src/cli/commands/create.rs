@@ -130,11 +130,6 @@ pub fn execute_with_storage(
     };
     let layer = storage_ctx.load_config(cli)?;
 
-    // Strict status-workflow enforcement (issue #311). Reject an out-of-set
-    // `--status` before any write when the project configures
-    // `workflow.strict: true`. No-op when the workflow section is absent.
-    enforce_workflow_status(&storage_ctx.paths.beads_dir, args.status.as_deref())?;
-
     let config = CreateConfig {
         id_config: config::id_config_from_layer(&layer),
         default_priority: config::default_priority_from_layer(&layer)?,
@@ -143,6 +138,16 @@ pub fn execute_with_storage(
         source_repo: canonical_source_repo(&storage_ctx.paths.beads_dir),
         source_repo_path: canonical_source_repo_path(&storage_ctx.paths.beads_dir),
     };
+
+    // Strict status-workflow enforcement (issue #311), plus GH #503's narrow
+    // provenance-backed entry route. This remains before every mutation:
+    // parents/dependencies used as provenance are resolved read-only here.
+    enforce_workflow_status_for_create(
+        &storage_ctx.storage,
+        &storage_ctx.paths.beads_dir,
+        args,
+        &config.id_config.prefix,
+    )?;
 
     // Resolve the description up front — before the retry closure — so the
     // verbatim `--description-file` content (or `-` stdin, which can only be
@@ -274,6 +279,64 @@ fn enforce_workflow_status(beads_dir: &Path, raw_status: Option<&str>) -> Result
     policy
         .workflow
         .validate_transition(None, parsed.as_str(), None)
+}
+
+/// Create-specific initial admission with GH #503 provenance-backed routes.
+///
+/// A route never overrides the declared status vocabulary. It is consulted
+/// only after the ordinary `initial` transition refuses, and it requires both
+/// a configured label and a parent/dependency that resolves to an existing
+/// local issue. External dependencies deliberately do not count as provenance.
+fn enforce_workflow_status_for_create(
+    storage: &SqliteStorage,
+    beads_dir: &Path,
+    args: &CreateArgs,
+    prefix: &str,
+) -> Result<()> {
+    let policy = crate::close_policy::load_for_beads_dir(beads_dir)?;
+    if !policy.workflow.is_enforced() && !policy.workflow.transitions_enforced() {
+        return Ok(());
+    }
+    let parsed: Status = match args.status.as_deref() {
+        Some(raw) => raw.parse()?,
+        None => Status::Open,
+    };
+    policy.workflow.validate_status(parsed.as_str())?;
+    let initial = policy
+        .workflow
+        .validate_transition(None, parsed.as_str(), None);
+    if initial.is_ok() || policy.workflow.entry_routes.is_empty() {
+        return initial;
+    }
+
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(prefix.to_string()));
+    let has_existing_relation = if let Some(parent) = args.parent.as_deref() {
+        // A configured entry route must not turn a bad parent into permission:
+        // propagate the same resolution error normal create would surface.
+        resolve_issue_id(storage, &resolver, parent)?;
+        true
+    } else {
+        let mut found = false;
+        for dependency in &args.deps {
+            let (_, dependency_id) = parse_create_dependency(dependency)?;
+            if dependency_id.starts_with("external:") {
+                continue;
+            }
+            resolve_dependency_id(&resolver, storage, &dependency_id)?;
+            found = true;
+            break;
+        }
+        found
+    };
+
+    if policy
+        .workflow
+        .allows_entry_route(parsed.as_str(), &args.labels, has_existing_relation)
+    {
+        Ok(())
+    } else {
+        initial
+    }
 }
 
 fn auto_flush_after_create(storage_ctx: &mut config::OpenStorageResult, ctx: &OutputContext) {
