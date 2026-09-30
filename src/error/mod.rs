@@ -20,6 +20,22 @@ pub use structured::{ErrorCode, StructuredError};
 use std::path::PathBuf;
 use thiserror::Error;
 
+/// What clears an engine `BusyRecovery` ("database is busy (recovery in
+/// progress)"): a WAL index (`beads.db-shm`) the engine must rebuild before
+/// it reads, which a read-only open cannot do.
+///
+/// Read-only commands read a private snapshot for the index shapes br
+/// recognizes (the zero-page index a SQLite reader leaves, #507; an index an
+/// older engine left, #521), and any command that writes rebuilds those in
+/// place. Every other refused index (a torn header, a truncated or garbled
+/// file) is rebuilt only by the explicit recovery command, which is what
+/// this names. The same wording is used wherever the error is re-worded.
+pub const WAL_INDEX_RECOVERY_REMEDIATION: &str = "The WAL index (.beads/beads.db-shm) must be \
+     rebuilt before br can read the database. Run `br doctor migrate-schema recover`: it \
+     rebuilds the index, keeps the pre-recovery files under .beads/.br_recovery, and does not \
+     change issue data. If another br process is recovering the database right now, retry \
+     after it finishes.";
+
 /// Primary error type for `beads_rust` operations.
 ///
 /// Design: Structured variants for common cases.
@@ -353,6 +369,20 @@ impl BeadsError {
         }
     }
 
+    /// Whether the engine refused this open because the WAL index
+    /// (`beads.db-shm`) must be rebuilt first (`BusyRecovery`), looking
+    /// through context wrappers. See [`WAL_INDEX_RECOVERY_REMEDIATION`].
+    #[must_use]
+    pub fn is_busy_recovery(&self) -> bool {
+        match self {
+            Self::Database(fsqlite_error::FrankenError::BusyRecovery) => true,
+            Self::WithContext { source, .. } => source
+                .downcast_ref::<Self>()
+                .is_some_and(Self::is_busy_recovery),
+            _ => false,
+        }
+    }
+
     /// Returns true if the error is transient and can be retried.
     #[must_use]
     pub fn is_transient(&self) -> bool {
@@ -468,6 +498,9 @@ impl BeadsError {
             } => Some(
                 "Inspect the operation state before retrying: this authority may be acquired after writes. Do not delete the lock file or blindly repeat the primary mutation.",
             ),
+            Self::Database(fsqlite_error::FrankenError::BusyRecovery) => {
+                Some(WAL_INDEX_RECOVERY_REMEDIATION)
+            }
             Self::AmbiguousId { .. } => Some("Provide more characters of the ID"),
             Self::HasDependents { .. } => Some("Use --force or --cascade to delete anyway"),
             Self::ImportCollision { .. } => Some("Use --force to overwrite or resolve manually"),
@@ -671,6 +704,38 @@ mod tests {
             context["operation"],
             serde_json::Value::String("upgrade".to_string())
         );
+    }
+
+    #[test]
+    fn busy_recovery_names_the_command_that_rebuilds_the_index() {
+        let bare = BeadsError::Database(fsqlite_error::FrankenError::BusyRecovery);
+        let wrapped = BeadsError::WithContext {
+            context: "opening the tracker".to_string(),
+            source: Box::new(BeadsError::Database(
+                fsqlite_error::FrankenError::BusyRecovery,
+            )),
+        };
+        for err in [&bare, &wrapped] {
+            assert!(err.is_busy_recovery());
+            assert!(err.to_string().contains("recovery in progress"), "{err}");
+            let structured = StructuredError::from_error(err);
+            let hint = structured
+                .hint
+                .clone()
+                .expect("BusyRecovery must carry a next step");
+            assert_eq!(hint, WAL_INDEX_RECOVERY_REMEDIATION);
+            assert!(hint.contains("br doctor migrate-schema recover"), "{hint}");
+            let human = structured.to_human(false);
+            assert!(
+                human.contains("Hint: The WAL index (.beads/beads.db-shm)"),
+                "{human}"
+            );
+            assert_eq!(structured.to_json()["error"]["hint"], hint.as_str());
+        }
+        // Other engine errors keep their own (absent) suggestion.
+        let other = BeadsError::Database(fsqlite_error::FrankenError::Internal("x".to_string()));
+        assert!(!other.is_busy_recovery());
+        assert!(other.suggestion().is_none());
     }
 
     #[test]

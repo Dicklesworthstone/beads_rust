@@ -86,6 +86,52 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
+## Unreleased
+
+### Label exclusion for list, ready, search and count (#522)
+
+- `br list`, `br ready`, `br search` and `br count` accept
+  `--exclude-label <label>`, repeatable. An issue carrying any excluded label
+  is hidden. It composes with `--label` (all of) and `--label-any` (any of):
+  those select, then the exclusion removes. `ready --limit` and the list and
+  search pages apply after the exclusion, so hidden issues never shorten a
+  page, and saved queries (`br query save`) keep the flag. JSON output is
+  unchanged apart from the rows it filters. There is deliberately no config
+  file or environment setting for it: a filter that hides issues by default
+  would change what `br ready` means for every agent in the workspace.
+
+### `.br_recovery` no longer grows without bound after SQLite reads
+
+- **Every write after a stock SQLite reader (bv, the `sqlite3` shell) opened
+  the tracker copied the whole database twice** into a new
+  `.beads/.br_recovery/schema-migrations/` run, once as the backup and once
+  for the private rehearsal, and nothing ever removed them. When the WAL holds
+  no frames and the index has the zero-page shape SQLite leaves (#507), the
+  main database file is the complete committed state and rebuilding the index
+  cannot change it. Recovery now keeps only the old index plus its receipts in
+  that case, still checks that the main database and WAL come out
+  byte-identical, and still requires a clean integrity check. If the check
+  finds damage that predates the recovery, the original index is put back and
+  the complete-backup rehearsal handles it exactly as before.
+- After each successful recovery, br removes that database's completed
+  recovery runs that are both outside the five newest and older than seven
+  days. Failed and interrupted recovery runs, the run just created, runs of
+  other databases, and schema-migration runs (used by `undo`) are never
+  removed.
+
+### "database is busy (recovery in progress)" names its fix
+
+- Since 0.7.3, read-only commands read around the WAL indexes SQLite readers
+  and br 0.6.0 leave behind, and ordinary commands rebuild them. Any other
+  index the engine refuses (a torn header, a truncated or overwritten
+  `beads.db-shm`) still failed every command, reads and writes alike, with
+  "database is busy (recovery in progress)" and no next step; `br doctor
+  --repair` refused as well. Only `br doctor migrate-schema recover` clears
+  it. The error now says so: as a hint on the error itself, in the
+  pending-merge refusal that writing commands report, in the
+  `sync_merge_pending_unknown` warning's `remediation`, and in the
+  `br doctor --repair` refusal.
+
 ## v0.7.3 — 2026-09-29
 
 [Release](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.3).

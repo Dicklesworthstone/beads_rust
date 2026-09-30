@@ -1189,6 +1189,35 @@ prints an `ID collision` warning (`id_collisions` in `--json`). `br sync
 --import-only` refuses a JSONL that would drop a local issue this way and
 points at `br sync --merge`.
 
+### Error: "database is busy (recovery in progress)"
+
+**Cause:** the WAL index (`.beads/beads.db-shm`) has to be rebuilt before the
+engine will read the database. Stock SQLite programs that open the tracker
+(bv, the `sqlite3` shell, Python) and br 0.6.0 leave indexes like that; for
+those, read-only commands (`--no-auto-import --no-auto-flush`, which is what bv
+runs) read a private snapshot and any ordinary command rebuilds the index, so
+you should not see this error. You see it when the index is damaged in some
+other way (a torn header, a truncated or overwritten file), which every command
+refuses, or while another br process is recovering the database.
+
+```bash
+# Rebuild the index; the main database, WAL and issue data are not changed
+br doctor migrate-schema recover
+
+# Diagnose
+br doctor
+```
+
+Each rebuild keeps its pre-recovery state under
+`.beads/.br_recovery/schema-migrations/<run>/recovery-before/`. When the WAL
+holds no frames (the usual state after a SQLite reader), only the old index is
+kept, because the main database file already holds every row and is not
+changed. Otherwise the complete database family is kept. br removes completed
+recovery runs automatically once they are both outside the five newest for
+that database and older than seven days. Failed or interrupted recovery runs,
+and schema-migration runs (which `br doctor migrate-schema undo` needs), are
+never removed automatically.
+
 ### Command Output is Garbled
 
 ```bash

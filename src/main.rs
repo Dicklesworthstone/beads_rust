@@ -421,7 +421,8 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
             Err(error) => {
                 return Err(BeadsError::SyncConflict {
                     message: format!(
-                        "Refusing no-DB mutation because pending sync-merge state could not be inspected under database-family authority: {error}"
+                        "Refusing no-DB mutation because pending sync-merge state could not be inspected under database-family authority: {}",
+                        pending_merge_inspection_failure(&error)
                     ),
                 });
             }
@@ -472,7 +473,8 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
             Err(error) => {
                 return Err(BeadsError::SyncConflict {
                     message: format!(
-                        "Refusing storage open because pending sync-merge state could not be inspected under database-family authority: {error}"
+                        "Refusing storage open because pending sync-merge state could not be inspected under database-family authority: {}",
+                        pending_merge_inspection_failure(&error)
                     ),
                 });
             }
@@ -1688,14 +1690,34 @@ fn emit_pending_sync_merge_warning(
     }
 }
 
+/// The inspection failure behind a pending-merge refusal or warning. When the
+/// engine refused on the WAL index (`BusyRecovery`), name the one command
+/// that rebuilds every index shape: ordinary commands fail on the same
+/// refusal, so "restore read access" alone leaves the operator stuck.
+fn pending_merge_inspection_failure(error: &BeadsError) -> String {
+    if error.is_busy_recovery() {
+        format!(
+            "{error}. {}",
+            beads_rust::error::WAL_INDEX_RECOVERY_REMEDIATION
+        )
+    } else {
+        error.to_string()
+    }
+}
+
 fn emit_pending_sync_merge_inspection_warning(error: &BeadsError, json_mode: bool) {
     if json_mode {
+        let remediation = if error.is_busy_recovery() {
+            beads_rust::error::WAL_INDEX_RECOVERY_REMEDIATION
+        } else {
+            "Run `br doctor --json` and restore read-only database-family access before mutating."
+        };
         let payload = serde_json::json!({
             "level": "warning",
             "code": "sync_merge_pending_unknown",
             "message": "Read-only command is proceeding with automatic sync disabled because pending merge state could not be inspected",
             "inspection_error": error.to_string(),
-            "remediation": "Run `br doctor --json` and restore read-only database-family access before mutating."
+            "remediation": remediation
         });
         eprintln!(
             "{}",

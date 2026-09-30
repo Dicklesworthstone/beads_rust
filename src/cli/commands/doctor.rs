@@ -766,6 +766,12 @@ fn refuse_doctor_mutation_if_merge_pending(
                      fails closed, and this database's schema version says repair is not the \
                      command that clears it"
                 )
+            } else if error.is_busy_recovery() {
+                format!(
+                    "could not prove that no sync merge is pending ({error}); doctor mutation \
+                     fails closed because the engine will not read through the WAL index. \
+                     Preserve the WAL and run `br doctor migrate-schema recover`"
+                )
             } else {
                 format!(
                     "could not prove that no sync merge is pending ({error}); doctor mutation fails closed"
@@ -777,7 +783,11 @@ fn refuse_doctor_mutation_if_merge_pending(
                 "pending": "unknown",
                 "database_path": db_path.display().to_string(),
                 "inspection_error": error.to_string(),
-                "remediation": remediation.unwrap_or_else(|| "Restore read-only access to the database family and rerun `br doctor` before attempting repair.".to_string()),
+                "remediation": remediation.unwrap_or_else(|| if error.is_busy_recovery() {
+                    crate::error::WAL_INDEX_RECOVERY_REMEDIATION.to_string()
+                } else {
+                    "Restore read-only access to the database family and rerun `br doctor` before attempting repair.".to_string()
+                }),
             });
             merge_json_object(&mut evidence, hint.json_details());
             (reason, evidence)
@@ -1295,8 +1305,9 @@ impl DatabaseAdmissionHint {
                 "The database and WAL are present, but the derived WAL index is in the known \
                  initialized-zero-page poison state from GitHub #507. Preserve the complete \
                  database family and run `br doctor migrate-schema recover`; that command \
-                 rehearses recovery on a private copy and retains the poisoned index as evidence \
-                 before live admission. If the database also has corrupt indexes, recovery \
+                 retains the poisoned index as evidence and requires the main database and WAL \
+                 to come out unchanged (when the WAL holds frames it first rehearses on a \
+                 private copy of the whole family). If the database also has corrupt indexes, recovery \
                  says so and `br doctor --repair-indexes` then rebuilds them. Do not run \
                  generic `br doctor --repair` or delete the WAL: committed records may exist \
                  only in WAL."
