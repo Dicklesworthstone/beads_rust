@@ -1537,11 +1537,46 @@ workflow:
 ```
 
 This lets a bug move from `draft` directly to `open`. Tasks and unconfigured
-types still go through `planned`. All issues must first enter through the
-global `initial` rule. A class edge adds permission for that exact move;
-required fields, fresh transition comments, gates, and capacity still apply.
-Omitting `class_transitions` preserves the global routes. With `strict: false`,
-route and status enforcement remains advisory.
+types still go through `planned`. A class edge adds permission for that exact
+move; required fields, fresh transition comments, gates, and capacity still
+apply. Omitting `class_transitions` preserves the global routes. With
+`strict: false`, route and status enforcement remains advisory.
+
+For triage/follow-up creation that must skip the global `initial` status, use
+`entry_routes`. An entry route is deliberately narrower than a class edge:
+the new issue must carry both the configured label and at least one
+parent/dependency that resolves to an existing local issue. Neither half is
+sufficient by itself, and an `external:` dependency does not count as tracked
+provenance.
+
+```yaml
+workflow:
+  strict: true
+  statuses: [draft, in_planning, open, closed]
+  transitions:
+    initial: [draft]
+    draft: [in_planning]
+    in_planning: [open]
+  entry_routes:
+    - {label: bug, to: in_planning}
+    - {label: follow-up, to: open}
+```
+
+For example, this may enter `in_planning` directly because the label matches
+and the dependency anchors the new issue to an existing bead:
+
+```bash
+br create 'Parser regression' --status in_planning --labels bug \
+  --deps discovered-from:br-abc
+```
+
+The same command without `--labels bug`, without the existing relation, with
+only an external relation, or with a target status not named by the matching
+route is refused by the ordinary `initial` policy. Entry routes are
+case-insensitive for labels/statuses, reject duplicate label/target pairs, and
+must target a declared status when strict status validation is active. They are
+additive exceptions for normal CLI creation; importing historical issues does
+not reinterpret their initial admission through these routes.
 
 `issue_type` matches the parsed type stored on the issue, case-insensitively;
 it introduces no additional issue field. An update that changes both type and
