@@ -1,5 +1,27 @@
 # Dependency Upgrade Log
 
+## September 30: FrankenSQLite 0.4.4 → 0.4.7 uniform family
+
+- [x] All 15 directly pinned `fsqlite*` crates move to `0.4.7` in `Cargo.toml`;
+  a targeted `cargo update` moved exactly the 20 `fsqlite*` packages in
+  `Cargo.lock` (the five `fsqlite-ext-*` follow transitively) and nothing
+  else. fsqlite 0.4.7 still requires `asupersync ^0.5.0`, so br's `=0.5.0`
+  pin is unchanged.
+- [x] Read the fsqlite CHANGELOG for 0.4.5–0.4.7. Relevant to br: GH#431
+  (`e85717e0a`, 0.4.6) admits stock SQLite's unindexed empty WAL index beside
+  a header-only WAL, and stale reader marks recover or fail fast (GH#430);
+  0.4.7 fixes index entries written without their rowid by large multi-row
+  `INSERT ... VALUES` (hfdt-dlkam3) and the serialized-DDL index race
+  (bd-4iaoi); 0.4.6 fixes a page referenced twice across a WAL generation
+  (bd-b5vmw). `busy_timeout` is now one budget per statement (GH#423).
+- [x] br consequences: the read-only private-snapshot fallback no longer
+  fires for the GH#431 shape (`stock_empty_index_present`), because the engine
+  reads through it. Writable startup still recovers it: on 0.4.7 the first
+  commit through that index fails with `BusyRecovery` (reproduced on hz4 with
+  a real Python `sqlite3` reader, then `br create`). `.br-wal-index-*`
+  quarantines get the recovery-run retention rule. See CHANGELOG
+  "Unreleased".
+
 ## September 18: the `otrgz` pending-merge-inspection reproducer closes on 0.4.4 — COMPLETE
 
 `otrgz` opened on a real failure: the eight-process/30-second linearizability

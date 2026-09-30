@@ -2769,6 +2769,13 @@ impl SqliteStorage {
         path: &Path,
         source_lease: Option<crate::sync::DatabaseOpenerLease>,
     ) -> Result<Option<Self>> {
+        // Stable target so tests and operators can count whole-family copies
+        // (`RUST_LOG=br::read_snapshot=info`).
+        tracing::info!(
+            target: "br::read_snapshot",
+            database = %path.display(),
+            "read-only open is reading a private snapshot of the database family"
+        );
         let directory = tempfile::tempdir()?;
         let copy_path = directory.path().join("snapshot.db");
         let mut family = capture_read_snapshot_family(path)?;
@@ -17439,20 +17446,21 @@ fn verify_read_snapshot_family(family: &mut [ReadSnapshotMember]) -> Result<()> 
 /// (after its own transient retries) is facing a settled WAL index the engine
 /// can never admit read-only: one left by br 0.6.0's engine, which never
 /// maintained it, or one from another WAL generation (GH #521), or the
-/// initialized zero-page index of #507.
+/// initialized zero-page index of #507 (beside a WAL that holds frames, or
+/// without stock SQLite's header checksum). Only a writable open can rebuild
+/// such an index, so the read goes through a private snapshot whose index is
+/// rebuilt off to the side, never touching the live family. Writable opens keep #507's identity-bound quarantine.
 ///
-/// The zero-page shape is what stock SQLite writes whenever it is the first
-/// connection to open a family whose WAL holds no frames: it rebuilds the
-/// index and leaves `szPage` 0 because a header-only WAL has no frame to take
-/// a page size from. Any SQLite reader of the tracker (bv, the sqlite3 shell)
-/// therefore leaves it behind, and fsqlite 0.4.x refuses that header. Only a
-/// writable open can rebuild such an index, so the read goes through a
-/// private snapshot whose index is rebuilt off to the side, never touching
-/// the live family. Writable opens keep #507's identity-bound quarantine.
+/// Stock SQLite's unindexed empty index beside a header-only WAL, which any
+/// SQLite reader of the tracker (bv, the sqlite3 shell) leaves behind, is not
+/// one of these: FrankenSQLite 0.4.6+ admits it for reads (fsqlite GH#431),
+/// so a `BusyRecovery` there is ordinary contention and never worth a copy of
+/// the whole family.
 fn stale_read_only_wal_index(path: &Path) -> Result<bool> {
     // A zero-page index (salts and szPage zero) also disagrees with any valid
     // WAL header on page size, so the stale classifier covers #507 as well.
-    Ok(crate::franken_sync::wal_index::stale_index_present(path)?)
+    Ok(crate::franken_sync::wal_index::stale_index_present(path)?
+        && !crate::franken_sync::wal_index::stock_empty_index_present(path)?)
 }
 
 fn missing_read_only_wal_index(path: &Path) -> Result<bool> {

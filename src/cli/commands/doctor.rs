@@ -704,10 +704,12 @@ fn refuse_doctor_mutation_if_merge_pending(
     ctx: &OutputContext,
 ) {
     let refusal = match inspect_pending_sync_merge_under_authority(db_path, authority) {
-        // Read-only inspection now reads behind a #507 zero-page index through
-        // a private snapshot, so it can succeed while the live index is still
-        // in that state. Generic doctor mutation keeps failing closed there:
-        // the explicit, identity-bound `migrate-schema recover` owns it.
+        // Read-only inspection reads behind a #507 zero-page index (through
+        // the engine for stock SQLite's empty index, else a private snapshot),
+        // so it can succeed while the live index is still in that state. The
+        // first commit would still fail, so generic doctor mutation keeps
+        // failing closed: the explicit, identity-bound `migrate-schema
+        // recover` owns it.
         Ok(None) if DatabaseAdmissionHint::probe(db_path).is_poisoned_wal_index() => {
             let hint = DatabaseAdmissionHint::PoisonedWalIndex;
             let reason = "the derived WAL index is in the initialized-zero-page state (GH #507); \
@@ -2737,13 +2739,25 @@ fn inspect_database_sidecars(db_path: &Path) -> Result<SidecarInspection> {
 
     if shm_kind.is_regular_file()
         && wal_kind.is_regular_file()
+        && crate::franken_sync::wal_index::stock_empty_index_present(db_path).unwrap_or(false)
+    {
+        // Stock SQLite writes this whenever it is the first connection to a
+        // family whose WAL holds no frames (bv, the sqlite3 shell). The engine
+        // reads through it directly (fsqlite GH#431); its first commit does
+        // not, so writing commands still rebuild it first.
+        inspection.informational_findings.push(format!(
+            "SHM WAL index at {} is the empty index stock SQLite leaves after reading the tracker (GH #507 shape); read-only commands read through it, the next ordinary br command rebuilds it, or run `br doctor migrate-schema recover`",
+            PathBuf::from(format!("{}-shm", db_path.to_string_lossy())).display()
+        ));
+    } else if shm_kind.is_regular_file()
+        && wal_kind.is_regular_file()
         && crate::franken_sync::wal_index::poisoned_index_present(db_path).unwrap_or(false)
     {
-        // Stock SQLite writes this shape whenever it is the first connection
-        // to a family whose WAL holds no frames (bv, the sqlite3 shell).
-        // Reads work through a private snapshot; say what rebuilds it.
+        // The #507 zero-page shape the engine does not admit (for example
+        // beside a WAL that holds frames). Reads work through a private
+        // snapshot; say what rebuilds it.
         inspection.informational_findings.push(format!(
-            "SHM WAL index at {} is in the initialized zero-page state (GH #507) that stock SQLite leaves after reading the tracker; read-only commands read a private snapshot, the next ordinary br command rebuilds it, or run `br doctor migrate-schema recover`",
+            "SHM WAL index at {} is in the initialized zero-page state (GH #507); read-only commands read a private snapshot, the next ordinary br command rebuilds it, or run `br doctor migrate-schema recover`",
             PathBuf::from(format!("{}-shm", db_path.to_string_lossy())).display()
         ));
     } else if shm_kind.is_regular_file()

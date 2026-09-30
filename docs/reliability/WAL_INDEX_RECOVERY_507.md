@@ -13,6 +13,17 @@ diagnostics. It did not introduce a new VACUUM implementation. #507 reports an
 interruption in the recommended migration/maintenance workflow; that causal
 engine sequence still requires an interruption reproducer.
 
+Stock SQLite writes the same zero-page header, with a valid checksum, whenever
+it is the first connection to a family whose WAL is only its 32-byte header,
+so every stock reader of the tracker (bv, the sqlite3 shell) leaves it behind.
+FrankenSQLite 0.4.6+ admits that exact shape for reads (fsqlite GH#431,
+`e85717e0a`), so since the 0.4.7 bump read-only commands read the live family
+through it (`stock_empty_index_present` keeps it out of the private-snapshot
+fallback). The first commit through it still fails with `BusyRecovery` on
+0.4.7, so writable startup keeps the index-only recovery for it. The poison
+beside a WAL that holds frames, or without a valid stock checksum, is
+unchanged and takes every path below.
+
 The index contains regenerable state. Committed, unexported records can remain
 in the WAL. Never discard the WAL or rebuild from an older JSONL snapshot to
 work around this admission failure.

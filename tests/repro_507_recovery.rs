@@ -13,7 +13,7 @@
 mod common;
 
 use beads_rust::franken_sync::{Connection, SqliteValue};
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
 use serde_json::Value;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -881,6 +881,26 @@ fn read_only_commands_read_wal_only_rows_behind_a_poisoned_index() {
         "poisoned_read_only_show",
     );
     assert_eq!(show[0]["title"], WAL_ONLY_TITLE);
+    // This poison is not stock SQLite's admitted empty index (its WAL holds
+    // frames), so the read really does go through the private snapshot.
+    let probed = run_br_with_env(
+        &workspace,
+        [
+            "list",
+            "--all",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        [("RUST_LOG", "error,br::read_snapshot=info")],
+        "poisoned_read_only_snapshot_probe",
+    );
+    assert!(probed.status.success(), "{}", probed.stderr);
+    assert!(
+        probed.stderr.contains("reading a private snapshot"),
+        "{}",
+        probed.stderr
+    );
     assert_eq!(protected_payload(&workspace), before);
     assert_eq!(
         fs::read(workspace.root.join(".beads/beads.db-shm")).unwrap(),

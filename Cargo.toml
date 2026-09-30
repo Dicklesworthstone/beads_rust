@@ -48,7 +48,7 @@ clap_complete = { version = "4.6.11", features = ["unstable-dynamic"] }
 # depends on fsqlite-ext-json internally, but the 0.3.9+ extension enables
 # only serde_json's `preserve_order`; the old viral `arbitrary_precision`
 # feature no longer affects br's JSON/TOON serializers.
-fsqlite = { version = "0.4.4", default-features = false, features = [
+fsqlite = { version = "0.4.7", default-features = false, features = [
     "native",
     "linux-asupersync-uring",
     "fts5",
@@ -56,20 +56,20 @@ fsqlite = { version = "0.4.4", default-features = false, features = [
     "icu",
     "misc",
 ] }
-fsqlite-types = "0.4.4"
-fsqlite-error = "0.4.4"
-fsqlite-core = "0.4.4"
-fsqlite-func = "0.4.4"
-fsqlite-vdbe = "0.4.4"
-fsqlite-vfs = "0.4.4"
-fsqlite-pager = "0.4.4"
-fsqlite-parser = "0.4.4"
-fsqlite-planner = "0.4.4"
-fsqlite-wal = "0.4.4"
-fsqlite-btree = "0.4.4"
-fsqlite-ast = "0.4.4"
-fsqlite-mvcc = "0.4.4"
-fsqlite-observability = "0.4.4"
+fsqlite-types = "0.4.7"
+fsqlite-error = "0.4.7"
+fsqlite-core = "0.4.7"
+fsqlite-func = "0.4.7"
+fsqlite-vdbe = "0.4.7"
+fsqlite-vfs = "0.4.7"
+fsqlite-pager = "0.4.7"
+fsqlite-parser = "0.4.7"
+fsqlite-planner = "0.4.7"
+fsqlite-wal = "0.4.7"
+fsqlite-btree = "0.4.7"
+fsqlite-ast = "0.4.7"
+fsqlite-mvcc = "0.4.7"
+fsqlite-observability = "0.4.7"
 
 # Current-thread runtime that drives fsqlite 0.4's async (!Send) futures to
 # completion behind the synchronous `franken_sync::Connection` bridge.

@@ -119,6 +119,28 @@ this repo): commits `55c186682` + `5946b3b7c` in
   other databases, and schema-migration runs (used by `undo`) are never
   removed.
 
+### FrankenSQLite 0.4.7; reads after a SQLite reader no longer copy the database
+
+- The engine moves from FrankenSQLite 0.4.4 to 0.4.7 (every fsqlite crate).
+  0.4.7 fixes silent index corruption after a single large multi-row
+  `INSERT ... VALUES` (hfdt-dlkam3) and a race where a schema change beside
+  concurrent writers left rows out of a new index (bd-4iaoi); 0.4.6 fixed a
+  page referenced twice across a WAL generation (bd-b5vmw).
+- 0.4.6+ reads through the empty WAL index stock SQLite writes when it is the
+  first connection to a tracker whose WAL holds no frames (fsqlite GH#431),
+  which is what bv or the `sqlite3` shell leave after every read. Read-only
+  commands (`--no-auto-import --no-auto-flush`, what bv generates) now read
+  the live database there instead of copying the whole family to a private
+  snapshot on every call. The first commit through that index still fails in
+  0.4.7, so the next writing command still rebuilds it with the index-only
+  recovery above. The #507 index beside a WAL that holds frames, and the stale
+  indexes br 0.6.0 left, still read through a private snapshot.
+- The `.br-wal-index-*` directories that each such rebuild leaves beside the
+  database (the index it set aside, about 32 KiB) now follow the recovery-run
+  rule: after a successful recovery, finished ones outside the newest five and
+  older than seven days are removed. A quarantine that failed, never finished,
+  belongs to another database or does not match its own receipt is kept.
+
 ### "database is busy (recovery in progress)" names its fix
 
 - Since 0.7.3, read-only commands read around the WAL indexes SQLite readers

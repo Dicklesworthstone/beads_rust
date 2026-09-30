@@ -824,7 +824,60 @@ fn recover_engine_admission(
             "could not prune old WAL-index recovery runs; they are kept"
         ),
     }
+    // The same rule for the `.br-wal-index-*` directories each quarantine of
+    // a poisoned index leaves beside the database.
+    match recovery_failure_receipts(&migration.beads_dir).and_then(|failures| {
+        crate::franken_sync::wal_index::prune_quarantined_indexes(
+            &migration.db_path,
+            RECOVERY_RUNS_KEPT,
+            std::time::Duration::from_secs(
+                u64::try_from(RECOVERY_RUN_MIN_AGE_DAYS).unwrap_or(7) * 24 * 60 * 60,
+            ),
+            std::time::SystemTime::now(),
+            &failures,
+        )
+        .map_err(BeadsError::Io)
+    }) {
+        Ok(pruned) if !pruned.is_empty() => tracing::info!(
+            pruned = pruned.len(),
+            kept_recent = RECOVERY_RUNS_KEPT,
+            "pruned completed WAL-index quarantines past the retention window"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            "could not prune old WAL-index quarantines; they are kept"
+        ),
+    }
     Ok(receipt)
+}
+
+/// The text of every `recovery-failed.json` under the recovery runs root. A
+/// failed quarantine's error names the directory it retained, which keeps
+/// that directory out of [`prune_quarantined_indexes`]'s reach.
+///
+/// [`prune_quarantined_indexes`]: crate::franken_sync::wal_index::prune_quarantined_indexes
+fn recovery_failure_receipts(beads_dir: &Path) -> Result<Vec<String>> {
+    let root = migration_runs_root(beads_dir);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(BeadsError::Io(error)),
+    };
+    let mut receipts = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(BeadsError::Io)?;
+        match fs::read(entry.path().join("recovery-failed.json")) {
+            Ok(bytes) => receipts.push(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => return Err(BeadsError::Io(error)),
+        }
+    }
+    Ok(receipts)
 }
 
 /// How many of a database's newest WAL-index recovery runs are always kept.
@@ -5355,6 +5408,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let db = temp.path().join("beads.db");
         crate::franken_sync::wal_index::tests::write_stock_header_only_family(&db);
+        // Only reads go through stock SQLite's empty index on FrankenSQLite
+        // 0.4.7 (GH#431); the first commit still needs it rebuilt.
         assert!(wal_index_needs_recovery_for_engine(&db, true).unwrap());
         assert!(!wal_index_needs_recovery_for_engine(&db, false).unwrap());
         assert_eq!(
@@ -6369,7 +6424,22 @@ mod tests {
             let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
             conn.execute(&declaration(before)).unwrap();
             close_connection(conn).unwrap();
-            let plan_before = build_plan(&migration.db_path).unwrap();
+            let plan_before = match build_plan(&migration.db_path) {
+                Ok(plan) => plan,
+                // FrankenSQLite 0.4.6+ evaluates CHECK expressions in
+                // `integrity_check` without SQLite's double-quoted-string
+                // fallback, so an unresolvable "ALLOWED" is reported as a
+                // missing column where stock SQLite says ok. Planning then
+                // refuses, which already keeps a stale plan from authorizing
+                // anything.
+                Err(error)
+                    if before.contains("\"ALLOWED\"")
+                        && error.to_string().contains("no such column: ALLOWED") =>
+                {
+                    continue;
+                }
+                Err(error) => panic!("plan for {before}: {error}"),
+            };
             let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
             conn.execute("DROP TABLE operator_constraint").unwrap();
             conn.execute(&declaration(changed)).unwrap();

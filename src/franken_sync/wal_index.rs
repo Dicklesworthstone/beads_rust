@@ -221,6 +221,68 @@ pub fn poisoned_index_present_for_engine(
     probe_for_engine(path, engine_reads_on_disk_index)
 }
 
+/// Whether `shm` is stock SQLite's initialized, unindexed empty WAL index:
+/// the header stock writes when it is the first connection to a family whose
+/// WAL holds no frames (bv, the sqlite3 shell). It has #507's zero-page shape,
+/// but a supported version, a valid native-order checksum, and no frame count.
+fn unindexed_empty_headers(wal: &[u8; 32], shm: &[u8; 96]) -> bool {
+    let native_big_endian = cfg!(target_endian = "big");
+    let native = |bytes: &[u8]| u32::from_ne_bytes(bytes.try_into().expect("u32 field"));
+    poisoned_headers(wal, shm)
+        && native(&shm[..4]) == 3_007_000
+        && shm[13] <= 1
+        && checksum(&shm[..40], [0, 0], native_big_endian)
+            == [native(&shm[40..44]), native(&shm[44..48])]
+}
+
+fn stock_empty_probe(path: &Path, engine_reads_on_disk_index: bool) -> io::Result<bool> {
+    if !engine_reads_on_disk_index {
+        return Ok(false);
+    }
+    let wal_path = sidecar(path, "-wal");
+    // Only a bare header: any frame (or partial frame) makes the empty index
+    // stale, and the engine then still requires recovery.
+    match fs::symlink_metadata(&wal_path) {
+        Ok(metadata) if metadata.file_type().is_file() && metadata.len() == 32 => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    let Some(wal) = prefix::<32>(&wal_path)? else {
+        return Ok(false);
+    };
+    let Some(shm) = prefix::<96>(&sidecar(path, "-shm"))? else {
+        return Ok(false);
+    };
+    Ok(unindexed_empty_headers(&wal, &shm))
+}
+
+/// Whether the index beside `path` is stock SQLite's unindexed empty index
+/// beside a header-only WAL: #507's shape as every stock reader of the
+/// tracker (bv, the sqlite3 shell) leaves it. FrankenSQLite 0.4.6+ admits it
+/// for reads (fsqlite GH#431), so read-only commands read the live family
+/// instead of a private snapshot. The first commit through that index still
+/// fails with `BusyRecovery` on 0.4.7, so writable startup keeps rebuilding
+/// it ([`poisoned_index_present`] matches it too).
+///
+/// # Errors
+/// Returns an error when a family member exists but cannot be read.
+pub fn stock_empty_index_present(path: &Path) -> io::Result<bool> {
+    stock_empty_probe(path, ENGINE_READS_ON_DISK_WAL_INDEX)
+}
+
+/// [`stock_empty_index_present`] for an engine that does (or does not) read
+/// the on-disk index, so both platform behaviors are testable.
+///
+/// # Errors
+/// Returns an error when a family member exists but cannot be read.
+pub fn stock_empty_index_present_for_engine(
+    path: &Path,
+    engine_reads_on_disk_index: bool,
+) -> io::Result<bool> {
+    stock_empty_probe(path, engine_reads_on_disk_index)
+}
+
 /// Whether a settled `-shm` index can never admit a reader of this WAL: it
 /// was never initialized, or it describes another WAL generation or more
 /// frames than the WAL holds. The engine answers every one of these with
@@ -505,11 +567,14 @@ pub(super) fn quarantine_poisoned_index(
             "wal_sha256": &wal_hash,
             "shm_sha256": &shm_hash,
             "retained_index": destination.display().to_string(),
+            // Announces that a finished quarantine writes this marker, so
+            // retention never mistakes an unmarked one for a legacy success.
+            "completion_marker": QUARANTINE_COMPLETE,
         });
         let mut marker = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(retained.join("prepared.json"))?;
+            .open(retained.join(QUARANTINE_PREPARED))?;
         marker.write_all(
             serde_json::to_string_pretty(&receipt)
                 .map_err(io::Error::other)?
@@ -582,12 +647,223 @@ pub(super) fn quarantine_poisoned_index(
             "WAL-index quarantine did not complete: {error}; {disposition}"
         )));
     }
+    // Retention marker only: without it the directory is simply kept, so a
+    // failure to write it must not turn a verified quarantine into an error.
+    if let Err(error) = write_quarantine_complete(&retained, &destination) {
+        tracing::warn!(
+            retained = %retained.display(),
+            %error,
+            "could not mark the quarantined WAL index complete; it is kept indefinitely"
+        );
+    }
     tracing::warn!(
         database = %path.display(),
         retained = %retained.display(),
         "quarantined poisoned WAL index; main database and WAL preserved byte-for-byte"
     );
     Ok(true)
+}
+
+/// Prefix of the directory each quarantine retains beside the database.
+const QUARANTINE_PREFIX: &str = ".br-wal-index-";
+/// A quarantine directory renamed aside for removal; swept on the next prune.
+const QUARANTINE_PRUNING_PREFIX: &str = ".br-pruning-wal-index-";
+/// Written once a quarantine completed and its payload was verified.
+const QUARANTINE_COMPLETE: &str = "quarantine-complete.json";
+const QUARANTINE_PREPARED: &str = "prepared.json";
+const QUARANTINED_INDEX: &str = "poisoned-shm";
+
+fn write_quarantine_complete(retained: &Path, destination: &Path) -> io::Result<()> {
+    let receipt = serde_json::json!({
+        "schema_version": "br.wal_index.quarantine.v1",
+        "stage": "complete",
+        "retained_index": destination.display().to_string(),
+    });
+    let mut marker = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(retained.join(QUARANTINE_COMPLETE))?;
+    marker.write_all(
+        serde_json::to_string_pretty(&receipt)
+            .map_err(io::Error::other)?
+            .as_bytes(),
+    )?;
+    marker.sync_all()?;
+    sync_directory(retained)
+}
+
+/// Classify a `.br-wal-index-*` directory: `None` unless its receipt names
+/// the database at `database_path` (another database's, or an unreadable
+/// receipt, is neither counted nor removed); otherwise whether it is a
+/// finished quarantine that may be removed once old enough.
+///
+/// Finished means `quarantine-complete.json` is present, or, for directories
+/// br 0.7.3 and earlier wrote (their receipt names no `completion_marker`),
+/// that the directory holds
+/// exactly its receipt and the retained index, the index hashes to what the
+/// receipt recorded, and no recovery failure receipt names the directory.
+/// A partial or failed quarantine is evidence and is kept.
+fn quarantine_status(
+    dir: &Path,
+    database_path: &str,
+    failure_receipts: &[String],
+) -> io::Result<Option<bool>> {
+    let receipt = match fs::read(dir.join(QUARANTINE_PREPARED)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Ok(receipt) = serde_json::from_slice::<serde_json::Value>(&receipt) else {
+        return Ok(None);
+    };
+    if receipt
+        .get("database_path")
+        .and_then(serde_json::Value::as_str)
+        != Some(database_path)
+    {
+        return Ok(None);
+    }
+    Ok(Some(quarantine_is_finished(
+        dir,
+        &receipt,
+        failure_receipts,
+    )?))
+}
+
+fn quarantine_is_finished(
+    dir: &Path,
+    receipt: &serde_json::Value,
+    failure_receipts: &[String],
+) -> io::Result<bool> {
+    if fs::symlink_metadata(dir.join(QUARANTINE_COMPLETE)).is_ok_and(|meta| meta.is_file()) {
+        return Ok(true);
+    }
+    // A quarantine that announced the marker but never wrote it was
+    // interrupted or failed.
+    if receipt.get("completion_marker").is_some() {
+        return Ok(false);
+    }
+    let mut names = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        names.push(entry?.file_name());
+    }
+    names.sort();
+    // Sorted: "poisoned-shm" < "prepared.json".
+    if names != [QUARANTINED_INDEX, QUARANTINE_PREPARED] {
+        return Ok(false);
+    }
+    let index = dir.join(QUARANTINED_INDEX);
+    if !fs::symlink_metadata(&index)?.is_file() {
+        return Ok(false);
+    }
+    let Some(expected) = receipt
+        .get("shm_sha256")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(false);
+    };
+    if hash_file(&mut File::open(&index)?)? != expected {
+        return Ok(false);
+    }
+    let name = dir.file_name().unwrap_or_default().to_string_lossy();
+    Ok(!failure_receipts
+        .iter()
+        .any(|receipt| receipt.contains(name.as_ref())))
+}
+
+/// Remove this database's finished WAL-index quarantine directories
+/// (`.br-wal-index-*` beside it) that are both outside the newest `keep` and
+/// older than `min_age`, by the time their receipt was written. Failed,
+/// partial and foreign directories are never removed (see
+/// [`quarantine_status`]); `failure_receipts` holds the text of every
+/// recovery failure receipt, which names the directory a failed quarantine
+/// retained. Returns the removed directories.
+///
+/// # Errors
+/// Returns an error when the database directory cannot be read.
+pub fn prune_quarantined_indexes(
+    db_path: &Path,
+    keep: usize,
+    min_age: std::time::Duration,
+    now: std::time::SystemTime,
+    failure_receipts: &[String],
+) -> io::Result<Vec<PathBuf>> {
+    let parent = db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent)?;
+    let database_path = parent
+        .join(
+            db_path
+                .file_name()
+                .ok_or_else(|| invalid("missing database filename"))?,
+        )
+        .display()
+        .to_string();
+    let mut quarantines = Vec::new();
+    let mut doomed = Vec::new();
+    for entry in fs::read_dir(&parent)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(QUARANTINE_PRUNING_PREFIX) {
+            doomed.push(entry.path());
+            continue;
+        }
+        if !name.starts_with(QUARANTINE_PREFIX) {
+            continue;
+        }
+        let path = entry.path();
+        // A directory without a readable receipt counts toward nothing and
+        // stays (for example a quarantine still being prepared).
+        let Ok(receipt) = fs::symlink_metadata(path.join(QUARANTINE_PREPARED)) else {
+            continue;
+        };
+        let Ok(written) = receipt.modified() else {
+            continue;
+        };
+        if !receipt.is_file() {
+            continue;
+        }
+        let Some(finished) = quarantine_status(&path, &database_path, failure_receipts)? else {
+            continue;
+        };
+        quarantines.push((written, path, finished));
+    }
+    // Newest first; ties broken by name so the order is total.
+    quarantines.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    let mut pruned = Vec::new();
+    for (written, path, finished) in quarantines.into_iter().skip(keep) {
+        let old_enough = now.duration_since(written).is_ok_and(|age| age >= min_age);
+        if !finished || !old_enough {
+            continue;
+        }
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let mut aside = std::ffi::OsString::from(QUARANTINE_PRUNING_PREFIX);
+        aside.push(name.to_string_lossy().trim_start_matches(QUARANTINE_PREFIX));
+        let aside = parent.join(aside);
+        if let Err(error) = fs::rename(&path, &aside) {
+            tracing::warn!(dir = %path.display(), %error, "could not set aside old WAL-index quarantine");
+            continue;
+        }
+        doomed.push(aside);
+        pruned.push(path);
+    }
+    if !doomed.is_empty() {
+        sync_directory(&parent)?;
+    }
+    for dir in doomed {
+        if let Err(error) = fs::remove_dir_all(&dir) {
+            tracing::warn!(dir = %dir.display(), %error, "could not remove old WAL-index quarantine");
+        }
+    }
+    Ok(pruned)
 }
 
 #[cfg(test)]
@@ -688,6 +964,161 @@ pub mod tests {
         }
     }
 
+    /// Stock SQLite's unindexed empty index: #507's shape under a valid
+    /// native-order header checksum (sqlite3 `walIndexWriteHdr`), computed
+    /// for this host's byte order.
+    fn stock_empty_index() -> [u8; 96] {
+        let mut header: [u8; 48] = poison()[..48].try_into().unwrap();
+        header[13] = u8::from(cfg!(target_endian = "big"));
+        let sum = checksum(&header[..40], [0, 0], cfg!(target_endian = "big"));
+        header[40..44].copy_from_slice(&sum[0].to_ne_bytes());
+        header[44..48].copy_from_slice(&sum[1].to_ne_bytes());
+        let mut shm = [0; 96];
+        shm[..48].copy_from_slice(&header);
+        shm[48..].copy_from_slice(&header);
+        shm
+    }
+
+    #[test]
+    fn stock_empty_index_is_recognized_only_beside_a_header_only_wal() {
+        if cfg!(target_endian = "little") {
+            // Byte for byte what stock SQLite 3.51 wrote on a little-endian host.
+            assert_eq!(stock_empty_index(), stock_sqlite_header_only_index());
+        }
+        let (_temp, db, _) = fixture();
+        // #507's poison fixture carries no checksum: still poison, not admitted.
+        assert!(poisoned_index_present_for_engine(&db, true).unwrap());
+        assert!(!stock_empty_index_present_for_engine(&db, true).unwrap());
+
+        fs::write(sidecar(&db, "-shm"), stock_empty_index()).unwrap();
+        assert!(poisoned_index_present_for_engine(&db, true).unwrap());
+        assert!(stock_empty_index_present_for_engine(&db, true).unwrap());
+        // Where the engine keeps its index in memory, nothing is classified.
+        assert!(!stock_empty_index_present_for_engine(&db, false).unwrap());
+
+        for (offset, label) in [(0, "version"), (40, "checksum"), (48, "torn copy")] {
+            let mut changed = stock_empty_index();
+            changed[offset] ^= 1;
+            if offset != 48 {
+                changed[offset + 48] ^= 1;
+            }
+            fs::write(sidecar(&db, "-shm"), changed).unwrap();
+            assert!(
+                !stock_empty_index_present_for_engine(&db, true).unwrap(),
+                "{label}"
+            );
+        }
+
+        // Any WAL byte past the header (a frame, or part of one) makes the
+        // empty index stale; the engine then still requires recovery.
+        fs::write(sidecar(&db, "-shm"), stock_empty_index()).unwrap();
+        let mut wal = wal_header(4096, false).to_vec();
+        wal.push(0);
+        fs::write(sidecar(&db, "-wal"), &wal).unwrap();
+        assert!(poisoned_index_present_for_engine(&db, true).unwrap());
+        assert!(!stock_empty_index_present_for_engine(&db, true).unwrap());
+        fs::remove_file(sidecar(&db, "-wal")).unwrap();
+        assert!(!stock_empty_index_present_for_engine(&db, true).unwrap());
+    }
+
+    #[test]
+    fn prune_keeps_recent_failed_foreign_and_unproven_quarantines() {
+        const DAY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("beads.db");
+        let database_path = fs::canonicalize(temp.path())
+            .unwrap()
+            .join("beads.db")
+            .display()
+            .to_string();
+        let now = std::time::SystemTime::now();
+        let index = [7_u8; 96];
+        let index_sha = hash_file(&mut {
+            let path = temp.path().join("index-for-hash");
+            fs::write(&path, index).unwrap();
+            File::open(&path).unwrap()
+        })
+        .unwrap();
+        // (name, database, announces marker, writes marker, index bytes, extra file, age)
+        let make = |name: &str,
+                    database: &str,
+                    announced: bool,
+                    complete: bool,
+                    shm: &[u8],
+                    extra: bool,
+                    age_days: u32| {
+            let dir = temp.path().join(format!("{QUARANTINE_PREFIX}{name}"));
+            fs::create_dir(&dir).unwrap();
+            let mut receipt = serde_json::json!({
+                "schema_version": "br.wal_index.quarantine.v1",
+                "database_path": database,
+                "shm_sha256": &index_sha,
+            });
+            if announced {
+                receipt["completion_marker"] = QUARANTINE_COMPLETE.into();
+            }
+            fs::write(dir.join(QUARANTINED_INDEX), shm).unwrap();
+            if complete {
+                fs::write(dir.join(QUARANTINE_COMPLETE), "{}").unwrap();
+            }
+            if extra {
+                fs::write(dir.join("stray"), "").unwrap();
+            }
+            let prepared = dir.join(QUARANTINE_PREPARED);
+            fs::write(&prepared, receipt.to_string()).unwrap();
+            File::options()
+                .write(true)
+                .open(&prepared)
+                .unwrap()
+                .set_modified(now - DAY * age_days)
+                .unwrap();
+        };
+        make("a", &database_path, true, true, &index, false, 1);
+        make("b", &database_path, true, true, &index, false, 8);
+        make("c", &database_path, true, true, &index, false, 9);
+        make("d", &database_path, true, false, &index, false, 10);
+        make("e", &database_path, false, false, &index, false, 11);
+        make("f", &database_path, false, false, &[8; 96], false, 12);
+        make("g", &database_path, false, false, &index, false, 13);
+        make("h", "/elsewhere/beads.db", true, true, &index, false, 20);
+        make("i", &database_path, false, false, &index, true, 14);
+        fs::create_dir(temp.path().join(format!("{QUARANTINE_PREFIX}j"))).unwrap();
+        let leftover = temp.path().join(format!("{QUARANTINE_PRUNING_PREFIX}k"));
+        fs::create_dir(&leftover).unwrap();
+        let failures = [format!(
+            "{{\"error\":\"WAL-index quarantine did not complete: x; evidence retained at {}\"}}",
+            temp.path().join(format!("{QUARANTINE_PREFIX}g")).display()
+        )];
+
+        let mut pruned = prune_quarantined_indexes(&db, 2, DAY * 7, now, &failures).unwrap();
+        pruned.sort();
+        let named = |name: &str| {
+            fs::canonicalize(temp.path())
+                .unwrap()
+                .join(format!("{QUARANTINE_PREFIX}{name}"))
+        };
+        // a and b are the newest two; c (marked) and e (proven legacy) go;
+        // d (never marked), f (index changed), g (named by a failure), i
+        // (unexpected contents), h (another database) and j (no receipt) stay.
+        assert_eq!(pruned, [named("c"), named("e")]);
+        for name in ["a", "b", "d", "f", "g", "h", "i", "j"] {
+            assert!(named(name).is_dir(), "{name} must be kept");
+        }
+        assert!(!named("c").exists() && !named("e").exists());
+        assert!(!leftover.exists(), "an interrupted prune is swept");
+        assert!(
+            prune_quarantined_indexes(&db, 2, DAY * 7, now, &failures)
+                .unwrap()
+                .is_empty()
+        );
+        // Young finished quarantines are kept no matter how many there are.
+        assert!(
+            prune_quarantined_indexes(&db, 0, DAY * 30, now, &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn healthy_salts_and_64k_encoding_are_not_poison() {
         for size in [512_u32, 4096, 65_536] {
@@ -751,12 +1182,13 @@ pub mod tests {
     }
 
     /// The engine's reaction to the index stock SQLite writes beside a
-    /// header-only WAL, on a real database. A read-write open rebuilds it and
-    /// reads the data; read-only admission reports `BusyRecovery` on fsqlite
-    /// 0.4.4 (Dicklesworthstone/frankensqlite#431), which is why startup
-    /// carries its own detector and quarantine for this shape. When the
-    /// engine starts accepting it read-only, this test still passes and the
-    /// recovery path becomes removable.
+    /// header-only WAL, on a real database. fsqlite 0.4.4 refused it
+    /// read-only with `BusyRecovery`; 0.4.6+ admits it for reads
+    /// (Dicklesworthstone/frankensqlite#431), so read-only commands no longer
+    /// copy the family. On 0.4.7 the first commit through it still fails
+    /// with `BusyRecovery`, which is why writable startup keeps rebuilding
+    /// it. When the engine starts accepting that commit, this test still
+    /// passes and the startup recovery for this shape becomes removable.
     #[cfg(unix)]
     #[test]
     fn engine_reaction_to_stock_header_only_index() {
@@ -770,7 +1202,12 @@ pub mod tests {
         conn.close().unwrap();
         let install_stock_family = || {
             fs::write(sidecar(&db, "-wal"), wal_header(4096, false)).unwrap();
-            fs::write(sidecar(&db, "-shm"), stock_sqlite_header_only_index()).unwrap();
+            // A full 32 KiB region as stock leaves it: the header copies,
+            // then reader mark 0 at zero and marks 1..=4 unused.
+            let mut shm = vec![0_u8; 32 * 1024];
+            shm[..96].copy_from_slice(&stock_sqlite_header_only_index());
+            shm[104..120].fill(0xFF);
+            fs::write(sidecar(&db, "-shm"), shm).unwrap();
         };
         let count = |conn: &crate::franken_sync::Connection| {
             conn.query_row("SELECT count(*) FROM t")
@@ -778,22 +1215,35 @@ pub mod tests {
         };
 
         install_stock_family();
-        match crate::franken_sync::compat::open_with_flags(
+        if cfg!(target_endian = "little") {
+            assert!(stock_empty_index_present(&db).unwrap());
+        }
+        let read_only = crate::franken_sync::compat::open_with_flags(
             &path,
             crate::franken_sync::compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
-        .and_then(|conn| count(&conn))
-        {
-            Ok(rows) => assert_eq!(rows, Some(1)),
-            Err(error) => assert!(
-                matches!(error, FrankenError::BusyRecovery),
-                "read-only admission failed other than BusyRecovery: {error:?}"
-            ),
-        }
+        .unwrap();
+        assert_eq!(count(&read_only).unwrap(), Some(1));
+        read_only.close().unwrap();
 
+        // A writable open reads through it too; its first commit either
+        // lands (a future engine) or is refused as recovery, never lost.
         install_stock_family();
-        let conn = crate::franken_sync::Connection::open(path).unwrap();
+        let conn = crate::franken_sync::Connection::open(path.clone()).unwrap();
         assert_eq!(count(&conn).unwrap(), Some(1));
+        let expected = match conn.execute("INSERT INTO t VALUES (2)") {
+            Ok(_) => Some(2),
+            Err(FrankenError::BusyRecovery) => Some(1),
+            Err(error) => panic!("commit through the stock index failed otherwise: {error:?}"),
+        };
+        let _ = conn.close();
+        let read_only = crate::franken_sync::compat::open_with_flags(
+            &path,
+            crate::franken_sync::compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        assert_eq!(count(&read_only).unwrap(), expected);
+        read_only.close().unwrap();
     }
 
     #[test]
@@ -1104,6 +1554,8 @@ pub mod tests {
         let receipt: serde_json::Value =
             serde_json::from_slice(&fs::read(retained.join("prepared.json")).unwrap()).unwrap();
         assert_eq!(receipt["schema_version"], "br.wal_index.quarantine.v1");
+        assert_eq!(receipt["completion_marker"], QUARANTINE_COMPLETE);
+        assert!(retained.join(QUARANTINE_COMPLETE).is_file());
         // Crash after quarantine is restartable: no second quarantine is needed.
         assert!(!quarantine_poisoned_index(db.to_str().unwrap(), id).unwrap());
     }

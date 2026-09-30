@@ -23,7 +23,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -281,12 +281,29 @@ fn read_only_commands_work_after_a_stock_sqlite_reader() {
     ];
     for (index, args) in invocations.iter().enumerate() {
         let label = format!("stock_sqlite_read_only_{index}");
-        let run = run_br(&workspace, args.iter().copied(), &label);
+        // Doctor reports a caller's verbose RUST_LOG as a finding of its own,
+        // so only the data commands carry the snapshot probe.
+        let run = if index == 4 {
+            run_br(&workspace, args.iter().copied(), &label)
+        } else {
+            run_br_with_env(
+                &workspace,
+                args.iter().copied(),
+                [("RUST_LOG", SNAPSHOT_PROBE_LOG)],
+                &label,
+            )
+        };
         let output = format!("{}{}", run.stdout, run.stderr);
         assert!(run.status.success(), "{label} {args:?}: {output}");
         assert!(
             !output.contains("recovery in progress"),
             "{label}: {output}"
+        );
+        // FrankenSQLite 0.4.6+ admits stock SQLite's empty index (fsqlite
+        // GH#431): the engine reads the live family, with no private copy.
+        assert!(
+            !output.contains(SNAPSHOT_MARKER),
+            "{label}: the engine must read the family directly: {output}"
         );
         assert!(
             output.contains(KEPT_TITLE) || index == 4,
@@ -299,10 +316,31 @@ fn read_only_commands_work_after_a_stock_sqlite_reader() {
         );
     }
     assert_eq!(migration_run_count(&workspace), 0);
+    assert_eq!(wal_index_quarantine_count(&workspace), 0);
+}
+
+/// `RUST_LOG` that surfaces only the private-snapshot event.
+const SNAPSHOT_PROBE_LOG: &str = "error,br::read_snapshot=info";
+/// The event a read-only open logs when it copies the family to a snapshot.
+const SNAPSHOT_MARKER: &str = "reading a private snapshot";
+
+fn wal_index_quarantine_count(workspace: &BrWorkspace) -> usize {
+    fs::read_dir(workspace.root.join(".beads"))
+        .expect(".beads")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".br-wal-index-")
+        })
+        .count()
 }
 
 /// An ordinary command still rebuilds the stock SQLite index in place, after
-/// which reads take the engine's own path again.
+/// which reads take the engine's own path again. FrankenSQLite 0.4.7 reads
+/// through that index but refuses the first commit through it, so writes keep
+/// this index-only recovery.
 #[test]
 fn ordinary_command_rebuilds_a_stock_sqlite_index() {
     let workspace = settled_workspace();
@@ -384,6 +422,26 @@ fn ordinary_command_rebuilds_a_stock_sqlite_index() {
             .any(|title| title == "after the SQLite reader"),
         "{titles:?}"
     );
+
+    // Each rebuild set the live index aside once, and marked it finished so
+    // retention can remove it once it is old enough.
+    let quarantines: Vec<PathBuf> = fs::read_dir(workspace.root.join(".beads"))
+        .expect(".beads")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".br-wal-index-"))
+        })
+        .collect();
+    assert_eq!(quarantines.len(), 2, "{quarantines:?}");
+    for quarantine in &quarantines {
+        assert!(
+            quarantine.join("quarantine-complete.json").is_file(),
+            "{}",
+            quarantine.display()
+        );
+    }
 }
 
 /// Index damage outside the shapes read-only commands read around (#507,
