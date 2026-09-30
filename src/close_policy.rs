@@ -195,6 +195,22 @@ pub struct Workflow {
     /// are accepted. Matching is exact and case-insensitive.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub class_transitions: Vec<ClassTransition>,
+    /// Additive create-time entry routes (GitHub #503). A route can admit a
+    /// non-default initial status only when the prospective issue carries the
+    /// configured label AND at least one parent/dependency resolves to an
+    /// existing issue. Global `transitions.initial` remains authoritative for
+    /// ordinary creates; these rules are narrow provenance-backed exceptions.
+    ///
+    /// ```yaml
+    /// entry_routes:
+    ///   - {label: bug, to: open}
+    ///   - {label: follow-up, to: in_planning}
+    /// ```
+    ///
+    /// Status and label matching are case-insensitive. No hardcoded status
+    /// names are implied by this feature.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry_routes: Vec<EntryRoute>,
     /// Per-transition gate rules (issue #312, layer 2). A map of
     /// `"from -> to"` (the transition the gates guard) to the set of gate
     /// conditions required before that move is allowed.
@@ -265,6 +281,20 @@ pub struct ClassTransition {
     /// Exact existing status; reserved global sources and wildcards are forbidden.
     pub from: String,
     /// Exact target status, still subject to ordinary status and transition gates.
+    pub to: String,
+}
+
+/// One provenance-backed exception to the global initial-status rule (GH #503).
+///
+/// The relation requirement is intentionally not configurable: an entry route
+/// exists specifically to let triage/follow-up work skip entry ceremony only
+/// when the new issue remains anchored to existing tracked work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntryRoute {
+    /// Prospective label required on the new issue.
+    pub label: String,
+    /// Initial status this label may enter when an existing relation is present.
     pub to: String,
 }
 
@@ -1647,6 +1677,66 @@ impl Workflow {
         self.strict && !self.transitions.is_empty()
     }
 
+    /// Whether a create may use a provenance-backed exception to the global
+    /// `initial` transition rule (GitHub #503).
+    ///
+    /// A matching label by itself is never enough: the caller must already
+    /// have proved that at least one requested parent/dependency resolves to an
+    /// existing issue. This keeps the exception auditable and prevents a label
+    /// typo from silently widening initial admission.
+    #[must_use]
+    pub fn allows_entry_route(
+        &self,
+        to: &str,
+        labels: &[String],
+        has_existing_relation: bool,
+    ) -> bool {
+        has_existing_relation
+            && self.entry_routes.iter().any(|route| {
+                route.to.eq_ignore_ascii_case(to)
+                    && labels
+                        .iter()
+                        .any(|label| label.eq_ignore_ascii_case(&route.label))
+            })
+    }
+
+    /// Validate provenance-backed create entry routes at policy-load time.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty/control-bearing labels or targets, duplicate
+    /// case-insensitive label/target pairs, and targets outside a configured
+    /// strict status vocabulary.
+    pub fn validate_entry_routes(&self) -> Result<()> {
+        let invalid = |reason| BeadsError::validation("workflow.entry_routes", reason);
+        let mut seen = std::collections::HashSet::new();
+        for (index, route) in self.entry_routes.iter().enumerate() {
+            for (field, value) in [("label", route.label.as_str()), ("to", route.to.as_str())] {
+                if value.is_empty()
+                    || value.trim() != value
+                    || value.chars().any(char::is_control)
+                {
+                    return Err(invalid(format!(
+                        "rule {index} {field} must be a non-empty literal without outer whitespace or control characters"
+                    )));
+                }
+            }
+            if self.is_enforced() && !self.allows(&route.to) {
+                return Err(invalid(format!(
+                    "rule {index} target '{}' is not declared in workflow.statuses",
+                    route.to
+                )));
+            }
+            let key = (route.label.to_lowercase(), route.to.to_lowercase());
+            if !seen.insert(key) {
+                return Err(invalid(format!(
+                    "rule {index} duplicates the same label/target pair case-insensitively"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Validate opt-in class edges without changing the global workflow graph.
     ///
     /// # Errors
@@ -2842,6 +2932,7 @@ pub fn load_for_beads_dir(beads_dir: &Path) -> Result<PolicyDocument> {
     document.workflow.validate_capacity()?;
     document.workflow.validate_required_fields()?;
     document.workflow.validate_class_transitions()?;
+    document.workflow.validate_entry_routes()?;
 
     // Re-parse the raw YAML into a free-form value tree so we can diff it
     // against the typed schema and surface unknown fields without failing
@@ -2994,6 +3085,7 @@ impl PolicyNode {
                 ("statuses", Self::Scalar),
                 ("transitions", Self::Scalar),
                 ("class_transitions", Self::Scalar),
+                ("entry_routes", Self::Scalar),
                 // `GateRule` and `ConditionalGate` are `serde(default)` without
                 // `deny_unknown_fields`, so a misspelled `require_all` /
                 // `require_if` / `label` / `priority` / `gate` parses fine and
@@ -3113,6 +3205,47 @@ mod tests {
             workflow.ready_status_group(),
             vec!["open".to_string(), "rework".to_string()]
         );
+    }
+
+    #[test]
+    fn entry_routes_require_relation_and_match_label_and_target() {
+        let raw = r#"workflow:
+  strict: true
+  statuses: [draft, planning, open]
+  transitions:
+    initial: [draft]
+  entry_routes:
+    - {label: bug, to: open}
+    - {label: follow-up, to: planning}
+"#;
+        let document: PolicyDocument = serde_yml::from_str(raw).unwrap();
+        let workflow = &document.workflow;
+        workflow.validate_entry_routes().unwrap();
+        assert!(workflow.allows_entry_route("OPEN", &["Bug".to_string()], true));
+        assert!(workflow.allows_entry_route(
+            "planning",
+            &["triage".to_string(), "FOLLOW-UP".to_string()],
+            true
+        ));
+        assert!(!workflow.allows_entry_route("open", &["bug".to_string()], false));
+        assert!(!workflow.allows_entry_route("open", &["task".to_string()], true));
+        assert!(!workflow.allows_entry_route("draft", &["bug".to_string()], true));
+
+        let value: serde_yml::Value = serde_yml::from_str(raw).unwrap();
+        assert!(
+            detect_unknown_policy_fields(&value).is_empty(),
+            "entry_routes must be a canonical policy key"
+        );
+
+        let mut invalid = workflow.clone();
+        invalid.entry_routes[0].to = "missing".to_string();
+        assert!(invalid.validate_entry_routes().is_err());
+        invalid.entry_routes[0].to = "open".to_string();
+        invalid.entry_routes.push(EntryRoute {
+            label: "BUG".to_string(),
+            to: "OPEN".to_string(),
+        });
+        assert!(invalid.validate_entry_routes().is_err());
     }
 
     #[test]
