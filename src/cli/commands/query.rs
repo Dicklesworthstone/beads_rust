@@ -49,6 +49,8 @@ pub struct SavedFilters {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub label_any: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_label: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub priority: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority_min: Option<u8>,
@@ -92,6 +94,7 @@ impl From<&ListArgs> for SavedFilters {
             id: args.id.clone(),
             label: args.label.clone(),
             label_any: args.label_any.clone(),
+            exclude_label: args.exclude_label.clone(),
             priority: args.priority.clone(),
             priority_min: args.priority_min,
             priority_max: args.priority_max,
@@ -121,6 +124,7 @@ impl SavedFilters {
             id: self.id.clone(),
             label: self.label.clone(),
             label_any: self.label_any.clone(),
+            exclude_label: self.exclude_label.clone(),
             priority: self.priority.clone(),
             priority_min: self.priority_min,
             priority_max: self.priority_max,
@@ -182,6 +186,11 @@ impl SavedFilters {
                 base.label_any
             } else {
                 cli.label_any.clone()
+            },
+            exclude_label: if cli.exclude_label.is_empty() {
+                base.exclude_label
+            } else {
+                cli.exclude_label.clone()
             },
             priority: if cli.priority.is_empty() {
                 base.priority
@@ -1062,6 +1071,7 @@ mod tests {
             id: vec!["id1".to_string(), "id2".to_string()],
             label: vec!["urgent".to_string(), "backend".to_string()],
             label_any: vec!["optional".to_string()],
+            exclude_label: vec!["subsystem-b".to_string()],
             priority: vec!["0".to_string(), "1".to_string(), "2".to_string()],
             priority_min: Some(0),
             priority_max: Some(2),
@@ -1087,6 +1097,7 @@ mod tests {
         assert_eq!(parsed.id, filters.id);
         assert_eq!(parsed.label, filters.label);
         assert_eq!(parsed.label_any, filters.label_any);
+        assert_eq!(parsed.exclude_label, filters.exclude_label);
         assert_eq!(parsed.priority, filters.priority);
         assert_eq!(parsed.priority_min, filters.priority_min);
         assert_eq!(parsed.priority_max, filters.priority_max);

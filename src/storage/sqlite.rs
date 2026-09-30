@@ -1153,6 +1153,45 @@ fn append_label_or_membership_exists(
         params.push(SqliteValue::from(label.as_str()));
     }
 }
+
+/// Hide issues carrying any of `exclude_labels` (`--exclude-label`, GH #522).
+///
+/// A correlated `NOT EXISTS` binds one parameter per distinct label however
+/// many issues carry it, so the predicate stays bounded where a resolved
+/// `id NOT IN (...)` list would grow with the tracker. The alias keeps the
+/// subquery unambiguous in queries that also join `labels`.
+fn append_label_exclusion_filter(
+    sql: &mut String,
+    params: &mut Vec<SqliteValue>,
+    exclude_labels: &[String],
+) {
+    let unique_labels = unique_label_refs(exclude_labels);
+    if unique_labels.is_empty() {
+        return;
+    }
+
+    let placeholders: Vec<String> = unique_labels.iter().map(|_| "?".to_string()).collect();
+    let _ = write!(
+        sql,
+        " AND NOT EXISTS (
+            SELECT 1
+            FROM labels AS excluded_labels
+            WHERE excluded_labels.issue_id = issues.id
+              AND excluded_labels.label IN ({})
+        )",
+        placeholders.join(",")
+    );
+    for label in unique_labels {
+        params.push(SqliteValue::from(label.as_str()));
+    }
+}
+
+fn has_label_exclusion(filters: &ListFilters) -> bool {
+    filters
+        .exclude_labels
+        .as_ref()
+        .is_some_and(|labels| !labels.is_empty())
+}
 // `fsqlite` starts returning false PRIMARY KEY conflicts when we rewrite
 // existing `export_hashes` rows with a single multi-values INSERT. Batch the
 // DELETE side for efficiency, but re-insert one row at a time for correctness.
@@ -8564,6 +8603,11 @@ impl SqliteStorage {
         if let Some(ref issue_ids) = label_candidate_ids {
             append_issue_id_membership_filter(&mut sql, &mut params, issue_ids);
         }
+        append_label_exclusion_filter(
+            &mut sql,
+            &mut params,
+            filters.exclude_labels.as_deref().unwrap_or(&[]),
+        );
 
         if let Some(ref statuses) = filters.statuses
             && !statuses.is_empty()
@@ -8770,6 +8814,7 @@ impl SqliteStorage {
                 .labels_or
                 .as_ref()
                 .is_some_and(|labels| !labels.is_empty())
+            || has_label_exclusion(filters)
             || filters
                 .types
                 .as_ref()
@@ -8899,6 +8944,7 @@ impl SqliteStorage {
                 .labels_or
                 .as_ref()
                 .is_some_and(|labels| !labels.is_empty())
+            || has_label_exclusion(filters)
             || filters
                 .types
                 .as_ref()
@@ -8994,6 +9040,7 @@ impl SqliteStorage {
                 .labels_or
                 .as_ref()
                 .is_some_and(|labels| !labels.is_empty())
+            || has_label_exclusion(filters)
             || filters
                 .priorities
                 .as_ref()
@@ -9086,6 +9133,7 @@ impl SqliteStorage {
                 .labels_or
                 .as_ref()
                 .is_some_and(|labels| !labels.is_empty())
+            || has_label_exclusion(filters)
             || filters
                 .types
                 .as_ref()
@@ -9148,6 +9196,7 @@ impl SqliteStorage {
                 .labels_or
                 .as_ref()
                 .is_some_and(|labels| !labels.is_empty())
+            || has_label_exclusion(filters)
             || filters
                 .types
                 .as_ref()
@@ -9289,6 +9338,11 @@ impl SqliteStorage {
         } else if let Some(ref issue_ids) = label_candidate_ids {
             append_issue_id_membership_filter(&mut sql, &mut params, issue_ids);
         }
+        append_label_exclusion_filter(
+            &mut sql,
+            &mut params,
+            filters.exclude_labels.as_deref().unwrap_or(&[]),
+        );
 
         if let Some(ref statuses) = filters.statuses
             && !statuses.is_empty()
@@ -9665,6 +9719,11 @@ impl SqliteStorage {
         } else if let Some(ref issue_ids) = label_candidate_ids {
             append_issue_id_membership_filter(&mut sql, &mut params, issue_ids);
         }
+        append_label_exclusion_filter(
+            &mut sql,
+            &mut params,
+            filters.exclude_labels.as_deref().unwrap_or(&[]),
+        );
 
         if let Some(ref statuses) = filters.statuses
             && !statuses.is_empty()
@@ -9826,6 +9885,11 @@ impl SqliteStorage {
         if let Some(ref issue_ids) = label_candidate_ids {
             append_issue_id_membership_filter(&mut sql, &mut params, issue_ids);
         }
+        append_label_exclusion_filter(
+            &mut sql,
+            &mut params,
+            filters.exclude_labels.as_deref().unwrap_or(&[]),
+        );
 
         if let Some(ref statuses) = filters.statuses
             && !statuses.is_empty()
@@ -9997,6 +10061,11 @@ impl SqliteStorage {
                 None => {}
             }
         }
+        append_label_exclusion_filter(
+            &mut sql,
+            &mut params,
+            filters.exclude_labels.as_deref().unwrap_or(&[]),
+        );
 
         if let Some(ref types) = filters.types
             && !types.is_empty()
@@ -10199,6 +10268,10 @@ impl SqliteStorage {
         sort: ReadySortPolicy,
         projection: ReadyIssueProjection,
     ) -> Result<Vec<Issue>> {
+        if !filters.exclude_labels.is_empty() {
+            return self.get_ready_issues_excluding_labels(filters, sort, projection);
+        }
+
         let readiness = self.ready_readiness_probe(filters)?;
         if !readiness.has_candidate_status {
             return Ok(Vec::new());
@@ -10259,6 +10332,42 @@ impl SqliteStorage {
                 )
             }
         }
+    }
+
+    /// Ready issues minus those carrying any `exclude_labels` (GH #522).
+    ///
+    /// The exclusion is resolved in Rust, not SQL: the ready candidate query
+    /// switches to a label JOIN for several filter shapes, and the embedded
+    /// engine has mis-evaluated subqueries under that JOIN before (#307). The
+    /// underlying query therefore runs without a limit, so rows removed here
+    /// cannot leave a short page; the caller's limit is applied afterwards,
+    /// on the already-sorted result.
+    fn get_ready_issues_excluding_labels(
+        &self,
+        filters: &ReadyFilters,
+        sort: ReadySortPolicy,
+        projection: ReadyIssueProjection,
+    ) -> Result<Vec<Issue>> {
+        let mut inner = filters.clone();
+        inner.exclude_labels = Vec::new();
+        let Some(excluded_ids) = self.query_issue_ids_with_any_label(&filters.exclude_labels)?
+        else {
+            return self.get_ready_issues_with_projection(&inner, sort, projection);
+        };
+        if excluded_ids.is_empty() {
+            return self.get_ready_issues_with_projection(&inner, sort, projection);
+        }
+
+        inner.limit = None;
+        let excluded_ids: HashSet<String> = excluded_ids.into_iter().collect();
+        let mut issues = self.get_ready_issues_with_projection(&inner, sort, projection)?;
+        issues.retain(|issue| !excluded_ids.contains(&issue.id));
+        if let Some(limit) = filters.limit
+            && limit > 0
+        {
+            issues.truncate(limit);
+        }
+        Ok(issues)
     }
 
     /// Resolve the set of issue IDs matched by a `--parent` filter on `ready`.
@@ -18480,6 +18589,9 @@ pub struct ListFilters {
     pub labels: Option<Vec<String>>,
     /// Filter by labels (OR logic)
     pub labels_or: Option<Vec<String>>,
+    /// Hide issues carrying any of these labels. Applied after `labels` and
+    /// `labels_or`, so it narrows whatever those select.
+    pub exclude_labels: Option<Vec<String>>,
     /// Filter by `updated_at` <= timestamp
     pub updated_before: Option<DateTime<Utc>>,
     /// Filter by `updated_at` >= timestamp
@@ -18639,6 +18751,8 @@ pub struct ReadyFilters {
     pub unassigned: bool,
     pub labels_and: Vec<String>,
     pub labels_or: Vec<String>,
+    /// Hide issues carrying any of these labels.
+    pub exclude_labels: Vec<String>,
     pub types: Option<Vec<IssueType>>,
     pub priorities: Option<Vec<Priority>>,
     pub include_deferred: bool,
@@ -18728,6 +18842,7 @@ fn default_visible_limited_page_limit(filters: &ListFilters) -> Option<usize> {
         && !filters.reverse
         && filters.labels.as_ref().is_none_or(Vec::is_empty)
         && filters.labels_or.as_ref().is_none_or(Vec::is_empty)
+        && !has_label_exclusion(filters)
         && filters.updated_before.is_none()
         && filters.updated_after.is_none();
 
@@ -18750,6 +18865,7 @@ fn default_visible_single_label_count_filter(filters: &ListFilters) -> Option<&s
         && !filters.include_templates
         && filters.title_contains.is_none()
         && filters.labels_or.as_ref().is_none_or(Vec::is_empty)
+        && !has_label_exclusion(filters)
         && filters.updated_before.is_none()
         && filters.updated_after.is_none();
 

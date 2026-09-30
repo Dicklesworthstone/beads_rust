@@ -89,6 +89,9 @@ fn execute_inner(args: &CountArgs, ctx: &OutputContext, storage: &SqliteStorage)
     filters.include_closed = filters.include_closed || args.include_closed;
     filters.include_templates = args.include_templates;
     filters.title_contains.clone_from(&args.title_contains);
+    if !args.exclude_label.is_empty() {
+        filters.exclude_labels = Some(args.exclude_label.clone());
+    }
 
     let by = resolve_count_grouping(args)?;
 
@@ -416,12 +419,21 @@ fn is_default_visible_group_count(filters: &ListFilters) -> bool {
         && !filters.reverse
         && filters.labels.as_ref().is_none_or(Vec::is_empty)
         && filters.labels_or.as_ref().is_none_or(Vec::is_empty)
+        && filters.exclude_labels.as_ref().is_none_or(Vec::is_empty)
         && filters.updated_before.is_none()
         && filters.updated_after.is_none()
 }
 
+/// Filters the lean `StatsIssueRow` scan cannot evaluate, so grouping must go
+/// through `list_issues`, which applies them in SQL. Stats rows carry no
+/// labels, which rules out `--exclude-label` (GH #522).
 fn should_use_full_issue_rows_for_count(filters: &ListFilters) -> bool {
-    filters.title_contains.is_some() || filters.assignee.as_deref() == Some("")
+    filters.title_contains.is_some()
+        || filters.assignee.as_deref() == Some("")
+        || filters
+            .exclude_labels
+            .as_ref()
+            .is_some_and(|labels| !labels.is_empty())
 }
 
 fn stats_row_matches_count_filters(issue: &StatsIssueRow, filters: &ListFilters) -> bool {
@@ -561,6 +573,7 @@ mod tests {
             include_closed: false,
             include_templates: false,
             title_contains: None,
+            exclude_label: vec![],
         }
     }
 

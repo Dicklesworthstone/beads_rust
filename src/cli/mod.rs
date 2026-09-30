@@ -1869,6 +1869,10 @@ pub struct ListArgs {
     #[arg(long, add = ArgValueCompleter::new(label_completer))]
     pub label_any: Vec<String>,
 
+    /// Hide issues carrying this label (can be repeated; any match hides the issue)
+    #[arg(long, value_name = "LABEL", add = ArgValueCompleter::new(label_completer))]
+    pub exclude_label: Vec<String>,
+
     /// Filter by priority: 0-4 or P0-P4, ranges like 0-1, comma lists; repeatable
     #[arg(long, short = 'p', add = ArgValueCompleter::new(priority_completer))]
     pub priority: Vec<String>,
@@ -2598,6 +2602,10 @@ pub struct CountArgs {
     /// Title contains substring
     #[arg(long)]
     pub title_contains: Option<String>,
+
+    /// Hide issues carrying this label (can be repeated; any match hides the issue)
+    #[arg(long, value_name = "LABEL", add = ArgValueCompleter::new(label_completer))]
+    pub exclude_label: Vec<String>,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, Eq, PartialEq)]
@@ -2728,6 +2736,10 @@ pub struct ReadyArgs {
     /// Filter by label (OR logic, can be repeated)
     #[arg(long, add = ArgValueCompleter::new(label_completer))]
     pub label_any: Vec<String>,
+
+    /// Hide issues carrying this label (can be repeated; any match hides the issue)
+    #[arg(long, value_name = "LABEL", add = ArgValueCompleter::new(label_completer))]
+    pub exclude_label: Vec<String>,
 
     /// Filter by issue type (can be repeated)
     #[arg(long = "type", short = 't', add = ArgValueCompleter::new(issue_type_completer))]

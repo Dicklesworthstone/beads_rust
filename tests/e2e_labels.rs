@@ -1337,3 +1337,232 @@ fn e2e_update_reports_label_changes() {
         "labels: {labels:?}"
     );
 }
+
+/// `--exclude-label` (GH #522) hides issues carrying any excluded label from
+/// `list`, `ready`, `search` and `count`, composes with the include filters,
+/// leaves the JSON shapes alone, and round-trips through saved queries.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_exclude_label_filters_list_ready_search_count() {
+    let _log = common::test_log("e2e_exclude_label_filters_list_ready_search_count");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = |title: &str, labels: &str, label: &str| -> String {
+        let mut args = vec!["create", title];
+        if !labels.is_empty() {
+            args.extend(["--labels", labels]);
+        }
+        let run = run_br(&workspace, args, label);
+        assert!(run.status.success(), "{label} failed: {}", run.stderr);
+        parse_created_id(&run.stdout)
+    };
+    let keep_a = create("gadget keep a", "component-a", "create_keep_a");
+    let hide_b = create("gadget hide b", "component-a,subsystem-b", "create_hide_b");
+    let hide_legacy = create("gadget hide legacy", "legacy", "create_hide_legacy");
+    let keep_plain = create("gadget keep plain", "", "create_keep_plain");
+
+    let ids_of = |issues: &[Value]| -> Vec<String> {
+        let mut ids: Vec<String> = issues
+            .iter()
+            .map(|issue| issue["id"].as_str().expect("id").to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+    let sorted = |mut ids: Vec<String>| {
+        ids.sort();
+        ids
+    };
+    let both_kept = sorted(vec![keep_a.clone(), keep_plain.clone()]);
+
+    // list: repeatable flag, any match hides; JSON keeps its page envelope.
+    let list = run_br(
+        &workspace,
+        [
+            "list",
+            "--exclude-label",
+            "subsystem-b",
+            "--exclude-label",
+            "legacy",
+            "--json",
+        ],
+        "list_exclude",
+    );
+    assert!(list.status.success(), "list failed: {}", list.stderr);
+    let page = common::cli::parse_list_page(&list.stdout);
+    assert_eq!(page["total"], 2, "page: {page}");
+    let issues = page["issues"].as_array().expect("issues").clone();
+    assert_eq!(ids_of(&issues), both_kept);
+
+    // list: composes with --label (AND) and --label-any (OR).
+    let list = run_br(
+        &workspace,
+        [
+            "list",
+            "--label",
+            "component-a",
+            "--exclude-label",
+            "subsystem-b",
+            "--json",
+        ],
+        "list_label_and_exclude",
+    );
+    assert!(list.status.success(), "list failed: {}", list.stderr);
+    assert_eq!(
+        ids_of(&common::cli::parse_list_issues(&list.stdout)),
+        vec![keep_a.clone()]
+    );
+    let list = run_br(
+        &workspace,
+        [
+            "list",
+            "--label-any",
+            "component-a",
+            "--label-any",
+            "legacy",
+            "--exclude-label",
+            "legacy",
+            "--json",
+        ],
+        "list_label_any_and_exclude",
+    );
+    assert!(list.status.success(), "list failed: {}", list.stderr);
+    assert_eq!(
+        ids_of(&common::cli::parse_list_issues(&list.stdout)),
+        sorted(vec![keep_a.clone(), hide_b.clone()])
+    );
+
+    // list text output honours the flag too.
+    let list = run_br(
+        &workspace,
+        ["list", "--exclude-label", "subsystem-b"],
+        "list_text_exclude",
+    );
+    assert!(list.status.success(), "list failed: {}", list.stderr);
+    assert!(!list.stdout.contains(&hide_b), "stdout: {}", list.stdout);
+    assert!(
+        list.stdout.contains(&hide_legacy),
+        "stdout: {}",
+        list.stdout
+    );
+
+    // ready: same semantics, plus a limit that must apply after exclusion.
+    let ready = run_br(
+        &workspace,
+        [
+            "ready",
+            "--exclude-label",
+            "subsystem-b",
+            "--exclude-label",
+            "legacy",
+            "--json",
+        ],
+        "ready_exclude",
+    );
+    assert!(ready.status.success(), "ready failed: {}", ready.stderr);
+    let ready_issues = common::cli::extract_issues_array(&ready.stdout);
+    assert_eq!(ids_of(&ready_issues), both_kept);
+    assert!(
+        ready_issues.iter().all(|issue| issue["labels"].is_array()),
+        "ready JSON keeps its labels field: {ready_issues:?}"
+    );
+    let ready = run_br(
+        &workspace,
+        [
+            "ready",
+            "--exclude-label",
+            "subsystem-b",
+            "--exclude-label",
+            "legacy",
+            "--limit",
+            "1",
+            "--json",
+        ],
+        "ready_exclude_limit",
+    );
+    assert!(ready.status.success(), "ready failed: {}", ready.stderr);
+    let ready_issues = common::cli::extract_issues_array(&ready.stdout);
+    assert_eq!(ready_issues.len(), 1, "ready: {ready_issues:?}");
+    assert!(both_kept.contains(&ready_issues[0]["id"].as_str().unwrap().to_string()));
+
+    // search
+    let search = run_br(
+        &workspace,
+        [
+            "search",
+            "gadget",
+            "--label",
+            "component-a",
+            "--exclude-label",
+            "subsystem-b",
+            "--json",
+        ],
+        "search_exclude",
+    );
+    assert!(search.status.success(), "search failed: {}", search.stderr);
+    assert_eq!(
+        ids_of(&common::cli::extract_issues_array(&search.stdout)),
+        vec![keep_a.clone()]
+    );
+
+    // count, plain and grouped by label.
+    let count = run_br(
+        &workspace,
+        [
+            "count",
+            "--exclude-label",
+            "subsystem-b",
+            "--exclude-label",
+            "legacy",
+            "--json",
+        ],
+        "count_exclude",
+    );
+    assert!(count.status.success(), "count failed: {}", count.stderr);
+    assert_eq!(common::cli::parse_json_value(&count.stdout)["count"], 2);
+    let count = run_br(
+        &workspace,
+        [
+            "count",
+            "--by-label",
+            "--exclude-label",
+            "subsystem-b",
+            "--json",
+        ],
+        "count_by_label_exclude",
+    );
+    assert!(count.status.success(), "count failed: {}", count.stderr);
+    let grouped = common::cli::parse_json_value(&count.stdout);
+    assert_eq!(grouped["total"], 3, "grouped: {grouped}");
+    let groups = grouped["groups"].as_array().expect("groups");
+    assert!(
+        groups.iter().all(|group| group["group"] != "subsystem-b"),
+        "groups: {groups:?}"
+    );
+    let count = run_br(
+        &workspace,
+        ["count", "--by-type", "--exclude-label", "legacy", "--json"],
+        "count_by_type_exclude",
+    );
+    assert!(count.status.success(), "count failed: {}", count.stderr);
+    assert_eq!(common::cli::parse_json_value(&count.stdout)["total"], 3);
+
+    // Saved queries keep the exclusion.
+    let save = run_br(
+        &workspace,
+        ["query", "save", "not-b", "--exclude-label", "subsystem-b"],
+        "query_save_exclude",
+    );
+    assert!(save.status.success(), "query save failed: {}", save.stderr);
+    let run = run_br(
+        &workspace,
+        ["query", "run", "not-b", "--json"],
+        "query_run_exclude",
+    );
+    assert!(run.status.success(), "query run failed: {}", run.stderr);
+    let ids = ids_of(&common::cli::extract_issues_array(&run.stdout));
+    assert!(!ids.contains(&hide_b), "ids: {ids:?}");
+    assert_eq!(ids.len(), 3, "ids: {ids:?}");
+}

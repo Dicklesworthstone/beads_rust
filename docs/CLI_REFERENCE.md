@@ -295,6 +295,7 @@ br list [OPTIONS]
 | `--id <ID>` | Filter by specific IDs (can repeat) |
 | `-l, --label <LABEL>` | Filter by label (AND logic, can repeat) |
 | `--label-any <LABEL>` | Filter by label (OR logic, can repeat) |
+| `--exclude-label <LABEL>` | Hide issues carrying this label (can repeat; any match hides). Applied after `--label`/`--label-any` |
 | `-p, --priority <PRIORITY>` | Filter by priority (can repeat) |
 | `--priority-min <N>` | Filter by minimum priority |
 | `--priority-max <N>` | Filter by maximum priority |
@@ -615,6 +616,7 @@ br ready [OPTIONS]
 | `--unassigned` | Show only unassigned |
 | `-l, --label <LABEL>` | Filter by label (AND logic) |
 | `--label-any <LABEL>` | Filter by label (OR logic) |
+| `--exclude-label <LABEL>` | Hide issues carrying this label (can repeat; any match hides). `--limit` applies after the exclusion |
 | `-t, --type <TYPE>` | Filter by type |
 | `-p, --priority <N>` | Filter by priority |
 | `--sort <POLICY>` | Sort: hybrid (default), priority, oldest |
@@ -1080,6 +1082,9 @@ br search "authentication"
 
 # Search with filters
 br search "bug" -t bug --assignee alice
+
+# Leave out work that belongs to another workstation or team
+br search "parser" --exclude-label subsystem-b
 ```
 
 ---
@@ -1109,6 +1114,7 @@ br count [OPTIONS]
 | `--include-closed` | Include closed issues; use `--status tombstone` for tombstones |
 | `--include-templates` | Include template issues |
 | `--title-contains <TEXT>` | Title contains substring |
+| `--exclude-label <LABEL>` | Hide issues carrying this label (can repeat; any match hides) |
 
 **Examples:**
 ```bash

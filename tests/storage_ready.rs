@@ -315,6 +315,196 @@ fn ready_filter_by_labels_or() {
     assert!(!ids.contains(&issue3.id));
 }
 
+#[test]
+fn ready_exclude_labels_hides_any_matching_label_and_composes_with_includes() {
+    let mut storage = test_db();
+
+    let backend = fixtures::issue("Backend only");
+    let backend_subsystem = fixtures::issue("Backend on subsystem workstation");
+    let frontend_legacy = fixtures::issue("Frontend legacy");
+    let unlabeled = fixtures::issue("No labels");
+    for issue in [&backend, &backend_subsystem, &frontend_legacy, &unlabeled] {
+        storage.create_issue(issue, "tester").unwrap();
+    }
+    storage.add_label(&backend.id, "backend", "tester").unwrap();
+    storage
+        .add_label(&backend_subsystem.id, "backend", "tester")
+        .unwrap();
+    storage
+        .add_label(&backend_subsystem.id, "subsystem-b", "tester")
+        .unwrap();
+    storage
+        .add_label(&frontend_legacy.id, "frontend", "tester")
+        .unwrap();
+    storage
+        .add_label(&frontend_legacy.id, "legacy", "tester")
+        .unwrap();
+
+    // Any one excluded label hides the issue; unlabeled issues stay visible.
+    let filters = ReadyFilters {
+        exclude_labels: vec!["subsystem-b".to_string(), "legacy".to_string()],
+        ..Default::default()
+    };
+    let mut ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
+    ids.sort();
+    let mut expected = vec![backend.id.clone(), unlabeled.id.clone()];
+    expected.sort();
+    assert_eq!(ids, expected);
+
+    // Exclusion narrows the AND and OR label selections.
+    let filters = ReadyFilters {
+        labels_and: vec!["backend".to_string()],
+        exclude_labels: vec!["subsystem-b".to_string()],
+        ..Default::default()
+    };
+    assert_eq!(
+        ready_ids(&storage, &filters, ReadySortPolicy::Oldest),
+        vec![backend.id.clone()]
+    );
+    let filters = ReadyFilters {
+        labels_or: vec!["backend".to_string(), "frontend".to_string()],
+        exclude_labels: vec!["legacy".to_string()],
+        ..Default::default()
+    };
+    let mut ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
+    ids.sort();
+    let mut expected = vec![backend.id.clone(), backend_subsystem.id.clone()];
+    expected.sort();
+    assert_eq!(ids, expected);
+
+    // Including and excluding the same label selects nothing.
+    let filters = ReadyFilters {
+        labels_and: vec!["backend".to_string()],
+        exclude_labels: vec!["backend".to_string()],
+        ..Default::default()
+    };
+    assert!(ready_ids(&storage, &filters, ReadySortPolicy::Oldest).is_empty());
+
+    // A label nobody carries excludes nothing.
+    let filters = ReadyFilters {
+        exclude_labels: vec!["no-such-label".to_string()],
+        ..Default::default()
+    };
+    assert_eq!(
+        ready_ids(&storage, &filters, ReadySortPolicy::Oldest).len(),
+        4
+    );
+}
+
+#[test]
+fn ready_exclude_labels_applies_limit_after_exclusion_for_every_sort() {
+    let mut storage = test_db();
+
+    // The three highest-priority issues are excluded, so a limit applied
+    // before the exclusion would return an empty or short page.
+    let mut kept = Vec::new();
+    for i in 0..3 {
+        let issue = fixtures::IssueBuilder::new(&format!("Excluded P0 {i}"))
+            .with_priority(Priority::CRITICAL)
+            .build();
+        storage.create_issue(&issue, "tester").unwrap();
+        storage.add_label(&issue.id, "elsewhere", "tester").unwrap();
+    }
+    for i in 0..3 {
+        let issue = fixtures::IssueBuilder::new(&format!("Kept P2 {i}"))
+            .with_priority(Priority::MEDIUM)
+            .build();
+        storage.create_issue(&issue, "tester").unwrap();
+        kept.push(issue.id);
+    }
+
+    for sort in [
+        ReadySortPolicy::Hybrid,
+        ReadySortPolicy::Priority,
+        ReadySortPolicy::Oldest,
+    ] {
+        let unlimited = ReadyFilters {
+            exclude_labels: vec!["elsewhere".to_string()],
+            ..Default::default()
+        };
+        let all_kept = ready_ids(&storage, &unlimited, sort);
+        let mut sorted_kept = all_kept.clone();
+        sorted_kept.sort();
+        let mut expected = kept.clone();
+        expected.sort();
+        assert_eq!(sorted_kept, expected, "{sort:?}");
+
+        let limited = ReadyFilters {
+            exclude_labels: vec!["elsewhere".to_string()],
+            limit: Some(2),
+            ..Default::default()
+        };
+        // Same order as the unlimited result, cut to the limit.
+        assert_eq!(
+            ready_ids(&storage, &limited, sort),
+            all_kept[..2],
+            "{sort:?}"
+        );
+    }
+}
+
+#[test]
+fn ready_exclude_labels_composes_with_type_assignee_and_parent_filters() {
+    let mut storage = test_db();
+
+    let epic = fixtures::IssueBuilder::new("Epic")
+        .with_type(IssueType::Epic)
+        .build();
+    storage.create_issue(&epic, "tester").unwrap();
+
+    let child_bug = fixtures::IssueBuilder::new("Child bug")
+        .with_type(IssueType::Bug)
+        .with_assignee("alice")
+        .build();
+    let child_bug_excluded = fixtures::IssueBuilder::new("Child bug elsewhere")
+        .with_type(IssueType::Bug)
+        .with_assignee("alice")
+        .build();
+    let child_task = fixtures::IssueBuilder::new("Child task")
+        .with_type(IssueType::Task)
+        .with_assignee("alice")
+        .build();
+    for issue in [&child_bug, &child_bug_excluded, &child_task] {
+        storage.create_issue(issue, "tester").unwrap();
+        storage
+            .add_dependency(&issue.id, &epic.id, "parent-child", "tester")
+            .unwrap();
+        storage
+            .add_label(&issue.id, "component-a", "tester")
+            .unwrap();
+    }
+    storage
+        .add_label(&child_bug_excluded.id, "subsystem-b", "tester")
+        .unwrap();
+
+    // Types + assignee + a label AND filter switch the candidate query to its
+    // label-JOIN form; the parent filter adds a resolved membership list.
+    let filters = ReadyFilters {
+        labels_and: vec!["component-a".to_string()],
+        exclude_labels: vec!["subsystem-b".to_string()],
+        types: Some(vec![IssueType::Bug]),
+        assignee: Some("alice".to_string()),
+        parent: Some(epic.id.clone()),
+        ..Default::default()
+    };
+    assert_eq!(
+        ready_ids(&storage, &filters, ReadySortPolicy::Hybrid),
+        vec![child_bug.id.clone()]
+    );
+
+    let filters = ReadyFilters {
+        exclude_labels: vec!["subsystem-b".to_string()],
+        parent: Some(epic.id.clone()),
+        recursive: true,
+        ..Default::default()
+    };
+    let mut ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
+    ids.sort();
+    let mut expected = vec![child_bug.id.clone(), child_task.id.clone()];
+    expected.sort();
+    assert_eq!(ids, expected);
+}
+
 // ============================================================================
 // LIMIT FILTER TESTS
 // ============================================================================

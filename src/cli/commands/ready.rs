@@ -139,6 +139,7 @@ fn execute_inner(
         unassigned: args.unassigned,
         labels_and: args.label.clone(),
         labels_or: args.label_any.clone(),
+        exclude_labels: args.exclude_label.clone(),
         types: parse_types(&args.type_)?,
         priorities: parse_priorities(&args.priority)?,
         include_deferred: args.include_deferred,
@@ -309,6 +310,7 @@ fn ready_filters_are_restrictive(filters: &ReadyFilters) -> bool {
         || filters.unassigned
         || !filters.labels_and.is_empty()
         || !filters.labels_or.is_empty()
+        || !filters.exclude_labels.is_empty()
         || filters
             .types
             .as_ref()

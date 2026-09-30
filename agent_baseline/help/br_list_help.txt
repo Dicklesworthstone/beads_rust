@@ -24,6 +24,9 @@ Options:
       --label-any <LABEL_ANY>
           Filter by label (OR logic, can be repeated)
 
+      --exclude-label <LABEL>
+          Hide issues carrying this label (can be repeated; any match hides the issue)
+
   -p, --priority <PRIORITY>
           Filter by priority: 0-4 or P0-P4, ranges like 0-1, comma lists; repeatable
 

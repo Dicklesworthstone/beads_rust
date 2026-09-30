@@ -996,3 +996,261 @@ fn filter_with_special_characters_in_title() {
     // Should match because title contains literal %
     assert_eq!(results.len(), 1);
 }
+
+// ============================================================================
+// LABEL EXCLUSION TESTS (GH #522)
+// ============================================================================
+
+/// Four open issues: `keep-a` (component-a), `hide-b` (component-a +
+/// subsystem-b), `hide-legacy` (legacy), `keep-plain` (no labels), plus a
+/// closed `closed-b` (subsystem-b) that matches the search term "widget".
+fn exclusion_fixture() -> (beads_rust::storage::SqliteStorage, [String; 5]) {
+    let mut storage = test_db();
+    let keep_a = IssueBuilder::new("widget keep a")
+        .with_priority(Priority::CRITICAL)
+        .build();
+    let hide_b = IssueBuilder::new("widget hide b")
+        .with_priority(Priority::CRITICAL)
+        .with_type(IssueType::Bug)
+        .build();
+    let hide_legacy = IssueBuilder::new("widget hide legacy")
+        .with_priority(Priority::HIGH)
+        .build();
+    let keep_plain = IssueBuilder::new("widget keep plain")
+        .with_priority(Priority::MEDIUM)
+        .build();
+    let closed_b = IssueBuilder::new("widget closed b")
+        .with_status(Status::Closed)
+        .build();
+    for issue in [&keep_a, &hide_b, &hide_legacy, &keep_plain, &closed_b] {
+        storage.create_issue(issue, "tester").unwrap();
+    }
+    storage
+        .add_label(&keep_a.id, "component-a", "tester")
+        .unwrap();
+    storage
+        .add_label(&hide_b.id, "component-a", "tester")
+        .unwrap();
+    storage
+        .add_label(&hide_b.id, "subsystem-b", "tester")
+        .unwrap();
+    storage
+        .add_label(&hide_legacy.id, "legacy", "tester")
+        .unwrap();
+    storage
+        .add_label(&closed_b.id, "subsystem-b", "tester")
+        .unwrap();
+    (
+        storage,
+        [
+            keep_a.id,
+            hide_b.id,
+            hide_legacy.id,
+            keep_plain.id,
+            closed_b.id,
+        ],
+    )
+}
+
+fn sorted_ids(issues: &[beads_rust::model::Issue]) -> Vec<String> {
+    let mut ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
+    ids.sort();
+    ids
+}
+
+fn sorted(mut ids: Vec<String>) -> Vec<String> {
+    ids.sort();
+    ids
+}
+
+/// The `exclude_labels` field value, which is optional in `ListFilters`.
+#[allow(clippy::unnecessary_wraps)]
+fn exclude(labels: &[&str]) -> Option<Vec<String>> {
+    Some(labels.iter().map(ToString::to_string).collect())
+}
+
+#[test]
+fn exclude_labels_hides_issues_carrying_any_excluded_label() {
+    let (storage, [keep_a, _hide_b, _hide_legacy, keep_plain, _closed_b]) = exclusion_fixture();
+
+    let filters = ListFilters {
+        exclude_labels: exclude(&["subsystem-b", "legacy"]),
+        ..Default::default()
+    };
+    let expected = sorted(vec![keep_a.clone(), keep_plain.clone()]);
+    assert_eq!(
+        sorted_ids(&storage.list_issues(&filters).unwrap()),
+        expected
+    );
+    assert_eq!(
+        sorted_ids(
+            &storage
+                .list_text_issues_for_command_output(&filters)
+                .unwrap()
+        ),
+        expected
+    );
+    assert_eq!(storage.count_issues_with_filters(&filters).unwrap(), 2);
+
+    // Duplicate and unknown labels change nothing.
+    let filters = ListFilters {
+        exclude_labels: exclude(&["subsystem-b", "subsystem-b", "legacy", "no-such-label"]),
+        ..Default::default()
+    };
+    assert_eq!(
+        sorted_ids(&storage.list_issues(&filters).unwrap()),
+        expected
+    );
+    assert_eq!(storage.count_issues_with_filters(&filters).unwrap(), 2);
+
+    // An empty exclusion list is the same as none.
+    let filters = ListFilters {
+        exclude_labels: Some(vec![]),
+        ..Default::default()
+    };
+    assert_eq!(storage.list_issues(&filters).unwrap().len(), 4);
+}
+
+#[test]
+fn exclude_labels_composes_with_label_and_other_filters() {
+    let (storage, [keep_a, _hide_b, _hide_legacy, keep_plain, closed_b]) = exclusion_fixture();
+
+    // AND label selection, then exclusion.
+    let filters = ListFilters {
+        labels: Some(vec!["component-a".to_string()]),
+        exclude_labels: exclude(&["subsystem-b"]),
+        ..Default::default()
+    };
+    assert_eq!(
+        sorted_ids(&storage.list_issues(&filters).unwrap()),
+        vec![keep_a.clone()]
+    );
+    assert_eq!(storage.count_issues_with_filters(&filters).unwrap(), 1);
+
+    // OR label selection, then exclusion, with a non-label filter that moves
+    // the count query off its uncorrelated label path.
+    let filters = ListFilters {
+        labels_or: Some(vec!["component-a".to_string(), "legacy".to_string()]),
+        exclude_labels: exclude(&["legacy"]),
+        priorities: Some(vec![Priority::CRITICAL, Priority::HIGH]),
+        ..Default::default()
+    };
+    assert_eq!(storage.count_issues_with_filters(&filters).unwrap(), 2);
+    assert!(
+        storage
+            .list_issues(&filters)
+            .unwrap()
+            .iter()
+            .all(|issue| issue.id != keep_plain)
+    );
+
+    // Including and excluding the same label selects nothing.
+    let filters = ListFilters {
+        labels: Some(vec!["component-a".to_string()]),
+        exclude_labels: exclude(&["component-a"]),
+        ..Default::default()
+    };
+    assert!(storage.list_issues(&filters).unwrap().is_empty());
+    assert_eq!(storage.count_issues_with_filters(&filters).unwrap(), 0);
+
+    // Closed issues are excluded too once they are in scope.
+    let filters = ListFilters {
+        include_closed: true,
+        exclude_labels: exclude(&["subsystem-b"]),
+        ..Default::default()
+    };
+    assert!(
+        storage
+            .list_issues(&filters)
+            .unwrap()
+            .iter()
+            .all(|issue| issue.id != closed_b)
+    );
+}
+
+#[test]
+fn exclude_labels_applies_before_limit_and_offset() {
+    let (storage, [keep_a, _hide_b, _hide_legacy, keep_plain, _closed_b]) = exclusion_fixture();
+
+    // Default order is priority first, and two of the three highest-priority
+    // issues are excluded: a limit applied before the exclusion would
+    // return a short page. This shape is also the one the default-visible
+    // fast path would otherwise take.
+    let filters = ListFilters {
+        exclude_labels: exclude(&["subsystem-b", "legacy"]),
+        limit: Some(2),
+        ..Default::default()
+    };
+    let page: Vec<String> = storage
+        .list_issues(&filters)
+        .unwrap()
+        .into_iter()
+        .map(|issue| issue.id)
+        .collect();
+    assert_eq!(page, vec![keep_a.clone(), keep_plain.clone()]);
+    let text_page: Vec<String> = storage
+        .list_text_issues_for_command_output(&filters)
+        .unwrap()
+        .into_iter()
+        .map(|issue| issue.id)
+        .collect();
+    assert_eq!(text_page, page);
+
+    let filters = ListFilters {
+        exclude_labels: exclude(&["subsystem-b", "legacy"]),
+        limit: Some(1),
+        offset: Some(1),
+        ..Default::default()
+    };
+    let page: Vec<String> = storage
+        .list_issues(&filters)
+        .unwrap()
+        .into_iter()
+        .map(|issue| issue.id)
+        .collect();
+    assert_eq!(page, vec![keep_plain]);
+}
+
+#[test]
+fn exclude_labels_applies_to_label_counts_and_search() {
+    let (storage, [keep_a, _hide_b, _hide_legacy, keep_plain, _closed_b]) = exclusion_fixture();
+
+    let filters = ListFilters {
+        exclude_labels: exclude(&["subsystem-b"]),
+        ..Default::default()
+    };
+    let label_counts = storage.count_labels_with_filters(&filters).unwrap();
+    assert_eq!(
+        label_counts,
+        vec![
+            ("(no labels)".to_string(), 1),
+            ("component-a".to_string(), 1),
+            ("legacy".to_string(), 1),
+        ]
+    );
+
+    let filters = ListFilters {
+        exclude_labels: exclude(&["subsystem-b", "legacy"]),
+        ..Default::default()
+    };
+    assert_eq!(
+        sorted_ids(&storage.search_issues("widget", &filters).unwrap()),
+        sorted(vec![keep_a, keep_plain])
+    );
+    assert_eq!(
+        storage
+            .count_closed_search_matches("widget", &filters)
+            .unwrap(),
+        0
+    );
+    let filters = ListFilters {
+        exclude_labels: exclude(&["legacy"]),
+        ..Default::default()
+    };
+    assert_eq!(
+        storage
+            .count_closed_search_matches("widget", &filters)
+            .unwrap(),
+        1
+    );
+}

@@ -592,6 +592,11 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         } else {
             Some(args.label_any.clone())
         },
+        exclude_labels: if args.exclude_label.is_empty() {
+            None
+        } else {
+            Some(args.exclude_label.clone())
+        },
         updated_before: None,
         updated_after: None,
     })
@@ -632,6 +637,7 @@ fn should_use_full_relation_scan(
         && args.title_contains.is_none()
         && args.label.is_empty()
         && args.label_any.is_empty()
+        && args.exclude_label.is_empty()
 }
 
 fn should_use_full_default_visible_structured_scan(
@@ -654,6 +660,7 @@ fn should_use_full_default_visible_structured_scan(
         && args.title_contains.is_none()
         && args.label.is_empty()
         && args.label_any.is_empty()
+        && args.exclude_label.is_empty()
         && args.sort.is_none()
         && !args.reverse
 }
