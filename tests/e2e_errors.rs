@@ -3121,6 +3121,8 @@ fn class_transition_workspace(open_capacity: usize) -> BrWorkspace {
     closed: [draft]
   class_transitions:
     - {{issue_type: bug, from: draft, to: open}}
+  entry_routes:
+    - {{label: triage, to: open}}
   required_fields:
     "draft -> open": [acceptance_criteria_present, transition_comment]
   gates:
@@ -3271,6 +3273,118 @@ fn e2e_class_transitions_preserve_initial_global_and_strict_routes() {
         ],
     );
     assert_class_transition_and_global_route(&workspace, &bug, &task);
+}
+
+#[test]
+fn e2e_entry_routes_require_both_existing_relation_and_configured_label() {
+    let workspace = class_transition_workspace(4);
+    let anchor = class_draft(
+        &workspace,
+        "Existing triage anchor",
+        None,
+        "- [ ] Anchor work remains",
+    );
+
+    // Neither half of the provenance pair is sufficient by itself.
+    assert_prerequisite_policy_refusal(
+        &workspace,
+        &[
+            "create",
+            "Label only cannot skip initial",
+            "--status",
+            "open",
+            "--labels",
+            "triage",
+            "--json",
+        ],
+        "VALIDATION_FAILED",
+        None,
+    );
+    assert_prerequisite_policy_refusal(
+        &workspace,
+        &[
+            "create",
+            "Relation only cannot skip initial",
+            "--status",
+            "open",
+            "--deps",
+            &format!("discovered-from:{anchor}"),
+            "--json",
+        ],
+        "VALIDATION_FAILED",
+        None,
+    );
+
+    // An external reference is not an existing tracked bead and cannot
+    // authorize the entry route even with the right label.
+    assert_prerequisite_policy_refusal(
+        &workspace,
+        &[
+            "create",
+            "External relation cannot authorize",
+            "--status",
+            "open",
+            "--labels",
+            "triage",
+            "--deps",
+            "related:external:ticket-42",
+            "--json",
+        ],
+        "VALIDATION_FAILED",
+        None,
+    );
+
+    // The configured label plus a relation that resolves to the existing
+    // anchor admits exactly the configured initial status.
+    let admitted = class_cli(
+        &workspace,
+        &[
+            "create",
+            "Provenance-backed triage bug",
+            "--status",
+            "open",
+            "--labels",
+            "TRIAGE",
+            "--deps",
+            &format!("discovered-from:{anchor}"),
+        ],
+    );
+    let admitted_id = admitted["id"].as_str().unwrap().to_owned();
+    assert_eq!(admitted["status"], "open");
+
+    let storage = SqliteStorage::open(&workspace.root.join(".beads/beads.db")).unwrap();
+    let stored = storage.get_issue(&admitted_id).unwrap().unwrap();
+    assert_eq!(stored.status.as_str(), "open");
+    let labels = storage.get_labels(&admitted_id).unwrap();
+    assert!(
+        labels.iter().any(|label| label.eq_ignore_ascii_case("triage")),
+        "{labels:?}"
+    );
+    let dependencies = storage.get_dependencies(&admitted_id).unwrap();
+    assert!(
+        dependencies
+            .iter()
+            .any(|dependency| dependency.depends_on_id == anchor),
+        "{dependencies:?}"
+    );
+    drop(storage);
+
+    assert_prerequisite_policy_refusal(
+        &workspace,
+        &[
+            "create",
+            "Route target is exact",
+            "--status",
+            "planned",
+            "--labels",
+            "triage",
+            "--deps",
+            &format!("discovered-from:{anchor}"),
+            "--json",
+        ],
+        "VALIDATION_FAILED",
+        None,
+    );
 }
 
 fn assert_class_transition_and_global_route(workspace: &BrWorkspace, bug: &str, task: &str) {
