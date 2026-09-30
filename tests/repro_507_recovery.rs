@@ -919,3 +919,107 @@ fn read_only_commands_read_wal_only_rows_behind_a_poisoned_index() {
         poisoned
     );
 }
+
+/// Run directories under `.beads/.br_recovery/schema-migrations`.
+fn recovery_runs(workspace: &BrWorkspace) -> Vec<std::path::PathBuf> {
+    let root = workspace.root.join(".beads/.br_recovery/schema-migrations");
+    let mut runs: Vec<_> = fs::read_dir(root)
+        .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+        .unwrap_or_default();
+    runs.sort();
+    runs
+}
+
+/// The stock SQLite shape: #507's zero-page index beside a header-only WAL.
+/// There only the index needs rebuilding, so recovery keeps only the index
+/// instead of two copies of the database. When the database already had
+/// damaged indexes, that cheap path must still end where the full path does:
+/// the original index goes back byte for byte, and the complete-backup
+/// rehearsal refuses automatic recovery and admits explicit recovery, as in
+/// `poisoned_index_with_prior_index_damage_recovers_then_reindexes`.
+#[test]
+fn header_only_wal_poison_with_index_damage_falls_back_to_the_full_rehearsal() {
+    if isolated_test("header_only_wal_poison_with_index_damage_falls_back_to_the_full_rehearsal") {
+        return;
+    }
+    let workspace = BrWorkspace::new();
+    succeeds(&workspace, &["init", "--prefix", "hw", "--json"], "init");
+    for ordinal in 0..3 {
+        succeeds(
+            &workspace,
+            &["create", &format!("settled issue {ordinal}"), "--json"],
+            &format!("create_{ordinal}"),
+        );
+    }
+    let db = workspace.root.join(".beads/beads.db");
+    assert_eq!(
+        fs::read(workspace.root.join(".beads/beads.db-wal"))
+            .unwrap()
+            .len(),
+        32,
+        "fixture precondition: header-only WAL, so main holds every row"
+    );
+    // Read the index's root page from a private copy; the live family is
+    // only ever changed by the damage itself.
+    let scratch = tempfile::tempdir().unwrap();
+    let copy = scratch.path().join("copy.db");
+    fs::copy(&db, &copy).unwrap();
+    let connection = Connection::open(copy.to_string_lossy().into_owned()).unwrap();
+    let (root, page_size) = tree_root_page(&connection, "idx_issues_updated_at");
+    connection.close().unwrap();
+    drop_last_leaf_cell(&db, root, page_size);
+    let poisoned = poison_index(&workspace);
+    let before = protected_payload(&workspace);
+
+    let list = run_br(&workspace, ["list", "--json"], "damaged_header_only_list");
+    assert!(!list.status.success());
+    let error = format!("{}{}", list.stdout, list.stderr);
+    assert!(error.contains("corrupt indexes"), "{error}");
+    assert!(error.contains("br doctor --repair-indexes"), "{error}");
+    assert_eq!(protected_payload(&workspace), before);
+    assert_eq!(
+        fs::read(workspace.root.join(".beads/beads.db-shm")).unwrap(),
+        poisoned,
+        "the original index is back in place"
+    );
+    let runs = recovery_runs(&workspace);
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    let superseded = runs
+        .iter()
+        .find(|run| run.join("recovery-superseded.json").is_file())
+        .expect("the index-only attempt records that it handed over");
+    let retained: Vec<_> = fs::read_dir(superseded.join("recovery-before"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(retained, ["beads.db-shm"]);
+    let full = runs
+        .iter()
+        .find(|run| run.join("recovery-failed.json").is_file())
+        .expect("the complete-backup rehearsal refused");
+    assert_eq!(
+        fs::read(full.join("recovery-before/beads.db-shm")).unwrap(),
+        poisoned
+    );
+    assert!(full.join("recovery-before/beads.db").is_file());
+
+    let receipt = succeeds(
+        &workspace,
+        &[
+            "doctor",
+            "migrate-schema",
+            "recover",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "damaged_header_only_recovery",
+    );
+    assert_eq!(receipt["stage"], "complete", "{receipt}");
+    assert_eq!(receipt["backup_scope"], "complete-family", "{receipt}");
+    assert_eq!(
+        receipt["index_corruption"]["remediation"],
+        "br doctor --repair-indexes"
+    );
+    assert_eq!(protected_payload(&workspace), before);
+}

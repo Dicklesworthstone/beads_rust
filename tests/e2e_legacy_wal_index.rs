@@ -316,6 +316,56 @@ fn ordinary_command_rebuilds_a_stock_sqlite_index() {
     );
     let rebuilt = fs::read(beads_file(&workspace, "beads.db-shm")).expect("rebuilt -shm");
     assert_ne!(rebuilt[..96], installed[..96], "the live index was rebuilt");
+
+    // The WAL held no frames, so the index was all recovery had to rebuild:
+    // the run retains that index and its receipts, not two copies of the
+    // whole database (a backup plus a private rehearsal).
+    assert_eq!(migration_run_count(&workspace), 1);
+    let run = fs::read_dir(beads_file(&workspace, ".br_recovery/schema-migrations"))
+        .expect("runs")
+        .next()
+        .expect("one run")
+        .expect("run entry")
+        .path();
+    let mut retained: Vec<String> = fs::read_dir(run.join("recovery-before"))
+        .expect("retained pre-state")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    retained.sort();
+    assert_eq!(retained, ["beads.db-shm"]);
+    assert_eq!(
+        fs::read(run.join("recovery-before/beads.db-shm")).expect("retained index"),
+        installed,
+        "the retained index is the one the SQLite reader left"
+    );
+    assert!(!run.join("recovery-probe").exists());
+    let receipt: Value = serde_json::from_slice(
+        &fs::read(run.join("recovery-complete.json")).expect("completion receipt"),
+    )
+    .expect("receipt JSON");
+    assert_eq!(receipt["backup_scope"], "wal-index-only");
+    assert_eq!(receipt["stage"], "complete");
+    assert_eq!(receipt["logical_after"]["integrity_check"], "ok");
+
+    // Another stock SQLite read and write repeats the cheap path.
+    let second = install_stock_sqlite_index(&workspace);
+    let again = run_br(
+        &workspace,
+        ["create", "after a second read"],
+        "create_again",
+    );
+    assert!(again.status.success(), "{} {}", again.stdout, again.stderr);
+    assert_eq!(migration_run_count(&workspace), 2);
+    assert_ne!(
+        fs::read(beads_file(&workspace, "beads.db-shm")).expect("rebuilt -shm")[..96],
+        second[..96]
+    );
     let titles = listed_titles(
         &workspace,
         &[
@@ -334,4 +384,75 @@ fn ordinary_command_rebuilds_a_stock_sqlite_index() {
             .any(|title| title == "after the SQLite reader"),
         "{titles:?}"
     );
+}
+
+/// Index damage outside the shapes read-only commands read around (#507,
+/// #521) still refuses reads with "database is busy (recovery in progress)",
+/// and ordinary commands refuse on the same engine error. The error has to
+/// name the command that rebuilds the index, and that command has to work.
+#[test]
+fn unrecognized_index_damage_names_and_accepts_explicit_recovery() {
+    let workspace = settled_workspace();
+    let shm_path = beads_file(&workspace, "beads.db-shm");
+    let mut shm = fs::read(&shm_path).expect("live -shm");
+    // Tear the index header: its two copies no longer agree.
+    shm[16] ^= 0xFF;
+    fs::write(&shm_path, &shm).expect("torn -shm");
+
+    let read_only = run_br(
+        &workspace,
+        ["--no-auto-import", "--no-auto-flush", "list", "--json"],
+        "torn_read_only",
+    );
+    assert!(!read_only.status.success(), "{}", read_only.stdout);
+    let output = format!("{}{}", read_only.stdout, read_only.stderr);
+    assert!(output.contains("recovery in progress"), "{output}");
+    // Structured output: a warning object may precede the error object.
+    let hint = [&read_only.stdout, &read_only.stderr]
+        .into_iter()
+        .flat_map(|stream| {
+            serde_json::Deserializer::from_str(stream)
+                .into_iter::<Value>()
+                .map_while(Result::ok)
+                .collect::<Vec<_>>()
+        })
+        .find_map(|value| value["error"]["hint"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| panic!("the error JSON carries a hint: {output}"));
+    assert!(hint.contains("br doctor migrate-schema recover"), "{hint}");
+
+    let create = run_br(
+        &workspace,
+        ["create", "blocked by the index"],
+        "torn_create",
+    );
+    assert!(!create.status.success());
+    let output = format!("{}{}", create.stdout, create.stderr);
+    assert!(
+        output.contains("br doctor migrate-schema recover"),
+        "{output}"
+    );
+
+    let recover = run_br(
+        &workspace,
+        ["doctor", "migrate-schema", "recover", "--json"],
+        "torn_recover",
+    );
+    assert!(
+        recover.status.success(),
+        "{} {}",
+        recover.stdout,
+        recover.stderr
+    );
+    let titles = listed_titles(
+        &workspace,
+        &[
+            "--no-auto-import",
+            "--no-auto-flush",
+            "list",
+            "--all",
+            "--json",
+        ],
+        "torn_after_recover",
+    );
+    assert!(titles.iter().any(|title| title == KEPT_TITLE), "{titles:?}");
 }

@@ -334,6 +334,10 @@ struct EngineRecoveryReceipt {
     schema_version: &'static str,
     database_path: String,
     backup_path: String,
+    /// What `backup_path` holds: the complete family, or only the WAL index
+    /// when that was all recovery had to rebuild (see
+    /// `index_only_recovery_applies`).
+    backup_scope: &'static str,
     stage: String,
     raw_before: RawFamilyWitness,
     raw_after: Option<RawFamilyWitness>,
@@ -434,7 +438,15 @@ fn execute_recover(
             "Recovered engine read admission for {}",
             receipt.database_path
         );
-        println!("Pre-recovery family retained at {}", receipt.backup_path);
+        if receipt.backup_scope == RECOVERY_BACKUP_WAL_INDEX_ONLY {
+            println!(
+                "Only the WAL index needed rebuilding; the main database and WAL were unchanged. \
+                 Pre-recovery index retained at {}",
+                receipt.backup_path
+            );
+        } else {
+            println!("Pre-recovery family retained at {}", receipt.backup_path);
+        }
         if let Some(finding) = &receipt.index_corruption {
             println!(
                 "The database already had corrupt indexes ({}). A private rehearsal showed that \
@@ -634,17 +646,17 @@ pub fn recover_wal_index_for_startup(
     if !wal_index_needs_recovery(db_path)? {
         return Ok(());
     }
-    // Every automatic attempt copies the complete family into a new
-    // `.br_recovery` run before rehearsing. Rehearsal over identical bytes is
-    // deterministic, so once it has failed for this exact family, repeating it
-    // on every command only accumulates copies. Keep one snapshot per incident
-    // and report the retained one instead.
+    // Every automatic attempt retains its pre-state in a new `.br_recovery`
+    // run (the complete family, unless only the index had to be rebuilt).
+    // Recovery over identical bytes is deterministic, so once it has failed
+    // for this exact family, repeating it on every command only accumulates
+    // copies. Keep one snapshot per incident and report the retained one.
     let raw_before = recovery_family_witness(db_path)?;
     if let Some(prior) = prior_failed_recovery(beads_dir, &raw_before)? {
         return Err(BeadsError::SyncConflict {
             message: format!(
                 "automatic WAL index recovery already failed for this exact database family \
-                 at stage {} ({}); its complete pre-state is retained at {}. The database was \
+                 at stage {} ({}); its pre-recovery state is retained at {}. The database was \
                  not copied again. Run `br doctor migrate-schema recover` to retry explicitly, \
                  or `br doctor` for diagnosis.",
                 prior.stage,
@@ -785,6 +797,350 @@ fn recover_engine_admission(
     migration.write_authority.verify_database_authority()?;
     refuse_non_regular_component(&migration.db_path)?;
     let raw_before = recovery_family_witness(&migration.db_path)?;
+    let (receipt, run_dir) = if index_only_recovery_applies(&migration.db_path, &raw_before)? {
+        match recover_index_only(migration, &raw_before)? {
+            Some(completed) => completed,
+            None => recover_engine_admission_with_complete_backup(migration, strict_wal, policy)?,
+        }
+    } else {
+        recover_engine_admission_with_complete_backup(migration, strict_wal, policy)?
+    };
+    // Only a completed recovery prunes: a failed or interrupted one must not
+    // lose older evidence on its way out.
+    match prune_recovery_runs(
+        &migration.beads_dir,
+        &migration.db_path,
+        &run_dir,
+        Utc::now(),
+    ) {
+        Ok(pruned) if !pruned.is_empty() => tracing::info!(
+            pruned = pruned.len(),
+            kept_recent = RECOVERY_RUNS_KEPT,
+            "pruned completed WAL-index recovery runs past the retention window"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            "could not prune old WAL-index recovery runs; they are kept"
+        ),
+    }
+    Ok(receipt)
+}
+
+/// How many of a database's newest WAL-index recovery runs are always kept.
+const RECOVERY_RUNS_KEPT: usize = 5;
+/// Completed recovery runs younger than this are always kept.
+const RECOVERY_RUN_MIN_AGE_DAYS: i64 = 7;
+/// Backup scope of a recovery run that copied the whole database family.
+const RECOVERY_BACKUP_COMPLETE_FAMILY: &str = "complete-family";
+/// Backup scope of a recovery run that only had to rebuild the WAL index.
+const RECOVERY_BACKUP_WAL_INDEX_ONLY: &str = "wal-index-only";
+/// Marker for an index-only run that handed over to the complete-backup
+/// rehearsal: its only copy is the index it reinstated first.
+const RECOVERY_SUPERSEDED_RECEIPT: &str = "recovery-superseded.json";
+/// Prefix a run directory is renamed to before it is removed, so a removal
+/// that stops halfway never leaves something that looks like a live run.
+const PRUNING_PREFIX: &str = ".pruning-";
+
+/// Whether recovery only has to rebuild the WAL index: the index has the
+/// zero-page shape stock SQLite leaves on a family whose WAL holds no frames
+/// (#507), the WAL is its bare 32-byte header, and there is no rollback
+/// journal. The main database file is then the entire committed state, and
+/// rebuilding the index cannot change it, so copying the whole family (twice:
+/// backup and private rehearsal) on every such recovery bought nothing but
+/// disk use. That happened after every stock SQLite read of the tracker (bv,
+/// the sqlite3 shell).
+fn index_only_recovery_applies(db_path: &Path, raw_before: &RawFamilyWitness) -> Result<bool> {
+    let wal = component_for_suffix(raw_before, "-wal")?;
+    let shm = component_for_suffix(raw_before, "-shm")?;
+    let journal = component_for_suffix(raw_before, "-journal")?;
+    if !(wal.present && wal.length == Some(WAL_HEADER_BYTES) && shm.present && !journal.present) {
+        return Ok(false);
+    }
+    Ok(crate::franken_sync::wal_index::poisoned_index_present(
+        db_path,
+    )?)
+}
+
+/// Rebuild a #507 zero-page index in place, keeping only that index as the
+/// pre-state. Main database, WAL and journal must come out byte-identical,
+/// which is checked, and the result must pass a full integrity check.
+///
+/// Returns the completed receipt and its run directory. Returns `None` when
+/// the integrity check fails: the database had damage before this recovery,
+/// so the original index is reinstated, byte for byte, and the caller runs
+/// the complete-backup rehearsal, which classifies and reports it exactly as
+/// before.
+fn recover_index_only(
+    migration: &MigrationContext,
+    raw_before: &RawFamilyWitness,
+) -> Result<Option<(EngineRecoveryReceipt, PathBuf)>> {
+    let db_path = &migration.db_path;
+    let shm_witness = component_for_suffix(raw_before, "-shm")?.clone();
+    let run_id = allocate_run_id(&migration.beads_dir)?;
+    let run_dir = migration_runs_root(&migration.beads_dir).join(run_id);
+    let before_dir = run_dir.join("recovery-before");
+    ensure_new_directory(&before_dir)?;
+    let index_backup = backup_component_path(&before_dir, db_path, "-shm")?;
+    copy_regular_file_new(&family_component_path(db_path, "-shm"), &index_backup, None)?;
+    sync_directory(&before_dir)?;
+    verify_retained_component(&index_backup, &shm_witness)?;
+    let mut receipt = EngineRecoveryReceipt {
+        schema_version: "br.doctor.schema_migration.recovery.v1",
+        database_path: db_path.display().to_string(),
+        backup_path: before_dir.display().to_string(),
+        backup_scope: RECOVERY_BACKUP_WAL_INDEX_ONLY,
+        stage: "live-preflight".to_string(),
+        raw_before: raw_before.clone(),
+        raw_after: None,
+        logical_after: None,
+        index_corruption: None,
+        error: None,
+    };
+    write_json_new(&run_dir.join("recovery-prepared.json"), &receipt)?;
+    let operation = (|| -> Result<bool> {
+        migration.write_authority.verify_database_authority()?;
+        if recovery_family_witness(db_path)? != receipt.raw_before {
+            return Err(BeadsError::internal(
+                "database family changed before WAL index recovery",
+            ));
+        }
+        receipt.stage = "live-recovery".to_string();
+        recover_existing_family(db_path, Some(&migration.write_authority))?;
+        migration.write_authority.verify_database_authority()?;
+        let raw_after = recovery_family_witness(db_path)?;
+        require_recovery_payload_unchanged(&receipt.raw_before, &raw_after)?;
+        receipt.raw_after = Some(raw_after);
+        let logical_after = logical_witness(db_path)?;
+        let clean = integrity_check_is_clean(&logical_after.integrity_check);
+        receipt.logical_after = Some(logical_after);
+        if clean {
+            receipt.stage = "complete".to_string();
+            return Ok(true);
+        }
+        receipt.stage = "reinstate-index".to_string();
+        reinstate_retained_index(db_path, &index_backup, &shm_witness)?;
+        migration.write_authority.verify_database_authority()?;
+        let reinstated = recovery_family_witness(db_path)?;
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            if component_for_suffix(&reinstated, suffix)?
+                != component_for_suffix(&receipt.raw_before, suffix)?
+            {
+                return Err(BeadsError::internal(format!(
+                    "reinstating the original WAL index left component {suffix:?} different \
+                     from the pre-recovery state"
+                )));
+            }
+        }
+        receipt.stage = "superseded".to_string();
+        Ok(false)
+    })();
+    match operation {
+        Ok(true) => {
+            write_json_new(&run_dir.join("recovery-complete.json"), &receipt)?;
+            Ok(Some((receipt, run_dir)))
+        }
+        Ok(false) => {
+            write_json_new(&run_dir.join(RECOVERY_SUPERSEDED_RECEIPT), &receipt)?;
+            Ok(None)
+        }
+        Err(error) => {
+            receipt.error = Some(error.to_string());
+            write_json_new(&run_dir.join("recovery-failed.json"), &receipt)?;
+            Err(BeadsError::WithContext {
+                context: format!(
+                    "WAL index recovery failed at {}; the original index is retained at {}",
+                    receipt.stage,
+                    before_dir.display()
+                ),
+                source: Box::new(error),
+            })
+        }
+    }
+}
+
+/// Check a retained copy against the witness it was taken under.
+fn verify_retained_component(copy: &Path, witness: &RawComponentWitness) -> Result<()> {
+    let metadata = secure_file_metadata(copy)?.ok_or_else(|| {
+        BeadsError::internal(format!("retained copy is missing: {}", copy.display()))
+    })?;
+    let (length, sha256) = hash_regular_file(copy, &metadata)?;
+    if witness.length != Some(length) || witness.sha256.as_deref() != Some(sha256.as_str()) {
+        return Err(BeadsError::internal(format!(
+            "retained copy does not match the pre-recovery witness: {}",
+            copy.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Put the retained pre-recovery index back as the live `-shm`, atomically
+/// and with its original permissions. Runs only under the held family write
+/// authority and sole-opener lease of the recovery that removed it.
+fn reinstate_retained_index(
+    db_path: &Path,
+    retained: &Path,
+    witness: &RawComponentWitness,
+) -> Result<()> {
+    let live = family_component_path(db_path, "-shm");
+    let parent = live
+        .parent()
+        .ok_or_else(|| BeadsError::internal("WAL index path has no parent directory"))?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let staged = parent.join(format!(
+        ".{}.reinstate-{}-{nonce}.tmp",
+        live.file_name()
+            .map_or_else(|| "shm".into(), |name| name.to_string_lossy()),
+        std::process::id()
+    ));
+    copy_regular_file_new(retained, &staged, witness.unix_mode)?;
+    let installed = verify_retained_component(&staged, witness)
+        .and_then(|()| fs::rename(&staged, &live).map_err(BeadsError::Io));
+    if installed.is_err() {
+        // Our own staging copy; the retained original is untouched.
+        let _ = fs::remove_file(&staged);
+    }
+    installed?;
+    sync_directory(parent)
+}
+
+/// Remove this database's completed WAL-index recovery runs that are both
+/// outside the newest [`RECOVERY_RUNS_KEPT`] and older than
+/// [`RECOVERY_RUN_MIN_AGE_DAYS`].
+///
+/// Deliberately narrow. Only directories br created under
+/// `.br_recovery/schema-migrations/` with a recovery receipt for this
+/// database count as recovery runs. A run is removed only when it finished
+/// (`recovery-complete.json`, or an index-only run superseded by a complete
+/// backup) and carries no failure receipt; failed and in-progress runs are
+/// the evidence a later diagnosis needs and are never removed, and neither is
+/// `current_run`. Schema-migration runs (`undo` reads their backups) have no
+/// recovery receipt and are never touched. A run whose name does not carry
+/// the timestamp br writes is kept.
+fn prune_recovery_runs(
+    beads_dir: &Path,
+    db_path: &Path,
+    current_run: &Path,
+    now: chrono::DateTime<Utc>,
+) -> Result<Vec<PathBuf>> {
+    let root = migration_runs_root(beads_dir);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(BeadsError::Io(error)),
+    };
+    let database_path = db_path.display().to_string();
+    let mut runs = Vec::new();
+    let mut interrupted_prunes = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(BeadsError::Io)?;
+        let file_type = entry.file_type().map_err(BeadsError::Io)?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        if name.starts_with(PRUNING_PREFIX) {
+            interrupted_prunes.push(path);
+            continue;
+        }
+        let Some(created) = recovery_run_timestamp(&name) else {
+            continue;
+        };
+        let Some(status) = recovery_run_status(&path, &database_path)? else {
+            continue;
+        };
+        runs.push((created, path, status));
+    }
+    // Newest first; ties broken by name so the order is total.
+    runs.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    let min_age = chrono::Duration::days(RECOVERY_RUN_MIN_AGE_DAYS);
+    let mut pruned = Vec::new();
+    for (created, path, status) in runs.into_iter().skip(RECOVERY_RUNS_KEPT) {
+        if status != RecoveryRunStatus::Finished || path == current_run || now - created < min_age {
+            continue;
+        }
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let mut doomed_name = OsString::from(PRUNING_PREFIX);
+        doomed_name.push(name);
+        let doomed = root.join(doomed_name);
+        if let Err(error) = fs::rename(&path, &doomed) {
+            tracing::warn!(run = %path.display(), %error, "could not set aside old recovery run");
+            continue;
+        }
+        interrupted_prunes.push(doomed);
+        pruned.push(path);
+    }
+    if !interrupted_prunes.is_empty() {
+        sync_directory(&root)?;
+    }
+    for doomed in interrupted_prunes {
+        if let Err(error) = fs::remove_dir_all(&doomed) {
+            tracing::warn!(run = %doomed.display(), %error, "could not remove old recovery run");
+        }
+    }
+    Ok(pruned)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryRunStatus {
+    Finished,
+    /// Failed, or prepared without a verdict (interrupted, or running).
+    Retained,
+}
+
+/// The creation time `allocate_run_id` encodes at the front of a run name
+/// (`20260930T120000.123456Z-<pid>-<n>`).
+fn recovery_run_timestamp(name: &str) -> Option<chrono::DateTime<Utc>> {
+    let (stamp, _) = name.split_once("Z-")?;
+    chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%dT%H%M%S%.f")
+        .ok()
+        .map(|naive| naive.and_utc())
+}
+
+/// Classify a run directory as a recovery run of `database_path`, or `None`
+/// for anything else (schema-migration runs, other databases' runs, runs
+/// whose receipt this binary cannot read).
+fn recovery_run_status(run_dir: &Path, database_path: &str) -> Result<Option<RecoveryRunStatus>> {
+    let prepared = run_dir.join("recovery-prepared.json");
+    let bytes = match fs::read(&prepared) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(BeadsError::Io(error)),
+    };
+    let Ok(receipt) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Ok(None);
+    };
+    if receipt
+        .get("database_path")
+        .and_then(serde_json::Value::as_str)
+        != Some(database_path)
+    {
+        return Ok(None);
+    }
+    let has =
+        |name: &str| -> Result<bool> { Ok(secure_file_metadata(&run_dir.join(name))?.is_some()) };
+    if has("recovery-failed.json")? {
+        return Ok(Some(RecoveryRunStatus::Retained));
+    }
+    if has("recovery-complete.json")? || has(RECOVERY_SUPERSEDED_RECEIPT)? {
+        return Ok(Some(RecoveryRunStatus::Finished));
+    }
+    Ok(Some(RecoveryRunStatus::Retained))
+}
+
+fn recover_engine_admission_with_complete_backup(
+    migration: &MigrationContext,
+    strict_wal: bool,
+    policy: PreexistingIndexCorruption,
+) -> Result<(EngineRecoveryReceipt, PathBuf)> {
+    migration.write_authority.verify_database_authority()?;
+    refuse_non_regular_component(&migration.db_path)?;
+    let raw_before = recovery_family_witness(&migration.db_path)?;
     let run_id = allocate_run_id(&migration.beads_dir)?;
     let run_dir = migration_runs_root(&migration.beads_dir).join(run_id);
     let before_dir = run_dir.join("recovery-before");
@@ -795,6 +1151,7 @@ fn recover_engine_admission(
         schema_version: "br.doctor.schema_migration.recovery.v1",
         database_path: migration.db_path.display().to_string(),
         backup_path: before_dir.display().to_string(),
+        backup_scope: RECOVERY_BACKUP_COMPLETE_FAMILY,
         stage: "private-recovery".to_string(),
         raw_before,
         raw_after: None,
@@ -861,7 +1218,7 @@ fn recover_engine_admission(
         });
     }
     write_json_new(&run_dir.join("recovery-complete.json"), &receipt)?;
-    Ok(receipt)
+    Ok((receipt, run_dir))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5016,6 +5373,238 @@ mod tests {
             missing_wal_index(&db).unwrap(),
             crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY
         );
+    }
+
+    /// One run directory as br lays it out. `receipts` names the receipt
+    /// files to write; recovery receipts carry `database_path`.
+    fn make_run(root: &Path, name: &str, database_path: &str, receipts: &[&str]) -> PathBuf {
+        let run = root.join(name);
+        fs::create_dir_all(run.join("recovery-before")).unwrap();
+        fs::write(run.join("recovery-before").join("beads.db"), b"retained").unwrap();
+        for receipt in receipts {
+            fs::write(
+                run.join(receipt),
+                serde_json::json!({ "database_path": database_path }).to_string(),
+            )
+            .unwrap();
+        }
+        run
+    }
+
+    fn run_name(now: chrono::DateTime<Utc>, days_ago: i64, counter: u32) -> String {
+        format!(
+            "{}-4242-{counter}",
+            (now - chrono::Duration::days(days_ago)).format("%Y%m%dT%H%M%S%.6fZ")
+        )
+    }
+
+    #[test]
+    fn recovery_run_names_carry_their_creation_time() {
+        let run_id = allocate_run_id(TempDir::new().unwrap().path()).unwrap();
+        let created = recovery_run_timestamp(&run_id).expect("allocate_run_id format parses");
+        assert!((Utc::now() - created).num_seconds().abs() < 60, "{run_id}");
+        assert!(recovery_run_timestamp("not-a-run").is_none());
+        assert!(recovery_run_timestamp("20269999T000000.000000Z-1-0").is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn recovery_retention_prunes_only_old_finished_runs_of_this_database() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let database = db_path.display().to_string();
+        let root = migration_runs_root(&beads_dir);
+        fs::create_dir_all(&root).unwrap();
+        let now = Utc::now();
+        let prepared = "recovery-prepared.json";
+        let complete = "recovery-complete.json";
+
+        let current = make_run(
+            &root,
+            &run_name(now, 0, 0),
+            &database,
+            &[prepared, complete],
+        );
+        // Newest first after the current run: three recent finished runs, then
+        // an index-only run superseded by a complete backup.
+        let recent: Vec<PathBuf> = (1..=3)
+            .map(|day| {
+                make_run(
+                    &root,
+                    &run_name(now, day, 0),
+                    &database,
+                    &[prepared, complete],
+                )
+            })
+            .collect();
+        let superseded_recent = make_run(
+            &root,
+            &run_name(now, 4, 0),
+            &database,
+            &[prepared, RECOVERY_SUPERSEDED_RECEIPT],
+        );
+        // Beyond the newest five but younger than seven days: kept.
+        let young = make_run(
+            &root,
+            &run_name(now, 5, 0),
+            &database,
+            &[prepared, complete],
+        );
+        // Beyond the newest five and older than seven days: pruned.
+        let old_finished: Vec<PathBuf> = (10..=12)
+            .map(|day| {
+                make_run(
+                    &root,
+                    &run_name(now, day, 0),
+                    &database,
+                    &[prepared, complete],
+                )
+            })
+            .collect();
+        let old_superseded = make_run(
+            &root,
+            &run_name(now, 13, 0),
+            &database,
+            &[prepared, RECOVERY_SUPERSEDED_RECEIPT],
+        );
+        // Evidence and foreign runs that no age may remove.
+        let old_failed = make_run(
+            &root,
+            &run_name(now, 20, 0),
+            &database,
+            &[prepared, "recovery-failed.json"],
+        );
+        let old_in_progress = make_run(&root, &run_name(now, 21, 0), &database, &[prepared]);
+        let old_other_database = make_run(
+            &root,
+            &run_name(now, 22, 0),
+            "/elsewhere/.beads/beads.db",
+            &[prepared, complete],
+        );
+        let old_migration = make_run(
+            &root,
+            &run_name(now, 23, 0),
+            &database,
+            &["prepared.json", "applied.json"],
+        );
+        let unreadable_receipt = root.join(run_name(now, 24, 0));
+        fs::create_dir_all(&unreadable_receipt).unwrap();
+        fs::write(unreadable_receipt.join(prepared), b"{ not json").unwrap();
+        fs::write(unreadable_receipt.join(complete), b"{}").unwrap();
+        let unnamed = make_run(&root, "operator-kept-run", &database, &[prepared, complete]);
+        let interrupted = root.join(format!("{PRUNING_PREFIX}{}", run_name(now, 30, 0)));
+        fs::create_dir_all(interrupted.join("recovery-before")).unwrap();
+
+        let mut pruned = prune_recovery_runs(&beads_dir, &db_path, &current, now).unwrap();
+        pruned.sort();
+        let mut expected: Vec<PathBuf> = old_finished.clone();
+        expected.push(old_superseded.clone());
+        expected.sort();
+        assert_eq!(pruned, expected);
+        for gone in old_finished.iter().chain([&old_superseded, &interrupted]) {
+            assert!(!gone.exists(), "{} must be removed", gone.display());
+        }
+        for kept in recent.iter().chain([
+            &current,
+            &superseded_recent,
+            &young,
+            &old_failed,
+            &old_in_progress,
+            &old_other_database,
+            &old_migration,
+            &unreadable_receipt,
+            &unnamed,
+        ]) {
+            assert!(kept.is_dir(), "{} must be kept", kept.display());
+        }
+        let leftovers: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(PRUNING_PREFIX))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        // Idempotent: nothing further qualifies.
+        assert!(
+            prune_recovery_runs(&beads_dir, &db_path, &current, now)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn recovery_retention_never_prunes_the_current_run_or_within_the_newest_five() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let database = db_path.display().to_string();
+        let root = migration_runs_root(&beads_dir);
+        fs::create_dir_all(&root).unwrap();
+        let now = Utc::now();
+        // Every run is old; only the count protects the newest five, and the
+        // "current" run is protected even though it sorts last here.
+        let runs: Vec<PathBuf> = (0..7)
+            .map(|index| {
+                make_run(
+                    &root,
+                    &run_name(now, 30 + index, 0),
+                    &database,
+                    &["recovery-prepared.json", "recovery-complete.json"],
+                )
+            })
+            .collect();
+        let current = runs.last().unwrap().clone();
+        let pruned = prune_recovery_runs(&beads_dir, &db_path, &current, now).unwrap();
+        assert_eq!(pruned, vec![runs[5].clone()]);
+        for (index, run) in runs.iter().enumerate() {
+            assert_eq!(run.is_dir(), index != 5, "run {index}");
+        }
+
+        // No runs root at all is not an error.
+        let empty = TempDir::new().unwrap();
+        assert!(
+            prune_recovery_runs(empty.path(), &db_path, &current, now)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_retention_ignores_symlinked_runs() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let database = db_path.display().to_string();
+        let root = migration_runs_root(&beads_dir);
+        fs::create_dir_all(&root).unwrap();
+        let now = Utc::now();
+        let outside = make_run(
+            temp.path(),
+            "outside-target",
+            &database,
+            &["recovery-prepared.json", "recovery-complete.json"],
+        );
+        for index in 0..6 {
+            make_run(
+                &root,
+                &run_name(now, index, 0),
+                &database,
+                &["recovery-prepared.json", "recovery-complete.json"],
+            );
+        }
+        let link = root.join(run_name(now, 40, 0));
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let current = root.join(run_name(now, 0, 0));
+        prune_recovery_runs(&beads_dir, &db_path, &current, now).unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(outside.join("recovery-before").join("beads.db").is_file());
     }
 
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
