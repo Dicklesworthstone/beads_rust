@@ -3362,9 +3362,7 @@ fn e2e_entry_routes_require_both_existing_relation_and_configured_label() {
     );
     let dependencies = storage.get_dependencies(&admitted_id).unwrap();
     assert!(
-        dependencies
-            .iter()
-            .any(|dependency| dependency.depends_on_id == anchor),
+        dependencies.iter().any(|dependency| dependency == &anchor),
         "{dependencies:?}"
     );
     drop(storage);
