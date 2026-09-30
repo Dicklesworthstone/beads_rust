@@ -1709,6 +1709,15 @@ impl Workflow {
     /// strict status vocabulary.
     pub fn validate_entry_routes(&self) -> Result<()> {
         let invalid = |reason| BeadsError::validation("workflow.entry_routes", reason);
+        if !self.entry_routes.is_empty()
+            && (!self.transitions_enforced()
+                || self.transitions_from(TRANSITION_INITIAL).is_none())
+        {
+            return Err(invalid(
+                "entry routes require strict workflow transition enforcement and an explicit non-empty transitions.initial rule; without that gate there is no initial admission to narrow"
+                    .to_string(),
+            ));
+        }
         let mut seen = std::collections::HashSet::new();
         for (index, route) in self.entry_routes.iter().enumerate() {
             for (field, value) in [("label", route.label.as_str()), ("to", route.to.as_str())] {
@@ -3246,6 +3255,19 @@ mod tests {
             to: "OPEN".to_string(),
         });
         assert!(invalid.validate_entry_routes().is_err());
+
+        let mut no_initial = workflow.clone();
+        no_initial.transitions.remove(TRANSITION_INITIAL);
+        assert!(
+            no_initial.validate_entry_routes().is_err(),
+            "entry routes without an initial gate would be misleading"
+        );
+        let mut advisory = workflow.clone();
+        advisory.strict = false;
+        assert!(
+            advisory.validate_entry_routes().is_err(),
+            "entry routes require enforced transitions"
+        );
     }
 
     #[test]
