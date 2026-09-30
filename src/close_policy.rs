@@ -1710,8 +1710,7 @@ impl Workflow {
     pub fn validate_entry_routes(&self) -> Result<()> {
         let invalid = |reason| BeadsError::validation("workflow.entry_routes", reason);
         if !self.entry_routes.is_empty()
-            && (!self.transitions_enforced()
-                || self.transitions_from(TRANSITION_INITIAL).is_none())
+            && (!self.transitions_enforced() || self.transitions_from(TRANSITION_INITIAL).is_none())
         {
             return Err(invalid(
                 "entry routes require strict workflow transition enforcement and an explicit non-empty transitions.initial rule; without that gate there is no initial admission to narrow"
@@ -1721,9 +1720,7 @@ impl Workflow {
         let mut seen = std::collections::HashSet::new();
         for (index, route) in self.entry_routes.iter().enumerate() {
             for (field, value) in [("label", route.label.as_str()), ("to", route.to.as_str())] {
-                if value.is_empty()
-                    || value.trim() != value
-                    || value.chars().any(char::is_control)
+                if value.is_empty() || value.trim() != value || value.chars().any(char::is_control)
                 {
                     return Err(invalid(format!(
                         "rule {index} {field} must be a non-empty literal without outer whitespace or control characters"
@@ -3218,7 +3215,7 @@ mod tests {
 
     #[test]
     fn entry_routes_require_relation_and_match_label_and_target() {
-        let raw = r#"workflow:
+        let raw = r"workflow:
   strict: true
   statuses: [draft, planning, open]
   transitions:
@@ -3226,7 +3223,7 @@ mod tests {
   entry_routes:
     - {label: bug, to: open}
     - {label: follow-up, to: planning}
-"#;
+";
         let document: PolicyDocument = serde_yml::from_str(raw).unwrap();
         let workflow = &document.workflow;
         workflow.validate_entry_routes().unwrap();
@@ -4386,7 +4383,7 @@ close_policy:
         );
         assert_table_covers(
             PolicyNode::Workflow,
-            &field_names_of(&class_transition_workflow()),
+            &field_names_of(&representative_workflow()),
             "Workflow",
         );
     }
@@ -4463,7 +4460,7 @@ close_policy:
         );
         assert_no_stale(
             PolicyNode::Workflow,
-            &field_names_of(&class_transition_workflow()),
+            &field_names_of(&representative_workflow()),
             "Workflow",
         );
     }
@@ -5392,6 +5389,17 @@ workflow:
 ";
         let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
         assert!(detect_unknown_policy_fields(&raw).is_empty());
+    }
+
+    /// A workflow that serialises every optional table the policy parser
+    /// knows about; empty ones are skipped when serialising.
+    fn representative_workflow() -> Workflow {
+        let mut workflow = class_transition_workflow();
+        workflow.entry_routes.push(EntryRoute {
+            label: "bug".to_string(),
+            to: "open".to_string(),
+        });
+        workflow
     }
 
     fn class_transition_workflow() -> Workflow {

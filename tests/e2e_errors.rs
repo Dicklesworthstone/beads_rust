@@ -3357,7 +3357,9 @@ fn e2e_entry_routes_require_both_existing_relation_and_configured_label() {
     assert_eq!(stored.status.as_str(), "open");
     let labels = storage.get_labels(&admitted_id).unwrap();
     assert!(
-        labels.iter().any(|label| label.eq_ignore_ascii_case("triage")),
+        labels
+            .iter()
+            .any(|label| label.eq_ignore_ascii_case("triage")),
         "{labels:?}"
     );
     let dependencies = storage.get_dependencies(&admitted_id).unwrap();
