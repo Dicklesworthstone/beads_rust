@@ -100,6 +100,20 @@ this repo): commits `55c186682` + `5946b3b7c` in
   file or environment setting for it: a filter that hides issues by default
   would change what `br ready` means for every agent in the workspace.
 
+### Provenance-backed entry routes in `policy.yaml` (#503)
+
+- `workflow.entry_routes` lets `br create` skip the global `initial` status
+  for follow-up work. With `- {label: triage, to: open}`, a new issue enters
+  `open` directly when it carries the `triage` label and at least one parent
+  or dependency names an issue that already exists in the tracker. A label
+  alone, a relation alone, an `external:` reference, or a status the route
+  does not name is still refused by the `initial` rule. Routes require strict
+  transition enforcement and an explicit `transitions.initial`; labels and
+  statuses match case-insensitively, and duplicate or undeclared targets are
+  rejected when the policy loads. Imports are not reinterpreted through
+  routes. The storage layer repeats the check inside the create transaction,
+  so every create path applies the same rule.
+
 ### `.br_recovery` no longer grows without bound after SQLite reads
 
 - **Every write after a stock SQLite reader (bv, the `sqlite3` shell) opened

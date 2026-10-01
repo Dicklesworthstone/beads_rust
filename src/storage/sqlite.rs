@@ -6924,8 +6924,15 @@ impl SqliteStorage {
         self.mutate("create_issue", actor, |conn, ctx| {
             workflow_policy.validate_status(issue.status.as_str())?;
             // Class-specific edges apply only after creation; every issue
-            // enters through the same configured initial route.
-            workflow_policy.validate_transition(None, issue.status.as_str(), None)?;
+            // enters through the configured initial route, or through a
+            // provenance-backed entry route (GH #503) re-proved here inside
+            // the write transaction.
+            if let Err(initial) =
+                workflow_policy.validate_transition(None, issue.status.as_str(), None)
+                && !Self::create_admitted_by_entry_route(conn, &workflow_policy, issue)?
+            {
+                return Err(initial);
+            }
             // Explicit duplicate check since fsqlite does not enforce
             // UNIQUE constraints on non-rowid columns.
             match conn.query_row_with_params(
@@ -8393,6 +8400,41 @@ impl SqliteStorage {
             .filter_map(|row| row.get(0).and_then(SqliteValue::as_text))
             .map(str::to_string)
             .collect())
+    }
+
+    /// Whether a create the global `initial` rule refused is admitted by a
+    /// provenance-backed entry route (GH #503).
+    ///
+    /// The CLI checks the route before any write; this repeats the proof
+    /// inside the create transaction so the storage layer, which every create
+    /// path reaches, never admits on a label alone. At least one parent or
+    /// dependency must name an issue that exists in this database now;
+    /// `external:` references never count as provenance.
+    fn create_admitted_by_entry_route(
+        conn: &Connection,
+        workflow_policy: &crate::close_policy::Workflow,
+        issue: &Issue,
+    ) -> Result<bool> {
+        if workflow_policy.entry_routes.is_empty()
+            || !workflow_policy.allows_entry_route(issue.status.as_str(), &issue.labels, true)
+        {
+            return Ok(false);
+        }
+        for dependency in &issue.dependencies {
+            let target = dependency.depends_on_id.as_str();
+            if target.starts_with("external:") || target == issue.id {
+                continue;
+            }
+            match conn.query_row_with_params(
+                "SELECT 1 FROM issues WHERE id = ? LIMIT 1",
+                &[SqliteValue::from(target)],
+            ) {
+                Ok(_) => return Ok(true),
+                Err(FrankenError::QueryReturnedNoRows) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(false)
     }
 
     fn get_issue_from_conn(conn: &Connection, id: &str) -> Result<Option<Issue>> {
@@ -22590,6 +22632,110 @@ required_fields:
                     .unwrap()
             )
         })
+    }
+
+    #[test]
+    fn entry_route_storage_admits_only_with_label_and_existing_relation() {
+        let mut workflow = class_transition_workflow();
+        workflow.entry_routes.push(crate::close_policy::EntryRoute {
+            label: "triage".to_owned(),
+            to: "open".to_owned(),
+        });
+        workflow.validate_entry_routes().unwrap();
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage.set_workflow_policy(workflow);
+        let anchor = make_issue(
+            "bd-anchor",
+            "Anchor",
+            Status::Draft,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&anchor, "route-tester").unwrap();
+
+        let relation = |issue_id: &str, target: &str, dep_type| Dependency {
+            issue_id: issue_id.to_owned(),
+            depends_on_id: target.to_owned(),
+            dep_type,
+            created_at: Utc::now(),
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        };
+        let candidate = |id: &str, status, labels: &[&str], deps: Vec<Dependency>| {
+            let mut issue = make_issue(id, id, status, 2, None, Utc::now(), None);
+            issue.labels = labels.iter().map(|label| (*label).to_owned()).collect();
+            issue.dependencies = deps;
+            issue
+        };
+        let before = class_transition_rows(&storage);
+        for issue in [
+            candidate("bd-label-only", Status::Open, &["triage"], vec![]),
+            candidate(
+                "bd-relation-only",
+                Status::Open,
+                &[],
+                vec![relation(
+                    "bd-relation-only",
+                    "bd-anchor",
+                    DependencyType::DiscoveredFrom,
+                )],
+            ),
+            candidate(
+                "bd-external",
+                Status::Open,
+                &["triage"],
+                vec![relation(
+                    "bd-external",
+                    "external:ticket-42",
+                    DependencyType::Related,
+                )],
+            ),
+            candidate(
+                "bd-missing",
+                Status::Open,
+                &["triage"],
+                vec![relation(
+                    "bd-missing",
+                    "bd-nowhere",
+                    DependencyType::DiscoveredFrom,
+                )],
+            ),
+            candidate(
+                "bd-wrong-target",
+                "planned".parse::<Status>().unwrap(),
+                &["triage"],
+                vec![relation(
+                    "bd-wrong-target",
+                    "bd-anchor",
+                    DependencyType::DiscoveredFrom,
+                )],
+            ),
+        ] {
+            let error = storage.create_issue(&issue, "route-tester").unwrap_err();
+            assert!(
+                matches!(error, BeadsError::Validation { .. }),
+                "{}: {error}",
+                issue.id
+            );
+            assert_eq!(class_transition_rows(&storage), before, "{}", issue.id);
+        }
+
+        let admitted = candidate(
+            "bd-admitted",
+            Status::Open,
+            &["TRIAGE"],
+            vec![relation(
+                "bd-admitted",
+                "bd-anchor",
+                DependencyType::DiscoveredFrom,
+            )],
+        );
+        storage.create_issue(&admitted, "route-tester").unwrap();
+        let stored = storage.get_issue("bd-admitted").unwrap().unwrap();
+        assert_eq!(stored.status, Status::Open);
     }
 
     #[test]
