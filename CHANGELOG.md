@@ -14,7 +14,7 @@ This changelog is organized by capability rather than diff order. Each version s
 - Release links: `https://github.com/Dicklesworthstone/beads_rust/releases/tag/<TAG>`
 
 **Scope window:** every version from inception (v0.1.0, 2026-01-18) through the current
-release (v0.7.3, 2026-09-29).
+release (v0.7.4, 2026-10-01).
 The full per-version detail is in the sections below; the timeline names the
 recent line and the milestone anchors. The September 8 audit examined all 79
 commits in `v0.5.10..v0.5.11` and six subsequent commits against Git diffs,
@@ -31,6 +31,7 @@ explicitly corrected during this audit.
 
 | Version | Date | Kind | Headline |
 |---|---|---|---|
+| [v0.7.4](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.4) | 2026-10-01 | Release | `--exclude-label` for list/ready/search/count (#522); FrankenSQLite 0.4.7, so reads after a SQLite reader such as bv no longer copy the database; bounded `.br_recovery` and `.br-wal-index-*` retention; provenance-backed create entry routes (#503); "recovery in progress" names `br doctor migrate-schema recover` |
 | [v0.7.3](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.3) | 2026-09-29 | Release | Read-only commands (`--no-auto-import --no-auto-flush`, the form bv generates) no longer fail with "recovery in progress" after a SQLite reader such as bv opened the tracker |
 | [v0.7.2](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.2) | 2026-09-29 | Release | WAL-index recovery no longer locked out by pre-existing index damage, and warns when rows may be lost (#523); `br update` reports label changes (#527) |
 | [v0.7.1](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.1) | 2026-09-28 | Release | Workspaces upgraded from 0.6.0 no longer wedge on a stale WAL index (#521); Windows WAL-index recovery no longer blocks every command (#520); older-schema databases self-heal (`doctor migrate-schema heal`); id-less mutation, coordination, epic close-policy and `policy.yaml` unknown-key fixes |
@@ -86,7 +87,10 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
-## Unreleased
+## v0.7.4 — 2026-10-01
+
+[Release](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.4).
+A patch release. The database schema is unchanged at 19.
 
 ### Label exclusion for list, ready, search and count (#522)
 
