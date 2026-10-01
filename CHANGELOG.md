@@ -172,6 +172,26 @@ A patch release. The database schema is unchanged at 19.
   `sync_merge_pending_unknown` warning's `remediation`, and in the
   `br doctor --repair` refusal.
 
+### Distribution and verification
+
+- Seven default-feature binaries were built from
+  [3956ebb8](https://github.com/Dicklesworthstone/beads_rust/commit/3956ebb8)
+  on Apple Silicon with the v0.7.3 recipe: macOS amd64/arm64 natively, Linux
+  GNU (glibc 2.28 floor) and static musl on amd64/arm64 with cargo-zigbuild,
+  and Windows amd64 with the GNU toolchain. GitHub Actions were not used.
+- The 24 assets are seven archives, seven SHA-256 sidecars, seven Minisign
+  signatures (key `36B847D11BA5A0D0`), aggregate checksums, and SPDX/CycloneDX
+  source SBOMs. Public downloads matched the checksums and signatures on
+  macOS and Linux, and the installer at the tag installed byte-identical
+  binaries on Apple Silicon and Linux amd64 into scratch prefixes. Every
+  binary reports commit 3956ebb8. The macOS (arm64 and Intel under Rosetta)
+  and Linux amd64 GNU and musl binaries passed a create, dependency, label,
+  `--exclude-label`, close, sync and doctor round trip, then a read-only
+  `show` and a write after a Python `sqlite3` read; the arm64 Linux binaries
+  ran under qemu-user. No Windows host was reachable, so the Windows binary
+  was not run.
+- The in-repo Homebrew, Scoop and AUR manifests point at these assets.
+
 ## v0.7.3 — 2026-09-29
 
 [Release](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.3).

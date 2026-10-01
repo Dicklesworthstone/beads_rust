@@ -21,8 +21,8 @@ options=('!strip' '!debug')
 source_x86_64=("${pkgname}-${pkgver}-x86_64.tar.gz::https://github.com/Dicklesworthstone/beads_rust/releases/download/v${pkgver}/br-${pkgver}-linux_amd64.tar.gz")
 source_aarch64=("${pkgname}-${pkgver}-aarch64.tar.gz::https://github.com/Dicklesworthstone/beads_rust/releases/download/v${pkgver}/br-${pkgver}-linux_arm64.tar.gz")
 
-sha256sums_x86_64=('4fcb20b8352eb85359b0f9ff7ec31f6c057ecf8e26184252c36ab1e447eef986')
-sha256sums_aarch64=('025d61e8d05426ed37d3b1045f893a92a587c6ba90ce24989232b4c0a38fcb8c')
+sha256sums_x86_64=('ba9e493175a1859b4d0427ad32e8636b26a128416041ed7bc7d41ab81ddc3333')
+sha256sums_aarch64=('7e9dd1da447ae663534fe46f1fd778a6bce1f0e36b4e3e9844770e3579dc7bd5')
 
 package() {
     install -Dm755 "${srcdir}/br" "${pkgdir}/usr/bin/br"

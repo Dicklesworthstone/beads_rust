@@ -19,11 +19,11 @@ class Br < Formula
   on_macos do
     on_arm do
       url "https://github.com/Dicklesworthstone/beads_rust/releases/download/v#{version}/br-#{version}-darwin_arm64.tar.gz"
-      sha256 "c5006b61faf84a82ab4b7f750269c94cefb55f9ab93b2b723c396932ad5fc2bb"  # darwin_arm64
+      sha256 "4e7619b919c0f720d0d520c51ce3b1c730387293cb6fe159e1f1cba8512ffad7"  # darwin_arm64
     end
     on_intel do
       url "https://github.com/Dicklesworthstone/beads_rust/releases/download/v#{version}/br-#{version}-darwin_amd64.tar.gz"
-      sha256 "d6b90e8c8c42f3208b574bed35d88c47a38edd936f1926e63b23dcde74cdb4eb"  # darwin_amd64
+      sha256 "38d2691fcf4921af6d1b4772b8c45c7c8c6dfdbea3b432064fb2ce6a71936e6e"  # darwin_amd64
     end
   end
 
@@ -31,11 +31,11 @@ class Br < Formula
   on_linux do
     on_arm do
       url "https://github.com/Dicklesworthstone/beads_rust/releases/download/v#{version}/br-#{version}-linux_musl_arm64.tar.gz"
-      sha256 "dbecdb0525d439bb4987395060ceac7a6dc3d51e15a3f8b890b67266b299ad66"  # linux_musl_arm64
+      sha256 "082d02cda1919d6b1587c0a932f5842fa510a7a18d80db0d2a85988959c4ae5b"  # linux_musl_arm64
     end
     on_intel do
       url "https://github.com/Dicklesworthstone/beads_rust/releases/download/v#{version}/br-#{version}-linux_musl_amd64.tar.gz"
-      sha256 "bf6d3c91c3e8a1171da4e92cbaec26625076669a9ccbf56bb9b57f8406929ecb"  # linux_musl_amd64
+      sha256 "5263fa20f988588b88320856e7a1086505d28a2456628b85cc8f6ec51e0af732"  # linux_musl_amd64
     end
   end
 
