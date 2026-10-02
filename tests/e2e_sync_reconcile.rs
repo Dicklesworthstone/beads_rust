@@ -525,10 +525,7 @@ fn source_repo_path_migration_reconciles_and_is_idempotent() {
     assert_eq!(plan["jsonl_rewrite_required"].as_bool(), Some(true));
     assert_eq!(plan["source_repo_preserved"].as_bool(), Some(true));
     assert_eq!(plan["vcs_status"].as_str(), Some("not_probed"));
-    let target = fs::canonicalize(&ws.root)
-        .expect("canonical workspace")
-        .to_string_lossy()
-        .into_owned();
+    let target = canonical_root(&ws);
     assert_eq!(plan["target_path"].as_str(), Some(target.as_str()));
     let token = plan["plan_sha256"]
         .as_str()
@@ -628,8 +625,13 @@ fn source_repo_path_migration_reconciles_and_is_idempotent() {
         3,
         "migration lost or duplicated rows"
     );
+    // GitHub #528: the database adopts this machine's path, but the shared
+    // JSONL never carries it; the migration strips legacy values.
     for row in normalized_jsonl.values() {
-        assert_eq!(row["source_repo_path"].as_str(), Some(target.as_str()));
+        assert!(
+            row.get("source_repo_path").is_none(),
+            "migrated JSONL still carries source_repo_path: {row}"
+        );
     }
     assert_eq!(
         normalized_jsonl[&database_newer_id]["source_repo"].as_str(),
@@ -791,6 +793,196 @@ fn source_repo_path_migration_rejects_equal_timestamp_payload_conflict() {
         Some("divergent source payload"),
         "failed plan must not import the source payload"
     );
+}
+
+// ============================================================================
+// source_repo_path stays machine-local (GitHub #528)
+// ============================================================================
+
+fn canonical_root(ws: &BrWorkspace) -> String {
+    dunce::canonicalize(&ws.root)
+        .expect("canonical workspace")
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn local_source_repo_path(ws: &BrWorkspace, id: &str) -> Option<String> {
+    SqliteStorage::open(&db_path(ws))
+        .expect("open DB")
+        .get_issue(id)
+        .expect("read issue")
+        .expect("issue exists")
+        .source_repo_path
+}
+
+fn assert_jsonl_has_no_source_repo_path(ws: &BrWorkspace) {
+    for line in read_jsonl_lines(ws) {
+        let row: Value = serde_json::from_str(&line).expect("JSONL row");
+        assert!(
+            row.get("source_repo_path").is_none(),
+            "JSONL leaks a machine-local source_repo_path: {line}"
+        );
+    }
+}
+
+#[test]
+fn create_keeps_source_repo_path_out_of_jsonl() {
+    let ws = BrWorkspace::new();
+    init_workspace(&ws, "localpath");
+    let id = create_issue(&ws, "Local path stays local", "localpath_create");
+    let flush = run_br(&ws, ["sync", "--flush-only", "--json"], "localpath_flush");
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+
+    assert_jsonl_has_no_source_repo_path(&ws);
+    let row: Value = serde_json::from_str(&read_jsonl_lines(&ws)[0]).expect("row");
+    assert!(
+        row["source_repo"].as_str().is_some(),
+        "the portable source_repo name is still exported: {row}"
+    );
+
+    let root = canonical_root(&ws);
+    assert_eq!(
+        local_source_repo_path(&ws, &id).as_deref(),
+        Some(root.as_str())
+    );
+    let show = run_br(&ws, ["show", &id, "--json"], "localpath_show");
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let shown = parse_json_value(&show.stdout);
+    let shown = shown.get(0).unwrap_or(&shown);
+    assert_eq!(shown["source_repo_path"].as_str(), Some(root.as_str()));
+
+    // A later edit re-exports the row without the field as well.
+    let update = run_br(
+        &ws,
+        ["update", &id, "--title", "Edited locally", "--json"],
+        "localpath_update",
+    );
+    assert!(update.status.success(), "update failed: {}", update.stderr);
+    let flush = run_br(&ws, ["sync", "--flush-only", "--json"], "localpath_reflush");
+    assert!(flush.status.success(), "reflush failed: {}", flush.stderr);
+    assert_jsonl_has_no_source_repo_path(&ws);
+}
+
+#[test]
+fn pulled_path_free_rows_keep_the_local_source_repo_path() {
+    for mode in ["import-only", "reconcile"] {
+        let ws = BrWorkspace::new();
+        init_workspace(&ws, "pulledpath");
+        let id = create_issue(&ws, "Edited on another machine", "pulledpath_create");
+        let flush = run_br(&ws, ["sync", "--flush-only", "--json"], "pulledpath_flush");
+        assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+        let root = canonical_root(&ws);
+
+        // A peer edits the row; its export has no source_repo_path.
+        let mut lines = read_jsonl_lines(&ws);
+        lines[0] = set_row_field(&lines[0], "title", json!("Edited by a peer"));
+        lines[0] = set_row_field(&lines[0], "updated_at", json!("2030-01-01T00:00:00Z"));
+        write_jsonl_lines(&ws, &lines);
+
+        let run = run_br(
+            &ws,
+            ["sync", &format!("--{mode}"), "--json"],
+            "pulledpath_sync",
+        );
+        assert!(
+            run.status.success(),
+            "{mode} failed: stdout={} stderr={}",
+            run.stdout,
+            run.stderr
+        );
+        let issue = SqliteStorage::open(&db_path(&ws))
+            .expect("open DB")
+            .get_issue(&id)
+            .expect("read issue")
+            .expect("issue exists");
+        assert_eq!(
+            issue.title, "Edited by a peer",
+            "{mode} did not apply the peer edit"
+        );
+        assert_eq!(
+            issue.source_repo_path.as_deref(),
+            Some(root.as_str()),
+            "{mode} erased the local source_repo_path"
+        );
+    }
+}
+
+#[test]
+fn legacy_jsonl_with_absolute_source_repo_path_still_imports() {
+    let ws = BrWorkspace::new();
+    init_workspace(&ws, "legacypath");
+    let id = create_issue(&ws, "Exported by an older br", "legacypath_create");
+    let flush = run_br(&ws, ["sync", "--flush-only", "--json"], "legacypath_flush");
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+
+    // Older br versions exported the creating machine's absolute path.
+    let mut lines = read_jsonl_lines(&ws);
+    let legacy = clone_row(
+        &lines[0],
+        "br-legacy1",
+        "Legacy row from another machine",
+        "2026-01-01T00:00:00Z",
+        "2026-01-01T00:00:00Z",
+    );
+    lines.push(set_row_field(
+        &legacy,
+        "source_repo_path",
+        json!("/home/someone-else/checkout"),
+    ));
+    lines[0] = set_row_field(
+        &lines[0],
+        "source_repo_path",
+        json!("/home/someone-else/checkout"),
+    );
+    write_jsonl_lines(&ws, &lines);
+
+    let import = run_br(
+        &ws,
+        ["sync", "--import-only", "--json"],
+        "legacypath_import",
+    );
+    assert!(
+        import.status.success(),
+        "legacy import failed: stdout={} stderr={}",
+        import.stdout,
+        import.stderr
+    );
+    assert_eq!(
+        local_source_repo_path(&ws, "br-legacy1").as_deref(),
+        Some("/home/someone-else/checkout")
+    );
+    // The shared row's payload is unchanged, so its local path is untouched.
+    let root = canonical_root(&ws);
+    assert_eq!(
+        local_source_repo_path(&ws, &id).as_deref(),
+        Some(root.as_str())
+    );
+
+    // Rows written from now on drop the legacy field.
+    let update = run_br(
+        &ws,
+        [
+            "update",
+            "br-legacy1",
+            "--title",
+            "Touched locally",
+            "--json",
+        ],
+        "legacypath_update",
+    );
+    assert!(update.status.success(), "update failed: {}", update.stderr);
+    let flush = run_br(
+        &ws,
+        ["sync", "--flush-only", "--json"],
+        "legacypath_reflush",
+    );
+    assert!(flush.status.success(), "reflush failed: {}", flush.stderr);
+    let rewritten = read_jsonl_lines(&ws)
+        .into_iter()
+        .find(|line| row_id(line) == "br-legacy1")
+        .expect("legacy row");
+    let rewritten: Value = serde_json::from_str(&rewritten).expect("row");
+    assert!(rewritten.get("source_repo_path").is_none(), "{rewritten}");
 }
 
 // ============================================================================

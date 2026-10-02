@@ -585,6 +585,12 @@ pub struct Issue {
     /// under `~/Developer/foo` vs `~/Developer/scratch/foo` collide on
     /// `source_repo` but disagree here. Optional — older databases and
     /// hand-edited JSONL records without this field are valid.
+    ///
+    /// Machine-local (beads_rust#528): it lives in the database and in
+    /// command JSON output, but the JSONL export never carries it, so the
+    /// committed file does not leak local paths or churn between machines.
+    /// Legacy JSONL rows that still carry a value import as before. Because
+    /// it is not part of the synced payload, `sync_equals` ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_repo_path: Option<String>,
 
@@ -745,7 +751,6 @@ impl Issue {
             || self.external_ref != other.external_ref
             || self.source_system != other.source_system
             || self.source_repo != other.source_repo
-            || self.source_repo_path != other.source_repo_path
             || self.deleted_at != other.deleted_at
             || self.deleted_by != other.deleted_by
             || self.delete_reason != other.delete_reason
@@ -1777,16 +1782,27 @@ mod tests {
     }
 
     #[test]
-    fn test_issue_sync_equals_detects_source_repo_path_changes() {
+    fn test_issue_sync_equals_ignores_machine_local_source_repo_path() {
+        // beads_rust#528: source_repo_path is machine-local and never exported,
+        // so a DB row carrying it must still equal the path-free JSONL row.
         let mut issue1 = create_test_issue();
         issue1.source_repo = Some("widget_engine".to_string());
         issue1.source_repo_path = Some("/data/projects/widget_engine".to_string());
 
         let mut issue2 = issue1.clone();
         issue2.source_repo_path = Some("/data/projects/alternate/widget_engine".to_string());
+        assert!(issue1.sync_equals(&issue2));
+        assert!(issue2.sync_equals(&issue1));
 
-        assert!(!issue1.sync_equals(&issue2));
-        assert!(!issue2.sync_equals(&issue1));
+        let mut exported = issue1.clone();
+        exported.source_repo_path = None;
+        assert!(issue1.sync_equals(&exported));
+        assert!(exported.sync_equals(&issue1));
+
+        // The portable source_repo name is still part of the synced payload.
+        let mut renamed = issue1.clone();
+        renamed.source_repo = Some("other_engine".to_string());
+        assert!(!issue1.sync_equals(&renamed));
     }
 
     #[test]

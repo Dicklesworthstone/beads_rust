@@ -4829,12 +4829,19 @@ fn build_source_repo_path_migration_plan(
     let mut tombstones_preserved = 0usize;
     let mut ephemeral_source_records_skipped = 0usize;
 
+    // GitHub #528: the JSONL no longer carries source_repo_path. A row that
+    // still does is legacy and forces a rewrite that strips the field; an
+    // absent path is the current format, not a value to normalize, though the
+    // row still adopts the target path in the database.
+    let mut source_carries_legacy_paths = false;
     for mut incoming in source_issues {
         if incoming.ephemeral || incoming.id.contains("-wisp-") {
             ephemeral_source_records_skipped += 1;
             continue;
         }
-        if normalize_issue_source_repo_path(&mut incoming, &target_path) {
+        let carried_path = incoming.source_repo_path.is_some();
+        source_carries_legacy_paths |= carried_path;
+        if normalize_issue_source_repo_path(&mut incoming, &target_path) && carried_path {
             normalized_issue_ids.insert(incoming.id.clone());
         }
         normalized_source.insert(incoming.id.clone(), incoming.clone());
@@ -4886,18 +4893,21 @@ fn build_source_repo_path_migration_plan(
         }
     }
 
-    let jsonl_rewrite_required = normalized_source.len() != final_by_id.len()
+    let jsonl_rewrite_required = source_carries_legacy_paths
+        || normalized_source.len() != final_by_id.len()
         || final_by_id.iter().any(|(issue_id, issue)| {
             normalized_source
                 .get(issue_id)
                 .is_none_or(|source_issue| !source_issue.sync_equals(issue))
         });
+    // sync_equals ignores the machine-local path, so compare it explicitly:
+    // normalizing the database path is this migration's purpose.
     let mut changed_kept = final_by_id
         .values()
         .filter(|issue| {
-            original_database
-                .get(&issue.id)
-                .is_none_or(|before| !before.sync_equals(issue))
+            original_database.get(&issue.id).is_none_or(|before| {
+                !before.sync_equals(issue) || before.source_repo_path != issue.source_repo_path
+            })
         })
         .cloned()
         .collect::<Vec<_>>();

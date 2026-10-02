@@ -3055,8 +3055,10 @@ pub struct SyncArgs {
     /// Reconcile JSONL and normalize source_repo_path atomically
     ///
     /// Read-only by default. Builds a hash-bound plan that preserves the
-    /// portable source_repo value, imports source-only/newer rows, and rewrites
-    /// source_repo_path to the canonical current workspace path. Combine with
+    /// portable source_repo value, imports source-only/newer rows, sets the
+    /// database's machine-local source_repo_path to the canonical current
+    /// workspace path, and strips legacy source_repo_path values from the
+    /// JSONL, which never carries the field. Combine with
     /// --apply and the exact --expect-plan-sha256 token to commit DB and JSONL
     /// through the crash-recoverable sync publication saga.
     #[arg(long = "migrate-source-repo-path")]

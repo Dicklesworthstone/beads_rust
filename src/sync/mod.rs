@@ -5568,6 +5568,10 @@ fn canonicalize_additive_issue_for_storage(issue: &mut Issue) {
 fn additive_issues_semantically_equal(left: &Issue, right: &Issue) -> bool {
     let mut left = left.clone();
     let mut right = right.clone();
+    // GitHub #528: the machine-local source_repo_path is not exported, so a DB
+    // row that carries it is not drift against its path-free JSONL row.
+    left.source_repo_path = None;
+    right.source_repo_path = None;
     for comment in &mut left.comments {
         comment.id = 0;
     }
@@ -7930,6 +7934,25 @@ fn plan_additive_reconcile_in_snapshot(
         if issue_has_conflict {
             continue;
         }
+
+        // GitHub #528: JSONL rows do not carry the machine-local
+        // source_repo_path, and the import UPDATE keeps the row's local value
+        // when the incoming one is absent. Plan with that value so the scalar
+        // witness, the predicted raw row and the write all agree.
+        let local_path_issue;
+        let issue = match database.get(&issue.id) {
+            Some(existing)
+                if issue.source_repo_path.is_none() && existing.source_repo_path.is_some() =>
+            {
+                let mut filled = issue.clone();
+                filled
+                    .source_repo_path
+                    .clone_from(&existing.source_repo_path);
+                local_path_issue = filled;
+                &local_path_issue
+            }
+            _ => issue,
+        };
 
         match database.get(&issue.id) {
             None => {
@@ -12487,6 +12510,11 @@ fn exact_full_export_hash_mapping(
 }
 
 fn normalize_issue_for_export(issue: &mut Issue) {
+    // GitHub #528: source_repo_path is this machine's absolute workspace path.
+    // It stays in the database for local tooling, but the committed JSONL is
+    // shared across machines, so it never carries the field.
+    issue.source_repo_path = None;
+
     if !issue.labels.is_empty() {
         issue.labels.sort_unstable();
         issue.labels.dedup();
@@ -25271,6 +25299,30 @@ mod tests {
             .map(|comment| comment.id)
             .collect::<Vec<_>>();
         assert_eq!(ids, vec![2, 9]);
+    }
+
+    #[test]
+    fn test_export_omits_machine_local_source_repo_path() {
+        // GitHub #528: the committed JSONL must not carry this machine's
+        // absolute workspace path; the database keeps it for local tooling.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut issue = make_test_issue("bd-path", "Local path");
+        issue.source_repo = Some("widget_engine".to_string());
+        issue.source_repo_path = Some("/home/me/src/widget_engine".to_string());
+        storage.create_issue(&issue, "test").unwrap();
+
+        let mut writer = Vec::new();
+        export_to_writer_with_policy(&storage, &mut writer, ExportErrorPolicy::Strict).unwrap();
+        let output = String::from_utf8(writer).unwrap();
+        let row: serde_json::Value = serde_json::from_str(output.trim_end()).unwrap();
+        assert!(row.get("source_repo_path").is_none(), "{output}");
+        assert_eq!(row["source_repo"].as_str(), Some("widget_engine"));
+
+        let stored = storage.get_issue("bd-path").unwrap().unwrap();
+        assert_eq!(
+            stored.source_repo_path.as_deref(),
+            Some("/home/me/src/widget_engine")
+        );
     }
 
     #[test]

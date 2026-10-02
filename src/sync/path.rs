@@ -57,6 +57,11 @@ use tracing::{debug, warn};
 /// Derive the absolute canonical path of the source repository (the parent of
 /// `.beads/`) for the `source_repo_path` field on an issue.
 ///
+/// The value is machine-local: it is stored in the database but never written
+/// to `issues.jsonl` (GitHub #528). On Windows the extended-length `\\?\`
+/// prefix that `canonicalize` adds is dropped when the path can be spelled
+/// without it.
+///
 /// This lives in the process-free sync boundary because both issue creation
 /// and source-path migration need the same path identity without delegating
 /// from sync code into a process-capable CLI command module.
@@ -75,7 +80,7 @@ pub fn canonical_source_repo_path(beads_dir: &Path) -> Option<String> {
     } else {
         parent
     };
-    let canonical = parent.canonicalize().ok()?;
+    let canonical = dunce::canonicalize(parent).ok()?;
     let path_str = canonical.to_string_lossy().into_owned();
     (!path_str.is_empty()).then_some(path_str)
 }

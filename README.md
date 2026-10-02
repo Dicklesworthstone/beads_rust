@@ -1143,9 +1143,15 @@ protected backup, so retain it until recovery is verified.
 
 ### Reconcile portable source repository paths
 
-To reconcile valid rows from both stores while replacing stale
-machine-specific `source_repo_path` values with the canonical current workspace
-path, review and apply an exact hash-bound plan:
+`source_repo_path` is machine-local: the database keeps the absolute
+workspace path for local tooling (`br show --json`, `br list --json`), but
+`issues.jsonl` never carries it, so the committed file does not leak local
+paths or churn between machines. Older JSONL rows that still carry a path
+import normally and lose the field when they are next written.
+
+To reconcile valid rows from both stores, set every row's local
+`source_repo_path` to the canonical current workspace path, and strip legacy
+paths from the JSONL in one step, review and apply an exact hash-bound plan:
 
 ```bash
 plan="$(br sync --migrate-source-repo-path --robot)"

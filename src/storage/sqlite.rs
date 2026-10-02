@@ -20240,6 +20240,10 @@ impl SqliteStorage {
         Ok(rows)
     }
 
+    /// Overwrite an existing row from an imported issue. `source_repo_path`
+    /// is machine-local and JSONL rows no longer carry it (GitHub #528), so an
+    /// absent incoming value keeps the row's local path instead of erasing it;
+    /// a legacy row that still carries a path overwrites it as before.
     fn update_issue_row_for_import(
         &self,
         issue: &Issue,
@@ -20254,7 +20258,8 @@ impl SqliteStorage {
                 issue_type = ?, assignee = ?, owner = ?, estimated_minutes = ?,
                 created_at = ?, created_by = ?, updated_at = ?, closed_at = ?,
                 close_reason = ?, closed_by_session = ?, due_at = ?, defer_until = ?,
-                external_ref = ?, source_system = ?, source_repo = ?, source_repo_path = ?,
+                external_ref = ?, source_system = ?, source_repo = ?,
+                source_repo_path = COALESCE(?, source_repo_path),
                 deleted_at = ?, deleted_by = ?, delete_reason = ?, original_type = ?, compaction_level = ?,
                 compacted_at = ?, compacted_at_commit = ?, original_size = ?, sender = ?,
                 ephemeral = ?, pinned = ?, is_template = ?, agent_context = ?, prerequisites = ?
@@ -27507,6 +27512,37 @@ required_fields:
         assert!(cleared.source_repo_path.is_none());
         let reread = storage.get_issue("bd-srp").unwrap().unwrap();
         assert!(reread.source_repo_path.is_none());
+    }
+
+    #[test]
+    fn test_import_update_keeps_local_source_repo_path_when_row_omits_it() {
+        // GitHub #528: JSONL rows no longer carry the machine-local path, so
+        // importing a peer's edit must not erase this machine's value, while a
+        // legacy row that still carries a path keeps overwriting it.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 5, 1, 0, 0, 0).unwrap();
+        let mut issue = make_issue("bd-lp", "local path", Status::Open, 2, None, t1, None);
+        issue.source_repo_path = Some("/data/projects/widget_engine".to_string());
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let mut pulled = storage.get_issue("bd-lp").unwrap().unwrap();
+        pulled.title = "edited by a peer".to_string();
+        pulled.source_repo_path = None;
+        assert!(storage.upsert_issue_for_import(&pulled).unwrap());
+        let reread = storage.get_issue("bd-lp").unwrap().unwrap();
+        assert_eq!(reread.title, "edited by a peer");
+        assert_eq!(
+            reread.source_repo_path.as_deref(),
+            Some("/data/projects/widget_engine")
+        );
+
+        pulled.source_repo_path = Some("/home/peer/widget_engine".to_string());
+        assert!(storage.upsert_issue_for_import(&pulled).unwrap());
+        let reread = storage.get_issue("bd-lp").unwrap().unwrap();
+        assert_eq!(
+            reread.source_repo_path.as_deref(),
+            Some("/home/peer/widget_engine")
+        );
     }
 
     #[test]

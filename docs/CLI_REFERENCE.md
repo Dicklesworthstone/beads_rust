@@ -1819,7 +1819,7 @@ br sync [OPTIONS]
 
 **Portable source path migration (`--migrate-source-repo-path`):**
 - The default invocation emits a `br.sync.source-repo-path-migration.v1` dry-run receipt. It reconciles JSONL-only and newer shared rows without deleting SQLite-only rows, preserves tombstones, and fails closed on equal-timestamp semantic drift.
-- Every surviving `source_repo_path` is planned for the canonical current workspace directory. The portable `source_repo` display name is preserved rather than replaced by a machine-specific path.
+- Every surviving row's database `source_repo_path` is planned for the canonical current workspace directory, and legacy `source_repo_path` values are stripped from the JSONL, which never carries the machine-local field. The portable `source_repo` display name is preserved rather than replaced by a machine-specific path.
 - Apply requires the exact `plan_sha256` and uses the durable DB/JSONL/base publication saga. If interrupted after the database transaction or JSONL publication, the next migration or merge invocation resumes the pending receipt before starting new work.
 - Migration does not probe Git. Its receipt reports `vcs_status: "not_probed"`; run `br vcs-status --json` separately when staged/worktree state must be reviewed.
 

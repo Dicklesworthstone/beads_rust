@@ -347,8 +347,10 @@ br sync --migrate-source-repo-path --apply \
 The plan imports JSONL-only rows, takes a strictly newer shared payload from
 the newer side, preserves SQLite tombstones, and rejects equal-timestamp
 semantic drift. Every surviving row receives the canonical directory that
-contains the active `.beads/` folder in `source_repo_path`; the portable
-`source_repo` display name is not derived from or replaced by that path.
+contains the active `.beads/` folder in its database `source_repo_path`; the
+portable `source_repo` display name is not derived from or replaced by that
+path. `source_repo_path` is machine-local and never exported, so the published
+JSONL carries no `source_repo_path` at all and legacy values are stripped.
 
 Apply uses the same durable publication saga as three-way merge: the database
 transaction records a hash-bound pending receipt, JSONL is conditionally
