@@ -1147,7 +1147,9 @@ protected backup, so retain it until recovery is verified.
 workspace path for local tooling (`br show --json`, `br list --json`), but
 `issues.jsonl` never carries it, so the committed file does not leak local
 paths or churn between machines. Older JSONL rows that still carry a path
-import normally and lose the field when they are next written.
+import normally and lose the field when they are next written; such a legacy
+path only fills a row that has none and never replaces this machine's own
+path.
 
 To reconcile valid rows from both stores, set every row's local
 `source_repo_path` to the canonical current workspace path, and strip legacy

@@ -908,6 +908,75 @@ fn pulled_path_free_rows_keep_the_local_source_repo_path() {
 }
 
 #[test]
+fn legacy_peer_edit_does_not_replace_the_local_source_repo_path() {
+    // An older br on another machine still exports its own absolute path.
+    // Importing that peer's edit applies the edit but keeps this machine's
+    // path; the foreign path never names this workspace.
+    for mode in ["import-only", "reconcile", "reconcile-additive"] {
+        let ws = BrWorkspace::new();
+        init_workspace(&ws, "legacyedit");
+        let id = create_issue(&ws, "Edited by an older br", "legacyedit_create");
+        let flush = run_br(&ws, ["sync", "--flush-only", "--json"], "legacyedit_flush");
+        assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+        let root = canonical_root(&ws);
+
+        let mut lines = read_jsonl_lines(&ws);
+        lines[0] = set_row_field(&lines[0], "title", json!("Edited by an older peer"));
+        lines[0] = set_row_field(&lines[0], "updated_at", json!("2030-01-01T00:00:00Z"));
+        lines[0] = set_row_field(
+            &lines[0],
+            "source_repo_path",
+            json!("/home/someone-else/checkout"),
+        );
+        write_jsonl_lines(&ws, &lines);
+
+        let mut args = vec![
+            "sync".to_string(),
+            format!("--{mode}"),
+            "--json".to_string(),
+        ];
+        if mode == "reconcile-additive" {
+            // A source-newer scalar edit needs explicit source authority.
+            args.extend(["--resolve-source-id".to_string(), id.clone()]);
+            let plan = run_br(&ws, args.clone(), "legacyedit_plan");
+            assert!(
+                plan.status.success(),
+                "additive plan failed: {}",
+                plan.stderr
+            );
+            let plan = parse_json_value(&plan.stdout);
+            assert_eq!(plan["status"], "ready", "{plan}");
+            args.extend([
+                "--apply".to_string(),
+                "--expect-plan-sha256".to_string(),
+                plan["plan_sha256"].as_str().expect("plan sha").to_string(),
+            ]);
+        }
+        let run = run_br(&ws, args, "legacyedit_sync");
+        assert!(
+            run.status.success(),
+            "{mode} failed: stdout={} stderr={}",
+            run.stdout,
+            run.stderr
+        );
+        let issue = SqliteStorage::open(&db_path(&ws))
+            .expect("open DB")
+            .get_issue(&id)
+            .expect("read issue")
+            .expect("issue exists");
+        assert_eq!(
+            issue.title, "Edited by an older peer",
+            "{mode} did not apply the peer edit"
+        );
+        assert_eq!(
+            issue.source_repo_path.as_deref(),
+            Some(root.as_str()),
+            "{mode} replaced the local source_repo_path with a peer's"
+        );
+    }
+}
+
+#[test]
 fn legacy_jsonl_with_absolute_source_repo_path_still_imports() {
     let ws = BrWorkspace::new();
     init_workspace(&ws, "legacypath");

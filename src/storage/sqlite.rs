@@ -2001,6 +2001,17 @@ pub(crate) struct ReconcileTransactionOutcome<T> {
     pub database_authority_preserved: bool,
 }
 
+/// How a JSONL import UPDATE treats the machine-local `source_repo_path`
+/// (GitHub #528).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportSourceRepoPath {
+    /// Keep the row's own path; an incoming value only fills an empty one.
+    KeepLocal,
+    /// Replace the row's path with the incoming value (the explicit
+    /// `--migrate-source-repo-path` rewrite).
+    Overwrite,
+}
+
 impl SqliteStorage {
     #[cfg(test)]
     pub(crate) fn arm_database_replacement_after_commit_for_test() {
@@ -20241,34 +20252,58 @@ impl SqliteStorage {
     }
 
     /// Overwrite an existing row from an imported issue. `source_repo_path`
-    /// is machine-local and JSONL rows no longer carry it (GitHub #528), so an
-    /// absent incoming value keeps the row's local path instead of erasing it;
-    /// a legacy row that still carries a path overwrites it as before.
+    /// is machine-local and JSONL rows no longer carry it (GitHub #528): the
+    /// row's own path wins, and an incoming value only fills a row that has
+    /// none. A legacy row exported by an older br carries the exporting
+    /// machine's path, which never names this machine's workspace, so it must
+    /// not replace the local one. Only the explicit source_repo_path migration
+    /// passes [`ImportSourceRepoPath::Overwrite`].
     fn update_issue_row_for_import(
         &self,
         issue: &Issue,
         timestamps: &ImportIssueTimestampStrings,
+        source_repo_path: ImportSourceRepoPath,
     ) -> Result<usize> {
         let mut params = Self::import_issue_field_values(issue, timestamps);
         params.push(SqliteValue::from(issue.id.as_str()));
-        let rows = self.conn.execute_with_params(
-            r"UPDATE issues SET
+        let sql = match source_repo_path {
+            ImportSourceRepoPath::KeepLocal => Self::IMPORT_UPDATE_KEEP_LOCAL_SOURCE_REPO_PATH_SQL,
+            ImportSourceRepoPath::Overwrite => Self::IMPORT_UPDATE_OVERWRITE_SOURCE_REPO_PATH_SQL,
+        };
+        let rows = self.conn.execute_with_params(sql, &params)?;
+
+        Ok(rows)
+    }
+
+    /// Import UPDATE that keeps a row's machine-local `source_repo_path`
+    /// and only fills it when the row has none (GitHub #528).
+    const IMPORT_UPDATE_KEEP_LOCAL_SOURCE_REPO_PATH_SQL: &'static str = r"UPDATE issues SET
                 content_hash = ?, title = ?, description = ?, design = ?,
                 acceptance_criteria = ?, notes = ?, status = ?, priority = ?,
                 issue_type = ?, assignee = ?, owner = ?, estimated_minutes = ?,
                 created_at = ?, created_by = ?, updated_at = ?, closed_at = ?,
                 close_reason = ?, closed_by_session = ?, due_at = ?, defer_until = ?,
                 external_ref = ?, source_system = ?, source_repo = ?,
-                source_repo_path = COALESCE(?, source_repo_path),
+                source_repo_path = COALESCE(source_repo_path, ?),
                 deleted_at = ?, deleted_by = ?, delete_reason = ?, original_type = ?, compaction_level = ?,
                 compacted_at = ?, compacted_at_commit = ?, original_size = ?, sender = ?,
                 ephemeral = ?, pinned = ?, is_template = ?, agent_context = ?, prerequisites = ?
-              WHERE id = ?",
-            &params,
-        )?;
+              WHERE id = ?";
 
-        Ok(rows)
-    }
+    /// Import UPDATE that sets `source_repo_path` from the incoming issue;
+    /// reserved for the explicit source_repo_path migration.
+    const IMPORT_UPDATE_OVERWRITE_SOURCE_REPO_PATH_SQL: &'static str = r"UPDATE issues SET
+                content_hash = ?, title = ?, description = ?, design = ?,
+                acceptance_criteria = ?, notes = ?, status = ?, priority = ?,
+                issue_type = ?, assignee = ?, owner = ?, estimated_minutes = ?,
+                created_at = ?, created_by = ?, updated_at = ?, closed_at = ?,
+                close_reason = ?, closed_by_session = ?, due_at = ?, defer_until = ?,
+                external_ref = ?, source_system = ?, source_repo = ?,
+                source_repo_path = ?,
+                deleted_at = ?, deleted_by = ?, delete_reason = ?, original_type = ?, compaction_level = ?,
+                compacted_at = ?, compacted_at_commit = ?, original_size = ?, sender = ?,
+                ephemeral = ?, pinned = ?, is_template = ?, agent_context = ?, prerequisites = ?
+              WHERE id = ?";
 
     /// Insert a new issue during JSONL import without first probing for existence.
     ///
@@ -20309,6 +20344,17 @@ impl SqliteStorage {
     }
 
     pub(crate) fn upsert_issue_for_import_in_tx(&self, issue: &Issue) -> Result<bool> {
+        self.upsert_issue_for_import_with_source_repo_path_in_tx(
+            issue,
+            ImportSourceRepoPath::KeepLocal,
+        )
+    }
+
+    fn upsert_issue_for_import_with_source_repo_path_in_tx(
+        &self,
+        issue: &Issue,
+        source_repo_path: ImportSourceRepoPath,
+    ) -> Result<bool> {
         let timestamps = ImportIssueTimestampStrings::from_issue(issue);
 
         // Narrow existence probe: don't deserialize the row, just check
@@ -20324,7 +20370,7 @@ impl SqliteStorage {
         };
 
         if issue_exists {
-            let rows = self.update_issue_row_for_import(issue, &timestamps)?;
+            let rows = self.update_issue_row_for_import(issue, &timestamps, source_repo_path)?;
             if rows == 0 {
                 return Err(BeadsError::Database(FrankenError::Internal(format!(
                     "import update did not find existing issue {}",
@@ -21032,8 +21078,16 @@ impl SqliteStorage {
             // Materialize every issue row before validating/inserting
             // dependency relations so references between two newly merged
             // rows do not depend on report ordering.
+            // GitHub #528: kept rows keep this machine's source_repo_path;
+            // only the source_repo_path migration exists to replace it.
+            let source_repo_path = if intent.resolution == "source-repo-path-migration" {
+                ImportSourceRepoPath::Overwrite
+            } else {
+                ImportSourceRepoPath::KeepLocal
+            };
             for issue in kept {
-                storage.upsert_issue_for_import_in_tx(issue)?;
+                storage
+                    .upsert_issue_for_import_with_source_repo_path_in_tx(issue, source_repo_path)?;
             }
             for issue in kept {
                 storage.sync_labels_for_import_in_tx(&issue.id, &issue.labels)?;
@@ -27515,10 +27569,10 @@ required_fields:
     }
 
     #[test]
-    fn test_import_update_keeps_local_source_repo_path_when_row_omits_it() {
+    fn test_import_update_keeps_local_source_repo_path() {
         // GitHub #528: JSONL rows no longer carry the machine-local path, so
-        // importing a peer's edit must not erase this machine's value, while a
-        // legacy row that still carries a path keeps overwriting it.
+        // importing a peer's edit must neither erase nor replace this
+        // machine's value.
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 5, 1, 0, 0, 0).unwrap();
         let mut issue = make_issue("bd-lp", "local path", Status::Open, 2, None, t1, None);
@@ -27536,12 +27590,53 @@ required_fields:
             Some("/data/projects/widget_engine")
         );
 
+        // A legacy row from an older br carries the exporting machine's path;
+        // it must not replace this machine's own value.
         pulled.source_repo_path = Some("/home/peer/widget_engine".to_string());
+        pulled.title = "edited by an older peer".to_string();
         assert!(storage.upsert_issue_for_import(&pulled).unwrap());
         let reread = storage.get_issue("bd-lp").unwrap().unwrap();
+        assert_eq!(reread.title, "edited by an older peer");
         assert_eq!(
             reread.source_repo_path.as_deref(),
+            Some("/data/projects/widget_engine")
+        );
+
+        // A row with no local path adopts the legacy value.
+        let mut bare = make_issue("bd-np", "no local path", Status::Open, 2, None, t1, None);
+        storage.create_issue(&bare, "tester").unwrap();
+        bare.source_repo_path = Some("/home/peer/widget_engine".to_string());
+        assert!(storage.upsert_issue_for_import(&bare).unwrap());
+        assert_eq!(
+            storage
+                .get_issue("bd-np")
+                .unwrap()
+                .unwrap()
+                .source_repo_path
+                .as_deref(),
             Some("/home/peer/widget_engine")
+        );
+
+        // Only the explicit migration replaces a local path.
+        pulled.source_repo_path = Some("/srv/canonical/widget_engine".to_string());
+        assert!(
+            storage
+                .with_connection_write_transaction(|_| {
+                    storage.upsert_issue_for_import_with_source_repo_path_in_tx(
+                        &pulled,
+                        ImportSourceRepoPath::Overwrite,
+                    )
+                })
+                .unwrap()
+        );
+        assert_eq!(
+            storage
+                .get_issue("bd-lp")
+                .unwrap()
+                .unwrap()
+                .source_repo_path
+                .as_deref(),
+            Some("/srv/canonical/widget_engine")
         );
     }
 

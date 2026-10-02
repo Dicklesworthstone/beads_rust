@@ -589,8 +589,10 @@ pub struct Issue {
     /// Machine-local (beads_rust#528): it lives in the database and in
     /// command JSON output, but the JSONL export never carries it, so the
     /// committed file does not leak local paths or churn between machines.
-    /// Legacy JSONL rows that still carry a value import as before. Because
-    /// it is not part of the synced payload, `sync_equals` ignores it.
+    /// A legacy JSONL row that still carries a value imports it into a new
+    /// row or a row without a path, but never replaces this machine's own
+    /// value. Because it is not part of the synced payload, `sync_equals`
+    /// ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_repo_path: Option<String>,
 

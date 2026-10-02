@@ -7935,14 +7935,15 @@ fn plan_additive_reconcile_in_snapshot(
             continue;
         }
 
-        // GitHub #528: JSONL rows do not carry the machine-local
-        // source_repo_path, and the import UPDATE keeps the row's local value
-        // when the incoming one is absent. Plan with that value so the scalar
-        // witness, the predicted raw row and the write all agree.
+        // GitHub #528: source_repo_path is machine-local. The import UPDATE
+        // keeps the row's own value (an incoming one, carried only by legacy
+        // JSONL, just fills an empty row), so plan with that value and the
+        // scalar witness, the predicted raw row and the write all agree.
         let local_path_issue;
         let issue = match database.get(&issue.id) {
             Some(existing)
-                if issue.source_repo_path.is_none() && existing.source_repo_path.is_some() =>
+                if existing.source_repo_path.is_some()
+                    && issue.source_repo_path != existing.source_repo_path =>
             {
                 let mut filled = issue.clone();
                 filled
