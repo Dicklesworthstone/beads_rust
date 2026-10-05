@@ -6496,19 +6496,27 @@ fn inner_gitignore_missing_patterns(contents: &str) -> Vec<&'static str> {
 /// Whether the ignore file `contents` ignore a direct-child file named
 /// `probe`. Gitignore semantics for the subset that matters here: last
 /// matching rule wins, `!` negates, `#` comments, a leading `/` anchors to
-/// the `.beads/` directory (equivalent for direct children), trailing-`/`
-/// directory rules and nested (`a/b`) rules never match a file probe.
+/// the `.beads/` directory (equivalent for direct children), leading `**/`
+/// matches in every directory (including this one), trailing-`/` directory
+/// rules and nested (`a/b`) rules never match a file probe. Whitespace follows
+/// Git exactly (see [`normalize_gitignore_line`]) so doctor never claims a
+/// file is ignored when Git would expose it.
 fn inner_gitignore_ignores_probe(contents: &str, probe: &str) -> bool {
     let mut ignored = false;
-    for raw_line in contents.lines() {
-        let line = raw_line.trim();
+    // Split on `\n` only: `str::lines` would already strip a CR before the
+    // LF, and Git strips exactly one.
+    for raw_line in contents.split('\n') {
+        let line = normalize_gitignore_line(raw_line);
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let (negated, pattern) = line
             .strip_prefix('!')
             .map_or((false, line), |pattern| (true, pattern));
-        let pattern = pattern.strip_prefix('/').unwrap_or(pattern);
+        let mut pattern = pattern.strip_prefix('/').unwrap_or(pattern);
+        while let Some(rest) = pattern.strip_prefix("**/") {
+            pattern = rest;
+        }
         if pattern.is_empty() || pattern.ends_with('/') || pattern.contains('/') {
             continue;
         }
@@ -6517,6 +6525,28 @@ fn inner_gitignore_ignores_probe(contents: &str, probe: &str) -> bool {
         }
     }
     ignored
+}
+
+/// Strip what Git itself discards from one `\n`-terminated ignore-file line:
+/// a single trailing `\r`, then unescaped trailing ASCII spaces. Leading
+/// whitespace, trailing tabs, a second `\r` and an escaped trailing space
+/// (`\ `) are part of the pattern, so a plain `trim()` would let doctor
+/// certify coverage Git does not provide.
+fn normalize_gitignore_line(raw_line: &str) -> &str {
+    let mut line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+    while let Some(without_space) = line.strip_suffix(' ') {
+        let escaping_backslashes = without_space
+            .as_bytes()
+            .iter()
+            .rev()
+            .take_while(|byte| **byte == b'\\')
+            .count();
+        if !escaping_backslashes.is_multiple_of(2) {
+            break;
+        }
+        line = without_space;
+    }
+    line
 }
 
 /// Minimal single-segment gitignore glob: `*` matches any run (including
@@ -19094,6 +19124,42 @@ mod tests {
         ));
         assert!(!inner_gitignore_ignores_probe(
             "*.lock\n!.write.lock\n*.tmp\n",
+            ".write.lock"
+        ));
+    }
+
+    #[test]
+    fn test_inner_gitignore_leading_space_is_literal() {
+        // Git treats leading whitespace as part of the pattern: ` *.tmp`
+        // ignores ` x.tmp`, not `probe.tmp`. Doctor must not certify it.
+        assert!(!inner_gitignore_ignores_probe(" *.lock\n", ".write.lock"));
+        assert!(!inner_gitignore_ignores_probe(" *.tmp\n", "probe.tmp"));
+        let missing = inner_gitignore_missing_patterns(" *.lock\n *.tmp\n");
+        assert!(missing.contains(&"*.lock"), "{missing:?}");
+        assert!(missing.contains(&"*.tmp"), "{missing:?}");
+    }
+
+    #[test]
+    fn test_inner_gitignore_trailing_whitespace_follows_git() {
+        // Git discards one trailing CR and unescaped trailing spaces, but keeps
+        // trailing tabs, a second CR and an escaped trailing space as literal
+        // pattern bytes.
+        assert!(inner_gitignore_ignores_probe("*.tmp  \n", "probe.tmp"));
+        assert!(inner_gitignore_ignores_probe("*.tmp\r\n", "probe.tmp"));
+        assert!(inner_gitignore_ignores_probe("*.tmp\r", "probe.tmp"));
+        assert!(!inner_gitignore_ignores_probe("*.tmp\r\r\n", "probe.tmp"));
+        assert!(!inner_gitignore_ignores_probe("*.tmp\t\n", "probe.tmp"));
+        assert!(!inner_gitignore_ignores_probe("*.tmp\\ \n", "probe.tmp"));
+        assert!(!inner_gitignore_ignores_probe("*.lock\t\n", ".write.lock"));
+    }
+
+    #[test]
+    fn test_inner_gitignore_recursive_prefix_covers_direct_children() {
+        // `**/<pattern>` matches in every directory, including `.beads/`.
+        assert!(inner_gitignore_ignores_probe("**/*.lock\n", ".write.lock"));
+        assert!(inner_gitignore_ignores_probe("/**/*.tmp\n", "probe.tmp"));
+        assert!(!inner_gitignore_ignores_probe(
+            "**/*.lock\n!**/.write.lock\n",
             ".write.lock"
         ));
     }
