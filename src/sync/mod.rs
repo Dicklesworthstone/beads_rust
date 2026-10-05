@@ -22330,6 +22330,56 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_refresh_base_snapshot_rejects_anchor_symlink_without_touching_target() {
+        // Issue #378 anchor refresh contract: a symlinked `beads.base.jsonl`
+        // is refused rather than followed, so a flush can never write the
+        // merge anchor through a link to a file outside the workspace.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let outside_dir = temp.path().join("outside");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::write(&jsonl_path, "{\"id\":\"bd-current\"}\n").unwrap();
+
+        let outside_snapshot = outside_dir.join("captured.jsonl");
+        fs::write(&outside_snapshot, "do-not-touch\n").unwrap();
+        let snapshot_path = beads_dir.join("beads.base.jsonl");
+        symlink(&outside_snapshot, &snapshot_path).unwrap();
+
+        refresh_base_snapshot_from_flushed_jsonl(&jsonl_path, &beads_dir)
+            .expect_err("a symlinked merge anchor must be refused, not followed");
+        assert_eq!(
+            fs::read_to_string(&outside_snapshot).unwrap(),
+            "do-not-touch\n",
+            "a symlinked anchor target must remain untouched"
+        );
+        assert!(
+            fs::symlink_metadata(&snapshot_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "refusal must leave the operator's anchor node in place"
+        );
+        let stray_temps: Vec<String> = fs::read_dir(&beads_dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"))
+            })
+            .collect();
+        assert!(
+            stray_temps.is_empty(),
+            "a refused anchor refresh must not strand temp files: {stray_temps:?}"
+        );
+    }
+
     #[test]
     fn test_export_with_issues() {
         let mut storage = SqliteStorage::open_memory().unwrap();
