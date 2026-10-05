@@ -13051,14 +13051,25 @@ fn inspect_doctor_jsonl(
 ///   (`satisfied_blockers` / `dangling_blockers`) so consumers never have to
 ///   re-read the database to tell them apart.
 /// - `dep.fully_unblocked_open`: open issues that DO declare blocking
-///   dependencies but where EVERY blocker is now closed/tombstoned/absent.
+///   dependencies but where EVERY blocker is now closed/tombstoned/absent
+///   (or a template, which never gates ready work).
 ///   #432: an issue whose blockers all completed is the benign steady state,
 ///   not a defect — it is reported `Ok` with details, split into `ready`
 ///   (satisfies every `br ready` condition derivable from the record) and
 ///   `excluded` (deliberately kept off the ready queue: claimed, deferred,
-///   pinned, ephemeral/wisp, template, custom status — with the reason
-///   named). The one derivable inconsistency — status still `blocked` while
-///   no live blocker remains — is reported `Warn` (`stale_blocked`).
+///   pinned, ephemeral/wisp, template, custom status, parent-child
+///   hierarchy — with the reason named). The one derivable inconsistency —
+///   status still `blocked` while nothing gates the issue any more — is
+///   reported `Warn` (`stale_blocked`).
+///
+/// Readiness mirrors the blocked cache `br ready` reads once this JSONL is
+/// imported (`SqliteStorage::compute_blocked_issues_map_impl`): template
+/// targets never gate, a blocked parent blocks every descendant, and an epic
+/// is blocked by its open children. A dangling target does not gate, because
+/// import drops dependency rows whose local target is absent. So an issue
+/// still gated through the parent-child hierarchy is `excluded` (never
+/// `ready`) and never `stale_blocked`: telling the operator to reopen it would
+/// not make it ready.
 ///
 /// "Open" here means non-terminal (not `closed`/`tombstone`) and non-draft —
 /// the same work-surface notion `br ready` uses. Blocking edge types are the
@@ -13087,12 +13098,11 @@ fn check_dependency_graph_jsonl(path: &Path, checks: &mut Vec<CheckResult>) {
         }
     };
 
-    // Index status by id. Terminal = closed or tombstone (a satisfied blocker).
-    let mut status_by_id: std::collections::HashMap<String, crate::model::Status> =
-        std::collections::HashMap::with_capacity(issues.len());
-    for issue in &issues {
-        status_by_id.insert(issue.id.clone(), issue.status.clone());
-    }
+    // Index issues by id. Terminal = closed or tombstone (a satisfied blocker).
+    let issue_by_id: std::collections::HashMap<&str, &crate::model::Issue> = issues
+        .iter()
+        .map(|issue| (issue.id.as_str(), issue))
+        .collect();
 
     // A blocker is "live" (still blocking) when it exists AND is non-terminal.
     // A blocker is "dead" when its target is terminal OR absent (and not an
@@ -13100,17 +13110,21 @@ fn check_dependency_graph_jsonl(path: &Path, checks: &mut Vec<CheckResult>) {
     // states are opposite conditions — a present-but-terminal blocker is a
     // SATISFIED dependency (the normal end of completed work), while an
     // absent one is a DANGLING edge (points at nothing) — so classify rather
-    // than collapse.
+    // than collapse. A non-terminal template target is neither: the blocked
+    // cache never lets a template gate ready work, yet the edge is not a
+    // completed dependency either, so it is kept out of the dead-edge report.
     let blocker_fate = |target: &str| -> BlockerFate {
         if target.starts_with("external:") {
             return BlockerFate::Live;
         }
-        match status_by_id.get(target) {
-            Some(status) if status.is_terminal() => BlockerFate::Satisfied,
+        match issue_by_id.get(target) {
+            Some(issue) if issue.status.is_terminal() => BlockerFate::Satisfied,
+            Some(issue) if issue.is_template => BlockerFate::NonGating,
             Some(_) => BlockerFate::Live,
             None => BlockerFate::Dangling,
         }
     };
+    let hierarchy_gated_ids = hierarchy_gated_issue_ids(&issues, &issue_by_id);
 
     let mut dead_edge_issues: Vec<serde_json::Value> = Vec::new();
     let mut dangling_edge_issue_ids: Vec<String> = Vec::new();
@@ -13151,11 +13165,13 @@ fn check_dependency_graph_jsonl(path: &Path, checks: &mut Vec<CheckResult>) {
 
         let mut satisfied: Vec<&str> = Vec::new();
         let mut dangling: Vec<&str> = Vec::new();
+        let mut live_count = 0usize;
         for target in &blocking_targets {
             match blocker_fate(target) {
-                BlockerFate::Live => {}
+                BlockerFate::Live => live_count += 1,
                 BlockerFate::Satisfied => satisfied.push(target),
                 BlockerFate::Dangling => dangling.push(target),
+                BlockerFate::NonGating => {}
             }
         }
         let dead_count = satisfied.len() + dangling.len();
@@ -13178,10 +13194,13 @@ fn check_dependency_graph_jsonl(path: &Path, checks: &mut Vec<CheckResult>) {
             }
         }
 
-        // Fully unblocked: every declared blocker is dead (closed/absent), so
-        // nothing live remains to block this open issue.
-        if dead_count == blocking_targets.len() {
-            fully_unblocked_issues.push(classify_fully_unblocked(issue));
+        // Fully unblocked: every declared blocker is dead (closed/absent) or a
+        // template, so no forward blocker remains to gate this open issue.
+        if live_count == 0 {
+            fully_unblocked_issues.push(classify_fully_unblocked(
+                issue,
+                hierarchy_gated_ids.contains(issue.id.as_str()),
+            ));
         }
     }
 
@@ -13199,6 +13218,10 @@ enum BlockerFate {
     Satisfied,
     /// Absent from the JSONL entirely — the edge points at nothing. A defect.
     Dangling,
+    /// Present, non-terminal template. The blocked cache never lets a
+    /// template gate ready work, but the dependency is not completed either,
+    /// so it is neither live nor reported as a dead edge.
+    NonGating,
 }
 
 /// #432: a fully-unblocked open issue plus its readiness classification,
@@ -13212,11 +13235,107 @@ struct FullyUnblockedIssue {
     /// the issue satisfies every derivable ready condition.
     excluded_reasons: Vec<&'static str>,
     /// True when status is still `blocked` although no live blocker remains —
-    /// the one derivable real inconsistency in this check.
+    /// the one derivable real inconsistency in this check. Never set while
+    /// the parent-child hierarchy still gates the issue, or for templates:
+    /// reopening those would not make them ready.
     stale_blocked: bool,
 }
 
-fn classify_fully_unblocked(issue: &crate::model::Issue) -> FullyUnblockedIssue {
+/// Issue ids the blocked cache would consider blocked once this JSONL is
+/// imported, so the doctor's readiness verdict cannot drift from `br ready`.
+/// Mirrors `SqliteStorage::compute_blocked_issues_map_impl`:
+///
+/// 1. direct `blocks`/`conditional-blocks`/`waits-for` blockers gate when the
+///    target is present and neither terminal nor a template, or is an
+///    `external:` ref (unresolved externals block `br ready` — fail closed).
+///    A missing local target does not gate: import drops dependency rows
+///    whose target is absent, so the database never sees the edge;
+/// 2. a directly or transitively blocked parent blocks every local
+///    descendant (`propagate_blocked_parents`);
+/// 3. only then, epics are blocked by their open, non-template children
+///    (`load_local_open_child_blockers_impl`), so an epic blocked solely by
+///    its children does not transitively block those same children.
+///
+/// Self-edges are ignored, matching the forward-edge audit above. For an
+/// issue whose forward blockers are all dead or templates, membership can
+/// only come from steps 2 and 3, hence the name.
+fn hierarchy_gated_issue_ids<'a>(
+    issues: &'a [crate::model::Issue],
+    issue_by_id: &std::collections::HashMap<&str, &crate::model::Issue>,
+) -> std::collections::HashSet<&'a str> {
+    use crate::model::{DependencyType, IssueType};
+    use std::collections::{HashMap, HashSet};
+
+    let mut children_by_parent: HashMap<&str, Vec<&str>> = HashMap::new();
+    for issue in issues {
+        for dependency in &issue.dependencies {
+            if dependency.dep_type == DependencyType::ParentChild
+                && !issue.id.starts_with("external:")
+                && !dependency.depends_on_id.starts_with("external:")
+            {
+                children_by_parent
+                    .entry(dependency.depends_on_id.as_str())
+                    .or_default()
+                    .push(issue.id.as_str());
+            }
+        }
+    }
+
+    let mut gated: HashSet<&str> = issues
+        .iter()
+        .filter(|issue| {
+            issue.dependencies.iter().any(|dependency| {
+                matches!(
+                    dependency.dep_type,
+                    DependencyType::Blocks
+                        | DependencyType::ConditionalBlocks
+                        | DependencyType::WaitsFor
+                ) && dependency.depends_on_id != issue.id
+                    && (dependency.depends_on_id.starts_with("external:")
+                        || issue_by_id
+                            .get(dependency.depends_on_id.as_str())
+                            .is_some_and(|target| {
+                                !target.status.is_terminal() && !target.is_template
+                            }))
+            })
+        })
+        .map(|issue| issue.id.as_str())
+        .collect();
+
+    let mut queue: Vec<&str> = gated.iter().copied().collect();
+    while let Some(parent_id) = queue.pop() {
+        if let Some(children) = children_by_parent.get(parent_id) {
+            for &child_id in children {
+                if gated.insert(child_id) {
+                    queue.push(child_id);
+                }
+            }
+        }
+    }
+
+    for (parent_id, children) in &children_by_parent {
+        let Some(parent) = issue_by_id.get(parent_id) else {
+            continue;
+        };
+        if parent.issue_type != IssueType::Epic {
+            continue;
+        }
+        if children.iter().any(|child_id| {
+            issue_by_id
+                .get(child_id)
+                .is_some_and(|child| !child.status.is_terminal() && !child.is_template)
+        }) {
+            gated.insert(*parent_id);
+        }
+    }
+
+    gated
+}
+
+fn classify_fully_unblocked(
+    issue: &crate::model::Issue,
+    hierarchy_gated: bool,
+) -> FullyUnblockedIssue {
     use crate::model::Status;
     let mut excluded_reasons: Vec<&'static str> = Vec::new();
     let mut stale_blocked = false;
@@ -13248,6 +13367,13 @@ fn classify_fully_unblocked(issue: &crate::model::Issue) -> FullyUnblockedIssue 
     if issue.is_template {
         excluded_reasons.push("template");
     }
+    if hierarchy_gated {
+        excluded_reasons.push("blocked through the parent-child hierarchy");
+    }
+    // A persisted `blocked` status is stale only when nothing `br ready`
+    // honors still gates the issue: an inherited or epic-rollup blocker keeps
+    // the status truthful, and a template is never ready-work.
+    let stale_blocked = stale_blocked && !hierarchy_gated && !issue.is_template;
     FullyUnblockedIssue {
         id: issue.id.clone(),
         excluded_reasons,
@@ -13405,7 +13531,7 @@ fn emit_fully_unblocked_open(
         map.insert(
             "remediation".to_string(),
             serde_json::Value::String(
-                "These issues have status `blocked` but no live blocker remains — update their status (e.g. `br update <id> --status open`) so they surface as ready.".to_string(),
+                "These issues have status `blocked` but no live blocker or parent-child gate remains — update their status (e.g. `br update <id> --status open`) so they surface as ready.".to_string(),
             ),
         );
     }
@@ -13414,7 +13540,7 @@ fn emit_fully_unblocked_open(
         "dep.fully_unblocked_open",
         CheckStatus::Warn,
         Some(format!(
-            "{} open issue(s) still have status `blocked` although every blocker is closed or absent: {}",
+            "{} open issue(s) still have status `blocked` although every blocker is closed or absent and no parent-child blocker gates them: {}",
             stale_blocked.len(),
             stale_blocked.join(", ")
         )),
@@ -15723,6 +15849,227 @@ mod tests {
         // Satisfied-only edges: the dead-edge check stays Ok.
         let dead = find_check(&checks, "dep.dead_closed_blocking_edges").unwrap();
         assert_eq!(dead.status, CheckStatus::Ok, "{dead:?}");
+    }
+
+    fn parent_child_dependency(child_id: &str, parent_id: &str) -> crate::model::Dependency {
+        crate::model::Dependency {
+            issue_id: child_id.to_string(),
+            depends_on_id: parent_id.to_string(),
+            dep_type: crate::model::DependencyType::ParentChild,
+            created_at: Utc::now(),
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        }
+    }
+
+    #[test]
+    fn test_dep_graph_jsonl_skips_blocked_templates() {
+        // Templates are never ready-work candidates: a `blocked` template with
+        // only satisfied blockers is excluded, not an actionable finding.
+        let temp = TempDir::new().unwrap();
+        let jsonl = temp.path().join("issues.jsonl");
+        let mut template = issue_with_blockers("bd-template", Status::Blocked, &["bd-closed"]);
+        template.is_template = true;
+        write_issues_jsonl(
+            &jsonl,
+            &[
+                template,
+                closed_issue_with_reason("bd-closed", "bd-closed", "done"),
+            ],
+        );
+
+        let mut checks = Vec::new();
+        check_dependency_graph_jsonl(&jsonl, &mut checks);
+
+        let unblocked =
+            find_check(&checks, "dep.fully_unblocked_open").expect("fully-unblocked check");
+        assert_eq!(
+            unblocked.status,
+            CheckStatus::Ok,
+            "templates are not ready-work candidates and must not be actionable findings: {unblocked:?}"
+        );
+        let details = unblocked.details.as_ref().expect("fully-unblocked details");
+        assert_eq!(
+            details.get("stale_blocked").unwrap(),
+            &serde_json::json!([])
+        );
+        assert_eq!(
+            details.get("excluded").unwrap(),
+            &serde_json::json!([{ "id": "bd-template", "reasons": ["template"] }])
+        );
+    }
+
+    #[test]
+    fn test_dep_graph_jsonl_open_template_blocker_does_not_gate_readiness() {
+        // The blocked cache never lets a template gate ready work, so an open
+        // template target leaves its dependent ready. The edge is not a
+        // completed dependency either, so it is not reported as a dead edge.
+        let temp = TempDir::new().unwrap();
+        let jsonl = temp.path().join("issues.jsonl");
+        let mut template = sample_issue("bd-template", "bd-template");
+        template.is_template = true;
+        write_issues_jsonl(
+            &jsonl,
+            &[
+                issue_with_blockers("bd-uses-template", Status::Open, &["bd-template"]),
+                template,
+            ],
+        );
+
+        let mut checks = Vec::new();
+        check_dependency_graph_jsonl(&jsonl, &mut checks);
+
+        let dead = find_check(&checks, "dep.dead_closed_blocking_edges").unwrap();
+        assert_eq!(dead.status, CheckStatus::Ok, "{dead:?}");
+        assert!(dead.message.is_none(), "{dead:?}");
+        assert!(
+            dead.details
+                .as_ref()
+                .is_none_or(|details| details.get("issues").is_none()),
+            "a template edge must not be reported as a dead edge: {dead:?}"
+        );
+        let unblocked = find_check(&checks, "dep.fully_unblocked_open").unwrap();
+        assert_eq!(unblocked.status, CheckStatus::Ok, "{unblocked:?}");
+        assert_eq!(
+            unblocked.details.as_ref().unwrap().get("ready").unwrap(),
+            &serde_json::json!(["bd-uses-template"])
+        );
+    }
+
+    #[test]
+    fn test_dep_graph_jsonl_respects_parent_child_blocking_before_stale_status_warning() {
+        // `br ready` propagates a blocked parent to every descendant and
+        // blocks an epic while any child is open, so neither may be listed as
+        // ready or told to reopen.
+        let temp = TempDir::new().unwrap();
+        let jsonl = temp.path().join("issues.jsonl");
+
+        let blocked_parent = issue_with_blockers("bd-parent", Status::Open, &["bd-live"]);
+        let mut inherited_child =
+            issue_with_blockers("bd-inherited-child", Status::Blocked, &["bd-closed"]);
+        inherited_child
+            .dependencies
+            .push(parent_child_dependency("bd-inherited-child", "bd-parent"));
+        let mut open_grandchild =
+            issue_with_blockers("bd-open-grandchild", Status::Open, &["bd-closed"]);
+        open_grandchild.dependencies.push(parent_child_dependency(
+            "bd-open-grandchild",
+            "bd-inherited-child",
+        ));
+
+        let external_parent =
+            issue_with_blockers("bd-external-parent", Status::Open, &["external:other:bd-1"]);
+        let mut external_child =
+            issue_with_blockers("bd-external-child", Status::Open, &["bd-closed"]);
+        external_child.dependencies.push(parent_child_dependency(
+            "bd-external-child",
+            "bd-external-parent",
+        ));
+
+        let mut epic = issue_with_blockers("bd-epic", Status::Blocked, &["bd-closed"]);
+        epic.issue_type = crate::model::IssueType::Epic;
+        let mut epic_child = sample_issue("bd-epic-child", "bd-epic-child");
+        epic_child
+            .dependencies
+            .push(parent_child_dependency("bd-epic-child", "bd-epic"));
+
+        let independently_stale =
+            issue_with_blockers("bd-independent", Status::Blocked, &["bd-closed"]);
+        let live = sample_issue("bd-live", "bd-live");
+
+        write_issues_jsonl(
+            &jsonl,
+            &[
+                blocked_parent,
+                inherited_child,
+                open_grandchild,
+                external_parent,
+                external_child,
+                epic,
+                epic_child,
+                independently_stale,
+                closed_issue_with_reason("bd-closed", "bd-closed", "done"),
+                live,
+            ],
+        );
+
+        let mut checks = Vec::new();
+        check_dependency_graph_jsonl(&jsonl, &mut checks);
+
+        let missing =
+            find_check(&checks, "dep.dead_closed_blocking_edges").expect("missing-edge check");
+        assert_eq!(missing.status, CheckStatus::Ok, "{missing:?}");
+
+        let unblocked =
+            find_check(&checks, "dep.fully_unblocked_open").expect("fully-unblocked check");
+        assert_eq!(unblocked.status, CheckStatus::Warn, "{unblocked:?}");
+        let details = unblocked.details.as_ref().expect("fully-unblocked details");
+        assert_eq!(
+            details.get("stale_blocked").unwrap(),
+            &serde_json::json!(["bd-independent"]),
+            "parent-inherited and epic-child blockers must suppress false stale-status warnings"
+        );
+        assert_eq!(
+            details.get("ready").unwrap(),
+            &serde_json::json!([]),
+            "hierarchy-gated issues must never be listed as ready: {details}"
+        );
+        let excluded_ids: Vec<&str> = details
+            .get("excluded")
+            .and_then(serde_json::Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry.get("id").and_then(serde_json::Value::as_str))
+            .collect();
+        for id in [
+            "bd-inherited-child",
+            "bd-open-grandchild",
+            "bd-external-child",
+            "bd-epic",
+        ] {
+            assert!(excluded_ids.contains(&id), "{id} missing from {details}");
+        }
+        let message = unblocked.message.as_deref().unwrap();
+        assert!(message.contains("bd-independent"), "{message}");
+        assert!(!message.contains("bd-inherited-child"), "{message}");
+        assert!(!message.contains("bd-epic"), "{message}");
+    }
+
+    #[test]
+    fn test_dep_graph_jsonl_dangling_parent_blocker_does_not_gate_children() {
+        // Import drops dependency rows whose local target is absent, so a
+        // parent whose only blocker is missing is not blocked in the database
+        // `br ready` reads, and neither are its children.
+        let temp = TempDir::new().unwrap();
+        let jsonl = temp.path().join("issues.jsonl");
+        let mut child = issue_with_blockers("bd-child", Status::Open, &["bd-closed"]);
+        child
+            .dependencies
+            .push(parent_child_dependency("bd-child", "bd-parent"));
+        write_issues_jsonl(
+            &jsonl,
+            &[
+                issue_with_blockers("bd-parent", Status::Open, &["bd-missing"]),
+                child,
+                closed_issue_with_reason("bd-closed", "bd-closed", "done"),
+            ],
+        );
+
+        let mut checks = Vec::new();
+        check_dependency_graph_jsonl(&jsonl, &mut checks);
+
+        let dead = find_check(&checks, "dep.dead_closed_blocking_edges").unwrap();
+        assert_eq!(dead.status, CheckStatus::Warn, "{dead:?}");
+        let unblocked = find_check(&checks, "dep.fully_unblocked_open").unwrap();
+        assert_eq!(unblocked.status, CheckStatus::Ok, "{unblocked:?}");
+        let details = unblocked.details.as_ref().unwrap();
+        assert_eq!(
+            details.get("ready").unwrap(),
+            &serde_json::json!(["bd-parent", "bd-child"]),
+            "{details}"
+        );
+        assert_eq!(details.get("excluded").unwrap(), &serde_json::json!([]));
     }
 
     #[test]
