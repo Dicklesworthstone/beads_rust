@@ -25,7 +25,10 @@
 //!    `.br_recovery`. With database-only data, automatic mode refuses and
 //!    names the explicit `br doctor migrate-schema heal`, which does the same
 //!    upgrade but re-adds the database-only issues as unflushed changes so the
-//!    next flush exports them.
+//!    next flush exports them. A malformed issue or relation is never silently
+//!    omitted from that audit. A rebuild that cannot restore an unreadable
+//!    payload requires explicit `--discard-db-only` authorization; a retained
+//!    backup alone is not permission to remove data from the live tracker.
 
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
@@ -131,8 +134,8 @@ impl StaleSchemaAudit {
 pub enum HealMode {
     /// Ordinary command startup: heal only when the audit is clean.
     Automatic,
-    /// `br doctor migrate-schema heal`: heal regardless, re-adding the
-    /// restorable database-only issues unless `discard_db_only`.
+    /// `br doctor migrate-schema heal`: re-add the restorable database-only
+    /// issues. A rebuild with unreadable payloads requires `discard_db_only`.
     Explicit { discard_db_only: bool },
 }
 
@@ -225,6 +228,14 @@ pub fn refusal_error(audit: &StaleSchemaAudit) -> BeadsError {
         "migrates the database in place without dropping any row, keeping a recovery bundle \
          and printing an undo command"
             .to_string()
+    } else if audit
+        .db_only
+        .iter()
+        .any(|issue| issue.reason == DbOnlyReason::Unreadable)
+    {
+        "refuses a JSONL rebuild that cannot restore unreadable issues; inspect and repair \
+         those original payloads before attempting a lossless rebuild"
+            .to_string()
     } else {
         "rebuilds the database from issues.jsonl, re-adds the database-only issues as \
          unflushed changes (exported by the next flush), and keeps the old database in \
@@ -253,8 +264,9 @@ pub fn refusal_error(audit: &StaleSchemaAudit) -> BeadsError {
 ///
 /// # Errors
 ///
-/// Returns an error only when the database cannot be opened or queried at
-/// all; unprovable content is reported through [`StaleSchemaAudit`].
+/// Returns an error for engine access failures or records whose identity or
+/// ownership cannot be read without loss. Undecodable issue payloads and
+/// their relations are reported as unreadable through [`StaleSchemaAudit`].
 pub(crate) fn audit_stale_database(
     db_path: &Path,
     jsonl: Option<&JsonlSourceSnapshot>,
@@ -308,8 +320,8 @@ fn audit_connection(
         Some(
             conn.query("SELECT issue_id FROM dirty_issues")?
                 .iter()
-                .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_owned))
-                .collect(),
+                .map(|row| required_legacy_text(row.get(0), "dirty_issues", "issue_id"))
+                .collect::<Result<HashSet<_>>>()?,
         )
     } else {
         // Without dirty tracking every differing row must be treated as
@@ -455,7 +467,16 @@ fn parse_jsonl(mut reader: impl BufRead) -> Result<HashMap<String, Issue>> {
         }
         let issue: Issue = serde_json::from_str(trimmed)
             .map_err(|error| BeadsError::Config(format!("line {line_num}: {error}")))?;
-        issues.insert(issue.id.clone(), issue);
+        if issue.id.trim().is_empty() {
+            return Err(BeadsError::Config(format!(
+                "line {line_num}: empty issue id cannot certify a schema-heal source"
+            )));
+        }
+        if issues.insert(issue.id.clone(), issue).is_some() {
+            return Err(BeadsError::Config(format!(
+                "line {line_num}: duplicate issue id cannot certify a schema-heal source"
+            )));
+        }
     }
     Ok(issues)
 }
@@ -519,19 +540,13 @@ fn read_legacy_issues(
     let mut labels: HashMap<String, Vec<String>> = HashMap::new();
     if tables.contains("labels") {
         for row in conn.query("SELECT issue_id, label FROM labels")? {
-            if let (Some(issue_id), Some(label)) = (
-                row.get(0).and_then(SqliteValue::as_text),
-                row.get(1).and_then(SqliteValue::as_text),
-            ) {
-                labels
-                    .entry(issue_id.to_owned())
-                    .or_default()
-                    .push(label.to_owned());
-            }
+            let issue_id = required_legacy_text(row.get(0), "labels", "issue_id")?;
+            let label = required_legacy_text(row.get(1), "labels", "label")?;
+            labels.entry(issue_id).or_default().push(label);
         }
     }
-    let dependencies = read_related_rows(conn, tables, "dependencies")?;
-    let comments = read_related_rows(conn, tables, "comments")?;
+    let mut dependencies = read_related_rows(conn, tables, "dependencies")?;
+    let mut comments = read_related_rows(conn, tables, "comments")?;
 
     let select = issue_columns
         .iter()
@@ -540,24 +555,58 @@ fn read_legacy_issues(
         .join(", ");
     let rows = conn.query(&format!("SELECT {select} FROM issues"))?;
     let mut issues = Vec::with_capacity(rows.len());
+    let mut ids = HashSet::new();
     for row in rows {
         let values: Vec<SqliteValue> = row.values().to_vec();
-        let Some(id) = column_value(issue_columns, &values, "id")
-            .and_then(SqliteValue::as_text)
-            .map(str::to_owned)
-        else {
-            continue;
-        };
+        let id = required_legacy_text(
+            column_value(issue_columns, &values, "id"),
+            "issues",
+            "id",
+        )?;
+        if !ids.insert(id.clone()) {
+            return Err(BeadsError::Config(
+                "duplicate legacy issue ids cannot be preserved by schema healing".to_string(),
+            ));
+        }
+        let issue_dependencies = dependencies.remove(&id).unwrap_or_default();
+        let issue_comments = comments.remove(&id).unwrap_or_default();
         let decoded = decode_issue(
             issue_columns,
             &values,
             labels.remove(&id).unwrap_or_default(),
-            dependencies.get(&id).map(Vec::as_slice).unwrap_or_default(),
-            comments.get(&id).map(Vec::as_slice).unwrap_or_default(),
+            &issue_dependencies,
+            &issue_comments,
         );
         issues.push(LegacyIssue { id, decoded });
     }
+    for (table, orphaned) in [
+        ("labels", !labels.is_empty()),
+        ("dependencies", !dependencies.is_empty()),
+        ("comments", !comments.is_empty()),
+    ] {
+        if orphaned {
+            return Err(BeadsError::Config(format!(
+                "legacy {table} contains rows without an owning issue; refusing a lossy schema heal"
+            )));
+        }
+    }
     Ok(issues)
+}
+
+fn required_legacy_text(
+    value: Option<&SqliteValue>,
+    table: &str,
+    column: &str,
+) -> Result<String> {
+    value
+        .and_then(SqliteValue::as_text)
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            BeadsError::Config(format!(
+                "legacy {table}.{column} must be nonempty text; refusing a lossy schema heal"
+            ))
+        })
 }
 
 fn column_value<'a>(
@@ -588,15 +637,23 @@ fn read_related_rows(
         .collect::<Vec<_>>()
         .join(", ");
     for row in conn.query(&format!("SELECT {select} FROM {}", quote_identifier(table)))? {
+        let issue_id = required_legacy_text(
+            column_value(&columns, row.values(), "issue_id"),
+            table,
+            "issue_id",
+        )?;
         let mut object = Map::new();
         for (column, value) in columns.iter().zip(row.values()) {
             if let Some(json) = sqlite_to_json(value) {
                 object.insert(column.clone(), json);
+            } else if !matches!(value, SqliteValue::Null) {
+                return Err(BeadsError::Config(format!(
+                    "legacy {table}.{column} cannot be represented in JSON; \
+                     refusing a lossy schema heal"
+                )));
             }
         }
-        if let Some(Value::String(issue_id)) = object.get("issue_id").cloned() {
-            related.entry(issue_id).or_default().push(object);
-        }
+        related.entry(issue_id).or_default().push(object);
     }
     Ok(related)
 }
@@ -611,7 +668,8 @@ fn sqlite_to_json(value: &SqliteValue) -> Option<Value> {
 }
 
 /// Decode one legacy issue row into the current model, or `None` when a
-/// required field cannot be represented.
+/// populated field or relation cannot be represented. Returning a partial
+/// issue would let an omitted child masquerade as data already in JSONL.
 fn decode_issue(
     columns: &[String],
     values: &[SqliteValue],
@@ -630,47 +688,57 @@ fn decode_issue(
                 Some(timestamp) => {
                     object.insert(name.to_owned(), Value::String(timestamp.to_rfc3339()));
                 }
-                // An unparseable required timestamp makes the row unreadable;
-                // an optional one is only a missing value.
-                None if matches!(name, "created_at" | "updated_at") => return None,
-                None => {}
+                // Legacy optional timestamps may be empty, but a populated
+                // value that cannot be decoded is data, not absence.
+                None
+                    if !matches!(name, "created_at" | "updated_at")
+                        && value.as_text().is_some_and(|text| text.trim().is_empty()) =>
+                {}
+                None => return None,
             }
         } else if BOOL_FIELDS.contains(&name) {
             let flag = match value {
                 SqliteValue::Integer(integer) => *integer != 0,
-                other => matches!(other.as_text(), Some("1" | "true" | "TRUE")),
+                other => match other.as_text()?.trim() {
+                    "1" => true,
+                    "0" | "" => false,
+                    text if text.eq_ignore_ascii_case("true") => true,
+                    text if text.eq_ignore_ascii_case("false") => false,
+                    _ => return None,
+                },
             };
             object.insert(name.to_owned(), Value::Bool(flag));
         } else if INT_FIELDS.contains(&name) {
+            if name != "priority" && value.as_text().is_some_and(|text| text.trim().is_empty()) {
+                continue;
+            }
             let integer = match value {
                 SqliteValue::Integer(integer) => Some(*integer),
                 other => other.as_text().and_then(|text| text.trim().parse().ok()),
-            };
-            if let Some(integer) = integer {
-                object.insert(name.to_owned(), Value::from(integer));
+            }?;
+            object.insert(name.to_owned(), Value::from(integer));
+        } else if STRING_FIELDS.contains(&name) {
+            let text = value.as_text()?;
+            if !text.is_empty() || matches!(name, "id" | "title") {
+                object.insert(name.to_owned(), Value::String(text.to_owned()));
             }
-        } else if STRING_FIELDS.contains(&name)
-            && let Some(text) = value.as_text()
-            && (!text.is_empty() || matches!(name, "id" | "title"))
-        {
-            object.insert(name.to_owned(), Value::String(text.to_owned()));
         }
     }
     let created_at = object.get("created_at").cloned();
     let dependencies: Vec<Dependency> = dependencies
         .iter()
-        .filter_map(|row| decode_related(row, created_at.as_ref()))
-        .collect();
+        .map(|row| decode_related(row, created_at.as_ref()))
+        .collect::<Option<_>>()?;
     let comments: Vec<Comment> = comments
         .iter()
-        .filter_map(|row| {
+        .map(|row| {
             let mut row = row.clone();
             if let Some(Value::String(text)) = row.remove("text").or_else(|| row.remove("body")) {
                 row.insert("text".to_owned(), Value::String(text));
             }
             decode_related(&row, created_at.as_ref())
         })
-        .collect();
+        .collect::<Option<_>>()?;
     object.insert(
         "labels".to_owned(),
         Value::Array(labels.iter().cloned().map(Value::String).collect()),
@@ -693,15 +761,18 @@ fn decode_related<T: serde::de::DeserializeOwned>(
     fallback_created_at: Option<&Value>,
 ) -> Option<T> {
     let mut row = row.clone();
-    let created_at = row
-        .get("created_at")
-        .and_then(|value| match value {
-            Value::String(text) => legacy_timestamp_text(text),
-            Value::Number(number) => number.as_i64().and_then(legacy_epoch),
-            _ => None,
-        })
-        .map(|timestamp| Value::String(timestamp.to_rfc3339()))
-        .or_else(|| fallback_created_at.cloned())?;
+    let created_at = match row.get("created_at") {
+        None | Some(Value::Null) => fallback_created_at.cloned()?,
+        Some(Value::String(text)) if text.trim().is_empty() => fallback_created_at.cloned()?,
+        Some(value) => {
+            let timestamp = match value {
+                Value::String(text) => legacy_timestamp_text(text),
+                Value::Number(number) => number.as_i64().and_then(legacy_epoch),
+                _ => None,
+            }?;
+            Value::String(timestamp.to_rfc3339())
+        }
+    };
     row.insert("created_at".to_owned(), created_at);
     serde_json::from_value(Value::Object(row)).ok()
 }
@@ -875,6 +946,10 @@ pub fn heal_stale_schema(ctx: &HealContext<'_>, mode: HealMode) -> Result<HealRe
              br release that wrote it (`br sync --flush-only`), then rerun `{HEAL_COMMAND}`"
         )));
     };
+    // A successful reviewed migration above preserves raw rows. A JSONL
+    // rebuild cannot do that for unreadable payloads, even in explicit mode.
+    // Enforce this before calling the routine that replaces the live family.
+    require_lossless_rebuild(&audit, discard_db_only)?;
     let mut merged = startup.merged_config.clone();
     merged.merge_from(&ctx.cli.as_layer());
     let allow_external_jsonl =
@@ -954,6 +1029,29 @@ fn capture_jsonl(
     Ok((Some(authority), Some(source)))
 }
 
+fn require_lossless_rebuild(audit: &StaleSchemaAudit, discard_db_only: bool) -> Result<()> {
+    if let Some(reason) = &audit.unprovable {
+        return Err(BeadsError::Config(format!(
+            "cannot certify a schema-heal rebuild: {reason}; the rebuild was not started"
+        )));
+    }
+    if !discard_db_only
+        && audit
+            .db_only
+            .iter()
+            .any(|issue| issue.reason == DbOnlyReason::Unreadable)
+    {
+        return Err(BeadsError::Config(format!(
+            "schema-heal rebuild refused: unreadable database-only payloads cannot be \
+             restored ({}). The rebuild was not started. Repair the original payloads first; \
+             `{HEAL_COMMAND} --discard-db-only` is an explicit choice to keep database-only \
+             data only in the retained backup, not in the rebuilt tracker",
+            audit.db_only_summary()
+        )));
+    }
+    Ok(())
+}
+
 /// Planned action for a stale database, as `--dry-run` reports it.
 fn planned_action(audit: &StaleSchemaAudit, discard_db_only: bool) -> String {
     if REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&audit.from_version) {
@@ -962,6 +1060,9 @@ fn planned_action(audit: &StaleSchemaAudit, discard_db_only: bool) -> String {
              command retained)",
             audit.from_version, audit.to_version
         );
+    }
+    if let Err(error) = require_lossless_rebuild(audit, discard_db_only) {
+        return format!("refuse rebuild: {error}");
     }
     let restorable = audit
         .db_only
@@ -1212,5 +1313,216 @@ mod tests {
         }
         assert_eq!(legacy_epoch(1_767_468_508_000), Some(expected));
         assert_eq!(legacy_timestamp_text("not a date"), None);
+    }
+
+    fn legacy_audit_fixture() -> (Connection, Vec<u8>) {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE issues (id TEXT, title TEXT, status TEXT, priority INTEGER, \
+             issue_type TEXT, created_at TEXT, updated_at TEXT)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO issues VALUES ('a-1', 'title a-1', 'open', 2, 'task', \
+             '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .unwrap();
+        let jsonl = serde_json::to_vec(&issue("a-1", "2026-01-01T00:00:00Z")).unwrap();
+        (conn, jsonl)
+    }
+
+    #[test]
+    fn malformed_relations_cannot_make_a_schema_audit_appear_clean() {
+        for setup in [
+            [
+                "CREATE TABLE comments (id INTEGER, issue_id TEXT, author TEXT, text TEXT)",
+                "INSERT INTO comments VALUES (1, 'a-1', 'agent', NULL)",
+            ],
+            [
+                "CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT)",
+                "INSERT INTO dependencies VALUES ('a-1', NULL, 'blocks')",
+            ],
+        ] {
+            let (conn, jsonl) = legacy_audit_fixture();
+            for sql in setup {
+                conn.execute(sql).unwrap();
+            }
+            // The old filter_map decoder discarded the only child and
+            // incorrectly certified this exact issue as already in JSONL.
+            let audit = audit_connection(&conn, Some(std::io::Cursor::new(jsonl))).unwrap();
+            assert!(!audit.is_clean());
+            assert_eq!(audit.db_issue_count, 1);
+            assert_eq!(audit.db_only.len(), 1);
+            assert_eq!(audit.db_only[0].id, "a-1");
+            assert_eq!(audit.db_only[0].reason, DbOnlyReason::Unreadable);
+            assert!(!audit.db_only[0].restorable);
+            assert!(audit.restorable.is_empty());
+            assert!(require_lossless_rebuild(&audit, false).is_err());
+            assert!(require_lossless_rebuild(&audit, true).is_ok());
+            assert!(planned_action(&audit, false).starts_with("refuse rebuild:"));
+            assert!(planned_action(&audit, true).starts_with("rebuild schema"));
+        }
+    }
+
+    #[test]
+    fn schema_audit_refuses_unattributable_or_unrepresentable_records() {
+        let cases: &[(&[&str], &str)] = &[
+            (&["UPDATE issues SET id = NULL"], "issues.id"),
+            (
+                &["INSERT INTO issues SELECT * FROM issues"],
+                "duplicate legacy issue ids",
+            ),
+            (
+                &[
+                    "CREATE TABLE labels (issue_id TEXT, label TEXT)",
+                    "INSERT INTO labels VALUES (NULL, 'retained')",
+                ],
+                "labels.issue_id",
+            ),
+            (
+                &[
+                    "CREATE TABLE labels (issue_id TEXT, label BLOB)",
+                    "INSERT INTO labels VALUES ('a-1', X'FEED')",
+                ],
+                "labels.label",
+            ),
+            (
+                &[
+                    "CREATE TABLE comments (issue_id TEXT, text TEXT)",
+                    "INSERT INTO comments VALUES (NULL, 'retained')",
+                ],
+                "comments.issue_id",
+            ),
+            (
+                &[
+                    "CREATE TABLE comments (issue_id TEXT, text TEXT)",
+                    "INSERT INTO comments VALUES ('missing-owner', 'retained')",
+                ],
+                "without an owning issue",
+            ),
+            (
+                &[
+                    "CREATE TABLE dependencies (issue_id TEXT, metadata BLOB)",
+                    "INSERT INTO dependencies VALUES ('a-1', X'FEED')",
+                ],
+                "dependencies.metadata",
+            ),
+            (
+                &[
+                    "CREATE TABLE dirty_issues (issue_id TEXT)",
+                    "INSERT INTO dirty_issues VALUES (NULL)",
+                ],
+                "dirty_issues.issue_id",
+            ),
+        ];
+        for &(setup, expected) in cases {
+            let (conn, jsonl) = legacy_audit_fixture();
+            for sql in setup {
+                conn.execute(sql).unwrap();
+            }
+            let error = audit_connection(&conn, Some(std::io::Cursor::new(jsonl))).unwrap_err();
+            assert!(error.to_string().contains(expected), "{expected}: {error}");
+        }
+    }
+
+    #[test]
+    fn populated_invalid_optional_values_are_not_silently_defaulted() {
+        for (column, value) in [
+            ("due_at", SqliteValue::from("not a date")),
+            ("pinned", SqliteValue::from("not a boolean")),
+            ("estimated_minutes", SqliteValue::from("not an integer")),
+            ("description", SqliteValue::Integer(42)),
+        ] {
+            let columns: Vec<String> = ["id", "title", "created_at", "updated_at", column]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            let values = [
+                SqliteValue::from("a-1"),
+                SqliteValue::from("title a-1"),
+                SqliteValue::from("2026-01-01T00:00:00Z"),
+                SqliteValue::from("2026-01-01T00:00:00Z"),
+                value,
+            ];
+            assert!(
+                decode_issue(&columns, &values, Vec::new(), &[], &[]).is_none(),
+                "{column}"
+            );
+        }
+    }
+
+    #[test]
+    fn related_timestamp_fallback_requires_absence_not_a_malformed_value() {
+        let fallback = serde_json::json!("2026-01-01T00:00:00Z");
+        let mut row = serde_json::json!({
+            "id": 1, "issue_id": "a-1", "author": "agent", "text": "retained",
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(decode_related::<Comment>(&row, Some(&fallback)).is_some());
+        for absent in [Value::Null, serde_json::json!("")] {
+            row.insert("created_at".to_string(), absent);
+            assert!(decode_related::<Comment>(&row, Some(&fallback)).is_some());
+        }
+        for malformed in [
+            serde_json::json!("not a date"),
+            serde_json::json!({"bad": true}),
+        ] {
+            row.insert("created_at".to_string(), malformed);
+            assert!(decode_related::<Comment>(&row, Some(&fallback)).is_none());
+        }
+    }
+
+    #[test]
+    fn valid_legacy_children_are_preserved_in_the_restore_plan() {
+        let (conn, _) = legacy_audit_fixture();
+        for sql in [
+            "CREATE TABLE labels (issue_id TEXT, label TEXT)",
+            "INSERT INTO labels VALUES ('a-1', 'local-only')",
+            "CREATE TABLE comments (id INTEGER, issue_id TEXT, author TEXT, body TEXT)",
+            "INSERT INTO comments VALUES (1, 'a-1', 'agent', 'unexported comment')",
+            "CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT, created_by TEXT)",
+            "INSERT INTO dependencies VALUES ('a-1', 'external-target', 'blocks', 'agent')",
+            "ALTER TABLE issues ADD COLUMN due_at TEXT",
+            "UPDATE issues SET due_at = ''",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let older = serde_json::to_vec(&issue("a-1", "2025-12-01T00:00:00Z")).unwrap();
+        let audit = audit_connection(&conn, Some(std::io::Cursor::new(older))).unwrap();
+        assert!(!audit.is_clean());
+        assert_eq!(audit.restorable.len(), 1);
+        let restored = &audit.restorable[0].issue;
+        assert_eq!(restored.labels, vec!["local-only".to_string()]);
+        assert_eq!(restored.comments.len(), 1);
+        assert_eq!(restored.comments[0].body, "unexported comment");
+        assert_eq!(restored.comments[0].created_at, restored.created_at);
+        assert_eq!(restored.dependencies.len(), 1);
+        assert_eq!(restored.dependencies[0].depends_on_id, "external-target");
+        assert_eq!(restored.dependencies[0].created_at, restored.created_at);
+        assert!(restored.due_at.is_none());
+        assert!(require_lossless_rebuild(&audit, false).is_ok());
+    }
+
+    #[test]
+    fn duplicate_or_unprovable_jsonl_never_authorizes_a_rebuild() {
+        let (conn, jsonl) = legacy_audit_fixture();
+        let mut duplicate = jsonl.clone();
+        duplicate.push(b'\n');
+        duplicate.extend_from_slice(&jsonl);
+        let audit = audit_connection(&conn, Some(std::io::Cursor::new(duplicate))).unwrap();
+        assert!(!audit.is_clean());
+        assert!(
+            audit
+                .unprovable
+                .as_deref()
+                .unwrap()
+                .contains("duplicate issue id")
+        );
+        for discard in [false, true] {
+            assert!(require_lossless_rebuild(&audit, discard).is_err());
+            assert!(planned_action(&audit, discard).starts_with("refuse rebuild:"));
+        }
     }
 }
