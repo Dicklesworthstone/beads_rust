@@ -11,6 +11,7 @@ mod common;
 
 use assert_cmd::Command;
 use beads_rust::franken_sync::Connection;
+use beads_rust::model::{Comment, Dependency, DependencyType};
 use common::dataset_registry::isolated_beads_rust_replay;
 use fsqlite_types::SqliteValue;
 use std::ffi::OsStr;
@@ -76,12 +77,28 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    spawn_br_child_in_dir_with_env(root, args, std::iter::empty::<(String, String)>())
+}
+
+fn spawn_br_child_in_dir_with_env<I, S, E, K, V>(
+    root: &Path,
+    args: I,
+    env_vars: E,
+) -> std::process::Child
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+    E: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
     let mut cmd = StdCommand::new(assert_cmd::cargo::cargo_bin!("br"));
     cmd.current_dir(root);
     cmd.args(args);
     clear_inherited_br_env_std(&mut cmd);
     cmd.env("NO_COLOR", "1");
     cmd.env("RUST_LOG", "error");
+    cmd.envs(env_vars);
     cmd.env("RUST_BACKTRACE", "1");
     cmd.env("HOME", root);
     // Hermetic $PATH: dual `br` installs otherwise trip the br_path_dupes
@@ -417,6 +434,164 @@ where
         success: output.status.success(),
         exit_code: output.status.code(),
         _duration: duration,
+    }
+}
+
+/// Build the issue/relation tables through the normal import path, outside the
+/// timed region. Fixed identities, timestamps, labels, comments, and short
+/// dependency branches make the 600/2,435-row fixtures directly comparable.
+fn seed_noop_auto_import_workspace(issue_count: usize) -> (TempDir, String) {
+    let temp = isolated_temp_dir("no-op auto-import regression");
+    let root = temp.path().to_path_buf();
+    let init = run_br_in_dir(&root, ["init", "--prefix", "test"]);
+    assert!(init.success, "init failed: {init:?}");
+
+    let mut jsonl = String::new();
+    for index in 0..issue_count {
+        let mut issue = common::fixtures::issue(&format!("No-op import issue {index}"));
+        issue.id = format!("test-{index:05x}");
+        issue.description =
+            Some("Import certification must preserve this issue and its relations. ".repeat(4));
+        issue.labels = vec!["import-scale".to_string(), format!("team-{}", index % 11)];
+        if index % 4 == 0 {
+            issue.comments.push(Comment {
+                id: i64::try_from(index + 1).unwrap(),
+                issue_id: issue.id.clone(),
+                author: "scale-fixture".to_string(),
+                body: format!("Discussion for issue {index}"),
+                created_at: issue.updated_at,
+            });
+        }
+        if index % 8 == 1 {
+            issue.dependencies.push(Dependency {
+                issue_id: issue.id.clone(),
+                depends_on_id: format!("test-{:05x}", index - 1),
+                dep_type: DependencyType::Blocks,
+                created_at: issue.created_at,
+                created_by: Some("scale-fixture".to_string()),
+                metadata: None,
+                thread_id: None,
+            });
+        }
+        writeln!(&mut jsonl, "{}", serde_json::to_string(&issue).unwrap()).unwrap();
+    }
+    fs::write(root.join(".beads/issues.jsonl"), &jsonl).unwrap();
+    let imported = run_br_in_dir(&root, ["sync", "--import-only", "--json"]);
+    assert!(imported.success, "seed import failed: {imported:?}");
+    let receipt: serde_json::Value = serde_json::from_str(&imported.stdout).unwrap();
+    assert_eq!(receipt["created"], issue_count);
+    assert_eq!(receipt["updated"], 0);
+    (temp, jsonl)
+}
+
+fn import_debug_value(stderr: &str, message: &str, field: &str) -> u64 {
+    let mut matching = stderr.lines().filter(|line| line.contains(message));
+    let line = matching
+        .next()
+        .unwrap_or_else(|| panic!("missing import diagnostic {message:?}: {stderr}"));
+    assert!(
+        matching.next().is_none(),
+        "expected one import diagnostic {message:?}: {stderr}"
+    );
+    let prefix = format!("{field}=");
+    line.split_whitespace()
+        .find_map(|part| part.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("missing {field} in {line}"))
+        .parse()
+        .unwrap_or_else(|error| panic!("invalid {field} in {line}: {error}"))
+}
+
+/// Reject a witness-only fast path: every sample must parse the complete
+/// source, run the write transaction, and report zero created/updated issues.
+fn assert_noop_auto_import(stderr: &str, issue_count: usize) -> Duration {
+    assert_eq!(
+        import_debug_value(
+            stderr,
+            "Import phase: parsed and validated JSONL",
+            "records"
+        ),
+        u64::try_from(issue_count).unwrap()
+    );
+    assert_eq!(
+        import_debug_value(stderr, "Auto-import completed", "imported_count"),
+        0
+    );
+    let started_ms = import_debug_value(
+        stderr,
+        "Import phase: collision plan ready; applying rows",
+        "elapsed_ms",
+    );
+    let finished_ms = import_debug_value(
+        stderr,
+        "Import phase: write transaction finished",
+        "elapsed_ms",
+    );
+    Duration::from_millis(finished_ms.checked_sub(started_ms).unwrap())
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct QueuedBrChildren(Vec<std::process::Child>);
+
+#[cfg(unix)]
+impl QueuedBrChildren {
+    fn drain_pipe(
+        mut pipe: impl std::io::Read + Send + 'static,
+    ) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })
+    }
+
+    fn finish(mut self, timeout: Duration) -> Vec<std::process::Output> {
+        let deadline = Instant::now() + timeout;
+        // Debug imports can produce more than a pipe buffer of diagnostics.
+        // Drain both streams while the children are running, or the importer
+        // could block in logging while still holding the workspace lock.
+        // Keep ownership of the children here so timeout/unwind cleanup can
+        // kill and reap them even while the pipe readers are still active.
+        let readers = self
+            .0
+            .iter_mut()
+            .map(|child| {
+                (
+                    Self::drain_pipe(child.stdout.take().expect("piped child stdout")),
+                    Self::drain_pipe(child.stderr.take().expect("piped child stderr")),
+                )
+            })
+            .collect::<Vec<_>>();
+        while self
+            .0
+            .iter_mut()
+            .any(|child| child.try_wait().unwrap().is_none())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "queued commands did not finish within {timeout:?}"
+            );
+            thread::sleep(WRITE_LOCK_WAIT_POLL_INTERVAL);
+        }
+        self.0
+            .drain(..)
+            .zip(readers)
+            .map(|(mut child, (stdout, stderr))| std::process::Output {
+                status: child.wait().unwrap(),
+                stdout: stdout.join().expect("stdout reader panicked").unwrap(),
+                stderr: stderr.join().expect("stderr reader panicked").unwrap(),
+            })
+            .collect()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for QueuedBrChildren {
+    fn drop(&mut self) {
+        for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -1489,6 +1664,233 @@ fn e2e_doctor_reports_live_write_lock_without_mutating_workspace() {
         lock_check["details"]["reason"], "persistent_advisory_inode",
         "{lock_check}"
     );
+}
+
+/// GitHub #535: exercise the complete no-op auto-import, including relation
+/// certification, at approximately four times the input size. Medians from
+/// interleaved samples and a small noise allowance exclude quadratic growth
+/// without imposing a machine-specific millisecond performance target.
+#[test]
+fn e2e_noop_auto_import_apply_cost_scales_with_issue_count() {
+    let _log = common::test_log("e2e_noop_auto_import_apply_cost_scales_with_issue_count");
+    let _serial = common::workspace_replay_test_guard();
+    let small = seed_noop_auto_import_workspace(600);
+    let large = seed_noop_auto_import_workspace(2_435);
+    let fixtures = [(600, &small), (2_435, &large)];
+    let mut samples = [Vec::new(), Vec::new()];
+
+    for round in 0..3 {
+        for (slot, (issue_count, (temp, original_jsonl))) in fixtures.iter().enumerate() {
+            let root = temp.path().to_path_buf();
+            let jsonl_path = root.join(".beads/issues.jsonl");
+            // The source bytes must change on every run. Merely touching an
+            // unchanged export measures the content-witness shortcut instead
+            // of the skipped-row path that caused the lock starvation.
+            // Put whitespace inside each JSON object: the staleness hash
+            // deliberately ignores blank lines and leading/trailing space.
+            let padding = " ".repeat(round + 1);
+            let mut changed_bytes = String::new();
+            for line in original_jsonl.lines() {
+                let fields = line.strip_prefix('{').unwrap();
+                writeln!(&mut changed_bytes, "{{{padding}{fields}").unwrap();
+            }
+            fs::write(&jsonl_path, &changed_bytes).unwrap();
+            let result = run_br_in_dir_with_env(
+                &root,
+                ["--no-auto-flush", "count", "--json"],
+                [("RUST_LOG", "error,beads_rust::sync=debug")],
+            );
+            assert!(result.success, "no-op auto-import failed: {result:?}");
+            let payload: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+            assert_eq!(payload["count"], *issue_count);
+            samples[slot].push(assert_noop_auto_import(&result.stderr, *issue_count));
+            assert_eq!(fs::read_to_string(&jsonl_path).unwrap(), changed_bytes);
+        }
+    }
+
+    for sample in &mut samples {
+        sample.sort_unstable();
+    }
+    let [small_samples, large_samples] = &samples;
+    let small_median = small_samples[1];
+    let large_median = large_samples[1];
+    eprintln!(
+        "no-op auto-import write transaction: 600 rows {small_samples:?}; \
+         2435 rows {large_samples:?}"
+    );
+    // Four times the rows allows at most ten times the apply cost, plus
+    // 250 ms scheduler/timestamp noise. Quadratic per-ID reloads take about
+    // sixteen times the work; the production 30 s lock contract has a
+    // separate end-to-end regression below.
+    assert!(
+        large_median < small_median * 10 + Duration::from_millis(250),
+        "no-op import apply cost grew superlinearly: 600 rows {small_samples:?}, \
+         2435 rows {large_samples:?}"
+    );
+
+    for (issue_count, (temp, _)) in fixtures {
+        let db_path = temp.path().join(".beads/beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let hashes = conn.query("SELECT COUNT(*) FROM export_hashes").unwrap();
+        assert_eq!(
+            hashes[0].get(0).and_then(SqliteValue::as_integer),
+            Some(i64::try_from(issue_count).unwrap()),
+            "every unchanged issue must remain certified after repeated imports"
+        );
+        let dirty = conn.query("SELECT COUNT(*) FROM dirty_issues").unwrap();
+        assert_eq!(dirty[0].get(0).and_then(SqliteValue::as_integer), Some(0));
+        let needs_flush = conn
+            .query("SELECT value FROM metadata WHERE key = 'needs_flush'")
+            .unwrap();
+        assert!(
+            needs_flush
+                .first()
+                .and_then(|row| row.get(0))
+                .and_then(SqliteValue::as_text)
+                != Some("true"),
+            "a genuine no-op must not request an export"
+        );
+    }
+}
+
+/// GitHub #535: an older restored export can trigger thousands of skips even
+/// when the database has no dirty rows. The importing reader must preserve
+/// newer local state and release write authority before queued commands hit
+/// the unchanged default 30 s timeout.
+#[test]
+#[cfg(unix)]
+#[allow(clippy::incompatible_msrv, clippy::too_many_lines)]
+fn e2e_noop_auto_import_releases_lock_before_queued_commands_time_out() {
+    const ISSUE_COUNT: usize = 2_435;
+    const LOCAL_TITLE: &str = "Newer local state survives restoring an older export";
+    let _log =
+        common::test_log("e2e_noop_auto_import_releases_lock_before_queued_commands_time_out");
+    let _serial = common::workspace_replay_test_guard();
+    let (temp, older_jsonl) = seed_noop_auto_import_workspace(ISSUE_COUNT);
+    let root = temp.path().to_path_buf();
+    let updated = run_br_in_dir(
+        &root,
+        ["update", "test-00000", "--title", LOCAL_TITLE, "--json"],
+    );
+    assert!(updated.success, "local update failed: {updated:?}");
+    let flush = run_br_in_dir(&root, ["sync", "--flush-only", "--json"]);
+    assert!(flush.success, "flush before restoration failed: {flush:?}");
+    let jsonl_path = root.join(".beads/issues.jsonl");
+    assert!(
+        fs::read_to_string(&jsonl_path)
+            .unwrap()
+            .contains(LOCAL_TITLE)
+    );
+    fs::write(&jsonl_path, &older_jsonl).unwrap();
+
+    let owner = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(".beads/.write.lock"))
+        .unwrap();
+    owner.lock().unwrap();
+
+    let mut children = QueuedBrChildren::default();
+    children.0.push(spawn_br_child_in_dir_with_env(
+        &root,
+        ["--no-auto-flush", "count", "--json"],
+        [("RUST_LOG", "error,beads_rust::sync=debug")],
+    ));
+    let first_waiter = wait_for_workspace_waiters(&root, 1);
+    wait_for_child_to_block_on_write_lock(&mut children.0[0], "no-op importing reader");
+    #[cfg(target_os = "linux")]
+    wait_for_child_owned_workspace_registration(&root, &mut children.0[0]);
+
+    children.0.push(spawn_br_child_in_dir(
+        &root,
+        ["--no-auto-flush", "show", "test-00000", "--json"],
+    ));
+    wait_for_workspace_waiters(&root, 2);
+    wait_for_child_to_block_on_write_lock(&mut children.0[1], "reader behind no-op import");
+    children.0.push(spawn_br_child_in_dir(
+        &root,
+        [
+            "--no-auto-flush",
+            "label",
+            "add",
+            "test-00001",
+            "concurrent-after-import",
+            "--json",
+        ],
+    ));
+    let all_waiters = wait_for_workspace_waiters(&root, 3);
+    wait_for_child_to_block_on_write_lock(&mut children.0[2], "writer behind no-op import");
+    assert_eq!(
+        first_waiter[0], all_waiters[0],
+        "the actual importing command must own the first turn"
+    );
+
+    let released_at = Instant::now();
+    drop(owner);
+    let outputs = children.finish(Duration::from_secs(35));
+    let elapsed = released_at.elapsed();
+    for (role, output) in ["importer", "reader", "writer"].into_iter().zip(&outputs) {
+        assert!(
+            output.status.success(),
+            "{role} failed behind no-op import after {elapsed:?}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let apply_time =
+        assert_noop_auto_import(&String::from_utf8_lossy(&outputs[0].stderr), ISSUE_COUNT);
+    assert!(
+        apply_time < Duration::from_secs(30),
+        "no-op import consumed the workspace lock budget: {apply_time:?}"
+    );
+    eprintln!(
+        "2435-row restored export: no-op apply {apply_time:?}, \
+         all queued commands returned after {elapsed:?}"
+    );
+    let count: serde_json::Value = serde_json::from_slice(&outputs[0].stdout).unwrap();
+    assert_eq!(count["count"], ISSUE_COUNT);
+    let shown: serde_json::Value = serde_json::from_slice(&outputs[1].stdout).unwrap();
+    assert_eq!(shown[0]["title"], LOCAL_TITLE);
+    assert_eq!(fs::read_to_string(&jsonl_path).unwrap(), older_jsonl);
+
+    let conn =
+        Connection::open(root.join(".beads/beads.db").to_string_lossy().into_owned()).unwrap();
+    let hashes = conn
+        .query("SELECT COUNT(*) FROM export_hashes WHERE issue_id = 'test-00000'")
+        .unwrap();
+    assert_eq!(
+        hashes[0].get(0).and_then(SqliteValue::as_integer),
+        Some(0),
+        "newer local state must not be certified as present in the restored export"
+    );
+    let needs_flush = conn
+        .query("SELECT value FROM metadata WHERE key = 'needs_flush'")
+        .unwrap();
+    assert_eq!(
+        needs_flush[0].get(0).and_then(SqliteValue::as_text),
+        Some("true")
+    );
+    let labels = conn
+        .query("SELECT COUNT(*) FROM labels WHERE issue_id = 'test-00001' AND label = 'concurrent-after-import'")
+        .unwrap();
+    assert_eq!(labels[0].get(0).and_then(SqliteValue::as_integer), Some(1));
+    drop(conn);
+
+    let flush = run_br_in_dir(&root, ["sync", "--flush-only", "--json"]);
+    assert!(flush.success, "database-ahead flush failed: {flush:?}");
+    let exported = fs::read_to_string(&jsonl_path).unwrap();
+    assert!(exported.contains(LOCAL_TITLE));
+    assert!(exported.contains("concurrent-after-import"));
+    assert_eq!(
+        exported
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count(),
+        ISSUE_COUNT
+    );
+    assert!(wait_for_workspace_waiters(&root, 0).is_empty());
 }
 
 /// Auto-import runs before nominally read-only commands, but the import itself

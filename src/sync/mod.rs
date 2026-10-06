@@ -23919,6 +23919,12 @@ mod tests {
     fn test_skip_certification_compares_full_payload_even_with_equal_content_hash() {
         let incoming = make_test_issue("bd-full-payload", "Equal content hash");
         let mut stored = incoming.clone();
+        canonicalize_persisted_issue_defaults(&mut stored);
+        assert!(skipped_import_matches_stored_issue(
+            Some(&stored),
+            &incoming.id,
+            &incoming
+        ));
         // Audit timestamps are intentionally ignored, while a due date is
         // synced but absent from the content hash. It must prevent certification.
         stored.due_at = Some(stored.created_at);
@@ -24484,6 +24490,216 @@ mod tests {
         );
         assert!(storage.get_export_hash("bd-rel").unwrap().is_none());
         assert_eq!(storage.get_labels("bd-rel").unwrap(), vec!["local-only"]);
+    }
+
+    #[test]
+    fn test_import_skip_certification_preserves_database_ahead_payloads() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+        let issues = [
+            "comment",
+            "dependency",
+            "due",
+            "label",
+            "unchanged",
+            "target",
+            "clock",
+        ]
+        .map(|name| make_issue_at(&format!("bd-skip-{name}"), name, fixed_time(100)));
+        let ids = issues
+            .iter()
+            .map(|issue| issue.id.clone())
+            .collect::<Vec<_>>();
+        write_additive_issues(&path, &issues);
+        import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+
+        storage
+            .add_comment("bd-skip-comment", "local", "newer local comment")
+            .unwrap();
+        storage
+            .add_dependency("bd-skip-dependency", "bd-skip-target", "blocks", "local")
+            .unwrap();
+        storage
+            .add_label("bd-skip-label", "local-only", "local")
+            .unwrap();
+        storage
+            .execute_raw(
+                "UPDATE issues SET due_at = '2035-01-02T03:04:05Z',
+                 updated_at = '2030-01-02T03:04:05Z' WHERE id = 'bd-skip-due'",
+            )
+            .unwrap();
+        storage
+            .execute_raw(
+                "UPDATE issues SET updated_at = '2030-01-02T03:04:05Z'
+                 WHERE id = 'bd-skip-clock'",
+            )
+            .unwrap();
+        // Model restoring an old export after the local changes were flushed:
+        // dirty markers cannot be used to discover these newer local payloads.
+        storage.clear_dirty_issues_legacy(&ids).unwrap();
+        storage.set_metadata("needs_flush", "false").unwrap();
+        let before = storage.get_issues_for_export(&ids).unwrap();
+        for incoming in &issues {
+            let local = before.iter().find(|issue| issue.id == incoming.id).unwrap();
+            assert_eq!(
+                local.compute_content_hash(),
+                incoming.compute_content_hash(),
+                "the narrow content hash must not reveal these differences"
+            );
+        }
+
+        let result =
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+        assert_eq!(result.imported_count, 0);
+        assert_eq!(result.skipped_count, issues.len());
+        assert_eq!(result.export_hashes_recorded, 3);
+        assert_eq!(storage.get_issues_for_export(&ids).unwrap(), before);
+        assert_eq!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true")
+        );
+        for (index, issue) in issues.iter().enumerate() {
+            assert_eq!(
+                storage.get_export_hash(&issue.id).unwrap().is_some(),
+                index >= 4,
+                "only semantically equal rows may be certified: {}",
+                issue.id
+            );
+        }
+
+        let refreshed = temp_dir.path().join("refreshed.jsonl");
+        export_to_jsonl(&storage, &refreshed, &ExportConfig::default()).unwrap();
+        let exported = fs::read_to_string(refreshed)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Issue>(line).unwrap())
+            .collect::<Vec<_>>();
+        for local in &before {
+            let exported = exported.iter().find(|issue| issue.id == local.id).unwrap();
+            assert!(
+                local.sync_equals(exported),
+                "flush must retain {}",
+                local.id
+            );
+        }
+    }
+
+    #[test]
+    fn test_import_skip_certification_observes_same_target_action_order() {
+        for (skip_first, change_title, needs_flush) in [
+            (false, true, true),
+            (false, false, false),
+            (true, false, true),
+        ] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let path = temp_dir.path().join("issues.jsonl");
+            let mut original = make_issue_at("bd-main", "Original", fixed_time(100));
+            if skip_first {
+                original.comments.push(Comment {
+                    id: 1,
+                    issue_id: original.id.clone(),
+                    author: "local".to_string(),
+                    body: "before the update".to_string(),
+                    created_at: fixed_time(100),
+                });
+            }
+            write_additive_issues(&path, std::slice::from_ref(&original));
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+            storage.set_metadata("needs_flush", "false").unwrap();
+
+            let mut update = original.clone();
+            update.updated_at = fixed_time(200);
+            if change_title {
+                update.title = "Changed by the preceding update".to_string();
+            } else {
+                update.labels = vec!["updated".to_string()];
+                update.comments = vec![Comment {
+                    id: 2,
+                    issue_id: update.id.clone(),
+                    author: "remote".to_string(),
+                    body: "after the update".to_string(),
+                    created_at: fixed_time(200),
+                }];
+            }
+            // The alias collides by the original content hash. Classification
+            // uses the pre-import metadata, so it skips even after an update.
+            let mut alias = if skip_first || change_title {
+                original
+            } else {
+                update.clone()
+            };
+            alias.id = "bd-alias".to_string();
+            alias.updated_at = fixed_time(50);
+            for comment in &mut alias.comments {
+                comment.issue_id.clone_from(&alias.id);
+                comment.id += 100; // Per-database comment rowids are not sync identity.
+            }
+            let rows = if skip_first {
+                vec![alias, update.clone()]
+            } else {
+                vec![update.clone(), alias]
+            };
+            write_additive_issues(&path, &rows);
+
+            let result =
+                import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd"))
+                    .unwrap();
+            assert_eq!(result.updated_count, 1);
+            assert_eq!(result.skipped_count, 1);
+            assert_eq!(result.export_hashes_recorded, 1);
+            assert_eq!(
+                storage.get_metadata("needs_flush").unwrap().as_deref() == Some("true"),
+                needs_flush,
+                "skip_first={skip_first}, change_title={change_title}"
+            );
+            let actual = storage.get_issue_for_export("bd-main").unwrap().unwrap();
+            canonicalize_persisted_issue_defaults(&mut update);
+            assert!(actual.sync_equals(&update));
+            assert_eq!(
+                storage.get_export_hash("bd-main").unwrap().unwrap().0,
+                update.compute_content_hash(),
+                "a stale skip must not replace the preceding update's export hash"
+            );
+            assert!(storage.get_issue("bd-alias").unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn test_import_skip_certification_reads_repaired_state_after_update() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+        let original = make_issue_at("bd-main", "Repairable", fixed_time(100));
+        write_additive_issues(&path, std::slice::from_ref(&original));
+        import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+        storage
+            .execute_raw("UPDATE issues SET due_at = 'invalid' WHERE id = 'bd-main'")
+            .unwrap();
+        assert!(storage.get_issue("bd-main").is_err());
+
+        let mut update = original;
+        update.updated_at = fixed_time(200);
+        update.due_at = Some(fixed_time(500));
+        let mut alias = update.clone();
+        alias.id = "bd-alias".to_string();
+        alias.updated_at = fixed_time(50);
+        write_additive_issues(&path, &[update, alias]);
+
+        let result = import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd"))
+            .expect("a preceding update must repair the target before skip certification reads it");
+        assert_eq!(result.updated_count, 1);
+        assert_eq!(result.skipped_count, 1);
+        assert_eq!(result.export_hashes_recorded, 1);
+        assert_ne!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            storage.get_issue("bd-main").unwrap().unwrap().due_at,
+            Some(fixed_time(500))
+        );
     }
 
     #[test]
