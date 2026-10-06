@@ -2672,3 +2672,338 @@ raise SystemExit(int(os.environ['BR_PERF_FIXTURE_EXIT']))
         expect_exit(&output, 0, "");
     }
 }
+
+/// Execute the recovery workflow's shell orchestration with local command
+/// controls. These prove pinning and failure propagation, not engine recovery;
+/// the workflow still runs the real stock-SQLite and native Rust regressions.
+#[cfg(unix)]
+mod recovery_contention {
+    use std::fs;
+    use std::process::{Command, Output};
+
+    use serde_json::{Value, json};
+
+    const CHECKOUT: &str = "Check out the exact triggering revision";
+    const BASELINE_STEP: &str =
+        "Reproduce the original sequential Linux latch on the pinned baseline";
+    const GATES: &str = "Run recovery, namespace security, and whole-crate gates";
+    const BASELINE: &str = "2a3142837750901b968164d936ac40cc61f35b1a";
+    const BASELINE_BLOB: &str = "f5dd019571cd9e9146b534fa52132c46771718d1";
+    const TRIGGER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const GATE_COMMANDS: [&str; 16] = [
+        "cargo fmt --all -- --check",
+        "cargo test --locked --lib recovery_532 -- --nocapture",
+        "cargo test --locked --test repro_532_recovery_contention -- --nocapture",
+        "cargo test --locked --lib franken_sync::wal_index::tests -- --nocapture",
+        "cargo test --locked --lib franken_sync::tests::failed_no_checkpoint_close_keeps_its_policy_on_retry -- --nocapture",
+        "cargo test --locked --lib sync::db_inode_lock::tests -- --nocapture",
+        "cargo test --locked --test repro_507_recovery -- --nocapture",
+        "cargo test --locked --lib cli::commands::doctor_subsystems::schema_migration::tests -- --nocapture",
+        "cargo test --locked --test e2e_schema_migration_upgrade -- --nocapture",
+        "cargo test --locked --test e2e_torn_wal_startup -- --nocapture",
+        "cargo test --locked --test e2e_legacy_wal_index -- --nocapture",
+        "cargo test --locked --test workflow_action_pins -- --nocapture",
+        "cargo check --locked --all-targets --all-features",
+        "cargo clippy --locked --all-targets --all-features -- -D warnings",
+        "git diff --check",
+        "git diff --exit-code HEAD",
+    ];
+
+    // Shell functions prevent these controls from compiling, making network
+    // requests, or operating on the repository's real Git state.
+    const COMMAND_CONTROLS: &str = r#"
+record() {
+  printf '%s\n' "$*" >> "$CONTROL_LOG"
+  if test "$*" = "$CONTROL_FAIL"; then return 19; fi
+}
+git() {
+  record git "$@" || return "$?"
+  case "$1" in
+    init|remote|fetch|checkout) ;;
+    worktree)
+      test "$2" = add && test "$3" = --detach || return 91
+      mkdir -p "$4"
+      ;;
+    rev-parse)
+      test "$2" = HEAD || return 91
+      printf '%s\n' "$CONTROL_HEAD"
+      ;;
+    -C)
+      test "$2" = "$RUNNER_TEMP/gh532-baseline" || return 91
+      case "$3 $4" in
+        'rev-parse HEAD') printf '%s\n' "$CONTROL_BASELINE_HEAD" ;;
+        'rev-parse HEAD:src/cli/commands/doctor_subsystems/schema_migration.rs')
+          printf '%s\n' "$CONTROL_BASELINE_BLOB" ;;
+        'diff --exit-code') test "$5" = HEAD ;;
+        *) return 91 ;;
+      esac
+      ;;
+    diff)
+      test "$*" = 'diff --check' || test "$*" = 'diff --exit-code HEAD'
+      ;;
+    *) return 91 ;;
+  esac
+}
+cargo() {
+  record cargo "$@" || return "$?"
+  printf 'cargo-cwd %s\n' "$PWD" >> "$CONTROL_LOG"
+}
+python3() { record python3 "$@"; }
+"#;
+
+    fn workflow() -> Value {
+        serde_yml::from_str(
+            &fs::read_to_string(".github/workflows/recovery-contention.yml").unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn step(name: &str) -> Value {
+        let workflow = workflow();
+        let selected = workflow["jobs"]["qualify"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|step| step["name"] == name)
+            .collect::<Vec<_>>();
+        assert_eq!(selected.len(), 1, "unique recovery step: {name}");
+        selected[0].clone()
+    }
+
+    struct FragmentControl {
+        root: tempfile::TempDir,
+    }
+
+    impl FragmentControl {
+        fn new() -> Self {
+            let root = tempfile::TempDir::new().unwrap();
+            fs::write(root.path().join("commands"), "").unwrap();
+            fs::write(root.path().join("summary"), "").unwrap();
+            Self { root }
+        }
+
+        fn run(&self, name: &str, variables: &[(&str, &str)]) -> Output {
+            let script = format!(
+                "{COMMAND_CONTROLS}\n{}",
+                step(name)["run"].as_str().unwrap()
+            );
+            Command::new("bash")
+                .args([
+                    "--noprofile",
+                    "--norc",
+                    "-e",
+                    "-o",
+                    "pipefail",
+                    "-c",
+                    &script,
+                ])
+                .current_dir(self.root.path())
+                .env("GITHUB_REPOSITORY", "Dicklesworthstone/beads_rust")
+                .env("GITHUB_SHA", TRIGGER)
+                .env("RUNNER_TEMP", self.root.path())
+                .env("GITHUB_STEP_SUMMARY", self.root.path().join("summary"))
+                .env("CONTROL_LOG", self.root.path().join("commands"))
+                .env("CONTROL_FAIL", "")
+                .env("CONTROL_HEAD", TRIGGER)
+                .env("CONTROL_BASELINE_HEAD", BASELINE)
+                .env("CONTROL_BASELINE_BLOB", BASELINE_BLOB)
+                .envs(variables.iter().copied())
+                .output()
+                .unwrap()
+        }
+
+        fn commands(&self) -> Vec<String> {
+            fs::read_to_string(self.root.path().join("commands"))
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+
+        fn gates(&self) -> Vec<String> {
+            self.commands()
+                .into_iter()
+                .filter(|command| command.starts_with("cargo ") || command.starts_with("git diff "))
+                .collect()
+        }
+
+        fn baseline_build(&self) -> String {
+            format!(
+                "cargo build --locked --bin br --target-dir {}/gh532-baseline-target",
+                self.root.path().display()
+            )
+        }
+
+        fn negative_control(&self) -> String {
+            let root = self.root.path().display();
+            format!(
+                "python3 tests/e2e_scripts/recovery_contention_532.py {root}/gh532-baseline-target/debug/br {root}/gh532-before sequential explicit --expect-latch"
+            )
+        }
+    }
+
+    fn expect_status(output: &Output, code: i32) {
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn qualification_is_read_only_and_keeps_the_baseline_gate_mandatory() {
+        let workflow = workflow();
+        assert_eq!(workflow["permissions"], json!({"contents": "read"}));
+        assert_eq!(workflow["on"]["push"]["branches"], json!(["main"]));
+        let jobs = workflow["jobs"].as_object().unwrap();
+        assert_eq!(jobs.len(), 1, "qualification must not publish a repair");
+        let qualify = &jobs["qualify"];
+        assert!(qualify["permissions"].is_null());
+        assert!(qualify["outputs"].is_null());
+        assert_eq!(qualify["runs-on"], "ubuntu-latest");
+        assert_eq!(
+            qualify["if"],
+            "github.repository == 'Dicklesworthstone/beads_rust' && github.ref == 'refs/heads/main'"
+        );
+        let steps = qualify["steps"].as_array().unwrap();
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| step["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                CHECKOUT,
+                "Install the repository's pinned Rust toolchain",
+                BASELINE_STEP,
+                GATES
+            ]
+        );
+        for step in steps {
+            assert!(step["uses"].is_null(), "no external Actions added");
+            assert!(step["if"].is_null(), "every preceding step must pass");
+            assert!(step["continue-on-error"].is_null());
+        }
+    }
+
+    #[test]
+    fn checkout_and_qualification_refuse_a_substituted_triggering_revision() {
+        let control = FragmentControl::new();
+        expect_status(&control.run(CHECKOUT, &[]), 0);
+        assert!(
+            control
+                .commands()
+                .contains(&format!("git fetch --depth=1 origin {TRIGGER}"))
+        );
+        for name in [CHECKOUT, BASELINE_STEP, GATES] {
+            let control = FragmentControl::new();
+            expect_status(&control.run(name, &[("CONTROL_HEAD", BASELINE)]), 1);
+            assert!(!control.commands().iter().any(|command| {
+                command.starts_with("cargo ") || command.starts_with("python3 ")
+            }));
+        }
+    }
+
+    #[test]
+    fn original_latch_control_uses_the_complete_pinned_source_tree() {
+        let control = FragmentControl::new();
+        expect_status(&control.run(BASELINE_STEP, &[]), 0);
+        let root = control.root.path().display();
+        assert_eq!(
+            control.commands(),
+            [
+                "git rev-parse HEAD".to_string(),
+                format!("git fetch --depth=1 origin {BASELINE}"),
+                format!("git worktree add --detach {root}/gh532-baseline {BASELINE}"),
+                format!("git -C {root}/gh532-baseline rev-parse HEAD"),
+                format!(
+                    "git -C {root}/gh532-baseline rev-parse HEAD:src/cli/commands/doctor_subsystems/schema_migration.rs"
+                ),
+                control.baseline_build(),
+                format!("cargo-cwd {root}/gh532-baseline"),
+                format!("git -C {root}/gh532-baseline diff --exit-code HEAD"),
+                control.negative_control(),
+                "git rev-parse HEAD".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn original_latch_control_refuses_wrong_source_and_failed_proofs() {
+        for key in ["CONTROL_BASELINE_HEAD", "CONTROL_BASELINE_BLOB"] {
+            let control = FragmentControl::new();
+            expect_status(&control.run(BASELINE_STEP, &[(key, TRIGGER)]), 1);
+            assert!(!control.commands().iter().any(|command| {
+                command.starts_with("cargo ") || command.starts_with("python3 ")
+            }));
+        }
+        for failure in ["build", "dirty-source", "negative-control"] {
+            let control = FragmentControl::new();
+            let command = match failure {
+                "build" => control.baseline_build(),
+                "dirty-source" => format!(
+                    "git -C {}/gh532-baseline diff --exit-code HEAD",
+                    control.root.path().display()
+                ),
+                _ => control.negative_control(),
+            };
+            expect_status(
+                &control.run(BASELINE_STEP, &[("CONTROL_FAIL", &command)]),
+                19,
+            );
+            if failure != "negative-control" {
+                assert!(
+                    !control
+                        .commands()
+                        .iter()
+                        .any(|command| command.starts_with("python3 "))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_recovery_gate_runs_and_each_failure_prevents_qualification() {
+        for failed_command in std::iter::once("").chain(GATE_COMMANDS) {
+            let control = FragmentControl::new();
+            let output = control.run(GATES, &[("CONTROL_FAIL", failed_command)]);
+            expect_status(&output, i32::from(!failed_command.is_empty()));
+            assert_eq!(
+                control.gates(),
+                GATE_COMMANDS,
+                "no later proof may be skipped"
+            );
+            let summary = fs::read_to_string(control.root.path().join("summary")).unwrap();
+            let failures = usize::from(!failed_command.is_empty());
+            assert_eq!(
+                summary
+                    .lines()
+                    .filter(|line| line.starts_with("FAIL (19):"))
+                    .count(),
+                failures
+            );
+            assert_eq!(
+                summary
+                    .lines()
+                    .filter(|line| line.starts_with("PASS:"))
+                    .count(),
+                GATE_COMMANDS.len() - failures
+            );
+            if failures != 0 {
+                assert!(summary.contains(&format!("FAIL (19): `{failed_command}`")));
+            }
+        }
+    }
+
+    #[test]
+    fn missing_gate_summary_cannot_report_success_or_skip_later_proofs() {
+        let control = FragmentControl::new();
+        let directory = control.root.path().to_str().unwrap();
+        expect_status(
+            &control.run(GATES, &[("GITHUB_STEP_SUMMARY", directory)]),
+            1,
+        );
+        assert_eq!(control.gates(), GATE_COMMANDS);
+    }
+}

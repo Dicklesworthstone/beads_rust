@@ -155,6 +155,30 @@ observational sync modes (`--status`, `--reconcile --dry-run`), and diagnostic
 doctor commands do not enter the automatic repair path. Recovery
 receipts and original bytes remain under `.br_recovery/schema-migrations/`.
 
+Automatic recovery distinguishes a failed live open from a failed repair
+(GH #532). A typed busy/locked error during the identity-bound live recovery
+open records `failure_kind: transient-contention` and returns immediately.
+After the holder exits, a later command may attempt recovery again even when
+the retained database-family bytes are identical. The refused invocation does
+not retry the requested mutation. Every failed receipt and its pre-state stay
+available as evidence.
+
+Private rehearsal, identity/preflight checks, connection close, content and
+integrity verification, and index reinstatement remain fail-closed. A matching
+failure in any of those phases still blocks automatic recovery; a retryable
+receipt cannot hide another matching fail-closed incident. Unknown or malformed
+failure classifications also retain the block. Receipt recognition on upgrade
+is limited to the exact legacy live BUSY messages, the known v1 recovery schema
+and backup scope, and the explicitly null post-open witnesses emitted by 0.7.4.
+Legacy receipts with recorded post-open state are not treated as opener
+contention. Recognition never deletes or rewrites an old receipt.
+
+`tests/repro_532_recovery_contention.rs` exercises real stock-SQLite readers,
+sequential and concurrent CLI opens, legacy receipts, retained bytes and modes,
+and a refused mutation followed by a successful later invocation. The Linux
+qualification workflow runs those tests against checked-out production source
+and separately requires the pinned original binary to reproduce the latch.
+
 Read-only inspection of a missing-index family uses a private snapshot. It
 retains the original opener lease, copies the complete family through retained
 no-follow descriptors, and checks source identities, metadata and full content
