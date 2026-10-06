@@ -4,13 +4,15 @@ Arguments: BR WORKSPACE CASE {discovery,explicit} [--expect-latch].
 The optional negative control verifies the original failure on an old binary;
 normal Cargo tests require recovery without any manual repair or sidecar removal.
 """
+import base64
 import concurrent.futures
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 from pathlib import Path
+import selectors
 import sqlite3
-import stat
 import subprocess
 import sys
 import threading
@@ -64,6 +66,12 @@ def success(*args):
     return result
 
 
+def listed_issues(result):
+    page = json.loads(result.stdout)
+    assert isinstance(page, dict) and isinstance(page.get("issues"), list), page
+    return page["issues"]
+
+
 def contention(result):
     message = text(result)
     assert result.returncode != 0, ("reader must exclude recovery", message)
@@ -74,23 +82,81 @@ def contention(result):
     )), ("unexpected failure", result.returncode, message)
 
 
-def bytes_and_mode(path):
-    try:
-        return path.read_bytes(), stat.S_IMODE(path.stat().st_mode)
-    except FileNotFoundError:
-        return None
-
-
 def protected_family():
-    # Include the original index in the busy-attempt witness; only successful
-    # recovery may replace it. JSONL cannot be used to rebuild away the problem.
+    # Closing ANY descriptor for an inode in the SQLite reader's process can
+    # release that process's POSIX locks, including the reader's own locks.
+    # Witness main/WAL/SHM from a separate process, never with read_bytes here.
+    # Retain complete bytes and modes, not just the presence of the files.
+    observe = """
+import base64, json, stat, sys
+from pathlib import Path
+result = {}
+for name in sys.argv[1:]:
+    path = Path(name)
+    try:
+        result[name] = [base64.b64encode(path.read_bytes()).decode("ascii"),
+                        stat.S_IMODE(path.stat().st_mode)]
+    except FileNotFoundError:
+        result[name] = None
+print(json.dumps(result))
+"""
+    paths = (
+        DB, Path(str(DB) + "-wal"), Path(str(DB) + "-shm"),
+        Path(str(DB) + "-journal"), BEADS / "issues.jsonl",
+    )
+    observed = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", observe, *map(str, paths)],
+        env=ENV, text=True, capture_output=True, timeout=45, check=True,
+    )
     return {
-        str(path): bytes_and_mode(path)
-        for path in (
-            DB, Path(str(DB) + "-wal"), Path(str(DB) + "-shm"),
-            Path(str(DB) + "-journal"), BEADS / "issues.jsonl",
-        )
+        name: None if value is None else (base64.b64decode(value[0], validate=True), value[1])
+        for name, value in json.loads(observed.stdout).items()
     }
+
+
+@contextmanager
+def stock_reader():
+    uri = DB.as_uri() + "?mode=ro"
+    if EXPLICIT:
+        # Linux corroboration: one Python process owns the connection and
+        # sequences br subprocesses, then closes it before the next br open.
+        reader = sqlite3.connect(uri, uri=True)
+        try:
+            assert reader.execute("select count(*) from issues").fetchone() == (1,)
+            yield
+        finally:
+            reader.close()
+        return
+    # Reporter ordering: a separate stock-reader process stays alive until
+    # all refused br commands finish. Pipes synchronize this without sleeps.
+    holder = """
+import sqlite3, sys
+reader = sqlite3.connect(sys.argv[1], uri=True)
+try:
+    assert reader.execute("select count(*) from issues").fetchone() == (1,)
+    print("reader open", flush=True)
+    assert sys.stdin.read(1) == "x"
+finally:
+    reader.close()
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-I", "-S", "-c", holder, uri], env=ENV, text=True,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        with selectors.DefaultSelector() as ready:
+            ready.register(child.stdout, selectors.EVENT_READ)
+            assert ready.select(45), "stock reader did not announce readiness"
+        assert child.stdout.readline().strip() == "reader open", "stock reader failed to open"
+        yield
+    finally:
+        try:
+            _, stderr = child.communicate(input="x", timeout=45)
+            assert child.returncode == 0, ("stock reader failed", stderr)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate(timeout=45)
 
 
 def failures():
@@ -144,13 +210,11 @@ for iteration in range(rounds):
     # Exactly the reporter's sequence: a stock read-only SQLite connection,
     # a completed SELECT, one or more completed br opens, then reader.close()
     # before the next br process is even started. No timing-based release.
-    reader = sqlite3.connect(DB.as_uri() + "?mode=ro", uri=True)
-    try:
-        assert reader.execute("select count(*) from issues").fetchone()[0] == 1
+    with stock_reader():
         before = protected_family()
-        wal = Path(str(DB) + "-wal").read_bytes()
+        wal = before[str(DB) + "-wal"][0]
         assert len(wal) == 32, "the index-only recovery fast path must be exercised"
-        original_index = Path(str(DB) + "-shm").read_bytes()
+        original_index = before[str(DB) + "-shm"][0]
         old_failures = set(failures())
         busy = run("list", "--json")
         assert busy.returncode == 2, ("first busy attempt", busy.returncode, text(busy))
@@ -168,8 +232,6 @@ for iteration in range(rounds):
                 contention(run("list", "--json"))
             remember_evidence(set(failures()) - old_failures, original_index)
         assert protected_family() == before, "a busy recovery changed the original family"
-    finally:
-        reader.close()
     assert protected_family() == before, "reader exit must leave the same witnessed bytes"
 
     if EXPECT_LATCH:
@@ -190,12 +252,19 @@ for iteration in range(rounds):
             EVIDENCE[path] = path.read_bytes()
 
     if CASE == "concurrent":
-        for result in fanout():
-            if result.returncode != 0:
-                contention(result)
+        # Race the FIRST successful recovery after the holder exits, then
+        # repeat fresh-process waves. All-busy waves are not proof of progress.
+        for _ in range(3):
+            results = fanout()
+            assert any(result.returncode == 0 for result in results), [text(r) for r in results]
+            for result in results:
+                if result.returncode != 0:
+                    contention(result)
+                else:
+                    assert any(issue["id"] == seed_id for issue in listed_issues(result)), result.stdout
     for _ in range(3):
         result = success("list", "--json")
-        assert any(issue["id"] == seed_id for issue in json.loads(result.stdout)), result.stdout
+        assert any(issue["id"] == seed_id for issue in listed_issues(result)), result.stdout
     # Successful recovery may rebuild -shm, but not replace durable issue
     # bytes from JSONL or alter a journal that it did not own.
     after_recovery = protected_family()
@@ -214,7 +283,7 @@ for iteration in range(rounds):
 # Reading again is insufficient: the workspace must admit a real new mutation.
 after = json.loads(success("create", "after", "-t", "task", "-p", "3", "--json").stdout)
 assert after["id"] != seed_id
-listed = json.loads(success("list", "--json").stdout)
+listed = listed_issues(success("list", "--json"))
 assert {issue["id"] for issue in listed} == {seed_id, after["id"]}
 assert_evidence_retained()
 print(json.dumps({"result": "passed", "case": CASE, "explicit_db": EXPLICIT}))
