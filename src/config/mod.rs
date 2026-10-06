@@ -5958,34 +5958,21 @@ impl ConfigLayer {
 
     /// Merge another layer on top of this one (higher precedence wins).
     ///
-    /// Keys are normalized (hyphens replaced with underscores) before insertion
-    /// so that `issue-prefix` (from YAML) and `issue_prefix` (from defaults)
-    /// are treated as the same key and higher-precedence layers always win.
+    /// Config key aliases are normalized before insertion so that `issue-prefix`
+    /// (from YAML) and `issue_prefix` (from defaults) are treated as the same key
+    /// and higher-precedence layers always win. External project names are
+    /// identifiers, so their spelling is preserved after the namespace prefix.
     pub fn merge_from(&mut self, other: &Self) {
         for (key, value) in &other.startup {
-            let canonical = key.replace('-', "_");
-            // Remove any variant of this key that already exists under a
-            // different spelling (e.g. hyphenated vs underscored).
-            if canonical == *key {
-                let hyphenated = key.replace('_', "-");
-                if hyphenated != *key {
-                    self.startup.remove(&hyphenated);
-                }
-            } else {
-                self.startup.remove(&canonical);
-            }
+            let canonical = canonical_config_key(key);
+            self.startup.remove(&hyphenated_config_key(&canonical));
+            self.startup.remove(key);
             self.startup.insert(canonical, value.clone());
         }
         for (key, value) in &other.runtime {
-            let canonical = key.replace('-', "_");
-            if canonical == *key {
-                let hyphenated = key.replace('_', "-");
-                if hyphenated != *key {
-                    self.runtime.remove(&hyphenated);
-                }
-            } else {
-                self.runtime.remove(&canonical);
-            }
+            let canonical = canonical_config_key(key);
+            self.runtime.remove(&hyphenated_config_key(&canonical));
+            self.runtime.remove(key);
             self.runtime.insert(canonical, value.clone());
         }
     }
@@ -6959,14 +6946,7 @@ pub fn external_projects_from_layer(
     let iter = layer.startup.iter().chain(layer.runtime.iter());
 
     for (key, value) in iter {
-        let key_lower = key.to_lowercase();
-        let is_external = key_lower.starts_with("external_projects.")
-            || key_lower.starts_with("external-projects.");
-        if !is_external {
-            continue;
-        }
-
-        let project = key.split_once('.').map(|(_, rest)| rest);
+        let project = external_project_name_from_config_key(key);
         let Some(project) = project.filter(|p| !p.trim().is_empty()) else {
             continue;
         };
@@ -7340,13 +7320,39 @@ pub fn is_startup_key(key: &str) -> bool {
 
 fn insert_key_value(layer: &mut ConfigLayer, key: &str, value: String) {
     // Normalize hyphens to underscores so YAML keys like `issue-prefix`
-    // are stored under the same canonical key as `issue_prefix`.
-    let canonical = key.replace('-', "_");
+    // are stored under the same canonical key as `issue_prefix`. Preserve
+    // external project identifiers, which must match dependency IDs exactly.
+    let canonical = canonical_config_key(key);
     if is_startup_key(key) {
         layer.startup.insert(canonical, value);
     } else {
         layer.runtime.insert(canonical, value);
     }
+}
+
+#[must_use]
+pub(crate) fn external_project_name_from_config_key(key: &str) -> Option<&str> {
+    let (namespace, project) = key.split_once('.')?;
+    (namespace.eq_ignore_ascii_case("external_projects")
+        || namespace.eq_ignore_ascii_case("external-projects"))
+    .then_some(project)
+}
+
+/// Normalize config aliases without rewriting dynamic external project names.
+#[must_use]
+pub(crate) fn canonical_config_key(key: &str) -> String {
+    let key = key.trim();
+    external_project_name_from_config_key(key).map_or_else(
+        || key.to_lowercase().replace('-', "_"),
+        |project| format!("external_projects.{project}"),
+    )
+}
+
+fn hyphenated_config_key(key: &str) -> String {
+    external_project_name_from_config_key(key).map_or_else(
+        || key.replace('_', "-"),
+        |project| format!("external-projects.{project}"),
+    )
 }
 
 fn normalize_key(key: &str) -> String {
@@ -7433,7 +7439,8 @@ pub fn lock_timeout_from_layer(layer: &ConfigLayer) -> Option<u64> {
         .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
-fn layer_from_yaml_value(value: &serde_yml::Value) -> ConfigLayer {
+#[must_use]
+pub(crate) fn layer_from_yaml_value(value: &serde_yml::Value) -> ConfigLayer {
     let mut layer = ConfigLayer::default();
     let mut flat = HashMap::new();
     flatten_yaml(value, "", &mut flat);
@@ -8867,6 +8874,82 @@ routing:
             Some(&temp.path().join("runtime-path")),
             "Runtime config should override lower-precedence startup config"
         );
+    }
+
+    #[test]
+    fn external_project_names_survive_yaml_and_layer_precedence() {
+        let base_yaml = serde_yml::from_str(
+            "external_projects:\n  platform-infra: hyphen\n  platform_infra: underscore\n  Platform-Infra: mixed\n  platform:\n    infra: dotted\nissue-prefix: base\nlock-timeout: 250\n",
+        )
+        .expect("base config");
+        let override_yaml = serde_yml::from_str(
+            "EXTERNAL-PROJECTS.Platform-Infra: overridden\nexternal-projects.platform.v1: versioned\nissue_prefix: chosen\nlock_timeout: 500\n",
+        )
+        .expect("higher-precedence config");
+        let merged = ConfigLayer::merge_layers(&[
+            layer_from_yaml_value(&base_yaml),
+            layer_from_yaml_value(&override_yaml),
+        ]);
+
+        let temp = TempDir::new().expect("tempdir");
+        let projects = external_projects_from_layer(&merged, &temp.path().join(".beads"));
+        let expected = [
+            ("platform-infra", "hyphen"),
+            ("platform_infra", "underscore"),
+            ("Platform-Infra", "overridden"),
+            ("platform.infra", "dotted"),
+            ("platform.v1", "versioned"),
+        ];
+        assert_eq!(projects.len(), expected.len());
+        for (project, path) in expected {
+            assert_eq!(projects.get(project), Some(&temp.path().join(path)));
+            assert_eq!(
+                merged.get(&format!("external_projects.{project}")),
+                Some(path)
+            );
+        }
+        assert_eq!(merged.get("issue_prefix"), Some("chosen"));
+        assert_eq!(lock_timeout_from_layer(&merged), Some(500));
+        assert!(!merged.runtime.contains_key("issue-prefix"));
+        assert!(!merged.startup.contains_key("lock-timeout"));
+    }
+
+    #[test]
+    fn external_project_namespace_aliases_do_not_alias_project_names() {
+        let mut layer = ConfigLayer::default();
+        layer.startup.insert(
+            "external-projects.platform_infra".to_string(),
+            "old-underscore".to_string(),
+        );
+        layer.startup.insert(
+            "external_projects.platform-infra".to_string(),
+            "hyphen".to_string(),
+        );
+        let mut higher = ConfigLayer::default();
+        higher.startup.insert(
+            "external_projects.platform_infra".to_string(),
+            "new-underscore".to_string(),
+        );
+        layer.merge_from(&higher);
+
+        assert_eq!(
+            layer.get("external_projects.platform-infra"),
+            Some("hyphen")
+        );
+        assert_eq!(
+            layer.get("external_projects.platform_infra"),
+            Some("new-underscore")
+        );
+        assert!(
+            !layer
+                .startup
+                .contains_key("external-projects.platform_infra")
+        );
+        assert_eq!(
+            canonical_config_key("EXTERNAL-PROJECTS.Platform-Infra.v1"),
+            "external_projects.Platform-Infra.v1"
+        );
+        assert_eq!(canonical_config_key("LOCK-TIMEOUT"), "lock_timeout");
     }
 
     #[test]

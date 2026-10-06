@@ -11,7 +11,7 @@
 
 use crate::cli::{ConfigCommands, OutputFormatBasic};
 use crate::config::{
-    self, CliOverrides, ConfigLayer, ConfigPaths, default_config_layer,
+    self, CliOverrides, ConfigLayer, ConfigPaths, canonical_config_key, default_config_layer,
     discover_optional_beads_dir_with_cli, id_config_from_layer, load_legacy_user_config,
     load_project_config, load_user_config, resolve_actor,
 };
@@ -365,10 +365,6 @@ fn merge_layers(layers: &[LayerWithSource]) -> ConfigLayer {
     merged
 }
 
-fn canonical_config_key(key: &str) -> String {
-    key.trim().to_lowercase().replace('-', "_")
-}
-
 /// `br config schema`: the keys br reads, from the registry in `crate::config`.
 fn show_config_schema(format: OutputFormatBasic, json_mode: bool, ctx: &OutputContext) {
     let keys = crate::config::KNOWN_CONFIG_KEYS;
@@ -422,6 +418,12 @@ fn config_key_aliases(key: &str) -> Vec<String> {
     let trimmed = key.trim();
     let mut aliases = Vec::new();
     push_unique_config_alias(&mut aliases, trimmed.to_string());
+
+    if let Some(project) = config::external_project_name_from_config_key(trimmed) {
+        push_unique_config_alias(&mut aliases, format!("external_projects.{project}"));
+        push_unique_config_alias(&mut aliases, format!("external-projects.{project}"));
+        return aliases;
+    }
 
     let lower = trimmed.to_lowercase();
     push_unique_config_alias(&mut aliases, lower.clone());
@@ -919,9 +921,7 @@ fn set_config_value(
     let mut config = load_mutable_yaml_config(&config_path)?;
 
     // Set the value
-    let parts: Vec<&str> = key.split('.').collect();
-    let old_value = get_yaml_value(&config, &parts);
-    set_yaml_value(&mut config, &parts, parse_scalar_config_value(value));
+    let old_value = set_yaml_config_value(&mut config, key, parse_scalar_config_value(value));
 
     // Write back atomically (temp file + rename) to prevent corruption on crash
     let yaml_str = serde_yml::to_string(&config)?;
@@ -1002,6 +1002,29 @@ fn parse_scalar_config_value(value: &str) -> serde_yml::Value {
         },
         serde_yml::Value::Bool,
     )
+}
+
+fn set_yaml_config_value(
+    config: &mut serde_yml::Value,
+    key: &str,
+    value: serde_yml::Value,
+) -> Option<String> {
+    if config::external_project_name_from_config_key(key.trim()).is_some() {
+        let canonical = canonical_config_key(key);
+        let old_value = config::layer_from_yaml_value(config)
+            .get(&canonical)
+            .map(str::to_owned);
+        delete_external_project_from_yaml(config, "", &canonical);
+        // A literal key preserves dots in a project name without overwriting
+        // a nested mapping for a different name such as `platform.v1`.
+        set_yaml_value(config, &[&canonical], value);
+        return old_value;
+    }
+
+    let parts: Vec<&str> = key.split('.').collect();
+    let old_value = get_yaml_value(config, &parts);
+    set_yaml_value(config, &parts, value);
+    old_value
 }
 
 fn set_yaml_value(config: &mut serde_yml::Value, parts: &[&str], value: serde_yml::Value) {
@@ -1216,8 +1239,42 @@ fn apply_prepared_yaml_delete(prepared: Option<PreparedYamlDelete>) -> Result<bo
 }
 
 fn delete_from_yaml(value: &mut serde_yml::Value, key: &str) -> bool {
+    if config::external_project_name_from_config_key(key.trim()).is_some() {
+        return delete_external_project_from_yaml(value, "", &canonical_config_key(key));
+    }
     let parts: Vec<&str> = key.split('.').collect();
     delete_nested(value, &parts)
+}
+
+fn delete_external_project_from_yaml(
+    value: &mut serde_yml::Value,
+    prefix: &str,
+    canonical_key: &str,
+) -> bool {
+    let serde_yml::Value::Mapping(map) = value else {
+        return false;
+    };
+    let keys: Vec<_> = map.keys().cloned().collect();
+    let mut deleted = false;
+    for key in keys {
+        let Some(part) = key.as_str() else {
+            continue;
+        };
+        let path = if prefix.is_empty() {
+            part.to_string()
+        } else {
+            format!("{prefix}.{part}")
+        };
+        let Some(child) = map.get_mut(&key) else {
+            continue;
+        };
+        if matches!(child, serde_yml::Value::Mapping(_)) {
+            deleted |= delete_external_project_from_yaml(child, &path, canonical_key);
+        } else if canonical_config_key(&path) == canonical_key {
+            deleted |= map.remove(&key).is_some();
+        }
+    }
+    deleted
 }
 
 fn delete_nested(value: &mut serde_yml::Value, path: &[&str]) -> bool {
@@ -1602,6 +1659,86 @@ mod tests {
         let contents = fs::read_to_string(&config_path).unwrap();
         assert!(!contents.contains("issue-prefix"));
         assert!(!contents.contains("auto-flush"));
+    }
+
+    #[test]
+    fn test_external_project_config_edits_preserve_distinct_names() {
+        let mut yaml = serde_yml::from_str(
+            "external_projects:\n  platform-infra: hyphen\n  platform_infra: underscore\n  Platform-Infra: mixed\n  platform:\n    v1: nested\nexternal-projects.platform.v2: flat\n",
+        )
+        .expect("external config");
+
+        assert_eq!(
+            set_yaml_config_value(
+                &mut yaml,
+                "external-projects.platform-infra",
+                serde_yml::Value::String("updated".to_string()),
+            ),
+            Some("hyphen".to_string())
+        );
+        assert_eq!(
+            set_yaml_config_value(
+                &mut yaml,
+                "external_projects.platform",
+                serde_yml::Value::String("parent-name".to_string()),
+            ),
+            None
+        );
+
+        let layer = config::layer_from_yaml_value(&yaml);
+        for (project, expected) in [
+            ("platform-infra", "updated"),
+            ("platform_infra", "underscore"),
+            ("Platform-Infra", "mixed"),
+            ("platform", "parent-name"),
+            ("platform.v1", "nested"),
+            ("platform.v2", "flat"),
+        ] {
+            assert_eq!(
+                layer.get(&format!("external_projects.{project}")),
+                Some(expected)
+            );
+        }
+
+        assert!(delete_from_yaml(
+            &mut yaml,
+            "EXTERNAL-PROJECTS.platform-infra"
+        ));
+        assert!(delete_from_yaml(&mut yaml, "external_projects.platform"));
+        assert!(!delete_from_yaml(&mut yaml, "external_projects.platform"));
+        let layer = config::layer_from_yaml_value(&yaml);
+        assert!(layer.get("external_projects.platform-infra").is_none());
+        assert!(layer.get("external_projects.platform").is_none());
+        assert_eq!(
+            layer.get("external_projects.platform_infra"),
+            Some("underscore")
+        );
+        assert_eq!(layer.get("external_projects.Platform-Infra"), Some("mixed"));
+        assert_eq!(layer.get("external_projects.platform.v1"), Some("nested"));
+        assert_eq!(layer.get("external_projects.platform.v2"), Some("flat"));
+
+        assert_eq!(
+            config_key_aliases("external-projects.Platform-Infra.v1"),
+            vec![
+                "external-projects.Platform-Infra.v1".to_string(),
+                "external_projects.Platform-Infra.v1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_external_project_config_delete_matches_dotted_yaml_forms() {
+        for yaml_text in [
+            "external-projects.platform.v1: selected\nexternal_projects.platform_v1: neighbor\n",
+            "external_projects:\n  platform.v1: selected\n  platform_v1: neighbor\n",
+            "external-projects:\n  platform:\n    v1: selected\n  platform_v1: neighbor\n",
+        ] {
+            let mut yaml = serde_yml::from_str(yaml_text).expect("external config");
+            assert!(delete_from_yaml(&mut yaml, "external_projects.platform.v1"));
+            let layer = config::layer_from_yaml_value(&yaml);
+            assert!(layer.get("external_projects.platform.v1").is_none());
+            assert_eq!(layer.get("external_projects.platform_v1"), Some("neighbor"));
+        }
     }
 
     #[test]

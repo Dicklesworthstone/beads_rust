@@ -1008,6 +1008,228 @@ fn e2e_dep_list_external_nodes() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_external_project_names_preserve_config_and_dependency_identity() {
+    let _log =
+        common::test_log("e2e_external_project_names_preserve_config_and_dependency_identity");
+    let workspace = BrWorkspace::new();
+    let producer = BrWorkspace::new();
+    let waiting_producer = BrWorkspace::new();
+    for (project, label) in [
+        (&workspace, "consumer"),
+        (&producer, "producer"),
+        (&waiting_producer, "waiting_producer"),
+    ] {
+        let init = run_br(project, ["init", "--prefix", "bd"], label);
+        assert!(
+            init.status.success(),
+            "{label} init failed: {}",
+            init.stderr
+        );
+    }
+    let mut provider_ids = Vec::new();
+    for (project, label) in [(&producer, "producer"), (&waiting_producer, "waiting")] {
+        let create = run_br(
+            project,
+            ["create", "Provide prod-env"],
+            &format!("{label}_create"),
+        );
+        assert!(
+            create.status.success(),
+            "provider create failed: {}",
+            create.stderr
+        );
+        let id = parse_created_id(&create.stdout);
+        let tagged = run_br(
+            project,
+            ["update", &id, "--add-label", "provides:prod-env"],
+            &format!("{label}_label"),
+        );
+        assert!(
+            tagged.status.success(),
+            "provider label failed: {}",
+            tagged.stderr
+        );
+        provider_ids.push(id);
+    }
+
+    let producer_path = producer.root.to_str().expect("producer path");
+    let waiting_path = waiting_producer
+        .root
+        .to_str()
+        .expect("waiting producer path");
+    let yaml = serde_yml::to_string(&serde_json::json!({
+        "issue_prefix": "bd",
+        "external_projects": {
+            "platform-infra": waiting_path,
+            "platform_infra": waiting_path,
+            "Platform-Infra": producer_path,
+            "platform": { "v1": producer_path }
+        }
+    }))
+    .expect("consumer config");
+    fs::write(workspace.root.join(".beads/config.yaml"), yaml).expect("write consumer config");
+
+    // Updating the namespace alias must replace only that exact name. Adding
+    // `platform` must retain the existing nested spelling of `platform.v1`.
+    for (key, value) in [
+        ("external-projects.platform-infra", producer_path),
+        ("external_projects.platform", waiting_path),
+    ] {
+        let set = run_br(
+            &workspace,
+            ["config", "set", key, value],
+            &format!("set_{key}"),
+        );
+        assert!(set.status.success(), "config set failed: {}", set.stderr);
+    }
+    let names = [
+        ("platform-infra", true),
+        ("platform_infra", false),
+        ("Platform-Infra", true),
+        ("platform.v1", true),
+        ("platform", false),
+    ];
+    let listed = run_br(&workspace, ["config", "list", "--json"], "config_list");
+    assert!(
+        listed.status.success(),
+        "config list failed: {}",
+        listed.stderr
+    );
+    let config: Value = serde_json::from_str(&listed.stdout).expect("config JSON");
+    let mut consumers = Vec::new();
+    for (name, satisfied_after_close) in names {
+        let key = format!("external_projects.{name}");
+        let expected_path = if satisfied_after_close {
+            producer_path
+        } else {
+            waiting_path
+        };
+        assert_eq!(config[&key], expected_path, "config list changed {name}");
+        let alias = format!("EXTERNAL-PROJECTS.{name}");
+        let get = run_br(
+            &workspace,
+            ["config", "get", &alias, "--json"],
+            &format!("get_{name}"),
+        );
+        assert!(get.status.success(), "config get failed: {}", get.stderr);
+        let value: Value = serde_json::from_str(&get.stdout).expect("config value JSON");
+        assert_eq!(value["value"], expected_path, "config get changed {name}");
+
+        let title = format!("Consume {name}");
+        let create = run_br(&workspace, ["create", &title], &format!("create_{name}"));
+        assert!(
+            create.status.success(),
+            "consumer create failed: {}",
+            create.stderr
+        );
+        let id = parse_created_id(&create.stdout);
+        let external_id = format!("external:{name}:prod-env");
+        let dep = run_br(
+            &workspace,
+            ["dep", "add", &id, &external_id],
+            &format!("dep_{name}"),
+        );
+        assert!(dep.status.success(), "dep add failed: {}", dep.stderr);
+        consumers.push((name, id, external_id, satisfied_after_close));
+    }
+
+    let before = run_br(&workspace, ["ready", "--json"], "ready_before_close");
+    assert!(before.status.success(), "ready failed: {}", before.stderr);
+    assert!(extract_issues_array(&before.stdout).is_empty());
+    let close = run_br(&producer, ["close", &provider_ids[0]], "close_provider");
+    assert!(
+        close.status.success(),
+        "provider close failed: {}",
+        close.stderr
+    );
+    let after = run_br(&workspace, ["ready", "--json"], "ready_after_close");
+    assert!(after.status.success(), "ready failed: {}", after.stderr);
+    let ready = extract_issues_array(&after.stdout);
+
+    let show_args = std::iter::once("show".to_string())
+        .chain(consumers.iter().map(|(_, id, _, _)| id.clone()))
+        .chain(std::iter::once("--json".to_string()));
+    let show = run_br(&workspace, show_args, "show_consumers");
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let details = extract_issues_array(&show.stdout);
+    for (name, id, external_id, expected) in &consumers {
+        assert_eq!(
+            ready.iter().any(|issue| issue["id"] == id.as_str()),
+            *expected,
+            "readiness used the wrong project for {name}"
+        );
+        let detail = details
+            .iter()
+            .find(|issue| issue["id"] == id.as_str())
+            .expect("consumer");
+        let dependency = detail["dependencies"]
+            .as_array()
+            .expect("dependencies")
+            .iter()
+            .find(|dependency| dependency["id"] == external_id.as_str())
+            .expect("external dependency");
+        assert_eq!(
+            dependency["status"],
+            if *expected { "closed" } else { "blocked" }
+        );
+    }
+
+    let unset = run_br(
+        &workspace,
+        [
+            "config",
+            "unset",
+            "external-projects.platform-infra",
+            "--json",
+        ],
+        "unset_hyphenated_project",
+    );
+    assert!(
+        unset.status.success(),
+        "config unset failed: {}",
+        unset.stderr
+    );
+    let listed = run_br(
+        &workspace,
+        ["config", "list", "--json"],
+        "config_after_unset",
+    );
+    assert!(
+        listed.status.success(),
+        "config list failed: {}",
+        listed.stderr
+    );
+    let config: Value = serde_json::from_str(&listed.stdout).expect("config JSON");
+    assert!(config.get("external_projects.platform-infra").is_none());
+    for (name, _, _, expected) in consumers.iter().skip(1) {
+        assert_eq!(
+            config[format!("external_projects.{name}")],
+            if *expected {
+                producer_path
+            } else {
+                waiting_path
+            },
+            "unsetting platform-infra changed {name}"
+        );
+    }
+    let after_unset = run_br(&workspace, ["ready", "--json"], "ready_after_unset");
+    assert!(
+        after_unset.status.success(),
+        "ready failed: {}",
+        after_unset.stderr
+    );
+    let ready = extract_issues_array(&after_unset.stdout);
+    for (name, id, _, expected) in &consumers {
+        assert_eq!(
+            ready.iter().any(|issue| issue["id"] == id.as_str()),
+            *expected && *name != "platform-infra",
+            "unsetting platform-infra changed readiness for {name}"
+        );
+    }
+}
+
+#[test]
 fn e2e_close_suggest_next_unblocks() {
     common::init_test_logging();
     info!("e2e_close_suggest_next_unblocks: starting");
