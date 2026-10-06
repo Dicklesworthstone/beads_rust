@@ -666,11 +666,11 @@ pub(crate) mod checkpoint_fault {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     thread_local! {
-        pub(super) static FAIL_NEXT_CLOSE: std::cell::Cell<bool> = const {
+        pub(crate) static FAIL_NEXT_CLOSE: std::cell::Cell<bool> = const {
             std::cell::Cell::new(false)
         };
     }

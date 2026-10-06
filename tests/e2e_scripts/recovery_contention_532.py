@@ -47,6 +47,7 @@ ENV.update({
 PREFIX = [BR, "--db", str(DB)] if EXPLICIT else [BR]
 LATCH = "automatic WAL index recovery already failed for this exact database family"
 EVIDENCE = {}
+CREATE_AFTER = ("create", "after", "-t", "task", "-p", "3", "--json")
 
 
 def run(*args):
@@ -220,7 +221,10 @@ for iteration in range(rounds):
         assert busy.returncode == 2, ("first busy attempt", busy.returncode, text(busy))
         assert "database is busy (recovery in progress)" in text(busy), text(busy)
         created = set(failures()) - old_failures
-        assert created, "the actual recovery failure path must run, not just a lock timeout"
+        assert len(created) == 1, (
+            "one invocation must run recovery exactly once, not time out or retry internally",
+            created,
+        )
         remember_evidence(created, original_index)
         if not EXPECT_LATCH:
             if CASE == "concurrent":
@@ -231,6 +235,20 @@ for iteration in range(rounds):
                 # no unbounded internal retry loop or manual repair is involved.
                 contention(run("list", "--json"))
             remember_evidence(set(failures()) - old_failures, original_index)
+            if iteration == rounds - 1:
+                # The mutation must stop at the same single failed startup
+                # attempt. Submit this exact request again only after the
+                # holder has exited, below, and require exactly one new issue.
+                before_create = set(failures())
+                refused_create = run(*CREATE_AFTER)
+                contention(refused_create)
+                assert refused_create.returncode == 2, text(refused_create)
+                create_failures = set(failures()) - before_create
+                assert len(create_failures) == 1, (
+                    "a contended mutation must retain one recovery attempt and return",
+                    create_failures,
+                )
+                remember_evidence(create_failures, original_index)
         assert protected_family() == before, "a busy recovery changed the original family"
     assert protected_family() == before, "reader exit must leave the same witnessed bytes"
 
@@ -264,7 +282,10 @@ for iteration in range(rounds):
                     assert any(issue["id"] == seed_id for issue in listed_issues(result)), result.stdout
     for _ in range(3):
         result = success("list", "--json")
-        assert any(issue["id"] == seed_id for issue in listed_issues(result)), result.stdout
+        assert [issue["id"] for issue in listed_issues(result)] == [seed_id], (
+            "a refused command must not have created an issue",
+            result.stdout,
+        )
     # Successful recovery may rebuild -shm, but not replace durable issue
     # bytes from JSONL or alter a journal that it did not own.
     after_recovery = protected_family()
@@ -281,9 +302,10 @@ for iteration in range(rounds):
     }))
 
 # Reading again is insufficient: the workspace must admit a real new mutation.
-after = json.loads(success("create", "after", "-t", "task", "-p", "3", "--json").stdout)
+after = json.loads(success(*CREATE_AFTER).stdout)
 assert after["id"] != seed_id
 listed = listed_issues(success("list", "--json"))
 assert {issue["id"] for issue in listed} == {seed_id, after["id"]}
+assert len(listed) == 2, "the later mutation must execute exactly once"
 assert_evidence_retained()
 print(json.dumps({"result": "passed", "case": CASE, "explicit_db": EXPLICIT}))

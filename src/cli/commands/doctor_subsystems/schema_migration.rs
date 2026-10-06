@@ -348,6 +348,65 @@ struct EngineRecoveryReceipt {
     #[serde(skip_serializing_if = "Option::is_none")]
     index_corruption: Option<IndexCorruptionFinding>,
     error: Option<String>,
+    /// Contention is a property of live openers, not of these retained bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_kind: Option<RecoveryFailureKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum RecoveryFailureKind {
+    TransientContention,
+    FailClosed,
+}
+
+impl RecoveryFailureKind {
+    fn for_error(stage: &str, error: &BeadsError) -> Self {
+        // BusyRecovery in the private rehearsal can describe a deterministic
+        // admission failure. Only contention while opening the verified live
+        // family is eligible for another automatic attempt (GH #532).
+        if stage == "live-recovery" && live_recovery_contention(error) {
+            Self::TransientContention
+        } else {
+            Self::FailClosed
+        }
+    }
+
+    const fn retry_hint(self) -> &'static str {
+        match self {
+            Self::TransientContention => {
+                "; transient contention: close other database readers/openers and retry this command"
+            }
+            Self::FailClosed => "",
+        }
+    }
+}
+
+const fn engine_recovery_contention(error: &fsqlite_error::FrankenError) -> bool {
+    matches!(
+        error,
+        fsqlite_error::FrankenError::Busy
+            | fsqlite_error::FrankenError::BusyRecovery
+            | fsqlite_error::FrankenError::DatabaseLocked { .. }
+    )
+}
+
+fn live_recovery_contention(error: &BeadsError) -> bool {
+    match error {
+        BeadsError::Database(error) => engine_recovery_contention(error),
+        BeadsError::DatabaseLocked { .. } => true,
+        // Unwrap only the transparent context wrapper, not errors indicating
+        // an indeterminate/committed outcome that happen to contain BUSY.
+        BeadsError::WithContext { source, .. } => {
+            source
+                .downcast_ref::<BeadsError>()
+                .is_some_and(live_recovery_contention)
+                || source
+                    .downcast_ref::<fsqlite_error::FrankenError>()
+                    .is_some_and(engine_recovery_contention)
+        }
+        _ => false,
+    }
 }
 
 /// Integrity damage that predates WAL-index recovery and that rebuilding the
@@ -648,9 +707,10 @@ pub fn recover_wal_index_for_startup(
     }
     // Every automatic attempt retains its pre-state in a new `.br_recovery`
     // run (the complete family, unless only the index had to be rebuilt).
-    // Recovery over identical bytes is deterministic, so once it has failed
-    // for this exact family, repeating it on every command only accumulates
-    // copies. Keep one snapshot per incident and report the retained one.
+    // Content/verification failures over identical bytes must not accumulate
+    // copies on every command. Live opener contention is not deterministic
+    // over those bytes: retain its evidence, but allow the next command to
+    // retry after the holder exits. Never retry a mutation within this call.
     let raw_before = recovery_family_witness(db_path)?;
     if let Some(prior) = prior_failed_recovery(beads_dir, &raw_before)? {
         return Err(BeadsError::SyncConflict {
@@ -681,6 +741,43 @@ struct PriorRecoveryFailure {
     stage: String,
     raw_before: RawFamilyWitness,
     error: Option<String>,
+    // Preserve presence as well as value: an unknown or null classification
+    // must remain fail-closed, not fall back to the legacy text exception.
+    #[serde(flatten)]
+    details: serde_json::Map<String, serde_json::Value>,
+}
+
+impl PriorRecoveryFailure {
+    fn is_transient_contention(&self) -> bool {
+        if self.stage != "live-recovery"
+            || self.details.get("schema_version").and_then(serde_json::Value::as_str)
+                != Some("br.doctor.schema_migration.recovery.v1")
+            || !matches!(
+                self.details.get("backup_scope").and_then(serde_json::Value::as_str),
+                Some(RECOVERY_BACKUP_WAL_INDEX_ONLY | RECOVERY_BACKUP_COMPLETE_FAMILY)
+            )
+            // Both fields were always serialized by 0.7.4. Missing fields are
+            // not its exact receipt shape, and populated fields prove the open
+            // succeeded: old receipts used live-recovery for verification too.
+            || self.details.get("raw_after") != Some(&serde_json::Value::Null)
+            || self.details.get("logical_after") != Some(&serde_json::Value::Null)
+            || self.details.get("index_corruption").is_some_and(|value| !value.is_null())
+        {
+            return false;
+        }
+        match self.details.get("failure_kind") {
+            Some(kind) => kind.as_str() == Some("transient-contention"),
+            // Upgrade the exact receipts written by br 0.7.4, without
+            // deleting/rewriting them or matching arbitrary "busy" substrings.
+            None => matches!(
+                self.error.as_deref(),
+                Some(
+                    "Database error: database is busy"
+                        | "Database error: database is busy (recovery in progress)"
+                )
+            ),
+        }
+    }
 }
 
 /// Find an earlier failed recovery run whose pre-state is byte-identical
@@ -712,7 +809,9 @@ fn prior_failed_recovery(
         let Ok(prior) = serde_json::from_slice::<PriorRecoveryFailure>(&bytes) else {
             continue;
         };
-        if &prior.raw_before == raw_before {
+        if &prior.raw_before == raw_before && !prior.is_transient_contention() {
+            // Keep scanning past retryable receipts: a separate genuine
+            // failure for these same bytes must still block automatic repair.
             return Ok(Some(prior));
         }
     }
@@ -759,7 +858,11 @@ fn require_recovery_payload_unchanged(
     Ok(())
 }
 
-fn recover_existing_family(path: &Path, authority: Option<&DatabaseFamilyWriteLock>) -> Result<()> {
+fn recover_existing_family(
+    path: &Path,
+    authority: Option<&DatabaseFamilyWriteLock>,
+    mut live_stage: Option<&mut String>,
+) -> Result<()> {
     let metadata = secure_file_metadata(path)?
         .ok_or_else(|| BeadsError::internal("recovery database disappeared"))?;
     let retained = File::open(path)?;
@@ -775,10 +878,19 @@ fn recover_existing_family(path: &Path, authority: Option<&DatabaseFamilyWriteLo
     if let Some(authority) = authority {
         authority.verify_database_authority()?;
     }
+    // Only the identity-bound opener may report retryable live contention.
+    // Binding failures above, and close/verification failures below, remain
+    // fail-closed even if their sources contain a typed busy error.
+    if let Some(stage) = live_stage.as_deref_mut() {
+        *stage = "live-recovery".to_string();
+    }
     let conn = Connection::open_existing_with_expected_identity(
         path.to_string_lossy().into_owned(),
         identity,
     )?;
+    if let Some(stage) = live_stage {
+        *stage = "live-verification".to_string();
+    }
     close_connection(conn)?;
     // Keep the identity descriptor alive through engine close.
     if !same_file_identity(&retained.metadata()?, &fs::symlink_metadata(path)?) {
@@ -949,6 +1061,7 @@ fn recover_index_only(
         logical_after: None,
         index_corruption: None,
         error: None,
+        failure_kind: None,
     };
     write_json_new(&run_dir.join("recovery-prepared.json"), &receipt)?;
     let operation = (|| -> Result<bool> {
@@ -958,8 +1071,11 @@ fn recover_index_only(
                 "database family changed before WAL index recovery",
             ));
         }
-        receipt.stage = "live-recovery".to_string();
-        recover_existing_family(db_path, Some(&migration.write_authority))?;
+        recover_existing_family(
+            db_path,
+            Some(&migration.write_authority),
+            Some(&mut receipt.stage),
+        )?;
         migration.write_authority.verify_database_authority()?;
         let raw_after = recovery_family_witness(db_path)?;
         require_recovery_payload_unchanged(&receipt.raw_before, &raw_after)?;
@@ -998,13 +1114,16 @@ fn recover_index_only(
             Ok(None)
         }
         Err(error) => {
+            let failure_kind = RecoveryFailureKind::for_error(&receipt.stage, &error);
+            receipt.failure_kind = Some(failure_kind);
             receipt.error = Some(error.to_string());
             write_json_new(&run_dir.join("recovery-failed.json"), &receipt)?;
             Err(BeadsError::WithContext {
                 context: format!(
-                    "WAL index recovery failed at {}; the original index is retained at {}",
+                    "WAL index recovery failed at {}; the original index is retained at {}{}",
                     receipt.stage,
-                    before_dir.display()
+                    before_dir.display(),
+                    failure_kind.retry_hint()
                 ),
                 source: Box::new(error),
             })
@@ -1211,6 +1330,7 @@ fn recover_engine_admission_with_complete_backup(
         logical_after: None,
         index_corruption: None,
         error: None,
+        failure_kind: None,
     };
     write_json_new(&run_dir.join("recovery-prepared.json"), &receipt)?;
     let operation = (|| -> Result<()> {
@@ -1224,7 +1344,7 @@ fn recover_engine_admission_with_complete_backup(
         if strict_wal {
             crate::storage::sqlite::validate_wal_for_index_recovery(&probe_db)?;
         }
-        recover_existing_family(&probe_db, None)?;
+        recover_existing_family(&probe_db, None, None)?;
         require_recovery_payload_unchanged(&probe_before, &recovery_family_witness(&probe_db)?)?;
         let expected = logical_witness(&probe_db)?;
         if !integrity_check_is_clean(&expected.integrity_check) {
@@ -1243,8 +1363,11 @@ fn recover_engine_admission_with_complete_backup(
             ));
         }
         verify_backup_family(&migration.db_path, &before_dir, &receipt.raw_before)?;
-        receipt.stage = "live-recovery".to_string();
-        recover_existing_family(&migration.db_path, Some(&migration.write_authority))?;
+        recover_existing_family(
+            &migration.db_path,
+            Some(&migration.write_authority),
+            Some(&mut receipt.stage),
+        )?;
         migration.write_authority.verify_database_authority()?;
         let raw_after = recovery_family_witness(&migration.db_path)?;
         require_recovery_payload_unchanged(&receipt.raw_before, &raw_after)?;
@@ -1259,13 +1382,16 @@ fn recover_engine_admission_with_complete_backup(
         Ok(())
     })();
     if let Err(error) = operation {
+        let failure_kind = RecoveryFailureKind::for_error(&receipt.stage, &error);
+        receipt.failure_kind = Some(failure_kind);
         receipt.error = Some(error.to_string());
         write_json_new(&run_dir.join("recovery-failed.json"), &receipt)?;
         return Err(BeadsError::WithContext {
             context: format!(
-                "engine recovery failed at {}; complete pre-state retained at {}",
+                "engine recovery failed at {}; complete pre-state retained at {}{}",
                 receipt.stage,
-                before_dir.display()
+                before_dir.display(),
+                failure_kind.retry_hint()
             ),
             source: Box::new(error),
         });
@@ -5780,6 +5906,284 @@ mod tests {
             ddl_token_fingerprint("create table operator ([a b] text)", true),
             "equivalent quoting and keyword case can still be reserialized"
         );
+    }
+
+    #[test]
+    fn recovery_532_classifies_only_typed_live_opener_contention() {
+        use fsqlite_error::FrankenError;
+        let busy_errors = [
+            BeadsError::Database(FrankenError::Busy),
+            BeadsError::Database(FrankenError::BusyRecovery),
+            BeadsError::Database(FrankenError::DatabaseLocked {
+                path: PathBuf::from("beads.db"),
+            }),
+            BeadsError::DatabaseLocked {
+                path: PathBuf::from("beads.db"),
+            },
+            BeadsError::WithContext {
+                context: "opening the live family".to_string(),
+                source: Box::new(BeadsError::Database(FrankenError::BusyRecovery)),
+            },
+            BeadsError::WithContext {
+                context: "opening the live family".to_string(),
+                source: Box::new(FrankenError::Busy),
+            },
+        ];
+        for error in &busy_errors {
+            assert_eq!(
+                RecoveryFailureKind::for_error("live-recovery", error),
+                RecoveryFailureKind::TransientContention,
+            );
+            for stage in [
+                "private-recovery",
+                "live-preflight",
+                "live-verification",
+                "reinstate-index",
+            ] {
+                assert_eq!(
+                    RecoveryFailureKind::for_error(stage, error),
+                    RecoveryFailureKind::FailClosed,
+                    "{stage}: {error}",
+                );
+            }
+        }
+        for error in [
+            BeadsError::Database(FrankenError::DatabaseCorrupt {
+                detail: "database is busy (recovery in progress)".to_string(),
+            }),
+            BeadsError::Database(FrankenError::BusySnapshot {
+                conflicting_pages: "1".to_string(),
+            }),
+            BeadsError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            BeadsError::internal("database is busy (recovery in progress)"),
+            BeadsError::SyncConflict {
+                message: "busy".to_string(),
+            },
+            BeadsError::CommittedStateUnwitnessed {
+                operation: "recovery".to_string(),
+                source: Box::new(FrankenError::BusyRecovery),
+            },
+            BeadsError::WithContext {
+                context: "recovery".to_string(),
+                source: Box::new(BeadsError::CommittedArtifactFailure {
+                    operation: "recovery".to_string(),
+                    primary_path: PathBuf::from("beads.db"),
+                    artifact_path: PathBuf::from("receipt.json"),
+                    source: Box::new(FrankenError::Busy),
+                }),
+            },
+        ] {
+            assert_eq!(
+                RecoveryFailureKind::for_error("live-recovery", &error),
+                RecoveryFailureKind::FailClosed,
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_532_legacy_and_unknown_receipts_are_narrowly_classified() {
+        let mut receipt = serde_json::json!({
+            "schema_version": "br.doctor.schema_migration.recovery.v1",
+            "backup_scope": "wal-index-only",
+            "backup_path": "retained",
+            "stage": "live-recovery",
+            "raw_before": {"components": []},
+            "raw_after": null,
+            "logical_after": null,
+            "error": "Database error: database is busy (recovery in progress)",
+        });
+        let transient = |value: &serde_json::Value| {
+            serde_json::from_value::<PriorRecoveryFailure>(value.clone())
+                .expect("parse receipt")
+                .is_transient_contention()
+        };
+        assert!(
+            transient(&receipt),
+            "the exact 0.7.4 receipt must not latch"
+        );
+        receipt["error"] = "Database error: database is busy".into();
+        assert!(transient(&receipt));
+        for error in [
+            "Database error: database is busy (recovery in progress); corrupt WAL",
+            "Database error: database disk image is malformed: busy",
+            "database is busy (recovery in progress)",
+        ] {
+            receipt["error"] = error.into();
+            assert!(!transient(&receipt));
+        }
+        receipt["error"] = "Database error: database is busy (recovery in progress)".into();
+        for kind in [
+            serde_json::json!("fail-closed"),
+            serde_json::json!("future-kind"),
+            serde_json::Value::Null,
+            serde_json::json!(true),
+            serde_json::json!({"retryable": true}),
+        ] {
+            receipt["failure_kind"] = kind;
+            assert!(
+                !transient(&receipt),
+                "unknown classification must keep the latch"
+            );
+        }
+        receipt["failure_kind"] = "transient-contention".into();
+        assert!(transient(&receipt));
+        for stage in [
+            "private-recovery",
+            "live-preflight",
+            "live-verification",
+            "reinstate-index",
+        ] {
+            receipt["stage"] = stage.into();
+            assert!(!transient(&receipt), "{stage} is not a live open");
+            receipt.as_object_mut().unwrap().remove("failure_kind");
+            assert!(
+                !transient(&receipt),
+                "legacy {stage} must also remain blocked"
+            );
+            receipt["failure_kind"] = "transient-contention".into();
+        }
+    }
+
+    #[test]
+    fn recovery_532_legacy_post_open_and_incomplete_receipts_stay_blocked() {
+        let receipt = serde_json::json!({
+            "schema_version": "br.doctor.schema_migration.recovery.v1",
+            "backup_scope": "wal-index-only",
+            "backup_path": "retained",
+            "stage": "live-recovery",
+            "raw_before": {"components": []},
+            "raw_after": null,
+            "logical_after": null,
+            "error": "Database error: database is busy (recovery in progress)",
+        });
+        let transient = |value: &serde_json::Value| {
+            serde_json::from_value::<PriorRecoveryFailure>(value.clone())
+                .expect("parse receipt")
+                .is_transient_contention()
+        };
+        for scope in ["wal-index-only", "complete-family"] {
+            let mut valid = receipt.clone();
+            valid["backup_scope"] = scope.into();
+            for classified in [false, true] {
+                if classified {
+                    valid["failure_kind"] = "transient-contention".into();
+                }
+                assert!(transient(&valid), "the emitted pre-open shape is retryable");
+                for field in [
+                    "schema_version",
+                    "backup_scope",
+                    "raw_after",
+                    "logical_after",
+                ] {
+                    let mut incomplete = valid.clone();
+                    incomplete.as_object_mut().unwrap().remove(field);
+                    assert!(
+                        !transient(&incomplete),
+                        "missing {field} must remain blocked"
+                    );
+                }
+                for (field, value) in [
+                    ("schema_version", serde_json::json!("future-recovery.v2")),
+                    ("backup_scope", serde_json::json!("unknown-scope")),
+                    ("raw_after", serde_json::json!({"components": []})),
+                    (
+                        "logical_after",
+                        serde_json::json!({"integrity_check": "busy"}),
+                    ),
+                    (
+                        "index_corruption",
+                        serde_json::json!({"integrity_check": "damaged"}),
+                    ),
+                ] {
+                    let mut after_open = valid.clone();
+                    after_open[field] = value;
+                    assert!(!transient(&after_open), "{field} must retain the latch");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_532_scanner_retains_evidence_and_finds_real_failure_after_busy() {
+        let temp = TempDir::new().expect("tempdir");
+        let db = temp.path().join("beads.db");
+        fs::write(&db, b"witnessed original bytes").unwrap();
+        let raw = recovery_family_witness(&db).unwrap();
+        let root = migration_runs_root(temp.path());
+        let busy_run = root.join("busy");
+        fs::create_dir_all(busy_run.join("recovery-before")).unwrap();
+        let backup = busy_run.join("recovery-before/beads.db-shm");
+        fs::write(&backup, b"retained index evidence").unwrap();
+        let mut receipt = serde_json::json!({
+            "schema_version": "br.doctor.schema_migration.recovery.v1",
+            "backup_scope": "wal-index-only",
+            "backup_path": busy_run.join("recovery-before"),
+            "stage": "live-recovery",
+            "raw_before": raw,
+            "raw_after": null,
+            "logical_after": null,
+            "error": "Database error: database is busy (recovery in progress)",
+            "failure_kind": "transient-contention",
+        });
+        let busy_path = busy_run.join("recovery-failed.json");
+        write_json_new(&busy_path, &receipt).unwrap();
+        let retained = fs::read(&busy_path).unwrap();
+        for _ in 0..3 {
+            assert!(prior_failed_recovery(temp.path(), &raw).unwrap().is_none());
+            assert_eq!(fs::read(&busy_path).unwrap(), retained);
+            assert_eq!(fs::read(&backup).unwrap(), b"retained index evidence");
+        }
+        let failed_run = root.join("genuine-failure");
+        fs::create_dir_all(&failed_run).unwrap();
+        receipt["failure_kind"] = "fail-closed".into();
+        receipt["error"] = "protected database component changed".into();
+        write_json_new(&failed_run.join("recovery-failed.json"), &receipt).unwrap();
+        let prior = prior_failed_recovery(temp.path(), &raw).unwrap().unwrap();
+        assert_eq!(
+            prior.error.as_deref(),
+            Some("protected database component changed")
+        );
+        assert_eq!(fs::read(&busy_path).unwrap(), retained);
+        fs::write(&db, b"different original bytes").unwrap();
+        assert!(
+            prior_failed_recovery(temp.path(), &recovery_family_witness(&db).unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn recovery_532_close_contention_is_post_open_and_fail_closed() {
+        let (_temp, migration) = reviewed_source_migration_context("beads.db", 17);
+        let before = recovery_family_witness(&migration.db_path).unwrap();
+        let mut stage = "live-preflight".to_string();
+        crate::franken_sync::tests::FAIL_NEXT_CLOSE.with(|fault| fault.set(true));
+        let result = recover_existing_family(
+            &migration.db_path,
+            Some(&migration.write_authority),
+            Some(&mut stage),
+        );
+        let unconsumed =
+            crate::franken_sync::tests::FAIL_NEXT_CLOSE.with(|fault| fault.replace(false));
+        assert!(
+            !unconsumed,
+            "the injected error must occur during close, after open"
+        );
+        let error = result.unwrap_err();
+        assert!(matches!(
+            error,
+            BeadsError::Database(fsqlite_error::FrankenError::BusyRecovery)
+        ));
+        assert_eq!(stage, "live-verification");
+        assert_eq!(
+            RecoveryFailureKind::for_error(&stage, &error),
+            RecoveryFailureKind::FailClosed
+        );
+        require_recovery_payload_unchanged(
+            &before,
+            &recovery_family_witness(&migration.db_path).unwrap(),
+        )
+        .unwrap();
     }
 
     /// beads_rust-891u: the from==to maintenance-only plan attests the
