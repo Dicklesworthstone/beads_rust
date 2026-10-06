@@ -7597,7 +7597,7 @@ fn additive_blocking_cycle_components(issues: &BTreeMap<String, Issue>) -> Vec<V
     let mut finish_order = Vec::with_capacity(graph.len());
 
     for start in graph.keys() {
-        if !visited.insert(start.clone()) {
+        if visited.contains(start) {
             continue;
         }
         let mut stack = vec![(start.clone(), false)];
@@ -7606,10 +7606,16 @@ fn additive_blocking_cycle_components(issues: &BTreeMap<String, Issue>) -> Vec<V
                 finish_order.push(node);
                 continue;
             }
+            // Mark a node when its DFS frame is entered, not when siblings
+            // are queued. A queued sibling may still be reachable through
+            // this subtree and must finish before the subtree does (#536).
+            if !visited.insert(node.clone()) {
+                continue;
+            }
             stack.push((node.clone(), true));
             if let Some(neighbors) = graph.get(&node) {
                 for neighbor in neighbors.iter().rev() {
-                    if visited.insert(neighbor.clone()) {
+                    if !visited.contains(neighbor) {
                         stack.push((neighbor.clone(), false));
                     }
                 }
@@ -16214,10 +16220,9 @@ fn run_reconcile_apply_tx(
                 target_id,
                 &issue,
                 &computed_hash,
-            ) {
-                if export_hash_ids.insert(export_id.clone()) {
-                    export_hash_batch.push((export_id, export_hash));
-                }
+            ) && export_hash_ids.insert(export_id.clone())
+            {
+                export_hash_batch.push((export_id, export_hash));
             }
             if skipped.len() >= IMPORT_SKIP_CERTIFICATION_BATCH_SIZE {
                 outcome.uncertified_local_wins += certify_skipped_imports(
@@ -20602,6 +20607,217 @@ mod tests {
         assert!(!serialized.contains("PRIVATE-COMMENT"));
         assert!(!serialized.contains("\\u001b"));
         assert_eq!(plan.mutation_count(), 0);
+    }
+
+    fn additive_cycle_test_issues(
+        ids: &[&str],
+        edges: &[(usize, usize)],
+    ) -> BTreeMap<String, Issue> {
+        let mut issues = ids
+            .iter()
+            .map(|&id| (id.to_string(), make_issue_at(id, id, fixed_time(100))))
+            .collect::<BTreeMap<_, _>>();
+        for &(from, to) in edges {
+            issues
+                .get_mut(ids[from])
+                .expect("fixture edge source")
+                .dependencies
+                .push(Dependency {
+                    issue_id: ids[from].to_string(),
+                    depends_on_id: ids[to].to_string(),
+                    dep_type: DependencyType::Blocks,
+                    created_at: fixed_time(90),
+                    created_by: None,
+                    metadata: None,
+                    thread_id: None,
+                });
+        }
+        issues
+    }
+
+    /// Independent oracle: compute each vertex's positive-length reachability
+    /// with a queue, then group mutually reachable vertices. No finish order,
+    /// reversed graph, or production graph-building helper is used.
+    fn additive_cycle_reachability_oracle(
+        ids: &[&str],
+        edges: &[(usize, usize)],
+    ) -> Vec<Vec<String>> {
+        let mut reachable = vec![BTreeSet::new(); ids.len()];
+        for (source, targets) in reachable.iter_mut().enumerate() {
+            let mut pending = std::collections::VecDeque::from([source]);
+            while let Some(node) = pending.pop_front() {
+                for &(from, to) in edges {
+                    if from == node && targets.insert(to) {
+                        pending.push_back(to);
+                    }
+                }
+            }
+        }
+
+        let mut assigned = BTreeSet::new();
+        let mut cycles = Vec::new();
+        for (source, targets) in reachable.iter().enumerate() {
+            if assigned.contains(&source) || !targets.contains(&source) {
+                continue;
+            }
+            let mut component = Vec::new();
+            for &target in targets {
+                if reachable[target].contains(&source) {
+                    assigned.insert(target);
+                    component.push(ids[target].to_string());
+                }
+            }
+            component.sort_unstable();
+            cycles.push(component);
+        }
+        cycles.sort_unstable();
+        cycles
+    }
+
+    #[test]
+    fn additive_blocking_cycles_allow_sibling_dependency_dag() {
+        let ids = ["bd-parent", "bd-parent.1", "bd-parent.2"];
+        let mut issues = additive_cycle_test_issues(&ids, &[(1, 2)]);
+        for child in &ids[1..] {
+            issues
+                .get_mut(*child)
+                .unwrap()
+                .dependencies
+                .push(Dependency {
+                    issue_id: (*child).to_string(),
+                    depends_on_id: ids[0].to_string(),
+                    dep_type: DependencyType::ParentChild,
+                    created_at: fixed_time(90),
+                    created_by: None,
+                    metadata: None,
+                    thread_id: None,
+                });
+        }
+        assert!(additive_blocking_cycle_components(&issues).is_empty());
+
+        // The real return edge must still form exactly the sibling cycle;
+        // their containing parent does not become part of that component.
+        issues
+            .get_mut(ids[2])
+            .unwrap()
+            .dependencies
+            .push(Dependency {
+                issue_id: ids[2].to_string(),
+                depends_on_id: ids[1].to_string(),
+                dep_type: DependencyType::Blocks,
+                created_at: fixed_time(90),
+                created_by: None,
+                metadata: None,
+                thread_id: None,
+            });
+        assert_eq!(
+            additive_blocking_cycle_components(&issues),
+            vec![vec![ids[1].to_string(), ids[2].to_string()]]
+        );
+    }
+
+    #[test]
+    fn additive_blocking_cycles_match_reachability_for_all_four_vertex_graphs() {
+        let ids = ["bd-a", "bd-b", "bd-c", "bd-d"];
+        // All 2^16 directed graphs, including self-loops, disconnected
+        // components, branching DAGs, and multiple separate cycles.
+        for mask in 0_u16..=u16::MAX {
+            let edges = (0..16)
+                .filter(|bit| mask & (1_u16 << bit) != 0)
+                .map(|bit| (bit / 4, bit % 4))
+                .collect::<Vec<_>>();
+            let issues = additive_cycle_test_issues(&ids, &edges);
+            assert_eq!(
+                additive_blocking_cycle_components(&issues),
+                additive_cycle_reachability_oracle(&ids, &edges),
+                "directed graph mask={mask:#06x}, edges={edges:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn additive_blocking_cycles_preserve_membership_under_id_permutations() {
+        let ids = ["bd-parent", "bd-parent.1", "bd-parent.2"];
+        let permutations = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        for mask in 0_u16..(1 << 9) {
+            let edges = (0..9)
+                .filter(|bit| mask & (1_u16 << bit) != 0)
+                .map(|bit| (bit / 3, bit % 3))
+                .collect::<Vec<_>>();
+            let expected = additive_cycle_reachability_oracle(&ids, &edges);
+            for permutation in permutations {
+                let renamed_ids = permutation.map(|index| ids[index]);
+                let issues = additive_cycle_test_issues(&renamed_ids, &edges);
+                let mut restored = additive_blocking_cycle_components(&issues)
+                    .into_iter()
+                    .map(|component| {
+                        let mut original_ids = component
+                            .iter()
+                            .map(|id| {
+                                let index = renamed_ids
+                                    .iter()
+                                    .position(|renamed| *renamed == id)
+                                    .expect("renamed component member");
+                                ids[index].to_string()
+                            })
+                            .collect::<Vec<_>>();
+                        original_ids.sort_unstable();
+                        original_ids
+                    })
+                    .collect::<Vec<_>>();
+                restored.sort_unstable();
+                assert_eq!(
+                    restored, expected,
+                    "mask={mask:#05x}, permutation={permutation:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn additive_blocking_cycles_accept_constructed_dags_with_shared_descendants() {
+        for seed in 0..16_usize {
+            // Logical edge order is always acyclic, while a bijection scrambles
+            // lexical issue-ID order. Seed zero includes every forward edge.
+            let names = (0..41)
+                .map(|index| format!("bd-dag-{:02}", (index * 17 + seed) % 41))
+                .collect::<Vec<_>>();
+            let ids = names.iter().map(String::as_str).collect::<Vec<_>>();
+            let mut edges = Vec::new();
+            for from in 0..ids.len() {
+                for to in (from + 1)..ids.len() {
+                    if seed == 0 || (from * 17 + to * 7 + seed) & 3 != 0 {
+                        edges.push((from, to));
+                    }
+                }
+            }
+            let issues = additive_cycle_test_issues(&ids, &edges);
+            assert!(
+                additive_blocking_cycle_components(&issues).is_empty(),
+                "constructed DAG seed={seed}"
+            );
+        }
+
+        // Deep paths with overlapping descendants exercise the iterative
+        // traversal without depending on the process's call-stack limit.
+        let names = (0..4096)
+            .map(|index| format!("bd-deep-{index:04}"))
+            .collect::<Vec<_>>();
+        let ids = names.iter().map(String::as_str).collect::<Vec<_>>();
+        let edges = (0..ids.len())
+            .flat_map(|from| ((from + 1)..=(from + 2).min(ids.len() - 1)).map(move |to| (from, to)))
+            .collect::<Vec<_>>();
+        assert!(
+            additive_blocking_cycle_components(&additive_cycle_test_issues(&ids, &edges))
+                .is_empty()
+        );
     }
 
     #[test]

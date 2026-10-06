@@ -273,6 +273,16 @@ fn reconcile_import_config(ws: &BrWorkspace) -> ImportConfig {
     }
 }
 
+fn reconcile_persistent_file_stats(ws: &BrWorkspace) -> BTreeMap<String, (u128, u64)> {
+    // Engine namespace admission refreshes these sidecars on read-only opens.
+    // Their contents remain covered by hash_files_under; every other file's
+    // stat retains the existing dry-run contract.
+    stat_files_under(&beads_dir(ws))
+        .into_iter()
+        .filter(|(path, _)| !path.contains("-fsqlite-ns-"))
+        .collect()
+}
+
 // ============================================================================
 // Mode validation
 // ============================================================================
@@ -327,6 +337,350 @@ fn bare_sync_refused_and_reconcile_mode_exclusive() {
         !dry.status.success(),
         "--dry-run without --reconcile must be rejected"
     );
+}
+
+// ============================================================================
+// Additive reconciliation cycle classification (GitHub #536)
+// ============================================================================
+
+#[test]
+fn additive_sibling_dag_plans_read_only_and_applies_all_typed_edges() {
+    let source = BrWorkspace::new();
+    let target = BrWorkspace::new();
+    for (workspace, label) in [(&source, "dag_source_init"), (&target, "dag_target_init")] {
+        let init = run_br(workspace, ["init", "--prefix", "bd"], label);
+        assert!(init.status.success(), "init failed: {init:?}");
+    }
+
+    let mut ids = Vec::<String>::new();
+    for (title, kind) in [("Parent", "epic"), ("Child A", "task"), ("Child B", "task")] {
+        let mut args = vec![
+            "--no-auto-import",
+            "--no-auto-flush",
+            "create",
+            title,
+            "--type",
+            kind,
+            "--status",
+            "draft",
+            "--json",
+        ];
+        if let Some(parent) = ids.first() {
+            args.extend(["--parent", parent]);
+        }
+        let created = run_br(&source, args, &format!("dag_create_{title}"));
+        assert!(created.status.success(), "create failed: {created:?}");
+        let row: Value = serde_json::from_str(&created.stdout).expect("whole create JSON");
+        ids.push(row["id"].as_str().expect("created ID").to_string());
+    }
+    let dependency = run_br(
+        &source,
+        [
+            "--no-auto-import",
+            "--no-auto-flush",
+            "dep",
+            "add",
+            &ids[1],
+            &ids[2],
+            "--type",
+            "blocks",
+            "--json",
+        ],
+        "dag_add_sibling_dependency",
+    );
+    assert!(
+        dependency.status.success(),
+        "dep add failed: {dependency:?}"
+    );
+    let flush = run_br(
+        &source,
+        [
+            "--no-auto-import",
+            "--no-auto-flush",
+            "sync",
+            "--flush-only",
+            "--json",
+        ],
+        "dag_source_flush",
+    );
+    assert!(flush.status.success(), "flush failed: {flush:?}");
+    let cycles = run_br(
+        &source,
+        [
+            "--no-auto-import",
+            "--no-auto-flush",
+            "dep",
+            "cycles",
+            "--include-closed",
+            "--blocking-only",
+            "--json",
+        ],
+        "dag_native_cycles",
+    );
+    assert!(cycles.status.success(), "cycle check failed: {cycles:?}");
+    let cycles: Value = serde_json::from_str(&cycles.stdout).expect("whole cycle-check JSON");
+    assert_eq!(cycles["cycles"], json!([]));
+    assert_eq!(cycles["total_count"], 0);
+
+    assert_eq!(issue_count(&target, "dag_empty_target"), 0);
+    let source_hashes = hash_files_under(&beads_dir(&source));
+    let source_stats = reconcile_persistent_file_stats(&source);
+    let target_hashes = hash_files_under(&beads_dir(&target));
+    let target_stats = reconcile_persistent_file_stats(&target);
+    let external_jsonl = jsonl_path(&source).to_string_lossy().to_string();
+    let plan = run_br_with_env(
+        &target,
+        [
+            "--no-auto-import",
+            "--no-auto-flush",
+            "sync",
+            "--reconcile-additive",
+            "--allow-external-jsonl",
+            "--json",
+        ],
+        [("BEADS_JSONL", &external_jsonl)],
+        "dag_additive_plan",
+    );
+    assert!(plan.status.success(), "DAG plan was refused: {plan:?}");
+    let receipt: Value = serde_json::from_str(&plan.stdout).expect("whole additive plan JSON");
+    let mut expected_ids = ids.clone();
+    expected_ids.sort();
+    assert_eq!(receipt["status"], "ready");
+    assert_eq!(receipt["created"], 3);
+    assert_eq!(receipt["created_issue_ids"], json!(expected_ids));
+    assert_eq!(receipt["preexisting_blocking_cycles"], 0);
+    assert_eq!(receipt["projected_blocking_cycles"], 0);
+    assert_eq!(receipt["new_blocking_cycles"], 0);
+    assert_eq!(receipt["conflict_issue_ids"], json!([]));
+    assert_eq!(receipt["conflict_witnesses"], json!([]));
+    assert_eq!(hash_files_under(&beads_dir(&source)), source_hashes);
+    assert_eq!(reconcile_persistent_file_stats(&source), source_stats);
+    assert_eq!(hash_files_under(&beads_dir(&target)), target_hashes);
+    assert_eq!(reconcile_persistent_file_stats(&target), target_stats);
+
+    let apply = run_br_with_env(
+        &target,
+        [
+            "--no-auto-import",
+            "--no-auto-flush",
+            "sync",
+            "--reconcile-additive",
+            "--allow-external-jsonl",
+            "--apply",
+            "--expect-plan-sha256",
+            receipt["plan_sha256"].as_str().expect("reviewed plan SHA"),
+            "--json",
+        ],
+        [("BEADS_JSONL", &external_jsonl)],
+        "dag_additive_apply",
+    );
+    assert!(apply.status.success(), "DAG apply failed: {apply:?}");
+    let applied: Value = serde_json::from_str(&apply.stdout).expect("whole additive apply JSON");
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(applied["created"], 3);
+    assert_eq!(applied["events_before"], applied["events_after"]);
+    assert_eq!(hash_files_under(&beads_dir(&source)), source_hashes);
+    assert_eq!(reconcile_persistent_file_stats(&source), source_stats);
+    let storage = SqliteStorage::open(&db_path(&target)).expect("open applied target");
+    let stored = storage
+        .get_issues_for_export(&ids)
+        .expect("read applied graph");
+    assert_eq!(stored.len(), 3);
+    let mut actual_edges = stored
+        .iter()
+        .flat_map(|issue| &issue.dependencies)
+        .map(|dependency| {
+            (
+                dependency.issue_id.clone(),
+                dependency.depends_on_id.clone(),
+                dependency.dep_type.as_str().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    actual_edges.sort();
+    let mut expected_edges = vec![
+        (ids[1].clone(), ids[0].clone(), "parent-child".to_string()),
+        (ids[2].clone(), ids[0].clone(), "parent-child".to_string()),
+        (ids[1].clone(), ids[2].clone(), "blocks".to_string()),
+    ];
+    expected_edges.sort();
+    assert_eq!(
+        actual_edges, expected_edges,
+        "reconciliation must retain every typed edge"
+    );
+}
+
+#[test]
+fn additive_real_cycles_refuse_planning_and_apply_without_mutation() {
+    for (label, ids, edges, reason, expected_cycles) in [
+        (
+            "two_node_cycle",
+            &["bd-cycle-a", "bd-cycle-b"][..],
+            &[(0usize, 1usize), (1, 0)][..],
+            "projected_blocking_cycle",
+            1,
+        ),
+        (
+            "self_loop",
+            &["bd-self-loop"][..],
+            &[(0, 0)][..],
+            "self_dependency",
+            0,
+        ),
+    ] {
+        let target = BrWorkspace::new();
+        let init = run_br(
+            &target,
+            ["init", "--prefix", "bd"],
+            &format!("{label}_init"),
+        );
+        assert!(init.status.success(), "init failed: {init:?}");
+        let seed_id = create_issue(
+            &target,
+            "Keep existing database state",
+            &format!("{label}_seed"),
+        );
+        let events_before = all_events_dump(&target);
+        let source_path = target.root.join("cyclic-issues.jsonl");
+        let source = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let dependencies = edges
+                    .iter()
+                    .filter(|(from, _)| *from == index)
+                    .map(|(_, to)| {
+                        json!({
+                            "issue_id": id,
+                            "depends_on_id": ids[*to],
+                            "type": "blocks",
+                            "created_at": "2026-01-01T00:00:00Z"
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                json!({
+                    "id": id,
+                    "title": format!("Cyclic source issue {index}"),
+                    "status": "draft",
+                    "priority": 2,
+                    "issue_type": "task",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                    "dependencies": dependencies
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&source_path, source.as_bytes()).expect("write cyclic source fixture");
+        let source_stat = fs::metadata(&source_path).expect("cyclic source metadata");
+        let target_hashes = hash_files_under(&beads_dir(&target));
+        let target_stats = reconcile_persistent_file_stats(&target);
+        let source_override = source_path.to_string_lossy().to_string();
+        let mut args = vec![
+            "--no-auto-import",
+            "--no-auto-flush",
+            "sync",
+            "--reconcile-additive",
+            "--allow-external-jsonl",
+            "--json",
+        ];
+        let plan = run_br_with_env(
+            &target,
+            args.clone(),
+            [("BEADS_JSONL", &source_override)],
+            &format!("{label}_plan"),
+        );
+        assert_eq!(
+            plan.status.code(),
+            Some(6),
+            "cycle plan must conflict: {plan:?}"
+        );
+        let receipt: Value =
+            serde_json::from_str(&plan.stdout).expect("whole conflicted plan JSON");
+        assert_eq!(receipt["status"], "conflicted");
+        assert_eq!(receipt["preexisting_blocking_cycles"], 0);
+        assert_eq!(receipt["projected_blocking_cycles"], expected_cycles);
+        assert_eq!(receipt["new_blocking_cycles"], expected_cycles);
+        assert_eq!(receipt["conflict_issue_ids"], json!(ids));
+        assert_eq!(receipt["conflict_reasons"][reason], json!(ids.len()));
+        let witnesses = receipt["conflict_witnesses"]
+            .as_array()
+            .expect("conflict witnesses");
+        assert_eq!(witnesses.len(), ids.len());
+        let mut expected_member_hashes = ids
+            .iter()
+            .map(|id| beads_rust::util::hex_encode(&Sha256::digest(id.as_bytes())))
+            .collect::<Vec<_>>();
+        expected_member_hashes.sort();
+        for (witness, id) in witnesses.iter().zip(ids) {
+            assert_eq!(witness["issue_id"], *id);
+            assert_eq!(witness["reasons"], json!([reason]));
+            let details = witness["details"]
+                .as_array()
+                .expect("cycle witness details");
+            assert_eq!(details.len(), 1);
+            assert_eq!(details[0]["reason"], reason);
+            assert_eq!(
+                details[0]["related_value_sha256"],
+                json!(expected_member_hashes)
+            );
+        }
+        assert_eq!(hash_files_under(&beads_dir(&target)), target_hashes);
+        assert_eq!(reconcile_persistent_file_stats(&target), target_stats);
+
+        args.extend([
+            "--apply",
+            "--expect-plan-sha256",
+            receipt["plan_sha256"]
+                .as_str()
+                .expect("conflicted plan SHA"),
+        ]);
+        let apply = run_br_with_env(
+            &target,
+            args,
+            [("BEADS_JSONL", &source_override)],
+            &format!("{label}_apply_refused"),
+        );
+        assert_eq!(
+            apply.status.code(),
+            Some(6),
+            "cyclic apply must refuse: {apply:?}"
+        );
+        assert_eq!(hash_files_under(&beads_dir(&target)), target_hashes);
+        assert_eq!(reconcile_persistent_file_stats(&target), target_stats);
+        assert_eq!(
+            fs::read(&source_path).expect("source after refusal"),
+            source.as_bytes()
+        );
+        let source_after = fs::metadata(&source_path).expect("source metadata after refusal");
+        assert_eq!(source_after.len(), source_stat.len());
+        assert_eq!(
+            source_after.modified().unwrap(),
+            source_stat.modified().unwrap()
+        );
+        assert_eq!(all_events_dump(&target), events_before);
+        let storage = SqliteStorage::open(&db_path(&target)).expect("open unchanged target");
+        assert_eq!(
+            storage.count_all_issues().expect("unchanged issue count"),
+            1
+        );
+        assert!(
+            storage
+                .get_issue(&seed_id)
+                .expect("read existing seed")
+                .is_some()
+        );
+        for id in ids {
+            assert!(
+                storage
+                    .get_issue(id)
+                    .expect("read rejected issue")
+                    .is_none()
+            );
+        }
+    }
 }
 
 // ============================================================================

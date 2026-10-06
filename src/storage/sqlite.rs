@@ -70,10 +70,10 @@ const REDUNDANT_LABEL_COVERAGE_MIN_CANDIDATES: usize = 8_192;
 /// comment changes. Metadata and export-hash writes do not invalidate it.
 #[derive(Debug)]
 pub(crate) struct ImportIssueLookup {
-    issue_rowids: HashMap<String, i64>,
-    label_rowids: HashMap<String, Vec<i64>>,
-    dependency_rowids: HashMap<String, Vec<i64>>,
-    comment_rowids: HashMap<String, Vec<i64>>,
+    issues: HashMap<String, i64>,
+    labels: HashMap<String, Vec<i64>>,
+    dependencies: HashMap<String, Vec<i64>>,
+    comments: HashMap<String, Vec<i64>>,
 }
 
 impl ImportIssueLookup {
@@ -19608,10 +19608,10 @@ impl SqliteStorage {
         }
 
         Ok(ImportIssueLookup {
-            issue_rowids,
-            label_rowids: self.import_relation_rowids("labels")?,
-            dependency_rowids: self.import_relation_rowids("dependencies")?,
-            comment_rowids: self.import_relation_rowids("comments")?,
+            issues: issue_rowids,
+            labels: self.import_relation_rowids("labels")?,
+            dependencies: self.import_relation_rowids("dependencies")?,
+            comments: self.import_relation_rowids("comments")?,
         })
     }
 
@@ -19665,7 +19665,7 @@ impl SqliteStorage {
         let issue_rowids: Vec<i64> = ids
             .iter()
             .filter(|id| seen.insert(id.as_str()))
-            .filter_map(|id| lookup.issue_rowids.get(id).copied())
+            .filter_map(|id| lookup.issues.get(id).copied())
             .collect();
         let mut issues: Vec<Issue> = self
             .import_comparison_rows(
@@ -19692,7 +19692,7 @@ impl SqliteStorage {
         for row in self.import_comparison_rows(
             "labels",
             "issue_id, label",
-            &ImportIssueLookup::relation_rowids(&lookup.label_rowids, &issues),
+            &ImportIssueLookup::relation_rowids(&lookup.labels, &issues),
         )? {
             let owner = row.get(0).and_then(SqliteValue::as_text).unwrap_or("");
             let label = row.get(1).and_then(SqliteValue::as_text).unwrap_or("");
@@ -19703,7 +19703,7 @@ impl SqliteStorage {
         for row in self.import_comparison_rows(
             "dependencies",
             "issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id",
-            &ImportIssueLookup::relation_rowids(&lookup.dependency_rowids, &issues),
+            &ImportIssueLookup::relation_rowids(&lookup.dependencies, &issues),
         )? {
             let dependency = import_dependency_from_row(&row)?;
             if let Some(&index) = positions.get(&dependency.issue_id) {
@@ -19713,7 +19713,7 @@ impl SqliteStorage {
         for row in self.import_comparison_rows(
             "comments",
             "id, issue_id, author, text, created_at",
-            &ImportIssueLookup::relation_rowids(&lookup.comment_rowids, &issues),
+            &ImportIssueLookup::relation_rowids(&lookup.comments, &issues),
         )? {
             let comment = comment_from_row(&row)?;
             if let Some(&index) = positions.get(&comment.issue_id) {
@@ -28557,10 +28557,10 @@ required_fields:
             .map(str::to_string);
             let mut expected = storage.get_issues_for_export(&ids)?;
             let lookup = storage.build_import_issue_lookup()?;
-            assert_eq!(lookup.issue_rowids.get("bd-a"), Some(&-8));
-            assert_eq!(lookup.label_rowids.get("bd-a"), Some(&vec![-11]));
-            assert_eq!(lookup.dependency_rowids.get("bd-a"), Some(&vec![15]));
-            assert_eq!(lookup.comment_rowids.get("bd-a"), Some(&vec![103]));
+            assert_eq!(lookup.issues.get("bd-a"), Some(&-8));
+            assert_eq!(lookup.labels.get("bd-a"), Some(&vec![-11]));
+            assert_eq!(lookup.dependencies.get("bd-a"), Some(&vec![15]));
+            assert_eq!(lookup.comments.get("bd-a"), Some(&vec![103]));
 
             let mut actual = storage.get_issues_for_import_comparison(&ids, &lookup)?;
             expected.sort_by(|left, right| left.id.cmp(&right.id));
