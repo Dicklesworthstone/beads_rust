@@ -1,0 +1,457 @@
+name: WAL recovery contention qualification
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/cli/commands/doctor_subsystems/schema_migration.rs'
+      - 'tests/repro_532_recovery_contention.rs'
+      - 'tests/e2e_scripts/recovery_contention_532.py'
+      - '.github/workflows/recovery-contention.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recovery-contention-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    name: Reproduce, repair, and qualify GH 532 on Linux
+    if: github.repository == 'Dicklesworthstone/beads_rust' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUST_BACKTRACE: 1
+      NO_COLOR: 1
+    outputs:
+      source: ${{ steps.candidate.outputs.source }}
+      source_sha: ${{ steps.candidate.outputs.source_sha }}
+    steps:
+      # Native Git keeps this one-time operator-authorized repair independent
+      # of external Actions and their supply-chain pin inventory.
+      - name: Check out the exact triggering revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init --initial-branch=main
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD:src/cli/commands/doctor_subsystems/schema_migration.rs)" = f5dd019571cd9e9146b534fa52132c46771718d1
+
+      - name: Install the repository's pinned Rust toolchain
+        shell: bash
+        run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+
+      - name: Reproduce the original sequential Linux latch before changing code
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --bin br
+          python3 tests/e2e_scripts/recovery_contention_532.py target/debug/br "$RUNNER_TEMP/gh532-before" sequential explicit --expect-latch
+
+      - name: Apply the reviewed narrow repair to the pinned source blob
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/gh532.patch" <<'ISSUE_532_PATCH'
+          diff --git a/src/cli/commands/doctor_subsystems/schema_migration.rs b/src/cli/commands/doctor_subsystems/schema_migration.rs
+          --- a/src/cli/commands/doctor_subsystems/schema_migration.rs
+          +++ b/src/cli/commands/doctor_subsystems/schema_migration.rs
+          @@ -348,4 +348,63 @@
+               error: Option<String>,
+          +    /// Contention is a property of live openers, not of these retained bytes.
+          +    #[serde(skip_serializing_if = "Option::is_none")]
+          +    failure_kind: Option<RecoveryFailureKind>,
+          +}
+          +
+          +#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+          +#[serde(rename_all = "kebab-case")]
+          +enum RecoveryFailureKind {
+          +    TransientContention,
+          +    FailClosed,
+          +}
+          +
+          +impl RecoveryFailureKind {
+          +    fn for_error(stage: &str, error: &BeadsError) -> Self {
+          +        // BusyRecovery in the private rehearsal can describe a deterministic
+          +        // admission failure. Only contention while opening the verified live
+          +        // family is eligible for another automatic attempt (GH #532).
+          +        if stage == "live-recovery" && live_recovery_contention(error) {
+          +            Self::TransientContention
+          +        } else {
+          +            Self::FailClosed
+          +        }
+          +    }
+          +
+          +    const fn retry_hint(self) -> &'static str {
+          +        match self {
+          +            Self::TransientContention => {
+          +                "; transient contention: close other database readers/openers and retry this command"
+          +            }
+          +            Self::FailClosed => "",
+          +        }
+          +    }
+          +}
+          +
+          +const fn engine_recovery_contention(error: &fsqlite_error::FrankenError) -> bool {
+          +    matches!(
+          +        error,
+          +        fsqlite_error::FrankenError::Busy
+          +            | fsqlite_error::FrankenError::BusyRecovery
+          +            | fsqlite_error::FrankenError::DatabaseLocked { .. }
+          +    )
+          +}
+          +
+          +fn live_recovery_contention(error: &BeadsError) -> bool {
+          +    match error {
+          +        BeadsError::Database(error) => engine_recovery_contention(error),
+          +        BeadsError::DatabaseLocked { .. } => true,
+          +        // Unwrap only the transparent context wrapper, not errors indicating
+          +        // an indeterminate/committed outcome that happen to contain BUSY.
+          +        BeadsError::WithContext { source, .. } => {
+          +            source
+          +                .downcast_ref::<BeadsError>()
+          +                .is_some_and(live_recovery_contention)
+          +                || source
+          +                    .downcast_ref::<fsqlite_error::FrankenError>()
+          +                    .is_some_and(engine_recovery_contention)
+          +        }
+          +        _ => false,
+          +    }
+           }
+           
+           /// Integrity damage that predates WAL-index recovery and that rebuilding the
+          @@ -648,6 +707,7 @@
+               // Every automatic attempt retains its pre-state in a new `.br_recovery`
+               // run (the complete family, unless only the index had to be rebuilt).
+          -    // Recovery over identical bytes is deterministic, so once it has failed
+          -    // for this exact family, repeating it on every command only accumulates
+          -    // copies. Keep one snapshot per incident and report the retained one.
+          +    // Content/verification failures over identical bytes must not accumulate
+          +    // copies on every command. Live opener contention is not deterministic
+          +    // over those bytes: retain its evidence, but allow the next command to
+          +    // retry after the holder exits. Never retry a mutation within this call.
+               let raw_before = recovery_family_witness(db_path)?;
+          @@ -683,4 +743,28 @@
+               error: Option<String>,
+          +    // Preserve presence as well as value: an unknown or null classification
+          +    // must remain fail-closed, not fall back to the legacy text exception.
+          +    #[serde(flatten)]
+          +    details: serde_json::Map<String, serde_json::Value>,
+          +}
+          +
+          +impl PriorRecoveryFailure {
+          +    fn is_transient_contention(&self) -> bool {
+          +        if self.stage != "live-recovery" {
+          +            return false;
+          +        }
+          +        match self.details.get("failure_kind") {
+          +            Some(kind) => kind.as_str() == Some("transient-contention"),
+          +            // Upgrade the exact receipts written by br 0.7.4, without
+          +            // deleting/rewriting them or matching arbitrary "busy" substrings.
+          +            None => matches!(
+          +                self.error.as_deref(),
+          +                Some(
+          +                    "Database error: database is busy"
+          +                        | "Database error: database is busy (recovery in progress)"
+          +                )
+          +            ),
+          +        }
+          +    }
+           }
+           
+           /// Find an earlier failed recovery run whose pre-state is byte-identical
+          @@ -724,3 +808,5 @@
+          -        if &prior.raw_before == raw_before {
+          +        if &prior.raw_before == raw_before && !prior.is_transient_contention() {
+          +            // Keep scanning past retryable receipts: a separate genuine
+          +            // failure for these same bytes must still block automatic repair.
+                       return Ok(Some(prior));
+                   }
+          @@ -949,6 +1035,7 @@
+                   logical_after: None,
+                   index_corruption: None,
+                   error: None,
+          +        failure_kind: None,
+               };
+               write_json_new(&run_dir.join("recovery-prepared.json"), &receipt)?;
+               let operation = (|| -> Result<bool> {
+          @@ -960,3 +1047,4 @@
+                   receipt.stage = "live-recovery".to_string();
+                   recover_existing_family(db_path, Some(&migration.write_authority))?;
+          +        receipt.stage = "live-verification".to_string();
+                   migration.write_authority.verify_database_authority()?;
+          @@ -1000,9 +1088,12 @@
+                   Err(error) => {
+          +            let failure_kind = RecoveryFailureKind::for_error(&receipt.stage, &error);
+          +            receipt.failure_kind = Some(failure_kind);
+                       receipt.error = Some(error.to_string());
+                       write_json_new(&run_dir.join("recovery-failed.json"), &receipt)?;
+                       Err(BeadsError::WithContext {
+                           context: format!(
+          -                    "WAL index recovery failed at {}; the original index is retained at {}",
+          +                    "WAL index recovery failed at {}; the original index is retained at {}{}",
+                               receipt.stage,
+          -                    before_dir.display()
+          +                    before_dir.display(),
+          +                    failure_kind.retry_hint()
+                           ),
+          @@ -1207,6 +1298,7 @@
+                   logical_after: None,
+                   index_corruption: None,
+                   error: None,
+          +        failure_kind: None,
+               };
+               write_json_new(&run_dir.join("recovery-prepared.json"), &receipt)?;
+               let operation = (|| -> Result<()> {
+          @@ -1246,3 +1338,4 @@
+                   receipt.stage = "live-recovery".to_string();
+                   recover_existing_family(&migration.db_path, Some(&migration.write_authority))?;
+          +        receipt.stage = "live-verification".to_string();
+                   migration.write_authority.verify_database_authority()?;
+          @@ -1262,9 +1355,12 @@
+               if let Err(error) = operation {
+          +        let failure_kind = RecoveryFailureKind::for_error(&receipt.stage, &error);
+          +        receipt.failure_kind = Some(failure_kind);
+                   receipt.error = Some(error.to_string());
+                   write_json_new(&run_dir.join("recovery-failed.json"), &receipt)?;
+                   return Err(BeadsError::WithContext {
+                       context: format!(
+          -                "engine recovery failed at {}; complete pre-state retained at {}",
+          +                "engine recovery failed at {}; complete pre-state retained at {}{}",
+                           receipt.stage,
+          -                before_dir.display()
+          +                before_dir.display(),
+          +                failure_kind.retry_hint()
+                       ),
+          @@ -5786,2 +5882,136 @@
+          +    #[test]
+          +    fn recovery_532_classifies_only_typed_live_opener_contention() {
+          +        use fsqlite_error::FrankenError;
+          +        let busy_errors = [
+          +            BeadsError::Database(FrankenError::Busy),
+          +            BeadsError::Database(FrankenError::BusyRecovery),
+          +            BeadsError::Database(FrankenError::DatabaseLocked {
+          +                path: PathBuf::from("beads.db"),
+          +            }),
+          +            BeadsError::WithContext {
+          +                context: "opening the live family".to_string(),
+          +                source: Box::new(BeadsError::Database(FrankenError::BusyRecovery)),
+          +            },
+          +            BeadsError::WithContext {
+          +                context: "opening the live family".to_string(),
+          +                source: Box::new(FrankenError::Busy),
+          +            },
+          +        ];
+          +        for error in &busy_errors {
+          +            assert_eq!(
+          +                RecoveryFailureKind::for_error("live-recovery", error),
+          +                RecoveryFailureKind::TransientContention,
+          +            );
+          +            for stage in ["private-recovery", "live-preflight", "live-verification", "reinstate-index"] {
+          +                assert_eq!(
+          +                    RecoveryFailureKind::for_error(stage, error),
+          +                    RecoveryFailureKind::FailClosed,
+          +                    "{stage}: {error}",
+          +                );
+          +            }
+          +        }
+          +        for error in [
+          +            BeadsError::Database(FrankenError::DatabaseCorrupt {
+          +                detail: "database is busy (recovery in progress)".to_string(),
+          +            }),
+          +            BeadsError::Database(FrankenError::BusySnapshot {
+          +                conflicting_pages: "1".to_string(),
+          +            }),
+          +            BeadsError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+          +            BeadsError::internal("database is busy (recovery in progress)"),
+          +            BeadsError::SyncConflict { message: "busy".to_string() },
+          +        ] {
+          +            assert_eq!(
+          +                RecoveryFailureKind::for_error("live-recovery", &error),
+          +                RecoveryFailureKind::FailClosed,
+          +            );
+          +        }
+          +    }
+          +
+          +    #[test]
+          +    fn recovery_532_legacy_and_unknown_receipts_are_narrowly_classified() {
+          +        let mut receipt = serde_json::json!({
+          +            "backup_path": "retained",
+          +            "stage": "live-recovery",
+          +            "raw_before": {"components": []},
+          +            "error": "Database error: database is busy (recovery in progress)",
+          +        });
+          +        let transient = |value: &serde_json::Value| {
+          +            serde_json::from_value::<PriorRecoveryFailure>(value.clone())
+          +                .expect("parse receipt")
+          +                .is_transient_contention()
+          +        };
+          +        assert!(transient(&receipt), "the exact 0.7.4 receipt must not latch");
+          +        receipt["error"] = "Database error: database is busy".into();
+          +        assert!(transient(&receipt));
+          +        for error in [
+          +            "Database error: database is busy (recovery in progress); corrupt WAL",
+          +            "Database error: database disk image is malformed: busy",
+          +            "database is busy (recovery in progress)",
+          +        ] {
+          +            receipt["error"] = error.into();
+          +            assert!(!transient(&receipt));
+          +        }
+          +        receipt["error"] = "Database error: database is busy (recovery in progress)".into();
+          +        for kind in [
+          +            serde_json::json!("fail-closed"),
+          +            serde_json::json!("future-kind"),
+          +            serde_json::Value::Null,
+          +            serde_json::json!(true),
+          +            serde_json::json!({"retryable": true}),
+          +        ] {
+          +            receipt["failure_kind"] = kind;
+          +            assert!(!transient(&receipt), "unknown classification must keep the latch");
+          +        }
+          +        receipt["failure_kind"] = "transient-contention".into();
+          +        assert!(transient(&receipt));
+          +        for stage in ["private-recovery", "live-preflight", "live-verification", "reinstate-index"] {
+          +            receipt["stage"] = stage.into();
+          +            assert!(!transient(&receipt), "{stage} is not a live open");
+          +            receipt.as_object_mut().unwrap().remove("failure_kind");
+          +            assert!(!transient(&receipt), "legacy {stage} must also remain blocked");
+          +            receipt["failure_kind"] = "transient-contention".into();
+          +        }
+          +    }
+          +
+          +    #[test]
+          +    fn recovery_532_scanner_retains_evidence_and_finds_real_failure_after_busy() {
+          +        let temp = TempDir::new().expect("tempdir");
+          +        let db = temp.path().join("beads.db");
+          +        fs::write(&db, b"witnessed original bytes").unwrap();
+          +        let raw = recovery_family_witness(&db).unwrap();
+          +        let root = migration_runs_root(temp.path());
+          +        let busy_run = root.join("busy");
+          +        fs::create_dir_all(busy_run.join("recovery-before")).unwrap();
+          +        let backup = busy_run.join("recovery-before/beads.db-shm");
+          +        fs::write(&backup, b"retained index evidence").unwrap();
+          +        let mut receipt = serde_json::json!({
+          +            "backup_path": busy_run.join("recovery-before"),
+          +            "stage": "live-recovery",
+          +            "raw_before": raw,
+          +            "error": "Database error: database is busy (recovery in progress)",
+          +            "failure_kind": "transient-contention",
+          +        });
+          +        let busy_path = busy_run.join("recovery-failed.json");
+          +        write_json_new(&busy_path, &receipt).unwrap();
+          +        let retained = fs::read(&busy_path).unwrap();
+          +        for _ in 0..3 {
+          +            assert!(prior_failed_recovery(temp.path(), &raw).unwrap().is_none());
+          +            assert_eq!(fs::read(&busy_path).unwrap(), retained);
+          +            assert_eq!(fs::read(&backup).unwrap(), b"retained index evidence");
+          +        }
+          +        let failed_run = root.join("genuine-failure");
+          +        fs::create_dir_all(&failed_run).unwrap();
+          +        receipt["failure_kind"] = "fail-closed".into();
+          +        receipt["error"] = "protected database component changed".into();
+          +        write_json_new(&failed_run.join("recovery-failed.json"), &receipt).unwrap();
+          +        let prior = prior_failed_recovery(temp.path(), &raw).unwrap().unwrap();
+          +        assert_eq!(prior.error.as_deref(), Some("protected database component changed"));
+          +        assert_eq!(fs::read(&busy_path).unwrap(), retained);
+          +        fs::write(&db, b"different original bytes").unwrap();
+          +        assert!(prior_failed_recovery(temp.path(), &recovery_family_witness(&db).unwrap())
+          +            .unwrap().is_none());
+          +    }
+          +
+               /// beads_rust-891u: the from==to maintenance-only plan attests the
+               /// `VACUUM INTO` candidate with `logical_witnesses_match_except_integrity`,
+          ISSUE_532_PATCH
+          git apply --check "$RUNNER_TEMP/gh532.patch"
+          git apply "$RUNNER_TEMP/gh532.patch"
+          rustfmt --edition 2024 src/cli/commands/doctor_subsystems/schema_migration.rs tests/repro_532_recovery_contention.rs
+          git diff --check
+
+      - name: Run recovery, namespace security, and whole-crate gates
+        shell: bash
+        run: |
+          set -uo pipefail
+          failed=0
+          gate() {
+            printf '\n::group::%s\n' "$*"
+            if "$@"; then
+              printf 'PASS: `%s`\n\n' "$*" >> "$GITHUB_STEP_SUMMARY"
+            else
+              status=$?
+              printf 'FAIL (%s): `%s`\n\n' "$status" "$*" >> "$GITHUB_STEP_SUMMARY"
+              failed=1
+            fi
+            echo '::endgroup::'
+          }
+          gate cargo fmt --all -- --check
+          gate cargo test --locked --lib recovery_532 -- --nocapture
+          gate cargo test --locked --test repro_532_recovery_contention -- --nocapture
+          gate cargo test --locked --lib franken_sync::wal_index::tests -- --nocapture
+          gate cargo test --locked --lib franken_sync::tests::failed_no_checkpoint_close_keeps_its_policy_on_retry -- --nocapture
+          gate cargo test --locked --lib sync::db_inode_lock::tests -- --nocapture
+          gate cargo test --locked --test repro_507_recovery -- --nocapture
+          gate cargo test --locked --test e2e_schema_migration_upgrade -- --nocapture
+          gate cargo test --locked --test workflow_action_pins -- --nocapture
+          gate cargo check --locked --all-targets --all-features
+          gate cargo clippy --locked --all-targets --all-features -- -D warnings
+          gate git diff --check
+          test "$failed" -eq 0
+
+      - name: Hand off only the qualified source bytes
+        id: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          path=src/cli/commands/doctor_subsystems/schema_migration.rs
+          test "$(git diff --name-only)" = "$path"
+          printf 'source_sha=%s\n' "$(git hash-object "$path")" >> "$GITHUB_OUTPUT"
+          printf 'source=' >> "$GITHUB_OUTPUT"
+          base64 -w0 "$path" >> "$GITHUB_OUTPUT"
+          printf '\n' >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Commit the qualified fix directly to unchanged main
+    needs: qualify
+    if: github.repository == 'Dicklesworthstone/beads_rust' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Install the exact tested file and fast-forward main
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SOURCE_SHA: ${{ needs.qualify.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          git init --initial-branch=main
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD:src/cli/commands/doctor_subsystems/schema_migration.rs)" = f5dd019571cd9e9146b534fa52132c46771718d1
+          path=src/cli/commands/doctor_subsystems/schema_migration.rs
+          base64 --decode > "$path" <<'QUALIFIED_SOURCE_BASE64'
+          ${{ needs.qualify.outputs.source }}
+          QUALIFIED_SOURCE_BASE64
+          test "$(git hash-object "$path")" = "$EXPECTED_SOURCE_SHA"
+          git diff --check
+          test "$(git diff --name-only)" = "$path"
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$GITHUB_SHA"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- "$path"
+          git commit -m 'fix(recovery): retry transient live WAL-index contention without latching (#532)' -m 'Retain every failure receipt and backup, but distinguish typed live opener contention from fail-closed recovery failures. Recognize only exact legacy live BUSY receipts. Keep unknown classifications, private rehearsal failures, post-open verification, and deterministic matching incidents blocking.' -m "Validated against the original sequential Linux reproduction plus recovery/security and whole-crate gates in ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+          # No token is stored in the checkout or printed in the logs. No force
+          # update: a racing main commit causes a rejection instead of data loss.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin HEAD:refs/heads/main
+          printf 'Committed `%s` directly to main.\n' "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
