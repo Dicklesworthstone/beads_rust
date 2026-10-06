@@ -272,6 +272,23 @@ impl std::fmt::Debug for Connection {
     }
 }
 
+/// Preserve the distinction between a refused opener and failed session setup.
+/// Only the latter reaches this boundary: the engine has already admitted the
+/// recovery connection, so its BUSY code must not opt into #532's retry policy.
+fn recovery_configuration_failure(error: FrankenError) -> FrankenError {
+    if matches!(
+        error,
+        FrankenError::Busy | FrankenError::BusyRecovery | FrankenError::DatabaseLocked { .. }
+    ) {
+        FrankenError::Internal(format!(
+            "engine recovery admission completed, but session configuration failed: {error}; \
+             this post-admission failure is not retryable opener contention"
+        ))
+    } else {
+        error
+    }
+}
+
 impl Connection {
     /// Open an existing database only when its VFS handle matches the retained identity.
     ///
@@ -284,6 +301,9 @@ impl Connection {
     /// Every handle returned here closes without checkpointing, including
     /// retries after quarantine or missing-index reconstruction. Recovery may
     /// rebuild caches, but it must not rewrite the protected main/WAL payload.
+    /// Admission errors keep their engine types. A busy error from subsequent
+    /// session configuration becomes an explicit non-retryable internal error,
+    /// so startup retains the fail-closed incident rather than retrying it.
     pub fn open_existing_with_expected_identity(
         path: impl Into<String>,
         identity: fsqlite_vfs::FileIdentity,
@@ -296,7 +316,7 @@ impl Connection {
         // #507: after an interruption the index may already be absent or
         // healthy, so quarantine is not a reliable signal for close policy.
         // Set the policy at construction, before any initialization SQL.
-        Self::from_inner(inner, true, false)
+        Self::from_inner(inner, true, false).map_err(recovery_configuration_failure)
     }
 
     /// Open (or create) a database at `path`.
@@ -321,6 +341,10 @@ impl Connection {
         };
         if !serialized {
             return Ok(connection);
+        }
+        #[cfg(test)]
+        if let Some(error) = tests::take_recovery_configuration_error(checkpoint_on_close) {
+            return Err(error);
         }
         // br already serializes mutations through its workspace write lock
         // and owns whole-transaction retries. Keep the engine on SQLite's
@@ -673,6 +697,116 @@ pub(crate) mod tests {
         pub(crate) static FAIL_NEXT_CLOSE: std::cell::Cell<bool> = const {
             std::cell::Cell::new(false)
         };
+        pub(super) static RECOVERY_CONFIGURATION_ERROR: RefCell<Option<FrankenError>> = const {
+            RefCell::new(None)
+        };
+    }
+
+    pub(super) fn take_recovery_configuration_error(
+        checkpoint_on_close: bool,
+    ) -> Option<FrankenError> {
+        if checkpoint_on_close {
+            None
+        } else {
+            RECOVERY_CONFIGURATION_ERROR.with(|fault| fault.borrow_mut().take())
+        }
+    }
+
+    #[test]
+    fn recovery_532_configuration_contention_is_fail_closed_after_admission() {
+        if run_recovery_test_in_subprocess(
+            "franken_sync::tests::recovery_532_configuration_contention_is_fail_closed_after_admission",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("recovery-configuration.db");
+        let wal = temp.path().join("recovery-configuration.db-wal");
+        let path = db.to_string_lossy().into_owned();
+        let sentinel = "GH532 session failure must preserve this WAL-only row";
+        let mut writer = Connection::open(path.clone()).unwrap();
+        writer.execute("PRAGMA journal_mode = WAL").unwrap();
+        writer.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+        writer.execute("CREATE TABLE t (v TEXT)").unwrap();
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        writer
+            .execute_with_params("INSERT INTO t VALUES (?1)", &[SqliteValue::from(sentinel)])
+            .unwrap();
+        writer.close_without_checkpoint_in_place().unwrap();
+        drop(writer);
+        let main_before = std::fs::read(&db).unwrap();
+        let wal_before = std::fs::read(&wal).unwrap();
+        assert!(wal_before.len() > 32);
+        assert!(
+            !main_before
+                .windows(sentinel.len())
+                .any(|b| b == sentinel.as_bytes())
+        );
+        assert!(
+            wal_before
+                .windows(sentinel.len())
+                .any(|b| b == sentinel.as_bytes())
+        );
+        let retained = std::fs::File::open(&db).unwrap();
+        let identity = fsqlite_vfs::FileIdentity::from_file(&retained)
+            .unwrap()
+            .unwrap();
+
+        for injected in [
+            FrankenError::Busy,
+            FrankenError::BusyRecovery,
+            FrankenError::DatabaseLocked { path: db.clone() },
+        ] {
+            let cause = injected.to_string();
+            RECOVERY_CONFIGURATION_ERROR.with(|fault| {
+                assert!(fault.borrow().is_none());
+                *fault.borrow_mut() = Some(injected);
+            });
+            let result = Connection::open_existing_with_expected_identity(path.clone(), identity);
+            let unconsumed = RECOVERY_CONFIGURATION_ERROR.with(|fault| fault.borrow_mut().take());
+            assert!(
+                unconsumed.is_none(),
+                "the fault must follow real engine admission"
+            );
+            let error = result.unwrap_err();
+            assert!(
+                matches!(&error, FrankenError::Internal(detail)
+                    if detail.contains("admission completed") && detail.contains(&cause)),
+                "post-admission errors must not escape as retryable BUSY: {error}"
+            );
+            assert!(!error.is_transient(), "{error}");
+            assert_eq!(std::fs::read(&db).unwrap(), main_before);
+            assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
+
+            // Error-path Drop must release admission without checkpointing.
+            // A clean explicit recovery then reads the very same WAL-only row.
+            let recovered =
+                Connection::open_existing_with_expected_identity(path.clone(), identity).unwrap();
+            assert!(!recovered.checkpoint_on_close);
+            let row = recovered.query_row("SELECT v FROM t").unwrap();
+            assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some(sentinel));
+            recovered.close().unwrap();
+            assert_eq!(std::fs::read(&db).unwrap(), main_before);
+            assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
+        }
+    }
+
+    #[test]
+    fn recovery_532_configuration_failure_preserves_non_contention_types() {
+        let error = recovery_configuration_failure(FrankenError::WalCorrupt {
+            detail: "retained WAL checksum evidence".to_string(),
+        });
+        assert!(matches!(
+            error,
+            FrankenError::WalCorrupt { detail } if detail == "retained WAL checksum evidence"
+        ));
+        let indeterminate = FrankenError::DatabaseImagePublicationOutcomeIndeterminate {
+            detail: "do not retry an indeterminate publication".to_string(),
+        };
+        assert!(matches!(
+            recovery_configuration_failure(indeterminate),
+            FrankenError::DatabaseImagePublicationOutcomeIndeterminate { .. }
+        ));
     }
 
     #[test]
