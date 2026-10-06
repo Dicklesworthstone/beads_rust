@@ -641,6 +641,143 @@ fn corrupt_wal_and_live_peer_refuse_before_live_index_quarantine() {
     }
 }
 
+/// GH #532: a peer lease must refuse before creating a failure receipt, then
+/// allow automatic recovery on the next invocation after the peer leaves.
+/// Use committed WAL-only records, not the header-only fast-path fixture.
+#[test]
+fn sole_opener_contention_does_not_latch_startup_recovery_532() {
+    if isolated_test("sole_opener_contention_does_not_latch_startup_recovery_532") {
+        return;
+    }
+    let workspace = current_workspace(false);
+    let poisoned = poison_index(&workspace);
+    let db = workspace.root.join(".beads/beads.db");
+    let peer = beads_rust::sync::DatabaseOpenerLease::register(&db).unwrap();
+    let before = protected_payload(&workspace);
+    assert!(recovery_runs(&workspace).is_empty());
+    for attempt in 0..3 {
+        let run = run_br(
+            &workspace,
+            ["list", "--json"],
+            &format!("held_opener_532_{attempt}"),
+        );
+        let error = format!("{}{}", run.stdout, run.stderr);
+        assert!(!run.status.success(), "{error}");
+        assert!(error.contains("sole opener"), "{error}");
+        assert!(!error.contains("already failed"), "{error}");
+        assert_eq!(protected_payload(&workspace), before);
+        assert_eq!(fs::read(db.with_file_name("beads.db-shm")).unwrap(), poisoned);
+        assert!(recovery_runs(&workspace).is_empty());
+    }
+    drop(peer);
+
+    // No explicit recover, receipt removal, or sidecar replacement intervenes.
+    let list = succeeds(&workspace, &["list", "--json"], "released_opener_532");
+    let issues = list["issues"].as_array().expect("issue list");
+    assert_eq!(issues.len(), 3);
+    assert!(issues.iter().all(|issue| issue["title"] == WAL_ONLY_TITLE));
+    let runs = recovery_runs(&workspace);
+    assert_eq!(runs.len(), 1, "one successful automatic recovery");
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(runs[0].join("recovery-complete.json")).unwrap()).unwrap();
+    assert_eq!(receipt["backup_scope"], "complete-family");
+    let backup = Path::new(receipt["backup_path"].as_str().unwrap());
+    assert_eq!(read_optional(&backup.join("beads.db-wal")), before[1]);
+    assert_eq!(fs::read(backup.join("beads.db-shm")).unwrap(), poisoned);
+
+    let created = succeeds(
+        &workspace,
+        &["create", "after sole opener release", "--json"],
+        "released_opener_create_532",
+    );
+    let listed = succeeds(&workspace, &["list", "--json"], "released_opener_final_532");
+    let issues = listed["issues"].as_array().expect("issue list");
+    assert_eq!(issues.len(), 4);
+    assert!(issues.iter().any(|issue| issue["id"] == created["id"]));
+    assert_eq!(
+        issues
+            .iter()
+            .filter(|issue| issue["title"] == WAL_ONLY_TITLE)
+            .count(),
+        3,
+        "every original WAL-only record must survive the later mutation"
+    );
+}
+
+/// GH #532 must not disable the incident latch for actual byte damage. Real
+/// startup must retain one complete backup and refuse later reads AND writes
+/// over the same corrupt family without accumulating copies or losing evidence.
+#[test]
+fn deterministic_recovery_failure_still_latches_without_new_copies_532() {
+    if isolated_test("deterministic_recovery_failure_still_latches_without_new_copies_532") {
+        return;
+    }
+    let workspace = current_workspace(false);
+    let poisoned = poison_index(&workspace);
+    let wal_path = workspace.root.join(".beads/beads.db-wal");
+    let mut wal = fs::read(&wal_path).unwrap();
+    wal[48] ^= 1; // First frame checksum; keep the valid WAL header intact.
+    fs::write(&wal_path, wal).unwrap();
+    let before = protected_payload(&workspace);
+    let first = run_br(&workspace, ["list", "--json"], "bad_wal_532");
+    let error = format!("{}{}", first.stdout, first.stderr);
+    assert!(!first.status.success(), "{error}");
+    assert!(error.contains("checksum"), "{error}");
+    let runs = recovery_runs(&workspace);
+    assert_eq!(runs.len(), 1, "one retained incident, not a snapshot storm");
+    let failure_path = runs[0].join("recovery-failed.json");
+    let failure_bytes = fs::read(&failure_path).unwrap();
+    let receipt: Value = serde_json::from_slice(&failure_bytes).unwrap();
+    assert_eq!(receipt["failure_kind"], "fail-closed");
+    assert_eq!(receipt["backup_scope"], "complete-family");
+    let backup = Path::new(receipt["backup_path"].as_str().unwrap());
+    let retained = [
+        "beads.db",
+        "beads.db-wal",
+        "beads.db-journal",
+        "beads.db-shm",
+    ]
+    .map(|name| read_optional(&backup.join(name)));
+    assert_eq!(retained[0], before[0]);
+    assert_eq!(retained[1], before[1]);
+    assert_eq!(retained[2], before[2]);
+    assert_eq!(retained[3].as_ref(), Some(&poisoned));
+    for (attempt, args) in [
+        &["list", "--json"][..],
+        &["create", "must remain refused", "--json"][..],
+        &["list", "--json"][..],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let run = run_br(&workspace, args, &format!("bad_wal_retry_532_{attempt}"));
+        let error = format!("{}{}", run.stdout, run.stderr);
+        assert_eq!(run.status.code(), Some(6), "{error}");
+        assert!(
+            error.contains("already failed for this exact database family"),
+            "{error}"
+        );
+        assert_eq!(recovery_runs(&workspace), runs, "no new recovery runs");
+        assert_eq!(fs::read(&failure_path).unwrap(), failure_bytes);
+        assert_eq!(
+            [
+                "beads.db",
+                "beads.db-wal",
+                "beads.db-journal",
+                "beads.db-shm",
+            ]
+            .map(|name| read_optional(&backup.join(name))),
+            retained,
+            "all retained pre-recovery components must stay byte-identical"
+        );
+        assert_eq!(protected_payload(&workspace), before);
+        assert_eq!(
+            fs::read(workspace.root.join(".beads/beads.db-shm")).unwrap(),
+            poisoned
+        );
+    }
+}
+
 fn integrity_status(workspace: &BrWorkspace, label: &str) -> Value {
     let doctor = run_br(
         workspace,
