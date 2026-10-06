@@ -2790,6 +2790,24 @@ impl SqliteStorage {
         let directory = tempfile::tempdir()?;
         let copy_path = directory.path().join("snapshot.db");
         let mut family = capture_read_snapshot_family(path)?;
+        #[cfg(unix)]
+        let _source_namespace = {
+            // Admit the original lock domain before copying. A private copy
+            // must never turn a refused foreign-owned source into an admitted
+            // current-UID database. Keep the original namespace bound through
+            // both capture verification and private recovery.
+            let source = family
+                .first()
+                .and_then(|member| member.source.as_ref())
+                .ok_or_else(|| BeadsError::Config("Missing snapshot source database".into()))?;
+            let identity = fsqlite_vfs::FileIdentity::from_file(&source.file)?
+                .ok_or_else(|| BeadsError::Config("Missing snapshot source identity".into()))?;
+            fsqlite_vfs::namespace::PendingNamespaceOpen::begin(
+                path,
+                fsqlite_vfs::namespace::NamespaceOpenIntent::ReadOnlyExisting,
+            )?
+            .bind(identity)?
+        };
         for member in &mut family {
             // The live index is only a derived cache the engine refused. The
             // private copy never inherits it: the engine rebuilds its own from
@@ -17129,6 +17147,24 @@ fn namespace_sidecar_mode_repair_witnesses(
                 ),
             });
         }
+        if std::env::var_os("FSQLITE_TRUSTED_UNIX_DATABASE").is_some()
+            || std::env::var_os("FSQLITE_TRUSTED_UNIX_GID").is_some()
+        {
+            let source = StableSchemaSource::open_optional(&sidecar, "shared namespace sidecar")?
+                .ok_or_else(|| {
+                BeadsError::Config("Namespace sidecar disappeared during sharing preflight".into())
+            })?;
+            if fsqlite_vfs::namespace::validate_trusted_unix_group_sidecar(
+                db_path,
+                &sidecar,
+                &source.file.metadata()?,
+            )? {
+                // An opted-in shared sidecar must satisfy the strict group
+                // policy. Never convert an invalid shared layout into 0600
+                // through the single-UID mode-healing path.
+                continue;
+            }
+        }
         let mode = metadata.permissions().mode();
         if mode & 0o077 != 0 {
             let database_bounded =
@@ -17461,7 +17497,12 @@ fn capture_read_snapshot_family(path: &Path) -> Result<Vec<ReadSnapshotMember>> 
             {
                 use std::os::unix::fs::MetadataExt;
 
-                if metadata.uid() != effective_uid() || metadata.nlink() != 1 {
+                let shared = fsqlite_vfs::namespace::validate_trusted_unix_group_sidecar(
+                    path,
+                    &member_path,
+                    metadata,
+                )?;
+                if (!shared && metadata.uid() != effective_uid()) || metadata.nlink() != 1 {
                     return Err(BeadsError::SyncConflict {
                         message: format!(
                             "Refusing unsafe fsqlite namespace sidecar {}: uid {} and {} hard links; expected current uid {} and exactly one link",

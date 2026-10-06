@@ -91,6 +91,50 @@ checkpoints are skipped while peers are present; `br doctor` reports `wal_size`
 and the sole-opener state (`beads_rust-dk45.5` adds an `engine` block with the
 lease holder).
 
+### Explicit trusted Unix group sharing (#533)
+
+The default namespace-sidecar policy is single-UID ownership. A setgid tracker
+directory and group-writable database files alone do not enable cross-UID
+sharing. For an existing tracker whose users explicitly trust each other, the
+FrankenSQLite namespace policy can be enabled for one exact database path:
+
+```bash
+FSQLITE_TRUSTED_UNIX_DATABASE=/absolute/resolved/workspace/.beads/beads.db \
+FSQLITE_TRUSTED_UNIX_GID=989 br list
+```
+
+Set both variables on every participating invocation, before any database is
+opened; keep them fixed in long-lived processes. Every participant must have
+the selected GID as its effective or supplementary group. The database's
+immediate parent must be owned by the database owner, with that GID and mode
+exactly `2770`. The database and
+both `-fsqlite-ns-gate` / `-fsqlite-ns-use` files must have that GID and mode
+exactly `0660`; both sidecars must remain owned by the database owner. Initialize
+and provision the tracker as that owner while all other processes are stopped.
+Only the owner may create missing namespace sidecars. Also provision the
+remaining database family, JSONL/configuration files, and coordination files
+for the trusted group, and use an appropriate umask for newly created files.
+
+No existing file is automatically chmodded or chowned by this opt-in. Unsafe
+modes, symlinks, extra links, wrong sidecar ownership, nonmembers and invalid
+configuration remain refused. Directory ancestry and the selected group are
+trusted; do not grant access to outsiders via ACLs. Namespace files must never
+be unlinked to work around a refusal while any process is using the tracker.
+New JSONL export files in the selected database's directory are finalized
+through their retained descriptors at `0660` after both namespace sidecars
+pass the trusted-group policy. This preserves sharing across atomic exports;
+external exports and private candidates retain the owner-only default.
+Private read snapshots validate and admit the original namespace before
+copying and keep it bound through recovery; private candidates keep the
+single-UID policy. This mechanism targets br's sequential single-writer
+tracker operations, not the engine's owner-only `.fsqlite-shm` MVCC transport.
+
+The engine must include the trusted-group namespace implementation; an older
+linked engine cannot gain cross-UID support from permissions or environment
+variables alone. The root-only Linux regression is
+`tests/e2e_scripts/trusted_group_sharing.sh /absolute/path/to/br`; it uses
+disposable numeric UIDs/GID without modifying system accounts.
+
 ### Missing shared WAL index at startup
 
 Ordinary startup can reconstruct a missing `-shm` index for an existing WAL

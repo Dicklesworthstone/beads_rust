@@ -3172,7 +3172,10 @@ fn create_jsonl_temp_file(output_path: &Path, config: &ExportConfig) -> Result<(
             options.mode(0o600);
         }
         match options.open(&temp_path) {
-            Ok(temp_file) => return Ok((temp_path, temp_file)),
+            Ok(temp_file) => {
+                apply_trusted_group_jsonl_permissions(&temp_path, &temp_file)?;
+                return Ok((temp_path, temp_file));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 if fs::symlink_metadata(&temp_path)
                     .is_ok_and(|metadata| metadata.file_type().is_symlink())
@@ -3220,6 +3223,7 @@ where
         // substitution can therefore never redirect creation, but it still
         // invalidates ordinary success and must be surfaced immediately.
         jsonl_authority.verify_jsonl_authority()?;
+        apply_trusted_group_jsonl_permissions(&temp_path, &temp_file)?;
         return Ok((temp_path, pinned_temp, temp_file));
     }
 
@@ -3268,6 +3272,77 @@ fn create_base_snapshot_temp_file_under_authority(
         |temp_path| validate_temp_file_path(temp_path, snapshot_path, jsonl_dir, false),
         |_| Ok(()),
     )
+}
+
+#[cfg(unix)]
+fn apply_trusted_group_jsonl_permissions(path: &Path, file: &File) -> Result<bool> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    let Some(database) = std::env::var_os("FSQLITE_TRUSTED_UNIX_DATABASE") else {
+        return Ok(false);
+    };
+    let database = PathBuf::from(database);
+    // Sharing never changes external exports or private recovery candidates.
+    let parent = path
+        .parent()
+        .ok_or_else(|| BeadsError::Config("Missing JSONL parent".into()))?
+        .canonicalize()?;
+    if Some(parent.as_path()) != database.parent() {
+        return Ok(false);
+    }
+    let mut group = None;
+    for suffix in crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES {
+        let mut name = database.as_os_str().to_os_string();
+        name.push(suffix);
+        let sidecar = PathBuf::from(name);
+        let source = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(&sidecar)?;
+        let metadata = source.metadata()?;
+        if !fsqlite_vfs::namespace::validate_trusted_unix_group_sidecar(
+            &database, &sidecar, &metadata,
+        )? {
+            return Ok(false);
+        }
+        group = Some(metadata.gid());
+    }
+    let metadata = file.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || Some(metadata.gid()) != group
+        || !named.is_file()
+        || named.nlink() != 1
+        || (named.dev(), named.ino()) != (metadata.dev(), metadata.ino())
+    {
+        return Err(BeadsError::Config(
+            "Unsafe trusted-group JSONL temporary file".into(),
+        ));
+    }
+    // The owner created this exact descriptor in the verified setgid parent.
+    // Never chmod an existing destination or use a path-following chmod here.
+    file.set_permissions(fs::Permissions::from_mode(0o660))?;
+    let after = file.metadata()?;
+    let named_after = fs::symlink_metadata(path)?;
+    if after.mode() & 0o7777 != 0o660
+        || after.gid() != metadata.gid()
+        || after.nlink() != 1
+        || !named_after.is_file()
+        || named_after.nlink() != 1
+        || (named_after.dev(), named_after.ino()) != (after.dev(), after.ino())
+    {
+        return Err(BeadsError::Config(
+            "Filesystem did not retain trusted-group JSONL permissions".into(),
+        ));
+    }
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn apply_trusted_group_jsonl_permissions(_path: &Path, _file: &File) -> Result<bool> {
+    Ok(false)
 }
 
 #[cfg(unix)]
@@ -12848,7 +12923,9 @@ fn prepare_jsonl_temp_output(
 
     let (temp_path, temp_file) = create_jsonl_temp_file(output_path, config)?;
     let temp_guard = TempFileGuard::new(temp_path.clone());
-    set_restrictive_jsonl_permissions(&temp_path);
+    if !apply_trusted_group_jsonl_permissions(&temp_path, &temp_file)? {
+        set_restrictive_jsonl_permissions(&temp_path);
+    }
 
     Ok(JsonlTempOutput {
         temp_path,
@@ -17736,6 +17813,86 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_group_jsonl_permission_child() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Some(database) = std::env::var_os("BR_GROUP_JSONL_TEST_DATABASE") else {
+            return;
+        };
+        let database = PathBuf::from(database);
+        let output = database.with_file_name("issues.jsonl");
+        let (temp_path, file) = create_jsonl_temp_file(&output, &ExportConfig::default()).unwrap();
+        assert_eq!(
+            file.metadata().unwrap().permissions().mode() & 0o7777,
+            0o660
+        );
+        let outside = TempDir::new().unwrap();
+        let (_, private) = create_jsonl_temp_file(
+            &outside.path().join("issues.jsonl"),
+            &ExportConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            private.metadata().unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        let alias = output.with_extension("alias");
+        symlink(&temp_path, &alias).unwrap();
+        assert!(apply_trusted_group_jsonl_permissions(&alias, &file).is_err());
+        fs::hard_link(&temp_path, output.with_extension("hardlink")).unwrap();
+        assert!(apply_trusted_group_jsonl_permissions(&temp_path, &file).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_group_jsonl_exports_keep_group_write() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let directory = TempDir::new().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o2770)).unwrap();
+        let database = directory.path().join("beads.db");
+        fs::write(&database, b"namespace permission fixture").unwrap();
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o660)).unwrap();
+        let file = File::open(&database).unwrap();
+        let identity = fsqlite_vfs::FileIdentity::from_file(&file)
+            .unwrap()
+            .unwrap();
+        let binding = fsqlite_vfs::namespace::PendingNamespaceOpen::begin(
+            &database,
+            fsqlite_vfs::namespace::NamespaceOpenIntent::Shared,
+        )
+        .unwrap()
+        .bind(identity)
+        .unwrap();
+        binding.finish_bootstrap().unwrap();
+        drop(binding);
+        for suffix in crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES {
+            let mut name = database.as_os_str().to_os_string();
+            name.push(suffix);
+            fs::set_permissions(PathBuf::from(name), fs::Permissions::from_mode(0o660)).unwrap();
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sync::tests::trusted_group_jsonl_permission_child",
+                "--nocapture",
+            ])
+            .env("FSQLITE_TRUSTED_UNIX_DATABASE", &database)
+            .env(
+                "FSQLITE_TRUSTED_UNIX_GID",
+                file.metadata().unwrap().gid().to_string(),
+            )
+            .env("BR_GROUP_JSONL_TEST_DATABASE", &database)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     fn make_test_issue(id: &str, title: &str) -> Issue {
         Issue {

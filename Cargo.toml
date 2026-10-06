@@ -48,7 +48,10 @@ clap_complete = { version = "4.6.11", features = ["unstable-dynamic"] }
 # depends on fsqlite-ext-json internally, but the 0.3.9+ extension enables
 # only serde_json's `preserve_order`; the old viral `arbitrary_precision`
 # feature no longer affects br's JSON/TOON serializers.
-fsqlite = { version = "0.4.7", default-features = false, features = [
+# GH#533: the trusted-sharing validator is not in the published 0.4.7
+# family. Pin the entire engine source to the same audited commit so the
+# namespace policy used by br's preflight and by its engine cannot diverge.
+fsqlite = { version = "0.4.8", git = "https://github.com/Dicklesworthstone/frankensqlite.git", rev = "f919f063a3c6a2d4dea3d7a296c8a04b08edf1ad", default-features = false, features = [
     "native",
     "linux-asupersync-uring",
     "fts5",
@@ -56,20 +59,20 @@ fsqlite = { version = "0.4.7", default-features = false, features = [
     "icu",
     "misc",
 ] }
-fsqlite-types = "0.4.7"
-fsqlite-error = "0.4.7"
-fsqlite-core = "0.4.7"
-fsqlite-func = "0.4.7"
-fsqlite-vdbe = "0.4.7"
-fsqlite-vfs = "0.4.7"
-fsqlite-pager = "0.4.7"
-fsqlite-parser = "0.4.7"
-fsqlite-planner = "0.4.7"
-fsqlite-wal = "0.4.7"
-fsqlite-btree = "0.4.7"
-fsqlite-ast = "0.4.7"
-fsqlite-mvcc = "0.4.7"
-fsqlite-observability = "0.4.7"
+fsqlite-types = { version = "0.4.8", git = "https://github.com/Dicklesworthstone/frankensqlite.git", rev = "f919f063a3c6a2d4dea3d7a296c8a04b08edf1ad" }
+fsqlite-error = { version = "0.4.8", git = "https://github.com/Dicklesworthstone/frankensqlite.git", rev = "f919f063a3c6a2d4dea3d7a296c8a04b08edf1ad" }
+fsqlite-core = { version = "0.4.8", git = "https://github.com/Dicklesworthstone/frankensqlite.git", rev = "f919f063a3c6a2d4dea3d7a296c8a04b08edf1ad" }
+fsqlite-func = { version = "0.4.8", git = "https://github.com/Dicklesworthstone/frankensqlite.git", rev = "f919f063a3c6a2d4dea3d7a296c8a04b08edf1ad" }
+fsqlite-vdbe = { version = "0.4.8", git = "https://github.com/Dicklesworthstone/frankensqlite.git", rev = "f919f063a3c6a2d4dea3d7a296c8a04b08edf1ad" }
+fsqlite-vfs = { version = "0.4.8", git = "https://github.com/Dicklesworthstone/frankensqlite.git", rev = "f919f063a3c6a2d4dea3d7a296c8a04b08edf1ad" }
+fsqlite-pager = { version = "0.4.8", git = "https://github.com/Dicklesworthstone/frankensqlite.git", rev = "f919f063a3c6a2d4dea3d7a296c8a04b08edf1ad" }
+fsqlite-parser = { version = "0.4.8", git = "https://github.com/Dicklesworthstone/frankensqlite.git", rev = "f919f063a3c6a2d4dea3d7a296c8a04b08edf1ad" }
+fsqlite-planner = { version = "0.4.8", git = "https://github.com/Dicklesworthstone/frankensqlite.git", rev = "f919f063a3c6a2d4dea3d7a296c8a04b08edf1ad" }
+fsqlite-wal = { version = "0.4.8", git = "https://github.com/Dicklesworthstone/frankensqlite.git", rev = "f919f063a3c6a2d4dea3d7a296c8a04b08edf1ad" }
+fsqlite-btree = { version = "0.4.8", git = "https://github.com/Dicklesworthstone/frankensqlite.git", rev = "f919f063a3c6a2d4dea3d7a296c8a04b08edf1ad" }
+fsqlite-ast = { version = "0.4.8", git = "https://github.com/Dicklesworthstone/frankensqlite.git", rev = "f919f063a3c6a2d4dea3d7a296c8a04b08edf1ad" }
+fsqlite-mvcc = { version = "0.4.8", git = "https://github.com/Dicklesworthstone/frankensqlite.git", rev = "f919f063a3c6a2d4dea3d7a296c8a04b08edf1ad" }
+fsqlite-observability = { version = "0.4.8", git = "https://github.com/Dicklesworthstone/frankensqlite.git", rev = "f919f063a3c6a2d4dea3d7a296c8a04b08edf1ad" }
 
 # Current-thread runtime that drives fsqlite 0.4's async (!Send) futures to
 # completion behind the synchronous `franken_sync::Connection` bridge.
@@ -223,7 +226,9 @@ self_update = [
 
 # NOTE: no `[patch.crates-io]` here.
 #
-# SQLite 0.4, Asupersync 0.5 and the optional FastMCP family resolve from crates.io.
+# Asupersync 0.5 and the optional FastMCP family resolve from crates.io.
+# The SQLite family is pinned to one upstream Git revision until the
+# trusted-group namespace API is available in a published family.
 # This lets
 # `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked`
 # work without requiring sibling `frankensqlite` or `fastmcp_rust`
