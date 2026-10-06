@@ -673,6 +673,7 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
                     &paths.beads_dir,
                     &paths.jsonl_path,
                     expected_prefix.as_deref(),
+                    paths.metadata.deletions_retention_days,
                     allow_external_jsonl,
                     false,
                     false,
@@ -1086,6 +1087,7 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
                     &paths.db_path,
                     &paths.jsonl_path,
                 ),
+                paths.metadata.deletions_retention_days,
                 history,
             )
         {

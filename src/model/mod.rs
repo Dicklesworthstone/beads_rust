@@ -861,32 +861,42 @@ impl Issue {
             return false;
         }
 
-        let Some(days) = retention_days else {
-            return false;
-        };
-
-        if days == 0 {
-            return false; // Keep forever if 0 (though usually means disabled/immediate, assume safe default)
-        }
-
-        let Some(deleted_at) = self.deleted_at else {
-            return false; // Keep if deletion time is unknown
-        };
-
-        // Clamp days to a safe maximum to avoid panic in Duration::days().
-        // chrono::Duration can handle up to ~292,000 years, but we'll clamp to
-        // something extremely safe for an issue tracker (e.g., 1000 years).
-        let max_safe_days = 365_u64 * 1000;
-        let days_i64 = i64::try_from(days.min(max_safe_days)).unwrap_or(365_000);
-        let Some(expiration_time) = deleted_at.checked_add_signed(chrono::Duration::days(days_i64))
-        else {
-            // A positive retention period that extends beyond chrono's maximum
-            // representable timestamp has not expired at any representable
-            // cutoff, so retain the tombstone.
-            return false;
-        };
-        as_of > expiration_time
+        tombstone_expired_at(self.deleted_at, retention_days, as_of)
     }
+}
+
+/// Apply the tombstone TTL to a persisted deletion timestamp without loading
+/// the rest of an issue. The caller must first establish tombstone status.
+pub(crate) fn tombstone_expired_at(
+    deleted_at: Option<DateTime<Utc>>,
+    retention_days: Option<u64>,
+    as_of: DateTime<Utc>,
+) -> bool {
+    let Some(days) = retention_days else {
+        return false;
+    };
+
+    if days == 0 {
+        return false; // Keep forever when retention is disabled.
+    }
+
+    let Some(deleted_at) = deleted_at else {
+        return false; // Keep if deletion time is unknown.
+    };
+
+    // Clamp days to a safe maximum to avoid panic in Duration::days().
+    // chrono::Duration can handle up to ~292,000 years, but we'll clamp to
+    // something extremely safe for an issue tracker (e.g., 1000 years).
+    let max_safe_days = 365_u64 * 1000;
+    let days_i64 = i64::try_from(days.min(max_safe_days)).unwrap_or(365_000);
+    let Some(expiration_time) = deleted_at.checked_add_signed(chrono::Duration::days(days_i64))
+    else {
+        // A positive retention period that extends beyond chrono's maximum
+        // representable timestamp has not expired at any representable
+        // cutoff, so retain the tombstone.
+        return false;
+    };
+    as_of > expiration_time
 }
 
 /// Epic completion status with child counts.

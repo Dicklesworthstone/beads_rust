@@ -16057,6 +16057,40 @@ impl SqliteStorage {
             .collect())
     }
 
+    /// Find tombstones intentionally omitted by an export at one frozen cutoff.
+    ///
+    /// Read only retention metadata, without hydrating issues or their
+    /// relations. Status and timestamps use the same decoders as full export,
+    /// including legacy status casing and numeric deletion timestamps. An
+    /// unknown deletion time never authorizes omission.
+    pub(crate) fn get_expired_tombstone_ids_at(
+        &self,
+        retention_days: Option<u64>,
+        as_of: DateTime<Utc>,
+    ) -> Result<HashSet<String>> {
+        if retention_days.is_none_or(|days| days == 0) {
+            return Ok(HashSet::new());
+        }
+
+        let rows = self.conn.query(
+            "SELECT id, status, deleted_at FROM issues \
+             WHERE (ephemeral = 0 OR ephemeral IS NULL) AND id NOT LIKE '%-wisp-%'",
+        )?;
+        let mut expired = HashSet::new();
+        for row in rows {
+            if parse_status(row.get(1).and_then(SqliteValue::as_text)) != Status::Tombstone {
+                continue;
+            }
+            let deleted_at = parse_opt_datetime_value(row.get(2))?;
+            if crate::model::tombstone_expired_at(deleted_at, retention_days, as_of)
+                && let Some(id) = row.get(0).and_then(SqliteValue::as_text)
+            {
+                expired.insert(id.to_string());
+            }
+        }
+        Ok(expired)
+    }
+
     /// Delete dependency rows owned by the given issues whose target issue is
     /// missing, inside the current write transaction.
     ///
@@ -39550,6 +39584,108 @@ required_fields:
     fn test_parse_datetime_garbage_returns_error() {
         let result = parse_datetime("not-a-date");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_expired_tombstone_projection_matches_persisted_export_population() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let as_of = Utc.with_ymd_and_hms(2026, 10, 6, 12, 0, 0).unwrap();
+        let expired_at = as_of - chrono::Duration::days(31);
+        let boundary = as_of - chrono::Duration::days(30);
+        let cases = [
+            (
+                "bd-ttl-text",
+                "tombstone",
+                SqliteValue::from(expired_at.to_rfc3339()),
+                false,
+            ),
+            (
+                "bd-ttl-integer",
+                "TOMBSTONE",
+                SqliteValue::Integer(expired_at.timestamp_micros()),
+                false,
+            ),
+            (
+                "bd-ttl-boundary",
+                "tombstone",
+                SqliteValue::from(boundary.to_rfc3339()),
+                false,
+            ),
+            ("bd-ttl-null", "tombstone", SqliteValue::Null, false),
+            ("bd-ttl-empty", "tombstone", SqliteValue::from(""), false),
+            (
+                "bd-ttl-live",
+                "open",
+                SqliteValue::from(expired_at.to_rfc3339()),
+                false,
+            ),
+            (
+                "bd-ttl-local",
+                "tombstone",
+                SqliteValue::from(expired_at.to_rfc3339()),
+                true,
+            ),
+            (
+                "bd-wisp-expired",
+                "tombstone",
+                SqliteValue::from(expired_at.to_rfc3339()),
+                false,
+            ),
+        ];
+        for (id, status, deleted_at, ephemeral) in cases {
+            let issue = make_issue(id, id, Status::Open, 2, None, expired_at, None);
+            storage.create_issue(&issue, "tester").unwrap();
+            storage
+                .conn
+                .execute_with_params(
+                    "UPDATE issues SET status = ?, deleted_at = ?, ephemeral = ? WHERE id = ?",
+                    &[
+                        SqliteValue::from(status),
+                        deleted_at,
+                        SqliteValue::Integer(i64::from(ephemeral)),
+                        SqliteValue::from(id),
+                    ],
+                )
+                .unwrap();
+        }
+
+        let expired = storage
+            .get_expired_tombstone_ids_at(Some(30), as_of)
+            .unwrap();
+        assert_eq!(
+            expired,
+            HashSet::from(["bd-ttl-text".to_string(), "bd-ttl-integer".to_string()])
+        );
+        let ids = storage.get_non_ephemeral_issue_ids().unwrap();
+        let hydrated = storage.get_issues_for_export(&ids).unwrap();
+        assert_eq!(
+            expired,
+            hydrated
+                .into_iter()
+                .filter(|issue| issue.is_expired_tombstone_at(Some(30), as_of))
+                .map(|issue| issue.id)
+                .collect::<HashSet<_>>()
+        );
+
+        storage
+            .conn
+            .execute("UPDATE issues SET deleted_at = 'not-a-date' WHERE id = 'bd-ttl-null'")
+            .unwrap();
+        assert!(
+            storage
+                .get_expired_tombstone_ids_at(Some(30), as_of)
+                .is_err(),
+            "malformed deletion data must not authorize omission"
+        );
+        for disabled in [None, Some(0)] {
+            assert!(
+                storage
+                    .get_expired_tombstone_ids_at(disabled, as_of)
+                    .unwrap()
+                    .is_empty(),
+                "disabled retention must not decode deletion dates"
+            );
+        }
     }
 
     #[test]

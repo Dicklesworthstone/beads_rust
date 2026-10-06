@@ -1620,6 +1620,7 @@ fn rebuild_with_tombstone_preservation(
         &paths.db_path,
         &paths.jsonl_path,
         allow_external_jsonl,
+        paths.metadata.deletions_retention_days,
     );
     validate_sync_path_with_external(
         &paths.jsonl_path,
@@ -1674,6 +1675,7 @@ fn rebuild_database_from_jsonl(
         &paths.db_path,
         &paths.jsonl_path,
         allow_external_jsonl,
+        paths.metadata.deletions_retention_days,
     );
     validate_sync_path_with_external(
         &paths.jsonl_path,
@@ -1819,6 +1821,7 @@ pub(crate) fn repair_database_from_jsonl_snapshot_under_write_authority(
         db_path,
         source.display_path(),
         allow_external_jsonl,
+        None,
     );
     import_config.show_progress = show_progress;
     import_config.skip_prefix_validation = true;
@@ -4438,6 +4441,7 @@ impl OpenStorageResult {
             &self.paths.db_path,
             &self.paths.jsonl_path,
             self.allow_external_jsonl,
+            self.paths.metadata.deletions_retention_days,
         );
         validate_sync_path_with_external(
             &self.paths.jsonl_path,
@@ -5026,10 +5030,12 @@ impl OpenStorageResult {
         let beads_dir = self.paths.beads_dir.clone();
         let jsonl_path = self.paths.jsonl_path.clone();
         let allow_external_jsonl = self.allow_external_jsonl;
+        let retention_days = self.paths.metadata.deletions_retention_days;
         self.auto_flush_under_retained_authority(
             &beads_dir,
             &jsonl_path,
             allow_external_jsonl,
+            retention_days,
             history,
         )?;
         Ok(())
@@ -5044,7 +5050,7 @@ impl OpenStorageResult {
     /// second `flock` descriptor for the same sidecar blocks the process on
     /// itself until the write-lock timeout expires (GitHub #487).
     ///
-    /// `beads_dir` / `jsonl_path` / `allow_external_jsonl` are parameters
+    /// `beads_dir` / `jsonl_path` / `allow_external_jsonl` / `retention_days` are parameters
     /// rather than `self.paths` because the CLI's post-command flush resolves
     /// them from its own startup context.
     ///
@@ -5056,6 +5062,7 @@ impl OpenStorageResult {
         beads_dir: &Path,
         jsonl_path: &Path,
         allow_external_jsonl: bool,
+        retention_days: Option<u64>,
         history: crate::sync::history::HistoryConfig,
     ) -> Result<crate::sync::AutoFlushResult> {
         let Self {
@@ -5068,6 +5075,7 @@ impl OpenStorageResult {
             beads_dir,
             jsonl_path,
             allow_external_jsonl,
+            retention_days,
             history,
             jsonl_write_authority.as_deref(),
         )
@@ -5419,6 +5427,7 @@ fn open_storage_with_startup_config_impl(
                 &paths.db_path,
                 &paths.jsonl_path,
                 allow_external_jsonl,
+                paths.metadata.deletions_retention_days,
             );
             import_config.skip_prefix_validation = true;
             // JSONL-only mode rebuilds this private database from the whole
@@ -5749,11 +5758,13 @@ fn import_config_for_resolved_jsonl(
     db_path: &Path,
     jsonl_path: &Path,
     explicit_allow_external_jsonl: bool,
+    retention_days: Option<u64>,
 ) -> ImportConfig {
     ImportConfig {
         beads_dir: Some(beads_dir.to_path_buf()),
         allow_external_jsonl: explicit_allow_external_jsonl
             || implicit_external_jsonl_allowed(beads_dir, db_path, jsonl_path),
+        retention_days,
         show_progress: false,
         // Every caller re-ingests the workspace's own resolved sidecar
         // (rebuild/recovery/bootstrap), never a foreign JSONL. The configured

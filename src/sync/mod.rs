@@ -3732,6 +3732,11 @@ pub struct ImportConfig {
     pub orphan_mode: OrphanMode,
     /// Force upsert even if timestamps are equal or older.
     pub force_upsert: bool,
+    /// Tombstone retention policy of the resolved export destination.
+    /// Expired local tombstones may be absent from JSONL without requiring a
+    /// flush. Import still preserves their database payload and revokes stale
+    /// export certificates. None or zero keeps tombstones indefinitely.
+    pub retention_days: Option<u64>,
     /// The `.beads` directory path for path validation.
     /// If None, path validation is skipped (for backwards compatibility).
     pub beads_dir: Option<PathBuf>,
@@ -3750,6 +3755,7 @@ impl Default for ImportConfig {
             clear_duplicate_external_refs: false,
             orphan_mode: OrphanMode::Strict,
             force_upsert: false,
+            retention_days: None,
             beads_dir: None,
             allow_external_jsonl: false,
             show_progress: false,
@@ -12342,11 +12348,13 @@ pub struct AutoImportResult {
 /// # Errors
 ///
 /// Returns an error if staleness checks, metadata reads, or import steps fail.
+#[allow(clippy::too_many_arguments)]
 pub fn auto_import_if_stale(
     storage: &mut SqliteStorage,
     beads_dir: &Path,
     jsonl_path: &Path,
     expected_prefix: Option<&str>,
+    retention_days: Option<u64>,
     allow_external_jsonl: bool,
     allow_stale: bool,
     no_auto_import: bool,
@@ -12400,6 +12408,7 @@ pub fn auto_import_if_stale(
         // invariant. Auto-import should preserve mixed-prefix workspaces.
         skip_prefix_validation: true,
         beads_dir: Some(beads_dir.to_path_buf()),
+        retention_days,
         allow_external_jsonl,
         show_progress: false,
         ..Default::default()
@@ -12774,8 +12783,14 @@ fn find_post_import_fk_violation(storage: &SqliteStorage) -> Result<Option<(Stri
     Ok(None)
 }
 
-fn is_issue_exportable(issue: &Issue, retention_days: Option<u64>) -> bool {
-    !issue.ephemeral && !issue.id.contains("-wisp-") && !issue.is_expired_tombstone(retention_days)
+fn is_issue_exportable_at(
+    issue: &Issue,
+    retention_days: Option<u64>,
+    as_of: DateTime<Utc>,
+) -> bool {
+    !issue.ephemeral
+        && !issue.id.contains("-wisp-")
+        && !issue.is_expired_tombstone_at(retention_days, as_of)
 }
 
 fn finalize_incremental_auto_flush(
@@ -13304,6 +13319,8 @@ struct IncrementalAutoFlushChanges {
 fn collect_incremental_auto_flush_changes(
     storage: &SqliteStorage,
     dirty_metadata: Vec<(String, String)>,
+    retention_days: Option<u64>,
+    export_as_of: DateTime<Utc>,
 ) -> Result<IncrementalAutoFlushChanges> {
     let dirty_len = dirty_metadata.len();
     let mut removed_hash_ids = Vec::with_capacity(dirty_len);
@@ -13320,7 +13337,7 @@ fn collect_incremental_auto_flush_changes(
     for (issue_id, _) in &dirty_metadata {
         let maybe_issue = issues_by_id.remove(issue_id);
         match maybe_issue {
-            Some(mut issue) if is_issue_exportable(&issue, None) => {
+            Some(mut issue) if is_issue_exportable_at(&issue, retention_days, export_as_of) => {
                 normalize_issue_for_export(&mut issue);
                 let json = serde_json::to_string(&issue).map_err(|err| {
                     BeadsError::Config(format!(
@@ -13434,6 +13451,68 @@ fn apply_incremental_auto_flush_changes(
     changed
 }
 
+/// A clean tombstone can expire while another issue becomes dirty. Reconcile
+/// these removals against the captured source and actual certificate rows so
+/// already-pruned tombstones do not cause repeated per-ID database writes.
+fn collect_incremental_retention_removals(
+    storage: &SqliteStorage,
+    source: &JsonlSourceSnapshot,
+    changes: &mut IncrementalAutoFlushChanges,
+    retention_days: Option<u64>,
+    export_as_of: DateTime<Utc>,
+) -> Result<Option<BTreeMap<String, String>>> {
+    let expired = storage.get_expired_tombstone_ids_at(retention_days, export_as_of)?;
+    if expired.is_empty() {
+        return Ok(None);
+    }
+
+    let lines_by_id = read_jsonl_lines_by_id(source)?;
+    let certificate_ids = storage
+        .execute_raw_query("SELECT issue_id FROM export_hashes")?
+        .into_iter()
+        .filter_map(|row| {
+            row.first()
+                .and_then(SqliteValue::as_text)
+                .map(str::to_owned)
+        })
+        .collect::<HashSet<_>>();
+    let mut removed_ids = changes
+        .removed_hash_ids
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    for id in expired {
+        if removed_ids.contains(&id) {
+            // Dirty-row removals already carry the command's local mutation;
+            // this sweep only broadens export to previously clean tombstones.
+            continue;
+        }
+        if let Some(line) = lines_by_id.get(&id) {
+            let source_issue: Issue = serde_json::from_str(line).map_err(|error| {
+                BeadsError::SyncConflict {
+                    message: format!(
+                        "Cannot verify tombstone retention for JSONL issue '{id}': {error}; reconcile with `br sync --merge` before automatic export"
+                    ),
+                }
+            })?;
+            if !source_issue.is_expired_tombstone_at(retention_days, export_as_of) {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "JSONL issue '{id}' is not expired but its clean database tombstone is; refusing automatic retention cleanup. Reconcile with `br sync --merge` first"
+                    ),
+                });
+            }
+        }
+        if (lines_by_id.contains_key(&id) || certificate_ids.contains(&id))
+            && removed_ids.insert(id.clone())
+        {
+            changes.removed_hash_ids.push(id);
+        }
+    }
+    // Reuse this parse when applying the dirty rows and writing the result.
+    Ok(Some(lines_by_id))
+}
+
 /// Export dirty issues into an existing JSONL by rewriting only their lines.
 ///
 /// The live file is read exactly once: one immutable [`JsonlSourceSnapshot`]
@@ -13444,10 +13523,8 @@ fn apply_incremental_auto_flush_changes(
 /// of the published bytes (GitHub #485).
 fn try_incremental_auto_flush(
     storage: &mut SqliteStorage,
-    beads_dir: &Path,
     jsonl_path: &Path,
-    allow_external_jsonl: bool,
-    history: &HistoryConfig,
+    export_config: &ExportConfig,
     provided_jsonl_authority: Option<&JsonlFamilyWriteLock>,
 ) -> Result<Option<AutoFlushResult>> {
     // Missing or non-regular targets take the full-export path, which reports
@@ -13495,27 +13572,38 @@ fn try_incremental_auto_flush(
         return Ok(Some(AutoFlushResult::default()));
     }
 
-    let changes = collect_incremental_auto_flush_changes(storage, dirty_metadata)?;
-    let export_config = ExportConfig {
-        force: false,
-        beads_dir: Some(beads_dir.to_path_buf()),
-        allow_external_jsonl,
-        history: history.clone(),
-        ..Default::default()
-    };
-
-    if let Some(result) = try_existing_line_auto_flush(
+    let export_as_of = export_config.export_as_of.unwrap_or_else(Utc::now);
+    let mut changes = collect_incremental_auto_flush_changes(
         storage,
-        jsonl_path,
-        &export_config,
-        &changes,
-        jsonl_authority,
+        dirty_metadata,
+        export_config.retention_days,
+        export_as_of,
+    )?;
+    let retained_lines = collect_incremental_retention_removals(
+        storage,
         &source,
-    )? {
+        &mut changes,
+        export_config.retention_days,
+        export_as_of,
+    )?;
+
+    if retained_lines.is_none()
+        && let Some(result) = try_existing_line_auto_flush(
+            storage,
+            jsonl_path,
+            export_config,
+            &changes,
+            jsonl_authority,
+            &source,
+        )?
+    {
         return Ok(Some(result));
     }
 
-    let mut lines_by_id = read_jsonl_lines_by_id(&source)?;
+    let mut lines_by_id = match retained_lines {
+        Some(lines) => lines,
+        None => read_jsonl_lines_by_id(&source)?,
+    };
     let changed = apply_incremental_auto_flush_changes(&mut lines_by_id, &changes);
 
     if !changed {
@@ -13537,7 +13625,7 @@ fn try_incremental_auto_flush(
     }
 
     let content_hash =
-        write_jsonl_lines_atomically(&lines_by_id, jsonl_path, &export_config, &source)?;
+        write_jsonl_lines_atomically(&lines_by_id, jsonl_path, export_config, &source)?;
     jsonl_authority.verify_jsonl_authority()?;
     finalize_incremental_auto_flush(
         storage,
@@ -13581,6 +13669,7 @@ pub struct AutoFlushResult {
 /// * `storage` - Mutable reference to the `SQLite` storage
 /// * `beads_dir` - Path to the .beads directory
 /// * `jsonl_path` - Resolved JSONL export target for this workspace
+/// * `retention_days` - Tombstone retention from the same resolved workspace metadata
 /// * `history` - The `.br_history` policy resolved by
 ///   [`crate::config::resolved_history_config_from_layer`]; callers must never
 ///   substitute `HistoryConfig::default()`, which ignores
@@ -13594,6 +13683,7 @@ pub fn auto_flush(
     beads_dir: &Path,
     jsonl_path: &Path,
     allow_external_jsonl: bool,
+    retention_days: Option<u64>,
     history: HistoryConfig,
 ) -> Result<AutoFlushResult> {
     auto_flush_with_authority(
@@ -13601,6 +13691,7 @@ pub fn auto_flush(
         beads_dir,
         jsonl_path,
         allow_external_jsonl,
+        retention_days,
         history,
         None,
     )
@@ -13628,6 +13719,7 @@ pub fn auto_flush_with_authority(
     beads_dir: &Path,
     jsonl_path: &Path,
     allow_external_jsonl: bool,
+    retention_days: Option<u64>,
     history: HistoryConfig,
     provided_jsonl_authority: Option<&JsonlFamilyWriteLock>,
 ) -> Result<AutoFlushResult> {
@@ -13657,6 +13749,19 @@ pub fn auto_flush_with_authority(
 
     validate_sync_path_with_external(jsonl_path, beads_dir, allow_external_jsonl)?;
 
+    // One policy and cutoff govern both incremental export and its full
+    // fallback. `needs_flush` must never bypass the data-loss guards: a local
+    // win over restored JSONL is pending work, not permission to force export.
+    let export_config = ExportConfig {
+        force: false,
+        beads_dir: Some(beads_dir.to_path_buf()),
+        allow_external_jsonl,
+        retention_days,
+        export_as_of: Some(Utc::now()),
+        history,
+        ..Default::default()
+    };
+
     tracing::debug!(
         dirty_count,
         needs_flush,
@@ -13669,10 +13774,8 @@ pub fn auto_flush_with_authority(
         // the flush falls through to a full export.
         match try_incremental_auto_flush(
             storage,
-            beads_dir,
             jsonl_path,
-            allow_external_jsonl,
-            &history,
+            &export_config,
             provided_jsonl_authority,
         ) {
             Ok(Some(result)) => {
@@ -13709,22 +13812,6 @@ pub fn auto_flush_with_authority(
             return Ok(AutoFlushResult::default());
         }
     }
-
-    // Configure export with defaults, including beads_dir for path validation.
-    // `needs_flush` is deliberately NOT passed as `force` (#405): doing so
-    // disabled the exporter's data-loss guards, and the import path also arms
-    // `needs_flush` when a local record wins over JSONL — a state in which a
-    // forced auto-flush can destroy merged issues the DB never imported. The
-    // purge_issue flow that used to need force is handled by the
-    // purged-pending-export marker, which the guard subtracts from its loss
-    // computation.
-    let export_config = ExportConfig {
-        force: false,
-        beads_dir: Some(beads_dir.to_path_buf()),
-        allow_external_jsonl,
-        history,
-        ..Default::default()
-    };
 
     // Perform export
     let expected_missing_jsonl = (!jsonl_exists).then_some(None);
@@ -14886,6 +14973,7 @@ fn stream_import_actions_in_tx(
     base_result: &ImportResult,
     progress: &indicatif::ProgressBar,
     relation_tables_proven_empty: bool,
+    retention_as_of: DateTime<Utc>,
 ) -> Result<ImportResult> {
     let mut tx_result = base_result.clone();
     let mut seen_external_refs = HashSet::new();
@@ -15025,16 +15113,21 @@ fn stream_import_actions_in_tx(
     // but still requires a full export. Use the certified collision targets,
     // not raw JSONL IDs or the old certificate cache. The metadata map avoids
     // another database scan when every local ID is already covered; otherwise
-    // one narrow ID query excludes intentionally local ephemerals and wisps.
+    // narrow metadata scans exclude ephemerals, wisps, and tombstones omitted
+    // by the resolved retention policy. No issue or relation reload is needed.
     let needs_flush = uncertified_local_wins > 0
         || (metadata
             .meta_by_id
             .keys()
             .any(|id| !export_hash_ids.contains(id))
-            && storage
-                .get_non_ephemeral_issue_ids()?
-                .iter()
-                .any(|id| !export_hash_ids.contains(id)));
+            && {
+                let expired =
+                    storage.get_expired_tombstone_ids_at(config.retention_days, retention_as_of)?;
+                storage
+                    .get_non_ephemeral_issue_ids()?
+                    .iter()
+                    .any(|id| !export_hash_ids.contains(id) && !expired.contains(id))
+            });
     if needs_flush {
         tracing::debug!(
             uncertified_local_wins,
@@ -15414,6 +15507,9 @@ fn import_from_jsonl_snapshot_impl(
 
     let jsonl_hash = compute_jsonl_snapshot_content_hash(source)?;
     let observed_jsonl = observed_jsonl_snapshot_witness(source);
+    // Transaction retries must make the same retention decision for local
+    // records absent from this immutable source.
+    let retention_as_of = Utc::now();
 
     // Phase 2: Execute Actions
     //
@@ -15470,6 +15566,7 @@ fn import_from_jsonl_snapshot_impl(
             &result,
             &progress,
             relation_tables_proven_empty,
+            retention_as_of,
         )?;
 
         storage.set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
@@ -23040,6 +23137,7 @@ mod tests {
             &beads_dir,
             &jsonl_path,
             None,
+            None,
             false,
             true,
             false,
@@ -23066,6 +23164,7 @@ mod tests {
             &mut storage,
             &beads_dir,
             &jsonl_path,
+            None,
             None,
             false,
             false,
@@ -23129,6 +23228,7 @@ mod tests {
             &mut storage,
             &beads_dir,
             &external_jsonl,
+            None,
             None,
             false,
             false,
@@ -23349,6 +23449,7 @@ mod tests {
             &beads_dir,
             &jsonl_path,
             false,
+            None,
             history.clone(),
         )
         .unwrap();
@@ -23361,6 +23462,7 @@ mod tests {
             &beads_dir,
             &jsonl_path,
             false,
+            None,
             history.clone(),
         )
         .unwrap();
@@ -23383,6 +23485,7 @@ mod tests {
             &beads_dir,
             &jsonl_path,
             false,
+            None,
             HistoryConfig {
                 enabled: false,
                 ..HistoryConfig::default()
@@ -23422,6 +23525,7 @@ mod tests {
             &beads_dir,
             &jsonl_path,
             false,
+            None,
             history.clone(),
         )
         .unwrap();
@@ -23438,7 +23542,7 @@ mod tests {
         );
 
         retitle(&mut storage, "bd-fast-1", "Changed title");
-        auto_flush(&mut storage, &beads_dir, &jsonl_path, false, history).unwrap();
+        auto_flush(&mut storage, &beads_dir, &jsonl_path, false, None, history).unwrap();
         io_stats::reset();
         assert!(!auto_import_probe(&storage, &beads_dir, &jsonl_path, false).unwrap());
         assert_eq!(
@@ -23488,6 +23592,7 @@ mod tests {
             &beads_dir,
             &jsonl_path,
             false,
+            None,
             HistoryConfig::default(),
         )
         .unwrap_err();
@@ -23522,6 +23627,7 @@ mod tests {
             &beads_dir,
             &outside_jsonl_path,
             false,
+            None,
             HistoryConfig::default(),
         )
         .unwrap_err();
@@ -23552,6 +23658,7 @@ mod tests {
             &beads_dir,
             &jsonl_path,
             false,
+            None,
             HistoryConfig::default(),
         )
         .unwrap_err();
@@ -23600,6 +23707,7 @@ mod tests {
             &beads_dir,
             &jsonl_path,
             false,
+            None,
             HistoryConfig::default(),
         )
         .unwrap_err();
@@ -24321,6 +24429,7 @@ mod tests {
                 &beads_dir,
                 &jsonl_path,
                 false,
+                None,
                 HistoryConfig::default(),
             )
             .unwrap();
@@ -24358,6 +24467,7 @@ mod tests {
                 &beads_dir,
                 &jsonl_path,
                 false,
+                None,
                 HistoryConfig::default(),
             )
             .unwrap();
@@ -24388,6 +24498,7 @@ mod tests {
                 &beads_dir,
                 &jsonl_path,
                 Some("bd"),
+                None,
                 false,
                 false,
                 false,
@@ -24416,6 +24527,7 @@ mod tests {
                 &beads_dir,
                 &jsonl_path,
                 false,
+                None,
                 HistoryConfig::default(),
             )
             .unwrap();
@@ -24441,6 +24553,168 @@ mod tests {
             assert_eq!(
                 pending_export_state(&storage, true).unwrap(),
                 (0, false, false)
+            );
+        }
+    }
+
+    #[test]
+    fn test_auto_import_retention_pruned_export_stays_clean() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+        let live = make_test_issue("bd-ttl-live", "Retained issue");
+        let mut expired = make_test_issue("bd-ttl-expired", "Preserved deletion history");
+        expired.status = Status::Tombstone;
+        expired.closed_at = Some(expired.updated_at);
+        expired.deleted_at = Some(Utc::now() - chrono::Duration::days(31));
+        expired.deleted_by = Some("tester".to_string());
+        for issue in [&live, &expired] {
+            storage.create_issue(issue, "tester").unwrap();
+        }
+        auto_flush(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            false,
+            Some(30),
+            HistoryConfig::default(),
+        )
+        .unwrap();
+        let before = storage.get_issue_for_export(&expired.id).unwrap().unwrap();
+        assert_eq!(read_issues_from_jsonl(&jsonl_path).unwrap().len(), 1);
+        assert_eq!(
+            pending_export_state(&storage, true).unwrap(),
+            (0, false, false)
+        );
+
+        // Change in-object whitespace so the source hash cannot bypass a real
+        // semantic no-op import of the retention-pruned snapshot.
+        let jsonl = fs::read_to_string(&jsonl_path)
+            .unwrap()
+            .replacen('{', "{ ", 1);
+        fs::write(&jsonl_path, &jsonl).unwrap();
+        let imported = auto_import_if_stale(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            Some("bd"),
+            Some(30),
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(imported.attempted);
+        assert_eq!(imported.imported_count, 0);
+        assert_eq!(
+            storage.get_issue_for_export(&expired.id).unwrap().unwrap(),
+            before
+        );
+        assert_eq!(
+            pending_export_state(&storage, true).unwrap(),
+            (0, false, false)
+        );
+        assert!(storage.get_export_hash(&expired.id).unwrap().is_none());
+        assert!(storage.get_export_hash(&live.id).unwrap().is_some());
+        assert_eq!(fs::read_to_string(&jsonl_path).unwrap(), jsonl);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_incremental_retention_preserves_newer_unimported_source_state() {
+        for source_state in ["live", "recent", "unknown"] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+            let live = make_test_issue("bd-ttl-local", "Unrelated local edit");
+            let mut expired = make_test_issue("bd-ttl-old", "Old database tombstone");
+            expired.status = Status::Tombstone;
+            expired.closed_at = Some(expired.updated_at);
+            expired.deleted_at = Some(Utc::now() - chrono::Duration::days(31));
+            expired.deleted_by = Some("tester".to_string());
+            for issue in [&live, &expired] {
+                storage.create_issue(issue, "tester").unwrap();
+            }
+            auto_flush(
+                &mut storage,
+                &beads_dir,
+                &jsonl_path,
+                false,
+                None,
+                HistoryConfig::default(),
+            )
+            .unwrap();
+            let mut source_issues = read_issues_from_jsonl(&jsonl_path).unwrap();
+            let incoming = source_issues
+                .iter_mut()
+                .find(|issue| issue.id == expired.id)
+                .unwrap();
+            incoming.description = Some("Unimported source payload must survive".to_string());
+            incoming.updated_at = expired.updated_at + chrono::Duration::seconds(1);
+            match source_state {
+                "live" => {
+                    incoming.status = Status::Open;
+                    incoming.closed_at = None;
+                    incoming.deleted_at = None;
+                    incoming.deleted_by = None;
+                }
+                "recent" => incoming.deleted_at = Some(Utc::now()),
+                _ => incoming.deleted_at = None,
+            }
+            incoming.content_hash = Some(incoming.compute_content_hash());
+            let incoming = incoming.clone();
+            let source_refs = source_issues.iter().collect::<Vec<_>>();
+            write_jsonl_issues(&jsonl_path, &source_refs);
+            retitle(&mut storage, &live.id, "Pending local change");
+            let source_before = fs::read(&jsonl_path).unwrap();
+            let dirty_before = storage.get_dirty_issue_metadata().unwrap();
+            let local_before = storage.get_issue_for_export(&expired.id).unwrap().unwrap();
+            assert_eq!(
+                pending_export_state(&storage, true).unwrap(),
+                (1, false, true)
+            );
+            let staleness = compute_staleness(&storage, &jsonl_path).unwrap();
+            assert!(staleness.jsonl_newer && staleness.db_newer);
+
+            let imported = auto_import_if_stale(
+                &mut storage,
+                &beads_dir,
+                &jsonl_path,
+                Some("bd"),
+                Some(30),
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+            assert!(!imported.attempted, "both sides have pending changes");
+            let error = auto_flush(
+                &mut storage,
+                &beads_dir,
+                &jsonl_path,
+                false,
+                Some(30),
+                HistoryConfig::default(),
+            )
+            .unwrap_err();
+            assert!(matches!(&error, BeadsError::SyncConflict { .. }));
+            assert!(
+                error
+                    .to_string()
+                    .contains("refusing automatic retention cleanup")
+            );
+            assert_eq!(
+                fs::read(&jsonl_path).unwrap(),
+                source_before,
+                "source={source_state}"
+            );
+            assert_eq!(storage.get_dirty_issue_metadata().unwrap(), dirty_before);
+            assert_eq!(
+                storage.get_issue_for_export(&expired.id).unwrap().unwrap(),
+                local_before
+            );
+            assert!(
+                read_issues_from_jsonl(&jsonl_path)
+                    .unwrap()
+                    .contains(&incoming)
             );
         }
     }
@@ -26848,6 +27122,7 @@ mod tests {
             &beads_dir,
             &output_path,
             false,
+            None,
             HistoryConfig::default(),
         )
         .unwrap();
@@ -26863,6 +27138,7 @@ mod tests {
             &beads_dir,
             &output_path,
             false,
+            None,
             HistoryConfig::default(),
         )
         .unwrap();
@@ -26966,7 +27242,8 @@ mod tests {
     }
 
     #[test]
-    fn frozen_export_cutoff_keeps_writer_and_file_bytes_and_hashes_identical() {
+    #[allow(clippy::too_many_lines)]
+    fn frozen_export_cutoff_keeps_full_and_incremental_exports_identical() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let export_as_of = fixed_time(2_000_000_000);
         let ttl = chrono::Duration::days(30);
@@ -27021,6 +27298,72 @@ mod tests {
         assert_eq!(writer_report.issues_exported, file_report.issues_exported);
         assert!(writer_result.exported_ids.contains(&boundary.id));
         assert!(writer_result.skipped_tombstone_ids.contains(&expired.id));
+
+        let config = ExportConfig {
+            force: false,
+            ..config
+        };
+        let incremental = try_incremental_auto_flush(&mut storage, &output_path, &config, None)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !incremental.flushed,
+            "the same cutoff must produce the same bytes"
+        );
+        assert_eq!(fs::read(&output_path).unwrap(), writer);
+        assert!(storage.get_export_hash(&boundary.id).unwrap().is_some());
+        assert!(storage.get_export_hash(&expired.id).unwrap().is_none());
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+
+        // Only the live issue becomes dirty, while the clean boundary
+        // tombstone expires one nanosecond after the previous export cutoff.
+        retitle(&mut storage, &open.id, "Changed after boundary");
+        let later_cutoff = export_as_of + chrono::Duration::nanoseconds(1);
+        let config = ExportConfig {
+            export_as_of: Some(later_cutoff),
+            ..config
+        };
+        let mut expected = Vec::new();
+        let (expected_result, _) = export_to_writer_with_policy_and_retention_at(
+            &storage,
+            &mut expected,
+            ExportErrorPolicy::Strict,
+            Some(30),
+            later_cutoff,
+        )
+        .unwrap();
+        io_stats::reset();
+        let incremental = try_incremental_auto_flush(&mut storage, &output_path, &config, None)
+            .unwrap()
+            .unwrap();
+        assert!(incremental.flushed);
+        assert_eq!(
+            io_stats::source_opens(),
+            1,
+            "retention must reuse the captured source"
+        );
+        assert_eq!(incremental.content_hash, expected_result.content_hash);
+        assert_eq!(fs::read(&output_path).unwrap(), expected);
+        assert_eq!(incremental.exported_count, 1);
+        assert!(storage.get_export_hash(&boundary.id).unwrap().is_none());
+        assert!(storage.get_export_hash(&expired.id).unwrap().is_none());
+
+        // Expired rows remain in the DB, but later exports must not issue
+        // another certificate deletion for each already-pruned tombstone.
+        let source = capture_jsonl_source_snapshot(&output_path).unwrap();
+        let mut changes =
+            collect_incremental_auto_flush_changes(&storage, Vec::new(), Some(30), later_cutoff)
+                .unwrap();
+        collect_incremental_retention_removals(
+            &storage,
+            &source,
+            &mut changes,
+            Some(30),
+            later_cutoff,
+        )
+        .unwrap();
+        assert!(changes.removed_hash_ids.is_empty());
+        assert_eq!(storage.get_non_ephemeral_issue_ids().unwrap().len(), 3);
     }
 
     #[test]

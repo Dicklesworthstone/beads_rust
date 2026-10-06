@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use beads_rust::model::{Issue, Status};
 use beads_rust::storage::SqliteStorage;
 use beads_rust::sync::{
     ImportConfig, METADATA_JSONL_CONTENT_HASH, METADATA_JSONL_MTIME, METADATA_JSONL_SIZE,
@@ -2770,6 +2771,422 @@ fn bulk_two_thousand_issue_input() {
     assert_eq!(plan_count(&receipt, "created"), 0);
     assert_eq!(plan_count(&receipt, "updated"), SECOND_PASS_NEWER as u64);
     assert_eq!(issue_count(&ws, "bulk_count2"), TOTAL);
+}
+
+// ============================================================================
+// Retention-aware import certification and automatic export
+// ============================================================================
+
+fn set_workspace_retention_days(ws: &BrWorkspace, days: u64) {
+    let path = beads_dir(ws).join("metadata.json");
+    let mut metadata: Value =
+        serde_json::from_slice(&fs::read(&path).expect("read workspace metadata"))
+            .expect("parse workspace metadata");
+    metadata["deletions_retention_days"] = json!(days);
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&metadata).expect("serialize workspace metadata"),
+    )
+    .expect("set workspace retention policy");
+}
+
+fn stored_retention_issue(ws: &BrWorkspace, id: &str) -> Issue {
+    SqliteStorage::open(&db_path(ws))
+        .expect("open retention database")
+        .get_issue_for_export(id)
+        .expect("hydrate retention issue")
+        .expect("retention issue exists")
+}
+
+fn delete_retention_fixture(
+    ws: &BrWorkspace,
+    id: &str,
+    deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+    label: &str,
+) -> Issue {
+    // Close through the CLI first so a later no-op import has no unrelated
+    // closed_at normalization to perform. Leave both transitions unflushed.
+    let close = run_br(
+        ws,
+        [
+            "--no-auto-import",
+            "--no-auto-flush",
+            "close",
+            id,
+            "--reason",
+            "Retention fixture closure",
+        ],
+        &format!("{label}_close"),
+    );
+    assert!(close.status.success(), "fixture close failed: {close:?}");
+    let delete = run_br(
+        ws,
+        [
+            "--no-auto-import",
+            "--no-auto-flush",
+            "delete",
+            id,
+            "--force",
+            "--reason",
+            "Retention fixture deletion",
+        ],
+        &format!("{label}_delete"),
+    );
+    assert!(delete.status.success(), "fixture delete failed: {delete:?}");
+
+    // Deletion dates have no CLI editing surface. Adjust only that persisted
+    // field, preserving the real CLI mutation's dirty marker and event trail.
+    let mut issue = stored_retention_issue(ws, id);
+    assert_eq!(issue.status, Status::Tombstone);
+    issue.deleted_at = deleted_at;
+    SqliteStorage::open(&db_path(ws))
+        .expect("open deletion-date fixture")
+        .upsert_issue_for_import(&issue)
+        .expect("set fixture deletion date");
+    stored_retention_issue(ws, id)
+}
+
+fn assert_retention_export(ws: &BrWorkspace, expected_ids: &[&str], expired_id: &str) {
+    let exported = read_jsonl_lines(ws)
+        .iter()
+        .map(|line| serde_json::from_str::<Issue>(line).expect("exported retention issue"))
+        .collect::<Vec<_>>();
+    let mut actual_ids = exported
+        .iter()
+        .map(|issue| issue.id.as_str())
+        .collect::<Vec<_>>();
+    actual_ids.sort_unstable();
+    let mut expected_ids = expected_ids.to_vec();
+    expected_ids.sort_unstable();
+    assert_eq!(actual_ids, expected_ids, "exact retained JSONL population");
+
+    let storage = SqliteStorage::open(&db_path(ws)).expect("open export certificate witness");
+    assert_eq!(storage.get_dirty_issue_count().expect("dirty count"), 0);
+    assert_eq!(
+        storage
+            .get_metadata("needs_flush")
+            .expect("flush flag")
+            .as_deref(),
+        Some("false"),
+        "intentional retention omissions must not leave export pending"
+    );
+    for issue in exported {
+        let (hash, _) = storage
+            .get_export_hash(&issue.id)
+            .expect("read retained issue certificate")
+            .expect("published issue must be certified");
+        assert_eq!(hash, issue.compute_content_hash());
+    }
+    assert!(
+        storage
+            .get_export_hash(expired_id)
+            .expect("read expired issue certificate")
+            .is_none(),
+        "an omitted expired tombstone must never be certified as published"
+    );
+}
+
+#[test]
+fn retention_export_followed_by_noop_import_stays_clean() {
+    let ws = BrWorkspace::new();
+    init_workspace(&ws, "retention_noop");
+    set_workspace_retention_days(&ws, 30);
+    let live_id = create_issue(&ws, "Retained live issue", "retention_live");
+    let expired_id = create_issue(&ws, "Expired local tombstone", "retention_expired");
+    let comment = run_br(
+        &ws,
+        [
+            "comments",
+            "add",
+            &expired_id,
+            "Preserve deleted issue history",
+        ],
+        "retention_comment",
+    );
+    assert!(
+        comment.status.success(),
+        "fixture comment failed: {comment:?}"
+    );
+    let expired = delete_retention_fixture(
+        &ws,
+        &expired_id,
+        Some(chrono::Utc::now() - chrono::Duration::days(365)),
+        "retention_expired",
+    );
+    assert!(expired.is_expired_tombstone(Some(30)));
+    assert_eq!(expired.comments.len(), 1);
+    let live = stored_retention_issue(&ws, &live_id);
+    let events = all_events_dump(&ws);
+
+    let flush = run_br(
+        &ws,
+        ["--no-auto-import", "sync", "--flush-only", "--json"],
+        "retention_explicit_flush",
+    );
+    assert!(flush.status.success(), "retention export failed: {flush:?}");
+    assert_retention_export(&ws, &[&live_id], &expired_id);
+    assert_eq!(stored_retention_issue(&ws, &expired_id), expired);
+    assert_eq!(stored_retention_issue(&ws, &live_id), live);
+    assert_eq!(all_events_dump(&ws), events);
+
+    // Change bytes inside the JSON object, preserving every issue field but
+    // bypassing the stored-file-hash shortcut for the first import.
+    let before_hash = compute_jsonl_hash(&jsonl_path(&ws)).expect("export hash");
+    let reformatted = read_jsonl_lines(&ws)
+        .iter()
+        .map(|line| line.replacen('{', "{ ", 1))
+        .collect::<Vec<_>>();
+    write_jsonl_lines(&ws, &reformatted);
+    assert_ne!(
+        compute_jsonl_hash(&jsonl_path(&ws)).expect("reformatted hash"),
+        before_hash
+    );
+    let source_bytes = fs::read(jsonl_path(&ws)).expect("reformatted source bytes");
+
+    for (pass, label) in ["retention_import", "retention_repeat"]
+        .into_iter()
+        .enumerate()
+    {
+        let import = run_br(
+            &ws,
+            ["--no-auto-flush", "sync", "--import-only", "--json"],
+            label,
+        );
+        assert!(import.status.success(), "no-op import failed: {import:?}");
+        let receipt = parse_json_value(&import.stdout);
+        assert_eq!(receipt["created"], 0);
+        assert_eq!(receipt["updated"], 0);
+        if pass == 0 {
+            assert_eq!(receipt["skipped"], 1, "must execute skip certification");
+        }
+        assert_retention_export(&ws, &[&live_id], &expired_id);
+        assert_eq!(stored_retention_issue(&ws, &expired_id), expired);
+        assert_eq!(stored_retention_issue(&ws, &live_id), live);
+        assert_eq!(issue_count(&ws, label), 2);
+        assert_eq!(all_events_dump(&ws), events);
+        assert_eq!(
+            fs::read(jsonl_path(&ws)).expect("source bytes"),
+            source_bytes
+        );
+    }
+}
+
+#[test]
+fn retention_incremental_auto_flush_omits_dirty_and_clean_expired_tombstones() {
+    for (label, clean_tombstone) in [("dirty_expired", false), ("clean_expired", true)] {
+        let ws = BrWorkspace::new();
+        init_workspace(&ws, label);
+        let live_id = create_issue(&ws, "Unrelated live issue", "incremental_live");
+        let expired_id = create_issue(&ws, "Pending expired tombstone", "incremental_expired");
+        let expired = delete_retention_fixture(
+            &ws,
+            &expired_id,
+            Some(chrono::Utc::now() - chrono::Duration::days(365)),
+            label,
+        );
+
+        if clean_tombstone {
+            // Export with the default keep-forever policy before enabling
+            // retention. The later live edit must also remove this clean row.
+            let flush = run_br(
+                &ws,
+                ["--no-auto-import", "sync", "--flush-only", "--json"],
+                "incremental_keep_forever_flush",
+            );
+            assert!(flush.status.success(), "fixture export failed: {flush:?}");
+        }
+        assert!(
+            read_jsonl_lines(&ws)
+                .iter()
+                .any(|line| row_id(line) == expired_id)
+        );
+        set_workspace_retention_days(&ws, 30);
+        let tombstone_events = {
+            let storage = SqliteStorage::open(&db_path(&ws)).expect("open incremental fixture");
+            let expected_dirty = usize::from(!clean_tombstone);
+            assert_eq!(
+                storage.get_dirty_issue_count().expect("dirty count"),
+                expected_dirty
+            );
+            assert_eq!(
+                storage
+                    .get_metadata("needs_flush")
+                    .expect("flush flag")
+                    .as_deref(),
+                Some("false"),
+                "an existing source with no full-flush request must use the incremental path"
+            );
+            assert!(
+                storage
+                    .get_export_hash(&expired_id)
+                    .expect("prior certificate")
+                    .is_some()
+            );
+            storage
+                .get_events(&expired_id, 0)
+                .expect("tombstone events")
+        };
+
+        let update = run_br(
+            &ws,
+            [
+                "update",
+                &live_id,
+                "--title",
+                "Live edit triggers retention",
+                "--json",
+            ],
+            "incremental_ordinary_update",
+        );
+        assert!(
+            update.status.success(),
+            "ordinary update failed: {update:?}"
+        );
+        assert_retention_export(&ws, &[&live_id], &expired_id);
+        assert_eq!(stored_retention_issue(&ws, &expired_id), expired);
+        assert_eq!(
+            stored_retention_issue(&ws, &live_id).title,
+            "Live edit triggers retention"
+        );
+        let storage = SqliteStorage::open(&db_path(&ws)).expect("open incremental result");
+        assert_eq!(storage.count_all_issues().expect("issue count"), 2);
+        assert_eq!(
+            storage
+                .get_events(&expired_id, 0)
+                .expect("tombstone events"),
+            tombstone_events
+        );
+    }
+}
+
+#[test]
+fn retention_restored_omissions_require_full_auto_flush_for_protected_local_state() {
+    for (label, tombstone, deleted_at) in [
+        ("live", false, None),
+        (
+            "recent_tombstone",
+            true,
+            Some(chrono::Utc::now() - chrono::Duration::days(1)),
+        ),
+        ("unknown_date_tombstone", true, None),
+    ] {
+        let ws = BrWorkspace::new();
+        init_workspace(&ws, label);
+        set_workspace_retention_days(&ws, 30);
+        let anchor_id = create_issue(&ws, "Shared source row", "retention_anchor");
+        let protected_id = create_issue(&ws, "Preserve omitted local state", "retention_protected");
+        let comment = run_br(
+            &ws,
+            [
+                "comments",
+                "add",
+                &protected_id,
+                "Local relation survives restored omission",
+            ],
+            "retention_protected_comment",
+        );
+        assert!(
+            comment.status.success(),
+            "fixture comment failed: {comment:?}"
+        );
+        let expired_id = create_issue(&ws, "Intentionally omitted expired state", "retention_old");
+        let expired = delete_retention_fixture(
+            &ws,
+            &expired_id,
+            Some(chrono::Utc::now() - chrono::Duration::days(365)),
+            "retention_old",
+        );
+        let protected = if tombstone {
+            delete_retention_fixture(&ws, &protected_id, deleted_at, label)
+        } else {
+            stored_retention_issue(&ws, &protected_id)
+        };
+        assert!(!protected.is_expired_tombstone(Some(30)));
+        assert_eq!(protected.comments.len(), 1);
+        let flush = run_br(
+            &ws,
+            ["--no-auto-import", "sync", "--flush-only", "--json"],
+            "retention_before_restore",
+        );
+        assert!(flush.status.success(), "fixture export failed: {flush:?}");
+        assert_retention_export(&ws, &[&anchor_id, &protected_id], &expired_id);
+
+        let restored = read_jsonl_lines(&ws)
+            .into_iter()
+            .filter(|line| row_id(line) != protected_id)
+            .collect::<Vec<_>>();
+        write_jsonl_lines(&ws, &restored);
+        let source_bytes = fs::read(jsonl_path(&ws)).expect("restored source bytes");
+        let events = all_events_dump(&ws);
+        let import = run_br(
+            &ws,
+            ["--no-auto-flush", "sync", "--import-only", "--json"],
+            "retention_import_restored",
+        );
+        assert!(
+            import.status.success(),
+            "restored import failed: {import:?}"
+        );
+        let receipt = parse_json_value(&import.stdout);
+        assert_eq!(receipt["created"], 0);
+        assert_eq!(receipt["updated"], 0);
+        assert_eq!(receipt["skipped"], 1);
+        assert_eq!(get_needs_flush(&ws).as_deref(), Some("true"));
+        assert_eq!(stored_retention_issue(&ws, &protected_id), protected);
+        assert_eq!(stored_retention_issue(&ws, &expired_id), expired);
+        assert_eq!(all_events_dump(&ws), events);
+        assert_eq!(
+            fs::read(jsonl_path(&ws)).expect("source bytes"),
+            source_bytes
+        );
+        {
+            let storage = SqliteStorage::open(&db_path(&ws)).expect("open pending export witness");
+            assert_eq!(storage.get_dirty_issue_count().expect("dirty count"), 0);
+            assert!(
+                storage
+                    .get_export_hash(&protected_id)
+                    .expect("omitted certificate")
+                    .is_none()
+            );
+        }
+
+        // needs_flush, not a dirty protected issue, must select the full
+        // automatic exporter after this ordinary mutation of the shared row.
+        let update = run_br(
+            &ws,
+            [
+                "update",
+                &anchor_id,
+                "--title",
+                "Edited after restored export",
+                "--json",
+            ],
+            "retention_ordinary_full_flush",
+        );
+        assert!(
+            update.status.success(),
+            "ordinary update failed: {update:?}"
+        );
+        assert_retention_export(&ws, &[&anchor_id, &protected_id], &expired_id);
+        assert_eq!(stored_retention_issue(&ws, &protected_id), protected);
+        assert_eq!(stored_retention_issue(&ws, &expired_id), expired);
+        assert_eq!(issue_count(&ws, label), 3);
+
+        let published = read_jsonl_lines(&ws)
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).expect("published issue"))
+            .find(|issue| issue["id"].as_str() == Some(protected_id.as_str()))
+            .expect("omitted issue restored to JSONL");
+        let mut expected = serde_json::to_value(&protected).expect("protected issue JSON");
+        expected
+            .as_object_mut()
+            .expect("issue object")
+            .remove("source_repo_path");
+        assert_eq!(
+            published, expected,
+            "full auto-flush must preserve the complete local payload"
+        );
+    }
 }
 
 #[test]

@@ -1126,8 +1126,15 @@ fn dispatch_sync_subcommand(
                 .map(|()| SyncDispatchCompletion::default())
         }
         SyncOperation::Reconcile => {
-            execute_reconcile(&mut open_result.storage, path_policy, args, options.use_json, ctx)
-                .map(|()| SyncDispatchCompletion::default())
+            execute_reconcile(
+                &mut open_result.storage,
+                path_policy,
+                args,
+                options.use_json,
+                options.retention_days,
+                ctx,
+            )
+            .map(|()| SyncDispatchCompletion::default())
         }
         SyncOperation::ReconcileAdditive => Err(BeadsError::Internal {
             message: "reviewed additive reconciliation bypassed its sole lock-owning command path"
@@ -1236,6 +1243,7 @@ fn dispatch_publishing_sync_subcommand(
                 args,
                 options.use_json,
                 options.show_progress,
+                options.retention_days,
                 auto_rebuilt,
                 retained_source,
                 retained_authority,
@@ -3400,6 +3408,7 @@ fn execute_import(
     args: &SyncArgs,
     use_json: bool,
     show_progress: bool,
+    retention_days: Option<u64>,
     auto_rebuilt: bool,
     retained_source: config::RetainedJsonlSourceRef<'_>,
     retained_authority: Option<&crate::sync::JsonlFamilyWriteLock>,
@@ -3674,6 +3683,7 @@ fn execute_import(
         clear_duplicate_external_refs: args.rename_prefix,
         orphan_mode,
         force_upsert: args.force,
+        retention_days,
         beads_dir: Some(path_policy.beads_dir.clone()),
         allow_external_jsonl: path_policy.allow_external_jsonl,
         show_progress,
@@ -4179,6 +4189,7 @@ fn execute_reconcile(
     path_policy: &SyncPathPolicy,
     args: &SyncArgs,
     use_json: bool,
+    retention_days: Option<u64>,
     ctx: &OutputContext,
 ) -> Result<()> {
     let jsonl_path = &path_policy.jsonl_path;
@@ -4195,6 +4206,7 @@ fn execute_reconcile(
         clear_duplicate_external_refs: false,
         orphan_mode: OrphanMode::Strict,
         force_upsert: false,
+        retention_days,
         beads_dir: Some(path_policy.beads_dir.clone()),
         allow_external_jsonl: path_policy.allow_external_jsonl,
         show_progress: false,

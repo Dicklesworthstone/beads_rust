@@ -48,6 +48,7 @@ fn test_auto_flush_optimizes_no_content_change() {
         &beads_dir,
         &jsonl_path,
         false,
+        None,
         HistoryConfig::default(),
     )
     .unwrap();
@@ -87,6 +88,7 @@ fn test_auto_flush_optimizes_no_content_change() {
         &beads_dir,
         &jsonl_path,
         false,
+        None,
         HistoryConfig::default(),
     )
     .unwrap();
@@ -121,6 +123,7 @@ fn test_auto_flush_flush_on_label_change() {
         &beads_dir,
         &jsonl_path,
         false,
+        None,
         HistoryConfig::default(),
     )
     .unwrap();
@@ -139,6 +142,7 @@ fn test_auto_flush_flush_on_label_change() {
         &beads_dir,
         &jsonl_path,
         false,
+        None,
         HistoryConfig::default(),
     )
     .unwrap();
@@ -166,6 +170,7 @@ fn test_auto_flush_uses_resolved_jsonl_path() {
         &beads_dir,
         &custom_jsonl_path,
         true,
+        None,
         HistoryConfig::default(),
     )
     .unwrap();
@@ -190,6 +195,7 @@ fn test_auto_flush_preserves_unrelated_existing_jsonl_lines() {
         &beads_dir,
         &jsonl_path,
         false,
+        None,
         HistoryConfig::default(),
     )
     .unwrap();
@@ -218,6 +224,7 @@ fn test_auto_flush_preserves_unrelated_existing_jsonl_lines() {
         &beads_dir,
         &jsonl_path,
         false,
+        None,
         HistoryConfig::default(),
     )
     .unwrap();
@@ -263,6 +270,7 @@ fn test_auto_flush_keeps_jsonl_id_sorted_after_creates() {
             &beads_dir,
             &jsonl_path,
             false,
+            None,
             HistoryConfig::default()
         )
         .unwrap()
@@ -282,6 +290,7 @@ fn test_auto_flush_keeps_jsonl_id_sorted_after_creates() {
         &beads_dir,
         &jsonl_path,
         false,
+        None,
         HistoryConfig::default(),
     )
     .unwrap();
@@ -317,6 +326,7 @@ fn test_auto_flush_keeps_jsonl_id_sorted_after_creates() {
             &beads_dir,
             &jsonl_path,
             false,
+            None,
             HistoryConfig::default()
         )
         .unwrap()

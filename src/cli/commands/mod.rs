@@ -357,6 +357,7 @@ pub(super) fn auto_import_storage_ctx_if_stale(
         &storage_ctx.paths.beads_dir,
         &storage_ctx.paths.jsonl_path,
         Some(expected_prefix.as_str()),
+        storage_ctx.paths.metadata.deletions_retention_days,
         allow_external_jsonl,
         cli.allow_stale.unwrap_or(false),
         no_auto_import,

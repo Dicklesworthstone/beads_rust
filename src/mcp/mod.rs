@@ -367,6 +367,8 @@ pub struct BeadsState {
     pub allow_external_jsonl: bool,
     pub actor: String,
     pub issue_prefix: Option<String>,
+    /// Tombstone retention from the workspace metadata retained at server startup.
+    pub retention_days: Option<u64>,
     /// `.br_history` policy resolved once at server start from the merged
     /// config layer and the environment (GitHub #484); every MCP auto-flush
     /// exports with exactly this configuration.
@@ -661,6 +663,7 @@ impl BeadsState {
             &self.beads_dir,
             &self.jsonl_path,
             self.allow_external_jsonl,
+            self.retention_days,
             self.history.clone(),
         )
         .map_err(|err| auto_flush_mcp_error(&self.beads_dir, &self.jsonl_path, err))?;
@@ -778,6 +781,7 @@ mod tests {
             allow_external_jsonl: false,
             actor: "mcp-test".to_string(),
             issue_prefix: Some("br".to_string()),
+            retention_days: None,
             history: crate::sync::history::HistoryConfig::default(),
             read_snapshot_cache: None,
         }
@@ -1619,6 +1623,7 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         .lock_timeout
         .or_else(|| config::lock_timeout_from_layer(&merged_layer))
         .or(Some(crate::sync::default_write_lock_timeout_ms()));
+    let retention_days = startup.paths.metadata.deletions_retention_days;
     let (prefix, db_path, jsonl_path, history) =
         bootstrap_serve_paths(&beads_dir, startup, overrides, lock_timeout)?;
     let allow_external_jsonl =
@@ -1631,6 +1636,7 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         allow_external_jsonl,
         actor: args.actor.clone(),
         issue_prefix: prefix,
+        retention_days,
         history,
         read_snapshot_cache: mcp_read_snapshot_cache_from_env(),
     });
