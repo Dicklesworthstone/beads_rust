@@ -15014,9 +15014,24 @@ fn stream_import_actions_in_tx(
         storage.clear_export_hashes_in_tx(&stale_ids)?;
     }
     tx_result.export_hashes_recorded = export_hash_ids.len();
-    if uncertified_local_wins > 0 {
+    // A restored export can omit an already-flushed local issue entirely.
+    // Such a row never reaches skip certification and has no dirty marker,
+    // but still requires a full export. Use the certified collision targets,
+    // not raw JSONL IDs or the old certificate cache. The metadata map avoids
+    // another database scan when every local ID is already covered; otherwise
+    // one narrow ID query excludes intentionally local ephemerals and wisps.
+    let needs_flush = uncertified_local_wins > 0
+        || (metadata
+            .meta_by_id
+            .keys()
+            .any(|id| !export_hash_ids.contains(id))
+            && storage
+                .get_non_ephemeral_issue_ids()?
+                .iter()
+                .any(|id| !export_hash_ids.contains(id)));
+    if needs_flush {
         tracing::debug!(
-            count = uncertified_local_wins,
+            uncertified_local_wins,
             "Import preserved local records that differ from JSONL; marking database for flush"
         );
         storage.set_metadata_in_tx("needs_flush", "true")?;
@@ -24073,6 +24088,212 @@ mod tests {
             storage.get_metadata("needs_flush").unwrap().as_deref(),
             Some("true")
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_auto_import_restored_export_requires_flush_for_database_only_issues() {
+        for (empty_source, missing_certificates) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+            let retained = make_test_issue("bd-restored-retained", "Already exported issue");
+            storage.create_issue(&retained, "tester").unwrap();
+            let first = auto_flush(
+                &mut storage,
+                &beads_dir,
+                &jsonl_path,
+                false,
+                HistoryConfig::default(),
+            )
+            .unwrap();
+            assert!(first.flushed);
+            let retained_export = read_issues_from_jsonl(&jsonl_path).unwrap().remove(0);
+            let older_jsonl = if empty_source {
+                String::new()
+            } else {
+                fs::read_to_string(&jsonl_path).unwrap()
+            };
+
+            let mut absent = make_test_issue("bd-restored-absent", "Newer local creation");
+            absent.description =
+                Some("This entire issue is absent from the restored export".into());
+            absent.labels = vec!["local-only".to_string()];
+            absent.comments.push(Comment {
+                id: 1,
+                issue_id: absent.id.clone(),
+                author: "tester".to_string(),
+                body: "Keep the local discussion".to_string(),
+                created_at: absent.created_at,
+            });
+            absent.dependencies.push(Dependency {
+                issue_id: absent.id.clone(),
+                depends_on_id: retained.id.clone(),
+                dep_type: DependencyType::Blocks,
+                created_at: absent.created_at,
+                created_by: Some("tester".to_string()),
+                metadata: None,
+                thread_id: None,
+            });
+            storage.create_issue(&absent, "tester").unwrap();
+            let second = auto_flush(
+                &mut storage,
+                &beads_dir,
+                &jsonl_path,
+                false,
+                HistoryConfig::default(),
+            )
+            .unwrap();
+            assert!(second.flushed);
+            assert_eq!(second.exported_count, 2);
+            assert!(storage.get_export_hash(&absent.id).unwrap().is_some());
+            if missing_certificates {
+                storage.clear_all_export_hashes().unwrap();
+            }
+            assert_eq!(
+                pending_export_state(&storage, true).unwrap(),
+                (0, false, false)
+            );
+            let ids = vec![retained.id.clone(), absent.id.clone()];
+            let before = storage.get_issues_for_export(&ids).unwrap();
+            assert!(
+                before
+                    .iter()
+                    .find(|issue| issue.id == retained.id)
+                    .unwrap()
+                    .sync_equals(&retained_export),
+                "every row still present in the older export must match exactly"
+            );
+
+            fs::write(&jsonl_path, &older_jsonl).unwrap();
+            let imported = auto_import_if_stale(
+                &mut storage,
+                &beads_dir,
+                &jsonl_path,
+                Some("bd"),
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+            assert!(imported.attempted);
+            assert_eq!(imported.imported_count, 0);
+            assert_eq!(storage.get_issues_for_export(&ids).unwrap(), before);
+            assert_eq!(fs::read_to_string(&jsonl_path).unwrap(), older_jsonl);
+            assert!(storage.get_export_hash(&absent.id).unwrap().is_none());
+            assert_eq!(
+                storage.get_export_hash(&retained.id).unwrap().is_some(),
+                !empty_source
+            );
+            assert_eq!(
+                pending_export_state(&storage, true).unwrap(),
+                (0, true, true),
+                "empty_source={empty_source}, missing_certificates={missing_certificates}"
+            );
+            let staleness = compute_staleness(&storage, &jsonl_path).unwrap();
+            assert!(!staleness.jsonl_newer);
+            assert!(staleness.db_newer);
+
+            let flushed = auto_flush(
+                &mut storage,
+                &beads_dir,
+                &jsonl_path,
+                false,
+                HistoryConfig::default(),
+            )
+            .unwrap();
+            assert!(
+                flushed.flushed,
+                "a later ordinary flush must restore DB-only issues"
+            );
+            assert_eq!(flushed.exported_count, 2);
+            let exported = read_issues_from_jsonl(&jsonl_path).unwrap();
+            assert_eq!(exported.len(), before.len());
+            for expected in &before {
+                assert!(
+                    exported
+                        .iter()
+                        .find(|issue| issue.id == expected.id)
+                        .unwrap()
+                        .sync_equals(expected),
+                    "the exported issue and all its relations must survive: {}",
+                    expected.id
+                );
+            }
+            assert!(storage.get_export_hash(&absent.id).unwrap().is_some());
+            assert_eq!(
+                pending_export_state(&storage, true).unwrap(),
+                (0, false, false)
+            );
+        }
+    }
+
+    #[test]
+    fn test_import_excluded_local_issues_and_collision_aliases_do_not_require_flush() {
+        for (include_regular, alias_source) in [(false, false), (true, false), (true, true)] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let jsonl_path = temp_dir.path().join("issues.jsonl");
+            let regular = make_test_issue("bd-covered", "Covered by a certified target");
+            let mut ephemeral = make_test_issue("bd-ephemeral", "Intentionally local");
+            ephemeral.ephemeral = true;
+            let wisp = make_test_issue("bd-wisp-hidden", "Wisp without the ephemeral flag");
+            storage.create_issue(&ephemeral, "tester").unwrap();
+            storage.create_issue(&wisp, "tester").unwrap();
+            assert!(!storage.get_issue(&wisp.id).unwrap().unwrap().ephemeral);
+            if include_regular {
+                storage.create_issue(&regular, "tester").unwrap();
+                let mut incoming = storage.get_issue_for_export(&regular.id).unwrap().unwrap();
+                if alias_source {
+                    incoming.id = "bd-alias".to_string();
+                }
+                write_jsonl_issues(&jsonl_path, &[&incoming]);
+            } else {
+                fs::write(&jsonl_path, "").unwrap();
+            }
+            let ids = storage.get_all_ids().unwrap();
+            storage.clear_dirty_issues_legacy(&ids).unwrap();
+            storage.set_metadata("needs_flush", "false").unwrap();
+            // Stale derived rows are not proof that an excluded issue belongs
+            // in JSONL. The regular issue deliberately starts uncertified.
+            storage
+                .set_export_hashes(&[
+                    (
+                        ephemeral.id.clone(),
+                        "stale-ephemeral-certificate".to_string(),
+                    ),
+                    (wisp.id.clone(), "stale-wisp-certificate".to_string()),
+                ])
+                .unwrap();
+            let before = storage.get_issues_for_export(&ids).unwrap();
+
+            let imported = import_from_jsonl(
+                &mut storage,
+                &jsonl_path,
+                &ImportConfig::default(),
+                Some("bd"),
+            )
+            .unwrap();
+            assert_eq!(imported.imported_count, 0);
+            assert_eq!(imported.skipped_count, usize::from(include_regular));
+            assert_eq!(
+                imported.export_hashes_recorded,
+                usize::from(include_regular)
+            );
+            assert_eq!(storage.get_issues_for_export(&ids).unwrap(), before);
+            assert_eq!(
+                pending_export_state(&storage, true).unwrap(),
+                (0, false, false)
+            );
+            assert!(storage.get_export_hash(&ephemeral.id).unwrap().is_none());
+            assert!(storage.get_export_hash(&wisp.id).unwrap().is_none());
+            assert_eq!(
+                storage.get_export_hash(&regular.id).unwrap().is_some(),
+                include_regular
+            );
+            assert!(storage.get_issue("bd-alias").unwrap().is_none());
+        }
     }
 
     #[test]
