@@ -63,6 +63,30 @@ const DEFAULT_BUSY_TIMEOUT_MS: u64 = 0;
 const SQLITE_VAR_LIMIT: usize = 900;
 const REDUNDANT_LABEL_COVERAGE_MIN_CANDIDATES: usize = 8_192;
 
+/// Narrow row locations for comparing skipped imports without repeated table scans.
+///
+/// This lookup belongs to the active transaction that built it. It must be
+/// discarded before that transaction ends or any issue, label, dependency, or
+/// comment changes. Metadata and export-hash writes do not invalidate it.
+#[derive(Debug)]
+pub(crate) struct ImportIssueLookup {
+    issue_rowids: HashMap<String, i64>,
+    label_rowids: HashMap<String, Vec<i64>>,
+    dependency_rowids: HashMap<String, Vec<i64>>,
+    comment_rowids: HashMap<String, Vec<i64>>,
+}
+
+impl ImportIssueLookup {
+    fn relation_rowids(owners: &HashMap<String, Vec<i64>>, issues: &[Issue]) -> Vec<i64> {
+        issues
+            .iter()
+            .filter_map(|issue| owners.get(&issue.id))
+            .flatten()
+            .copied()
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ListRelationMetadata {
     pub(crate) labels: Vec<String>,
@@ -19551,6 +19575,186 @@ fn escape_like_pattern(s: &str) -> String {
 // ============================================================================
 
 impl SqliteStorage {
+    /// Build one narrow row-location index per table for a stable import transaction.
+    ///
+    /// The canonical runtime schema uses ordinary rowid tables, with no column
+    /// shadowing `rowid`. Reading only rowids and owners avoids decoding payloads
+    /// of unrelated issues, including malformed legacy timestamps.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error outside a transaction or if a database query fails.
+    pub(crate) fn build_import_issue_lookup(&self) -> Result<ImportIssueLookup> {
+        if !self.conn.as_async().in_transaction() {
+            return Err(BeadsError::internal(
+                "import issue lookup requires an active transaction",
+            ));
+        }
+
+        let mut issue_rowids = HashMap::new();
+        for row in self.conn.query("SELECT rowid, id FROM issues")? {
+            let Some(id) = row.get(1).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let rowid = row
+                .get(0)
+                .and_then(SqliteValue::as_integer)
+                .ok_or_else(|| BeadsError::internal("issue lookup row has no integer rowid"))?;
+            if issue_rowids.insert(id.to_string(), rowid).is_some() {
+                return Err(BeadsError::internal(format!(
+                    "import issue lookup found duplicate issue ID {id:?}"
+                )));
+            }
+        }
+
+        Ok(ImportIssueLookup {
+            issue_rowids,
+            label_rowids: self.import_relation_rowids("labels")?,
+            dependency_rowids: self.import_relation_rowids("dependencies")?,
+            comment_rowids: self.import_relation_rowids("comments")?,
+        })
+    }
+
+    fn import_relation_rowids(&self, table: &str) -> Result<HashMap<String, Vec<i64>>> {
+        let mut owners: HashMap<String, Vec<i64>> = HashMap::new();
+        for row in self
+            .conn
+            .query(&format!("SELECT rowid, issue_id FROM {table}"))?
+        {
+            let Some(owner) = row.get(1).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let rowid = row
+                .get(0)
+                .and_then(SqliteValue::as_integer)
+                .ok_or_else(|| {
+                    BeadsError::internal(format!("{table} lookup row has no integer rowid"))
+                })?;
+            owners.entry(owner.to_string()).or_default().push(rowid);
+        }
+        Ok(owners)
+    }
+
+    /// Hydrate the requested issues and synced relations through integer rowid seeks.
+    ///
+    /// Each existing ID is returned once; missing IDs are omitted and output order
+    /// is unspecified. Ephemeral issues and wisps are included just as they are in
+    /// `get_issues_for_export`. Close-policy audit is omitted because `sync_equals`
+    /// does not compare it.
+    ///
+    /// `lookup` must have been built in this same active transaction, without any
+    /// intervening issue or relation writes. An import containing mutations must
+    /// use the ordinary export lookup instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error outside a transaction, on a database failure, or if a
+    /// requested issue or relation cannot be decoded.
+    pub(crate) fn get_issues_for_import_comparison(
+        &self,
+        ids: &[String],
+        lookup: &ImportIssueLookup,
+    ) -> Result<Vec<Issue>> {
+        if !self.conn.as_async().in_transaction() {
+            return Err(BeadsError::internal(
+                "import issue comparison requires an active transaction",
+            ));
+        }
+
+        let mut seen = HashSet::new();
+        let issue_rowids: Vec<i64> = ids
+            .iter()
+            .filter(|id| seen.insert(id.as_str()))
+            .filter_map(|id| lookup.issue_rowids.get(id).copied())
+            .collect();
+        let mut issues: Vec<Issue> = self
+            .import_comparison_rows(
+                "issues",
+                "id, content_hash, title, description, design, acceptance_criteria, notes,
+                 status, priority, issue_type, assignee, owner, estimated_minutes,
+                 created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
+                 due_at, defer_until, external_ref, source_system, source_repo,
+                 deleted_at, deleted_by, delete_reason, original_type,
+                 compaction_level, compacted_at, compacted_at_commit, original_size,
+                 sender, ephemeral, pinned, is_template, source_repo_path, agent_context,
+                 prerequisites",
+                &issue_rowids,
+            )?
+            .iter()
+            .map(Self::issue_from_row)
+            .collect::<Result<_>>()?;
+        let positions: HashMap<String, usize> = issues
+            .iter()
+            .enumerate()
+            .map(|(index, issue)| (issue.id.clone(), index))
+            .collect();
+
+        for row in self.import_comparison_rows(
+            "labels",
+            "issue_id, label",
+            &ImportIssueLookup::relation_rowids(&lookup.label_rowids, &issues),
+        )? {
+            let owner = row.get(0).and_then(SqliteValue::as_text).unwrap_or("");
+            let label = row.get(1).and_then(SqliteValue::as_text).unwrap_or("");
+            if let Some(&index) = positions.get(owner) {
+                issues[index].labels.push(label.to_string());
+            }
+        }
+        for row in self.import_comparison_rows(
+            "dependencies",
+            "issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id",
+            &ImportIssueLookup::relation_rowids(&lookup.dependency_rowids, &issues),
+        )? {
+            let dependency = import_dependency_from_row(&row)?;
+            if let Some(&index) = positions.get(&dependency.issue_id) {
+                issues[index].dependencies.push(dependency);
+            }
+        }
+        for row in self.import_comparison_rows(
+            "comments",
+            "id, issue_id, author, text, created_at",
+            &ImportIssueLookup::relation_rowids(&lookup.comment_rowids, &issues),
+        )? {
+            let comment = comment_from_row(&row)?;
+            if let Some(&index) = positions.get(&comment.issue_id) {
+                issues[index].comments.push(comment);
+            }
+        }
+
+        for issue in &mut issues {
+            issue.labels.sort();
+            issue.labels.dedup();
+            issue
+                .dependencies
+                .sort_by(|left, right| left.depends_on_id.cmp(&right.depends_on_id));
+            issue.comments.sort_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+        }
+        Ok(issues)
+    }
+
+    fn import_comparison_rows(
+        &self,
+        table: &str,
+        columns: &str,
+        rowids: &[i64],
+    ) -> Result<Vec<Row>> {
+        let mut rows = Vec::with_capacity(rowids.len());
+        for chunk in rowids.chunks(SQLITE_VAR_LIMIT) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            // The pinned engine seeks bound INTEGER rowid IN predicates. TEXT
+            // owner IN predicates, or adding ORDER BY here, fall back to scans.
+            // Keep ordering in Rust so every hydration visits only these rows.
+            let sql = format!("SELECT {columns} FROM {table} WHERE rowid IN ({placeholders})");
+            let params: Vec<SqliteValue> = chunk.iter().copied().map(SqliteValue::from).collect();
+            rows.extend(self.conn.query_with_params(&sql, &params)?);
+        }
+        Ok(rows)
+    }
+
     /// Get issue with all relations populated for export.
     ///
     /// Includes labels, dependencies, and comments.
@@ -21822,6 +22026,39 @@ fn fetch_comment(conn: &Connection, comment_id: i64) -> Result<Comment> {
         Err(error) => return Err(error.into()),
     };
     comment_from_row(&row)
+}
+
+fn import_dependency_from_row(row: &Row) -> Result<Dependency> {
+    Ok(Dependency {
+        issue_id: row
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("")
+            .to_string(),
+        depends_on_id: row
+            .get(1)
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("")
+            .to_string(),
+        dep_type: row
+            .get(2)
+            .and_then(SqliteValue::as_text)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DependencyType::Blocks),
+        created_at: parse_datetime_value(row.get(3))?,
+        created_by: row
+            .get(4)
+            .and_then(SqliteValue::as_text)
+            .map(str::to_string),
+        metadata: row
+            .get(5)
+            .and_then(SqliteValue::as_text)
+            .map(str::to_string),
+        thread_id: row
+            .get(6)
+            .and_then(SqliteValue::as_text)
+            .map(str::to_string),
+    })
 }
 
 fn comment_from_row(row: &Row) -> Result<Comment> {
@@ -28267,6 +28504,235 @@ required_fields:
         );
         let fk = rebuilt.conn.query("PRAGMA foreign_key_check").unwrap();
         assert!(fk.is_empty(), "restore left FK violations: {fk:?}");
+    }
+
+    #[test]
+    fn test_import_issue_lookup_matches_targeted_export_with_relations() -> Result<()> {
+        let mut storage = SqliteStorage::open_memory()?;
+        storage.with_write_transaction(|storage| {
+            execute_batch(
+                &storage.conn,
+                r#"
+                INSERT INTO issues (rowid, id, title) VALUES
+                    (31, 'bd-z', 'Full relations'),
+                    (-8, 'bd-a', 'Defaults'),
+                    (97, 'bd-wisp-test', 'Wisp'),
+                    (212, 'bd-ephemeral', 'Ephemeral'),
+                    (42, 'bd-unrequested', 'Not requested');
+                UPDATE issues SET ephemeral = 1 WHERE id = 'bd-ephemeral';
+                UPDATE issues SET description = 'description', design = 'design',
+                    acceptance_criteria = 'criteria', notes = 'notes',
+                    prerequisites = '- [x] input', owner = 'owner',
+                    estimated_minutes = 37, created_by = 'creator',
+                    due_at = '2026-11-02T03:04:05Z', defer_until = '2026-10-02T03:04:05Z',
+                    external_ref = 'https://example.invalid/535', source_system = 'peer',
+                    source_repo = '/repo', source_repo_path = '/local/repo',
+                    compaction_level = 2, compacted_at = '2026-09-01T00:00:00Z',
+                    compacted_at_commit = 'abc123', original_size = 1234,
+                    sender = 'sender', pinned = 1, is_template = 1,
+                    agent_context = '{"scope":"test"}'
+                    WHERE id = 'bd-z';
+                INSERT INTO labels (rowid, issue_id, label) VALUES
+                    (101, 'bd-z', 'z-last'), (-11, 'bd-a', 'other'),
+                    (3, 'bd-z', 'a-first'), (65, 'bd-unrequested', 'unrelated');
+                INSERT INTO dependencies
+                    (rowid, issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id)
+                    VALUES
+                    (78, 'bd-z', 'external-z', 'waits-for', '2026-01-02T00:00:00Z',
+                        'alice', '{"gate":"all"}', 'thread-z'),
+                    (-3, 'bd-z', 'external-a', 'custom-type', '2026-01-01T00:00:00Z',
+                        'bob', NULL, NULL),
+                    (15, 'bd-a', 'external-default', 'blocks', '2026-01-01T00:00:00Z',
+                        '', '{}', '');
+                INSERT INTO comments (id, issue_id, author, text, created_at) VALUES
+                    (91, 'bd-z', 'alice', 'Later', '2026-02-02T00:00:00Z'),
+                    (55, 'bd-z', 'bob', 'Same time, later ID', '2026-02-01T00:00:00Z'),
+                    (7, 'bd-z', 'alice', 'First', '2026-02-01T00:00:00Z'),
+                    (103, 'bd-a', 'other', 'Other issue', '2026-01-01T00:00:00Z');
+                "#,
+            )?;
+            let ids = [
+                "bd-z", "bd-wisp-test", "bd-missing", "bd-a", "bd-z", "bd-ephemeral", "bd-a",
+            ]
+            .map(str::to_string);
+            let mut expected = storage.get_issues_for_export(&ids)?;
+            let lookup = storage.build_import_issue_lookup()?;
+            assert_eq!(lookup.issue_rowids.get("bd-a"), Some(&-8));
+            assert_eq!(lookup.label_rowids.get("bd-a"), Some(&vec![-11]));
+            assert_eq!(lookup.dependency_rowids.get("bd-a"), Some(&vec![15]));
+            assert_eq!(lookup.comment_rowids.get("bd-a"), Some(&vec![103]));
+
+            let mut actual = storage.get_issues_for_import_comparison(&ids, &lookup)?;
+            expected.sort_by(|left, right| left.id.cmp(&right.id));
+            actual.sort_by(|left, right| left.id.cmp(&right.id));
+            assert_eq!(actual.len(), 4);
+            assert_eq!(actual, expected);
+            let full = actual.iter().find(|issue| issue.id == "bd-z").unwrap();
+            assert_eq!(full.labels, ["a-first", "z-last"]);
+            assert_eq!(full.dependencies[0].depends_on_id, "external-a");
+            assert_eq!(
+                full.comments.iter().map(|comment| comment.id).collect::<Vec<_>>(),
+                [7, 55, 91]
+            );
+            assert!(storage.get_issues_for_import_comparison(&[], &lookup)?.is_empty());
+            assert!(
+                storage
+                    .get_issues_for_import_comparison(&["bd-missing".to_string()], &lookup)?
+                    .is_empty()
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_import_issue_lookup_chunks_issue_and_relation_rowids() -> Result<()> {
+        const ROW_COUNT: usize = SQLITE_VAR_LIMIT + 1;
+        let mut storage = SqliteStorage::open_memory()?;
+        storage.with_write_transaction(|storage| {
+            let issue_values = (0..ROW_COUNT)
+                .map(|index| format!("({}, 'bd-row-{index:04}', 'Issue {index}')", index * 7 + 13))
+                .collect::<Vec<_>>()
+                .join(",");
+            storage.conn.execute(&format!(
+                "INSERT INTO issues (rowid, id, title) VALUES {issue_values}"
+            ))?;
+            // One owner has more relations than a SQL bind batch. Sparse rowids
+            // and reverse insertion order keep owner IDs and row locations distinct.
+            let label_values = (0..ROW_COUNT)
+                .rev()
+                .map(|index| format!("({}, 'bd-row-0000', 'label-{index:04}')", index * 5 + 9))
+                .collect::<Vec<_>>()
+                .join(",");
+            storage.conn.execute(&format!(
+                "INSERT INTO labels (rowid, issue_id, label) VALUES {label_values}"
+            ))?;
+            let dependency_values = (0..ROW_COUNT)
+                .rev()
+                .map(|index| format!("({}, 'bd-row-0000', 'external-{index:04}')", index * 3 + 2))
+                .collect::<Vec<_>>()
+                .join(",");
+            storage.conn.execute(&format!(
+                "INSERT INTO dependencies (rowid, issue_id, depends_on_id) VALUES {dependency_values}"
+            ))?;
+            let comment_values = (0..ROW_COUNT)
+                .rev()
+                .map(|index| {
+                    format!(
+                        "({}, 'bd-row-0000', 'author', 'Comment {index}', '2026-01-01T00:00:00Z')",
+                        index * 11 + 1
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            storage.conn.execute(&format!(
+                "INSERT INTO comments (id, issue_id, author, text, created_at) VALUES {comment_values}"
+            ))?;
+
+            let mut ids: Vec<String> = (0..ROW_COUNT)
+                .rev()
+                .map(|index| format!("bd-row-{index:04}"))
+                .collect();
+            let mut expected = storage.get_issues_for_export(&ids)?;
+            // Duplicates on both sides of the bind boundary must not duplicate
+            // issues or their relations in the comparison result.
+            ids.extend(["bd-row-0000".to_string(), "bd-row-0900".to_string()]);
+            let lookup = storage.build_import_issue_lookup()?;
+            let mut actual = storage.get_issues_for_import_comparison(&ids, &lookup)?;
+            expected.sort_by(|left, right| left.id.cmp(&right.id));
+            actual.sort_by(|left, right| left.id.cmp(&right.id));
+            assert_eq!(actual.len(), ROW_COUNT);
+            assert_eq!(actual[0].labels.len(), ROW_COUNT);
+            assert_eq!(actual[0].dependencies.len(), ROW_COUNT);
+            assert_eq!(actual[0].comments.len(), ROW_COUNT);
+            assert_eq!(actual, expected);
+            let single = storage.get_issues_for_import_comparison(
+                &["bd-row-0000".to_string()],
+                &lookup,
+            )?;
+            assert_eq!(single.len(), 1);
+            assert_eq!(single[0], actual[0]);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_import_issue_lookup_only_decodes_requested_payloads() -> Result<()> {
+        let mut storage = SqliteStorage::open_memory()?;
+        storage.with_write_transaction(|storage| {
+            execute_batch(
+                &storage.conn,
+                "INSERT INTO issues (id, title) VALUES
+                    ('bd-good', 'Good'), ('bd-bad-issue', 'Bad issue'),
+                    ('bd-bad-comment', 'Bad comment'), ('bd-bad-dependency', 'Bad dependency');
+                 UPDATE issues SET created_at = 'invalid issue date' WHERE id = 'bd-bad-issue';
+                 INSERT INTO comments (issue_id, author, text, created_at)
+                    VALUES ('bd-bad-comment', 'author', 'Body', 'invalid comment date');
+                 INSERT INTO dependencies (issue_id, depends_on_id, created_at)
+                    VALUES ('bd-bad-dependency', 'external-target', 'invalid dependency date');",
+            )?;
+            let lookup = storage.build_import_issue_lookup()?;
+            let ids = ["bd-good".to_string()];
+            let actual = storage.get_issues_for_import_comparison(&ids, &lookup)?;
+            let expected = storage.get_issues_for_export(&ids)?;
+            assert_eq!(actual, expected);
+            for id in ["bd-bad-issue", "bd-bad-comment", "bd-bad-dependency"] {
+                let ids = [id.to_string()];
+                assert!(storage.get_issues_for_export(&ids).is_err(), "{id}");
+                assert!(
+                    storage
+                        .get_issues_for_import_comparison(&ids, &lookup)
+                        .is_err(),
+                    "a requested malformed payload must still fail: {id}"
+                );
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_import_issue_lookup_ignores_close_audit_only_differences() -> Result<()> {
+        let mut storage = SqliteStorage::open_memory()?;
+        storage.with_write_transaction(|storage| {
+            execute_batch(
+                &storage.conn,
+                r#"INSERT INTO issues (id, title, status, closed_at)
+                    VALUES ('bd-audit', 'Closed', 'closed', '2026-01-01T00:00:00Z');
+                   INSERT INTO close_metadata
+                    (issue_id, bypassed_policy, bypass_reason, policy_gates_fired)
+                    VALUES ('bd-audit', 1, 'local audit', '["local_gate"]');"#,
+            )?;
+            let ids = ["bd-audit".to_string()];
+            let expected = storage.get_issues_for_export(&ids)?;
+            let lookup = storage.build_import_issue_lookup()?;
+            // Receipt updates may happen while comparing subsequent import batches.
+            // They do not alter any row locations stored by the lookup.
+            storage.conn.execute(
+                "INSERT INTO export_hashes (issue_id, content_hash, exported_at)
+                 VALUES ('bd-audit', 'receipt', '2026-01-02T00:00:00Z')",
+            )?;
+            let actual = storage.get_issues_for_import_comparison(&ids, &lookup)?;
+            assert_eq!(expected[0].bypassed_policy, Some(true));
+            assert_eq!(expected[0].bypass_reason.as_deref(), Some("local audit"));
+            assert_eq!(actual[0].bypassed_policy, None);
+            assert_eq!(actual[0].bypass_reason, None);
+            assert_eq!(actual[0].policy_gates_fired, None);
+            assert!(actual[0].sync_equals(&expected[0]));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_import_issue_lookup_requires_active_transaction() -> Result<()> {
+        let mut storage = SqliteStorage::open_memory()?;
+        assert!(storage.build_import_issue_lookup().is_err());
+        let lookup =
+            storage.with_write_transaction(|storage| storage.build_import_issue_lookup())?;
+        assert!(
+            storage
+                .get_issues_for_import_comparison(&[], &lookup)
+                .is_err()
+        );
+        Ok(())
     }
 
     /// GitHub #474: a bypassed close must travel through the JSONL export

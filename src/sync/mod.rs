@@ -70,6 +70,7 @@ pub(crate) use path::{
 
 use crate::error::{BeadsError, Result};
 use crate::model::{Comment, Dependency, DependencyType, Issue};
+use crate::storage::sqlite::ImportIssueLookup;
 use crate::storage::{EventAttribution, SqliteStorage};
 use crate::sync::history::HistoryConfig;
 use crate::util::id::{IdConfig, IdGenerator, parse_id};
@@ -14777,6 +14778,7 @@ fn export_hash_entry_for_import_action(
 /// local comments or fields excluded from that hash (GitHub #535).
 fn certify_skipped_imports(
     storage: &SqliteStorage,
+    lookup: Option<&ImportIssueLookup>,
     skipped: &mut Vec<(String, Issue, String)>,
     hashes: &mut Vec<(String, String)>,
     ids: &mut HashSet<String>,
@@ -14788,11 +14790,13 @@ fn certify_skipped_imports(
         .iter()
         .map(|(id, _, _)| id.clone())
         .collect::<Vec<_>>();
-    let stored = storage
-        .get_issues_for_export(&target_ids)?
-        .into_iter()
-        .map(|issue| (issue.id.clone(), issue))
-        .collect::<HashMap<_, _>>();
+    let stored = match lookup {
+        Some(lookup) => storage.get_issues_for_import_comparison(&target_ids, lookup)?,
+        None => storage.get_issues_for_export(&target_ids)?,
+    }
+    .into_iter()
+    .map(|issue| (issue.id.clone(), issue))
+    .collect::<HashMap<_, _>>();
     let mut uncertified = 0;
     for (id, incoming, hash) in skipped.drain(..) {
         if skipped_import_matches_stored_issue(stored.get(&id), &id, &incoming) {
@@ -14804,6 +14808,64 @@ fn certify_skipped_imports(
         }
     }
     Ok(uncertified)
+}
+
+/// Load the derived certificate table once for a skip-only import. These hashes
+/// only avoid redundant writes after full payload certification; they never
+/// decide whether a skipped issue matches the source.
+fn load_import_export_hashes(storage: &SqliteStorage) -> Result<HashMap<String, String>> {
+    let mut hashes = HashMap::new();
+    for row in storage
+        .execute_raw_query("SELECT issue_id, content_hash, exported_at FROM export_hashes")?
+    {
+        let [
+            SqliteValue::Text(id),
+            SqliteValue::Text(hash),
+            SqliteValue::Text(_),
+        ] = row.as_slice()
+        else {
+            // Ordinary import has always rebuilt this derived table, including
+            // malformed cache rows. Preserve that repair behavior without
+            // swallowing a query error or trusting an incomplete cache.
+            storage.clear_all_export_hashes_in_tx()?;
+            return Ok(HashMap::new());
+        };
+        if hashes
+            .insert(id.as_str().to_string(), hash.as_str().to_string())
+            .is_some()
+        {
+            storage.clear_all_export_hashes_in_tx()?;
+            return Ok(HashMap::new());
+        }
+    }
+    Ok(hashes)
+}
+
+fn write_import_export_hash_batch(
+    storage: &SqliteStorage,
+    batch: &mut Vec<(String, String)>,
+    current: Option<&mut HashMap<String, String>>,
+) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let Some(current) = current else {
+        storage.insert_export_hashes_after_clear_in_tx(batch)?;
+        batch.clear();
+        return Ok(());
+    };
+
+    let mut changed = Vec::new();
+    for (id, hash) in batch.drain(..) {
+        if current.get(&id) != Some(&hash) {
+            current.insert(id.clone(), hash.clone());
+            changed.push((id, hash));
+        }
+    }
+    if !changed.is_empty() {
+        storage.set_export_hashes_in_tx(&changed)?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -14828,13 +14890,27 @@ fn stream_import_actions_in_tx(
     let stream_started = Instant::now();
 
     progress.set_position(0);
-    storage.clear_all_export_hashes_in_tx()?;
     // Comment IDs are globally unique. Release every comment row owned by an
     // issue this transaction will replace before replaying any individual
     // issue, so authoritative IDs can move between those issues without the
     // result depending on JSONL line order. The enclosing transaction restores
     // all rows if a later action or semantic verification fails.
     storage.delete_comments_for_import_issue_ids_in_tx(comment_owner_ids_to_replace)?;
+    // The collision scan records every insert/update in this list. An empty
+    // list proves the immutable source will only skip rows using the same
+    // frozen classification metadata. Build the row-location index once in
+    // this transaction; mixed imports keep their ordered, live-state reads.
+    let skip_lookup = if comment_owner_ids_to_replace.is_empty() {
+        Some(storage.build_import_issue_lookup()?)
+    } else {
+        None
+    };
+    let mut current_export_hashes = if skip_lookup.is_some() {
+        Some(load_import_export_hashes(storage)?)
+    } else {
+        storage.clear_all_export_hashes_in_tx()?;
+        None
+    };
 
     for_each_jsonl_import_issue(
         source,
@@ -14869,6 +14945,7 @@ fn stream_import_actions_in_tx(
             if !matches!(action, CollisionAction::Skip { .. }) {
                 uncertified_local_wins += certify_skipped_imports(
                     storage,
+                    skip_lookup.as_ref(),
                     &mut skipped,
                     &mut export_hash_batch,
                     &mut export_hash_ids,
@@ -14895,14 +14972,18 @@ fn stream_import_actions_in_tx(
             if skipped.len() >= IMPORT_SKIP_CERTIFICATION_BATCH_SIZE {
                 uncertified_local_wins += certify_skipped_imports(
                     storage,
+                    skip_lookup.as_ref(),
                     &mut skipped,
                     &mut export_hash_batch,
                     &mut export_hash_ids,
                 )?;
             }
             if export_hash_batch.len() >= IMPORT_EXPORT_HASH_BATCH_SIZE {
-                storage.insert_export_hashes_after_clear_in_tx(&export_hash_batch)?;
-                export_hash_batch.clear();
+                write_import_export_hash_batch(
+                    storage,
+                    &mut export_hash_batch,
+                    current_export_hashes.as_mut(),
+                )?;
             }
 
             progress.inc(1);
@@ -14912,12 +14993,25 @@ fn stream_import_actions_in_tx(
 
     uncertified_local_wins += certify_skipped_imports(
         storage,
+        skip_lookup.as_ref(),
         &mut skipped,
         &mut export_hash_batch,
         &mut export_hash_ids,
     )?;
-    if !export_hash_batch.is_empty() {
-        storage.insert_export_hashes_after_clear_in_tx(&export_hash_batch)?;
+    write_import_export_hash_batch(
+        storage,
+        &mut export_hash_batch,
+        current_export_hashes.as_mut(),
+    )?;
+    if let Some(current) = current_export_hashes {
+        // A previous certificate is not evidence for this import. Drop rows
+        // absent from the source and rows whose newer local payload did not
+        // match, even when their narrow content hash is unchanged.
+        let stale_ids = current
+            .into_keys()
+            .filter(|id| !export_hash_ids.contains(id))
+            .collect::<Vec<_>>();
+        storage.clear_export_hashes_in_tx(&stale_ids)?;
     }
     tx_result.export_hashes_recorded = export_hash_ids.len();
     if uncertified_local_wins > 0 {
@@ -16038,6 +16132,19 @@ fn run_reconcile_apply_tx(
     let mut applied_ids: Vec<String> = Vec::new();
     let mut action_index = 0usize;
     let mut skipped = Vec::new();
+    let skip_lookup = if !plan.actions.is_empty()
+        && plan.actions.iter().all(|action| {
+            matches!(
+                action.kind,
+                ReconcileActionKind::SkipOlder
+                    | ReconcileActionKind::SkipEqual
+                    | ReconcileActionKind::SkipTombstone
+            )
+        }) {
+        Some(storage.build_import_issue_lookup()?)
+    } else {
+        None
+    };
 
     let source = capture_jsonl_source_snapshot(input_path)?;
     let (record_count, ephemeral_skipped) = for_each_reconcile_classified_row(
@@ -16069,6 +16176,7 @@ fn run_reconcile_apply_tx(
             if !matches!(action, CollisionAction::Skip { .. }) {
                 outcome.uncertified_local_wins += certify_skipped_imports(
                     storage,
+                    skip_lookup.as_ref(),
                     &mut skipped,
                     &mut export_hash_batch,
                     &mut export_hash_ids,
@@ -16099,6 +16207,7 @@ fn run_reconcile_apply_tx(
             if skipped.len() >= IMPORT_SKIP_CERTIFICATION_BATCH_SIZE {
                 outcome.uncertified_local_wins += certify_skipped_imports(
                     storage,
+                    skip_lookup.as_ref(),
                     &mut skipped,
                     &mut export_hash_batch,
                     &mut export_hash_ids,
@@ -16116,6 +16225,7 @@ fn run_reconcile_apply_tx(
 
     outcome.uncertified_local_wins += certify_skipped_imports(
         storage,
+        skip_lookup.as_ref(),
         &mut skipped,
         &mut export_hash_batch,
         &mut export_hash_ids,
@@ -23966,6 +24076,113 @@ mod tests {
     }
 
     #[test]
+    fn test_skip_only_import_reconciles_certificates_without_rewriting_matches() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+        let unchanged = make_test_issue("bd-cert-unchanged", "Unchanged certificate");
+        let ahead = make_test_issue("bd-cert-ahead", "Local comment differs");
+        let stale = make_test_issue("bd-cert-stale", "Repair cached hash");
+        let absent = make_test_issue("bd-cert-absent", "Only in the database");
+        write_jsonl_issues(&jsonl_path, &[&unchanged, &ahead, &stale, &absent]);
+        import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+
+        let comment = storage
+            .add_comment(&ahead.id, "local", "Keep this comment")
+            .unwrap();
+        storage
+            .set_export_hashes(&[
+                (ahead.id.clone(), crate::util::content_hash(&ahead)),
+                (stale.id.clone(), "outdated-cache-entry".to_string()),
+            ])
+            .unwrap();
+        storage
+            .execute_raw("UPDATE export_hashes SET exported_at = '2020-01-01T00:00:00Z'")
+            .unwrap();
+        let certificate_before = storage
+            .execute_raw_query(
+                "SELECT rowid, issue_id, content_hash, exported_at FROM export_hashes WHERE issue_id = 'bd-cert-unchanged'",
+            )
+            .unwrap();
+        storage.set_metadata("needs_flush", "false").unwrap();
+        write_jsonl_issues(&jsonl_path, &[&unchanged, &ahead, &stale]);
+
+        let result = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+
+        assert_eq!(result.imported_count, 0);
+        assert_eq!(result.skipped_count, 3);
+        assert_eq!(result.export_hashes_recorded, 2);
+        assert_eq!(
+            storage
+                .execute_raw_query(
+                    "SELECT rowid, issue_id, content_hash, exported_at FROM export_hashes WHERE issue_id = 'bd-cert-unchanged'",
+                )
+                .unwrap(),
+            certificate_before,
+            "a certified no-op must retain the existing certificate row and timestamp"
+        );
+        assert_eq!(
+            storage.get_export_hash(&stale.id).unwrap().unwrap().0,
+            crate::util::content_hash(&stale)
+        );
+        assert!(storage.get_export_hash(&ahead.id).unwrap().is_none());
+        assert!(storage.get_export_hash(&absent.id).unwrap().is_none());
+        assert!(storage.get_issue(&absent.id).unwrap().is_some());
+        assert_eq!(storage.get_comments(&ahead.id).unwrap(), vec![comment]);
+        assert_eq!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn test_skip_only_import_repairs_malformed_certificate_cache() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+        let issue = make_test_issue("bd-cert-malformed", "Repair derived cache");
+        write_jsonl_issues(&jsonl_path, &[&issue]);
+        import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+        for malformed_cache in [
+            "UPDATE export_hashes SET content_hash = X'ff00'",
+            "UPDATE export_hashes SET exported_at = X'ff00'",
+        ] {
+            storage.execute_raw(malformed_cache).unwrap();
+            let result = import_from_jsonl(
+                &mut storage,
+                &jsonl_path,
+                &ImportConfig::default(),
+                Some("bd-"),
+            )
+            .unwrap();
+            assert_eq!(result.imported_count, 0);
+            assert_eq!(result.skipped_count, 1);
+            assert_eq!(result.export_hashes_recorded, 1);
+            let (hash, exported_at) = storage.get_export_hash(&issue.id).unwrap().unwrap();
+            assert_eq!(hash, crate::util::content_hash(&issue));
+            assert!(DateTime::parse_from_rfc3339(&exported_at).is_ok());
+        }
+    }
+
+    #[test]
     fn test_skip_certification_compares_full_payload_even_with_equal_content_hash() {
         let incoming = make_test_issue("bd-full-payload", "Equal content hash");
         let mut stored = incoming.clone();
@@ -23995,6 +24212,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     #[ignore = "timing comparison; run on a quiet host with --nocapture"]
     fn test_skip_certification_scaling_against_per_row_reload() {
         // Keep the incumbent live in the same invocation. This is a bounded
@@ -24022,42 +24240,68 @@ mod tests {
             )
             .unwrap();
 
-            let start = Instant::now();
-            for issue in &incoming {
-                let stored = storage.get_issue_for_export(&issue.id).unwrap();
-                assert!(skipped_import_matches_stored_issue(
-                    stored.as_ref(),
-                    &issue.id,
-                    issue
-                ));
-            }
-            let incumbent = start.elapsed();
-            let mut skipped = incoming
-                .iter()
-                .map(|issue| {
-                    (
-                        issue.id.clone(),
-                        issue.clone(),
-                        crate::util::content_hash(issue),
-                    )
+            let (incumbent, batched, indexed) = storage
+                .with_read_transaction(|storage| {
+                    let start = Instant::now();
+                    for issue in &incoming {
+                        let stored = storage.get_issue_for_export(&issue.id).unwrap();
+                        assert!(skipped_import_matches_stored_issue(
+                            stored.as_ref(),
+                            &issue.id,
+                            issue
+                        ));
+                    }
+                    let incumbent = start.elapsed();
+                    let certify = |lookup: Option<&ImportIssueLookup>| {
+                        let mut hashes = Vec::new();
+                        let mut ids = HashSet::new();
+                        for chunk in incoming.chunks(IMPORT_SKIP_CERTIFICATION_BATCH_SIZE) {
+                            let mut skipped = chunk
+                                .iter()
+                                .map(|issue| {
+                                    (
+                                        issue.id.clone(),
+                                        issue.clone(),
+                                        crate::util::content_hash(issue),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            assert_eq!(
+                                certify_skipped_imports(
+                                    storage,
+                                    lookup,
+                                    &mut skipped,
+                                    &mut hashes,
+                                    &mut ids,
+                                )
+                                .unwrap(),
+                                0
+                            );
+                            assert!(skipped.is_empty());
+                        }
+                        assert_eq!(hashes.len(), count);
+                    };
+                    let start = Instant::now();
+                    certify(None);
+                    let batched = start.elapsed();
+                    let start = Instant::now();
+                    let lookup = storage.build_import_issue_lookup()?;
+                    certify(Some(&lookup));
+                    Ok((incumbent, batched, start.elapsed()))
                 })
-                .collect::<Vec<_>>();
-            let mut hashes = Vec::new();
-            let mut ids = HashSet::new();
-            let start = Instant::now();
-            assert_eq!(
-                certify_skipped_imports(&storage, &mut skipped, &mut hashes, &mut ids).unwrap(),
-                0
+                .unwrap();
+            eprintln!(
+                "issues={count} per_row={incumbent:?} text_id_batch={batched:?} rowid_batch={indexed:?}"
             );
-            let batched = start.elapsed();
-            assert_eq!(hashes.len(), count);
-            assert!(skipped.is_empty());
-            eprintln!("issues={count} per_row={incumbent:?} batched={batched:?}");
-            timings.push(batched);
+            timings.push(indexed);
             if count == 2435 {
                 assert!(
-                    batched < incumbent,
+                    indexed < incumbent,
                     "batch must beat the live per-row baseline"
+                );
+                assert!(
+                    indexed < batched,
+                    "rowid lookup must beat the live text-ID batch"
                 );
             }
             let start = Instant::now();

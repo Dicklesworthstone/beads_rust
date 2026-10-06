@@ -558,11 +558,7 @@ fn read_legacy_issues(
     let mut ids = HashSet::new();
     for row in rows {
         let values: Vec<SqliteValue> = row.values().to_vec();
-        let id = required_legacy_text(
-            column_value(issue_columns, &values, "id"),
-            "issues",
-            "id",
-        )?;
+        let id = required_legacy_text(column_value(issue_columns, &values, "id"), "issues", "id")?;
         if !ids.insert(id.clone()) {
             return Err(BeadsError::Config(
                 "duplicate legacy issue ids cannot be preserved by schema healing".to_string(),
@@ -593,11 +589,7 @@ fn read_legacy_issues(
     Ok(issues)
 }
 
-fn required_legacy_text(
-    value: Option<&SqliteValue>,
-    table: &str,
-    column: &str,
-) -> Result<String> {
+fn required_legacy_text(value: Option<&SqliteValue>, table: &str, column: &str) -> Result<String> {
     value
         .and_then(SqliteValue::as_text)
         .filter(|text| !text.trim().is_empty())
@@ -690,10 +682,8 @@ fn decode_issue(
                 }
                 // Legacy optional timestamps may be empty, but a populated
                 // value that cannot be decoded is data, not absence.
-                None
-                    if !matches!(name, "created_at" | "updated_at")
-                        && value.as_text().is_some_and(|text| text.trim().is_empty()) =>
-                {}
+                None if !matches!(name, "created_at" | "updated_at")
+                    && value.as_text().is_some_and(|text| text.trim().is_empty()) => {}
                 None => return None,
             }
         } else if BOOL_FIELDS.contains(&name) {

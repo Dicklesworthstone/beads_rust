@@ -666,7 +666,10 @@ fn sole_opener_contention_does_not_latch_startup_recovery_532() {
         assert!(error.contains("sole opener"), "{error}");
         assert!(!error.contains("already failed"), "{error}");
         assert_eq!(protected_payload(&workspace), before);
-        assert_eq!(fs::read(db.with_file_name("beads.db-shm")).unwrap(), poisoned);
+        assert_eq!(
+            fs::read(db.with_file_name("beads.db-shm")).unwrap(),
+            poisoned
+        );
         assert!(recovery_runs(&workspace).is_empty());
     }
     drop(peer);
