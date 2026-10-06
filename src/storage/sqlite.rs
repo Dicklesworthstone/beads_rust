@@ -35431,6 +35431,66 @@ required_fields:
         assert_eq!(fs::read(target).unwrap(), b"do not touch");
     }
 
+    /// Runs `sync::tests::trusted_group_jsonl_permission_child` in a fresh copy
+    /// of this test binary with the trusted-group opt-in set (#533).
+    ///
+    /// The opt-in is process environment, so the child gets its own process.
+    /// This spawning half lives here, not in `sync::tests`, because
+    /// `SyncSafetyValidator::validate_no_git_authority_in_sync_sources` keeps
+    /// all process authority out of the sync source boundary.
+    #[cfg(unix)]
+    #[test]
+    fn trusted_group_jsonl_exports_keep_group_write() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        const CHILD: &str = "sync::tests::trusted_group_jsonl_permission_child";
+        let directory = TempDir::new().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o2770)).unwrap();
+        let database = directory.path().join("beads.db");
+        fs::write(&database, b"namespace permission fixture").unwrap();
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o660)).unwrap();
+        let file = fs::File::open(&database).unwrap();
+        let identity = fsqlite_vfs::FileIdentity::from_file(&file)
+            .unwrap()
+            .unwrap();
+        let binding = fsqlite_vfs::namespace::PendingNamespaceOpen::begin(
+            &database,
+            fsqlite_vfs::namespace::NamespaceOpenIntent::Shared,
+        )
+        .unwrap()
+        .bind(identity)
+        .unwrap();
+        binding.finish_bootstrap().unwrap();
+        drop(binding);
+        for suffix in crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES {
+            let mut name = database.as_os_str().to_os_string();
+            name.push(suffix);
+            fs::set_permissions(PathBuf::from(name), fs::Permissions::from_mode(0o660)).unwrap();
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", CHILD, "--nocapture"])
+            .env("FSQLITE_TRUSTED_UNIX_DATABASE", &database)
+            .env(
+                "FSQLITE_TRUSTED_UNIX_GID",
+                file.metadata().unwrap().gid().to_string(),
+            )
+            .env("BR_GROUP_JSONL_TEST_DATABASE", &database)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A filter that matches nothing also exits 0 ("0 passed"). Require
+        // the child's own result line so a renamed child cannot pass vacuously.
+        assert!(
+            stdout.contains(&format!("test {CHILD} ... ok")),
+            "child test did not run\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn wal_index_recovery_accepts_engine_committed_wal() {
         let temp = TempDir::new().unwrap();

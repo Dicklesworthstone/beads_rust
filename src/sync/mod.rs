@@ -18332,6 +18332,12 @@ mod tests {
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
+    /// Child half of `storage::sqlite::tests::trusted_group_jsonl_exports_keep_group_write`.
+    ///
+    /// It stays here because it calls the private JSONL temp-file helpers. The
+    /// half that starts it lives outside this module because the sync source
+    /// boundary holds no process authority. Without the parent's environment
+    /// this test returns at once.
     #[cfg(unix)]
     #[test]
     fn trusted_group_jsonl_permission_child() {
@@ -18361,55 +18367,6 @@ mod tests {
         assert!(apply_trusted_group_jsonl_permissions(&alias, &file).is_err());
         fs::hard_link(&temp_path, output.with_extension("hardlink")).unwrap();
         assert!(apply_trusted_group_jsonl_permissions(&temp_path, &file).is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn trusted_group_jsonl_exports_keep_group_write() {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        let directory = TempDir::new().unwrap();
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o2770)).unwrap();
-        let database = directory.path().join("beads.db");
-        fs::write(&database, b"namespace permission fixture").unwrap();
-        fs::set_permissions(&database, fs::Permissions::from_mode(0o660)).unwrap();
-        let file = File::open(&database).unwrap();
-        let identity = fsqlite_vfs::FileIdentity::from_file(&file)
-            .unwrap()
-            .unwrap();
-        let binding = fsqlite_vfs::namespace::PendingNamespaceOpen::begin(
-            &database,
-            fsqlite_vfs::namespace::NamespaceOpenIntent::Shared,
-        )
-        .unwrap()
-        .bind(identity)
-        .unwrap();
-        binding.finish_bootstrap().unwrap();
-        drop(binding);
-        for suffix in crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES {
-            let mut name = database.as_os_str().to_os_string();
-            name.push(suffix);
-            fs::set_permissions(PathBuf::from(name), fs::Permissions::from_mode(0o660)).unwrap();
-        }
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "sync::tests::trusted_group_jsonl_permission_child",
-                "--nocapture",
-            ])
-            .env("FSQLITE_TRUSTED_UNIX_DATABASE", &database)
-            .env(
-                "FSQLITE_TRUSTED_UNIX_GID",
-                file.metadata().unwrap().gid().to_string(),
-            )
-            .env("BR_GROUP_JSONL_TEST_DATABASE", &database)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
     }
 
     fn make_test_issue(id: &str, title: &str) -> Issue {
