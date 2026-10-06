@@ -102,6 +102,9 @@ const EXPORT_FULL_SCAN_ISSUE_THRESHOLD: usize = 20_000;
 const EXPORT_PARALLEL_PREPARE_MIN_ISSUES: usize = 256;
 const DEFAULT_JSONL_EXPORT_PARALLELISM: usize = 64;
 const IMPORT_EXPORT_HASH_BATCH_SIZE: usize = 512;
+// Match the storage layer's bulk-query variable window. Keep skipped
+// payloads bounded even when a large ledger imports entirely as a no-op.
+const IMPORT_SKIP_CERTIFICATION_BATCH_SIZE: usize = 900;
 const MAX_JSONL_TEMP_PATH_ATTEMPTS: u32 = 64;
 
 #[cfg(test)]
@@ -14726,13 +14729,14 @@ fn cleanup_import_orphans_counting_dependencies_in_tx(
 }
 
 fn skipped_import_matches_stored_issue(
-    storage: &SqliteStorage,
+    stored: Option<&Issue>,
     target_id: &str,
     incoming: &Issue,
-) -> Result<bool> {
-    let Some(mut stored) = storage.get_issue_for_export(target_id)? else {
-        return Ok(false);
+) -> bool {
+    let Some(stored) = stored else {
+        return false;
     };
+    let mut stored = stored.clone();
     let mut expected = incoming.clone();
     if expected.id != target_id {
         expected.id = target_id.to_string();
@@ -14743,28 +14747,63 @@ fn skipped_import_matches_stored_issue(
 
     normalize_issue_for_export(&mut stored);
     normalize_issue_for_export(&mut expected);
-    Ok(stored.sync_equals(&expected))
+    stored.sync_equals(&expected)
 }
 
 fn export_hash_entry_for_import_action(
-    storage: &SqliteStorage,
+    skipped: &mut Vec<(String, Issue, String)>,
     action: &CollisionAction,
     target_id: &str,
     issue: &Issue,
     computed_hash: &str,
-) -> Result<Option<(String, String)>> {
+) -> Option<(String, String)> {
     match action {
         CollisionAction::Insert | CollisionAction::Update { .. } => {
-            Ok(Some((target_id.to_string(), computed_hash.to_string())))
+            Some((target_id.to_string(), computed_hash.to_string()))
         }
         CollisionAction::Skip { .. } => {
-            if skipped_import_matches_stored_issue(storage, target_id, issue)? {
-                Ok(Some((target_id.to_string(), computed_hash.to_string())))
-            } else {
-                Ok(None)
-            }
+            skipped.push((
+                target_id.to_string(),
+                issue.clone(),
+                computed_hash.to_string(),
+            ));
+            None
         }
     }
+}
+
+/// Certify skips against the complete synced payload, including relations.
+/// A content hash alone cannot prove that a restored export matches newer
+/// local comments or fields excluded from that hash (GitHub #535).
+fn certify_skipped_imports(
+    storage: &SqliteStorage,
+    skipped: &mut Vec<(String, Issue, String)>,
+    hashes: &mut Vec<(String, String)>,
+    ids: &mut HashSet<String>,
+) -> Result<usize> {
+    if skipped.is_empty() {
+        return Ok(0);
+    }
+    let target_ids = skipped
+        .iter()
+        .map(|(id, _, _)| id.clone())
+        .collect::<Vec<_>>();
+    let stored = storage
+        .get_issues_for_export(&target_ids)?
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect::<HashMap<_, _>>();
+    let mut uncertified = 0;
+    for (id, incoming, hash) in skipped.drain(..) {
+        if skipped_import_matches_stored_issue(stored.get(&id), &id, &incoming) {
+            if ids.insert(id.clone()) {
+                hashes.push((id, hash));
+            }
+        } else {
+            uncertified += 1;
+        }
+    }
+    Ok(uncertified)
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -14785,6 +14824,7 @@ fn stream_import_actions_in_tx(
     let mut export_hash_batch = Vec::with_capacity(IMPORT_EXPORT_HASH_BATCH_SIZE);
     let mut export_hash_ids = HashSet::new();
     let mut uncertified_local_wins = 0usize;
+    let mut skipped = Vec::new();
     let stream_started = Instant::now();
 
     progress.set_position(0);
@@ -14824,6 +14864,16 @@ fn stream_import_actions_in_tx(
             };
 
             apply_collision_renames(&mut issue, collision_renames);
+            // Flush before mutations so certification observes exactly the
+            // same transaction state as the former per-row lookup.
+            if !matches!(action, CollisionAction::Skip { .. }) {
+                uncertified_local_wins += certify_skipped_imports(
+                    storage,
+                    &mut skipped,
+                    &mut export_hash_batch,
+                    &mut export_hash_ids,
+                )?;
+            }
             process_import_action(
                 storage,
                 &action,
@@ -14833,20 +14883,26 @@ fn stream_import_actions_in_tx(
             )?;
 
             if let Some((export_id, export_hash)) = export_hash_entry_for_import_action(
-                storage,
+                &mut skipped,
                 &action,
                 &target_id,
                 &issue,
                 &computed_hash,
-            )? {
+            ) {
                 export_hash_ids.insert(export_id.clone());
                 export_hash_batch.push((export_id, export_hash));
-                if export_hash_batch.len() >= IMPORT_EXPORT_HASH_BATCH_SIZE {
-                    storage.insert_export_hashes_after_clear_in_tx(&export_hash_batch)?;
-                    export_hash_batch.clear();
-                }
-            } else {
-                uncertified_local_wins += 1;
+            }
+            if skipped.len() >= IMPORT_SKIP_CERTIFICATION_BATCH_SIZE {
+                uncertified_local_wins += certify_skipped_imports(
+                    storage,
+                    &mut skipped,
+                    &mut export_hash_batch,
+                    &mut export_hash_ids,
+                )?;
+            }
+            if export_hash_batch.len() >= IMPORT_EXPORT_HASH_BATCH_SIZE {
+                storage.insert_export_hashes_after_clear_in_tx(&export_hash_batch)?;
+                export_hash_batch.clear();
             }
 
             progress.inc(1);
@@ -14854,6 +14910,12 @@ fn stream_import_actions_in_tx(
         },
     )?;
 
+    uncertified_local_wins += certify_skipped_imports(
+        storage,
+        &mut skipped,
+        &mut export_hash_batch,
+        &mut export_hash_ids,
+    )?;
     if !export_hash_batch.is_empty() {
         storage.insert_export_hashes_after_clear_in_tx(&export_hash_batch)?;
     }
@@ -15975,6 +16037,7 @@ fn run_reconcile_apply_tx(
     let mut export_hash_ids = HashSet::new();
     let mut applied_ids: Vec<String> = Vec::new();
     let mut action_index = 0usize;
+    let mut skipped = Vec::new();
 
     let source = capture_jsonl_source_snapshot(input_path)?;
     let (record_count, ephemeral_skipped) = for_each_reconcile_classified_row(
@@ -16003,6 +16066,14 @@ fn run_reconcile_apply_tx(
 
             let computed_hash = crate::util::content_hash(&issue);
             apply_collision_renames(&mut issue, collision_renames);
+            if !matches!(action, CollisionAction::Skip { .. }) {
+                outcome.uncertified_local_wins += certify_skipped_imports(
+                    storage,
+                    &mut skipped,
+                    &mut export_hash_batch,
+                    &mut export_hash_ids,
+                )?;
+            }
             process_import_action(storage, action, &issue, &mut import_result, false)?;
 
             match kind {
@@ -16015,17 +16086,23 @@ fn run_reconcile_apply_tx(
             }
 
             if let Some((export_id, export_hash)) = export_hash_entry_for_import_action(
-                storage,
+                &mut skipped,
                 action,
                 target_id,
                 &issue,
                 &computed_hash,
-            )? {
+            ) {
                 if export_hash_ids.insert(export_id.clone()) {
                     export_hash_batch.push((export_id, export_hash));
                 }
-            } else {
-                outcome.uncertified_local_wins += 1;
+            }
+            if skipped.len() >= IMPORT_SKIP_CERTIFICATION_BATCH_SIZE {
+                outcome.uncertified_local_wins += certify_skipped_imports(
+                    storage,
+                    &mut skipped,
+                    &mut export_hash_batch,
+                    &mut export_hash_ids,
+                )?;
             }
             Ok(())
         },
@@ -16037,6 +16114,12 @@ fn run_reconcile_apply_tx(
         ));
     }
 
+    outcome.uncertified_local_wins += certify_skipped_imports(
+        storage,
+        &mut skipped,
+        &mut export_hash_batch,
+        &mut export_hash_ids,
+    )?;
     if !export_hash_batch.is_empty() {
         storage.set_changed_export_hashes_in_tx(&export_hash_batch)?;
     }
@@ -23790,6 +23873,156 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn test_import_skip_batch_preserves_database_ahead_of_restored_export() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+        let unchanged = make_test_issue("bd-unchanged", "Unchanged");
+        let ahead = make_test_issue("bd-ahead", "Local comment must survive");
+        write_jsonl_issues(&jsonl_path, &[&unchanged, &ahead]);
+        import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+        let comment = storage
+            .add_comment(&ahead.id, "local", "newer local state")
+            .unwrap();
+        storage.set_metadata("needs_flush", "false").unwrap();
+
+        let result = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+        assert_eq!(result.created_count, 0);
+        assert_eq!(result.updated_count, 0);
+        assert_eq!(result.skipped_count, 2);
+        assert_eq!(result.export_hashes_recorded, 1);
+        assert!(storage.get_export_hash(&unchanged.id).unwrap().is_some());
+        assert!(storage.get_export_hash(&ahead.id).unwrap().is_none());
+        assert_eq!(storage.get_comments(&ahead.id).unwrap(), vec![comment]);
+        assert_eq!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn test_skip_certification_compares_full_payload_even_with_equal_content_hash() {
+        let incoming = make_test_issue("bd-full-payload", "Equal content hash");
+        let mut stored = incoming.clone();
+        // Audit timestamps are intentionally ignored, while a due date is
+        // synced but absent from the content hash. It must prevent certification.
+        stored.due_at = Some(stored.created_at);
+        assert_eq!(
+            crate::util::content_hash(&incoming),
+            crate::util::content_hash(&stored)
+        );
+        assert!(!skipped_import_matches_stored_issue(
+            Some(&stored),
+            &incoming.id,
+            &incoming
+        ));
+        assert!(!skipped_import_matches_stored_issue(
+            None,
+            &incoming.id,
+            &incoming
+        ));
+    }
+
+    #[test]
+    #[ignore = "timing comparison; run on a quiet host with --nocapture"]
+    fn test_skip_certification_scaling_against_per_row_reload() {
+        // Keep the incumbent live in the same invocation. This is a bounded
+        // maintenance measurement, not a release performance qualification.
+        let mut timings = Vec::new();
+        let mut import_timings = Vec::new();
+        for count in [300, 1200, 2435] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let jsonl_path = temp_dir.path().join("issues.jsonl");
+            let incoming = (0..count)
+                .map(|index| {
+                    make_test_issue(
+                        &format!("bd-scale-{index}"),
+                        &format!("Scale issue {index}"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            write_jsonl_issues(&jsonl_path, &incoming.iter().collect::<Vec<_>>());
+            import_from_jsonl(
+                &mut storage,
+                &jsonl_path,
+                &ImportConfig::default(),
+                Some("bd-"),
+            )
+            .unwrap();
+
+            let start = Instant::now();
+            for issue in &incoming {
+                let stored = storage.get_issue_for_export(&issue.id).unwrap();
+                assert!(skipped_import_matches_stored_issue(
+                    stored.as_ref(),
+                    &issue.id,
+                    issue
+                ));
+            }
+            let incumbent = start.elapsed();
+            let mut skipped = incoming
+                .iter()
+                .map(|issue| {
+                    (
+                        issue.id.clone(),
+                        issue.clone(),
+                        crate::util::content_hash(issue),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut hashes = Vec::new();
+            let mut ids = HashSet::new();
+            let start = Instant::now();
+            assert_eq!(
+                certify_skipped_imports(&storage, &mut skipped, &mut hashes, &mut ids).unwrap(),
+                0
+            );
+            let batched = start.elapsed();
+            assert_eq!(hashes.len(), count);
+            assert!(skipped.is_empty());
+            eprintln!("issues={count} per_row={incumbent:?} batched={batched:?}");
+            timings.push(batched);
+            if count == 2435 {
+                assert!(
+                    batched < incumbent,
+                    "batch must beat the live per-row baseline"
+                );
+            }
+            let start = Instant::now();
+            let result = import_from_jsonl(
+                &mut storage,
+                &jsonl_path,
+                &ImportConfig::default(),
+                Some("bd-"),
+            )
+            .unwrap();
+            let elapsed = start.elapsed();
+            assert_eq!(result.imported_count, 0);
+            assert_eq!(result.skipped_count, count);
+            assert_eq!(result.export_hashes_recorded, count);
+            eprintln!("issues={count} no_op_import={elapsed:?}");
+            import_timings.push(elapsed);
+        }
+        // An 8.1x input increase permits 12x time plus scheduler noise, but
+        // rejects the reported ~70x growth. Do not impose tight CI timings.
+        assert!(timings[2] < timings[0] * 12 + std::time::Duration::from_millis(100));
+        assert!(import_timings[2] < import_timings[0] * 12 + std::time::Duration::from_millis(100));
     }
 
     /// GitHub #468: legacy JSONL dependencies omitting `created_by`,

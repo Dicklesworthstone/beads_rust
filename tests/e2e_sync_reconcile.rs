@@ -2417,3 +2417,126 @@ fn bulk_two_thousand_issue_input() {
     assert_eq!(plan_count(&receipt, "updated"), SECOND_PASS_NEWER as u64);
     assert_eq!(issue_count(&ws, "bulk_count2"), TOTAL);
 }
+
+#[test]
+fn restored_export_no_op_import_does_not_starve_concurrent_commands() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let ws = BrWorkspace::new();
+    init_workspace(&ws, "skip_contention");
+    let seed = create_issue(&ws, "Local state must survive", "skip_seed");
+    let template = read_jsonl_lines(&ws)[0].clone();
+    let mut lines = vec![template];
+    for index in 1..2435 {
+        lines.push(synthetic_row(&lines[0], index));
+    }
+    write_jsonl_lines(&ws, &lines);
+    let imported = run_br(&ws, ["sync", "--import-only", "--json"], "skip_import");
+    assert!(imported.status.success(), "{}", imported.stderr);
+    let old_export = fs::read(jsonl_path(&ws)).unwrap();
+    let local = run_br(
+        &ws,
+        ["comments", "add", &seed, "local before restore"],
+        "skip_local",
+    );
+    assert!(local.status.success(), "{}", local.stderr);
+    fs::write(jsonl_path(&ws), &old_export).unwrap();
+
+    let log_path = ws.root.join("skip_import.log");
+    let log = fs::File::create(&log_path).unwrap();
+    let started = Instant::now();
+    let mut importer = Command::new(assert_cmd::cargo::cargo_bin!("br"))
+        .current_dir(&ws.root)
+        .args(["--no-auto-flush", "-v", "show", &seed, "--json"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log))
+        .spawn()
+        .unwrap();
+    // Wait for the actual import apply phase, rather than merely racing
+    // process startup. A fast importer may finish before this poll observes it.
+    loop {
+        let log = fs::read_to_string(&log_path).unwrap();
+        if log.contains("collision plan ready; applying rows") {
+            break;
+        }
+        if let Some(status) = importer.try_wait().unwrap() {
+            assert!(status.success(), "{log}");
+            panic!("auto-import apply phase was not observed: {log}");
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "import did not reach apply: {log}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            run_br(
+                &ws,
+                [
+                    "--lock-timeout",
+                    "10000",
+                    "--no-auto-flush",
+                    "show",
+                    &seed,
+                    "--json",
+                ],
+                "skip_reader",
+            )
+        });
+        let writer = scope.spawn(|| {
+            run_br(
+                &ws,
+                [
+                    "--lock-timeout",
+                    "10000",
+                    "--no-auto-flush",
+                    "comments",
+                    "add",
+                    &seed,
+                    "concurrent writer",
+                ],
+                "skip_writer",
+            )
+        });
+        let reader = reader.join().unwrap();
+        let writer = writer.join().unwrap();
+        assert!(reader.status.success(), "reader starved: {}", reader.stderr);
+        assert!(writer.status.success(), "writer starved: {}", writer.stderr);
+    });
+    assert!(
+        importer.wait().unwrap().success(),
+        "{}",
+        fs::read_to_string(&log_path).unwrap()
+    );
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(
+        log.contains("imported_count=0"),
+        "expected a no-op import: {log}"
+    );
+    let apply_line = log
+        .lines()
+        .find(|line| line.contains("issue rows, relations, and export hashes written"))
+        .expect("import must report its apply duration");
+    let apply_ms = apply_line
+        .split("elapsed_ms=")
+        .nth(1)
+        .and_then(|suffix| suffix.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .expect("numeric apply duration");
+    assert!(
+        apply_ms < 10_000,
+        "skip certification held the lock too long: {apply_line}"
+    );
+    eprintln!("2435-row restored export: {apply_line}");
+    let comments = run_br(
+        &ws,
+        ["--no-auto-flush", "comments", "list", &seed, "--json"],
+        "skip_comments",
+    );
+    assert!(comments.status.success(), "{}", comments.stderr);
+    assert!(comments.stdout.contains("local before restore"));
+    assert!(comments.stdout.contains("concurrent writer"));
+}
