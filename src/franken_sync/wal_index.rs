@@ -641,7 +641,7 @@ pub(super) fn quarantine_poisoned_index(
         tracing::warn!(
             retained = %retained.display(),
             %error,
-            "could not mark the quarantined WAL index complete; it is kept indefinitely"
+            "could not mark the quarantined WAL index complete; evidence is retained for later verification"
         );
     }
     tracing::warn!(
@@ -654,7 +654,7 @@ pub(super) fn quarantine_poisoned_index(
 
 /// Prefix of the directory each quarantine retains beside the database.
 const QUARANTINE_PREFIX: &str = ".br-wal-index-";
-/// A quarantine directory renamed aside for removal; swept on the next prune.
+/// A quarantine directory renamed aside for removal; revalidated on restart.
 const QUARANTINE_PRUNING_PREFIX: &str = ".br-pruning-wal-index-";
 /// Written once a quarantine completed and its payload was verified.
 const QUARANTINE_COMPLETE: &str = "quarantine-complete.json";
@@ -680,39 +680,89 @@ fn write_quarantine_complete(retained: &Path, destination: &Path) -> io::Result<
     sync_directory(retained)
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuarantinePreparation {
+    schema_version: String,
+    database_path: String,
+    reason: String,
+    main_sha256: String,
+    wal_sha256: String,
+    shm_sha256: String,
+    retained_index: String,
+    // Missing means the known legacy format. An explicit null is unproven,
+    // just like an unknown marker name, and must not enter that exception.
+    #[serde(default, deserialize_with = "deserialize_completion_marker")]
+    completion_marker: Option<String>,
+}
+
+fn deserialize_completion_marker<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <String as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuarantineCompletion {
+    schema_version: String,
+    stage: String,
+    retained_index: String,
+}
+
+/// Read only recognized regular receipt files. Partial, unknown, duplicate,
+/// missing, and aliased evidence never supplies authority to remove a run.
+fn read_quarantine_receipt<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
+    let mut file = match open_regular(path, false) {
+        Ok(file) => file,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let receipt = match serde_json::from_reader(&mut file) {
+        Ok(receipt) => receipt,
+        Err(error) if error.is_io() => return Err(io::Error::other(error)),
+        Err(_) => return Ok(None),
+    };
+    verify_name(path, &file)?;
+    Ok(Some(receipt))
+}
+
 /// Classify a `.br-wal-index-*` directory: `None` unless its receipt names
 /// the database at `database_path` (another database's, or an unreadable
 /// receipt, is neither counted nor removed); otherwise whether it is a
 /// finished quarantine that may be removed once old enough.
 ///
-/// Finished means `quarantine-complete.json` is present, or, for directories
-/// br 0.7.3 and earlier wrote (their receipt names no `completion_marker`),
-/// that the directory holds
-/// exactly its receipt and the retained index, the index hashes to what the
-/// receipt recorded, and no recovery failure receipt names the directory.
-/// A partial or failed quarantine is evidence and is kept.
+/// Both current and legacy runs must hold exactly their recognized regular
+/// receipts and the unchanged retained index, and no recovery failure receipt
+/// may name the directory. Current runs also need a valid completion receipt
+/// agreeing with the preparation; mere file creation is not completion.
+/// `recorded_dir` preserves the original name after a verified run was renamed
+/// aside for pruning. Partially removed runs that lost their proof are kept.
 fn quarantine_status(
     dir: &Path,
+    recorded_dir: &Path,
     database_path: &str,
     failure_receipts: &[String],
 ) -> io::Result<Option<bool>> {
-    let receipt = match fs::read(dir.join(QUARANTINE_PREPARED)) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let Ok(receipt) = serde_json::from_slice::<serde_json::Value>(&receipt) else {
+    let Some(receipt) =
+        read_quarantine_receipt::<QuarantinePreparation>(&dir.join(QUARANTINE_PREPARED))?
+    else {
         return Ok(None);
     };
-    if receipt
-        .get("database_path")
-        .and_then(serde_json::Value::as_str)
-        != Some(database_path)
-    {
+    if receipt.database_path != database_path {
         return Ok(None);
     }
     Ok(Some(quarantine_is_finished(
         dir,
+        recorded_dir,
         &receipt,
         failure_receipts,
     )?))
@@ -720,43 +770,144 @@ fn quarantine_status(
 
 fn quarantine_is_finished(
     dir: &Path,
-    receipt: &serde_json::Value,
+    recorded_dir: &Path,
+    receipt: &QuarantinePreparation,
     failure_receipts: &[String],
 ) -> io::Result<bool> {
-    if fs::symlink_metadata(dir.join(QUARANTINE_COMPLETE)).is_ok_and(|meta| meta.is_file()) {
-        return Ok(true);
-    }
-    // A quarantine that announced the marker but never wrote it was
-    // interrupted or failed.
-    if receipt.get("completion_marker").is_some() {
-        return Ok(false);
-    }
-    let mut names = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        names.push(entry?.file_name());
-    }
-    names.sort();
-    // Sorted: "poisoned-shm" < "prepared.json".
-    if names != [QUARANTINED_INDEX, QUARANTINE_PREPARED] {
-        return Ok(false);
-    }
-    let index = dir.join(QUARANTINED_INDEX);
-    if !fs::symlink_metadata(&index)?.is_file() {
-        return Ok(false);
-    }
-    let Some(expected) = receipt
-        .get("shm_sha256")
-        .and_then(serde_json::Value::as_str)
-    else {
+    let Some(recorded_name) = recorded_dir.file_name().and_then(|name| name.to_str()) else {
         return Ok(false);
     };
-    if hash_file(&mut File::open(&index)?)? != expected {
+    let Some(current_name) = dir.file_name().and_then(|name| name.to_str()) else {
+        return Ok(false);
+    };
+    if failure_receipts
+        .iter()
+        .any(|failure| failure.contains(recorded_name) || failure.contains(current_name))
+    {
         return Ok(false);
     }
-    let name = dir.file_name().unwrap_or_default().to_string_lossy();
-    Ok(!failure_receipts
-        .iter()
-        .any(|receipt| receipt.contains(name.as_ref())))
+    let valid_hash = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if receipt.schema_version != "br.wal_index.quarantine.v1"
+        || receipt.reason != "initialized-zero-page-wal-index"
+        || receipt.retained_index != recorded_dir.join(QUARANTINED_INDEX).display().to_string()
+        || !valid_hash(&receipt.main_sha256)
+        || !valid_hash(&receipt.wal_sha256)
+        || !valid_hash(&receipt.shm_sha256)
+    {
+        return Ok(false);
+    }
+    let marked = match receipt.completion_marker.as_deref() {
+        None => false,
+        Some(QUARANTINE_COMPLETE) => true,
+        Some(_) => return Ok(false),
+    };
+    let mut names = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            return Ok(false);
+        }
+        names.push(entry.file_name());
+    }
+    names.sort();
+    // Sorted: "poisoned-shm" < "prepared.json" < "quarantine-complete.json".
+    let expected_names = if marked {
+        vec![QUARANTINED_INDEX, QUARANTINE_PREPARED, QUARANTINE_COMPLETE]
+    } else {
+        vec![QUARANTINED_INDEX, QUARANTINE_PREPARED]
+    };
+    if names != expected_names {
+        return Ok(false);
+    }
+    if marked {
+        let Some(completion) =
+            read_quarantine_receipt::<QuarantineCompletion>(&dir.join(QUARANTINE_COMPLETE))?
+        else {
+            return Ok(false);
+        };
+        if completion.schema_version != receipt.schema_version
+            || completion.stage != "complete"
+            || completion.retained_index != receipt.retained_index
+        {
+            return Ok(false);
+        }
+    }
+    let index = dir.join(QUARANTINED_INDEX);
+    let mut retained = match open_regular(&index, false) {
+        Ok(file) => file,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    if hash_file(&mut retained)? != receipt.shm_sha256 {
+        return Ok(false);
+    }
+    verify_name(&index, &retained)?;
+    Ok(true)
+}
+
+fn open_quarantine_directory(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    let directory = options.open(path)?;
+    if !directory.metadata()?.is_dir() || !fs::symlink_metadata(path)?.file_type().is_dir() {
+        return Err(invalid(
+            "WAL-index pruning refuses a non-directory or alias",
+        ));
+    }
+    // Retain the descriptor until the final comparison and deletion. File IDs
+    // can be reused after their objects are released.
+    let _ = identity(&directory)?;
+    Ok(directory)
+}
+
+/// Recheck the staged generation immediately before removal. This rejects
+/// observed replacement or evidence drift since discovery; it does not make
+/// recursive deletion atomic against arbitrary concurrent filesystem writers.
+fn remove_verified_quarantine(
+    dir: &Path,
+    recorded_dir: &Path,
+    database_path: &str,
+    failure_receipts: &[String],
+    retained_directory: &File,
+) -> io::Result<bool> {
+    let expected_identity = identity(retained_directory)?;
+    if identity(&open_quarantine_directory(dir)?)? != expected_identity
+        || quarantine_status(dir, recorded_dir, database_path, failure_receipts)? != Some(true)
+        || identity(&open_quarantine_directory(dir)?)? != expected_identity
+    {
+        return Ok(false);
+    }
+    sync_directory(
+        dir.parent()
+            .ok_or_else(|| invalid("quarantine directory has no parent"))?,
+    )?;
+    fs::remove_dir_all(dir)?;
+    Ok(true)
 }
 
 /// Remove this database's finished WAL-index quarantine directories
@@ -769,6 +920,7 @@ fn quarantine_is_finished(
 ///
 /// # Errors
 /// Returns an error when the database directory cannot be read.
+#[allow(clippy::too_many_lines)]
 pub fn prune_quarantined_indexes(
     db_path: &Path,
     keep: usize,
@@ -776,6 +928,11 @@ pub fn prune_quarantined_indexes(
     now: std::time::SystemTime,
     failure_receipts: &[String],
 ) -> io::Result<Vec<PathBuf>> {
+    // Staging must preserve any existing destination. Where that primitive is
+    // unavailable, retain all evidence, including interrupted staging names.
+    if !WAL_INDEX_QUARANTINE_SUPPORTED {
+        return Ok(Vec::new());
+    }
     let parent = db_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -789,8 +946,24 @@ pub fn prune_quarantined_indexes(
         )
         .display()
         .to_string();
+    let remove =
+        |dir: &Path, recorded_dir: &Path, directory: &File| match remove_verified_quarantine(
+            dir,
+            recorded_dir,
+            &database_path,
+            failure_receipts,
+            directory,
+        ) {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                dir = %dir.display(),
+                "WAL-index pruning evidence changed; staged directory is retained"
+            ),
+            Err(error) => tracing::warn!(
+                dir = %dir.display(), %error, "could not remove old WAL-index quarantine"
+            ),
+        };
     let mut quarantines = Vec::new();
-    let mut doomed = Vec::new();
     for entry in fs::read_dir(&parent)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
@@ -798,14 +971,27 @@ pub fn prune_quarantined_indexes(
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(QUARANTINE_PRUNING_PREFIX) {
-            doomed.push(entry.path());
+        if let Some(original_suffix) = name.strip_prefix(QUARANTINE_PRUNING_PREFIX) {
+            if original_suffix.is_empty() {
+                continue;
+            }
+            let original = parent.join(format!("{QUARANTINE_PREFIX}{original_suffix}"));
+            let directory = open_quarantine_directory(&entry.path())?;
+            // The prefix alone is never deletion authority. Recheck intact
+            // evidence against its original path and this database; a partial
+            // removal that erased that proof must remain for diagnosis.
+            if quarantine_status(&entry.path(), &original, &database_path, failure_receipts)?
+                == Some(true)
+            {
+                remove(&entry.path(), &original, &directory);
+            }
             continue;
         }
         if !name.starts_with(QUARANTINE_PREFIX) {
             continue;
         }
         let path = entry.path();
+        let directory = open_quarantine_directory(&path)?;
         // A directory without a readable receipt counts toward nothing and
         // stays (for example a quarantine still being prepared).
         let Ok(receipt) = fs::symlink_metadata(path.join(QUARANTINE_PREPARED)) else {
@@ -817,9 +1003,13 @@ pub fn prune_quarantined_indexes(
         if !receipt.is_file() {
             continue;
         }
-        let Some(finished) = quarantine_status(&path, &database_path, failure_receipts)? else {
+        let Some(finished) = quarantine_status(&path, &path, &database_path, failure_receipts)?
+        else {
             continue;
         };
+        if identity(&open_quarantine_directory(&path)?)? != identity(&directory)? {
+            continue;
+        }
         quarantines.push((written, path, finished));
     }
     // Newest first; ties broken by name so the order is total.
@@ -836,20 +1026,28 @@ pub fn prune_quarantined_indexes(
         let mut aside = std::ffi::OsString::from(QUARANTINE_PRUNING_PREFIX);
         aside.push(name.to_string_lossy().trim_start_matches(QUARANTINE_PREFIX));
         let aside = parent.join(aside);
-        if let Err(error) = fs::rename(&path, &aside) {
+        // Discovery selects work, not deletion authority. Recheck one selected
+        // candidate under a retained descriptor; never hold a descriptor for
+        // every accumulated run while sorting or waiting to remove siblings.
+        let directory = open_quarantine_directory(&path)?;
+        if fs::symlink_metadata(path.join(QUARANTINE_PREPARED))?.modified()? != written
+            || quarantine_status(&path, &path, &database_path, failure_receipts)? != Some(true)
+            || identity(&open_quarantine_directory(&path)?)? != identity(&directory)?
+        {
+            tracing::warn!(
+                dir = %path.display(),
+                "WAL-index quarantine evidence changed; directory is retained"
+            );
+            continue;
+        }
+        // An unproven interrupted prune may already occupy this name. Keep
+        // both directories rather than replacing even an empty destination.
+        if let Err(error) = quarantine_name(&path, &aside) {
             tracing::warn!(dir = %path.display(), %error, "could not set aside old WAL-index quarantine");
             continue;
         }
-        doomed.push(aside);
+        remove(&aside, &path, &directory);
         pruned.push(path);
-    }
-    if !doomed.is_empty() {
-        sync_directory(&parent)?;
-    }
-    for dir in doomed {
-        if let Err(error) = fs::remove_dir_all(&dir) {
-            tracing::warn!(dir = %dir.display(), %error, "could not remove old WAL-index quarantine");
-        }
     }
     Ok(pruned)
 }
@@ -1007,6 +1205,7 @@ pub mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn prune_keeps_recent_failed_foreign_and_unproven_quarantines() {
         const DAY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
         let temp = tempfile::tempdir().unwrap();
@@ -1024,6 +1223,18 @@ pub mod tests {
             File::open(&path).unwrap()
         })
         .unwrap();
+        let named = |name: &str| {
+            fs::canonicalize(temp.path())
+                .unwrap()
+                .join(format!("{QUARANTINE_PREFIX}{name}"))
+        };
+        let completion = |dir: &Path| {
+            serde_json::json!({
+                "schema_version": "br.wal_index.quarantine.v1",
+                "stage": "complete",
+                "retained_index": dir.join(QUARANTINED_INDEX).display().to_string(),
+            })
+        };
         // (name, database, announces marker, writes marker, index bytes, extra file, age)
         let make = |name: &str,
                     database: &str,
@@ -1032,19 +1243,23 @@ pub mod tests {
                     shm: &[u8],
                     extra: bool,
                     age_days: u32| {
-            let dir = temp.path().join(format!("{QUARANTINE_PREFIX}{name}"));
+            let dir = named(name);
             fs::create_dir(&dir).unwrap();
             let mut receipt = serde_json::json!({
                 "schema_version": "br.wal_index.quarantine.v1",
                 "database_path": database,
+                "reason": "initialized-zero-page-wal-index",
+                "main_sha256": &index_sha,
+                "wal_sha256": &index_sha,
                 "shm_sha256": &index_sha,
+                "retained_index": dir.join(QUARANTINED_INDEX).display().to_string(),
             });
             if announced {
                 receipt["completion_marker"] = QUARANTINE_COMPLETE.into();
             }
             fs::write(dir.join(QUARANTINED_INDEX), shm).unwrap();
             if complete {
-                fs::write(dir.join(QUARANTINE_COMPLETE), "{}").unwrap();
+                fs::write(dir.join(QUARANTINE_COMPLETE), completion(&dir).to_string()).unwrap();
             }
             if extra {
                 fs::write(dir.join("stray"), "").unwrap();
@@ -1067,30 +1282,270 @@ pub mod tests {
         make("g", &database_path, false, false, &index, false, 13);
         make("h", "/elsewhere/beads.db", true, true, &index, false, 20);
         make("i", &database_path, false, false, &index, true, 14);
-        fs::create_dir(temp.path().join(format!("{QUARANTINE_PREFIX}j"))).unwrap();
+        fs::create_dir(named("j")).unwrap();
+        let mut kept = ["a", "b", "d", "f", "g", "h", "i", "j"].map(named).to_vec();
+
+        // Every new negative control is older than both retention gates:
+        // it stays because completion is unproven, never just because it is young.
+        for (name, bytes) in [("empty-marker", ""), ("truncated-marker", "{\"stage\":")] {
+            make(name, &database_path, true, true, &index, false, 15);
+            fs::write(named(name).join(QUARANTINE_COMPLETE), bytes).unwrap();
+            kept.push(named(name));
+        }
+        make(
+            "duplicate-marker",
+            &database_path,
+            true,
+            true,
+            &index,
+            false,
+            15,
+        );
+        let duplicate = completion(&named("duplicate-marker")).to_string().replacen(
+            '{',
+            "{\"stage\":\"failed\",",
+            1,
+        );
+        fs::write(
+            named("duplicate-marker").join(QUARANTINE_COMPLETE),
+            duplicate,
+        )
+        .unwrap();
+        kept.push(named("duplicate-marker"));
+        for (name, field, value) in [
+            (
+                "unknown-marker-schema",
+                "schema_version",
+                serde_json::json!("br.wal_index.quarantine.v2"),
+            ),
+            ("failed-marker-stage", "stage", serde_json::json!("failed")),
+            (
+                "mismatched-marker-path",
+                "retained_index",
+                serde_json::json!("/elsewhere/poisoned-shm"),
+            ),
+            (
+                "unknown-marker-field",
+                "unreviewed",
+                serde_json::json!(true),
+            ),
+        ] {
+            make(name, &database_path, true, true, &index, false, 15);
+            let mut marker = completion(&named(name));
+            marker[field] = value;
+            fs::write(named(name).join(QUARANTINE_COMPLETE), marker.to_string()).unwrap();
+            kept.push(named(name));
+        }
+        make(
+            "marked-failure",
+            &database_path,
+            true,
+            true,
+            &index,
+            false,
+            15,
+        );
+        make(
+            "marked-changed",
+            &database_path,
+            true,
+            true,
+            &[8; 96],
+            false,
+            15,
+        );
+        make("marked-extra", &database_path, true, true, &index, true, 15);
+        kept.extend(["marked-failure", "marked-changed", "marked-extra"].map(named));
+
+        for (name, field, value) in [
+            (
+                "null-announcement",
+                "completion_marker",
+                serde_json::Value::Null,
+            ),
+            (
+                "unknown-announcement",
+                "completion_marker",
+                serde_json::json!("future-complete.json"),
+            ),
+            (
+                "unknown-prepared-schema",
+                "schema_version",
+                serde_json::json!("br.wal_index.quarantine.v2"),
+            ),
+            (
+                "mismatched-prepared-path",
+                "retained_index",
+                serde_json::json!("/elsewhere/poisoned-shm"),
+            ),
+        ] {
+            make(name, &database_path, true, true, &index, false, 15);
+            let prepared = named(name).join(QUARANTINE_PREPARED);
+            let mut receipt: serde_json::Value =
+                serde_json::from_slice(&fs::read(&prepared).unwrap()).unwrap();
+            receipt[field] = value;
+            fs::write(&prepared, receipt.to_string()).unwrap();
+            File::options()
+                .write(true)
+                .open(&prepared)
+                .unwrap()
+                .set_modified(now - DAY * 15)
+                .unwrap();
+            kept.push(named(name));
+        }
+
+        // Restarted prunes still carry paths naming their original quarantine.
+        // Only intact proof for this database can resume; an empty prefix-only
+        // directory or a partially removed receipt is not deletion authority.
+        let staged = |name: &str| {
+            fs::canonicalize(temp.path())
+                .unwrap()
+                .join(format!("{QUARANTINE_PRUNING_PREFIX}{name}"))
+        };
+        for (name, database, marked) in [
+            ("resume-complete", database_path.as_str(), true),
+            ("resume-legacy", database_path.as_str(), false),
+            ("resume-foreign", "/elsewhere/beads.db", true),
+            ("resume-failure", database_path.as_str(), true),
+            ("resume-malformed", database_path.as_str(), true),
+        ] {
+            make(name, database, marked, marked, &index, false, 15);
+            if name == "resume-malformed" {
+                fs::write(named(name).join(QUARANTINE_COMPLETE), "{").unwrap();
+            }
+            fs::rename(named(name), staged(name)).unwrap();
+        }
+        kept.extend(["resume-foreign", "resume-failure", "resume-malformed"].map(staged));
+        make(
+            "changed-after-scan",
+            &database_path,
+            true,
+            true,
+            &index,
+            false,
+            15,
+        );
+        fs::rename(named("changed-after-scan"), staged("changed-after-scan")).unwrap();
+        let observed = open_quarantine_directory(&staged("changed-after-scan")).unwrap();
+        fs::write(staged("changed-after-scan").join(QUARANTINE_COMPLETE), "{}").unwrap();
+        assert!(
+            !remove_verified_quarantine(
+                &staged("changed-after-scan"),
+                &named("changed-after-scan"),
+                &database_path,
+                &[],
+                &observed,
+            )
+            .unwrap(),
+            "completion drift after discovery must be rechecked before removal"
+        );
+        kept.push(staged("changed-after-scan"));
+
+        make(
+            "replaced-after-scan",
+            &database_path,
+            true,
+            true,
+            &index,
+            false,
+            15,
+        );
+        fs::rename(named("replaced-after-scan"), staged("replaced-after-scan")).unwrap();
+        let observed = open_quarantine_directory(&staged("replaced-after-scan")).unwrap();
+        let previous = temp.path().join("retained-prune-predecessor");
+        fs::rename(staged("replaced-after-scan"), &previous).unwrap();
+        make(
+            "replaced-after-scan",
+            &database_path,
+            true,
+            true,
+            &index,
+            false,
+            15,
+        );
+        fs::rename(named("replaced-after-scan"), staged("replaced-after-scan")).unwrap();
+        assert_ne!(
+            identity(&open_quarantine_directory(&staged("replaced-after-scan")).unwrap()).unwrap(),
+            identity(&observed).unwrap(),
+            "the replacement must be a distinct directory generation"
+        );
+        assert!(
+            !remove_verified_quarantine(
+                &staged("replaced-after-scan"),
+                &named("replaced-after-scan"),
+                &database_path,
+                &[],
+                &observed,
+            )
+            .unwrap(),
+            "byte-identical replacement evidence must not inherit deletion authority"
+        );
+        kept.extend([previous, staged("replaced-after-scan")]);
         let leftover = temp.path().join(format!("{QUARANTINE_PRUNING_PREFIX}k"));
         fs::create_dir(&leftover).unwrap();
-        let failures = [format!(
-            "{{\"error\":\"WAL-index quarantine did not complete: x; evidence retained at {}\"}}",
-            temp.path().join(format!("{QUARANTINE_PREFIX}g")).display()
-        )];
+        kept.push(leftover);
+        let malformed_prefix = temp.path().join(QUARANTINE_PRUNING_PREFIX);
+        fs::create_dir(&malformed_prefix).unwrap();
+        kept.push(malformed_prefix);
+        make(
+            "staging-collision",
+            &database_path,
+            true,
+            true,
+            &index,
+            false,
+            15,
+        );
+        fs::create_dir(staged("staging-collision")).unwrap();
+        kept.extend([named("staging-collision"), staged("staging-collision")]);
+        if !WAL_INDEX_QUARANTINE_SUPPORTED {
+            kept.extend([
+                named("c"),
+                named("e"),
+                staged("resume-complete"),
+                staged("resume-legacy"),
+            ]);
+        }
+        let failures = ["g", "marked-failure", "resume-failure", "replaced-after-scan"].map(|name| {
+            format!(
+                "{{\"error\":\"WAL-index quarantine did not complete: x; evidence retained at {}\"}}",
+                named(name).display()
+            )
+        });
+        let contents = |dir: &Path| {
+            fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), fs::read(entry.path()).unwrap())
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let evidence: Vec<_> = kept.iter().map(|dir| (dir, contents(dir))).collect();
 
         let mut pruned = prune_quarantined_indexes(&db, 2, DAY * 7, now, &failures).unwrap();
         pruned.sort();
-        let named = |name: &str| {
-            fs::canonicalize(temp.path())
-                .unwrap()
-                .join(format!("{QUARANTINE_PREFIX}{name}"))
-        };
         // a and b are the newest two; c (marked) and e (proven legacy) go;
         // d (never marked), f (index changed), g (named by a failure), i
         // (unexpected contents), h (another database) and j (no receipt) stay.
-        assert_eq!(pruned, [named("c"), named("e")]);
-        for name in ["a", "b", "d", "f", "g", "h", "i", "j"] {
-            assert!(named(name).is_dir(), "{name} must be kept");
+        if WAL_INDEX_QUARANTINE_SUPPORTED {
+            assert_eq!(pruned, [named("c"), named("e")]);
+            assert!(!named("c").exists() && !named("e").exists());
+            assert!(
+                !staged("resume-complete").exists(),
+                "verified prune resumes"
+            );
+            assert!(
+                !staged("resume-legacy").exists(),
+                "verified legacy prune resumes"
+            );
+        } else {
+            assert!(pruned.is_empty(), "unsupported staging retains every run");
         }
-        assert!(!named("c").exists() && !named("e").exists());
-        assert!(!leftover.exists(), "an interrupted prune is swept");
+        for (dir, before) in &evidence {
+            assert!(dir.is_dir(), "{} must be kept", dir.display());
+            assert_eq!(contents(dir), *before, "{} changed evidence", dir.display());
+        }
         assert!(
             prune_quarantined_indexes(&db, 2, DAY * 7, now, &failures)
                 .unwrap()
