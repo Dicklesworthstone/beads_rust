@@ -13490,7 +13490,7 @@ fn collect_incremental_retention_changes(
             });
         }
         for mut issue in issues {
-            if issue.status != Status::Tombstone
+            if issue.status != crate::model::Status::Tombstone
                 || !is_issue_exportable_at(&issue, retention_days, export_as_of)
             {
                 return Err(BeadsError::SyncConflict {
