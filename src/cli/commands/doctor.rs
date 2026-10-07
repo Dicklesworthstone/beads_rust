@@ -6378,15 +6378,15 @@ fn check_inner_gitignore_present(beads_dir: &Path, checks: &mut Vec<CheckResult>
 /// entirely. TOCTOU-safe: missing patterns are re-derived at fix time.
 /// One canonical `.beads/.gitignore` coverage expectation (GitHub #427).
 ///
-/// Coverage is judged by PROBES — representative artifact filenames that
-/// must all be ignored — so operator-authored equivalents (e.g. a broad
-/// `*.db?*` or `*.lock`) satisfy an expectation without textual equality
-/// with `append_pattern`. When any probe is uncovered, `doctor --repair`
-/// appends `append_pattern`.
+/// Coverage is judged by PROBES — representative artifact files and
+/// directories that must all be ignored — so operator-authored equivalents
+/// (e.g. a broad `*.db?*` or `*.lock`) satisfy an expectation without textual
+/// equality with `append_pattern`. When any probe is uncovered,
+/// `doctor --repair` appends `append_pattern`.
 struct InnerGitignoreExpectation {
     /// Pattern appended by `doctor --repair` when coverage is missing.
     append_pattern: &'static str,
-    /// Representative direct-child filenames that must be ignored.
+    /// Direct-child names that must be ignored; a trailing `/` denotes a directory.
     probes: &'static [&'static str],
 }
 
@@ -6447,9 +6447,28 @@ const INNER_GITIGNORE_EXPECTATIONS: &[InnerGitignoreExpectation] = &[
         append_pattern: "*.fsqlite-migration-state",
         probes: &["beads.db.fsqlite-migration-state"],
     },
+    // Recovery evidence is kept in directories whose members do not share
+    // the database filename. File-only rules cannot protect those bytes
+    // from accidental staging (beads_rust-9uavz).
+    InnerGitignoreExpectation {
+        append_pattern: ".br-wal-index-*/",
+        probes: &[".br-wal-index-A1b2C3/", ".br-wal-index-9xYzQ7/"],
+    },
+    InnerGitignoreExpectation {
+        append_pattern: ".br_recovery/",
+        probes: &[".br_recovery/"],
+    },
+    InnerGitignoreExpectation {
+        append_pattern: ".br_history/",
+        probes: &[".br_history/"],
+    },
     InnerGitignoreExpectation {
         append_pattern: ".write.lock",
         probes: &[".write.lock"],
+    },
+    InnerGitignoreExpectation {
+        append_pattern: ".write-waiters.lock/",
+        probes: &[".write-waiters.lock/"],
     },
     // The whole-command write lock above is only one of the lock sidecars a
     // live workspace keeps. Every open also leaves a per-database opener lease
@@ -6493,15 +6512,20 @@ fn inner_gitignore_missing_patterns(contents: &str) -> Vec<&'static str> {
         .collect()
 }
 
-/// Whether the ignore file `contents` ignore a direct-child file named
-/// `probe`. Gitignore semantics for the subset that matters here: last
+/// Whether `contents` ignore a direct-child `probe`; a trailing `/` marks
+/// a directory rather than a file. Semantics for the subset needed here: last
 /// matching rule wins, `!` negates, `#` comments, a leading `/` anchors to
 /// the `.beads/` directory (equivalent for direct children), leading `**/`
-/// matches in every directory (including this one), trailing-`/` directory
-/// rules and nested (`a/b`) rules never match a file probe. Whitespace follows
-/// Git exactly (see [`normalize_gitignore_line`]) so doctor never claims a
-/// file is ignored when Git would expose it.
+/// matches in every directory (including this one), and trailing-`/` rules
+/// match only directory probes. Nested (`a/b`) patterns remain unsupported:
+/// an ignored child does not establish that its whole evidence directory is
+/// ignored. Unknown negations invalidate directory coverage until a later
+/// supported rule covers it again, even if a slash appears to mark a child
+/// pattern. Whitespace follows Git exactly (see [`normalize_gitignore_line`]).
 fn inner_gitignore_ignores_probe(contents: &str, probe: &str) -> bool {
+    let (probe, is_directory) = probe
+        .strip_suffix('/')
+        .map_or((probe, false), |name| (name, true));
     let mut ignored = false;
     // Split on `\n` only: `str::lines` would already strip a CR before the
     // LF, and Git strips exactly one.
@@ -6517,7 +6541,23 @@ fn inner_gitignore_ignores_probe(contents: &str, probe: &str) -> bool {
         while let Some(rest) = pattern.strip_prefix("**/") {
             pattern = rest;
         }
-        if pattern.is_empty() || pattern.ends_with('/') || pattern.contains('/') {
+        let (pattern, directory_only) = pattern
+            .strip_suffix('/')
+            .map_or((pattern, false), |name| (name, true));
+        if pattern.is_empty() || (directory_only && !is_directory) {
+            continue;
+        }
+        // This matcher does not interpret character classes or escapes. A
+        // negation using either could expose the directory, so do not certify
+        // its coverage even when a slash appears to mark a child: `[/.]` can
+        // match a dot. This can conservatively request a redundant repair.
+        if is_directory && negated && (pattern.contains('[') || pattern.contains('\\')) {
+            ignored = false;
+            continue;
+        }
+        // A supported child-only exception cannot re-include a child while
+        // its parent remains ignored.
+        if pattern.contains('/') {
             continue;
         }
         if gitignore_glob_matches(pattern, probe) {
@@ -6615,8 +6655,8 @@ fn fix_inner_gitignore_if_warned(
     };
     // A file that is not there is not an incomplete file. Appending only the
     // patterns doctor maintains would create a `.gitignore` covering database
-    // artifacts and nothing else — no `.br_history/`, `.br_recovery/`, sync
-    // state, merge artifacts or daemon runtime files — so a repository that had
+    // and recovery artifacts but no sync state, merge artifacts or daemon
+    // runtime files — so a repository that had
     // lost the file would start showing those as untracked, which is the very
     // problem this check exists to prevent (GitHub #501). Write the canonical
     // file `br init` writes instead.
@@ -19036,12 +19076,14 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
-        // Everything the pre-#501 append set covered — and nothing else.
+        // Complete directory coverage alongside the pre-#501 file rules,
+        // isolating the missing per-database lock sidecars.
         fs::write(
             beads_dir.join(".gitignore"),
             b"*.db\n*.db-journal\n*.db-shm\n*.db-wal*\n*-fsqlite-ns-gate\n\
               *-fsqlite-ns-use\n*.vacuum-wal-cert*\n*.fsqlite-migration-state\n\
-              .write.lock\n*.tmp\n"
+              .write.lock\n*.tmp\n.br-wal-index-*/\n.br_recovery/\n\
+              .br_history/\n.write-waiters.lock/\n"
                 .as_slice(),
         )
         .unwrap();
@@ -19061,14 +19103,14 @@ mod tests {
     #[test]
     fn test_check_inner_gitignore_operator_megamix_equivalents_are_ok() {
         // GitHub #427: operator-authored equivalents (broad `*.db?*`,
-        // `*.lock`, `*-fsqlite-ns-*` generics) must satisfy coverage via
+        // `*.lock`, `.br*/`, `*-fsqlite-ns-*` generics) must satisfy coverage via
         // probes without textual equality with the canonical patterns.
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
         fs::write(
             beads_dir.join(".gitignore"),
-            b"*.db\n*.db?*\n*-fsqlite-ns-gate\n*-fsqlite-ns-use\n*.lock\n*.tmp\n",
+            b"*.db\n*.db?*\n*-fsqlite-ns-gate\n*-fsqlite-ns-use\n*.lock\n*.tmp\n.br*/\n",
         )
         .unwrap();
 
@@ -19162,6 +19204,116 @@ mod tests {
             "**/*.lock\n!**/.write.lock\n",
             ".write.lock"
         ));
+    }
+
+    #[test]
+    fn test_inner_gitignore_directory_rules_preserve_file_and_negation_semantics() {
+        for pattern in [
+            ".br-wal-index-*/\n",
+            "/.br-wal-index-*/\n",
+            "**/.br-wal-index-*/\n",
+            "/**/.br-wal-index-*/  \r\n",
+        ] {
+            assert!(inner_gitignore_ignores_probe(
+                pattern,
+                ".br-wal-index-recovery/"
+            ));
+            assert!(
+                !inner_gitignore_ignores_probe(pattern, ".br-wal-index-recovery"),
+                "a directory-only rule must not certify a regular file: {pattern:?}"
+            );
+        }
+        assert!(inner_gitignore_ignores_probe(".br*\n", ".br_recovery/"));
+        assert!(inner_gitignore_ignores_probe(
+            "*.lock\n",
+            ".write-waiters.lock/"
+        ));
+        assert!(!inner_gitignore_ignores_probe(
+            ".br*/\n!/.br_recovery/\n",
+            ".br_recovery/"
+        ));
+        assert!(!inner_gitignore_ignores_probe(
+            "**/.br_history/\n!**/.br_history\n",
+            ".br_history/"
+        ));
+        assert!(!inner_gitignore_ignores_probe(
+            ".br_recovery/*\n",
+            ".br_recovery/"
+        ));
+        assert!(
+            inner_gitignore_ignores_probe(
+                ".br_recovery/\n!.br_recovery/receipt.json\n",
+                ".br_recovery/"
+            ),
+            "a child exception cannot re-include files beneath an ignored parent"
+        );
+        assert!(!inner_gitignore_ignores_probe(
+            ".br_recovery/\t\n",
+            ".br_recovery/"
+        ));
+        for exception in ["![.]br_recovery/", "!\\.br_recovery/", "![/.]br_recovery/"] {
+            let contents = format!(".br_recovery/\n{exception}\n");
+            assert!(
+                !inner_gitignore_ignores_probe(&contents, ".br_recovery/"),
+                "unsupported negation must not certify directory coverage: {exception}"
+            );
+            assert!(inner_gitignore_ignores_probe(
+                &format!("{contents}.br_recovery/\n"),
+                ".br_recovery/"
+            ));
+        }
+        // Unsupported negations with apparent child paths are conservative:
+        // requesting a redundant repair is safer than certifying coverage
+        // without knowing whether a slash belongs to a character class.
+        assert!(!inner_gitignore_ignores_probe(
+            ".br_recovery/\n![.]br_recovery/receipt.json\n!\\.br_recovery/receipt.json\n",
+            ".br_recovery/"
+        ));
+    }
+
+    #[test]
+    fn test_inner_gitignore_quarantine_coverage_requires_multiple_names() {
+        for name in [".br-wal-index-A1b2C3/", ".br-wal-index-9xYzQ7/"] {
+            assert!(
+                inner_gitignore_missing_patterns(name).contains(&".br-wal-index-*/"),
+                "ignoring one retained run must not certify the quarantine family"
+            );
+        }
+        assert!(
+            !inner_gitignore_missing_patterns(".br-wal-index-*/").contains(&".br-wal-index-*/")
+        );
+    }
+
+    #[test]
+    fn test_check_inner_gitignore_flags_missing_runtime_directories() {
+        let directories = [
+            ".br-wal-index-*/",
+            ".br_recovery/",
+            ".br_history/",
+            ".write-waiters.lock/",
+        ];
+        // Keep every file expectation covered, but make none of the four
+        // directories ignored. The explicit DB lock rules replace *.lock,
+        // which would otherwise also cover the waiter directory.
+        let legacy = crate::cli::commands::init::BEADS_GITIGNORE
+            .lines()
+            .filter(|line| !directories.contains(line) && *line != "*.lock")
+            .chain([".br-db-openers-*.lock", ".br-db-write-*.lock"])
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(inner_gitignore_missing_patterns(&legacy), directories);
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir(&beads_dir).unwrap();
+        fs::write(beads_dir.join(".gitignore"), legacy).unwrap();
+        let mut checks = Vec::new();
+        check_inner_gitignore_present(&beads_dir, &mut checks);
+        let check = find_check(&checks, "gitignore.beads_inner_present").unwrap();
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(
+            check.details.as_ref().unwrap()["missing_patterns"],
+            serde_json::json!(directories)
+        );
     }
 
     #[test]
@@ -20067,11 +20219,13 @@ mod tests {
             crate::cli::commands::init::BEADS_GITIGNORE,
             "a missing file must be restored to the canonical template"
         );
-        // The patterns that make this more than the append path: history and
-        // recovery directories, sync state, merge artifacts, daemon runtime.
+        // The full template keeps runtime evidence and the additional sync,
+        // merge, and daemon rules beyond the maintained append set.
         for pattern in [
             ".br_history/",
             ".br_recovery/",
+            ".br-wal-index-*/",
+            ".write-waiters.lock/",
             "sync_base.jsonl",
             "beads.base.jsonl",
             "daemon.pid",
@@ -20096,12 +20250,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
-        // .gitignore has one canonical pattern + a custom one; missing *.tmp.
-        fs::write(
-            beads_dir.join(".gitignore"),
-            "# operator custom\n.write.lock\nlocal-cache/\n",
-        )
-        .unwrap();
+        // Preserve custom rules and the missing final newline while adding
+        // every uncovered runtime family through the existing repair path.
+        let before = "# operator custom\n.write.lock\nlocal-cache/";
+        fs::write(beads_dir.join(".gitignore"), before).unwrap();
 
         let mut report = DoctorReport {
             ok: false,
@@ -20119,15 +20271,23 @@ mod tests {
             Some(InnerGitignoreFix::Appended)
         );
         let after = fs::read_to_string(beads_dir.join(".gitignore")).unwrap();
-        // Existing operator lines preserved verbatim.
-        assert!(after.contains("# operator custom"), "{after:?}");
-        assert!(after.contains("local-cache/"), "{after:?}");
-        // Both canonical patterns now present.
-        assert!(
-            after.lines().any(|l| l.trim() == ".write.lock"),
-            "{after:?}"
+        let expected = format!(
+            "{before}\n{}\n",
+            inner_gitignore_missing_patterns(before).join("\n")
         );
-        assert!(after.lines().any(|l| l.trim() == "*.tmp"), "{after:?}");
+        assert_eq!(after, expected, "existing bytes must be preserved exactly");
+        assert!(inner_gitignore_missing_patterns(&after).is_empty());
+        report.checks.clear();
+        check_inner_gitignore_present(&beads_dir, &mut report.checks);
+        assert_eq!(
+            fix_inner_gitignore_if_warned(&beads_dir, &report, &ctx, Some(&mut session)),
+            None,
+            "a second repair must not append duplicate rules"
+        );
+        assert_eq!(
+            fs::read_to_string(beads_dir.join(".gitignore")).unwrap(),
+            after
+        );
     }
 
     #[test]

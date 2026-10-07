@@ -72,6 +72,8 @@ last-touched
 # `br doctor --repair`. Recovery artifacts live under their own directory
 # rather than relying on the database globs above (#271).
 .br_recovery/
+# WAL-index quarantine evidence retained beside the database
+.br-wal-index-*/
 
 # Sync state (local-only, per-machine)
 .sync.lock
@@ -751,6 +753,7 @@ mod tests {
         );
         assert!(content.contains("*.lock"));
         assert!(content.lines().any(|line| line == ".write-waiters.lock/"));
+        assert!(content.lines().any(|line| line == ".br-wal-index-*/"));
         info!("test_gitignore_excludes_db_files: assertions passed");
     }
 }

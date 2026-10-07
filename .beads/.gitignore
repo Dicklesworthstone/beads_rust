@@ -62,3 +62,6 @@ sync_base.jsonl
 .write.lock
 .write-waiters.lock/
 *.tmp
+
+# WAL-index quarantine evidence is local to this database family.
+.br-wal-index-*/

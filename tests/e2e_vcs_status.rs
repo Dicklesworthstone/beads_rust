@@ -1,6 +1,8 @@
 //! End-to-end contract tests for the explicit, bounded `br vcs-status`
 //! diagnostic. These tests intentionally live outside sync safety coverage:
 //! VCS process authority is opt-in and isolated to this command.
+//! Runtime-ignore tests also use Git as a fixture oracle for init/doctor;
+//! those production paths never invoke Git or change the index.
 
 #![allow(clippy::too_many_lines)]
 
@@ -164,6 +166,213 @@ fn assert_common_contract(value: &Value, available: bool) {
     assert_eq!(value["path"], ".beads/issues.jsonl", "{value}");
     assert!(value["timeout_ms"].as_u64().is_some(), "{value}");
     assert!(value["duration_ms"].as_u64().is_some(), "{value}");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_runtime_recovery_directories_are_ignored_by_init_and_repair() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _log = common::test_log("e2e_runtime_recovery_directories_are_ignored_by_init_and_repair");
+    let workspace = tracked_workspace();
+    let ignore_path = workspace.root.join(".beads/.gitignore");
+    let canonical = std::fs::read_to_string(&ignore_path).expect("canonical ignore file");
+    let directories = [
+        ".br-wal-index-*/",
+        ".br_recovery/",
+        ".br_history/",
+        ".write-waiters.lock/",
+    ];
+    let evidence = [
+        (
+            ".beads/.br-wal-index-fixture/poisoned-shm",
+            "retained\0original WAL index",
+        ),
+        (
+            ".beads/.br-wal-index-fixture/prepared.json",
+            "retained quarantine receipt\n",
+        ),
+        (
+            ".beads/.br_recovery/fixture/original.bin",
+            "retained recovery bytes\n",
+        ),
+        (
+            ".beads/.br_history/fixture.jsonl",
+            "retained local history\n",
+        ),
+        (
+            ".beads/.write-waiters.lock/00000000000000000001-0123456789abcdef.waiter",
+            // A valid, unlocked peer registration is retained by the queue
+            // scanner; only an owning WorkspaceWriteWaiter removes its leaf.
+            "retained abandoned registration\n",
+        ),
+    ];
+    let assert_ignored = |relative: &str, ignored: bool| {
+        let result = git(
+            &workspace.root,
+            &["check-ignore", "--no-index", "-q", "--", relative],
+        );
+        assert_eq!(
+            result.status.code(),
+            Some(if ignored { 0 } else { 1 }),
+            "wrong Git ignore result for {relative}: {result:?}"
+        );
+    };
+    for (relative, contents) in evidence {
+        let path = workspace.root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).expect("runtime directory");
+        std::fs::write(path, contents).expect("retained evidence");
+        assert_ignored(relative, true);
+    }
+    for relative in [JSONL, ".beads/config.yaml", ".beads/.gitignore"] {
+        assert_ignored(relative, false);
+    }
+
+    // Reproduce an older file-only ignore set. Keep the DB lock files
+    // covered explicitly so *.lock cannot conceal missing waiter coverage.
+    let legacy = canonical
+        .lines()
+        .filter(|line| !directories.contains(line) && *line != "*.lock")
+        .chain([
+            ".br-db-openers-*.lock",
+            ".br-db-write-*.lock",
+            "# retain operator rules verbatim",
+            "local-only/",
+        ])
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&ignore_path, &legacy).expect("legacy ignore file");
+    for (relative, _) in evidence {
+        assert_ignored(relative, false);
+    }
+
+    // Git is an independent test oracle above and below, never an implicit
+    // doctor subprocess. Reject any attempt to invoke it during the command.
+    let sentinel_dir = workspace.root.join("git-sentinel");
+    std::fs::create_dir(&sentinel_dir).expect("sentinel directory");
+    let sentinel = workspace.root.join("doctor-invoked-git");
+    let script = sentinel_dir.join("git");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n: > \"$DOCTOR_TEST_GIT_SENTINEL\"\nexit 97\n",
+    )
+    .expect("Git sentinel");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+        .expect("executable sentinel");
+    // The shared runner deduplicates PATH after caller overrides. Run these
+    // probes directly so the rejecting sentinel is the effective Git binary,
+    // with the same fixture isolation and per-invocation logs as that runner.
+    let run_doctor = |args: &[&str], label: &str| {
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin!("br"));
+        for (key, _) in std::env::vars_os() {
+            let name = key.to_string_lossy();
+            if name.starts_with("BD_")
+                || name.starts_with("BEADS_")
+                || matches!(
+                    name.as_ref(),
+                    "BR_DISABLE_READ_ONLY_FAST_OPEN"
+                        | "BR_OUTPUT_FORMAT"
+                        | "TOON_DEFAULT_FORMAT"
+                        | "TOON_STATS"
+                )
+            {
+                command.env_remove(key);
+            }
+        }
+        command
+            .current_dir(&workspace.root)
+            .args(args)
+            .env("BR_HISTORY_MIN_INTERVAL_SECS", "0")
+            .env("HOME", &workspace.root)
+            .env("RUST_LOG", "error")
+            .env("NO_COLOR", "1")
+            .env("RUST_BACKTRACE", "1")
+            .env("DOCTOR_TEST_GIT_SENTINEL", &sentinel)
+            .env("PATH", &sentinel_dir);
+        let start = std::time::Instant::now();
+        let output = command.output().expect("run doctor with Git sentinel");
+        let duration = start.elapsed();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let log_path = workspace.log_dir.join(format!("{label}.log"));
+        std::fs::write(
+            &log_path,
+            format!(
+                "label: {label}\nduration: {duration:?}\nstatus: {}\nargs: {args:?}\n\nstdout:\n{stdout}\n\nstderr:\n{stderr}\n",
+                output.status
+            ),
+        )
+        .expect("write doctor invocation log");
+        eprintln!(
+            "{}",
+            serde_json::json!({"kind": "cli_harness", "workspace": workspace.root,
+                "label": label, "binary": assert_cmd::cargo::cargo_bin!("br"),
+                "args": args, "exit": output.status.code(),
+                "duration_ms": duration.as_millis(), "stdout": stdout, "stderr": stderr})
+        );
+        common::cli::BrRun {
+            stdout,
+            stderr,
+            status: output.status,
+            duration,
+            log_path,
+        }
+    };
+    let index_before = std::fs::read(workspace.root.join(".git/index")).expect("Git index");
+    let diagnosed = run_doctor(&["doctor", "--no-db", "--json"], "runtime_ignore_before");
+    let report: Value =
+        serde_json::from_str(&extract_json_payload(&diagnosed.stdout)).expect("doctor report JSON");
+    let check = report["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["name"] == "gitignore.beads_inner_present")
+        .expect("inner ignore finding");
+    assert_eq!(check["status"], "warn", "{report}");
+    assert_eq!(
+        check["details"]["missing_patterns"],
+        serde_json::json!(directories)
+    );
+
+    let expected = format!("{legacy}\n{}\n", directories.join("\n"));
+    for label in ["runtime_ignore_repair", "runtime_ignore_repeat"] {
+        let repaired = run_doctor(
+            &[
+                "doctor",
+                "--no-db",
+                "--repair",
+                "--only",
+                "fm-configs-gitignore-leaking-beads",
+                "--json",
+            ],
+            label,
+        );
+        assert!(
+            matches!(repaired.status.code(), Some(0 | 2)),
+            "doctor repair failed: {repaired:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ignore_path).expect("repaired ignore file"),
+            expected,
+            "repair must preserve existing bytes and append each missing rule once"
+        );
+        assert!(!sentinel.exists(), "doctor invoked Git");
+        assert_eq!(
+            std::fs::read(workspace.root.join(".git/index")).expect("unchanged Git index"),
+            index_before
+        );
+        for (relative, contents) in evidence {
+            assert_eq!(
+                std::fs::read(workspace.root.join(relative)).expect("preserved evidence"),
+                contents.as_bytes(),
+                "repair changed {relative}"
+            );
+            assert_ignored(relative, true);
+        }
+        for relative in [JSONL, ".beads/config.yaml", ".beads/.gitignore"] {
+            assert_ignored(relative, false);
+        }
+    }
 }
 
 #[test]
