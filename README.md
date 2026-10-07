@@ -427,6 +427,15 @@ when Agent Mail reservation or liveness evidence is required.
 
 The MCP tool surface is `list_issues`, `show_issue`, `create_issue`,
 `update_issue`, `close_issue`, `manage_dependencies`, and `project_overview`.
+`create_issue` accepts an optional `status` for a single issue or each item in
+`issues[]`; it defaults to `open`, as the CLI does. Projects whose workflow
+requires a different initial state can pass that state explicitly, such as
+`{"title":"Investigate the failure","status":"draft"}`. A configured
+`workflow.entry_routes` rule also works through MCP when the request supplies
+its matching label and an existing `parent`. Status vocabulary, initial
+admission, provenance, and capacity are enforced by the same storage transaction
+as CLI creation, and each successful result reports the actual created status.
+
 The resource surface is `beads://project/info`, `beads://issue/{id}`,
 `beads://schema`, `beads://labels`, `beads://issues/ready`,
 `beads://issues/blocked`, `beads://issues/in_progress`,

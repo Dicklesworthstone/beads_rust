@@ -1632,20 +1632,13 @@ impl CreateIssueTool {
     }
 }
 
-fn create_issue_result_json(
-    id: &str,
-    title: &str,
-    priority: Priority,
-    issue_type: &IssueType,
-    parent_id: Option<&str>,
-    coercions: &[String],
-) -> Value {
+fn create_issue_result_json(issue: &Issue, parent_id: Option<&str>, coercions: &[String]) -> Value {
     let mut result = json!({
-        "id": id,
-        "title": title,
-        "status": "open",
-        "priority": priority.0,
-        "type": issue_type.as_str(),
+        "id": issue.id,
+        "title": issue.title,
+        "status": issue.status.as_str(),
+        "priority": issue.priority.0,
+        "type": issue.issue_type.as_str(),
         "next_actions": [
             "Use update_issue to add details or change fields",
             "Use manage_dependencies to link to other issues"
@@ -1673,6 +1666,15 @@ fn create_issue_json(
     validate_mcp_title(&title)?;
 
     let mut coercions: Vec<String> = Vec::new();
+    let workflow = storage.workflow_policy();
+    let (status, status_warning) = optional_str_arg(args, "status")?
+        .as_deref()
+        .map(|raw| parse_status(raw, &workflow))
+        .transpose()?
+        .unwrap_or((Status::Open, None));
+    if let Some(warning) = status_warning {
+        coercions.push(warning);
+    }
 
     let (issue_type, type_warning) = optional_str_arg(args, "type")?
         .as_deref()
@@ -1725,7 +1727,9 @@ fn create_issue_json(
         description: description.clone(),
         acceptance_criteria,
         prerequisites,
-        status: Status::Open,
+        closed_at: matches!(status, Status::Closed).then_some(now),
+        deleted_at: matches!(status, Status::Tombstone).then_some(now),
+        status,
         priority,
         issue_type: issue_type.clone(),
         assignee: assignee.clone(),
@@ -1752,23 +1756,18 @@ fn create_issue_json(
         .map_err(BeadsError::from_validation_errors)
         .map_err(beads_to_mcp)?;
 
-    let workflow = storage.workflow_policy();
     workflow
         .validate_status(issue.status.as_str())
         .map_err(beads_to_mcp)?;
-    workflow
-        .validate_transition(None, issue.status.as_str(), None)
-        .map_err(beads_to_mcp)?;
+    // Storage proves initial admission, including label-and-parent entry
+    // routes, inside the same transaction that creates the issue.
     storage.set_pending_event_attribution(mcp_event_attribution(args)?);
     storage
         .create_issue(&issue, &state.actor)
         .map_err(beads_to_mcp)?;
 
     Ok(create_issue_result_json(
-        &id,
-        &title,
-        priority,
-        &issue_type,
+        &issue,
         parent_id.as_deref(),
         &coercions,
     ))
@@ -1784,6 +1783,7 @@ fn create_issue_batch_items(args: &Value) -> McpResult<Option<Vec<Value>>> {
         "description",
         "acceptance_criteria",
         "prerequisites",
+        "status",
         "type",
         "priority",
         "assignee",
@@ -1920,6 +1920,10 @@ impl ToolHandler for CreateIssueTool {
                         "type": "string",
                         "description": "Prerequisite checklist preserved verbatim; separate from acceptance criteria and dependency edges"
                     },
+                    "status": {
+                        "type": "string",
+                        "description": "Initial status (default: open). Supports project-defined statuses and configured entry routes; requires ordinary workflow admission."
+                    },
                     "type": {
                         "type": "string",
                         "description": "Issue type: task (default), bug, feature, epic, chore, docs, question. Aliases: feat, defect, enhancement, refactor, doc."
@@ -1948,9 +1952,15 @@ impl ToolHandler for CreateIssueTool {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": CREATE_ISSUE_BATCH_MAX,
-                        "description": "Batch of issue objects using the same fields as a single create item, including title, description, acceptance_criteria, prerequisites, type, priority, assignee, labels, and parent. Returns {items,count,ok_count,error_count}; each item is either {index,title,id,ok:true,result} using the legacy single-create result shape, or {index,title,ok:false,error}. Partial failures do not fail the whole batch.",
+                        "description": "Batch of issue objects using the same fields as a single create item, including title, description, acceptance_criteria, prerequisites, status, type, priority, assignee, labels, and parent. Returns {items,count,ok_count,error_count}; each item is either {index,title,id,ok:true,result} using the legacy single-create result shape, or {index,title,ok:false,error}. Partial failures do not fail the whole batch.",
                         "items": {
                             "type": "object",
+                            "properties": {
+                                "status": {
+                                    "type": "string",
+                                    "description": "Initial status (default: open), subject to the project workflow and configured entry routes."
+                                }
+                            },
                             "required": ["title"],
                             "additionalProperties": true
                         }
@@ -4209,6 +4219,146 @@ mod tests {
     }
 
     #[test]
+    fn create_issue_schema_exposes_optional_single_and_batch_status() {
+        let temp = TempDir::new().expect("tempdir");
+        let tool = CreateIssueTool::new(mcp_test_state(&temp));
+        let schema = tool.definition().input_schema;
+        for status in [
+            &schema["properties"]["status"],
+            &schema["properties"]["issues"]["items"]["properties"]["status"],
+        ] {
+            assert_eq!(status["type"], "string");
+            assert!(
+                status.get("enum").is_none(),
+                "custom statuses must be accepted"
+            );
+        }
+        assert_eq!(schema["oneOf"][0]["required"], json!(["title"]));
+        assert_eq!(
+            schema["properties"]["issues"]["items"]["required"],
+            json!(["title"])
+        );
+    }
+
+    #[test]
+    fn create_issue_status_uses_workflow_vocabulary_and_reports_coercions() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        fs::write(
+            state.beads_dir.join("policy.yaml"),
+            "workflow:\n  strict: true\n  statuses: [draft, in_planning, active, in_progress]\n  transitions:\n    initial: [draft, in_planning, active, in_progress]\n",
+        )
+        .expect("write workflow");
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = CreateIssueTool::new(Arc::clone(&state));
+
+        for (requested, expected, warning) in [
+            ("draft", "draft", None),
+            ("in_planning", "in_planning", None),
+            // A declared custom status wins over a built-in alias.
+            ("active", "active", None),
+            (
+                "wip",
+                "in_progress",
+                Some("'wip' interpreted as 'in_progress'"),
+            ),
+        ] {
+            let result = content_json(
+                &tool
+                    .call(
+                        &ctx,
+                        json!({"title": format!("Create as {requested}"), "status": requested}),
+                    )
+                    .expect("create in declared initial status"),
+            );
+            assert_eq!(result["status"], expected, "{result}");
+            if let Some(warning) = warning {
+                assert_eq!(result["coercions"], json!([warning]));
+                assert_eq!(result["warnings"], result["coercions"]);
+            } else {
+                assert!(result.get("coercions").is_none(), "{result}");
+                assert!(result.get("warnings").is_none(), "{result}");
+            }
+
+            let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+            let stored = storage
+                .get_issue(result["id"].as_str().expect("created id"))
+                .expect("get created issue")
+                .expect("created issue exists");
+            assert_eq!(stored.status.as_str(), expected);
+            assert_eq!(stored.closed_at, None);
+            assert_eq!(stored.deleted_at, None);
+        }
+    }
+
+    #[test]
+    fn create_issue_terminal_status_sets_matching_timestamp_and_export() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = CreateIssueTool::new(Arc::clone(&state));
+
+        for (requested, expected) in [
+            ("closed", Status::Closed),
+            ("done", Status::Closed),
+            ("tombstone", Status::Tombstone),
+        ] {
+            let result = content_json(
+                &tool
+                    .call(
+                        &ctx,
+                        json!({"title": format!("Create terminal {requested}"), "status": requested}),
+                    )
+                    .expect("create terminal issue"),
+            );
+            assert_eq!(result["status"], expected.as_str());
+            let id = result["id"].as_str().expect("created id");
+            let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+            let stored = storage
+                .get_issue(id)
+                .expect("get created issue")
+                .expect("created issue exists");
+            assert_eq!(stored.status, expected);
+            assert_eq!(
+                stored.closed_at,
+                (expected == Status::Closed).then_some(stored.created_at)
+            );
+            assert_eq!(
+                stored.deleted_at,
+                (expected == Status::Tombstone).then_some(stored.created_at)
+            );
+            let exported = fs::read_to_string(&state.jsonl_path)
+                .expect("read auto-flushed JSONL")
+                .lines()
+                .map(|line| serde_json::from_str::<Issue>(line).expect("parse exported issue"))
+                .find(|issue| issue.id == id)
+                .expect("terminal issue remains exportable");
+            assert_eq!(exported.status, stored.status);
+            assert_eq!(exported.closed_at, stored.closed_at);
+            assert_eq!(exported.deleted_at, stored.deleted_at);
+        }
+    }
+
+    #[test]
+    fn create_issue_rejects_non_string_status_without_creating_an_issue() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = CreateIssueTool::new(Arc::clone(&state));
+
+        for status in [Value::Null, json!(4), json!(["draft"])] {
+            let error = tool
+                .call(&ctx, json!({"title": "Invalid status", "status": status}))
+                .expect_err("status must be a string");
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert!(error.message.contains("'status' must be a string"));
+        }
+        let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        assert_eq!(storage.count_issues().expect("count issues"), 0);
+        assert!(!state.jsonl_path.exists());
+    }
+
+    #[test]
     fn create_issue_batch_returns_ordered_items_partial_errors_and_flushes() {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
@@ -4230,6 +4380,7 @@ mod tests {
                         {"title": ""},
                         {
                             "title": "batch create child",
+                            "status": "draft",
                             "parent": "br-mcp-create-parent",
                             "labels": ["team:child"]
                         },
@@ -4260,6 +4411,7 @@ mod tests {
             batch["items"][2]["result"]["parent"].as_str(),
             Some("br-mcp-create-parent")
         );
+        assert_eq!(batch["items"][2]["result"]["status"], "draft");
         assert_eq!(
             batch["items"][3]["error"]["data"]["error_type"].as_str(),
             Some("ISSUE_NOT_FOUND")
@@ -4268,6 +4420,14 @@ mod tests {
         let storage = SqliteStorage::open(&state.db_path).expect("open storage");
         let first_id = batch["items"][0]["id"].as_str().expect("first id");
         let child_id = batch["items"][2]["id"].as_str().expect("child id");
+        assert_eq!(
+            storage
+                .get_issue(child_id)
+                .expect("get child")
+                .unwrap()
+                .status,
+            Status::Draft
+        );
         assert_eq!(
             storage.get_labels(first_id).expect("first labels"),
             vec!["team:create".to_string()]
@@ -4297,18 +4457,20 @@ mod tests {
         let ctx = McpContext::new(Cx::for_testing(), 1);
         let tool = CreateIssueTool::new(state);
 
-        let err = tool
-            .call(
-                &ctx,
-                json!({
-                    "title": "single title",
-                    "issues": [{"title": "batch title"}]
-                }),
-            )
-            .expect_err("title and issues together should fail");
+        for args in [
+            json!({
+                "title": "single title",
+                "issues": [{"title": "batch title"}]
+            }),
+            json!({"status": "draft", "issues": [{"title": "batch title"}]}),
+        ] {
+            let err = tool
+                .call(&ctx, args)
+                .expect_err("single fields and issues together should fail");
 
-        assert_eq!(err.code, McpErrorCode::InvalidParams);
-        assert!(err.message.contains("either title"));
+            assert_eq!(err.code, McpErrorCode::InvalidParams);
+            assert!(err.message.contains("either title"));
+        }
     }
 
     #[test]

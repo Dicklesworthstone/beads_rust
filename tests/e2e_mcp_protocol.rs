@@ -1560,6 +1560,235 @@ fn mcp_prerequisites_and_acceptance_round_trip_through_prospective_policy() {
     );
 }
 
+fn write_mcp_entry_policy(root: &Path, enabled: bool, open_capacity: usize) {
+    let entry_routes = if enabled {
+        "  entry_routes:\n    - {label: triage, to: open}\n    - {label: follow_up, to: triage_queue}\n"
+    } else {
+        ""
+    };
+    std::fs::write(
+        root.join(".beads/policy.yaml"),
+        format!(
+            r#"workflow:
+  strict: true
+  statuses: [draft, open, triage_queue, in_progress, closed]
+  transitions:
+    initial: [draft]
+    draft: [open]
+    open: [in_progress]
+    triage_queue: [open]
+    in_progress: [closed]
+    closed: [draft]
+{entry_routes}  capacity:
+    statuses:
+      open: {{hard: {open_capacity}}}
+"#
+        ),
+    )
+    .expect("create admission policy");
+}
+
+fn assert_mcp_created_status(
+    client: &mut McpClient,
+    root: &Path,
+    created: &Value,
+    status: &str,
+    parent: Option<&str>,
+) -> String {
+    let id = created["id"].as_str().expect("created issue ID");
+    assert_eq!(created["status"], status);
+    let shown = first_record(cli_json(root, &["show", id]));
+    assert_eq!(shown["status"], status);
+    assert_eq!(shown["created_by"], ACTOR);
+    assert_eq!(
+        client.call_tool("show_issue", json!({"id": id}))["status"],
+        status
+    );
+    let jsonl = std::fs::read_to_string(root.join(".beads/issues.jsonl")).expect("creation export");
+    let exported = jsonl
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("exported issue"))
+        .find(|issue| issue["id"] == id)
+        .expect("created issue exported");
+    assert_eq!(exported["status"], status);
+    assert_eq!(exported["created_by"], ACTOR);
+    if let Some(parent) = parent {
+        assert_eq!(created["parent"], parent);
+        let edge = exported_dependency(root, id, "parent-child");
+        assert_eq!(edge["depends_on_id"], parent);
+        assert_eq!(edge["created_by"], ACTOR);
+    }
+    let connection = read_only_db(root);
+    let events = connection
+        .query_with_params(
+            "SELECT actor FROM events WHERE issue_id = ? AND event_type = 'created'",
+            &[id.into()],
+        )
+        .expect("creation audit event");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].get(0), Some(&ACTOR.into()));
+    connection.close().expect("close creation observer");
+    id.to_string()
+}
+
+#[test]
+fn mcp_create_admits_explicit_initial_status_and_configured_entry_routes() {
+    let workspace = ProtocolWorkspace::new().expect("workspace");
+    let root = workspace.path();
+    cli_json(root, &["init", "--prefix", "entry"]);
+    write_mcp_entry_policy(root, true, 4);
+    let parent = first_id(&cli_json(
+        root,
+        &["create", "Known work", "--status", "draft"],
+    ));
+    let mut client = McpClient::spawn(root);
+    let draft = client.call_tool(
+        "create_issue",
+        json!({"title": "Plan before implementation", "status": "draft",
+            "acceptance_criteria": "- [ ] Implement the feature"}),
+    );
+    let draft_id = assert_mcp_created_status(&mut client, root, &draft, "draft", None);
+    assert_eq!(
+        first_record(cli_json(root, &["show", &draft_id]))["acceptance_criteria"],
+        "- [ ] Implement the feature"
+    );
+    for (target, label) in [("open", "triage"), ("triage_queue", "follow_up")] {
+        // Both interfaces must admit the same explicit relation/label/status
+        // combination under one policy, including a project-defined status.
+        let cli_id = first_id(&cli_json(
+            root,
+            &[
+                "create",
+                "CLI discovered work",
+                "--status",
+                target,
+                "--parent",
+                &parent,
+                "--labels",
+                label,
+            ],
+        ));
+        assert_eq!(
+            first_record(cli_json(root, &["show", &cli_id]))["status"],
+            target
+        );
+        let created = client.call_tool(
+            "create_issue",
+            json!({"title": "MCP discovered work", "status": target,
+                "parent": parent, "labels": [label]}),
+        );
+        let id = assert_mcp_created_status(&mut client, root, &created, target, Some(&parent));
+        assert_eq!(
+            first_record(cli_json(root, &["show", &id]))["labels"],
+            json!([label])
+        );
+    }
+    for arguments in [
+        json!({"title": "Default still obeys initial admission"}),
+        json!({"title": "Label alone cannot admit", "status": "open", "labels": ["triage"]}),
+        json!({"title": "Parent alone cannot admit", "status": "open", "parent": parent}),
+        json!({"title": "Unknown target cannot admit", "status": "unlisted", "parent": parent, "labels": ["triage"]}),
+    ] {
+        assert_policy_refusal_unchanged(
+            &mut client,
+            root,
+            "create_issue",
+            arguments,
+            "VALIDATION_FAILED",
+        );
+    }
+    // A running server must re-read revoked entry routes before its next write.
+    write_mcp_entry_policy(root, false, 4);
+    assert_policy_refusal_unchanged(
+        &mut client,
+        root,
+        "create_issue",
+        json!({"title": "Revoked route", "status": "triage_queue", "parent": parent, "labels": ["follow_up"]}),
+        "VALIDATION_FAILED",
+    );
+    let (status, stderr) = client.finish();
+    assert!(
+        status.success() || status.code() == Some(130),
+        "{status}: {stderr}"
+    );
+}
+
+#[test]
+fn mcp_create_batch_preserves_entry_admission_and_capacity_per_item() {
+    let workspace = ProtocolWorkspace::new().expect("workspace");
+    let root = workspace.path();
+    cli_json(root, &["init", "--prefix", "entrybatch"]);
+    write_mcp_entry_policy(root, false, 1);
+    let parent = first_id(&cli_json(
+        root,
+        &["create", "Known batch work", "--status", "draft"],
+    ));
+    let mut client = McpClient::spawn(root);
+    // The same running server must also discover newly enabled routes.
+    assert_policy_refusal_unchanged(
+        &mut client,
+        root,
+        "create_issue",
+        json!({"title": "Not admitted yet", "status": "open", "parent": parent, "labels": ["triage"]}),
+        "VALIDATION_FAILED",
+    );
+    write_mcp_entry_policy(root, true, 1);
+    let batch = client.call_tool(
+        "create_issue",
+        json!({"issues": [
+            {"title": "Batch draft", "status": "draft"},
+            {"title": "First capacity slot", "status": "open", "parent": parent, "labels": ["triage"]},
+            {"title": "No second capacity slot", "status": "open", "parent": parent, "labels": ["triage"]},
+            {"title": "Batch custom route", "status": "triage_queue", "parent": parent, "labels": ["follow_up"]},
+            {"title": "No provenance", "status": "triage_queue", "labels": ["follow_up"]}
+        ]}),
+    );
+    assert_eq!(batch["count"], 5);
+    assert_eq!(batch["ok_count"], 3);
+    assert_eq!(batch["error_count"], 2);
+    assert_eq!(
+        batch["items"][2]["error"]["data"]["error_type"],
+        "WORKFLOW_CAPACITY_EXCEEDED"
+    );
+    assert_eq!(
+        batch["items"][4]["error"]["data"]["error_type"],
+        "VALIDATION_FAILED"
+    );
+    let mut expected_ids = BTreeSet::from([parent.clone()]);
+    for (index, status, expected_parent) in [
+        (0, "draft", None),
+        (1, "open", Some(parent.as_str())),
+        (3, "triage_queue", Some(parent.as_str())),
+    ] {
+        assert_eq!(batch["items"][index]["ok"], true);
+        expected_ids.insert(assert_mcp_created_status(
+            &mut client,
+            root,
+            &batch["items"][index]["result"],
+            status,
+            expected_parent,
+        ));
+    }
+    let mut actual_ids = BTreeSet::new();
+    ids_in(&cli_json(root, &["list", "--all"]), &mut actual_ids);
+    assert_eq!(
+        actual_ids, expected_ids,
+        "refused batch items must leave no issue rows"
+    );
+    assert_policy_refusal_unchanged(
+        &mut client,
+        root,
+        "create_issue",
+        json!({"title": "Single capacity refusal", "status": "open", "parent": parent, "labels": ["triage"]}),
+        "WORKFLOW_CAPACITY_EXCEEDED",
+    );
+    let (status, stderr) = client.finish();
+    assert!(
+        status.success() || status.code() == Some(130),
+        "{status}: {stderr}"
+    );
+}
+
 fn write_mcp_class_policy(root: &Path, enabled: bool, open_capacity: usize) {
     let class_rules = if enabled {
         "  class_transitions:\n    - {issue_type: bug, from: draft, to: open}\n"
@@ -1728,7 +1957,7 @@ fn assert_mcp_class_scope_refusals(
     task: &str,
     unknown: &str,
 ) {
-    // MCP create has no status input: its open default still obeys initial admission.
+    // Omitting create status keeps the open default subject to initial admission.
     assert_policy_refusal_unchanged(
         client,
         root,
