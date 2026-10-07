@@ -70,7 +70,7 @@ pub(crate) use path::{
 
 use crate::error::{BeadsError, Result};
 use crate::model::{Comment, Dependency, DependencyType, Issue};
-use crate::storage::sqlite::ImportIssueLookup;
+use crate::storage::sqlite::{ExportCloseBypassAudit, ImportIssueLookup};
 use crate::storage::{EventAttribution, SqliteStorage};
 use crate::sync::history::HistoryConfig;
 use crate::util::id::{IdConfig, IdGenerator, parse_id};
@@ -13451,22 +13451,71 @@ fn apply_incremental_auto_flush_changes(
     changed
 }
 
-/// A clean tombstone can expire while another issue becomes dirty. Reconcile
-/// these removals against the captured source and actual certificate rows so
-/// already-pruned tombstones do not cause repeated per-ID database writes.
-fn collect_incremental_retention_removals(
+/// A retention change can exclude a clean tombstone or make a previously
+/// omitted one exportable again. Merge those population changes into the
+/// captured source without overwriting any unrelated source payload.
+fn collect_incremental_retention_changes(
     storage: &SqliteStorage,
     source: &JsonlSourceSnapshot,
     changes: &mut IncrementalAutoFlushChanges,
     retention_days: Option<u64>,
     export_as_of: DateTime<Utc>,
 ) -> Result<Option<BTreeMap<String, String>>> {
-    let expired = storage.get_expired_tombstone_ids_at(retention_days, export_as_of)?;
-    if expired.is_empty() {
+    let (retained, expired) =
+        storage.get_tombstone_retention_ids_at(retention_days, export_as_of)?;
+    if retained.is_empty() && expired.is_empty() {
         return Ok(None);
     }
 
     let lines_by_id = read_jsonl_lines_by_id(source)?;
+    let mut removed_ids = changes
+        .removed_hash_ids
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut missing = retained
+        .into_iter()
+        .filter(|id| {
+            !lines_by_id.contains_key(id)
+                && !changes.replacement_lines.contains_key(id)
+                && !removed_ids.contains(id)
+        })
+        .collect::<Vec<_>>();
+    missing.sort_unstable();
+    for ids in missing.chunks(EXPORT_ISSUE_BATCH_SIZE) {
+        let issues = storage.get_issues_for_export(ids)?;
+        if issues.len() != ids.len() {
+            return Err(BeadsError::SyncConflict {
+                message: "Retained tombstones changed while preparing automatic export".to_string(),
+            });
+        }
+        for mut issue in issues {
+            if issue.status != Status::Tombstone
+                || !is_issue_exportable_at(&issue, retention_days, export_as_of)
+            {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Retained tombstone '{}' changed while preparing automatic export",
+                        issue.id
+                    ),
+                });
+            }
+            normalize_issue_for_export(&mut issue);
+            let json = serde_json::to_string(&issue).map_err(|error| {
+                BeadsError::Config(format!(
+                    "Failed to serialize retained tombstone '{}': {error}",
+                    issue.id
+                ))
+            })?;
+            changes
+                .issue_hashes
+                .push((issue.id.clone(), issue.compute_content_hash()));
+            changes.replacement_lines.insert(issue.id, json);
+        }
+    }
+    if expired.is_empty() {
+        return Ok(Some(lines_by_id));
+    }
     let certificate_ids = storage
         .execute_raw_query("SELECT issue_id FROM export_hashes")?
         .into_iter()
@@ -13475,11 +13524,6 @@ fn collect_incremental_retention_removals(
                 .and_then(SqliteValue::as_text)
                 .map(str::to_owned)
         })
-        .collect::<HashSet<_>>();
-    let mut removed_ids = changes
-        .removed_hash_ids
-        .iter()
-        .cloned()
         .collect::<HashSet<_>>();
     for id in expired {
         if removed_ids.contains(&id) {
@@ -13511,6 +13555,106 @@ fn collect_incremental_retention_removals(
     }
     // Reuse this parse when applying the dirty rows and writing the result.
     Ok(Some(lines_by_id))
+}
+
+/// A clean explicit flush may still need to apply a changed retention policy.
+/// The stored file hash does not certify database payloads: an earlier
+/// incremental export may have preserved newer, unimported source rows.
+/// Authorize a full retention export only after comparing complete payloads
+/// in bounded rowid batches against one coherent database snapshot.
+pub(crate) fn clean_retention_export_required(
+    storage: &SqliteStorage,
+    source: &JsonlSourceSnapshot,
+    source_ids: &HashSet<String>,
+    retention_days: Option<u64>,
+    export_as_of: DateTime<Utc>,
+) -> Result<bool> {
+    storage.with_read_transaction(|storage| {
+        let (retained, expired) =
+            storage.get_tombstone_retention_ids_at(retention_days, export_as_of)?;
+        if !retained.iter().any(|id| !source_ids.contains(id))
+            && !expired.iter().any(|id| source_ids.contains(id))
+        {
+            return Ok(false);
+        }
+        let lookup = storage.build_import_issue_lookup()?;
+        // The normal exporter includes this audit projection. Read it once,
+        // rather than scanning close_metadata again for each payload batch.
+        let audit = storage.load_close_bypass_audit_for_export()?;
+        let mut pending = Vec::with_capacity(IMPORT_SKIP_CERTIFICATION_BATCH_SIZE);
+        let mut reader = source.reader();
+        let mut line = String::new();
+        let mut line_number = 0;
+        let mut seen_ids = HashSet::new();
+        while reader.read_line(&mut line)? > 0 {
+            line_number += 1;
+            if !line.trim().is_empty() {
+                // Certification must observe the captured payload. Import's
+                // repairs (terminal timestamps, status aliases, external refs)
+                // could hide a difference or invent one in a valid export.
+                let issue: Issue = serde_json::from_str(line.trim()).map_err(|error| {
+                    BeadsError::Config(format!("Invalid JSON at line {line_number}: {error}"))
+                })?;
+                if !seen_ids.insert(issue.id.clone()) {
+                    return Err(BeadsError::SyncConflict {
+                        message: format!(
+                            "Duplicate JSONL issue '{}' while certifying retention export",
+                            issue.id
+                        ),
+                    });
+                }
+                pending.push(issue);
+            }
+            if pending.len() >= IMPORT_SKIP_CERTIFICATION_BATCH_SIZE {
+                verify_clean_retention_source_batch(storage, &lookup, &audit, &mut pending)?;
+            }
+            line.clear();
+        }
+        verify_clean_retention_source_batch(storage, &lookup, &audit, &mut pending)?;
+        Ok(true)
+    })
+}
+
+fn verify_clean_retention_source_batch(
+    storage: &SqliteStorage,
+    lookup: &ImportIssueLookup,
+    audit: &ExportCloseBypassAudit,
+    pending: &mut Vec<Issue>,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let ids = pending
+        .iter()
+        .map(|issue| issue.id.clone())
+        .collect::<Vec<_>>();
+    let mut stored = storage.get_issues_for_import_comparison(&ids, lookup)?;
+    audit.attach(&mut stored);
+    let stored = stored
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect::<HashMap<_, _>>();
+    for issue in pending.drain(..) {
+        // Import can ignore clocks and derived audit fields on a skip, but
+        // a full export would serialize them over the captured source.
+        let matches = stored.get(&issue.id).is_some_and(|actual| {
+            actual.created_at == issue.created_at
+                && actual.updated_at == issue.updated_at
+                && actual.bypassed_policy == issue.bypassed_policy
+                && actual.bypass_reason == issue.bypass_reason
+                && actual.policy_gates_fired == issue.policy_gates_fired
+                && skipped_import_matches_stored_issue(Some(actual), &issue.id, &issue)
+        });
+        if !matches {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Cannot apply retention during a clean flush: JSONL issue '{}' differs from the database; reconcile with `br sync --merge` before exporting",
+                    issue.id
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Export dirty issues into an existing JSONL by rewriting only their lines.
@@ -13579,7 +13723,7 @@ fn try_incremental_auto_flush(
         export_config.retention_days,
         export_as_of,
     )?;
-    let retained_lines = collect_incremental_retention_removals(
+    let retained_lines = collect_incremental_retention_changes(
         storage,
         &source,
         &mut changes,
@@ -27354,7 +27498,7 @@ mod tests {
         let mut changes =
             collect_incremental_auto_flush_changes(&storage, Vec::new(), Some(30), later_cutoff)
                 .unwrap();
-        collect_incremental_retention_removals(
+        collect_incremental_retention_changes(
             &storage,
             &source,
             &mut changes,
@@ -27364,6 +27508,38 @@ mod tests {
         .unwrap();
         assert!(changes.removed_hash_ids.is_empty());
         assert_eq!(storage.get_non_ephemeral_issue_ids().unwrap().len(), 3);
+
+        // Disabling retention makes both previously omitted clean tombstones
+        // eligible again. An unrelated dirty row must restore the same full
+        // population without requiring either tombstone to become dirty.
+        retitle(
+            &mut storage,
+            &open.id,
+            "Changed after retention was disabled",
+        );
+        let config = ExportConfig {
+            retention_days: None,
+            ..config
+        };
+        let mut expected = Vec::new();
+        let (expected_result, _) = export_to_writer_with_policy_and_retention_at(
+            &storage,
+            &mut expected,
+            ExportErrorPolicy::Strict,
+            None,
+            later_cutoff,
+        )
+        .unwrap();
+        let incremental = try_incremental_auto_flush(&mut storage, &output_path, &config, None)
+            .unwrap()
+            .unwrap();
+        assert!(incremental.flushed);
+        assert_eq!(incremental.exported_count, 3);
+        assert_eq!(incremental.content_hash, expected_result.content_hash);
+        assert_eq!(fs::read(&output_path).unwrap(), expected);
+        assert!(storage.get_export_hash(&boundary.id).unwrap().is_some());
+        assert!(storage.get_export_hash(&expired.id).unwrap().is_some());
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
     }
 
     #[test]

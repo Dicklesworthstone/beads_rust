@@ -2886,6 +2886,368 @@ fn assert_retention_export(ws: &BrWorkspace, expected_ids: &[&str], expired_id: 
     );
 }
 
+fn assert_restored_tombstone_payload(ws: &BrWorkspace, expected: &Issue) {
+    let published = read_jsonl_lines(ws)
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).expect("published issue"))
+        .find(|issue| issue["id"].as_str() == Some(expected.id.as_str()))
+        .expect("retained tombstone restored to export");
+    let mut expected_json = serde_json::to_value(expected).unwrap();
+    expected_json
+        .as_object_mut()
+        .unwrap()
+        .remove("source_repo_path");
+    assert_eq!(published, expected_json, "complete tombstone payload");
+    assert_eq!(stored_retention_issue(ws, &expected.id), *expected);
+    let storage = SqliteStorage::open(&db_path(ws)).unwrap();
+    assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+    assert_eq!(
+        storage.get_metadata("needs_flush").unwrap().as_deref(),
+        Some("false")
+    );
+    assert_eq!(
+        storage.get_export_hash(&expected.id).unwrap().unwrap().0,
+        expected.compute_content_hash()
+    );
+}
+
+#[test]
+fn clean_explicit_flush_applies_retention_contraction_and_expansion() {
+    for expanded_days in [0, 90] {
+        let ws = BrWorkspace::new();
+        init_workspace(&ws, "clean_policy");
+        let live_id = create_issue(&ws, "Live issue", "clean_policy_live");
+        let closed = run_br(&ws, ["close", &live_id], "clean_policy_close");
+        assert!(closed.status.success(), "{closed:?}");
+        let tombstone_id = create_issue(&ws, "Retention history", "clean_policy_deleted");
+        let comment = run_br(
+            &ws,
+            ["comments", "add", &tombstone_id, "Keep this history"],
+            "clean_policy_comment",
+        );
+        assert!(comment.status.success(), "{comment:?}");
+        let tombstone = delete_retention_fixture(
+            &ws,
+            &tombstone_id,
+            Some(chrono::Utc::now() - chrono::Duration::days(60)),
+            "clean_policy",
+        );
+        SqliteStorage::open(&db_path(&ws))
+            .unwrap()
+            .record_close_metadata(
+                &live_id,
+                &beads_rust::close_policy::AttributionValues::default(),
+                true,
+                Some("Retained audit evidence"),
+                &["retention-proof".to_string()],
+            )
+            .unwrap();
+        let initial = run_br(
+            &ws,
+            ["sync", "--flush-only", "--json"],
+            "clean_policy_initial",
+        );
+        assert!(initial.status.success(), "{initial:?}");
+        assert_restored_tombstone_payload(&ws, &tombstone);
+        let audited = read_jsonl_lines(&ws)
+            .iter()
+            .map(|line| serde_json::from_str::<Issue>(line).unwrap())
+            .find(|issue| issue.id == live_id)
+            .unwrap();
+        assert_eq!(audited.bypassed_policy, Some(true));
+        assert_eq!(
+            audited.bypass_reason.as_deref(),
+            Some("Retained audit evidence")
+        );
+        assert_eq!(
+            audited.policy_gates_fired,
+            Some(vec!["retention-proof".to_string()])
+        );
+        let events = SqliteStorage::open(&db_path(&ws))
+            .unwrap()
+            .get_events(&tombstone_id, 100)
+            .unwrap();
+
+        set_workspace_retention_days(&ws, 30);
+        let contracted = run_br(
+            &ws,
+            ["sync", "--flush-only", "--json"],
+            "clean_policy_contract",
+        );
+        assert!(contracted.status.success(), "{contracted:?}");
+        assert_eq!(parse_json_value(&contracted.stdout)["exported_issues"], 1);
+        assert_retention_export(&ws, &[&live_id], &tombstone_id);
+
+        set_workspace_retention_days(&ws, expanded_days);
+        let expanded = run_br(
+            &ws,
+            ["sync", "--flush-only", "--json"],
+            "clean_policy_expand",
+        );
+        assert!(expanded.status.success(), "{expanded:?}");
+        assert_eq!(parse_json_value(&expanded.stdout)["exported_issues"], 2);
+        assert_restored_tombstone_payload(&ws, &tombstone);
+        assert_eq!(
+            SqliteStorage::open(&db_path(&ws))
+                .unwrap()
+                .get_events(&tombstone_id, 100)
+                .unwrap(),
+            events
+        );
+
+        let bytes = fs::read(jsonl_path(&ws)).unwrap();
+        let repeated = run_br(
+            &ws,
+            ["sync", "--flush-only", "--json"],
+            "clean_policy_repeat",
+        );
+        assert!(repeated.status.success(), "{repeated:?}");
+        assert_eq!(parse_json_value(&repeated.stdout)["exported_issues"], 0);
+        assert_eq!(fs::read(jsonl_path(&ws)).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn incremental_retention_expansion_restores_clean_tombstones_and_preserves_source() {
+    for expanded_days in [0, 90] {
+        let ws = BrWorkspace::new();
+        init_workspace(&ws, "expand_policy");
+        let dirty_id = create_issue(&ws, "Local edit", "expand_dirty");
+        let remote_id = create_issue(&ws, "Remote history", "expand_remote");
+        let tombstone_id = create_issue(&ws, "Retained history", "expand_deleted");
+        let comment = run_br(
+            &ws,
+            ["comments", "add", &tombstone_id, "Retained comment"],
+            "expand_comment",
+        );
+        assert!(comment.status.success(), "{comment:?}");
+        let tombstone = delete_retention_fixture(
+            &ws,
+            &tombstone_id,
+            Some(chrono::Utc::now() - chrono::Duration::days(60)),
+            "expand_policy",
+        );
+        set_workspace_retention_days(&ws, 30);
+        let initial = run_br(&ws, ["sync", "--flush-only", "--json"], "expand_initial");
+        assert!(initial.status.success(), "{initial:?}");
+        assert_retention_export(&ws, &[&dirty_id, &remote_id], &tombstone_id);
+        let local_remote = stored_retention_issue(&ws, &remote_id);
+        set_workspace_retention_days(&ws, expanded_days);
+        let before = fs::read(jsonl_path(&ws)).unwrap();
+        let read = run_br(&ws, ["count", "--json"], "expand_no_pending");
+        assert!(read.status.success(), "{read:?}");
+        assert_eq!(
+            fs::read(jsonl_path(&ws)).unwrap(),
+            before,
+            "no pending automatic export stays a no-op"
+        );
+
+        let pending = run_br(
+            &ws,
+            [
+                "--no-auto-flush",
+                "update",
+                &dirty_id,
+                "--title",
+                "Pending local edit",
+            ],
+            "expand_pending",
+        );
+        assert!(pending.status.success(), "{pending:?}");
+        let mut lines = read_jsonl_lines(&ws);
+        let remote_line = lines
+            .iter_mut()
+            .find(|line| serde_json::from_str::<Value>(line).unwrap()["id"] == remote_id)
+            .unwrap();
+        *remote_line = set_row_field(remote_line, "due_at", json!("2035-01-02T03:04:05Z"));
+        *remote_line = set_row_field(remote_line, "updated_at", json!("2035-01-01T00:00:00Z"));
+        let remote_line = remote_line.clone();
+        write_jsonl_lines(&ws, &lines);
+        assert_eq!(
+            serde_json::from_str::<Issue>(&remote_line)
+                .unwrap()
+                .compute_content_hash(),
+            local_remote.compute_content_hash(),
+            "narrow hashes do not certify this source difference"
+        );
+
+        let updated = run_br(
+            &ws,
+            ["update", &dirty_id, "--title", "Published local edit"],
+            "expand_flush",
+        );
+        assert!(updated.status.success(), "{updated:?}");
+        let published = read_jsonl_lines(&ws);
+        assert_eq!(published.len(), 3);
+        assert!(
+            published.contains(&remote_line),
+            "untouched newer source payload must survive verbatim"
+        );
+        assert_restored_tombstone_payload(&ws, &tombstone);
+        assert_eq!(stored_retention_issue(&ws, &remote_id), local_remote);
+        assert_eq!(
+            stored_retention_issue(&ws, &dirty_id).title,
+            "Published local edit"
+        );
+    }
+}
+
+#[test]
+fn clean_retention_flush_refuses_source_payload_preserved_by_incremental_export() {
+    for (field, value) in [
+        ("due_at", json!("2035-01-02T03:04:05Z")),
+        // Import repairs this to None. A clean exporter must still certify
+        // the captured source, rather than compare a repaired replacement.
+        ("external_ref", json!("")),
+        ("created_at", json!("2020-01-01T00:00:00Z")),
+        ("updated_at", json!("2035-01-01T00:00:00Z")),
+        ("bypassed_policy", json!(true)),
+        ("bypass_reason", json!("Peer's retained audit reason")),
+        ("policy_gates_fired", json!(["peer-gate"])),
+    ] {
+        let ws = BrWorkspace::new();
+        init_workspace(&ws, "retention_guard");
+        let dirty_id = create_issue(&ws, "Local edit", "guard_dirty");
+        let remote_id = create_issue(&ws, "Remote history", "guard_remote");
+        let tombstone_id = create_issue(&ws, "Expiring history", "guard_deleted");
+        let tombstone = delete_retention_fixture(
+            &ws,
+            &tombstone_id,
+            Some(chrono::Utc::now() - chrono::Duration::days(60)),
+            "retention_guard",
+        );
+        let initial = run_br(&ws, ["sync", "--flush-only", "--json"], "guard_initial");
+        assert!(initial.status.success(), "{initial:?}");
+        let local_remote = stored_retention_issue(&ws, &remote_id);
+        let pending = run_br(
+            &ws,
+            [
+                "--no-auto-flush",
+                "update",
+                &dirty_id,
+                "--title",
+                "Pending local edit",
+            ],
+            "guard_pending",
+        );
+        assert!(pending.status.success(), "{pending:?}");
+        let mut lines = read_jsonl_lines(&ws);
+        let remote_line = lines
+            .iter_mut()
+            .find(|line| serde_json::from_str::<Value>(line).unwrap()["id"] == remote_id)
+            .unwrap();
+        *remote_line = set_row_field(remote_line, field, value);
+        let remote_line = remote_line.clone();
+        write_jsonl_lines(&ws, &lines);
+        let updated = run_br(
+            &ws,
+            [
+                "--no-auto-import",
+                "update",
+                &dirty_id,
+                "--title",
+                "Published local edit",
+            ],
+            "guard_incremental",
+        );
+        assert!(updated.status.success(), "{updated:?}");
+        assert!(read_jsonl_lines(&ws).contains(&remote_line));
+        {
+            let storage = SqliteStorage::open(&db_path(&ws)).unwrap();
+            assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+            assert_eq!(
+                storage.get_metadata("needs_flush").unwrap().as_deref(),
+                Some("false")
+            );
+            assert_eq!(
+                storage.get_metadata(METADATA_JSONL_CONTENT_HASH).unwrap(),
+                Some(compute_jsonl_hash(&jsonl_path(&ws)).unwrap()),
+                "the incremental exporter recorded this exact source hash"
+            );
+            assert_eq!(
+                storage.get_export_hash(&remote_id).unwrap().unwrap().0,
+                serde_json::from_str::<Issue>(&remote_line)
+                    .unwrap()
+                    .compute_content_hash(),
+                "even the narrow certificate still matches"
+            );
+        }
+        set_workspace_retention_days(&ws, 30);
+        let before = fs::read(jsonl_path(&ws)).unwrap();
+        let anchor_before = fs::read(beads_dir(&ws).join("beads.base.jsonl")).unwrap();
+        let refused = run_br(&ws, ["sync", "--flush-only", "--json"], "guard_refused");
+        assert!(
+            !refused.status.success(),
+            "full export would overwrite newer source: {refused:?}"
+        );
+        assert!(
+            format!("{} {}", refused.stdout, refused.stderr)
+                .contains("Cannot apply retention during a clean flush")
+        );
+        assert_eq!(fs::read(jsonl_path(&ws)).unwrap(), before);
+        assert_eq!(
+            fs::read(beads_dir(&ws).join("beads.base.jsonl")).unwrap(),
+            anchor_before
+        );
+        assert_eq!(stored_retention_issue(&ws, &remote_id), local_remote);
+        assert_eq!(stored_retention_issue(&ws, &tombstone_id), tombstone);
+        assert_eq!(
+            SqliteStorage::open(&db_path(&ws))
+                .unwrap()
+                .get_dirty_issue_count()
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[test]
+fn clean_retention_flush_accepts_direct_tombstone_without_closed_at() {
+    let ws = BrWorkspace::new();
+    init_workspace(&ws, "direct_tombstone");
+    let created = run_br(
+        &ws,
+        [
+            "--no-auto-flush",
+            "create",
+            "Direct tombstone",
+            "--status",
+            "tombstone",
+            "--json",
+        ],
+        "direct_create",
+    );
+    assert!(created.status.success(), "{created:?}");
+    let id = parse_json_value(&created.stdout)["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut tombstone = stored_retention_issue(&ws, &id);
+    assert_eq!(tombstone.status, Status::Tombstone);
+    assert!(
+        tombstone.closed_at.is_none(),
+        "direct CLI creation does not fabricate a close timestamp"
+    );
+    tombstone.deleted_at = Some(chrono::Utc::now() - chrono::Duration::days(60));
+    SqliteStorage::open(&db_path(&ws))
+        .unwrap()
+        .upsert_issue_for_import(&tombstone)
+        .unwrap();
+    let initial = run_br(&ws, ["sync", "--flush-only", "--json"], "direct_initial");
+    assert!(initial.status.success(), "{initial:?}");
+    assert_restored_tombstone_payload(&ws, &tombstone);
+
+    set_workspace_retention_days(&ws, 30);
+    let contracted = run_br(&ws, ["sync", "--flush-only", "--json"], "direct_contract");
+    assert!(contracted.status.success(), "{contracted:?}");
+    assert_retention_export(&ws, &[], &id);
+    assert_eq!(stored_retention_issue(&ws, &id), tombstone);
+    set_workspace_retention_days(&ws, 0);
+    let expanded = run_br(&ws, ["sync", "--flush-only", "--json"], "direct_expand");
+    assert!(expanded.status.success(), "{expanded:?}");
+    assert_restored_tombstone_payload(&ws, &tombstone);
+}
+
 #[test]
 fn retention_export_followed_by_noop_import_stays_clean() {
     let ws = BrWorkspace::new();
@@ -3217,8 +3579,29 @@ fn restored_export_no_op_import_does_not_starve_concurrent_commands() {
     let log_path = ws.root.join("skip_import.log");
     let log = fs::File::create(&log_path).unwrap();
     let started = Instant::now();
-    let mut importer = Command::new(assert_cmd::cargo::cargo_bin!("br"))
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("br"));
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("BD_")
+            || name.starts_with("BEADS_")
+            || matches!(
+                name.as_ref(),
+                "BR_DISABLE_READ_ONLY_FAST_OPEN"
+                    | "BR_OUTPUT_FORMAT"
+                    | "TOON_DEFAULT_FORMAT"
+                    | "TOON_STATS"
+            )
+        {
+            command.env_remove(key);
+        }
+    }
+    let mut importer = command
         .current_dir(&ws.root)
+        .env("HOME", &ws.root)
+        .env("RUST_LOG", "error,beads_rust::sync=debug")
+        .env("NO_COLOR", "1")
+        .env("PATH", common::cli::deduplicated_br_path())
+        .env("BR_HISTORY_MIN_INTERVAL_SECS", "0")
         .args(["--no-auto-flush", "-v", "show", &seed, "--json"])
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))

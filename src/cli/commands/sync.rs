@@ -27,8 +27,8 @@ use crate::sync::{
     SyncMergePendingReceipt, analyze_jsonl_snapshot,
     apply_reviewed_additive_reconcile_under_authority, apply_sync_reconcile,
     canonical_source_repo_path, canonical_sync_path_sha256, capture_sync_database_witness,
-    compute_jsonl_snapshot_content_hash, compute_staleness, database_write_authority_sha256,
-    ensure_no_conflict_markers_snapshot, export_temp_path,
+    clean_retention_export_required, compute_jsonl_snapshot_content_hash, compute_staleness,
+    database_write_authority_sha256, ensure_no_conflict_markers_snapshot, export_temp_path,
     export_to_jsonl_with_policy_expected_under_authorities,
     export_to_jsonl_with_policy_expected_under_authority, finalize_export_under_authority,
     get_issue_ids_from_jsonl_snapshot, id_matches_expected_prefix, import_from_jsonl_snapshot,
@@ -2518,6 +2518,7 @@ fn execute_flush(
     let needs_flush = storage.get_metadata("needs_flush")?.as_deref() == Some("true");
     let jsonl_exists = source.is_some();
     let db_issue_count = storage.count_issues()?;
+    let export_as_of = chrono::Utc::now();
     debug!(dirty_count = dirty_ids.len(), "Found dirty issues");
 
     // Refuse to overwrite a JSONL that still holds unresolved merge-conflict
@@ -2642,45 +2643,61 @@ fn execute_flush(
             }
         }
 
-        // Certified: ensure the anchor holds the exact snapshot bytes (also
-        // covers the missing-anchor case). A byte-identical regular-file
-        // anchor is left untouched so an idempotent no-op flush keeps its
-        // inode; anything else (missing, symlinked, byte-divergent — even
-        // whitespace-only drift the content hash cannot see) is replaced
-        // with the exact snapshot bytes.
-        let anchor_path = path_policy.beads_dir.join("beads.base.jsonl");
-        let snapshot_bytes = {
-            let mut bytes = Vec::with_capacity(usize::try_from(noop_source.size()).unwrap_or(0));
-            std::io::copy(&mut noop_source.reader(), &mut bytes).map_err(BeadsError::Io)?;
-            bytes
-        };
-        let anchor_is_exact = fs::symlink_metadata(&anchor_path)
-            .map(|meta| meta.is_file())
-            .unwrap_or(false)
-            && fs::read(&anchor_path).is_ok_and(|bytes| bytes == snapshot_bytes);
-        if !anchor_is_exact {
-            refresh_base_snapshot_from_flushed_jsonl_snapshot(noop_source, &path_policy.beads_dir)?;
-        }
-
-        if use_json {
-            let result = FlushResult {
-                exported_issues: 0,
-                exported_dependencies: 0,
-                exported_labels: 0,
-                exported_comments: 0,
-                content_hash: String::new(),
-                cleared_dirty: 0,
-                policy: export_policy,
-                success_rate: 1.0,
-                errors: Vec::new(),
-                manifest_path: None,
-                publication_atomicity: None,
+        // A clean database can still have a different export population after
+        // the retention policy changes or a tombstone expires. Only fall
+        // through to full export after complete source-payload certification;
+        // a stored file hash alone cannot authorize overwriting retained rows.
+        if !clean_retention_export_required(
+            storage,
+            noop_source,
+            &jsonl_ids,
+            retention_days,
+            export_as_of,
+        )? {
+            // Certified: ensure the anchor holds the exact snapshot bytes (also
+            // covers the missing-anchor case). A byte-identical regular-file
+            // anchor is left untouched so an idempotent no-op flush keeps its
+            // inode; anything else (missing, symlinked, byte-divergent — even
+            // whitespace-only drift the content hash cannot see) is replaced
+            // with the exact snapshot bytes.
+            let anchor_path = path_policy.beads_dir.join("beads.base.jsonl");
+            let snapshot_bytes = {
+                let mut bytes =
+                    Vec::with_capacity(usize::try_from(noop_source.size()).unwrap_or(0));
+                std::io::copy(&mut noop_source.reader(), &mut bytes).map_err(BeadsError::Io)?;
+                bytes
             };
-            ctx.json_pretty(&result);
-        } else if should_render_human_sync_output(ctx, use_json) {
-            println!("Nothing to export (no dirty issues)");
+            let anchor_is_exact = fs::symlink_metadata(&anchor_path)
+                .map(|meta| meta.is_file())
+                .unwrap_or(false)
+                && fs::read(&anchor_path).is_ok_and(|bytes| bytes == snapshot_bytes);
+            if !anchor_is_exact {
+                refresh_base_snapshot_from_flushed_jsonl_snapshot(
+                    noop_source,
+                    &path_policy.beads_dir,
+                )?;
+            }
+
+            if use_json {
+                let result = FlushResult {
+                    exported_issues: 0,
+                    exported_dependencies: 0,
+                    exported_labels: 0,
+                    exported_comments: 0,
+                    content_hash: String::new(),
+                    cleared_dirty: 0,
+                    policy: export_policy,
+                    success_rate: 1.0,
+                    errors: Vec::new(),
+                    manifest_path: None,
+                    publication_atomicity: None,
+                };
+                ctx.json_pretty(&result);
+            } else if should_render_human_sync_output(ctx, use_json) {
+                println!("Nothing to export (no dirty issues)");
+            }
+            return Ok(None);
         }
-        return Ok(None);
     }
 
     // Configure export. `needs_flush` must NOT be conflated with the user's
@@ -2695,7 +2712,7 @@ fn execute_flush(
         is_default_path: true,
         error_policy: export_policy,
         retention_days,
-        export_as_of: None,
+        export_as_of: Some(export_as_of),
         beads_dir: Some(path_policy.beads_dir.clone()),
         allow_external_jsonl: path_policy.allow_external_jsonl,
         show_progress,

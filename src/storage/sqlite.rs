@@ -87,6 +87,27 @@ impl ImportIssueLookup {
     }
 }
 
+/// The exporter-visible close audit, reusable across bounded issue batches.
+#[derive(Debug, Default)]
+pub(crate) struct ExportCloseBypassAudit {
+    by_issue: HashMap<String, (Option<String>, Option<Vec<String>>)>,
+}
+
+impl ExportCloseBypassAudit {
+    pub(crate) fn attach(&self, issues: &mut [Issue]) {
+        if self.by_issue.is_empty() {
+            return;
+        }
+        for issue in issues {
+            if let Some((reason, gates)) = self.by_issue.get(&issue.id) {
+                issue.bypassed_policy = Some(true);
+                issue.bypass_reason.clone_from(reason);
+                issue.policy_gates_fired.clone_from(gates);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ListRelationMetadata {
     pub(crate) labels: Vec<String>,
@@ -15440,17 +15461,22 @@ impl SqliteStorage {
     ///
     /// Returns an error if the audit query fails.
     pub(crate) fn attach_close_bypass_audit_for_export(&self, issues: &mut [Issue]) -> Result<()> {
-        if issues.is_empty() || !crate::storage::schema::table_exists(&self.conn, "close_metadata")
-        {
+        if issues.is_empty() {
             return Ok(());
+        }
+        self.load_close_bypass_audit_for_export()?.attach(issues);
+        Ok(())
+    }
+
+    /// Read the same audit projection once for a coherent batched export proof.
+    pub(crate) fn load_close_bypass_audit_for_export(&self) -> Result<ExportCloseBypassAudit> {
+        if !crate::storage::schema::table_exists(&self.conn, "close_metadata") {
+            return Ok(ExportCloseBypassAudit::default());
         }
         let rows = self.conn.query(
             "SELECT issue_id, bypass_reason, policy_gates_fired
              FROM close_metadata WHERE bypassed_policy = 1",
         )?;
-        if rows.is_empty() {
-            return Ok(());
-        }
         let mut audit: HashMap<String, (Option<String>, Option<Vec<String>>)> = HashMap::new();
         for row in &rows {
             let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
@@ -15463,14 +15489,7 @@ impl SqliteStorage {
                 .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok());
             audit.insert(issue_id.to_string(), (reason, gates));
         }
-        for issue in issues.iter_mut() {
-            if let Some((reason, gates)) = audit.get(&issue.id) {
-                issue.bypassed_policy = Some(true);
-                issue.bypass_reason.clone_from(reason);
-                issue.policy_gates_fired.clone_from(gates);
-            }
-        }
-        Ok(())
+        Ok(ExportCloseBypassAudit { by_issue: audit })
     }
 
     /// Get all dependency records for all issues.
@@ -16072,23 +16091,44 @@ impl SqliteStorage {
             return Ok(HashSet::new());
         }
 
+        self.get_tombstone_retention_ids_at(retention_days, as_of)
+            .map(|(_, expired)| expired)
+    }
+
+    /// Partition export-eligible tombstones under the current retention policy.
+    /// Only IDs and retention metadata are read; callers hydrate missing
+    /// retained records in batches when an export must restore them.
+    pub(crate) fn get_tombstone_retention_ids_at(
+        &self,
+        retention_days: Option<u64>,
+        as_of: DateTime<Utc>,
+    ) -> Result<(HashSet<String>, HashSet<String>)> {
         let rows = self.conn.query(
             "SELECT id, status, deleted_at FROM issues \
              WHERE (ephemeral = 0 OR ephemeral IS NULL) AND id NOT LIKE '%-wisp-%'",
         )?;
+        let mut retained = HashSet::new();
         let mut expired = HashSet::new();
         for row in rows {
             if parse_status(row.get(1).and_then(SqliteValue::as_text)) != Status::Tombstone {
                 continue;
             }
-            let deleted_at = parse_opt_datetime_value(row.get(2))?;
-            if crate::model::tombstone_expired_at(deleted_at, retention_days, as_of)
-                && let Some(id) = row.get(0).and_then(SqliteValue::as_text)
-            {
+            let Some(id) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let is_expired = if retention_days.is_some_and(|days| days != 0) {
+                let deleted_at = parse_opt_datetime_value(row.get(2))?;
+                crate::model::tombstone_expired_at(deleted_at, retention_days, as_of)
+            } else {
+                false
+            };
+            if is_expired {
                 expired.insert(id.to_string());
+            } else {
+                retained.insert(id.to_string());
             }
         }
-        Ok(expired)
+        Ok((retained, expired))
     }
 
     /// Delete dependency rows owned by the given issues whose target issue is
@@ -39586,8 +39626,7 @@ required_fields:
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_expired_tombstone_projection_matches_persisted_export_population() {
+    fn tombstone_projection_fixture() -> (SqliteStorage, DateTime<Utc>) {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let as_of = Utc.with_ymd_and_hms(2026, 10, 6, 12, 0, 0).unwrap();
         let expired_at = as_of - chrono::Duration::days(31);
@@ -39648,7 +39687,12 @@ required_fields:
                 )
                 .unwrap();
         }
+        (storage, as_of)
+    }
 
+    #[test]
+    fn test_expired_tombstone_projection_matches_persisted_export_population() {
+        let (storage, as_of) = tombstone_projection_fixture();
         let expired = storage
             .get_expired_tombstone_ids_at(Some(30), as_of)
             .unwrap();
@@ -39658,6 +39702,21 @@ required_fields:
         );
         let ids = storage.get_non_ephemeral_issue_ids().unwrap();
         let hydrated = storage.get_issues_for_export(&ids).unwrap();
+        let (retained, projected_expired) = storage
+            .get_tombstone_retention_ids_at(Some(30), as_of)
+            .unwrap();
+        assert_eq!(projected_expired, expired);
+        assert_eq!(
+            retained,
+            hydrated
+                .iter()
+                .filter(|issue| {
+                    issue.status == Status::Tombstone
+                        && !issue.is_expired_tombstone_at(Some(30), as_of)
+                })
+                .map(|issue| issue.id.clone())
+                .collect::<HashSet<_>>()
+        );
         assert_eq!(
             expired,
             hydrated
@@ -39684,6 +39743,21 @@ required_fields:
                     .unwrap()
                     .is_empty(),
                 "disabled retention must not decode deletion dates"
+            );
+            let (retained, expired) = storage
+                .get_tombstone_retention_ids_at(disabled, as_of)
+                .unwrap();
+            assert!(expired.is_empty());
+            assert_eq!(
+                retained,
+                HashSet::from([
+                    "bd-ttl-text".to_string(),
+                    "bd-ttl-integer".to_string(),
+                    "bd-ttl-boundary".to_string(),
+                    "bd-ttl-null".to_string(),
+                    "bd-ttl-empty".to_string(),
+                ]),
+                "disabled policy retains eligible tombstones without decoding dates"
             );
         }
     }

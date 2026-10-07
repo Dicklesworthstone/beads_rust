@@ -117,6 +117,34 @@ arbitrary daemonized descendants. No sync mode calls or delegates to it.
 | **Empty DB guard** | Exporting 0 issues over a JSONL with N issues | `--force` |
 | **Stale DB guard** | Exporting when DB is missing issues from JSONL | `--force` |
 
+### Tombstone retention
+
+The workspace's `metadata.json` can set `deletions_retention_days` to a positive
+number of days. Export omits a tombstone only after that interval has elapsed
+since its known deletion time. An absent or zero setting keeps tombstones
+indefinitely; an unknown deletion time never authorizes omission. Retention
+changes the JSONL population without deleting the database record or its history.
+
+`br sync --flush-only` applies the current policy even when every database row
+is clean. Shortening retention can remove expired tombstones from JSONL;
+lengthening or disabling it can restore clean tombstones previously omitted.
+Automatic export applies those same population changes when local work is
+pending. With no pending work, automatic export remains a no-op; use the explicit
+flush command to apply a policy change immediately.
+
+Incremental export preserves untouched source rows while restoring eligible
+tombstones. Before removing a clean expired database tombstone, it also checks
+that the captured JSONL row is an expired tombstone under the same policy.
+A newer live row, recent deletion, unknown deletion time, or unreadable payload
+causes refusal and requires reconciliation with `br sync --merge`.
+
+A clean explicit flush that needs to change retention compares the captured
+source payloads with the database before allowing a full export. Matching file
+or issue hashes alone do not authorize overwriting source content: a previous
+incremental export may have preserved external changes while updating the file
+witness. A mismatch leaves JSONL and the merge anchor untouched and requests
+reconciliation. Existing explicit `--force` behavior is unchanged.
+
 ### Import Guards
 
 | Guard | What it prevents | Override |
