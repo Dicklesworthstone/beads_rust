@@ -70,7 +70,7 @@ pub(crate) use path::{
 
 use crate::error::{BeadsError, Result};
 use crate::model::{Comment, Dependency, DependencyType, Issue};
-use crate::storage::sqlite::{ExportCloseBypassAudit, ImportIssueLookup};
+use crate::storage::sqlite::{ExportCloseBypassAudit, ImportCloseBypassAudit, ImportIssueLookup};
 use crate::storage::{EventAttribution, SqliteStorage};
 use crate::sync::history::HistoryConfig;
 use crate::util::id::{IdConfig, IdGenerator, parse_id};
@@ -15016,6 +15016,7 @@ fn export_hash_entry_for_import_action(
 fn certify_skipped_imports(
     storage: &SqliteStorage,
     lookup: Option<&ImportIssueLookup>,
+    close_audit: &mut ImportCloseBypassAudit,
     skipped: &mut Vec<(String, Issue, String)>,
     hashes: &mut Vec<(String, String)>,
     ids: &mut HashSet<String>,
@@ -15029,14 +15030,25 @@ fn certify_skipped_imports(
         .collect::<Vec<_>>();
     let stored = match lookup {
         Some(lookup) => storage.get_issues_for_import_comparison(&target_ids, lookup)?,
-        None => storage.get_issues_for_export(&target_ids)?,
+        None => storage.get_issues_for_import_comparison_live(&target_ids)?,
     }
     .into_iter()
     .map(|issue| (issue.id.clone(), issue))
     .collect::<HashMap<_, _>>();
     let mut uncertified = 0;
-    for (id, incoming, hash) in skipped.drain(..) {
-        if skipped_import_matches_stored_issue(stored.get(&id), &id, &incoming) {
+    for (id, mut incoming, hash) in skipped.drain(..) {
+        if !skipped_import_matches_stored_issue(stored.get(&id), &id, &incoming) {
+            // An older close's audit must not attach to a different local
+            // payload, such as a reopened issue or a later closure.
+            uncertified += 1;
+            continue;
+        }
+        if incoming.bypassed_policy == Some(true) && !close_audit.contains_record(&id) {
+            incoming.id.clone_from(&id);
+            storage.persist_imported_close_bypass_audit_in_tx(&incoming)?;
+            close_audit.record_imported(&id, &incoming);
+        }
+        if close_audit.matches_export(&id, &incoming) {
             if ids.insert(id.clone()) {
                 hashes.push((id, hash));
             }
@@ -15124,6 +15136,7 @@ fn stream_import_actions_in_tx(
     let mut export_hash_batch = Vec::with_capacity(IMPORT_EXPORT_HASH_BATCH_SIZE);
     let mut export_hash_ids = HashSet::new();
     let mut uncertified_local_wins = 0usize;
+    let mut audit_invalidated_certificate = false;
     let mut skipped = Vec::new();
     let stream_started = Instant::now();
 
@@ -15149,6 +15162,9 @@ fn stream_import_actions_in_tx(
         storage.clear_all_export_hashes_in_tx()?;
         None
     };
+    // Include non-bypassed local records: they are authoritative too. Audit
+    // inserts are tracked in this snapshot and never move issue/relation rowids.
+    let mut close_audit = storage.load_import_close_bypass_audit()?;
 
     for_each_jsonl_import_issue(
         source,
@@ -15184,6 +15200,7 @@ fn stream_import_actions_in_tx(
                 uncertified_local_wins += certify_skipped_imports(
                     storage,
                     skip_lookup.as_ref(),
+                    &mut close_audit,
                     &mut skipped,
                     &mut export_hash_batch,
                     &mut export_hash_ids,
@@ -15204,13 +15221,24 @@ fn stream_import_actions_in_tx(
                 &issue,
                 &computed_hash,
             ) {
-                export_hash_ids.insert(export_id.clone());
-                export_hash_batch.push((export_id, export_hash));
+                // Insert/update persisted source audit only when no local row
+                // existed. A preserved local audit can differ even after the
+                // issue payload was updated, so it needs export certification.
+                close_audit.record_imported(&export_id, &issue);
+                if close_audit.matches_export(&export_id, &issue) {
+                    export_hash_ids.insert(export_id.clone());
+                    export_hash_batch.push((export_id, export_hash));
+                } else {
+                    uncertified_local_wins += 1;
+                    audit_invalidated_certificate |= export_hash_ids.remove(&export_id);
+                    export_hash_batch.retain(|(id, _)| id != &export_id);
+                }
             }
             if skipped.len() >= IMPORT_SKIP_CERTIFICATION_BATCH_SIZE {
                 uncertified_local_wins += certify_skipped_imports(
                     storage,
                     skip_lookup.as_ref(),
+                    &mut close_audit,
                     &mut skipped,
                     &mut export_hash_batch,
                     &mut export_hash_ids,
@@ -15232,6 +15260,7 @@ fn stream_import_actions_in_tx(
     uncertified_local_wins += certify_skipped_imports(
         storage,
         skip_lookup.as_ref(),
+        &mut close_audit,
         &mut skipped,
         &mut export_hash_batch,
         &mut export_hash_ids,
@@ -15241,6 +15270,15 @@ fn stream_import_actions_in_tx(
         &mut export_hash_batch,
         current_export_hashes.as_mut(),
     )?;
+    let current_export_hashes = if current_export_hashes.is_none() && audit_invalidated_certificate
+    {
+        // A prior batch may already have certified this target before a later
+        // mutation preserved conflicting local audit. Inspect actual receipt
+        // rows once on that exceptional path so the old certificate is revoked.
+        Some(load_import_export_hashes(storage)?)
+    } else {
+        current_export_hashes
+    };
     if let Some(current) = current_export_hashes {
         // A previous certificate is not evidence for this import. Drop rows
         // absent from the source and rows whose newer local payload did not
@@ -15473,7 +15511,7 @@ fn verify_applied_import_issue_semantics(
         .map(|id| (*id).to_string())
         .collect::<Vec<_>>();
     let actual_by_id = storage
-        .get_issues_for_export(&ids)?
+        .get_issues_for_import_comparison_live(&ids)?
         .into_iter()
         .map(|issue| (issue.id.clone(), issue))
         .collect::<HashMap<_, _>>();
@@ -16394,6 +16432,8 @@ fn run_reconcile_apply_tx(
     let mut applied_ids: Vec<String> = Vec::new();
     let mut action_index = 0usize;
     let mut skipped = Vec::new();
+    let mut close_audit = storage.load_import_close_bypass_audit()?;
+    let current_export_hashes = load_import_export_hashes(storage)?;
     let skip_lookup = if !plan.actions.is_empty()
         && plan.actions.iter().all(|action| {
             matches!(
@@ -16439,6 +16479,7 @@ fn run_reconcile_apply_tx(
                 outcome.uncertified_local_wins += certify_skipped_imports(
                     storage,
                     skip_lookup.as_ref(),
+                    &mut close_audit,
                     &mut skipped,
                     &mut export_hash_batch,
                     &mut export_hash_ids,
@@ -16461,14 +16502,23 @@ fn run_reconcile_apply_tx(
                 target_id,
                 &issue,
                 &computed_hash,
-            ) && export_hash_ids.insert(export_id.clone())
-            {
-                export_hash_batch.push((export_id, export_hash));
+            ) {
+                close_audit.record_imported(&export_id, &issue);
+                if close_audit.matches_export(&export_id, &issue) {
+                    if export_hash_ids.insert(export_id.clone()) {
+                        export_hash_batch.push((export_id, export_hash));
+                    }
+                } else {
+                    outcome.uncertified_local_wins += 1;
+                    export_hash_ids.remove(&export_id);
+                    export_hash_batch.retain(|(id, _)| id != &export_id);
+                }
             }
             if skipped.len() >= IMPORT_SKIP_CERTIFICATION_BATCH_SIZE {
                 outcome.uncertified_local_wins += certify_skipped_imports(
                     storage,
                     skip_lookup.as_ref(),
+                    &mut close_audit,
                     &mut skipped,
                     &mut export_hash_batch,
                     &mut export_hash_ids,
@@ -16487,6 +16537,7 @@ fn run_reconcile_apply_tx(
     outcome.uncertified_local_wins += certify_skipped_imports(
         storage,
         skip_lookup.as_ref(),
+        &mut close_audit,
         &mut skipped,
         &mut export_hash_batch,
         &mut export_hash_ids,
@@ -16494,6 +16545,19 @@ fn run_reconcile_apply_tx(
     if !export_hash_batch.is_empty() {
         storage.set_changed_export_hashes_in_tx(&export_hash_batch)?;
     }
+    // A stale certificate cannot survive a source row that failed payload or
+    // audit certification. Revoke only existing rows, once per target; DB-only
+    // bookkeeping remains governed by the reconcile plan's existing contract.
+    let uncertified_targets = plan
+        .actions
+        .iter()
+        .map(|action| action.target_id.as_str())
+        .filter(|id| !export_hash_ids.contains(*id) && current_export_hashes.contains_key(*id))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    storage.clear_export_hashes_in_tx(&uncertified_targets)?;
 
     outcome.created = import_result.created_count;
     outcome.updated = import_result.updated_count;
@@ -24518,6 +24582,331 @@ mod tests {
         );
     }
 
+    fn issue_with_exported_close_audit(storage: &SqliteStorage, id: &str) -> Issue {
+        storage
+            .get_issues_for_export(&[id.to_string()])
+            .unwrap()
+            .pop()
+            .unwrap()
+    }
+
+    fn assert_repeated_audit_import_is_noop(
+        storage: &mut SqliteStorage,
+        path: &Path,
+        expected: &Issue,
+    ) {
+        storage
+            .execute_raw("UPDATE close_metadata SET recorded_at = '2020-01-01T00:00:00Z'")
+            .unwrap();
+        storage
+            .execute_raw("UPDATE export_hashes SET exported_at = '2020-01-01T00:00:00Z'")
+            .unwrap();
+        let audit_before = storage
+            .execute_raw_query("SELECT rowid, * FROM close_metadata")
+            .unwrap();
+        let certificates_before = storage
+            .execute_raw_query("SELECT rowid, * FROM export_hashes")
+            .unwrap();
+        let repeated =
+            import_from_jsonl(storage, path, &ImportConfig::default(), Some("bd")).unwrap();
+        assert_eq!(repeated.imported_count, 0);
+        assert_eq!(repeated.skipped_count, 1);
+        assert_eq!(repeated.export_hashes_recorded, 1);
+        assert_eq!(
+            storage
+                .execute_raw_query("SELECT rowid, * FROM close_metadata")
+                .unwrap(),
+            audit_before
+        );
+        assert_eq!(
+            storage
+                .execute_raw_query("SELECT rowid, * FROM export_hashes")
+                .unwrap(),
+            certificates_before
+        );
+        assert_eq!(
+            issue_with_exported_close_audit(storage, &expected.id),
+            *expected
+        );
+    }
+
+    #[test]
+    fn test_import_preserves_source_close_audit_on_insert_and_equal_skip() {
+        for fresh in [true, false] {
+            for (reason, gates) in [
+                (None, None),
+                (Some(String::new()), Some(Vec::new())),
+                (
+                    Some("Reviewed bypass".to_string()),
+                    Some(vec!["tests".to_string()]),
+                ),
+            ] {
+                let mut storage = SqliteStorage::open_memory().unwrap();
+                let temp_dir = TempDir::new().unwrap();
+                let path = temp_dir.path().join("issues.jsonl");
+                let mut incoming =
+                    make_issue_at("bd-audit", "Closed with evidence", fixed_time(100));
+                incoming.status = Status::Closed;
+                incoming.closed_at = Some(incoming.updated_at);
+                if !fresh {
+                    write_additive_issues(&path, std::slice::from_ref(&incoming));
+                    import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd"))
+                        .unwrap();
+                }
+                incoming.bypassed_policy = Some(true);
+                incoming.bypass_reason = reason.clone();
+                incoming.policy_gates_fired = gates.clone();
+                write_additive_issues(&path, std::slice::from_ref(&incoming));
+                let imported =
+                    import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd"))
+                        .unwrap();
+                assert_eq!(imported.created_count, usize::from(fresh));
+                assert_eq!(imported.skipped_count, usize::from(!fresh));
+                assert_eq!(imported.export_hashes_recorded, 1);
+                let exported = issue_with_exported_close_audit(&storage, &incoming.id);
+                assert_eq!(exported.bypassed_policy, Some(true));
+                assert_eq!(exported.bypass_reason, reason);
+                assert_eq!(exported.policy_gates_fired, gates);
+                assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+                assert_ne!(
+                    storage.get_metadata("needs_flush").unwrap().as_deref(),
+                    Some("true")
+                );
+                assert!(storage.get_events(&incoming.id, 100).unwrap().is_empty());
+
+                assert_repeated_audit_import_is_noop(&mut storage, &path, &exported);
+            }
+        }
+    }
+
+    #[test]
+    fn test_import_local_close_audit_precedence_controls_certification() {
+        for update in [false, true] {
+            for local_bypassed in [false, true] {
+                let mut storage = SqliteStorage::open_memory().unwrap();
+                let temp_dir = TempDir::new().unwrap();
+                let path = temp_dir.path().join("issues.jsonl");
+                let mut incoming = make_issue_at("bd-audit", "Closed locally", fixed_time(100));
+                incoming.status = Status::Closed;
+                incoming.closed_at = Some(incoming.updated_at);
+                write_additive_issues(&path, std::slice::from_ref(&incoming));
+                import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd"))
+                    .unwrap();
+                storage
+                    .record_close_metadata(
+                        &incoming.id,
+                        &crate::close_policy::AttributionValues::default(),
+                        local_bypassed,
+                        Some("Local authoritative reason"),
+                        &["local_gate".to_string()],
+                    )
+                    .unwrap();
+                let audit_before = storage
+                    .execute_raw_query("SELECT rowid, * FROM close_metadata")
+                    .unwrap();
+                incoming.bypassed_policy = Some(true);
+                incoming.bypass_reason = Some("Conflicting source reason".to_string());
+                incoming.policy_gates_fired = Some(vec!["source_gate".to_string()]);
+                if update {
+                    incoming.updated_at = fixed_time(200);
+                    incoming.title = "Source scalar update".to_string();
+                }
+                storage.set_metadata("needs_flush", "false").unwrap();
+                write_additive_issues(&path, std::slice::from_ref(&incoming));
+                let result =
+                    import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd"))
+                        .unwrap();
+                assert_eq!(result.updated_count, usize::from(update));
+                assert_eq!(result.skipped_count, usize::from(!update));
+                assert_eq!(result.export_hashes_recorded, 0);
+                assert!(storage.get_export_hash(&incoming.id).unwrap().is_none());
+                assert_eq!(
+                    storage.get_metadata("needs_flush").unwrap().as_deref(),
+                    Some("true")
+                );
+                assert_eq!(
+                    storage
+                        .execute_raw_query("SELECT rowid, * FROM close_metadata")
+                        .unwrap(),
+                    audit_before
+                );
+                let exported = issue_with_exported_close_audit(&storage, &incoming.id);
+                assert_eq!(exported.title, incoming.title);
+                assert_eq!(exported.bypassed_policy, local_bypassed.then_some(true));
+                assert_eq!(
+                    exported.bypass_reason.as_deref(),
+                    local_bypassed.then_some("Local authoritative reason")
+                );
+                assert!(storage.get_events(&incoming.id, 100).unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn test_import_skipped_close_audit_does_not_attach_to_newer_local_payload() {
+        for reopened in [false, true] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let path = temp_dir.path().join("issues.jsonl");
+            let mut source = make_issue_at("bd-audit", "Historical close", fixed_time(100));
+            source.status = Status::Closed;
+            source.closed_at = Some(source.updated_at);
+            let mut local = source.clone();
+            local.updated_at = fixed_time(200);
+            if reopened {
+                local.status = Status::Open;
+                local.closed_at = None;
+            } else {
+                local.closed_at = Some(local.updated_at);
+            }
+            storage.upsert_issue_for_import(&local).unwrap();
+            source.bypassed_policy = Some(true);
+            source.bypass_reason = Some("Historical bypass".to_string());
+            write_additive_issues(&path, &[source]);
+            let before = issue_with_exported_close_audit(&storage, &local.id);
+            let result =
+                import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd"))
+                    .unwrap();
+            assert_eq!(result.skipped_count, 1);
+            assert_eq!(result.export_hashes_recorded, 0);
+            assert!(storage.get_close_metadata(&local.id).unwrap().is_none());
+            assert_eq!(issue_with_exported_close_audit(&storage, &local.id), before);
+            assert_eq!(
+                storage.get_metadata("needs_flush").unwrap().as_deref(),
+                Some("true")
+            );
+        }
+    }
+
+    #[test]
+    fn test_import_audit_certification_tracks_same_target_mutation_boundaries() {
+        for (skip_first, filler_count, reconcile) in [
+            (false, 0, false),
+            (true, 0, false),
+            (true, IMPORT_SKIP_CERTIFICATION_BATCH_SIZE, false),
+            (false, 0, true),
+            (true, 0, true),
+        ] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let path = temp_dir.path().join("issues.jsonl");
+            let mut original = make_issue_at("bd-main", "Shared closure", fixed_time(100));
+            original.status = Status::Closed;
+            original.closed_at = Some(original.updated_at);
+            let fillers = (0..filler_count)
+                .map(|index| {
+                    make_issue_at(
+                        &format!("bd-fill-{index}"),
+                        &format!("Filler {index}"),
+                        fixed_time(100),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut initial = vec![original.clone()];
+            initial.extend(fillers.iter().cloned());
+            write_additive_issues(&path, &initial);
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+            let mut alias = original.clone();
+            alias.id = "bd-alias".to_string();
+            alias.bypassed_policy = Some(true);
+            alias.bypass_reason = Some("Audit adopted from skip".to_string());
+            let mut update = original;
+            update.updated_at = fixed_time(200);
+            update.due_at = Some(fixed_time(300));
+            update.bypassed_policy = Some(true);
+            update.bypass_reason = Some("Audit carried by update".to_string());
+            let mut rows = if skip_first {
+                vec![alias.clone()]
+            } else {
+                vec![update.clone()]
+            };
+            rows.extend(fillers);
+            rows.push(if skip_first { update } else { alias });
+            write_additive_issues(&path, &rows);
+
+            let certified = if reconcile {
+                let plan = plan_sync_reconcile(&storage, &path, &ImportConfig::default()).unwrap();
+                let applied =
+                    apply_sync_reconcile(&mut storage, &path, &ImportConfig::default(), &plan)
+                        .unwrap();
+                assert_eq!(applied.updated, 1);
+                applied.export_hashes_recorded
+            } else {
+                let imported =
+                    import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd"))
+                        .unwrap();
+                assert_eq!(imported.updated_count, 1);
+                assert_eq!(imported.skipped_count, filler_count + 1);
+                imported.export_hashes_recorded
+            };
+            assert_eq!(certified, filler_count + usize::from(!skip_first));
+            assert_eq!(
+                storage.get_export_hash("bd-main").unwrap().is_some(),
+                !skip_first
+            );
+            assert_eq!(
+                storage.get_metadata("needs_flush").unwrap().as_deref(),
+                Some("true")
+            );
+            let actual = issue_with_exported_close_audit(&storage, "bd-main");
+            assert_eq!(actual.due_at, Some(fixed_time(300)));
+            assert_eq!(
+                actual.bypass_reason.as_deref(),
+                Some(if skip_first {
+                    "Audit adopted from skip"
+                } else {
+                    "Audit carried by update"
+                })
+            );
+            assert!(storage.get_issue("bd-alias").unwrap().is_none());
+            assert!(storage.get_events("bd-main", 100).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_import_non_bypassed_audit_defaults_remain_certifiable() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+        let mut issue = make_issue_at("bd-audit", "Non-bypassed closure", fixed_time(100));
+        issue.status = Status::Closed;
+        issue.closed_at = Some(issue.updated_at);
+        for flag in [None, Some(false), None] {
+            issue.bypassed_policy = flag;
+            write_additive_issues(&path, std::slice::from_ref(&issue));
+            let result =
+                import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd"))
+                    .unwrap();
+            assert_eq!(result.export_hashes_recorded, 1);
+            assert!(storage.get_close_metadata(&issue.id).unwrap().is_none());
+            assert_ne!(
+                storage.get_metadata("needs_flush").unwrap().as_deref(),
+                Some("true")
+            );
+        }
+    }
+
+    #[test]
+    fn test_additive_creation_keeps_close_audit_out_of_reviewed_mutations() {
+        let temp_dir = TempDir::new().unwrap();
+        let (_, path, config) = additive_test_paths(&temp_dir);
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut incoming = make_issue_at("bd-audit", "Additive closure", fixed_time(100));
+        incoming.status = Status::Closed;
+        incoming.closed_at = Some(incoming.updated_at);
+        incoming.bypassed_policy = Some(true);
+        incoming.bypass_reason = Some("Source evidence outside additive scope".to_string());
+        incoming.policy_gates_fired = Some(vec!["source_gate".to_string()]);
+        write_additive_issues(&path, &[incoming]);
+        let source_before = fs::read(&path).unwrap();
+        let plan = plan_additive_reconcile(&storage, &path, &config).unwrap();
+        apply_reviewed_additive_plan(&mut storage, &path, &config, &plan).unwrap();
+        assert!(storage.get_issue("bd-audit").unwrap().is_some());
+        assert!(storage.get_close_metadata("bd-audit").unwrap().is_none());
+        assert!(storage.get_events("bd-audit", 100).unwrap().is_empty());
+        assert_eq!(fs::read(&path).unwrap(), source_before);
+    }
+
     #[test]
     fn test_import_skip_batch_preserves_database_ahead_of_restored_export() {
         let mut storage = SqliteStorage::open_memory().unwrap();
@@ -25108,6 +25497,7 @@ mod tests {
                     }
                     let incumbent = start.elapsed();
                     let certify = |lookup: Option<&ImportIssueLookup>| {
+                        let mut close_audit = storage.load_import_close_bypass_audit().unwrap();
                         let mut hashes = Vec::new();
                         let mut ids = HashSet::new();
                         for chunk in incoming.chunks(IMPORT_SKIP_CERTIFICATION_BATCH_SIZE) {
@@ -25125,6 +25515,7 @@ mod tests {
                                 certify_skipped_imports(
                                     storage,
                                     lookup,
+                                    &mut close_audit,
                                     &mut skipped,
                                     &mut hashes,
                                     &mut ids,

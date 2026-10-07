@@ -2774,6 +2774,425 @@ fn bulk_two_thousand_issue_input() {
 }
 
 // ============================================================================
+// Ordinary import preserves exported close-policy audit evidence
+// ============================================================================
+
+fn init_import_audit_workspace(ws: &BrWorkspace) {
+    let init = run_br(ws, ["init", "--prefix", "audit"], "audit_init");
+    assert!(init.status.success(), "{init:?}");
+}
+
+fn import_audit_rows(ws: &BrWorkspace) -> BTreeMap<String, Value> {
+    read_jsonl_lines(ws)
+        .iter()
+        .map(|line| {
+            let row: Value = serde_json::from_str(line).expect("audit source row");
+            (row["id"].as_str().expect("audit issue ID").to_string(), row)
+        })
+        .collect()
+}
+
+fn write_import_audit_rows(ws: &BrWorkspace, rows: &BTreeMap<String, Value>) {
+    write_jsonl_lines(
+        ws,
+        &rows
+            .values()
+            .map(|row| serde_json::to_string(row).expect("serialize audit source"))
+            .collect::<Vec<_>>(),
+    );
+}
+
+fn import_audit_issue(ws: &BrWorkspace, id: &str) -> Issue {
+    SqliteStorage::open(&db_path(ws))
+        .expect("open audit database")
+        .get_issues_for_export(&[id.to_string()])
+        .expect("hydrate issue and exported audit")
+        .pop()
+        .expect("audit issue exists")
+}
+
+fn ordinary_audit_import(ws: &BrWorkspace, label: &str) -> Value {
+    let import = run_br(
+        ws,
+        ["--no-auto-flush", "sync", "--import-only", "--json"],
+        label,
+    );
+    assert!(
+        import.status.success(),
+        "ordinary import failed: {import:?}"
+    );
+    parse_json_value(&import.stdout)
+}
+
+fn assert_import_audit_export(ws: &BrWorkspace, expected: &Issue) {
+    let mut expected = expected.clone();
+    expected.source_repo_path = None;
+    assert_eq!(
+        import_audit_rows(ws).get(&expected.id),
+        Some(&serde_json::to_value(&expected).expect("expected exported issue")),
+        "the complete issue and close audit must survive ordinary export"
+    );
+}
+
+fn add_source_bypass_audit(row: &mut Value) {
+    row["bypassed_policy"] = json!(true);
+    row["bypass_reason"] = json!("Peer's reviewed waiver");
+    row["policy_gates_fired"] = json!(["acceptance_criteria", "security_review"]);
+}
+
+#[test]
+fn ordinary_import_persists_new_close_audit_through_later_mutation_and_export() {
+    let producer = BrWorkspace::new();
+    init_import_audit_workspace(&producer);
+    let audited = create_issue(&producer, "Imported audited closure", "audit_create");
+    let minimal = create_issue(
+        &producer,
+        "Audit with optional fields absent",
+        "audit_minimal",
+    );
+    let sibling = create_issue(&producer, "Unaudited sibling", "audit_sibling");
+    for id in [&audited, &minimal] {
+        let closed = run_br(&producer, ["close", id], &format!("audit_close_{id}"));
+        assert!(closed.status.success(), "{closed:?}");
+    }
+    let mut rows = import_audit_rows(&producer);
+    add_source_bypass_audit(rows.get_mut(&audited).expect("audited source"));
+    rows.get_mut(&minimal).expect("minimal source")["bypassed_policy"] = json!(true);
+
+    let consumer = BrWorkspace::new();
+    init_import_audit_workspace(&consumer);
+    assert_eq!(issue_count(&consumer, "audit_empty"), 0);
+    let events = all_events_dump(&consumer);
+    write_import_audit_rows(&consumer, &rows);
+    let source = fs::read(jsonl_path(&consumer)).expect("audit source bytes");
+    let receipt = ordinary_audit_import(&consumer, "audit_import_fresh");
+    assert_eq!(receipt["created"], 3);
+    assert_eq!(receipt["updated"], 0);
+    assert_eq!(
+        all_events_dump(&consumer),
+        events,
+        "import invents no events"
+    );
+    assert_eq!(fs::read(jsonl_path(&consumer)).unwrap(), source);
+
+    let storage = SqliteStorage::open(&db_path(&consumer)).unwrap();
+    let audit = storage.get_close_metadata(&audited).unwrap().unwrap();
+    assert!(audit.bypassed_policy);
+    assert_eq!(
+        audit.bypass_reason.as_deref(),
+        Some("Peer's reviewed waiver")
+    );
+    assert_eq!(
+        audit.policy_gates_fired,
+        vec![
+            "acceptance_criteria".to_string(),
+            "security_review".to_string()
+        ]
+    );
+    assert!(storage.get_close_metadata(&minimal).unwrap().is_some());
+    assert!(storage.get_close_metadata(&sibling).unwrap().is_none());
+    assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+    assert_eq!(
+        storage.get_metadata("needs_flush").unwrap().as_deref(),
+        Some("false")
+    );
+    for id in [&audited, &minimal, &sibling] {
+        assert!(storage.get_export_hash(id).unwrap().is_some());
+    }
+    drop(storage);
+    let minimal_before = import_audit_issue(&consumer, &minimal);
+    assert_eq!(minimal_before.bypassed_policy, Some(true));
+    assert_eq!(minimal_before.bypass_reason, None);
+    assert_eq!(minimal_before.policy_gates_fired, None);
+
+    let updated = run_br(
+        &consumer,
+        ["update", &audited, "--priority", "1"],
+        "audit_update_after_import",
+    );
+    assert!(updated.status.success(), "{updated:?}");
+    let storage = SqliteStorage::open(&db_path(&consumer)).unwrap();
+    assert_eq!(storage.get_close_metadata(&audited).unwrap(), Some(audit));
+    assert!(storage.get_close_metadata(&sibling).unwrap().is_none());
+    assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+    assert_eq!(
+        storage.get_metadata("needs_flush").unwrap().as_deref(),
+        Some("false")
+    );
+    drop(storage);
+    assert_import_audit_export(&consumer, &import_audit_issue(&consumer, &audited));
+    assert_import_audit_export(&consumer, &minimal_before);
+    assert_import_audit_export(&consumer, &import_audit_issue(&consumer, &sibling));
+}
+
+#[test]
+fn ordinary_import_adopts_matching_skipped_audit_without_churning_noops() {
+    let ws = BrWorkspace::new();
+    init_import_audit_workspace(&ws);
+    let id = create_issue(&ws, "Matching imported audit", "audit_skip_create");
+    let comment = run_br(
+        &ws,
+        ["comments", "add", &id, "Preserve discussion"],
+        "audit_skip_comment",
+    );
+    assert!(comment.status.success(), "{comment:?}");
+    let closed = run_br(&ws, ["close", &id], "audit_skip_close");
+    assert!(closed.status.success(), "{closed:?}");
+    let before = import_audit_issue(&ws, &id);
+    assert!(
+        SqliteStorage::open(&db_path(&ws))
+            .unwrap()
+            .get_close_metadata(&id)
+            .unwrap()
+            .is_none()
+    );
+    let events = all_events_dump(&ws);
+    let mut rows = import_audit_rows(&ws);
+    add_source_bypass_audit(rows.get_mut(&id).unwrap());
+    write_import_audit_rows(&ws, &rows);
+    let source = fs::read(jsonl_path(&ws)).unwrap();
+    let receipt = ordinary_audit_import(&ws, "audit_skip_adopt");
+    assert_eq!(receipt["created"], 0);
+    assert_eq!(receipt["updated"], 0);
+    assert_eq!(receipt["skipped"], 1);
+    assert_eq!(fs::read(jsonl_path(&ws)).unwrap(), source);
+    let mut expected = before;
+    expected.bypassed_policy = Some(true);
+    expected.bypass_reason = Some("Peer's reviewed waiver".to_string());
+    expected.policy_gates_fired = Some(vec![
+        "acceptance_criteria".to_string(),
+        "security_review".to_string(),
+    ]);
+    assert_eq!(import_audit_issue(&ws, &id), expected);
+    assert_eq!(all_events_dump(&ws), events);
+
+    let storage = SqliteStorage::open(&db_path(&ws)).unwrap();
+    let audit = storage
+        .get_close_metadata(&id)
+        .unwrap()
+        .expect("adopted audit row");
+    let certificate = storage
+        .get_export_hash(&id)
+        .unwrap()
+        .expect("certified imported audit");
+    assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+    assert_eq!(
+        storage.get_metadata("needs_flush").unwrap().as_deref(),
+        Some("false")
+    );
+    drop(storage);
+    for pass in 0..2 {
+        // Force the full ordinary-import skip path on both repeats, rather
+        // than proving only the file-hash shortcut is a no-op.
+        let lines = read_jsonl_lines(&ws)
+            .iter()
+            .map(|line| line.replacen('{', "{ ", 1))
+            .collect::<Vec<_>>();
+        write_jsonl_lines(&ws, &lines);
+        let bytes = fs::read(jsonl_path(&ws)).unwrap();
+        let receipt = ordinary_audit_import(&ws, &format!("audit_skip_repeat_{pass}"));
+        assert_eq!(receipt["created"], 0);
+        assert_eq!(receipt["updated"], 0);
+        assert_eq!(receipt["skipped"], 1);
+        let storage = SqliteStorage::open(&db_path(&ws)).unwrap();
+        assert_eq!(
+            storage.get_close_metadata(&id).unwrap(),
+            Some(audit.clone())
+        );
+        assert_eq!(
+            storage.get_export_hash(&id).unwrap(),
+            Some(certificate.clone()),
+            "no-op certification must retain exported_at"
+        );
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+        assert_eq!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("false")
+        );
+        drop(storage);
+        assert_eq!(import_audit_issue(&ws, &id), expected);
+        assert_eq!(all_events_dump(&ws), events);
+        assert_eq!(fs::read(jsonl_path(&ws)).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn ordinary_import_preserves_authoritative_local_close_audit_and_republishes_it() {
+    for source_case in [
+        "missing",
+        "different_reason",
+        "different_gates",
+        "local_false",
+    ] {
+        let ws = BrWorkspace::new();
+        init_import_audit_workspace(&ws);
+        let id = create_issue(&ws, "Authoritative local closure", "audit_local_create");
+        let sibling = create_issue(&ws, "Trigger ordinary export", "audit_local_sibling");
+        fs::write(
+            beads_dir(&ws).join("policy.yaml"),
+            "close_policy:\n  require_close_reason:\n    enabled: true\n    min_length: 40\n",
+        )
+        .unwrap();
+        let close = if source_case == "local_false" {
+            run_br(
+                &ws,
+                [
+                    "close",
+                    &id,
+                    "--reason",
+                    "Completed with the required local policy evidence and review",
+                ],
+                "audit_local_compliant",
+            )
+        } else {
+            run_br(
+                &ws,
+                [
+                    "close",
+                    &id,
+                    "--reason",
+                    "done",
+                    "--bypass-policy",
+                    "--bypass-reason",
+                    "Local reviewed exception",
+                ],
+                "audit_local_bypass",
+            )
+        };
+        assert!(close.status.success(), "{close:?}");
+        let storage = SqliteStorage::open(&db_path(&ws)).unwrap();
+        let audit = storage
+            .get_close_metadata(&id)
+            .unwrap()
+            .expect("real CLI close metadata");
+        assert_eq!(audit.bypassed_policy, source_case != "local_false");
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+        assert!(storage.get_export_hash(&id).unwrap().is_some());
+        drop(storage);
+        let local = import_audit_issue(&ws, &id);
+        let events = all_events_dump(&ws);
+        let mut rows = import_audit_rows(&ws);
+        let row = rows.get_mut(&id).unwrap();
+        match source_case {
+            "missing" => {
+                for field in ["bypassed_policy", "bypass_reason", "policy_gates_fired"] {
+                    row.as_object_mut().unwrap().remove(field);
+                }
+            }
+            "different_reason" => row["bypass_reason"] = json!("Other machine's waiver"),
+            "different_gates" => row["policy_gates_fired"] = json!([]),
+            "local_false" => add_source_bypass_audit(row),
+            _ => unreachable!(),
+        }
+        write_import_audit_rows(&ws, &rows);
+        let source = fs::read(jsonl_path(&ws)).unwrap();
+        let receipt = ordinary_audit_import(&ws, &format!("audit_local_import_{source_case}"));
+        assert_eq!(receipt["created"], 0);
+        assert_eq!(receipt["updated"], 0);
+        assert_eq!(receipt["skipped"], 2);
+        assert_eq!(import_audit_issue(&ws, &id), local);
+        assert_eq!(all_events_dump(&ws), events);
+        assert_eq!(fs::read(jsonl_path(&ws)).unwrap(), source);
+        let storage = SqliteStorage::open(&db_path(&ws)).unwrap();
+        assert_eq!(
+            storage.get_close_metadata(&id).unwrap(),
+            Some(audit.clone())
+        );
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+        assert_eq!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true")
+        );
+        assert!(
+            storage.get_export_hash(&id).unwrap().is_none(),
+            "audit mismatch must revoke certification"
+        );
+        assert!(storage.get_export_hash(&sibling).unwrap().is_some());
+        drop(storage);
+
+        let update = run_br(
+            &ws,
+            ["update", &sibling, "--priority", "1"],
+            "audit_local_republish",
+        );
+        assert!(update.status.success(), "{update:?}");
+        assert_import_audit_export(&ws, &local);
+        let storage = SqliteStorage::open(&db_path(&ws)).unwrap();
+        assert_eq!(storage.get_close_metadata(&id).unwrap(), Some(audit));
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+        assert_eq!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("false")
+        );
+        assert!(storage.get_export_hash(&id).unwrap().is_some());
+    }
+}
+
+#[test]
+fn ordinary_import_never_attaches_stale_close_audit_to_newer_local_state() {
+    for local_change in ["reopened", "title", "comment"] {
+        let ws = BrWorkspace::new();
+        init_import_audit_workspace(&ws);
+        let id = create_issue(&ws, "Closure before local changes", "audit_newer_create");
+        let sibling = create_issue(&ws, "Publish preserved local state", "audit_newer_sibling");
+        let closed = run_br(&ws, ["close", &id], "audit_newer_close");
+        assert!(closed.status.success(), "{closed:?}");
+        let mut restored = import_audit_rows(&ws);
+        add_source_bypass_audit(restored.get_mut(&id).unwrap());
+        let changed = match local_change {
+            "reopened" => run_br(&ws, ["reopen", &id], "audit_newer_reopen"),
+            "title" => run_br(
+                &ws,
+                ["update", &id, "--title", "Newer authoritative local title"],
+                "audit_newer_title",
+            ),
+            "comment" => run_br(
+                &ws,
+                ["comments", "add", &id, "Newer local review discussion"],
+                "audit_newer_comment",
+            ),
+            _ => unreachable!(),
+        };
+        assert!(changed.status.success(), "{changed:?}");
+        let local = import_audit_issue(&ws, &id);
+        let events = all_events_dump(&ws);
+        write_import_audit_rows(&ws, &restored);
+        let source = fs::read(jsonl_path(&ws)).unwrap();
+        let receipt = ordinary_audit_import(&ws, &format!("audit_newer_import_{local_change}"));
+        assert_eq!(receipt["created"], 0);
+        assert_eq!(receipt["updated"], 0);
+        assert_eq!(receipt["skipped"], 2);
+        assert_eq!(import_audit_issue(&ws, &id), local);
+        assert_eq!(all_events_dump(&ws), events);
+        assert_eq!(fs::read(jsonl_path(&ws)).unwrap(), source);
+        let storage = SqliteStorage::open(&db_path(&ws)).unwrap();
+        assert!(storage.get_close_metadata(&id).unwrap().is_none());
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+        assert_eq!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true")
+        );
+        assert!(storage.get_export_hash(&id).unwrap().is_none());
+        drop(storage);
+        let update = run_br(
+            &ws,
+            ["update", &sibling, "--priority", "1"],
+            "audit_newer_republish",
+        );
+        assert!(update.status.success(), "{update:?}");
+        assert_import_audit_export(&ws, &local);
+        let storage = SqliteStorage::open(&db_path(&ws)).unwrap();
+        assert!(storage.get_close_metadata(&id).unwrap().is_none());
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+        assert_eq!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("false")
+        );
+        assert!(storage.get_export_hash(&id).unwrap().is_some());
+    }
+}
+
+// ============================================================================
 // Retention-aware import certification and automatic export
 // ============================================================================
 

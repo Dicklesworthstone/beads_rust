@@ -154,6 +154,21 @@ reconciliation. Existing explicit `--force` behavior is unchanged.
 | **Payload comment identity** | Treating a database-local comment rowid as global identity: two clones both mint comment id `1`, so a merged JSONL routinely carries one id for two issues; import reassigns the local rowid and verifies comments by `(issue, created_at, author, text)` instead of refusing the file | n/a - never refuses; same-issue duplicate payloads are still rejected |
 | **Tombstone protection** | Resurrecting deleted issues | **None** - by design |
 
+Ordinary import preserves exported close-policy bypass evidence. A new issue
+keeps its bypass flag, reason, and fired gates. For a skipped issue, import can
+adopt that evidence only when the stored issue and relations match the incoming
+payload, including its closure state, and no local close metadata exists.
+Existing local close metadata takes precedence, including a recorded close
+without a bypass.
+
+Import certifies a row as synchronized only when its resulting exported audit
+also matches the source. A conflicting or missing source audit leaves the local
+record intact, revokes its export certificate, and keeps the database marked
+for flush. Audit comparison uses one transaction-scoped snapshot alongside
+batched issue comparisons; repeated no-op imports do not rewrite audit rows or
+unchanged certificates. Legacy `--reconcile` uses the same certification rules.
+Token-bound `--reconcile-additive` retains its separate no-audit-mutation contract.
+
 ### Merge Guards
 
 | Guard | What it prevents | Override |

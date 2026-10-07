@@ -94,6 +94,16 @@ pub(crate) struct ExportCloseBypassAudit {
 }
 
 impl ExportCloseBypassAudit {
+    fn insert_decoded(&mut self, issue_id: &str, reason: Option<&str>, gates: Option<&str>) {
+        self.by_issue.insert(
+            issue_id.to_string(),
+            (
+                reason.map(str::to_string),
+                gates.and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok()),
+            ),
+        );
+    }
+
     pub(crate) fn attach(&self, issues: &mut [Issue]) {
         if self.by_issue.is_empty() {
             return;
@@ -104,6 +114,46 @@ impl ExportCloseBypassAudit {
                 issue.bypass_reason.clone_from(reason);
                 issue.policy_gates_fired.clone_from(gates);
             }
+        }
+    }
+}
+
+/// Local audit precedence and exporter-visible values for one import transaction.
+/// Audit inserts do not invalidate the issue/relation row locations used by skips.
+#[derive(Debug, Default)]
+pub(crate) struct ImportCloseBypassAudit {
+    recorded_ids: HashSet<String>,
+    exported: ExportCloseBypassAudit,
+}
+
+impl ImportCloseBypassAudit {
+    pub(crate) fn contains_record(&self, issue_id: &str) -> bool {
+        self.recorded_ids.contains(issue_id)
+    }
+
+    /// Mirror a successful insert-only audit write without reloading the table.
+    pub(crate) fn record_imported(&mut self, issue_id: &str, issue: &Issue) {
+        if issue.bypassed_policy == Some(true) && self.recorded_ids.insert(issue_id.to_string()) {
+            self.exported.by_issue.insert(
+                issue_id.to_string(),
+                (
+                    issue.bypass_reason.clone(),
+                    issue.policy_gates_fired.clone(),
+                ),
+            );
+        }
+    }
+
+    pub(crate) fn matches_export(&self, issue_id: &str, issue: &Issue) -> bool {
+        match self.exported.by_issue.get(issue_id) {
+            Some((reason, gates)) => {
+                issue.bypassed_policy == Some(true)
+                    && reason == &issue.bypass_reason
+                    && gates == &issue.policy_gates_fired
+            }
+            // Only bypassed closes project audit fields into JSONL. Explicit
+            // false and an absent flag both represent a non-bypassed close.
+            None => issue.bypassed_policy != Some(true),
         }
     }
 }
@@ -15477,19 +15527,45 @@ impl SqliteStorage {
             "SELECT issue_id, bypass_reason, policy_gates_fired
              FROM close_metadata WHERE bypassed_policy = 1",
         )?;
-        let mut audit: HashMap<String, (Option<String>, Option<Vec<String>>)> = HashMap::new();
+        let mut audit = ExportCloseBypassAudit::default();
         for row in &rows {
             let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
                 continue;
             };
-            let reason = row.get(1).and_then(SqliteValue::as_text).map(String::from);
-            let gates = row
-                .get(2)
-                .and_then(SqliteValue::as_text)
-                .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok());
-            audit.insert(issue_id.to_string(), (reason, gates));
+            audit.insert_decoded(
+                issue_id,
+                row.get(1).and_then(SqliteValue::as_text),
+                row.get(2).and_then(SqliteValue::as_text),
+            );
         }
-        Ok(ExportCloseBypassAudit { by_issue: audit })
+        Ok(audit)
+    }
+
+    /// Read audit ownership and export values once inside the importing transaction.
+    pub(crate) fn load_import_close_bypass_audit(&self) -> Result<ImportCloseBypassAudit> {
+        if !self.conn.as_async().in_transaction() {
+            return Err(BeadsError::internal(
+                "import audit lookup requires an active transaction",
+            ));
+        }
+        let mut audit = ImportCloseBypassAudit::default();
+        for row in self.conn.query(
+            "SELECT issue_id, bypassed_policy = 1, bypass_reason, policy_gates_fired \
+             FROM close_metadata",
+        )? {
+            let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            audit.recorded_ids.insert(issue_id.to_string());
+            if row.get(1).and_then(SqliteValue::as_integer) == Some(1) {
+                audit.exported.insert_decoded(
+                    issue_id,
+                    row.get(2).and_then(SqliteValue::as_text),
+                    row.get(3).and_then(SqliteValue::as_text),
+                );
+            }
+        }
+        Ok(audit)
     }
 
     /// Get all dependency records for all issues.
@@ -19857,6 +19933,17 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_issues_for_export(&self, ids: &[String]) -> Result<Vec<Issue>> {
+        let mut issues = self.get_issues_for_import_comparison_live(ids)?;
+        self.attach_close_bypass_audit_for_export(&mut issues)?;
+        Ok(issues)
+    }
+
+    /// Hydrate current issue/relation rows for an import containing mutations.
+    /// The caller's transaction-scoped audit projection supplies close metadata.
+    pub(crate) fn get_issues_for_import_comparison_live(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<Issue>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -19881,8 +19968,6 @@ impl SqliteStorage {
                 issue.comments = comments.clone();
             }
         }
-
-        self.attach_close_bypass_audit_for_export(&mut issues)?;
 
         Ok(issues)
     }
@@ -20638,7 +20723,11 @@ impl SqliteStorage {
 
     pub(crate) fn insert_new_issue_for_import_in_tx(&self, issue: &Issue) -> Result<bool> {
         let timestamps = ImportIssueTimestampStrings::from_issue(issue);
-        Ok(self.insert_issue_row_for_import(issue, &timestamps)? > 0)
+        let inserted = self.insert_issue_row_for_import(issue, &timestamps)? > 0;
+        if inserted {
+            self.persist_imported_close_bypass_audit_in_tx(issue)?;
+        }
+        Ok(inserted)
     }
 
     /// Upsert an issue (create or update) for import operations.
@@ -20711,9 +20800,14 @@ impl SqliteStorage {
     /// `close_metadata` (GitHub #474). A locally recorded row wins — the
     /// machine that performed the bypass holds the richer record (closer
     /// attribution columns) — so this is insert-only.
-    fn persist_imported_close_bypass_audit_in_tx(&self, issue: &Issue) -> Result<()> {
+    pub(crate) fn persist_imported_close_bypass_audit_in_tx(&self, issue: &Issue) -> Result<()> {
         if issue.bypassed_policy != Some(true) {
             return Ok(());
+        }
+        if !self.conn.as_async().in_transaction() {
+            return Err(BeadsError::internal(
+                "import audit persistence requires an active transaction",
+            ));
         }
         let gates_json = issue
             .policy_gates_fired
