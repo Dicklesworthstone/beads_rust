@@ -7434,7 +7434,11 @@ fn db_override_from_layer(layer: &ConfigLayer) -> Option<PathBuf> {
     })
 }
 
-fn resolve_db_override_from_layer(beads_dir: &Path, layer: &ConfigLayer) -> Option<PathBuf> {
+/// Resolve a startup database override without following its leaf.
+pub(crate) fn resolve_db_override_from_layer(
+    beads_dir: &Path,
+    layer: &ConfigLayer,
+) -> Option<PathBuf> {
     db_override_from_layer(layer).map(|path| {
         if path.is_absolute() {
             path

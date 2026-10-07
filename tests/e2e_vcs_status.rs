@@ -168,6 +168,944 @@ fn assert_common_contract(value: &Value, available: bool) {
     assert!(value["duration_ms"].as_u64().is_some(), "{value}");
 }
 
+fn runtime_workspace() -> BrWorkspace {
+    let workspace = BrWorkspace::new();
+    git_ok(&workspace.root, &["init", "--initial-branch=main"]);
+    let metadata = workspace.root.join(".beads");
+    std::fs::create_dir(&metadata).expect("runtime metadata directory");
+    std::fs::write(
+        metadata.join("metadata.json"),
+        r#"{"database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+    )
+    .expect("tracker metadata");
+    std::fs::write(
+        metadata.join(".gitignore"),
+        "*.db*\n.br-wal-index-*/\n.br_recovery/\n.br_history/\n.write.lock\n.write-waiters.lock/\n",
+    )
+    .expect("runtime ignore rules");
+    // The audit must be useful precisely when opening the engine or importing
+    // JSONL is unsafe. Neither fixture is valid input to those paths.
+    std::fs::write(
+        metadata.join("beads.db"),
+        b"invalid SQLite database\0retained",
+    )
+    .expect("unopenable database");
+    std::fs::write(
+        metadata.join("issues.jsonl"),
+        "<<<<<<< unresolved export\nnot JSON\n",
+    )
+    .expect("unparseable export");
+    workspace
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RuntimeFixtureEntry {
+    Directory,
+    File(Vec<u8>),
+    Symlink(std::path::PathBuf),
+}
+
+fn runtime_metadata_snapshot(
+    workspace: &BrWorkspace,
+) -> std::collections::BTreeMap<std::path::PathBuf, RuntimeFixtureEntry> {
+    runtime_directory_snapshot(&workspace.root.join(".beads"))
+}
+
+fn runtime_directory_snapshot(
+    root: &Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, RuntimeFixtureEntry> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut snapshot = std::collections::BTreeMap::new();
+    while let Some(path) = pending.pop() {
+        let kind = std::fs::symlink_metadata(&path).expect("fixture metadata");
+        let relative = path
+            .strip_prefix(root)
+            .expect("metadata-local fixture")
+            .to_path_buf();
+        if kind.is_dir() {
+            snapshot.insert(relative, RuntimeFixtureEntry::Directory);
+            for entry in std::fs::read_dir(&path).expect("fixture directory") {
+                pending.push(entry.expect("fixture entry").path());
+            }
+        } else if kind.file_type().is_symlink() {
+            snapshot.insert(
+                relative,
+                RuntimeFixtureEntry::Symlink(std::fs::read_link(&path).expect("fixture link")),
+            );
+        } else {
+            assert!(
+                kind.is_file(),
+                "unexpected fixture type: {}",
+                path.display()
+            );
+            snapshot.insert(
+                relative,
+                RuntimeFixtureEntry::File(std::fs::read(&path).expect("fixture bytes")),
+            );
+        }
+    }
+    snapshot
+}
+
+fn runtime_status_json(workspace: &BrWorkspace, label: &str) -> Value {
+    let output = run_br(
+        workspace,
+        ["vcs-status", "--runtime-files", "--json"],
+        label,
+    );
+    assert!(
+        output.status.success(),
+        "runtime audit failed: {}",
+        output.stderr
+    );
+    serde_json::from_str(&extract_json_payload(&output.stdout)).expect("runtime audit JSON")
+}
+
+fn assert_runtime_contract(value: &Value, available: bool) {
+    assert_eq!(value["schema"], "br.vcs-runtime-status.v1", "{value}");
+    assert_eq!(value["requested"], true, "{value}");
+    assert_eq!(value["available"], available, "{value}");
+    assert_eq!(value["vcs"], "git", "{value}");
+    assert_eq!(value["observation_atomic"], false, "{value}");
+    assert_eq!(value["path_scope"], "workspace_metadata", "{value}");
+    assert_eq!(value["metadata_path"], ".beads", "{value}");
+    assert_eq!(value["index_only"], true, "{value}");
+    assert_eq!(value["automatic_remediation_available"], false, "{value}");
+    assert!(value["timeout_ms"].as_u64().is_some(), "{value}");
+    assert!(value["duration_ms"].as_u64().is_some(), "{value}");
+    if !available {
+        assert!(value.get("tracked_count").is_none(), "{value}");
+        assert!(value.get("files").is_none(), "{value}");
+    }
+}
+
+#[test]
+fn e2e_vcs_runtime_audit_finds_ignored_tracked_files_without_opening_or_repairing_data() {
+    let _log = common::test_log(
+        "e2e_vcs_runtime_audit_finds_ignored_tracked_files_without_opening_or_repairing_data",
+    );
+    let workspace = runtime_workspace();
+    let runtime = [
+        ("beads.db", "database"),
+        ("beads.db-wal", "wal"),
+        ("beads.db-shm", "shared_memory"),
+        ("beads.db-journal", "journal"),
+        ("beads.db-wal-cert", "wal_certificate"),
+        ("beads.db-fsqlite-ns-gate", "namespace_state"),
+        ("beads.db-fsqlite-ns-use", "namespace_state"),
+        ("beads.db.fsqlite-migration-state", "migration_state"),
+        ("beads.db.bad_20261007", "recovery_evidence"),
+        ("beads.db.corrupt_20261007", "recovery_evidence"),
+        ("beads.db.stale_20261007", "recovery_evidence"),
+        (".br-wal-index-fixture/poisoned-shm", "recovery_evidence"),
+        (".br-wal-index-fixture/prepared.json", "recovery_evidence"),
+        (
+            ".br_recovery/fixture/recovery-failed.json",
+            "recovery_evidence",
+        ),
+        (".br_history/export.jsonl", "history"),
+        (".write.lock", "writer_coordination"),
+        (
+            ".write-waiters.lock/registered.waiter",
+            "writer_coordination",
+        ),
+    ];
+    for (relative, _) in runtime {
+        let path = workspace.root.join(".beads").join(relative);
+        std::fs::create_dir_all(path.parent().expect("runtime parent")).expect("runtime directory");
+        if relative != "beads.db" {
+            std::fs::write(&path, format!("retained {relative}\0evidence\n"))
+                .expect("runtime evidence");
+        }
+        let ignored = git(
+            &workspace.root,
+            &[
+                "check-ignore",
+                "--no-index",
+                "-q",
+                "--",
+                &format!(".beads/{relative}"),
+            ],
+        );
+        assert_eq!(ignored.status.code(), Some(0), "{relative}: {ignored:?}");
+    }
+    for relative in [
+        ".beads/config.yaml",
+        ".beads/ordinary-notes.md",
+        ".beads/beads.db.notes.md",
+        ".beads/docs/recovery-failed.json",
+        ".beads/docs/beads.db-wal-cert.md",
+        "adjacent/.beads/beads.db-wal-cert",
+        "beads.db-wal-cert",
+    ] {
+        let path = workspace.root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("ordinary parent"))
+            .expect("ordinary directory");
+        let contents = if relative.ends_with("config.yaml") {
+            "issue-prefix: runtime\n"
+        } else {
+            "ordinary tracked data\n"
+        };
+        std::fs::write(path, contents).expect("non-runtime fixture");
+    }
+    git_ok(
+        &workspace.root,
+        &[
+            "add",
+            "--force",
+            "--",
+            ".beads",
+            "adjacent",
+            "beads.db-wal-cert",
+        ],
+    );
+    git_ok(
+        &workspace.root,
+        &["commit", "-m", "retain tracked runtime fixtures"],
+    );
+
+    // Add a genuine index entry without ever creating its worktree leaf.
+    // An inventory of existing files would silently miss this tracked risk.
+    let missing = "beads.db-wal-cert-head";
+    let blob = git_stdout(
+        &workspace.root,
+        &["rev-parse", "HEAD:.beads/beads.db-wal-cert"],
+    );
+    git_ok(
+        &workspace.root,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{blob},.beads/{missing}"),
+        ],
+    );
+    assert!(!workspace.root.join(".beads").join(missing).exists());
+    let metadata_before = runtime_metadata_snapshot(&workspace);
+    let index_before =
+        std::fs::read(workspace.root.join(".git/index")).expect("index before audit");
+    let head_before = git_stdout(&workspace.root, &["rev-parse", "HEAD"]);
+    let head_file_before =
+        std::fs::read(workspace.root.join(".git/HEAD")).expect("HEAD before audit");
+
+    for label in [
+        "runtime_tracked_inventory",
+        "runtime_tracked_inventory_again",
+    ] {
+        let status = runtime_status_json(&workspace, label);
+        assert_runtime_contract(&status, true);
+        assert!(status.get("reason").is_none(), "{status}");
+        let files = status["files"]
+            .as_array()
+            .expect("complete runtime inventory");
+        assert_eq!(status["tracked_count"], runtime.len() + 1, "{status}");
+        assert_eq!(files.len(), runtime.len() + 1, "{status}");
+        let observed = files
+            .iter()
+            .map(|file| {
+                (
+                    file["path"].as_str().expect("runtime path"),
+                    file["kind"].as_str().expect("runtime kind"),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let expected = runtime
+            .into_iter()
+            .chain([(missing, "wal_certificate")])
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(observed, expected, "{status}");
+        assert_eq!(
+            runtime_metadata_snapshot(&workspace),
+            metadata_before,
+            "audit changed data or recovery evidence"
+        );
+        assert_eq!(
+            std::fs::read(workspace.root.join(".git/index")).expect("index after audit"),
+            index_before
+        );
+        assert_eq!(
+            std::fs::read(workspace.root.join(".git/HEAD")).expect("HEAD after audit"),
+            head_file_before
+        );
+        assert_eq!(
+            git_stdout(&workspace.root, &["rev-parse", "HEAD"]),
+            head_before
+        );
+        assert!(
+            !workspace.root.join(".beads").join(missing).exists(),
+            "audit rebuilt a missing sidecar"
+        );
+    }
+}
+
+#[test]
+fn e2e_vcs_runtime_audit_distinguishes_an_empty_index_from_a_configured_nested_family() {
+    let _log = common::test_log(
+        "e2e_vcs_runtime_audit_distinguishes_an_empty_index_from_a_configured_nested_family",
+    );
+    let workspace = runtime_workspace();
+    let docs = workspace.root.join(".beads/docs");
+    std::fs::create_dir(&docs).expect("ordinary documentation directory");
+    std::fs::write(docs.join("beads.db"), "documented database fixture\n")
+        .expect("ordinary nested data");
+    git_ok(
+        &workspace.root,
+        &[
+            "add",
+            "--force",
+            "--",
+            JSONL,
+            ".beads/metadata.json",
+            ".beads/.gitignore",
+            ".beads/docs/beads.db",
+        ],
+    );
+    git_ok(
+        &workspace.root,
+        &["commit", "-m", "track ordinary metadata"],
+    );
+    let empty = runtime_status_json(&workspace, "runtime_empty_inventory");
+    assert_runtime_contract(&empty, true);
+    assert_eq!(empty["tracked_count"], 0, "{empty}");
+    assert_eq!(empty["files"], serde_json::json!([]), "{empty}");
+    assert!(empty.get("reason").is_none(), "{empty}");
+
+    std::fs::write(
+        workspace.root.join(".beads/metadata.json"),
+        r#"{"database":"nested/tracker.sqlite","jsonl_export":"missing.jsonl"}"#,
+    )
+    .expect("configured nested database");
+    let nested = workspace.root.join(".beads/nested");
+    std::fs::create_dir(&nested).expect("configured database directory");
+    for leaf in [
+        "tracker.sqlite",
+        "tracker.sqlite-wal-cert",
+        "tracker.sqlite-fsqlite-ns-gate",
+    ] {
+        std::fs::write(nested.join(leaf), format!("invalid but retained {leaf}\0"))
+            .expect("configured runtime file");
+    }
+    // Recovery is retained beside the configured database, which can itself
+    // live below the metadata root. JSON-looking leaves in those reserved
+    // namespaces remain recovery evidence rather than shared export data.
+    for relative in [
+        ".br_recovery/run/recovery-failed.json",
+        ".br-wal-index-run/prepared.json",
+    ] {
+        let path = nested.join(relative);
+        std::fs::create_dir_all(path.parent().expect("nested recovery parent"))
+            .expect("nested recovery directory");
+        std::fs::write(
+            path,
+            r#"{"retained":"recovery evidence","export":"issues.jsonl"}"#,
+        )
+        .expect("nested recovery receipt");
+    }
+    git_ok(
+        &workspace.root,
+        &[
+            "add",
+            "--force",
+            "--",
+            ".beads/metadata.json",
+            ".beads/nested",
+        ],
+    );
+    let metadata_before = runtime_metadata_snapshot(&workspace);
+    let index_before =
+        std::fs::read(workspace.root.join(".git/index")).expect("configured-family index");
+    let head_before = git_stdout(&workspace.root, &["rev-parse", "HEAD"]);
+    let status = runtime_status_json(&workspace, "runtime_configured_nested_family");
+    assert_runtime_contract(&status, true);
+    assert_eq!(status["tracked_count"], 5, "{status}");
+    assert_eq!(
+        status["files"],
+        serde_json::json!([
+            {"path": "nested/.br-wal-index-run/prepared.json", "kind": "recovery_evidence"},
+            {"path": "nested/.br_recovery/run/recovery-failed.json", "kind": "recovery_evidence"},
+            {"path": "nested/tracker.sqlite", "kind": "database"},
+            {"path": "nested/tracker.sqlite-fsqlite-ns-gate", "kind": "namespace_state"},
+            {"path": "nested/tracker.sqlite-wal-cert", "kind": "wal_certificate"},
+        ]),
+        "{status}"
+    );
+    assert_eq!(runtime_metadata_snapshot(&workspace), metadata_before);
+    assert_eq!(
+        std::fs::read(workspace.root.join(".git/index")).expect("preserved configured index"),
+        index_before
+    );
+    assert_eq!(
+        git_stdout(&workspace.root, &["rev-parse", "HEAD"]),
+        head_before
+    );
+}
+
+#[test]
+fn e2e_vcs_runtime_audit_refuses_gitlink_ancestors_that_hide_the_selected_family() {
+    let _log = common::test_log(
+        "e2e_vcs_runtime_audit_refuses_gitlink_ancestors_that_hide_the_selected_family",
+    );
+    for (metadata_relative, database_relative, boundary, expected_listing, label) in [
+        (
+            "nested/tracker/.beads",
+            "beads.db",
+            "nested",
+            b"".as_slice(),
+            "runtime_metadata_below_gitlink",
+        ),
+        (
+            ".beads",
+            "nested/tracker.sqlite",
+            ".beads/nested",
+            b"nested\0".as_slice(),
+            "runtime_database_below_gitlink",
+        ),
+    ] {
+        let workspace = BrWorkspace::new();
+        git_ok(&workspace.root, &["init", "--initial-branch=main"]);
+        std::fs::write(
+            workspace.root.join("README.md"),
+            "ancestor-boundary fixture\n",
+        )
+        .expect("fixture README");
+        git_ok(&workspace.root, &["add", "README.md"]);
+        git_ok(
+            &workspace.root,
+            &["commit", "-m", "real commit for gitlink identity"],
+        );
+        let head_before = git_stdout(&workspace.root, &["rev-parse", "HEAD"]);
+        let metadata = workspace.root.join(metadata_relative);
+        let database = metadata.join(database_relative);
+        std::fs::create_dir_all(database.parent().expect("database parent"))
+            .expect("physically present nested family");
+        std::fs::write(
+            metadata.join("metadata.json"),
+            serde_json::json!({"database": database_relative, "jsonl_export": "issues.jsonl"})
+                .to_string(),
+        )
+        .expect("selected metadata");
+        std::fs::write(metadata.join("issues.jsonl"), "not importable JSONL\n")
+            .expect("retained invalid export");
+        std::fs::write(&database, "invalid SQLite database\0retained")
+            .expect("retained invalid database");
+        let recovery = database
+            .parent()
+            .expect("recovery parent")
+            .join(".br_recovery/run/recovery-failed.json");
+        std::fs::create_dir_all(recovery.parent().expect("receipt parent"))
+            .expect("retained recovery directory");
+        std::fs::write(recovery, "retained failure evidence\n").expect("retained receipt");
+
+        // A gitlink is one index entry even though a real directory containing
+        // the selected tracker exists below it. Plain ls-files at that tracker
+        // can therefore look empty or omit its entire configured DB subtree.
+        git_ok(
+            &workspace.root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{head_before},{boundary}"),
+            ],
+        );
+        let listing = git(&metadata, &["ls-files", "--cached", "-z", "--", "."]);
+        assert!(listing.status.success(), "{label}: {listing:?}");
+        assert_eq!(
+            listing.stdout, expected_listing,
+            "{label}: fixture lost its hidden scope"
+        );
+        let metadata_before = runtime_directory_snapshot(&metadata);
+        let index_before =
+            std::fs::read(workspace.root.join(".git/index")).expect("index with gitlink boundary");
+        let output = run_br_with_env(
+            &workspace,
+            ["vcs-status", "--runtime-files", "--json"],
+            [("BEADS_DIR", metadata.as_os_str())],
+            label,
+        );
+        assert!(output.status.success(), "{label}: {}", output.stderr);
+        let status: Value = serde_json::from_str(&extract_json_payload(&output.stdout))
+            .expect("ancestor-boundary inventory JSON");
+        assert_runtime_contract(&status, false);
+        assert_eq!(
+            status["reason"], "scope_crosses_tracked_non_directory",
+            "{status}"
+        );
+        assert_eq!(runtime_directory_snapshot(&metadata), metadata_before);
+        assert_eq!(
+            std::fs::read(workspace.root.join(".git/index")).expect("preserved gitlink index"),
+            index_before
+        );
+        assert_eq!(
+            git_stdout(&workspace.root, &["rev-parse", "HEAD"]),
+            head_before
+        );
+        assert!(
+            workspace.root.join(boundary).is_dir(),
+            "audit displaced a working directory"
+        );
+    }
+}
+
+#[test]
+fn e2e_vcs_runtime_audit_counts_real_unmerged_index_paths_once() {
+    let _log = common::test_log("e2e_vcs_runtime_audit_counts_real_unmerged_index_paths_once");
+    let workspace = runtime_workspace();
+    git_ok(
+        &workspace.root,
+        &["add", "--", ".beads/metadata.json", JSONL],
+    );
+    git_ok(
+        &workspace.root,
+        &["commit", "-m", "base for runtime conflict"],
+    );
+    let path = ".beads/beads.db-wal-cert";
+    std::fs::write(workspace.root.join(path), "first certificate generation\n")
+        .expect("first blob");
+    let first = git_stdout(&workspace.root, &["hash-object", "-w", path]);
+    std::fs::write(workspace.root.join(path), "second certificate generation\n")
+        .expect("second blob");
+    let second = git_stdout(&workspace.root, &["hash-object", "-w", path]);
+    assert_ne!(first, second);
+    git_with_stdin_ok(
+        &workspace.root,
+        &["update-index", "--index-info"],
+        &format!("100644 {first} 1\t{path}\n100644 {second} 2\t{path}\n100644 {first} 3\t{path}\n"),
+    );
+    let stages = git(
+        &workspace.root,
+        &["ls-files", "--unmerged", "-z", "--", path],
+    );
+    assert!(stages.status.success(), "{stages:?}");
+    assert_eq!(
+        stages.stdout.iter().filter(|byte| **byte == 0).count(),
+        3,
+        "three actual conflict stages"
+    );
+    let metadata_before = runtime_metadata_snapshot(&workspace);
+    let index_before = std::fs::read(workspace.root.join(".git/index")).expect("unmerged index");
+    let head_before = git_stdout(&workspace.root, &["rev-parse", "HEAD"]);
+
+    let status = runtime_status_json(&workspace, "runtime_unmerged_inventory");
+    assert_runtime_contract(&status, true);
+    assert_eq!(status["tracked_count"], 1, "{status}");
+    assert_eq!(
+        status["files"],
+        serde_json::json!([{"path": "beads.db-wal-cert", "kind": "wal_certificate"}]),
+        "{status}"
+    );
+    assert_eq!(runtime_metadata_snapshot(&workspace), metadata_before);
+    assert_eq!(
+        std::fs::read(workspace.root.join(".git/index")).expect("preserved unmerged index"),
+        index_before
+    );
+    assert_eq!(
+        git_stdout(&workspace.root, &["rev-parse", "HEAD"]),
+        head_before
+    );
+}
+
+#[test]
+fn e2e_vcs_runtime_audit_refuses_truncated_index_output_without_a_partial_count() {
+    let _log = common::test_log(
+        "e2e_vcs_runtime_audit_refuses_truncated_index_output_without_a_partial_count",
+    );
+    let workspace = runtime_workspace();
+    let blob = git_stdout(&workspace.root, &["hash-object", "-w", ".beads/beads.db"]);
+    let mut entries = String::new();
+    for index in 0..512 {
+        entries.push_str(&format!(
+            "100644 {blob}\t.beads/.br_recovery/retained-generation-{index:04}-with-a-long-diagnostic-name/original.db\n"
+        ));
+    }
+    git_with_stdin_ok(&workspace.root, &["update-index", "--index-info"], &entries);
+    let actual = git(
+        &workspace.root.join(".beads"),
+        &["ls-files", "--cached", "-z", "--", "."],
+    );
+    assert!(actual.status.success(), "{actual:?}");
+    assert!(
+        actual.stdout.len() > 32 * 1024,
+        "fixture must exceed the retained-output cap"
+    );
+    let index_before = std::fs::read(workspace.root.join(".git/index")).expect("large index");
+    let metadata_before = runtime_metadata_snapshot(&workspace);
+    let output = run_br(
+        &workspace,
+        [
+            "vcs-status",
+            "--runtime-files",
+            "--timeout-ms",
+            "30000",
+            "--json",
+        ],
+        "runtime_inventory_output_limit",
+    );
+    assert!(
+        output.status.success(),
+        "bounded refusal is a diagnostic result: {}",
+        output.stderr
+    );
+    let status: Value = serde_json::from_str(&extract_json_payload(&output.stdout))
+        .expect("bounded inventory JSON");
+    assert_runtime_contract(&status, false);
+    assert_eq!(status["reason"], "probe_output_limit", "{status}");
+    assert_eq!(
+        std::fs::read(workspace.root.join(".git/index")).expect("preserved large index"),
+        index_before
+    );
+    assert_eq!(runtime_metadata_snapshot(&workspace), metadata_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_vcs_runtime_audit_keeps_a_selected_symlink_alias_inside_its_metadata_scope() {
+    use std::os::unix::fs::{MetadataExt, symlink};
+
+    let _log = common::test_log(
+        "e2e_vcs_runtime_audit_keeps_a_selected_symlink_alias_inside_its_metadata_scope",
+    );
+    let workspace = runtime_workspace();
+    let foreign = workspace.root.join("outside-runtime");
+    std::fs::create_dir(&foreign).expect("foreign database directory");
+    for (leaf, bytes) in [
+        ("private.sqlite", "foreign invalid database\0"),
+        ("private.sqlite-wal", "foreign WAL bytes\0"),
+        ("private.sqlite-wal-cert", "foreign certificate bytes\0"),
+        (
+            "private.sqlite-fsqlite-ns-gate",
+            "foreign namespace bytes\0",
+        ),
+    ] {
+        std::fs::write(foreign.join(leaf), bytes).expect("foreign runtime fixture");
+    }
+    let selected = workspace.root.join(".beads/custom.sqlite");
+    symlink(foreign.join("private.sqlite"), &selected).expect("custom database symlink");
+    for leaf in ["custom.sqlite-wal-cert", "custom.sqlite-fsqlite-ns-gate"] {
+        std::fs::write(
+            workspace.root.join(".beads").join(leaf),
+            format!("retained local alias {leaf}\0"),
+        )
+        .expect("local alias sidecar");
+    }
+    git_ok(
+        &workspace.root,
+        &[
+            "add",
+            "--force",
+            "--",
+            ".beads/metadata.json",
+            JSONL,
+            ".beads/custom.sqlite",
+            ".beads/custom.sqlite-wal-cert",
+            ".beads/custom.sqlite-fsqlite-ns-gate",
+            "outside-runtime",
+        ],
+    );
+    git_ok(
+        &workspace.root,
+        &[
+            "commit",
+            "-m",
+            "track selected alias and foreign runtime fixtures",
+        ],
+    );
+    let alias_index = git_stdout(
+        &workspace.root,
+        &["ls-files", "--stage", "--", ".beads/custom.sqlite"],
+    );
+    assert!(alias_index.starts_with("120000 "), "{alias_index}");
+    let foreign_snapshot = || {
+        std::fs::read_dir(&foreign)
+            .expect("foreign directory")
+            .map(|entry| {
+                let entry = entry.expect("foreign entry");
+                let metadata = std::fs::symlink_metadata(entry.path()).expect("foreign metadata");
+                assert!(metadata.is_file());
+                (
+                    entry.file_name(),
+                    (
+                        metadata.dev(),
+                        metadata.ino(),
+                        metadata.mode(),
+                        metadata.len(),
+                        std::fs::read(entry.path()).expect("foreign bytes"),
+                    ),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let foreign_before = foreign_snapshot();
+    let index_before = std::fs::read(workspace.root.join(".git/index")).expect("alias index");
+    let head_before = git_stdout(&workspace.root, &["rev-parse", "HEAD"]);
+
+    for (args, label) in [
+        (
+            vec![
+                "--db",
+                ".beads/custom.sqlite",
+                "vcs-status",
+                "--runtime-files",
+                "--json",
+            ],
+            "runtime_cli_selected_symlink",
+        ),
+        (
+            vec!["vcs-status", "--runtime-files", "--json"],
+            "runtime_metadata_selected_symlink",
+        ),
+        (
+            vec!["vcs-status", "--runtime-files", "--json"],
+            "runtime_project_selected_symlink",
+        ),
+    ] {
+        if label == "runtime_metadata_selected_symlink" {
+            std::fs::write(
+                workspace.root.join(".beads/metadata.json"),
+                r#"{"database":"custom.sqlite","jsonl_export":"missing.jsonl"}"#,
+            )
+            .expect("metadata-selected alias");
+        } else if label == "runtime_project_selected_symlink" {
+            std::fs::write(
+                workspace.root.join(".beads/metadata.json"),
+                r#"{"database":"beads.db","jsonl_export":"missing.jsonl"}"#,
+            )
+            .expect("metadata fallback differs from the selected alias");
+            std::fs::write(
+                workspace.root.join(".beads/config.yaml"),
+                "db: custom.sqlite\n",
+            )
+            .expect("startup-layer-selected alias");
+        }
+        let metadata_before = runtime_metadata_snapshot(&workspace);
+        let alias_before = std::fs::symlink_metadata(&selected).expect("alias identity");
+        let output = run_br(&workspace, args, label);
+        assert!(output.status.success(), "{label}: {}", output.stderr);
+        let status: Value = serde_json::from_str(&extract_json_payload(&output.stdout))
+            .expect("alias inventory JSON");
+        assert_runtime_contract(&status, true);
+        assert_eq!(status["tracked_count"], 3, "{status}");
+        assert_eq!(
+            status["files"],
+            serde_json::json!([
+                {"path": "custom.sqlite", "kind": "database"},
+                {"path": "custom.sqlite-fsqlite-ns-gate", "kind": "namespace_state"},
+                {"path": "custom.sqlite-wal-cert", "kind": "wal_certificate"},
+            ]),
+            "{status}"
+        );
+        assert_eq!(runtime_metadata_snapshot(&workspace), metadata_before);
+        let alias_after = std::fs::symlink_metadata(&selected).expect("preserved alias identity");
+        assert_eq!(
+            (
+                alias_after.dev(),
+                alias_after.ino(),
+                alias_after.mode(),
+                alias_after.len()
+            ),
+            (
+                alias_before.dev(),
+                alias_before.ino(),
+                alias_before.mode(),
+                alias_before.len()
+            ),
+            "audit replaced the selected symlink"
+        );
+        assert_eq!(
+            foreign_snapshot(),
+            foreign_before,
+            "audit touched the foreign family"
+        );
+        assert_eq!(
+            std::fs::read(workspace.root.join(".git/index")).expect("preserved alias index"),
+            index_before
+        );
+        assert_eq!(
+            git_stdout(&workspace.root, &["rev-parse", "HEAD"]),
+            head_before
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_vcs_runtime_audit_refuses_non_utf8_paths_without_lossy_or_partial_results() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let _log = common::test_log(
+        "e2e_vcs_runtime_audit_refuses_non_utf8_paths_without_lossy_or_partial_results",
+    );
+    let workspace = runtime_workspace();
+    let relative = std::path::PathBuf::from(std::ffi::OsString::from_vec(
+        b".beads/.br_recovery/invalid-\xff/original.db".to_vec(),
+    ));
+    let path = workspace.root.join(&relative);
+    std::fs::create_dir_all(path.parent().expect("non-UTF-8 parent")).expect("non-UTF-8 directory");
+    std::fs::write(&path, "retained recovery bytes\0").expect("non-UTF-8 evidence");
+    // A valid finding sorts before the unsupported record. Even this known
+    // prefix must not be presented as a complete or empty inventory.
+    std::fs::write(
+        workspace.root.join(".beads/.br_recovery/aaa.db"),
+        "retained earlier recovery evidence\n",
+    )
+    .expect("valid finding before unsupported path");
+    let staged = Command::new("git")
+        .current_dir(&workspace.root)
+        .args(["add", "--force", "--"])
+        .arg(".beads/.br_recovery/aaa.db")
+        .arg(&relative)
+        .env("HOME", &workspace.root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .expect("stage raw path");
+    assert!(staged.status.success(), "{staged:?}");
+    let index_before = std::fs::read(workspace.root.join(".git/index")).expect("raw-path index");
+    let metadata_before = runtime_metadata_snapshot(&workspace);
+    let status = runtime_status_json(&workspace, "runtime_non_utf8_inventory");
+    assert_runtime_contract(&status, false);
+    assert_eq!(status["reason"], "unsupported_path_encoding", "{status}");
+    assert_eq!(
+        std::fs::read(workspace.root.join(".git/index")).expect("preserved raw-path index"),
+        index_before
+    );
+    assert_eq!(runtime_metadata_snapshot(&workspace), metadata_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_vcs_runtime_audit_times_out_an_effective_git_probe_without_repairing_data() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _log = common::test_log(
+        "e2e_vcs_runtime_audit_times_out_an_effective_git_probe_without_repairing_data",
+    );
+    let workspace = runtime_workspace();
+    let probe_dir = workspace.root.join("runtime-timeout-git");
+    std::fs::create_dir(&probe_dir).expect("timeout probe directory");
+    let sentinel = workspace.root.join("runtime-probe-invoked");
+    let script = probe_dir.join("git");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf invoked > \"$RUNTIME_AUDIT_PROBE_SENTINEL\"\nwhile :; do :; done\n",
+    )
+    .expect("timeout probe");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+        .expect("executable timeout probe");
+    let metadata_before = runtime_metadata_snapshot(&workspace);
+    let head_before = std::fs::read(workspace.root.join(".git/HEAD")).expect("unborn HEAD");
+    assert!(!workspace.root.join(".git/index").exists());
+
+    // The shared runner rewrites PATH after caller overrides. Set it last on
+    // the actual command so this test cannot accidentally use ordinary Git.
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("br"));
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("BD_")
+            || name.starts_with("BEADS_")
+            || matches!(
+                name.as_ref(),
+                "BR_DISABLE_READ_ONLY_FAST_OPEN"
+                    | "BR_OUTPUT_FORMAT"
+                    | "TOON_DEFAULT_FORMAT"
+                    | "TOON_STATS"
+            )
+        {
+            command.env_remove(key);
+        }
+    }
+    command
+        .current_dir(&workspace.root)
+        .args([
+            "vcs-status",
+            "--runtime-files",
+            "--timeout-ms",
+            "500",
+            "--json",
+        ])
+        .env("HOME", &workspace.root)
+        .env("RUST_LOG", "error")
+        .env("NO_COLOR", "1")
+        .env("RUST_BACKTRACE", "1")
+        .env("RUNTIME_AUDIT_PROBE_SENTINEL", &sentinel)
+        .env("PATH", &probe_dir);
+    let started = std::time::Instant::now();
+    let output = command.output().expect("runtime audit with timed-out Git");
+    let duration = started.elapsed();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    std::fs::write(
+        workspace.log_dir.join("runtime_probe_timeout.log"),
+        format!(
+            "duration: {duration:?}\nstatus: {}\nstdout:\n{stdout}\nstderr:\n{stderr}\n",
+            output.status
+        ),
+    )
+    .expect("timeout diagnostic log");
+    assert!(
+        output.status.success(),
+        "bounded timeout is a diagnostic result: {stderr}"
+    );
+    assert!(sentinel.exists(), "the test did not exercise its Git probe");
+    assert!(
+        duration < std::time::Duration::from_secs(5),
+        "probe did not stop near its budget: {duration:?}"
+    );
+    let status: Value =
+        serde_json::from_str(&extract_json_payload(&stdout)).expect("timeout inventory JSON");
+    assert_runtime_contract(&status, false);
+    assert_eq!(status["reason"], "probe_timed_out", "{status}");
+    assert_eq!(runtime_metadata_snapshot(&workspace), metadata_before);
+    assert_eq!(
+        std::fs::read(workspace.root.join(".git/HEAD")).expect("preserved HEAD"),
+        head_before
+    );
+    assert!(
+        !workspace.root.join(".git/index").exists(),
+        "audit created an index"
+    );
+}
+
+#[test]
+fn e2e_vcs_runtime_audit_rejects_jsonl_scope_flags_before_inspecting_data() {
+    let _log =
+        common::test_log("e2e_vcs_runtime_audit_rejects_jsonl_scope_flags_before_inspecting_data");
+    let workspace = runtime_workspace();
+    let metadata_before = runtime_metadata_snapshot(&workspace);
+    for (args, label) in [
+        (
+            vec![
+                "vcs-status",
+                "--runtime-files",
+                "--jsonl",
+                ".beads/issues.jsonl",
+                "--json",
+            ],
+            "runtime_jsonl_conflict",
+        ),
+        (
+            vec![
+                "vcs-status",
+                "--runtime-files",
+                "--allow-external-jsonl",
+                "--json",
+            ],
+            "runtime_external_conflict",
+        ),
+    ] {
+        let output = run_br(&workspace, args, label);
+        assert!(
+            !output.status.success(),
+            "scope conflict was accepted: {output:?}"
+        );
+        let diagnostic = format!("{}{}", output.stdout, output.stderr);
+        assert!(diagnostic.contains("--runtime-files"), "{diagnostic}");
+        assert!(diagnostic.contains("cannot be used with"), "{diagnostic}");
+        assert_eq!(runtime_metadata_snapshot(&workspace), metadata_before);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn e2e_runtime_recovery_directories_are_ignored_by_init_and_repair() {

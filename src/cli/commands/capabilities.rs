@@ -577,6 +577,8 @@ fn command_safety_notes(name: &str) -> &'static [&'static str] {
             "Uses bounded, read-only Git plumbing with prompts, hooks, filters, lazy fetch, and optional locks disabled.",
             "The Git executable selected from PATH is trusted; this is not a process sandbox.",
             "External JSONL paths require `--allow-external-jsonl` and are redacted in output.",
+            "--runtime-files inventories tracked database and recovery paths under workspace metadata without opening database or JSONL contents.",
+            "Runtime findings are informational; unavailable scans omit the count, and no result authorizes untracking or guarantees cross-clone checkout safety.",
         ],
         "doctor" => &[
             "Ordinary commands never cross a schema-version boundary implicitly.",
@@ -1067,6 +1069,7 @@ fn command_contract(name: &str) -> CommandContract {
             examples: &[
                 "br vcs-status --json",
                 "br vcs-status --timeout-ms 5000 --robot",
+                "br vcs-status --runtime-files --json",
             ],
         },
         "doctor" => CommandContract {
@@ -1235,6 +1238,17 @@ mod tests {
 
         let detail = command_detail_for_path("vcs-status").expect("vcs-status detail");
         assert_eq!(detail.operation, "read");
+        assert!(
+            contract
+                .examples
+                .contains(&"br vcs-status --runtime-files --json")
+        );
+        assert!(
+            detail
+                .safety_notes
+                .iter()
+                .any(|note| note.contains("Runtime findings are informational"))
+        );
         assert!(
             detail
                 .safety_notes

@@ -106,6 +106,28 @@ system/global/common/worktree precedence without printing configured paths.
 The command is not a process sandbox and does not claim to terminate
 arbitrary daemonized descendants. No sync mode calls or delegates to it.
 
+For the distinct risk of database or recovery files already tracked by Git,
+run `br vcs-status --runtime-files --json`. This explicit mode inventories the
+index under the selected metadata directory without opening database or JSONL
+contents. It reports unique paths and their runtime/evidence families,
+including tracked files whose working-tree copy is absent. The same bounded
+Git runner applies. Indexed ancestor entries that hide the selected directory
+or configured database make the inventory unavailable. Timeout, output-limit,
+malformed-output, and unsupported encoding failures also produce
+`available: false` with no count or file list; callers must not interpret them
+as an empty inventory.
+
+The result is informational and limited to the current index. Existing ignore
+rules do not untrack committed files, and a zero result does not establish
+cross-clone checkout safety. There is no automatic untracking or restoration:
+before publishing removals from Git tracking, every affected clone needs its
+own complete database and recovery evidence preserved. Otherwise the next
+pull can remove a clean clone's live sidecars. Ordinary doctor and sync do not
+invoke this audit or turn its findings into a new health-check failure.
+The separate [tracked-runtime auditor](reliability/TRACKED_RUNTIME_AUDIT.md)
+additionally inspects HEAD and optional incoming commits across one or more
+worktrees; it has its own operator-facing result and exit-code contract.
+
 ---
 
 ## Safety Guards

@@ -12,7 +12,10 @@
 //! reading source code. The CLI surface marks `br schema` as
 //! not-yet-stable; agents should re-call across release boundaries.
 
-use crate::cli::commands::{init::InitResult, vcs::VcsExportStatus};
+use crate::cli::commands::{
+    init::InitResult,
+    vcs::{VcsExportStatus, VcsRuntimeStatus},
+};
 use crate::cli::{
     OutputFormat, SchemaArgs, SchemaTarget, resolve_output_format_basic_with_outer_mode,
 };
@@ -220,6 +223,7 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
                 schema_for_output::<crate::cli::commands::sync::SourceRepoPathMigrationReceipt>(),
             );
             schemas.insert("VcsExportStatus", schema_for_output::<VcsExportStatus>());
+            schemas.insert("VcsRuntimeStatus", schema_for_output::<VcsRuntimeStatus>());
             schemas.insert("ErrorEnvelope", schema_for_output::<ErrorEnvelope>());
         }
         SchemaTarget::Issue => {
@@ -265,6 +269,7 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
         }
         SchemaTarget::VcsStatus => {
             schemas.insert("VcsExportStatus", schema_for_output::<VcsExportStatus>());
+            schemas.insert("VcsRuntimeStatus", schema_for_output::<VcsRuntimeStatus>());
         }
         SchemaTarget::Error => {
             schemas.insert("ErrorEnvelope", schema_for_output::<ErrorEnvelope>());
@@ -361,6 +366,23 @@ fn build_commands(target: SchemaTarget) -> BTreeMap<&'static str, CommandShape> 
                  never executes Git content filters, and reports sequential evidence with \
                  observation_atomic=false. Structured machine-mode errors are currently \
                  emitted on stdout.",
+            ),
+        },
+    );
+    commands.insert(
+        "vcs-status --runtime-files",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".",
+            items_at: None,
+            item_schema: Some("VcsRuntimeStatus"),
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "Explicit bounded inventory of tracked database and recovery files in the \
+                 workspace metadata directory. Reads the Git index without opening database \
+                 or JSONL contents. Unavailable scans omit tracked_count and files; a zero \
+                 count is not a cross-clone migration or checkout-safety guarantee. Findings \
+                 are informational and do not perform automatic remediation.",
             ),
         },
     );
@@ -639,6 +661,8 @@ mod tests {
     fn vcs_status_schema_and_command_shape_are_discoverable() {
         let schemas = build_schemas(SchemaTarget::VcsStatus);
         assert!(schemas.contains_key("VcsExportStatus"));
+        assert!(schemas.contains_key("VcsRuntimeStatus"));
+        assert!(build_schemas(SchemaTarget::All).contains_key("VcsRuntimeStatus"));
 
         let commands = build_commands(SchemaTarget::Commands);
         let shape = commands
@@ -651,6 +675,40 @@ mod tests {
             !shape.error_envelope_on_stderr,
             "top-level structured CLI errors are emitted on stdout"
         );
+        let runtime = commands
+            .get("vcs-status --runtime-files")
+            .expect("runtime inventory command shape");
+        assert_eq!(runtime.shape, "object");
+        assert_eq!(runtime.jq_filter, ".");
+        assert_eq!(runtime.item_schema, Some("VcsRuntimeStatus"));
+        assert!(!runtime.error_envelope_on_stderr);
+        let schema = serde_json::to_value(&schemas["VcsRuntimeStatus"])
+            .expect("runtime inventory schema JSON");
+        let properties = schema["properties"]
+            .as_object()
+            .expect("runtime properties");
+        for field in [
+            "available",
+            "index_only",
+            "automatic_remediation_available",
+            "tracked_count",
+            "files",
+            "reason",
+        ] {
+            assert!(
+                properties.contains_key(field),
+                "missing runtime field {field}"
+            );
+        }
+        let required = schema["required"]
+            .as_array()
+            .expect("required runtime fields");
+        for field in ["tracked_count", "files"] {
+            assert!(
+                !required.iter().any(|value| value == field),
+                "unavailable inventory must be representable without {field}"
+            );
+        }
     }
 
     #[test]

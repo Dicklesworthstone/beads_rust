@@ -19,6 +19,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -29,10 +30,12 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 
 const STATUS_SCHEMA: &str = "br.vcs-export-status.v2";
+const RUNTIME_STATUS_SCHEMA: &str = "br.vcs-runtime-status.v1";
 const MAX_CAPTURE_BYTES_PER_STREAM: usize = 32 * 1024;
 const MIN_TIMEOUT_MS: u64 = 25;
 const MAX_TIMEOUT_MS: u64 = 30_000;
 const EXPLICIT_COMMAND: &str = "br vcs-status --json";
+const EXPLICIT_RUNTIME_COMMAND: &str = "br vcs-status --runtime-files --json";
 
 /// Explicit Git visibility for the configured JSONL export.
 ///
@@ -77,6 +80,55 @@ pub struct VcsExportStatus {
     pub worktree_raw_git_blob_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_raw_sha256: Option<String>,
+}
+
+/// Explicit inventory of tracked local state under the selected metadata directory.
+///
+/// This observes the current index, not HEAD, worktree contents, or other clones.
+/// An unavailable inventory has no count or partial path list. Findings confer no
+/// permission to delete, untrack, restore, or regenerate any family member.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct VcsRuntimeStatus {
+    pub schema: &'static str,
+    pub requested: bool,
+    pub available: bool,
+    pub vcs: &'static str,
+    pub observation_atomic: bool,
+    pub path_scope: &'static str,
+    pub metadata_path: String,
+    pub timeout_ms: u64,
+    pub duration_ms: u64,
+    pub index_only: bool,
+    pub automatic_remediation_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracked_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<TrackedRuntimeFile>>,
+}
+
+/// One known local-state path in the Git index, relative to the metadata directory.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, JsonSchema)]
+pub struct TrackedRuntimeFile {
+    pub path: String,
+    pub kind: RuntimeFileKind,
+}
+
+/// Why a tracked path belongs to a local database, coordination, or evidence family.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeFileKind {
+    Database,
+    Wal,
+    SharedMemory,
+    Journal,
+    WalCertificate,
+    NamespaceState,
+    MigrationState,
+    RecoveryEvidence,
+    History,
+    WriterCoordination,
 }
 
 /// Object format used by the selected Git repository.
@@ -202,6 +254,9 @@ pub fn execute(
     validate_timeout(args.timeout_ms)?;
     let started = Instant::now();
     let deadline = started + Duration::from_millis(args.timeout_ms);
+    if args.runtime_files {
+        return execute_runtime_status(args, cli, ctx, started, deadline);
+    }
     let target = resolve_target(args, cli, deadline)?;
     let status = collect_git_export_status(&target, args.timeout_ms, started, deadline);
 
@@ -226,6 +281,377 @@ fn validate_timeout(timeout_ms: u64) -> Result<()> {
         field: "timeout_ms".to_string(),
         reason: format!("must be between {MIN_TIMEOUT_MS} and {MAX_TIMEOUT_MS} milliseconds"),
     })
+}
+
+fn execute_runtime_status(
+    args: &VcsStatusArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    started: Instant,
+    deadline: Instant,
+) -> Result<()> {
+    if args.jsonl.is_some() || args.allow_external_jsonl {
+        return Err(BeadsError::Validation {
+            field: "runtime_files".to_string(),
+            reason: "runtime-file diagnostics cannot select an external or alternate JSONL"
+                .to_string(),
+        });
+    }
+    let selected = config::discover_beads_dir_with_cli(cli)?;
+    let directory = dunce::canonicalize(&selected).map_err(|_| BeadsError::Validation {
+        field: "runtime_files".to_string(),
+        reason: "the selected metadata directory is not accessible".to_string(),
+    })?;
+    if contains_git_component(&selected) || contains_git_component(&directory) {
+        return Err(BeadsError::Validation {
+            field: "runtime_files".to_string(),
+            reason: "VCS diagnostics refuse directories inside Git metadata".to_string(),
+        });
+    }
+    let status = collect_git_runtime_status(&directory, cli, args.timeout_ms, started, deadline);
+    if ctx.is_quiet() && !ctx.is_json() && !ctx.is_toon() && !args.robot {
+        return Ok(());
+    }
+    if ctx.is_json() || args.robot {
+        ctx.json_pretty(&status);
+    } else if ctx.is_toon() {
+        ctx.toon(&status);
+    } else {
+        render_runtime_human(&status);
+    }
+    Ok(())
+}
+
+fn collect_git_runtime_status(
+    directory: &Path,
+    cli: &config::CliOverrides,
+    timeout_ms: u64,
+    started: Instant,
+    deadline: Instant,
+) -> VcsRuntimeStatus {
+    let name = directory.file_name().unwrap_or(directory.as_os_str());
+    let metadata_path = name.to_str().map_or_else(
+        || format!("<workspace-metadata sha256={}>", raw_os_str_sha256(name)),
+        str::to_string,
+    );
+    let mut status = VcsRuntimeStatus {
+        schema: RUNTIME_STATUS_SCHEMA,
+        requested: true,
+        available: false,
+        vcs: "git",
+        observation_atomic: false,
+        path_scope: "workspace_metadata",
+        metadata_path,
+        timeout_ms,
+        duration_ms: 0,
+        index_only: true,
+        automatic_remediation_available: false,
+        reason: None,
+        tracked_count: None,
+        files: None,
+    };
+    match collect_git_runtime_files(directory, cli, deadline) {
+        Ok(files) => {
+            status.available = true;
+            status.tracked_count = Some(files.len());
+            status.files = Some(files);
+        }
+        Err(failure) => status.reason = Some(failure.reason()),
+    }
+    status.duration_ms = elapsed_millis(started);
+    status
+}
+
+fn collect_git_runtime_files(
+    directory: &Path,
+    cli: &config::CliOverrides,
+    deadline: Instant,
+) -> std::result::Result<Vec<TrackedRuntimeFile>, CollectionFailure> {
+    verify_repository(directory, deadline)?;
+    // Path resolution reads configuration only. Never capture the JSONL or open
+    // the database: the diagnostic must remain usable on a damaged live family.
+    let configured = config::load_startup_config_with_paths_uncached(directory, cli.db.as_ref())
+        .map_err(|_| CollectionFailure::Semantic("configuration_unavailable"))?;
+    let requested = runtime_requested_database_path(
+        directory,
+        cli.db.as_deref(),
+        &configured.layers,
+        &configured.paths.db_path,
+    )?;
+    let database = runtime_database_relative_path(directory, &requested)?;
+    let scope = run_named_probe(
+        "runtime_prefix",
+        OsStr::new("git"),
+        directory,
+        &os_args(&["rev-parse", "--show-prefix"]),
+        deadline,
+    )?;
+    if !scope.status.success() {
+        return Err(CollectionFailure::Semantic("probe_failed"));
+    }
+    let (root, metadata_prefix) = parse_runtime_git_scope(directory, &scope.stdout)?;
+    let first = metadata_prefix
+        .split('/')
+        .next()
+        .filter(|part| !part.is_empty())
+        .unwrap_or(".");
+    let output = run_named_probe(
+        "runtime_index",
+        OsStr::new("git"),
+        &root,
+        &os_args(&["ls-files", "--cached", "-z", "--", first]),
+        deadline,
+    )?;
+    if !output.status.success() {
+        return Err(CollectionFailure::Semantic("probe_failed"));
+    }
+    let files = parse_runtime_index_paths(&output.stdout, &metadata_prefix, database.as_deref())?;
+    if Instant::now() >= deadline {
+        return Err(ProbeFailure::TimedOut.into());
+    }
+    Ok(files)
+}
+
+fn parse_runtime_git_scope(
+    directory: &Path,
+    output: &[u8],
+) -> std::result::Result<(PathBuf, String), CollectionFailure> {
+    const FAILURE: CollectionFailure = CollectionFailure::Semantic("probe_failed");
+    // Strip the command terminator only: whitespace can be part of a real
+    // directory name. A nonempty Git prefix always ends with a slash.
+    let output = output.strip_suffix(b"\n").ok_or(FAILURE)?;
+    let output = output.strip_suffix(b"\r").unwrap_or(output);
+    let prefix = std::str::from_utf8(output)
+        .map_err(|_| CollectionFailure::Semantic("unsupported_path_encoding"))?;
+    if prefix.is_empty() {
+        return Ok((directory.to_path_buf(), String::new()));
+    }
+    let relative = prefix.strip_suffix('/').ok_or(FAILURE)?;
+    if !valid_runtime_index_path(relative) || !directory.ends_with(Path::new(relative)) {
+        return Err(FAILURE);
+    }
+    let mut root = directory.to_path_buf();
+    for _ in relative.split('/') {
+        if !root.pop() {
+            return Err(FAILURE);
+        }
+    }
+    Ok((root, prefix.to_string()))
+}
+
+fn runtime_requested_database_path(
+    directory: &Path,
+    cli_database: Option<&Path>,
+    layers: &[config::ConfigLayer],
+    resolved_database: &Path,
+) -> std::result::Result<PathBuf, CollectionFailure> {
+    if let Some(database) = cli_database {
+        return Ok(database.to_path_buf());
+    }
+    for layer in layers.iter().rev() {
+        // Two aliases make the selected lexical name depend on HashMap order.
+        // Refuse this ambiguity instead of inferring an indexed symlink's name
+        // from a path whose leaf may already have been canonicalized.
+        let aliases = layer.startup.keys().filter(|key| {
+            key.trim().eq_ignore_ascii_case("db") || key.trim().eq_ignore_ascii_case("database")
+        });
+        if aliases.take(2).count() > 1 {
+            return Err(CollectionFailure::Semantic(
+                "configured_database_scope_unavailable",
+            ));
+        }
+        if let Some(database) = config::resolve_db_override_from_layer(directory, layer) {
+            return Ok(database);
+        }
+    }
+    Ok(resolved_database.to_path_buf())
+}
+
+fn runtime_database_relative_path(
+    directory: &Path,
+    database: &Path,
+) -> std::result::Result<Option<String>, CollectionFailure> {
+    const FAILURE: CollectionFailure =
+        CollectionFailure::Semantic("configured_database_scope_unavailable");
+    let absolute = if database.is_absolute() {
+        database.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(|_| FAILURE)?.join(database)
+    };
+    let parent = absolute.parent().ok_or(FAILURE)?;
+    // Keep the indexed name when the configured leaf is a symlink. Only its
+    // parent determines the inventory scope; no database contents are opened.
+    let parent = dunce::canonicalize(parent).map_err(|_| FAILURE)?;
+    let Ok(relative_parent) = parent.strip_prefix(directory) else {
+        return Ok(None);
+    };
+    let relative = relative_parent.join(absolute.file_name().ok_or(FAILURE)?);
+    let path = relative
+        .components()
+        .map(|component| component.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()
+        .ok_or(CollectionFailure::Semantic("unsupported_path_encoding"))?
+        .join("/");
+    if !valid_runtime_index_path(&path) {
+        return Err(FAILURE);
+    }
+    Ok(Some(path))
+}
+
+fn parse_runtime_index_paths(
+    output: &[u8],
+    metadata_prefix: &str,
+    database: Option<&str>,
+) -> std::result::Result<Vec<TrackedRuntimeFile>, CollectionFailure> {
+    const FAILURE: CollectionFailure = CollectionFailure::Semantic("probe_failed");
+    if output.is_empty() {
+        return Ok(Vec::new());
+    }
+    let records = split_nul_records(output).ok_or(FAILURE)?;
+    let mut files = BTreeMap::new();
+    for record in records {
+        let path = std::str::from_utf8(record)
+            .map_err(|_| CollectionFailure::Semantic("unsupported_path_encoding"))?;
+        if !valid_runtime_index_path(path) {
+            return Err(FAILURE);
+        }
+        let metadata_path = metadata_prefix.strip_suffix('/').unwrap_or(metadata_prefix);
+        if !metadata_path.is_empty()
+            && (path == metadata_path || runtime_path_is_ancestor(path, metadata_path))
+        {
+            return Err(CollectionFailure::Semantic(
+                "scope_crosses_tracked_non_directory",
+            ));
+        }
+        let Some(path) = path.strip_prefix(metadata_prefix) else {
+            continue;
+        };
+        // Index records are files, symlinks, or gitlinks, never ordinary
+        // directories. Such an ancestor can conceal the entire selected scope
+        // or DB family, so a descendant-only query would give false assurance.
+        if database.is_some_and(|database| runtime_path_is_ancestor(path, database)) {
+            return Err(CollectionFailure::Semantic(
+                "scope_crosses_tracked_non_directory",
+            ));
+        }
+        if let Some(kind) = classify_runtime_file(path, database) {
+            // `ls-files --cached` can repeat unmerged paths once per stage.
+            // The inventory counts paths, never conflict-stage records.
+            files.insert(path.to_string(), kind);
+        }
+    }
+    Ok(files
+        .into_iter()
+        .map(|(path, kind)| TrackedRuntimeFile { path, kind })
+        .collect())
+}
+
+fn runtime_path_is_ancestor(path: &str, descendant: &str) -> bool {
+    descendant
+        .strip_prefix(path)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn valid_runtime_index_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    !path.starts_with(['/', '\\'])
+        && !(bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        && path.split('/').all(|component| {
+            !component.is_empty()
+                && component != "."
+                && component != ".."
+                && !component.eq_ignore_ascii_case(".git")
+        })
+}
+
+fn classify_runtime_file(path: &str, database: Option<&str>) -> Option<RuntimeFileKind> {
+    // Recovery namespaces live beside the configured database, which may be
+    // nested below the metadata directory. Their reserved names remain local
+    // state at any depth; ordinary nested docs and fixtures stay excluded.
+    for component in path.split('/') {
+        if component == ".br_recovery"
+            || component
+                .strip_prefix(".br-wal-index-")
+                .is_some_and(|suffix| !suffix.is_empty())
+        {
+            return Some(RuntimeFileKind::RecoveryEvidence);
+        }
+        if component == ".br_history" {
+            return Some(RuntimeFileKind::History);
+        }
+        if component == ".write-waiters.lock" {
+            return Some(RuntimeFileKind::WriterCoordination);
+        }
+    }
+    if let Some(suffix) = database.and_then(|database| path.strip_prefix(database))
+        && let Some(kind) = runtime_database_suffix_kind(suffix)
+    {
+        return Some(kind);
+    }
+    // Generic family names live beside the metadata, not inside ordinary docs
+    // or fixtures. A configured nested database was handled by its exact path.
+    if path.contains('/') {
+        return None;
+    }
+    if path.ends_with(".lock") {
+        return Some(RuntimeFileKind::WriterCoordination);
+    }
+    if let Some(end) = path.rfind(".db")
+        && let Some(kind) = runtime_database_suffix_kind(&path[end + 3..])
+    {
+        return Some(kind);
+    }
+    // Namespace and migration sidecars are emitted for temporary databases too,
+    // including schema migration's `.vacuum` targets without a .db extension.
+    config::db_sidecar_suffixes().find_map(|suffix| {
+        let base = path.strip_suffix(*suffix)?;
+        if base.is_empty() {
+            return None;
+        }
+        let kind = runtime_database_suffix_kind(suffix)?;
+        (matches!(
+            kind,
+            RuntimeFileKind::NamespaceState | RuntimeFileKind::MigrationState
+        ) || base.ends_with(".vacuum"))
+        .then_some(kind)
+    })
+}
+
+fn runtime_database_suffix_kind(suffix: &str) -> Option<RuntimeFileKind> {
+    match suffix {
+        "" => Some(RuntimeFileKind::Database),
+        "-wal" => Some(RuntimeFileKind::Wal),
+        "-shm" => Some(RuntimeFileKind::SharedMemory),
+        "-journal" => Some(RuntimeFileKind::Journal),
+        "-wal-cert" | "-wal-cert-head" => Some(RuntimeFileKind::WalCertificate),
+        "-fsqlite-ns-gate" | "-fsqlite-ns-use" => Some(RuntimeFileKind::NamespaceState),
+        ".fsqlite-migration-state" => Some(RuntimeFileKind::MigrationState),
+        suffix
+            if legacy_recovery_suffix(suffix)
+                || config::db_sidecar_suffixes().any(|sidecar| {
+                    suffix
+                        .strip_prefix(*sidecar)
+                        .is_some_and(legacy_recovery_suffix)
+                }) =>
+        {
+            Some(RuntimeFileKind::RecoveryEvidence)
+        }
+        _ => None,
+    }
+}
+
+fn legacy_recovery_suffix(suffix: &str) -> bool {
+    suffix.starts_with(".stale_")
+        || suffix.starts_with(".rebuild_")
+        || [".bad", ".corrupt"].iter().any(|prefix| {
+            suffix.strip_prefix(*prefix).is_some_and(|tail| {
+                tail.is_empty()
+                    || tail
+                        .as_bytes()
+                        .first()
+                        .is_some_and(|byte| matches!(byte, b'_' | b'-' | b'.'))
+            })
+        })
 }
 
 fn resolve_target(
@@ -438,7 +864,7 @@ fn collect_git_export_status_inner(
     started: Instant,
     deadline: Instant,
 ) -> std::result::Result<VcsExportStatus, CollectionFailure> {
-    verify_repository(target, deadline)?;
+    verify_repository(&target.parent, deadline)?;
     let object_format = read_object_format(target, deadline)?;
     let head = read_head_identity(target, object_format, deadline)?;
     let parsed_index = read_index(target, object_format, deadline)?;
@@ -487,13 +913,13 @@ fn collect_git_export_status_inner(
 }
 
 fn verify_repository(
-    target: &ResolvedGitTarget,
+    directory: &Path,
     deadline: Instant,
 ) -> std::result::Result<(), CollectionFailure> {
     let output = run_named_probe(
         "repository",
         OsStr::new("git"),
-        &target.parent,
+        directory,
         &os_args(&["rev-parse", "--is-inside-work-tree"]),
         deadline,
     )?;
@@ -505,7 +931,7 @@ fn verify_repository(
         };
     }
 
-    match git_marker_presence(&target.parent) {
+    match git_marker_presence(directory) {
         GitMarkerPresence::Absent => Err(CollectionFailure::Semantic("not_git_repository")),
         GitMarkerPresence::Present | GitMarkerPresence::Indeterminate => {
             Err(CollectionFailure::Semantic("probe_failed"))
@@ -1615,6 +2041,61 @@ fn render_human(status: &VcsExportStatus) {
     );
 }
 
+fn render_runtime_human(status: &VcsRuntimeStatus) {
+    println!("Git runtime-file status");
+    println!(
+        "  Metadata directory: {}",
+        sanitize_terminal_inline(&status.metadata_path)
+    );
+    println!(
+        "  Scope: current index only; HEAD, worktree bytes, and other clones are not inspected"
+    );
+    println!("  Atomic observation: no (sequential evidence)");
+    println!("  Automatic remediation: unavailable");
+    if !status.available {
+        println!("  Available: no");
+        println!("  Reason: {}", status.reason.unwrap_or("probe_failed"));
+        println!("  Retry: {EXPLICIT_RUNTIME_COMMAND}");
+        return;
+    }
+    println!("  Available: yes");
+    println!(
+        "  Tracked runtime paths: {}",
+        status.tracked_count.unwrap_or(0)
+    );
+    for file in status.files.as_deref().unwrap_or_default() {
+        println!(
+            "    {} ({})",
+            sanitize_terminal_inline(&file.path),
+            runtime_kind_label(file.kind)
+        );
+    }
+    if status.tracked_count.is_some_and(|count| count > 0) {
+        println!(
+            "  Git checkout operations can replace or remove these local database and evidence paths."
+        );
+        println!(
+            "  Coordinate preservation on every clone before publishing or pulling their removal."
+        );
+        println!("  This diagnostic does not untrack files or establish a safe migration.");
+    }
+}
+
+const fn runtime_kind_label(kind: RuntimeFileKind) -> &'static str {
+    match kind {
+        RuntimeFileKind::Database => "database",
+        RuntimeFileKind::Wal => "WAL",
+        RuntimeFileKind::SharedMemory => "shared memory",
+        RuntimeFileKind::Journal => "journal",
+        RuntimeFileKind::WalCertificate => "WAL certificate",
+        RuntimeFileKind::NamespaceState => "namespace state",
+        RuntimeFileKind::MigrationState => "migration state",
+        RuntimeFileKind::RecoveryEvidence => "recovery evidence",
+        RuntimeFileKind::History => "history",
+        RuntimeFileKind::WriterCoordination => "writer coordination",
+    }
+}
+
 const fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
@@ -1660,10 +2141,12 @@ fn worktree_state_label(value: Option<WorktreeState>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitObjectFormat, ProbeFailure, attributes_require_transform, external_path_descriptor,
+        CollectionFailure, GitObjectFormat, ProbeFailure, RuntimeFileKind,
+        attributes_require_transform, classify_runtime_file, external_path_descriptor,
         hardened_git_command, hash_snapshot_as_git_blob, is_git_process_environment_key,
-        parse_head_identity, parse_index_entries, parse_object_id, parse_single_ignored_match,
-        workspace_path_label,
+        parse_head_identity, parse_index_entries, parse_object_id, parse_runtime_git_scope,
+        parse_runtime_index_paths, parse_single_ignored_match, runtime_database_relative_path,
+        runtime_requested_database_path, workspace_path_label,
     };
     #[cfg(unix)]
     use super::{
@@ -1681,6 +2164,416 @@ mod tests {
     use std::time::Duration;
     use std::time::Instant;
     use tempfile::TempDir;
+
+    #[test]
+    fn runtime_index_inventory_classifies_known_database_and_evidence_families() {
+        let cases = [
+            ("beads.db", RuntimeFileKind::Database),
+            ("beads.db-wal", RuntimeFileKind::Wal),
+            ("beads.db-shm", RuntimeFileKind::SharedMemory),
+            ("beads.db-journal", RuntimeFileKind::Journal),
+            ("beads.db-wal-cert", RuntimeFileKind::WalCertificate),
+            ("beads.db-wal-cert-head", RuntimeFileKind::WalCertificate),
+            ("beads.db-fsqlite-ns-gate", RuntimeFileKind::NamespaceState),
+            ("beads.db-fsqlite-ns-use", RuntimeFileKind::NamespaceState),
+            (
+                "beads.db.fsqlite-migration-state",
+                RuntimeFileKind::MigrationState,
+            ),
+            (
+                ".beads.db.schema-migration-run.vacuum-wal-cert",
+                RuntimeFileKind::WalCertificate,
+            ),
+            (
+                ".beads.db.schema-migration-run.vacuum-fsqlite-ns-use",
+                RuntimeFileKind::NamespaceState,
+            ),
+            ("beads.db.bad_20261007", RuntimeFileKind::RecoveryEvidence),
+            (
+                "beads.db.corrupt.20261007",
+                RuntimeFileKind::RecoveryEvidence,
+            ),
+            ("beads.db.stale_20261007", RuntimeFileKind::RecoveryEvidence),
+            (
+                "beads.db-wal.stale_20261007",
+                RuntimeFileKind::RecoveryEvidence,
+            ),
+            (
+                "beads.db.rebuild_20261007",
+                RuntimeFileKind::RecoveryEvidence,
+            ),
+            (
+                ".br-wal-index-run/poisoned-shm",
+                RuntimeFileKind::RecoveryEvidence,
+            ),
+            (
+                ".br-wal-index-run/prepared.json",
+                RuntimeFileKind::RecoveryEvidence,
+            ),
+            (
+                ".br_recovery/run/before/beads.db",
+                RuntimeFileKind::RecoveryEvidence,
+            ),
+            (
+                ".br_history/issues.20261007.jsonl",
+                RuntimeFileKind::History,
+            ),
+            (
+                ".write-waiters.lock/holder",
+                RuntimeFileKind::WriterCoordination,
+            ),
+            (".write.lock", RuntimeFileKind::WriterCoordination),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(classify_runtime_file(path, None), Some(expected), "{path}");
+        }
+    }
+
+    #[test]
+    fn runtime_index_inventory_excludes_ordinary_files_and_similarly_named_paths() {
+        for path in [
+            "issues.jsonl",
+            "config.yaml",
+            "metadata.json",
+            "routes.jsonl",
+            "README.md",
+            ".gitignore",
+            "docs/beads.db",
+            "docs/beads.db-wal",
+            "beads.db-walrus",
+            "beads.db-wal-cert-head.md",
+            "beads.db.badger.md",
+            "beads.db.corruption.md",
+            "beads.db.stale.md",
+            ".br_recovery-notes/README.md",
+            ".br_history-notes/README.md",
+            ".write-waiters.lock-notes/README.md",
+            ".br-wal-index-/README.md",
+            "notes.fsqlite-migration-state.md",
+        ] {
+            assert_eq!(classify_runtime_file(path, None), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn runtime_index_inventory_finds_reserved_namespaces_beside_nested_databases() {
+        for (path, expected) in [
+            (
+                "nested/.br_recovery/run/recovery-failed.json",
+                RuntimeFileKind::RecoveryEvidence,
+            ),
+            (
+                "nested/.br-wal-index-run/prepared.json",
+                RuntimeFileKind::RecoveryEvidence,
+            ),
+            (
+                "deep/nested/.br_history/issues.jsonl",
+                RuntimeFileKind::History,
+            ),
+            (
+                "deep/nested/.write-waiters.lock/holder",
+                RuntimeFileKind::WriterCoordination,
+            ),
+        ] {
+            assert_eq!(classify_runtime_file(path, None), Some(expected), "{path}");
+            assert_eq!(
+                classify_runtime_file(path, Some("nested/tracker.sqlite")),
+                Some(expected),
+                "{path}"
+            );
+        }
+        for path in [
+            "docs/nested.db",
+            "nested/docs/example.db-wal",
+            "nested/.br_recovery-notes/README.md",
+            "nested/.br_history-notes/README.md",
+            "nested/.write-waiters.lock-notes/README.md",
+        ] {
+            assert_eq!(classify_runtime_file(path, None), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn runtime_inventory_recognizes_only_the_configured_custom_database_family() {
+        let database = "state/tracker.sqlite";
+        assert_eq!(
+            classify_runtime_file(database, Some(database)),
+            Some(RuntimeFileKind::Database)
+        );
+        for suffix in crate::config::db_sidecar_suffixes() {
+            let path = format!("{database}{suffix}");
+            assert!(
+                classify_runtime_file(&path, Some(database)).is_some(),
+                "the inventory must cover every supported engine suffix: {path}"
+            );
+        }
+        for path in [
+            "state/tracker.sqlite3",
+            "state/tracker.sqlite-wal-notes",
+            "state/tracker.sqlite/docs",
+            "other/tracker.sqlite",
+            "other/tracker.sqlite-wal",
+        ] {
+            assert_eq!(classify_runtime_file(path, Some(database)), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn runtime_index_parser_deduplicates_paths_and_preserves_exact_names() {
+        let files = parse_runtime_index_paths(
+            b"beads.db-wal-cert\0issues.jsonl\0beads.db-wal-cert\0\
+              .br-wal-index-run/prepared\nrecord.json\0beads.db-shm\0",
+            "",
+            Some("beads.db"),
+        )
+        .expect("valid NUL-delimited index");
+        let observed = files
+            .iter()
+            .map(|file| (file.path.as_str(), file.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observed,
+            [
+                (
+                    ".br-wal-index-run/prepared\nrecord.json",
+                    RuntimeFileKind::RecoveryEvidence
+                ),
+                ("beads.db-shm", RuntimeFileKind::SharedMemory),
+                ("beads.db-wal-cert", RuntimeFileKind::WalCertificate),
+            ]
+        );
+        assert!(parse_runtime_index_paths(b"", "", None).unwrap().is_empty());
+        assert!(
+            parse_runtime_index_paths(b"issues.jsonl\0config.yaml\0README.md\0", "", None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn runtime_index_parser_never_turns_invalid_or_partial_output_into_an_inventory() {
+        for output in [
+            b"beads.db-wal".as_slice(),
+            b"\0",
+            b"beads.db-wal\0\0",
+            b"beads.db-wal\0/elsewhere/beads.db\0",
+            b"beads.db-wal\0../beads.db\0",
+            b"beads.db-wal\0./beads.db\0",
+            b"beads.db-wal\0directory/../beads.db\0",
+            b"beads.db-wal\0directory//beads.db\0",
+            b"beads.db-wal\0directory/\0",
+            b"beads.db-wal\0C:/beads.db\0",
+            b"beads.db-wal\0\\\\server\\beads.db\0",
+            b"beads.db-wal\0.git/index\0",
+            b"beads.db-wal\0directory/.GIT/index\0",
+        ] {
+            assert_eq!(
+                parse_runtime_index_paths(output, "", None).unwrap_err(),
+                CollectionFailure::Semantic("probe_failed"),
+                "{output:?}"
+            );
+        }
+        assert_eq!(
+            parse_runtime_index_paths(b"beads.db-wal\0.br_recovery/\xff\0", "", None).unwrap_err(),
+            CollectionFailure::Semantic("unsupported_path_encoding")
+        );
+    }
+
+    #[test]
+    fn runtime_git_scope_requires_an_exact_relative_prefix() {
+        let temp = TempDir::new().unwrap();
+        let directory = temp.path().join("project/.beads");
+        assert_eq!(
+            parse_runtime_git_scope(&directory, b"project/.beads/\n").unwrap(),
+            (temp.path().to_path_buf(), "project/.beads/".to_string())
+        );
+        assert_eq!(
+            parse_runtime_git_scope(&directory, b"\n").unwrap(),
+            (directory.clone(), String::new())
+        );
+        assert_eq!(
+            parse_runtime_git_scope(&directory, b"project/.beads/\r\n").unwrap(),
+            (temp.path().to_path_buf(), "project/.beads/".to_string())
+        );
+        for output in [
+            b"project/.beads/".as_slice(),
+            b"project/.beads\n",
+            b"/project/.beads/\n",
+            b"project/../.beads/\n",
+            b"project//.beads/\n",
+            b"other/.beads/\n",
+            b"./project/.beads/\n",
+        ] {
+            assert_eq!(
+                parse_runtime_git_scope(&directory, output).unwrap_err(),
+                CollectionFailure::Semantic("probe_failed"),
+                "{output:?}"
+            );
+        }
+        assert_eq!(
+            parse_runtime_git_scope(&directory, b"project/\xff/\n").unwrap_err(),
+            CollectionFailure::Semantic("unsupported_path_encoding")
+        );
+    }
+
+    #[test]
+    fn runtime_index_scope_rejects_indexed_ancestors_instead_of_reporting_no_files() {
+        for (output, metadata_prefix, database) in [
+            (b"nested\0".as_slice(), "nested/tracker/.beads/", "beads.db"),
+            (b"nested/tracker\0", "nested/tracker/.beads/", "beads.db"),
+            (
+                b"nested/tracker/.beads\0",
+                "nested/tracker/.beads/",
+                "beads.db",
+            ),
+            (b".beads/nested\0", ".beads/", "nested/tracker.sqlite"),
+            (b"nested\0", "", "nested/tracker.sqlite"),
+            (
+                b".beads/beads.db-wal\0.beads/nested\0",
+                ".beads/",
+                "nested/tracker.sqlite",
+            ),
+        ] {
+            assert_eq!(
+                parse_runtime_index_paths(output, metadata_prefix, Some(database)).unwrap_err(),
+                CollectionFailure::Semantic("scope_crosses_tracked_non_directory"),
+                "{output:?}"
+            );
+        }
+        let files = parse_runtime_index_paths(
+            b"project/outside.db\0project/.beads-other/beads.db\0\
+              project/.beads/issues.jsonl\0project/.beads/nested2\0\
+              project/.beads/nested/tracker.sqlite-wal\0",
+            "project/.beads/",
+            Some("nested/tracker.sqlite"),
+        )
+        .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "nested/tracker.sqlite-wal");
+        assert_eq!(files[0].kind, RuntimeFileKind::Wal);
+    }
+
+    #[test]
+    fn runtime_database_scope_excludes_external_databases_without_opening_the_leaf() {
+        let temp = TempDir::new().unwrap();
+        let directory = temp.path().join(".beads");
+        let nested = directory.join("state");
+        fs::create_dir_all(&nested).unwrap();
+        let directory = dunce::canonicalize(directory).unwrap();
+        let database = directory.join("state/tracker.sqlite");
+        // There is deliberately no database file to open or recover.
+        assert!(!database.exists());
+        assert_eq!(
+            runtime_database_relative_path(&directory, &database).unwrap(),
+            Some("state/tracker.sqlite".to_string())
+        );
+        assert_eq!(
+            runtime_database_relative_path(&directory, &temp.path().join("external.sqlite"))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            runtime_database_relative_path(&directory, &directory.join("missing/tracker.sqlite"))
+                .unwrap_err(),
+            CollectionFailure::Semantic("configured_database_scope_unavailable")
+        );
+    }
+
+    #[test]
+    fn runtime_database_selection_preserves_lexical_paths_and_configuration_precedence() {
+        let temp = TempDir::new().unwrap();
+        let directory = temp.path();
+        let fallback = directory.join("default.db");
+        let legacy_path = directory.join("legacy.sqlite");
+        let project_path = directory.join("project.sqlite");
+        let mut legacy = crate::config::ConfigLayer::default();
+        legacy
+            .startup
+            .insert("db".to_string(), legacy_path.to_str().unwrap().to_string());
+        let mut project = crate::config::ConfigLayer::default();
+        project.startup.insert(
+            "database".to_string(),
+            project_path.to_str().unwrap().to_string(),
+        );
+        let mut environment = crate::config::ConfigLayer::default();
+        environment
+            .startup
+            .insert("db".to_string(), "  ".to_string());
+        let layers = [legacy, project, environment];
+        assert_eq!(
+            runtime_requested_database_path(directory, None, &layers, &fallback).unwrap(),
+            project_path
+        );
+        let lexical_alias = Path::new(".beads/custom.sqlite");
+        assert_eq!(
+            runtime_requested_database_path(directory, Some(lexical_alias), &layers, &fallback)
+                .unwrap(),
+            lexical_alias
+        );
+        assert_eq!(
+            runtime_requested_database_path(directory, None, &[], &fallback).unwrap(),
+            fallback
+        );
+    }
+
+    #[test]
+    fn runtime_database_selection_refuses_ambiguity_independent_of_alias_order() {
+        let directory = Path::new("/metadata");
+        for aliases in [
+            [("db", "/first.sqlite"), ("database", "/second.sqlite")],
+            [("database", "/second.sqlite"), ("db", "/first.sqlite")],
+        ] {
+            let mut layer = crate::config::ConfigLayer::default();
+            for (key, value) in aliases {
+                layer.startup.insert(key.to_string(), value.to_string());
+            }
+            // A resolved path cannot establish which lexical alias should be
+            // inventoried when both are configured. Both orderings refuse.
+            for resolved in [Path::new("/first.sqlite"), Path::new("/second.sqlite")] {
+                assert_eq!(
+                    runtime_requested_database_path(directory, None, &[layer.clone()], resolved)
+                        .unwrap_err(),
+                    CollectionFailure::Semantic("configured_database_scope_unavailable")
+                );
+            }
+            let cli = Path::new(".beads/explicit.sqlite");
+            assert_eq!(
+                runtime_requested_database_path(directory, Some(cli), &[layer], directory).unwrap(),
+                cli
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_mode_is_explicit_and_rejects_jsonl_scope_options() {
+        use clap::Parser;
+
+        let cli =
+            crate::cli::Cli::try_parse_from(["br", "vcs-status", "--runtime-files", "--json"])
+                .expect("explicit runtime diagnostic");
+        assert!(matches!(
+            cli.command,
+            crate::cli::Commands::VcsStatus(args) if args.runtime_files
+        ));
+        assert!(!crate::cli::VcsStatusArgs::default().runtime_files);
+        for arguments in [
+            vec![
+                "br",
+                "vcs-status",
+                "--runtime-files",
+                "--jsonl",
+                "issues.jsonl",
+            ],
+            vec![
+                "br",
+                "vcs-status",
+                "--runtime-files",
+                "--allow-external-jsonl",
+            ],
+        ] {
+            assert!(crate::cli::Cli::try_parse_from(arguments).is_err());
+        }
+    }
 
     #[test]
     fn object_id_parser_obeys_the_selected_repository_format() {

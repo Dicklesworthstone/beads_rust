@@ -2746,6 +2746,52 @@ schemas:
         description: Relationship between the securely captured JSONL leaf and the Git index.
         type: string
         enum[8]: clean,modified,deleted,untracked,ignored,unmerged,comparison_unavailable,absent
+  VcsRuntimeStatus:
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+    title: VcsRuntimeStatus
+    description: "Explicit inventory of tracked local state under the selected metadata directory.\n\nThis observes the current index, not HEAD, worktree contents, or other clones.\nAn unavailable inventory has no count or partial path list. Findings confer no\npermission to delete, untrack, restore, or regenerate any family member."
+    type: object
+    properties:
+      schema.type: string
+      requested.type: boolean
+      available.type: boolean
+      vcs.type: string
+      observation_atomic.type: boolean
+      path_scope.type: string
+      metadata_path.type: string
+      timeout_ms:
+        type: integer
+        format: uint64
+        minimum: 0
+      duration_ms:
+        type: integer
+        format: uint64
+        minimum: 0
+      index_only.type: boolean
+      automatic_remediation_available.type: boolean
+      reason.type[2]: string,"null"
+      tracked_count:
+        type[2]: integer,"null"
+        format: uint
+        minimum: 0
+      files:
+        type[2]: array,"null"
+        items:
+          "$ref": #/$defs/TrackedRuntimeFile
+    required[11]: schema,requested,available,vcs,observation_atomic,path_scope,metadata_path,timeout_ms,duration_ms,index_only,automatic_remediation_available
+    "$defs":
+      TrackedRuntimeFile:
+        description: "One known local-state path in the Git index, relative to the metadata directory."
+        type: object
+        properties:
+          path.type: string
+          kind:
+            "$ref": #/$defs/RuntimeFileKind
+        required[2]: path,kind
+      RuntimeFileKind:
+        description: "Why a tracked path belongs to a local database, coordination, or evidence family."
+        type: string
+        enum[10]: database,wal,shared_memory,journal,wal_certificate,namespace_state,migration_state,recovery_evidence,history,writer_coordination
 commands:
   blocked:
     shape: object
@@ -2880,3 +2926,9 @@ commands:
     item_schema: VcsExportStatus
     error_envelope_on_stderr: false
     notes: "Explicit bounded read-only Git diagnostic. It is isolated from sync, retains HEAD/index evidence when worktree comparison is unavailable, never executes Git content filters, and reports sequential evidence with observation_atomic=false. Structured machine-mode errors are currently emitted on stdout."
+  "vcs-status --runtime-files":
+    shape: object
+    jq_filter: .
+    item_schema: VcsRuntimeStatus
+    error_envelope_on_stderr: false
+    notes: "Explicit bounded inventory of tracked database and recovery files in the workspace metadata directory. Reads the Git index without opening database or JSONL contents. Unavailable scans omit tracked_count and files; a zero count is not a cross-clone migration or checkout-safety guarantee. Findings are informational and do not perform automatic remediation."

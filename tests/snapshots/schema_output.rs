@@ -34,6 +34,7 @@ const EXPECTED_SCHEMA_NAMES: &[&str] = &[
     "SyncReconcileReceipt",
     "TreeNode",
     "VcsExportStatus",
+    "VcsRuntimeStatus",
 ];
 
 static JSON_GENERATED_AT_RE: LazyLock<Regex> =
@@ -215,6 +216,15 @@ fn assert_schema_document_shape(document: &Value, context: &str) {
     );
     assert_command_item_schemas_resolve(document, context);
     assert_coordination_contract_coverage(document, context);
+    let runtime = command_shape_value(document, "vcs-status --runtime-files")
+        .expect("runtime inventory command shape");
+    assert_eq!(runtime["item_schema"], "VcsRuntimeStatus");
+    let runtime_schema =
+        schema_value(document, "VcsRuntimeStatus").expect("runtime inventory schema");
+    assert!(
+        runtime_schema["properties"]["tracked_count"].is_object(),
+        "{context} runtime count must be discoverable"
+    );
 }
 
 fn assert_toon_matches_json_schema_metadata(json: &Value, toon: &Value) {

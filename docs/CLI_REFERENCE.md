@@ -1916,12 +1916,13 @@ br sync --flush-only -v
 
 ### vcs-status
 
-Explicitly inspect Git visibility for the configured JSONL export. This is a
-separate, user-requested diagnostic capability; no `br sync` mode delegates to
-it or executes Git.
+Explicitly inspect Git visibility for the configured JSONL export, or inventory
+tracked local database and recovery files. This is a separate, user-requested
+diagnostic capability; no `br sync` mode delegates to it or executes Git.
 
 ```bash
 br vcs-status [--jsonl PATH] [--allow-external-jsonl] [--timeout-ms MILLISECONDS] [--json|--robot]
+br vcs-status --runtime-files [--timeout-ms MILLISECONDS] [--json|--robot]
 ```
 
 The machine-readable `br.vcs-export-status.v2` record reports:
@@ -1986,6 +1987,59 @@ br vcs-status \
   --allow-external-jsonl \
   --json
 ```
+
+#### Tracked database and recovery files
+
+`br vcs-status --runtime-files --json` inspects the Git index beneath the
+selected workspace metadata directory. It reports tracked databases, WAL and
+journal state, durability certificates, namespace and migration state, retained
+recovery evidence, local history, and writer coordination files. Ordinary JSONL
+exports, configuration, and documentation are excluded from the findings.
+
+This mode does not open database or JSONL contents, so a malformed database or
+missing export does not prevent the inventory. Tracked files appear even when
+their working-tree copy is missing. Unmerged index stages are counted once per
+path. The scan uses the existing shared deadline and 32 KiB limit per output
+stream, and is confined to the selected metadata directory. A configured
+database outside that directory does not widen the scan. `--runtime-files`
+conflicts with `--jsonl` and `--allow-external-jsonl`.
+
+The audit also checks indexed ancestors of the selected directory and configured
+database. A tracked file, symlink, or submodule hiding that scope produces
+`scope_crosses_tracked_non_directory` with no inventory. Reading those ancestors
+can require listing the metadata directory's top-level repository subtree;
+that wider listing uses the same output cap and can make the scan unavailable.
+
+The separate `br.vcs-runtime-status.v1` receipt includes:
+
+- `available`, `reason`, and the requested timeout and observed duration;
+- `path_scope: "workspace_metadata"` and `metadata_path`;
+- `index_only: true` and `observation_atomic: false`;
+- `tracked_count` and `files`, whose `path` values are relative to the metadata
+  directory and whose `kind` identifies the runtime or evidence family;
+- `automatic_remediation_available: false`.
+
+An unavailable scan omits both `tracked_count` and `files`. Missing Git,
+timeouts, oversized output, malformed records, and unsupported path encodings
+must be handled as unknown inventory, not as zero findings. Findings and
+unavailable probes are informational diagnostic results; valid invocations
+return success. Workspace or argument validation errors still return errors.
+`br schema vcs-status --format json` describes both VCS receipt types, and
+`br schema commands --format json` includes this explicit mode.
+
+Ignore rules protect untracked paths from ordinary staging; they do not remove
+files already present in the Git index. Git checkout operations can replace or
+remove tracked runtime files. A zero index count is not proof that HEAD,
+pending commits, another clone, or an external database is safe. The diagnostic
+does not untrack files or repair this cross-clone hazard. Before publishing a
+commit that removes runtime files from tracking, coordinate preservation of
+each clone's own complete database and evidence family; an untracking commit
+can otherwise delete another clone's clean sidecars on its next pull.
+
+For an operator audit that also checks HEAD, staged untracking, an already-local
+incoming commit, or several worktrees, use the separate
+[tracked-runtime auditor](reliability/TRACKED_RUNTIME_AUDIT.md). Its findings and
+exit codes are distinct from this informational current-index diagnostic.
 
 ---
 

@@ -981,7 +981,7 @@ EXAMPLES:
     /// Update an issue
     Update(Box<UpdateArgs>),
 
-    /// Explicitly inspect Git visibility for the configured JSONL export
+    /// Explicitly inspect Git visibility for JSONL or local runtime files
     ///
     /// This diagnostic is intentionally separate from `br sync`: sync never
     /// executes Git. The command applies a shared probe budget, bounded output,
@@ -1473,9 +1473,15 @@ pub struct InfoArgs {
     pub thanks: bool,
 }
 
-/// Arguments for the explicit VCS export-status diagnostic.
+/// Arguments for the explicit VCS diagnostics.
 #[derive(Args, Debug, Clone)]
 pub struct VcsStatusArgs {
+    /// List tracked database and recovery files under the selected metadata directory
+    ///
+    /// Reads the current Git index only; never opens the database or untracks files.
+    #[arg(long, conflicts_with_all = ["jsonl", "allow_external_jsonl"])]
+    pub runtime_files: bool,
+
     /// Inspect this JSONL instead of the configured workspace export
     #[arg(long, value_name = "PATH")]
     pub jsonl: Option<PathBuf>,
@@ -1500,6 +1506,7 @@ pub struct VcsStatusArgs {
 impl Default for VcsStatusArgs {
     fn default() -> Self {
         Self {
+            runtime_files: false,
             jsonl: None,
             allow_external_jsonl: false,
             timeout_ms: 2_000,
