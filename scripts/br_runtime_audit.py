@@ -28,6 +28,13 @@ from typing import Iterable
 SCHEMA = "br.git-runtime-audit.v1"
 OID = re.compile(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 MODES = {b"100644", b"100755", b"120000", b"160000"}
+SIDECAR_SUFFIXES = (
+    (b"-wal-cert-head", "certificate_head"), (b"-wal-cert", "certificate"),
+    (b"-fsqlite-ns-gate", "namespace"), (b"-fsqlite-ns-use", "namespace"),
+    (b".fsqlite-migration-state", "migration_state"),
+    (b"-journal", "journal"), (b"-shm", "shared_index"),
+    (b"-wal", "wal"), (b"-ns", "namespace"),
+)
 GUIDANCE = (
     "Do not run git rm --cached and tell other clones to pull. Git can remove "
     "their runtime files when that commit arrives. Stop tracker users in every "
@@ -53,19 +60,33 @@ def relative_path(value: str) -> str:
     return value
 
 
+def legacy_recovery_suffix(suffix: bytes) -> bool:
+    """Recognize a retained filename suffix, not a substring or child path."""
+    if b"/" in suffix:
+        return False
+    if suffix.startswith((b".stale_", b".rebuild_")):
+        return True
+    for prefix in (b".bad", b".corrupt"):
+        if suffix.startswith(prefix):
+            tail = suffix[len(prefix):]
+            if not tail or tail[:1] in {b"_", b"-", b"."}:
+                return True
+    return False
+
+
+def retained_database_suffix(suffix: bytes) -> bool:
+    """Bind legacy evidence to the database or one of its known sidecars."""
+    return legacy_recovery_suffix(suffix) or any(
+        suffix.startswith(sidecar) and legacy_recovery_suffix(suffix[len(sidecar):])
+        for sidecar, _ in SIDECAR_SUFFIXES)
+
+
 def runtime_kind(path: bytes, beads_dirs: tuple[bytes, ...], databases: tuple[bytes, ...]) -> str | None:
     """Classify names only. Runtime contents, links, and live metadata are not read."""
-    suffixes = (
-        (b"-wal-cert-head", "certificate_head"), (b"-wal-cert", "certificate"),
-        (b"-fsqlite-ns-gate", "namespace"), (b"-fsqlite-ns-use", "namespace"),
-        (b".fsqlite-migration-state", "migration_state"),
-        (b"-journal", "journal"), (b"-shm", "shared_index"),
-        (b"-wal", "wal"), (b"-ns", "namespace"),
-    )
     for database in databases:
         if path == database:
             return "database"
-        for suffix, kind in suffixes:
+        for suffix, kind in SIDECAR_SUFFIXES:
             if path == database + suffix:
                 return kind
     for directory in beads_dirs:
@@ -85,7 +106,7 @@ def runtime_kind(path: bytes, beads_dirs: tuple[bytes, ...], databases: tuple[by
                 return "shared_index_recovery"
         if name.endswith(b".db"):
             return "database"
-        for suffix, kind in suffixes:
+        for suffix, kind in SIDECAR_SUFFIXES:
             if name.endswith(suffix):
                 stem = name[:-len(suffix)]
                 if (stem.endswith((b".db", b".sqlite", b".sqlite3"))
@@ -108,6 +129,19 @@ def runtime_kind(path: bytes, beads_dirs: tuple[bytes, ...], databases: tuple[by
         if name in {b"beads.base.jsonl", b"beads.base.meta.json", b"beads.left.jsonl",
                     b"beads.left.meta.json", b"beads.right.jsonl", b"beads.right.meta.json"}:
             return "merge_temporary"
+        # Older recovery paths retained the database and sidecars beside the
+        # live family. Match the same suffix boundaries as br vcs-status, so
+        # ordinary names such as beads.db.badger.md remain shared files.
+        for extension in (b".db", b".sqlite", b".sqlite3"):
+            _, separator, suffix = name.rpartition(extension)
+            if separator and retained_database_suffix(suffix):
+                return "recovery"
+    # Explicit databases may be extensionless and outside the metadata scope.
+    # Require their exact basename; a neighboring tracker or child directory
+    # is not part of that database family. Existing categories above win.
+    for database in databases:
+        if path.startswith(database) and retained_database_suffix(path[len(database):]):
+            return "recovery"
     return None
 
 

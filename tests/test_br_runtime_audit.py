@@ -57,6 +57,11 @@ class AuditTests(unittest.TestCase):
     def run_audit(self, **kwargs):
         return audit.audit_repository(self.repo, **kwargs)
 
+    def repository_witness(self):
+        return {str(path.relative_to(self.repo)):
+                (path.stat().st_dev, path.stat().st_ino, path.read_bytes())
+                for path in self.repo.rglob("*") if path.is_file()}
+
     def test_unborn_empty_repository_is_complete_and_clean(self):
         report = self.run_audit()
         self.assertEqual(report["status"], "clean", report)
@@ -173,6 +178,135 @@ class AuditTests(unittest.TestCase):
         self.write(".beads/beads.db-wal-cert.retained")
         self.commit(".beads")
         self.assertEqual(self.run_audit()["findings"][0]["kind"], "wal_sidecar")
+
+    def test_legacy_recovery_file_alone_cannot_be_reported_clean(self):
+        self.write("README.md", b"ordinary shared documentation")
+        self.commit("README.md")
+        paths = (
+            ".beads/beads.db.bad_20261007T172510",
+            ".beads/beads.db.corrupt_20261007T172510",
+            ".beads/beads.db.stale_20261007T172510",
+            ".beads/queue.sqlite-wal-cert.stale_20261007T172510",
+            ".beads/queue.sqlite3-shm.rebuild_20261007T172510",
+        )
+        for name in paths:
+            with self.subTest(path=name):
+                self.write(name, b"retained incident evidence; never regenerate")
+                self.commit(name)
+                before = self.repository_witness()
+                report = self.run_audit()
+                self.assertEqual(self.repository_witness(), before)
+                self.assertTrue(report["complete"], report)
+                self.assertEqual(report["status"], "unsafe", report)
+                self.assertEqual([(item["path"], item["kind"])
+                                  for item in report["findings"]], [(name, "recovery")])
+                self.assertTrue(report["findings"][0]["head_entries"])
+                self.assertTrue(report["findings"][0]["index_entries"])
+            # The next commit has exactly one retained file in Git. Previous
+            # evidence stays on disk, untracked, and is never deleted.
+            self.git("update-index", "--force-remove", "--", name)
+
+    def test_legacy_recovery_staged_untracking_stays_unsafe(self):
+        name = ".beads/beads.db.corrupt_20261007T172510"
+        self.write(name, b"retained corrupt database")
+        self.commit(name)
+        self.git("update-index", "--force-remove", "--", name)
+        before = self.repository_witness()
+        report = self.run_audit()
+        self.assertEqual(self.repository_witness(), before)
+        self.assertTrue(report["complete"], report)
+        self.assertEqual(report["status"], "unsafe", report)
+        self.assertEqual([item["path"] for item in report["findings"]], [name])
+        finding = report["findings"][0]
+        self.assertEqual(finding["kind"], "recovery")
+        self.assertTrue(finding["staged_untracking"])
+        self.assertTrue(finding["head_entries"])
+        self.assertFalse(finding["index_entries"])
+
+    def test_incoming_legacy_recovery_deletion_and_replacement_are_reported(self):
+        name = ".beads/queue.sqlite-wal-cert.stale_20261007T172510"
+        self.write(name, b"independent local retained certificate")
+        self.write("README.md", b"ordinary shared documentation")
+        head = self.commit(name, "README.md")
+        replacement = self.write("incoming-certificate", b"different retained certificate")
+        replacement_oid = self.git("hash-object", "-w", "--", str(replacement)).stdout.strip().decode()
+        for transition in ("deletes", "replaces"):
+            with self.subTest(transition=transition):
+                if transition == "deletes":
+                    self.git("update-index", "--force-remove", "--", name)
+                else:
+                    self.git("update-index", "--cacheinfo", f"100644,{replacement_oid},{name}")
+                tree = self.git("write-tree").stdout.strip().decode()
+                incoming = self.git("commit-tree", tree, "-p", head,
+                                    "-m", f"incoming legacy evidence {transition}").stdout.strip().decode()
+                # Construct an already-local incoming commit, then restore
+                # the original index without checking it out or touching the
+                # retained payload. HEAD stays on the original local commit.
+                self.git("add", "-f", "--", name)
+                before = self.repository_witness()
+                report = self.run_audit(incoming_ref=incoming)
+                self.assertEqual(self.repository_witness(), before)
+                self.assertTrue(report["complete"], report)
+                self.assertEqual(report["status"], "unsafe", report)
+                self.assertEqual(report["head"], head)
+                self.assertEqual(report["incoming_commit"], incoming)
+                self.assertEqual([item["path"] for item in report["findings"]], [name])
+                finding = report["findings"][0]
+                self.assertEqual(finding["kind"], "recovery")
+                self.assertFalse(finding["staged_untracking"])
+                self.assertFalse(finding["incoming_adds"])
+                self.assertEqual(finding["incoming_deletes"], transition == "deletes")
+                self.assertEqual(finding["incoming_replaces"], transition == "replaces")
+
+    def test_extensionless_legacy_recovery_requires_exact_database_scope(self):
+        expected = (
+            "cache/tracker.bad_20261007T172510",
+            "cache/tracker.corrupt_20261007T172510",
+            "cache/tracker.stale_20261007T172510",
+            "cache/tracker-wal-cert.stale_20261007T172510",
+            "cache/tracker-shm.rebuild_20261007T172510",
+        )
+        unrelated = (
+            "cache/unrelated.db.bad_20261007T172510",
+            "cache/tracker-other.corrupt_20261007T172510",
+            "cache/tracker.badger.md",
+            "cache/tracker.corruption.md",
+            "cache/tracker.stale.md",
+            "cache/tracker.bad_123/README.md",
+            ".beads-archive/beads.db.corrupt_20261007T172510",
+        )
+        for name in (*expected, *unrelated):
+            self.write(name, b"retained test fixture")
+        self.commit("cache", ".beads-archive")
+        before = self.repository_witness()
+        self.assertEqual(self.run_audit()["status"], "clean")
+        report = self.run_audit(databases=("cache/tracker",))
+        self.assertEqual(self.repository_witness(), before)
+        self.assertTrue(report["complete"], report)
+        self.assertEqual(report["status"], "unsafe", report)
+        self.assertEqual({item["path"]: item["kind"] for item in report["findings"]},
+                         {name: "recovery" for name in expected})
+
+    def test_legacy_lookalike_names_are_not_recovery_evidence(self):
+        paths = (
+            ".beads/beads.db.badger.md",
+            ".beads/beads.db.corruption.md",
+            ".beads/beads.db.stale.md",
+            ".beads/beads.db.rebuild.md",
+            ".beads/queue.sqlite.badger.md",
+            ".beads/notes.bad_20261007T172510",
+            ".beads/beads.db.bad_123/README.md",
+            ".beads-archive/beads.db.bad_20261007T172510",
+        )
+        for name in paths:
+            self.write(name)
+        self.commit(".beads", ".beads-archive")
+        before = self.repository_witness()
+        report = self.run_audit()
+        self.assertEqual(self.repository_witness(), before)
+        self.assertTrue(report["complete"], report)
+        self.assertEqual(report["status"], "clean", report)
+        self.assertEqual(report["findings"], [])
 
     def test_quarantine_directory_contents_are_runtime_not_shared_json(self):
         paths = {

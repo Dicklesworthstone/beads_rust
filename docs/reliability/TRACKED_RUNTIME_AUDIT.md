@@ -28,6 +28,15 @@ removals, replacements, or additions of recognized runtime paths. Recovery
 namespace contents are included even when their leaf names look like shared JSON.
 Git replacement refs are disabled so they cannot mask actual commit contents.
 
+Legacy recovery files beside a database are included as well: `.bad` and
+`.corrupt` with an end-of-name or `_`, `-`, or `.` boundary, and `.stale_` or
+`.rebuild_` suffixes. These names must belong to a `.db`, `.sqlite`, or `.sqlite3`
+database or known sidecar inside the selected metadata directory, or to an exact
+explicit `--database` family. Newly recognized legacy files use the existing
+`recovery` kind; existing sidecar categories keep their meaning. Ordinary names
+such as `beads.db.badger.md`, neighboring trackers, and files beneath a lookalike
+directory do not become recovery findings.
+
 Exit 0 means no recognized tracked runtime paths in the requested scope. Exit 1
 means findings exist. Exit 2 means some evidence was unavailable or incomplete;
 fleet output retains successful observations from other repositories. JSON uses
@@ -67,7 +76,10 @@ python3 -m unittest discover -s tests -p 'test_br_runtime_audit.py' -v
 Tests use disposable local Git repositories and no engine dependency. They check
 HEAD/index differences, incoming changes, linked worktrees, SHA-256 repositories,
 merge stages, hostile path names, bounds, and exact worktree/index byte and inode
-preservation. The two-clone control first verifies the read-only warning, then
+preservation. Legacy evidence is tested as the sole tracked finding, after staged
+untracking, and before incoming deletion or replacement; explicit extensionless
+families and ordinary-name negatives constrain its scope. The two-clone control
+first verifies the read-only warning, then
 performs a synthetic untracking transition outside the auditor to demonstrate
 that Git really removes the peer file. Fixtures are retained under the system
 temporary directory for inspection. These tests do not replace Rust or release
