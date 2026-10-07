@@ -1187,7 +1187,8 @@ pub(crate) mod tests {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE guarded (value TEXT)").unwrap();
         conn.execute("BEGIN IMMEDIATE").unwrap();
-        conn.execute("INSERT INTO guarded VALUES ('pending')").unwrap();
+        conn.execute("INSERT INTO guarded VALUES ('pending')")
+            .unwrap();
         for sql in [
             "ROLLBACK; PRAGMA wal_checkpoint(PASSIVE)",
             "INSERT INTO guarded VALUES ('leaked'); PRAGMA wal_checkpoint(TRUNCATE)",
@@ -1539,7 +1540,9 @@ pub(crate) mod tests {
                 7 => conn
                     .query_with_params("PRAGMA wal_checkpoint(TRUNCATE)", &[])
                     .map(|_| ()),
-                8 => conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)").map(|_| ()),
+                8 => conn
+                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .map(|_| ()),
                 _ => conn
                     .query_row_with_params("PRAGMA wal_checkpoint(TRUNCATE)", &[])
                     .map(|_| ()),

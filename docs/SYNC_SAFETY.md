@@ -167,7 +167,13 @@ record intact, revokes its export certificate, and keeps the database marked
 for flush. Audit comparison uses one transaction-scoped snapshot alongside
 batched issue comparisons; repeated no-op imports do not rewrite audit rows or
 unchanged certificates. Legacy `--reconcile` uses the same certification rules.
-Token-bound `--reconcile-additive` retains its separate no-audit-mutation contract.
+Token-bound `--reconcile-additive` accepts the typed close-audit fields emitted
+by ordinary export, but retains its separate no-audit-mutation contract. The
+original audit bytes remain part of the reviewed source witness; changing them
+invalidates the apply token. Additive recovery neither creates close metadata
+nor replays the source bypass flag, reason, or fired gates into local audit
+records. Unknown fields, duplicate fields, and invalid audit field types are
+still refused.
 
 ### Merge Guards
 

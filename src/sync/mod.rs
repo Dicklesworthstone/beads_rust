@@ -6179,6 +6179,11 @@ fn parse_strict_additive_issue(trimmed: &str, line_num: usize) -> Result<Issue> 
         "closed_at",
         "close_reason",
         "closed_by_session",
+        // Exported audit evidence is parsed with its model types and remains
+        // bound by the source witness; canonicalization keeps it out of writes.
+        "bypassed_policy",
+        "bypass_reason",
+        "policy_gates_fired",
         "due_at",
         "defer_until",
         "external_ref",
@@ -19390,6 +19395,71 @@ mod tests {
     }
 
     #[test]
+    fn strict_additive_source_validates_close_audit_fields() {
+        let mut issue = make_issue_at("bd-audit", "Audited closure", fixed_time(100));
+        issue.status = Status::Closed;
+        issue.closed_at = Some(issue.updated_at);
+        issue.bypassed_policy = Some(true);
+        issue.bypass_reason = Some("Reviewed source evidence".to_string());
+        issue.policy_gates_fired = Some(vec!["source_gate".to_string()]);
+        let canonical = serde_json::to_string(&issue).unwrap();
+        let parsed = parse_strict_additive_issue(&canonical, 1).unwrap();
+        assert_eq!(parsed.bypassed_policy, Some(true));
+        assert_eq!(
+            parsed.bypass_reason.as_deref(),
+            Some("Reviewed source evidence")
+        );
+        assert_eq!(
+            parsed.policy_gates_fired,
+            Some(vec!["source_gate".to_string()])
+        );
+
+        for (field, invalid) in [
+            ("bypassed_policy", serde_json::json!("true")),
+            ("bypass_reason", serde_json::json!(false)),
+            ("policy_gates_fired", serde_json::json!("source_gate")),
+            ("policy_gates_fired", serde_json::json!([1])),
+        ] {
+            let mut record = serde_json::to_value(&issue).unwrap();
+            record[field] = invalid;
+            let error = parse_strict_additive_issue(&record.to_string(), 1).unwrap_err();
+            assert!(
+                error.to_string().contains("Invalid issue"),
+                "{field}: {error}"
+            );
+        }
+
+        let duplicate = canonical.replacen(
+            r#""bypassed_policy":true"#,
+            r#""bypassed_policy":true,"bypassed_policy":false"#,
+            1,
+        );
+        let error = parse_strict_additive_issue(&duplicate, 1).unwrap_err();
+        assert!(error.to_string().contains("duplicate JSON object member"));
+
+        for (field, value, expected_error) in [
+            (
+                "unreviewed_audit",
+                serde_json::json!(true),
+                "Unknown issue field",
+            ),
+            (
+                "content_hash",
+                serde_json::json!("untrusted"),
+                "ignored field",
+            ),
+        ] {
+            let mut record = serde_json::to_value(&issue).unwrap();
+            record[field] = value;
+            let error = parse_strict_additive_issue(&record.to_string(), 1).unwrap_err();
+            assert!(
+                error.to_string().contains(expected_error),
+                "{field}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn additive_reconcile_repairs_content_hash_only_drift_then_is_a_true_noop() {
         let temp = TempDir::new().unwrap();
         let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
@@ -24865,6 +24935,46 @@ mod tests {
     }
 
     #[test]
+    fn test_additive_source_close_audit_drift_invalidates_reviewed_plan() {
+        let temp_dir = TempDir::new().unwrap();
+        let (_, path, config) = additive_test_paths(&temp_dir);
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut incoming = make_issue_at("bd-audit", "Additive closure", fixed_time(100));
+        incoming.status = Status::Closed;
+        incoming.closed_at = Some(incoming.updated_at);
+        incoming.bypassed_policy = Some(true);
+        incoming.bypass_reason = Some("Reviewed source evidence".to_string());
+        incoming.policy_gates_fired = Some(vec!["source_gate".to_string()]);
+        write_additive_issues(&path, std::slice::from_ref(&incoming));
+        let reviewed = plan_additive_reconcile(&storage, &path, &config).unwrap();
+
+        incoming.bypass_reason = Some("Changed source evidence".to_string());
+        write_additive_issues(&path, std::slice::from_ref(&incoming));
+        let source_before_apply = fs::read(&path).unwrap();
+        let current = plan_additive_reconcile(&storage, &path, &config).unwrap();
+        assert_eq!(
+            reviewed.receipt.source_storage_projection_sha256,
+            current.receipt.source_storage_projection_sha256,
+            "audit evidence is outside the planned issue mutations"
+        );
+        assert_ne!(
+            reviewed.receipt.source_raw_sha256,
+            current.receipt.source_raw_sha256
+        );
+        assert_ne!(reviewed.receipt.plan_sha256, current.receipt.plan_sha256);
+        let error =
+            apply_reviewed_additive_plan(&mut storage, &path, &config, &reviewed).unwrap_err();
+        assert!(matches!(&error, BeadsError::SyncConflict { .. }));
+        assert!(error.to_string().contains("plan is stale"));
+        let database_after = hydrate_additive_database_issues(&storage).unwrap();
+        assert_eq!(
+            additive_database_witness(&storage, &database_after).unwrap(),
+            reviewed.receipt.target_before
+        );
+        assert_eq!(fs::read(&path).unwrap(), source_before_apply);
+    }
+
+    #[test]
     fn test_import_skip_batch_preserves_database_ahead_of_restored_export() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -25149,10 +25259,18 @@ mod tests {
                 "recent" => incoming.deleted_at = Some(Utc::now()),
                 _ => incoming.deleted_at = None,
             }
-            incoming.content_hash = Some(incoming.compute_content_hash());
+            // The derived content_hash is #[serde(skip)]; keep the expected
+            // record in wire form so exact equality still checks every
+            // exported field, including timestamps and tombstone metadata.
+            assert!(incoming.content_hash.is_none());
             let incoming = incoming.clone();
             let source_refs = source_issues.iter().collect::<Vec<_>>();
             write_jsonl_issues(&jsonl_path, &source_refs);
+            assert!(
+                read_issues_from_jsonl(&jsonl_path)
+                    .unwrap()
+                    .contains(&incoming)
+            );
             retitle(&mut storage, &live.id, "Pending local change");
             let source_before = fs::read(&jsonl_path).unwrap();
             let dirty_before = storage.get_dirty_issue_metadata().unwrap();

@@ -91,6 +91,7 @@ These are explicit design exclusions. br sync is intentionally less invasive tha
 | AR-7 | HIGH | Derived blocked cache and child counters equal an independent issue-graph projection | Seed stale/corrupt caches; plan, rebuild, compare exact maps and digests |
 | AR-8 | HIGH | Strict source parsing rejects unknown or silently normalized fields | Unknown-field, enum-alias, blank optional, ignored content-hash, and omitted-option round-trip tests |
 | AR-9 | HIGH | Receipt JSON Schema and command envelope are discoverable through `br schema` | Schema catalog and enum-domain tests |
+| AR-10 | HIGH | Known exported close-audit fields are bound to the reviewed source and never replayed by additive recovery | Typed-field acceptance and invalid-type/duplicate/unknown refusal; audit-only source drift invalidates the token; exact local close-metadata and event witnesses remain unchanged |
 
 ---
 
