@@ -84,3 +84,86 @@ performs a synthetic untracking transition outside the auditor to demonstrate
 that Git really removes the peer file. Fixtures are retained under the system
 temporary directory for inspection. These tests do not replace Rust or release
 qualification.
+
+## Offline preservation and independent recovery
+
+`scripts/br_runtime_snapshot.py` implements the per-clone preservation and
+recovery boundary. It is a separate, explicitly invoked POSIX/Python 3.10+ tool;
+the auditor and native `br vcs-status --runtime-files` remain observational.
+No Python packages are required. The snapshot tool never invokes Git or SQLite.
+
+**Stop every tracker user before capture and keep them stopped throughout the
+operator-controlled Git transition and live-installation review.** The required
+`--writers-stopped` flag records the operator's assertion. It does not acquire
+engine/opener locks, stop processes, or make this an online backup. Repeated
+identity, namespace and byte checks detect observed changes; they cannot prove
+quiescence or prevent a transaction from straddling separate file copies.
+
+Choose the complete directory containing the database, its journals/WAL,
+certificates, namespace/migration state, and retained recovery evidence. The
+tool copies every regular file and empty directory, including untracked files
+and unknown future sidecars. It does not infer custom database paths from
+metadata, CLI overrides, or environment variables. A database stored outside
+`.beads` needs its own complete directory captured during the same stopped
+interval. Do not treat a metadata-only snapshot as coverage of an external DB.
+
+```sh
+# Use a new bundle path outside all Git worktrees; its parent must exist.
+python3 scripts/br_runtime_snapshot.py capture \
+  /path/to/clone-b/.beads /private/backups/clone-b-before --writers-stopped
+
+# Retain the printed manifest_sha256 separately from the bundle.
+python3 scripts/br_runtime_snapshot.py verify \
+  /private/backups/clone-b-before --manifest-sha256 SAVED_SHA256
+
+# Recover ALL saved paths into a different new directory, never over live files.
+python3 scripts/br_runtime_snapshot.py materialize \
+  /private/backups/clone-b-before /private/backups/clone-b-recovered \
+  --manifest-sha256 SAVED_SHA256
+```
+
+A successful materialization produces `clone-b-recovered/data/` plus a
+`recovery.json` receipt after full byte readback and synchronization. Files are
+0600 and directories 0700. Original modes are recorded but not reinstated;
+ownership, ACLs, extended attributes and timestamps are not restored. Inspect
+permissions and paths before any separately reviewed live installation. The
+snapshot never merges newly pulled shared JSONL/configuration into the saved
+local generation, swaps directories, changes live configuration, or selects
+individual certificates for replacement. Keep each clone's own family together.
+
+Capture/verification/materialization return 0 only on success, or 2 for refusal
+or incomplete work, with JSON output. Existing destinations are refused. Failed
+output is retained for inspection and must not be treated as ready; retry with
+a new destination. Capture checks source bytes again and rechecks the entire
+namespace; materialization validates the complete bundle before creating output,
+hashes each copied object again, and verifies the complete recovered directory.
+The separately saved manifest hash is the trust anchor. A digest recomputed from
+an untrusted or edited manifest is not equivalent evidence.
+
+Source links, multiply linked files, special files, different-device subtrees,
+`.git` metadata, ambiguous roots, overlapping outputs and symlinked ancestors
+are refused. Output checks conventional `.git` directory/gitfile worktrees;
+this is not a sandbox for privileged mount changes or concurrent same-user
+filesystem manipulation. The default byte limit is 4 GiB, with 100,000 entries,
+64 path components, a 32 MiB manifest cap and a 300-second cooperative deadline.
+`--max-bytes` and `--timeout` can raise the byte/time budgets. Blocking filesystem
+calls and `fsync` cannot be preempted by the cooperative deadline.
+
+This supplies recoverable per-clone copies, not an automatic cross-clone
+untracking/checkout protocol. Every affected clone still requires coordination,
+its own verified snapshot, and engine-specific validation of the separately
+recovered generation before live installation. No snapshot or materialization
+receipt certifies database health or authorizes certificate quarantine.
+
+```sh
+python3 -m unittest discover -s tests -p 'test_br_runtime_snapshot.py' -v
+```
+
+The two-clone regressions perform real Git untracking/fast-forward transitions
+with both clean and dirty peer files, then recover the peer's exact original
+bytes into a new directory. Synthetic stock-SQLite databases contain committed
+WAL-only rows; the recovered copies reopen with those rows and pass
+`integrity_check`, while a main-only control loses the WAL-only rows. Opaque
+certificate sentinels prove byte preservation, not FrankenSQLite certificate
+validity. These tests never open production trackers and are not native
+FrankenSQLite, native `br`, or release qualification.

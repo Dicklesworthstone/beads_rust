@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import sqlite3
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -128,6 +130,21 @@ class SnapshotTests(unittest.TestCase):
         with self.assertRaises(OSError):
             snapshot.capture(self.source, alias / "saved", writers_stopped=True)
         self.assertFalse(self.bundle.exists())
+
+    def test_double_slash_alias_cannot_create_a_bundle_inside_its_source(self):
+        source = self.root / "offline"
+        source.mkdir()
+        (source / "beads.db").write_bytes(b"keep")
+        alias = Path("/" + str(source))
+        target = source / "saved"
+        with self.assertRaisesRegex(snapshot.SnapshotFailure, "double_slash"):
+            snapshot.capture(alias, target, writers_stopped=True)
+        self.assertFalse(target.exists())
+
+    def test_directory_enumeration_stops_at_the_entry_bound(self):
+        with snapshot.directory(self.source) as fd:
+            with self.assertRaisesRegex(snapshot.SnapshotFailure, "inventory_limit"):
+                snapshot.directory_names(fd, snapshot.Budget(10, 1024), 1)
 
     def test_maximum_depth_snapshot_is_also_verifiable(self):
         source = self.root / "depth"
@@ -316,6 +333,238 @@ class SnapshotTests(unittest.TestCase):
             code = snapshot.main(["verify", str(self.bundle), "--manifest-sha256", expected])
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(stdout.getvalue())["status"], "verified")
+
+    def test_materialize_preserves_every_byte_empty_directory_and_absence(self):
+        name = b"local-\xff\n"
+        with open(os.fsencode(self.source) + b"/" + name, "wb") as file:
+            file.write(b"unusual name, exact payload")
+        before = self.witness()
+        receipt = self.capture()
+        destination = self.root / "recovered"
+        result = snapshot.materialize(self.bundle, destination, receipt["manifest_sha256"])
+        self.assertEqual(result["status"], "materialized")
+        self.assertFalse(result["live_installation_performed"])
+        self.assertFalse(result["engine_validated"])
+        self.assertEqual(before, self.witness())
+        data = destination / "data"
+        for path, (_info, contents) in before.items():
+            self.assertEqual((data / os.fsdecode(path)).read_bytes(), contents)
+        self.assertTrue((data / ".br_recovery" / "incident" / "empty").is_dir())
+        self.assertFalse((data / "beads.db-journal").exists())
+        for path in destination.rglob("*"):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700 if path.is_dir() else 0o600)
+        self.assertEqual(json.loads((destination / "recovery.json").read_bytes()), result)
+        snapshot.verify(self.bundle, receipt["manifest_sha256"])
+
+    def test_materialize_validates_corruption_before_creating_output(self):
+        receipt = self.capture()
+        record = next(record for record in self.manifest()["entries"] if record["kind"] == "file")
+        (self.bundle / "payload" / record["object"]).write_bytes(b"x" * record["size"])
+        destination = self.root / "recovered"
+        with self.assertRaisesRegex(snapshot.SnapshotFailure, "digest"):
+            snapshot.materialize(self.bundle, destination, receipt["manifest_sha256"])
+        self.assertFalse(destination.exists())
+
+    def test_materialize_never_reuses_existing_output_or_live_source(self):
+        receipt = self.capture()
+        destination = self.root / "recovered"
+        destination.mkdir()
+        sentinel = destination / "beads.db-wal-cert"
+        sentinel.write_bytes(b"foreign generation")
+        for target in [destination, self.source, self.source / "new", self.bundle / "new"]:
+            with self.subTest(target=target), self.assertRaises((snapshot.SnapshotFailure, FileExistsError)):
+                snapshot.materialize(self.bundle, target, receipt["manifest_sha256"])
+        self.assertEqual(sentinel.read_bytes(), b"foreign generation")
+        self.assertFalse((self.source / "new").exists())
+
+    def test_materialize_does_not_touch_a_new_live_generation(self):
+        before = self.witness()
+        receipt = self.capture()
+        self.source.rename(self.repo / "retained-old")
+        self.source.mkdir()
+        sentinel = self.source / "beads.db-wal-cert"
+        sentinel.write_bytes(b"new live generation must remain separate")
+        current = self.witness()
+        destination = self.root / "recovered"
+        snapshot.materialize(self.bundle, destination, receipt["manifest_sha256"])
+        self.assertEqual(current, self.witness())
+        self.assertEqual((destination / "data" / "beads.db-wal-cert").read_bytes(), before[b"beads.db-wal-cert"][1])
+
+    def test_interrupted_materialization_retains_partial_output_without_receipt(self):
+        receipt = self.capture()
+        original = snapshot.stream
+        destination = self.root / "recovered"
+        writes = 0
+
+        def fail(file, size, budget, target=None):
+            nonlocal writes
+            if target is not None:
+                writes += 1
+                if writes == 2:
+                    raise OSError("injected recovery write failure")
+            return original(file, size, budget, target)
+
+        with mock.patch.object(snapshot, "stream", side_effect=fail), self.assertRaises(OSError):
+            snapshot.materialize(self.bundle, destination, receipt["manifest_sha256"])
+        self.assertTrue((destination / "data").exists())
+        self.assertFalse((destination / "recovery.json").exists())
+        snapshot.verify(self.bundle, receipt["manifest_sha256"])
+
+    def test_materialization_readback_detects_bad_destination_bytes(self):
+        receipt = self.capture()
+        original = snapshot.stream
+        destination = self.root / "recovered"
+
+        def corrupt(file, size, budget, target=None):
+            result = original(file, size, budget, target)
+            if target is not None and size:
+                os.pwrite(target, b"X", 0)
+            return result
+
+        with mock.patch.object(snapshot, "stream", side_effect=corrupt), self.assertRaisesRegex(snapshot.SnapshotFailure, "materialized_digest"):
+            snapshot.materialize(self.bundle, destination, receipt["manifest_sha256"])
+        self.assertFalse((destination / "recovery.json").exists())
+
+    def test_bundle_change_after_preflight_cannot_publish_recovery_receipt(self):
+        receipt = self.capture()
+        original = snapshot.stream
+        destination = self.root / "recovered"
+
+        def add(file, size, budget, target=None):
+            result = original(file, size, budget, target)
+            if target is not None:
+                (self.bundle / "unexpected").write_bytes(b"bundle changed")
+            return result
+
+        with mock.patch.object(snapshot, "stream", side_effect=add), self.assertRaisesRegex(snapshot.SnapshotFailure, "bundle_changed"):
+            snapshot.materialize(self.bundle, destination, receipt["manifest_sha256"])
+        self.assertFalse((destination / "recovery.json").exists())
+
+    def test_materialization_failure_never_marks_partial_output_complete(self):
+        receipt = self.capture()
+        destination = self.root / "recovered"
+        with mock.patch.object(snapshot.os, "fsync", side_effect=OSError("sync failed")), self.assertRaises(OSError):
+            snapshot.materialize(self.bundle, destination, receipt["manifest_sha256"])
+        self.assertFalse((destination / "recovery.json").exists())
+
+    def test_empty_directory_can_be_captured_and_materialized(self):
+        source = self.root / "empty"
+        source.mkdir()
+        receipt = snapshot.capture(source, self.bundle, writers_stopped=True, max_bytes=0)
+        result = snapshot.materialize(self.bundle, self.root / "recovered", receipt["manifest_sha256"], max_bytes=0)
+        self.assertEqual(result["files"], 0)
+        self.assertEqual(list(Path(result["data_directory"]).iterdir()), [])
+
+    def git(self, directory, *args, success=True):
+        env = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
+        env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                   GIT_TERMINAL_PROMPT="0", LC_ALL="C")
+        result = subprocess.run(["git", "-c", f"core.hooksPath={os.devnull}",
+                                 "-c", "core.fsmonitor=false", "-c", "user.name=Fixture",
+                                 "-c", "user.email=fixture@localhost", *args],
+                                cwd=directory, env=env, capture_output=True, timeout=10)
+        if success:
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        return result
+
+    def sqlite_writer(self, path, sentinel, initialize=False):
+        # A separate process deliberately leaves a committed WAL without close's
+        # checkpoint. It has exited before capture: there is no active writer.
+        program = '''
+import os, sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("PRAGMA journal_mode=WAL")
+c.execute("PRAGMA wal_autocheckpoint=0")
+if sys.argv[3] == "yes":
+    c.execute("CREATE TABLE issues (title TEXT)")
+    c.commit()
+    c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+c.execute("INSERT INTO issues VALUES (?)", (sys.argv[2],))
+c.commit()
+os._exit(0)
+'''
+        result = subprocess.run([sys.executable, "-c", program, str(path), sentinel,
+                                 "yes" if initialize else "no"], capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+
+    def snapshot_cli(self, *args):
+        result = subprocess.run([sys.executable, str(SCRIPT), *map(str, args)],
+                                capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout.decode(errors="replace") + result.stderr.decode(errors="replace"))
+        return json.loads(result.stdout)
+
+    def two_clone_recovery(self, dirty):
+        author = self.root / "author"
+        author.mkdir()
+        self.git(author, "init", "-b", "main")
+        tracker = author / ".beads"
+        tracker.mkdir()
+        seed = "seed committed only in WAL"
+        self.sqlite_writer(tracker / "beads.db", seed, initialize=True)
+        self.assertNotIn(seed.encode(), (tracker / "beads.db").read_bytes())
+        self.assertIn(seed.encode(), (tracker / "beads.db-wal").read_bytes())
+        # These are opaque preservation sentinels, NOT FrankenSQLite certificates.
+        (tracker / "beads.db-wal-cert").write_bytes(b"author certificate sentinel")
+        (tracker / "beads.db-wal-cert-head").write_bytes(b"author certificate-head sentinel")
+        (tracker / "issues.jsonl").write_bytes(b"{\"shared\":true}\n")
+        self.git(author, "add", ".beads")
+        self.git(author, "commit", "-m", "synthetic tracked runtime")
+        peer = self.root / "peer"
+        self.git(self.root, "clone", "--no-local", str(author), str(peer))
+        local = peer / ".beads"
+        local_seed = "peer-only committed work must not be replaced by author data"
+        if dirty:
+            self.sqlite_writer(local / "beads.db", local_seed)
+            (local / "beads.db-wal-cert").write_bytes(b"peer-specific certificate sentinel")
+        local_before = {path.name: path.read_bytes() for path in local.iterdir()}
+        index_before = (peer / ".git" / "index").read_bytes()
+        head_before = self.git(peer, "rev-parse", "HEAD").stdout
+        saved = self.root / "peer-backup"
+        receipt = self.snapshot_cli("capture", local, saved, "--writers-stopped")
+        self.assertEqual(index_before, (peer / ".git" / "index").read_bytes())
+        self.assertEqual(head_before, self.git(peer, "rev-parse", "HEAD").stdout)
+        self.assertEqual(local_before, {path.name: path.read_bytes() for path in local.iterdir()})
+        runtime = sorted(".beads/" + name for name in local_before if name != "issues.jsonl")
+        # Only this disposable fixture driver mutates Git, never the tool.
+        self.git(author, "rm", "--cached", "--", *runtime)
+        (tracker / ".gitignore").write_bytes(b"beads.db*\n")
+        self.git(author, "add", ".beads/.gitignore")
+        self.git(author, "commit", "-m", "synthetic runtime untracking")
+        self.git(peer, "fetch", "origin")
+        attempt = self.git(peer, "merge", "--ff-only", "origin/main", success=False)
+        if dirty:
+            self.assertNotEqual(attempt.returncode, 0, "dirty tracked WAL must obstruct the naive update")
+            self.assertEqual(local_before, {path.name: path.read_bytes() for path in local.iterdir()})
+            # Model an operator retaining the stopped original before updating.
+            # No reset/clean or destruction of the peer generation is used.
+            local.rename(self.root / "peer-original-retained")
+            self.git(peer, "merge", "--ff-only", "origin/main")
+        else:
+            self.assertEqual(attempt.returncode, 0, attempt.stderr.decode(errors="replace"))
+        self.assertFalse((local / "beads.db").exists(), "Git actually removes the tracked peer database")
+        self.assertFalse((local / "beads.db-wal-cert").exists())
+        self.snapshot_cli("verify", saved, "--manifest-sha256", receipt["manifest_sha256"])
+        restored = self.snapshot_cli("materialize", saved, self.root / "peer-recovered",
+                                     "--manifest-sha256", receipt["manifest_sha256"])
+        data = Path(restored["data_directory"])
+        self.assertEqual(local_before, {path.name: path.read_bytes() for path in data.iterdir()})
+        # Negative control: copying only main loses committed WAL-only rows.
+        main_only = self.root / "main-only.db"
+        main_only.write_bytes(local_before["beads.db"])
+        with sqlite3.connect(main_only) as control:
+            self.assertNotIn((seed,), control.execute("SELECT title FROM issues").fetchall())
+        with sqlite3.connect(data / "beads.db") as recovered:
+            rows = recovered.execute("SELECT title FROM issues ORDER BY title").fetchall()
+            self.assertEqual(rows, sorted([(seed,), (local_seed,)] if dirty else [(seed,)]))
+            self.assertEqual(recovered.execute("PRAGMA integrity_check").fetchall(), [("ok",)])
+        # Engine reads of the NEW recovery directory cannot change the bundle.
+        self.snapshot_cli("verify", saved, "--manifest-sha256", receipt["manifest_sha256"])
+
+    def test_two_clone_untracking_recovers_clean_peer_with_real_wal_only_work(self):
+        self.two_clone_recovery(False)
+
+    def test_two_clone_untracking_recovers_dirty_peer_without_mixing_generations(self):
+        self.two_clone_recovery(True)
 
 
 if __name__ == "__main__":

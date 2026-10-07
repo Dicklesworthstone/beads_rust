@@ -14,7 +14,7 @@ output for inspection; no existing path is overwritten or deleted.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import hashlib
 import json
 import math
@@ -54,13 +54,15 @@ class Budget:
 def platform_check() -> None:
     if (os.name != "posix" or not hasattr(os, "O_NOFOLLOW")
             or not {os.open, os.stat, os.mkdir}.issubset(os.supports_dir_fd)
-            or os.listdir not in os.supports_fd):
+            or os.scandir not in os.supports_fd):
         raise SnapshotFailure("descriptor_relative_filesystem_support_required")
 
 
 def absolute(path: Path) -> Path:
     if ".." in path.parts:
         raise SnapshotFailure("parent_traversal_refused")
+    if path.anchor == "//":
+        raise SnapshotFailure("ambiguous_double_slash_root")
     return Path(os.path.abspath(path))
 
 
@@ -108,6 +110,17 @@ def assert_bound(path: Path, fd: int) -> None:
             raise SnapshotFailure("directory_identity_changed")
 
 
+def directory_names(fd: int, budget: Budget, maximum: int) -> list[bytes]:
+    names = []
+    with os.scandir(fd) as scan:
+        for entry in scan:
+            budget.check()
+            if len(names) >= maximum:
+                raise SnapshotFailure("inventory_limit_exceeded")
+            names.append(os.fsencode(entry.name))
+    return sorted(names)
+
+
 def inventory(root: int, budget: Budget) -> dict[bytes, tuple[str, tuple[int, ...]]]:
     result: dict[bytes, tuple[str, tuple[int, ...]]] = {}
     device = os.fstat(root).st_dev
@@ -119,7 +132,7 @@ def inventory(root: int, budget: Budget) -> dict[bytes, tuple[str, tuple[int, ..
         if depth > MAX_DEPTH or len(result) >= MAX_ENTRIES:
             raise SnapshotFailure("inventory_limit_exceeded")
         result[prefix] = ("directory", identity(os.fstat(fd)))
-        for name in sorted(os.fsencode(name) for name in os.listdir(fd)):
+        for name in directory_names(fd, budget, MAX_ENTRIES - len(result)):
             budget.check()
             if depth >= MAX_DEPTH:
                 raise SnapshotFailure("inventory_limit_exceeded")
@@ -191,14 +204,27 @@ def new_file(parent: int, name: bytes):
 
 
 @contextmanager
-def external_output(path: Path, excluded: Path):
+def external_output(path: Path, excluded: Path, *also_excluded: Path):
     """Create once outside worktrees; never repurpose an existing directory."""
-    path, excluded = absolute(path), absolute(excluded)
-    if path == excluded or excluded in path.parents or path in excluded.parents:
-        raise SnapshotFailure("source_and_output_overlap")
+    path = absolute(path)
+    exclusions = [absolute(item) for item in (excluded, *also_excluded)]
+    protected = set()
+    for item in exclusions:
+        if path == item or item in path.parents or path in item.parents:
+            raise SnapshotFailure("source_and_output_overlap")
+        try:
+            with directory(item) as original:
+                info = os.fstat(original)
+                protected.add((info.st_dev, info.st_ino))
+        except FileNotFoundError:
+            # The recorded original may be gone after a Git transition.
+            continue
     with directory(path.parent) as parent:
         for ancestor in (path.parent, *path.parent.parents):
             with directory(ancestor) as fd:
+                info = os.fstat(fd)
+                if (info.st_dev, info.st_ino) in protected:
+                    raise SnapshotFailure("source_and_output_overlap")
                 try:
                     os.stat(b".git", dir_fd=fd, follow_symlinks=False)
                 except FileNotFoundError:
@@ -283,7 +309,7 @@ def unique_members(pairs):
     return result
 
 
-def manifest_entries(raw: bytes, expected: str, budget: Budget) -> list[dict]:
+def parse_manifest(raw: bytes, expected: str, budget: Budget) -> tuple[list[dict], Path]:
     if not isinstance(expected, str) or not DIGEST.fullmatch(expected):
         raise SnapshotFailure("trusted_manifest_sha256_required")
     if hashlib.sha256(raw).hexdigest() != expected:
@@ -326,7 +352,8 @@ def manifest_entries(raw: bytes, expected: str, budget: Budget) -> list[dict]:
                 if total > budget.max_bytes:
                     raise SnapshotFailure("byte_limit_exceeded")
             seen[path] = kind
-        return entries
+        source = Path(os.fsdecode(bytes.fromhex(document["source_path_hex"])))
+        return entries, absolute(source)
     except (KeyError, TypeError, ValueError, RecursionError) as error:
         raise SnapshotFailure("invalid_manifest") from error
 
@@ -335,7 +362,7 @@ def manifest_entries(raw: bytes, expected: str, budget: Budget) -> list[dict]:
 def verified_bundle(bundle: Path, expected: str, budget: Budget):
     with directory(bundle) as root:
         before = identity(os.fstat(root))
-        if set(os.listdir(root)) != {"manifest.json", "payload"}:
+        if set(directory_names(root, budget, 2)) != {b"manifest.json", b"payload"}:
             raise SnapshotFailure("incomplete_or_unexpected_bundle_members")
         with member(root, b"manifest.json") as file:
             info = os.fstat(file)
@@ -345,18 +372,18 @@ def verified_bundle(bundle: Path, expected: str, budget: Budget):
                 raw = reader.read(MANIFEST_LIMIT + 1)
             if identity(os.fstat(file)) != identity(info):
                 raise SnapshotFailure("manifest_changed")
-        entries = manifest_entries(raw, expected, budget)
+        entries, source = parse_manifest(raw, expected, budget)
         with member(root, b"payload", is_directory=True) as payload:
             payload_before = identity(os.fstat(payload))
             objects = {record["object"] for record in entries if record["kind"] == "file"}
-            if set(os.listdir(payload)) != objects:
+            if set(directory_names(payload, budget, len(objects))) != {name.encode() for name in objects}:
                 raise SnapshotFailure("payload_inventory_mismatch")
             for record in entries:
                 if record["kind"] == "file":
                     with member(payload, record["object"].encode()) as saved:
                         if stream(saved, record["size"], budget) != record["sha256"]:
                             raise SnapshotFailure("payload_digest_mismatch")
-            yield entries, payload
+            yield entries, payload, source
             budget.check()
             if identity(os.fstat(root)) != before or identity(os.fstat(payload)) != payload_before:
                 raise SnapshotFailure("bundle_changed")
@@ -366,11 +393,81 @@ def verified_bundle(bundle: Path, expected: str, budget: Budget):
 def verify(bundle: Path, expected: str, *, timeout: float = 300,
            max_bytes: int = 4 * 1024**3) -> dict:
     platform_check()
-    with verified_bundle(bundle, expected, Budget(timeout, max_bytes)) as (entries, _):
+    with verified_bundle(bundle, expected, Budget(timeout, max_bytes)) as (entries, _, _source):
         result = {"status": "verified", "manifest_sha256": expected,
                   "files": sum(record["kind"] == "file" for record in entries),
                   "bytes": sum(record.get("size", 0) for record in entries),
                   "engine_validated": False}
+    return result
+
+
+def verify_materialized(data: int, entries: list[dict], budget: Budget) -> None:
+    before = inventory(data, budget)
+    expected_paths = {bytes.fromhex(record["path_hex"]): record for record in entries}
+    if before.keys() != expected_paths.keys():
+        raise SnapshotFailure("materialized_inventory_mismatch")
+    for path, record in expected_paths.items():
+        if before[path][0] != record["kind"]:
+            raise SnapshotFailure("materialized_kind_mismatch")
+        if record["kind"] == "file":
+            with member(data, path) as file:
+                if stream(file, record["size"], budget) != record["sha256"]:
+                    raise SnapshotFailure("materialized_digest_mismatch")
+    if inventory(data, budget) != before:
+        raise SnapshotFailure("materialized_directory_changed")
+
+
+def materialize(bundle: Path, destination: Path, expected: str, *,
+                timeout: float = 300, max_bytes: int = 4 * 1024**3) -> dict:
+    """Recover an indivisible snapshot to NEW private output, never a live tree.
+
+    Validate every object before creating output, then hash again while copying
+    and read back the entire result. A recovery receipt is written only after
+    bundle verification and data synchronization have finished. On failure the
+    incomplete destination remains; retries must choose a different new path.
+    Ownership, ACLs, xattrs and timestamps are intentionally not reinstated.
+    Files are 0600 and directories 0700, regardless of recorded original modes.
+    """
+    platform_check()
+    budget = Budget(timeout, max_bytes)
+    destination = absolute(destination)
+    with ExitStack() as outputs:
+        with verified_bundle(bundle, expected, budget) as (entries, payload, source):
+            if destination == source or source in destination.parents or destination in source.parents:
+                raise SnapshotFailure("source_and_output_overlap")
+            output = outputs.enter_context(external_output(destination, bundle, source))
+            os.mkdir(b"data", 0o700, dir_fd=output)
+            with member(output, b"data", is_directory=True) as data:
+                for record in entries[1:]:
+                    budget.check()
+                    path = bytes.fromhex(record["path_hex"])
+                    parent_path, _, name = path.rpartition(b"/")
+                    with member(data, parent_path, is_directory=True) as parent:
+                        if record["kind"] == "directory":
+                            os.mkdir(name, 0o700, dir_fd=parent)
+                        else:
+                            with member(payload, record["object"].encode()) as saved, new_file(parent, name) as restored:
+                                digest = stream(saved, record["size"], budget, restored)
+                                if digest != record["sha256"]:
+                                    raise SnapshotFailure("payload_changed_during_materialization")
+                        os.fsync(parent)
+                verify_materialized(data, entries, budget)
+                # Synchronize children before their directory entries/parents.
+                for record in reversed(entries):
+                    if record["kind"] == "directory":
+                        with member(data, bytes.fromhex(record["path_hex"]), is_directory=True) as child:
+                            os.fsync(child)
+                assert_bound(destination / "data", data)
+        # Exit verified_bundle BEFORE publishing a success receipt.
+        budget.check()
+        result = {"schema": "br.runtime-materialization.v1", "status": "materialized",
+                  "manifest_sha256": expected, "data_directory": str(destination / "data"),
+                  "files": sum(record["kind"] == "file" for record in entries),
+                  "bytes": sum(record.get("size", 0) for record in entries),
+                  "permissions": "private_0700_0600", "engine_validated": False,
+                  "live_installation_performed": False}
+        with new_file(output, b"recovery.json") as receipt:
+            write_all(receipt, encode_manifest(result))
     return result
 
 
@@ -384,7 +481,11 @@ def main(argv: list[str] | None = None) -> int:
     check = commands.add_parser("verify", help="verify against the separately retained receipt")
     check.add_argument("bundle", type=Path)
     check.add_argument("--manifest-sha256", required=True)
-    for command in (pack, check):
+    restore = commands.add_parser("materialize", help="recover the whole bundle to a NEW external directory")
+    restore.add_argument("bundle", type=Path)
+    restore.add_argument("destination", type=Path)
+    restore.add_argument("--manifest-sha256", required=True)
+    for command in (pack, check, restore):
         command.add_argument("--timeout", type=float, default=300)
         command.add_argument("--max-bytes", type=int, default=4 * 1024**3)
     args = parser.parse_args(argv)
@@ -392,6 +493,8 @@ def main(argv: list[str] | None = None) -> int:
         options = {"timeout": args.timeout, "max_bytes": args.max_bytes}
         if args.command == "capture":
             result = capture(args.source, args.bundle, writers_stopped=args.writers_stopped, **options)
+        elif args.command == "materialize":
+            result = materialize(args.bundle, args.destination, args.manifest_sha256, **options)
         else:
             result = verify(args.bundle, args.manifest_sha256, **options)
     except (SnapshotFailure, OSError) as error:
