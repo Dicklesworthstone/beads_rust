@@ -22,6 +22,6 @@ pub mod sqlite;
 pub(crate) use search::unicode_issue_fields_match;
 pub(crate) use sqlite::{BulkDependencyInsert, ChangelogIssueRow};
 pub use sqlite::{
-    CloseMetadataRow, EventAttribution, IssueUpdate, LabelSetChanges, ListFilters, ReadyFilters,
-    ReadySortPolicy, SqliteStorage, StatsIssueRow,
+    CloseMetadataRow, EventAttribution, IssueUpdate, LabelSetChanges, LabelUpdate, ListFilters,
+    ReadyFilters, ReadySortPolicy, SqliteStorage, StatsIssueRow,
 };

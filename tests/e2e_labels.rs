@@ -4,6 +4,7 @@
 
 mod common;
 
+use beads_rust::storage::SqliteStorage;
 use common::cli::{BrWorkspace, extract_json_payload, run_br};
 use common::dataset_registry::isolated_beads_rust_replay;
 use common::harness::{
@@ -1335,6 +1336,398 @@ fn e2e_update_reports_label_changes() {
         labels,
         vec!["api".to_string(), "urgent".to_string()],
         "labels: {labels:?}"
+    );
+}
+
+fn prospective_label_workspace() -> BrWorkspace {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "prospective_labels_init");
+    assert!(init.status.success(), "{init:?}");
+    std::fs::write(
+        workspace.root.join(".beads/policy.yaml"),
+        r#"workflow:
+  strict: true
+  statuses: [open, in_progress, closed]
+  gates:
+    "open -> in_progress":
+      require_if:
+        - label: security
+          gate: security_review
+"#,
+    )
+    .expect("write conditional-label policy");
+    workspace
+}
+
+fn prospective_label_issue(workspace: &BrWorkspace, title: &str, labels: &str) -> String {
+    let title = format!("Label fixture: {title}");
+    let created = run_br(
+        workspace,
+        ["create", &title, "--labels", labels, "--json"],
+        "prospective_labels_create",
+    );
+    assert!(created.status.success(), "{created:?}");
+    let issue: Value = serde_json::from_str(&extract_json_payload(&created.stdout)).unwrap();
+    issue["id"].as_str().unwrap().to_owned()
+}
+
+/// Include every persistent table and the published export, so a refused
+/// combined update cannot leave scalar, label, event, comment, or dirty changes.
+fn prospective_label_snapshot(
+    workspace: &BrWorkspace,
+) -> (std::collections::BTreeMap<String, String>, Vec<u8>) {
+    use beads_rust::franken_sync::SqliteValue;
+    use beads_rust::franken_sync::compat::{OpenFlags, open_with_flags};
+
+    let connection = open_with_flags(
+        &workspace.root.join(".beads/beads.db").to_string_lossy(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let mut tables = std::collections::BTreeMap::new();
+    for row in connection
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .unwrap()
+    {
+        let name = row.get(0).and_then(SqliteValue::as_text).unwrap();
+        let sql = format!(
+            "SELECT * FROM \"{}\" ORDER BY rowid",
+            name.replace('"', "\"\"")
+        );
+        tables.insert(
+            name.to_owned(),
+            format!("{:?}", connection.query(&sql).unwrap()),
+        );
+    }
+    connection.close().unwrap();
+    let jsonl = std::fs::read(workspace.root.join(".beads/issues.jsonl")).unwrap();
+    (tables, jsonl)
+}
+
+fn assert_prospective_label_refusal(
+    workspace: &BrWorkspace,
+    args: &[&str],
+    expected_exit: i32,
+    expected_code: &str,
+) {
+    let before = prospective_label_snapshot(workspace);
+    let mut args = args.to_vec();
+    args.push("--json");
+    let refused = run_br(workspace, args, "prospective_labels_refused");
+    assert_eq!(refused.status.code(), Some(expected_exit), "{refused:?}");
+    let error: Value = serde_json::from_str(&extract_json_payload(&refused.stdout)).unwrap();
+    assert_eq!(error["error"]["code"], expected_code, "{error}");
+    if expected_code == "POLICY_VIOLATION" {
+        assert!(
+            error["error"]["context"]["violations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|violation| violation["gate"] == "gate_security_review"),
+            "{error}"
+        );
+    }
+    assert_eq!(prospective_label_snapshot(workspace), before);
+}
+
+fn report_prospective_label_gate(workspace: &BrWorkspace, id: &str) {
+    // Gate reports require the condition to be applicable at report time.
+    // Label edits preserve the source status revision, so this genuine pass
+    // remains usable when the tested request re-adds security and transitions.
+    let labelled = run_br(
+        workspace,
+        ["label", "add", id, "security"],
+        "prospective_labels_gate_applicable",
+    );
+    assert!(labelled.status.success(), "{labelled:?}");
+    let reported = run_br(
+        workspace,
+        [
+            "gate",
+            "report",
+            id,
+            "--gate",
+            "security_review",
+            "--provider",
+            "ci",
+            "--status",
+            "pass",
+            "--to",
+            "in_progress",
+            "--json",
+        ],
+        "prospective_labels_gate",
+    );
+    assert!(reported.status.success(), "{reported:?}");
+    let restored = run_br(
+        workspace,
+        ["label", "remove", id, "security"],
+        "prospective_labels_gate_remove_condition",
+    );
+    assert!(restored.status.success(), "{restored:?}");
+}
+
+#[test]
+fn e2e_update_prospective_labels_add_and_set_require_conditional_gate() {
+    let workspace = prospective_label_workspace();
+    for operation in ["--add-label", "--set-labels"] {
+        let id = prospective_label_issue(&workspace, operation, "seed");
+        assert_prospective_label_refusal(
+            &workspace,
+            &[
+                "update",
+                &id,
+                "--status",
+                "in_progress",
+                "--title",
+                "Must remain unchanged",
+                "--priority",
+                "0",
+                "--transition-comment",
+                "Must not be recorded",
+                operation,
+                "security",
+            ],
+            4,
+            "POLICY_VIOLATION",
+        );
+    }
+}
+
+#[test]
+fn e2e_update_prospective_labels_removal_and_clear_admit_final_labels() {
+    let workspace = prospective_label_workspace();
+    for (operation, value, expected) in [
+        ("--remove-label", "security", vec!["seed"]),
+        ("--set-labels", ",", Vec::new()),
+    ] {
+        let id = prospective_label_issue(&workspace, operation, "security,seed");
+        let updated = run_br(
+            &workspace,
+            [
+                "update",
+                &id,
+                "--status",
+                "in_progress",
+                "--transition-comment",
+                "Final labels do not require security review",
+                operation,
+                value,
+                "--json",
+            ],
+            "prospective_labels_removed",
+        );
+        assert!(updated.status.success(), "{updated:?}");
+        let storage = SqliteStorage::open(&workspace.root.join(".beads/beads.db")).unwrap();
+        assert_eq!(
+            storage.get_issue(&id).unwrap().unwrap().status.as_str(),
+            "in_progress"
+        );
+        assert_eq!(storage.get_labels(&id).unwrap(), expected);
+        assert_eq!(storage.get_comments(&id).unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn e2e_update_prospective_labels_batch_rolls_back_until_all_gates_pass() {
+    let workspace = prospective_label_workspace();
+    let first = prospective_label_issue(&workspace, "Gate already passed", "seed");
+    let second = prospective_label_issue(&workspace, "Gate missing", "seed");
+    report_prospective_label_gate(&workspace, &first);
+    let args = [
+        "update",
+        &first,
+        &second,
+        "--status",
+        "in_progress",
+        "--title",
+        "Atomic batch title",
+        "--add-label",
+        "security",
+        "--transition-comment",
+        "Batch admitted together",
+    ];
+    assert_prospective_label_refusal(&workspace, &args, 4, "POLICY_VIOLATION");
+    report_prospective_label_gate(&workspace, &second);
+    let accepted = run_br(&workspace, args, "prospective_labels_batch_accepted");
+    assert!(accepted.status.success(), "{accepted:?}");
+    let storage = SqliteStorage::open(&workspace.root.join(".beads/beads.db")).unwrap();
+    for id in [&first, &second] {
+        let issue = storage.get_issue(id).unwrap().unwrap();
+        assert_eq!(issue.status.as_str(), "in_progress");
+        assert_eq!(issue.title, "Atomic batch title");
+        assert_eq!(storage.get_labels(id).unwrap(), vec!["security", "seed"]);
+        assert_eq!(storage.get_comments(id).unwrap().len(), 1);
+        assert_eq!(
+            storage
+                .get_events(id, 0)
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == beads_rust::model::EventType::StatusChanged)
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn e2e_update_prospective_labels_overflow_preserves_whole_request() {
+    let workspace = prospective_label_workspace();
+    let labels = (0..64)
+        .map(|index| format!("label-{index:02}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let first = prospective_label_issue(&workspace, "Room for one more", "seed");
+    let full = prospective_label_issue(&workspace, "Already at label limit", &labels);
+    assert_prospective_label_refusal(
+        &workspace,
+        &[
+            "update",
+            &first,
+            &full,
+            "--status",
+            "in_progress",
+            "--title",
+            "Must not partially update",
+            "--add-label",
+            "overflow",
+            "--transition-comment",
+            "Must not partially comment",
+        ],
+        4,
+        "VALIDATION_FAILED",
+    );
+}
+
+#[test]
+fn e2e_update_prospective_labels_stale_token_preserves_whole_request() {
+    let workspace = prospective_label_workspace();
+    let id = prospective_label_issue(&workspace, "Guarded update", "seed");
+    let shown = run_br(
+        &workspace,
+        ["show", &id, "--json"],
+        "prospective_labels_token",
+    );
+    assert!(shown.status.success(), "{shown:?}");
+    let issue: Value = serde_json::from_str(&extract_json_payload(&shown.stdout)).unwrap();
+    let token = issue[0]["updated_at"].as_str().unwrap();
+    let moved = run_br(
+        &workspace,
+        ["update", &id, "--priority", "1"],
+        "prospective_labels_new_revision",
+    );
+    assert!(moved.status.success(), "{moved:?}");
+    assert_prospective_label_refusal(
+        &workspace,
+        &[
+            "update",
+            &id,
+            "--status",
+            "in_progress",
+            "--title",
+            "Stale title",
+            "--set-labels",
+            "replacement",
+            "--transition-comment",
+            "Stale transition",
+            "--if-unchanged",
+            token,
+        ],
+        6,
+        "UPDATE_PRECONDITION_FAILED",
+    );
+}
+
+#[test]
+fn e2e_update_prospective_labels_true_noop_and_net_receipts_keep_order() {
+    let workspace = prospective_label_workspace();
+    let id = prospective_label_issue(&workspace, "Composed label updates", "seed");
+    let before = prospective_label_snapshot(&workspace);
+    let noop = run_br(
+        &workspace,
+        [
+            "update",
+            &id,
+            "--add-label",
+            "seed",
+            "--remove-label",
+            "absent",
+            "--set-labels",
+            "seed",
+        ],
+        "prospective_labels_noop",
+    );
+    assert!(noop.status.success(), "{noop:?}");
+    assert!(!noop.stdout.contains("labels:"), "{noop:?}");
+    assert_eq!(prospective_label_snapshot(&workspace), before);
+
+    // Real add/remove operations retain their audit events even when their
+    // net human receipt is empty. They are distinct from the true no-op above.
+    let label_event_count = || {
+        let storage = SqliteStorage::open(&workspace.root.join(".beads/beads.db")).unwrap();
+        storage
+            .get_events(&id, 0)
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type,
+                    beads_rust::model::EventType::LabelAdded
+                        | beads_rust::model::EventType::LabelRemoved
+                )
+            })
+            .count()
+    };
+    let events_before = label_event_count();
+    let cancelled = run_br(
+        &workspace,
+        [
+            "update",
+            &id,
+            "--add-label",
+            "temporary",
+            "--remove-label",
+            "temporary",
+        ],
+        "prospective_labels_cancelled_receipt",
+    );
+    assert!(cancelled.status.success(), "{cancelled:?}");
+    assert!(!cancelled.stdout.contains("labels:"), "{cancelled:?}");
+    assert_eq!(label_event_count(), events_before + 2);
+
+    let composed = run_br(
+        &workspace,
+        [
+            "update",
+            &id,
+            "--priority",
+            "0",
+            "--add-label",
+            "zeta",
+            "--add-label",
+            "alpha",
+            "--remove-label",
+            "seed",
+            "--set-labels",
+            "gamma,zeta",
+        ],
+        "prospective_labels_receipt",
+    );
+    assert!(composed.status.success(), "{composed:?}");
+    let labels: Vec<_> = composed
+        .stdout
+        .lines()
+        .filter(|line| line.trim_start().starts_with("labels:"))
+        .map(str::trim)
+        .collect();
+    assert_eq!(labels, ["labels: +zeta +gamma -seed"]);
+    assert!(
+        composed.stdout.contains("priority: P2 → P0"),
+        "{composed:?}"
+    );
+    assert_eq!(
+        labels_of(&workspace, &id, "prospective_labels_final"),
+        vec!["gamma", "zeta"]
     );
 }
 

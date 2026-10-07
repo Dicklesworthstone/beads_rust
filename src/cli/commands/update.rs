@@ -15,7 +15,7 @@ use crate::format::{format_status_label, format_type_label, sanitize_terminal_in
 use crate::model::acceptance::{AcceptanceCriteriaOutput, AcceptanceEdit, plan_acceptance_edit};
 use crate::model::{Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
-use crate::storage::{EventAttribution, IssueUpdate, LabelSetChanges, SqliteStorage};
+use crate::storage::{EventAttribution, IssueUpdate, LabelSetChanges, LabelUpdate, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::LabelValidator;
@@ -862,7 +862,7 @@ fn execute_prepared_route_with_resources(
         || !matches!(prepared.resolved_parent, ParentUpdatePlan::Unchanged);
     let parent_changes_cache = !matches!(prepared.resolved_parent, ParentUpdatePlan::Unchanged);
 
-    // Snapshot every row before the atomic field-update transaction. Human
+    // Snapshot every row before the atomic field/label transaction. Human
     // diffs are derived from these validated snapshots, preserving the #256
     // defense while allowing the whole status batch to commit or roll back as
     // one unit.
@@ -876,6 +876,34 @@ fn execute_prepared_route_with_resources(
             issue_before_result,
         )?;
         issues_before.insert(id.clone(), issue_before);
+    }
+
+    let label_update = (!prepared.add_labels.is_empty()
+        || !prepared.remove_labels.is_empty()
+        || prepared.set_labels)
+        .then(|| LabelUpdate {
+            add: prepared.add_labels.clone(),
+            remove: prepared.remove_labels.clone(),
+            set: prepared
+                .set_labels
+                .then(|| prepared.valid_set_labels.clone()),
+        });
+    // Human receipts use the validated pre-write snapshot and the same
+    // ordered label plan that storage applies. This read is only for display;
+    // policy admission and writes use the live labels inside the transaction.
+    let mut label_diffs = HashMap::new();
+    if use_human_output && let Some(labels) = &label_update {
+        let mut labels_before = prepared
+            .storage_ctx
+            .storage
+            .get_labels_for_issues(&prepared.resolved_ids)?;
+        for id in &prepared.resolved_ids {
+            let before = labels_before.remove(id).unwrap_or_default();
+            let (_, changes) = labels.project(&before)?;
+            let mut diff = UpdateDiff::default();
+            diff.record_label_set(&changes);
+            label_diffs.insert(id.clone(), diff);
+        }
     }
 
     // Acceptance-checklist edits are per issue (each was planned from that
@@ -897,8 +925,15 @@ fn execute_prepared_route_with_resources(
     let has_notes_writes = notes_appends.values().any(|plan| plan.output.applied);
 
     let mut capacity_warnings = Vec::new();
-    if !prepared.update.is_empty() || has_acceptance_writes || has_notes_writes {
+    if !prepared.update.is_empty()
+        || has_acceptance_writes
+        || has_notes_writes
+        || label_update.is_some()
+    {
         let mut issue_update = prepared.update.clone();
+        if label_update.is_some() {
+            issue_update.labels.clone_from(&label_update);
+        }
         issue_update.skip_cache_rebuild = defer_blocked_cache_rebuild;
         let atomic_updates = prepared
             .resolved_ids
@@ -941,66 +976,7 @@ fn execute_prepared_route_with_resources(
 
     for id in &prepared.resolved_ids {
         let issue_before = issues_before.remove(id).flatten();
-        // Net label change for the human receipt (GitHub #527), built from
-        // what each label write reports it actually changed.
-        let mut label_diff = UpdateDiff::default();
-
-        // Apply labels
-        for label in &prepared.add_labels {
-            let add_label_result = retry_mutation_with_jsonl_recovery(
-                &mut prepared.storage_ctx,
-                !route_has_mutated,
-                "update label add",
-                Some(id.as_str()),
-                |storage| storage.add_label(id, label, &prepared.actor),
-            );
-            let added = preserve_blocked_cache_on_error(
-                &mut prepared.storage_ctx.storage,
-                blocked_cache_dirty,
-                "update",
-                add_label_result,
-            )?;
-            if added {
-                label_diff.record_label_added(label);
-            }
-            route_has_mutated = true;
-        }
-        for label in &prepared.remove_labels {
-            let remove_label_result = retry_mutation_with_jsonl_recovery(
-                &mut prepared.storage_ctx,
-                !route_has_mutated,
-                "update label remove",
-                Some(id.as_str()),
-                |storage| storage.remove_label(id, label, &prepared.actor),
-            );
-            let removed = preserve_blocked_cache_on_error(
-                &mut prepared.storage_ctx.storage,
-                blocked_cache_dirty,
-                "update",
-                remove_label_result,
-            )?;
-            if removed {
-                label_diff.record_label_removed(label);
-            }
-            route_has_mutated = true;
-        }
-        if prepared.set_labels {
-            let set_labels_result = retry_mutation_with_jsonl_recovery(
-                &mut prepared.storage_ctx,
-                !route_has_mutated,
-                "update label set",
-                Some(id.as_str()),
-                |storage| storage.set_labels(id, &prepared.valid_set_labels, &prepared.actor),
-            );
-            let changes = preserve_blocked_cache_on_error(
-                &mut prepared.storage_ctx.storage,
-                blocked_cache_dirty,
-                "update",
-                set_labels_result,
-            )?;
-            label_diff.record_label_set(&changes);
-            route_has_mutated = true;
-        }
+        let label_diff = label_diffs.remove(id).unwrap_or_default();
 
         // Apply parent
         let parent_result = apply_parent_update(
@@ -1952,6 +1928,7 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
         delete_reason: None,
         transition_comment: args.transition_comment.clone(),
         workflow_policy_bypass_reason: None,
+        labels: None,
         skip_cache_rebuild: false,
         expect_unassigned: args.claim,
         claim_exclusive: args.claim && claim_exclusive,
@@ -3900,11 +3877,9 @@ because downstream tooling links to them.\n\n- [ ] schema migration applied\n\
     }
 
     #[test]
-    fn test_execute_prepared_route_repairs_blocked_cache_after_late_update_error() {
+    fn test_execute_prepared_route_rolls_back_fields_when_labels_fail() {
         init_test_logging();
-        info!(
-            "test_execute_prepared_route_repairs_blocked_cache_after_late_update_error: starting"
-        );
+        info!("test_execute_prepared_route_rolls_back_fields_when_labels_fail: starting");
 
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
@@ -3982,7 +3957,9 @@ because downstream tooling links to them.\n\n- [ ] schema migration applied\n\
             routed_write_lock: RoutedWorkspaceWriteLock::local(),
         };
 
-        let ctx = OutputContext::from_flags(false, false, true);
+        // Machine output does not read labels for a human receipt, so the
+        // missing table fails inside the combined field/label transaction.
+        let ctx = OutputContext::from_flags(true, false, true);
         let err = execute_prepared_route(prepared, &ctx).expect_err("update should fail");
         assert!(
             !err.to_string().contains("failed to rebuild blocked cache"),
@@ -3996,18 +3973,16 @@ because downstream tooling links to them.\n\n- [ ] schema migration applied\n\
             .get_issue("bd-blocker")
             .expect("load blocker")
             .expect("blocker should still exist");
-        assert_eq!(blocker_after.status, Status::Closed);
+        assert_eq!(blocker_after.status, Status::Open);
         assert!(
-            !reopened
+            reopened
                 .storage
                 .get_blocked_ids()
-                .expect("blocked ids after repair")
+                .expect("blocked ids after rollback")
                 .contains("bd-blocked"),
-            "dependent issue should be unblocked after the blocker closed despite the later error"
+            "the refused label write must roll back the status and leave its dependent blocked"
         );
 
-        info!(
-            "test_execute_prepared_route_repairs_blocked_cache_after_late_update_error: assertions passed"
-        );
+        info!("test_execute_prepared_route_rolls_back_fields_when_labels_fail: assertions passed");
     }
 }

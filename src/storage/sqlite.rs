@@ -330,6 +330,75 @@ pub struct LabelSetChanges {
     pub removed: Vec<String>,
 }
 
+impl LabelSetChanges {
+    fn record_added(&mut self, label: &str) {
+        if let Some(position) = self.removed.iter().position(|value| value == label) {
+            self.removed.remove(position);
+        } else if !self.added.iter().any(|value| value == label) {
+            self.added.push(label.to_string());
+        }
+    }
+
+    fn record_removed(&mut self, label: &str) {
+        if let Some(position) = self.added.iter().position(|value| value == label) {
+            self.added.remove(position);
+        } else if !self.removed.iter().any(|value| value == label) {
+            self.removed.push(label.to_string());
+        }
+    }
+}
+
+/// Label operations committed with an issue update, in add/remove/set order.
+#[derive(Debug, Clone, Default)]
+pub struct LabelUpdate {
+    pub add: Vec<String>,
+    pub remove: Vec<String>,
+    pub set: Option<Vec<String>>,
+}
+
+impl LabelUpdate {
+    /// Project the final labels and operation-ordered net receipt without writes.
+    /// Intermediate additions obey the same cap as the stored operations, even
+    /// when a later removal or replacement would reduce the final count.
+    pub(crate) fn project(&self, current: &[String]) -> Result<(Vec<String>, LabelSetChanges)> {
+        let mut labels = current.to_vec();
+        let mut changes = LabelSetChanges::default();
+        for label in &self.add {
+            validate_storage_label(label)?;
+            if !labels.contains(label) {
+                if labels.len() >= ISSUE_LABEL_MAX_COUNT {
+                    return Err(label_count_error());
+                }
+                labels.push(label.clone());
+                changes.record_added(label);
+            }
+        }
+        for label in &self.remove {
+            validate_storage_label(label)?;
+            if labels.contains(label) {
+                labels.retain(|value| value != label);
+                changes.record_removed(label);
+            }
+        }
+        if let Some(requested) = &self.set {
+            let desired = dedupe_preserving_order(requested);
+            validate_storage_labels(&desired)?;
+            for label in &labels {
+                if !desired.contains(label) {
+                    changes.record_removed(label);
+                }
+            }
+            for label in &desired {
+                if !labels.contains(label) {
+                    changes.record_added(label);
+                }
+            }
+            labels = desired;
+        }
+        Ok((labels, changes))
+    }
+}
+
 /// Observed occupancy of one configured capacity (GitHub #384 phase 6).
 ///
 /// Produced by [`SqliteStorage::capacity_snapshot`] for the observability
@@ -7490,10 +7559,13 @@ impl SqliteStorage {
                     "SELECT label FROM labels WHERE issue_id = ? ORDER BY label",
                     &[SqliteValue::from(id.as_str())],
                 )?;
-                let labels = label_rows
+                let mut labels = label_rows
                     .iter()
                     .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
                     .collect::<Vec<_>>();
+                if let Some(update) = &update.labels {
+                    labels = update.project(&labels)?.0;
+                }
                 let priority = update.priority.map_or(issue.priority.0, |value| value.0);
                 let status_revision = Self::status_revision_in_tx(conn, id)?;
                 let results =
@@ -8170,7 +8242,7 @@ impl SqliteStorage {
         }
 
         if set_clauses.is_empty() {
-            return Ok(());
+            return Self::apply_label_update_in_tx(conn, ctx, id, updates.labels.as_ref());
         }
 
         // Update updated_at only when a stored field needs rewriting.
@@ -8245,6 +8317,26 @@ impl SqliteStorage {
 
         ctx.mark_dirty(id);
 
+        Self::apply_label_update_in_tx(conn, ctx, id, updates.labels.as_ref())
+    }
+
+    fn apply_label_update_in_tx(
+        conn: &Connection,
+        ctx: &mut MutationContext,
+        id: &str,
+        update: Option<&LabelUpdate>,
+    ) -> Result<()> {
+        if let Some(update) = update {
+            for label in &update.add {
+                Self::add_label_in_tx(conn, ctx, id, label)?;
+            }
+            for label in &update.remove {
+                Self::remove_label_in_tx(conn, ctx, id, label)?;
+            }
+            if let Some(labels) = &update.set {
+                Self::set_labels_in_tx(conn, ctx, id, labels)?;
+            }
+        }
         Ok(())
     }
 
@@ -13529,66 +13621,76 @@ impl SqliteStorage {
         validate_storage_label(label)?;
 
         self.mutate("add_label", actor, |conn, ctx| {
-            match Self::issue_status_in_tx(conn, issue_id)? {
-                Some(Status::Tombstone) => {
-                    return Err(BeadsError::Validation {
-                        field: "issue_id".to_string(),
-                        reason: format!("cannot add label to tombstone issue: {issue_id}"),
-                    });
-                }
-                Some(_) => {}
-                None => {
-                    return Err(BeadsError::IssueNotFound {
-                        id: issue_id.to_string(),
-                    });
-                }
-            }
-
-            let row = conn.query_row_with_params(
-                "SELECT count(*) FROM labels WHERE issue_id = ? AND label = ?",
-                &[SqliteValue::from(issue_id), SqliteValue::from(label)],
-            )?;
-            let exists = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
-
-            if exists > 0 {
-                return Ok(false);
-            }
-
-            let row = conn.query_row_with_params(
-                "SELECT count(*) FROM labels WHERE issue_id = ?",
-                &[SqliteValue::from(issue_id)],
-            )?;
-            let label_count = row
-                .get(0)
-                .and_then(SqliteValue::as_integer)
-                .and_then(|count| usize::try_from(count).ok())
-                .unwrap_or(usize::MAX);
-            if label_count >= ISSUE_LABEL_MAX_COUNT {
-                return Err(label_count_error());
-            }
-
-            conn.execute_with_params(
-                "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
-                &[SqliteValue::from(issue_id), SqliteValue::from(label)],
-            )?;
-
-            ctx.record_event(
-                EventType::LabelAdded,
-                issue_id,
-                Some(format!("Added label {label}")),
-            );
-            ctx.mark_dirty(issue_id);
-
-            conn.execute_with_params(
-                "UPDATE issues SET updated_at = ? WHERE id = ?",
-                &[
-                    SqliteValue::from(Utc::now().to_rfc3339()),
-                    SqliteValue::from(issue_id),
-                ],
-            )?;
-
-            Ok(true)
+            Self::add_label_in_tx(conn, ctx, issue_id, label)
         })
+    }
+
+    fn add_label_in_tx(
+        conn: &Connection,
+        ctx: &mut MutationContext,
+        issue_id: &str,
+        label: &str,
+    ) -> Result<bool> {
+        validate_storage_label(label)?;
+        match Self::issue_status_in_tx(conn, issue_id)? {
+            Some(Status::Tombstone) => {
+                return Err(BeadsError::Validation {
+                    field: "issue_id".to_string(),
+                    reason: format!("cannot add label to tombstone issue: {issue_id}"),
+                });
+            }
+            Some(_) => {}
+            None => {
+                return Err(BeadsError::IssueNotFound {
+                    id: issue_id.to_string(),
+                });
+            }
+        }
+
+        let row = conn.query_row_with_params(
+            "SELECT count(*) FROM labels WHERE issue_id = ? AND label = ?",
+            &[SqliteValue::from(issue_id), SqliteValue::from(label)],
+        )?;
+        let exists = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
+
+        if exists > 0 {
+            return Ok(false);
+        }
+
+        let row = conn.query_row_with_params(
+            "SELECT count(*) FROM labels WHERE issue_id = ?",
+            &[SqliteValue::from(issue_id)],
+        )?;
+        let label_count = row
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or(usize::MAX);
+        if label_count >= ISSUE_LABEL_MAX_COUNT {
+            return Err(label_count_error());
+        }
+
+        conn.execute_with_params(
+            "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
+            &[SqliteValue::from(issue_id), SqliteValue::from(label)],
+        )?;
+
+        ctx.record_event(
+            EventType::LabelAdded,
+            issue_id,
+            Some(format!("Added label {label}")),
+        );
+        ctx.mark_dirty(issue_id);
+
+        conn.execute_with_params(
+            "UPDATE issues SET updated_at = ? WHERE id = ?",
+            &[
+                SqliteValue::from(Utc::now().to_rfc3339()),
+                SqliteValue::from(issue_id),
+            ],
+        )?;
+
+        Ok(true)
     }
 
     /// Add one label to many issues in a single storage mutation.
@@ -13793,45 +13895,55 @@ impl SqliteStorage {
         validate_storage_label(label)?;
 
         self.mutate("remove_label", actor, |conn, ctx| {
-            match Self::issue_status_in_tx(conn, issue_id)? {
-                Some(Status::Tombstone) => {
-                    return Err(BeadsError::Validation {
-                        field: "issue_id".to_string(),
-                        reason: format!("cannot remove label from tombstone issue: {issue_id}"),
-                    });
-                }
-                Some(_) => {}
-                None => {
-                    return Err(BeadsError::IssueNotFound {
-                        id: issue_id.to_string(),
-                    });
-                }
-            }
+            Self::remove_label_in_tx(conn, ctx, issue_id, label)
+        })
+    }
 
-            let rows = conn.execute_with_params(
-                "DELETE FROM labels WHERE issue_id = ? AND label = ?",
-                &[SqliteValue::from(issue_id), SqliteValue::from(label)],
+    fn remove_label_in_tx(
+        conn: &Connection,
+        ctx: &mut MutationContext,
+        issue_id: &str,
+        label: &str,
+    ) -> Result<bool> {
+        validate_storage_label(label)?;
+        match Self::issue_status_in_tx(conn, issue_id)? {
+            Some(Status::Tombstone) => {
+                return Err(BeadsError::Validation {
+                    field: "issue_id".to_string(),
+                    reason: format!("cannot remove label from tombstone issue: {issue_id}"),
+                });
+            }
+            Some(_) => {}
+            None => {
+                return Err(BeadsError::IssueNotFound {
+                    id: issue_id.to_string(),
+                });
+            }
+        }
+
+        let rows = conn.execute_with_params(
+            "DELETE FROM labels WHERE issue_id = ? AND label = ?",
+            &[SqliteValue::from(issue_id), SqliteValue::from(label)],
+        )?;
+
+        if rows > 0 {
+            conn.execute_with_params(
+                "UPDATE issues SET updated_at = ? WHERE id = ?",
+                &[
+                    SqliteValue::from(Utc::now().to_rfc3339()),
+                    SqliteValue::from(issue_id),
+                ],
             )?;
 
-            if rows > 0 {
-                conn.execute_with_params(
-                    "UPDATE issues SET updated_at = ? WHERE id = ?",
-                    &[
-                        SqliteValue::from(Utc::now().to_rfc3339()),
-                        SqliteValue::from(issue_id),
-                    ],
-                )?;
+            ctx.record_event(
+                EventType::LabelRemoved,
+                issue_id,
+                Some(format!("Removed label {label}")),
+            );
+            ctx.mark_dirty(issue_id);
+        }
 
-                ctx.record_event(
-                    EventType::LabelRemoved,
-                    issue_id,
-                    Some(format!("Removed label {label}")),
-                );
-                ctx.mark_dirty(issue_id);
-            }
-
-            Ok(rows > 0)
-        })
+        Ok(rows > 0)
     }
 
     /// Remove one label from many issues in a single storage mutation.
@@ -14040,104 +14152,113 @@ impl SqliteStorage {
         actor: &str,
     ) -> Result<LabelSetChanges> {
         self.mutate("set_labels", actor, |conn, ctx| {
-            Self::ensure_issue_mutable_in_tx(conn, issue_id, "set labels on")?;
+            Self::set_labels_in_tx(conn, ctx, issue_id, labels)
+        })
+    }
 
-            let old_rows = conn.query_with_params(
-                "SELECT label FROM labels WHERE issue_id = ?",
-                &[SqliteValue::from(issue_id)],
-            )?;
-            let old_labels_raw: Vec<String> = old_rows
+    fn set_labels_in_tx(
+        conn: &Connection,
+        ctx: &mut MutationContext,
+        issue_id: &str,
+        labels: &[String],
+    ) -> Result<LabelSetChanges> {
+        Self::ensure_issue_mutable_in_tx(conn, issue_id, "set labels on")?;
+
+        let old_rows = conn.query_with_params(
+            "SELECT label FROM labels WHERE issue_id = ?",
+            &[SqliteValue::from(issue_id)],
+        )?;
+        let old_labels_raw: Vec<String> = old_rows
+            .iter()
+            .filter_map(|r| r.get(0).and_then(SqliteValue::as_text).map(String::from))
+            .collect();
+        let old_labels = dedupe_preserving_order(&old_labels_raw);
+        let desired_labels = dedupe_preserving_order(labels);
+        validate_storage_labels(&desired_labels)?;
+
+        let old_matches_desired = old_labels.len() == desired_labels.len()
+            && old_labels
                 .iter()
-                .filter_map(|r| r.get(0).and_then(SqliteValue::as_text).map(String::from))
-                .collect();
-            let old_labels = dedupe_preserving_order(&old_labels_raw);
-            let desired_labels = dedupe_preserving_order(labels);
-            validate_storage_labels(&desired_labels)?;
+                .all(|label| desired_labels.contains(label));
+        let db_has_duplicate_labels = old_labels_raw.len() != old_labels.len();
 
-            let old_matches_desired = old_labels.len() == desired_labels.len()
-                && old_labels
-                    .iter()
-                    .all(|label| desired_labels.contains(label));
-            let db_has_duplicate_labels = old_labels_raw.len() != old_labels.len();
+        if old_matches_desired && !db_has_duplicate_labels {
+            return Ok(LabelSetChanges::default());
+        }
 
-            if old_matches_desired && !db_has_duplicate_labels {
-                return Ok(LabelSetChanges::default());
+        conn.execute_with_params(
+            "DELETE FROM labels WHERE issue_id = ?",
+            &[SqliteValue::from(issue_id)],
+        )?;
+
+        let mut seen_labels = HashSet::new();
+        for label in &desired_labels {
+            if !seen_labels.insert(label.as_str()) {
+                continue;
             }
+            conn.execute_with_params(
+                "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(label.as_str()),
+                ],
+            )?;
+        }
+
+        // Record changes
+        let removed: Vec<_> = old_labels
+            .iter()
+            .filter(|label| !desired_labels.contains(label))
+            .collect();
+        let added: Vec<_> = desired_labels
+            .iter()
+            .filter(|label| !old_labels.contains(label))
+            .collect();
+
+        if !removed.is_empty() || !added.is_empty() || db_has_duplicate_labels {
+            let mut details = Vec::new();
+            if !removed.is_empty() {
+                details.push(format!(
+                    "removed: {}",
+                    removed
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !added.is_empty() {
+                details.push(format!(
+                    "added: {}",
+                    added
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if db_has_duplicate_labels && removed.is_empty() && added.is_empty() {
+                details.push("normalized duplicate labels".to_string());
+            }
+            ctx.record_event(
+                EventType::Updated,
+                issue_id,
+                Some(format!("Labels {}", details.join("; "))),
+            );
+            ctx.mark_dirty(issue_id);
 
             conn.execute_with_params(
-                "DELETE FROM labels WHERE issue_id = ?",
-                &[SqliteValue::from(issue_id)],
+                "UPDATE issues SET updated_at = ? WHERE id = ?",
+                &[
+                    SqliteValue::from(Utc::now().to_rfc3339()),
+                    SqliteValue::from(issue_id),
+                ],
             )?;
+        }
 
-            let mut seen_labels = HashSet::new();
-            for label in &desired_labels {
-                if !seen_labels.insert(label.as_str()) {
-                    continue;
-                }
-                conn.execute_with_params(
-                    "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
-                    &[
-                        SqliteValue::from(issue_id),
-                        SqliteValue::from(label.as_str()),
-                    ],
-                )?;
-            }
-
-            // Record changes
-            let removed: Vec<_> = old_labels
-                .iter()
-                .filter(|label| !desired_labels.contains(label))
-                .collect();
-            let added: Vec<_> = desired_labels
-                .iter()
-                .filter(|label| !old_labels.contains(label))
-                .collect();
-
-            if !removed.is_empty() || !added.is_empty() || db_has_duplicate_labels {
-                let mut details = Vec::new();
-                if !removed.is_empty() {
-                    details.push(format!(
-                        "removed: {}",
-                        removed
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                }
-                if !added.is_empty() {
-                    details.push(format!(
-                        "added: {}",
-                        added
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                }
-                if db_has_duplicate_labels && removed.is_empty() && added.is_empty() {
-                    details.push("normalized duplicate labels".to_string());
-                }
-                ctx.record_event(
-                    EventType::Updated,
-                    issue_id,
-                    Some(format!("Labels {}", details.join("; "))),
-                );
-                ctx.mark_dirty(issue_id);
-
-                conn.execute_with_params(
-                    "UPDATE issues SET updated_at = ? WHERE id = ?",
-                    &[
-                        SqliteValue::from(Utc::now().to_rfc3339()),
-                        SqliteValue::from(issue_id),
-                    ],
-                )?;
-            }
-
-            Ok(LabelSetChanges {
-                added: added.into_iter().cloned().collect(),
-                removed: removed.into_iter().cloned().collect(),
-            })
+        Ok(LabelSetChanges {
+            added: added.into_iter().cloned().collect(),
+            removed: removed.into_iter().cloned().collect(),
         })
     }
 
@@ -18912,6 +19033,8 @@ pub struct StatsIssueRow {
 /// Fields to update on an issue.
 #[derive(Debug, Clone, Default)]
 pub struct IssueUpdate {
+    /// Labels applied after scalar writes, under the same guards and transaction.
+    pub labels: Option<LabelUpdate>,
     pub title: Option<String>,
     pub description: Option<Option<String>>,
     pub design: Option<Option<String>>,
@@ -18982,7 +19105,8 @@ pub struct IssueUpdate {
 impl IssueUpdate {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.title.is_none()
+        self.labels.is_none()
+            && self.title.is_none()
             && self.description.is_none()
             && self.design.is_none()
             && self.acceptance_criteria.is_none()
@@ -19012,9 +19136,8 @@ impl IssueUpdate {
             // A precondition is not a field change, but it must still be
             // *checked*, and the only place that happens is inside the write
             // transaction this flag gates (GitHub #500). Reporting such an
-            // update as empty skipped the check while a label, parent or
-            // acceptance edit — which are applied outside `IssueUpdate` —
-            // went ahead anyway, which is precisely the write the caller
+            // update as empty skipped the check while separately applied
+            // edits went ahead, which is precisely the write the caller
             // asked to make conditional.
             && self.expect_updated_at.is_none()
     }
@@ -29421,6 +29544,310 @@ required_fields:
             storage.get_labels("bd-l-cap").unwrap().len(),
             ISSUE_LABEL_MAX_COUNT
         );
+    }
+
+    fn label_update_rows(storage: &SqliteStorage) -> [String; 8] {
+        [
+            "issues",
+            "labels",
+            "events",
+            "comments",
+            "dirty_issues",
+            "metadata",
+            "close_metadata",
+            "capacity_occupancy",
+        ]
+        .map(|table| {
+            format!(
+                "{:?}",
+                storage
+                    .conn
+                    .query(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                    .unwrap()
+            )
+        })
+    }
+
+    #[test]
+    fn test_label_update_projection_preserves_operation_order_and_cap() {
+        let plan = LabelUpdate {
+            add: vec!["zeta".to_string(), "alpha".to_string()],
+            remove: vec!["seed".to_string()],
+            set: Some(vec!["gamma".to_string(), "zeta".to_string()]),
+        };
+        let (labels, changes) = plan.project(&["seed".to_string()]).unwrap();
+        assert_eq!(labels, vec!["gamma", "zeta"]);
+        assert_eq!(changes.added, vec!["zeta", "gamma"]);
+        assert_eq!(changes.removed, vec!["seed"]);
+
+        let full = (0..ISSUE_LABEL_MAX_COUNT)
+            .map(|index| format!("label-{index}"))
+            .collect::<Vec<_>>();
+        let duplicate = LabelUpdate {
+            add: vec![full[0].clone()],
+            ..Default::default()
+        };
+        assert_eq!(
+            duplicate.project(&full).unwrap(),
+            (full.clone(), LabelSetChanges::default())
+        );
+        let overflow = LabelUpdate {
+            add: vec!["extra".to_string()],
+            remove: vec![full[0].clone()],
+            set: Some(Vec::new()),
+        };
+        assert!(
+            overflow
+                .project(&full)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds 64 labels")
+        );
+    }
+
+    fn conditional_label_workflow() -> crate::close_policy::Workflow {
+        let mut workflow = crate::close_policy::Workflow {
+            strict: true,
+            ..Default::default()
+        };
+        workflow.gates.insert(
+            "open -> closed".to_string(),
+            crate::close_policy::GateRule {
+                require_if: vec![crate::close_policy::ConditionalGate {
+                    label: Some("needs-review".to_string()),
+                    gate: crate::close_policy::GateSpec::Named("review".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        workflow
+    }
+
+    #[test]
+    fn test_label_update_gates_use_final_labels() {
+        for (seeded, add, remove, set, passed, allowed) in [
+            (false, true, false, None, false, false),
+            (false, false, false, Some(true), false, false),
+            (false, true, false, None, true, true),
+            (true, false, true, None, false, true),
+            (true, false, false, Some(false), false, true),
+            (false, true, true, None, false, true),
+            (false, true, false, Some(false), false, true),
+        ] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            storage.set_workflow_policy(conditional_label_workflow());
+            let issue = make_issue(
+                "bd-label-gate",
+                "Review",
+                Status::Open,
+                2,
+                None,
+                Utc::now(),
+                None,
+            );
+            storage.create_issue(&issue, "tester").unwrap();
+            let review = vec!["needs-review".to_string()];
+            if seeded {
+                storage.set_labels(&issue.id, &review, "tester").unwrap();
+            }
+            if passed {
+                if !seeded {
+                    storage.add_label(&issue.id, &review[0], "tester").unwrap();
+                }
+                storage
+                    .record_scoped_gate_result(
+                        &issue.id, "open", 0, "closed", "review", "review", true, None, "reviewer",
+                    )
+                    .unwrap();
+                if !seeded {
+                    storage
+                        .remove_label(&issue.id, &review[0], "tester")
+                        .unwrap();
+                }
+            }
+            storage.clear_all_dirty_issues().unwrap();
+            let before = label_update_rows(&storage);
+            let labels = LabelUpdate {
+                add: if add { review.clone() } else { Vec::new() },
+                remove: if remove { review.clone() } else { Vec::new() },
+                set: set.map(|keep| if keep { review.clone() } else { Vec::new() }),
+            };
+            let expected = labels
+                .project(&storage.get_labels(&issue.id).unwrap())
+                .unwrap()
+                .0;
+            let result = storage.update_issue(
+                &issue.id,
+                &IssueUpdate {
+                    status: Some(Status::Closed),
+                    labels: Some(labels),
+                    transition_comment: Some("Ready for closure".to_string()),
+                    ..Default::default()
+                },
+                "tester",
+            );
+            if allowed {
+                assert_eq!(result.unwrap().status, Status::Closed);
+                assert_eq!(storage.get_labels(&issue.id).unwrap(), expected);
+                assert_eq!(storage.get_comments(&issue.id).unwrap().len(), 1);
+            } else {
+                assert!(matches!(result, Err(BeadsError::PolicyViolation { .. })));
+                assert_eq!(label_update_rows(&storage), before);
+            }
+        }
+    }
+
+    #[test]
+    fn test_label_only_update_preserves_noops_and_checks_guards() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = make_issue(
+            "bd-label-guard",
+            "Guarded",
+            Status::Open,
+            2,
+            Some("alice"),
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage.add_label(&issue.id, "stable", "tester").unwrap();
+        storage.clear_all_dirty_issues().unwrap();
+        let current = storage.get_issue(&issue.id).unwrap().unwrap();
+        let before = label_update_rows(&storage);
+        let unchanged = IssueUpdate {
+            labels: Some(LabelUpdate {
+                add: vec!["stable".to_string()],
+                remove: vec!["absent".to_string()],
+                set: Some(vec!["stable".to_string(), "stable".to_string()]),
+            }),
+            expect_updated_at: Some(current.updated_at),
+            ..Default::default()
+        };
+        storage
+            .update_issue(&issue.id, &unchanged, "tester")
+            .unwrap();
+        assert_eq!(label_update_rows(&storage), before);
+
+        let label_change = LabelUpdate {
+            add: vec!["new".to_string()],
+            ..Default::default()
+        };
+        let stale = IssueUpdate {
+            labels: Some(label_change.clone()),
+            expect_updated_at: Some(current.updated_at - chrono::Duration::seconds(1)),
+            ..Default::default()
+        };
+        assert!(matches!(
+            storage.update_issue(&issue.id, &stale, "tester"),
+            Err(BeadsError::UpdatePreconditionFailed { .. })
+        ));
+        let claimed = IssueUpdate {
+            labels: Some(label_change.clone()),
+            expect_unassigned: true,
+            claim_actor: Some("bob".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            storage
+                .update_issue(&issue.id, &claimed, "tester")
+                .unwrap_err()
+                .to_string()
+                .contains("already assigned")
+        );
+        assert_eq!(label_update_rows(&storage), before);
+
+        let changed = storage
+            .update_issue(
+                &issue.id,
+                &IssueUpdate {
+                    labels: Some(label_change),
+                    expect_updated_at: Some(current.updated_at),
+                    ..Default::default()
+                },
+                "tester",
+            )
+            .unwrap();
+        assert_eq!(
+            storage.get_labels(&issue.id).unwrap(),
+            vec!["new", "stable"]
+        );
+        assert_ne!(changed.updated_at, current.updated_at);
+        assert_eq!(storage.get_dirty_issue_ids().unwrap(), vec![issue.id]);
+    }
+
+    #[test]
+    fn test_label_update_failure_rolls_back_entire_issue_batch() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for id in ["bd-label-first", "bd-label-full"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 2, None, Utc::now(), None),
+                    "tester",
+                )
+                .unwrap();
+        }
+        let full = (0..ISSUE_LABEL_MAX_COUNT)
+            .map(|index| format!("label-{index}"))
+            .collect::<Vec<_>>();
+        storage
+            .set_labels("bd-label-full", &full, "tester")
+            .unwrap();
+        storage.clear_all_dirty_issues().unwrap();
+        let before = label_update_rows(&storage);
+        for (labels, expected_error) in [
+            (
+                LabelUpdate {
+                    add: vec!["extra".to_string()],
+                    remove: vec![full[0].clone()],
+                    set: Some(Vec::new()),
+                },
+                "exceeds 64 labels",
+            ),
+            (
+                LabelUpdate {
+                    remove: vec!["bad label".to_string()],
+                    ..Default::default()
+                },
+                "invalid characters",
+            ),
+            (
+                LabelUpdate {
+                    set: Some(vec!["bad label".to_string()]),
+                    ..Default::default()
+                },
+                "invalid characters",
+            ),
+        ] {
+            let result = storage.update_issues_atomically(
+                &[
+                    (
+                        "bd-label-first".to_string(),
+                        IssueUpdate {
+                            title: Some("Must roll back".to_string()),
+                            status: Some(Status::Closed),
+                            transition_comment: Some("Must roll back too".to_string()),
+                            labels: Some(LabelUpdate {
+                                add: vec!["first".to_string()],
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "bd-label-full".to_string(),
+                        IssueUpdate {
+                            title: Some("Also rolls back".to_string()),
+                            labels: Some(labels),
+                            ..Default::default()
+                        },
+                    ),
+                ],
+                "tester",
+            );
+            assert!(result.unwrap_err().to_string().contains(expected_error));
+            assert_eq!(label_update_rows(&storage), before);
+        }
     }
 
     #[test]

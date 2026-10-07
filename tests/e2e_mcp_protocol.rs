@@ -737,9 +737,8 @@ fn mcp_fixed_resources_and_issue_template_are_all_reachable() {
 ///
 /// The CLI has had `--if-unchanged` since #500; the MCP tool is what agents
 /// actually write through, and read-decide-write is its normal shape. Both
-/// application paths are exercised, because they enforce the precondition in
-/// different places: a field update is checked inside `update_issue`'s write
-/// transaction, while a label-only update never calls it.
+/// field and label-only application paths are exercised; both must enforce
+/// the precondition inside the shared update transaction.
 fn exercise_if_unchanged_over_mcp(client: &mut McpClient, id: &str) {
     let read = client.call_tool("show_issue", json!({"id": id}));
     let stamp = read["updated_at"]
@@ -765,9 +764,7 @@ fn exercise_if_unchanged_over_mcp(client: &mut McpClient, id: &str) {
         "a stale if_unchanged must refuse the write: {error}"
     );
 
-    // A label-only update takes the path that never reaches `update_issue`, so
-    // it needs its own check; without one, `if_unchanged` was silently ignored
-    // for exactly the edits that are easiest to make concurrently.
+    // Label-only edits must enforce the same stale-token refusal as fields.
     let label_error = client.tool_error(
         "update_issue",
         json!({"id": id, "labels_add": ["stale-write"], "if_unchanged": stamp}),
@@ -1262,6 +1259,7 @@ fn policy_bookkeeping(root: &Path) -> Value {
     // Debug preserves the SQL value types and every column in this comparison.
     let result = json!({
         "issues": format!("{:?}", connection.query("SELECT * FROM issues ORDER BY id").expect("all issue fields")),
+        "labels": format!("{:?}", connection.query("SELECT * FROM labels ORDER BY issue_id, label").expect("all labels")),
         "comments": format!("{:?}", connection.query("SELECT * FROM comments ORDER BY id").expect("all comments")),
         "events": format!("{:?}", connection.query("SELECT * FROM events ORDER BY id").expect("events including status revisions")),
         "gates": format!("{:?}", connection.query("SELECT * FROM gate_result_history ORDER BY id").expect("gate history")),
@@ -1432,6 +1430,239 @@ fn exercise_close_policy(
         &client.read_resource(&format!("beads://issue/{rework}")),
         "Custom ready work"
     ));
+}
+
+fn write_label_transition_policy(root: &Path) {
+    std::fs::write(
+        root.join(".beads/policy.yaml"),
+        r#"workflow:
+  strict: true
+  statuses: [open, in_review, closed]
+  transitions:
+    initial: [open]
+    open: [in_review]
+    in_review: [open, closed]
+    closed: [open]
+  gates:
+    "open -> in_review":
+      require_if:
+        - label: security
+          gate: security_review
+"#,
+    )
+    .expect("conditional-label policy");
+}
+
+fn assert_mcp_label_state(
+    client: &mut McpClient,
+    root: &Path,
+    id: &str,
+    status: &str,
+    labels: &[&str],
+) {
+    let exported = std::fs::read_to_string(root.join(".beads/issues.jsonl"))
+        .expect("exported labels")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("exported issue"))
+        .find(|row| row["id"] == id)
+        .expect("issue was exported");
+    for row in [
+        client.call_tool("show_issue", json!({"id": id})),
+        first_record(cli_json(root, &["show", id])),
+        exported,
+    ] {
+        assert_eq!(row["status"], status, "{row}");
+        assert_eq!(
+            row.get("labels").cloned().unwrap_or_else(|| json!([])),
+            json!(labels),
+            "{row}"
+        );
+    }
+}
+
+#[test]
+fn mcp_status_transitions_use_prospective_labels_for_conditional_gates() {
+    let workspace = ProtocolWorkspace::new().expect("workspace");
+    let root = workspace.path();
+    cli_json(root, &["init", "--prefix", "labelgate"]);
+    let mut client = McpClient::spawn(root);
+    let added = first_id(&client.call_tool("create_issue", json!({"title": "New security scope"})));
+    let removed = first_id(&client.call_tool(
+        "create_issue",
+        json!({"title": "Leaving security scope", "labels": ["security"]}),
+    ));
+    let cancelled =
+        first_id(&client.call_tool("create_issue", json!({"title": "Cancelled label addition"})));
+    write_label_transition_policy(root);
+
+    let refused = assert_policy_refusal_unchanged(
+        &mut client,
+        root,
+        "update_issue",
+        json!({"id": added, "title": "Must remain unchanged", "status": "in_review",
+            "labels_add": ["security"], "comment": "Must not append", "force": true}),
+        "POLICY_VIOLATION",
+    );
+    assert!(contains_text(&refused, "security_review"), "{refused}");
+    assert_mcp_label_state(&mut client, root, &added, "open", &[]);
+
+    // Gate reporting selects currently applicable labels. Record a real pass
+    // with the label present, then remove it without changing status revision.
+    cli_json(root, &["update", &added, "--add-label", "security"]);
+    cli_json(
+        root,
+        &[
+            "gate",
+            "report",
+            &added,
+            "--gate",
+            "security_review",
+            "--provider",
+            "reviewer",
+            "--status",
+            "pass",
+            "--to",
+            "in_review",
+        ],
+    );
+    cli_json(root, &["update", &added, "--remove-label", "security"]);
+    let changed = client.call_tool(
+        "update_issue",
+        json!({"id": added, "status": "in_review", "labels_add": ["security"]}),
+    );
+    assert_eq!(changed["status"], "in_review");
+    assert_mcp_label_state(&mut client, root, &added, "in_review", &["security"]);
+
+    // Neither of these issues has a gate pass. Final absence of the scoped
+    // label makes the condition inapplicable, including add-before-remove.
+    for arguments in [
+        json!({"id": removed, "status": "in_review", "labels_remove": ["security"]}),
+        json!({"id": cancelled, "status": "in_review", "labels_add": ["security"], "labels_remove": ["security"]}),
+    ] {
+        let changed = client.call_tool("update_issue", arguments);
+        assert_eq!(changed["status"], "in_review");
+    }
+    assert_mcp_label_state(&mut client, root, &removed, "in_review", &[]);
+    assert_mcp_label_state(&mut client, root, &cancelled, "in_review", &[]);
+    let (status, stderr) = client.finish();
+    assert!(
+        status.success() || status.code() == Some(130),
+        "{status}: {stderr}"
+    );
+}
+
+#[test]
+fn mcp_conditional_label_batch_keeps_per_item_atomicity_and_partial_results() {
+    let workspace = ProtocolWorkspace::new().expect("workspace");
+    let root = workspace.path();
+    cli_json(root, &["init", "--prefix", "labelbatch"]);
+    let mut client = McpClient::spawn(root);
+    let first = first_id(&client.call_tool("create_issue", json!({"title": "First admission"})));
+    let refused =
+        first_id(&client.call_tool("create_issue", json!({"title": "Guarded middle item"})));
+    let last = first_id(&client.call_tool(
+        "create_issue",
+        json!({"title": "Last admission", "labels": ["security"]}),
+    ));
+    write_label_transition_policy(root);
+    let refused_before = capacity_contender_state(root, &refused);
+    let batch = client.call_tool(
+        "update_issue",
+        json!({"updates": [
+            {"id": first, "status": "in_review", "labels_add": ["ordinary"]},
+            {"id": refused, "status": "in_review", "title": "Must not commit", "labels_add": ["security"], "comment": "Must not append"},
+            {"id": last, "status": "in_review", "labels_remove": ["security"]}
+        ]}),
+    );
+    assert_eq!(batch["count"], 3);
+    assert_eq!(batch["ok_count"], 2);
+    assert_eq!(batch["error_count"], 1);
+    assert_eq!(batch["items"][0]["ok"], true);
+    assert_eq!(batch["items"][1]["ok"], false);
+    assert_eq!(
+        batch["items"][1]["error"]["data"]["error_type"],
+        "POLICY_VIOLATION"
+    );
+    assert!(
+        batch["items"][1]["error"]["data"]
+            .get("mutation_committed")
+            .is_none(),
+        "refusal inherited another item's commit: {batch}"
+    );
+    assert_eq!(batch["items"][2]["ok"], true);
+    assert_eq!(capacity_contender_state(root, &refused), refused_before);
+    assert_mcp_label_state(&mut client, root, &first, "in_review", &["ordinary"]);
+    assert_mcp_label_state(&mut client, root, &refused, "open", &[]);
+    assert_mcp_label_state(&mut client, root, &last, "in_review", &[]);
+    let (status, stderr) = client.finish();
+    assert!(
+        status.success() || status.code() == Some(130),
+        "{status}: {stderr}"
+    );
+}
+
+#[test]
+fn mcp_label_and_comment_updates_return_reusable_final_concurrency_tokens() {
+    let workspace = ProtocolWorkspace::new().expect("workspace");
+    let root = workspace.path();
+    cli_json(root, &["init", "--prefix", "labeltoken"]);
+    let mut client = McpClient::spawn(root);
+    let id =
+        first_id(&client.call_tool("create_issue", json!({"title": "Conditional label edits"})));
+    let mut token = client.call_tool("show_issue", json!({"id": id}))["updated_at"].clone();
+    let stale = token.clone();
+    for mut arguments in [
+        json!({"labels_add": ["first"]}),
+        json!({"title": "Fields and labels", "labels_add": ["second"], "labels_remove": ["first"]}),
+        json!({"title": "Fields, labels and comment", "labels_add": ["third"], "comment": "Committed after fields and labels"}),
+        json!({"comment": "Comment-only revision"}),
+    ] {
+        arguments["id"] = json!(id);
+        arguments["if_unchanged"] = token;
+        let updated = client.call_tool("update_issue", arguments);
+        let shown = client.call_tool("show_issue", json!({"id": id}));
+        assert_eq!(
+            updated["updated_at"], shown["updated_at"],
+            "must return final persisted revision"
+        );
+        let chained = client.call_tool(
+            "update_issue",
+            json!({"id": id, "priority": "1", "if_unchanged": updated["updated_at"]}),
+        );
+        token = chained["updated_at"].clone();
+    }
+    assert_policy_refusal_unchanged(
+        &mut client,
+        root,
+        "update_issue",
+        json!({"id": id, "title": "Stale fields", "labels_add": ["stale"],
+            "comment": "Stale comment", "if_unchanged": stale}),
+        "UPDATE_PRECONDITION_FAILED",
+    );
+    let before = policy_bookkeeping(root);
+    let jsonl = std::fs::read(root.join(".beads/issues.jsonl")).expect("before no-op");
+    let noop = client.call_tool(
+        "update_issue",
+        json!({"id": id, "labels_add": ["second", "second"], "labels_remove": ["absent"], "if_unchanged": token}),
+    );
+    assert_eq!(noop["updated_at"], token);
+    assert_eq!(
+        policy_bookkeeping(root),
+        before,
+        "duplicate add and absent remove must be no-ops"
+    );
+    assert_eq!(
+        std::fs::read(root.join(".beads/issues.jsonl")).unwrap(),
+        jsonl
+    );
+    assert_mcp_label_state(&mut client, root, &id, "open", &["second", "third"]);
+    let comments = cli_json(root, &["comments", "list", &id]);
+    assert_eq!(comments.as_array().expect("comments").len(), 2);
+    let (status, stderr) = client.finish();
+    assert!(
+        status.success() || status.code() == Some(130),
+        "{status}: {stderr}"
+    );
 }
 
 #[test]
@@ -2803,6 +3034,10 @@ fn capacity_contender_state(root: &Path, id: &str) -> Value {
     for (name, sql) in [
         ("issue", "SELECT * FROM issues WHERE id = ?"),
         (
+            "labels",
+            "SELECT * FROM labels WHERE issue_id = ? ORDER BY label",
+        ),
+        (
             "comments",
             "SELECT * FROM comments WHERE issue_id = ? ORDER BY id",
         ),
@@ -3017,49 +3252,56 @@ fn mcp_export_failure_reports_committed_state_and_can_be_reconciled() {
 }
 
 #[test]
-fn mcp_batch_reports_a_committed_item_when_a_later_label_operation_fails() {
+fn mcp_batch_label_overflow_refuses_the_whole_item_without_mutation() {
     let workspace = ProtocolWorkspace::new().expect("workspace");
     let root = workspace.path();
     cli_json(root, &["init", "--prefix", "partial"]);
     let mut client = McpClient::spawn(root);
-    // The documented per-issue label limit is a real storage refusal, not an
-    // injected handler error. The title update precedes this label operation.
+    // The documented per-issue label limit is a real storage refusal. Fields
+    // and labels must roll back together, and the comment must not append.
     let mut labels: Vec<String> = (0..64).map(|index| format!("label-{index}")).collect();
     labels.sort();
     let created = client.call_tool(
         "create_issue",
-        json!({"title": "Before partial batch", "labels": labels}),
+        json!({"title": "Before refused batch", "labels": labels}),
     );
     let id = created["id"].as_str().expect("created id");
+    let before = policy_bookkeeping(root);
+    let jsonl = std::fs::read(root.join(".beads/issues.jsonl")).expect("before refusal");
     let batch = client.call_tool(
         "update_issue",
         json!({"updates": [
-            {"id": id, "title": "Title committed before label refusal", "labels_add": ["overflow"]},
+            {"id": id, "title": "Title must not commit", "status": "in_progress", "labels_add": ["overflow"], "comment": "Must not append"},
             {"id": id, "status": "closed"}
         ]}),
     );
     assert_eq!(batch["count"], 2);
     assert_eq!(batch["ok_count"], 0);
     assert_eq!(batch["error_count"], 2);
-    let partial = &batch["items"][0];
-    assert_eq!(partial["ok"], false);
-    assert_eq!(partial["error"]["data"]["error_type"], "VALIDATION_FAILED");
-    assert_eq!(partial["error"]["data"]["mutation_committed"], true);
-    assert_eq!(partial["error"]["data"]["retry_mutation"], false);
-    assert_eq!(
-        partial["error"]["data"]["publication"],
-        "see_request_outcome"
+    let overflow = &batch["items"][0];
+    assert_eq!(overflow["ok"], false);
+    assert_eq!(overflow["error"]["data"]["error_type"], "VALIDATION_FAILED");
+    assert!(
+        overflow["error"]["data"]
+            .get("mutation_committed")
+            .is_none(),
+        "rolled-back item reported a commit: {batch}"
     );
     let refused = &batch["items"][1];
     assert_eq!(refused["ok"], false);
     assert!(
         refused["error"]["data"].get("mutation_committed").is_none(),
-        "clean refusal inherited earlier item's commit: {batch}"
+        "clean refusal reported a commit: {batch}"
     );
     let issue = client.read_resource(&format!("beads://issue/{id}"));
-    assert_eq!(issue["title"], "Title committed before label refusal");
+    assert_eq!(issue["title"], "Before refused batch");
     assert_eq!(issue["status"], "open");
     assert_eq!(issue["labels"], json!(labels));
+    assert_eq!(policy_bookkeeping(root), before);
+    assert_eq!(
+        std::fs::read(root.join(".beads/issues.jsonl")).unwrap(),
+        jsonl
+    );
     let connection = read_only_db(root);
     assert!(
         connection
@@ -3074,7 +3316,7 @@ fn mcp_batch_reports_a_committed_item_when_a_later_label_operation_fails() {
         .map(|line| serde_json::from_str(line).expect("JSONL record"))
         .collect();
     assert_eq!(exported.len(), 1);
-    assert_eq!(exported[0]["title"], "Title committed before label refusal");
+    assert_eq!(exported[0]["title"], "Before refused batch");
     assert_eq!(exported[0]["labels"], json!(labels));
     let (status, stderr) = client.finish();
     assert!(

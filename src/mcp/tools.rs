@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use crate::error::{BeadsError, ErrorCode, StructuredError};
 use crate::model::acceptance::{AcceptanceCriteriaOutput, AcceptanceEdit, plan_acceptance_edit};
 use crate::model::{Comment, DependencyType, Issue, IssueType, Priority, Status};
-use crate::storage::{IssueUpdate, ListFilters, SqliteStorage};
+use crate::storage::{IssueUpdate, LabelUpdate, ListFilters, SqliteStorage};
 use crate::validation::{CommentValidator, IssueValidator, LabelValidator};
 
 use super::{BeadsState, ensure_not_shutting_down, mcp_ready_issues};
@@ -29,8 +29,8 @@ use super::{BeadsState, ensure_not_shutting_down, mcp_ready_issues};
 // Constants — pre-computed sets for O(1) placeholder detection
 // ---------------------------------------------------------------------------
 
-/// Field keys in `update_issue` that map to `IssueUpdate` struct fields.
-/// Used to distinguish field updates from label/comment side-effects.
+/// Scalar field keys in `update_issue` that map to `IssueUpdate` fields.
+/// Label changes also use the shared update transaction; comments are appended.
 const UPDATE_FIELD_KEYS: &[&str] = &[
     "title",
     "description",
@@ -2121,10 +2121,10 @@ fn mcp_event_attribution(args: &Value) -> McpResult<crate::storage::EventAttribu
 /// (#505).
 ///
 /// A field update carries the precondition into `storage.update_issue`, which
-/// checks it inside its own write transaction. A label-only or comment-only
-/// update makes no such call, so without this the precondition would be
-/// silently ignored for exactly the edits that are easiest to make
-/// concurrently. It is still atomic against other beads writers, because
+/// checks it inside its own write transaction, including label-only edits.
+/// A comment-only update makes no such call, so without this the precondition
+/// would be silently ignored for a concurrent comment. It is still atomic
+/// against other beads writers, because
 /// `with_mutation` holds the cross-process database-family write lock around
 /// the whole handler.
 fn ensure_update_precondition(
@@ -2199,18 +2199,24 @@ fn apply_update_issue_json(
         updates.acceptance_criteria = Some(Some(plan.edit.body.clone()));
     }
 
-    let has_field_updates =
-        acceptance_rewrite || UPDATE_FIELD_KEYS.iter().any(|k| args.get(k).is_some());
-    let has_side_effects = !labels_to_add.is_empty()
-        || !labels_to_remove.is_empty()
-        || comment.as_deref().is_some_and(|s| !s.is_empty());
+    if !labels_to_add.is_empty() || !labels_to_remove.is_empty() {
+        updates.labels = Some(LabelUpdate {
+            add: labels_to_add,
+            remove: labels_to_remove,
+            set: None,
+        });
+    }
+    let has_field_updates = acceptance_rewrite
+        || updates.labels.is_some()
+        || UPDATE_FIELD_KEYS.iter().any(|k| args.get(k).is_some());
+    let has_comment = comment.as_deref().is_some_and(|s| !s.is_empty());
 
     storage.set_pending_event_attribution(attribution);
-    let issue = if has_field_updates {
+    let mut issue = if has_field_updates {
         storage
             .update_issue(&id, &updates, &state.actor)
             .map_err(beads_to_mcp)?
-    } else if has_side_effects || acceptance.is_some() {
+    } else if has_comment || acceptance.is_some() {
         match storage
             .get_issue_details(&id, false, false, 0)
             .map_err(beads_to_mcp)?
@@ -2236,18 +2242,6 @@ fn apply_update_issue_json(
         ));
     };
 
-    // Handle label mutations.
-    for label in &labels_to_add {
-        storage
-            .add_label(&id, label, &state.actor)
-            .map_err(beads_to_mcp)?;
-    }
-    for label in &labels_to_remove {
-        storage
-            .remove_label(&id, label, &state.actor)
-            .map_err(beads_to_mcp)?;
-    }
-
     // Add comment if provided.
     if let Some(comment) = comment.as_deref()
         && !comment.is_empty()
@@ -2255,6 +2249,12 @@ fn apply_update_issue_json(
         storage
             .add_comment(&id, &state.actor, comment)
             .map_err(beads_to_mcp)?;
+        // Comments advance updated_at after the shared field/label transaction.
+        // Return the final token so the next conditional edit can use it.
+        issue = match storage.get_issue(&id).map_err(beads_to_mcp)? {
+            Some(issue) => issue,
+            None => return Err(issue_not_found_err(storage, &id)?),
+        };
     }
 
     Ok(update_issue_result_json(
@@ -2467,12 +2467,12 @@ impl ToolHandler for UpdateIssueTool {
                     "labels_add": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Labels to add. See beads://labels for existing labels."
+                        "description": "Labels to add atomically with field updates, before labels_remove. Workflow gates use the resulting labels. See beads://labels for existing labels."
                     },
                     "labels_remove": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Labels to remove"
+                        "description": "Labels to remove atomically with field updates, after labels_add. Workflow gates use the resulting labels."
                     },
                     "comment": {
                         "type": "string",

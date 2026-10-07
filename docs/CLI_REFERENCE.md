@@ -464,6 +464,21 @@ br update bd-abc123 --add-label "urgent,reviewed"
 br update bd-abc123 --append-notes "decision: keep the WAL until the migration is verified"
 ```
 
+**Combined field and label updates.** When `update` combines fields with labels,
+it applies both in one transaction across the selected issues in each workspace.
+Labels follow the order add, remove, then replace (`--set-labels`).
+Workflow transition gates evaluate the labels that this transaction will save,
+so adding a conditional-gate label with `--status` requires that gate, and
+removing it changes the prospective requirements. A gate, label-limit, or
+revision-guard refusal rolls back the combined field and label changes.
+Parent changes remain a subsequent operation.
+
+With no other changes, repeated additions of existing labels, removals of absent
+labels, and equivalent replacements leave issue timestamps and audit events
+unchanged. Adding and then removing a new label still records both operations;
+its net human label receipt is empty. The 64-label limit applies during additions,
+before later removals or replacement.
+
 **Overwrite guard for accumulating text fields (#467, #481).** `description`,
 `design`, `acceptance_criteria`, `prerequisites`, `notes`, and `agent_context` build up over an
 issue's life and are often supplied from shell variables, where an unset
