@@ -387,8 +387,10 @@ impl Connection {
         )
     }
 
-    /// Query, returning all rows.
+    /// Query, returning all rows. Checkpoints must be standalone, but their
+    /// raw status remains available even when the checkpoint is incomplete.
     pub fn query(&self, sql: &str) -> Result<Vec<Row>, FrankenError> {
+        is_wal_checkpoint_pragma(sql)?;
         #[cfg(test)]
         if let Some(status) = checkpoint_fault::take(self.inner.path(), sql) {
             return self.query_with_params("SELECT ?1, ?2, ?3", &status.map(SqliteValue::Integer));
@@ -402,6 +404,7 @@ impl Connection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<Vec<Row>, FrankenError> {
+        is_wal_checkpoint_pragma(sql)?;
         #[cfg(test)]
         if let Some(status) = checkpoint_fault::take(self.inner.path(), sql) {
             return self.query_with_params("SELECT ?1, ?2, ?3", &status.map(SqliteValue::Integer));
@@ -415,6 +418,12 @@ impl Connection {
 
     /// Query, returning exactly one row.
     pub fn query_row(&self, sql: &str) -> Result<Row, FrankenError> {
+        is_wal_checkpoint_pragma(sql)?;
+        #[cfg(test)]
+        if let Some(status) = checkpoint_fault::take(self.inner.path(), sql) {
+            let params = status.map(SqliteValue::Integer);
+            return self.query_row_with_params("SELECT ?1, ?2, ?3", &params);
+        }
         with_engine_retries!(self.inner, sql, drive(self.inner.query_row(sql)))
     }
 
@@ -424,6 +433,12 @@ impl Connection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<Row, FrankenError> {
+        is_wal_checkpoint_pragma(sql)?;
+        #[cfg(test)]
+        if let Some(status) = checkpoint_fault::take(self.inner.path(), sql) {
+            let params = status.map(SqliteValue::Integer);
+            return self.query_row_with_params("SELECT ?1, ?2, ?3", &params);
+        }
         with_engine_retries!(
             self.inner,
             sql,
@@ -1146,6 +1161,12 @@ pub(crate) mod tests {
                 conn.execute(sql).expect_err("mixed execute must fail"),
                 conn.execute_with_params(sql, &[])
                     .expect_err("mixed parameterized execute must fail"),
+                conn.query(sql).expect_err("mixed query must fail"),
+                conn.query_with_params(sql, &[])
+                    .expect_err("mixed parameterized query must fail"),
+                conn.query_row(sql).expect_err("mixed row query must fail"),
+                conn.query_row_with_params(sql, &[])
+                    .expect_err("mixed parameterized row query must fail"),
             ] {
                 assert!(
                     matches!(error, FrankenError::Internal(ref detail) if detail.contains("standalone")),
@@ -1162,11 +1183,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn checkpoint_query_batches_preserve_the_callers_transaction() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE guarded (value TEXT)").unwrap();
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        conn.execute("INSERT INTO guarded VALUES ('pending')").unwrap();
+        for sql in [
+            "ROLLBACK; PRAGMA wal_checkpoint(PASSIVE)",
+            "INSERT INTO guarded VALUES ('leaked'); PRAGMA wal_checkpoint(TRUNCATE)",
+            "PRAGMA wal_checkpoint(PASSIVE); COMMIT",
+        ] {
+            for call in 0..4 {
+                let result = match call {
+                    0 => conn.query(sql).map(|_| ()),
+                    1 => conn.query_with_params(sql, &[]).map(|_| ()),
+                    2 => conn.query_row(sql).map(|_| ()),
+                    _ => conn.query_row_with_params(sql, &[]).map(|_| ()),
+                };
+                assert!(
+                    matches!(&result, Err(FrankenError::Internal(detail))
+                        if detail.contains("standalone")),
+                    "query path {call}: {sql}: {result:?}"
+                );
+                assert!(conn.inner.in_transaction(), "query path {call}: {sql}");
+                let row = conn.query_row("SELECT value FROM guarded").unwrap();
+                assert_eq!(row.values(), &[SqliteValue::from("pending")]);
+            }
+        }
+        conn.execute("ROLLBACK").unwrap();
+        assert!(conn.query("SELECT value FROM guarded").unwrap().is_empty());
+    }
+
+    #[test]
     fn checkpoint_execute_rejects_partial_query_rows_but_queries_keep_them() {
         let conn = Connection::open(":memory:").unwrap();
         let sql = "PRAGMA wal_checkpoint(TRUNCATE)";
         for status in [[1, 23, 0], [0, 23, 7], [1, 23, 23]] {
-            checkpoint_fault::with_results(conn.inner.path(), vec![(sql, status); 3], || {
+            checkpoint_fault::with_results(conn.inner.path(), vec![(sql, status); 6], || {
                 assert!(matches!(conn.execute(sql), Err(FrankenError::Busy)));
                 assert!(matches!(
                     conn.execute_with_params(sql, &[]),
@@ -1174,6 +1227,18 @@ pub(crate) mod tests {
                 ));
                 assert_eq!(
                     conn.query(sql).unwrap()[0].values(),
+                    &status.map(SqliteValue::Integer)
+                );
+                assert_eq!(
+                    conn.query_with_params(sql, &[]).unwrap()[0].values(),
+                    &status.map(SqliteValue::Integer)
+                );
+                assert_eq!(
+                    conn.query_row(sql).unwrap().values(),
+                    &status.map(SqliteValue::Integer)
+                );
+                assert_eq!(
+                    conn.query_row_with_params(sql, &[]).unwrap().values(),
                     &status.map(SqliteValue::Integer)
                 );
             });
@@ -1309,13 +1374,21 @@ pub(crate) mod tests {
         let sql = "PRAGMA wal_checkpoint(PASSIVE)";
         let statement = conn.prepare(sql).unwrap();
         for status in [[0, 23, 7], [1, 23, 0], [1, 23, 23]] {
-            checkpoint_fault::with_results(conn.inner.path(), vec![(sql, status); 4], || {
+            checkpoint_fault::with_results(conn.inner.path(), vec![(sql, status); 6], || {
                 assert_eq!(
                     statement.query().unwrap()[0].values(),
                     &status.map(SqliteValue::Integer)
                 );
                 assert_eq!(
                     statement.query_with_params(&[]).unwrap()[0].values(),
+                    &status.map(SqliteValue::Integer)
+                );
+                assert_eq!(
+                    statement.query_row().unwrap().values(),
+                    &status.map(SqliteValue::Integer)
+                );
+                assert_eq!(
+                    statement.query_row_with_params(&[]).unwrap().values(),
                     &status.map(SqliteValue::Integer)
                 );
                 assert!(matches!(statement.execute(), Err(FrankenError::Busy)));
@@ -1367,6 +1440,47 @@ pub(crate) mod tests {
         conn.close().unwrap();
     }
 
+    #[test]
+    fn checkpoint_queries_execute_new_writes_on_every_call_path() {
+        if run_recovery_test_in_subprocess(
+            "franken_sync::tests::checkpoint_queries_execute_new_writes_on_every_call_path",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("query-checkpoint.db");
+        let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        conn.execute("PRAGMA journal_mode = WAL").unwrap();
+        conn.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+        conn.execute("CREATE TABLE t (value INTEGER)").unwrap();
+        let sql = "PRAGMA wal_checkpoint(TRUNCATE)";
+        conn.execute(sql).unwrap();
+        let statement = conn.prepare(sql).unwrap();
+        for call in 0..8 {
+            let before = std::fs::read(&db).unwrap();
+            conn.execute_with_params("INSERT INTO t VALUES (?1)", &[SqliteValue::Integer(call)])
+                .unwrap();
+            assert_eq!(std::fs::read(&db).unwrap(), before);
+            // No injected status: each direct/prepared query must execute a
+            // real checkpoint against the newly committed WAL generation.
+            let rows = match call {
+                0 => conn.query(sql),
+                1 => conn.query_with_params(sql, &[]),
+                2 => conn.query_row(sql).map(|row| vec![row]),
+                3 => conn.query_row_with_params(sql, &[]).map(|row| vec![row]),
+                4 => statement.query(),
+                5 => statement.query_with_params(&[]),
+                6 => statement.query_row().map(|row| vec![row]),
+                _ => statement.query_row_with_params(&[]).map(|row| vec![row]),
+            };
+            assert_eq!(checkpoint_execute_result(rows).unwrap(), 0);
+            assert_ne!(std::fs::read(&db).unwrap(), before, "query path {call}");
+        }
+        assert_eq!(conn.query("SELECT value FROM t").unwrap().len(), 8);
+        drop(statement);
+        conn.close().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn prepared_checkpoint_rejects_new_certificate_corruption_on_every_call_path() {
@@ -1378,7 +1492,7 @@ pub(crate) mod tests {
             return;
         }
         let temp = tempfile::tempdir().unwrap();
-        for call in 0..6 {
+        for call in 0..10 {
             let db = temp.path().join(format!("prepared-cert-{call}.db"));
             let mut conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
             conn.execute("PRAGMA journal_mode = WAL").unwrap();
@@ -1420,12 +1534,20 @@ pub(crate) mod tests {
                 2 => statement.query().map(|_| ()),
                 3 => statement.query_with_params(&[]).map(|_| ()),
                 4 => statement.query_row().map(|_| ()),
-                _ => statement.query_row_with_params(&[]).map(|_| ()),
+                5 => statement.query_row_with_params(&[]).map(|_| ()),
+                6 => conn.query("PRAGMA wal_checkpoint(TRUNCATE)").map(|_| ()),
+                7 => conn
+                    .query_with_params("PRAGMA wal_checkpoint(TRUNCATE)", &[])
+                    .map(|_| ()),
+                8 => conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)").map(|_| ()),
+                _ => conn
+                    .query_row_with_params("PRAGMA wal_checkpoint(TRUNCATE)", &[])
+                    .map(|_| ()),
             };
             assert!(
                 matches!(result, Err(FrankenError::WalCorrupt { ref detail })
                     if detail.contains("parallel WAL certificate suffix does not start at a record boundary")),
-                "prepared checkpoint path {call} reused success or changed the error: {result:?}"
+                "checkpoint path {call} reused success or changed the error: {result:?}"
             );
             assert_eq!(witness(), before, "refusal must preserve payload evidence");
             drop(statement);
