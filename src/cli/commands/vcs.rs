@@ -2146,7 +2146,7 @@ mod tests {
         hardened_git_command, hash_snapshot_as_git_blob, is_git_process_environment_key,
         parse_head_identity, parse_index_entries, parse_object_id, parse_runtime_git_scope,
         parse_runtime_index_paths, parse_single_ignored_match, runtime_database_relative_path,
-        runtime_requested_database_path, workspace_path_label,
+        runtime_requested_database_path, valid_runtime_index_path, workspace_path_label,
     };
     #[cfg(unix)]
     use super::{
@@ -2315,6 +2315,135 @@ mod tests {
             "other/tracker.sqlite-wal",
         ] {
             assert_eq!(classify_runtime_file(path, Some(database)), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn runtime_inventory_lock_suffix_matches_only_the_exact_case_br_creates() {
+        // Decision (beads_rust-b8rtf): a top-level `*.lock` index entry is
+        // writer coordination only with the exact lowercase suffix br writes.
+        // The names come from the real lock producers rather than a copied
+        // list, so a renamed sidecar cannot silently drop out of coverage.
+        let temp = TempDir::new().unwrap();
+        let beads = temp.path().join(".beads");
+        fs::create_dir(&beads).unwrap();
+        let jsonl = beads.join("issues.jsonl");
+        fs::write(&jsonl, b"").unwrap();
+        let database = beads.join("beads.db");
+        let entry_names = |directory: &Path| {
+            fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before = entry_names(&beads);
+
+        let family = crate::sync::blocking_database_family_write_lock_with_timeout(
+            &beads,
+            &database,
+            Some(5_000),
+        )
+        .expect("database-family write lock");
+        let jsonl_authority =
+            crate::sync::blocking_jsonl_family_write_lock_with_timeout(&jsonl, Some(5_000))
+                .expect("JSONL-family write lock");
+        let sync_lock = crate::sync::try_sync_lock(&beads)
+            .expect("sync lock")
+            .expect("uncontended sync lock");
+        let mut lease =
+            crate::sync::DatabaseOpenerLease::register(&database).expect("opener lease");
+        let exclusive = lease
+            .try_exclusive()
+            .expect("sole-opener transition barrier");
+        let created = entry_names(&beads)
+            .difference(&before)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        lease
+            .release_exclusive(exclusive)
+            .expect("restore the shared opener registration");
+        drop((lease, sync_lock, jsonl_authority, family));
+
+        // `.write.lock`, `.sync.lock`, and the hashed database-write,
+        // JSONL-write, opener-lease and opener-transition sidecars.
+        assert_eq!(created.len(), 6, "{created:?}");
+        assert!(created.contains(".write.lock"), "{created:?}");
+        assert!(created.contains(".sync.lock"), "{created:?}");
+        for name in &created {
+            assert_eq!(
+                classify_runtime_file(name, None),
+                Some(RuntimeFileKind::WriterCoordination),
+                "{name}"
+            );
+            let stem = name
+                .strip_suffix(".lock")
+                .unwrap_or_else(|| panic!("br lock sidecars use a lowercase suffix: {name}"));
+            for variant in [
+                name.to_ascii_uppercase(),
+                format!("{stem}.LOCK"),
+                format!("{stem}.Lock"),
+            ] {
+                assert_eq!(classify_runtime_file(&variant, None), None, "{variant}");
+            }
+        }
+        assert_eq!(
+            classify_runtime_file("X.lock", None),
+            Some(RuntimeFileKind::WriterCoordination)
+        );
+        assert_eq!(classify_runtime_file("X.LOCK", None), None);
+    }
+
+    #[test]
+    fn runtime_index_path_validator_keeps_its_root_and_drive_boundaries() {
+        // Expected values were recorded against the original validator on
+        // origin/main 7c8cea7e; the beads_rust-b8rtf rewrite must keep them all.
+        for (path, expected) in [
+            ("", false),
+            ("/", false),
+            ("/beads.db", false),
+            ("\\", false),
+            ("\\beads.db", false),
+            ("\\\\host", false),
+            ("\\\\host\\share\\beads.db", false),
+            ("//host/share/beads.db", false),
+            ("C:", false),
+            ("c:", false),
+            ("C:/", false),
+            ("C:/beads.db", false),
+            ("c:\\", false),
+            ("c:\\beads.db", false),
+            ("z:beads.db", false),
+            // Both ends of each ASCII letter range, and their outside neighbours.
+            ("A:", false),
+            ("Z:", false),
+            ("a:", false),
+            ("z:", false),
+            ("@:", true),
+            ("[:", true),
+            ("`:", true),
+            ("{:", true),
+            (":", true),
+            (":beads.db", true),
+            ("1:", true),
+            ("_:", true),
+            ("\u{e9}:", true),
+            ("C", true),
+            ("c", true),
+            ("CC:", true),
+            ("dir/C:", true),
+            ("beads.db", true),
+            ("nested/beads.db", true),
+            (".gitignore", true),
+            (".", false),
+            ("..", false),
+            ("dir/", false),
+            ("dir//beads.db", false),
+            ("dir/./beads.db", false),
+            ("dir/../beads.db", false),
+            (".git", false),
+            ("dir/.GIT/index", false),
+        ] {
+            assert_eq!(valid_runtime_index_path(path), expected, "{path:?}");
         }
     }
 
