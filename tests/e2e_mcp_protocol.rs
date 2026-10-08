@@ -1800,7 +1800,7 @@ fn write_mcp_entry_policy(root: &Path, enabled: bool, open_capacity: usize) {
     std::fs::write(
         root.join(".beads/policy.yaml"),
         format!(
-            r#"workflow:
+            r"workflow:
   strict: true
   statuses: [draft, open, triage_queue, in_progress, closed]
   transitions:
@@ -1813,7 +1813,7 @@ fn write_mcp_entry_policy(root: &Path, enabled: bool, open_capacity: usize) {
 {entry_routes}  capacity:
     statuses:
       open: {{hard: {open_capacity}}}
-"#
+"
         ),
     )
     .expect("create admission policy");
