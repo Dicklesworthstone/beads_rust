@@ -677,11 +677,14 @@ fn e2e_vcs_runtime_audit_counts_real_unmerged_index_paths_once() {
         &["ls-files", "--unmerged", "-z", "--", path],
     );
     assert!(stages.status.success(), "{stages:?}");
-    assert_eq!(
-        stages.stdout.iter().filter(|byte| **byte == 0).count(),
-        3,
-        "three actual conflict stages"
-    );
+    // `ls-files -z` terminates every record, the last one included, with NUL.
+    let stage_records = stages
+        .stdout
+        .strip_suffix(b"\0")
+        .expect("NUL-terminated unmerged records")
+        .split(|byte| *byte == 0)
+        .count();
+    assert_eq!(stage_records, 3, "three actual conflict stages");
     let metadata_before = runtime_metadata_snapshot(&workspace);
     let index_before = std::fs::read(workspace.root.join(".git/index")).expect("unmerged index");
     let head_before = git_stdout(&workspace.root, &["rev-parse", "HEAD"]);
@@ -1150,9 +1153,10 @@ fn e2e_runtime_recovery_directories_are_ignored_by_init_and_repair() {
             &workspace.root,
             &["check-ignore", "--no-index", "-q", "--", relative],
         );
+        // `check-ignore -q` exits 0 for an ignored path and 1 otherwise.
         assert_eq!(
             result.status.code(),
-            Some(if ignored { 0 } else { 1 }),
+            Some(i32::from(!ignored)),
             "wrong Git ignore result for {relative}: {result:?}"
         );
     };
