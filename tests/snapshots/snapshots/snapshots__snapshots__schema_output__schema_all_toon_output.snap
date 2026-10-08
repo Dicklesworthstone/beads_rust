@@ -2931,4 +2931,4 @@ commands:
     jq_filter: .
     item_schema: VcsRuntimeStatus
     error_envelope_on_stderr: false
-    notes: "Explicit bounded inventory of tracked database and recovery files in the workspace metadata directory. Reads the Git index without opening database or JSONL contents. Unavailable scans omit tracked_count and files; a zero count is not a cross-clone migration or checkout-safety guarantee. Findings are informational and do not perform automatic remediation."
+    notes: Explicit bounded inventory of tracked database and recovery files in the workspace metadata directory. Reads the Git index without opening database or JSONL contents. Unavailable scans omit tracked_count and files; a zero count is not a cross-clone migration or checkout-safety guarantee. Findings are informational and do not perform automatic remediation.
