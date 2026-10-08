@@ -147,7 +147,7 @@ flate2 = "1.1"
 libc = "0.2.190"
 # fastmcp-client 0.10.0 requires this exact version, including with MCP disabled.
 rustix = { version = "=1.1.4", features = ["fs", "process"] }
-signal-hook = "0.4.4"
+signal-hook = "0.4.5"
 
 [target.'cfg(windows)'.dependencies]
 # Capability-relative Windows filesystem access. Pin exactly because the

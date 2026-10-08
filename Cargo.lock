@@ -297,7 +297,7 @@ dependencies = [
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.0",
- "signal-hook 0.4.4",
+ "signal-hook 0.4.5",
  "slab",
  "smallvec",
  "socket2",
@@ -451,7 +451,7 @@ dependencies = [
  "sha1 0.11.0",
  "sha2 0.11.0",
  "shell-words",
- "signal-hook 0.4.4",
+ "signal-hook 0.4.5",
  "similar 3.2.0",
  "tar",
  "tempfile",
@@ -2276,7 +2276,7 @@ dependencies = [
  "gix-zlib",
  "nonempty",
  "parking_lot",
- "signal-hook 0.4.4",
+ "signal-hook 0.4.5",
  "smallvec",
  "thiserror",
 ]
@@ -2968,7 +2968,7 @@ dependencies = [
  "gix-fs",
  "libc",
  "parking_lot",
- "signal-hook 0.4.4",
+ "signal-hook 0.4.5",
  "signal-hook-registry",
  "tempfile",
 ]
@@ -5297,9 +5297,9 @@ dependencies = [
 
 [[package]]
 name = "signal-hook"
-version = "0.4.4"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2a0c28ca5908dbdbcd52e6fdaa00358ab88637f8ab33e1f188dd510eb44b53d"
+checksum = "b29ffa27d3d59a049bb328258de100f8012848d1b08d444e08bbc02ac468435e"
 dependencies = [
  "libc",
  "signal-hook-registry",
