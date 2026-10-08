@@ -553,9 +553,12 @@ fn runtime_path_is_ancestor(path: &str, descendant: &str) -> bool {
 }
 
 fn valid_runtime_index_path(path: &str) -> bool {
-    let bytes = path.as_bytes();
+    // Index paths are repository-relative: refuse POSIX and Windows roots
+    // (`/`, `\`, UNC `\\host`) and drive-qualified spellings (`C:`, `c:\`).
+    let drive_qualified =
+        matches!(path.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic());
     !path.starts_with(['/', '\\'])
-        && !(bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        && !drive_qualified
         && path.split('/').all(|component| {
             !component.is_empty()
                 && component != "."
@@ -593,6 +596,16 @@ fn classify_runtime_file(path: &str, database: Option<&str>) -> Option<RuntimeFi
     if path.contains('/') {
         return None;
     }
+    // Deliberately case-sensitive, so the lint's premise does not hold here:
+    // `.lock` is not a user-chosen extension but the exact suffix of the
+    // sidecars br creates (`.write.lock`, `.sync.lock`, and the lowercase-hex
+    // `.br-db-write-*`, `.br-jsonl-write-*` and `.br-db-openers-*` families).
+    // `X.LOCK` is never one of them. Every other runtime family in this
+    // classifier is matched case-sensitively too, as is the canonical
+    // `*.lock` ignore rule under Git's case-sensitive `core.ignorecase=false`.
+    // Pinned by
+    // `runtime_inventory_lock_suffix_matches_only_the_exact_case_br_creates`.
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
     if path.ends_with(".lock") {
         return Some(RuntimeFileKind::WriterCoordination);
     }
