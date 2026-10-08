@@ -5872,9 +5872,9 @@ dependencies = [
 
 [[package]]
 name = "tru"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11070d9b998793fc0aeb4a3ff3b3c0836a734eef17dc44df3a2216fea14385ae"
+checksum = "05cea74a8eecb031bc6ee8df1fd322b2bc5e725c3e11dabc61aa032279e933e1"
 dependencies = [
  "anyhow",
  "chrono",

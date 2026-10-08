@@ -114,7 +114,7 @@ crossterm = "0.29"
 rich_rust = { version = "0.2.3", features = ["markdown", "json", "backtrace"] }
 
 # TOON format support (sibling project)
-toon_rust = { version = "0.2.4", package = "tru" }
+toon_rust = { version = "0.2.5", package = "tru" }
 
 # Path normalization (strips \\?\ prefix on Windows)
 dunce = "1.0.5"
