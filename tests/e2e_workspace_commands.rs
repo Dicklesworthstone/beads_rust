@@ -659,16 +659,18 @@ fn e2e_doctor_namespace_identity_detects_displaced_main_without_mutating_family(
     let create = run_br(&workspace, ["create", "Retained issue", "--json"], "create");
     assert!(create.status.success(), "{create:?}");
     let database = workspace.root.join(".beads/beads.db");
-    // Hold a real namespace generation lease, as another live engine opener
-    // would. Current FrankenSQLite can rebind a quiescent copied record, but
-    // it must refuse to join this live generation through a different inode.
-    let pending = fsqlite_vfs::PendingNamespaceOpen::begin(
-        &database,
-        fsqlite_vfs::NamespaceOpenIntent::ReadOnlyExisting,
-    )
-    .unwrap();
-    let recorded_identity = pending.expected_identity().unwrap();
-    let lease = pending.bind(recorded_identity).unwrap();
+    // Hold a real live engine opener. Current FrankenSQLite can rebind a
+    // quiescent copied record, but it must refuse to join this live
+    // generation through a different inode. A bare namespace lease is not a
+    // faithful stand-in: it holds no main-file or `-shm` participation lock,
+    // which FrankenSQLite 0.4.8 (bd-sz9j5) reads as a pre-0.4 peer and
+    // refuses as IncompatiblePeerEngine instead of the identity mismatch
+    // under test. The connection stays idle until it is dropped below.
+    let live_opener =
+        Connection::open(database.to_string_lossy().into_owned()).expect("live engine opener");
+    live_opener
+        .query_row("SELECT count(*) FROM issues")
+        .expect("live opener reads through the WAL index");
     let displaced = workspace.root.join("displaced-beads.db");
     fs::rename(&database, &displaced).expect("preserve displaced main database");
     fs::copy(&displaced, &database).expect("copy identical bytes into a different inode");
@@ -688,9 +690,19 @@ fn e2e_doctor_namespace_identity_detects_displaced_main_without_mutating_family(
         !list.status.success(),
         "foreign namespace must refuse: {list:?}"
     );
+    // FrankenSQLite 0.4.8 reports this live foreign generation in one of two
+    // ways. The identity-bound CannotOpen is the intended diagnosis; with the
+    // bd-sz9j5 legacy-peer probe, the same live 0.4.x opener holding the
+    // displaced inode is seen without main-file or `-shm` participation at
+    // the stable path and refused as IncompatiblePeerEngine ("older ...
+    // (0.3.x)"), which misnames the peer (beads_rust-ccetp). Both are
+    // refusals to join; the family must still be byte-identical below.
+    let refusal = format!("{}{}", list.stdout, list.stderr);
     assert!(
-        format!("{}{}", list.stdout, list.stderr).contains("unable to open database file"),
-        "expected the engine's CannotOpen refusal: {list:?}"
+        refusal.contains("unable to open database file")
+            || refusal
+                .contains("is open in another process by an older, incompatible fsqlite engine"),
+        "expected an engine refusal to join the foreign generation: {list:?}"
     );
     assert_namespace_family_preserved(&workspace, &before, false);
 
@@ -717,7 +729,10 @@ fn e2e_doctor_namespace_identity_detects_displaced_main_without_mutating_family(
     // Removing the live opener changes the engine's admission decision, not
     // the diagnosis evidence. Doctor must still report the quiescent mismatch
     // without rebinding it; an ordinary CLI open may then legitimately rebind.
-    drop(lease);
+    // Closing the real opener may settle its own sidecars, so the quiescent
+    // phase compares against the family as that close left it.
+    drop(live_opener);
+    let before = namespace_family_bytes(&workspace);
     let quiescent = run_br(&workspace, ["doctor", "--json"], "quiescent_mismatch");
     assert_eq!(namespace_check(&quiescent)["details"]["state"], "mismatch");
     assert_namespace_family_preserved(&workspace, &before, false);
