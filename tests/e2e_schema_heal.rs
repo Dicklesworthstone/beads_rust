@@ -548,11 +548,11 @@ fn orphan_relation_rows_refuse_a_rebuild_until_discard_is_explicit() {
         "orphans4_create",
     );
     assert!(!create.status.success(), "create must refuse");
+    // With --json the refusal is a JSON error on stdout.
+    let refusal = format!("{}{}", create.stdout, create.stderr);
     assert!(
-        create.stderr.contains("without an owning issue")
-            && create.stderr.contains("--discard-db-only"),
-        "{}",
-        create.stderr
+        refusal.contains("without an owning issue") && refusal.contains("--discard-db-only"),
+        "{refusal}"
     );
     assert_eq!(header_user_version(&db_path), 4, "nothing changed");
 
@@ -562,11 +562,10 @@ fn orphan_relation_rows_refuse_a_rebuild_until_discard_is_explicit() {
         "orphans4_heal",
     );
     assert!(!heal.status.success(), "plain heal must refuse");
+    let refusal = format!("{}{}", heal.stdout, heal.stderr);
     assert!(
-        heal.stderr.contains("rebuild refused") && heal.stderr.contains("without an owning issue"),
-        "{} {}",
-        heal.stdout,
-        heal.stderr
+        refusal.contains("rebuild refused") && refusal.contains("without an owning issue"),
+        "{refusal}"
     );
     assert_eq!(header_user_version(&db_path), 4, "nothing changed");
     assert_eq!(relation_rows(&db_path, "leg-deleted"), (1, 1));
