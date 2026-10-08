@@ -17885,7 +17885,7 @@ fn snapshot_preserved_issue(
     issue_id: &str,
     kind: &str,
 ) -> Option<PreservedIssue> {
-    let issue = match storage.get_issue(issue_id) {
+    let issue = match read_issue_row_for_preservation(storage, issue_id) {
         Ok(issue) => issue,
         Err(error) => {
             tracing::warn!(
@@ -17940,6 +17940,27 @@ fn snapshot_preserved_issue(
         dependencies,
         comments,
     })
+}
+
+/// Read one issue row for a pre-rebuild snapshot.
+///
+/// A rebuild runs because the database is damaged, and FrankenSQLite's keyed
+/// single-row lookup can fail on a malformed page that belongs to another
+/// table (a damaged `comments` page fails `get_issue` for every issue) while
+/// the batched reader still returns the intact row. Giving the row up there
+/// silently discarded every unflushed edit and comment in the workspace, so
+/// retry through the batched reader before reporting the row unreadable.
+fn read_issue_row_for_preservation(
+    storage: &SqliteStorage,
+    issue_id: &str,
+) -> Result<Option<Issue>> {
+    match storage.get_issue(issue_id) {
+        Ok(issue) => Ok(issue),
+        Err(keyed_error) => match storage.get_issues_by_ids(&[issue_id.to_string()]) {
+            Ok(issues) => Ok(issues.into_iter().find(|issue| issue.id == issue_id)),
+            Err(_) => Err(keyed_error),
+        },
+    }
 }
 
 /// Snapshot every tombstoned issue in the database, including its labels,
@@ -25324,6 +25345,69 @@ mod tests {
                     .unwrap()
                     .contains(&incoming)
             );
+        }
+    }
+
+    /// A rebuild snapshot taken from a database with one damaged `comments`
+    /// page must still capture every dirty issue row: losing the row loses
+    /// the issue's unflushed edits along with the unreadable comments.
+    #[test]
+    fn test_dirty_snapshot_keeps_issue_rows_when_comments_are_unreadable() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("beads.db");
+        let ids: Vec<String> = (0..30).map(|i| format!("bd-dmg{i:02}")).collect();
+        let comments_root = {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            for id in &ids {
+                storage
+                    .create_issue(&make_test_issue(id, &format!("issue {id}")), "tester")
+                    .unwrap();
+            }
+            storage.clear_dirty_flags(&ids).unwrap();
+            let padding = "x".repeat(200);
+            for id in &ids[..20] {
+                storage
+                    .add_comment(id, "tester", &format!("unflushed comment {padding}"))
+                    .unwrap();
+            }
+            assert_eq!(storage.get_dirty_issue_ids().unwrap().len(), 20);
+            storage.checkpoint_full().unwrap();
+            let rows = storage
+                .execute_raw_query("SELECT rootpage FROM sqlite_master WHERE name = 'comments'")
+                .unwrap();
+            match rows.first().and_then(|row| row.first()) {
+                Some(SqliteValue::Integer(page)) => u64::try_from(*page).unwrap(),
+                other => panic!("comments root page: {other:?}"),
+            }
+        };
+        for suffix in ["-wal", "-shm"] {
+            let _ = fs::remove_file(temp_dir.path().join(format!("beads.db{suffix}")));
+        }
+        {
+            use std::os::unix::fs::FileExt;
+            let file = fs::OpenOptions::new().write(true).open(&db_path).unwrap();
+            file.write_at(&[0xff; 8], (comments_root - 1) * 4096)
+                .unwrap();
+        }
+
+        // With FrankenSQLite 0.4.8 the keyed single-row lookup fails on the
+        // damaged comments root even though the issue rows are intact; the
+        // snapshot must not depend on that lookup.
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let snapshot = snapshot_dirty_live_issues(&storage);
+        let mut preserved: Vec<&str> = snapshot.iter().map(|p| p.issue.id.as_str()).collect();
+        preserved.sort_unstable();
+        assert_eq!(
+            preserved,
+            ids[..20].iter().map(String::as_str).collect::<Vec<_>>(),
+            "every dirty issue row must survive into the rebuild snapshot"
+        );
+        for entry in &snapshot {
+            assert_eq!(entry.issue.title, format!("issue {}", entry.issue.id));
+            // Unreadable comments are reported as missing, never as empty:
+            // `Some(vec![])` would delete the JSONL comments on restore.
+            assert!(entry.comments.is_none(), "{}", entry.issue.id);
+            assert!(entry.labels.is_some() && entry.dependencies.is_some());
         }
     }
 

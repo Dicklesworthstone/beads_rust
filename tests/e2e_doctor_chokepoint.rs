@@ -1916,6 +1916,112 @@ fn startup_auto_recovery_preserves_dirty_unflushed_issue() {
     );
 }
 
+/// One damaged `comments` page must not cost every unflushed issue its local
+/// edits. Before the fix the pre-rebuild snapshot could not read any dirty
+/// issue row (the keyed lookup fails on the foreign damaged page), so
+/// `--repair` rebuilt from the JSONL, dropped the unflushed title edit, and
+/// still reported a verified success with nothing preserved.
+#[test]
+fn repair_rebuild_keeps_dirty_rows_and_names_unreadable_comments() {
+    let tmp = isolated_tempdir();
+    let root = tmp.path().to_path_buf();
+    br_init(&root);
+    let create = br_cmd(&root)
+        .args(["create", "--title", "flushed title", "--json"])
+        .output()
+        .expect("br create spawned");
+    assert!(create.status.success(), "br create failed");
+    let id = parse_trailing_json(&String::from_utf8_lossy(&create.stdout))["id"]
+        .as_str()
+        .expect("created id")
+        .to_string();
+    let flush = br_cmd(&root)
+        .args(["sync", "--flush-only"])
+        .output()
+        .expect("br sync spawned");
+    assert!(flush.status.success(), "br sync --flush-only failed");
+    for args in [
+        vec![
+            "update",
+            &id,
+            "--title",
+            "unflushed local title",
+            "--no-auto-flush",
+        ],
+        vec![
+            "comments",
+            "add",
+            &id,
+            "unflushed comment",
+            "--no-auto-flush",
+        ],
+    ] {
+        let out = br_cmd(&root).args(&args).output().expect("br spawned");
+        assert!(out.status.success(), "br {args:?} failed");
+    }
+
+    let db_path = root.join(".beads").join("beads.db");
+    let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open database");
+    let comments_root = conn
+        .query_row("SELECT rootpage FROM sqlite_master WHERE name = 'comments'")
+        .expect("read comments root")
+        .get(0)
+        .and_then(fsqlite_types::SqliteValue::as_integer)
+        .expect("integer root page");
+    let page_size = conn
+        .query_row("PRAGMA page_size")
+        .expect("read page size")
+        .get(0)
+        .and_then(fsqlite_types::SqliteValue::as_integer)
+        .expect("integer page size");
+    conn.close().expect("checkpointing close");
+    let _ = fs::remove_file(root.join(".beads").join("beads.db-wal"));
+    let _ = fs::remove_file(root.join(".beads").join("beads.db-shm"));
+    {
+        use std::os::unix::fs::FileExt;
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&db_path)
+            .expect("open db rw");
+        let offset = u64::try_from((comments_root - 1) * page_size).expect("page offset");
+        file.write_at(&[0xff; 8], offset)
+            .expect("damage comments root");
+    }
+
+    let out = br_cmd(&root)
+        .args(["doctor", "--repair", "--json"])
+        .output()
+        .expect("br doctor --repair spawned");
+    let repair = parse_trailing_json(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(repair["repaired"], true, "repair payload: {repair}");
+    assert!(
+        repair["preserved_dirty_issue_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|preserved| preserved == id.as_str())),
+        "the dirty issue row must be preserved: {repair}"
+    );
+    let warnings = repair["dirty_preservation_warnings"]
+        .as_array()
+        .expect("unpreservable comments must be reported, not dropped silently");
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains(id.as_str()) && text.contains("comments"))),
+        "warnings must name the issue and the unreadable comments: {repair}"
+    );
+
+    let show = br_cmd(&root)
+        .args(["show", &id, "--json"])
+        .output()
+        .expect("br show spawned");
+    assert!(
+        show.status.success(),
+        "preserved issue {id} must be readable"
+    );
+    let shown: Value = serde_json::from_slice(&show.stdout).expect("show --json array");
+    assert_eq!(shown[0]["title"], "unflushed local title", "show: {shown}");
+}
+
 #[test]
 fn e2e_reviewed_schema_migration_refuses_current_layout_with_historical_stamp() {
     let temp = isolated_tempdir();

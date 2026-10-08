@@ -34,7 +34,7 @@ use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -98,6 +98,13 @@ struct DoctorRepairResult {
     /// (e.g. a corrupt page made a table unreadable before the rebuild).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     history_preservation_warnings: Vec<String>,
+    /// Loud, human-readable warnings for unflushed issue state the rebuild
+    /// could not carry: a dirty issue whose row was unreadable, or a restored
+    /// issue whose labels, dependencies or comments were unreadable and so
+    /// keep their JSONL copy. The pre-repair family stays in the recovery
+    /// directory.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    dirty_preservation_warnings: Vec<String>,
 }
 
 /// One preserved history table's restore outcome (GitHub #471).
@@ -3500,8 +3507,14 @@ fn repair_database_from_jsonl_after_preflight(
     // --rebuild` preserves via snapshot/restore) and any creation or
     // edit that had not yet been flushed (GitHub #394), since the
     // rebuild only replays what's in the JSONL.
-    let (preserved_tombstones, preserved_dirty_issues) =
-        preserved_state_for_doctor_rebuild(db_path, source);
+    let DoctorPreservedState {
+        tombstones: preserved_tombstones,
+        dirty: preserved_dirty_issues,
+        warnings: dirty_preservation_warnings,
+    } = preserved_state_for_doctor_rebuild(db_path, source);
+    for warning in &dirty_preservation_warnings {
+        tracing::warn!(db_path = %db_path.display(), warning, "doctor --repair cannot fully preserve unflushed local state");
+    }
 
     // GitHub #471: snapshot every DB-only append-only/history table before
     // the rebuild. The JSONL carries issue state only; without this the
@@ -3585,6 +3598,7 @@ fn repair_database_from_jsonl_after_preflight(
         verified_backups,
         preserved_history,
         history_preservation_warnings,
+        dirty_preservation_warnings,
     })
 }
 
@@ -3888,9 +3902,9 @@ fn write_jsonl_rebuild_verification_failed_marker(
 fn preserved_state_for_doctor_rebuild(
     db_path: &Path,
     source: &JsonlSourceSnapshot,
-) -> (Vec<PreservedIssue>, Vec<PreservedIssue>) {
+) -> DoctorPreservedState {
     if !db_path.is_file() {
-        return (Vec::new(), Vec::new());
+        return DoctorPreservedState::default();
     }
     let storage = match SqliteStorage::open(db_path) {
         Ok(storage) => storage,
@@ -3900,14 +3914,20 @@ fn preserved_state_for_doctor_rebuild(
                 error = %err,
                 "Could not open DB for pre-repair preservation snapshot; proceeding without preservation"
             );
-            return (Vec::new(), Vec::new());
+            return DoctorPreservedState::default();
         }
     };
     let tombstone_snapshot = snapshot_tombstones(&storage);
     let dirty_snapshot = snapshot_dirty_live_issues(&storage);
+    let mut warnings =
+        unreadable_dirty_issue_warnings(&storage, &tombstone_snapshot, &dirty_snapshot);
     drop(storage);
     if tombstone_snapshot.is_empty() && dirty_snapshot.is_empty() {
-        return (tombstone_snapshot, dirty_snapshot);
+        return DoctorPreservedState {
+            tombstones: tombstone_snapshot,
+            dirty: dirty_snapshot,
+            warnings,
+        };
     }
     let jsonl_filter = match scan_jsonl_snapshot_for_tombstone_filter(source) {
         Ok(filter) => filter,
@@ -3920,10 +3940,84 @@ fn preserved_state_for_doctor_rebuild(
             JsonlTombstoneFilter::default()
         }
     };
-    (
-        tombstones_missing_from_jsonl_tombstones(tombstone_snapshot, &jsonl_filter),
-        dirty_issues_missing_from_jsonl(dirty_snapshot, &jsonl_filter),
-    )
+    let dirty = dirty_issues_missing_from_jsonl(dirty_snapshot, &jsonl_filter);
+    warnings.extend(dirty.iter().filter_map(partially_preserved_issue_warning));
+    DoctorPreservedState {
+        tombstones: tombstones_missing_from_jsonl_tombstones(tombstone_snapshot, &jsonl_filter),
+        dirty,
+        warnings,
+    }
+}
+
+/// Unflushed state captured from the pre-repair database, and an account of
+/// what could not be captured.
+#[derive(Default)]
+struct DoctorPreservedState {
+    tombstones: Vec<PreservedIssue>,
+    dirty: Vec<PreservedIssue>,
+    warnings: Vec<String>,
+}
+
+/// Name every dirty issue whose row exists but could not be snapshotted, so a
+/// rebuild cannot discard its unflushed changes silently. A dirty marker
+/// whose issue row is simply absent is an orphan, not lost data.
+fn unreadable_dirty_issue_warnings(
+    storage: &SqliteStorage,
+    tombstones: &[PreservedIssue],
+    dirty: &[PreservedIssue],
+) -> Vec<String> {
+    let dirty_ids = match storage.get_dirty_issue_ids() {
+        Ok(ids) => ids,
+        Err(err) => {
+            return vec![format!(
+                "the dirty-issue markers could not be read ({err}); unflushed local changes are not carried across the rebuild"
+            )];
+        }
+    };
+    let captured: HashSet<&str> = tombstones
+        .iter()
+        .chain(dirty)
+        .map(|preserved| preserved.issue.id.as_str())
+        .collect();
+    let missing: Vec<String> = dirty_ids
+        .into_iter()
+        .filter(|id| !captured.contains(id.as_str()))
+        .collect();
+    if missing.is_empty() {
+        return Vec::new();
+    }
+    let unreadable = match storage.get_issues_by_ids(&missing) {
+        Ok(rows) => rows.into_iter().map(|issue| issue.id).collect(),
+        Err(_) => missing,
+    };
+    unreadable
+        .into_iter()
+        .map(|id| {
+            format!(
+                "dirty issue {id} could not be read before the rebuild; its unflushed changes are not in the rebuilt database"
+            )
+        })
+        .collect()
+}
+
+/// Describe the relation sets of a restored dirty issue that could not be
+/// read; the rebuilt issue keeps the JSONL copy of those.
+fn partially_preserved_issue_warning(preserved: &PreservedIssue) -> Option<String> {
+    let unreadable: Vec<&str> = [
+        ("labels", preserved.labels.is_none()),
+        ("dependencies", preserved.dependencies.is_none()),
+        ("comments", preserved.comments.is_none()),
+    ]
+    .into_iter()
+    .filter_map(|(relation, missing)| missing.then_some(relation))
+    .collect();
+    (!unreadable.is_empty()).then(|| {
+        format!(
+            "dirty issue {} was restored, but its {} could not be read; the rebuilt issue keeps the JSONL copy of those",
+            preserved.issue.id,
+            unreadable.join(", ")
+        )
+    })
 }
 
 #[cfg(test)]
@@ -15132,6 +15226,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             "preserved_dirty_issue_ids": &repair_result.preserved_dirty_issue_ids,
             "preserved_history": &repair_result.preserved_history,
             "history_preservation_warnings": &repair_result.history_preservation_warnings,
+            "dirty_preservation_warnings": &repair_result.dirty_preservation_warnings,
             "verified_backups": &repair_result.verified_backups,
             "post_repair": post_repair.report,
             "verified": post_repair_verified,
@@ -15172,6 +15267,9 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         }
         for warning in &repair_result.history_preservation_warnings {
             ctx.warning(&format!("History NOT fully preserved: {warning}"));
+        }
+        for warning in &repair_result.dirty_preservation_warnings {
+            ctx.warning(&format!("Unflushed change NOT fully preserved: {warning}"));
         }
         if let Some(reason) = verification_failure_reason.as_deref() {
             ctx.warning(reason);
@@ -16917,6 +17015,7 @@ mod tests {
             verified_backups: Vec::new(),
             preserved_history: Vec::new(),
             history_preservation_warnings: Vec::new(),
+            dirty_preservation_warnings: Vec::new(),
         };
 
         let audit =
@@ -16993,6 +17092,7 @@ mod tests {
             verified_backups: Vec::new(),
             preserved_history: Vec::new(),
             history_preservation_warnings: Vec::new(),
+            dirty_preservation_warnings: Vec::new(),
         };
         let mut session =
             DoctorRepairSession::new(temp.path(), /* dry_run = */ false).expect("session builds");
