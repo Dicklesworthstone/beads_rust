@@ -328,7 +328,7 @@ checksum = "7b00d5ceff520908bcb2fa6efacf2ab6a0ae45639e87eb1de70b78df13acf636"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -696,6 +696,7 @@ dependencies = [
  "cipher",
  "cpufeatures 0.3.0",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -708,6 +709,7 @@ dependencies = [
  "chacha20",
  "cipher",
  "poly1305",
+ "zeroize",
 ]
 
 [[package]]
@@ -805,7 +807,7 @@ dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -1373,7 +1375,7 @@ checksum = "c6232dd377dcc64799954cbd3a9bb882e9cdc1308ccd87b1c098f1fb2eaf82a8"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -1482,9 +1484,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-client"
-version = "0.10.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d60560bddd591b960f255ead49f6deed34eaff5314b7a1baaac24c04dc2170f"
+checksum = "fe8a7cd2865e29ca34e76dd29362b88a37954582bca51cffc0228a4b869b3f98"
 dependencies = [
  "asupersync",
  "dirs",
@@ -1500,9 +1502,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-console"
-version = "0.10.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71e6cdeb7bbec9b08174d0be3de2ede523e1ae4e2e285a74b188b47c7cc14ad0"
+checksum = "c1a68538ac1f995a3800279746d0c39d30131fd428f42b0a54c9d72a2321c763"
 dependencies = [
  "fastmcp-core",
  "fastmcp-protocol",
@@ -1519,11 +1521,12 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-core"
-version = "0.10.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2acbf2bce54484af1882fb9212a9505ebaef21708754b41cbc60a887ce94caf7"
+checksum = "99607ae1afb10464356d5243ceadafd5515cd54a7f0cdddd331a9a0719b28823"
 dependencies = [
  "asupersync",
+ "chacha20poly1305",
  "getrandom 0.4.3",
  "hmac",
  "log",
@@ -1536,35 +1539,37 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-derive"
-version = "0.10.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5c6d1b75488ea2faf336bf5ff60160c148dfcb0bd47c487ff3df4dcb9effc8d"
+checksum = "400d0f21be2034d945fdc95ad68b488d3e3f7ea7c34b6a7ec6bc889fdac50414"
 dependencies = [
  "fastmcp-protocol",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.6",
 ]
 
 [[package]]
 name = "fastmcp-protocol"
-version = "0.10.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0938af1f3cff85e94b508b6847c92ba83d2f385b3caa370d13f6c485fef4e0ab"
+checksum = "807877fb8076d5ab3a9b33fc81c1d79a482c347ff86478c4e18e38a033e643d3"
 dependencies = [
  "base64 0.23.1",
  "fastmcp-core",
  "regex",
+ "ring",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
 name = "fastmcp-rust"
-version = "0.10.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c87b9be042ea7af3cefeeea424d35cec8d8a5e6d2b17fb4036d3ec51690caab1"
+checksum = "f87848d809e71ed158b932460660079f91fb2a358a4204c77f5d8b10307cba2f"
 dependencies = [
  "asupersync",
  "fastmcp-client",
@@ -1580,9 +1585,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-server"
-version = "0.10.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6357f5384b51a10f12a2c7c7251fe13326f7bdf9a7b6e21ead2ab7368b8c1430"
+checksum = "5e2c23f182fe3c1ce54c3832834d47540054600df6ad46a9515a0a5c3ab615ad"
 dependencies = [
  "asupersync",
  "base64 0.23.1",
@@ -1603,9 +1608,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-transport"
-version = "0.10.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d86ba0eface593b5693c8a1bef191ab0f78162fecab3ac5d5da4def9b676a0f"
+checksum = "2d225ce681b9c820e14539e7f8f23154a914914e1c27a60a366008f285a7b646"
 dependencies = [
  "asupersync",
  "fastmcp-core",
@@ -4731,7 +4736,7 @@ checksum = "2c9283685feec7d69af75fb0e858d5e7378f33fe4fc699383b2916ab9273e03c"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -4893,9 +4898,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.4"
+version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
 dependencies = [
  "bitflags 2.13.1",
  "errno",
@@ -5056,7 +5061,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "serde_derive_internals",
- "syn 3.0.5",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -5160,7 +5165,7 @@ checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -5171,7 +5176,7 @@ checksum = "f852137cce035d6a4df67ccce505ff6b3e9fd3a10e3e52b24dc71e650bb1a9bd"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -5491,9 +5496,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "3.0.5"
+version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12df2e0110f65b775f769bb17ef989067a1d931b2eb822bd4346631eeada89f9"
+checksum = "8593e8e72159ed2257d083c7a454a85cbf854f37a0966d8d483aff8c8a3ebcee"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5582,7 +5587,7 @@ checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -6759,7 +6764,7 @@ checksum = "47402523226a02bfe5230160dc3ccc089aa6f6f19e7fcbb4e6f824bbb1b4aa62"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.6",
 ]
 
 [[package]]
