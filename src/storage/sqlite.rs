@@ -18926,6 +18926,20 @@ pub(crate) fn probe_read_only_open_is_observational(db_path: &Path) -> Result<Re
         if !name.starts_with(&file_name) || !entry.file_type()?.is_file() {
             continue;
         }
+        // The namespace sidecars record the live main file's inode, so on a
+        // copy they name a different file. A read-only open of the copy then
+        // either rewrites that record (engine fallback, bd-g5rdj) or, through
+        // the private WAL-snapshot opener's identity-bound admission, refuses
+        // the copy outright — the probe reported a healthy family missing its
+        // WAL index as unopenable. They are machine-local lock state, not part
+        // of the byte-neutrality contract measured below, and a read-only open
+        // admits a sidecar-less database without creating them.
+        if crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES
+            .iter()
+            .any(|suffix| name.strip_prefix(&file_name) == Some(*suffix))
+        {
+            continue;
+        }
         copied_bytes += std::fs::copy(entry.path(), scratch.path().join(&name))?;
     }
 
