@@ -7625,6 +7625,48 @@ fn check_dirty_bitmap_divergence(conn: &Connection, checks: &mut Vec<CheckResult
 const DIRTY_BITMAP_ORPHAN_PREDICATE: &str =
     "NOT EXISTS (SELECT 1 FROM issues WHERE issues.id = dirty_issues.issue_id)";
 
+/// True when an integrity check found the database structurally damaged.
+///
+/// Every orphan-row fixer decides "orphan" with an `issues.id` lookup. On a
+/// malformed database that lookup can miss a live issue — a damaged
+/// `sqlite_autoindex_issues_1` page reads as "no such id" — so the prune
+/// would delete rows that belong to live issues. For `dirty_issues` that row
+/// is the only record that an unflushed issue still needs exporting, and the
+/// JSONL rebuild that follows then drops the issue itself (beads_rust-n8pdn).
+/// Structural damage belongs to that rebuild, which preserves dirty issues,
+/// comments and history on its own; the surgical prunes stand aside.
+fn report_has_structural_integrity_error(report: &DoctorReport) -> bool {
+    report.checks.iter().any(|check| {
+        matches!(check.status, CheckStatus::Error)
+            && matches!(
+                check.name.as_str(),
+                "sqlite.integrity_check" | "sqlite3.integrity_check"
+            )
+    })
+}
+
+/// Shared refusal for the orphan prunes on a structurally damaged database.
+/// Returns `true` when the named prune must not run.
+fn orphan_prune_blocked_by_integrity_error(
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    table: &str,
+) -> bool {
+    if !report_has_structural_integrity_error(report) {
+        return false;
+    }
+    tracing::warn!(
+        table,
+        "Skipping orphan-row prune: the database failed its integrity check, so orphan detection is unreliable"
+    );
+    if !ctx.is_json() {
+        ctx.warning(&format!(
+            "Skipping {table} orphan prune: the database failed its integrity check, so a live issue can look missing; the JSONL rebuild repairs this damage instead"
+        ));
+    }
+    true
+}
+
 fn fix_dirty_bitmap_orphans_if_warned(
     db_path: &Path,
     report: &DoctorReport,
@@ -7635,7 +7677,7 @@ fn fix_dirty_bitmap_orphans_if_warned(
         .checks
         .iter()
         .any(|c| c.name == "dirty_bitmap" && c.status == CheckStatus::Warn);
-    if !has_warning {
+    if !has_warning || orphan_prune_blocked_by_integrity_error(report, ctx, "dirty_issues") {
         return false;
     }
     let Some(session) = session else {
@@ -7751,7 +7793,7 @@ fn fix_comments_orphans_if_warned(
         .checks
         .iter()
         .any(|c| c.name == "comments.orphans" && c.status == CheckStatus::Warn);
-    if !has_warning {
+    if !has_warning || orphan_prune_blocked_by_integrity_error(report, ctx, "comments") {
         return false;
     }
     let Some(session) = session else {
@@ -7866,7 +7908,7 @@ fn fix_labels_orphans_if_warned(
         .checks
         .iter()
         .any(|c| c.name == "labels.orphans" && c.status == CheckStatus::Warn);
-    if !has_warning {
+    if !has_warning || orphan_prune_blocked_by_integrity_error(report, ctx, "labels") {
         return false;
     }
     let Some(session) = session else {
@@ -7991,7 +8033,7 @@ fn fix_dependencies_orphans_if_warned(
         .checks
         .iter()
         .any(|c| c.name == "dependencies.orphans" && c.status == CheckStatus::Warn);
-    if !has_warning {
+    if !has_warning || orphan_prune_blocked_by_integrity_error(report, ctx, "dependencies") {
         return false;
     }
     let Some(session) = session else {
@@ -24555,6 +24597,34 @@ mod tests {
             }],
         };
         assert!(!report_has_warn_level_page_anomaly(&report));
+    }
+
+    #[test]
+    fn orphan_prunes_stand_aside_only_for_integrity_errors() {
+        let check = |name: &str, status: CheckStatus| CheckResult {
+            name: name.to_string(),
+            status,
+            message: Some("database disk image is malformed".to_string()),
+            details: None,
+        };
+        // beads_rust-n8pdn: a malformed issues index makes live issues look
+        // missing, so the orphan prunes must not run against it.
+        for name in ["sqlite.integrity_check", "sqlite3.integrity_check"] {
+            assert!(report_has_structural_integrity_error(&report_with(vec![
+                check(name, CheckStatus::Error)
+            ])));
+        }
+        // Warn-level page residue and unrelated errors leave the prunes on.
+        assert!(!report_has_structural_integrity_error(&report_with(vec![
+            check("sqlite.integrity_check", CheckStatus::Warn)
+        ])));
+        assert!(!report_has_structural_integrity_error(&report_with(vec![
+            check("db.write_probe", CheckStatus::Error),
+            check("dirty_bitmap", CheckStatus::Warn),
+        ])));
+        assert!(!report_has_structural_integrity_error(&report_with(
+            Vec::new()
+        )));
     }
 
     #[test]
