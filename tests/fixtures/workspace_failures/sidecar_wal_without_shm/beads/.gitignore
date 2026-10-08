@@ -14,6 +14,10 @@ last-touched
 # Local history backups
 .br_history/
 
+# Recovery evidence directories (post-e734526 doctor expectations)
+.br_recovery/
+.br-wal-index-*/
+
 # Sync state (local-only, per-machine)
 .sync.lock
 sync_base.jsonl
