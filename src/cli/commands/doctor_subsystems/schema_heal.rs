@@ -90,6 +90,15 @@ pub struct DbOnlyIssue {
     pub restorable: bool,
 }
 
+/// Relation rows (`labels`, `dependencies`, `comments`) whose owning issue row
+/// is gone, typically left by deletes that older releases ran without
+/// foreign-key enforcement.
+#[derive(Debug, Clone, Serialize)]
+pub struct OrphanRelationRows {
+    pub table: &'static str,
+    pub rows: usize,
+}
+
 /// Result of comparing a stale database with the JSONL snapshot.
 #[derive(Debug, Clone, Serialize)]
 pub struct StaleSchemaAudit {
@@ -98,6 +107,10 @@ pub struct StaleSchemaAudit {
     pub db_issue_count: usize,
     pub jsonl_issue_count: usize,
     pub db_only: Vec<DbOnlyIssue>,
+    /// Well-formed relation rows without an owning issue row. A reviewed
+    /// in-place migration keeps them; a JSONL rebuild cannot carry them, so it
+    /// requires explicit `--discard-db-only`.
+    pub orphan_relations: Vec<OrphanRelationRows>,
     /// A reason the whole database cannot be audited (not a beads tracker,
     /// no JSONL, unparseable JSONL). Always blocks automatic healing.
     pub unprovable: Option<String>,
@@ -110,6 +123,30 @@ impl StaleSchemaAudit {
     #[must_use]
     pub fn is_clean(&self) -> bool {
         self.unprovable.is_none() && self.db_only.is_empty()
+    }
+
+    /// True when the database holds relation rows without an owning issue.
+    #[must_use]
+    pub fn has_orphan_relations(&self) -> bool {
+        !self.orphan_relations.is_empty()
+    }
+
+    /// Whether ordinary commands may upgrade without the explicit heal: the
+    /// audit is clean, and any orphan relation rows will be kept by the
+    /// reviewed in-place migration rather than dropped by a JSONL rebuild.
+    #[must_use]
+    pub fn automatic_heal_allowed(&self) -> bool {
+        self.is_clean()
+            && (!self.has_orphan_relations()
+                || REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&self.from_version))
+    }
+
+    fn orphan_summary(&self) -> String {
+        self.orphan_relations
+            .iter()
+            .map(|orphans| format!("{} {} row(s)", orphans.rows, orphans.table))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     fn db_only_summary(&self) -> String {
@@ -152,6 +189,10 @@ pub struct HealOutcome {
     pub restored_db_only: Vec<String>,
     /// Database-only issues left only in the backup.
     pub backup_only_db_only: Vec<String>,
+    /// Relation rows without an owning issue that a rebuild kept only in the
+    /// backup (`--discard-db-only`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub backup_only_orphan_relations: Vec<OrphanRelationRows>,
     /// Why a reviewed migration was not used, when the rebuild ran instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub migration_fallback_reason: Option<String>,
@@ -180,6 +221,16 @@ impl HealOutcome {
             line.push_str(&format!(
                 "; {} superseded database-only edit(s) kept only in the backup",
                 self.backup_only_db_only.len()
+            ));
+        }
+        if !self.backup_only_orphan_relations.is_empty() {
+            let rows: usize = self
+                .backup_only_orphan_relations
+                .iter()
+                .map(|orphans| orphans.rows)
+                .sum();
+            line.push_str(&format!(
+                "; {rows} relation row(s) without an owning issue kept only in the backup"
             ));
         }
         line
@@ -218,11 +269,22 @@ fn current_version() -> u32 {
 pub fn refusal_error(audit: &StaleSchemaAudit) -> BeadsError {
     let found = i32::try_from(audit.from_version).unwrap_or(i32::MAX);
     let why = audit.unprovable.clone().unwrap_or_else(|| {
-        format!(
-            "{} issue(s) exist only in the database: {}",
-            audit.db_only.len(),
-            audit.db_only_summary()
-        )
+        let mut why = Vec::new();
+        if !audit.db_only.is_empty() {
+            why.push(format!(
+                "{} issue(s) exist only in the database: {}",
+                audit.db_only.len(),
+                audit.db_only_summary()
+            ));
+        }
+        if audit.has_orphan_relations() {
+            why.push(format!(
+                "the database holds relation rows without an owning issue ({}), which a \
+                 rebuild from issues.jsonl cannot carry",
+                audit.orphan_summary()
+            ));
+        }
+        why.join("; ")
     });
     let what = if REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&audit.from_version) {
         "migrates the database in place without dropping any row, keeping a recovery bundle \
@@ -236,6 +298,12 @@ pub fn refusal_error(audit: &StaleSchemaAudit) -> BeadsError {
         "refuses a JSONL rebuild that cannot restore unreadable issues; inspect and repair \
          those original payloads before attempting a lossless rebuild"
             .to_string()
+    } else if audit.has_orphan_relations() {
+        format!(
+            "refuses a JSONL rebuild that would drop those relation rows; `{HEAL_COMMAND} \
+             --discard-db-only` is the explicit choice to rebuild and keep them only in the \
+             retained .beads/.br_recovery backup"
+        )
     } else {
         "rebuilds the database from issues.jsonl, re-adds the database-only issues as \
          unflushed changes (exported by the next flush), and keeps the old database in \
@@ -292,6 +360,7 @@ fn audit_connection(
         db_issue_count: 0,
         jsonl_issue_count: 0,
         db_only: Vec::new(),
+        orphan_relations: Vec::new(),
         unprovable: None,
         restorable: Vec::new(),
     };
@@ -314,8 +383,9 @@ fn audit_connection(
         return Ok(audit);
     }
 
-    let db_issues = read_legacy_issues(conn, &tables, &issue_columns)?;
+    let (db_issues, orphan_relations) = read_legacy_issues(conn, &tables, &issue_columns)?;
     audit.db_issue_count = db_issues.len();
+    audit.orphan_relations = orphan_relations;
     let dirty: Option<HashSet<String>> = if tables.contains("dirty_issues") {
         Some(
             conn.query("SELECT issue_id FROM dirty_issues")?
@@ -536,7 +606,7 @@ fn read_legacy_issues(
     conn: &Connection,
     tables: &HashSet<String>,
     issue_columns: &[String],
-) -> Result<Vec<LegacyIssue>> {
+) -> Result<(Vec<LegacyIssue>, Vec<OrphanRelationRows>)> {
     let mut labels: HashMap<String, Vec<String>> = HashMap::new();
     if tables.contains("labels") {
         for row in conn.query("SELECT issue_id, label FROM labels")? {
@@ -575,18 +645,24 @@ fn read_legacy_issues(
         );
         issues.push(LegacyIssue { id, decoded });
     }
-    for (table, orphaned) in [
-        ("labels", !labels.is_empty()),
-        ("dependencies", !dependencies.is_empty()),
-        ("comments", !comments.is_empty()),
-    ] {
-        if orphaned {
-            return Err(BeadsError::Config(format!(
-                "legacy {table} contains rows without an owning issue; refusing a lossy schema heal"
-            )));
-        }
-    }
-    Ok(issues)
+    // Well-formed relation rows whose issue row is gone (deletes that older
+    // releases ran without foreign-key enforcement) have no issue to compare
+    // or restore. Report them rather than refusing the whole audit: the
+    // reviewed in-place migration keeps them, and a JSONL rebuild requires
+    // explicit `--discard-db-only` (see `require_lossless_rebuild`).
+    let orphan_relations = [
+        ("labels", labels.values().map(Vec::len).sum::<usize>()),
+        (
+            "dependencies",
+            dependencies.values().map(Vec::len).sum::<usize>(),
+        ),
+        ("comments", comments.values().map(Vec::len).sum::<usize>()),
+    ]
+    .into_iter()
+    .filter(|&(_, rows)| rows > 0)
+    .map(|(table, rows)| OrphanRelationRows { table, rows })
+    .collect();
+    Ok((issues, orphan_relations))
 }
 
 fn required_legacy_text(value: Option<&SqliteValue>, table: &str, column: &str) -> Result<String> {
@@ -890,7 +966,7 @@ pub fn heal_stale_schema(ctx: &HealContext<'_>, mode: HealMode) -> Result<HealRe
     let mut audit = audit_stale_database(&paths.db_path, source.as_ref())?;
     audit.from_version = from_version;
     let discard_db_only = match mode {
-        HealMode::Automatic if !audit.is_clean() => {
+        HealMode::Automatic if !audit.automatic_heal_allowed() => {
             return Ok(HealResult::Refused(Box::new(audit)));
         }
         HealMode::Automatic => false,
@@ -913,6 +989,7 @@ pub fn heal_stale_schema(ctx: &HealContext<'_>, mode: HealMode) -> Result<HealRe
                     backup: backup.display().to_string(),
                     restored_db_only: Vec::new(),
                     backup_only_db_only: Vec::new(),
+                    backup_only_orphan_relations: Vec::new(),
                     migration_fallback_reason: None,
                 }));
             }
@@ -922,6 +999,16 @@ pub fn heal_stale_schema(ctx: &HealContext<'_>, mode: HealMode) -> Result<HealRe
             Err(error) if stale_schema_version(&paths.db_path)?.is_some() => {
                 if !audit.is_clean() && matches!(mode, HealMode::Automatic) {
                     return Err(error);
+                }
+                if audit.has_orphan_relations() && matches!(mode, HealMode::Automatic) {
+                    return Err(BeadsError::Config(format!(
+                        "the reviewed schema-{from_version} migration did not complete ({error}); \
+                         the database was left on schema {from_version}. A rebuild from \
+                         issues.jsonl cannot carry its relation rows without an owning issue \
+                         ({}). `{HEAL_COMMAND} --discard-db-only` rebuilds and keeps those rows \
+                         only in the retained backup",
+                        audit.orphan_summary()
+                    )));
                 }
                 migration_fallback_reason = Some(error.to_string());
             }
@@ -996,6 +1083,9 @@ pub fn heal_stale_schema(ctx: &HealContext<'_>, mode: HealMode) -> Result<HealRe
         backup: backup.display().to_string(),
         restored_db_only,
         backup_only_db_only,
+        // Reachable with orphans only under `--discard-db-only`
+        // (`require_lossless_rebuild`): a rebuild never carries them.
+        backup_only_orphan_relations: audit.orphan_relations.clone(),
         migration_fallback_reason,
     }))
 }
@@ -1039,6 +1129,15 @@ fn require_lossless_rebuild(audit: &StaleSchemaAudit, discard_db_only: bool) -> 
             audit.db_only_summary()
         )));
     }
+    if !discard_db_only && audit.has_orphan_relations() {
+        return Err(BeadsError::Config(format!(
+            "schema-heal rebuild refused: the database holds relation rows without an owning \
+             issue ({}), which a rebuild from issues.jsonl cannot carry. The rebuild was not \
+             started. `{HEAL_COMMAND} --discard-db-only` is an explicit choice to keep them \
+             only in the retained backup, not in the rebuilt tracker",
+            audit.orphan_summary()
+        )));
+    }
     Ok(())
 }
 
@@ -1079,11 +1178,64 @@ fn planned_action(audit: &StaleSchemaAudit, discard_db_only: bool) -> String {
             }
         )
     };
+    // `require_lossless_rebuild` passed, so orphans here mean `--discard-db-only`.
+    let orphans = if audit.has_orphan_relations() {
+        format!(
+            "; {} without an owning issue kept only in the backup",
+            audit.orphan_summary()
+        )
+    } else {
+        String::new()
+    };
     format!(
         "rebuild schema {} -> {} from issues.jsonl, old database family moved to \
-         .beads/.br_recovery{tail}",
+         .beads/.br_recovery{tail}{orphans}",
         audit.from_version, audit.to_version
     )
+}
+
+/// Human-readable `heal --dry-run` report.
+fn print_dry_run_audit(audit: &StaleSchemaAudit, action: &str) {
+    println!(
+        "Database schema {} (this br uses {}); {} issue(s) in the database, {} in the JSONL.",
+        audit.from_version, audit.to_version, audit.db_issue_count, audit.jsonl_issue_count
+    );
+    if let Some(reason) = &audit.unprovable {
+        println!("Audit incomplete: {reason}.");
+    } else if audit.db_only.is_empty() {
+        if audit.has_orphan_relations() {
+            println!(
+                "Relation rows without an owning issue: {}.",
+                audit.orphan_summary()
+            );
+        }
+        if audit.automatic_heal_allowed() {
+            println!(
+                "Nothing exists only in the database; ordinary commands heal it \
+                 automatically."
+            );
+        } else {
+            println!(
+                "No issue exists only in the database, but a rebuild would drop those \
+                 relation rows, so ordinary commands refuse."
+            );
+        }
+    } else {
+        println!(
+            "{} issue(s) exist only in the database:",
+            audit.db_only.len()
+        );
+        for issue in &audit.db_only {
+            println!("  {} ({})", issue.id, issue.reason.describe());
+        }
+        if audit.has_orphan_relations() {
+            println!(
+                "Relation rows without an owning issue: {}.",
+                audit.orphan_summary()
+            );
+        }
+    }
+    println!("Heal would: {action}.");
 }
 
 /// Execute `br doctor migrate-schema heal`.
@@ -1110,7 +1262,7 @@ pub fn execute_heal(
             let payload = serde_json::json!({
                 "dry_run": true,
                 "audit": audit,
-                "automatic_heal_allowed": audit.is_clean(),
+                "automatic_heal_allowed": audit.automatic_heal_allowed(),
                 "planned_action": action,
             });
             println!(
@@ -1118,26 +1270,7 @@ pub fn execute_heal(
                 serde_json::to_string_pretty(&payload).map_err(BeadsError::Json)?
             );
         } else {
-            println!(
-                "Database schema {} (this br uses {}); {} issue(s) in the database, {} in the JSONL.",
-                audit.from_version, audit.to_version, audit.db_issue_count, audit.jsonl_issue_count
-            );
-            if let Some(reason) = &audit.unprovable {
-                println!("Audit incomplete: {reason}.");
-            } else if audit.db_only.is_empty() {
-                println!(
-                    "Nothing exists only in the database; ordinary commands heal it automatically."
-                );
-            } else {
-                println!(
-                    "{} issue(s) exist only in the database:",
-                    audit.db_only.len()
-                );
-                for issue in &audit.db_only {
-                    println!("  {} ({})", issue.id, issue.reason.describe());
-                }
-            }
-            println!("Heal would: {action}.");
+            print_dry_run_audit(&audit, &action);
         }
         return Ok(());
     }
@@ -1385,13 +1518,6 @@ mod tests {
             ),
             (
                 &[
-                    "CREATE TABLE comments (issue_id TEXT, text TEXT)",
-                    "INSERT INTO comments VALUES ('missing-owner', 'retained')",
-                ],
-                "without an owning issue",
-            ),
-            (
-                &[
                     "CREATE TABLE dependencies (issue_id TEXT, metadata BLOB)",
                     "INSERT INTO dependencies VALUES ('a-1', X'FEED')",
                 ],
@@ -1413,6 +1539,56 @@ mod tests {
             let error = audit_connection(&conn, Some(std::io::Cursor::new(jsonl))).unwrap_err();
             assert!(error.to_string().contains(expected), "{expected}: {error}");
         }
+    }
+
+    /// Well-formed relation rows whose issue is gone (deletes that older releases
+    /// ran without foreign-key enforcement) used to fail the whole audit, so every
+    /// mutating command and even `heal --discard-db-only` refused such a database.
+    /// They are reported instead: the reviewed in-place migration keeps them, and
+    /// only a JSONL rebuild, which cannot carry them, needs `--discard-db-only`.
+    #[test]
+    fn orphan_relation_rows_are_reported_and_only_a_rebuild_needs_discard() {
+        let (conn, jsonl) = legacy_audit_fixture();
+        for sql in [
+            "CREATE TABLE comments (issue_id TEXT, text TEXT)",
+            "INSERT INTO comments VALUES ('missing-owner', 'retained')",
+            "INSERT INTO comments VALUES ('missing-owner', 'second')",
+            "CREATE TABLE labels (issue_id TEXT, label TEXT)",
+            "INSERT INTO labels VALUES ('missing-owner', 'retained')",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let mut audit = audit_connection(&conn, Some(std::io::Cursor::new(jsonl))).unwrap();
+        assert!(audit.is_clean(), "orphans are not issues: {audit:?}");
+        let orphans: Vec<(&str, usize)> = audit
+            .orphan_relations
+            .iter()
+            .map(|orphans| (orphans.table, orphans.rows))
+            .collect();
+        assert_eq!(orphans, [("labels", 1), ("comments", 2)]);
+
+        audit.from_version = REVIEWED_MIGRATION_SOURCE_VERSIONS[0];
+        assert!(audit.automatic_heal_allowed(), "the migration keeps them");
+        audit.from_version = 4;
+        assert!(!audit.automatic_heal_allowed(), "a rebuild would drop them");
+        assert!(
+            refusal_error(&audit)
+                .to_string()
+                .contains("--discard-db-only")
+        );
+
+        let refused = require_lossless_rebuild(&audit, false).unwrap_err();
+        assert!(
+            refused.to_string().contains("without an owning issue"),
+            "{refused}"
+        );
+        assert!(planned_action(&audit, false).starts_with("refuse rebuild"));
+        require_lossless_rebuild(&audit, true).expect("explicit discard authorizes it");
+        assert!(
+            planned_action(&audit, true).contains("kept only in the backup"),
+            "{}",
+            planned_action(&audit, true)
+        );
     }
 
     #[test]

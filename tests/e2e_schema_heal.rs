@@ -16,6 +16,7 @@
 
 mod common;
 
+use beads_rust::franken_sync::{Connection, SqliteValue};
 use common::cli::{BrWorkspace, extract_json_payload, run_br};
 use flate2::read::GzDecoder;
 use serde_json::Value;
@@ -409,4 +410,206 @@ fn dangling_dependency_edge_does_not_block_import_or_heal() {
             .is_none_or(Vec::is_empty),
         "the dangling edge is dropped locally"
     );
+}
+
+/// Delete an issue the way pre-0.6.0 releases could: with foreign-key
+/// enforcement off, so its label and comment rows outlive it.
+fn add_orphan_relations(db_path: &Path, ghost: &str) {
+    let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open fixture");
+    for statement in [
+        "PRAGMA foreign_keys = OFF".to_owned(),
+        format!("INSERT INTO labels (issue_id, label) VALUES ('{ghost}', 'orphan-label')"),
+        format!(
+            "INSERT INTO comments (issue_id, author, text, created_at) \
+             VALUES ('{ghost}', 'agent', 'orphan comment', '2026-01-01 00:00:00')"
+        ),
+    ] {
+        conn.execute(&statement).expect("add orphan relation row");
+    }
+    conn.close().expect("close fixture");
+}
+
+/// `(labels, comments)` rows owned by `issue_id`, read from a scratch copy so
+/// the inspected database family is never touched.
+fn relation_rows(db_path: &Path, issue_id: &str) -> (i64, i64) {
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let copy = scratch.path().join("copy.db");
+    fs::copy(db_path, &copy).expect("copy database");
+    let wal = PathBuf::from(format!("{}-wal", db_path.display()));
+    if wal.is_file() {
+        fs::copy(&wal, scratch.path().join("copy.db-wal")).expect("copy WAL");
+    }
+    let conn = Connection::open(copy.to_string_lossy().into_owned()).expect("open copy");
+    let count = |table: &str| match conn
+        .query(&format!(
+            "SELECT count(*) FROM {table} WHERE issue_id = '{issue_id}'"
+        ))
+        .expect("count rows")
+        .first()
+        .and_then(|row| row.get(0).cloned())
+    {
+        Some(SqliteValue::Integer(rows)) => rows,
+        other => panic!("count({table}) returned {other:?}"),
+    };
+    let rows = (count("labels"), count("comments"));
+    let _ = conn.close();
+    rows
+}
+
+/// A pre-0.6.0 database holding the label and comment of a deleted issue used
+/// to fail the stale-schema audit outright ("contains rows without an owning
+/// issue"), so every mutating command refused and even
+/// `heal --discard-db-only` failed. The reviewed in-place migration keeps those
+/// rows, so the ordinary automatic heal now proceeds without dropping them.
+#[test]
+fn orphan_relation_rows_heal_through_the_reviewed_migration_and_are_kept() {
+    let workspace = BrWorkspace::new();
+    let beads_dir = workspace.root.join(".beads");
+    fs::create_dir_all(&beads_dir).expect("create .beads");
+    let mut decoder = GzDecoder::new(
+        fs::File::open(fixture_dir().join("schema16_v0219_release.db.gz")).expect("open gz"),
+    );
+    let mut bytes = Vec::new();
+    decoder.read_to_end(&mut bytes).expect("gunzip");
+    let db_path = beads_dir.join("beads.db");
+    fs::write(&db_path, bytes).expect("write db");
+    fs::copy(
+        fixture_dir().join("schema16_issues.jsonl"),
+        beads_dir.join("issues.jsonl"),
+    )
+    .expect("copy jsonl");
+    fs::copy(
+        fixture_dir().join("schema16_config.yaml"),
+        beads_dir.join("config.yaml"),
+    )
+    .expect("copy config");
+    add_orphan_relations(&db_path, "v15ws-deleted");
+    assert_eq!(header_user_version(&db_path), 16);
+
+    let dry = run_br(
+        &workspace,
+        ["doctor", "migrate-schema", "heal", "--dry-run", "--json"],
+        "orphans16_dry_run",
+    );
+    assert!(dry.status.success(), "{}", dry.stderr);
+    let dry = json_stdout(&dry.stdout);
+    assert_eq!(
+        dry["audit"]["orphan_relations"],
+        serde_json::json!([
+            {"table": "labels", "rows": 1},
+            {"table": "comments", "rows": 1}
+        ]),
+        "{dry}"
+    );
+    assert_eq!(dry["automatic_heal_allowed"], true, "{dry}");
+
+    let create = run_br(
+        &workspace,
+        ["create", "Created after orphan heal", "--json"],
+        "orphans16_create",
+    );
+    assert!(
+        create.status.success(),
+        "create must heal and proceed: {}",
+        create.stderr
+    );
+    assert!(
+        create.stderr.contains("migrated it in place"),
+        "{}",
+        create.stderr
+    );
+    assert_eq!(header_user_version(&db_path), current_version());
+    assert_eq!(
+        relation_rows(&db_path, "v15ws-deleted"),
+        (1, 1),
+        "the in-place migration keeps every row"
+    );
+}
+
+/// Without a reviewed migration (schema 4 heals by rebuilding from the JSONL),
+/// orphan relation rows cannot be carried into the rebuilt tracker. Ordinary
+/// commands and the plain heal refuse and change nothing; the explicit
+/// `--discard-db-only` rebuilds and keeps the rows only in the retained backup.
+#[test]
+fn orphan_relation_rows_refuse_a_rebuild_until_discard_is_explicit() {
+    let workspace = BrWorkspace::new();
+    let db_path = install(
+        &workspace,
+        "schema4_v0127_clean.db.gz",
+        "schema4_v0127.issues.jsonl",
+        "leg",
+    );
+    add_orphan_relations(&db_path, "leg-deleted");
+    assert_eq!(header_user_version(&db_path), 4);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Must not run", "--json"],
+        "orphans4_create",
+    );
+    assert!(!create.status.success(), "create must refuse");
+    assert!(
+        create.stderr.contains("without an owning issue")
+            && create.stderr.contains("--discard-db-only"),
+        "{}",
+        create.stderr
+    );
+    assert_eq!(header_user_version(&db_path), 4, "nothing changed");
+
+    let heal = run_br(
+        &workspace,
+        ["doctor", "migrate-schema", "heal", "--json"],
+        "orphans4_heal",
+    );
+    assert!(!heal.status.success(), "plain heal must refuse");
+    assert!(
+        heal.stderr.contains("rebuild refused") && heal.stderr.contains("without an owning issue"),
+        "{} {}",
+        heal.stdout,
+        heal.stderr
+    );
+    assert_eq!(header_user_version(&db_path), 4, "nothing changed");
+    assert_eq!(relation_rows(&db_path, "leg-deleted"), (1, 1));
+
+    let heal = run_br(
+        &workspace,
+        [
+            "doctor",
+            "migrate-schema",
+            "heal",
+            "--discard-db-only",
+            "--json",
+        ],
+        "orphans4_heal_discard",
+    );
+    assert!(heal.status.success(), "{} {}", heal.stdout, heal.stderr);
+    let outcome = json_stdout(&heal.stdout);
+    assert_eq!(outcome["action"], "rebuilt", "{outcome}");
+    assert_eq!(
+        outcome["backup_only_orphan_relations"],
+        serde_json::json!([
+            {"table": "labels", "rows": 1},
+            {"table": "comments", "rows": 1}
+        ]),
+        "{outcome}"
+    );
+    assert_eq!(header_user_version(&db_path), current_version());
+    assert_eq!(relation_rows(&db_path, "leg-deleted"), (0, 0));
+    let issue = show(&workspace, "leg-n57");
+    assert_eq!(issue["labels"], serde_json::json!(["legacy-label"]));
+
+    // The rows survive byte-for-byte in the retained schema-4 backup.
+    let recovery = workspace.root.join(".beads/.br_recovery");
+    let retained = walk(&recovery)
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("beads.db") && !name.contains('-'))
+        })
+        .find(|path| {
+            fs::read(path).is_ok_and(|bytes| bytes.len() > 100 && header_bytes(&bytes) == 4)
+        })
+        .unwrap_or_else(|| panic!("schema-4 backup must be retained under {recovery:?}"));
+    assert_eq!(relation_rows(&retained, "leg-deleted"), (1, 1));
 }
