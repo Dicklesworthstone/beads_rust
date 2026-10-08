@@ -5,6 +5,7 @@ use crate::format::{
 };
 use crate::model::{Comment, Dependency, Issue};
 use crate::output::{OutputContext, OutputMode, Theme};
+use rich_rust::cells::cell_len;
 use rich_rust::prelude::*;
 use rich_rust::renderables::markdown::Markdown;
 
@@ -99,12 +100,12 @@ impl<'a> IssuePanel<'a> {
             let sanitized = sanitize_terminal_text(desc);
             if ctx.mode() == OutputMode::Rich && contains_markdown(&sanitized) {
                 let inner_width = ctx.width().saturating_sub(4).max(1);
-                for segment in Markdown::new(sanitized.as_ref()).render(inner_width) {
-                    match segment.style {
-                        Some(style) => content.append_styled(&segment.text, style),
-                        None => content.append(&segment.text),
-                    }
-                }
+                content.append_text(&markdown_description_text(
+                    sanitized.as_ref(),
+                    inner_width,
+                    wrap,
+                    self.theme,
+                ));
             } else {
                 content.append_styled(sanitized.as_ref(), self.theme.issue_description.clone());
             }
@@ -280,6 +281,133 @@ impl<'a> IssuePanel<'a> {
     }
 }
 
+/// Narrowest body a hanging indent may leave. Below this a deeply nested
+/// item wraps at the full width instead of into a one-word column.
+const MIN_HANGING_BODY_WIDTH: usize = 8;
+
+/// Style handed to `rich_rust`'s Markdown renderer for inline code. The
+/// renderer pads every code span to ` code ` (GitHub #529); a true color no
+/// other renderer style uses lets [`markdown_description_text`] find exactly
+/// those segments, drop the padding before anything measures or wraps them,
+/// and restyle them with the theme's `inline_code`.
+fn inline_code_sentinel() -> Style {
+    Style::new().color(Color::from_rgb(1, 2, 3))
+}
+
+/// Render a Markdown description into panel text `width` cells wide.
+///
+/// Inline code loses the renderer's padding and takes the theme's inline-code
+/// style (GitHub #529). With `wrap`, a line wider than `width` wraps under its
+/// own text: continuation lines repeat the line's indentation and blockquote
+/// bars and replace its list marker with blanks, so a wrapped bullet keeps its
+/// hanging indent (GitHub #530). Lines that fit are returned unchanged, so the
+/// panel's later wrap never splits them again.
+fn markdown_description_text(source: &str, width: usize, wrap: bool, theme: &Theme) -> Text {
+    let sentinel = inline_code_sentinel();
+    let mut lines = Vec::new();
+    let mut current = Text::new("");
+    for segment in Markdown::new(source)
+        .code_style(sentinel.clone())
+        .render(width)
+    {
+        if segment.is_control() {
+            continue;
+        }
+        let is_code = segment.style.as_ref() == Some(&sentinel);
+        let text = segment.text.as_ref();
+        let (text, style) = if is_code {
+            (
+                text.strip_prefix(' ')
+                    .and_then(|code| code.strip_suffix(' '))
+                    .unwrap_or(text),
+                Some(theme.inline_code.clone()),
+            )
+        } else {
+            (text, segment.style)
+        };
+        for (idx, part) in text.split('\n').enumerate() {
+            if idx > 0 {
+                lines.push(std::mem::replace(&mut current, Text::new("")));
+            }
+            match &style {
+                Some(style) if !part.is_empty() => current.append_styled(part, style.clone()),
+                _ => current.append(part),
+            }
+        }
+    }
+    lines.push(current);
+
+    let mut rendered = Text::new("");
+    for (idx, line) in lines.iter().enumerate() {
+        if idx > 0 {
+            rendered.append("\n");
+        }
+        // The renderer pads each line to `width`; padding is not content and
+        // would otherwise count against the wrap below.
+        let line = line.slice(0, line.plain().trim_end_matches(' ').chars().count());
+        if !wrap || line.cell_len() <= width {
+            rendered.append_text(&line);
+            continue;
+        }
+        let (prefix_chars, continuation) = markdown_hanging_prefix(&line);
+        let body_width = width.saturating_sub(continuation.cell_len());
+        if body_width < MIN_HANGING_BODY_WIDTH {
+            rendered.append_text(&line);
+            continue;
+        }
+        let body = line.slice(prefix_chars, line.len());
+        for (piece_idx, piece) in body.wrap(body_width).iter().enumerate() {
+            if piece_idx == 0 {
+                rendered.append_text(&line.slice(0, prefix_chars));
+            } else {
+                rendered.append("\n");
+                rendered.append_text(&continuation);
+            }
+            rendered.append_text(piece);
+        }
+    }
+    rendered
+}
+
+/// Split a rendered Markdown line into its structural prefix (indentation,
+/// blockquote bars, one list marker and an optional task checkbox) and the
+/// prefix its wrapped continuation lines carry: the same width, with bars
+/// kept and markers blanked. Returns the prefix length in chars.
+fn markdown_hanging_prefix(line: &Text) -> (usize, Text) {
+    let chars: Vec<char> = line.plain().chars().collect();
+    let mut idx = 0;
+    let mut continuation = Text::new("");
+    let mut marker_seen = false;
+    while let Some(&ch) = chars.get(idx) {
+        let followed_by_space = chars.get(idx + 1) == Some(&' ');
+        if ch == ' ' {
+            continuation.append(" ");
+            idx += 1;
+        } else if ch == '│' && followed_by_space && !marker_seen {
+            continuation.append_text(&line.slice(idx, idx + 2));
+            idx += 2;
+        } else if matches!(ch, '•' | '☐' | '☑') && followed_by_space {
+            marker_seen = true;
+            continuation.append(&" ".repeat(cell_len(&ch.to_string()) + 1));
+            idx += 2;
+        } else if ch.is_ascii_digit() && !marker_seen {
+            let digits = chars[idx..]
+                .iter()
+                .take_while(|digit| digit.is_ascii_digit())
+                .count();
+            if chars.get(idx + digits) != Some(&'.') || chars.get(idx + digits + 1) != Some(&' ') {
+                break;
+            }
+            marker_seen = true;
+            continuation.append(&" ".repeat(digits + 2));
+            idx += digits + 2;
+        } else {
+            break;
+        }
+    }
+    (idx, continuation)
+}
+
 fn wrap_rich_text(text: &Text, panel_width: usize) -> Text {
     let content_width = panel_width.saturating_sub(4).max(1);
     let lines = text.wrap(content_width);
@@ -365,12 +493,99 @@ fn render_dependency_refs(deps: &[Dependency], content: &mut Text, theme: &Theme
 
 #[cfg(test)]
 mod tests {
-    use super::{IssuePanel, dependency_arrow, render_dependency_list, render_dependency_refs};
+    use super::{
+        IssuePanel, dependency_arrow, markdown_description_text, render_dependency_list,
+        render_dependency_refs,
+    };
     use crate::format::IssueWithDependencyMetadata;
     use crate::model::{Dependency, DependencyType, Issue, Priority, Status};
     use crate::output::Theme;
     use chrono::Utc;
     use rich_rust::prelude::Text;
+
+    fn markdown_lines(source: &str, width: usize, wrap: bool) -> Vec<String> {
+        let mut lines: Vec<String> =
+            markdown_description_text(source, width, wrap, &Theme::default())
+                .plain()
+                .lines()
+                .map(str::to_string)
+                .collect();
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        lines
+    }
+
+    #[test]
+    fn markdown_inline_code_has_no_padding_and_uses_theme_style() {
+        let theme = Theme::default();
+        let text =
+            markdown_description_text("run `make build` to build, then `x`.", 80, true, &theme);
+        assert_eq!(text.plain().trim_end(), "run make build to build, then x.");
+        let code_spans: Vec<String> = text
+            .spans()
+            .iter()
+            .filter(|span| span.style == theme.inline_code)
+            .map(|span| text.slice(span.start, span.end).plain().to_string())
+            .collect();
+        assert_eq!(code_spans, vec!["make build", "x"]);
+    }
+
+    #[test]
+    fn markdown_wrapped_code_span_never_leaves_a_padding_only_line() {
+        // Without the fix the padded span " make build " could wrap so that a
+        // line held only its padding (GitHub #529).
+        for width in 10..30 {
+            for line in markdown_lines("aaaa bbbb `make build` cccc", width, true) {
+                assert!(line.chars().count() <= width, "{line:?} exceeds {width}");
+                assert!(!line.trim().is_empty() || line.is_empty(), "{line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_wrapped_bullet_keeps_hanging_indent() {
+        // The exact shape GitHub #530 asks for.
+        let lines = markdown_lines("* blah blah blah blah blah", 18, true);
+        assert_eq!(lines, vec!["  • blah blah blah", "    blah blah"]);
+
+        let ordered = markdown_lines("1. alpha beta gamma delta epsilon", 16, true);
+        assert_eq!(ordered[0], "  1. alpha beta ");
+        assert!(ordered[1..].iter().all(|line| line.starts_with("     ")));
+        assert!(ordered[1..].iter().all(|line| !line.trim().is_empty()));
+
+        let nested = markdown_lines("- outer\n  - inner words wrap here nicely", 20, true);
+        assert_eq!(nested[0], "  • outer");
+        assert!(nested[1].starts_with("    • inner"));
+        assert!(nested[2..].iter().all(|line| line.starts_with("      ")));
+    }
+
+    #[test]
+    fn markdown_wrapped_task_item_and_quote_keep_their_prefix() {
+        let task = markdown_lines("- [ ] write the regression test first", 20, true);
+        assert!(task[0].starts_with("  • ☐ write"));
+        assert!(task[1..].iter().all(|line| line.starts_with("      ")));
+
+        let quote = markdown_lines("> one two three four five six seven", 14, true);
+        assert!(quote.len() > 1);
+        assert!(quote.iter().all(|line| line.starts_with("│ ")), "{quote:?}");
+    }
+
+    #[test]
+    fn markdown_lines_that_fit_or_no_wrap_are_unchanged() {
+        assert_eq!(
+            markdown_lines("- short\n- items", 40, true),
+            vec!["  • short", "  • items"]
+        );
+        // --no-wrap leaves long lines alone for the terminal to handle.
+        assert_eq!(
+            markdown_lines("* blah blah blah blah blah", 18, false),
+            vec!["  • blah blah blah blah blah"]
+        );
+        // A plain paragraph wraps at the full width with no indent.
+        let para = markdown_lines("**word** one two three four five", 12, true);
+        assert!(para.iter().skip(1).all(|line| !line.starts_with(' ')));
+    }
 
     #[test]
     fn workflow_fields_are_distinct_and_terminal_safe() {
