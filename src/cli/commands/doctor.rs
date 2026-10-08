@@ -7729,14 +7729,39 @@ const DIRTY_BITMAP_ORPHAN_PREDICATE: &str =
 /// JSONL rebuild that follows then drops the issue itself (beads_rust-n8pdn).
 /// Structural damage belongs to that rebuild, which preserves dirty issues,
 /// comments and history on its own; the surgical prunes stand aside.
+///
+/// Rows "missing from index" are otherwise a benign Warn (partial-index
+/// artifacts), except in the `issues` primary-key index: that is the index the
+/// `issues.id` lookups read, so a live issue missing from it looks deleted.
 fn report_has_structural_integrity_error(report: &DoctorReport) -> bool {
     report.checks.iter().any(|check| {
-        matches!(check.status, CheckStatus::Error)
-            && matches!(
-                check.name.as_str(),
-                "sqlite.integrity_check" | "sqlite3.integrity_check"
-            )
+        matches!(
+            check.name.as_str(),
+            "sqlite.integrity_check" | "sqlite3.integrity_check"
+        ) && (matches!(check.status, CheckStatus::Error)
+            || integrity_check_reports_missing_issue_key(check))
     })
+}
+
+/// True when an integrity check reports rows missing from the `issues`
+/// primary-key index (`sqlite_autoindex_issues_*`).
+fn integrity_check_reports_missing_issue_key(check: &CheckResult) -> bool {
+    let names_issue_key = |text: &str| {
+        let lower = text.to_lowercase();
+        lower.contains("missing from index") && lower.contains("sqlite_autoindex_issues_")
+    };
+    check.message.as_deref().is_some_and(names_issue_key)
+        || check
+            .details
+            .as_ref()
+            .and_then(|details| details.get("messages"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|messages| {
+                messages
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .any(names_issue_key)
+            })
 }
 
 /// Shared refusal for the orphan prunes on a structurally damaged database.
@@ -7751,11 +7776,11 @@ fn orphan_prune_blocked_by_integrity_error(
     }
     tracing::warn!(
         table,
-        "Skipping orphan-row prune: the database failed its integrity check, so orphan detection is unreliable"
+        "Skipping orphan-row prune: the integrity check found damage that makes orphan detection unreliable"
     );
     if !ctx.is_json() {
         ctx.warning(&format!(
-            "Skipping {table} orphan prune: the database failed its integrity check, so a live issue can look missing; the JSONL rebuild repairs this damage instead"
+            "Skipping {table} orphan prune: the integrity check found damage that can make a live issue look missing; the JSONL rebuild repairs this damage instead"
         ));
     }
     true
@@ -24725,6 +24750,39 @@ mod tests {
         assert!(!report_has_structural_integrity_error(&report_with(
             Vec::new()
         )));
+    }
+
+    /// beads_rust-n8pdn, Warn-level form: "row N missing from index" is reported
+    /// as a benign Warn, but in the `issues` primary-key index it makes the
+    /// orphan prunes' `issues.id` lookups miss live issues, whose comments and
+    /// labels the prunes would then delete before REINDEX runs.
+    #[test]
+    fn orphan_prunes_stand_aside_when_the_issue_key_index_lost_rows() {
+        let warn = |message: &str, details: Option<serde_json::Value>| CheckResult {
+            name: "sqlite.integrity_check".to_string(),
+            status: CheckStatus::Warn,
+            message: Some(message.to_string()),
+            details,
+        };
+        assert!(report_has_structural_integrity_error(&report_with(vec![
+            warn("row 7 missing from index sqlite_autoindex_issues_1", None)
+        ])));
+        assert!(report_has_structural_integrity_error(&report_with(vec![
+            warn(
+                "2 integrity messages",
+                Some(serde_json::json!({ "messages": [
+                    "row 3 missing from index idx_issues_status",
+                    "row 7 missing from index sqlite_autoindex_issues_1",
+                ] })),
+            )
+        ])));
+        // Partial-index artifacts elsewhere keep the prunes on.
+        assert!(!report_has_structural_integrity_error(&report_with(vec![
+            warn("row 3 missing from index idx_issues_status", None)
+        ])));
+        assert!(!report_has_structural_integrity_error(&report_with(vec![
+            warn("row 3 missing from index sqlite_autoindex_labels_1", None)
+        ])));
     }
 
     #[test]
