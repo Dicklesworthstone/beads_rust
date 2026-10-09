@@ -1,8 +1,9 @@
 //! End-to-end contract tests for the explicit, bounded `br vcs-status`
 //! diagnostic. These tests intentionally live outside sync safety coverage:
-//! VCS process authority is opt-in and isolated to this command.
+//! VCS process authority is opt-in through this command or
+//! `br doctor --git-runtime-files`.
 //! Runtime-ignore tests also use Git as a fixture oracle for init/doctor;
-//! those production paths never invoke Git or change the index.
+//! ordinary init/doctor paths never invoke Git or change the index.
 
 #![allow(clippy::too_many_lines)]
 
@@ -1107,6 +1108,212 @@ fn e2e_vcs_runtime_audit_rejects_jsonl_scope_flags_before_inspecting_data() {
         assert!(diagnostic.contains("cannot be used with"), "{diagnostic}");
         assert_eq!(runtime_metadata_snapshot(&workspace), metadata_before);
     }
+}
+
+#[test]
+fn e2e_doctor_git_runtime_files_is_explicit_and_preserves_tracked_evidence() {
+    let _log =
+        common::test_log("e2e_doctor_git_runtime_files_is_explicit_and_preserves_tracked_evidence");
+    let workspace = tracked_workspace();
+    let metadata = workspace.root.join(".beads");
+    let evidence_dir = metadata.join(".br-wal-index-doctor-opt-in");
+    std::fs::create_dir(&evidence_dir).expect("retained recovery directory");
+    let retained = ".br-wal-index-doctor-opt-in/poisoned-shm";
+    std::fs::write(metadata.join(retained), b"retained recovery evidence\0\n")
+        .expect("retained recovery bytes");
+    git_ok(
+        &workspace.root,
+        &[
+            "add",
+            "--force",
+            "--",
+            ".beads/.br-wal-index-doctor-opt-in/poisoned-shm",
+            ".beads/metadata.json",
+        ],
+    );
+    // A genuine tracked entry with no worktree leaf proves the detector
+    // inventories the index instead of listing existing runtime files.
+    let missing = ".br_recovery/doctor-opt-in-missing/original.db";
+    let blob = git_stdout(
+        &workspace.root,
+        &[
+            "hash-object",
+            "-w",
+            ".beads/.br-wal-index-doctor-opt-in/poisoned-shm",
+        ],
+    );
+    git_ok(
+        &workspace.root,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{blob},.beads/{missing}"),
+        ],
+    );
+    let expected_paths = serde_json::json!([retained, missing]);
+    let git_dir = workspace.root.join(".git");
+    let git_before = runtime_directory_snapshot(&git_dir);
+    let evidence_before = runtime_directory_snapshot(&evidence_dir);
+    let database_before = std::fs::read(metadata.join("beads.db")).expect("database bytes");
+    let assert_preserved = || {
+        assert_eq!(runtime_directory_snapshot(&git_dir), git_before);
+        assert_eq!(runtime_directory_snapshot(&evidence_dir), evidence_before);
+        assert!(
+            !metadata.join(missing).exists(),
+            "doctor created missing evidence"
+        );
+        assert_eq!(
+            std::fs::read(metadata.join("beads.db")).expect("database remains readable"),
+            database_before
+        );
+    };
+    let assert_inventory = |report: &Value| {
+        let check = report["checks"]
+            .as_array()
+            .expect("doctor checks")
+            .iter()
+            .find(|check| check["name"] == "git.tracked_runtime_files")
+            .expect("explicit runtime inventory");
+        assert_eq!(check["status"], "ok", "{report}");
+        assert_eq!(check["details"]["inspected"], true, "{check}");
+        assert_eq!(check["details"]["tracked_count"], 2, "{check}");
+        assert_eq!(check["details"]["tracked_files"], expected_paths, "{check}");
+    };
+    for (args, label) in [
+        (vec!["doctor", "--no-db", "--json"], "full"),
+        (vec!["doctor", "--no-db", "--quick", "--json"], "quick"),
+    ] {
+        let baseline = run_br(
+            &workspace,
+            args.clone(),
+            &format!("doctor_git_{label}_baseline"),
+        );
+        assert!(
+            matches!(baseline.status.code(), Some(0 | 1)),
+            "{baseline:?}"
+        );
+        let baseline_report: Value =
+            serde_json::from_str(&extract_json_payload(&baseline.stdout)).expect("doctor JSON");
+        assert!(
+            baseline_report["checks"]
+                .as_array()
+                .expect("baseline checks")
+                .iter()
+                .all(|check| check["name"] != "git.tracked_runtime_files"),
+            "{baseline_report}"
+        );
+        assert_preserved();
+        let mut explicit_args = args;
+        explicit_args.push("--git-runtime-files");
+        let explicit = run_br(
+            &workspace,
+            explicit_args,
+            &format!("doctor_git_{label}_explicit"),
+        );
+        assert_eq!(
+            explicit.status.code(),
+            baseline.status.code(),
+            "informational inventory changed doctor exit status: {explicit:?}"
+        );
+        let report: Value =
+            serde_json::from_str(&extract_json_payload(&explicit.stdout)).expect("explicit JSON");
+        assert_inventory(&report);
+        assert_preserved();
+    }
+
+    // Force a real early repair and report recollection. The explicit
+    // inventory must survive in the emitted post-repair report as well.
+    let ignore_path = metadata.join(".gitignore");
+    let original = std::fs::read_to_string(&ignore_path).expect("canonical ignore rules");
+    assert!(original.lines().any(|line| line == ".br-wal-index-*/"));
+    let legacy = original
+        .lines()
+        .filter(|line| *line != ".br-wal-index-*/")
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&ignore_path, format!("{legacy}\n")).expect("legacy ignore rules");
+    let repaired = run_br(
+        &workspace,
+        [
+            "doctor",
+            "--no-db",
+            "--git-runtime-files",
+            "--repair",
+            "--only",
+            "fm-configs-gitignore-leaking-beads",
+            "--json",
+        ],
+        "doctor_git_explicit_repair",
+    );
+    assert!(
+        matches!(repaired.status.code(), Some(0 | 2)),
+        "{repaired:?}"
+    );
+    let repair: Value =
+        serde_json::from_str(&extract_json_payload(&repaired.stdout)).expect("repair JSON");
+    assert_eq!(repair["repaired"], true, "{repair}");
+    assert_inventory(&repair["report"]);
+    assert_inventory(&repair["post_repair"]);
+    assert!(
+        std::fs::read_to_string(&ignore_path)
+            .expect("repaired ignore rules")
+            .lines()
+            .any(|line| line == ".br-wal-index-*/")
+    );
+    assert_preserved();
+}
+
+#[test]
+fn e2e_doctor_git_runtime_files_keeps_unavailable_inventory_unknown() {
+    let _log = common::test_log("e2e_doctor_git_runtime_files_keeps_unavailable_inventory_unknown");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "doctor_git_unavailable_init");
+    assert!(init.status.success(), "{init:?}");
+    let output = run_br(
+        &workspace,
+        ["doctor", "--no-db", "--git-runtime-files", "--json"],
+        "doctor_git_not_a_repository",
+    );
+    assert!(matches!(output.status.code(), Some(0 | 1)), "{output:?}");
+    let report: Value =
+        serde_json::from_str(&extract_json_payload(&output.stdout)).expect("doctor JSON");
+    let check = report["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["name"] == "git.tracked_runtime_files")
+        .expect("requested but unavailable inventory");
+    assert_eq!(check["status"], "ok", "{check}");
+    assert_eq!(check["details"]["inspected"], false, "{check}");
+    assert!(check["details"].get("tracked_count").is_none(), "{check}");
+    assert!(check["details"].get("tracked_files").is_none(), "{check}");
+
+    let unsupported = run_br(
+        &workspace,
+        ["doctor", "--git-runtime-files", "health", "--json"],
+        "doctor_git_rejects_ignored_subcommand_option",
+    );
+    assert!(!unsupported.status.success(), "{unsupported:?}");
+    assert!(
+        format!("{}{}", unsupported.stdout, unsupported.stderr).contains("--git-runtime-files"),
+        "{unsupported:?}"
+    );
+
+    let unsupported_triage = run_br(
+        &workspace,
+        ["doctor", "--git-runtime-files", "--robot-triage", "--json"],
+        "doctor_git_rejects_discarded_triage_inventory",
+    );
+    assert_eq!(
+        unsupported_triage.status.code(),
+        Some(2),
+        "{unsupported_triage:?}"
+    );
+    let diagnostic = format!("{}{}", unsupported_triage.stdout, unsupported_triage.stderr);
+    assert!(diagnostic.contains("cannot be used with"), "{diagnostic}");
+    assert!(diagnostic.contains("--git-runtime-files"), "{diagnostic}");
+    assert!(diagnostic.contains("--robot-triage"), "{diagnostic}");
 }
 
 #[cfg(unix)]

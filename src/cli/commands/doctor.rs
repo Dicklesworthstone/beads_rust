@@ -9243,7 +9243,7 @@ fn check_root_gitignore(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     }
 }
 
-/// Informational detector: check whether git tracks beads runtime files
+/// Explicit informational detector: check whether Git tracks beads runtime files
 /// (databases, WALs, lock files, sidecars).
 ///
 /// Designed per beads_rust-9uavz: shipping as Warn would turn br doctor red
@@ -9273,6 +9273,7 @@ fn check_git_tracked_runtime_files(
                     "Git tracks {count} beads DB runtime file(s) under .beads/ (run `br vcs-status --runtime-files` for details)"
                 )),
                 Some(serde_json::json!({
+                    "inspected": true,
                     "tracked_count": count,
                     "tracked_files": paths,
                     "remediation": "Do not naively run `git rm --cached`. Follow docs/reliability/TRACKED_RUNTIME_AUDIT.md to snapshot local state and coordinate untracking across clones.",
@@ -9286,12 +9287,24 @@ fn check_git_tracked_runtime_files(
                 CheckStatus::Ok,
                 None,
                 Some(serde_json::json!({
+                    "inspected": true,
                     "tracked_count": 0,
                 })),
             );
         }
         None => {
-            // Not a git repository or git probe timed out/failed; non-fatal informational check.
+            push_check(
+                checks,
+                "git.tracked_runtime_files",
+                CheckStatus::Ok,
+                Some(
+                    "Git runtime-file inventory is unavailable; run `br vcs-status --runtime-files --json` for details"
+                        .to_string(),
+                ),
+                Some(serde_json::json!({
+                    "inspected": false,
+                })),
+            );
         }
     }
 }
@@ -13115,7 +13128,6 @@ fn collect_doctor_report_with_mode_and_db_override(
     // Pass-5 cycle 18: .br_history/ snapshot accumulation (inode pressure).
     check_br_history_size(beads_dir, &mut checks);
     check_root_gitignore(beads_dir, &mut checks);
-    check_git_tracked_runtime_files(beads_dir, db_override, &mut checks);
     check_routes_jsonl(beads_dir, &mut checks);
     check_rust_log_noisy(&mut checks);
     check_permissions_beads_dir(beads_dir, &mut checks);
@@ -14016,6 +14028,18 @@ fn inspect_existing_doctor_database(
 /// acquired before the pending-merge gate is violated.
 #[allow(clippy::too_many_lines)]
 pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
+    if args.git_runtime_files
+        && (args.subcommand.is_some()
+            || args.selftest
+            || args.bundle.is_some()
+            || args.repair_indexes
+            || args.robot_triage)
+    {
+        return Err(BeadsError::Validation {
+            field: "git-runtime-files".to_string(),
+            reason: "--git-runtime-files requires the flat doctor report; omit doctor subcommands, --selftest, --bundle, --repair-indexes, and --robot-triage".to_string(),
+        });
+    }
     // `--selftest` never looks at the caller's workspace: it drives the
     // binary through a lifecycle in a throwaway directory and exits.
     if args.selftest {
@@ -14258,16 +14282,24 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     } else {
         DoctorInspectionMode::Full
     };
-    // #329: resolve `--no-db` (JSONL-only) the same way the storage layer does
-    // so DB-backed checks are skipped and reported via `db.no_db_mode`.
-    let no_db = resolve_doctor_no_db(&beads_dir, cli);
-    let mut initial = collect_doctor_report_with_mode_and_db_override(
-        &beads_dir,
-        &paths,
-        cli.db.as_ref(),
-        inspection_mode,
-        no_db,
-    )?;
+    // Keep Git authority in this explicit flat-command opt-in, including
+    // every post-repair recollection. Shared doctor collectors stay Git-free.
+    let collect_report = |mode| -> Result<DoctorRun> {
+        // #329: resolve no-db afresh after any configuration repair.
+        let no_db = resolve_doctor_no_db(&beads_dir, cli);
+        let mut run = collect_doctor_report_with_mode_and_db_override(
+            &beads_dir,
+            &paths,
+            cli.db.as_ref(),
+            mode,
+            no_db,
+        )?;
+        if args.git_runtime_files {
+            check_git_tracked_runtime_files(&beads_dir, cli.db.as_ref(), &mut run.report.checks);
+        }
+        Ok(run)
+    };
+    let mut initial = collect_report(inspection_mode)?;
 
     // WP6: --robot-triage short-circuits the flat run with a single
     // `br.doctor.triage.v1` envelope. Read-only; no further dispatch.
@@ -14312,7 +14344,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             let repaired =
                 fix_root_gitignore_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
             if repaired {
-                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+                initial = collect_report(DoctorInspectionMode::Full)?;
             }
             repaired
         } else {
@@ -14329,7 +14361,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             let repaired =
                 fix_merge_artifacts_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
             if repaired {
-                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+                initial = collect_report(DoctorInspectionMode::Full)?;
             }
             repaired
         } else {
@@ -14349,7 +14381,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 session.as_mut(),
             );
             if repaired {
-                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+                initial = collect_report(DoctorInspectionMode::Full)?;
             }
             repaired
         } else {
@@ -14370,7 +14402,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 session.as_mut(),
             );
             if repaired {
-                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+                initial = collect_report(DoctorInspectionMode::Full)?;
             }
             repaired
         } else {
@@ -14390,7 +14422,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 session.as_mut(),
             );
             if repaired {
-                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+                initial = collect_report(DoctorInspectionMode::Full)?;
             }
             repaired
         } else {
@@ -14407,7 +14439,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         let repaired =
             fix_base_jsonl_symlink_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
         if repaired {
-            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            initial = collect_report(DoctorInspectionMode::Full)?;
         }
         repaired
     } else {
@@ -14421,7 +14453,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             let repaired =
                 fix_orphan_tmp_files_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
             if repaired {
-                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+                initial = collect_report(DoctorInspectionMode::Full)?;
             }
             repaired
         } else {
@@ -14438,7 +14470,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 session.as_mut(),
             );
             if repaired {
-                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+                initial = collect_report(DoctorInspectionMode::Full)?;
             }
             repaired
         } else {
@@ -14456,7 +14488,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 session.as_mut(),
             );
             if repaired {
-                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+                initial = collect_report(DoctorInspectionMode::Full)?;
             }
             repaired
         } else {
@@ -14474,7 +14506,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 session.as_mut(),
             );
             if repaired {
-                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+                initial = collect_report(DoctorInspectionMode::Full)?;
             }
             repaired
         } else {
@@ -14494,7 +14526,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             let repaired =
                 fix_base_jsonl_stale_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
             if repaired {
-                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+                initial = collect_report(DoctorInspectionMode::Full)?;
             }
             repaired
         } else {
@@ -14511,7 +14543,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 session.as_mut(),
             );
             if repaired {
-                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+                initial = collect_report(DoctorInspectionMode::Full)?;
             }
             repaired
         } else {
@@ -14530,7 +14562,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 session.as_mut(),
             );
             if repaired {
-                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+                initial = collect_report(DoctorInspectionMode::Full)?;
             }
             repaired
         } else {
@@ -14546,7 +14578,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         let repaired =
             fix_db_sidecar_modes_if_warned(&paths.db_path, &initial.report, ctx, session.as_mut());
         if repaired {
-            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            initial = collect_report(DoctorInspectionMode::Full)?;
         }
         repaired
     } else {
@@ -14562,7 +14594,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             let repaired =
                 fix_inner_gitignore_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
             if repaired.is_some() {
-                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+                initial = collect_report(DoctorInspectionMode::Full)?;
             }
             repaired
         } else {
@@ -14580,7 +14612,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 session.as_mut(),
             );
             if repaired {
-                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+                initial = collect_report(DoctorInspectionMode::Full)?;
             }
             repaired
         } else {
@@ -14595,7 +14627,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         let repaired =
             fix_comments_orphans_if_warned(&paths.db_path, &initial.report, ctx, session.as_mut());
         if repaired {
-            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            initial = collect_report(DoctorInspectionMode::Full)?;
         }
         repaired
     } else {
@@ -14610,7 +14642,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         let repaired =
             fix_labels_orphans_if_warned(&paths.db_path, &initial.report, ctx, session.as_mut());
         if repaired {
-            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            initial = collect_report(DoctorInspectionMode::Full)?;
         }
         repaired
     } else {
@@ -14628,7 +14660,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 session.as_mut(),
             );
             if repaired {
-                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+                initial = collect_report(DoctorInspectionMode::Full)?;
             }
             repaired
         } else {
@@ -14654,7 +14686,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 write_authority,
             );
             if repaired {
-                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+                initial = collect_report(DoctorInspectionMode::Full)?;
             }
             repaired
         } else {
@@ -14669,7 +14701,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             let repaired =
                 fix_null_defaults_if_warned(&paths.db_path, &initial.report, ctx, session.as_mut());
             if repaired {
-                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+                initial = collect_report(DoctorInspectionMode::Full)?;
             }
             repaired
         } else {
@@ -14700,7 +14732,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             write_authority,
         );
         if repaired {
-            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            initial = collect_report(DoctorInspectionMode::Full)?;
         }
         repaired
     } else {
@@ -14738,7 +14770,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             session.as_mut(),
         );
         if reconciled {
-            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            initial = collect_report(DoctorInspectionMode::Full)?;
         }
         reconciled
     } else {
@@ -14869,7 +14901,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 );
             }
 
-            let post_warning_repair = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            let post_warning_repair = collect_report(DoctorInspectionMode::Full)?;
             let verified = warning_repair_verified(
                 &post_warning_repair.report,
                 has_blocked_cache_rebuild,
@@ -14932,7 +14964,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             // fixers (gitignore, merge artifacts, inner_gitignore_append,
             // orphan rows, WAL checkpoint, null defaults, etc.) may have
             // fired. Each early fixer re-collects the report on success
-            // (`initial = collect_doctor_report_for_cli(...)` after every
+            // (`initial = collect_report(...)` after every
             // fix), so `initial.report` here is already the post-repair
             // state — emit it as `post_repair` and surface the
             // `verified` invariant the test contract / repair surface
@@ -15013,7 +15045,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     }
 
     let mut after_local_repair = if local_repair.applied() {
-        collect_doctor_report_for_cli(&beads_dir, &paths, cli)?
+        collect_report(DoctorInspectionMode::Full)?
     } else {
         initial.clone()
     };
@@ -15041,7 +15073,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             repair_write_authority,
         );
         if local_repair.vacuumed {
-            after_local_repair = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            after_local_repair = collect_report(DoctorInspectionMode::Full)?;
         }
     }
 
@@ -15207,7 +15239,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         }
     }
 
-    let post_repair = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+    let post_repair = collect_report(DoctorInspectionMode::Full)?;
     let post_repair_verified = jsonl_rebuild_repair_verified(
         &post_repair.report,
         &repair_result.preserved_dirty_issue_ids,
@@ -27088,6 +27120,7 @@ version = "2026-05-11-abc123"
             dry_run: false,
             robot_triage: false,
             quick: false,
+            git_runtime_files: false,
             only: Vec::new(),
             skip: Vec::new(),
             unsafe_auto_fix: false,
@@ -27174,6 +27207,7 @@ version = "2026-05-11-abc123"
             dry_run: false,
             robot_triage: false,
             quick: false,
+            git_runtime_files: false,
             only: Vec::new(),
             skip: Vec::new(),
             unsafe_auto_fix: false,
@@ -27477,6 +27511,7 @@ version = "2026-05-11-abc123"
             dry_run: false,
             robot_triage: false,
             quick: false,
+            git_runtime_files: false,
             only: Vec::new(),
             skip: Vec::new(),
             unsafe_auto_fix: false,
@@ -27538,6 +27573,7 @@ version = "2026-05-11-abc123"
             dry_run: false,
             robot_triage: false,
             quick: false,
+            git_runtime_files: false,
             only: Vec::new(),
             skip: Vec::new(),
             unsafe_auto_fix: false,
@@ -27611,6 +27647,7 @@ version = "2026-05-11-abc123"
             dry_run: true,
             robot_triage: false,
             quick: false,
+            git_runtime_files: false,
             only: Vec::new(),
             skip: Vec::new(),
             unsafe_auto_fix: false,
@@ -27864,7 +27901,7 @@ version = "2026-05-11-abc123"
                 .details
                 .as_ref()
                 .and_then(|d| d.get("tracked_count"))
-                .and_then(|v| v.as_u64()),
+                .and_then(serde_json::Value::as_u64),
             Some(1)
         );
         let files = check

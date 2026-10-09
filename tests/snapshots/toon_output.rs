@@ -99,6 +99,7 @@ fn toon_golden_show_output() {
     let decoded = strict_toon(&output);
     assert_eq!(decoded.as_array().expect("show issues").len(), 1);
     assert_eq!(decoded[0]["id"], "bd-ready-p0");
+    assert_eq!(decoded[0]["title"], "01 Ready Critical Unassigned");
 
     let normalized = normalize_toon_output(&output.stdout);
     assert_snapshot!("toon_show_output", normalized);
@@ -128,6 +129,9 @@ fn toon_golden_ready_output() {
         .map(|issue| issue["id"].as_str().expect("ready id"))
         .collect();
     assert_eq!(ids, ["bd-blocker", "bd-ready-p0", "bd-ready-p1-assigned"]);
+    assert_eq!(decoded[0]["title"], "00 Blocking Root");
+    assert_eq!(decoded[1]["title"], "01 Ready Critical Unassigned");
+    assert_eq!(decoded[2]["title"], "02 Ready Assigned Feature");
 
     let normalized = normalize_toon_output(&output.stdout);
     assert_snapshot!("toon_ready_output", normalized);

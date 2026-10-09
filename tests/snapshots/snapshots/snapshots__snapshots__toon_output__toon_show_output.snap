@@ -4,7 +4,7 @@ expression: normalized
 ---
 [1]:
   - id: bd-ready-p0
-    title: "01 Ready Critical Unassigned"
+    title: 01 Ready Critical Unassigned
     status: open
     priority: 0
     issue_type: bug

@@ -2310,6 +2310,27 @@ fn startup_auto_recovery_refuses_unreadable_dirty_issue() {
 }
 
 #[test]
+fn startup_auto_recovery_refuses_unrepresentable_dirty_notes() {
+    let fixture = StartupRecoveryFixture::new("dirty-notes");
+    fixture.add_recoverable_anomaly();
+    let db_path = fixture.root.join(".beads/beads.db");
+    let conn = Connection::open(db_path.to_string_lossy().into_owned())
+        .expect("open fixture for unrepresentable notes");
+    assert_eq!(
+        conn.execute_with_params(
+            "UPDATE issues SET notes = X'ff' WHERE id = ?1",
+            &[fsqlite_types::SqliteValue::from(fixture.issue_id.as_str())],
+        )
+        .expect("seed BLOB-valued notes on the dirty issue"),
+        1
+    );
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("checkpoint unrepresentable notes");
+    conn.close().expect("close unrepresentable-notes fixture");
+    assert_startup_refuses_with_diagnostics(&fixture, &[&fixture.issue_id, "notes"], false);
+}
+
+#[test]
 fn startup_auto_recovery_refuses_unreadable_tombstone() {
     let fixture = StartupRecoveryFixture::new("tombstone");
     fixture.damage_issue_timestamp(&fixture.tombstone_id);
@@ -2341,6 +2362,10 @@ fn startup_auto_recovery_refuses_unreadable_relationships() {
                 repair["repaired"], true,
                 "explicit repair remains available: {repair}"
             );
+            assert_eq!(
+                repair["verified"], true,
+                "restored dependencies must be reflected in the verified cache: {repair}"
+            );
             assert!(
                 repair["dirty_preservation_warnings"]
                     .as_array()
@@ -2357,6 +2382,14 @@ fn startup_auto_recovery_refuses_unreadable_relationships() {
                 "show_after_explicit_repair",
             );
             assert_eq!(shown[0]["title"], "unflushed local title");
+            let ready = startup_fixture_succeeds(
+                &fixture.root,
+                &["ready", "--json"],
+                "ready_after_explicit_repair",
+            );
+            let ready = ready.as_array().expect("ready issue list");
+            assert!(ready.iter().all(|issue| issue["id"] != fixture.issue_id));
+            assert!(ready.iter().any(|issue| issue["id"] == fixture.db_only_id));
         }
     }
 }

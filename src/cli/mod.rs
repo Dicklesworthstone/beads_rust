@@ -3404,6 +3404,16 @@ pub struct DoctorArgs {
     #[arg(long)]
     pub quick: bool,
 
+    /// Explicitly inspect database and recovery files tracked by Git.
+    ///
+    /// Adds an informational check to the flat doctor report. Uses Git with
+    /// a one-second probe budget; never untracks files or repairs their contents.
+    #[arg(
+        long,
+        conflicts_with_all = ["selftest", "bundle", "repair_indexes", "robot_triage"]
+    )]
+    pub git_runtime_files: bool,
+
     /// Pass-5 cycle 1: with `--repair`, only run fixers whose FM
     /// identifier matches one of the supplied values. Accepts
     /// comma-separated lists and repeated `--only` flags. Empty list

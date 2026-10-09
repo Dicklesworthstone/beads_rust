@@ -90,10 +90,51 @@ where
 }
 
 #[cfg(target_os = "linux")]
-fn read_child_wait_channel(pid: u32) -> Option<String> {
-    fs::read_to_string(format!("/proc/{pid}/wchan"))
-        .ok()
-        .map(|channel| channel.trim().to_string())
+fn child_procfs_identity(
+    child: &std::process::Child,
+    label: &str,
+) -> (u32, Option<rustix::fd::OwnedFd>) {
+    use rustix::fd::AsRawFd;
+    use rustix::process::{Pid, PidfdFlags, pidfd_open};
+
+    // Child::id() uses our PID namespace, while procfs may be mounted for an
+    // ancestor namespace. The owned pidfd's fdinfo reports this exact child
+    // in the mounted procfs namespace without scanning unrelated processes.
+    let pidfd = match pidfd_open(Pid::from_child(child), PidfdFlags::empty()) {
+        Ok(pidfd) => pidfd,
+        Err(error) => {
+            // Older kernels may lack pidfds. A numeric lookup is safe only
+            // after witnessing that procfs uses our own PID namespace.
+            let proc_self = fs::read_link("/proc/self").unwrap_or_else(|read_error| {
+                panic!(
+                    "{label}: pidfd_open failed ({error}); cannot verify the procfs PID namespace: {read_error}"
+                )
+            });
+            assert_eq!(
+                proc_self,
+                PathBuf::from(std::process::id().to_string()),
+                "{label}: pidfd_open failed ({error}); refusing to observe child {} through a different procfs PID namespace",
+                child.id()
+            );
+            return (child.id(), None);
+        }
+    };
+    let fdinfo_path = format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd());
+    let fdinfo = fs::read_to_string(&fdinfo_path).unwrap_or_else(|error| {
+        panic!("{label}: cannot read the owned child's PID mapping at {fdinfo_path}: {error}")
+    });
+    let proc_pid = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("Pid:"))
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+        .unwrap_or_else(|| panic!("{label}: no positive child PID in {fdinfo_path}: {fdinfo:?}"));
+    (proc_pid, Some(pidfd))
+}
+
+#[cfg(target_os = "linux")]
+fn read_child_wait_channel(pid: u32) -> std::io::Result<String> {
+    fs::read_to_string(format!("/proc/{pid}/wchan")).map(|channel| channel.trim().to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -113,6 +154,9 @@ fn wait_for_child_to_block_on_write_lock(child: &mut std::process::Child, label:
     #[cfg(target_os = "linux")]
     {
         let deadline = std::time::Instant::now() + WRITE_LOCK_WAIT_OBSERVATION_TIMEOUT;
+        // Keep the descriptor alive throughout polling; only this owned
+        // child's mapped procfs entry may provide the contention witness.
+        let (proc_pid, _pidfd) = child_procfs_identity(child, label);
 
         loop {
             let status = child.try_wait().expect("poll child while waiting for lock");
@@ -121,17 +165,17 @@ fn wait_for_child_to_block_on_write_lock(child: &mut std::process::Child, label:
                 "{label} exited before reaching .write.lock contention: {status:?}"
             );
 
-            let wait_channel = read_child_wait_channel(child.id());
+            let wait_channel = read_child_wait_channel(proc_pid);
             if wait_channel
                 .as_deref()
-                .is_some_and(is_write_lock_wait_channel)
+                .is_ok_and(is_write_lock_wait_channel)
             {
                 return;
             }
 
             assert!(
                 std::time::Instant::now() < deadline,
-                "{label} stayed alive but was never observed blocked on .write.lock; last wait channel: {wait_channel:?}"
+                "{label} stayed alive but was never observed blocked on .write.lock via /proc/{proc_pid}/wchan; last wait channel: {wait_channel:?}"
             );
             thread::sleep(WRITE_LOCK_WAIT_POLL_INTERVAL);
         }

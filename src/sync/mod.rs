@@ -14539,6 +14539,7 @@ struct ImportMetadataMaps {
 struct ImportCollisionPlan {
     renames: HashMap<String, String>,
     comment_owner_ids_to_replace: Vec<String>,
+    comments_by_target: HashMap<String, Vec<Comment>>,
 }
 
 fn parse_normalized_import_issue(trimmed: &str, line_num: usize) -> Result<(Issue, usize)> {
@@ -14624,8 +14625,9 @@ fn collect_import_validation_plan(
         // importing clone fail until the JSONL was hand-edited (GitHub #486).
         // Import reassigns the local rowid on collision and the semantic
         // verifier compares comments by payload, so no refusal is needed.
-        // Same-issue duplicates are still rejected by
-        // `validate_import_comments_for_issue`.
+        // Same-issue duplicates are rejected before comment union in the
+        // collision scan, and by `validate_import_comments_for_issue` when
+        // writing relations.
 
         plan.identity
             .fingerprints
@@ -14860,6 +14862,7 @@ fn scan_import_collision_renames(
     let mut seen_external_refs = HashSet::new();
     let mut renames = HashMap::new();
     let mut comment_owner_ids_to_replace = BTreeSet::new();
+    let mut comments_by_target: HashMap<String, Vec<Comment>> = HashMap::new();
     let progress =
         create_progress_bar(record_count as u64, "Scanning issues", config.show_progress);
 
@@ -14890,6 +14893,34 @@ fn scan_import_collision_renames(
         if target_id != issue.id {
             renames.insert(issue.id.clone(), target_id.clone());
         }
+        if !issue.comments.is_empty() {
+            // Distinct source IDs may resolve to one target. Preserve comments
+            // from every alias, including skipped rows, before ordered updates
+            // replace that target's relations inside the write transaction.
+            // Validate ownership and within-record rowids before union can
+            // rekey comments or allocate fresh ids for legitimate clone collisions.
+            let mut seen_comment_ids = HashSet::new();
+            for comment in &mut issue.comments {
+                if comment.issue_id != issue.id {
+                    return Err(BeadsError::validation(
+                        "comment.issue_id",
+                        format!(
+                            "comment issue_id '{}' does not match import issue '{}'",
+                            comment.issue_id, issue.id
+                        ),
+                    ));
+                }
+                if comment.id > 0 && !seen_comment_ids.insert(comment.id) {
+                    return Err(BeadsError::validation(
+                        "comment.id",
+                        format!("duplicate import comment id {}", comment.id),
+                    ));
+                }
+                comment.issue_id.clone_from(&target_id);
+            }
+            let comments = comments_by_target.entry(target_id.clone()).or_default();
+            *comments = union_comment_lists(comments, &issue.comments, &target_id);
+        }
         if matches!(
             action,
             CollisionAction::Insert | CollisionAction::Update { .. }
@@ -14905,6 +14936,7 @@ fn scan_import_collision_renames(
     Ok(ImportCollisionPlan {
         renames,
         comment_owner_ids_to_replace: comment_owner_ids_to_replace.into_iter().collect(),
+        comments_by_target,
     })
 }
 
@@ -15130,6 +15162,7 @@ fn stream_import_actions_in_tx(
     prefix_renames: &HashMap<String, String>,
     collision_renames: &HashMap<String, String>,
     comment_owner_ids_to_replace: &[String],
+    incoming_comments_by_target: &HashMap<String, Vec<Comment>>,
     metadata: &ImportMetadataMaps,
     base_result: &ImportResult,
     progress: &indicatif::ProgressBar,
@@ -15141,7 +15174,7 @@ fn stream_import_actions_in_tx(
     let mut export_hash_batch = Vec::with_capacity(IMPORT_EXPORT_HASH_BATCH_SIZE);
     let mut export_hash_ids = HashSet::new();
     let mut uncertified_local_wins = 0usize;
-    let mut audit_invalidated_certificate = false;
+    let mut invalidated_certificate = false;
     let mut skipped = Vec::new();
     let stream_started = Instant::now();
 
@@ -15149,10 +15182,12 @@ fn stream_import_actions_in_tx(
     // Comment IDs are globally unique. Release every comment row owned by an
     // issue this transaction will replace before replaying any individual
     // issue, so authoritative IDs can move between those issues without the
+    // result depending on JSONL line order. The enclosing transaction restores
+    // all rows if a later action or semantic verification fails.
     // Comments are append-only facts (beads_rust-hcoe6). Snapshot the existing
-    // comments for issues being replaced before clearing their comment rows, so
-    // any database-only comments can be unioned into the imported payload.
-    let mut existing_comments_by_issue = if comment_owner_ids_to_replace.is_empty() {
+    // comments before clearing their rows; every Update unions this snapshot
+    // and all source aliases so no later action can discard an earlier fact.
+    let existing_comments_by_issue = if comment_owner_ids_to_replace.is_empty() {
         HashMap::new()
     } else {
         storage.get_comments_for_issues(comment_owner_ids_to_replace)?
@@ -15204,26 +15239,54 @@ fn stream_import_actions_in_tx(
                 CollisionResult::NewIssue => issue.id.clone(),
             };
 
-            apply_collision_renames(&mut issue, collision_renames);
-
-            // Comments are append-only facts across both branches (beads_rust-hcoe6).
-            // When updating, union incoming JSONL comments with pre-existing DB comments
-            // so local comments are never deleted by an update.
-            if matches!(action, CollisionAction::Update { .. }) {
-                if let Some(existing_comments) = existing_comments_by_issue.remove(&target_id) {
-                    let old_len = issue.comments.len();
-                    issue.comments =
-                        union_comment_lists(&issue.comments, &existing_comments, &target_id);
-                    if issue.comments.len() != old_len {
-                        computed_hash = crate::util::content_hash(&issue);
-                    }
+            // Displacement replaces a different issue at this ID. Its local
+            // comments belong to the relocated issue, and the narrow hash used
+            // to prove relocation does not establish that those facts survived.
+            if matches!(
+                &collision,
+                CollisionResult::Match {
+                    match_type: MatchType::DisplacedId,
+                    ..
                 }
+            ) && existing_comments_by_issue
+                .get(&target_id)
+                .is_some_and(|comments| !comments.is_empty())
+            {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "ID collision: local issue {target_id} has comments that cannot be assigned to a different replacement issue. Run `br sync --merge` to preserve both issue identities and their comments."
+                    ),
+                });
             }
 
-            // When skipping (DB is newer or equal), check if incoming JSONL has comments
-            // that the DB lacks (e.g. from an agent using --no-db). If so, union them into DB.
-            // If target_id is scheduled to be replaced in this transaction, Skip must not
-            // mutate the database row; Update will handle unioning.
+            apply_collision_renames(&mut issue, collision_renames);
+
+            // Keep the immutable incoming payload for certification whenever
+            // append-only union adds facts absent from this source record.
+            // A content hash excludes comments and cannot certify that union.
+            let source_before_comment_union = if matches!(action, CollisionAction::Update { .. }) {
+                let mut comments = issue.comments.clone();
+                if let Some(existing) = existing_comments_by_issue.get(&target_id) {
+                    comments = union_comment_lists(&comments, existing, &target_id);
+                }
+                if let Some(incoming) = incoming_comments_by_target.get(&target_id) {
+                    comments = union_comment_lists(&comments, incoming, &target_id);
+                }
+                if comments.len() > issue.comments.len() {
+                    let source_issue = issue.clone();
+                    issue.comments = comments;
+                    computed_hash = crate::util::content_hash(&issue);
+                    Some(source_issue)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // A skipped row can carry comments added through --no-db. Targets
+            // scheduled for replacement already include every source alias in
+            // their Update union; only skip-only targets need a relation write.
             if matches!(action, CollisionAction::Skip { .. }) {
                 let scheduled_for_replace = comment_owner_ids_to_replace
                     .iter()
@@ -15240,6 +15303,10 @@ fn stream_import_actions_in_tx(
                             &mut export_hash_batch,
                             &mut export_hash_ids,
                         )?;
+                        // A preceding alias may have certified the old comment
+                        // set, including in an already-written hash batch.
+                        invalidated_certificate |= export_hash_ids.remove(&target_id);
+                        export_hash_batch.retain(|(id, _)| id != &target_id);
                         storage.sync_comments_for_import_in_tx(&target_id, &union)?;
                         tx_result.comments_imported += union.len() - db_comments.len();
                     }
@@ -15292,12 +15359,22 @@ fn stream_import_actions_in_tx(
                 // existed. A preserved local audit can differ even after the
                 // issue payload was updated, so it needs export certification.
                 close_audit.record_imported(&export_id, &issue);
-                if close_audit.matches_export(&export_id, &issue) {
+                let source_matches =
+                    source_before_comment_union
+                        .as_ref()
+                        .is_none_or(|source_issue| {
+                            skipped_import_matches_stored_issue(
+                                Some(&issue),
+                                &export_id,
+                                source_issue,
+                            )
+                        });
+                if source_matches && close_audit.matches_export(&export_id, &issue) {
                     export_hash_ids.insert(export_id.clone());
                     export_hash_batch.push((export_id, export_hash));
                 } else {
                     uncertified_local_wins += 1;
-                    audit_invalidated_certificate |= export_hash_ids.remove(&export_id);
+                    invalidated_certificate |= export_hash_ids.remove(&export_id);
                     export_hash_batch.retain(|(id, _)| id != &export_id);
                 }
             }
@@ -15337,11 +15414,11 @@ fn stream_import_actions_in_tx(
         &mut export_hash_batch,
         current_export_hashes.as_mut(),
     )?;
-    let current_export_hashes = if current_export_hashes.is_none() && audit_invalidated_certificate
-    {
+    let current_export_hashes = if current_export_hashes.is_none() && invalidated_certificate {
         // A prior batch may already have certified this target before a later
-        // mutation preserved conflicting local audit. Inspect actual receipt
-        // rows once on that exceptional path so the old certificate is revoked.
+        // mutation preserved additional comments or conflicting local audit.
+        // Inspect actual receipt rows once on that exceptional path so the
+        // old certificate is revoked.
         Some(load_import_export_hashes(storage)?)
     } else {
         current_export_hashes
@@ -15811,6 +15888,7 @@ fn import_from_jsonl_snapshot_impl(
             &prefix_renames,
             &collision_plan.renames,
             &collision_plan.comment_owner_ids_to_replace,
+            &collision_plan.comments_by_target,
             &metadata,
             &result,
             &progress,
@@ -18015,7 +18093,7 @@ fn snapshot_preserved_issue(
     kind: &str,
     warnings: &mut Vec<String>,
 ) -> Option<PreservedIssue> {
-    let issue = match read_issue_row_for_preservation(storage, issue_id) {
+    let issue = match storage.get_issue_for_preservation(issue_id) {
         Ok(Some(issue)) => issue,
         Ok(None) => {
             if kind == "tombstone" {
@@ -18078,36 +18156,6 @@ fn snapshot_preserved_issue(
     })
 }
 
-/// Read one issue row for a pre-rebuild snapshot.
-///
-/// A rebuild runs because the database is damaged, and FrankenSQLite's keyed
-/// single-row lookup can fail on a malformed page that belongs to another
-/// table (a damaged `comments` page fails `get_issue` for every issue) while
-/// the batched reader still returns the intact row. Giving the row up there
-/// silently discarded every unflushed edit and comment in the workspace, so
-/// retry through the batched reader before reporting the row unreadable.
-fn read_issue_row_for_preservation(
-    storage: &SqliteStorage,
-    issue_id: &str,
-) -> Result<Option<Issue>> {
-    match storage.get_issue(issue_id) {
-        Ok(issue) => Ok(issue),
-        Err(keyed_error) => match storage.get_issues_by_ids(&[issue_id.to_string()]) {
-            Ok(issues) => {
-                let mut matches = issues.into_iter().filter(|issue| issue.id == issue_id);
-                let issue = matches.next();
-                if matches.next().is_some() {
-                    return Err(BeadsError::Config(format!(
-                        "multiple issue rows match {issue_id}; no unique row can be snapshotted"
-                    )));
-                }
-                Ok(issue)
-            }
-            Err(_) => Err(keyed_error),
-        },
-    }
-}
-
 /// Read preservation candidates without silently skipping malformed IDs.
 /// The normal list helpers discard non-text IDs, which is inappropriate when
 /// deciding whether an automatic rebuild can preserve all unflushed state.
@@ -18131,9 +18179,10 @@ fn preservation_issue_ids(
     };
     rows.into_iter()
         .enumerate()
-        .filter_map(|(index, row)| match row.first().and_then(SqliteValue::as_text) {
-            Some(id) => Some(id.to_string()),
-            None => {
+        .filter_map(|(index, row)| {
+            if let Some(id) = row.first().and_then(SqliteValue::as_text) {
+                Some(id.to_string())
+            } else {
                 record_preservation_warning(
                     warnings,
                     format!(
@@ -18250,20 +18299,18 @@ pub(crate) fn snapshot_dirty_live_issues(storage: &SqliteStorage) -> Vec<Preserv
 ///
 /// The rebuild has already moved the original database family into the
 /// recovery directory and replaced it with a clean JSONL import at this
-/// point, so on failure the live DB is *valid* (it mirrors the JSONL),
-/// just missing whatever local unflushed tombstones we tried to preserve.
+/// point. Issue restoration is atomic, but a cache-refresh failure can occur
+/// after the restored rows have committed. The error must not claim that
+/// those rows were lost or promise that repeating the rebuild is harmless.
 /// Without this wrapper, a transient lock-contention retry exhaustion
 /// inside `restore_preserved_issues` would bubble up through callers that
 /// otherwise describe the failure as "JSONL may be corrupt" or "database
 /// recovery failed", both of which are actively misleading for this
-/// specific post-rebuild failure mode. The wrapped message tells the
-/// operator: re-running the command is idempotent and safe; the only
-/// thing they've lost is local deletions that hadn't yet been flushed.
+/// specific post-rebuild failure mode. The wrapped message directs the
+/// operator to the retained recovery evidence before another repair.
 ///
 /// Callers should prefer this helper over calling `restore_preserved_issues`
-/// directly when the restore follows an already-completed rebuild. Use
-/// the bare `restore_preserved_issues` when the surrounding transaction is
-/// still mid-rebuild and a rollback is still possible.
+/// directly when the restore follows an already-completed rebuild.
 ///
 /// # Errors
 ///
@@ -18281,11 +18328,10 @@ pub(crate) fn restore_tombstones_after_rebuild(
     restore_preserved_issues(storage, tombstones).map_err(|err| BeadsError::WithContext {
         context: format!(
             "Rebuild from JSONL succeeded, but failed to restore {count} preserved \
-             tombstone(s). The database now mirrors the JSONL exactly — any local \
-             deletions that had not yet been flushed to the JSONL are gone. \
-             Re-running the command is idempotent and safe (the rebuild itself \
-             completed successfully). If the underlying cause is lock contention, \
-             wait for other `br` processes to finish and try again."
+             tombstone(s) and refresh their blocked-state cache. Issue restoration \
+             is atomic, but a cache-refresh failure can occur after restored rows \
+             have committed. Inspect the retained recovery evidence before \
+             attempting another repair."
         ),
         source: Box::new(err),
     })
@@ -18296,8 +18342,7 @@ pub(crate) fn restore_tombstones_after_rebuild(
 /// — only the unflushed-edit restoration step failed (GitHub #394).
 ///
 /// Same contract as `restore_tombstones_after_rebuild`, with a message
-/// naming the actual casualty: local edits that had not yet been flushed
-/// to the JSONL, rather than local deletions.
+/// naming the local edits that had not yet been flushed to the JSONL.
 ///
 /// # Errors
 ///
@@ -18315,23 +18360,25 @@ pub(crate) fn restore_dirty_issues_after_rebuild(
     restore_preserved_issues(storage, dirty_issues).map_err(|err| BeadsError::WithContext {
         context: format!(
             "Rebuild from JSONL succeeded, but failed to restore {count} dirty \
-             unflushed issue(s). The database now mirrors the JSONL exactly — any \
-             local creations or edits that had not yet been flushed to the JSONL \
-             are gone. Re-running the command is idempotent and safe (the rebuild \
-             itself completed successfully). If the underlying cause is lock \
-             contention, wait for other `br` processes to finish and try again."
+             unflushed issue(s) and refresh their blocked-state cache. Issue \
+             restoration is atomic, but a cache-refresh failure can occur after \
+             restored rows have committed. Inspect the retained recovery evidence \
+             before attempting another repair."
         ),
         source: Box::new(err),
     })
 }
 
 /// Restore preserved issues (and their relations) atomically and mark
-/// them dirty so the next flush re-exports them.
+/// them dirty so the next flush re-exports them, then refresh derived blocking
+/// state before returning success.
 ///
 /// # Errors
 ///
-/// Returns an error if the underlying write transaction fails; the entire
-/// restore is rolled back on failure.
+/// A failed issue-restoration transaction rolls back its rows, relations and
+/// dirty markers together. A later cache-refresh error leaves those restored
+/// rows committed and the cache marked stale, so readers cannot trust an old
+/// projection of the dependency graph.
 pub(crate) fn restore_preserved_issues(
     storage: &mut SqliteStorage,
     preserved: &[PreservedIssue],
@@ -18357,8 +18404,14 @@ pub(crate) fn restore_preserved_issues(
             }
             storage.replace_dirty_issue_marker_in_tx(&entry.issue.id, &marked_at)?;
         }
+        storage.set_metadata_in_tx("blocked_cache_state", "stale")?;
         Ok(())
     })?;
+
+    // JSONL import built the cache before these local statuses and edges were
+    // restored. Refresh outside the issue transaction: the public rebuild
+    // applies and restores the engine's required FK-suppression workaround.
+    storage.rebuild_blocked_cache(true)?;
 
     tracing::debug!(
         count = preserved.len(),
@@ -24600,6 +24653,77 @@ mod tests {
     }
 
     #[test]
+    fn import_refuses_to_assign_displaced_issue_comments_to_a_different_issue() {
+        for include_relocated_comments in [false, true] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let local_child = issue_created_at("bd-p.1", "child from B", 25, 100);
+            storage.create_issue(&local_child, "tester").unwrap();
+            storage
+                .add_comment(&local_child.id, "local", "belongs only to B")
+                .unwrap();
+            storage
+                .clear_dirty_issues_legacy(std::slice::from_ref(&local_child.id))
+                .unwrap();
+            storage.set_metadata("needs_flush", "false").unwrap();
+            storage
+                .set_export_hashes(&[(local_child.id.clone(), local_child.compute_content_hash())])
+                .unwrap();
+            let before = storage
+                .get_issue_for_export(&local_child.id)
+                .unwrap()
+                .unwrap();
+            let certificate_before = storage.get_export_hash(&local_child.id).unwrap();
+
+            let temp_dir = TempDir::new().unwrap();
+            let jsonl_path = temp_dir.path().join("issues.jsonl");
+            let child_a = issue_created_at("bd-p.1", "child from A", 20, 20);
+            let mut relocated_b = before.clone();
+            relocated_b.id = "bd-p.2".to_string();
+            for comment in &mut relocated_b.comments {
+                comment.issue_id.clone_from(&relocated_b.id);
+            }
+            if !include_relocated_comments {
+                relocated_b.comments.clear();
+            }
+            assert_eq!(
+                before.compute_content_hash(),
+                relocated_b.compute_content_hash()
+            );
+            // The relocated row is inserted before the refused replacement,
+            // so rollback must restore precleared comments and remove that row.
+            write_jsonl_issues(&jsonl_path, &[&relocated_b, &child_a]);
+            let source_bytes = fs::read(&jsonl_path).unwrap();
+
+            let error = import_from_jsonl(
+                &mut storage,
+                &jsonl_path,
+                &ImportConfig::default(),
+                Some("bd-"),
+            )
+            .expect_err("comment-bearing displacement must preserve issue identity");
+            assert!(error.to_string().contains("ID collision"), "{error}");
+            assert!(error.to_string().contains("br sync --merge"), "{error}");
+            assert_eq!(
+                storage
+                    .get_issue_for_export(&local_child.id)
+                    .unwrap()
+                    .unwrap(),
+                before
+            );
+            assert!(storage.get_issue("bd-p.2").unwrap().is_none());
+            assert_eq!(
+                storage.get_export_hash(&local_child.id).unwrap(),
+                certificate_before
+            );
+            assert_eq!(
+                pending_export_state(&storage, true).unwrap(),
+                (0, false, false)
+            );
+            assert_eq!(fs::read(&jsonl_path).unwrap(), source_bytes);
+        }
+    }
+
+    #[test]
     fn import_leaves_a_relocated_issue_with_local_edits_to_sync_merge() {
         // GitHub #512: the JSONL carries this clone's issue under a new id, but
         // the local copy has changed since. Replacing the local row would drop
@@ -25738,6 +25862,321 @@ mod tests {
     }
 
     #[test]
+    fn test_unflushed_snapshot_reports_blob_notes_before_rebuild() {
+        for tombstone in [false, true] {
+            let fixture_root = TempDir::new().unwrap().keep();
+            let db_path = fixture_root.join("beads.db");
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            for id in ["bd-local", "bd-target"] {
+                storage
+                    .create_issue(&make_test_issue(id, id), "tester")
+                    .unwrap();
+            }
+            storage
+                .add_label("bd-local", "unflushed", "tester")
+                .unwrap();
+            storage
+                .add_dependency("bd-local", "bd-target", "related", "tester")
+                .unwrap();
+            storage
+                .add_comment("bd-local", "tester", "unflushed comment")
+                .unwrap();
+            storage
+                .clear_dirty_flags(&["bd-target".to_string()])
+                .unwrap();
+            if tombstone {
+                storage
+                    .delete_issue("bd-local", "tester", "local deletion", None)
+                    .unwrap();
+            }
+            storage
+                .execute_raw("UPDATE issues SET notes = X'ff' WHERE id = 'bd-local'")
+                .unwrap();
+            // Ordinary UI compatibility is unchanged. That permissive read
+            // cannot prove it is safe to replace the original database.
+            let displayed = storage.get_issue("bd-local").unwrap().unwrap();
+            assert!(displayed.notes.is_none());
+            let batched = storage
+                .get_issues_by_ids(&["bd-local".to_string()])
+                .unwrap();
+            assert_eq!(batched, vec![displayed]);
+
+            let snapshot = snapshot_unflushed_state(&storage);
+            assert!(snapshot.dirty.is_empty());
+            assert!(snapshot.tombstones.is_empty());
+            assert_eq!(snapshot.warnings.len(), 1, "{:?}", snapshot.warnings);
+            let warning = &snapshot.warnings[0];
+            let kind = if tombstone {
+                "tombstone"
+            } else {
+                "dirty issue"
+            };
+            assert!(warning.contains(&format!("{kind} bd-local")), "{warning}");
+            assert!(warning.contains("unrepresentable notes"), "{warning}");
+            assert_eq!(storage.get_labels("bd-local").unwrap(), vec!["unflushed"]);
+            assert_eq!(storage.get_dependencies_full("bd-local").unwrap().len(), 1);
+            assert_eq!(storage.get_comments("bd-local").unwrap().len(), 1);
+            let retained = storage
+                .execute_raw_query("SELECT notes FROM issues WHERE id = 'bd-local'")
+                .unwrap();
+            assert!(
+                matches!(&retained[0][0], SqliteValue::Blob(bytes) if bytes.as_ref() == [0xff])
+            );
+            assert!(db_path.is_file(), "damaged fixture remains available");
+        }
+    }
+
+    #[test]
+    fn test_unflushed_snapshot_reports_unrepresentable_issue_values() {
+        for (column, value) in [
+            ("title", "X'ff'"),
+            ("title", "NULL"),
+            ("description", "X'ff'"),
+            ("content_hash", "X'ff'"),
+            ("source_repo_path", "X'ff'"),
+            ("agent_context", "X'ff'"),
+            ("prerequisites", "X'ff'"),
+            ("status", "X'ff'"),
+            ("status", "NULL"),
+            ("issue_type", "X'ff'"),
+            ("issue_type", "NULL"),
+            ("priority", "NULL"),
+            ("priority", "X'ff'"),
+            ("priority", "2.5"),
+            ("priority", "4294967298"),
+            ("priority", "5"),
+            ("estimated_minutes", "X'ff'"),
+            ("estimated_minutes", "'unknown'"),
+            ("estimated_minutes", "2.5"),
+            ("estimated_minutes", "2147483648"),
+            ("compaction_level", "-2147483649"),
+            ("original_size", "4294967296"),
+            ("ephemeral", "X'ff'"),
+            ("pinned", "'true'"),
+            ("is_template", "1.5"),
+        ] {
+            let fixture_root = TempDir::new().unwrap().keep();
+            let mut storage = SqliteStorage::open(&fixture_root.join("beads.db")).unwrap();
+            storage
+                .create_issue(&make_test_issue("bd-local", "unflushed"), "tester")
+                .unwrap();
+            // Retain the original table while admitting corruption that the
+            // canonical constraints would reject at the normal write boundary.
+            storage
+                .execute_raw("ALTER TABLE issues RENAME TO retained_issues")
+                .unwrap();
+            storage
+                .execute_raw("CREATE TABLE issues AS SELECT * FROM retained_issues")
+                .unwrap();
+            storage
+                .execute_raw(&format!("UPDATE issues SET {column} = {value}"))
+                .unwrap();
+            let query = format!("SELECT {column} FROM issues WHERE id = 'bd-local'");
+            let before = storage.execute_raw_query(&query).unwrap();
+
+            let snapshot = snapshot_unflushed_state(&storage);
+            assert!(snapshot.dirty.is_empty(), "{column} = {value}");
+            assert!(snapshot.tombstones.is_empty(), "{column} = {value}");
+            assert_eq!(snapshot.warnings.len(), 1, "{:?}", snapshot.warnings);
+            let warning = &snapshot.warnings[0];
+            assert!(warning.contains("dirty issue bd-local"), "{warning}");
+            assert!(
+                warning.contains(&format!("unrepresentable {column}")),
+                "{warning}"
+            );
+            assert_eq!(storage.execute_raw_query(&query).unwrap(), before);
+            let retained = storage
+                .execute_raw_query("SELECT COUNT(*) FROM retained_issues")
+                .unwrap();
+            assert_eq!(retained[0][0].as_integer(), Some(1));
+        }
+    }
+
+    #[test]
+    fn test_unflushed_snapshot_preserves_legacy_nullable_issue_values() {
+        let fixture_root = TempDir::new().unwrap().keep();
+        let mut storage = SqliteStorage::open(&fixture_root.join("beads.db")).unwrap();
+        storage
+            .create_issue(
+                &make_test_issue("bd-local", "legacy nullable values"),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .execute_raw("ALTER TABLE issues RENAME TO retained_issues")
+            .unwrap();
+        storage
+            .execute_raw("CREATE TABLE issues AS SELECT * FROM retained_issues")
+            .unwrap();
+        storage
+            .execute_raw(
+                "UPDATE issues SET description = NULL, notes = NULL, owner = NULL,
+                 source_repo = NULL, prerequisites = NULL, content_hash = NULL,
+                 estimated_minutes = NULL, compaction_level = NULL, original_size = NULL,
+                 ephemeral = NULL, pinned = NULL, is_template = NULL,
+                 status = 'Review_Needed', issue_type = 'Investigation'",
+            )
+            .unwrap();
+
+        let snapshot = snapshot_unflushed_state(&storage);
+        assert!(snapshot.warnings.is_empty(), "{:?}", snapshot.warnings);
+        assert!(snapshot.tombstones.is_empty());
+        assert_eq!(snapshot.dirty.len(), 1);
+        let issue = &snapshot.dirty[0].issue;
+        assert_eq!(issue.id, "bd-local");
+        assert_eq!(issue.title, "legacy nullable values");
+        assert_eq!(issue.status, Status::Custom("review_needed".to_string()));
+        assert_eq!(
+            issue.issue_type,
+            IssueType::Custom("investigation".to_string())
+        );
+        assert!(issue.description.is_none());
+        assert!(issue.notes.is_none());
+        assert!(issue.owner.is_none());
+        assert!(issue.source_repo.is_none());
+        assert!(issue.prerequisites.is_none());
+        assert!(issue.content_hash.is_none());
+        assert!(issue.estimated_minutes.is_none());
+        assert!(issue.compaction_level.is_none());
+        assert!(issue.original_size.is_none());
+        assert!(!issue.ephemeral && !issue.pinned && !issue.is_template);
+        assert!(snapshot.dirty[0].labels.as_ref().unwrap().is_empty());
+        assert!(snapshot.dirty[0].dependencies.as_ref().unwrap().is_empty());
+        assert!(snapshot.dirty[0].comments.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_unflushed_snapshot_preserves_integer_and_datetime_issue_values() {
+        let canonical = DateTime::from_timestamp(1_776_651_488, 0).unwrap();
+        for (stored_timestamp, expected_timestamp, expected_optional) in [
+            ("'2026-04-20T02:18:08Z'", canonical, Some(canonical)),
+            ("'2026-04-20 02:18:08'", canonical, Some(canonical)),
+            ("1776651488000000", canonical, Some(canonical)),
+            (
+                "1776651488.25",
+                DateTime::from_timestamp(1_776_651_488, 250_000_000).unwrap(),
+                DateTime::from_timestamp(1_776_651_488, 250_000_000),
+            ),
+            ("NULL", DateTime::<Utc>::UNIX_EPOCH, None),
+            ("''", DateTime::<Utc>::UNIX_EPOCH, None),
+        ] {
+            let fixture_root = TempDir::new().unwrap().keep();
+            let mut storage = SqliteStorage::open(&fixture_root.join("beads.db")).unwrap();
+            storage
+                .create_issue(&make_test_issue("bd-local", "legacy numbers"), "tester")
+                .unwrap();
+            storage
+                .execute_raw("ALTER TABLE issues RENAME TO retained_issues")
+                .unwrap();
+            storage
+                .execute_raw("CREATE TABLE issues AS SELECT * FROM retained_issues")
+                .unwrap();
+            storage
+                .execute_raw(&format!(
+                    "UPDATE issues SET created_at = {stored_timestamp},
+                     updated_at = {stored_timestamp}, due_at = {stored_timestamp},
+                     priority = '4', estimated_minutes = '2147483647',
+                     compaction_level = -2147483648, original_size = 2147483647,
+                     ephemeral = -7, pinned = 0, is_template = 2"
+                ))
+                .unwrap();
+
+            let snapshot = snapshot_unflushed_state(&storage);
+            assert!(snapshot.warnings.is_empty(), "{:?}", snapshot.warnings);
+            assert_eq!(snapshot.dirty.len(), 1);
+            let issue = &snapshot.dirty[0].issue;
+            assert_eq!(issue.id, "bd-local");
+            assert_eq!(issue.created_at, expected_timestamp);
+            assert_eq!(issue.updated_at, expected_timestamp);
+            assert_eq!(issue.due_at, expected_optional);
+            assert_eq!(issue.priority, Priority::BACKLOG);
+            assert_eq!(issue.estimated_minutes, Some(i32::MAX));
+            assert_eq!(issue.compaction_level, Some(i32::MIN));
+            assert_eq!(issue.original_size, Some(i32::MAX));
+            assert!(issue.ephemeral && !issue.pinned && issue.is_template);
+            let mut restored = SqliteStorage::open(&fixture_root.join("restored.db")).unwrap();
+            restore_preserved_issues(&mut restored, &snapshot.dirty).unwrap();
+            assert_eq!(
+                restored.get_issue("bd-local").unwrap().as_ref(),
+                Some(issue)
+            );
+        }
+    }
+
+    #[test]
+    fn test_restore_preserved_cache_failure_retains_committed_state() {
+        let fixture_root = TempDir::new().unwrap().keep();
+        let mut storage = SqliteStorage::open(&fixture_root.join("beads.db")).unwrap();
+        for (id, title) in [("bd-local", "unflushed title"), ("bd-blocker", "blocker")] {
+            storage
+                .create_issue(&make_test_issue(id, title), "tester")
+                .unwrap();
+        }
+        storage
+            .add_dependency("bd-local", "bd-blocker", "blocks", "tester")
+            .unwrap();
+        storage.rebuild_blocked_cache(true).unwrap();
+        storage
+            .clear_dirty_flags(&["bd-blocker".to_string()])
+            .unwrap();
+        let snapshot = snapshot_unflushed_state(&storage);
+        assert!(snapshot.warnings.is_empty(), "{:?}", snapshot.warnings);
+        assert_eq!(snapshot.dirty.len(), 1);
+
+        storage
+            .execute_raw("UPDATE issues SET title = 'flushed title' WHERE id = 'bd-local'")
+            .unwrap();
+        storage
+            .execute_raw("DELETE FROM dependencies WHERE issue_id = 'bd-local'")
+            .unwrap();
+        storage
+            .clear_dirty_flags(&["bd-local".to_string()])
+            .unwrap();
+        storage
+            .execute_raw("ALTER TABLE blocked_issues_cache RENAME TO retained_blocked_cache")
+            .unwrap();
+        // Refuse the restored blocking edge at the derived-cache write only.
+        // Keep the original cache and every issue/relationship row available.
+        storage
+            .execute_raw(
+                "CREATE TABLE blocked_issues_cache (
+                    issue_id TEXT PRIMARY KEY,
+                    blocked_by TEXT NOT NULL CHECK (blocked_by = '[]'),
+                    blocked_at DATETIME NOT NULL
+                )",
+            )
+            .unwrap();
+
+        let error = restore_dirty_issues_after_rebuild(&mut storage, &snapshot.dirty)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("retained recovery evidence"), "{error}");
+        assert!(!error.contains("are gone"), "{error}");
+        assert_eq!(
+            storage.get_issue("bd-local").unwrap().unwrap().title,
+            "unflushed title"
+        );
+        assert_eq!(storage.get_blockers("bd-local").unwrap(), ["bd-blocker"]);
+        assert_eq!(
+            storage.get_dirty_issue_ids().unwrap(),
+            ["bd-local".to_string()]
+        );
+        assert_eq!(
+            storage
+                .get_metadata("blocked_cache_state")
+                .unwrap()
+                .as_deref(),
+            Some("stale")
+        );
+        let cache = storage
+            .execute_raw_query("SELECT COUNT(*) FROM blocked_issues_cache")
+            .unwrap();
+        assert_eq!(cache[0][0].as_integer(), Some(0));
+        let foreign_keys = storage.execute_raw_query("PRAGMA foreign_keys").unwrap();
+        assert_eq!(foreign_keys[0][0].as_integer(), Some(1));
+    }
+
+    #[test]
     fn test_unflushed_snapshot_reports_duplicate_issue_rows() {
         for tombstone in [false, true] {
             let fixture_root = TempDir::new().unwrap().keep();
@@ -26773,7 +27212,23 @@ mod tests {
             created_at: Utc::now() - chrono::Duration::minutes(30),
         });
         let json = serde_json::to_string(&incoming).unwrap();
-        fs::write(&path, format!("{json}\n")).unwrap();
+        let source_bytes = format!("{json}\n");
+        fs::write(&path, &source_bytes).unwrap();
+
+        // Model a clean database whose previously exported local comment is
+        // absent from the restored source. Dirty markers cannot hide a broken
+        // source certificate or supply the pending-flush signal for this test.
+        storage
+            .clear_dirty_issues_legacy(std::slice::from_ref(&existing.id))
+            .unwrap();
+        storage.set_metadata("needs_flush", "false").unwrap();
+        storage
+            .set_export_hashes(&[(existing.id.clone(), existing.compute_content_hash())])
+            .unwrap();
+        assert_eq!(
+            pending_export_state(&storage, true).unwrap(),
+            (0, false, false)
+        );
 
         let config = ImportConfig::default();
         let result = import_from_jsonl(&mut storage, &path, &config, Some("test-")).unwrap();
@@ -26784,6 +27239,29 @@ mod tests {
         let bodies: Vec<&str> = comments.iter().map(|c| c.body.as_str()).collect();
         assert!(bodies.contains(&"Comment from DB"));
         assert!(bodies.contains(&"Comment from JSONL"));
+        let stored = storage.get_issue_for_export("test-001").unwrap().unwrap();
+        assert_eq!(stored.title, "New title");
+        assert_eq!(
+            stored.compute_content_hash(),
+            incoming.compute_content_hash()
+        );
+        assert_eq!(result.export_hashes_recorded, 0);
+        assert!(storage.get_export_hash("test-001").unwrap().is_none());
+        assert_eq!(
+            pending_export_state(&storage, true).unwrap(),
+            (0, true, true)
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), source_bytes);
+
+        let repeated = import_from_jsonl(&mut storage, &path, &config, Some("test-")).unwrap();
+        assert_eq!(repeated.skipped_count, 1);
+        assert_eq!(repeated.export_hashes_recorded, 0);
+        assert_eq!(storage.get_comments("test-001").unwrap(), comments);
+        assert!(storage.get_export_hash("test-001").unwrap().is_none());
+        assert_eq!(
+            pending_export_state(&storage, true).unwrap(),
+            (0, true, true)
+        );
     }
 
     #[test]
@@ -27105,6 +27583,237 @@ mod tests {
                 "a stale skip must not replace the preceding update's export hash"
             );
             assert!(storage.get_issue("bd-alias").unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn test_import_comment_union_preserves_same_target_alias_facts() {
+        for (alias_first, alias_updates) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let path = temp_dir.path().join("issues.jsonl");
+            let mut original = make_issue_at("bd-main", "Shared target", fixed_time(100));
+            original.comments.push(Comment {
+                id: 1,
+                issue_id: original.id.clone(),
+                author: "local".to_string(),
+                body: "database fact".to_string(),
+                created_at: fixed_time(100),
+            });
+            write_additive_issues(&path, std::slice::from_ref(&original));
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+            storage.set_metadata("needs_flush", "false").unwrap();
+            assert_eq!(
+                pending_export_state(&storage, true).unwrap(),
+                (0, false, false)
+            );
+
+            let mut update = original.clone();
+            update.updated_at = fixed_time(200);
+            update.labels = vec!["explicit-update".to_string()];
+            update.comments = vec![Comment {
+                id: 2,
+                issue_id: update.id.clone(),
+                author: "remote".to_string(),
+                body: "update fact".to_string(),
+                created_at: fixed_time(200),
+            }];
+            let mut alias = original;
+            alias.id = "bd-alias".to_string();
+            alias.updated_at = fixed_time(if alias_updates { 300 } else { 50 });
+            alias.labels = vec!["alias-update".to_string()];
+            alias.comments = vec![Comment {
+                id: 3,
+                issue_id: alias.id.clone(),
+                author: "remote".to_string(),
+                body: "alias fact".to_string(),
+                created_at: fixed_time(300),
+            }];
+            let expected = if alias_updates && !alias_first {
+                &alias
+            } else {
+                &update
+            };
+            let expected_labels = expected.labels.clone();
+            let expected_updated_at = expected.updated_at;
+            let rows = if alias_first {
+                vec![alias, update]
+            } else {
+                vec![update, alias]
+            };
+            write_additive_issues(&path, &rows);
+
+            let imported =
+                import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd"))
+                    .unwrap();
+            assert_eq!(imported.updated_count, 1 + usize::from(alias_updates));
+            assert_eq!(imported.skipped_count, usize::from(!alias_updates));
+            let actual = storage.get_issue_for_export("bd-main").unwrap().unwrap();
+            assert_eq!(actual.labels, expected_labels);
+            assert_eq!(actual.updated_at, expected_updated_at);
+            let mut bodies = actual
+                .comments
+                .iter()
+                .map(|comment| comment.body.as_str())
+                .collect::<Vec<_>>();
+            bodies.sort_unstable();
+            assert_eq!(bodies, ["alias fact", "database fact", "update fact"]);
+            assert!(
+                actual
+                    .comments
+                    .iter()
+                    .all(|comment| comment.issue_id == "bd-main")
+            );
+            assert!(storage.get_issue("bd-alias").unwrap().is_none());
+            assert_eq!(imported.export_hashes_recorded, 0);
+            assert!(storage.get_export_hash("bd-main").unwrap().is_none());
+            assert_eq!(
+                pending_export_state(&storage, true).unwrap(),
+                (0, true, true)
+            );
+        }
+    }
+
+    #[test]
+    fn test_import_skip_comment_union_revokes_prior_source_certificate() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+        let mut original = make_issue_at("bd-main", "Shared target", fixed_time(100));
+        original.comments.push(Comment {
+            id: 1,
+            issue_id: original.id.clone(),
+            author: "local".to_string(),
+            body: "already certified fact".to_string(),
+            created_at: fixed_time(100),
+        });
+        write_additive_issues(&path, std::slice::from_ref(&original));
+        import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+        storage.set_metadata("needs_flush", "false").unwrap();
+        assert!(storage.get_export_hash("bd-main").unwrap().is_some());
+        assert_eq!(
+            pending_export_state(&storage, true).unwrap(),
+            (0, false, false)
+        );
+
+        let mut alias = original.clone();
+        alias.id = "bd-alias".to_string();
+        alias.updated_at = fixed_time(50);
+        alias.comments = vec![Comment {
+            id: 2,
+            issue_id: alias.id.clone(),
+            author: "remote".to_string(),
+            body: "later alias fact".to_string(),
+            created_at: fixed_time(200),
+        }];
+        write_additive_issues(&path, &[original.clone(), alias]);
+        let imported =
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+
+        assert_eq!(imported.updated_count, 0);
+        assert_eq!(imported.skipped_count, 2);
+        let actual = storage.get_issue_for_export("bd-main").unwrap().unwrap();
+        assert_eq!(actual.updated_at, original.updated_at);
+        assert_eq!(
+            actual.compute_content_hash(),
+            original.compute_content_hash()
+        );
+        assert_eq!(actual.comments.len(), 2);
+        assert!(
+            actual
+                .comments
+                .iter()
+                .any(|comment| comment.body == "already certified fact")
+        );
+        assert!(
+            actual
+                .comments
+                .iter()
+                .any(|comment| comment.body == "later alias fact")
+        );
+        assert_eq!(imported.export_hashes_recorded, 0);
+        assert!(storage.get_export_hash("bd-main").unwrap().is_none());
+        assert_eq!(
+            pending_export_state(&storage, true).unwrap(),
+            (0, true, true)
+        );
+    }
+
+    #[test]
+    fn test_import_comment_union_refuses_invalid_source_comments() {
+        for (alias_source, wrong_owner) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let path = temp_dir.path().join("issues.jsonl");
+            let mut original = make_issue_at("bd-main", "Protected comments", fixed_time(100));
+            original.comments.push(Comment {
+                id: 1,
+                issue_id: original.id.clone(),
+                author: "local".to_string(),
+                body: "must survive refusal".to_string(),
+                created_at: fixed_time(100),
+            });
+            write_additive_issues(&path, std::slice::from_ref(&original));
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+            storage.set_metadata("needs_flush", "false").unwrap();
+            let before = storage.get_issue_for_export("bd-main").unwrap().unwrap();
+            let certificate_before = storage.get_export_hash("bd-main").unwrap();
+
+            let mut update = original.clone();
+            update.updated_at = fixed_time(200);
+            let mut invalid = update.clone();
+            if alias_source {
+                invalid.id = "bd-alias".to_string();
+                invalid.updated_at = fixed_time(50);
+            }
+            invalid.comments = vec![Comment {
+                id: 7,
+                issue_id: if wrong_owner {
+                    "bd-unrelated".to_string()
+                } else {
+                    invalid.id.clone()
+                },
+                author: "remote".to_string(),
+                body: "first payload".to_string(),
+                created_at: fixed_time(150),
+            }];
+            if !wrong_owner {
+                let mut conflicting = invalid.comments[0].clone();
+                conflicting.body = "different payload under the same rowid".to_string();
+                invalid.comments.push(conflicting);
+            }
+            let rows = if alias_source {
+                vec![invalid, update]
+            } else {
+                vec![invalid]
+            };
+            write_additive_issues(&path, &rows);
+            let error =
+                import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd"))
+                    .expect_err("comment union must preserve source corruption refusals");
+            let expected_error = if wrong_owner {
+                "comment issue_id"
+            } else {
+                "duplicate import comment id"
+            };
+            assert!(error.to_string().contains(expected_error), "{error}");
+            assert_eq!(
+                storage.get_issue_for_export("bd-main").unwrap().unwrap(),
+                before
+            );
+            assert_eq!(
+                storage.get_export_hash("bd-main").unwrap(),
+                certificate_before
+            );
+            assert!(storage.get_issue("bd-alias").unwrap().is_none());
+            assert_eq!(
+                pending_export_state(&storage, true).unwrap(),
+                (0, false, false)
+            );
         }
     }
 

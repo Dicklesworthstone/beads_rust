@@ -1040,7 +1040,7 @@ fn open_sqlite_storage_with_recovery_strategy(
                 return Err(open_err);
             }
             rebuild_or_defer_after_open_error(
-                open_err,
+                &open_err,
                 beads_dir,
                 paths,
                 recovery_strategy,
@@ -1330,7 +1330,7 @@ fn prepare_fresh_storage_for_deferred_import(
 /// survive a rebuild. Refuse automatic replacement; only an explicit import
 /// may move the broken family aside without a preservation snapshot.
 fn rebuild_or_defer_after_open_error(
-    open_err: BeadsError,
+    open_err: &BeadsError,
     beads_dir: &Path,
     paths: &ConfigPaths,
     recovery_strategy: JsonlRecoveryStrategy,
@@ -5340,14 +5340,20 @@ fn open_sqlite_storage_for_startup(
                 },
                 None,
             )),
-            Ok(Some(_) | None) => open_sqlite_storage_with_recovery_after_fast_open_miss(
-                beads_dir,
-                paths,
-                lock_timeout,
-                bootstrap_layer,
-                options.write_authority,
-                options.allow_external_jsonl,
-            ),
+            Ok(storage) => {
+                // An ignored Some(_) keeps its registered read opener alive
+                // until the match finishes. Release it before recovery can
+                // replace the database and require a sole-opener checkpoint.
+                drop(storage);
+                open_sqlite_storage_with_recovery_after_fast_open_miss(
+                    beads_dir,
+                    paths,
+                    lock_timeout,
+                    bootstrap_layer,
+                    options.write_authority,
+                    options.allow_external_jsonl,
+                )
+            }
             Err(err) => {
                 tracing::trace!(
                     error = %err,
@@ -10154,52 +10160,66 @@ routing:
 
     #[test]
     fn open_storage_with_cli_recovers_when_post_open_probe_finds_duplicate_config_rows() {
-        let mut temp = TempDir::new().expect("tempdir");
-        temp.disable_cleanup(true);
-        let beads_dir = temp.path().join(".beads");
-        let db_path = beads_dir.join("beads.db");
-        let jsonl_path = beads_dir.join("issues.jsonl");
-        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        for read_only_fast_open in [false, true] {
+            let mut temp = TempDir::new().expect("tempdir");
+            temp.disable_cleanup(true);
+            let beads_dir = temp.path().join(".beads");
+            let db_path = beads_dir.join("beads.db");
+            let jsonl_path = beads_dir.join("issues.jsonl");
+            fs::create_dir_all(&beads_dir).expect("create beads dir");
 
-        let mut storage = SqliteStorage::open(&db_path).expect("create seed db");
-        storage
-            .set_config("issue_prefix", "bd")
-            .expect("seed issue prefix");
-        drop(storage);
-        insert_duplicate_issue_prefix_config_row(&db_path, "bd");
+            let mut storage = SqliteStorage::open(&db_path).expect("create seed db");
+            storage
+                .set_config("issue_prefix", "bd")
+                .expect("seed issue prefix");
+            drop(storage);
+            insert_duplicate_issue_prefix_config_row(&db_path, "bd");
+            if read_only_fast_open {
+                let fixture = Connection::open(db_path.to_string_lossy().into_owned())
+                    .expect("open fast-open-miss fixture");
+                fixture
+                    .execute("DROP INDEX idx_issues_status")
+                    .expect("invalidate the runtime-schema witness");
+                fixture.close().expect("checkpoint fixture");
+            }
 
-        write_single_issue_jsonl(
-            &jsonl_path,
-            "bd-rdup01",
-            "Recovered from duplicate config rows",
-        );
+            write_single_issue_jsonl(
+                &jsonl_path,
+                "bd-rdup01",
+                "Recovered from duplicate config rows",
+            );
 
-        let storage_ctx =
-            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
-        let issue = storage_ctx
-            .storage
-            .get_issue("bd-rdup01")
-            .expect("query issue")
-            .expect("issue should exist after duplicate-config recovery");
+            let cli = CliOverrides {
+                read_only_fast_open,
+                ..CliOverrides::default()
+            };
+            let storage_ctx = open_storage_with_cli(&beads_dir, &cli).expect("storage");
+            let issue = storage_ctx
+                .storage
+                .get_issue("bd-rdup01")
+                .expect("query issue")
+                .expect("issue should exist after duplicate-config recovery");
 
-        assert_eq!(issue.title, "Recovered from duplicate config rows");
-        assert!(!storage_ctx.no_db);
+            assert_eq!(issue.title, "Recovered from duplicate config rows");
+            assert!(!storage_ctx.no_db);
+            assert!(storage_ctx.auto_rebuilt);
 
-        let recovery_dir = beads_dir.join(RECOVERY_DIR_NAME);
-        let backups: Vec<_> = fs::read_dir(&recovery_dir)
-            .expect("list recovery dir")
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            backups.iter().any(|name| {
-                name.starts_with("beads.db.")
-                    && Path::new(name)
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("bak"))
-            }),
-            "duplicate-config database should be preserved in the recovery directory"
-        );
+            let recovery_dir = beads_dir.join(RECOVERY_DIR_NAME);
+            let backups: Vec<_> = fs::read_dir(&recovery_dir)
+                .expect("list recovery dir")
+                .filter_map(std::result::Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                backups.iter().any(|name| {
+                    name.starts_with("beads.db.")
+                        && Path::new(name)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("bak"))
+                }),
+                "duplicate-config database should be preserved in the recovery directory"
+            );
+        }
     }
 
     /// Returns true once the parent has checked the isolated test's result.

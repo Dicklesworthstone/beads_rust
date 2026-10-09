@@ -1185,27 +1185,43 @@ fn reinstate_retained_index(
 /// Deliberately narrow. Only directories br created under
 /// `.br_recovery/schema-migrations/` with a recovery receipt for this
 /// database count as recovery runs. A run is removed only when it finished
-/// (`recovery-complete.json`, or an index-only run superseded by a complete
-/// backup) and carries no failure receipt; failed and in-progress runs are
-/// the evidence a later diagnosis needs and are never removed, and neither is
-/// `current_run`. Schema-migration runs (`undo` reads their backups) have no
-/// recovery receipt and are never touched. A run whose name does not carry
-/// the timestamp br writes is kept.
+/// with agreeing, recognized preparation/completion receipts and the intact
+/// backup, and carries no failure receipt. A superseded index-only run is kept:
+/// its marker predates the follow-on complete backup and names no successor.
+/// Failed, partial, foreign, and unrecognized evidence is never removed, and
+/// neither is `current_run`. Schema-migration runs (`undo` reads their backups)
+/// have no recovery receipt and are never touched. A staged `.pruning-` name
+/// alone grants no deletion authority.
+#[allow(clippy::too_many_lines)]
 fn prune_recovery_runs(
     beads_dir: &Path,
     db_path: &Path,
     current_run: &Path,
     now: chrono::DateTime<Utc>,
 ) -> Result<Vec<PathBuf>> {
+    // No-replace staging and descriptor identity are prerequisites, including
+    // for resumed removals. Never fall back to an overwriting rename.
+    if !cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    )) {
+        return Ok(Vec::new());
+    }
     let root = migration_runs_root(beads_dir);
     let entries = match fs::read_dir(&root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(BeadsError::Io(error)),
     };
+    let Some(root_directory) = open_recovery_pruning_entry(&root, true)? else {
+        return Ok(Vec::new());
+    };
     let database_path = db_path.display().to_string();
+    let min_age = chrono::Duration::days(RECOVERY_RUN_MIN_AGE_DAYS);
     let mut runs = Vec::new();
-    let mut interrupted_prunes = Vec::new();
+    let mut staged_runs = Vec::new();
     for entry in entries {
         let entry = entry.map_err(BeadsError::Io)?;
         let file_type = entry.file_type().map_err(BeadsError::Io)?;
@@ -1214,24 +1230,61 @@ fn prune_recovery_runs(
         }
         let name = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path();
-        if name.starts_with(PRUNING_PREFIX) {
-            interrupted_prunes.push(path);
+        if let Some(original_name) = name.strip_prefix(PRUNING_PREFIX) {
+            let Some(created) = recovery_run_timestamp(original_name) else {
+                continue;
+            };
+            let original = root.join(original_name);
+            if original == current_run || path == current_run || now - created < min_age {
+                continue;
+            }
+            staged_runs.push((created, path, original));
             continue;
         }
         let Some(created) = recovery_run_timestamp(&name) else {
             continue;
         };
-        let Some(status) = recovery_run_status(&path, &database_path)? else {
+        // Count owned runs from their preparation only. Newest, current and
+        // young evidence is retained regardless of its verdict, so scanning
+        // it must not rehash every backup accumulated by a busy agent fleet.
+        let Some(prepared) = read_recovery_pruning_receipt(&path.join("recovery-prepared.json"))?
+        else {
             continue;
         };
-        runs.push((created, path, status));
+        if prepared.database_path != database_path {
+            continue;
+        }
+        runs.push((created, path));
     }
     // Newest first; ties broken by name so the order is total.
     runs.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
-    let min_age = chrono::Duration::days(RECOVERY_RUN_MIN_AGE_DAYS);
+    for (created, path, original) in staged_runs {
+        // Staging is not proof that the retention window still permits
+        // deletion. Require five newer, owned, unstaged runs; aliases never
+        // count twice, and keeping additional staged evidence is conservative.
+        if !runs
+            .get(RECOVERY_RUNS_KEPT - 1)
+            .is_some_and(|(kept_created, kept_path)| {
+                (kept_created, kept_path) > (&created, &original)
+            })
+        {
+            continue;
+        }
+        let Some(directory) = open_recovery_pruning_entry(&path, true)? else {
+            continue;
+        };
+        // A partial removal that lost its proof remains retained. The
+        // receipts still name the original run, not its staging alias.
+        if !recovery_pruning_entry_unchanged(&root, &root_directory, true)? {
+            return Ok(Vec::new());
+        }
+        if let Err(error) = remove_verified_recovery_run(&path, &original, db_path, &directory) {
+            tracing::warn!(run = %path.display(), %error, "could not remove verified staged recovery run");
+        }
+    }
     let mut pruned = Vec::new();
-    for (created, path, status) in runs.into_iter().skip(RECOVERY_RUNS_KEPT) {
-        if status != RecoveryRunStatus::Finished || path == current_run || now - created < min_age {
+    for (created, path) in runs.into_iter().skip(RECOVERY_RUNS_KEPT) {
+        if path == current_run || now - created < min_age {
             continue;
         }
         let Some(name) = path.file_name() else {
@@ -1240,19 +1293,30 @@ fn prune_recovery_runs(
         let mut doomed_name = OsString::from(PRUNING_PREFIX);
         doomed_name.push(name);
         let doomed = root.join(doomed_name);
-        if let Err(error) = fs::rename(&path, &doomed) {
+        // Discovery selects candidates, not deletion authority. Keep only this
+        // candidate's descriptor while checking and removing it; thousands of
+        // retained runs must not consume thousands of open descriptors.
+        let Some(directory) = open_recovery_pruning_entry(&path, true)? else {
+            continue;
+        };
+        if !recovery_pruning_entry_unchanged(&root, &root_directory, true)?
+            || recovery_run_status(&path, &path, db_path)? != Some(RecoveryRunStatus::Finished)
+            || !recovery_pruning_entry_unchanged(&path, &directory, true)?
+        {
+            continue;
+        }
+        if let Err(error) = rename_path_no_replace(&path, &doomed) {
             tracing::warn!(run = %path.display(), %error, "could not set aside old recovery run");
             continue;
         }
-        interrupted_prunes.push(doomed);
-        pruned.push(path);
-    }
-    if !interrupted_prunes.is_empty() {
-        sync_directory(&root)?;
-    }
-    for doomed in interrupted_prunes {
-        if let Err(error) = fs::remove_dir_all(&doomed) {
-            tracing::warn!(run = %doomed.display(), %error, "could not remove old recovery run");
+        match remove_verified_recovery_run(&doomed, &path, db_path, &directory) {
+            Ok(true) => pruned.push(path),
+            Ok(false) => {
+                tracing::warn!(run = %doomed.display(), "recovery evidence changed; staged run is retained");
+            }
+            Err(error) => {
+                tracing::warn!(run = %doomed.display(), %error, "could not remove old recovery run");
+            }
         }
     }
     Ok(pruned)
@@ -1274,35 +1338,541 @@ fn recovery_run_timestamp(name: &str) -> Option<chrono::DateTime<Utc>> {
         .map(|naive| naive.and_utc())
 }
 
-/// Classify a run directory as a recovery run of `database_path`, or `None`
+/// Classify a run directory as a recovery run of `db_path`, or `None`
 /// for anything else (schema-migration runs, other databases' runs, runs
-/// whose receipt this binary cannot read).
-fn recovery_run_status(run_dir: &Path, database_path: &str) -> Result<Option<RecoveryRunStatus>> {
-    let prepared = run_dir.join("recovery-prepared.json");
-    let bytes = match fs::read(&prepared) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(BeadsError::Io(error)),
-    };
-    let Ok(receipt) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+/// whose receipt this binary cannot read). Never follow receipt-supplied paths:
+/// `recorded_dir` is the original sibling name before no-replace staging.
+fn recovery_run_status(
+    run_dir: &Path,
+    recorded_dir: &Path,
+    db_path: &Path,
+) -> Result<Option<RecoveryRunStatus>> {
+    let Some(prepared) = read_recovery_pruning_receipt(&run_dir.join("recovery-prepared.json"))?
+    else {
         return Ok(None);
     };
-    if receipt
-        .get("database_path")
-        .and_then(serde_json::Value::as_str)
-        != Some(database_path)
+    if prepared.database_path != db_path.display().to_string() {
+        return Ok(None);
+    }
+    let retained = Some(RecoveryRunStatus::Retained);
+    // Any failure entry is a veto, including a malformed file or a symlink.
+    match fs::symlink_metadata(run_dir.join("recovery-failed.json")) {
+        Ok(_) => return Ok(retained),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(BeadsError::Io(error)),
+    }
+    let Some(completed) = read_recovery_pruning_receipt(&run_dir.join("recovery-complete.json"))?
+    else {
+        return Ok(retained);
+    };
+    if !recovery_pruning_receipts_agree(&prepared, &completed, recorded_dir) {
+        return Ok(retained);
+    }
+    let index_only = prepared.backup_scope == RECOVERY_BACKUP_WAL_INDEX_ONLY;
+    let directories: &[&str] = if index_only {
+        &["recovery-before"]
+    } else {
+        &["recovery-before", "recovery-probe"]
+    };
+    if !recovery_pruning_directory_contents(
+        run_dir,
+        &[
+            OsString::from("recovery-prepared.json"),
+            OsString::from("recovery-complete.json"),
+        ],
+        directories,
+    )? || !recovery_pruning_backup_matches(
+        &run_dir.join("recovery-before"),
+        db_path,
+        &prepared.raw_before,
+        index_only,
+    )? {
+        return Ok(retained);
+    }
+    if !index_only
+        && !recovery_pruning_probe_matches(
+            &run_dir.join("recovery-probe"),
+            db_path,
+            &prepared.raw_before,
+        )?
+    {
+        return Ok(retained);
+    }
+    Ok(Some(RecoveryRunStatus::Finished))
+}
+
+/// Only fields emitted by the known recovery writer can authorize pruning.
+/// Nullable witness fields are required: absence is not the emitted null.
+/// The pruning-only nested readers reject unknown and duplicate proof fields
+/// without tightening unrelated migration receipt deserialization.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryPruningReceipt {
+    schema_version: String,
+    database_path: String,
+    backup_path: String,
+    backup_scope: String,
+    stage: String,
+    #[serde(deserialize_with = "deserialize_recovery_pruning_raw")]
+    raw_before: RawFamilyWitness,
+    #[serde(deserialize_with = "deserialize_optional_recovery_pruning_raw")]
+    raw_after: Option<RawFamilyWitness>,
+    #[serde(deserialize_with = "deserialize_optional_recovery_pruning_logical")]
+    logical_after: Option<LogicalDatabaseWitness>,
+    error: serde_json::Value,
+    #[serde(default, deserialize_with = "present_recovery_pruning_field")]
+    index_corruption: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "present_recovery_pruning_field")]
+    failure_kind: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryPruningRaw {
+    components: Vec<RecoveryPruningComponent>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryPruningComponent {
+    suffix: String,
+    present: bool,
+    #[serde(deserialize_with = "required_recovery_pruning_option")]
+    length: Option<u64>,
+    #[serde(deserialize_with = "required_recovery_pruning_option")]
+    sha256: Option<String>,
+    #[serde(deserialize_with = "required_recovery_pruning_option")]
+    unix_mode: Option<u32>,
+}
+
+impl From<RecoveryPruningRaw> for RawFamilyWitness {
+    fn from(raw: RecoveryPruningRaw) -> Self {
+        Self {
+            components: raw
+                .components
+                .into_iter()
+                .map(|component| RawComponentWitness {
+                    suffix: component.suffix,
+                    present: component.present,
+                    length: component.length,
+                    sha256: component.sha256,
+                    unix_mode: component.unix_mode,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryPruningLogical {
+    user_version: u32,
+    integrity_check: String,
+    schema_sha256: String,
+    contents_sha256: String,
+    tables: Vec<RecoveryPruningTable>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryPruningTable {
+    name: String,
+    row_count: u64,
+    rows_sha256: String,
+}
+
+impl From<RecoveryPruningLogical> for LogicalDatabaseWitness {
+    fn from(logical: RecoveryPruningLogical) -> Self {
+        Self {
+            user_version: logical.user_version,
+            integrity_check: logical.integrity_check,
+            schema_sha256: logical.schema_sha256,
+            contents_sha256: logical.contents_sha256,
+            tables: logical
+                .tables
+                .into_iter()
+                .map(|table| LogicalTableWitness {
+                    name: table.name,
+                    row_count: table.row_count,
+                    rows_sha256: table.rows_sha256,
+                })
+                .collect(),
+        }
+    }
+}
+
+fn required_recovery_pruning_option<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+fn deserialize_recovery_pruning_raw<'de, D>(
+    deserializer: D,
+) -> std::result::Result<RawFamilyWitness, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    RecoveryPruningRaw::deserialize(deserializer).map(Into::into)
+}
+
+fn deserialize_optional_recovery_pruning_raw<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<RawFamilyWitness>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<RecoveryPruningRaw>::deserialize(deserializer).map(|raw| raw.map(Into::into))
+}
+
+fn deserialize_optional_recovery_pruning_logical<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<LogicalDatabaseWitness>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<RecoveryPruningLogical>::deserialize(deserializer)
+        .map(|logical| logical.map(Into::into))
+}
+
+fn present_recovery_pruning_field<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
+fn recovery_pruning_receipts_agree(
+    prepared: &RecoveryPruningReceipt,
+    completed: &RecoveryPruningReceipt,
+    recorded_dir: &Path,
+) -> bool {
+    let index_only = prepared.backup_scope == RECOVERY_BACKUP_WAL_INDEX_ONLY;
+    let expected_preparation = if index_only {
+        // 0.7.4 used live-recovery before performing the live preflight.
+        matches!(prepared.stage.as_str(), "live-preflight" | "live-recovery")
+    } else {
+        prepared.backup_scope == RECOVERY_BACKUP_COMPLETE_FAMILY
+            && prepared.stage == "private-recovery"
+    };
+    if !expected_preparation
+        || prepared.schema_version != "br.doctor.schema_migration.recovery.v1"
+        || completed.schema_version != prepared.schema_version
+        || completed.database_path != prepared.database_path
+        || prepared.backup_path != recorded_dir.join("recovery-before").display().to_string()
+        || completed.backup_path != prepared.backup_path
+        || completed.backup_scope != prepared.backup_scope
+        || completed.raw_before != prepared.raw_before
+        || completed.stage != "complete"
+        || prepared.raw_after.is_some()
+        || prepared.logical_after.is_some()
+        || !prepared.error.is_null()
+        || !completed.error.is_null()
+        || prepared.failure_kind.is_some()
+        || completed.failure_kind.is_some()
+        || prepared.index_corruption.is_some()
+        || completed.index_corruption.is_some()
+        || !recovery_pruning_raw_is_valid(&prepared.raw_before)
+    {
+        return false;
+    }
+    let Some(after) = &completed.raw_after else {
+        return false;
+    };
+    let Some(logical) = &completed.logical_after else {
+        return false;
+    };
+    if !recovery_pruning_raw_is_valid(after)
+        || !integrity_check_is_clean(&logical.integrity_check)
+        || !recovery_pruning_hash_is_valid(&logical.schema_sha256)
+        || !recovery_pruning_hash_is_valid(&logical.contents_sha256)
+        || logical
+            .tables
+            .iter()
+            .any(|table| !recovery_pruning_hash_is_valid(&table.rows_sha256))
+        || require_recovery_payload_unchanged(&prepared.raw_before, after).is_err()
+        || !prepared
+            .raw_before
+            .components
+            .iter()
+            .map(|component| &component.suffix)
+            .eq(after.components.iter().map(|component| &component.suffix))
+    {
+        return false;
+    }
+    !index_only
+        || (component_for_suffix(&prepared.raw_before, "-wal")
+            .is_ok_and(|wal| wal.present && wal.length == Some(WAL_HEADER_BYTES))
+            && component_for_suffix(&prepared.raw_before, "-shm").is_ok_and(|shm| shm.present)
+            && component_for_suffix(&prepared.raw_before, "-journal")
+                .is_ok_and(|journal| !journal.present))
+}
+
+fn recovery_pruning_hash_is_valid(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn recovery_pruning_raw_is_valid(witness: &RawFamilyWitness) -> bool {
+    let known: Vec<&str> = std::iter::once("")
+        .chain(config::db_sidecar_suffixes().copied())
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    witness.components.len() >= FAMILY_SUFFIXES.len()
+        && witness.components.iter().all(|component| {
+            known.contains(&component.suffix.as_str())
+                && seen.insert(component.suffix.as_str())
+                && if component.present {
+                    component.length.is_some()
+                        && component
+                            .sha256
+                            .as_deref()
+                            .is_some_and(recovery_pruning_hash_is_valid)
+                } else {
+                    component.length.is_none()
+                        && component.sha256.is_none()
+                        && component.unix_mode.is_none()
+                }
+        })
+        && FAMILY_SUFFIXES.iter().all(|suffix| seen.contains(suffix))
+        && component_for_suffix(witness, "").is_ok_and(|main| main.present)
+}
+
+fn recovery_pruning_identity(file: &File) -> Result<fsqlite_vfs::FileIdentity> {
+    fsqlite_vfs::FileIdentity::from_file(file)?
+        .ok_or_else(|| BeadsError::internal("recovery pruning cannot verify filesystem identity"))
+}
+
+/// Open without following aliases or waiting on special files. A retained
+/// descriptor prevents an unlinked directory's file ID from being reused.
+fn open_recovery_pruning_entry(path: &Path, directory: bool) -> Result<Option<File>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if if directory {
+        !metadata.is_dir()
+    } else {
+        !metadata.is_file()
+    } {
+        return Ok(None);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Even an eventual rejection must not open a known alias of a live
+        // SQLite inode: closing it can release this process's POSIX locks.
+        if !directory && metadata.nlink() != 1 {
+            return Ok(None);
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(
+            libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | if directory {
+                    libc::O_DIRECTORY
+                } else {
+                    libc::O_NONBLOCK
+                },
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+        options.custom_flags(
+            FILE_FLAG_OPEN_REPARSE_POINT
+                | if directory {
+                    FILE_FLAG_BACKUP_SEMANTICS
+                } else {
+                    0
+                },
+        );
+    }
+    let file = options.open(path)?;
+    let opened = file.metadata()?;
+    if if directory {
+        !opened.is_dir()
+    } else {
+        !opened.is_file()
+    } {
+        return Ok(None);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if !directory && opened.nlink() != 1 {
+            return Ok(None);
+        }
+    }
+    let _ = recovery_pruning_identity(&file)?;
+    Ok(Some(file))
+}
+
+fn recovery_pruning_entry_unchanged(path: &Path, retained: &File, directory: bool) -> Result<bool> {
+    let Some(current) = open_recovery_pruning_entry(path, directory)? else {
+        return Ok(false);
+    };
+    Ok(recovery_pruning_identity(&current)? == recovery_pruning_identity(retained)?)
+}
+
+fn read_recovery_pruning_receipt(path: &Path) -> Result<Option<RecoveryPruningReceipt>> {
+    const LIMIT: u64 = 16 * 1024 * 1024;
+    let Some(mut file) = open_recovery_pruning_entry(path, false)? else {
+        return Ok(None);
+    };
+    if file.metadata()?.len() > LIMIT {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    (&mut file).take(LIMIT + 1).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > LIMIT
+        || !recovery_pruning_entry_unchanged(path, &file, false)?
     {
         return Ok(None);
     }
-    let has =
-        |name: &str| -> Result<bool> { Ok(secure_file_metadata(&run_dir.join(name))?.is_some()) };
-    if has("recovery-failed.json")? {
-        return Ok(Some(RecoveryRunStatus::Retained));
+    Ok(serde_json::from_slice(&bytes).ok())
+}
+
+fn recovery_pruning_directory_contents(
+    dir: &Path,
+    files: &[OsString],
+    directories: &[&str],
+) -> Result<bool> {
+    let Some(retained) = open_recovery_pruning_entry(dir, true)? else {
+        return Ok(false);
+    };
+    let mut found = 0;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let name = entry.file_name();
+        if !((kind.is_file() && files.contains(&name))
+            || (kind.is_dir() && directories.iter().any(|expected| name == *expected)))
+        {
+            return Ok(false);
+        }
+        found += 1;
     }
-    if has("recovery-complete.json")? || has(RECOVERY_SUPERSEDED_RECEIPT)? {
-        return Ok(Some(RecoveryRunStatus::Finished));
+    Ok(found == files.len() + directories.len()
+        && recovery_pruning_entry_unchanged(dir, &retained, true)?)
+}
+
+fn recovery_pruning_file_matches(path: &Path, component: &RawComponentWitness) -> Result<bool> {
+    let Some(mut file) = open_recovery_pruning_entry(path, false)? else {
+        return Ok(false);
+    };
+    if component.length != Some(file.metadata()?.len()) {
+        return Ok(false);
     }
-    Ok(Some(RecoveryRunStatus::Retained))
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(
+        component.sha256.as_deref() == Some(hex_digest(digest.finalize().as_slice()).as_str())
+            && component.length == Some(file.metadata()?.len())
+            && recovery_pruning_entry_unchanged(path, &file, false)?,
+    )
+}
+
+fn recovery_pruning_backup_matches(
+    dir: &Path,
+    db_path: &Path,
+    before: &RawFamilyWitness,
+    index_only: bool,
+) -> Result<bool> {
+    let mut names = Vec::new();
+    for component in &before.components {
+        if !component.present || (index_only && component.suffix != "-shm") {
+            continue;
+        }
+        let path = backup_component_path(dir, db_path, &component.suffix)?;
+        let Some(name) = path.file_name() else {
+            return Ok(false);
+        };
+        names.push(name.to_os_string());
+        if !recovery_pruning_file_matches(&path, component)? {
+            return Ok(false);
+        }
+    }
+    recovery_pruning_directory_contents(dir, &names, &[])
+}
+
+fn recovery_pruning_probe_matches(
+    dir: &Path,
+    db_path: &Path,
+    before: &RawFamilyWitness,
+) -> Result<bool> {
+    let mut names = Vec::new();
+    for suffix in std::iter::once("").chain(config::db_sidecar_suffixes().copied()) {
+        let path = backup_component_path(dir, db_path, suffix)?;
+        let Some(file) = open_recovery_pruning_entry(&path, false)? else {
+            continue;
+        };
+        if let Some(name) = path.file_name() {
+            names.push(name.to_os_string());
+        }
+        drop(file);
+    }
+    if !recovery_pruning_directory_contents(dir, &names, &[])? {
+        return Ok(false);
+    }
+    for suffix in ["", "-wal", "-journal"] {
+        let component = component_for_suffix(before, suffix)?;
+        let path = backup_component_path(dir, db_path, suffix)?;
+        if component.present {
+            if !recovery_pruning_file_matches(&path, component)? {
+                return Ok(false);
+            }
+        } else if fs::symlink_metadata(path).is_ok() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Detect observed replacement and evidence drift before recursive removal.
+/// This is not an atomic delete against arbitrary concurrent filesystem writers.
+fn remove_verified_recovery_run(
+    dir: &Path,
+    recorded_dir: &Path,
+    db_path: &Path,
+    retained: &File,
+) -> Result<bool> {
+    if !recovery_pruning_entry_unchanged(dir, retained, true)?
+        || recovery_run_status(dir, recorded_dir, db_path)? != Some(RecoveryRunStatus::Finished)
+        || !recovery_pruning_entry_unchanged(dir, retained, true)?
+    {
+        return Ok(false);
+    }
+    let parent = dir
+        .parent()
+        .ok_or_else(|| BeadsError::internal("recovery run has no parent"))?;
+    sync_directory(parent)?;
+    fs::remove_dir_all(dir)?;
+    Ok(true)
 }
 
 fn recover_engine_admission_with_complete_backup(
@@ -5556,16 +6126,95 @@ mod tests {
         );
     }
 
-    /// One run directory as br lays it out. `receipts` names the receipt
-    /// files to write; recovery receipts carry `database_path`.
+    /// A complete byte-witnessed run with the same receipt and directory
+    /// layout as the recovery writer. No engine open is needed to exercise
+    /// evidence retention; the private probe has identical protected bytes.
     fn make_run(root: &Path, name: &str, database_path: &str, receipts: &[&str]) -> PathBuf {
+        make_run_with_scope(
+            root,
+            name,
+            database_path,
+            receipts,
+            receipts.contains(&RECOVERY_SUPERSEDED_RECEIPT),
+        )
+    }
+
+    fn make_run_with_scope(
+        root: &Path,
+        name: &str,
+        database_path: &str,
+        receipts: &[&str],
+        index_only: bool,
+    ) -> PathBuf {
         let run = root.join(name);
-        fs::create_dir_all(run.join("recovery-before")).unwrap();
-        fs::write(run.join("recovery-before").join("beads.db"), b"retained").unwrap();
-        for receipt in receipts {
+        let before = run.join("recovery-before");
+        fs::create_dir_all(&before).unwrap();
+        let database = Path::new(database_path);
+        let mut raw = RawFamilyWitness {
+            components: Vec::new(),
+        };
+        for suffix in std::iter::once("").chain(config::db_sidecar_suffixes().copied()) {
+            let bytes: Option<&[u8]> = match suffix {
+                "" => Some(b"retained"),
+                "-wal" => Some(&[7; 32]),
+                "-shm" => Some(&[8; 96]),
+                _ => None,
+            };
+            raw.components.push(RawComponentWitness {
+                suffix: suffix.to_string(),
+                present: bytes.is_some(),
+                length: bytes.map(|bytes| u64::try_from(bytes.len()).unwrap()),
+                sha256: bytes.map(|bytes| hex_digest(Sha256::digest(bytes).as_slice())),
+                unix_mode: None,
+            });
+            if let Some(bytes) = bytes {
+                if !index_only || suffix == "-shm" {
+                    fs::write(
+                        backup_component_path(&before, database, suffix).unwrap(),
+                        bytes,
+                    )
+                    .unwrap();
+                }
+                if !index_only {
+                    let probe = run.join("recovery-probe");
+                    fs::create_dir_all(&probe).unwrap();
+                    fs::write(
+                        backup_component_path(&probe, database, suffix).unwrap(),
+                        bytes,
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        let logical = serde_json::json!({
+            "user_version": 17,
+            "integrity_check": "ok",
+            "schema_sha256": "a".repeat(64),
+            "contents_sha256": "b".repeat(64),
+            "tables": [],
+        });
+        for name in receipts {
+            let prepared = *name == "recovery-prepared.json";
+            let stage = match *name {
+                "recovery-prepared.json" if index_only => "live-preflight",
+                "recovery-prepared.json" => "private-recovery",
+                "recovery-complete.json" => "complete",
+                RECOVERY_SUPERSEDED_RECEIPT => "superseded",
+                _ => "failed",
+            };
             fs::write(
-                run.join(receipt),
-                serde_json::json!({ "database_path": database_path }).to_string(),
+                run.join(name),
+                serde_json::json!({
+                    "schema_version": "br.doctor.schema_migration.recovery.v1",
+                    "database_path": database_path,
+                    "backup_path": before,
+                    "backup_scope": if index_only { RECOVERY_BACKUP_WAL_INDEX_ONLY } else { RECOVERY_BACKUP_COMPLETE_FAMILY },
+                    "stage": stage,
+                    "raw_before": raw,
+                    "raw_after": if prepared { serde_json::Value::Null } else { serde_json::to_value(&raw).unwrap() },
+                    "logical_after": if prepared { serde_json::Value::Null } else { logical.clone() },
+                    "error": null,
+                }).to_string(),
             )
             .unwrap();
         }
@@ -5632,7 +6281,8 @@ mod tests {
             &database,
             &[prepared, complete],
         );
-        // Beyond the newest five and older than seven days: pruned.
+        // Beyond the newest five and older than seven days: complete runs
+        // are pruned. A superseded marker alone proves no finished successor.
         let old_finished: Vec<PathBuf> = (10..=12)
             .map(|day| {
                 make_run(
@@ -5674,22 +6324,28 @@ mod tests {
         fs::write(unreadable_receipt.join(prepared), b"{ not json").unwrap();
         fs::write(unreadable_receipt.join(complete), b"{}").unwrap();
         let unnamed = make_run(&root, "operator-kept-run", &database, &[prepared, complete]);
+        let original = make_run(
+            &root,
+            &run_name(now, 30, 0),
+            &database,
+            &[prepared, complete],
+        );
         let interrupted = root.join(format!("{PRUNING_PREFIX}{}", run_name(now, 30, 0)));
-        fs::create_dir_all(interrupted.join("recovery-before")).unwrap();
+        fs::rename(&original, &interrupted).unwrap();
 
         let mut pruned = prune_recovery_runs(&beads_dir, &db_path, &current, now).unwrap();
         pruned.sort();
         let mut expected: Vec<PathBuf> = old_finished.clone();
-        expected.push(old_superseded.clone());
         expected.sort();
         assert_eq!(pruned, expected);
-        for gone in old_finished.iter().chain([&old_superseded, &interrupted]) {
+        for gone in old_finished.iter().chain([&interrupted]) {
             assert!(!gone.exists(), "{} must be removed", gone.display());
         }
         for kept in recent.iter().chain([
             &current,
             &superseded_recent,
             &young,
+            &old_superseded,
             &old_failed,
             &old_in_progress,
             &old_other_database,
@@ -5749,6 +6405,441 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn recovery_retention_keeps_staged_runs_within_the_retained_window() {
+        let now = Utc::now();
+        // Newest, fifth-newest, current, young, too few newer runs, and the
+        // positive control: an old staged run with five newer owned runs.
+        for (count, staged_index, first_age, keep) in [
+            (7, 0, 30, true),
+            (7, 4, 30, true),
+            (7, 6, 30, true),
+            (7, 5, 0, true),
+            (5, 3, 30, true),
+            (7, 5, 30, false),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let beads_dir = temp.path().join(".beads");
+            let db_path = beads_dir.join("beads.db");
+            let database = db_path.display().to_string();
+            let root = migration_runs_root(&beads_dir);
+            let runs: Vec<PathBuf> = (0..count)
+                .map(|index| {
+                    make_run(
+                        &root,
+                        &run_name(now, first_age + index, 0),
+                        &database,
+                        &["recovery-prepared.json", "recovery-complete.json"],
+                    )
+                })
+                .collect();
+            let current = runs.last().unwrap();
+            let original = &runs[staged_index];
+            let staged = root.join(format!(
+                "{PRUNING_PREFIX}{}",
+                original.file_name().unwrap().to_string_lossy()
+            ));
+            fs::rename(original, &staged).unwrap();
+
+            prune_recovery_runs(&beads_dir, &db_path, current, now).unwrap();
+
+            assert_eq!(
+                staged.is_dir(),
+                keep,
+                "count={count}, staged_index={staged_index}, first_age={first_age}"
+            );
+            for (index, run) in runs.iter().take(RECOVERY_RUNS_KEPT).enumerate() {
+                if index != staged_index {
+                    assert!(run.is_dir(), "newest run {index} must be retained");
+                }
+            }
+            assert!(if original == current {
+                staged.is_dir()
+            } else {
+                current.is_dir()
+            });
+        }
+    }
+
+    /// This regression deliberately uses only the original pruning API and
+    /// fixture API, so its unchanged body also demonstrates the old deletion.
+    #[test]
+    fn recovery_retention_keeps_unproven_verdicts_and_foreign_staged_evidence() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let database = db_path.display().to_string();
+        let root = migration_runs_root(&beads_dir);
+        let now = Utc::now();
+        let receipts = ["recovery-prepared.json", "recovery-complete.json"];
+        let current = make_run(&root, &run_name(now, 0, 0), &database, &receipts);
+        for day in 1..5 {
+            make_run(&root, &run_name(now, day, 0), &database, &receipts);
+        }
+        let eligible = make_run(&root, &run_name(now, 10, 0), &database, &receipts);
+        let mut kept = Vec::new();
+        for (counter, marker) in [(0, ""), (1, "{\"stage\":"), (2, "{}")] {
+            let run = make_run(&root, &run_name(now, 20, counter), &database, &receipts);
+            fs::write(run.join("recovery-complete.json"), marker).unwrap();
+            kept.push(run);
+        }
+        for (counter, owner, failed) in [
+            (0, "/another/tracker/beads.db", false),
+            (1, database.as_str(), true),
+        ] {
+            let original_name = run_name(now, 30, counter);
+            let run = make_run(&root, &original_name, owner, &receipts);
+            if failed {
+                fs::write(
+                    run.join("recovery-failed.json"),
+                    b"retained failure evidence",
+                )
+                .unwrap();
+            }
+            let staged = root.join(format!("{PRUNING_PREFIX}{original_name}"));
+            fs::rename(run, &staged).unwrap();
+            kept.push(staged);
+        }
+        let empty_staged = root.join(format!("{PRUNING_PREFIX}{}", run_name(now, 40, 0)));
+        fs::create_dir_all(&empty_staged).unwrap();
+        kept.push(empty_staged);
+        let retained: Vec<(PathBuf, Vec<u8>)> = kept
+            .iter()
+            .flat_map(|run| {
+                [
+                    "recovery-prepared.json",
+                    "recovery-complete.json",
+                    "recovery-failed.json",
+                    "recovery-before/beads.db",
+                ]
+                .into_iter()
+                .filter_map(|name| {
+                    let path = run.join(name);
+                    fs::read(&path).ok().map(|bytes| (path, bytes))
+                })
+            })
+            .collect();
+
+        let pruned = prune_recovery_runs(&beads_dir, &db_path, &current, now).unwrap();
+        assert!(pruned.contains(&eligible));
+        assert!(
+            !eligible.exists(),
+            "an old verified complete run must still be pruned"
+        );
+        let lost: Vec<_> = kept.iter().filter(|run| !run.is_dir()).collect();
+        assert!(
+            lost.is_empty(),
+            "unproven or foreign recovery evidence was deleted: {lost:?}"
+        );
+        assert_eq!(pruned, vec![eligible]);
+        for (path, bytes) in retained {
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                bytes,
+                "{} must stay byte-identical",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn recovery_retention_requires_agreeing_receipts_and_intact_owned_payloads() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let database = db_path.display().to_string();
+        let root = migration_runs_root(&beads_dir);
+        let now = Utc::now();
+        let receipts = ["recovery-prepared.json", "recovery-complete.json"];
+        let current = make_run(&root, &run_name(now, 0, 0), &database, &receipts);
+        for day in 1..5 {
+            make_run(&root, &run_name(now, day, 0), &database, &receipts);
+        }
+        let mut eligible = Vec::new();
+        for (counter, legacy) in [(0, false), (1, true)] {
+            let run = make_run_with_scope(
+                &root,
+                &run_name(now, 10, counter),
+                &database,
+                &receipts,
+                true,
+            );
+            if legacy {
+                let path = run.join("recovery-prepared.json");
+                let mut receipt: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                receipt["stage"] = "live-recovery".into();
+                fs::write(path, receipt.to_string()).unwrap();
+            }
+            eligible.push(run);
+        }
+        let mut kept = Vec::new();
+        for (counter, (field, value)) in [
+            (
+                "schema_version",
+                serde_json::json!("br.doctor.schema_migration.recovery.v2"),
+            ),
+            ("stage", serde_json::json!("live-verification")),
+            ("database_path", serde_json::json!("/another/beads.db")),
+            ("backup_path", serde_json::json!("/another/recovery-before")),
+            ("backup_scope", serde_json::json!("wal-index-only")),
+            ("raw_before", serde_json::json!({"components": []})),
+            ("raw_after", serde_json::Value::Null),
+            ("logical_after", serde_json::Value::Null),
+            ("error", serde_json::json!("verification failed")),
+            ("failure_kind", serde_json::Value::Null),
+            (
+                "index_corruption",
+                serde_json::json!({"integrity_check": "damaged"}),
+            ),
+            ("unreviewed", serde_json::json!(true)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let run = make_run(
+                &root,
+                &run_name(now, 20, u32::try_from(counter).unwrap()),
+                &database,
+                &receipts,
+            );
+            let path = run.join("recovery-complete.json");
+            let mut receipt: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            receipt[field] = value;
+            fs::write(path, receipt.to_string()).unwrap();
+            kept.push(run);
+        }
+        for (counter, relative, bytes) in [
+            (0, "recovery-before/beads.db", "changed original backup"),
+            (1, "recovery-probe/beads.db-wal", "changed private WAL"),
+            (
+                2,
+                "recovery-before/operator-evidence",
+                "unowned backup evidence",
+            ),
+            (
+                3,
+                "recovery-probe/operator-evidence",
+                "unowned private evidence",
+            ),
+            (
+                4,
+                ".recovery-complete.json.write-interrupted.tmp",
+                "unfinished publication",
+            ),
+            (5, "recovery-superseded.json", "contradictory verdict"),
+        ] {
+            let run = make_run(&root, &run_name(now, 30, counter), &database, &receipts);
+            fs::write(run.join(relative), bytes).unwrap();
+            kept.push(run);
+        }
+        let duplicate = make_run(&root, &run_name(now, 40, 0), &database, &receipts);
+        let path = duplicate.join("recovery-complete.json");
+        let marker = fs::read_to_string(&path).unwrap();
+        fs::write(path, marker.replacen('{', "{\"stage\":\"failed\",", 1)).unwrap();
+        kept.push(duplicate);
+        let missing = make_run(&root, &run_name(now, 40, 1), &database, &receipts);
+        let path = missing.join("recovery-prepared.json");
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        marker.as_object_mut().unwrap().remove("raw_after");
+        fs::write(path, marker.to_string()).unwrap();
+        kept.push(missing);
+        let damaged = make_run(&root, &run_name(now, 40, 2), &database, &receipts);
+        let path = damaged.join("recovery-complete.json");
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        marker["logical_after"]["integrity_check"] = "damaged rows".into();
+        fs::write(path, marker.to_string()).unwrap();
+        kept.push(damaged);
+
+        let mut pruned = prune_recovery_runs(&beads_dir, &db_path, &current, now).unwrap();
+        pruned.sort();
+        eligible.sort();
+        assert_eq!(
+            pruned, eligible,
+            "both current and exact legacy complete index-only runs still qualify"
+        );
+        for run in kept {
+            assert!(
+                run.is_dir(),
+                "unproven evidence must remain: {}",
+                run.display()
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_retention_preserves_staging_collisions_and_replaced_directories() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let database = db_path.display().to_string();
+        let root = migration_runs_root(&beads_dir);
+        let now = Utc::now();
+        let receipts = ["recovery-prepared.json", "recovery-complete.json"];
+        let current = make_run(&root, &run_name(now, 0, 0), &database, &receipts);
+        for day in 1..5 {
+            make_run(&root, &run_name(now, day, 0), &database, &receipts);
+        }
+        let name = run_name(now, 20, 0);
+        let original = make_run(&root, &name, &database, &receipts);
+        let collision = root.join(format!("{PRUNING_PREFIX}{name}"));
+        fs::create_dir(&collision).unwrap();
+        let collision_directory = open_recovery_pruning_entry(&collision, true)
+            .unwrap()
+            .unwrap();
+        assert!(
+            prune_recovery_runs(&beads_dir, &db_path, &current, now)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(original.is_dir());
+        assert!(
+            recovery_pruning_entry_unchanged(&collision, &collision_directory, true).unwrap(),
+            "an empty staging destination must not be overwritten"
+        );
+
+        let name = run_name(now, 30, 0);
+        let replaced = make_run(&root, &name, &database, &receipts);
+        let observed = open_recovery_pruning_entry(&replaced, true)
+            .unwrap()
+            .unwrap();
+        let retained = temp.path().join("retained-previous-directory");
+        fs::rename(&replaced, &retained).unwrap();
+        make_run(&root, &name, &database, &receipts);
+        assert!(!remove_verified_recovery_run(&replaced, &replaced, &db_path, &observed).unwrap());
+        assert!(retained.is_dir());
+        assert!(
+            replaced.is_dir(),
+            "a different directory generation must not inherit deletion authority"
+        );
+
+        let observed = open_recovery_pruning_entry(&replaced, true)
+            .unwrap()
+            .unwrap();
+        fs::write(replaced.join("recovery-complete.json"), b"{}").unwrap();
+        assert!(!remove_verified_recovery_run(&replaced, &replaced, &db_path, &observed).unwrap());
+        assert!(
+            replaced.is_dir(),
+            "completion must be rechecked after discovery"
+        );
+    }
+
+    #[test]
+    fn recovery_retention_rejects_nested_unknown_duplicate_and_missing_proof() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let database = db_path.display().to_string();
+        let root = migration_runs_root(&beads_dir);
+        let now = Utc::now();
+        let receipts = ["recovery-prepared.json", "recovery-complete.json"];
+        let current = make_run(&root, &run_name(now, 0, 0), &database, &receipts);
+        for day in 1..5 {
+            make_run(&root, &run_name(now, day, 0), &database, &receipts);
+        }
+        let mut kept = Vec::new();
+        for counter in 0..6 {
+            let run = make_run(&root, &run_name(now, 20, counter), &database, &receipts);
+            let path = run.join("recovery-complete.json");
+            let mut marker: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            match counter {
+                0 => marker["raw_before"]["unreviewed"] = true.into(),
+                1 => marker["raw_after"]["components"][0]["unreviewed"] = true.into(),
+                2 => {
+                    marker["raw_after"]["components"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("unix_mode");
+                }
+                3 => marker["logical_after"]["unreviewed"] = true.into(),
+                4 => {
+                    marker["logical_after"]["tables"] = serde_json::json!([{
+                        "name": "issues", "row_count": 1, "rows_sha256": "c".repeat(64), "unreviewed": true,
+                    }]);
+                }
+                _ => {}
+            }
+            let mut bytes = marker.to_string();
+            if counter == 5 {
+                // Passing through Value first would collapse the contradiction
+                // and accept the last integrity verdict, which is "ok".
+                bytes = bytes.replacen(
+                    "\"integrity_check\":\"ok\"",
+                    "\"integrity_check\":\"damaged\",\"integrity_check\":\"ok\"",
+                    1,
+                );
+            }
+            fs::write(path, bytes).unwrap();
+            kept.push(run);
+        }
+        assert!(
+            prune_recovery_runs(&beads_dir, &db_path, &current, now)
+                .unwrap()
+                .is_empty()
+        );
+        for run in kept {
+            assert!(
+                run.is_dir(),
+                "nested unproven evidence must remain: {}",
+                run.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_retention_refuses_aliased_receipts_and_payloads() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let database = db_path.display().to_string();
+        let root = migration_runs_root(&beads_dir);
+        let now = Utc::now();
+        let receipts = ["recovery-prepared.json", "recovery-complete.json"];
+        let current = make_run(&root, &run_name(now, 0, 0), &database, &receipts);
+        for day in 1..5 {
+            make_run(&root, &run_name(now, day, 0), &database, &receipts);
+        }
+        let mut retained = Vec::new();
+        for (counter, relative, hard_link) in [
+            (0, "recovery-complete.json", false),
+            (1, "recovery-before/beads.db", false),
+            (2, "recovery-complete.json", true),
+            (3, "recovery-before/beads.db", true),
+        ] {
+            let run = make_run(&root, &run_name(now, 20, counter), &database, &receipts);
+            let path = run.join(relative);
+            let outside = temp.path().join(format!("retained-alias-target-{counter}"));
+            fs::rename(&path, &outside).unwrap();
+            if hard_link {
+                fs::hard_link(&outside, &path).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&outside, &path).unwrap();
+            }
+            let bytes = fs::read(&outside).unwrap();
+            retained.push((run, path, outside, bytes));
+        }
+        assert!(
+            prune_recovery_runs(&beads_dir, &db_path, &current, now)
+                .unwrap()
+                .is_empty()
+        );
+        for (run, path, outside, bytes) in retained {
+            assert!(
+                run.is_dir(),
+                "aliased evidence must remain: {}",
+                run.display()
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(fs::read(&outside).unwrap(), bytes);
+        }
     }
 
     #[cfg(unix)]

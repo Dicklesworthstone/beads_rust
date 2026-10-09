@@ -8553,6 +8553,45 @@ impl SqliteStorage {
         Self::get_issue_from_conn(&self.conn, id)
     }
 
+    /// Read an issue without silently defaulting or discarding persisted values.
+    ///
+    /// Recovery uses this stricter decoder before it may replace the live
+    /// database. Ordinary display readers retain their compatibility behavior.
+    /// A damaged page in another table can break FrankenSQLite's keyed lookup
+    /// while the batched query still reads the intact issue row, so both query
+    /// shapes use the same strict decoder before reporting preservation failure.
+    pub(crate) fn get_issue_for_preservation(&self, id: &str) -> Result<Option<Issue>> {
+        let issue = match Self::get_issue_row_from_conn(&self.conn, id) {
+            Ok(Some(row)) => Self::issue_from_row_for_preservation(&row)?,
+            Ok(None) => return Ok(None),
+            Err(keyed_error) => {
+                let Ok(issues) = self.get_issues_by_ids_with_decoder(
+                    &[id.to_string()],
+                    Self::issue_from_row_for_preservation,
+                ) else {
+                    return Err(keyed_error);
+                };
+                let mut issues = issues.into_iter();
+                match (issues.next(), issues.next()) {
+                    (None, None) => return Ok(None),
+                    (Some(issue), None) => issue,
+                    _ => {
+                        return Err(BeadsError::Config(format!(
+                            "multiple issue rows match {id}; no unique row can be snapshotted"
+                        )));
+                    }
+                }
+            }
+        };
+        if issue.id != id {
+            return Err(BeadsError::internal(format!(
+                "storage consistency: preservation requested {id:?} but row returned id {:?}",
+                issue.id
+            )));
+        }
+        Ok(Some(issue))
+    }
+
     /// Get metadata for all issues to optimize import collision detection.
     ///
     /// # Errors
@@ -8654,6 +8693,20 @@ impl SqliteStorage {
     }
 
     fn get_issue_from_conn(conn: &Connection, id: &str) -> Result<Option<Issue>> {
+        let Some(row) = Self::get_issue_row_from_conn(conn, id)? else {
+            return Ok(None);
+        };
+        let issue = Self::issue_from_row(&row)?;
+        if issue.id != id {
+            return Err(BeadsError::internal(format!(
+                "storage consistency: get_issue_from_conn requested {id:?} but row returned id {:?}",
+                issue.id
+            )));
+        }
+        Ok(Some(issue))
+    }
+
+    fn get_issue_row_from_conn(conn: &Connection, id: &str) -> Result<Option<Row>> {
         let sql = r"
             SELECT id, content_hash, title, description, design,
                    acceptance_criteria, notes, status, priority, issue_type,
@@ -8667,19 +8720,11 @@ impl SqliteStorage {
             FROM issues
             WHERE id = ?
         ";
-        let row = match conn.query_row_with_params(sql, &[SqliteValue::from(id)]) {
-            Ok(row) => row,
-            Err(FrankenError::QueryReturnedNoRows) => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        let issue = Self::issue_from_row(&row)?;
-        if issue.id != id {
-            return Err(BeadsError::internal(format!(
-                "storage consistency: get_issue_from_conn requested {id:?} but row returned id {:?}",
-                issue.id
-            )));
+        match conn.query_row_with_params(sql, &[SqliteValue::from(id)]) {
+            Ok(row) => Ok(Some(row)),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
         }
-        Ok(Some(issue))
     }
 
     /// Get multiple issues by ID.
@@ -8688,6 +8733,14 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_issues_by_ids(&self, ids: &[String]) -> Result<Vec<Issue>> {
+        self.get_issues_by_ids_with_decoder(ids, Self::issue_from_row)
+    }
+
+    fn get_issues_by_ids_with_decoder(
+        &self,
+        ids: &[String],
+        decode: fn(&Row) -> Result<Issue>,
+    ) -> Result<Vec<Issue>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -8716,7 +8769,7 @@ impl SqliteStorage {
 
             let rows = self.conn.query_with_params(&sql, &params)?;
             for row in &rows {
-                issues.push(Self::issue_from_row(row)?);
+                issues.push(decode(row)?);
             }
         }
 
@@ -16600,6 +16653,87 @@ impl SqliteStorage {
             has_children: row.get(4).and_then(SqliteValue::as_integer).unwrap_or(0) != 0,
             parent: row.get(5).and_then(SqliteValue::as_text).map(String::from),
         })
+    }
+
+    /// Validate the full issue projection before the compatibility decoder can
+    /// turn an unreadable value into an empty string, `None`, or a default.
+    fn issue_from_row_for_preservation(row: &Row) -> Result<Issue> {
+        let invalid = |field: &str, expected: &str| {
+            BeadsError::Config(format!(
+                "issues row has missing or unrepresentable {field}; preservation requires {expected}"
+            ))
+        };
+        if row.values().len() != 39 {
+            return Err(BeadsError::Config(
+                "issues row has an incomplete preservation projection".to_string(),
+            ));
+        }
+        // Status and type accept custom text through the model parser; they
+        // must not become the default open/task when a non-text value is read.
+        for (index, field) in [(0, "id"), (2, "title"), (7, "status"), (9, "issue_type")] {
+            if !matches!(row.get(index), Some(SqliteValue::Text(_))) {
+                return Err(invalid(field, "text"));
+            }
+        }
+        // Empty text and NULL are intentional legacy representations of
+        // absent optional text. Other storage classes would be discarded.
+        for (index, field) in [
+            (1, "content_hash"),
+            (3, "description"),
+            (4, "design"),
+            (5, "acceptance_criteria"),
+            (6, "notes"),
+            (10, "assignee"),
+            (11, "owner"),
+            (14, "created_by"),
+            (17, "close_reason"),
+            (18, "closed_by_session"),
+            (21, "external_ref"),
+            (22, "source_system"),
+            (23, "source_repo"),
+            (25, "deleted_by"),
+            (26, "delete_reason"),
+            (27, "original_type"),
+            (30, "compacted_at_commit"),
+            (32, "sender"),
+            (36, "source_repo_path"),
+            (37, "agent_context"),
+            (38, "prerequisites"),
+        ] {
+            if !matches!(
+                row.get(index),
+                Some(SqliteValue::Null | SqliteValue::Text(_))
+            ) {
+                return Err(invalid(field, "text or NULL"));
+            }
+        }
+        if !matches!(row.get(8), Some(SqliteValue::Integer(0..=4))) {
+            return Err(invalid("priority", "an integer from 0 through 4"));
+        }
+        for (index, field) in [
+            (12, "estimated_minutes"),
+            (28, "compaction_level"),
+            (31, "original_size"),
+        ] {
+            match row.get(index) {
+                Some(SqliteValue::Null) => {}
+                Some(SqliteValue::Integer(value)) if i32::try_from(*value).is_ok() => {}
+                _ => return Err(invalid(field, "an integer representable as i32 or NULL")),
+            }
+        }
+        // Legacy NULL flags mean false, and every nonzero integer means true.
+        // A text, real, or BLOB flag would instead silently become false.
+        for (index, field) in [(33, "ephemeral"), (34, "pinned"), (35, "is_template")] {
+            if !matches!(
+                row.get(index),
+                Some(SqliteValue::Null | SqliteValue::Integer(_))
+            ) {
+                return Err(invalid(field, "an integer boolean or NULL"));
+            }
+        }
+        // Datetime decoding already rejects malformed text and BLOBs while
+        // preserving legacy NULL/empty values and numeric epoch representations.
+        Self::issue_from_row(row)
     }
 
     fn issue_from_row(row: &Row) -> Result<Issue> {
