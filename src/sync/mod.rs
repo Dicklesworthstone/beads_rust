@@ -15149,8 +15149,14 @@ fn stream_import_actions_in_tx(
     // Comment IDs are globally unique. Release every comment row owned by an
     // issue this transaction will replace before replaying any individual
     // issue, so authoritative IDs can move between those issues without the
-    // result depending on JSONL line order. The enclosing transaction restores
-    // all rows if a later action or semantic verification fails.
+    // Comments are append-only facts (beads_rust-hcoe6). Snapshot the existing
+    // comments for issues being replaced before clearing their comment rows, so
+    // any database-only comments can be unioned into the imported payload.
+    let mut existing_comments_by_issue = if comment_owner_ids_to_replace.is_empty() {
+        HashMap::new()
+    } else {
+        storage.get_comments_for_issues(comment_owner_ids_to_replace)?
+    };
     storage.delete_comments_for_import_issue_ids_in_tx(comment_owner_ids_to_replace)?;
     // The collision scan records every insert/update in this list. An empty
     // list proves the immutable source will only skip rows using the same
@@ -15185,7 +15191,7 @@ fn stream_import_actions_in_tx(
 
             handle_duplicate_external_ref(&mut issue, &mut seen_external_refs, config)?;
 
-            let computed_hash = crate::util::content_hash(&issue);
+            let mut computed_hash = crate::util::content_hash(&issue);
             let collision = detect_import_collision(&issue, metadata, &computed_hash)?;
             let action = determine_action(
                 &collision,
@@ -15199,6 +15205,62 @@ fn stream_import_actions_in_tx(
             };
 
             apply_collision_renames(&mut issue, collision_renames);
+
+            // Comments are append-only facts across both branches (beads_rust-hcoe6).
+            // When updating, union incoming JSONL comments with pre-existing DB comments
+            // so local comments are never deleted by an update.
+            if matches!(action, CollisionAction::Update { .. }) {
+                if let Some(existing_comments) = existing_comments_by_issue.remove(&target_id) {
+                    let old_len = issue.comments.len();
+                    issue.comments =
+                        union_comment_lists(&issue.comments, &existing_comments, &target_id);
+                    if issue.comments.len() != old_len {
+                        computed_hash = crate::util::content_hash(&issue);
+                    }
+                }
+            }
+
+            // When skipping (DB is newer or equal), check if incoming JSONL has comments
+            // that the DB lacks (e.g. from an agent using --no-db). If so, union them into DB.
+            // If target_id is scheduled to be replaced in this transaction, Skip must not
+            // mutate the database row; Update will handle unioning.
+            if matches!(action, CollisionAction::Skip { .. }) {
+                let scheduled_for_replace = comment_owner_ids_to_replace
+                    .iter()
+                    .any(|id| id == &target_id);
+                if !scheduled_for_replace && !issue.comments.is_empty() {
+                    let db_comments = storage.get_comments(&target_id)?;
+                    let union = union_comment_lists(&db_comments, &issue.comments, &target_id);
+                    if union.len() > db_comments.len() {
+                        uncertified_local_wins += certify_skipped_imports(
+                            storage,
+                            skip_lookup.as_ref(),
+                            &mut close_audit,
+                            &mut skipped,
+                            &mut export_hash_batch,
+                            &mut export_hash_ids,
+                        )?;
+                        storage.sync_comments_for_import_in_tx(&target_id, &union)?;
+                        tx_result.comments_imported += union.len() - db_comments.len();
+                    }
+                }
+
+                if let Ok(Some(existing_issue)) = storage.get_issue(&target_id) {
+                    let differing_fields = sync_mismatch_field_names(&existing_issue, &issue);
+                    let non_hash_differing: Vec<_> = differing_fields
+                        .into_iter()
+                        .filter(|f| f != "content_hash" && f != "comments")
+                        .collect();
+                    if !non_hash_differing.is_empty() {
+                        tracing::warn!(
+                            id = %target_id,
+                            differing_fields = ?non_hash_differing,
+                            "Import skip: existing database row is newer or equal, overriding incoming JSONL scalar fields"
+                        );
+                    }
+                }
+            }
+
             // Flush before mutations so certification observes exactly the
             // same transaction state as the former per-row lookup.
             if !matches!(action, CollisionAction::Skip { .. }) {
@@ -17148,6 +17210,55 @@ fn union_comments_if_diverged(
         issue
     };
     Some((base.map(with_union), with_union(left), with_union(right)))
+}
+
+/// Keep every comment either side has (multiset union by
+/// [`Comment::sync_key`]) when combining two comment sets (beads_rust-hcoe6).
+pub(crate) fn union_comment_lists(
+    primary: &[Comment],
+    secondary: &[Comment],
+    target_id: &str,
+) -> Vec<Comment> {
+    let mut remaining: HashMap<(&str, DateTime<Utc>, &str, &str), usize> = HashMap::new();
+    for comment in primary {
+        *remaining.entry(comment.sync_key()).or_default() += 1;
+    }
+    let mut extra = Vec::new();
+    for comment in secondary {
+        match remaining.get_mut(&comment.sync_key()) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => {
+                let mut c = comment.clone();
+                if c.issue_id != target_id {
+                    c.issue_id = target_id.to_string();
+                }
+                extra.push(c);
+            }
+        }
+    }
+    if extra.is_empty() {
+        return primary.to_vec();
+    }
+
+    let mut union = primary.to_vec();
+    union.extend(extra);
+    // Deterministic across clones regardless of which side is "primary".
+    union.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.author.cmp(&b.author))
+            .then_with(|| a.body.cmp(&b.body))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    // Comment ids are database-local rowids; two clones reuse them. Keep the
+    // first holder of each id and let the database mint fresh ids for the rest.
+    let mut seen_ids = HashSet::new();
+    for comment in &mut union {
+        if comment.id > 0 && !seen_ids.insert(comment.id) {
+            comment.id = 0;
+        }
+    }
+    union
 }
 
 /// How a three-way merge re-keys issues whose id collided (GitHub #512).
@@ -24705,8 +24816,8 @@ mod tests {
 
         let existing_updated = make_test_issue("bd-comment-update", "Applied update");
         storage.create_issue(&existing_updated, "tester").unwrap();
-        storage
-            .add_comment(&existing_updated.id, "local", "must be replaced")
+        let local_comment_updated = storage
+            .add_comment(&existing_updated.id, "local", "must be preserved")
             .unwrap();
         let mut incoming_updated = existing_updated.clone();
         incoming_updated.updated_at += chrono::Duration::minutes(1);
@@ -24735,11 +24846,11 @@ mod tests {
             storage.get_comments(&incoming_skipped.id).unwrap(),
             vec![local_comment]
         );
-        assert!(
-            storage
-                .get_comments(&incoming_updated.id)
-                .unwrap()
-                .is_empty()
+        // With append-only comment unioning (beads_rust-hcoe6), local comments are preserved
+        // rather than dropped on update.
+        assert_eq!(
+            storage.get_comments(&incoming_updated.id).unwrap(),
+            vec![local_comment_updated]
         );
     }
 
@@ -26638,6 +26749,130 @@ mod tests {
     }
 
     #[test]
+    fn test_import_update_unions_comments_from_database_and_jsonl() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+
+        let mut existing = make_test_issue("test-001", "Old title");
+        existing.created_at = Utc::now() - chrono::Duration::hours(2);
+        existing.updated_at = Utc::now() - chrono::Duration::hours(1);
+        storage.create_issue(&existing, "test").unwrap();
+        storage
+            .add_comment("test-001", "alice", "Comment from DB")
+            .unwrap();
+
+        let mut incoming = make_test_issue("test-001", "New title");
+        incoming.created_at = existing.created_at;
+        incoming.updated_at = Utc::now();
+        incoming.comments.push(Comment {
+            id: 10,
+            issue_id: "test-001".to_string(),
+            author: "bob".to_string(),
+            body: "Comment from JSONL".to_string(),
+            created_at: Utc::now() - chrono::Duration::minutes(30),
+        });
+        let json = serde_json::to_string(&incoming).unwrap();
+        fs::write(&path, format!("{json}\n")).unwrap();
+
+        let config = ImportConfig::default();
+        let result = import_from_jsonl(&mut storage, &path, &config, Some("test-")).unwrap();
+        assert_eq!(result.updated_count, 1);
+
+        let comments = storage.get_comments("test-001").unwrap();
+        assert_eq!(comments.len(), 2);
+        let bodies: Vec<&str> = comments.iter().map(|c| c.body.as_str()).collect();
+        assert!(bodies.contains(&"Comment from DB"));
+        assert!(bodies.contains(&"Comment from JSONL"));
+    }
+
+    #[test]
+    fn test_import_skip_unions_comments_from_jsonl_into_database() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+
+        let mut existing = make_test_issue("test-001", "Newer title");
+        existing.created_at = Utc::now() - chrono::Duration::hours(2);
+        existing.updated_at = Utc::now();
+        storage.create_issue(&existing, "test").unwrap();
+        let db_comment = storage
+            .add_comment("test-001", "alice", "Comment from DB")
+            .unwrap();
+
+        let mut incoming = make_test_issue("test-001", "Older title");
+        incoming.created_at = existing.created_at;
+        incoming.updated_at = Utc::now() - chrono::Duration::hours(1);
+        incoming.comments.push(Comment {
+            id: 10,
+            issue_id: "test-001".to_string(),
+            author: "alice".to_string(),
+            body: "Comment from DB".to_string(),
+            created_at: db_comment.created_at,
+        });
+        incoming.comments.push(Comment {
+            id: 11,
+            issue_id: "test-001".to_string(),
+            author: "bob".to_string(),
+            body: "New comment added via no-db".to_string(),
+            created_at: Utc::now() - chrono::Duration::minutes(40),
+        });
+        let json = serde_json::to_string(&incoming).unwrap();
+        fs::write(&path, format!("{json}\n")).unwrap();
+
+        let config = ImportConfig::default();
+        let result = import_from_jsonl(&mut storage, &path, &config, Some("test-")).unwrap();
+        assert_eq!(result.skipped_count, 1);
+
+        let unchanged = storage.get_issue("test-001").unwrap().unwrap();
+        assert_eq!(unchanged.title, "Newer title");
+
+        let comments = storage.get_comments("test-001").unwrap();
+        assert_eq!(comments.len(), 2);
+        let bodies: Vec<&str> = comments.iter().map(|c| c.body.as_str()).collect();
+        assert!(bodies.contains(&"Comment from DB"));
+        assert!(bodies.contains(&"New comment added via no-db"));
+    }
+
+    #[test]
+    fn test_union_comment_lists_preserves_both_and_deduplicates_by_sync_key() {
+        let t1 = fixed_time(100);
+        let t2 = fixed_time(200);
+        let t3 = fixed_time(300);
+
+        let c1 = Comment {
+            id: 1,
+            issue_id: "bd-1".to_string(),
+            author: "alice".to_string(),
+            body: "first".to_string(),
+            created_at: t1,
+        };
+        let c2 = Comment {
+            id: 2,
+            issue_id: "bd-1".to_string(),
+            author: "bob".to_string(),
+            body: "second".to_string(),
+            created_at: t2,
+        };
+        let c3 = Comment {
+            id: 3,
+            issue_id: "bd-1".to_string(),
+            author: "carol".to_string(),
+            body: "third".to_string(),
+            created_at: t3,
+        };
+
+        let primary = vec![c1.clone(), c3.clone()];
+        let secondary = vec![c1, c2];
+
+        let union = union_comment_lists(&primary, &secondary, "bd-1");
+        assert_eq!(union.len(), 3);
+        assert_eq!(union[0].body, "first");
+        assert_eq!(union[1].body, "second");
+        assert_eq!(union[2].body, "third");
+    }
+
+    #[test]
     fn test_import_tombstone_skip_marks_flush_pending() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -26822,13 +27057,13 @@ mod tests {
                 update.title = "Changed by the preceding update".to_string();
             } else {
                 update.labels = vec!["updated".to_string()];
-                update.comments = vec![Comment {
+                update.comments.push(Comment {
                     id: 2,
                     issue_id: update.id.clone(),
                     author: "remote".to_string(),
                     body: "after the update".to_string(),
                     created_at: fixed_time(200),
-                }];
+                });
             }
             // The alias collides by the original content hash. Classification
             // uses the pre-import metadata, so it skips even after an update.
