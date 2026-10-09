@@ -17863,10 +17863,9 @@ pub fn load_base_snapshot(jsonl_dir: &Path) -> Result<std::collections::HashMap<
 /// the JSONL) and for dirty live issues whose latest edit has not reached
 /// the JSONL yet (GitHub #394).
 ///
-/// The option wrappers on the relations let callers partially preserve an
-/// issue whose relation fetches failed (a pattern the CLI layer already
-/// uses): we keep the issue row and skip whatever relation set couldn't be
-/// read, rather than losing the issue entirely.
+/// The option wrappers distinguish an unreadable relation set from a known
+/// empty set. Explicit repair can retain a partially captured issue; automatic
+/// recovery must inspect the accompanying snapshot warnings before rebuilding.
 #[derive(Clone, Debug)]
 pub(crate) struct PreservedIssue {
     pub(crate) issue: Issue,
@@ -17875,65 +17874,91 @@ pub(crate) struct PreservedIssue {
     pub(crate) comments: Option<Vec<Comment>>,
 }
 
-/// Snapshot one issue row plus its relations, degrading gracefully: a
-/// missing or unreadable issue row yields `None` (with a warning), and a
-/// failed relation fetch yields issue-row-only preservation for that
-/// relation. `kind` labels the log lines so tombstone and dirty-issue
-/// snapshots stay distinguishable in traces.
+/// Captured unflushed state and every known obstacle to preserving it.
+///
+/// Warnings describe the capture itself, before any replacement has occurred.
+/// Automatic recovery refuses a snapshot with warnings; explicit repair can
+/// restore the readable portion and report the same diagnostics to the user.
+#[derive(Default)]
+pub(crate) struct UnflushedStateSnapshot {
+    pub(crate) tombstones: Vec<PreservedIssue>,
+    pub(crate) dirty: Vec<PreservedIssue>,
+    pub(crate) warnings: Vec<String>,
+}
+
+fn record_preservation_warning(warnings: &mut Vec<String>, warning: String) {
+    tracing::warn!(
+        warning,
+        "Unflushed state could not be completely snapshotted"
+    );
+    warnings.push(warning);
+}
+
+/// Snapshot one issue row and its relations, recording failures at the read
+/// that observed them. A later probe must never erase a preservation failure.
+/// A missing dirty row is an orphan marker, but a tombstone that was enumerated
+/// and then cannot be found is an incomplete snapshot.
 fn snapshot_preserved_issue(
     storage: &SqliteStorage,
     issue_id: &str,
     kind: &str,
+    warnings: &mut Vec<String>,
 ) -> Option<PreservedIssue> {
     let issue = match read_issue_row_for_preservation(storage, issue_id) {
-        Ok(issue) => issue,
+        Ok(Some(issue)) => issue,
+        Ok(None) => {
+            if kind == "tombstone" {
+                record_preservation_warning(
+                    warnings,
+                    format!(
+                        "tombstone {issue_id} was enumerated but its issue row could not be found before the rebuild"
+                    ),
+                );
+            }
+            return None;
+        }
         Err(error) => {
-            tracing::warn!(
-                issue_id = %issue_id,
-                kind,
-                error = %error,
-                "Skipping preservation for issue that could not be read before rebuild"
+            record_preservation_warning(
+                warnings,
+                format!(
+                    "{kind} {issue_id} could not be read before the rebuild ({error}); preservation of its unflushed state could not be established"
+                ),
             );
             return None;
         }
-    }?;
+    };
 
+    let mut unreadable_relations = Vec::new();
     let labels = match storage.get_labels(issue_id) {
         Ok(labels) => Some(labels),
         Err(error) => {
-            tracing::warn!(
-                issue_id = %issue_id,
-                kind,
-                error = %error,
-                "Failed to snapshot labels before rebuild; preserving issue row only"
-            );
+            unreadable_relations.push(format!("labels ({error})"));
             None
         }
     };
     let dependencies = match storage.get_dependencies_full(issue_id) {
         Ok(dependencies) => Some(dependencies),
         Err(error) => {
-            tracing::warn!(
-                issue_id = %issue_id,
-                kind,
-                error = %error,
-                "Failed to snapshot dependencies before rebuild; preserving issue row only"
-            );
+            unreadable_relations.push(format!("dependencies ({error})"));
             None
         }
     };
     let comments = match storage.get_comments(issue_id) {
         Ok(comments) => Some(comments),
         Err(error) => {
-            tracing::warn!(
-                issue_id = %issue_id,
-                kind,
-                error = %error,
-                "Failed to snapshot comments before rebuild; preserving issue row only"
-            );
+            unreadable_relations.push(format!("comments ({error})"));
             None
         }
     };
+    if !unreadable_relations.is_empty() {
+        record_preservation_warning(
+            warnings,
+            format!(
+                "{kind} {issue_id} could not be completely snapshotted before the rebuild: unreadable {}; preservation of these relationships could not be established",
+                unreadable_relations.join(", ")
+            ),
+        );
+    }
     Some(PreservedIssue {
         issue,
         labels,
@@ -17957,37 +17982,135 @@ fn read_issue_row_for_preservation(
     match storage.get_issue(issue_id) {
         Ok(issue) => Ok(issue),
         Err(keyed_error) => match storage.get_issues_by_ids(&[issue_id.to_string()]) {
-            Ok(issues) => Ok(issues.into_iter().find(|issue| issue.id == issue_id)),
+            Ok(issues) => {
+                let mut matches = issues.into_iter().filter(|issue| issue.id == issue_id);
+                let issue = matches.next();
+                if matches.next().is_some() {
+                    return Err(BeadsError::Config(format!(
+                        "multiple issue rows match {issue_id}; no unique row can be snapshotted"
+                    )));
+                }
+                Ok(issue)
+            }
             Err(_) => Err(keyed_error),
         },
     }
+}
+
+/// Read preservation candidates without silently skipping malformed IDs.
+/// The normal list helpers discard non-text IDs, which is inappropriate when
+/// deciding whether an automatic rebuild can preserve all unflushed state.
+fn preservation_issue_ids(
+    storage: &SqliteStorage,
+    query: &str,
+    kind: &str,
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    let rows = match storage.execute_raw_query(query) {
+        Ok(rows) => rows,
+        Err(error) => {
+            record_preservation_warning(
+                warnings,
+                format!(
+                    "the {kind} could not be read before the rebuild ({error}); preservation of unflushed local state could not be established"
+                ),
+            );
+            return Vec::new();
+        }
+    };
+    rows.into_iter()
+        .enumerate()
+        .filter_map(|(index, row)| match row.first().and_then(SqliteValue::as_text) {
+            Some(id) => Some(id.to_string()),
+            None => {
+                record_preservation_warning(
+                    warnings,
+                    format!(
+                        "the {kind} contain a non-text issue ID at row {index}; preservation of unflushed local state could not be established"
+                    ),
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+fn tombstone_ids_for_preservation(
+    storage: &SqliteStorage,
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    preservation_issue_ids(
+        storage,
+        "SELECT id FROM issues WHERE status = 'tombstone' ORDER BY id",
+        "tombstone issue IDs",
+        warnings,
+    )
+}
+
+fn dirty_ids_for_preservation(storage: &SqliteStorage, warnings: &mut Vec<String>) -> Vec<String> {
+    preservation_issue_ids(
+        storage,
+        "SELECT issue_id FROM dirty_issues ORDER BY marked_at",
+        "dirty-issue markers",
+        warnings,
+    )
+}
+
+/// Snapshot all unflushed state with a complete account of known capture
+/// failures. Each candidate is captured once, including tombstones without
+/// dirty markers; a dirty tombstone never receives two conflicting snapshots.
+#[must_use]
+pub(crate) fn snapshot_unflushed_state(storage: &SqliteStorage) -> UnflushedStateSnapshot {
+    let mut snapshot = UnflushedStateSnapshot::default();
+    let tombstone_ids = tombstone_ids_for_preservation(storage, &mut snapshot.warnings);
+    let dirty_ids = dirty_ids_for_preservation(storage, &mut snapshot.warnings);
+    let mut attempted_ids = HashSet::new();
+    for id in tombstone_ids {
+        if !attempted_ids.insert(id.clone()) {
+            record_preservation_warning(
+                &mut snapshot.warnings,
+                format!(
+                    "tombstone {id} appeared more than once while enumerating issue rows; preservation of these ambiguous records could not be established"
+                ),
+            );
+            continue;
+        }
+        if let Some(preserved) =
+            snapshot_preserved_issue(storage, &id, "tombstone", &mut snapshot.warnings)
+        {
+            snapshot.tombstones.push(preserved);
+        }
+    }
+    for id in dirty_ids {
+        if !attempted_ids.insert(id.clone()) {
+            continue;
+        }
+        if let Some(preserved) =
+            snapshot_preserved_issue(storage, &id, "dirty issue", &mut snapshot.warnings)
+        {
+            if preserved.issue.status == crate::model::Status::Tombstone {
+                snapshot.tombstones.push(preserved);
+            } else {
+                snapshot.dirty.push(preserved);
+            }
+        }
+    }
+    snapshot
 }
 
 /// Snapshot every tombstoned issue in the database, including its labels,
 /// dependencies, and comments, so a rebuild can restore deletion-retention
 /// state that is not present in the JSONL export.
 ///
-/// This is fully best-effort — the function never returns an error: if
-/// the enumeration query fails outright we log and return an empty list
-/// (the rebuild still proceeds without tombstone preservation), and
-/// per-tombstone relation fetches also degrade gracefully to issue-row-
-/// only preservation.
+/// Explicit sync imports use this best-effort snapshot and log failures.
+/// Automatic recovery and doctor repair use `snapshot_unflushed_state` to
+/// retain diagnostics as well as captured rows.
 #[must_use]
 pub(crate) fn snapshot_tombstones(storage: &SqliteStorage) -> Vec<PreservedIssue> {
-    let tombstone_ids = match storage.get_issue_ids_by_status(&crate::model::Status::Tombstone) {
-        Ok(ids) => ids,
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "Failed to enumerate tombstones before rebuild; continuing without tombstone preservation"
-            );
-            return Vec::new();
-        }
-    };
-
-    tombstone_ids
+    let mut warnings = Vec::new();
+    tombstone_ids_for_preservation(storage, &mut warnings)
         .iter()
-        .filter_map(|id| snapshot_preserved_issue(storage, id, "tombstone"))
+        .filter_map(|id| snapshot_preserved_issue(storage, id, "tombstone", &mut warnings))
         .collect()
 }
 
@@ -17997,25 +18120,15 @@ pub(crate) fn snapshot_tombstones(storage: &SqliteStorage) -> Vec<PreservedIssue
 /// (GitHub #394). Tombstone-status rows are skipped here; the sibling
 /// `snapshot_tombstones` pass owns deletion-retention state.
 ///
-/// Best-effort with the same degradation contract as `snapshot_tombstones`:
-/// enumeration failure logs and returns empty, per-issue failures skip that
-/// issue or degrade to issue-row-only preservation.
+/// Best-effort with the same degradation contract as `snapshot_tombstones`.
+/// Call `snapshot_unflushed_state` when failures must be returned to the caller.
 #[must_use]
+#[cfg(test)]
 pub(crate) fn snapshot_dirty_live_issues(storage: &SqliteStorage) -> Vec<PreservedIssue> {
-    let dirty_ids = match storage.get_dirty_issue_ids() {
-        Ok(ids) => ids,
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "Failed to enumerate dirty issues before rebuild; continuing without dirty-issue preservation"
-            );
-            return Vec::new();
-        }
-    };
-
-    dirty_ids
+    let mut warnings = Vec::new();
+    dirty_ids_for_preservation(storage, &mut warnings)
         .iter()
-        .filter_map(|id| snapshot_preserved_issue(storage, id, "dirty issue"))
+        .filter_map(|id| snapshot_preserved_issue(storage, id, "dirty issue", &mut warnings))
         .filter(|preserved| preserved.issue.status != crate::model::Status::Tombstone)
         .collect()
 }
@@ -25353,8 +25466,8 @@ mod tests {
     /// the issue's unflushed edits along with the unreadable comments.
     #[test]
     fn test_dirty_snapshot_keeps_issue_rows_when_comments_are_unreadable() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("beads.db");
+        let fixture_root = TempDir::new().unwrap().keep();
+        let db_path = fixture_root.join("beads.db");
         let ids: Vec<String> = (0..30).map(|i| format!("bd-dmg{i:02}")).collect();
         let comments_root = {
             let mut storage = SqliteStorage::open(&db_path).unwrap();
@@ -25380,8 +25493,17 @@ mod tests {
                 other => panic!("comments root page: {other:?}"),
             }
         };
+        // Retain the checkpointed sidecars outside the live database family
+        // so reopening must observe the damaged main-file page.
         for suffix in ["-wal", "-shm"] {
-            let _ = fs::remove_file(temp_dir.path().join(format!("beads.db{suffix}")));
+            let sidecar = fixture_root.join(format!("beads.db{suffix}"));
+            if sidecar.exists() {
+                fs::rename(
+                    &sidecar,
+                    fixture_root.join(format!("beads.before-damage.db{suffix}")),
+                )
+                .unwrap();
+            }
         }
         {
             use std::os::unix::fs::FileExt;
@@ -25394,20 +25516,406 @@ mod tests {
         // damaged comments root even though the issue rows are intact; the
         // snapshot must not depend on that lookup.
         let storage = SqliteStorage::open(&db_path).unwrap();
-        let snapshot = snapshot_dirty_live_issues(&storage);
-        let mut preserved: Vec<&str> = snapshot.iter().map(|p| p.issue.id.as_str()).collect();
+        let snapshot = snapshot_unflushed_state(&storage);
+        let mut preserved: Vec<&str> = snapshot.dirty.iter().map(|p| p.issue.id.as_str()).collect();
         preserved.sort_unstable();
         assert_eq!(
             preserved,
             ids[..20].iter().map(String::as_str).collect::<Vec<_>>(),
             "every dirty issue row must survive into the rebuild snapshot"
         );
-        for entry in &snapshot {
+        for entry in &snapshot.dirty {
             assert_eq!(entry.issue.title, format!("issue {}", entry.issue.id));
             // Unreadable comments are reported as missing, never as empty:
             // `Some(vec![])` would delete the JSONL comments on restore.
             assert!(entry.comments.is_none(), "{}", entry.issue.id);
             assert!(entry.labels.is_some() && entry.dependencies.is_some());
+            assert!(snapshot.warnings.iter().any(|warning| {
+                warning.contains(&entry.issue.id) && warning.contains("comments")
+            }));
+        }
+        assert_eq!(snapshot.warnings.len(), 20);
+        assert!(db_path.is_file(), "damaged fixture remains available");
+    }
+
+    #[test]
+    fn test_unflushed_snapshot_captures_dirty_tombstones_once_and_ignores_orphans() {
+        let fixture_root = TempDir::new().unwrap().keep();
+        let mut storage = SqliteStorage::open(&fixture_root.join("beads.db")).unwrap();
+        for id in ["bd-live", "bd-tombstone", "bd-clean-tombstone"] {
+            storage
+                .create_issue(&make_test_issue(id, id), "tester")
+                .unwrap();
+        }
+        storage.add_label("bd-live", "unflushed", "tester").unwrap();
+        storage
+            .add_comment("bd-live", "tester", "unflushed comment")
+            .unwrap();
+        storage
+            .add_dependency("bd-live", "bd-tombstone", "related", "tester")
+            .unwrap();
+        for id in ["bd-tombstone", "bd-clean-tombstone"] {
+            storage
+                .delete_issue(id, "tester", "local deletion", None)
+                .unwrap();
+        }
+        storage
+            .clear_dirty_flags(&["bd-clean-tombstone".to_string()])
+            .unwrap();
+        storage.execute_raw("PRAGMA foreign_keys = OFF").unwrap();
+        storage
+            .execute_raw(
+                "INSERT INTO dirty_issues (issue_id, marked_at) VALUES ('bd-orphan', '2026-10-08T00:00:00Z')",
+            )
+            .unwrap();
+        storage.execute_raw("PRAGMA foreign_keys = ON").unwrap();
+
+        let snapshot = snapshot_unflushed_state(&storage);
+        assert!(snapshot.warnings.is_empty(), "{:?}", snapshot.warnings);
+        assert_eq!(snapshot.tombstones.len(), 2);
+        assert_eq!(snapshot.dirty.len(), 1);
+        let live = &snapshot.dirty[0];
+        assert_eq!(live.issue.id, "bd-live");
+        assert_eq!(
+            live.labels.as_ref().unwrap(),
+            &vec!["unflushed".to_string()]
+        );
+        assert_eq!(live.dependencies.as_ref().unwrap().len(), 1);
+        assert_eq!(live.comments.as_ref().unwrap().len(), 1);
+        let tombstone_ids: HashSet<&str> = snapshot
+            .tombstones
+            .iter()
+            .map(|preserved| preserved.issue.id.as_str())
+            .collect();
+        assert_eq!(
+            tombstone_ids,
+            HashSet::from(["bd-tombstone", "bd-clean-tombstone"])
+        );
+    }
+
+    #[test]
+    fn test_unflushed_snapshot_reports_unreadable_live_and_tombstone_rows() {
+        let fixture_root = TempDir::new().unwrap().keep();
+        let mut storage = SqliteStorage::open(&fixture_root.join("beads.db")).unwrap();
+        for id in ["bd-live", "bd-tombstone"] {
+            storage
+                .create_issue(&make_test_issue(id, id), "tester")
+                .unwrap();
+        }
+        storage
+            .delete_issue("bd-tombstone", "tester", "local deletion", None)
+            .unwrap();
+        storage
+            .execute_raw("UPDATE issues SET updated_at = 'not-a-datetime'")
+            .unwrap();
+
+        let snapshot = snapshot_unflushed_state(&storage);
+        assert!(snapshot.dirty.is_empty());
+        assert!(snapshot.tombstones.is_empty());
+        assert_eq!(snapshot.warnings.len(), 2, "{:?}", snapshot.warnings);
+        for (kind, id) in [("dirty issue", "bd-live"), ("tombstone", "bd-tombstone")] {
+            assert!(
+                snapshot.warnings.iter().any(|warning| {
+                    warning.contains(&format!("{kind} {id}"))
+                        && warning.contains("could not be read")
+                        && warning.contains("not-a-datetime")
+                }),
+                "{:?}",
+                snapshot.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn test_unflushed_snapshot_reports_duplicate_issue_rows() {
+        for tombstone in [false, true] {
+            let fixture_root = TempDir::new().unwrap().keep();
+            let mut storage = SqliteStorage::open(&fixture_root.join("beads.db")).unwrap();
+            storage
+                .create_issue(&make_test_issue("bd-local", "unflushed"), "tester")
+                .unwrap();
+            if tombstone {
+                storage
+                    .delete_issue("bd-local", "tester", "local deletion", None)
+                    .unwrap();
+            }
+            // Retain the original table, then emulate damaged uniqueness
+            // state with two physical rows that cannot both occupy one ID.
+            storage
+                .execute_raw("ALTER TABLE issues RENAME TO retained_issues")
+                .unwrap();
+            storage
+                .execute_raw("CREATE TABLE issues AS SELECT * FROM retained_issues")
+                .unwrap();
+            storage
+                .execute_raw("INSERT INTO issues SELECT * FROM retained_issues")
+                .unwrap();
+            storage
+                .execute_raw("UPDATE issues SET title = 'other unflushed version' WHERE rowid = 2")
+                .unwrap();
+
+            let snapshot = snapshot_unflushed_state(&storage);
+            assert!(snapshot.tombstones.is_empty());
+            assert!(snapshot.dirty.is_empty());
+            let expected_warning_count = if tombstone { 2 } else { 1 };
+            assert_eq!(
+                snapshot.warnings.len(),
+                expected_warning_count,
+                "{:?}",
+                snapshot.warnings
+            );
+            assert!(snapshot.warnings.iter().any(|warning| {
+                warning.contains("bd-local could not be read")
+                    && warning.contains("multiple issue rows")
+            }));
+            assert_eq!(
+                snapshot.warnings.iter().any(|warning| {
+                    warning.contains("tombstone bd-local appeared more than once")
+                }),
+                tombstone
+            );
+            for (table, expected) in [("issues", 2), ("retained_issues", 1)] {
+                let retained = storage
+                    .execute_raw_query(&format!("SELECT COUNT(*) FROM {table}"))
+                    .unwrap();
+                assert_eq!(retained[0][0].as_integer(), Some(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn test_unflushed_snapshot_reports_candidate_enumeration_failures() {
+        for table in ["issues", "dirty_issues"] {
+            let fixture_root = TempDir::new().unwrap().keep();
+            let mut storage = SqliteStorage::open(&fixture_root.join("beads.db")).unwrap();
+            storage
+                .create_issue(&make_test_issue("bd-local", "unflushed"), "tester")
+                .unwrap();
+            storage
+                .execute_raw(&format!("ALTER TABLE {table} RENAME TO retained_{table}"))
+                .unwrap();
+
+            let snapshot = snapshot_unflushed_state(&storage);
+            let expected = if table == "issues" {
+                "tombstone issue IDs"
+            } else {
+                "dirty-issue markers"
+            };
+            assert!(
+                snapshot.warnings.iter().any(|warning| {
+                    warning.contains(expected) && warning.contains("could not be read")
+                }),
+                "table={table}: {:?}",
+                snapshot.warnings
+            );
+            let retained = storage
+                .execute_raw_query(&format!("SELECT COUNT(*) FROM retained_{table}"))
+                .unwrap();
+            assert_eq!(retained[0][0].as_integer(), Some(1));
+        }
+    }
+
+    #[test]
+    fn test_unflushed_snapshot_reports_malformed_candidate_ids() {
+        let fixture_root = TempDir::new().unwrap().keep();
+        let mut storage = SqliteStorage::open(&fixture_root.join("beads.db")).unwrap();
+        storage
+            .create_issue(&make_test_issue("bd-local", "unflushed"), "tester")
+            .unwrap();
+        storage.execute_raw("PRAGMA foreign_keys = OFF").unwrap();
+        storage
+            .execute_raw(
+                "INSERT INTO dirty_issues (issue_id, marked_at) VALUES (X'ff', '2026-10-08T00:00:00Z')",
+            )
+            .unwrap();
+        storage.execute_raw("PRAGMA foreign_keys = ON").unwrap();
+
+        let snapshot = snapshot_unflushed_state(&storage);
+        assert_eq!(snapshot.dirty.len(), 1);
+        assert_eq!(snapshot.warnings.len(), 1);
+        assert!(snapshot.warnings[0].contains("dirty-issue markers"));
+        assert!(snapshot.warnings[0].contains("non-text issue ID"));
+    }
+
+    #[test]
+    fn test_unflushed_snapshot_reports_every_unreadable_relationship_set() {
+        for table in ["labels", "dependencies", "comments"] {
+            let fixture_root = TempDir::new().unwrap().keep();
+            let mut storage = SqliteStorage::open(&fixture_root.join("beads.db")).unwrap();
+            for id in ["bd-local", "bd-target"] {
+                storage
+                    .create_issue(&make_test_issue(id, id), "tester")
+                    .unwrap();
+            }
+            storage
+                .add_label("bd-local", "unflushed", "tester")
+                .unwrap();
+            storage
+                .add_dependency("bd-local", "bd-target", "related", "tester")
+                .unwrap();
+            storage
+                .add_comment("bd-local", "tester", "unflushed comment")
+                .unwrap();
+            storage
+                .clear_dirty_flags(&["bd-target".to_string()])
+                .unwrap();
+            storage
+                .execute_raw(&format!("ALTER TABLE {table} RENAME TO retained_{table}"))
+                .unwrap();
+
+            let snapshot = snapshot_unflushed_state(&storage);
+            assert_eq!(snapshot.dirty.len(), 1, "table={table}");
+            assert_eq!(snapshot.warnings.len(), 1, "table={table}");
+            assert!(snapshot.warnings[0].contains("dirty issue bd-local"));
+            assert!(snapshot.warnings[0].contains(table));
+            let preserved = &snapshot.dirty[0];
+            assert_eq!(preserved.labels.is_none(), table == "labels");
+            assert_eq!(preserved.dependencies.is_none(), table == "dependencies");
+            assert_eq!(preserved.comments.is_none(), table == "comments");
+            let retained = storage
+                .execute_raw_query(&format!("SELECT COUNT(*) FROM retained_{table}"))
+                .unwrap();
+            assert_eq!(retained[0][0].as_integer(), Some(1));
+        }
+    }
+
+    #[test]
+    fn test_unflushed_snapshot_reports_unrepresentable_relationship_values() {
+        for (table, column, diagnostic) in [
+            ("labels", "label", "non-text label"),
+            ("dependencies", "depends_on_id", "non-text depends_on_id"),
+            ("dependencies", "type", "non-text type"),
+            ("dependencies", "created_at", "datetime"),
+            ("dependencies", "created_by", "non-text created_by"),
+            ("dependencies", "metadata", "non-text metadata"),
+            ("dependencies", "thread_id", "non-text thread_id"),
+            ("comments", "author", "author"),
+            ("comments", "text", "body"),
+            ("comments", "created_at", "timestamp"),
+        ] {
+            let fixture_root = TempDir::new().unwrap().keep();
+            let db_path = fixture_root.join("beads.db");
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            for id in ["bd-local", "bd-target"] {
+                storage
+                    .create_issue(&make_test_issue(id, id), "tester")
+                    .unwrap();
+            }
+            storage
+                .add_label("bd-local", "unflushed", "tester")
+                .unwrap();
+            storage
+                .add_dependency("bd-local", "bd-target", "related", "tester")
+                .unwrap();
+            storage
+                .add_comment("bd-local", "tester", "unflushed comment")
+                .unwrap();
+            storage
+                .clear_dirty_flags(&["bd-target".to_string()])
+                .unwrap();
+            // The pages remain readable, but SQLite permits BLOB values in
+            // these columns. Treating them as empty/default would lose state.
+            storage
+                .execute_raw(&format!(
+                    "UPDATE {table} SET {column} = X'ff' WHERE issue_id = 'bd-local'"
+                ))
+                .unwrap();
+
+            let snapshot = snapshot_unflushed_state(&storage);
+            assert_eq!(snapshot.dirty.len(), 1, "{table}.{column}");
+            assert_eq!(snapshot.warnings.len(), 1, "{table}.{column}");
+            let warning = &snapshot.warnings[0];
+            assert!(warning.contains("dirty issue bd-local"), "{warning}");
+            assert!(warning.contains(table), "{warning}");
+            assert!(warning.contains(diagnostic), "{warning}");
+            let preserved = &snapshot.dirty[0];
+            assert_eq!(preserved.labels.is_none(), table == "labels");
+            assert_eq!(preserved.dependencies.is_none(), table == "dependencies");
+            assert_eq!(preserved.comments.is_none(), table == "comments");
+            let retained = storage
+                .execute_raw_query(&format!(
+                    "SELECT {column} FROM {table} WHERE issue_id = 'bd-local'"
+                ))
+                .unwrap();
+            assert!(
+                matches!(&retained[0][0], SqliteValue::Blob(bytes) if bytes.as_ref() == [0xff])
+            );
+            assert!(db_path.is_file(), "damaged fixture remains available");
+        }
+    }
+
+    #[test]
+    fn test_unflushed_snapshot_preserves_legacy_dependency_values() {
+        let canonical = DateTime::from_timestamp(1_776_651_488, 0).unwrap();
+        for (stored_timestamp, expected_timestamp) in [
+            ("'2026-04-20T02:18:08Z'", canonical),
+            ("'2026-04-20 02:18:08'", canonical),
+            ("1776651488000000", canonical),
+            (
+                "1776651488.25",
+                DateTime::from_timestamp(1_776_651_488, 250_000_000).unwrap(),
+            ),
+            ("NULL", DateTime::<Utc>::UNIX_EPOCH),
+            ("''", DateTime::<Utc>::UNIX_EPOCH),
+        ] {
+            let fixture_root = TempDir::new().unwrap().keep();
+            let mut storage = SqliteStorage::open(&fixture_root.join("beads.db")).unwrap();
+            for id in ["bd-local", "bd-target"] {
+                storage
+                    .create_issue(&make_test_issue(id, id), "tester")
+                    .unwrap();
+            }
+            storage
+                .add_dependency("bd-local", "bd-target", "related", "tester")
+                .unwrap();
+            storage
+                .clear_dirty_flags(&["bd-target".to_string()])
+                .unwrap();
+            // Retain the original table while emulating a legacy schema that
+            // allows NULL timestamps and optional dependency metadata.
+            storage
+                .execute_raw("ALTER TABLE dependencies RENAME TO retained_dependencies")
+                .unwrap();
+            storage
+                .execute_raw(
+                    "CREATE TABLE dependencies (
+                        issue_id TEXT NOT NULL, depends_on_id TEXT NOT NULL,
+                        type TEXT NOT NULL, created_at DATETIME, created_by TEXT,
+                        metadata TEXT, thread_id TEXT
+                    )",
+                )
+                .unwrap();
+            storage
+                .execute_raw("INSERT INTO dependencies SELECT * FROM retained_dependencies")
+                .unwrap();
+            storage
+                .execute_raw(&format!(
+                    "UPDATE dependencies SET type = 'Review_Needed',
+                     created_at = {stored_timestamp}, created_by = NULL,
+                     metadata = NULL, thread_id = NULL"
+                ))
+                .unwrap();
+
+            let snapshot = snapshot_unflushed_state(&storage);
+            assert!(snapshot.warnings.is_empty(), "{:?}", snapshot.warnings);
+            assert_eq!(snapshot.dirty.len(), 1);
+            let dependencies = snapshot.dirty[0].dependencies.as_ref().unwrap();
+            assert_eq!(dependencies.len(), 1);
+            let dependency = &dependencies[0];
+            assert_eq!(dependency.issue_id, "bd-local");
+            assert_eq!(dependency.depends_on_id, "bd-target");
+            assert_eq!(
+                dependency.dep_type,
+                crate::model::DependencyType::Custom("review_needed".to_string())
+            );
+            assert_eq!(dependency.created_at, expected_timestamp);
+            assert!(dependency.created_by.is_none());
+            assert!(dependency.metadata.is_none());
+            assert!(dependency.thread_id.is_none());
+            let retained = storage
+                .execute_raw_query("SELECT COUNT(*) FROM retained_dependencies")
+                .unwrap();
+            assert_eq!(retained[0][0].as_integer(), Some(1));
         }
     }
 

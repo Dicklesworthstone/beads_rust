@@ -2,15 +2,15 @@
   "name": "interrupted_rebuild_leftovers",
   "family": "recovery_debris",
   "description": "A failed rebuild left a bad replacement database in place along with preserved backups and recovery artifacts.",
-  "expected_classification": "recoverable",
+  "expected_classification": "unsafe",
   "expected_command_outcomes": [
     {
       "surface": "startup/open",
-      "outcome": "success_with_auto_recovery"
+      "outcome": "fails_unflushed_preservation"
     },
     {
       "surface": "create",
-      "outcome": "success_with_auto_recovery"
+      "outcome": "fails_unflushed_preservation"
     },
     {
       "surface": "doctor",
@@ -22,7 +22,7 @@
     },
     {
       "surface": "sync --status",
-      "outcome": "status_in_sync"
+      "outcome": "fails_unflushed_preservation"
     },
     {
       "surface": "history",
@@ -32,6 +32,7 @@
   "source_hint": "Inspired by the large repo-root recovery dumps collected during real-world investigation.",
   "notes": [
     "The live beads.db is plain text on purpose; the interesting state is the preserved backup and .br_recovery trail.",
+    "Ordinary storage-backed commands refuse replacement when unflushed-state preservation cannot be established, retaining the live primary and all earlier recovery evidence.",
     "Future replay tests can assert that recovery tooling prefers the preserved backups over the broken live file.",
     "Post-de5bc9bd fail-closed contract: the .br_recovery/*.rebuild-failed marker means a prior rebuild's verification failed, so `doctor --repair` refuses and demands --allow-repeated-repair instead of silently re-rebuilding over the evidence."
   ]

@@ -725,7 +725,8 @@ mod tests {
     use tempfile::TempDir;
 
     fn storage_ctx_with_exported_issue() -> (TempDir, OpenStorageResult) {
-        let temp = TempDir::new().expect("tempdir");
+        let mut temp = TempDir::new().expect("tempdir");
+        temp.disable_cleanup(true);
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).expect("create beads dir");
         let db_path = beads_dir.join("beads.db");

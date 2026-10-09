@@ -2,15 +2,15 @@
   "name": "corrupt_db_text",
   "family": "corrupt_db",
   "description": "The primary database file is plain text while JSONL remains present and parseable.",
-  "expected_classification": "recoverable",
+  "expected_classification": "unsafe",
   "expected_command_outcomes": [
     {
       "surface": "startup/open",
-      "outcome": "success_with_auto_recovery"
+      "outcome": "fails_unflushed_preservation"
     },
     {
       "surface": "create",
-      "outcome": "success_with_auto_recovery"
+      "outcome": "fails_unflushed_preservation"
     },
     {
       "surface": "doctor",
@@ -22,7 +22,7 @@
     },
     {
       "surface": "sync --status",
-      "outcome": "status_in_sync"
+      "outcome": "fails_unflushed_preservation"
     },
     {
       "surface": "list --no-db",
@@ -32,6 +32,7 @@
   "source_hint": "Derived from the malformed-db repair cases in tests/e2e_workspace_commands.rs and tests/e2e_global_flags.rs.",
   "notes": [
     "Represents the simplest non-SQLite database corruption case.",
-    "Intended to drive rebuild-or-bypass behavior rather than low-level SQLite recovery."
+    "Ordinary storage-backed commands refuse replacement because the unreadable primary cannot establish preservation of unflushed state.",
+    "Explicit doctor repair reports the unavailable snapshot; list --no-db remains a supported JSONL-only bypass."
   ]
 }

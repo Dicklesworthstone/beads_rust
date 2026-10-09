@@ -84,7 +84,21 @@ fn br_init(cwd: &Path) {
 }
 
 fn isolated_tempdir() -> TempDir {
-    TempDir::new_in(common::cli::isolated_temp_root()).expect("create isolated tempdir")
+    tempfile::Builder::new()
+        .prefix("br-doctor-test-")
+        .disable_cleanup(true)
+        .tempdir_in(common::cli::isolated_temp_root())
+        .expect("create retained isolated tempdir")
+}
+
+/// Make page damage authoritative without unlinking any part of its source
+/// family. The retained fixture still contains the database and its sidecars.
+fn checkpoint_fixture_database(db_path: &Path) {
+    let conn = Connection::open(db_path.to_string_lossy().into_owned())
+        .expect("open fixture database for checkpoint");
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("checkpoint fixture database");
+    conn.close().expect("close checkpointed fixture database");
 }
 
 #[test]
@@ -1590,8 +1604,7 @@ fn legacy_op_audit_for_page_corruption_repair() {
     // otherwise the corrupted page may be masked by an uncheckpointed
     // overlay.
     let db_path = root.join(".beads").join("beads.db");
-    let _ = fs::remove_file(root.join(".beads").join("beads.db-wal"));
-    let _ = fs::remove_file(root.join(".beads").join("beads.db-shm"));
+    checkpoint_fixture_database(&db_path);
 
     // Overwrite a non-header page so `PRAGMA integrity_check` reports
     // page-level corruption (a trigger for `repair_via_vacuum` or, if the
@@ -1787,15 +1800,10 @@ fn seed_dirty_issue_and_corrupt_db(root: &Path) -> String {
         .expect("dirty issue id")
         .to_string();
 
-    // Drop any WAL/SHM sidecars so the page corruption lands in the
-    // authoritative main DB file rather than being masked by an
-    // uncheckpointed overlay. (This does not checkpoint anything — br
-    // checkpoints on clean close, so the rows are already in the main
-    // file; removal just discards the empty sidecars.) Same pattern as
-    // the vacuum test above.
+    // Checkpoint the complete family so an uncheckpointed overlay cannot
+    // mask the damaged page, and retain every fixture sidecar for inspection.
     let db_path = root.join(".beads").join("beads.db");
-    let _ = fs::remove_file(root.join(".beads").join("beads.db-wal"));
-    let _ = fs::remove_file(root.join(".beads").join("beads.db-shm"));
+    checkpoint_fixture_database(&db_path);
     {
         use std::os::unix::fs::FileExt;
         let f = std::fs::OpenOptions::new()
@@ -1916,6 +1924,648 @@ fn startup_auto_recovery_preserves_dirty_unflushed_issue() {
     );
 }
 
+// GitHub #539 / beads_rust-utbzw: an ordinary command may rebuild only after
+// establishing that all unflushed issue state can be carried across. Keep
+// both the original fixtures and each command's logs, including on success.
+struct StartupRecoveryFixture {
+    root: PathBuf,
+    issue_id: String,
+    dependency_id: String,
+    tombstone_id: String,
+    db_only_id: String,
+    jsonl: Vec<u8>,
+}
+
+fn startup_fixture_run(root: &Path, args: &[&str], label: &str) -> std::process::Output {
+    let mut cmd = br_cmd(root);
+    for key in [
+        "BR_DISABLE_READ_ONLY_FAST_OPEN",
+        "BR_OUTPUT_FORMAT",
+        "TOON_DEFAULT_FORMAT",
+        "TOON_STATS",
+    ] {
+        cmd.env_remove(key);
+    }
+    // Release builds ordinarily suppress tracing warnings. Every assertion
+    // below must hold at that filter, including the plain-text diagnostic.
+    cmd.env("RUST_LOG", "error");
+    let started = std::time::Instant::now();
+    let out = cmd
+        .args(args)
+        .output()
+        .expect("run retained recovery fixture");
+    let log = serde_json::json!({
+        "root": root,
+        "args": args,
+        "exit": out.status.code(),
+        "duration_ms": started.elapsed().as_millis(),
+        "stdout": String::from_utf8_lossy(&out.stdout),
+        "stderr": String::from_utf8_lossy(&out.stderr),
+    });
+    let logs = root.join("logs");
+    fs::create_dir_all(&logs).expect("retained fixture logs");
+    fs::write(
+        logs.join(format!("{label}.json")),
+        serde_json::to_vec_pretty(&log).expect("serialize fixture log"),
+    )
+    .expect("retain fixture command log");
+    eprintln!("{log}");
+    out
+}
+
+fn startup_fixture_succeeds(root: &Path, args: &[&str], label: &str) -> Value {
+    let out = startup_fixture_run(root, args, label);
+    assert!(out.status.success(), "fixture command {args:?}: {out:?}");
+    serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|err| panic!("whole stdout must be one JSON value: {err}; {out:?}"))
+}
+
+fn copy_startup_fixture_tree(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).expect("create retained fixture copy");
+    for entry in fs::read_dir(source).expect("read fixture tree") {
+        let entry = entry.expect("fixture tree entry");
+        let target = destination.join(entry.file_name());
+        let kind = entry.file_type().expect("fixture entry type");
+        if kind.is_dir() {
+            copy_startup_fixture_tree(&entry.path(), &target);
+        } else {
+            assert!(kind.is_file(), "unexpected fixture entry: {entry:?}");
+            fs::copy(entry.path(), target).expect("retain fixture file");
+        }
+    }
+}
+
+impl StartupRecoveryFixture {
+    fn new(label: &str) -> Self {
+        let root = tempfile::Builder::new()
+            .prefix(&format!("br-startup-recovery-539-{label}-"))
+            .disable_cleanup(true)
+            .tempdir_in(common::cli::isolated_temp_root())
+            .expect("create retained startup recovery fixture")
+            .keep();
+        startup_fixture_succeeds(&root, &["init", "--prefix", "recovery", "--json"], "init");
+        let create = |title: &str, label: &str| {
+            startup_fixture_succeeds(&root, &["create", title, "--json"], label)["id"]
+                .as_str()
+                .expect("created issue id")
+                .to_string()
+        };
+        let issue_id = create("flushed title", "create_issue");
+        let dependency_id = create("dependency target", "create_dependency");
+        let tombstone_id = create("local deletion", "create_tombstone");
+        startup_fixture_succeeds(
+            &root,
+            &["comments", "add", &issue_id, "flushed comment", "--json"],
+            "flushed_comment",
+        );
+        startup_fixture_succeeds(&root, &["sync", "--flush-only", "--json"], "flush");
+        let jsonl = fs::read(root.join(".beads/issues.jsonl")).expect("flushed JSONL");
+        for (args, label) in [
+            (
+                vec!["update", &issue_id, "--title", "unflushed local title"],
+                "unflushed_title",
+            ),
+            (
+                vec!["comments", "add", &issue_id, "unflushed comment"],
+                "unflushed_comment",
+            ),
+            (
+                vec!["label", "add", &issue_id, "unflushed-label"],
+                "unflushed_label",
+            ),
+            (
+                vec!["dep", "add", &issue_id, &dependency_id],
+                "unflushed_dependency",
+            ),
+            (
+                vec!["delete", &tombstone_id, "--force"],
+                "unflushed_tombstone",
+            ),
+        ] {
+            let mut args = args;
+            args.extend(["--no-auto-flush", "--no-auto-import", "--json"]);
+            startup_fixture_succeeds(&root, &args, label);
+        }
+        let db_only_id = startup_fixture_succeeds(
+            &root,
+            &["create", "db-only issue", "--no-auto-flush", "--json"],
+            "create_db_only",
+        )["id"]
+            .as_str()
+            .expect("db-only issue id")
+            .to_string();
+        assert_eq!(fs::read(root.join(".beads/issues.jsonl")).unwrap(), jsonl);
+        assert!(
+            !jsonl
+                .windows(db_only_id.len())
+                .any(|bytes| bytes == db_only_id.as_bytes()),
+            "DB-only issue must be absent from the recovery source"
+        );
+        checkpoint_fixture_database(&root.join(".beads/beads.db"));
+        let previous = root.join(".beads/.br_recovery/previous-run");
+        fs::create_dir_all(&previous).expect("previous recovery directory");
+        fs::write(
+            previous.join("beads.db"),
+            b"retained previous recovery evidence",
+        )
+        .expect("previous recovery evidence");
+        copy_startup_fixture_tree(
+            &root.join(".beads"),
+            &root.join("source-before-damage/.beads"),
+        );
+        Self {
+            root,
+            issue_id,
+            dependency_id,
+            tombstone_id,
+            db_only_id,
+            jsonl,
+        }
+    }
+
+    fn add_recoverable_anomaly(&self) {
+        let conn = Connection::open(
+            self.root
+                .join(".beads/beads.db")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .expect("open fixture database");
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'duplicate')")
+            .expect("seed duplicate config key");
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint anomaly");
+        conn.close().expect("close anomaly fixture");
+    }
+
+    fn damage_issue_timestamp(&self, id: &str) {
+        self.add_recoverable_anomaly();
+        let conn = Connection::open(
+            self.root
+                .join(".beads/beads.db")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .expect("open fixture for row damage");
+        conn.execute_with_params(
+            "UPDATE issues SET created_at = 'damaged timestamp' WHERE id = ?1",
+            &[fsqlite_types::SqliteValue::from(id)],
+        )
+        .expect("seed unreadable issue timestamp");
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint row damage");
+        conn.close().expect("close row-damaged fixture");
+    }
+
+    fn damage_table_page(&self, table: &str) {
+        self.add_recoverable_anomaly();
+        let db_path = self.root.join(".beads/beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned())
+            .expect("open fixture for page location");
+        let integer = |row: beads_rust::franken_sync::Row| {
+            row.get(0)
+                .and_then(fsqlite_types::SqliteValue::as_integer)
+                .and_then(|value| u64::try_from(value).ok())
+                .expect("positive page metadata")
+        };
+        let root_page = integer(
+            conn.query_row_with_params(
+                "SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                &[fsqlite_types::SqliteValue::from(table)],
+            )
+            .expect("locate table root"),
+        );
+        let page_size = integer(conn.query_row("PRAGMA page_size").expect("read page size"));
+        assert!(
+            root_page > 1,
+            "damage must leave the database header intact"
+        );
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint page fixture");
+        conn.close().expect("close before page damage");
+        damage_startup_fixture_bytes(&db_path, (root_page - 1) * page_size, &[0xff; 8]);
+    }
+}
+
+fn damage_startup_fixture_bytes(db_path: &Path, offset: u64, bytes: &[u8]) {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(db_path)
+        .expect("open fixture for damage");
+    file.seek(SeekFrom::Start(offset))
+        .expect("seek fixture damage offset");
+    file.write_all(bytes)
+        .expect("damage selected fixture bytes");
+    file.sync_all().expect("persist fixture damage");
+}
+
+struct StartupRecoveryBefore {
+    family: BTreeMap<PathBuf, Vec<u8>>,
+    #[cfg(unix)]
+    database_metadata: Option<fs::Metadata>,
+    recovery_hashes: BTreeMap<PathBuf, String>,
+}
+
+impl StartupRecoveryBefore {
+    fn capture(fixture: &StartupRecoveryFixture) -> Self {
+        let beads = fixture.root.join(".beads");
+        // This is a CLI-ready copy for independent replay and paired timing.
+        copy_startup_fixture_tree(&beads, &fixture.root.join("before/.beads"));
+        let family = fs::read_dir(&beads)
+            .expect("inventory database family")
+            .map(|entry| entry.expect("database family entry"))
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("beads.db"))
+            .map(|entry| {
+                let path = entry.path();
+                let bytes = fs::read(&path).expect("read retained family member");
+                (path, bytes)
+            })
+            .collect();
+        Self {
+            family,
+            #[cfg(unix)]
+            database_metadata: fs::metadata(beads.join("beads.db")).ok(),
+            recovery_hashes: hash_workspace(&beads.join(".br_recovery")),
+        }
+    }
+
+    fn assert_refusal_retained_sources(&self, fixture: &StartupRecoveryFixture) {
+        let beads = fixture.root.join(".beads");
+        for (path, bytes) in &self.family {
+            assert!(
+                path.is_file(),
+                "original family member was moved or removed: {}",
+                path.display()
+            );
+            // The engine may update its derived SHM read-lock state merely
+            // by opening the family. Committed source bytes must not change.
+            if path.file_name().is_some_and(|name| {
+                name == "beads.db" || name == "beads.db-wal" || name == "beads.db-journal"
+            }) {
+                assert_eq!(
+                    fs::read(path).unwrap(),
+                    *bytes,
+                    "source changed: {}",
+                    path.display()
+                );
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            match &self.database_metadata {
+                Some(before) => {
+                    let after =
+                        fs::metadata(beads.join("beads.db")).expect("retained database metadata");
+                    assert_eq!(
+                        (after.dev(), after.ino()),
+                        (before.dev(), before.ino()),
+                        "refusal must not install a replacement database"
+                    );
+                }
+                None => assert!(
+                    !beads.join("beads.db").exists(),
+                    "refusal must not install a missing database"
+                ),
+            }
+        }
+        assert_eq!(
+            hash_workspace(&beads.join(".br_recovery")),
+            self.recovery_hashes,
+            "refusal must retain previous recovery artifacts without creating a new rebuild backup"
+        );
+        assert_eq!(fs::read(beads.join("issues.jsonl")).unwrap(), fixture.jsonl);
+    }
+}
+
+fn assert_startup_refuses_with_diagnostics(
+    fixture: &StartupRecoveryFixture,
+    details: &[&str],
+    check_fast_fallback: bool,
+) {
+    let before = StartupRecoveryBefore::capture(fixture);
+    // stats selects ordinary startup in both output modes. A compatible
+    // read-only fast open need not run the anomaly probe at all. Header
+    // damage additionally exercises list's definite fast-open fallback.
+    let mut probes = vec![
+        (vec!["stats", "--json"], "refused_stats_json", true),
+        (vec!["stats"], "refused_stats", false),
+    ];
+    if check_fast_fallback {
+        probes.push((vec!["list", "--json"], "refused_list", true));
+    }
+    for (args, label, json) in probes {
+        let out = startup_fixture_run(&fixture.root, &args, label);
+        assert_eq!(
+            out.status.code(),
+            Some(6),
+            "expected SYNC_CONFLICT: {out:?}"
+        );
+        let message = if json {
+            let payload: Value = serde_json::from_slice(&out.stdout)
+                .unwrap_or_else(|err| panic!("stdout must be one error document: {err}; {out:?}"));
+            assert_eq!(payload["error"]["code"], "SYNC_CONFLICT", "{payload}");
+            payload["error"]["message"]
+                .as_str()
+                .expect("structured error message")
+                .to_string()
+        } else {
+            assert!(
+                out.stdout.is_empty(),
+                "plain refusal polluted stdout: {out:?}"
+            );
+            String::from_utf8(out.stderr).expect("plain diagnostic")
+        };
+        for detail in [
+            "Automatic database recovery refused",
+            "br doctor --repair",
+            ".br_recovery",
+        ]
+        .into_iter()
+        .chain(details.iter().copied())
+        {
+            assert!(
+                message.contains(detail),
+                "missing {detail:?} in diagnostic: {message}"
+            );
+        }
+        assert!(
+            message.contains(&fixture.root.join(".beads/beads.db").display().to_string()),
+            "diagnostic must identify retained database: {message}"
+        );
+        assert!(
+            !message.contains('\u{1b}'),
+            "ANSI in refusal diagnostic: {message}"
+        );
+        before.assert_refusal_retained_sources(fixture);
+    }
+}
+
+#[test]
+fn startup_auto_recovery_refuses_unreadable_dirty_issue() {
+    let fixture = StartupRecoveryFixture::new("dirty-row");
+    fixture.damage_issue_timestamp(&fixture.db_only_id);
+    assert_startup_refuses_with_diagnostics(&fixture, &[&fixture.db_only_id, "dirty"], false);
+}
+
+#[test]
+fn startup_auto_recovery_refuses_unreadable_tombstone() {
+    let fixture = StartupRecoveryFixture::new("tombstone");
+    fixture.damage_issue_timestamp(&fixture.tombstone_id);
+    assert_startup_refuses_with_diagnostics(&fixture, &[&fixture.tombstone_id, "tombstone"], false);
+}
+
+#[test]
+fn startup_auto_recovery_refuses_unreadable_dirty_markers() {
+    let fixture = StartupRecoveryFixture::new("dirty-markers");
+    fixture.damage_table_page("dirty_issues");
+    assert_startup_refuses_with_diagnostics(&fixture, &["dirty"], false);
+}
+
+#[test]
+fn startup_auto_recovery_refuses_unreadable_relationships() {
+    for table in ["comments", "labels", "dependencies"] {
+        let fixture = StartupRecoveryFixture::new(table);
+        fixture.damage_table_page(table);
+        assert_startup_refuses_with_diagnostics(&fixture, &[&fixture.issue_id, table], false);
+        if table == "comments" {
+            let out = startup_fixture_run(
+                &fixture.root,
+                &["doctor", "--repair", "--json"],
+                "explicit_comments_repair",
+            );
+            let repair: Value = serde_json::from_slice(&out.stdout)
+                .unwrap_or_else(|err| panic!("doctor JSON contract: {err}; {out:?}"));
+            assert_eq!(
+                repair["repaired"], true,
+                "explicit repair remains available: {repair}"
+            );
+            assert!(
+                repair["dirty_preservation_warnings"]
+                    .as_array()
+                    .expect("doctor warnings")
+                    .iter()
+                    .any(|warning| warning.as_str().is_some_and(|message| {
+                        message.contains(&fixture.issue_id) && message.contains("comments")
+                    })),
+                "explicit repair must report the incomplete snapshot: {repair}"
+            );
+            let shown = startup_fixture_succeeds(
+                &fixture.root,
+                &["show", &fixture.issue_id, "--json"],
+                "show_after_explicit_repair",
+            );
+            assert_eq!(shown[0]["title"], "unflushed local title");
+        }
+    }
+}
+
+#[test]
+fn startup_auto_recovery_refuses_open_error() {
+    let fixture = StartupRecoveryFixture::new("open-error");
+    let db_path = fixture.root.join(".beads/beads.db");
+    // Keep every page containing the unflushed records, but damage the
+    // SQLite signature so the original storage cannot even be opened.
+    damage_startup_fixture_bytes(&db_path, 0, &[0xff; 16]);
+    let source = fs::read(&db_path).expect("header-damaged source");
+    assert!(
+        source
+            .windows(fixture.db_only_id.len())
+            .any(|bytes| bytes == fixture.db_only_id.as_bytes())
+    );
+    assert_startup_refuses_with_diagnostics(&fixture, &["open", "unflushed"], true);
+
+    let out = startup_fixture_run(
+        &fixture.root,
+        &["doctor", "--repair", "--json"],
+        "explicit_open_error_repair",
+    );
+    let repair: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|err| panic!("doctor JSON contract: {err}; {out:?}"));
+    assert_eq!(
+        repair["repaired"], true,
+        "explicit repair remains available: {repair}"
+    );
+    assert!(
+        repair["dirty_preservation_warnings"]
+            .as_array()
+            .expect("doctor open-error preservation warnings")
+            .iter()
+            .any(|warning| warning.as_str().is_some_and(|message| {
+                message.contains("could not be opened") && message.contains("unflushed")
+            })),
+        "explicit repair must describe the unavailable original snapshot: {repair}"
+    );
+    startup_fixture_succeeds(
+        &fixture.root,
+        &["list", "--json"],
+        "list_after_explicit_repair",
+    );
+    let original_hash = sha256_hex(&source);
+    assert!(
+        hash_workspace(&fixture.root.join(".beads/.br_recovery"))
+            .values()
+            .any(|hash| hash == &original_hash),
+        "explicit repair must retain the database whose unreadable header hid unflushed state"
+    );
+}
+
+#[test]
+fn startup_auto_recovery_refuses_orphan_wal_before_explicit_repair() {
+    let fixture = StartupRecoveryFixture::new("orphan-wal");
+    let beads = fixture.root.join(".beads");
+    let db_path = beads.join("beads.db");
+    let wal_path = beads.join("beads.db-wal");
+    let sentinel = "WAL-only unflushed edit requiring explicit repair";
+    let mut conn = Connection::open(db_path.to_string_lossy().into_owned())
+        .expect("open fixture to create committed WAL");
+    conn.execute("PRAGMA journal_mode=WAL").unwrap();
+    conn.execute("PRAGMA wal_autocheckpoint=0").unwrap();
+    conn.execute_with_params(
+        "UPDATE issues SET title = ?1 WHERE id = ?2",
+        &[
+            fsqlite_types::SqliteValue::from(sentinel),
+            fsqlite_types::SqliteValue::from(fixture.db_only_id.as_str()),
+        ],
+    )
+    .expect("write real WAL-only issue edit");
+    conn.close_without_checkpoint_in_place()
+        .expect("leave committed WAL available");
+    drop(conn);
+    let main_bytes = fs::read(&db_path).expect("original main database");
+    let wal_bytes = fs::read(&wal_path).expect("committed fixture WAL");
+    assert!(
+        !main_bytes
+            .windows(sentinel.len())
+            .any(|bytes| bytes == sentinel.as_bytes())
+    );
+    assert!(
+        wal_bytes
+            .windows(sentinel.len())
+            .any(|bytes| bytes == sentinel.as_bytes()),
+        "the orphan sidecar must contain a real uncheckpointed issue edit"
+    );
+    let retained_main = fixture.root.join("retained-missing-main/beads.db");
+    fs::create_dir_all(retained_main.parent().unwrap()).unwrap();
+    fs::rename(&db_path, &retained_main).expect("retain the now-missing main database");
+
+    assert_startup_refuses_with_diagnostics(&fixture, &["orphaned sidecar", "beads.db-wal"], true);
+    assert!(
+        !db_path.exists(),
+        "automatic refusal must leave the main file absent"
+    );
+    let out = startup_fixture_run(
+        &fixture.root,
+        &["doctor", "--repair", "--json"],
+        "explicit_orphan_wal_repair",
+    );
+    let repair: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|err| panic!("doctor JSON contract: {err}; {out:?}"));
+    assert_eq!(repair["repaired"], true, "{repair}");
+    assert!(
+        repair["dirty_preservation_warnings"]
+            .as_array()
+            .expect("doctor orphan-sidecar preservation warnings")
+            .iter()
+            .any(|warning| warning.as_str().is_some_and(|message| {
+                message.contains("orphaned sidecar")
+                    && message.contains("beads.db-wal")
+                    && message.contains("unflushed")
+            })),
+        "sidecar quarantine must not erase the original preservation warning: {repair}"
+    );
+    assert_eq!(fs::read(&retained_main).unwrap(), main_bytes);
+    let wal_hash = sha256_hex(&wal_bytes);
+    let run_dir = single_run_dir(&fixture.root);
+    assert!(
+        hash_workspace(&run_dir.join("quarantine"))
+            .values()
+            .any(|hash| hash == &wal_hash),
+        "explicit repair must retain the exact unflushed WAL in its run quarantine"
+    );
+    startup_fixture_succeeds(
+        &fixture.root,
+        &["list", "--json"],
+        "list_after_orphan_repair",
+    );
+}
+
+#[test]
+fn startup_auto_recovery_preserves_complete_unflushed_state() {
+    let fixture = StartupRecoveryFixture::new("complete");
+    fixture.add_recoverable_anomaly();
+    let before = StartupRecoveryBefore::capture(&fixture);
+    startup_fixture_succeeds(&fixture.root, &["stats", "--json"], "successful_recovery");
+    let listed =
+        startup_fixture_succeeds(&fixture.root, &["list", "--json"], "list_after_recovery");
+    assert!(
+        listed["issues"]
+            .as_array()
+            .expect("unchanged list envelope")
+            .iter()
+            .any(|issue| issue["id"] == fixture.db_only_id)
+    );
+    let storage = beads_rust::storage::SqliteStorage::open(&fixture.root.join(".beads/beads.db"))
+        .expect("open recovered database");
+    assert_eq!(
+        storage.get_issue(&fixture.issue_id).unwrap().unwrap().title,
+        "unflushed local title"
+    );
+    assert_eq!(
+        storage.get_labels(&fixture.issue_id).unwrap(),
+        vec!["unflushed-label"]
+    );
+    assert!(
+        storage
+            .get_dependencies_full(&fixture.issue_id)
+            .unwrap()
+            .iter()
+            .any(|dependency| dependency.depends_on_id == fixture.dependency_id)
+    );
+    let comments = storage.get_comments(&fixture.issue_id).unwrap();
+    assert!(
+        comments
+            .iter()
+            .any(|comment| comment.body == "flushed comment")
+    );
+    assert!(
+        comments
+            .iter()
+            .any(|comment| comment.body == "unflushed comment")
+    );
+    assert_eq!(
+        storage
+            .get_issue(&fixture.tombstone_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        beads_rust::model::Status::Tombstone
+    );
+    let dirty = storage.get_dirty_issue_ids().unwrap();
+    for id in [
+        &fixture.issue_id,
+        &fixture.tombstone_id,
+        &fixture.db_only_id,
+    ] {
+        assert!(
+            dirty.contains(id),
+            "preserved issue must remain dirty: {id}; {dirty:?}"
+        );
+    }
+    assert_eq!(
+        fs::read(fixture.root.join(".beads/issues.jsonl")).unwrap(),
+        fixture.jsonl
+    );
+    let original_hash = sha256_hex(&before.family[&fixture.root.join(".beads/beads.db")]);
+    assert!(
+        hash_workspace(&fixture.root.join(".beads/.br_recovery"))
+            .values()
+            .any(|hash| hash == &original_hash),
+        "successful recovery must retain its original database"
+    );
+}
+
 /// One damaged `comments` page must not cost every unflushed issue its local
 /// edits. Before the fix the pre-rebuild snapshot could not read any dirty
 /// issue row (the keyed lookup fails on the foreign damaged page), so
@@ -1974,9 +2624,9 @@ fn repair_rebuild_keeps_dirty_rows_and_names_unreadable_comments() {
         .get(0)
         .and_then(fsqlite_types::SqliteValue::as_integer)
         .expect("integer page size");
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("checkpoint comments fixture without removing sidecars");
     conn.close().expect("checkpointing close");
-    let _ = fs::remove_file(root.join(".beads").join("beads.db-wal"));
-    let _ = fs::remove_file(root.join(".beads").join("beads.db-shm"));
     {
         use std::os::unix::fs::FileExt;
         let file = fs::OpenOptions::new()

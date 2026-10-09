@@ -139,6 +139,7 @@ pub enum WorkspaceFailureCommandOutcome {
     FailsConflictMarkers,
     FailsInvalidJson,
     FailsRepeatedRepair,
+    FailsUnflushedPreservation,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -242,7 +243,12 @@ pub fn isolated_workspace_failure_fixture(
             )
         })?;
 
-    let temp_dir = TempDir::new()?;
+    // Keep every materialized failure fixture and its command logs available
+    // after both successful replays and assertion failures.
+    let temp_dir = tempfile::Builder::new()
+        .prefix("br-workspace-failure-")
+        .disable_cleanup(true)
+        .tempdir()?;
     // Canonicalize the workspace root so it matches what `br where`/`info`
     // report: br resolves its database/JSONL paths through the canonical
     // `.beads` dir, and on macOS the raw system temp root is `/var/...` (a

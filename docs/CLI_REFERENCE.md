@@ -1802,6 +1802,7 @@ br sync [OPTIONS]
 - JSONL is authoritative. After import, entries present only in SQLite are removed; deletion tombstones are preserved when applicable.
 - `--rebuild` is rejected with every non-import mode, including `--flush-only`, `--merge`, `--status`, and `--witness`.
 - Recovery artifacts are preserved under `.beads/.br_recovery/` when br has to move aside a damaged SQLite family before rebuilding.
+- Automatic recovery refuses with `SYNC_CONFLICT` (exit 6) before replacement if reads of local tombstones, dirty issues, or their relationships reveal preservation failures, or if the original database cannot be opened. It names the failed reads, current database path, and retained recovery directory. Inspect with `br doctor`; `br doctor --repair` is the explicit best-effort repair path and reports `dirty_preservation_warnings` in JSON. See [Automatic recovery stops on preservation failures](SYNC_SAFETY.md#automatic-recovery-stops-on-preservation-failures).
 - If open-time recovery rebuilt the database before a semantic import flag such as `--rename-prefix` could apply, br prints a rerun command that includes the needed flags.
 
 **Prefix rename semantics (`--rename-prefix`):**

@@ -1475,7 +1475,8 @@ fn e2e_doctor_repair_json_rebuilds_when_db_is_missing() {
         "issues.jsonl should exist before repair test"
     );
 
-    fs::remove_file(&db_path).expect("remove beads db");
+    fs::rename(&db_path, workspace.root.join("retained-original-beads.db"))
+        .expect("retain original database outside its live path");
     assert!(
         !db_path.exists(),
         "database should be missing before repair"
@@ -1592,7 +1593,11 @@ fn e2e_doctor_detects_and_quarantines_anomalous_wal_sidecar() {
             // same thing on every engine version.
             let shm_path = beads_dir.join("beads.db-shm");
             if shm_path.exists() {
-                fs::remove_file(&shm_path).expect("clear engine-managed SHM sidecar");
+                fs::rename(
+                    &shm_path,
+                    workspace.root.join("retained-original-beads.db-shm"),
+                )
+                .expect("retain engine-managed SHM outside its live path");
             }
             wal_path
         };
@@ -2575,8 +2580,13 @@ fn e2e_engine_sidecar_refusal_is_explained_on_every_open_lane() {
     }
     assert_namespace_family_preserved(&workspace, &before, false);
 
-    // Dropping the extra link restores the family without any repair.
-    fs::remove_file(&alias).unwrap();
-    let count = run_br(&workspace, ["count", "--json"], "count_after_unlink");
+    // Keep both links to the rejected inode, then install a private copy of
+    // its bytes at the live path to establish the valid single-link control.
+    let retained_gate = workspace.root.join("retained-original-namespace-gate");
+    fs::rename(&gate, &retained_gate).unwrap();
+    fs::copy(&retained_gate, &gate).unwrap();
+    assert!(alias.is_file());
+    assert_eq!(fs::read(&gate).unwrap(), fs::read(&retained_gate).unwrap());
+    let count = run_br(&workspace, ["count", "--json"], "count_after_private_copy");
     assert!(count.status.success(), "{count:?}");
 }

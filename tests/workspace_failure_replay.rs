@@ -6,6 +6,7 @@ use common::{
     isolated_workspace_failure_fixture, list_workspace_failure_fixtures,
 };
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,6 +14,132 @@ struct FixtureWorkspace {
     metadata: WorkspaceFailureFixtureMetadata,
     beads_dir: PathBuf,
     workspace: BrWorkspace,
+    preservation_evidence: Option<PreservationRefusalEvidence>,
+}
+
+struct PreservationRefusalEvidence {
+    source_bytes: BTreeMap<PathBuf, Vec<u8>>,
+    family_paths: Vec<PathBuf>,
+    recovery_bytes: BTreeMap<PathBuf, Vec<u8>>,
+    #[cfg(unix)]
+    database_metadata: fs::Metadata,
+}
+
+impl PreservationRefusalEvidence {
+    fn capture(fixture: &FixtureWorkspace) -> Self {
+        let mut source_bytes = BTreeMap::new();
+        let mut family_paths = Vec::new();
+        for entry in fs::read_dir(&fixture.beads_dir).expect("read refusal fixture") {
+            let entry = entry.expect("refusal fixture entry");
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("beads.db") {
+                let path = entry.path();
+                family_paths.push(path.clone());
+                // Opening the engine may change derived SHM lock state.
+                // Committed source bytes and historical primary backups
+                // must remain unchanged when replacement is refused.
+                if matches!(
+                    name.as_ref(),
+                    "beads.db" | "beads.db-wal" | "beads.db-journal"
+                ) || name.starts_with("beads.db.")
+                {
+                    source_bytes.insert(path.clone(), fs::read(path).expect("read source bytes"));
+                }
+            } else if name.starts_with(".fixture_") {
+                for (relative, bytes) in retained_tree_bytes(&entry.path()) {
+                    source_bytes.insert(entry.path().join(relative), bytes);
+                }
+            }
+        }
+        let jsonl_path = fixture.beads_dir.join("issues.jsonl");
+        source_bytes.insert(
+            jsonl_path.clone(),
+            fs::read(jsonl_path).expect("read fixture JSONL"),
+        );
+        Self {
+            source_bytes,
+            family_paths,
+            recovery_bytes: retained_tree_bytes(&fixture.beads_dir.join(".br_recovery")),
+            #[cfg(unix)]
+            database_metadata: fs::metadata(current_database_path(fixture))
+                .expect("original fixture database metadata"),
+        }
+    }
+
+    fn assert_unchanged(&self, fixture: &FixtureWorkspace) {
+        for path in &self.family_paths {
+            assert!(
+                path.is_file(),
+                "original family member was moved or removed: {}",
+                path.display()
+            );
+        }
+        for (path, bytes) in &self.source_bytes {
+            assert_eq!(
+                fs::read(path).expect("read retained source"),
+                *bytes,
+                "refusal changed source bytes: {}",
+                path.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let after = fs::metadata(current_database_path(fixture))
+                .expect("retained fixture database metadata");
+            assert_eq!(
+                (after.dev(), after.ino()),
+                (self.database_metadata.dev(), self.database_metadata.ino()),
+                "refusal must not install a replacement database"
+            );
+        }
+        assert_eq!(
+            retained_tree_bytes(&fixture.beads_dir.join(".br_recovery")),
+            self.recovery_bytes,
+            "refusal must keep prior recovery evidence without creating a rebuild backup"
+        );
+    }
+}
+
+fn retained_tree_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn collect(root: &Path, path: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in fs::read_dir(path).expect("read retained fixture directory") {
+            let entry = entry.expect("retained fixture entry");
+            let kind = entry.file_type().expect("retained fixture entry type");
+            if kind.is_dir() {
+                collect(root, &entry.path(), files);
+            } else {
+                assert!(
+                    kind.is_file(),
+                    "fixture evidence must be a regular file: {}",
+                    entry.path().display()
+                );
+                files.insert(
+                    entry
+                        .path()
+                        .strip_prefix(root)
+                        .expect("fixture relative path")
+                        .to_path_buf(),
+                    fs::read(entry.path()).expect("read retained fixture file"),
+                );
+            }
+        }
+    }
+    let mut files = BTreeMap::new();
+    match fs::symlink_metadata(root) {
+        Ok(metadata) => {
+            assert!(
+                metadata.is_dir(),
+                "retained fixture root must be a directory: {}",
+                root.display()
+            );
+            collect(root, root, &mut files);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("inspect retained fixture root {}: {error}", root.display()),
+    }
+    files
 }
 
 fn fixture_workspace(name: &str) -> FixtureWorkspace {
@@ -23,7 +150,7 @@ fn fixture_workspace(name: &str) -> FixtureWorkspace {
     let log_dir = root.join("logs");
     fs::create_dir_all(&log_dir).expect("log dir");
 
-    let fixture = FixtureWorkspace {
+    let mut fixture = FixtureWorkspace {
         metadata,
         beads_dir,
         workspace: BrWorkspace {
@@ -31,6 +158,7 @@ fn fixture_workspace(name: &str) -> FixtureWorkspace {
             root,
             log_dir,
         },
+        preservation_evidence: None,
     };
 
     match name {
@@ -50,6 +178,12 @@ fn fixture_workspace(name: &str) -> FixtureWorkspace {
         }
         "sidecar_wal_without_shm" => prepare_current_wal_without_shm(&fixture),
         _ => {}
+    }
+
+    if fixture.metadata.outcome_for("startup/open")
+        == Some(WorkspaceFailureCommandOutcome::FailsUnflushedPreservation)
+    {
+        fixture.preservation_evidence = Some(PreservationRefusalEvidence::capture(&fixture));
     }
 
     fixture
@@ -598,6 +732,43 @@ fn assert_config_error(run: &BrRun, needle: &str, context: &str) {
     );
 }
 
+fn assert_unflushed_preservation_refusal(fixture: &FixtureWorkspace, run: &BrRun, context: &str) {
+    assert_eq!(
+        run.status.code(),
+        Some(6),
+        "{context}: expected preservation refusal: {run:?}"
+    );
+    // Parse the entire stdout so an unnoticed warning or success preamble
+    // cannot pass as a valid structured error document.
+    let error_json: Value = serde_json::from_str(&run.stdout).unwrap_or_else(|error| {
+        panic!("{context}: stdout must be one JSON error: {error}; {run:?}")
+    });
+    assert_eq!(
+        error_json["error"]["code"], "SYNC_CONFLICT",
+        "{context}: {error_json}"
+    );
+    let message = error_json["error"]["message"]
+        .as_str()
+        .expect("preservation error message");
+    for detail in [
+        "Automatic database recovery refused",
+        "unflushed-state preservation",
+        "not replaced",
+        ".br_recovery",
+        "br doctor --repair",
+    ] {
+        assert!(
+            message.contains(detail),
+            "{context}: missing {detail:?} in {message}"
+        );
+    }
+    fixture
+        .preservation_evidence
+        .as_ref()
+        .expect("preservation refusal fixture evidence")
+        .assert_unchanged(fixture);
+}
+
 fn first_issue_id(list_json: &Value) -> String {
     list_json["issues"]
         .as_array()
@@ -931,6 +1102,9 @@ fn assert_surface_outcome(
         WorkspaceFailureCommandOutcome::FailsRepeatedRepair => {
             assert_config_error(&run, "--allow-repeated-repair", &context);
         }
+        WorkspaceFailureCommandOutcome::FailsUnflushedPreservation => {
+            assert_unflushed_preservation_refusal(fixture, &run, &context);
+        }
     }
 }
 
@@ -1019,6 +1193,13 @@ fn assert_core_read_failure(
                 &format!("{} core ready", fixture.metadata.name),
             );
         }
+        WorkspaceFailureCommandOutcome::FailsUnflushedPreservation => {
+            assert_unflushed_preservation_refusal(
+                &ready_workspace,
+                &ready,
+                &format!("{} core ready", fixture.metadata.name),
+            );
+        }
         _ => unreachable!(),
     }
 
@@ -1045,6 +1226,13 @@ fn assert_core_read_failure(
             assert_config_error(
                 &show,
                 "conflict marker",
+                &format!("{} core show", fixture.metadata.name),
+            );
+        }
+        WorkspaceFailureCommandOutcome::FailsUnflushedPreservation => {
+            assert_unflushed_preservation_refusal(
+                &show_workspace,
+                &show,
                 &format!("{} core show", fixture.metadata.name),
             );
         }
@@ -1175,6 +1363,13 @@ fn assert_core_write_failure(
                 &format!("{} core create", fixture.metadata.name),
             );
         }
+        WorkspaceFailureCommandOutcome::FailsUnflushedPreservation => {
+            assert_unflushed_preservation_refusal(
+                fixture,
+                create,
+                &format!("{} core create", fixture.metadata.name),
+            );
+        }
         other => unreachable!(
             "{} has unsupported create outcome for core write replay: {:?}",
             fixture.metadata.name, other
@@ -1265,7 +1460,8 @@ fn workspace_failure_replay_core_read_surfaces_match_expected_posture() {
                 assert_core_read_success(&where_workspace);
             }
             WorkspaceFailureCommandOutcome::FailsPrefixMismatch
-            | WorkspaceFailureCommandOutcome::FailsConflictMarkers => {
+            | WorkspaceFailureCommandOutcome::FailsConflictMarkers
+            | WorkspaceFailureCommandOutcome::FailsUnflushedPreservation => {
                 let failure = fixture
                     .metadata
                     .outcome_for("startup/open")
@@ -1311,7 +1507,8 @@ fn workspace_failure_replay_core_write_surfaces_match_expected_posture() {
                 assert_core_write_success(&workspace, &create, expected_create);
             }
             WorkspaceFailureCommandOutcome::FailsPrefixMismatch
-            | WorkspaceFailureCommandOutcome::FailsConflictMarkers => {
+            | WorkspaceFailureCommandOutcome::FailsConflictMarkers
+            | WorkspaceFailureCommandOutcome::FailsUnflushedPreservation => {
                 assert_core_write_failure(&workspace, &create, expected_create);
             }
             other => unreachable!(
@@ -1334,6 +1531,7 @@ fn infer_classification(metadata: &WorkspaceFailureFixtureMetadata) -> &'static 
             WorkspaceFailureCommandOutcome::FailsPrefixMismatch
                 | WorkspaceFailureCommandOutcome::FailsConflictMarkers
                 | WorkspaceFailureCommandOutcome::FailsInvalidJson
+                | WorkspaceFailureCommandOutcome::FailsUnflushedPreservation
         )
     );
     let startup_needs_recovery = matches!(

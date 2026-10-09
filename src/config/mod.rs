@@ -24,7 +24,7 @@ use crate::sync::{
     import_from_jsonl_snapshot, import_from_jsonl_snapshot_into_fresh_replacement,
     preflight_import_snapshot, restore_dirty_issues_after_rebuild,
     restore_tombstones_after_rebuild, scan_jsonl_snapshot_for_tombstone_filter,
-    snapshot_dirty_live_issues, snapshot_tombstones, tombstones_missing_from_jsonl_tombstones,
+    snapshot_unflushed_state, tombstones_missing_from_jsonl_tombstones,
     verify_jsonl_source_snapshot_current,
 };
 use crate::util::id::{
@@ -948,6 +948,9 @@ fn open_sqlite_storage_with_recovery_strategy(
     write_authority: Option<&Arc<crate::sync::DatabaseFamilyWriteLock>>,
 ) -> Result<SqliteRecoveryOpenResult> {
     if !paths.db_path.is_file() {
+        if recovery_strategy == JsonlRecoveryStrategy::RebuildFromJsonl {
+            require_no_unreadable_orphan_state(beads_dir, &paths.db_path)?;
+        }
         // Whether the fresh database comes from the JSONL rebuild below or
         // from the empty-replacement install, engine sidecars left behind
         // without their database must be out of the way first
@@ -1040,11 +1043,7 @@ fn open_sqlite_storage_with_recovery_strategy(
                 open_err,
                 beads_dir,
                 paths,
-                lock_timeout,
-                bootstrap_layer,
-                allow_external_jsonl,
                 recovery_strategy,
-                write_authority,
                 &prepare_fresh_storage,
             )
         }
@@ -1065,6 +1064,7 @@ fn open_when_db_file_is_missing(
 ) -> Result<SqliteRecoveryOpenResult> {
     match recovery_strategy {
         JsonlRecoveryStrategy::RebuildFromJsonl => {
+            require_no_unreadable_orphan_state(beads_dir, &paths.db_path)?;
             let (storage, recovered_jsonl) = rebuild_database_from_jsonl(
                 beads_dir,
                 paths,
@@ -1104,6 +1104,58 @@ fn open_when_db_file_is_missing(
             })
         }
     }
+}
+
+/// A missing main file is safe to reconstruct only when no orphaned WAL or
+/// rollback journal could carry unflushed state. Empty/derived sidecars can
+/// still be quarantined by the normal missing-database installation path.
+fn require_no_unreadable_orphan_state(beads_dir: &Path, db_path: &Path) -> Result<()> {
+    let warnings = missing_database_preservation_warnings(db_path);
+    if warnings.is_empty() {
+        Ok(())
+    } else {
+        Err(automatic_recovery_preservation_refusal(
+            beads_dir, db_path, &warnings,
+        ))
+    }
+}
+
+/// Capture unknown state before any missing-database sidecar quarantine.
+/// Doctor retains the same warnings across its explicit best-effort repair.
+pub(crate) fn missing_database_preservation_warnings(db_path: &Path) -> Vec<String> {
+    // `Path::is_file()` also returns false for directories and inaccessible
+    // paths. Those are not evidence that the original database is absent.
+    match fs::symlink_metadata(db_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        state => {
+            let reason = match state {
+                Ok(_) => "the database path is present rather than missing".to_string(),
+                Err(error) => format!("the database path could not be inspected ({error})"),
+            };
+            return vec![format!(
+                "{reason}; preservation of its unflushed state could not be established"
+            )];
+        }
+    }
+    let mut warnings = Vec::new();
+    for suffix in ["-wal", "-journal"] {
+        let mut name = db_path.as_os_str().to_os_string();
+        name.push(suffix);
+        let sidecar = PathBuf::from(name);
+        match fs::symlink_metadata(&sidecar) {
+            Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {}
+            Ok(_) => warnings.push(format!(
+                "the main database is missing, but orphaned sidecar '{}' is nonempty or is not a regular file; its unflushed state cannot be read",
+                sidecar.display()
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warnings.push(format!(
+                "the main database is missing and orphaned sidecar '{}' could not be inspected ({error}); preservation of unflushed state could not be established",
+                sidecar.display()
+            )),
+        }
+    }
+    warnings
 }
 
 /// Issue #228: proactively quarantine truncated WAL sidecar files before
@@ -1274,55 +1326,24 @@ fn prepare_fresh_storage_for_deferred_import(
     Ok((storage, backup_set))
 }
 
-/// Handle the `Err(open_err)` branch of the top-level open: either
-/// rebuild the DB from JSONL or, on the deferred-import strategy, move
-/// the broken DB family aside and open a fresh placeholder. The rebuild
-/// arm prefers the original open error over a recovery error unless the
-/// recovery error carries extra context worth surfacing.
-#[allow(clippy::too_many_arguments)]
+/// An unopened database cannot establish which unflushed changes need to
+/// survive a rebuild. Refuse automatic replacement; only an explicit import
+/// may move the broken family aside without a preservation snapshot.
 fn rebuild_or_defer_after_open_error(
     open_err: BeadsError,
     beads_dir: &Path,
     paths: &ConfigPaths,
-    lock_timeout: Option<u64>,
-    bootstrap_layer: &ConfigLayer,
-    allow_external_jsonl: bool,
     recovery_strategy: JsonlRecoveryStrategy,
-    write_authority: Option<&Arc<crate::sync::DatabaseFamilyWriteLock>>,
     prepare_fresh_storage: &dyn Fn() -> Result<(SqliteStorage, RecoveryBackupSet)>,
 ) -> Result<SqliteRecoveryOpenResult> {
     match recovery_strategy {
-        JsonlRecoveryStrategy::RebuildFromJsonl => {
-            match rebuild_database_from_jsonl(
-                beads_dir,
-                paths,
-                lock_timeout,
-                bootstrap_layer,
-                allow_external_jsonl,
-                write_authority,
-            ) {
-                Ok((storage, recovered_jsonl)) => Ok(SqliteRecoveryOpenResult {
-                    storage,
-                    auto_rebuilt: true,
-                    pending_recovery_backup: None,
-                    recovered_jsonl: Some(recovered_jsonl),
-                }),
-                Err(recovery_err) => {
-                    warn!(
-                        db_path = %paths.db_path.display(),
-                        jsonl_path = %paths.jsonl_path.display(),
-                        open_error = %open_err,
-                        recovery_error = %recovery_err,
-                        "Automatic database recovery from JSONL failed"
-                    );
-                    if should_surface_recovery_error(&recovery_err) {
-                        Err(recovery_err)
-                    } else {
-                        Err(open_err)
-                    }
-                }
-            }
-        }
+        JsonlRecoveryStrategy::RebuildFromJsonl => Err(automatic_recovery_preservation_refusal(
+            beads_dir,
+            &paths.db_path,
+            &[format!(
+                "the original database could not be opened ({open_err}); unflushed tombstones, dirty issues, and their relationships could not be read"
+            )],
+        )),
         JsonlRecoveryStrategy::DeferToExplicitImport => {
             warn!(
                 db_path = %paths.db_path.display(),
@@ -1338,6 +1359,26 @@ fn rebuild_or_defer_after_open_error(
                 recovered_jsonl: None,
             })
         }
+    }
+}
+
+/// Use the normal error channel (including structured JSON errors), not the
+/// release-disabled warning log, for incomplete automatic preservation.
+fn automatic_recovery_preservation_refusal(
+    beads_dir: &Path,
+    db_path: &Path,
+    warnings: &[String],
+) -> BeadsError {
+    BeadsError::SyncConflict {
+        message: format!(
+            "Automatic database recovery refused because unflushed-state preservation could not be established:\n- {}\n\
+             The database was not replaced. Keep the current database family at '{}' and any previously retained recovery files in '{}'. \
+             Run `br doctor` to inspect the damage, then use `br doctor --repair` for explicit best-effort repair and review its preservation warnings. \
+             A repair can only preserve state it can read; retained files are not proof that unreadable changes can be recovered.",
+            warnings.join("\n- "),
+            db_path.display(),
+            recovery_dir_for_db_path(db_path, beads_dir).display(),
+        ),
     }
 }
 
@@ -1366,8 +1407,8 @@ fn should_attempt_jsonl_recovery(open_err: &BeadsError, db_path: &Path, jsonl_pa
         // expects a regular file (e.g. a `-journal` directory left by a
         // hostile or interrupted tool). fsqlite reports this as a plain I/O
         // error rather than a corruption variant, but it is exactly the
-        // structural damage a JSONL rebuild repairs: recovery backs the whole
-        // family up and recreates it.
+        // structural damage an explicit JSONL rebuild can repair. Automatic
+        // recovery must first report that preservation could not be established.
         BeadsError::Database(FrankenError::Io(io_err))
             if io_err.kind() == std::io::ErrorKind::IsADirectory
     ) || matches!(
@@ -1382,8 +1423,8 @@ fn should_attempt_jsonl_recovery(open_err: &BeadsError, db_path: &Path, jsonl_pa
         open_err,
         // Schema preflight reports non-regular database-family members as a
         // fail-closed SyncConflict before fsqlite can turn them into an I/O
-        // error.  Recovery moves the blocking member into the verified backup
-        // set, so preserve the established directory-sidecar recovery path.
+        // error. Explicit recovery can move the blocking member into a verified
+        // backup set; automatic recovery reports its preservation refusal.
         BeadsError::SyncConflict { message }
             if message.starts_with("Refusing schema preflight because the ")
                 && message.ends_with(" path is not a regular file")
@@ -1483,7 +1524,7 @@ fn rebuild_or_defer_after_recoverable_anomaly(
                 db_path = %paths.db_path.display(),
                 jsonl_path = %paths.jsonl_path.display(),
                 anomaly = %anomaly,
-                "Detected recoverable database anomaly after open; rebuilding from JSONL"
+                "Detected recoverable database anomaly after open; checking preservation before JSONL rebuild"
             );
             // Snapshot tombstones from the anomalous (but still queryable)
             // storage BEFORE we drop it. The anomaly detector only flags
@@ -1553,16 +1594,11 @@ fn rebuild_or_defer_after_probe_error(
                 db_path = %paths.db_path.display(),
                 jsonl_path = %paths.jsonl_path.display(),
                 probe_error = %probe_err,
-                "Post-open database probe failed; rebuilding from JSONL"
+                "Post-open database probe failed; checking preservation before JSONL rebuild"
             );
-            // Best-effort tombstone + dirty-issue snapshot. If the probe
-            // failed the storage may be in a strange state, but the
-            // snapshot helpers are fault-tolerant (warn+empty on
-            // enumeration failure, warn+partial on per-issue failure), so
-            // we try anyway: the worst case is the same as the old
-            // behavior (no preservation), the best case is we rescue the
-            // unflushed tombstones and unflushed local edits the old code
-            // lost silently (GitHub #394).
+            // A failed probe may still leave issue rows readable. Attempt
+            // preservation, but refuse replacement if any snapshot read
+            // fails instead of treating an empty or partial set as complete.
             let (storage, recovered_jsonl) = rebuild_with_tombstone_preservation(
                 storage,
                 beads_dir,
@@ -1636,7 +1672,7 @@ fn rebuild_with_tombstone_preservation(
         &paths.jsonl_path,
     )?);
     let (preserved_tombstones, preserved_dirty_issues) =
-        preserved_unflushed_state(&storage, &source);
+        preserved_unflushed_state(&storage, &source, beads_dir, &paths.db_path)?;
     drop(storage);
     let mut storage = rebuild_database_from_jsonl_snapshot(
         beads_dir,
@@ -1736,10 +1772,9 @@ fn rebuild_database_from_jsonl_snapshot(
 /// Snapshot local tombstones and dirty live issues that have not yet been
 /// flushed to JSONL.
 ///
-/// Returns empty vectors and logs a debug/warn entry on any failure —
-/// this is a preservation path, not a correctness invariant, so we always
-/// prefer to proceed with the rebuild rather than fail the whole command
-/// because we couldn't read an issue or couldn't read the JSONL. The
+/// Every snapshot read must succeed before automatic replacement is allowed.
+/// A missing row behind an orphan dirty marker is harmless, but an unreadable
+/// row, enumeration, or relationship set requires explicit repair. The
 /// returned vectors are filtered so only state the JSONL cannot reproduce
 /// survives: tombstones not already flushed as tombstones, and dirty live
 /// issues whose row is absent from the JSONL or strictly newer than its
@@ -1748,11 +1783,21 @@ fn rebuild_database_from_jsonl_snapshot(
 fn preserved_unflushed_state(
     storage: &SqliteStorage,
     source: &JsonlSourceSnapshot,
-) -> (Vec<PreservedIssue>, Vec<PreservedIssue>) {
-    let tombstone_snapshot = snapshot_tombstones(storage);
-    let dirty_snapshot = snapshot_dirty_live_issues(storage);
+    beads_dir: &Path,
+    db_path: &Path,
+) -> Result<(Vec<PreservedIssue>, Vec<PreservedIssue>)> {
+    let snapshot = snapshot_unflushed_state(storage);
+    if !snapshot.warnings.is_empty() {
+        return Err(automatic_recovery_preservation_refusal(
+            beads_dir,
+            db_path,
+            &snapshot.warnings,
+        ));
+    }
+    let tombstone_snapshot = snapshot.tombstones;
+    let dirty_snapshot = snapshot.dirty;
     if tombstone_snapshot.is_empty() && dirty_snapshot.is_empty() {
-        return (tombstone_snapshot, dirty_snapshot);
+        return Ok((tombstone_snapshot, dirty_snapshot));
     }
     let jsonl_filter = match scan_jsonl_snapshot_for_tombstone_filter(source) {
         Ok(filter) => filter,
@@ -1769,10 +1814,10 @@ fn preserved_unflushed_state(
             JsonlTombstoneFilter::default()
         }
     };
-    (
+    Ok((
         tombstones_missing_from_jsonl_tombstones(tombstone_snapshot, &jsonl_filter),
         dirty_issues_missing_from_jsonl(dirty_snapshot, &jsonl_filter),
-    )
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1990,19 +2035,6 @@ fn repair_database_from_jsonl_snapshot_with_import_config_under_write_authority_
         "SQLite rebuild from JSONL succeeded"
     );
     Ok((storage, import_result, backup_set))
-}
-
-fn should_surface_recovery_error(recovery_err: &BeadsError) -> bool {
-    matches!(recovery_err, BeadsError::WithContext { .. })
-        || is_symlinked_database_recovery_error(recovery_err)
-}
-
-fn is_symlinked_database_recovery_error(error: &BeadsError) -> bool {
-    matches!(
-        error,
-        BeadsError::Config(message)
-            if message.starts_with(SYMLINKED_DB_RECOVERY_ERROR_PREFIX)
-    )
 }
 
 fn reject_symlinked_database_path_for_recovery(db_path: &Path) -> Result<()> {
@@ -4429,13 +4461,6 @@ impl OpenStorageResult {
                 })?;
         write_authority.verify_database_authority()?;
 
-        // Preserve any attribution staged on the storage being replaced so the
-        // post-recovery retry can still stamp it (#312 hardening, F1). The
-        // failed first write did NOT commit, so `mutate()` left the staged value
-        // intact — but recovery swaps in a brand-new `SqliteStorage`, which would
-        // otherwise start with an empty pending slot and drop the attribution.
-        let preserved_attribution = self.storage.take_pending_event_attribution();
-        let preserved_workflow_policy = self.storage.workflow_policy();
         let import_config = import_config_for_resolved_jsonl(
             &self.paths.beads_dir,
             &self.paths.db_path,
@@ -4456,14 +4481,24 @@ impl OpenStorageResult {
         let source = Arc::new(crate::sync::capture_jsonl_source_snapshot(
             &self.paths.jsonl_path,
         )?);
-        let (preserved_tombstones, preserved_dirty_issues) =
-            preserved_unflushed_state(&self.storage, &source);
+        let (preserved_tombstones, preserved_dirty_issues) = preserved_unflushed_state(
+            &self.storage,
+            &source,
+            &self.paths.beads_dir,
+            &self.paths.db_path,
+        )?;
+
+        // Leave the original handle and staged attribution intact on every
+        // preservation refusal, including failure to prepare the sentinel.
+        let replacement_storage = SqliteStorage::open_memory()?;
+        let preserved_attribution = self.storage.take_pending_event_attribution();
+        let preserved_workflow_policy = self.storage.workflow_policy();
 
         // Close the old connection before rebuilding at the same path.
         // fsqlite tracks pages by file path, so keeping the old connection
         // open while creating a new database at the same path causes
         // BusySnapshot conflicts.
-        self.storage = SqliteStorage::open_memory()?;
+        self.storage = replacement_storage;
 
         let (storage, _, backup_set) =
             repair_database_from_jsonl_snapshot_with_import_config_deferred(
@@ -7516,6 +7551,7 @@ mod tests {
     use crate::franken_sync::Connection;
     use crate::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
+    use crate::storage::sqlite::database_family_snapshot;
     use chrono::Utc;
     use tempfile::TempDir;
 
@@ -7641,12 +7677,22 @@ mod tests {
         storage
             .set_config("issue_prefix", "bd")
             .expect("seed issue prefix");
+        storage
+            .create_issue(
+                &Issue {
+                    id: "bd-unflushed-schema".to_string(),
+                    title: "DB-only issue before the schema damage".to_string(),
+                    ..Issue::default()
+                },
+                "tester",
+            )
+            .expect("seed unflushed local issue absent from JSONL");
         drop(storage);
 
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open setup db");
         crate::storage::schema::execute_batch(
             &conn,
-            "DROP TABLE blocked_issues_cache;
+            "ALTER TABLE blocked_issues_cache RENAME TO retained_blocked_issues_cache;
             CREATE TABLE blocked_issues_cache (
                 issue_id TEXT PRIMARY KEY,
                 blocked_by TEXT NOT NULL,
@@ -7655,6 +7701,16 @@ mod tests {
             INSERT INTO config (key, value) VALUES ('issue_prefix', 'bd');",
         )
         .expect("create malformed blocked_issues_cache schema");
+        let checkpoint = conn
+            .query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint retained malformed schema fixture");
+        assert_eq!(
+            checkpoint[0]
+                .get(0)
+                .and_then(fsqlite_types::SqliteValue::as_integer),
+            Some(0)
+        );
+        conn.close().expect("close malformed schema fixture");
     }
 
     fn insert_duplicate_issue_prefix_config_row(db_path: &Path, value: &str) {
@@ -9774,9 +9830,9 @@ routing:
     }
 
     #[test]
-    fn open_storage_with_cli_recovers_corrupt_db_from_valid_jsonl() {
-        let temp = TempDir::new().expect("tempdir");
-        let beads_dir = temp.path().join(".beads");
+    fn open_storage_with_cli_refuses_unreadable_db_even_with_valid_jsonl() {
+        let retained = TempDir::new().expect("tempdir").keep();
+        let beads_dir = retained.join(".beads");
         let db_path = beads_dir.join("beads.db");
         let jsonl_path = beads_dir.join("issues.jsonl");
         fs::create_dir_all(&beads_dir).expect("create beads dir");
@@ -9784,50 +9840,138 @@ routing:
         fs::write(&db_path, b"not a sqlite database").expect("write corrupt db");
         write_single_issue_jsonl(&jsonl_path, "bd-recover1", "Recovered from JSONL");
 
-        let storage_ctx =
+        let jsonl_before = fs::read(&jsonl_path).expect("read JSONL");
+        for _ in 0..2 {
+            let error = open_storage_with_cli(&beads_dir, &CliOverrides::default())
+                .expect_err("unreadable database must require explicit repair");
+            assert!(matches!(error, BeadsError::SyncConflict { .. }));
+            let message = error.to_string();
+            assert!(
+                message.contains("Automatic database recovery refused"),
+                "{message}"
+            );
+            assert!(message.contains("could not be opened"), "{message}");
+            assert!(message.contains("br doctor --repair"), "{message}");
+            assert!(message.contains(".br_recovery"), "{message}");
+            assert_eq!(fs::read(&db_path).unwrap(), b"not a sqlite database");
+            assert_eq!(fs::read(&jsonl_path).unwrap(), jsonl_before);
+            assert!(!beads_dir.join(RECOVERY_DIR_NAME).exists());
+        }
+    }
+
+    /// Keep a real on-disk database with a dirty row that no Issue reader can
+    /// decode. JSONL still contains its earlier valid version, so replacement
+    /// would hide the unreadable local edit rather than repair it.
+    fn retained_unreadable_dirty_context() -> OpenStorageResult {
+        let retained = TempDir::new().expect("tempdir").keep();
+        let beads_dir = retained.join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let mut context =
             open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
-        let issue = storage_ctx
+        let issue = Issue {
+            id: "bd-unreadable".to_string(),
+            title: "Before the unflushed edit".to_string(),
+            ..Issue::default()
+        };
+        context
             .storage
-            .get_issue("bd-recover1")
-            .expect("query issue")
-            .expect("issue should exist after recovery");
-
-        assert_eq!(issue.title, "Recovered from JSONL");
-        assert!(!storage_ctx.no_db);
-        assert!(db_path.is_file(), "recovered database should exist");
-
-        let recovery_dir = beads_dir.join(RECOVERY_DIR_NAME);
-        let backups: Vec<_> = fs::read_dir(&recovery_dir)
-            .expect("list recovery dir")
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            backups.iter().any(|name| {
-                name.starts_with("beads.db.")
-                    && Path::new(name)
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("bak"))
-            }),
-            "original database should be preserved in the recovery directory"
-        );
-
-        drop(storage_ctx);
-
-        let reopened_ctx =
-            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("reopen storage");
-        let reopened_issue = reopened_ctx
+            .create_issue(&issue, "test")
+            .expect("create issue");
+        write_issue_jsonl(&context.paths.jsonl_path, &issue);
+        context.storage.execute_raw(
+            "UPDATE issues SET title = 'Unflushed local edit', updated_at = 'damaged timestamp' WHERE id = 'bd-unreadable'",
+        ).expect("damage the dirty issue row");
+        assert!(context.storage.get_issue(&issue.id).is_err());
+        assert!(context.storage.get_issues_by_ids(&[issue.id]).is_err());
+        let checkpoint = context
             .storage
-            .get_issue("bd-recover1")
-            .expect("query reopened issue")
-            .expect("issue should remain readable after reopening");
-        assert_eq!(reopened_issue.title, "Recovered from JSONL");
+            .execute_raw_query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint the damaged fixture without removing sidecars");
+        assert_eq!(checkpoint[0][0].as_integer(), Some(0), "{checkpoint:?}");
+        context
     }
 
     #[test]
-    fn open_storage_with_cli_recovers_malformed_schema_db_from_valid_jsonl() {
-        let temp = TempDir::new().expect("tempdir");
-        let beads_dir = temp.path().join(".beads");
+    fn automatic_mutation_recovery_refuses_before_consuming_pending_state() {
+        let mut context = retained_unreadable_dirty_context();
+        let attribution = crate::storage::EventAttribution::new(
+            Some("preservation-agent"),
+            Some("preservation-harness"),
+            Some("preservation-model"),
+            Some("preservation-session"),
+        );
+        context
+            .storage
+            .set_pending_event_attribution(attribution.clone());
+        let workflow = crate::close_policy::Workflow {
+            strict: true,
+            statuses: vec!["open".to_string(), "blocked".to_string()],
+            ..crate::close_policy::Workflow::default()
+        };
+        context.storage.set_workflow_policy(workflow.clone());
+        let before = database_family_snapshot(&context.paths.db_path).expect("snapshot family");
+        let jsonl_before = fs::read(&context.paths.jsonl_path).unwrap();
+
+        let error = context
+            .recover_database_from_jsonl()
+            .expect_err("unreadable dirty state must prevent replacement");
+
+        assert!(matches!(error, BeadsError::SyncConflict { .. }));
+        assert!(error.to_string().contains("bd-unreadable"), "{error}");
+        assert!(error.to_string().contains("br doctor --repair"), "{error}");
+        assert_eq!(
+            context.storage.pending_event_attribution_for_review(),
+            attribution
+        );
+        assert_eq!(context.storage.workflow_policy(), workflow);
+        assert!(!context.auto_rebuilt);
+        assert!(context.pending_recovery_backup.is_none());
+        assert_eq!(
+            database_family_snapshot(&context.paths.db_path).unwrap(),
+            before
+        );
+        assert_eq!(fs::read(&context.paths.jsonl_path).unwrap(), jsonl_before);
+        assert!(
+            !recovery_dir_for_db_path(&context.paths.db_path, &context.paths.beads_dir).exists()
+        );
+        assert!(
+            context.storage.get_issue("bd-unreadable").is_err(),
+            "the original persistent handle must remain installed"
+        );
+    }
+
+    #[test]
+    fn automatic_probe_error_recovery_refuses_incomplete_preservation() {
+        let context = retained_unreadable_dirty_context();
+        let db_path = context.paths.db_path.clone();
+        let beads_dir = context.paths.beads_dir.clone();
+        let before = fs::read(&db_path).unwrap();
+        let probe_error = BeadsError::Database(FrankenError::DatabaseCorrupt {
+            detail: "damaged startup probe page".to_string(),
+        });
+        let error = rebuild_or_defer_after_probe_error(
+            context.storage,
+            &probe_error,
+            &beads_dir,
+            &context.paths,
+            context.resolved_lock_timeout,
+            &context.bootstrap_layer,
+            context.allow_external_jsonl,
+            JsonlRecoveryStrategy::RebuildFromJsonl,
+            context.write_authority.as_ref(),
+            &|| panic!("automatic refusal must not prepare fresh storage"),
+        )
+        .expect_err("failed probe must not bypass preservation");
+        assert!(matches!(error, BeadsError::SyncConflict { .. }));
+        assert!(error.to_string().contains("bd-unreadable"), "{error}");
+        assert_eq!(fs::read(&db_path).unwrap(), before);
+        assert!(!recovery_dir_for_db_path(&db_path, &beads_dir).exists());
+    }
+
+    #[test]
+    fn open_storage_with_cli_refuses_malformed_schema_even_with_valid_jsonl() {
+        let retained = TempDir::new().expect("tempdir").keep();
+        let beads_dir = retained.join(".beads");
         let db_path = beads_dir.join("beads.db");
         let jsonl_path = beads_dir.join("issues.jsonl");
         fs::create_dir_all(&beads_dir).expect("create beads dir");
@@ -9839,39 +9983,74 @@ routing:
             "Recovered from malformed schema DB",
         );
 
-        let storage_ctx =
-            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
-        let issue = storage_ctx
-            .storage
-            .get_issue("bd-rmalf1")
-            .expect("query issue")
-            .expect("issue should exist after malformed-schema recovery");
-
-        assert_eq!(issue.title, "Recovered from malformed schema DB");
-        assert!(!storage_ctx.no_db);
-        assert!(db_path.is_file(), "recovered database should exist");
-
-        let recovery_dir = beads_dir.join(RECOVERY_DIR_NAME);
-        let backups: Vec<_> = fs::read_dir(&recovery_dir)
-            .expect("list recovery dir")
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        let jsonl_before = fs::read(&jsonl_path).unwrap();
+        let family_before: Vec<_> = database_family_paths(&db_path)
+            .into_iter()
+            .filter(|path| path.is_file())
             .collect();
+        #[cfg(unix)]
+        let database_before = fs::metadata(&db_path).unwrap();
+
+        // This table lacks the canonical foreign key. Runtime attestation
+        // rejects the storage open, so a successful issue snapshot cannot be
+        // established even though the JSONL and local issue pages are intact.
+        let error = open_storage_with_cli(&beads_dir, &CliOverrides::default())
+            .expect_err("malformed schema must require explicit repair");
+        assert!(matches!(error, BeadsError::SyncConflict { .. }));
+        let message = error.to_string();
+        for diagnostic in [
+            "Automatic database recovery refused",
+            "could not be opened",
+            "unflushed",
+            "br doctor --repair",
+            ".br_recovery",
+        ] {
+            assert!(message.contains(diagnostic), "{message}");
+        }
         assert!(
-            backups.iter().any(|name| {
-                name.starts_with("beads.db.")
-                    && Path::new(name)
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("bak"))
-            }),
-            "malformed original database should be preserved in the recovery directory"
+            message.contains(&db_path.display().to_string()),
+            "{message}"
+        );
+        for path in family_before {
+            assert!(
+                path.is_file(),
+                "original family member moved: {}",
+                path.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let after = fs::metadata(&db_path).unwrap();
+            assert_eq!(
+                (after.dev(), after.ino()),
+                (database_before.dev(), database_before.ino())
+            );
+        }
+        assert_eq!(fs::read(&jsonl_path).unwrap(), jsonl_before);
+        assert!(!beads_dir.join(RECOVERY_DIR_NAME).exists());
+        let conn = Connection::open(db_path.to_string_lossy().into_owned())
+            .expect("raw reader can still inspect retained issue pages");
+        let rows = conn
+            .query("SELECT id, title FROM issues WHERE id = 'bd-unflushed-schema'")
+            .expect("read retained local issue");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get(1).and_then(fsqlite_types::SqliteValue::as_text),
+            Some("DB-only issue before the schema damage")
+        );
+        assert!(
+            !jsonl_before
+                .windows("bd-unflushed-schema".len())
+                .any(|bytes| bytes == b"bd-unflushed-schema"),
+            "JSONL rebuild would omit the retained local issue"
         );
     }
 
     #[test]
-    fn open_storage_with_cli_recovers_malformed_schema_db_with_in_progress_issue() {
-        let temp = TempDir::new().expect("tempdir");
-        let beads_dir = temp.path().join(".beads");
+    fn open_storage_with_cli_refuses_malformed_schema_with_in_progress_jsonl_issue() {
+        let retained = TempDir::new().expect("tempdir").keep();
+        let beads_dir = retained.join(".beads");
         let db_path = beads_dir.join("beads.db");
         let jsonl_path = beads_dir.join("issues.jsonl");
         fs::create_dir_all(&beads_dir).expect("create beads dir");
@@ -9897,13 +10076,70 @@ routing:
         };
         write_issue_jsonl(&jsonl_path, &issue);
 
-        let storage_ctx =
-            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
-        let recovered_issue = storage_ctx
-            .storage
+        let jsonl_before = fs::read(&jsonl_path).unwrap();
+        let family_before: Vec<_> = database_family_paths(&db_path)
+            .into_iter()
+            .filter(|path| path.is_file())
+            .collect();
+        #[cfg(unix)]
+        let database_before = fs::metadata(&db_path).unwrap();
+        let error = open_storage_with_cli(&beads_dir, &CliOverrides::default())
+            .expect_err("special JSONL fields do not establish original DB preservation");
+        assert!(matches!(error, BeadsError::SyncConflict { .. }));
+        let message = error.to_string();
+        for diagnostic in [
+            "Automatic database recovery refused",
+            "could not be opened",
+            "br doctor --repair",
+            ".br_recovery",
+        ] {
+            assert!(message.contains(diagnostic), "{message}");
+        }
+        for path in family_before {
+            assert!(
+                path.is_file(),
+                "original family member moved: {}",
+                path.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let after = fs::metadata(&db_path).unwrap();
+            assert_eq!(
+                (after.dev(), after.ino()),
+                (database_before.dev(), database_before.ino())
+            );
+        }
+        assert_eq!(fs::read(&jsonl_path).unwrap(), jsonl_before);
+        assert!(!beads_dir.join(RECOVERY_DIR_NAME).exists());
+
+        // Explicit doctor repair uses this same snapshot-based installation
+        // helper. It remains available after automatic recovery refuses.
+        let jsonl_authority =
+            crate::sync::blocking_jsonl_family_write_lock_with_timeout(&jsonl_path, None)
+                .expect("explicit repair JSONL authority");
+        let source = crate::sync::capture_jsonl_source_snapshot(&jsonl_path)
+            .expect("explicit repair JSONL snapshot");
+        let (storage, _, backups) = repair_database_from_jsonl_snapshot(
+            &beads_dir,
+            &db_path,
+            None,
+            &ConfigLayer::default(),
+            false,
+            false,
+            &source,
+            &jsonl_authority,
+        )
+        .expect("explicit malformed-schema repair remains available");
+        assert!(
+            !backups.is_empty(),
+            "explicit repair must retain the old family"
+        );
+        let recovered_issue = storage
             .get_issue("beads_rust-3h0h")
             .expect("query issue")
-            .expect("issue should exist after malformed-schema recovery");
+            .expect("issue should exist after explicit malformed-schema repair");
 
         assert_eq!(
             recovered_issue.title,
@@ -9918,7 +10154,8 @@ routing:
 
     #[test]
     fn open_storage_with_cli_recovers_when_post_open_probe_finds_duplicate_config_rows() {
-        let temp = TempDir::new().expect("tempdir");
+        let mut temp = TempDir::new().expect("tempdir");
+        temp.disable_cleanup(true);
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
         let jsonl_path = beads_dir.join("issues.jsonl");
@@ -10367,7 +10604,8 @@ routing:
 
     #[test]
     fn deferred_recovery_restore_reopens_original_database_family() {
-        let temp = TempDir::new().expect("tempdir");
+        let mut temp = TempDir::new().expect("tempdir");
+        temp.disable_cleanup(true);
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
         let jsonl_path = beads_dir.join("issues.jsonl");
@@ -10431,7 +10669,8 @@ routing:
 
     #[test]
     fn deferred_recovery_restore_rejects_changed_verified_backup_without_touching_live_db() {
-        let temp = TempDir::new().expect("tempdir");
+        let mut temp = TempDir::new().expect("tempdir");
+        temp.disable_cleanup(true);
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
         let jsonl_path = beads_dir.join("issues.jsonl");
@@ -10499,7 +10738,8 @@ routing:
 
     #[test]
     fn deferred_recovery_restore_for_missing_db_cleans_up_fresh_database_family() {
-        let temp = TempDir::new().expect("tempdir");
+        let mut temp = TempDir::new().expect("tempdir");
+        temp.disable_cleanup(true);
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
         let jsonl_path = beads_dir.join("issues.jsonl");
@@ -10870,10 +11110,10 @@ routing:
     }
 
     #[test]
-    fn open_storage_with_cli_recovers_using_resolved_external_jsonl() {
-        let temp = TempDir::new().expect("tempdir");
-        let beads_dir = temp.path().join(".beads");
-        let external_dir = temp.path().join("external-store");
+    fn open_storage_with_cli_refuses_unreadable_db_with_resolved_external_jsonl() {
+        let retained = TempDir::new().expect("tempdir").keep();
+        let beads_dir = retained.join(".beads");
+        let external_dir = retained.join("external-store");
         let db_path = external_dir.join("beads.db");
         let jsonl_path = external_dir.join("issues.jsonl");
         fs::create_dir_all(&beads_dir).expect("create beads dir");
@@ -10883,24 +11123,28 @@ routing:
         write_single_issue_jsonl(&jsonl_path, "bd-rxtrn1", "Recovered from external JSONL");
 
         let cli = CliOverrides {
-            db: Some(db_path),
+            db: Some(db_path.clone()),
             ..CliOverrides::default()
         };
-        let storage_ctx = open_storage_with_cli(&beads_dir, &cli).expect("storage");
-        let issue = storage_ctx
-            .storage
-            .get_issue("bd-rxtrn1")
-            .expect("query issue")
-            .expect("issue should exist after recovery");
-
-        assert_eq!(issue.title, "Recovered from external JSONL");
-        assert_eq!(storage_ctx.paths.jsonl_path, jsonl_path);
+        let jsonl_before = fs::read(&jsonl_path).unwrap();
+        let error = open_storage_with_cli(&beads_dir, &cli)
+            .expect_err("external JSONL does not establish preservation of an unreadable DB");
+        assert!(matches!(error, BeadsError::SyncConflict { .. }));
+        assert!(error.to_string().contains("br doctor --repair"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains(&external_dir.join(RECOVERY_DIR_NAME).display().to_string()),
+            "{error}"
+        );
+        assert_eq!(fs::read(&db_path).unwrap(), b"not a sqlite database");
+        assert_eq!(fs::read(&jsonl_path).unwrap(), jsonl_before);
     }
 
     #[test]
     fn open_storage_with_cli_rebuilds_missing_db_from_jsonl() {
-        let temp = TempDir::new().expect("tempdir");
-        let beads_dir = temp.path().join(".beads");
+        let retained = TempDir::new().expect("tempdir").keep();
+        let beads_dir = retained.join(".beads");
         let db_path = beads_dir.join("beads.db");
         let jsonl_path = beads_dir.join("issues.jsonl");
         fs::create_dir_all(&beads_dir).expect("create beads dir");
@@ -10917,6 +11161,109 @@ routing:
 
         assert_eq!(issue.title, "Recovered from JSONL only");
         assert!(db_path.is_file(), "database should be rebuilt from JSONL");
+    }
+
+    #[test]
+    fn automatic_missing_db_recovery_refuses_orphaned_data_on_both_open_lanes() {
+        for fast_open in [false, true] {
+            for suffix in ["-wal", "-journal"] {
+                let retained = TempDir::new().expect("tempdir").keep();
+                let beads_dir = retained.join(".beads");
+                fs::create_dir_all(&beads_dir).unwrap();
+                let db_path = beads_dir.join("beads.db");
+                let jsonl_path = beads_dir.join("issues.jsonl");
+                write_single_issue_jsonl(&jsonl_path, "bd-source", "Flushed issue");
+                let sidecar = beads_dir.join(format!("beads.db{suffix}"));
+                fs::write(&sidecar, b"unreadable orphaned database state").unwrap();
+                let jsonl_before = fs::read(&jsonl_path).unwrap();
+                let cli = CliOverrides {
+                    read_only_fast_open: fast_open,
+                    ..CliOverrides::default()
+                };
+
+                let error = open_storage_with_cli(&beads_dir, &cli)
+                    .expect_err("unreadable orphaned state must require explicit repair");
+
+                assert!(matches!(error, BeadsError::SyncConflict { .. }));
+                assert!(error.to_string().contains("orphaned sidecar"), "{error}");
+                assert!(error.to_string().contains(suffix), "{error}");
+                assert!(error.to_string().contains("br doctor --repair"), "{error}");
+                assert!(!db_path.exists(), "refusal must not install a blank DB");
+                assert_eq!(
+                    fs::read(&sidecar).unwrap(),
+                    b"unreadable orphaned database state"
+                );
+                assert_eq!(fs::read(&jsonl_path).unwrap(), jsonl_before);
+                assert!(!beads_dir.join(RECOVERY_DIR_NAME).exists());
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_missing_db_recovery_accepts_empty_data_sidecars() {
+        let retained = TempDir::new().expect("tempdir").keep();
+        let beads_dir = retained.join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        write_single_issue_jsonl(
+            &beads_dir.join("issues.jsonl"),
+            "bd-empty-wal",
+            "Flushed issue",
+        );
+        for suffix in ["-wal", "-journal"] {
+            fs::write(beads_dir.join(format!("beads.db{suffix}")), b"").unwrap();
+        }
+        let context = open_storage_with_cli(&beads_dir, &CliOverrides::default())
+            .expect("empty sidecars carry no unflushed rows");
+        assert!(context.auto_rebuilt);
+        assert_eq!(
+            context
+                .storage
+                .get_issue("bd-empty-wal")
+                .unwrap()
+                .unwrap()
+                .title,
+            "Flushed issue"
+        );
+        assert!(db_path.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_missing_db_recovery_does_not_treat_dangling_sidecars_as_absent() {
+        let retained = TempDir::new().expect("tempdir").keep();
+        let beads_dir = retained.join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let journal = beads_dir.join("beads.db-journal");
+        let target = retained.join("missing-journal");
+        std::os::unix::fs::symlink(&target, &journal).unwrap();
+        let error = require_no_unreadable_orphan_state(&beads_dir, &db_path)
+            .expect_err("a dangling symlink is unknown state");
+        assert!(error.to_string().contains("orphaned sidecar"), "{error}");
+        assert_eq!(fs::read_link(journal).unwrap(), target);
+        assert!(!db_path.exists());
+        assert!(!beads_dir.join(RECOVERY_DIR_NAME).exists());
+    }
+
+    #[test]
+    fn automatic_missing_db_recovery_does_not_treat_a_directory_as_absent() {
+        let retained = TempDir::new().expect("tempdir").keep();
+        let beads_dir = retained.join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        fs::create_dir_all(&db_path).unwrap();
+        fs::write(db_path.join("retained-data"), b"original database family").unwrap();
+        let error = require_no_unreadable_orphan_state(&beads_dir, &db_path)
+            .expect_err("an existing non-file path is not an absent database");
+        assert!(
+            error.to_string().contains("present rather than missing"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(db_path.join("retained-data")).unwrap(),
+            b"original database family"
+        );
+        assert!(!beads_dir.join(RECOVERY_DIR_NAME).exists());
     }
 
     #[test]
@@ -11154,8 +11501,8 @@ routing:
 
     #[test]
     fn missing_db_recovery_quarantines_orphaned_fsqlite_sidecars() {
-        let temp = TempDir::new().expect("tempdir");
-        let beads_dir = temp.path().join(".beads");
+        let retained = TempDir::new().expect("tempdir").keep();
+        let beads_dir = retained.join(".beads");
         let db_path = beads_dir.join("beads.db");
         let jsonl_path = beads_dir.join("issues.jsonl");
         fs::create_dir_all(&beads_dir).expect("create beads dir");
@@ -11222,7 +11569,8 @@ routing:
 
     #[test]
     fn read_only_fast_open_miss_waits_for_write_lock_before_rebuild() {
-        let temp = TempDir::new().expect("tempdir");
+        let mut temp = TempDir::new().expect("tempdir");
+        temp.disable_cleanup(true);
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
         let jsonl_path = beads_dir.join("issues.jsonl");
@@ -11248,7 +11596,8 @@ routing:
 
     #[test]
     fn read_only_fast_open_miss_reuses_caller_write_lock_before_rebuild() {
-        let temp = TempDir::new().expect("tempdir");
+        let mut temp = TempDir::new().expect("tempdir");
+        temp.disable_cleanup(true);
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
         let jsonl_path = beads_dir.join("issues.jsonl");
@@ -11856,7 +12205,8 @@ routing:
 
     #[test]
     fn repair_database_replay_preserves_explicit_external_jsonl_allowance() {
-        let temp = TempDir::new().expect("tempdir");
+        let mut temp = TempDir::new().expect("tempdir");
+        temp.disable_cleanup(true);
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
         let external_dir = temp.path().join("external-store");
@@ -12151,9 +12501,9 @@ routing:
     }
 
     #[test]
-    fn open_storage_with_cli_backs_up_non_file_sidecars_that_block_recovery() {
-        let temp = TempDir::new().expect("tempdir");
-        let beads_dir = temp.path().join(".beads");
+    fn open_storage_with_cli_retains_non_file_sidecars_when_preservation_is_unknown() {
+        let retained = TempDir::new().expect("tempdir").keep();
+        let beads_dir = retained.join(".beads");
         let db_path = beads_dir.join("beads.db");
         let wal_dir = beads_dir.join("beads.db-wal");
         let jsonl_path = beads_dir.join("issues.jsonl");
@@ -12163,46 +12513,15 @@ routing:
         write_single_issue_jsonl(&jsonl_path, "bd-recover2", "Recovered with odd sidecar");
         fs::write(wal_dir.join("sentinel.txt"), "keep me").expect("write sentinel");
 
-        let storage_ctx =
-            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
-        let issue = storage_ctx
-            .storage
-            .get_issue("bd-recover2")
-            .expect("query issue")
-            .expect("issue should exist after recovery");
-
-        assert_eq!(issue.title, "Recovered with odd sidecar");
-        assert!(
-            !wal_dir.join("sentinel.txt").exists(),
-            "the original blocking wal directory should be moved away rather than reused in place"
-        );
-
-        let recovery_dir = beads_dir.join(RECOVERY_DIR_NAME);
-        let wal_backups: Vec<_> = fs::read_dir(&recovery_dir)
-            .expect("list recovery dir")
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.starts_with("beads.db-wal.")
-                            && Path::new(name)
-                                .extension()
-                                .is_some_and(|ext| ext.eq_ignore_ascii_case("bak"))
-                    })
-            })
-            .collect();
-        let sentinel_backup_count = wal_backups
-            .iter()
-            .filter(|path| {
-                fs::read_to_string(path.join("sentinel.txt")).is_ok_and(|text| text == "keep me")
-            })
-            .count();
+        let error = open_storage_with_cli(&beads_dir, &CliOverrides::default())
+            .expect_err("unreadable family must not be replaced automatically");
+        assert!(error.to_string().contains("br doctor --repair"), "{error}");
+        assert_eq!(fs::read(&db_path).unwrap(), b"not a sqlite database");
         assert_eq!(
-            sentinel_backup_count, 1,
-            "original wal directory sentinel backup count among {wal_backups:?}"
+            fs::read_to_string(wal_dir.join("sentinel.txt")).unwrap(),
+            "keep me"
         );
+        assert!(!beads_dir.join(RECOVERY_DIR_NAME).exists());
     }
 
     #[test]
@@ -12236,9 +12555,9 @@ routing:
     }
 
     #[test]
-    fn open_storage_with_cli_backs_up_rollback_journal_sidecars_during_recovery() {
-        let temp = TempDir::new().expect("tempdir");
-        let beads_dir = temp.path().join(".beads");
+    fn open_storage_with_cli_retains_rollback_journal_when_preservation_is_unknown() {
+        let retained = TempDir::new().expect("tempdir").keep();
+        let beads_dir = retained.join(".beads");
         let db_path = beads_dir.join("beads.db");
         let journal_dir = beads_dir.join("beads.db-journal");
         let jsonl_path = beads_dir.join("issues.jsonl");
@@ -12248,52 +12567,21 @@ routing:
         write_single_issue_jsonl(&jsonl_path, "bd-rjrnl1", "Recovered with journal");
         fs::write(journal_dir.join("sentinel.txt"), "keep me").expect("write sentinel");
 
-        let storage_ctx =
-            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
-        let issue = storage_ctx
-            .storage
-            .get_issue("bd-rjrnl1")
-            .expect("query issue")
-            .expect("issue should exist after recovery");
-
-        assert_eq!(issue.title, "Recovered with journal");
-        assert!(
-            !journal_dir.join("sentinel.txt").exists(),
-            "the original rollback journal sidecar should be moved out of the way during recovery"
-        );
-
-        let recovery_dir = beads_dir.join(RECOVERY_DIR_NAME);
-        let journal_backups: Vec<_> = fs::read_dir(&recovery_dir)
-            .expect("list recovery dir")
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.starts_with("beads.db-journal.")
-                            && Path::new(name)
-                                .extension()
-                                .is_some_and(|ext| ext.eq_ignore_ascii_case("bak"))
-                    })
-            })
-            .collect();
+        let error = open_storage_with_cli(&beads_dir, &CliOverrides::default())
+            .expect_err("unreadable family must not be replaced automatically");
+        assert!(error.to_string().contains("br doctor --repair"), "{error}");
+        assert_eq!(fs::read(&db_path).unwrap(), b"not a sqlite database");
         assert_eq!(
-            journal_backups.len(),
-            1,
-            "rollback journal should be backed up once"
-        );
-        assert_eq!(
-            fs::read_to_string(journal_backups[0].join("sentinel.txt"))
-                .expect("read backed-up sentinel"),
+            fs::read_to_string(journal_dir.join("sentinel.txt")).unwrap(),
             "keep me"
         );
+        assert!(!beads_dir.join(RECOVERY_DIR_NAME).exists());
     }
 
     #[test]
     fn open_storage_with_cli_does_not_recover_from_invalid_jsonl() {
-        let temp = TempDir::new().expect("tempdir");
-        let beads_dir = temp.path().join(".beads");
+        let retained = TempDir::new().expect("tempdir").keep();
+        let beads_dir = retained.join(".beads");
         let db_path = beads_dir.join("beads.db");
         let jsonl_path = beads_dir.join("issues.jsonl");
         fs::create_dir_all(&beads_dir).expect("create beads dir");
@@ -12304,8 +12592,8 @@ routing:
         let err =
             open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect_err("should fail");
         assert!(
-            matches!(err, BeadsError::Database(_)),
-            "invalid JSONL should preserve the original database open error"
+            matches!(err, BeadsError::SyncConflict { .. }),
+            "an unreadable original must be refused before attempting JSONL recovery"
         );
         assert!(
             db_path.is_file(),
@@ -12794,7 +13082,7 @@ routing:
             "missing backup should surface a contextual recovery error"
         );
         assert!(
-            should_surface_recovery_error(&err),
+            matches!(err, BeadsError::WithContext { .. }),
             "missing backup during restore should not be hidden behind the original open error"
         );
         assert!(

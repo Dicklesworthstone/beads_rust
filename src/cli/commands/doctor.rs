@@ -25,7 +25,7 @@ use crate::sync::{
     capture_jsonl_source_snapshot, compute_staleness, dirty_issues_missing_from_jsonl,
     restore_dirty_issues_after_rebuild, restore_tombstones_after_rebuild, scan_conflict_markers,
     scan_conflict_markers_snapshot, scan_jsonl_snapshot_for_tombstone_filter,
-    snapshot_dirty_live_issues, snapshot_tombstones, tombstones_missing_from_jsonl_tombstones,
+    snapshot_unflushed_state, tombstones_missing_from_jsonl_tombstones,
     validate_jsonl_issue_records, validate_jsonl_snapshot_issue_records, validate_no_git_path,
     validate_sync_path, validate_sync_path_with_external,
 };
@@ -34,7 +34,7 @@ use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -3498,11 +3498,10 @@ fn repair_database_from_jsonl_after_preflight(
     // Snapshot any local tombstones and dirty live issues before the
     // JSONL rebuild. `doctor --repair` reaches this branch only after
     // light repairs failed (or never applied) and the on-disk DB reports
-    // errors, so the storage handle here might be limping — but the
-    // snapshot helpers are already fault-tolerant (warn+empty on
-    // enumeration failure, warn+partial on per-issue failure) and the
-    // cost of trying is a few selects. Without this, repair would
-    // silently wipe any tombstone the user deleted but had not yet
+    // errors, so the storage handle here might be limping. The snapshot
+    // retains every known capture failure for the repair report while
+    // allowing this explicit repair to restore readable state. Without this,
+    // repair would silently wipe any tombstone the user deleted but had not yet
     // flushed to JSONL (same hazard that `br sync --import-only
     // --rebuild` preserves via snapshot/restore) and any creation or
     // edit that had not yet been flushed (GitHub #394), since the
@@ -3892,35 +3891,38 @@ fn write_jsonl_rebuild_verification_failed_marker(
 /// issues, guarded on every failure mode the doctor-repair path may
 /// encounter (DB missing, DB can't be opened, JSONL unreadable).
 ///
-/// This mirrors the helper at the config layer (`preserved_unflushed_state`)
-/// but has to live here because the doctor-repair entry point is where we
-/// have the storage-open attempt — the config helper receives an
-/// already-open storage handle. Returns `(tombstones, dirty_live_issues)`;
-/// each vector is empty if nothing survives filtering or if any step
-/// fails. The rebuild itself always proceeds either way, and the snapshot
-/// helpers log their own best-effort warnings.
+/// The shared snapshot report also protects automatic startup recovery.
+/// Explicit doctor repair can continue with a partial snapshot, reporting
+/// every known failure through `dirty_preservation_warnings`. Failure to open
+/// an existing database must be reported as unknown preservation, never as an
+/// empty, successful snapshot.
 fn preserved_state_for_doctor_rebuild(
     db_path: &Path,
     source: &JsonlSourceSnapshot,
 ) -> DoctorPreservedState {
     if !db_path.is_file() {
-        return DoctorPreservedState::default();
+        return DoctorPreservedState {
+            warnings: config::missing_database_preservation_warnings(db_path),
+            ..DoctorPreservedState::default()
+        };
     }
     let storage = match SqliteStorage::open(db_path) {
         Ok(storage) => storage,
         Err(err) => {
-            tracing::debug!(
-                db_path = %db_path.display(),
-                error = %err,
-                "Could not open DB for pre-repair preservation snapshot; proceeding without preservation"
-            );
-            return DoctorPreservedState::default();
+            return DoctorPreservedState {
+                warnings: vec![format!(
+                    "database {} could not be opened for a pre-rebuild snapshot ({err}); preservation of unflushed tombstones, dirty issues, and their relationships could not be established",
+                    db_path.display()
+                )],
+                ..DoctorPreservedState::default()
+            };
         }
     };
-    let tombstone_snapshot = snapshot_tombstones(&storage);
-    let dirty_snapshot = snapshot_dirty_live_issues(&storage);
-    let mut warnings =
-        unreadable_dirty_issue_warnings(&storage, &tombstone_snapshot, &dirty_snapshot);
+    let crate::sync::UnflushedStateSnapshot {
+        tombstones: tombstone_snapshot,
+        dirty: dirty_snapshot,
+        warnings,
+    } = snapshot_unflushed_state(&storage);
     drop(storage);
     if tombstone_snapshot.is_empty() && dirty_snapshot.is_empty() {
         return DoctorPreservedState {
@@ -3940,11 +3942,9 @@ fn preserved_state_for_doctor_rebuild(
             JsonlTombstoneFilter::default()
         }
     };
-    let dirty = dirty_issues_missing_from_jsonl(dirty_snapshot, &jsonl_filter);
-    warnings.extend(dirty.iter().filter_map(partially_preserved_issue_warning));
     DoctorPreservedState {
         tombstones: tombstones_missing_from_jsonl_tombstones(tombstone_snapshot, &jsonl_filter),
-        dirty,
+        dirty: dirty_issues_missing_from_jsonl(dirty_snapshot, &jsonl_filter),
         warnings,
     }
 }
@@ -3956,68 +3956,6 @@ struct DoctorPreservedState {
     tombstones: Vec<PreservedIssue>,
     dirty: Vec<PreservedIssue>,
     warnings: Vec<String>,
-}
-
-/// Name every dirty issue whose row exists but could not be snapshotted, so a
-/// rebuild cannot discard its unflushed changes silently. A dirty marker
-/// whose issue row is simply absent is an orphan, not lost data.
-fn unreadable_dirty_issue_warnings(
-    storage: &SqliteStorage,
-    tombstones: &[PreservedIssue],
-    dirty: &[PreservedIssue],
-) -> Vec<String> {
-    let dirty_ids = match storage.get_dirty_issue_ids() {
-        Ok(ids) => ids,
-        Err(err) => {
-            return vec![format!(
-                "the dirty-issue markers could not be read ({err}); unflushed local changes are not carried across the rebuild"
-            )];
-        }
-    };
-    let captured: HashSet<&str> = tombstones
-        .iter()
-        .chain(dirty)
-        .map(|preserved| preserved.issue.id.as_str())
-        .collect();
-    let missing: Vec<String> = dirty_ids
-        .into_iter()
-        .filter(|id| !captured.contains(id.as_str()))
-        .collect();
-    if missing.is_empty() {
-        return Vec::new();
-    }
-    let unreadable = match storage.get_issues_by_ids(&missing) {
-        Ok(rows) => rows.into_iter().map(|issue| issue.id).collect(),
-        Err(_) => missing,
-    };
-    unreadable
-        .into_iter()
-        .map(|id| {
-            format!(
-                "dirty issue {id} could not be read before the rebuild; its unflushed changes are not in the rebuilt database"
-            )
-        })
-        .collect()
-}
-
-/// Describe the relation sets of a restored dirty issue that could not be
-/// read; the rebuilt issue keeps the JSONL copy of those.
-fn partially_preserved_issue_warning(preserved: &PreservedIssue) -> Option<String> {
-    let unreadable: Vec<&str> = [
-        ("labels", preserved.labels.is_none()),
-        ("dependencies", preserved.dependencies.is_none()),
-        ("comments", preserved.comments.is_none()),
-    ]
-    .into_iter()
-    .filter_map(|(relation, missing)| missing.then_some(relation))
-    .collect();
-    (!unreadable.is_empty()).then(|| {
-        format!(
-            "dirty issue {} was restored, but its {} could not be read; the rebuilt issue keeps the JSONL copy of those",
-            preserved.issue.id,
-            unreadable.join(", ")
-        )
-    })
 }
 
 #[cfg(test)]
@@ -14280,6 +14218,15 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         return Ok(());
     }
 
+    // Local sidecar repair can quarantine an orphan WAL before the JSONL
+    // rebuild takes its snapshot. Retain that original preservation failure;
+    // a later empty live path must not turn it into a successful snapshot.
+    let missing_database_warnings = if args.repair && !paths.db_path.is_file() {
+        config::missing_database_preservation_warnings(&paths.db_path)
+    } else {
+        Vec::new()
+    };
+
     // Build the per-run session once when --repair is requested. Every repaired
     // write must have a run-dir, verbatim backup, and actions.jsonl trail. If
     // the run-dir cannot be created, fail closed before any fixer can fall back
@@ -15172,7 +15119,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         ctx.info("Repairing: rebuilding DB from JSONL...");
     }
 
-    let repair_result = match repair_database_from_jsonl(
+    let mut repair_result = match repair_database_from_jsonl(
         &beads_dir,
         &paths.db_path,
         jsonl_path,
@@ -15196,6 +15143,11 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             return Err(BeadsError::Config(jsonl_rebuild_failure_message(&err)));
         }
     };
+    for warning in missing_database_warnings {
+        if !repair_result.dirty_preservation_warnings.contains(&warning) {
+            repair_result.dirty_preservation_warnings.push(warning);
+        }
+    }
 
     let post_repair = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
     let post_repair_verified = jsonl_rebuild_repair_verified(
@@ -15427,6 +15379,121 @@ mod tests {
         storage
             .create_issue(&sample_issue(id, title), "tester")
             .unwrap();
+    }
+
+    #[test]
+    fn doctor_preservation_reports_existing_database_open_failure() {
+        let fixture_root = TempDir::new().unwrap().keep();
+        let db_path = fixture_root.join("beads.db");
+        let jsonl_path = fixture_root.join("issues.jsonl");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        create_sample_issue(&mut storage, "bd-local", "unflushed local issue");
+        storage.checkpoint_full().unwrap();
+        drop(storage);
+        fs::copy(&db_path, fixture_root.join("beads.before-damage.db")).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&db_path)
+            .unwrap()
+            .write_all(&[0xff; 16])
+            .unwrap();
+        fs::write(&jsonl_path, "").unwrap();
+        let source = capture_jsonl_source_snapshot(&jsonl_path).unwrap();
+
+        let preserved = preserved_state_for_doctor_rebuild(&db_path, &source);
+        assert!(preserved.tombstones.is_empty());
+        assert!(preserved.dirty.is_empty());
+        assert_eq!(preserved.warnings.len(), 1);
+        let warning = &preserved.warnings[0];
+        assert!(warning.contains("could not be opened"), "{warning}");
+        assert!(warning.contains("unflushed tombstones"), "{warning}");
+        assert!(warning.contains("dirty issues"), "{warning}");
+        assert!(warning.contains("relationships"), "{warning}");
+        assert!(
+            warning.contains(db_path.to_string_lossy().as_ref()),
+            "{warning}"
+        );
+        assert!(db_path.is_file(), "damaged fixture remains available");
+    }
+
+    #[test]
+    fn doctor_preservation_missing_database_has_no_local_state_to_warn_about() {
+        let fixture_root = TempDir::new().unwrap().keep();
+        let db_path = fixture_root.join("beads.db");
+        let jsonl_path = fixture_root.join("issues.jsonl");
+        fs::write(&jsonl_path, "").unwrap();
+        let source = capture_jsonl_source_snapshot(&jsonl_path).unwrap();
+
+        let preserved = preserved_state_for_doctor_rebuild(&db_path, &source);
+        assert!(preserved.tombstones.is_empty());
+        assert!(preserved.dirty.is_empty());
+        assert!(preserved.warnings.is_empty());
+        assert!(
+            !db_path.exists(),
+            "snapshot must not create a missing database"
+        );
+    }
+
+    #[test]
+    fn doctor_preservation_reports_missing_database_with_unreadable_sidecar_state() {
+        for suffix in ["-wal", "-journal"] {
+            let fixture_root = TempDir::new().unwrap().keep();
+            let db_path = fixture_root.join("beads.db");
+            let sidecar_path = fixture_root.join(format!("beads.db{suffix}"));
+            let jsonl_path = fixture_root.join("issues.jsonl");
+            let sidecar_bytes = b"retained orphan database pages";
+            fs::write(&sidecar_path, sidecar_bytes).unwrap();
+            fs::write(&jsonl_path, "").unwrap();
+            let source = capture_jsonl_source_snapshot(&jsonl_path).unwrap();
+
+            let preserved = preserved_state_for_doctor_rebuild(&db_path, &source);
+            assert!(preserved.tombstones.is_empty());
+            assert!(preserved.dirty.is_empty());
+            assert_eq!(preserved.warnings.len(), 1);
+            let warning = &preserved.warnings[0];
+            assert!(warning.contains("main database is missing"), "{warning}");
+            assert!(
+                warning.contains("unflushed state cannot be read"),
+                "{warning}"
+            );
+            assert!(
+                warning.contains(sidecar_path.to_string_lossy().as_ref()),
+                "{warning}"
+            );
+            assert_eq!(fs::read(&sidecar_path).unwrap(), sidecar_bytes);
+            assert!(
+                !db_path.exists(),
+                "snapshot must not create a missing database"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_preservation_does_not_open_a_dangling_database_symlink() {
+        let fixture_root = TempDir::new().unwrap().keep();
+        let db_path = fixture_root.join("beads.db");
+        let target = fixture_root.join("retained-missing-target.db");
+        let jsonl_path = fixture_root.join("issues.jsonl");
+        std::os::unix::fs::symlink(&target, &db_path).unwrap();
+        fs::write(&jsonl_path, "").unwrap();
+        let source = capture_jsonl_source_snapshot(&jsonl_path).unwrap();
+
+        let preserved = preserved_state_for_doctor_rebuild(&db_path, &source);
+        assert!(preserved.tombstones.is_empty());
+        assert!(preserved.dirty.is_empty());
+        assert_eq!(preserved.warnings.len(), 1);
+        assert!(preserved.warnings[0].contains("database path is present rather than missing"));
+        assert!(
+            fs::symlink_metadata(&db_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            !target.exists(),
+            "snapshot must not create a symlink target"
+        );
     }
 
     fn install_valid_pending_merge_receipt(db_path: &Path) -> SyncMergePendingReceipt {

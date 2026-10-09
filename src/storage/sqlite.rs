@@ -14266,16 +14266,24 @@ impl SqliteStorage {
     ///
     /// # Errors
     ///
-    /// Returns an error if the database query fails.
+    /// Returns an error if the database query fails or a stored label is not text.
     pub fn get_labels(&self, issue_id: &str) -> Result<Vec<String>> {
         let rows = self.conn.query_with_params(
             "SELECT label FROM labels WHERE issue_id = ? ORDER BY label",
             &[SqliteValue::from(issue_id)],
         )?;
-        Ok(rows
-            .iter()
-            .filter_map(|r| r.get(0).and_then(SqliteValue::as_text).map(String::from))
-            .collect())
+        rows.iter()
+            .map(|row| {
+                row.get(0)
+                    .and_then(SqliteValue::as_text)
+                    .map(String::from)
+                    .ok_or_else(|| {
+                        BeadsError::Config(format!(
+                            "labels row for {issue_id} has a missing or non-text label"
+                        ))
+                    })
+            })
+            .collect()
     }
 
     /// Get labels for multiple issues efficiently.
@@ -20113,7 +20121,8 @@ impl SqliteStorage {
     ///
     /// # Errors
     ///
-    /// Returns an error if the database query fails.
+    /// Returns an error if the database query fails or a stored dependency
+    /// cannot be represented without discarding one of its values.
     pub fn get_dependencies_full(&self, issue_id: &str) -> Result<Vec<crate::model::Dependency>> {
         let stmt = self.conn.prepare(
             "SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
@@ -20126,35 +20135,30 @@ impl SqliteStorage {
 
         let mut deps = Vec::with_capacity(rows.len());
         for row in &rows {
+            let required_text = |index, column| {
+                row.get(index)
+                    .and_then(SqliteValue::as_text)
+                    .ok_or_else(|| {
+                        BeadsError::Config(format!(
+                            "dependencies row for {issue_id} has a missing or non-text {column}"
+                        ))
+                    })
+            };
+            let optional_text = |index, column| match row.get(index) {
+                Some(SqliteValue::Null) => Ok(None),
+                Some(SqliteValue::Text(value)) => Ok(Some(value.to_string())),
+                _ => Err(BeadsError::Config(format!(
+                    "dependencies row for {issue_id} has a missing or non-text {column}"
+                ))),
+            };
             deps.push(crate::model::Dependency {
-                issue_id: row
-                    .get(0)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or("")
-                    .to_string(),
-                depends_on_id: row
-                    .get(1)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or("")
-                    .to_string(),
-                dep_type: row
-                    .get(2)
-                    .and_then(SqliteValue::as_text)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(crate::model::DependencyType::Blocks),
+                issue_id: required_text(0, "issue_id")?.to_string(),
+                depends_on_id: required_text(1, "depends_on_id")?.to_string(),
+                dep_type: required_text(2, "type")?.parse()?,
                 created_at: parse_datetime_value(row.get(3))?,
-                created_by: row
-                    .get(4)
-                    .and_then(SqliteValue::as_text)
-                    .map(str::to_string),
-                metadata: row
-                    .get(5)
-                    .and_then(SqliteValue::as_text)
-                    .map(str::to_string),
-                thread_id: row
-                    .get(6)
-                    .and_then(SqliteValue::as_text)
-                    .map(str::to_string),
+                created_by: optional_text(4, "created_by")?,
+                metadata: optional_text(5, "metadata")?,
+                thread_id: optional_text(6, "thread_id")?,
             });
         }
 

@@ -141,7 +141,13 @@ pub fn isolated_temp_root() -> PathBuf {
 
 impl BrWorkspace {
     pub fn new() -> Self {
-        let temp_dir = TempDir::new_in(isolated_temp_root()).expect("temp dir");
+        // Recovery failures must leave their database families and command
+        // logs available for diagnosis, including when a test panics.
+        let temp_dir = tempfile::Builder::new()
+            .prefix("br-workspace-test-")
+            .disable_cleanup(true)
+            .tempdir_in(isolated_temp_root())
+            .expect("retained temp dir");
         let root = temp_dir.path().to_path_buf();
         let log_dir = root.join("logs");
         fs::create_dir_all(&log_dir).expect("log dir");
@@ -497,22 +503,24 @@ mod tests {
     /// own issues" does not hold everywhere the suite runs.
     #[test]
     fn detects_paths_enclosed_by_a_beads_workspace() {
-        let root = TempDir::new_in(isolated_temp_root()).expect("temp dir");
-        let nested = root.path().join("a/b/c");
-        fs::create_dir_all(&nested).expect("nested dirs");
-        assert!(
-            !is_inside_beads_workspace(&nested),
-            "a plain temp tree must not look like a workspace"
-        );
+        let root = TempDir::new_in(isolated_temp_root())
+            .expect("temp dir")
+            .keep();
 
         for marker in [".beads", "_beads"] {
-            let workspace_marker = root.path().join(marker);
+            let tree = root.join(format!("tree-{marker}"));
+            let nested = tree.join("a/b/c");
+            fs::create_dir_all(&nested).expect("nested dirs");
+            assert!(
+                !is_inside_beads_workspace(&nested),
+                "a plain temp tree must not look like a workspace"
+            );
+            let workspace_marker = tree.join(marker);
             fs::create_dir_all(&workspace_marker).expect("workspace marker");
             assert!(
                 is_inside_beads_workspace(&nested),
                 "a descendant of a `{marker}` workspace must be detected"
             );
-            fs::remove_dir(&workspace_marker).expect("drop workspace marker");
         }
     }
 

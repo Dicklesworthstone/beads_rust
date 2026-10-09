@@ -358,6 +358,45 @@ because the original JSONL IDs no longer match the rewritten database IDs. If
 open-time recovery already rebuilt the database before `--rename-prefix` could
 apply, br reports a rerun command with the needed flags.
 
+### Automatic recovery stops on preservation failures
+
+Before ordinary commands rebuild a damaged database from JSONL, they snapshot
+the local tombstones and dirty issues, including their labels, dependencies,
+and comments. If these reads reveal an incomplete snapshot, automatic recovery
+refuses with `SYNC_CONFLICT` (exit 6). This includes failed candidate
+enumeration, unreadable or ambiguous issue rows, and unreadable relationship
+sets or relationship values the issue model cannot represent.
+An existing database that cannot be opened also requires explicit repair:
+the JSONL alone cannot establish which local changes were never flushed.
+
+The refusal happens before database replacement. The current database family
+stays at its existing path; files retained by earlier recovery or sidecar
+quarantine remain in the named `.br_recovery` directory. The diagnostic lists
+the failed reads and affected issue IDs when known. These are preservation
+shortfalls, not a count of lost changes. Retained bytes do not guarantee that
+already unreadable state can be recovered.
+
+Run `br doctor` to inspect the damage. If you choose to proceed with
+best-effort repair, run `br doctor --repair` and review its preservation
+warnings (`dirty_preservation_warnings` in `--json` output). Explicit repair
+can restore readable local state and may use the JSONL copy of unreadable
+relationships; inspect the retained files before accepting that result.
+
+Successful commands retain their existing stdout and JSON result shapes.
+Refused commands use the existing structured error envelope in JSON mode;
+the diagnostic is visible without enabling warning-level logging. The same
+preservation gate applies to post-open anomaly recovery, failed startup
+probes, and recovery after a command encounters database damage. An explicit
+import retains its requested JSONL-authoritative semantics when it opens
+through the deferred-import path. If an already-open `--rebuild` command
+delegates later corruption recovery to this shared recovery path, the same
+preservation refusal applies; doctor remains the explicit best-effort repair
+path. Reconstructing a genuinely missing database from JSONL remains
+available when no nonempty or unreadable orphaned WAL or rollback journal
+needs preservation. Empty data sidecars and derived engine sidecars do not
+block that reconstruction. Doctor retains warnings about unreadable orphaned
+state even when an earlier repair step quarantines its sidecars.
+
 ## Lossless Additive Recovery
 
 Use additive reconciliation when valid JSONL contains rows missing from SQLite

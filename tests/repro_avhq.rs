@@ -1,9 +1,9 @@
 //! beads_rust-avhq: engine sidecars left behind without their database file
 //! (`beads.db-wal-cert`, `beads.db-fsqlite-ns-gate`, `beads.db-wal`, ...)
-//! must not wedge `br`. Both the writable recovery path (a mutation
-//! re-installs a fresh database from `issues.jsonl`) and `br init` move the
-//! orphans into `.beads/.br_recovery/` first, keeping their bytes for
-//! inspection, and then proceed normally.
+//! retain their bytes. An ordinary mutation must refuse a nonempty orphan
+//! WAL because its unflushed state cannot be established without the main
+//! database. Explicit `br init` still quarantines the orphans before
+//! creating a fresh database.
 mod common;
 
 use std::fs;
@@ -26,6 +26,7 @@ fn br(root: &Path, args: &[&str]) -> Output {
         .args(args)
         .env("HOME", root)
         .env("NO_COLOR", "1")
+        .env("RUST_LOG", "error")
         .output()
         .expect("run br")
 }
@@ -77,55 +78,107 @@ fn assert_orphans_quarantined(beads_dir: &Path) {
     }
 }
 
+fn assert_preservation_refusal(refused: &Output) {
+    assert_eq!(refused.status.code(), Some(6), "{}", rendered(refused));
+    let error: serde_json::Value =
+        serde_json::from_slice(&refused.stdout).unwrap_or_else(|error| {
+            panic!(
+                "stdout must be one JSON error: {error}; {}",
+                rendered(refused)
+            )
+        });
+    assert_eq!(error["error"]["code"], "SYNC_CONFLICT", "{error}");
+    let message = error["error"]["message"]
+        .as_str()
+        .expect("preservation error message");
+    for detail in [
+        "Automatic database recovery refused",
+        "unflushed",
+        "beads.db-wal",
+        ".br_recovery",
+        "br doctor --repair",
+    ] {
+        assert!(message.contains(detail), "missing {detail:?}: {message}");
+    }
+}
+
 #[test]
-fn mutation_reinstalls_database_when_only_orphaned_sidecars_remain() {
-    let _log = common::test_log("mutation_reinstalls_database_when_only_orphaned_sidecars_remain");
-    let temp = TempDir::new_in(common::cli::isolated_temp_root()).expect("tempdir");
-    let root = temp.path();
+fn mutation_refuses_unreadable_orphaned_wal_before_reinstalling_database() {
+    let _log =
+        common::test_log("mutation_refuses_unreadable_orphaned_wal_before_reinstalling_database");
+    let retained_root = TempDir::new_in(common::cli::isolated_temp_root())
+        .expect("tempdir")
+        .keep();
+    let root = retained_root.as_path();
     let init = br(root, &["init"]);
     assert!(init.status.success(), "{}", rendered(&init));
     let created = br(root, &["create", "survives the lost database", "--json"]);
     assert!(created.status.success(), "{}", rendered(&created));
     let beads_dir = root.join(".beads");
+    let jsonl = fs::read(beads_dir.join("issues.jsonl")).expect("original JSONL");
+    let retained_family = root.join("retained-original-database");
+    fs::create_dir(&retained_family).expect("retained original family directory");
+    let mut original_family = Vec::new();
 
-    // Lose the database file and its legitimate sidecars, then plant stale
-    // engine sidecars as a crashed engine or a partial restore would leave.
-    for entry in fs::read_dir(&beads_dir)
-        .expect("list .beads")
-        .filter_map(Result::ok)
-    {
+    // Retain the original database family outside the live namespace, then
+    // plant the sidecars left by a partial restore. Their WAL bytes cannot
+    // be classified as safely flushed when the main file is absent.
+    for entry in fs::read_dir(&beads_dir).expect("list .beads") {
+        let entry = entry.expect("original family entry");
         if entry.file_name().to_string_lossy().starts_with("beads.db") {
-            fs::remove_file(entry.path()).expect("remove database family member");
+            let retained_path = retained_family.join(entry.file_name());
+            let bytes = fs::read(entry.path()).expect("read original family member");
+            fs::rename(entry.path(), &retained_path)
+                .expect("retain original database family member");
+            original_family.push((retained_path, bytes));
         }
     }
     plant_orphans(&beads_dir);
-
-    let recovered = br(root, &["create", "written after recovery", "--json"]);
+    assert!(!beads_dir.join("beads.db").exists(), "missing-main fixture");
     assert!(
-        recovered.status.success(),
-        "a mutation should install a fresh database instead of wedging on the orphans:\n{}",
-        rendered(&recovered)
+        !beads_dir.join(".br_recovery").exists(),
+        "new fixture should have no recovery files"
+    );
+
+    let refused = br(root, &["create", "must wait for explicit repair", "--json"]);
+    fs::write(root.join("startup-refusal.log"), rendered(&refused)).expect("retain refusal output");
+    assert_preservation_refusal(&refused);
+    assert!(
+        !beads_dir.join("beads.db").exists(),
+        "refusal must not create a database"
     );
     assert!(
-        beads_dir.join("beads.db").is_file(),
-        "fresh database should have been installed"
+        !beads_dir.join(".br_recovery").exists(),
+        "refusal must not quarantine the orphan family"
     );
-    assert_orphans_quarantined(&beads_dir);
-
-    let list = br(root, &["list", "--json"]);
-    assert!(list.status.success(), "{}", rendered(&list));
-    let listed = String::from_utf8_lossy(&list.stdout);
-    assert!(
-        listed.contains("survives the lost database") && listed.contains("written after recovery"),
-        "recovered database should hold the JSONL issue and the new one:\n{listed}"
+    for (name, bytes) in ORPHANS {
+        assert_eq!(
+            fs::read(beads_dir.join(name)).expect("retained orphan"),
+            bytes,
+            "orphan changed: {name}"
+        );
+    }
+    for (path, bytes) in original_family {
+        assert_eq!(
+            fs::read(&path).expect("retained original family"),
+            bytes,
+            "original fixture changed: {}",
+            path.display()
+        );
+    }
+    assert_eq!(
+        fs::read(beads_dir.join("issues.jsonl")).expect("retained JSONL"),
+        jsonl
     );
 }
 
 #[test]
 fn init_quarantines_orphaned_sidecars_before_creating_the_database() {
     let _log = common::test_log("init_quarantines_orphaned_sidecars_before_creating_the_database");
-    let temp = TempDir::new_in(common::cli::isolated_temp_root()).expect("tempdir");
-    let root = temp.path();
+    let retained_root = TempDir::new_in(common::cli::isolated_temp_root())
+        .expect("tempdir")
+        .keep();
+    let root = retained_root.as_path();
     let beads_dir = root.join(".beads");
     fs::create_dir_all(&beads_dir).expect("create .beads");
     plant_orphans(&beads_dir);
