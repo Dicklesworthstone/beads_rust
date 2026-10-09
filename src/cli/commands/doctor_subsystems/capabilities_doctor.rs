@@ -289,6 +289,7 @@ const DETECTOR_ROWS: &[DetectorRow] = &[
     ),
     ("br_path_dupes", "external_artifacts", "warn", true),
     ("gitignore.beads_inner_present", "configs", "warn", true),
+    ("git.tracked_runtime_files", "configs", "info", true),
     (
         "permissions.jsonl_world_writable",
         "permissions",

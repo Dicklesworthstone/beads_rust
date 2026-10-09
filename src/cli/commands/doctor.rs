@@ -1021,6 +1021,10 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
     ("config.yaml", "fm-configs-yaml-malformed"),
     ("config.unknown_keys", "fm-configs-unknown-keys"),
     ("policy.unknown_keys", "fm-configs-policy-unknown-keys"),
+    (
+        "git.tracked_runtime_files",
+        "fm-configs-vcs-tracked-runtime-files",
+    ),
     // agent_coordination
     (
         "audit.suspect_close_reasons",
@@ -9256,7 +9260,8 @@ fn check_git_tracked_runtime_files(
         db: db_override.cloned(),
         ..Default::default()
     };
-    match crate::cli::commands::vcs::collect_git_runtime_files_for_doctor(beads_dir, &cli, deadline) {
+    match crate::cli::commands::vcs::collect_git_runtime_files_for_doctor(beads_dir, &cli, deadline)
+    {
         Some(files) if !files.is_empty() => {
             let count = files.len();
             let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
@@ -9270,6 +9275,7 @@ fn check_git_tracked_runtime_files(
                 Some(serde_json::json!({
                     "tracked_count": count,
                     "tracked_files": paths,
+                    "remediation": "Do not naively run `git rm --cached`. Follow docs/reliability/TRACKED_RUNTIME_AUDIT.md to snapshot local state and coordinate untracking across clones.",
                 })),
             );
         }
@@ -9289,7 +9295,6 @@ fn check_git_tracked_runtime_files(
         }
     }
 }
-
 
 /// Detector: `.beads/routes.jsonl` parses cleanly and every line carries a
 /// non-empty `prefix` + `path`. Routes are used by route-aware commands
@@ -27815,5 +27820,70 @@ version = "2026-05-11-abc123"
                 assert_eq!(c.status, CheckStatus::Ok);
             }
         }
+    }
+
+    #[test]
+    fn check_git_tracked_runtime_files_reports_ok_with_tracked_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path();
+        let beads_dir = repo_root.join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+
+        let git_run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(repo_root)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Tester")
+                .env("GIT_AUTHOR_EMAIL", "tester@example.com")
+                .env("GIT_COMMITTER_NAME", "Tester")
+                .env("GIT_COMMITTER_EMAIL", "tester@example.com")
+                .output()
+        };
+
+        let Ok(init_out) = git_run(&["init", "-b", "main"]) else {
+            return;
+        };
+        if !init_out.status.success() {
+            return;
+        }
+
+        // Add a tracked runtime file (e.g. beads.db-wal-cert)
+        let cert_file = beads_dir.join("beads.db-wal-cert");
+        std::fs::write(&cert_file, b"test-cert").unwrap();
+        let _ = git_run(&["add", ".beads/beads.db-wal-cert"]);
+
+        let mut checks = Vec::new();
+        check_git_tracked_runtime_files(&beads_dir, None, &mut checks);
+        let check = find_check(&checks, "git.tracked_runtime_files")
+            .expect("check present when file tracked");
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert_eq!(
+            check
+                .details
+                .as_ref()
+                .and_then(|d| d.get("tracked_count"))
+                .and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        let files = check
+            .details
+            .as_ref()
+            .and_then(|d| d.get("tracked_files"))
+            .and_then(|v| v.as_array())
+            .expect("tracked_files array");
+        assert!(
+            files
+                .iter()
+                .any(|p| p.as_str() == Some("beads.db-wal-cert"))
+        );
+        assert!(
+            check
+                .message
+                .as_ref()
+                .expect("message")
+                .contains("1 beads DB runtime file(s)")
+        );
     }
 }
