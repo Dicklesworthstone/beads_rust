@@ -362,6 +362,14 @@ fn collect_git_runtime_status(
     status
 }
 
+pub(crate) fn collect_git_runtime_files_for_doctor(
+    directory: &Path,
+    cli: &config::CliOverrides,
+    deadline: Instant,
+) -> Option<Vec<TrackedRuntimeFile>> {
+    collect_git_runtime_files(directory, cli, deadline).ok()
+}
+
 fn collect_git_runtime_files(
     directory: &Path,
     cli: &config::CliOverrides,

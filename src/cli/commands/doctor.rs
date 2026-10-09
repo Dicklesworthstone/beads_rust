@@ -9239,6 +9239,58 @@ fn check_root_gitignore(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     }
 }
 
+/// Informational detector: check whether git tracks beads runtime files
+/// (databases, WALs, lock files, sidecars).
+///
+/// Designed per beads_rust-9uavz: shipping as Warn would turn br doctor red
+/// in 32 affected repos at once and break agent workflows gating on doctor ok (#292).
+/// It reports as Informational Ok with tracked count and file paths so operators and
+/// agents see the warning in details without failing doctor.
+fn check_git_tracked_runtime_files(
+    beads_dir: &Path,
+    db_override: Option<&PathBuf>,
+    checks: &mut Vec<CheckResult>,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+    let cli = config::CliOverrides {
+        db: db_override.cloned(),
+        ..Default::default()
+    };
+    match crate::cli::commands::vcs::collect_git_runtime_files_for_doctor(beads_dir, &cli, deadline) {
+        Some(files) if !files.is_empty() => {
+            let count = files.len();
+            let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+            push_check(
+                checks,
+                "git.tracked_runtime_files",
+                CheckStatus::Ok,
+                Some(format!(
+                    "Git tracks {count} beads DB runtime file(s) under .beads/ (run `br vcs-status --runtime-files` for details)"
+                )),
+                Some(serde_json::json!({
+                    "tracked_count": count,
+                    "tracked_files": paths,
+                })),
+            );
+        }
+        Some(_) => {
+            push_check(
+                checks,
+                "git.tracked_runtime_files",
+                CheckStatus::Ok,
+                None,
+                Some(serde_json::json!({
+                    "tracked_count": 0,
+                })),
+            );
+        }
+        None => {
+            // Not a git repository or git probe timed out/failed; non-fatal informational check.
+        }
+    }
+}
+
+
 /// Detector: `.beads/routes.jsonl` parses cleanly and every line carries a
 /// non-empty `prefix` + `path`. Routes are used by route-aware commands
 /// (`br show`, `br update`, `br dep`, etc.) to dispatch cross-workspace
@@ -13058,6 +13110,7 @@ fn collect_doctor_report_with_mode_and_db_override(
     // Pass-5 cycle 18: .br_history/ snapshot accumulation (inode pressure).
     check_br_history_size(beads_dir, &mut checks);
     check_root_gitignore(beads_dir, &mut checks);
+    check_git_tracked_runtime_files(beads_dir, db_override, &mut checks);
     check_routes_jsonl(beads_dir, &mut checks);
     check_rust_log_noisy(&mut checks);
     check_permissions_beads_dir(beads_dir, &mut checks);
@@ -27748,5 +27801,19 @@ version = "2026-05-11-abc123"
         );
 
         assert_eq!(checks[0].details, Some(original));
+    }
+
+    #[test]
+    fn check_git_tracked_runtime_files_reports_ok_in_clean_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        let mut checks = Vec::new();
+        check_git_tracked_runtime_files(&beads_dir, None, &mut checks);
+        for c in &checks {
+            if c.name == "git.tracked_runtime_files" {
+                assert_eq!(c.status, CheckStatus::Ok);
+            }
+        }
     }
 }
