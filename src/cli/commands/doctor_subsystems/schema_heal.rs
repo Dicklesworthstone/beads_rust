@@ -33,6 +33,8 @@
 //!    That authorization applies only to unrestorable payloads and orphan
 //!    relations: recoverable database-only issues are always re-added.
 
+mod rebuild_preflight;
+
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -996,9 +998,10 @@ pub enum HealResult {
 ///
 /// # Errors
 ///
-/// Returns an error when the audit cannot run or the upgrade fails; a failed
-/// upgrade leaves the original database family in place (reviewed migration
-/// restores it, and the rebuild restores it from its verified backup).
+/// Returns an error when the audit or upgrade fails. Deterministic local
+/// replay failures are rehearsed before live replacement. Reviewed migration
+/// and JSONL installation retain their existing backup/rollback protocols;
+/// late replay I/O failures still require the retained recovery backup.
 #[allow(clippy::too_many_lines)]
 pub fn heal_stale_schema(ctx: &HealContext<'_>, mode: HealMode) -> Result<HealResult> {
     let startup = config::load_startup_config_with_paths(ctx.beads_dir, ctx.cli.db.as_ref())?;
@@ -1079,6 +1082,11 @@ pub fn heal_stale_schema(ctx: &HealContext<'_>, mode: HealMode) -> Result<HealRe
         .lock_timeout
         .or_else(|| config::lock_timeout_from_layer(&merged))
         .or(Some(30000));
+    // A readable legacy payload can still conflict with imported rows or
+    // current constraints. Prove the complete replay on private state before
+    // replacing the live family, then verify the real result against it.
+    let rebuild_witness =
+        rebuild_preflight::rehearse(&source, &audit.restorable, &merged, lock_timeout)?;
     let (mut storage, _import, backups) =
         config::repair_database_from_jsonl_snapshot_under_write_authority(
             ctx.beads_dir,
@@ -1107,6 +1115,9 @@ pub fn heal_stale_schema(ctx: &HealContext<'_>, mode: HealMode) -> Result<HealRe
     // Superseded edits are already excluded by the audit's restore plan.
     let restore = audit.restorable.as_slice();
     crate::sync::restore_dirty_issues_after_rebuild(&mut storage, restore)?;
+    if let Some(witness) = rebuild_witness {
+        witness.verify(&storage)?;
+    }
     drop(storage);
 
     let restored: HashSet<&str> = restore
