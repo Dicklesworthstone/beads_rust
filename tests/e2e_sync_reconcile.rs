@@ -3841,7 +3841,7 @@ fn retention_incremental_auto_flush_omits_dirty_and_clean_expired_tombstones() {
 }
 
 #[test]
-fn retention_restored_omissions_require_full_auto_flush_for_protected_local_state() {
+fn retention_restored_omissions_preserve_local_state_without_republishing() {
     for (label, tombstone, deleted_at) in [
         ("live", false, None),
         (
@@ -3912,7 +3912,7 @@ fn retention_restored_omissions_require_full_auto_flush_for_protected_local_stat
         assert_eq!(receipt["created"], 0);
         assert_eq!(receipt["updated"], 0);
         assert_eq!(receipt["skipped"], 1);
-        assert_eq!(get_needs_flush(&ws).as_deref(), Some("true"));
+        assert_ne!(get_needs_flush(&ws).as_deref(), Some("true"));
         assert_eq!(stored_retention_issue(&ws, &protected_id), protected);
         assert_eq!(stored_retention_issue(&ws, &expired_id), expired);
         assert_eq!(all_events_dump(&ws), events);
@@ -3931,8 +3931,8 @@ fn retention_restored_omissions_require_full_auto_flush_for_protected_local_stat
             );
         }
 
-        // needs_flush, not a dirty protected issue, must select the full
-        // automatic exporter after this ordinary mutation of the shared row.
+        // An unrelated mutation must not resurrect a peer purge or publish
+        // an issue belonging only to another branch.
         let update = run_br(
             &ws,
             [
@@ -3948,7 +3948,7 @@ fn retention_restored_omissions_require_full_auto_flush_for_protected_local_stat
             update.status.success(),
             "ordinary update failed: {update:?}"
         );
-        assert_retention_export(&ws, &[&anchor_id, &protected_id], &expired_id);
+        assert_retention_export(&ws, &[&anchor_id], &expired_id);
         assert_eq!(stored_retention_issue(&ws, &protected_id), protected);
         assert_eq!(stored_retention_issue(&ws, &expired_id), expired);
         assert_eq!(issue_count(&ws, label), 3);
@@ -3956,17 +3956,8 @@ fn retention_restored_omissions_require_full_auto_flush_for_protected_local_stat
         let published = read_jsonl_lines(&ws)
             .iter()
             .map(|line| serde_json::from_str::<Value>(line).expect("published issue"))
-            .find(|issue| issue["id"].as_str() == Some(protected_id.as_str()))
-            .expect("omitted issue restored to JSONL");
-        let mut expected = serde_json::to_value(&protected).expect("protected issue JSON");
-        expected
-            .as_object_mut()
-            .expect("issue object")
-            .remove("source_repo_path");
-        assert_eq!(
-            published, expected,
-            "full auto-flush must preserve the complete local payload"
-        );
+            .find(|issue| issue["id"].as_str() == Some(protected_id.as_str()));
+        assert!(published.is_none(), "omitted row must stay unpublished");
     }
 }
 

@@ -4305,10 +4305,13 @@ impl SyncMergePendingReceipt {
                     .to_string(),
             });
         }
-        if export_finalization.export_metadata.rows != 5 {
+        // Older pending receipts predate the three complete-row bookkeeping
+        // keys. Both exact layouts remain supported; the table digest still
+        // pins every row present during finalization and recovery.
+        if !matches!(export_finalization.export_metadata.rows, 5 | 8) {
             return Err(BeadsError::SyncConflict {
                 message: format!(
-                    "Pending sync merge finalization requires exactly five export metadata rows, found {}",
+                    "Pending sync merge finalization requires exactly five export metadata rows (legacy) or eight (complete row receipts), found {}",
                     export_finalization.export_metadata.rows
                 ),
             });
@@ -4560,7 +4563,7 @@ impl SyncMergePendingReceipt {
                 Some(finalization),
             ) if raw_sha256 == &self.jsonl_after_raw_sha256
                 && finalization.export_hashes == self.jsonl_after_issue_hashes
-                && finalization.export_metadata.rows == 5
+                && matches!(finalization.export_metadata.rows, 5 | 8)
                 && finalization.jsonl_content_hash.as_deref()
                     == Some(self.jsonl_after_content_sha256.as_str())
                 && finalization.jsonl_mtime.as_deref() == Some(mtime.as_str())
@@ -5594,6 +5597,7 @@ struct AdditiveSourceWitness {
 struct AdditiveSourceSnapshot {
     witness: AdditiveSourceWitness,
     issues: BTreeMap<String, Issue>,
+    row_hashes: BTreeMap<String, String>,
     record_count: usize,
 }
 
@@ -6445,6 +6449,7 @@ fn additive_source_snapshot(
     let mut canonical_hasher = Sha256::new();
     let mut line = String::new();
     let mut issues = BTreeMap::new();
+    let mut row_hashes = BTreeMap::new();
     let mut record_count = 0usize;
     let mut line_num = 0usize;
     while reader.read_line(&mut line)? > 0 {
@@ -6471,6 +6476,7 @@ fn additive_source_snapshot(
             })?;
             canonicalize_additive_issue_for_storage(&mut issue);
             let issue_id = issue.id.clone();
+            row_hashes.insert(issue_id.clone(), hex_encode(&Sha256::digest(trimmed_bytes)));
             if issues.insert(issue_id.clone(), issue).is_some() {
                 return Err(BeadsError::Config(format!(
                     "Duplicate issue id '{issue_id}' in additive reconciliation source at line {line_num}"
@@ -6512,6 +6518,7 @@ fn additive_source_snapshot(
     let content_sha256 = hex_encode(&canonical_hasher.finalize());
 
     Ok(AdditiveSourceSnapshot {
+        row_hashes,
         witness: AdditiveSourceWitness {
             raw_sha256,
             content_sha256,
@@ -6825,6 +6832,9 @@ fn is_sync_merge_mutable_metadata_key(key: &str) -> bool {
             | METADATA_JSONL_MTIME
             | METADATA_JSONL_SIZE
             | METADATA_JSONL_FAST_WITNESS
+            | METADATA_JSONL_ROW_HASHES
+            | METADATA_JSONL_ROW_RECEIPT_VERSION
+            | METADATA_JSONL_UNIMPORTED_SOURCE
             | METADATA_LAST_EXPORT_TIME
             | "needs_flush"
             | "purged_ids_pending_export"
@@ -6835,6 +6845,9 @@ fn is_sync_merge_export_metadata_key(key: &str) -> bool {
     matches!(
         key,
         METADATA_JSONL_CONTENT_HASH
+            | METADATA_JSONL_ROW_HASHES
+            | METADATA_JSONL_ROW_RECEIPT_VERSION
+            | METADATA_JSONL_UNIMPORTED_SOURCE
             | METADATA_JSONL_MTIME
             | METADATA_JSONL_SIZE
             | METADATA_LAST_EXPORT_TIME
@@ -8471,6 +8484,18 @@ fn plan_additive_reconcile_in_snapshot(
     let desired_needs_flush = db_only_preserved != 0;
     let mut expected_metadata = additive_metadata(storage)?;
     expected_metadata.insert(
+        METADATA_JSONL_ROW_HASHES.to_string(),
+        serde_json::to_string(&source.row_hashes)?,
+    );
+    expected_metadata.insert(
+        METADATA_JSONL_ROW_RECEIPT_VERSION.to_string(),
+        "1".to_string(),
+    );
+    expected_metadata.insert(
+        METADATA_JSONL_UNIMPORTED_SOURCE.to_string(),
+        "false".to_string(),
+    );
+    expected_metadata.insert(
         METADATA_JSONL_CONTENT_HASH.to_string(),
         source.witness.content_sha256.clone(),
     );
@@ -9279,6 +9304,9 @@ pub(crate) fn apply_additive_reconcile(
             return Err(BeadsError::SyncConflict {
                 message: "JSONL witness changed during additive reconciliation apply".to_string(),
             });
+        }
+        for key in [METADATA_JSONL_ROW_HASHES, METADATA_JSONL_ROW_RECEIPT_VERSION, METADATA_JSONL_UNIMPORTED_SOURCE] {
+            storage.set_metadata_in_tx(key, &plan.expected_metadata[key])?;
         }
         let database_after = hydrate_additive_database_issues(storage)?;
         if database_after != plan.expected_issues {
@@ -11948,6 +11976,165 @@ pub(crate) fn export_to_writer_with_policy_and_retention_at<W: Write>(
 
 /// Metadata key for the JSONL content hash.
 pub const METADATA_JSONL_CONTENT_HASH: &str = "jsonl_content_hash";
+/// Local rows absent from the last imported source, preserved without
+/// scheduling automatic republication (branch switches and peer purges).
+const METADATA_IMPORT_OMITTED_IDS: &str = "import_omitted_ids";
+const METADATA_JSONL_ROW_HASHES: &str = "jsonl_row_hashes";
+const METADATA_JSONL_ROW_RECEIPT_VERSION: &str = "jsonl_row_receipt_version";
+const METADATA_JSONL_UNIMPORTED_SOURCE: &str = "jsonl_unimported_source";
+
+fn jsonl_row_hashes(source: &JsonlSourceSnapshot) -> Result<BTreeMap<String, String>> {
+    let mut hashes = BTreeMap::new();
+    for line in source.reader().lines() {
+        let line = line?;
+        let line = line.trim_ascii();
+        if !line.is_empty() {
+            let row: PartialId = serde_json::from_str(line)?;
+            hashes.insert(row.id, hex_encode(&Sha256::digest(line.as_bytes())));
+        }
+    }
+    Ok(hashes)
+}
+
+fn record_jsonl_row_receipts_in_tx(
+    storage: &SqliteStorage,
+    source: &JsonlSourceSnapshot,
+) -> Result<()> {
+    storage.set_metadata_in_tx(
+        METADATA_JSONL_ROW_HASHES,
+        &serde_json::to_string(&jsonl_row_hashes(source)?)?,
+    )?;
+    storage.set_metadata_in_tx(METADATA_JSONL_ROW_RECEIPT_VERSION, "1")?;
+    storage.set_metadata_in_tx(METADATA_JSONL_UNIMPORTED_SOURCE, "false")?;
+    Ok(())
+}
+
+fn imported_omitted_ids(storage: &SqliteStorage) -> Result<HashSet<String>> {
+    Ok(storage
+        .get_metadata(METADATA_IMPORT_OMITTED_IDS)?
+        .map(|value| serde_json::from_str(&value))
+        .transpose()?
+        .unwrap_or_default())
+}
+
+pub(crate) fn verify_full_export_source_loaded(
+    storage: &SqliteStorage,
+    source: &JsonlSourceSnapshot,
+    retention_days: Option<u64>,
+    export_as_of: DateTime<Utc>,
+) -> Result<()> {
+    let stored_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
+    // Init creates an empty JSONL before the first import/export receipt.
+    // It contains no peer records to lose, even with --no-auto-import.
+    let fresh_empty_source = stored_hash
+        .as_deref()
+        .is_none_or(|hash| hash.trim().is_empty())
+        && source.content_sha256() == hex_encode(&Sha256::digest([]));
+    let unverified = (stored_hash.as_deref() != Some(source.content_sha256())
+        && !fresh_empty_source)
+        || storage
+            .get_metadata(METADATA_JSONL_UNIMPORTED_SOURCE)?
+            .as_deref()
+            == Some("true")
+        || (!fresh_empty_source
+            && storage
+                .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?
+                .as_deref()
+                != Some("1"));
+    if unverified && !full_export_matches_source(storage, source, retention_days, export_as_of)? {
+        return Err(BeadsError::SyncConflict {
+            message: "JSONL contains changes that have not been imported; refusing full export. Run `br sync --merge` to preserve local and peer changes".to_string(),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn full_export_matches_source(
+    storage: &SqliteStorage,
+    source: &JsonlSourceSnapshot,
+    retention_days: Option<u64>,
+    export_as_of: DateTime<Utc>,
+) -> Result<bool> {
+    // Publication can succeed before bookkeeping/anchor finalization fails.
+    // Certify a retry only against the complete intended wire payload, never
+    // the narrower issue hashes that exclude comments and other fields.
+    let (expected, _) = export_to_writer_with_policy_and_retention_at(
+        storage,
+        &mut std::io::sink(),
+        ExportErrorPolicy::Strict,
+        retention_days,
+        export_as_of,
+    )?;
+    Ok(expected.content_hash == source.content_sha256())
+}
+
+pub(crate) fn ensure_full_export_preserves_imported_omissions(
+    storage: &SqliteStorage,
+) -> Result<()> {
+    let omitted_ids = imported_omitted_ids(storage)?;
+    if !omitted_ids.is_empty() {
+        let dirty_ids = storage
+            .get_dirty_issue_ids()?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        for id in storage.get_non_ephemeral_issue_ids()? {
+            // A deliberate edit or explicit merge may have published an
+            // omitted row since the import, or removed it from the DB.
+            if omitted_ids.contains(&id)
+                && !dirty_ids.contains(&id)
+                && storage.get_export_hash(&id)?.is_none()
+            {
+                return Err(BeadsError::SyncConflict {
+                    message: "Full export would republish rows omitted by the imported JSONL. Run `br sync --merge` to reconcile branch-local issues and peer purges".to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn automatic_full_export_previous_hash(
+    storage: &SqliteStorage,
+    jsonl_exists: bool,
+    needs_flush: bool,
+) -> Result<Option<String>> {
+    if needs_flush {
+        ensure_full_export_preserves_imported_omissions(storage)?;
+    }
+    if storage
+        .get_metadata(METADATA_JSONL_UNIMPORTED_SOURCE)?
+        .as_deref()
+        == Some("true")
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "JSONL contains unimported peer changes; refusing full automatic export. Run `br sync --merge` first".to_string(),
+        });
+    }
+    if jsonl_exists {
+        if storage
+            .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?
+            .as_deref()
+            != Some("1")
+            && storage
+                .get_metadata(METADATA_JSONL_CONTENT_HASH)?
+                .is_some_and(|hash| !hash.trim().is_empty())
+        {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "JSONL has no complete source receipt; import or merge before automatic export"
+                        .to_string(),
+            });
+        }
+        Ok(Some(
+            storage
+                .get_metadata(METADATA_JSONL_CONTENT_HASH)?
+                .filter(|hash| !hash.trim().is_empty())
+                .unwrap_or_else(|| hex_encode(&Sha256::digest([]))),
+        ))
+    } else {
+        Ok(None)
+    }
+}
 /// Metadata key for the exact observed JSONL mtime at the last successful sync.
 pub const METADATA_JSONL_MTIME: &str = "jsonl_mtime";
 /// Metadata key for the exact observed JSONL size at the last successful sync.
@@ -12094,7 +12281,12 @@ pub fn auto_import_probe_refreshing_witnesses(
     if let Some(refresh) = probe.refresh_witness {
         refresh_jsonl_witness_best_effort(storage, jsonl_path, &refresh);
     }
-    Ok(probe.jsonl_newer)
+    Ok(probe.jsonl_newer
+        || (probe.jsonl_exists
+            && storage
+                .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?
+                .as_deref()
+                != Some("1")))
 }
 
 /// Check whether auto-import needs to inspect JSONL contents without mutating metadata.
@@ -12118,7 +12310,13 @@ pub fn auto_import_probe(
     if jsonl_path.exists() {
         validate_sync_path_with_external(jsonl_path, beads_dir, allow_external_jsonl)?;
     }
-    compute_jsonl_newer_impl(storage, jsonl_path).map(|probe| probe.jsonl_newer)
+    let probe = compute_jsonl_newer_impl(storage, jsonl_path)?;
+    Ok(probe.jsonl_newer
+        || (probe.jsonl_exists
+            && storage
+                .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?
+                .as_deref()
+                != Some("1")))
 }
 
 fn compute_staleness_impl(
@@ -12182,7 +12380,13 @@ fn compute_jsonl_newer_impl(storage: &SqliteStorage, jsonl_path: &Path) -> Resul
         (Some(hash), Some(stored)) => jsonl_fast_witness_matches(stored, &observed, hash),
         _ => false,
     };
-    let jsonl_newer = if fast_witness_current {
+    let pending_source = storage
+        .get_metadata(METADATA_JSONL_UNIMPORTED_SOURCE)?
+        .as_deref()
+        == Some("true");
+    let jsonl_newer = if pending_source {
+        true
+    } else if fast_witness_current {
         false
     } else {
         match stored_hash.as_deref() {
@@ -12385,7 +12589,15 @@ pub fn auto_import_if_stale(
         validate_sync_path_with_external(jsonl_path, beads_dir, allow_external_jsonl)?;
     }
     let staleness = compute_staleness_refreshing_witnesses(storage, jsonl_path)?;
-    if !staleness.jsonl_newer {
+    let pending_source = storage
+        .get_metadata(METADATA_JSONL_UNIMPORTED_SOURCE)?
+        .as_deref()
+        == Some("true")
+        || storage
+            .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?
+            .as_deref()
+            != Some("1");
+    if !(staleness.jsonl_newer || staleness.jsonl_exists && pending_source) {
         return Ok(AutoImportResult::default());
     }
 
@@ -12541,6 +12753,7 @@ pub(crate) fn finalize_export_under_authority(
         // Update metadata
         storage.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
         record_verified_jsonl_witness_in_tx(storage, &observed_jsonl, &result.content_hash)?;
+        record_jsonl_row_receipts_in_tx(storage, published_source)?;
 
         // Keep the row stable and clear the flag in place so ordinary export
         // cycles avoid delete+insert churn on the metadata B-tree.
@@ -12800,9 +13013,7 @@ fn is_issue_exportable_at(
 
 fn finalize_incremental_auto_flush(
     storage: &mut SqliteStorage,
-    clear_dirty_metadata: &[(String, String)],
-    removed_hash_ids: &[String],
-    issue_hashes: &[(String, String)],
+    changes: &IncrementalAutoFlushChanges,
     content_hash: Option<&str>,
     jsonl_path: Option<&Path>,
 ) -> Result<()> {
@@ -12820,20 +13031,33 @@ fn finalize_incremental_auto_flush(
     };
 
     storage.with_write_transaction(|storage| -> Result<()> {
-        if !clear_dirty_metadata.is_empty() {
-            storage.clear_dirty_issues_in_tx(clear_dirty_metadata)?;
+        if !changes.dirty_metadata.is_empty() {
+            storage.clear_dirty_issues_in_tx(&changes.dirty_metadata)?;
         }
-        if !removed_hash_ids.is_empty() {
-            storage.clear_export_hashes_in_tx(removed_hash_ids)?;
+        if !changes.removed_hash_ids.is_empty() {
+            storage.clear_export_hashes_in_tx(&changes.removed_hash_ids)?;
         }
-        if !issue_hashes.is_empty() {
-            storage.set_changed_export_hashes_in_tx(issue_hashes)?;
+        if !changes.issue_hashes.is_empty() {
+            storage.set_changed_export_hashes_in_tx(&changes.issue_hashes)?;
         }
         if let Some((content_hash, observed_jsonl)) = &export_metadata {
             storage.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
             record_verified_jsonl_witness_in_tx(storage, observed_jsonl, content_hash)?;
         }
         storage.set_metadata_in_tx("needs_flush", "false")?;
+        storage.set_metadata_in_tx(
+            METADATA_JSONL_ROW_HASHES,
+            &serde_json::to_string(&changes.source_row_hashes)?,
+        )?;
+        storage.set_metadata_in_tx(METADATA_JSONL_ROW_RECEIPT_VERSION, "1")?;
+        storage.set_metadata_in_tx(
+            METADATA_JSONL_UNIMPORTED_SOURCE,
+            if changes.source_has_unimported_changes {
+                "true"
+            } else {
+                "false"
+            },
+        )?;
         // The published snapshot no longer contains purged issues (#405).
         storage.clear_purged_ids_pending_export_in_tx()?;
         Ok(())
@@ -13319,6 +13543,8 @@ struct IncrementalAutoFlushChanges {
     removed_hash_ids: Vec<String>,
     issue_hashes: Vec<(String, String)>,
     replacement_lines: HashMap<String, String>,
+    source_row_hashes: BTreeMap<String, String>,
+    source_has_unimported_changes: bool,
 }
 
 fn collect_incremental_auto_flush_changes(
@@ -13369,7 +13595,55 @@ fn collect_incremental_auto_flush_changes(
         removed_hash_ids,
         issue_hashes,
         replacement_lines,
+        source_row_hashes: BTreeMap::new(),
+        source_has_unimported_changes: false,
     })
+}
+
+fn certify_incremental_source_changes(
+    storage: &SqliteStorage,
+    source: &JsonlSourceSnapshot,
+    changes: &mut IncrementalAutoFlushChanges,
+) -> Result<()> {
+    let current = jsonl_row_hashes(source)?;
+    let known: BTreeMap<String, String> = storage
+        .get_metadata(METADATA_JSONL_ROW_HASHES)?
+        .map(|value| serde_json::from_str(&value))
+        .transpose()?
+        .unwrap_or_default();
+    let mut baseline = known;
+    for id in changes
+        .replacement_lines
+        .keys()
+        .chain(&changes.removed_hash_ids)
+    {
+        // Raw row receipts cover comments, relationships, clocks, and
+        // every other wire field excluded by the narrow content hash.
+        let already_published = changes
+            .replacement_lines
+            .get(id)
+            .map(|line| hex_encode(&Sha256::digest(line.trim_ascii().as_bytes())));
+        if current.get(id) != baseline.get(id) && current.get(id) != already_published.as_ref() {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "JSONL changed for issue '{id}'; refusing automatic export. Run `br sync --merge` to preserve local and peer changes"
+                ),
+            });
+        }
+    }
+    let mut published = current;
+    for (id, line) in &changes.replacement_lines {
+        let hash = hex_encode(&Sha256::digest(line.trim_ascii().as_bytes()));
+        baseline.insert(id.clone(), hash.clone());
+        published.insert(id.clone(), hash);
+    }
+    for id in &changes.removed_hash_ids {
+        baseline.remove(id);
+        published.remove(id);
+    }
+    changes.source_row_hashes = baseline;
+    changes.source_has_unimported_changes = published != changes.source_row_hashes;
+    Ok(())
 }
 
 fn try_existing_line_auto_flush(
@@ -13405,14 +13679,7 @@ fn try_existing_line_auto_flush(
                         .to_string(),
                 });
             }
-            finalize_incremental_auto_flush(
-                storage,
-                &changes.dirty_metadata,
-                &changes.removed_hash_ids,
-                &changes.issue_hashes,
-                None,
-                None,
-            )?;
+            finalize_incremental_auto_flush(storage, changes, None, None)?;
             Ok(Some(AutoFlushResult::default()))
         }
         ExistingJsonlReplacementWrite::Written {
@@ -13424,9 +13691,7 @@ fn try_existing_line_auto_flush(
             jsonl_authority.verify_jsonl_authority()?;
             finalize_incremental_auto_flush(
                 storage,
-                &changes.dirty_metadata,
-                &changes.removed_hash_ids,
-                &changes.issue_hashes,
+                changes,
                 Some(&content_hash),
                 Some(jsonl_path),
             )?;
@@ -13473,6 +13738,7 @@ fn collect_incremental_retention_changes(
     }
 
     let lines_by_id = read_jsonl_lines_by_id(source)?;
+    let omitted_ids = imported_omitted_ids(storage)?;
     let mut removed_ids = changes
         .removed_hash_ids
         .iter()
@@ -13482,6 +13748,7 @@ fn collect_incremental_retention_changes(
         .into_iter()
         .filter(|id| {
             !lines_by_id.contains_key(id)
+                && !omitted_ids.contains(id)
                 && !changes.replacement_lines.contains_key(id)
                 && !removed_ids.contains(id)
         })
@@ -13577,7 +13844,10 @@ pub(crate) fn clean_retention_export_required(
     storage.with_read_transaction(|storage| {
         let (retained, expired) =
             storage.get_tombstone_retention_ids_at(retention_days, export_as_of)?;
-        if !retained.iter().any(|id| !source_ids.contains(id))
+        let omitted_ids = imported_omitted_ids(storage)?;
+        if !retained
+            .iter()
+            .any(|id| !source_ids.contains(id) && !omitted_ids.contains(id))
             && !expired.iter().any(|id| source_ids.contains(id))
         {
             return Ok(false);
@@ -13735,6 +14005,7 @@ fn try_incremental_auto_flush(
         export_config.retention_days,
         export_as_of,
     )?;
+    certify_incremental_source_changes(storage, &source, &mut changes)?;
 
     if retained_lines.is_none()
         && let Some(result) = try_existing_line_auto_flush(
@@ -13762,28 +14033,14 @@ fn try_incremental_auto_flush(
                 message: "JSONL changed during incremental auto-flush reconciliation".to_string(),
             });
         }
-        finalize_incremental_auto_flush(
-            storage,
-            &changes.dirty_metadata,
-            &changes.removed_hash_ids,
-            &changes.issue_hashes,
-            None,
-            None,
-        )?;
+        finalize_incremental_auto_flush(storage, &changes, None, None)?;
         return Ok(Some(AutoFlushResult::default()));
     }
 
     let content_hash =
         write_jsonl_lines_atomically(&lines_by_id, jsonl_path, export_config, &source)?;
     jsonl_authority.verify_jsonl_authority()?;
-    finalize_incremental_auto_flush(
-        storage,
-        &changes.dirty_metadata,
-        &changes.removed_hash_ids,
-        &changes.issue_hashes,
-        Some(&content_hash),
-        Some(jsonl_path),
-    )?;
+    finalize_incremental_auto_flush(storage, &changes, Some(&content_hash), Some(jsonl_path))?;
 
     Ok(Some(AutoFlushResult {
         flushed: true,
@@ -13963,12 +14220,13 @@ pub fn auto_flush_with_authority(
     }
 
     // Perform export
-    let expected_missing_jsonl = (!jsonl_exists).then_some(None);
+    let expected_previous_jsonl =
+        automatic_full_export_previous_hash(storage, jsonl_exists, needs_flush)?;
     let (export_result, _report) = export_to_jsonl_with_policy_expected_authority(
         storage,
         jsonl_path,
         &export_config,
-        expected_missing_jsonl.as_ref(),
+        Some(&expected_previous_jsonl),
         None,
         provided_jsonl_authority,
         None,
@@ -15173,6 +15431,7 @@ fn stream_import_actions_in_tx(
     let mut seen_external_refs = HashSet::new();
     let mut export_hash_batch = Vec::with_capacity(IMPORT_EXPORT_HASH_BATCH_SIZE);
     let mut export_hash_ids = HashSet::new();
+    let mut source_target_ids = HashSet::new();
     let mut uncertified_local_wins = 0usize;
     let mut invalidated_certificate = false;
     let mut skipped = Vec::new();
@@ -15238,6 +15497,7 @@ fn stream_import_actions_in_tx(
                 CollisionResult::Match { existing_id, .. } => existing_id.clone(),
                 CollisionResult::NewIssue => issue.id.clone(),
             };
+            source_target_ids.insert(target_id.clone());
 
             // Displacement replaces a different issue at this ID. Its local
             // comments belong to the relocated issue, and the narrow hash used
@@ -15434,32 +15694,44 @@ fn stream_import_actions_in_tx(
         storage.clear_export_hashes_in_tx(&stale_ids)?;
     }
     tx_result.export_hashes_recorded = export_hash_ids.len();
-    // A restored export can omit an already-flushed local issue entirely.
-    // Such a row never reaches skip certification and has no dirty marker,
-    // but still requires a full export. Use the certified collision targets,
-    // not raw JSONL IDs or the old certificate cache. The metadata map avoids
-    // another database scan when every local ID is already covered; otherwise
-    // narrow metadata scans exclude ephemerals, wisps, and tombstones omitted
-    // by the resolved retention policy. No issue or relation reload is needed.
-    let needs_flush = uncertified_local_wins > 0
-        || (metadata
-            .meta_by_id
-            .keys()
-            .any(|id| !export_hash_ids.contains(id))
-            && {
-                let expired =
-                    storage.get_expired_tombstone_ids_at(config.retention_days, retention_as_of)?;
-                storage
-                    .get_non_ephemeral_issue_ids()?
-                    .iter()
-                    .any(|id| !export_hash_ids.contains(id) && !expired.contains(id))
-            });
+    // Absence is not a local edit: branch switches and peer purges both
+    // omit previously published rows. Preserve them in the DB, without
+    // suppressing future auto-imports or republishing them on a mutation.
+    // Remember omissions so retention cannot resurrect missing tombstones.
+    let omitted_ids = if metadata
+        .meta_by_id
+        .keys()
+        .any(|id| !source_target_ids.contains(id))
+    {
+        // Policy omissions and ephemeral rows are not peer purges. A later
+        // retention-policy change may intentionally restore old tombstones.
+        let expired =
+            storage.get_expired_tombstone_ids_at(config.retention_days, retention_as_of)?;
+        storage
+            .get_non_ephemeral_issue_ids()?
+            .into_iter()
+            .filter(|id| !source_target_ids.contains(id) && !expired.contains(id))
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    storage.set_metadata_in_tx(
+        METADATA_IMPORT_OMITTED_IDS,
+        &serde_json::to_string(&omitted_ids)?,
+    )?;
+    let needs_flush = uncertified_local_wins > 0;
     if needs_flush {
         tracing::debug!(
             uncertified_local_wins,
             "Import preserved local records that differ from JSONL; marking database for flush"
         );
         storage.set_metadata_in_tx("needs_flush", "true")?;
+    } else if storage.get_metadata("needs_flush")?.as_deref() == Some("true")
+        && storage.get_purged_ids_pending_export()?.is_empty()
+    {
+        // This import accounted for every source payload. Any remaining
+        // difference is an omission or a dirty row, handled incrementally.
+        storage.set_metadata_in_tx("needs_flush", "false")?;
     }
     tracing::debug!(
         elapsed_ms = stream_started.elapsed().as_millis(),
@@ -15833,8 +16105,7 @@ fn import_from_jsonl_snapshot_impl(
 
     let jsonl_hash = compute_jsonl_snapshot_content_hash(source)?;
     let observed_jsonl = observed_jsonl_snapshot_witness(source);
-    // Transaction retries must make the same retention decision for local
-    // records absent from this immutable source.
+    // Retried import transactions use one retention cutoff for omissions.
     let retention_as_of = Utc::now();
 
     // Phase 2: Execute Actions
@@ -15898,6 +16169,7 @@ fn import_from_jsonl_snapshot_impl(
 
         storage.set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
         record_verified_jsonl_witness_in_tx(storage, &observed_jsonl, &jsonl_hash)?;
+        record_jsonl_row_receipts_in_tx(storage, source)?;
 
         Ok(tx_result)
     });
@@ -16748,6 +17020,14 @@ fn run_reconcile_apply_tx(
     }
     storage.set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
     record_verified_jsonl_witness_in_tx(storage, &observed, &plan.witness.jsonl_content_hash)?;
+    let source = capture_optional_jsonl_source(input_path)?
+        .ok_or_else(|| reconcile_config_error("JSONL disappeared during reconcile apply"))?;
+    if source.content_sha256() != plan.witness.jsonl_content_hash {
+        return Err(reconcile_config_error(
+            "JSONL changed during reconcile apply; transaction rolled back",
+        ));
+    }
+    record_jsonl_row_receipts_in_tx(storage, &source)?;
     outcome.metadata_repaired = true;
 
     if outcome.uncertified_local_wins > 0 || !plan.db_only_ids.is_empty() {
@@ -25473,7 +25753,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn test_auto_import_restored_export_requires_flush_for_database_only_issues() {
+    fn test_auto_import_restored_export_preserves_database_only_issues_without_flush() {
         for (empty_source, missing_certificates) in
             [(false, false), (true, false), (false, true), (true, true)]
         {
@@ -25572,12 +25852,12 @@ mod tests {
             );
             assert_eq!(
                 pending_export_state(&storage, true).unwrap(),
-                (0, true, true),
+                (0, false, false),
                 "empty_source={empty_source}, missing_certificates={missing_certificates}"
             );
             let staleness = compute_staleness(&storage, &jsonl_path).unwrap();
             assert!(!staleness.jsonl_newer);
-            assert!(staleness.db_newer);
+            assert!(!staleness.db_newer);
 
             let flushed = auto_flush(
                 &mut storage,
@@ -25589,24 +25869,13 @@ mod tests {
             )
             .unwrap();
             assert!(
-                flushed.flushed,
-                "a later ordinary flush must restore DB-only issues"
+                !flushed.flushed,
+                "an omission alone must not republish a branch-local or purged issue"
             );
-            assert_eq!(flushed.exported_count, 2);
+            assert_eq!(storage.get_issues_for_export(&ids).unwrap(), before);
             let exported = read_issues_from_jsonl(&jsonl_path).unwrap();
-            assert_eq!(exported.len(), before.len());
-            for expected in &before {
-                assert!(
-                    exported
-                        .iter()
-                        .find(|issue| issue.id == expected.id)
-                        .unwrap()
-                        .sync_equals(expected),
-                    "the exported issue and all its relations must survive: {}",
-                    expected.id
-                );
-            }
-            assert!(storage.get_export_hash(&absent.id).unwrap().is_some());
+            assert_eq!(exported.len(), usize::from(!empty_source));
+            assert!(storage.get_export_hash(&absent.id).unwrap().is_none());
             assert_eq!(
                 pending_export_state(&storage, true).unwrap(),
                 (0, false, false)
@@ -29286,7 +29555,7 @@ mod tests {
 
         let finalization = capture_sync_merge_export_finalization_witness(&storage).unwrap();
         assert_eq!(finalization.dirty_issues.rows, 0);
-        assert_eq!(finalization.export_metadata.rows, 5);
+        assert_eq!(finalization.export_metadata.rows, 8);
         assert_eq!(
             finalization.export_hashes,
             sync_merge_export_hash_mapping_witness(&result.issue_hashes).unwrap()

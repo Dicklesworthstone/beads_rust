@@ -24,6 +24,426 @@ use fsqlite_types::SqliteValue;
 use serde_json::Value;
 use std::fs;
 
+fn checked_br(workspace: &BrWorkspace, args: &[&str], label: &str) -> common::cli::BrRun {
+    let result = run_br(workspace, args, label);
+    assert!(result.status.success(), "{label}: {result:?}");
+    result
+}
+
+fn git(workspace: &BrWorkspace, args: &[&str]) {
+    let result = std::process::Command::new("git")
+        .current_dir(&workspace.root)
+        .args(args)
+        .output()
+        .expect("run git fixture");
+    assert!(result.status.success(), "git {args:?}: {result:?}");
+}
+
+fn jsonl_records(path: &std::path::Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .expect("read JSONL")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("JSONL record"))
+        .collect()
+}
+
+#[test]
+fn legacy_workspace_refreshes_row_receipts_before_mutation() {
+    let workspace = BrWorkspace::new();
+    checked_br(&workspace, &["init", "--prefix", "bd"], "init");
+    let id = parse_created_id(&checked_br(&workspace, &["create", "Legacy"], "create").stdout);
+    let db_path = workspace.root.join(".beads/beads.db");
+    {
+        let mut storage = beads_rust::storage::SqliteStorage::open(&db_path).unwrap();
+        storage
+            .set_metadata("jsonl_row_receipt_version", "0")
+            .unwrap();
+        storage.set_metadata("jsonl_row_hashes", "{}").unwrap();
+    }
+    let result = checked_br(
+        &workspace,
+        &["update", &id, "--title", "Upgraded"],
+        "update",
+    );
+    assert!(!result.stderr.contains("automatic JSONL export failed"));
+    assert_eq!(
+        jsonl_records(&workspace.root.join(".beads/issues.jsonl"))[0]["title"],
+        "Upgraded"
+    );
+}
+
+#[test]
+fn incremental_export_preserves_unread_peer_comments_until_import() {
+    let workspace = BrWorkspace::new();
+    checked_br(&workspace, &["init", "--prefix", "bd"], "init");
+    let local = parse_created_id(&checked_br(&workspace, &["create", "Local"], "local").stdout);
+    let peer = parse_created_id(&checked_br(&workspace, &["create", "Peer"], "peer").stdout);
+    checked_br(&workspace, &["sync", "--flush-only"], "seed_merge_anchor");
+    checked_br(
+        &workspace,
+        &["update", &local, "--title", "Local edit", "--no-auto-flush"],
+        "dirty",
+    );
+    let path = workspace.root.join(".beads/issues.jsonl");
+    let mut rows = jsonl_records(&path);
+    let row = rows.iter_mut().find(|row| row["id"] == peer).unwrap();
+    row["comments"] = serde_json::json!([{"id": 101, "issue_id": peer, "author": "Peer", "text": "Unread peer comment", "created_at": "2026-01-01T00:00:00Z"}]);
+    let peer_row = row.clone();
+    let bytes = rows
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(&path, bytes).unwrap();
+    checked_br(
+        &workspace,
+        &["create", "Safe append", "--no-auto-import", "--allow-stale"],
+        "append",
+    );
+    assert_eq!(
+        jsonl_records(&path).iter().find(|row| row["id"] == peer),
+        Some(&peer_row)
+    );
+    let preserved = fs::read(&path).unwrap();
+    checked_br(
+        &workspace,
+        &[
+            "update",
+            &peer,
+            "--title",
+            "Pending local peer edit",
+            "--no-auto-import",
+            "--allow-stale",
+        ],
+        "conflict",
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        preserved,
+        "comment-only peer changes must block replacement even after an unrelated export"
+    );
+    checked_br(&workspace, &["sync", "--merge", "--force"], "merge");
+    let shown = checked_br(&workspace, &["show", &peer, "--json"], "show");
+    assert!(shown.stdout.contains("Unread peer comment"));
+    assert!(shown.stdout.contains("Pending local peer edit"));
+}
+
+#[test]
+fn incremental_export_keeps_unrelated_peer_changes_pending_for_auto_import() {
+    let workspace = BrWorkspace::new();
+    checked_br(&workspace, &["init", "--prefix", "bd"], "init");
+    let peer = parse_created_id(&checked_br(&workspace, &["create", "Peer"], "peer").stdout);
+    let path = workspace.root.join(".beads/issues.jsonl");
+    let mut rows = jsonl_records(&path);
+    rows[0]["title"] = serde_json::json!("Pulled peer title");
+    rows[0]["updated_at"] = serde_json::json!("2099-01-01T00:00:00Z");
+    fs::write(&path, format!("{}\n", rows[0])).unwrap();
+    checked_br(
+        &workspace,
+        &["create", "Safe append", "--no-auto-import", "--allow-stale"],
+        "append",
+    );
+    let shown = checked_br(&workspace, &["show", &peer, "--json"], "auto_import");
+    assert!(shown.stdout.contains("Pulled peer title"));
+}
+
+/// #548: a real branch checkout omits a locally published issue. Later peer
+/// changes to an existing ID (including comments) must still be imported.
+#[test]
+fn branch_switch_imports_peer_edits_and_comments_before_mutation() {
+    let workspace = BrWorkspace::new();
+    checked_br(&workspace, &["init", "--prefix", "bd"], "init");
+    let shared = checked_br(&workspace, &["create", "Shared issue"], "shared");
+    let shared_id = parse_created_id(&shared.stdout);
+    let path = workspace.root.join(".beads/issues.jsonl");
+    git(&workspace, &["init", "-b", "main"]);
+    git(&workspace, &["config", "user.name", "Sync regression"]);
+    git(
+        &workspace,
+        &["config", "user.email", "sync@example.invalid"],
+    );
+    git(&workspace, &["add", "-f", ".beads/issues.jsonl"]);
+    git(&workspace, &["commit", "-m", "shared seed"]);
+    git(&workspace, &["checkout", "-b", "feature"]);
+    let local = checked_br(&workspace, &["create", "Branch local issue"], "local");
+    let local_id = parse_created_id(&local.stdout);
+    git(&workspace, &["add", ".beads/issues.jsonl"]);
+    git(&workspace, &["commit", "-m", "feature issue"]);
+    git(&workspace, &["checkout", "main"]);
+    checked_br(&workspace, &["list", "--json"], "after_checkout");
+
+    // A peer uses an independent database and normal CLI mutations.
+    let peer = BrWorkspace::new();
+    checked_br(&peer, &["init", "--prefix", "bd"], "peer_init");
+    fs::copy(&path, peer.root.join(".beads/issues.jsonl")).expect("peer source");
+    checked_br(&peer, &["sync", "--import-only"], "peer_import");
+    checked_br(&peer, &["close", &shared_id], "peer_close");
+    checked_br(
+        &peer,
+        &["comments", "add", &shared_id, "Peer discussion"],
+        "peer_comment",
+    );
+    let peer_records = jsonl_records(&peer.root.join(".beads/issues.jsonl"));
+    fs::copy(peer.root.join(".beads/issues.jsonl"), &path).expect("pull peer JSONL");
+    checked_br(&workspace, &["create", "Subsequent mutation"], "after_pull");
+    let records = jsonl_records(&path);
+    let shared_after = records
+        .iter()
+        .find(|row| row["id"] == shared_id)
+        .expect("shared row");
+    assert_eq!(
+        shared_after, &peer_records[0],
+        "peer close and comments survived"
+    );
+    assert!(!records.iter().any(|row| row["id"] == local_id));
+    let local_show = checked_br(
+        &workspace,
+        &["show", &local_id, "--json"],
+        "local_preserved",
+    );
+    assert!(local_show.stdout.contains("Branch local issue"));
+    let shared_show = checked_br(&workspace, &["show", &shared_id, "--json"], "peer_imported");
+    assert!(shared_show.stdout.contains("Peer discussion"));
+    checked_br(
+        &workspace,
+        &["update", &local_id, "--title", "Intentional local edit"],
+        "publish_local_edit",
+    );
+    let republished = jsonl_records(&path);
+    assert!(
+        republished
+            .iter()
+            .any(|row| row["id"] == local_id && row["title"] == "Intentional local edit")
+    );
+    assert_eq!(
+        republished.iter().find(|row| row["id"] == shared_id),
+        Some(&peer_records[0])
+    );
+}
+
+/// #548: importing a peer's purge preserves the old local row as branch
+/// history, but an unrelated mutation must not publish it again.
+#[test]
+fn peer_purge_is_not_undone_by_subsequent_mutation() {
+    for tombstone in [false, true] {
+        let workspace = BrWorkspace::new();
+        checked_br(&workspace, &["init", "--prefix", "bd"], "init");
+        checked_br(&workspace, &["create", "Keeper"], "keeper");
+        let victim = checked_br(&workspace, &["create", "Peer purge victim"], "victim");
+        let victim_id = parse_created_id(&victim.stdout);
+        if tombstone {
+            checked_br(&workspace, &["delete", &victim_id, "--force"], "tombstone");
+        }
+        let path = workspace.root.join(".beads/issues.jsonl");
+        let peer = BrWorkspace::new();
+        checked_br(&peer, &["init", "--prefix", "bd"], "peer_init");
+        fs::copy(&path, peer.root.join(".beads/issues.jsonl")).expect("peer copy");
+        checked_br(&peer, &["sync", "--import-only"], "peer_import");
+        checked_br(
+            &peer,
+            &["delete", &victim_id, "--hard", "--force"],
+            "peer_purge",
+        );
+        fs::copy(peer.root.join(".beads/issues.jsonl"), &path).expect("pull purge");
+        checked_br(&workspace, &["list", "--json"], "import_purge");
+        checked_br(&workspace, &["create", "After peer purge"], "mutate");
+        assert!(
+            !jsonl_records(&path)
+                .iter()
+                .any(|row| row["id"] == victim_id)
+        );
+        checked_br(
+            &workspace,
+            &["show", &victim_id, "--json"],
+            "preserved_local_row",
+        );
+        checked_br(
+            &workspace,
+            &["sync", "--flush-only"],
+            "clean_flush_after_purge",
+        );
+        assert!(
+            !jsonl_records(&path)
+                .iter()
+                .any(|row| row["id"] == victim_id)
+        );
+        checked_br(
+            &workspace,
+            &["create", "Delayed local edit", "--no-auto-flush"],
+            "pending_after_purge",
+        );
+        let source_before = fs::read(&path).expect("purged source");
+        let full_flush = run_br(
+            &workspace,
+            ["sync", "--flush-only"],
+            "full_flush_after_purge",
+        );
+        assert!(
+            !full_flush.status.success(),
+            "must not republish a peer purge"
+        );
+        assert!(full_flush.stderr.contains("republish rows omitted"));
+        assert_eq!(fs::read(&path).expect("purged source"), source_before);
+        checked_br(
+            &workspace,
+            &["create", "Publish pending local work"],
+            "publish_pending",
+        );
+        let published = jsonl_records(&path);
+        assert!(
+            published
+                .iter()
+                .any(|row| row["title"] == "Delayed local edit")
+        );
+        assert!(!published.iter().any(|row| row["id"] == victim_id));
+    }
+}
+
+/// Both the full needs_flush path and the incremental dirty-row path must
+/// refuse unimported edits to existing IDs, even when no new IDs appear.
+#[test]
+fn auto_flush_refuses_existing_id_peer_edits_with_pending_local_changes() {
+    for full_export in [false, true] {
+        let workspace = BrWorkspace::new();
+        checked_br(&workspace, &["init", "--prefix", "bd"], "init");
+        let issue = checked_br(&workspace, &["create", "Local title"], "create");
+        let id = parse_created_id(&issue.stdout);
+        let path = workspace.root.join(".beads/issues.jsonl");
+        checked_br(&workspace, &["sync", "--flush-only"], "seed_merge_anchor");
+        if full_export {
+            make_jsonl_record_stale(&path, &id);
+            checked_br(
+                &workspace,
+                &["sync", "--import-only", "--no-auto-flush"],
+                "arm_full",
+            );
+        } else {
+            checked_br(
+                &workspace,
+                &[
+                    "update",
+                    &id,
+                    "--title",
+                    "Pending local title",
+                    "--no-auto-flush",
+                ],
+                "arm_incremental",
+            );
+        }
+        let mut rows = jsonl_records(&path);
+        rows[0]["title"] = Value::from("New peer title");
+        rows[0]["updated_at"] = Value::from("2099-01-01T00:00:00Z");
+        let peer_bytes = format!("{}\n", serde_json::to_string(&rows[0]).expect("peer JSON"));
+        fs::write(&path, &peer_bytes).expect("peer update");
+        let explicit = run_br(
+            &workspace,
+            ["sync", "--flush-only", "--no-auto-import"],
+            "explicit_stale_flush",
+        );
+        assert!(
+            !explicit.status.success(),
+            "unread peer edits must refuse export"
+        );
+        assert!(explicit.stderr.contains("JSONL changed since"));
+        assert_eq!(fs::read_to_string(&path).expect("source"), peer_bytes);
+        let mutation = run_br(
+            &workspace,
+            [
+                "create",
+                "Legitimate local creation",
+                "--allow-stale",
+                "--no-auto-import",
+            ],
+            "mutate_stale",
+        );
+        assert_eq!(fs::read_to_string(&path).expect("source"), peer_bytes);
+        assert!(
+            mutation.stderr.contains("AUTO_FLUSH_FAILED")
+                || mutation.stderr.contains("JSONL changed"),
+            "visible conflict: {mutation:?}"
+        );
+        let local = checked_br(
+            &workspace,
+            &["list", "--json", "--no-auto-import"],
+            "pending_preserved",
+        );
+        assert!(local.stdout.contains("Legitimate local creation"));
+        assert!(local.stdout.contains(if full_export {
+            "Local title"
+        } else {
+            "Pending local title"
+        }));
+        checked_br(
+            &workspace,
+            &["sync", "--merge", "--force"],
+            "recover_pending_changes",
+        );
+        let recovered = jsonl_records(&path);
+        assert!(recovered.iter().any(|row| row["title"] == "New peer title"));
+        assert!(
+            recovered
+                .iter()
+                .any(|row| row["title"] == "Legitimate local creation")
+        );
+    }
+}
+
+#[test]
+fn full_auto_flush_does_not_republish_omissions_alongside_local_wins() {
+    let workspace = BrWorkspace::new();
+    checked_br(&workspace, &["init", "--prefix", "bd"], "init");
+    let keeper = checked_br(&workspace, &["create", "Local winner"], "keeper");
+    let keeper_id = parse_created_id(&keeper.stdout);
+    let victim = checked_br(&workspace, &["create", "Omitted issue"], "victim");
+    let victim_id = parse_created_id(&victim.stdout);
+    let path = workspace.root.join(".beads/issues.jsonl");
+    let keeper_line = jsonl_records(&path)
+        .into_iter()
+        .find(|row| row["id"] == keeper_id)
+        .expect("keeper source row");
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string(&keeper_line).expect("JSON")),
+    )
+    .expect("source omits victim");
+    make_jsonl_record_stale(&path, &keeper_id);
+    checked_br(
+        &workspace,
+        &["sync", "--import-only", "--no-auto-flush"],
+        "import_local_win_and_omission",
+    );
+    let source_before = fs::read(&path).expect("source bytes");
+    let mutation = run_br(&workspace, ["create", "Saved pending creation"], "mutate");
+    assert!(mutation.status.success(), "local mutation: {mutation:?}");
+    assert!(mutation.stderr.contains("republish rows omitted"));
+    assert_eq!(fs::read(&path).expect("source bytes"), source_before);
+    checked_br(
+        &workspace,
+        &["show", &victim_id, "--json"],
+        "omission_preserved",
+    );
+    let pending = checked_br(&workspace, &["list", "--json"], "pending_preserved");
+    assert!(pending.stdout.contains("Saved pending creation"));
+    assert!(pending.stdout.contains("Local winner"));
+}
+
+#[test]
+fn first_mutation_without_auto_import_can_publish_to_empty_jsonl() {
+    let workspace = BrWorkspace::new();
+    checked_br(&workspace, &["init", "--prefix", "bd"], "init");
+    let created = checked_br(
+        &workspace,
+        &["create", "First local issue", "--no-auto-import"],
+        "first_export",
+    );
+    assert!(!created.stderr.contains("AUTO_FLUSH_FAILED"));
+    let records = jsonl_records(&workspace.root.join(".beads/issues.jsonl"));
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["title"], "First local issue");
+}
+
 fn parse_created_id(stdout: &str) -> String {
     let line = stdout.lines().next().unwrap_or("");
     let normalized = line.strip_prefix("✓ ").unwrap_or(line);

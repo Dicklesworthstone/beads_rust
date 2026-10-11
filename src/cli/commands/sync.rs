@@ -2654,6 +2654,12 @@ fn execute_flush(
             retention_days,
             export_as_of,
         )? {
+            crate::sync::verify_full_export_source_loaded(
+                storage,
+                noop_source,
+                retention_days,
+                export_as_of,
+            )?;
             // Certified: ensure the anchor holds the exact snapshot bytes (also
             // covers the missing-anchor case). A byte-identical regular-file
             // anchor is left untouched so an idempotent no-op flush keeps its
@@ -2722,6 +2728,61 @@ fn execute_flush(
     };
 
     // Execute export
+    if !args.force
+        && let Some(source) = source
+        && storage
+            .get_metadata(METADATA_JSONL_CONTENT_HASH)?
+            .as_deref()
+            != Some(source.content_sha256())
+        && !crate::sync::full_export_matches_source(storage, source, retention_days, export_as_of)?
+    {
+        // Keep the existing named-ID data-loss diagnostic when new IDs are
+        // present. Same-ID edits and purges need the content witness instead.
+        let (_, source_ids) = analyze_jsonl_snapshot(source)?;
+        let db_ids = storage
+            .get_non_ephemeral_issue_ids()?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let purged_ids = storage.get_purged_ids_pending_export()?;
+        let unknown_ids = source_ids
+            .iter()
+            .filter(|id| !db_ids.contains(*id) && !purged_ids.contains(*id))
+            .collect::<Vec<_>>();
+        if !unknown_ids.is_empty() {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Refusing to export stale database: JSONL contains issues absent from the database: {}. Run `br sync --merge` first",
+                    unknown_ids
+                        .iter()
+                        .map(|id| id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+        let fresh_empty_source = source_ids.is_empty()
+            && storage
+                .get_metadata(METADATA_JSONL_CONTENT_HASH)?
+                .is_none_or(|hash| hash.trim().is_empty());
+        if !fresh_empty_source
+            && source_ids
+                .iter()
+                .all(|id| db_ids.contains(id) || purged_ids.contains(id))
+        {
+            return Err(BeadsError::SyncConflict {
+                message: "Refusing to export stale database: JSONL changed since the last import/export. Run `br sync --merge` to reconcile local and peer changes, or use `--force` to intentionally replace JSONL".to_string(),
+            });
+        }
+    }
+    if !args.force && jsonl_exists {
+        crate::sync::ensure_full_export_preserves_imported_omissions(storage)?;
+        crate::sync::verify_full_export_source_loaded(
+            storage,
+            source.expect("existing source"),
+            retention_days,
+            export_as_of,
+        )?;
+    }
     info!(path = %jsonl_path.display(), "Writing issues.jsonl");
     let (export_result, report) = export_to_jsonl_with_policy_expected_under_authority(
         storage,

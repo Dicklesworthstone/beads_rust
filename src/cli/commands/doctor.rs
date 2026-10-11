@@ -14369,7 +14369,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     if !args.allow_repeated_repair
         && let Some(evidence) = prior_preservation_failure.as_ref()
     {
-        let reason = repeated_jsonl_rebuild_refusal_message(&evidence);
+        let reason = repeated_jsonl_rebuild_refusal_message(evidence);
         let recovery_audit = jsonl_rebuild_audit_record(
             "doctor.jsonl_rebuild",
             "refused",
