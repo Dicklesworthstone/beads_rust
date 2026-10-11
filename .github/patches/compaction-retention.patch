@@ -1,10 +1,14 @@
 diff --git a/src/config/mod.rs b/src/config/mod.rs
 --- a/src/config/mod.rs
 +++ b/src/config/mod.rs
-@@ -1,1 +1,3 @@
+@@ -10,5 +10,7 @@
+ //! 7. Defaults
+ 
 +#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 +mod compaction_retention;
  pub mod routing;
+ 
+ use crate::error::{BeadsError, Result, ResultExt};
 @@ -3343,4 +3345,20 @@
      match post_install_result {
 -        Ok(reopened) => Ok(reopened),
