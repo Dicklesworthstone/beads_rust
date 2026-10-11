@@ -1,0 +1,140 @@
+name: Compaction retention validation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/compaction-retention-validation.yml'
+      - '.github/patches/compaction-retention.patch'
+      - '.github/tests/compaction-retention-imports.py'
+      - 'src/config/compaction_retention.rs'
+      - 'src/config/mod.rs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compaction-retention-validation
+  cancel-in-progress: false
+
+jobs:
+  validate-and-activate:
+    if: github.repository == 'Dicklesworthstone/beads_rust' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-08-31
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      # No external Actions or persisted checkout credentials. The write token
+      # is supplied only to the final, post-validation publication step.
+      - name: Fetch the exact public source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Apply the hand-authored hook to its exact reviewed source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! grep -q '^mod compaction_retention;$' src/config/mod.rs; then
+            test "$(git hash-object src/config/mod.rs)" = fcb95f51ee2dab19b26f7f7ba9c3a192f439d54e
+            git apply --check --recount .github/patches/compaction-retention.patch
+            git apply --recount .github/patches/compaction-retention.patch
+          fi
+          test "$(grep -c 'compaction_retention::complete_and_prune(' src/config/mod.rs)" = 1
+          python3 -m py_compile .github/tests/compaction-retention-imports.py
+      - name: Install the repository's pinned Rust toolchain
+        shell: bash
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+      - name: Format only the implementation and its hook
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2024 --config skip_children=true src/config/mod.rs src/config/compaction_retention.rs
+          cargo fmt --all -- --check
+          git diff --check
+      - name: Run all retention regressions against real storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib config::compaction_retention::tests:: -- --list | tee "$RUNNER_TEMP/retention-tests.txt"
+          test "$(grep -c '^config::compaction_retention::tests::.*: test$' "$RUNNER_TEMP/retention-tests.txt")" = 15
+          cargo test --locked --lib config::compaction_retention::tests:: -- --test-threads=1 --nocapture
+      - name: Check and lint all targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked --all-targets
+          cargo clippy --locked --all-targets -- -D warnings
+      - name: Validate repeated CLI imports
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --bin br
+          python3 .github/tests/compaction-retention-imports.py target/debug/br
+      - name: Run the complete test suite
+        shell: bash
+        run: cargo test --locked
+      - name: Publish only the exact validated implementation directly to main
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          def run(*args, data=None):
+              return subprocess.check_output(args, input=data, text=True).strip()
+
+          def api(path, payload=None):
+              args = ['gh', 'api', f'repos/{os.environ["GITHUB_REPOSITORY"]}/{path}']
+              if payload is not None:
+                  args += ['--method', 'POST', '--input', '-']
+              return json.loads(run(*args, data=json.dumps(payload) if payload is not None else None))
+
+          allowed = {'src/config/mod.rs', 'src/config/compaction_retention.rs'}
+          changed = set(run('git', 'diff', '--name-only').splitlines())
+          if not changed <= allowed:
+              raise SystemExit(f'Refusing unexpected publication paths: {changed - allowed}')
+          if not changed:
+              print('Validated source is already committed; no publication needed.')
+              raise SystemExit(0)
+          expected = os.environ['GITHUB_SHA']
+          if api('git/ref/heads/main')['object']['sha'] != expected:
+              raise SystemExit('main advanced; do not publish or rebase untested changes')
+          base_tree = api(f'git/commits/{expected}')['tree']['sha']
+          entries = []
+          for path in sorted(changed):
+              content = pathlib.Path(path).read_text()
+              blob = api('git/blobs', {'content': content, 'encoding': 'utf-8'})['sha']
+              if blob != run('git', 'hash-object', path):
+                  raise SystemExit(f'Published blob differs from tested bytes: {path}')
+              entries.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': blob})
+          tree = api('git/trees', {'base_tree': base_tree, 'tree': entries})['sha']
+          commit = api('git/commits', {
+              'message': 'fix(config): activate validated completed-compaction retention (#554)\n\nPublish the exact source that passed retention, repeated-import, format, check, clippy, and complete test-suite gates.',
+              'tree': tree, 'parents': [expected],
+          })['sha']
+          # This non-forced update also rejects a concurrent divergent advance.
+          run('gh', 'api', f'repos/{os.environ["GITHUB_REPOSITORY"]}/git/refs/heads/main',
+              '--method', 'PATCH', '--input', '-',
+              data=json.dumps({'sha': commit, 'force': False}))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f'Validated activation commit: `{commit}`\n')
+          print(f'Published validated source directly to main: {commit}')
+          PY

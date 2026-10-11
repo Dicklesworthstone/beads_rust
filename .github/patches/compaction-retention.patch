@@ -1,0 +1,29 @@
+diff --git a/src/config/mod.rs b/src/config/mod.rs
+--- a/src/config/mod.rs
++++ b/src/config/mod.rs
+@@ -1,1 +1,3 @@
++#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
++mod compaction_retention;
+ pub mod routing;
+@@ -3343,4 +3345,20 @@
+     match post_install_result {
+-        Ok(reopened) => Ok(reopened),
++        Ok(reopened) => {
++            // A rollback that reopens the original database is NOT completion.
++            // Seal/prune only the newly installed, durable, reopened candidate.
++            // Retention failures must never roll back this successful install.
++            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
++            if let Err(error) = compaction_retention::complete_and_prune(
++                &retained_family,
++                write_authority,
++                Utc::now(),
++            ) {
++                warn!(
++                    %error,
++                    "Compaction succeeded; retained recovery evidence because cleanup was unsafe"
++                );
++            }
++            Ok(reopened)
++        }
+         Err(install_error) => {
+             if let Err(rollback_error) =
