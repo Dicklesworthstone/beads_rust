@@ -26,6 +26,7 @@ The e2e sync test suite verifies several critical safety properties:
 | `tests/e2e_sync_preflight_integration.rs` | Preflight checks catch safety issues before writes |
 | `tests/e2e_sync_reconcile.rs` | Additive `--reconcile`: false-equal repair, event preservation, dry-run zero-mutation, witness rollback |
 | `tests/e2e_basic_lifecycle.rs` | Additive dry-run/apply/idempotency receipt, event preservation, and unchanged-source coverage |
+| `tests/repro_3way_merge_bug.rs` | Local-export anchor regressions: branch close/reopen/create, missing rows and retention, stale/equal/clock-skewed updates, explicit winners, and tombstones |
 
 ## Running the Tests
 
@@ -65,6 +66,8 @@ cargo test --test e2e_sync_preflight_integration --release
 
 # Additive reconcile tests (br sync --reconcile / --dry-run)
 cargo test --test e2e_sync_reconcile --release
+# Export-anchor and deterministic merge regressions
+cargo test --test repro_3way_merge_bug --test repro_mergereport_determinism --release
 # Additive recovery with command-level logs retained by BrWorkspace
 RUST_LOG=beads_rust=debug cargo test --test e2e_basic_lifecycle \
   e2e_sync_additive_reconciliation_is_read_only_then_lossless_and_idempotent \

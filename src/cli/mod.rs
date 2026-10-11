@@ -3007,7 +3007,9 @@ pub struct SyncArgs {
     /// Perform a 3-way merge (Base + Local DB + Remote JSONL)
     ///
     /// Reconciles changes when both the database and JSONL have been modified.
-    /// Uses `.beads/beads.base.jsonl` as the common ancestor.
+    /// Uses `.beads/beads.base.jsonl`, the last local export, as its anchor.
+    /// Missing JSONL rows do not delete local issues unless --force-jsonl is
+    /// given. Divergent older or equal-timestamp rows require explicit resolution.
     #[arg(long)]
     pub merge: bool,
 

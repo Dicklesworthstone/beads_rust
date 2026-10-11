@@ -57,6 +57,8 @@ These are explicit design exclusions. br sync is intentionally less invasive tha
 | DL-3 | HIGH | Import never resurrects tombstoned issues | Unit test: tombstoned issue in JSONL, verify skip |
 | DL-4 | CRITICAL | Import conflict marker scan runs BEFORE any database modifications | Code inspection + unit test: markers detected → no DB changes |
 | DL-5 | MEDIUM | Any operation that could discard/override data logs a warning at INFO level | Log assertion test |
+| DL-6 | CRITICAL | With a local-export merge anchor, absence from incoming JSONL never deletes a local record without `--force-jsonl`; tombstone retention alone is not deletion evidence | Deterministic merge unit and CLI tests for missing exported and subsequently modified records with unset, zero, and positive retention |
+| DL-7 | CRITICAL | A differing external-only revision with a non-advancing timestamp requires explicit resolution; refusal preserves both source generations and local issue state | `AmbiguousBase` tests for older exports, equal timestamps, slow remote clocks, branch close/reopen/create, and explicit winners |
 
 ### 2.4 Input Validation Invariants
 

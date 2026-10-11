@@ -1192,10 +1192,25 @@ br sync --merge
 br doctor
 ```
 
-`br sync --merge` uses `.beads/beads.base.jsonl` as the common ancestor. If the
-same issue changed on both sides, br stops and asks for an explicit policy:
+`br sync --merge` uses `.beads/beads.base.jsonl`, the workspace's last local
+export, as its anchor. Switching branches can bring back a JSONL that never
+contained that export. A missing JSONL row therefore preserves the local issue,
+even when tombstone retention is configured; an explicit JSONL tombstone still
+represents deletion. `--force-jsonl` also allows a missing row to delete an
+issue present in both the anchor and the database.
+
+If the same issue changed on both sides, br stops and asks for an explicit policy:
 `--force-db` keeps the local SQLite version, `--force-jsonl` keeps the JSONL
-version, and `--force` keeps the newer timestamp.
+version, and `--force` keeps the newer timestamp (local wins a tie).
+
+The merge also reports `AmbiguousBase` when a differing external-only revision
+has an older or equal timestamp than the anchor or local copy. That might be
+an older export, or a legitimate edit from a machine with a slower clock.
+The default merge preserves both inputs and applies no issue changes until
+you resolve the ambiguity. For the known older-export case, `--force` keeps
+the newer local work while accepting unrelated newer JSONL updates. Use
+`--force-jsonl` only when the external version should win regardless of time.
+Timestamps cannot prove ancestry; br does not obtain one from Git.
 
 Comments are append-only, so the merge keeps every comment either side added.
 Two clones can also mint the same id for different issues (child ids such as

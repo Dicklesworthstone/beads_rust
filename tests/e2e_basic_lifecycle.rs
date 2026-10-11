@@ -2133,12 +2133,26 @@ fn e2e_sync_merge_resume_reuses_receipt_tombstone_cutoff() {
     drop(storage);
     fs::write(&base_path, &base_bytes).expect("write merge base");
 
+    // Absence from an external export cannot prove deletion. Supply the
+    // explicit tombstone that a deleting clone would have exported.
+    let victim_deleted_at = Utc::now();
+    let mut external_victim = victim.clone();
+    external_victim.status = Status::Tombstone;
+    external_victim.updated_at = victim_deleted_at;
+    external_victim.deleted_at = Some(victim_deleted_at);
+    external_victim.deleted_by = Some("external-clone".to_string());
+    external_victim.delete_reason = Some("explicit external deletion".to_string());
+    external_victim.original_type = Some("task".to_string());
     let current_jsonl = std::str::from_utf8(&base_bytes)
         .expect("canonical base is UTF-8")
         .lines()
-        .filter(|line| {
+        .map(|line| {
             let issue: Value = serde_json::from_str(line).expect("parse canonical base issue");
-            issue["id"].as_str() == Some(boundary_tombstone.id.as_str())
+            if issue["id"].as_str() == Some(victim.id.as_str()) {
+                serde_json::to_string(&external_victim).expect("serialize external tombstone")
+            } else {
+                line.to_string()
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -2224,6 +2238,13 @@ fn e2e_sync_merge_resume_reuses_receipt_tombstone_cutoff() {
     );
 
     let storage = SqliteStorage::open(&db_path).expect("open committed merge database");
+    let persisted_victim = storage
+        .get_issue(&victim.id)
+        .expect("read external deletion victim")
+        .expect("external tombstone persists");
+    assert_eq!(persisted_victim.status, Status::Tombstone);
+    assert_eq!(persisted_victim.updated_at, victim_deleted_at);
+    assert_eq!(persisted_victim.deleted_at, Some(victim_deleted_at));
     let persisted_boundary = storage
         .get_issue(&boundary_tombstone.id)
         .expect("read boundary tombstone")

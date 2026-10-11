@@ -16785,6 +16785,9 @@ pub enum ConflictType {
     BothModified,
     /// Issue was created in both local and external with different content.
     ConvergentCreation,
+    /// The base is a local export and cannot establish whether an older or
+    /// equal-timestamp external revision is stale or a new edit with clock skew.
+    AmbiguousBase,
 }
 
 /// Result of merging a single issue across base, left (local), and right (external).
@@ -16802,19 +16805,30 @@ pub enum MergeResult {
     Conflict(ConflictType),
 }
 
+/// What the caller knows about the relationship between the merge inputs.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum MergeBasePolicy {
+    /// The caller supplied a common ancestor of both sides.
+    #[default]
+    CommonAncestor,
+    /// The base records a local export that the external side may never have seen.
+    LocalExport,
+}
+
 /// Context for performing a 3-way merge operation.
 #[derive(Debug, Default)]
 pub struct MergeContext {
-    /// Base state (last known common state).
+    /// Base state, interpreted according to the caller's knowledge of its ancestry.
     pub base: std::collections::HashMap<String, Issue>,
     /// Left state (current SQLite/local changes).
     pub left: std::collections::HashMap<String, Issue>,
     /// Right state (current JSONL/external changes).
     pub right: std::collections::HashMap<String, Issue>,
+    base_policy: MergeBasePolicy,
 }
 
 impl MergeContext {
-    /// Create a new merge context from the three states.
+    /// Create a new merge context with a caller-supplied common ancestor.
     #[must_use]
     #[allow(clippy::missing_const_for_fn)]
     pub fn new(
@@ -16822,7 +16836,23 @@ impl MergeContext {
         left: std::collections::HashMap<String, Issue>,
         right: std::collections::HashMap<String, Issue>,
     ) -> Self {
-        Self { base, left, right }
+        Self {
+            base,
+            left,
+            right,
+            base_policy: MergeBasePolicy::CommonAncestor,
+        }
+    }
+
+    /// Treat the base as a local export rather than a proven common ancestor.
+    ///
+    /// Missing external rows then carry no deletion evidence, and an external
+    /// revision that is not newer cannot silently replace the exported state.
+    /// Explicit conflict strategies can still resolve such ambiguity.
+    #[must_use]
+    pub const fn with_local_export_base(mut self) -> Self {
+        self.base_policy = MergeBasePolicy::LocalExport;
+        self
     }
 
     /// Get all unique issue IDs across all three states.
@@ -17098,6 +17128,53 @@ pub fn merge_issue(
     }
 }
 
+/// A workspace export is not proof that the external side ever contained its
+/// rows. Preserve absent rows and require a decision for divergent external
+/// copies whose timestamps cannot distinguish old exports from clock skew.
+fn merge_issue_from_local_export(
+    base: Option<&Issue>,
+    left: Option<&Issue>,
+    right: Option<&Issue>,
+    strategy: ConflictResolution,
+) -> MergeResult {
+    match (base, left, right) {
+        (Some(_), Some(local), None) if strategy != ConflictResolution::PreferExternal => {
+            // Retention filters exported tombstones, never live issues. Keep
+            // the original row, including its timestamps, without recording
+            // a conflict resolution that the caller never needed to make.
+            MergeResult::Keep(local.clone())
+        }
+        (Some(base), Some(local), Some(external))
+            if local.sync_equals(base)
+                && !local.sync_equals(external)
+                && external.updated_at <= base.updated_at.max(local.updated_at) =>
+        {
+            // Comments have already been unioned, but the input audit
+            // timestamps are unchanged. Equal timestamps are ambiguous too:
+            // manually edited or low-resolution exports can share a timestamp.
+            let (chosen, note) = match strategy {
+                ConflictResolution::Manual => {
+                    return MergeResult::Conflict(ConflictType::AmbiguousBase);
+                }
+                ConflictResolution::PreferLocal => (local, "kept local"),
+                ConflictResolution::PreferExternal => (external, "kept external"),
+                ConflictResolution::PreferNewer => {
+                    if local.updated_at >= external.updated_at {
+                        (local, "kept local (newer timestamp or tie)")
+                    } else {
+                        (external, "kept external (newer timestamp)")
+                    }
+                }
+            };
+            MergeResult::KeepWithNote(
+                chosen.clone(),
+                format!("Local export base cannot establish external revision ancestry - {note}"),
+            )
+        }
+        _ => merge_issue(base, left, right, strategy),
+    }
+}
+
 /// Perform a 3-way merge across all issues in the context.
 ///
 /// This iterates through all unique issue IDs across base, left, and right,
@@ -17206,7 +17283,12 @@ pub fn three_way_merge(
             }
         }
 
-        let result = merge_issue(base, left, right, strategy);
+        let result = match context.base_policy {
+            MergeBasePolicy::CommonAncestor => merge_issue(base, left, right, strategy),
+            MergeBasePolicy::LocalExport => {
+                merge_issue_from_local_export(base, left, right, strategy)
+            }
+        };
         let revised = |mut issue: Issue| {
             if let Some(revision_at) = union_revision_at {
                 issue.updated_at = issue.updated_at.max(revision_at);
@@ -17220,7 +17302,12 @@ pub fn three_way_merge(
                 report.kept.push(revised(issue));
             }
             MergeResult::KeepWithNote(issue, note) => {
-                report.notes.push((issue.id.clone(), note));
+                // Merge notes become issue comments during atomic apply.
+                // Tombstone winners must retain the deletion without trying
+                // to append a comment to a deleted issue.
+                if issue.status != crate::model::Status::Tombstone {
+                    report.notes.push((issue.id.clone(), note));
+                }
                 report.kept.push(revised(issue));
             }
             MergeResult::Delete => {
@@ -17377,11 +17464,12 @@ impl IdCollisionPlan {
                 (issue.id.clone(), issue)
             })
             .collect();
-        MergeContext::new(
+        MergeContext {
             base,
-            rekey_side(&context.left, &self.local_renames),
-            rekey_side(&context.right, &self.external_renames),
-        )
+            left: rekey_side(&context.left, &self.local_renames),
+            right: rekey_side(&context.right, &self.external_renames),
+            base_policy: context.base_policy,
+        }
     }
 }
 
@@ -30794,6 +30882,393 @@ mod tests {
     // ========================================================================
     // three_way_merge orchestration tests
     // ========================================================================
+
+    #[test]
+    fn test_three_way_merge_local_export_preserves_absent_live_rows() {
+        let exported = created_issue("bd-exported", "Created and exported locally", 100);
+        let base_modified = created_issue("bd-modified", "Exported before local edit", 100);
+        let mut modified = with_comment(base_modified.clone(), 1, "Unexported work", 200);
+        modified.description = Some("Local work after exporting".to_string());
+        modified.updated_at = fixed_time_merge(200);
+        let external = created_issue("bd-external", "An unrelated external addition", 150);
+        let context = MergeContext::new(
+            issue_map(&[&exported, &base_modified]),
+            issue_map(&[&exported, &modified]),
+            issue_map(&[&external]),
+        )
+        .with_local_export_base();
+
+        for strategy in [
+            ConflictResolution::Manual,
+            ConflictResolution::PreferLocal,
+            ConflictResolution::PreferNewer,
+        ] {
+            let report = three_way_merge(&context, strategy, None);
+            assert!(report.conflicts.is_empty());
+            assert!(report.deleted.is_empty());
+            assert_eq!(report.kept.len(), 3);
+            for expected in [&exported, &modified, &external] {
+                assert!(report.kept.contains(expected));
+            }
+            assert!(report.notes.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_three_way_merge_local_export_force_jsonl_accepts_missing_live_deletion() {
+        let base = created_issue("bd-delete", "Exported locally", 100);
+        let mut modified = base.clone();
+        modified.title = "Unexported local edit".to_string();
+        modified.updated_at = fixed_time_merge(200);
+
+        for local in [&base, &modified] {
+            let context =
+                MergeContext::new(issue_map(&[&base]), issue_map(&[local]), HashMap::new())
+                    .with_local_export_base();
+            let report = three_way_merge(&context, ConflictResolution::PreferExternal, None);
+            assert_eq!(report.deleted, vec![base.id.clone()]);
+            assert!(report.kept.is_empty());
+            assert!(report.conflicts.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_three_way_merge_local_export_preserves_missing_tombstone_retention() {
+        let mut tombstone = created_issue("bd-deleted", "Already deleted locally", 100);
+        tombstone.status = Status::Tombstone;
+        tombstone.deleted_at = Some(fixed_time_merge(200));
+        tombstone.deleted_by = Some("deleter".to_string());
+        tombstone.delete_reason = Some("A real deletion".to_string());
+        tombstone.updated_at = fixed_time_merge(200);
+        let context = MergeContext::new(
+            issue_map(&[&tombstone]),
+            issue_map(&[&tombstone]),
+            HashMap::new(),
+        )
+        .with_local_export_base();
+
+        for strategy in [
+            ConflictResolution::Manual,
+            ConflictResolution::PreferLocal,
+            ConflictResolution::PreferNewer,
+        ] {
+            let report = three_way_merge(&context, strategy, None);
+            assert_eq!(report.kept, vec![tombstone.clone()]);
+            assert!(report.deleted.is_empty());
+            assert!(
+                report.notes.is_empty(),
+                "tombstones cannot receive merge comments"
+            );
+            assert!(report.conflicts.is_empty());
+            let as_of = fixed_time_merge(200 + 2 * 86_400);
+            assert!(report.kept[0].is_expired_tombstone_at(Some(1), as_of));
+            assert!(!report.kept[0].is_expired_tombstone_at(None, as_of));
+            assert!(!report.kept[0].is_expired_tombstone_at(Some(0), as_of));
+        }
+    }
+
+    #[test]
+    fn test_three_way_merge_local_export_reports_stale_and_equal_timestamp_ambiguity() {
+        // Both closing and reopening an issue are legitimate local work.
+        // Neither status is a safe tie-breaker for the incoming old copy.
+        for (local_status, external_status) in [
+            (Status::Closed, Status::Open),
+            (Status::Open, Status::Closed),
+        ] {
+            let mut base = created_issue("bd-lifecycle", "Locally exported lifecycle", 100);
+            base.status = local_status;
+            base.updated_at = fixed_time_merge(300);
+            let mut local = base.clone();
+            // sync_equals ignores this audit-only timestamp change.
+            local.updated_at = fixed_time_merge(400);
+            for timestamp in [200, 300, 350, 400] {
+                let mut external = base.clone();
+                external.status = external_status.clone();
+                external.updated_at = fixed_time_merge(timestamp);
+                let context = MergeContext::new(
+                    issue_map(&[&base]),
+                    issue_map(&[&local]),
+                    issue_map(&[&external]),
+                )
+                .with_local_export_base();
+                let report = three_way_merge(&context, ConflictResolution::Manual, None);
+                assert_eq!(
+                    report.conflicts,
+                    vec![(base.id.clone(), ConflictType::AmbiguousBase)]
+                );
+                assert!(report.kept.is_empty());
+                assert!(report.deleted.is_empty());
+                assert!(report.notes.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn test_three_way_merge_local_export_explicit_winners_resolve_clock_ambiguity() {
+        let mut base = created_issue("bd-clock", "Exported content", 50);
+        base.updated_at = fixed_time_merge(300);
+        let mut external = base.clone();
+        external.title = "Possibly newer edit from a slow clock".to_string();
+        external.updated_at = fixed_time_merge(200);
+
+        for local_timestamp in [100, 400] {
+            let mut local = base.clone();
+            local.updated_at = fixed_time_merge(local_timestamp);
+            let context = MergeContext::new(
+                issue_map(&[&base]),
+                issue_map(&[&local]),
+                issue_map(&[&external]),
+            )
+            .with_local_export_base();
+            for (strategy, expected) in [
+                (ConflictResolution::PreferLocal, &local),
+                (ConflictResolution::PreferExternal, &external),
+                (
+                    ConflictResolution::PreferNewer,
+                    if local_timestamp >= 200 {
+                        &local
+                    } else {
+                        &external
+                    },
+                ),
+            ] {
+                let report = three_way_merge(&context, strategy, None);
+                assert_eq!(report.kept, vec![expected.clone()]);
+                assert!(report.conflicts.is_empty());
+                assert!(report.deleted.is_empty());
+                assert_eq!(report.notes.len(), 1);
+                assert!(
+                    report.notes[0]
+                        .1
+                        .contains("cannot establish external revision ancestry")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_three_way_merge_local_export_accepts_newer_updates_and_explicit_tombstones() {
+        let base = created_issue("bd-update", "Exported content", 100);
+        let mut updated = base.clone();
+        updated.description = Some("A genuine external update".to_string());
+        updated.updated_at = fixed_time_merge(200);
+        let deletion_base = created_issue("bd-delete", "A genuinely deleted issue", 100);
+        let mut tombstone = deletion_base.clone();
+        tombstone.status = Status::Tombstone;
+        tombstone.deleted_at = Some(fixed_time_merge(200));
+        tombstone.updated_at = fixed_time_merge(200);
+        let context = MergeContext::new(
+            issue_map(&[&base, &deletion_base]),
+            issue_map(&[&base, &deletion_base]),
+            issue_map(&[&updated, &tombstone]),
+        )
+        .with_local_export_base();
+        let report = three_way_merge(&context, ConflictResolution::Manual, None);
+        assert!(report.conflicts.is_empty());
+        assert!(report.deleted.is_empty());
+        assert!(report.notes.is_empty());
+        assert_eq!(report.kept.len(), 2);
+        assert!(report.kept.contains(&updated));
+        assert!(report.kept.contains(&tombstone));
+
+        // A tombstone from a skewed clock still requires a decision. An
+        // explicit external choice applies it without an invalid merge comment.
+        tombstone.updated_at = deletion_base.updated_at;
+        let context = MergeContext::new(
+            issue_map(&[&deletion_base]),
+            issue_map(&[&deletion_base]),
+            issue_map(&[&tombstone]),
+        )
+        .with_local_export_base();
+        let unresolved = three_way_merge(&context, ConflictResolution::Manual, None);
+        assert_eq!(unresolved.conflicts[0].1, ConflictType::AmbiguousBase);
+        let forced = three_way_merge(&context, ConflictResolution::PreferExternal, None);
+        assert_eq!(forced.kept, vec![tombstone]);
+        assert!(forced.notes.is_empty());
+        assert!(forced.conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_three_way_merge_local_export_keeps_both_modified_conflicts() {
+        let base = created_issue("bd-conflict", "Base", 50);
+        let mut local = base.clone();
+        local.title = "Local edit".to_string();
+        local.updated_at = fixed_time_merge(200);
+        for timestamp in [75, 200, 300] {
+            let mut external = base.clone();
+            external.title = "Conflicting external edit".to_string();
+            external.updated_at = fixed_time_merge(timestamp);
+            let context = MergeContext::new(
+                issue_map(&[&base]),
+                issue_map(&[&local]),
+                issue_map(&[&external]),
+            )
+            .with_local_export_base();
+            let report = three_way_merge(&context, ConflictResolution::Manual, None);
+            assert_eq!(
+                report.conflicts,
+                vec![(base.id.clone(), ConflictType::BothModified)]
+            );
+            assert!(report.kept.is_empty());
+            assert!(report.deleted.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_three_way_merge_forced_conflicting_deletion_preserves_tombstone() {
+        let base = created_issue("bd-conflicting-delete", "Original issue", 100);
+        let mut local = base.clone();
+        local.description = Some("Conflicting local work".to_string());
+        local.updated_at = fixed_time_merge(200);
+        let mut tombstone = base.clone();
+        tombstone.status = Status::Tombstone;
+        tombstone.updated_at = fixed_time_merge(300);
+        tombstone.deleted_at = Some(fixed_time_merge(290));
+        tombstone.deleted_by = Some("external-deleter".to_string());
+        tombstone.delete_reason = Some("Explicit external deletion".to_string());
+
+        for local_export_base in [false, true] {
+            let context = MergeContext::new(
+                issue_map(&[&base]),
+                issue_map(&[&local]),
+                issue_map(&[&tombstone]),
+            );
+            let context = if local_export_base {
+                context.with_local_export_base()
+            } else {
+                context
+            };
+            let unresolved = three_way_merge(&context, ConflictResolution::Manual, None);
+            assert_eq!(
+                unresolved.conflicts,
+                vec![(base.id.clone(), ConflictType::BothModified)]
+            );
+            assert!(unresolved.kept.is_empty());
+
+            for strategy in [
+                ConflictResolution::PreferExternal,
+                ConflictResolution::PreferNewer,
+            ] {
+                let resolved = three_way_merge(&context, strategy, None);
+                assert_eq!(resolved.kept, vec![tombstone.clone()]);
+                assert!(resolved.conflicts.is_empty());
+                assert!(resolved.deleted.is_empty());
+                assert!(
+                    resolved.notes.is_empty(),
+                    "cannot attach comments to tombstones"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_three_way_merge_local_export_unions_comments_before_ancestry_decision() {
+        let mut base = with_comment(
+            created_issue("bd-comments", "Exported state", 50),
+            1,
+            "Local",
+            300,
+        );
+        base.updated_at = fixed_time_merge(300);
+        let mut external = created_issue("bd-comments", "Older external state", 50);
+        external = with_comment(external, 1, "External", 100);
+        external.updated_at = fixed_time_merge(100);
+        let context = MergeContext::new(
+            issue_map(&[&base]),
+            issue_map(&[&base]),
+            issue_map(&[&external]),
+        )
+        .with_local_export_base();
+        let unresolved = three_way_merge(&context, ConflictResolution::Manual, None);
+        assert_eq!(unresolved.conflicts[0].1, ConflictType::AmbiguousBase);
+
+        let forced = three_way_merge(&context, ConflictResolution::PreferLocal, None);
+        assert_eq!(forced.kept[0].title, base.title);
+        assert_eq!(forced.kept[0].comments.len(), 2);
+        assert!(
+            forced.kept[0]
+                .comments
+                .iter()
+                .any(|comment| comment.body == "Local")
+        );
+        assert!(
+            forced.kept[0]
+                .comments
+                .iter()
+                .any(|comment| comment.body == "External")
+        );
+        assert!(forced.kept[0].updated_at > base.updated_at);
+
+        // An old row that differs only in append-only comments is safe to
+        // combine, even though no timestamp can prove snapshot ancestry.
+        external.title.clone_from(&base.title);
+        let context = MergeContext::new(
+            issue_map(&[&base]),
+            issue_map(&[&base]),
+            issue_map(&[&external]),
+        )
+        .with_local_export_base();
+        let comments_only = three_way_merge(&context, ConflictResolution::Manual, None);
+        assert!(comments_only.conflicts.is_empty());
+        assert_eq!(comments_only.kept[0].comments, forced.kept[0].comments);
+    }
+
+    #[test]
+    fn test_three_way_merge_local_export_policy_survives_collision_rekey() {
+        let collision_local =
+            created_issue("bd-collision", "First independently created issue", 100);
+        let collision_external =
+            created_issue("bd-collision", "Second independently created issue", 200);
+        let missing = created_issue("bd-missing", "Export never seen externally", 100);
+        let mut exported = created_issue("bd-stale", "Locally exported content", 100);
+        exported.updated_at = fixed_time_merge(300);
+        let mut stale = exported.clone();
+        stale.title = "Old external content".to_string();
+        stale.updated_at = fixed_time_merge(100);
+        let context = MergeContext::new(
+            issue_map(&[&missing, &exported]),
+            issue_map(&[&collision_local, &missing, &exported]),
+            issue_map(&[&collision_external, &stale]),
+        )
+        .with_local_export_base();
+        let report = three_way_merge(&context, ConflictResolution::Manual, None);
+        assert_eq!(report.id_collisions.len(), 1);
+        assert!(report.kept.contains(&missing));
+        assert!(report.deleted.is_empty());
+        assert_eq!(
+            report.conflicts,
+            vec![(exported.id, ConflictType::AmbiguousBase)]
+        );
+        assert!(
+            report
+                .kept
+                .iter()
+                .any(|issue| issue.title == collision_local.title)
+        );
+        assert!(
+            report
+                .kept
+                .iter()
+                .any(|issue| issue.title == collision_external.title)
+        );
+    }
+
+    #[test]
+    fn test_three_way_merge_common_ancestor_keeps_equal_timestamp_updates_and_deletions() {
+        let base = created_issue("bd-ancestor", "Known ancestor", 100);
+        let mut external = base.clone();
+        external.title = "A real descendant with the same timestamp".to_string();
+        let removed = created_issue("bd-removed", "Deleted since the known ancestor", 100);
+        let context = MergeContext::new(
+            issue_map(&[&base, &removed]),
+            issue_map(&[&base, &removed]),
+            issue_map(&[&external]),
+        );
+        let report = three_way_merge(&context, ConflictResolution::Manual, None);
+        assert_eq!(report.kept, vec![external]);
+        assert_eq!(report.deleted, vec![removed.id]);
+        assert!(report.conflicts.is_empty());
+    }
 
     #[test]
     fn test_three_way_merge_basic() {

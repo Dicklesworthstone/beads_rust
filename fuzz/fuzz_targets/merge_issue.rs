@@ -452,6 +452,12 @@ fn assert_no_silent_conflict_resolution(
             }
         }
         ConflictResolution::PreferNewer => match conflict_type {
+            ConflictType::AmbiguousBase => {
+                return Err(
+                    "common-ancestor merge unexpectedly reported export-anchor ambiguity"
+                        .to_string(),
+                );
+            }
             ConflictType::BothModified | ConflictType::ConvergentCreation => {
                 let expected = newer_issue(case.local.as_ref(), case.external.as_ref());
                 assert_kept_matches(result, expected, "prefer-newer conflict winner")?;

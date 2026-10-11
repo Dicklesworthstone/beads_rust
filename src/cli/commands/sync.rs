@@ -5342,7 +5342,8 @@ fn execute_merge(
 
     let database_before = capture_sync_database_witness(storage)?;
 
-    // 1. Load Base State (ancestor) from the exact retained generation.
+    // 1. Load the last local export from the exact retained generation. It
+    // need not be an ancestor of a JSONL restored from an older branch.
     let base = load_base_snapshot_from_source(base_source.as_ref())?;
     debug!(base_count = base.len(), "Loaded base snapshot");
 
@@ -5404,13 +5405,10 @@ fn execute_merge(
                     .to_string(),
         });
     }
-    // A JSONL with no issues at all (a truncated file, an empty checkout)
-    // reads as "the other side deleted everything" and would delete every
-    // issue the database still shares with the last sync, under every
-    // strategy (an unchanged issue deleted on one side is not a conflict).
-    // Deletions normally leave tombstones, so refuse unless the deletion is
-    // explicitly accepted, as the export guard does for an empty database
-    // over a non-empty JSONL.
+    // An empty JSONL may be a truncated file or an empty checkout. Keep the
+    // existing explicit-authority guard rather than certifying that source
+    // as synchronized: deletions normally leave tombstones, and no external
+    // record establishes what happened to the locally exported issues.
     if source.is_some()
         && right.is_empty()
         && !args.force_jsonl
@@ -5418,7 +5416,7 @@ fn execute_merge(
     {
         return Err(BeadsError::SyncConflict {
             message:
-                "issues.jsonl contains no issues, so merging it would delete every issue the database shares with the last sync. Restore issues.jsonl (for example from git) or rewrite it from the database with `br sync --flush-only --force`; pass --force-jsonl to accept deleting them"
+                "issues.jsonl contains no issues and does not establish deletion intent for the locally exported issues. Restore issues.jsonl (for example from git) or rewrite it from the database with `br sync --flush-only --force`; pass --force-jsonl to accept deleting them"
                     .to_string(),
         });
     }
@@ -5430,8 +5428,11 @@ fn execute_merge(
         });
     }
 
-    // 4. Perform Merge
-    let context = MergeContext::new(base, left, right);
+    // 4. Perform Merge. Export updates the anchor without proving that the
+    // external source ever contained it. Missing rows therefore do not imply
+    // deletion, and non-advancing external revisions need explicit resolution.
+    // Tombstone retention only controls export population, not merge ancestry.
+    let context = MergeContext::new(base, left, right).with_local_export_base();
     let strategy = merge_conflict_resolution(args);
     let resolution = merge_conflict_resolution_label(strategy);
     let local_tombstones: HashSet<String> = context
@@ -5466,6 +5467,13 @@ fn execute_merge(
         for (id, kind) in &report.conflicts {
             use std::fmt::Write;
             let _ = writeln!(msg, "  - {id}: {kind:?}");
+        }
+        if report
+            .conflicts
+            .iter()
+            .any(|(_, kind)| *kind == crate::sync::ConflictType::AmbiguousBase)
+        {
+            msg.push_str("\nbeads.base.jsonl is the last local export, not a proven common ancestor. A differing JSONL row with an older or equal timestamp may be an older export or a clock-skewed edit; neither version was discarded.\n");
         }
         msg.push_str("\nUse --force-db to keep local DB changes, --force-jsonl to keep JSONL changes, or --force to keep the newer timestamp.");
         return Err(BeadsError::Config(msg));
@@ -5607,6 +5615,13 @@ fn render_merge_conflicts_rich(
         text.append(": ");
         text.append_styled(&format!("{kind:?}"), theme.error.clone());
         text.append("\n");
+    }
+
+    if conflicts
+        .iter()
+        .any(|(_, kind)| *kind == crate::sync::ConflictType::AmbiguousBase)
+    {
+        text.append("\nThe last local export is not a proven common ancestor. Older or equal JSONL timestamps cannot distinguish an older export from a clock-skewed edit; neither version was discarded.\n");
     }
 
     text.append("\n");

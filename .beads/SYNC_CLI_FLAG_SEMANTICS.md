@@ -111,6 +111,22 @@ br sync --reconcile-additive --resolve-source-id bd-x
 | Both Modified | Base, SQLite, and JSONL all contain divergent versions | "Merge conflicts detected..." | `--force`, `--force-db`, `--force-jsonl` |
 | Delete vs Modify | One side deletes an issue the other side modified | "Merge conflicts detected..." | `--force`, `--force-db`, `--force-jsonl` |
 | Convergent Creation | SQLite and JSONL independently create the same ID with different content | "Merge conflicts detected..." | `--force`, `--force-db`, `--force-jsonl` |
+| Ambiguous Base | Local payload equals the export anchor, but a differing JSONL row has an older or equal timestamp than the anchor or local copy | "AmbiguousBase"; neither input is discarded | `--force`, `--force-db`, `--force-jsonl` |
+
+`beads.base.jsonl` records the last local export, which may not be a common
+ancestor of an incoming branch's JSONL. An issue present in the anchor and
+database but absent from JSONL is preserved by default, even if it has local
+edits or tombstone retention is enabled. Only `--force-jsonl` interprets that
+absence as deletion. Explicit external tombstone rows still carry deletion
+intent; local tombstones remain protected against resurrection. Expiry keeps
+using the original deletion timestamp.
+
+For `AmbiguousBase`, manual mode refuses before applying the merge.
+`--force-db` keeps the local revision, `--force-jsonl` keeps the external
+revision regardless of timestamp, and `--force` picks the newer revision
+(local wins equal timestamps). Newer external-only updates still merge
+normally. Neither timestamps nor the anchor establish an authoritative common
+ancestor, and br does not run Git to look one up.
 
 ### 3.4 Non-Bypassable Guards
 

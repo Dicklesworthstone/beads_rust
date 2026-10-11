@@ -21785,6 +21785,13 @@ impl SqliteStorage {
 
             for (issue_id, note) in notes {
                 Self::ensure_issue_mutable_in_tx(&storage.conn, issue_id, "add merge note to")?;
+                // A selected revision may come from a clock ahead of ours.
+                // Appending the audit note must not make that revision look
+                // older than an external copy in a subsequent merge (#541).
+                let issue_updated_at = kept_by_id[issue_id.as_str()]
+                    .updated_at
+                    .max(timestamp)
+                    .to_rfc3339();
                 storage.conn.execute_with_params(
                     "INSERT INTO comments (issue_id, author, text, created_at) \
                      VALUES (?, ?, ?, ?)",
@@ -21798,7 +21805,7 @@ impl SqliteStorage {
                 storage.conn.execute_with_params(
                     "UPDATE issues SET updated_at = ? WHERE id = ?",
                     &[
-                        SqliteValue::from(created_at.as_str()),
+                        SqliteValue::from(issue_updated_at.as_str()),
                         SqliteValue::from(issue_id.as_str()),
                     ],
                 )?;
@@ -42217,6 +42224,83 @@ required_fields:
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn sync_merge_note_preserves_future_revision_without_changing_audit_time() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let merge_at = Utc.with_ymd_and_hms(2026, 7, 27, 7, 0, 0).unwrap();
+        let created_at = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let revisions = [
+            ("bd-note-past", merge_at - chrono::Duration::days(1)),
+            ("bd-note-equal", merge_at),
+            ("bd-note-future", merge_at + chrono::Duration::days(365)),
+        ];
+        let kept = revisions
+            .iter()
+            .map(|(id, revision)| {
+                let mut issue = make_issue(
+                    id,
+                    "Selected revision",
+                    Status::Open,
+                    2,
+                    None,
+                    created_at,
+                    None,
+                );
+                issue.updated_at = *revision;
+                issue
+            })
+            .collect::<Vec<_>>();
+        let notes = kept
+            .iter()
+            .map(|issue| {
+                (
+                    issue.id.clone(),
+                    "Explicitly selected local revision".to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &notes);
+        assert_eq!(intent.export_as_of, merge_at);
+        let receipt = storage
+            .apply_sync_merge_atomically(&kept, &[], &notes, &intent)
+            .unwrap();
+
+        for (id, revision) in revisions {
+            let stored = storage.get_issue(id).unwrap().unwrap();
+            assert!(stored.updated_at >= revision, "merge note regressed {id}");
+            assert!(stored.updated_at >= merge_at);
+            if revision > merge_at {
+                assert_eq!(stored.updated_at, revision);
+            } else {
+                assert_eq!(stored.updated_at, merge_at);
+            }
+            let comments = storage.get_comments(id).unwrap();
+            assert_eq!(comments.len(), 1);
+            assert_eq!(comments[0].created_at, merge_at);
+            assert_eq!(comments[0].author, "br-sync");
+            let event = storage
+                .get_events(id, 0)
+                .unwrap()
+                .into_iter()
+                .find(|event| event.event_type == EventType::Commented)
+                .expect("merge note audit event");
+            assert_eq!(event.created_at, merge_at);
+        }
+
+        let mut exported = Vec::new();
+        crate::sync::export_to_writer(&storage, &mut exported).unwrap();
+        assert_eq!(
+            receipt.jsonl_after_raw_sha256,
+            crate::util::hex_encode(&Sha256::digest(&exported)),
+            "receipt must bind the actual preserved revisions and audit notes"
+        );
+        assert_eq!(
+            receipt.database_after,
+            crate::sync::capture_sync_merge_core_witness(&storage).unwrap()
+        );
+        receipt.validate().unwrap();
     }
 
     #[test]

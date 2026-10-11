@@ -204,6 +204,33 @@ still refused.
 | **Both modified conflict** | Silently choosing between divergent SQLite and JSONL edits | `--force`, `--force-db`, `--force-jsonl` |
 | **Delete vs modify conflict** | Silently deleting one side's edit | `--force`, `--force-db`, `--force-jsonl` |
 | **Convergent creation conflict** | Silently choosing between independently created same-ID issues | `--force`, `--force-db`, `--force-jsonl` |
+| **Ambiguous export anchor** | A differing external-only row with an older or equal timestamp silently undoing exported local work, or silently discarding a legitimate clock-skewed edit | `--force`, `--force-db`, `--force-jsonl` |
+| **Missing external row** | Treating an issue absent from an older export as a deletion | `--force-jsonl` |
+
+The saved `beads.base.jsonl` is the last local export. It is not proof that the
+incoming JSONL contains that export. A missing external row preserves the
+local issue, including local modifications since the export. Tombstone expiry
+does not change this rule: it only omits records already known to be deleted.
+An explicit external tombstone remains a deletion, and local tombstones retain
+their protection against resurrection under every resolution policy. Keeping
+an absent local tombstone does not refresh its deletion time; normal export
+retention still applies.
+
+When the local payload equals the anchor but a differing external payload's
+`updated_at` does not advance beyond both the anchor and local timestamps,
+the default merge reports `AmbiguousBase`. It applies no issue, relation, or
+merge-note changes and leaves the input JSONL and anchor intact. This protects
+both an old branch export and a real update made with a slower clock. The
+explicit winner flags resolve that ambiguity using their normal policies;
+`--force` chooses the newer timestamp and prefers local on a tie. A strictly
+newer external-only revision remains eligible for normal merging. Changes on
+both sides retain the existing conflict behavior, and append-only comments
+are still combined before comparing the remaining payload.
+
+Resolution notes never move a retained issue's `updated_at` backwards, even
+when its clock is ahead of the merging machine. The note and its audit event
+record the actual merge time. A forced tombstone winner keeps its deletion
+metadata without attempting to attach a comment to the deleted issue.
 
 ### Additive Reconciliation Guards
 
