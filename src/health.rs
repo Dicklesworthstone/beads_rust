@@ -95,6 +95,9 @@ pub enum AnomalyClass {
     JsonlNewer,
     DbNewer,
     StaleRecoveryArtifacts,
+    PreservationUnverified {
+        detail: String,
+    },
     BlockedCacheStale,
     NullInNotNullColumn {
         table: String,
@@ -143,6 +146,7 @@ impl AnomalyClass {
             Self::JsonlNewer => "jsonl_newer",
             Self::DbNewer => "db_newer",
             Self::StaleRecoveryArtifacts => "stale_recovery_artifacts",
+            Self::PreservationUnverified { .. } => "preservation_unverified",
             Self::BlockedCacheStale => "blocked_cache_stale",
             Self::NullInNotNullColumn { .. } => "null_in_not_null_column",
             Self::DirtyFlagMismatch { .. } => "dirty_flag_mismatch",
@@ -169,7 +173,9 @@ impl AnomalyClass {
             | Self::TruncatedWal
             | Self::WriteProbeFailed { .. } => WorkspaceHealth::Recoverable,
 
-            Self::JsonlConflictMarkers | Self::JsonlParseError { .. } => WorkspaceHealth::Unsafe,
+            Self::JsonlConflictMarkers
+            | Self::JsonlParseError { .. }
+            | Self::PreservationUnverified { .. } => WorkspaceHealth::Unsafe,
 
             Self::SidecarMismatch { .. }
             | Self::DbJsonlCountMismatch { .. }
@@ -250,6 +256,9 @@ impl fmt::Display for AnomalyClass {
             Self::JsonlNewer => f.write_str("JSONL has newer data than database"),
             Self::DbNewer => f.write_str("database has newer data than JSONL"),
             Self::StaleRecoveryArtifacts => f.write_str("stale recovery artifacts present"),
+            Self::PreservationUnverified { detail } => {
+                write!(f, "local-state preservation unverified: {detail}")
+            }
             Self::BlockedCacheStale => f.write_str("blocked_issues_cache marked stale"),
             Self::NullInNotNullColumn { table, column } => {
                 write!(f, "NULL in NOT NULL column {table}.{column}")

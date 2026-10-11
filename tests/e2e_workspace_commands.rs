@@ -1000,10 +1000,11 @@ fn e2e_doctor_repair_json_rebuilds_and_returns_single_payload() {
         repaired.stderr
     );
 
-    let payload = extract_json_payload(&repaired.stdout);
-    let json: Value = serde_json::from_str(&payload).expect("repair doctor json");
+    let json: Value = serde_json::from_str(&repaired.stdout).expect("single repair doctor JSON");
     assert_eq!(json["repaired"], Value::Bool(true));
     assert_eq!(json["verified"], Value::Bool(true));
+    assert_eq!(json["database_verified"], true);
+    assert_eq!(json["preservation_verified"], true);
     assert_eq!(json["report"]["ok"], Value::Bool(false));
     assert_eq!(json["post_repair"]["ok"], Value::Bool(true));
 
@@ -1466,20 +1467,41 @@ fn e2e_doctor_repair_json_rebuilds_when_db_is_missing() {
 
     let create = run_br(&workspace, ["create", "Repair doctor missing DB"], "create");
     assert!(create.status.success(), "create failed: {}", create.stderr);
+    let flush = run_br(&workspace, ["sync", "--flush-only", "--json"], "flush");
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
 
     let db_path = workspace.root.join(".beads").join("beads.db");
     let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
-    assert!(db_path.exists(), "database should exist before deletion");
+    assert!(
+        db_path.exists(),
+        "database should exist before displacement"
+    );
     assert!(
         jsonl_path.exists(),
         "issues.jsonl should exist before repair test"
     );
+    let jsonl = fs::read(&jsonl_path).expect("exported recovery source");
 
-    fs::rename(&db_path, workspace.root.join("retained-original-beads.db"))
-        .expect("retain original database outside its live path");
+    // A successful checkpoint may retain a header-only WAL. Preserve the
+    // complete family outside its live path so this fixture has no orphan
+    // sidecars; the separate orphan-WAL case covers incomplete preservation.
+    let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open fixture db");
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("checkpoint exported fixture");
+    conn.close().expect("close checkpointed fixture");
+    let family = namespace_family_bytes(&workspace);
+    let retained = workspace.root.join("retained-database-family");
+    fs::create_dir_all(&retained).expect("retain original database family");
+    for name in family.keys() {
+        fs::rename(
+            workspace.root.join(".beads").join(name),
+            retained.join(name),
+        )
+        .expect("retain original family outside its live path");
+    }
     assert!(
-        !db_path.exists(),
-        "database should be missing before repair"
+        namespace_family_bytes(&workspace).is_empty(),
+        "database and every sidecar must be absent before repair"
     );
 
     let repaired = run_br(
@@ -1494,16 +1516,29 @@ fn e2e_doctor_repair_json_rebuilds_when_db_is_missing() {
         repaired.stderr
     );
 
-    let payload = extract_json_payload(&repaired.stdout);
-    let json: Value = serde_json::from_str(&payload).expect("repair doctor json");
+    let json: Value = serde_json::from_str(&repaired.stdout).expect("single repair doctor JSON");
     assert_eq!(json["repaired"], Value::Bool(true));
     assert_eq!(json["verified"], Value::Bool(true));
+    assert_eq!(json["database_verified"], true);
+    assert_eq!(json["preservation_verified"], true);
+    assert_eq!(json["dirty_preservation_warnings"], serde_json::json!([]));
     assert_eq!(json["report"]["ok"], Value::Bool(false));
     assert_eq!(json["post_repair"]["ok"], Value::Bool(true));
     assert!(
         db_path.exists(),
         "doctor repair should recreate the database from JSONL"
     );
+    assert_eq!(
+        fs::read(&jsonl_path).expect("unchanged recovery JSONL"),
+        jsonl
+    );
+    for (name, bytes) in family {
+        assert_eq!(
+            fs::read(retained.join(&name)).expect("retained original family"),
+            bytes,
+            "retained database family changed: {name}"
+        );
+    }
 }
 
 #[test]
@@ -1536,19 +1571,59 @@ fn e2e_doctor_repair_json_rebuilds_when_db_is_malformed() {
         ["doctor", "--repair", "--json"],
         "doctor_repair_malformed_db_json",
     );
-    assert!(
-        repaired.status.success(),
-        "doctor --repair --json failed for malformed db: stdout='{}' stderr='{}'",
-        repaired.stdout,
-        repaired.stderr
-    );
+    assert_eq!(repaired.status.code(), Some(2), "{repaired:?}");
 
-    let payload = extract_json_payload(&repaired.stdout);
-    let json: Value = serde_json::from_str(&payload).expect("repair doctor json");
+    let json: Value = serde_json::from_str(&repaired.stdout).expect("single partial repair JSON");
     assert_eq!(json["repaired"], Value::Bool(true));
-    assert_eq!(json["verified"], Value::Bool(true));
+    assert_eq!(json["verified"], false);
+    assert_eq!(json["database_verified"], true);
+    assert_eq!(json["preservation_verified"], false);
+    assert_eq!(json["code"], "fix_partial");
+    assert_eq!(json["recovery_audit"]["outcome"], "verification_failed");
     assert_eq!(json["report"]["ok"], Value::Bool(false));
-    assert_eq!(json["post_repair"]["ok"], Value::Bool(true));
+    assert_eq!(json["post_repair"]["ok"], false);
+    assert_eq!(json["post_repair"]["workspace_health"], "unsafe");
+    assert_eq!(json["post_repair"]["reliability_audit"]["health"], "unsafe");
+    assert!(
+        json["post_repair"]["reliability_audit"]["anomalies"]
+            .as_array()
+            .expect("post-repair anomaly audit")
+            .iter()
+            .any(|anomaly| anomaly["code"] == "preservation_unverified"),
+        "{json}"
+    );
+    assert!(
+        json["dirty_preservation_warnings"]
+            .as_array()
+            .expect("preservation warnings")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|message| message.contains("could not be opened"))),
+        "malformed database cannot establish lossless preservation: {json}"
+    );
+    let marker = json["recovery_failure_marker"]
+        .as_str()
+        .expect("retained failure marker");
+    let receipt: Value = serde_json::from_slice(&fs::read(marker).expect("read failure marker"))
+        .expect("valid failure marker");
+    assert_eq!(receipt["workspace_health"], "unsafe");
+    assert_eq!(
+        receipt["dirty_preservation_warnings"],
+        json["dirty_preservation_warnings"]
+    );
+    let backup = json["verified_backups"]
+        .as_array()
+        .expect("retained recovery backups")
+        .iter()
+        .find(|entry| entry["original"] == db_path.to_string_lossy().as_ref())
+        .expect("original database backup")["backup"]
+        .as_str()
+        .expect("database backup path");
+    assert_eq!(
+        fs::read(backup).expect("retained malformed primary"),
+        b"not a sqlite database"
+    );
 
     let show = run_br(
         &workspace,

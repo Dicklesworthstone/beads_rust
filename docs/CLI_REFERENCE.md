@@ -2269,7 +2269,7 @@ Checks database integrity, schema compatibility, and configuration.
 | Option | Description |
 |--------|-------------|
 | `--repair` | Attempt to repair detected issues by rebuilding DB from JSONL |
-| `--allow-repeated-repair` | Allow another JSONL rebuild after prior failed recovery evidence |
+| `--allow-repeated-repair` | Allow another JSONL rebuild after inspecting prior failed recovery evidence; does not waive preservation verification |
 | `--selftest` | Run this binary through a full issue lifecycle in a throwaway workspace and print a `br.doctor.selftest.v1` receipt (platform, filesystem probe, engine, per-step timings). Never touches the current workspace; exit 0 when every step passed, 1 otherwise |
 | `--selftest-dir <DIR>` | With `--selftest`, create the throwaway workspace under `DIR` (probe a specific filesystem such as a WSL2 DrvFS mount) |
 | `--keep` | With `--selftest`, keep the throwaway workspace for inspection |
@@ -2285,15 +2285,81 @@ beside `beads.db`, the shared opener lease and whether it is held, and any
 one finding with its registry entry, a live observation, fixers, and next
 commands; `br doctor explain --list` enumerates the finding ids.
 
-For a JSONL rebuild, `--repair --json` reports `repaired` independently from
-`verified`: reconstruction can complete while preservation fails. The result
-includes `database_verified`, `preservation_verified`, `ok`, `exit_code`, and
-`code`. Nonempty `dirty_preservation_warnings` or `history_preservation_warnings`
-force `verified: false`, audit outcome `verification_failed`, and exit **2**
-(`fix_partial`). One JSON result is emitted. Failure evidence and source files
-remain in `.br_recovery`; another repair refuses with exit **4** until the
-operator reviews the preservation-failure evidence and explicitly permits a
-retry with `--allow-repeated-repair`. See [sync safety](SYNC_SAFETY.md#automatic-recovery-stops-on-preservation-failures).
+#### JSONL rebuild verification
+
+`br doctor --repair --json` distinguishes completing a database rebuild from
+verifying the resulting state:
+
+| Field | Meaning after a JSONL rebuild |
+|-------|--------------------------------|
+| `repaired` | The database was rebuilt; this alone is not a verification verdict |
+| `database_verified` | Post-rebuild database checks passed, allowing documented benign recovery artifacts and preserved dirty-issue divergence |
+| `preservation_verified` | No dirty-state or DB-only history preservation failures were reported, including unresolved evidence from earlier attempts |
+| `verified`, `ok` | Both independent verification conditions passed |
+| `dirty_preservation_warnings` | Unflushed rows, tombstones, or relationships whose preservation could not be established |
+| `history_preservation_warnings` | DB-only history that could not be snapshotted or restored |
+| `preserved_tombstones`, `preserved_dirty_issues`, `preserved_dirty_issue_ids` | Confirmed restorations; an error can leave committed rows whose restoration could not be fully verified |
+| `recovery_failure_marker` | Confirmed verification evidence path, or `null` when verified or marker persistence could not be confirmed |
+| `recovery_failure_marker_error` | Marker-persistence error, or `null` when no such error occurred |
+| `code`, `exit_code` | The outcome name and matching process exit status |
+
+A healthy replacement with incomplete preservation returns one JSON document
+with this outcome (additional counts, checks, warnings and backup details are
+also included):
+
+```json
+{
+  "repaired": true,
+  "database_verified": true,
+  "preservation_verified": false,
+  "verified": false,
+  "ok": false,
+  "code": "fix_partial",
+  "exit_code": 2,
+  "recovery_audit": {"outcome": "verification_failed"}
+}
+```
+
+A fully verified rebuild exits **0** (`healthy`) and records audit outcome
+`verified`. A rebuild with failed database checks or incomplete preservation
+exits **2** (`fix_partial`), records `verification_failed`, and writes a
+`.verification-failed.json` marker with the warning lists. If marker persistence
+cannot be confirmed, the full partial result still includes the warnings,
+confirmed counts, and backup paths, and the audit keeps `verification_failed`.
+`recovery_failure_marker` is then `null` and `recovery_failure_marker_error`
+explains the failure. This does not establish whether a marker file exists,
+since a persistence error can occur after the file write. This partial-result
+envelope is complete; no second error document is appended to stdout.
+
+Restoration and reference-cleanup errors after replacement also produce a
+partial result with retained evidence. Counts describe confirmed completed
+work; zero after a reported error does not prove that no rows were changed.
+The `post_repair` workspace health, its reliability audit and any written failure
+marker report incomplete preservation as `unsafe`, even when the independent
+database checks pass.
+
+Unresolved preservation markers remain visible as `db.recovery_preservation`
+on subsequent inspections, even when the current database is healthy. Repair
+refuses before applying further fixes with **4** (`refused_unsafe`) by default.
+The refusal identifies the retained `recovery_failure_marker`.
+
+`--allow-repeated-repair` permits another attempt after inspecting the evidence.
+When retained preservation evidence is the only error finding, the retry returns
+a partial result without applying fixes or rebuilding: `repaired: false`,
+`verified: false`, `preservation_verified: false`, and exit **2** (`fix_partial`).
+It keeps the existing marker and recovery files. If other damage requires
+repair, the repeat flag permits remediation, but even successful local fixes or
+a healthy replacement cannot verify previously unpreserved changes. The result
+remains partial while the original preservation failure is unresolved.
+
+Neither retries nor aged-artifact quarantine silently clear this evidence.
+A missing database with no data-bearing sidecars still supports verified
+recovery from valid JSONL. Lossless restoration also continues to verify when
+restored local changes await a later `br sync --flush-only`.
+`--repair --no-db` refuses unresolved preservation evidence even with the repeat
+flag; it cannot verify the database while skipping database consistency checks.
+See [synchronization safety](SYNC_SAFETY.md#automatic-recovery-stops-on-preservation-failures)
+for preservation limits and retained-file recovery.
 
 #### Reviewed schema migration
 

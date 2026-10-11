@@ -10,7 +10,7 @@ Executable implementation: `src/health.rs`.
 | **Healthy** | All invariants hold | All |
 | **Degraded** | Derived state stale or minor drift | All (with advisory) |
 | **Recoverable** | Primary data intact, DB corrupted | Read-only until recovery |
-| **Unsafe** | Interchange data corrupted beyond repair | None until manual fix |
+| **Unsafe** | Interchange integrity or local-state preservation requires manual intervention | No verified recovery until the underlying shortfall is resolved |
 
 ## Failure Taxonomy
 
@@ -48,6 +48,7 @@ Executable implementation: `src/health.rs`.
 | `TruncatedWal` | Recoverable | WAL file is 1–31 bytes (zero bytes is a normal checkpoint result) | Preserve the family; use the existing quarantine/rebuild path after validating authority |
 | `JournalSidecarPresent` | Degraded | File existence check | Preserve the journal with its database; inspect before choosing recovery |
 | `StaleRecoveryArtifacts` | Degraded | Recovery temp files present | Retain incident evidence; review aged artifacts through the doctor repair plan |
+| `PreservationUnverified` | Unsafe | Doctor reports incomplete repair preservation, finds that evidence in a retained failed-repair marker, or cannot read the marker | Inspect retained files and resolve the original shortfall; another rebuild does not establish preservation |
 | `OrphanedLockFile` | Degraded | `.beads.lock` file stat | Verify liveness and inspect the doctor repair plan; file presence alone does not prove the lock is abandoned |
 
 A WAL or journal can contain committed or recoverable data absent from the main
@@ -58,6 +59,22 @@ with `--include-db` when database bytes are needed, review
 Keep the original family and recovery artifacts until the incident is resolved;
 any eventual removal is an operator decision. These recovery choices also apply
 to explicitly configured database families outside `.beads/`.
+
+`PreservationUnverified` has audit code `preservation_unverified` and doctor
+check name `db.recovery_preservation`. It describes unresolved local-state
+preservation, independently of the health of the rebuilt SQLite database. The
+current repair's post-repair report and any retained marker carry this unsafe
+workspace classification when preservation is incomplete. Doctor can
+diagnose the workspace and can attempt another explicit best-effort repair
+with `--allow-repeated-repair`, but cannot return a verified outcome while this
+evidence remains unresolved. When preservation evidence is the only error
+finding, an allowed retry returns a partial result without applying fixes or
+rebuilding, retaining the existing recovery marker and files. If other damage
+requires repair, resolving that damage still cannot establish that previously
+unreadable state survived. Failed-recovery evidence and its database family are
+excluded from automatic aged-artifact quarantine. See the
+[doctor verification contract](../CLI_REFERENCE.md#jsonl-rebuild-verification)
+for the independent result fields and retry exit codes.
 
 ### Derived State
 
@@ -183,7 +200,9 @@ itself (the captured commands take their own, exactly as a hand-run would).
 
 - Multiple Degraded anomalies do NOT escalate to Recoverable
 - Any single Recoverable anomaly blocks writes until resolved
-- Any single Unsafe anomaly blocks ALL operations
+- Any single Unsafe anomaly requires manual intervention before verified
+  recovery; diagnosis and specifically authorized best-effort recovery remain
+  available where the command supports them
 - Composite health = max(individual severities)
 
 ## Contract Versioning

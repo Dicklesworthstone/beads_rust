@@ -471,33 +471,57 @@ warnings (`dirty_preservation_warnings` in `--json` output). Explicit repair
 can restore readable local state and may use the JSONL copy of unreadable
 relationships; inspect the retained files before accepting that result.
 
-Database reconstruction and preservation are verified separately. On the
-JSONL rebuild path, `database_verified` describes the rebuilt database checks,
-and `preservation_verified` requires both `dirty_preservation_warnings` and
-`history_preservation_warnings` to be empty. `verified` and `ok` are true only
-when both checks pass. A known preservation shortfall or an unknown snapshot
-outcome therefore returns `repaired: true, verified: false`, audit outcome
-`verification_failed`, and exit status **2** (`fix_partial`). JSON mode emits
-one result object, including `exit_code` and `code`; it does not append a
-second error document. Human output distinguishes completed reconstruction
-from failed verification and names the preservation warnings.
+Database reconstruction and preservation are separate outcomes. A completed
+JSONL rebuild reports `repaired: true`, but `verified` and `ok` are true only
+when both `database_verified` and `preservation_verified` are true. Any
+`dirty_preservation_warnings` or `history_preservation_warnings`, including
+unresolved failures from earlier attempts, make `preservation_verified: false`
+even when the rebuilt database passes its checks. A retained failed preservation
+verdict remains disqualifying even without warning text. An unreadable snapshot
+means preservation is unverified; it does not establish how many changes were
+lost. Lossless restoration of unflushed changes continues to verify when those
+restored rows await a later `br sync --flush-only`.
 
-The `.br_recovery/*.verification-failed.json` marker retains those warnings
-alongside the original recovery files. A subsequent repair refuses with exit
-status **4** while a preservation-failure marker remains, including when the
-rebuilt database is healthy and no new rebuild is needed. Inspect the retained
-evidence before explicitly using `--allow-repeated-repair`; that flag permits
-another attempt and does not recover previously lost state or certify an
-earlier repair. An allowed retry still reports a partial result while
-prior preservation-failure evidence remains; it cannot turn a healthy
-reconstructed database into proof that missing local state was recovered.
-A genuinely missing database with no orphaned data sidecars
-can still be reconstructed and verified from JSONL without preservation
-warnings. Lossless restoration of unflushed changes continues to verify even
-when those restored rows need a later `br sync --flush-only`.
+An unverified rebuild returns exit **2** (`fix_partial`), records the recovery
+audit outcome as `verification_failed`, and writes a
+`.br_recovery/<database>.<timestamp>.verification-failed.json` evidence marker.
+The marker includes the independent verification results and the exact
+preservation warnings. If marker persistence cannot be confirmed, the full
+partial result still reports the warning evidence and backup paths, with
+`recovery_failure_marker: null` and an explicit `recovery_failure_marker_error`.
+That error does not establish whether the file write occurred. JSON mode emits
+one complete repair result, with `ok: false`, `verified: false`, `exit_code: 2`,
+and `code: "fix_partial"`;
+no second error document is appended. Text mode identifies the incomplete
+preservation and the marker path or persistence error without announcing a
+verified repair. The post-repair workspace classification, its reliability
+audit, and any written failure marker report incomplete preservation as `unsafe`
+independently of the database verification result. Restoration or reference-cleanup
+errors after replacement also retain a partial result. Counts describe confirmed
+completed work; zero after an error does not prove that no rows changed. See the
+[doctor JSON contract](CLI_REFERENCE.md#jsonl-rebuild-verification).
 
-Successful commands retain their existing stdout and JSON result shapes.
-Refused commands use the existing structured error envelope in JSON mode;
+Later doctor inspections report unresolved preservation evidence as
+`db.recovery_preservation`. Another repair is refused with exit **4** unless
+`--allow-repeated-repair` is supplied. Inspect the retained evidence before
+using that flag. When preservation evidence is the only error finding, an
+allowed retry returns exit **2** with `repaired: false` and `verified: false`
+without applying fixes or rebuilding. It keeps the existing marker and recovery
+files. Other damage can still receive best-effort repair, but a clean snapshot
+or successful local repair cannot establish that previously unreadable changes
+survived. Earlier preservation failures therefore continue to prevent verified
+success. Failed-recovery markers and their database family remain at their
+retained locations regardless of age. Resolve the original preservation
+shortfalls and preserve the incident evidence before manually retiring their
+markers.
+
+`--no-db` reads retained verification markers even though normal database
+consistency checks are skipped. Repair in that mode refuses unresolved
+preservation failures even with the repeat flag, because JSONL-only checks
+cannot verify database preservation.
+
+Ordinary commands retain their existing stdout and JSON result shapes.
+Refused automatic recovery uses the existing structured error envelope in JSON mode;
 the diagnostic is visible without enabling warning-level logging. The same
 preservation gate applies to post-open anomaly recovery, failed startup
 probes, and recovery after a command encounters database damage. An explicit

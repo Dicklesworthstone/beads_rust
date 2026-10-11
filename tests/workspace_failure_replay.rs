@@ -992,6 +992,129 @@ fn assert_repair_applied_surface(context: &str, json: &Value) {
     );
 }
 
+fn assert_partial_repair_surface(fixture: &FixtureWorkspace, run: &BrRun, context: &str) {
+    assert_eq!(run.status.code(), Some(2), "{context}: {run:?}");
+    let json: Value = serde_json::from_str(&run.stdout).unwrap_or_else(|error| {
+        panic!("{context}: partial repair must emit one JSON result: {error}; {run:?}")
+    });
+    assert_eq!(json["repaired"], true, "{context}: {json}");
+    assert_eq!(json["database_verified"], true, "{context}: {json}");
+    assert_eq!(json["preservation_verified"], false, "{context}: {json}");
+    assert_eq!(json["verified"], false, "{context}: {json}");
+    assert_eq!(json["post_repair"]["ok"], false, "{context}: {json}");
+    assert_eq!(
+        json["post_repair"]["workspace_health"], "unsafe",
+        "{context}: {json}"
+    );
+    let audit = &json["post_repair"]["reliability_audit"];
+    assert_eq!(
+        audit["source"], "doctor.jsonl_rebuild.post_repair",
+        "{context}: {json}"
+    );
+    assert_eq!(audit["health"], "unsafe", "{context}: {json}");
+    assert!(
+        audit["anomalies"]
+            .as_array()
+            .expect("post-repair anomaly audit")
+            .iter()
+            .any(|anomaly| anomaly["code"] == "preservation_unverified"),
+        "{context}: {json}"
+    );
+    assert_eq!(json["code"], "fix_partial", "{context}: {json}");
+    assert_eq!(json["exit_code"], 2, "{context}: {json}");
+    assert_eq!(
+        json["recovery_audit"]["outcome"], "verification_failed",
+        "{context}: {json}"
+    );
+    assert!(
+        json["dirty_preservation_warnings"]
+            .as_array()
+            .expect("unavailable preservation warnings")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|message| message.contains("could not be opened"))),
+        "{context}: malformed original database must have unavailable preservation: {json}"
+    );
+    let marker = Path::new(
+        json["recovery_failure_marker"]
+            .as_str()
+            .expect("failure marker path"),
+    );
+    assert!(marker.is_file(), "{context}: {}", marker.display());
+    assert!(
+        marker.starts_with(fixture.beads_dir.join(".br_recovery")),
+        "{context}: {json}"
+    );
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(marker).expect("retained failure marker"))
+            .expect("valid failure marker JSON");
+    assert_eq!(
+        receipt["outcome"], "verification_failed",
+        "{context}: {receipt}"
+    );
+    assert_eq!(
+        receipt["workspace_health"], "unsafe",
+        "{context}: {receipt}"
+    );
+    for field in [
+        "dirty_preservation_warnings",
+        "history_preservation_warnings",
+    ] {
+        assert_eq!(receipt[field], json[field], "{context}: {receipt}");
+    }
+    let source = fixture
+        .preservation_evidence
+        .as_ref()
+        .expect("original fixture evidence");
+    let recovery = retained_tree_bytes(&fixture.beads_dir.join(".br_recovery"));
+    assert!(
+        recovery
+            .values()
+            .any(|bytes| bytes == &source.source_bytes[&current_database_path(fixture)]),
+        "{context}: partial repair must retain the malformed original database"
+    );
+    for (path, bytes) in &source.recovery_bytes {
+        assert_eq!(
+            recovery.get(path),
+            Some(bytes),
+            "{context}: previous recovery evidence changed"
+        );
+    }
+    let jsonl = fixture.beads_dir.join("issues.jsonl");
+    assert_eq!(
+        fs::read(&jsonl).expect("retained source JSONL"),
+        source.source_bytes[&jsonl]
+    );
+    assert_sqlite_header(&current_database_path(fixture), context);
+}
+
+fn assert_repeated_repair_refusal(fixture: &FixtureWorkspace, run: &BrRun, context: &str) {
+    assert_eq!(run.status.code(), Some(4), "{context}: {run:?}");
+    let json: Value = serde_json::from_str(&run.stdout).unwrap_or_else(|error| {
+        panic!("{context}: repeated repair must emit one refusal result: {error}; {run:?}")
+    });
+    assert_eq!(json["ok"], false, "{context}: {json}");
+    assert_eq!(json["code"], "refused_unsafe", "{context}: {json}");
+    assert_eq!(json["exit_code"], 4, "{context}: {json}");
+    assert_eq!(json["verified"], false, "{context}: {json}");
+    assert_eq!(
+        json["recovery_audit"]["outcome"], "refused",
+        "{context}: {json}"
+    );
+    assert!(
+        json["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--allow-repeated-repair")),
+        "{context}: repeated repair must identify its explicit override: {json}"
+    );
+    fixture
+        .preservation_evidence
+        .as_ref()
+        .expect("prior failed repair evidence")
+        .assert_unchanged(fixture);
+}
+
 fn assert_status_surface(
     context: &str,
     json: &Value,
@@ -1008,32 +1131,6 @@ fn assert_status_surface(
         Value::Bool(expected_db_newer),
         "{context} reported unexpected db_newer: {json}"
     );
-}
-
-fn assert_partial_repair_surface(fixture: &FixtureWorkspace, run: &BrRun, context: &str) {
-    assert_eq!(run.status.code(), Some(2), "{context}: {run:?}");
-    let json: Value = serde_json::from_str(&run.stdout).expect("one partial repair result");
-    assert_eq!(json["repaired"], true, "{context}: {json}");
-    assert_eq!(json["verified"], false, "{context}: {json}");
-    assert_eq!(json["database_verified"], true, "{context}: {json}");
-    assert_eq!(json["preservation_verified"], false, "{context}: {json}");
-    assert_eq!(
-        json["recovery_audit"]["outcome"], "verification_failed",
-        "{context}: {json}"
-    );
-    assert!(
-        json["dirty_preservation_warnings"]
-            .as_array()
-            .is_some_and(|warnings| !warnings.is_empty()),
-        "{context}: {json}"
-    );
-    let marker = Path::new(
-        json["recovery_failure_marker"]
-            .as_str()
-            .expect("partial repair marker"),
-    );
-    assert!(marker.is_file(), "{context}: {}", marker.display());
-    assert_sqlite_header(&current_database_path(fixture), context);
 }
 
 fn assert_surface_outcome(
@@ -1129,7 +1226,7 @@ fn assert_surface_outcome(
             assert_config_error(&run, "invalid issue record", &context);
         }
         WorkspaceFailureCommandOutcome::FailsRepeatedRepair => {
-            assert_config_error(&run, "--allow-repeated-repair", &context);
+            assert_repeated_repair_refusal(fixture, &run, &context);
         }
         WorkspaceFailureCommandOutcome::FailsUnflushedPreservation => {
             assert_unflushed_preservation_refusal(fixture, &run, &context);

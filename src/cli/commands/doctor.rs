@@ -33,10 +33,10 @@ use chrono::{NaiveDate, Utc};
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -113,6 +113,20 @@ impl DoctorRepairResult {
     fn preservation_verified(&self) -> bool {
         self.dirty_preservation_warnings.is_empty() && self.history_preservation_warnings.is_empty()
     }
+}
+
+/// Preservation evidence retained by a failed JSONL rebuild. Older markers
+/// contain no preservation fields and continue to describe database-check
+/// failures only; malformed fields must never be interpreted as a clean run.
+#[derive(Debug, Deserialize)]
+struct JsonlRebuildPreservationEvidence {
+    outcome: String,
+    #[serde(default)]
+    preservation_verified: Option<bool>,
+    #[serde(default)]
+    dirty_preservation_warnings: Vec<String>,
+    #[serde(default)]
+    history_preservation_warnings: Vec<String>,
 }
 
 /// One preserved history table's restore outcome (GitHub #471).
@@ -476,6 +490,7 @@ const JSONL_REBUILD_REPEAT_ERROR_PREFIX: &str =
 const JSONL_REBUILD_DRY_RUN_SKIP_MESSAGE: &str =
     "doctor --repair --dry-run skipped JSONL rebuild; no database writes were applied";
 const JSONL_REBUILD_VERIFICATION_FAILED_SUFFIX: &str = ".verification-failed.json";
+const RECOVERY_PRESERVATION_CHECK: &str = "db.recovery_preservation";
 const ROOT_GITIGNORE_OFFENDING_PATTERNS: &[&str] = &[
     ".beads",
     ".beads/",
@@ -1770,6 +1785,14 @@ fn append_doctor_check_anomalies(check: &CheckResult, anomalies: &mut Vec<Anomal
         "db.recovery_artifacts.aged" if matches!(check.status, CheckStatus::Warn) => {
             push_anomaly(anomalies, AnomalyClass::StaleRecoveryArtifacts);
         }
+        RECOVERY_PRESERVATION_CHECK if matches!(check.status, CheckStatus::Error) => {
+            push_anomaly(
+                anomalies,
+                AnomalyClass::PreservationUnverified {
+                    detail: check_message(check),
+                },
+            );
+        }
         "db.sidecars" if matches!(check.status, CheckStatus::Error) => {
             let message = check.message.as_deref().unwrap_or_default();
             if message.contains("rollback journal") {
@@ -2252,7 +2275,7 @@ fn is_benign_post_rebuild_finding(check: &CheckResult) -> bool {
     }
 }
 
-/// Post-repair verification for the JSONL-rebuild path.
+/// Database checks for the JSONL-rebuild path, independent of preservation.
 ///
 /// Unlike [`repair_report_verified`] (which demands a pristine, zero-non-OK
 /// report), this tolerates the handful of benign findings a successful rebuild
@@ -2268,22 +2291,102 @@ fn is_benign_post_rebuild_finding(check: &CheckResult) -> bool {
 /// `counts.db_vs_jsonl` divergence they cause is accepted — but only in
 /// exactly that shape (see [`is_preserved_dirty_count_divergence`]).
 /// This checks database health only; callers must also require
-/// [`DoctorRepairResult::preservation_verified`] before publishing success.
+/// [`jsonl_rebuild_preservation_verified`] before publishing success.
 fn jsonl_rebuild_database_verified(
     report: &DoctorReport,
     preserved_dirty_issue_ids: &[String],
 ) -> bool {
-    report.ok
+    if report
+        .checks
+        .iter()
+        .any(|check| check.name == "db.no_db_mode")
+    {
+        return false;
+    }
+    // A retained preservation failure does not mean the replacement database
+    // is damaged. All other errors and non-benign findings remain disqualifying.
+    (report.ok || report_has_recovery_preservation_failure(report))
         && report.checks.iter().all(|check| {
-            matches!(check.status, CheckStatus::Ok)
+            check.name == RECOVERY_PRESERVATION_CHECK
+                || matches!(check.status, CheckStatus::Ok)
                 || is_benign_post_rebuild_finding(check)
                 || is_preserved_dirty_count_divergence(check, preserved_dirty_issue_ids)
         })
 }
 
+fn report_has_recovery_preservation_failure(report: &DoctorReport) -> bool {
+    report
+        .checks
+        .iter()
+        .any(|check| check.name == RECOVERY_PRESERVATION_CHECK && check.status != CheckStatus::Ok)
+}
+
+fn jsonl_rebuild_preservation_verified(report: &DoctorReport, repair: &DoctorRepairResult) -> bool {
+    repair.preservation_verified() && !report_has_recovery_preservation_failure(report)
+}
+
+/// Publish the preservation assessment in the same report as the database
+/// checks. A first repair has no failure marker yet, so inspecting the rebuilt
+/// database alone cannot discover this attempt's preservation warnings.
+fn record_jsonl_rebuild_preservation_failure(
+    report: &mut DoctorReport,
+    repair: &DoctorRepairResult,
+    db_path: &Path,
+    jsonl_path: &Path,
+) {
+    if jsonl_rebuild_preservation_verified(report, repair) {
+        return;
+    }
+
+    let mut markers = BTreeSet::new();
+    for check in report
+        .checks
+        .iter()
+        .filter(|check| check.name == RECOVERY_PRESERVATION_CHECK)
+    {
+        if let Some(paths) = check
+            .details
+            .as_ref()
+            .and_then(|details| details.get("markers"))
+            .and_then(serde_json::Value::as_array)
+        {
+            for path in paths.iter().filter_map(serde_json::Value::as_str) {
+                markers.insert(path.to_string());
+            }
+        }
+    }
+    report
+        .checks
+        .retain(|check| check.name != RECOVERY_PRESERVATION_CHECK);
+    report.checks.push(CheckResult {
+        name: RECOVERY_PRESERVATION_CHECK.to_string(),
+        status: CheckStatus::Error,
+        message: Some(
+            "Local-state preservation could not be verified. Inspect the retained recovery files and resolve the preservation failures before accepting the rebuilt database."
+                .to_string(),
+        ),
+        details: Some(serde_json::json!({
+            "markers": markers.into_iter().collect::<Vec<_>>(),
+            "preservation_verified": false,
+            "dirty_preservation_warnings": &repair.dirty_preservation_warnings,
+            "history_preservation_warnings": &repair.history_preservation_warnings,
+        })),
+    });
+
+    report.ok = !has_error(&report.checks);
+    let classification = classify_doctor_checks(db_path, jsonl_path, &report.checks);
+    let audit = classification.audit_record("doctor.jsonl_rebuild.post_repair");
+    report.workspace_health = Some(classification.health.to_string());
+    emit_doctor_reliability_audit("post_repair", report.ok, &audit, &report.checks);
+    report.reliability_audit = Some(audit);
+}
+
+/// A healthy replacement database cannot establish that unreadable local
+/// changes survived. Require both independent postconditions (GitHub #553),
+/// including unresolved preservation failures retained from previous attempts.
 fn jsonl_rebuild_repair_verified(report: &DoctorReport, repair: &DoctorRepairResult) -> bool {
-    repair.preservation_verified()
-        && jsonl_rebuild_database_verified(report, &repair.preserved_dirty_issue_ids)
+    jsonl_rebuild_database_verified(report, &repair.preserved_dirty_issue_ids)
+        && jsonl_rebuild_preservation_verified(report, repair)
 }
 
 /// GitHub #394: a rebuild that preserved dirty unflushed issues leaves the
@@ -3014,7 +3117,9 @@ fn check_recovery_artifacts(
     db_path: &Path,
     checks: &mut Vec<CheckResult>,
 ) -> Result<()> {
-    let artifacts = recovery_artifacts_for_db_family(beads_dir, db_path)?
+    let artifacts = recovery_artifacts_for_db_family(beads_dir, db_path)?;
+    check_recovery_preservation(&artifacts, db_path, checks);
+    let artifacts = artifacts
         .into_iter()
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>();
@@ -3035,6 +3140,101 @@ fn check_recovery_artifacts(
     }
 
     Ok(())
+}
+
+fn read_rebuild_preservation_evidence(path: &Path) -> Result<JsonlRebuildPreservationEvidence> {
+    // A marker is a small JSON document, never a database or a directory.
+    // Bound the read even if the file grows after metadata inspection.
+    const MAX_MARKER_BYTES: u64 = 16 * 1024 * 1024;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.len() > MAX_MARKER_BYTES {
+        return Err(BeadsError::Config(
+            "verification marker is not a regular file within the 16 MiB limit".to_string(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(MAX_MARKER_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_MARKER_BYTES {
+        return Err(BeadsError::Config(
+            "verification marker exceeds the 16 MiB limit".to_string(),
+        ));
+    }
+    let evidence: JsonlRebuildPreservationEvidence = serde_json::from_slice(&bytes)?;
+    if evidence.outcome != "verification_failed" {
+        return Err(BeadsError::Config(
+            "verification marker does not describe a failed verification".to_string(),
+        ));
+    }
+    Ok(evidence)
+}
+
+/// Keep a previous preservation failure visible even when a later repair
+/// sees a healthy replacement database. A retry authorizes another rebuild;
+/// it cannot prove that changes missing from that replacement were restored.
+fn check_recovery_preservation(
+    artifacts: &[PathBuf],
+    db_path: &Path,
+    checks: &mut Vec<CheckResult>,
+) {
+    let marker_prefix = format!("{}.", db_family_prefix(db_path));
+    let mut markers = Vec::new();
+    let mut dirty_warnings = Vec::new();
+    let mut history_warnings = Vec::new();
+    for path in artifacts {
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.starts_with(&marker_prefix)
+                    && name.ends_with(JSONL_REBUILD_VERIFICATION_FAILED_SUFFIX)
+            })
+        {
+            continue;
+        }
+        match read_rebuild_preservation_evidence(path) {
+            Ok(evidence)
+                if evidence.preservation_verified == Some(false)
+                    || !evidence.dirty_preservation_warnings.is_empty()
+                    || !evidence.history_preservation_warnings.is_empty() =>
+            {
+                markers.push(path.display().to_string());
+                dirty_warnings.extend(evidence.dirty_preservation_warnings);
+                history_warnings.extend(evidence.history_preservation_warnings);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                markers.push(path.display().to_string());
+                dirty_warnings.push(format!(
+                    "prior verification evidence '{}' could not be read ({err}); preservation of earlier local state could not be established",
+                    path.display()
+                ));
+            }
+        }
+    }
+    if markers.is_empty() {
+        return;
+    }
+    dirty_warnings.sort();
+    dirty_warnings.dedup();
+    history_warnings.sort();
+    history_warnings.dedup();
+    push_check(
+        checks,
+        RECOVERY_PRESERVATION_CHECK,
+        CheckStatus::Error,
+        Some(format!(
+            "Local-state preservation remains unverified from {} previous repair attempt(s). Inspect the retained recovery files and resolve the preservation failures before retiring their verification markers; --allow-repeated-repair does not establish preservation.",
+            markers.len()
+        )),
+        Some(serde_json::json!({
+            "markers": markers,
+            "preservation_verified": false,
+            "dirty_preservation_warnings": dirty_warnings,
+            "history_preservation_warnings": history_warnings,
+        })),
+    );
 }
 
 /// Pass-4 cycle 3 — detector for `fm-state_files-recovery-artifacts-orphaned`.
@@ -3303,6 +3503,15 @@ fn check_foreign_recovery_debris(
 fn recovery_artifacts_aged(beads_dir: &Path, db_path: &Path) -> Result<Vec<PathBuf>> {
     use std::time::{Duration, SystemTime};
     let all = recovery_artifacts_for_db_family(beads_dir, db_path)?;
+    // Failed recovery evidence has no automatic expiry. Moving the marker
+    // alone would forget the failure; moving the family would hide the bytes
+    // needed for manual recovery. Keep both in their discoverable location.
+    if all
+        .iter()
+        .any(|path| is_failed_jsonl_rebuild_artifact(path))
+    {
+        return Ok(Vec::new());
+    }
     let threshold = Duration::from_secs(RECOVERY_AGED_TTL_DAYS * 24 * 60 * 60);
     let now = SystemTime::now();
     let mut aged = Vec::new();
@@ -3371,30 +3580,90 @@ fn repeated_jsonl_rebuild_refusal_reason(
         .map(repeated_jsonl_rebuild_refusal_message))
 }
 
-/// Preserve a failed preservation verdict even when the live reconstructed
-/// database is healthy enough to take the no-op or local-repair path.
-fn prior_jsonl_rebuild_preservation_failure(
-    beads_dir: &Path,
-    db_path: &Path,
-) -> Result<Option<PriorJsonlRebuildFailureEvidence>> {
-    let artifacts = recovery_artifacts_for_db_family(beads_dir, db_path)?;
-    for path in &artifacts {
-        if !path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(JSONL_REBUILD_VERIFICATION_FAILED_SUFFIX))
-        {
-            continue;
-        }
-        let payload: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
-        if payload.get("preservation_verified") == Some(&serde_json::Value::Bool(false)) {
-            return Ok(Some(PriorJsonlRebuildFailureEvidence {
-                path: path.clone(),
-                artifact_count: artifacts.len(),
-            }));
+fn retained_preservation_warnings(report: &DoctorReport, field: &str) -> Vec<String> {
+    report
+        .checks
+        .iter()
+        .filter(|check| check.name == RECOVERY_PRESERVATION_CHECK)
+        .filter_map(|check| check.details.as_ref()?.get(field)?.as_array())
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn refuse_repeated_jsonl_rebuild(
+    report: &DoctorReport,
+    repaired: bool,
+    recovery_audit: &RecoveryAuditRecord,
+    ctx: &OutputContext,
+) -> Result<()> {
+    emit_unverified_repair(
+        report,
+        repaired,
+        recovery_audit,
+        DoctorExitCode::RefusedUnsafe,
+        ctx,
+    )
+}
+
+fn retained_preservation_marker(report: &DoctorReport) -> Option<&str> {
+    report
+        .checks
+        .iter()
+        .filter(|check| check.name == RECOVERY_PRESERVATION_CHECK)
+        .filter_map(|check| check.details.as_ref()?.get("markers")?.as_array())
+        .flatten()
+        .find_map(serde_json::Value::as_str)
+}
+
+fn report_has_only_preservation_errors(report: &DoctorReport) -> bool {
+    report_has_recovery_preservation_failure(report)
+        && report.checks.iter().all(|check| {
+            check.name == RECOVERY_PRESERVATION_CHECK || check.status != CheckStatus::Error
+        })
+}
+
+fn emit_unverified_repair(
+    report: &DoctorReport,
+    repaired: bool,
+    recovery_audit: &RecoveryAuditRecord,
+    exit_code: DoctorExitCode,
+    ctx: &OutputContext,
+) -> Result<()> {
+    emit_recovery_audit_record(recovery_audit);
+    if ctx.is_json() {
+        ctx.json(&serde_json::json!({
+            "ok": false,
+            "exit_code": exit_code.as_i32(),
+            "code": exit_code.as_str(),
+            "report": report,
+            "post_repair": report,
+            "repaired": repaired,
+            "database_verified": jsonl_rebuild_database_verified(report, &[]),
+            "preservation_verified": false,
+            "verified": false,
+            "dirty_preservation_warnings": retained_preservation_warnings(
+                report, "dirty_preservation_warnings",
+            ),
+            "history_preservation_warnings": retained_preservation_warnings(
+                report, "history_preservation_warnings",
+            ),
+            "recovery_audit": recovery_audit,
+            "recovery_failure_marker": retained_preservation_marker(report),
+            "message": recovery_audit.reason,
+        }));
+    } else {
+        print_report(report, ctx)?;
+        if let Some(reason) = recovery_audit.reason.as_deref() {
+            if matches!(exit_code, DoctorExitCode::RefusedUnsafe) {
+                ctx.error(reason);
+            } else {
+                ctx.warning(reason);
+            }
         }
     }
-    Ok(None)
+    crate::shutdown::exit_process(exit_code.as_i32());
 }
 
 fn push_inspection_error(
@@ -3554,7 +3823,7 @@ fn repair_database_from_jsonl_after_preflight(
     let DoctorPreservedState {
         tombstones: preserved_tombstones,
         dirty: preserved_dirty_issues,
-        warnings: dirty_preservation_warnings,
+        warnings: mut dirty_preservation_warnings,
     } = preserved_state_for_doctor_rebuild(db_path, source);
     for warning in &dirty_preservation_warnings {
         tracing::warn!(db_path = %db_path.display(), warning, "doctor --repair cannot fully preserve unflushed local state");
@@ -3600,15 +3869,71 @@ fn repair_database_from_jsonl_after_preflight(
         };
     let (mut storage, import_result, verified_backups) = recovery?;
 
-    restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
-    restore_dirty_issues_after_rebuild(&mut storage, &preserved_dirty_issues)?;
+    // The replacement is already installed. Keep restoration failures in the
+    // result so the caller can retain evidence and publish a partial verdict.
+    // An error may follow either a rolled-back issue transaction or committed
+    // rows with a failed cache refresh; count only confirmed restorations.
+    let preserved_tombstone_count =
+        match restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones) {
+            Ok(()) => preserved_tombstones.len(),
+            Err(err) => {
+                dirty_preservation_warnings.push(format!(
+                    "tombstone restoration could not be confirmed after the database rebuild: {err}"
+                ));
+                0
+            }
+        };
+    let dirty_restore = restore_dirty_issues_after_rebuild(&mut storage, &preserved_dirty_issues);
+    let preserved_dirty_issue_ids = match dirty_restore {
+        Ok(()) => preserved_dirty_issues
+            .iter()
+            .map(|preserved| preserved.issue.id.clone())
+            .collect::<Vec<_>>(),
+        Err(err) => {
+            dirty_preservation_warnings.push(format!(
+                "dirty issue restoration could not be confirmed after the database rebuild: {err}"
+            ));
+            Vec::new()
+        }
+    };
 
     // GitHub #471: reattach the DB-only history captured before the rebuild.
     // Keep the reconstructed database available if history restoration fails.
     // The warning makes the final verdict a partial repair; database health
     // alone must never certify preservation of the failed history snapshot.
-    let mut history_preservation_warnings = history_snapshot.failures.clone();
-    let preserved_history = match storage.restore_auxiliary_history_tables(&history_snapshot) {
+    let (preserved_history, history_preservation_warnings) =
+        restore_history_for_doctor_rebuild(&storage, &history_snapshot);
+
+    let fk_violations_cleaned = match cleanup_repair_missing_issue_references(&mut storage) {
+        Ok(cleaned) => cleaned,
+        Err(err) => {
+            dirty_preservation_warnings.push(format!(
+                "post-rebuild reference cleanup could not be completed; preservation of local relationships could not be verified and cleanup may have partially applied: {err}"
+            ));
+            0
+        }
+    };
+
+    Ok(DoctorRepairResult {
+        imported: import_result.imported_count,
+        skipped: import_result.skipped_count,
+        fk_violations_cleaned,
+        preserved_tombstones: preserved_tombstone_count,
+        preserved_dirty_issues: preserved_dirty_issue_ids.len(),
+        preserved_dirty_issue_ids,
+        verified_backups,
+        preserved_history,
+        history_preservation_warnings,
+        dirty_preservation_warnings,
+    })
+}
+
+fn restore_history_for_doctor_rebuild(
+    storage: &SqliteStorage,
+    history_snapshot: &crate::storage::sqlite::AuxiliaryHistorySnapshot,
+) -> (Vec<PreservedHistoryTableReport>, Vec<String>) {
+    let mut warnings = history_snapshot.failures.clone();
+    let preserved_history = match storage.restore_auxiliary_history_tables(history_snapshot) {
         Ok(report) => report
             .into_iter()
             .map(|(table, restored, skipped)| PreservedHistoryTableReport {
@@ -3618,31 +3943,14 @@ fn repair_database_from_jsonl_after_preflight(
             })
             .collect(),
         Err(err) => {
-            history_preservation_warnings.push(format!(
+            warnings.push(format!(
                 "could not restore the {} snapshotted history row(s) into the rebuilt database: {err}",
                 history_snapshot.row_count()
             ));
             Vec::new()
         }
     };
-
-    let fk_violations_cleaned = cleanup_repair_missing_issue_references(&mut storage)?;
-
-    Ok(DoctorRepairResult {
-        imported: import_result.imported_count,
-        skipped: import_result.skipped_count,
-        fk_violations_cleaned,
-        preserved_tombstones: preserved_tombstones.len(),
-        preserved_dirty_issues: preserved_dirty_issues.len(),
-        preserved_dirty_issue_ids: preserved_dirty_issues
-            .iter()
-            .map(|preserved| preserved.issue.id.clone())
-            .collect(),
-        verified_backups,
-        preserved_history,
-        history_preservation_warnings,
-        dirty_preservation_warnings,
-    })
+    (preserved_history, warnings)
 }
 
 /// Open the pre-repair database (best effort — it is usually corrupt when
@@ -3876,8 +4184,8 @@ fn jsonl_rebuild_failure_message(err: &BeadsError) -> String {
     }
     format!(
         "Repair import failed: {err}. \
-         No database writes were applied; the workspace is unchanged. \
-         Re-run `br doctor --json` to inspect the current state."
+         Preserve the recovery files and re-run `br doctor --json` to inspect \
+         the current state before retrying."
     )
 }
 
@@ -3899,13 +4207,28 @@ fn write_jsonl_rebuild_verification_failed_marker(
         .checks
         .iter()
         .filter(|check| {
-            matches!(check.status, CheckStatus::Error) || is_warn_level_page_anomaly_check(check)
+            check.status != CheckStatus::Ok
+                && !is_benign_post_rebuild_finding(check)
+                && !is_preserved_dirty_count_divergence(
+                    check,
+                    &repair_result.preserved_dirty_issue_ids,
+                )
         })
         .collect::<Vec<_>>();
     let payload = serde_json::json!({
         "phase": "doctor.jsonl_rebuild",
         "action": "jsonl_rebuild",
         "outcome": "verification_failed",
+        "repaired": true,
+        "database_verified": jsonl_rebuild_database_verified(
+            &post_repair.report,
+            &repair_result.preserved_dirty_issue_ids,
+        ),
+        "preservation_verified": jsonl_rebuild_preservation_verified(
+            &post_repair.report,
+            repair_result,
+        ),
+        "verified": false,
         "created_at": Utc::now().to_rfc3339(),
         "db_path": db_path.display().to_string(),
         "imported": repair_result.imported,
@@ -3914,10 +4237,9 @@ fn write_jsonl_rebuild_verification_failed_marker(
         "preserved_tombstones": repair_result.preserved_tombstones,
         "preserved_dirty_issues": repair_result.preserved_dirty_issues,
         "preserved_dirty_issue_ids": &repair_result.preserved_dirty_issue_ids,
+        "preserved_history": &repair_result.preserved_history,
         "dirty_preservation_warnings": &repair_result.dirty_preservation_warnings,
         "history_preservation_warnings": &repair_result.history_preservation_warnings,
-        "preservation_verified": repair_result.preservation_verified(),
-        "database_verified": jsonl_rebuild_database_verified(&post_repair.report, &repair_result.preserved_dirty_issue_ids),
         "verified_backups": &repair_result.verified_backups,
         "workspace_health": post_repair.report.workspace_health.as_deref(),
         "failed_checks": failed_checks,
@@ -13227,6 +13549,20 @@ fn collect_doctor_report_with_mode_and_db_override(
             )),
             Some(serde_json::json!({ "skipped_checks": skipped })),
         );
+        // Previous preservation failures are filesystem evidence, not a
+        // database consistency probe. JSONL-only inspection cannot erase
+        // them or establish that omitted database checks passed.
+        match recovery_artifacts_for_db_family(beads_dir, &paths.db_path) {
+            Ok(artifacts) => {
+                check_recovery_preservation(&artifacts, &paths.db_path, &mut checks);
+            }
+            Err(err) => push_inspection_error(
+                &mut checks,
+                RECOVERY_PRESERVATION_CHECK,
+                "Failed to inspect retained preservation evidence",
+                &err,
+            ),
+        }
     } else {
         // Pass-5 cycle 22: db-to-selected-jsonl size ratio (VACUUM candidate).
         check_db_bloat_vs_jsonl(&paths.db_path, jsonl_path.as_deref(), &mut checks);
@@ -14353,6 +14689,47 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         return Ok(());
     }
 
+    // An already healthy replacement cannot erase an earlier loss. Refuse
+    // before any fixer (including no-op and aged-evidence paths) unless the
+    // operator explicitly authorizes another best-effort attempt.
+    if args.repair && report_has_recovery_preservation_failure(&initial.report) {
+        let refusal = if resolve_doctor_no_db(&beads_dir, cli) {
+            Some(
+                "Cannot verify previous repair preservation in --no-db (JSONL-only) mode. Database-mode verification is required after reviewing the retained recovery evidence; --allow-repeated-repair cannot waive this requirement."
+                    .to_string(),
+            )
+        } else {
+            repeated_jsonl_rebuild_refusal_reason(
+                &beads_dir,
+                &paths.db_path,
+                args.allow_repeated_repair,
+            )?
+        };
+        if let Some(reason) = refusal {
+            let recovery_audit =
+                jsonl_rebuild_audit_record("doctor.jsonl_rebuild", "refused", None, Some(reason));
+            return refuse_repeated_jsonl_rebuild(&initial.report, false, &recovery_audit, ctx);
+        }
+        if report_has_only_preservation_errors(&initial.report) {
+            let recovery_audit = local_repair_audit_record(
+                "doctor.local_repair",
+                "verification_failed",
+                &LocalRepairResult::default(),
+                Some(
+                    "Prior local-state preservation remains unverified; inspect the retained recovery files. --allow-repeated-repair does not recover or verify the missing state. No repair writes were applied."
+                        .to_string(),
+                ),
+            );
+            return emit_unverified_repair(
+                &initial.report,
+                false,
+                &recovery_audit,
+                DoctorExitCode::FixPartial,
+                ctx,
+            );
+        }
+    }
+
     // Local sidecar repair can quarantine an orphan WAL before the JSONL
     // rebuild takes its snapshot. Retain that original preservation failure;
     // a later empty live path must not turn it into a successful snapshot.
@@ -14361,42 +14738,6 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     } else {
         Vec::new()
     };
-
-    let prior_preservation_failure = if args.repair {
-        prior_jsonl_rebuild_preservation_failure(&beads_dir, &paths.db_path)?
-    } else {
-        None
-    };
-    if !args.allow_repeated_repair
-        && let Some(evidence) = prior_preservation_failure.as_ref()
-    {
-        let reason = repeated_jsonl_rebuild_refusal_message(evidence);
-        let recovery_audit = jsonl_rebuild_audit_record(
-            "doctor.jsonl_rebuild",
-            "refused",
-            None,
-            Some(reason.clone()),
-        );
-        emit_recovery_audit_record(&recovery_audit);
-        if ctx.is_json() {
-            ctx.json(&serde_json::json!({
-                "ok": false,
-                "repaired": false,
-                "verified": false,
-                "preservation_verified": false,
-                "exit_code": DoctorExitCode::RefusedUnsafe.as_i32(),
-                "code": DoctorExitCode::RefusedUnsafe.as_str(),
-                "report": initial.report,
-                "recovery_audit": recovery_audit,
-                "recovery_failure_marker": evidence.path,
-                "message": reason,
-            }));
-        } else {
-            print_report(&initial.report, ctx)?;
-            ctx.error(&reason);
-        }
-        crate::shutdown::exit_process(DoctorExitCode::RefusedUnsafe.as_i32());
-    }
 
     // Build the per-run session once when --repair is requested. Every repaired
     // write must have a run-dir, verbatim backup, and actions.jsonl trail. If
@@ -14934,40 +15275,25 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             })?;
     let mut local_repair = LocalRepairResult::default();
 
-    // An explicit retry permits remediation, not certification of state lost
-    // by an earlier attempt. The no-op/warning path cannot restore that state.
-    if initial.report.ok
-        && let Some(evidence) = prior_preservation_failure.as_ref()
-    {
-        let reason = format!(
-            "Prior local-state preservation remains unverified; inspect '{}'. --allow-repeated-repair does not recover or verify the missing state.",
-            evidence.path.display()
-        );
+    // Early fixers may clear the remaining database errors, but they cannot
+    // restore state lost by an earlier rebuild or certify its preservation.
+    if report_has_only_preservation_errors(&initial.report) {
         let recovery_audit = early_repair.prepend_actions_to_audit(local_repair_audit_record(
             "doctor.local_repair",
             "verification_failed",
             &local_repair,
-            Some(reason.clone()),
+            Some(
+                "Database repairs cannot verify local state lost by an earlier repair; inspect the retained recovery files."
+                    .to_string(),
+            ),
         ));
-        emit_recovery_audit_record(&recovery_audit);
-        if ctx.is_json() {
-            ctx.json(&serde_json::json!({
-                "ok": false,
-                "repaired": early_repair.applied(),
-                "verified": false,
-                "preservation_verified": false,
-                "exit_code": DoctorExitCode::FixPartial.as_i32(),
-                "code": DoctorExitCode::FixPartial.as_str(),
-                "report": initial.report,
-                "recovery_audit": recovery_audit,
-                "recovery_failure_marker": evidence.path,
-                "message": reason,
-            }));
-        } else {
-            print_report(&initial.report, ctx)?;
-            ctx.warning(&reason);
-        }
-        crate::shutdown::exit_process(DoctorExitCode::FixPartial.as_i32());
+        return emit_unverified_repair(
+            &initial.report,
+            early_repair.applied(),
+            &recovery_audit,
+            DoctorExitCode::FixPartial,
+            ctx,
+        );
     }
 
     if initial.report.ok {
@@ -15194,6 +15520,25 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         }
     }
 
+    if report_has_only_preservation_errors(&after_local_repair.report) {
+        let recovery_audit = early_repair.prepend_actions_to_audit(local_repair_audit_record(
+            "doctor.local_repair",
+            "verification_failed",
+            &local_repair,
+            Some(
+                "Database repairs cannot verify local state lost by an earlier repair; inspect the retained recovery files."
+                    .to_string(),
+            ),
+        ));
+        return emit_unverified_repair(
+            &after_local_repair.report,
+            early_repair.applied() || local_repair.applied(),
+            &recovery_audit,
+            DoctorExitCode::FixPartial,
+            ctx,
+        );
+    }
+
     if repair_report_verified(&after_local_repair.report) {
         // Issue #245: REINDEX can fix index ordering so integrity_check
         // passes, but the underlying B-tree corruption may still cause
@@ -15315,10 +15660,14 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             "doctor.jsonl_rebuild",
             "refused",
             None,
-            Some(reason.clone()),
+            Some(reason),
         ));
-        emit_recovery_audit_record(&recovery_audit);
-        return Err(BeadsError::Config(reason));
+        return refuse_repeated_jsonl_rebuild(
+            &after_local_repair.report,
+            early_repair.applied() || local_repair.applied(),
+            &recovery_audit,
+            ctx,
+        );
     }
 
     if !ctx.is_json() {
@@ -15355,41 +15704,108 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             repair_result.dirty_preservation_warnings.push(warning);
         }
     }
-    if let Some(evidence) = prior_preservation_failure {
-        repair_result.dirty_preservation_warnings.push(format!(
-            "an earlier repair could not verify preservation of local state; unresolved evidence remains at '{}'",
-            evidence.path.display()
-        ));
-    }
 
-    let post_repair = collect_report(DoctorInspectionMode::Full)?;
+    // The database has already been replaced. An inspection failure must not
+    // discard the preservation result before its durable marker is written.
+    let mut post_repair =
+        collect_report(DoctorInspectionMode::Full).unwrap_or_else(|err| DoctorRun {
+            report: DoctorReport {
+                ok: false,
+                workspace_health: None,
+                reliability_audit: None,
+                checks: vec![CheckResult {
+                    name: "doctor.post_repair_inspection".to_string(),
+                    status: CheckStatus::Error,
+                    message: Some(format!("Could not inspect the rebuilt database: {err}")),
+                    details: None,
+                }],
+            },
+            jsonl_path: Some(jsonl_path.clone()),
+        });
+    if !report_has_recovery_preservation_failure(&post_repair.report) {
+        for check in &initial.report.checks {
+            if check.name == RECOVERY_PRESERVATION_CHECK && check.status != CheckStatus::Ok {
+                post_repair.report.checks.push(check.clone());
+                post_repair.report.ok = false;
+            }
+        }
+    }
+    for (field, warnings) in [
+        (
+            "dirty_preservation_warnings",
+            &mut repair_result.dirty_preservation_warnings,
+        ),
+        (
+            "history_preservation_warnings",
+            &mut repair_result.history_preservation_warnings,
+        ),
+    ] {
+        for warning in retained_preservation_warnings(&post_repair.report, field) {
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
+            }
+        }
+    }
+    record_jsonl_rebuild_preservation_failure(
+        &mut post_repair.report,
+        &repair_result,
+        &paths.db_path,
+        jsonl_path,
+    );
     let database_verified = jsonl_rebuild_database_verified(
         &post_repair.report,
         &repair_result.preserved_dirty_issue_ids,
     );
-    let preservation_verified = repair_result.preservation_verified();
+    let preservation_verified =
+        jsonl_rebuild_preservation_verified(&post_repair.report, &repair_result);
     let post_repair_verified = jsonl_rebuild_repair_verified(&post_repair.report, &repair_result);
-    let verification_failure_marker = if post_repair_verified {
-        None
+    let exit_code = if post_repair_verified {
+        DoctorExitCode::Healthy
     } else {
-        let marker_session = session.as_mut().ok_or_else(|| {
-            BeadsError::Config(
-                "Cannot write JSONL rebuild verification marker without a reversible repair session"
-                    .to_string(),
-            )
-        })?;
-        Some(write_jsonl_rebuild_verification_failed_marker(
-            &beads_dir,
-            &paths.db_path,
-            &post_repair,
-            &repair_result,
-            marker_session,
-        )?)
+        DoctorExitCode::FixPartial
     };
-    let verification_failure_reason = verification_failure_marker.as_ref().map(|path| {
+    let (verification_failure_marker, verification_failure_marker_error) = if post_repair_verified {
+        (None, None)
+    } else {
+        let marker = session
+            .as_mut()
+            .ok_or_else(|| {
+                BeadsError::Config(
+                    "Cannot write JSONL rebuild verification marker without a reversible repair session"
+                        .to_string(),
+                )
+            })
+            .and_then(|marker_session| {
+                write_jsonl_rebuild_verification_failed_marker(
+                    &beads_dir,
+                    &paths.db_path,
+                    &post_repair,
+                    &repair_result,
+                    marker_session,
+                )
+            });
+        match marker {
+            Ok(path) => (Some(path), None),
+            Err(err) => (
+                None,
+                Some(format!(
+                    "Verification marker persistence could not be confirmed: {err}. Preserve this repair result and the recovery files; automatic retry protection cannot be guaranteed until the evidence is retained."
+                )),
+            ),
+        }
+    };
+    let verification_failure_reason = (!post_repair_verified).then(|| {
+        let reason = if !preservation_verified {
+            "local-state preservation could not be verified; inspect retained recovery files before accepting the rebuilt database"
+        } else {
+            "post-repair database checks did not pass"
+        };
+        let evidence = verification_failure_marker.as_ref().map_or_else(
+            || verification_failure_marker_error.as_deref().unwrap_or("Verification marker persistence could not be confirmed").to_string(),
+            |path| format!("evidence marker written to '{}'", path.display()),
+        );
         format!(
-            "post-repair verification failed (database_verified={database_verified}, preservation_verified={preservation_verified}); evidence marker written to '{}'",
-            path.display()
+            "Repair verification failed (database_verified={database_verified}, preservation_verified={preservation_verified}): {reason}; {evidence}"
         )
     });
     let recovery_audit = early_repair.prepend_actions_to_audit(jsonl_rebuild_audit_record(
@@ -15406,6 +15822,9 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
 
     if ctx.is_json() {
         ctx.json(&serde_json::json!({
+            "ok": post_repair_verified,
+            "exit_code": exit_code.as_i32(),
+            "code": exit_code.as_str(),
             "report": initial.report,
             "repaired": true,
             "local_repair": local_repair,
@@ -15421,15 +15840,13 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             "dirty_preservation_warnings": &repair_result.dirty_preservation_warnings,
             "verified_backups": &repair_result.verified_backups,
             "post_repair": post_repair.report,
-            "verified": post_repair_verified,
-            "ok": post_repair_verified,
-            "exit_code": if post_repair_verified { DoctorExitCode::Healthy } else { DoctorExitCode::FixPartial }.as_i32(),
-            "code": if post_repair_verified { DoctorExitCode::Healthy } else { DoctorExitCode::FixPartial }.as_str(),
             "database_verified": database_verified,
             "preservation_verified": preservation_verified,
+            "verified": post_repair_verified,
             "recovery_failure_marker": verification_failure_marker
                 .as_ref()
                 .map(|path| path.display().to_string()),
+            "recovery_failure_marker_error": verification_failure_marker_error,
         }));
     } else {
         ctx.info(&format!(
@@ -15472,6 +15889,8 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         print_report(&post_repair.report, ctx)?;
         if let Some(reason) = verification_failure_reason.as_deref() {
             ctx.warning(reason);
+        } else {
+            ctx.info("Repair verified: database checks and local-state preservation passed.");
         }
     }
 
@@ -15480,7 +15899,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         // would append main's structured error envelope to stdout, breaking
         // callers that parse one JSON value. Reconstruction was applied, so
         // report a partial repair rather than a rollback or an unqualified win.
-        crate::shutdown::exit_process(DoctorExitCode::FixPartial.as_i32());
+        crate::shutdown::exit_process(exit_code.as_i32());
     }
 
     Ok(())
@@ -17383,6 +17802,78 @@ mod tests {
 
         let allowed = repeated_jsonl_rebuild_refusal_reason(&beads_dir, &db_path, true)?;
         assert!(allowed.is_none(), "explicit override should permit retry");
+        let mut checks = Vec::new();
+        check_recovery_artifacts(&beads_dir, &db_path, &mut checks)?;
+        let report = report_with(checks);
+        assert!(
+            !report_has_recovery_preservation_failure(&report),
+            "a legacy database-check failure must not invent a preservation loss"
+        );
+        assert!(jsonl_rebuild_database_verified(&report, &[]));
+        assert_eq!(fs::read(&marker)?, b"{\"outcome\":\"verification_failed\"}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_recovery_preservation_markers_fail_closed_across_retries() -> Result<()> {
+        for (name, marker_bytes, malformed) in [
+            (
+                "loss_without_warning_text",
+                br#"{"outcome":"verification_failed","preservation_verified":false,"dirty_preservation_warnings":[],"history_preservation_warnings":[]}"#.as_slice(),
+                false,
+            ),
+            (
+                "invalid_warning_type",
+                br#"{"outcome":"verification_failed","preservation_verified":true,"dirty_preservation_warnings":"unreadable issue"}"#.as_slice(),
+                true,
+            ),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let beads_dir = temp.path().join(".beads");
+            let db_path = beads_dir.join("beads.db");
+            let recovery_dir = beads_dir.join(".br_recovery");
+            fs::create_dir_all(&recovery_dir)?;
+            let marker = recovery_dir.join(format!(
+                "beads.db.{name}{JSONL_REBUILD_VERIFICATION_FAILED_SUFFIX}"
+            ));
+            fs::write(&marker, marker_bytes)?;
+
+            assert!(repeated_jsonl_rebuild_refusal_reason(&beads_dir, &db_path, false)?.is_some());
+            assert!(repeated_jsonl_rebuild_refusal_reason(&beads_dir, &db_path, true)?.is_none());
+            let mut checks = Vec::new();
+            check_recovery_artifacts(&beads_dir, &db_path, &mut checks)?;
+            let report = DoctorReport {
+                ok: !has_error(&checks),
+                workspace_health: None,
+                reliability_audit: None,
+                checks,
+            };
+            let check = find_check(&report.checks, RECOVERY_PRESERVATION_CHECK)
+                .expect("retained preservation failure");
+            assert_eq!(check.status, CheckStatus::Error, "{name}");
+            let details = check.details.as_ref().expect("marker details");
+            assert_eq!(details["markers"], serde_json::json!([marker.display().to_string()]));
+            assert_eq!(details["preservation_verified"], false);
+            let warnings = retained_preservation_warnings(&report, "dirty_preservation_warnings");
+            if malformed {
+                assert!(warnings.iter().any(|warning| warning.contains("could not be read")));
+            } else {
+                assert!(warnings.is_empty(), "a false verdict alone must remain disqualifying");
+            }
+            assert!(jsonl_rebuild_database_verified(&report, &[]));
+            assert!(report_has_recovery_preservation_failure(&report));
+            assert!(!repair_report_verified(&report));
+
+            let mut anomalies = Vec::new();
+            append_doctor_check_anomalies(check, &mut anomalies);
+            let classification = WorkspaceClassification::from_anomalies(anomalies);
+            assert_eq!(classification.health, WorkspaceHealth::Unsafe);
+            let audit = classification.anomalies[0].audit_entry();
+            assert_eq!(audit.code, "preservation_unverified");
+            assert_eq!(audit.severity, "unsafe");
+            assert!(audit.message.contains("local-state preservation unverified"));
+            assert_eq!(fs::read(&marker)?, marker_bytes);
+        }
         Ok(())
     }
 
@@ -17411,21 +17902,25 @@ mod tests {
                         message: Some("Parsed 1 records".to_string()),
                         details: None,
                     },
+                    sync_metadata_warn(true, false),
+                    count_divergence_warn(&["bd-kept"], &[]),
+                    CheckResult {
+                        name: "db.recovery_artifacts".to_string(),
+                        status: CheckStatus::Warn,
+                        message: Some("Retained pre-repair database".to_string()),
+                        details: None,
+                    },
                 ],
             },
             jsonl_path: None,
         };
         let repair = DoctorRepairResult {
             imported: 1,
-            skipped: 0,
-            fk_violations_cleaned: 0,
-            preserved_tombstones: 0,
-            preserved_dirty_issues: 0,
-            preserved_dirty_issue_ids: Vec::new(),
-            verified_backups: Vec::new(),
-            preserved_history: Vec::new(),
-            history_preservation_warnings: Vec::new(),
-            dirty_preservation_warnings: vec!["dirty issue bd-lost was unreadable".to_string()],
+            preserved_dirty_issues: 1,
+            preserved_dirty_issue_ids: vec!["bd-kept".to_string()],
+            history_preservation_warnings: vec!["events could not be read".to_string()],
+            dirty_preservation_warnings: vec!["dirty issue bd-lost could not be read".to_string()],
+            ..DoctorRepairResult::default()
         };
         let mut session =
             DoctorRepairSession::new(temp.path(), /* dry_run = */ false).expect("session builds");
@@ -17450,27 +17945,37 @@ mod tests {
         assert_eq!(payload["outcome"], "verification_failed");
         assert_eq!(payload["workspace_health"], "unsafe");
         assert_eq!(payload["imported"], 1);
+        assert_eq!(payload["repaired"], true);
+        assert_eq!(payload["database_verified"], false);
         assert_eq!(payload["preservation_verified"], false);
+        assert_eq!(payload["verified"], false);
         assert_eq!(
             payload["dirty_preservation_warnings"],
-            serde_json::json!(repair.dirty_preservation_warnings)
+            serde_json::json!(["dirty issue bd-lost could not be read"])
+        );
+        assert_eq!(
+            payload["history_preservation_warnings"],
+            serde_json::json!(["events could not be read"])
         );
         let failed_checks = payload["failed_checks"]
             .as_array()
             .expect("failed check array");
-        assert_eq!(failed_checks.len(), 1);
+        assert_eq!(failed_checks.len(), 2);
         assert_eq!(failed_checks[0]["name"], "sqlite.integrity_check");
+        assert_eq!(failed_checks[1]["name"], "sync.metadata");
 
         let evidence = prior_jsonl_rebuild_failure_evidence(&beads_dir, &db_path)?
             .expect("marker should become repeated-repair evidence");
         assert_eq!(evidence.path, marker);
         assert_eq!(
-            prior_jsonl_rebuild_preservation_failure(&beads_dir, &db_path)?
-                .expect("preservation failure")
-                .path,
-            marker
+            read_rebuild_preservation_evidence(&marker)?.preservation_verified,
+            Some(false)
         );
 
+        assert_jsonl_rebuild_marker_action(&session)
+    }
+
+    fn assert_jsonl_rebuild_marker_action(session: &DoctorRepairSession) -> Result<()> {
         let actions = fs::read_to_string(&session.run.actions_file)?;
         let action: serde_json::Value = serde_json::from_str(
             actions
@@ -17658,6 +18163,34 @@ mod tests {
             find_check(checks, "jsonl.parse").is_some(),
             "JSONL audit must still run under --no-db"
         );
+
+        let recovery_dir = beads_dir.join(".br_recovery");
+        fs::create_dir_all(&recovery_dir).unwrap();
+        let failure_marker = recovery_dir.join(format!(
+            "beads.db.previous{JSONL_REBUILD_VERIFICATION_FAILED_SUFFIX}"
+        ));
+        let failure_bytes = br#"{"outcome":"verification_failed","preservation_verified":false}"#;
+        fs::write(&failure_marker, failure_bytes).unwrap();
+        let retained = collect_doctor_report_with_mode_and_db_override(
+            &beads_dir,
+            &paths,
+            None,
+            DoctorInspectionMode::Full,
+            true,
+        )
+        .expect("JSONL-only report with retained preservation evidence");
+        assert!(!retained.report.ok);
+        assert_eq!(retained.report.workspace_health.as_deref(), Some("unsafe"));
+        assert!(report_has_recovery_preservation_failure(&retained.report));
+        assert!(!jsonl_rebuild_database_verified(&retained.report, &[]));
+        for db_check in [
+            "db.recovery_artifacts",
+            "schema.tables",
+            "counts.db_vs_jsonl",
+        ] {
+            assert!(find_check(&retained.report.checks, db_check).is_none());
+        }
+        assert_eq!(fs::read(&failure_marker).unwrap(), failure_bytes);
 
         // Contrast: with no_db = false, the DB-backed checks DO run.
         let run_db = collect_doctor_report_with_mode_and_db_override(
@@ -24355,15 +24888,20 @@ mod tests {
     #[test]
     fn unclassified_failure_attributes_no_cause() {
         // The residual case must describe what happened without inventing a
-        // culprit, and must state that nothing was written.
-        let err = BeadsError::Config("run directory is not writable".to_string());
+        // culprit or claiming that a post-rebuild restore made no changes.
+        let err = BeadsError::Config(
+            "Rebuild from JSONL succeeded, but failed to restore unflushed issues".to_string(),
+        );
         assert!(!is_database_unavailable_failure(&err));
         assert!(!is_jsonl_content_failure(&err));
 
         let message = jsonl_rebuild_failure_message(&err);
         assert!(
-            message.contains("No database writes were applied"),
-            "message should state the workspace is unchanged: {message}"
+            message.contains("Preserve the recovery files")
+                && message.contains("failed to restore unflushed issues")
+                && !message.contains("workspace is unchanged")
+                && !message.contains("No database writes were applied"),
+            "message must retain the restore failure without claiming rollback: {message}"
         );
         assert!(
             !message.to_lowercase().contains("corrupt"),
@@ -25184,6 +25722,172 @@ mod tests {
         assert!(!repair_report_verified(&report));
         // ...but the rebuild path's verifier tolerates them.
         assert!(jsonl_rebuild_database_verified(&report, &[]));
+    }
+
+    #[test]
+    fn jsonl_rebuild_verification_requires_complete_local_preservation() {
+        let report = report_with(vec![
+            sync_metadata_warn(false, true),
+            count_divergence_warn(&["bd-kept"], &[]),
+        ]);
+        let lossless = DoctorRepairResult {
+            imported: 1,
+            skipped: 0,
+            fk_violations_cleaned: 0,
+            preserved_tombstones: 0,
+            preserved_dirty_issues: 1,
+            preserved_dirty_issue_ids: vec!["bd-kept".to_string()],
+            verified_backups: Vec::new(),
+            preserved_history: Vec::new(),
+            history_preservation_warnings: Vec::new(),
+            dirty_preservation_warnings: Vec::new(),
+        };
+        assert!(jsonl_rebuild_repair_verified(&report, &lossless));
+        let skipped_database = report_with(vec![CheckResult {
+            name: "db.no_db_mode".to_string(),
+            status: CheckStatus::Ok,
+            message: Some("database checks skipped".to_string()),
+            details: None,
+        }]);
+        assert!(
+            !jsonl_rebuild_database_verified(&skipped_database, &[]),
+            "skipped database checks cannot establish a verified database"
+        );
+
+        let mut lost_dirty = lossless.clone();
+        lost_dirty
+            .dirty_preservation_warnings
+            .push("dirty issue bd-lost could not be read".to_string());
+        let mut lost_history = lossless.clone();
+        lost_history
+            .history_preservation_warnings
+            .push("events could not be read".to_string());
+        for partial in [&lost_dirty, &lost_history] {
+            assert!(jsonl_rebuild_database_verified(
+                &report,
+                &partial.preserved_dirty_issue_ids,
+            ));
+            assert!(!jsonl_rebuild_preservation_verified(&report, partial));
+            assert!(!jsonl_rebuild_repair_verified(&report, partial));
+        }
+
+        let mut retained_failure = report.clone();
+        retained_failure.ok = false;
+        retained_failure.checks.push(CheckResult {
+            name: RECOVERY_PRESERVATION_CHECK.to_string(),
+            status: CheckStatus::Error,
+            message: Some("previous repair could not preserve local state".to_string()),
+            details: None,
+        });
+        assert!(jsonl_rebuild_database_verified(
+            &retained_failure,
+            &lossless.preserved_dirty_issue_ids,
+        ));
+        assert!(!jsonl_rebuild_preservation_verified(
+            &retained_failure,
+            &lossless
+        ));
+        assert!(!jsonl_rebuild_repair_verified(&retained_failure, &lossless));
+
+        retained_failure.checks.push(CheckResult {
+            name: "db.open".to_string(),
+            status: CheckStatus::Error,
+            message: Some("rebuilt database cannot be opened".to_string()),
+            details: None,
+        });
+        assert!(
+            !jsonl_rebuild_database_verified(
+                &retained_failure,
+                &lossless.preserved_dirty_issue_ids,
+            ),
+            "a preservation diagnostic must never excuse an independent database failure"
+        );
+    }
+
+    #[test]
+    fn jsonl_rebuild_preservation_failure_updates_current_report_and_audit() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        drop(SqliteStorage::open(&db_path)?);
+        fs::write(&jsonl_path, "")?;
+        let mut report = report_with(vec![CheckResult {
+            name: "sqlite.integrity_check".to_string(),
+            status: CheckStatus::Ok,
+            message: Some("ok".to_string()),
+            details: None,
+        }]);
+        let healthy = classify_doctor_checks(&db_path, &jsonl_path, &report.checks);
+        assert_eq!(healthy.health, WorkspaceHealth::Healthy);
+        report.workspace_health = Some(healthy.health.to_string());
+        report.reliability_audit = Some(healthy.audit_record("doctor.inspect"));
+        let repair = DoctorRepairResult {
+            imported: 1,
+            skipped: 0,
+            fk_violations_cleaned: 0,
+            preserved_tombstones: 0,
+            preserved_dirty_issues: 0,
+            preserved_dirty_issue_ids: Vec::new(),
+            verified_backups: Vec::new(),
+            preserved_history: Vec::new(),
+            history_preservation_warnings: vec!["events could not be read".to_string()],
+            dirty_preservation_warnings: vec!["dirty issue bd-lost could not be read".to_string()],
+        };
+
+        record_jsonl_rebuild_preservation_failure(&mut report, &repair, &db_path, &jsonl_path);
+
+        assert!(
+            !report.ok,
+            "current preservation failures belong in the final report"
+        );
+        assert_eq!(report.workspace_health.as_deref(), Some("unsafe"));
+        let audit = report.reliability_audit.as_ref().expect("final audit");
+        assert_eq!(audit.health, "unsafe");
+        assert!(audit.anomalies.iter().any(|anomaly| {
+            anomaly.code == "preservation_unverified" && anomaly.severity == "unsafe"
+        }));
+        assert!(jsonl_rebuild_database_verified(&report, &[]));
+        assert!(!jsonl_rebuild_repair_verified(&report, &repair));
+        let check = find_check(&report.checks, RECOVERY_PRESERVATION_CHECK)
+            .expect("current preservation failure");
+        assert_eq!(check.status, CheckStatus::Error);
+        let details = check.details.as_ref().expect("preservation details");
+        assert_eq!(details["markers"], serde_json::json!([]));
+        assert_eq!(
+            details["dirty_preservation_warnings"],
+            serde_json::json!(repair.dirty_preservation_warnings)
+        );
+        assert_eq!(
+            details["history_preservation_warnings"],
+            serde_json::json!(repair.history_preservation_warnings)
+        );
+
+        // A subsequent assessment retains earlier evidence while publishing
+        // one combined finding for the current and previous attempts.
+        let prior_marker = temp.path().join("previous.verification-failed.json");
+        report
+            .checks
+            .iter_mut()
+            .find(|check| check.name == RECOVERY_PRESERVATION_CHECK)
+            .unwrap()
+            .details
+            .as_mut()
+            .unwrap()["markers"] = serde_json::json!([prior_marker]);
+        record_jsonl_rebuild_preservation_failure(&mut report, &repair, &db_path, &jsonl_path);
+        assert_eq!(
+            report
+                .checks
+                .iter()
+                .filter(|check| check.name == RECOVERY_PRESERVATION_CHECK)
+                .count(),
+            1
+        );
+        let check = find_check(&report.checks, RECOVERY_PRESERVATION_CHECK).unwrap();
+        assert_eq!(
+            check.details.as_ref().unwrap()["markers"],
+            serde_json::json!([prior_marker])
+        );
+        Ok(())
     }
 
     #[test]
@@ -27493,6 +28197,78 @@ version = "2026-05-11-abc123"
                 .is_symlink(),
             "refused snapshot symlink should be left in place for operator inspection"
         );
+    }
+
+    #[test]
+    fn test_recovery_preservation_failure_retains_entire_aged_family() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let recovery_dir = beads_dir.join(".br_recovery");
+        fs::create_dir_all(&recovery_dir)?;
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 24 * 60 * 60);
+        let originals = [
+            (
+                recovery_dir.join("beads.db.old.bak"),
+                b"original database".as_slice(),
+            ),
+            (
+                recovery_dir.join("beads.db-wal.old.bak"),
+                b"unflushed WAL".as_slice(),
+            ),
+            (
+                beads_dir.join("beads.db.bad_old"),
+                b"retained sibling".as_slice(),
+            ),
+        ];
+        for (path, bytes) in &originals {
+            fs::write(path, bytes)?;
+            OpenOptions::new()
+                .write(true)
+                .open(path)?
+                .set_times(fs::FileTimes::new().set_modified(old))?;
+        }
+        let mut expected = originals
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(recovery_artifacts_aged(&beads_dir, &db_path)?, expected);
+
+        let marker = recovery_dir.join(format!(
+            "beads.db.old{JSONL_REBUILD_VERIFICATION_FAILED_SUFFIX}"
+        ));
+        let marker_bytes = br#"{"outcome":"verification_failed","preservation_verified":false}"#;
+        fs::write(&marker, marker_bytes)?;
+        OpenOptions::new()
+            .write(true)
+            .open(&marker)?
+            .set_times(fs::FileTimes::new().set_modified(old))?;
+        assert!(recovery_artifacts_aged(&beads_dir, &db_path)?.is_empty());
+
+        // Even a previously collected age warning cannot authorize moving
+        // evidence after a failed preservation marker appears.
+        let report = report_with(vec![CheckResult {
+            name: "db.recovery_artifacts.aged".to_string(),
+            status: CheckStatus::Warn,
+            message: None,
+            details: None,
+        }]);
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Json, false, true);
+        let mut session = DoctorRepairSession::new(temp.path(), false)?;
+        assert!(!fix_recovery_artifacts_aged_if_warned(
+            &beads_dir,
+            &db_path,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+        for (path, bytes) in &originals {
+            assert_eq!(fs::read(path)?, *bytes, "retained {}", path.display());
+        }
+        assert_eq!(fs::read(&marker)?, marker_bytes);
+        assert!(fs::read_to_string(&session.run.actions_file)?.is_empty());
+        Ok(())
     }
 
     #[cfg(unix)]

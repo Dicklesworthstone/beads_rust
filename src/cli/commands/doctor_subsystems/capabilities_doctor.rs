@@ -318,6 +318,7 @@ const DETECTOR_ROWS: &[DetectorRow] = &[
         true,
     ),
     ("db.recovery_artifacts", "state_files", "info", true),
+    ("db.recovery_preservation", "state_files", "error", true),
     ("db.recovery_artifacts.aged", "state_files", "warn", true),
     ("db.foreign_recovery_debris", "state_files", "info", true),
     ("db.export_hash_cache", "caches_indexes", "warn", true),
