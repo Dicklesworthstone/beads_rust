@@ -18,12 +18,12 @@ use crate::sync::path::validate_sync_path_with_external;
 use crate::sync::{
     ExpectedJsonlSourceRef, ExportConfig, FreshDatabaseReplacementWitness, ImportConfig,
     ImportResult, JsonlSourceSnapshot, JsonlSourceStateWitness, JsonlTombstoneFilter,
-    PreservedIssue, blocking_database_family_write_lock_with_timeout,
+    UnflushedStateSnapshot, blocking_database_family_write_lock_with_timeout,
     capture_optional_jsonl_source, dirty_issues_missing_from_jsonl,
     export_to_jsonl_with_policy_expected_under_authority, finalize_export_under_authority,
     import_from_jsonl_snapshot, import_from_jsonl_snapshot_into_fresh_replacement,
     preflight_import_snapshot, restore_dirty_issues_after_rebuild,
-    restore_tombstones_after_rebuild, scan_jsonl_snapshot_for_tombstone_filter,
+    restore_tombstones_after_automatic_rebuild, scan_jsonl_snapshot_for_tombstone_filter,
     snapshot_unflushed_state, tombstones_missing_from_jsonl_tombstones,
     verify_jsonl_source_snapshot_current,
 };
@@ -1671,8 +1671,7 @@ fn rebuild_with_tombstone_preservation(
     let source = Arc::new(crate::sync::capture_jsonl_source_snapshot(
         &paths.jsonl_path,
     )?);
-    let (preserved_tombstones, preserved_dirty_issues) =
-        preserved_unflushed_state(&storage, &source, beads_dir, &paths.db_path)?;
+    let preserved = preserved_unflushed_state(&storage, &source, beads_dir, &paths.db_path)?;
     drop(storage);
     let mut storage = rebuild_database_from_jsonl_snapshot(
         beads_dir,
@@ -1684,8 +1683,12 @@ fn rebuild_with_tombstone_preservation(
         &jsonl_authority,
         write_authority,
     )?;
-    restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
-    restore_dirty_issues_after_rebuild(&mut storage, &preserved_dirty_issues)?;
+    restore_tombstones_after_automatic_rebuild(
+        &mut storage,
+        &preserved.tombstones,
+        &preserved.import_omitted_tombstones,
+    )?;
+    restore_dirty_issues_after_rebuild(&mut storage, &preserved.dirty)?;
     Ok((
         storage,
         RecoveredJsonlSource {
@@ -1785,8 +1788,8 @@ fn preserved_unflushed_state(
     source: &JsonlSourceSnapshot,
     beads_dir: &Path,
     db_path: &Path,
-) -> Result<(Vec<PreservedIssue>, Vec<PreservedIssue>)> {
-    let snapshot = snapshot_unflushed_state(storage);
+) -> Result<UnflushedStateSnapshot> {
+    let mut snapshot = snapshot_unflushed_state(storage);
     if !snapshot.warnings.is_empty() {
         return Err(automatic_recovery_preservation_refusal(
             beads_dir,
@@ -1794,10 +1797,8 @@ fn preserved_unflushed_state(
             &snapshot.warnings,
         ));
     }
-    let tombstone_snapshot = snapshot.tombstones;
-    let dirty_snapshot = snapshot.dirty;
-    if tombstone_snapshot.is_empty() && dirty_snapshot.is_empty() {
-        return Ok((tombstone_snapshot, dirty_snapshot));
+    if snapshot.tombstones.is_empty() && snapshot.dirty.is_empty() {
+        return Ok(snapshot);
     }
     let jsonl_filter = match scan_jsonl_snapshot_for_tombstone_filter(source) {
         Ok(filter) => filter,
@@ -1814,10 +1815,17 @@ fn preserved_unflushed_state(
             JsonlTombstoneFilter::default()
         }
     };
-    Ok((
-        tombstones_missing_from_jsonl_tombstones(tombstone_snapshot, &jsonl_filter),
-        dirty_issues_missing_from_jsonl(dirty_snapshot, &jsonl_filter),
-    ))
+    // A later source can reintroduce a live row at a formerly omitted ID.
+    // The local tombstone must still win that conflict and remain pending;
+    // only continued absence preserves the accepted clean-omission status.
+    snapshot.import_omitted_tombstones.retain(|id| {
+        !jsonl_filter.tombstone_ids.contains(id)
+            && !jsonl_filter.non_tombstone_updated_at.contains_key(id)
+    });
+    snapshot.tombstones =
+        tombstones_missing_from_jsonl_tombstones(snapshot.tombstones, &jsonl_filter);
+    snapshot.dirty = dirty_issues_missing_from_jsonl(snapshot.dirty, &jsonl_filter);
+    Ok(snapshot)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4481,7 +4489,7 @@ impl OpenStorageResult {
         let source = Arc::new(crate::sync::capture_jsonl_source_snapshot(
             &self.paths.jsonl_path,
         )?);
-        let (preserved_tombstones, preserved_dirty_issues) = preserved_unflushed_state(
+        let preserved = preserved_unflushed_state(
             &self.storage,
             &source,
             &self.paths.beads_dir,
@@ -4513,8 +4521,12 @@ impl OpenStorageResult {
             )?;
         self.storage = storage;
         self.pending_recovery_backup = Some(backup_set);
-        restore_tombstones_after_rebuild(&mut self.storage, &preserved_tombstones)?;
-        restore_dirty_issues_after_rebuild(&mut self.storage, &preserved_dirty_issues)?;
+        restore_tombstones_after_automatic_rebuild(
+            &mut self.storage,
+            &preserved.tombstones,
+            &preserved.import_omitted_tombstones,
+        )?;
+        restore_dirty_issues_after_rebuild(&mut self.storage, &preserved.dirty)?;
         write_authority.verify_database_authority()?;
         self.storage
             .attach_write_authority(Arc::clone(&write_authority));
@@ -9895,6 +9907,294 @@ routing:
             .expect("checkpoint the damaged fixture without removing sidecars");
         assert_eq!(checkpoint[0][0].as_integer(), Some(0), "{checkpoint:?}");
         context
+    }
+
+    fn context_with_imported_omission(
+        deleted_before_import: bool,
+    ) -> (TempDir, OpenStorageResult, Issue) {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let mut context = open_storage_with_cli(&beads_dir, &CliOverrides::default()).unwrap();
+        for id in ["bd-shared", "bd-peer-omitted", "bd-local-delete"] {
+            let issue = Issue {
+                id: id.to_string(),
+                title: id.to_string(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                ..Issue::default()
+            };
+            context.storage.create_issue(&issue, "test").unwrap();
+        }
+        context
+            .storage
+            .add_label("bd-peer-omitted", "retained-history", "test")
+            .unwrap();
+        context
+            .storage
+            .add_dependency("bd-peer-omitted", "bd-shared", "related", "test")
+            .unwrap();
+        context
+            .storage
+            .add_comment(
+                "bd-peer-omitted",
+                "test",
+                "History retained after peer purge",
+            )
+            .unwrap();
+        if deleted_before_import {
+            context
+                .storage
+                .delete_issue("bd-peer-omitted", "test", "Original deletion", None)
+                .unwrap();
+        }
+        crate::sync::auto_flush_with_authority(
+            &mut context.storage,
+            &beads_dir,
+            &context.paths.jsonl_path,
+            false,
+            None,
+            crate::sync::history::HistoryConfig::default(),
+            context.jsonl_write_authority.as_deref(),
+        )
+        .unwrap();
+        let omitted = context
+            .storage
+            .get_issue_for_export("bd-peer-omitted")
+            .unwrap()
+            .unwrap();
+        let retained = crate::sync::read_issues_from_jsonl(&context.paths.jsonl_path)
+            .unwrap()
+            .into_iter()
+            .filter(|issue| issue.id != omitted.id)
+            .map(|issue| serde_json::to_string(&issue).unwrap())
+            .collect::<Vec<_>>();
+        fs::write(
+            &context.paths.jsonl_path,
+            format!("{}\n", retained.join("\n")),
+        )
+        .unwrap();
+        crate::sync::import_from_jsonl(
+            &mut context.storage,
+            &context.paths.jsonl_path,
+            &ImportConfig::default(),
+            Some("bd"),
+        )
+        .unwrap();
+        assert_eq!(context.storage.get_dirty_issue_count().unwrap(), 0);
+        let omissions: std::collections::BTreeSet<String> = serde_json::from_str(
+            &context
+                .storage
+                .get_metadata("import_omitted_ids")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            omissions,
+            std::collections::BTreeSet::from([omitted.id.clone()])
+        );
+        (temp, context, omitted)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn automatic_recovery_keeps_clean_peer_omissions_and_exports_dirty_tombstones() {
+        for (locally_deleted, reintroduced) in [(false, false), (true, false), (false, true)] {
+            let (_temp, mut context, original_omitted) =
+                context_with_imported_omission(!locally_deleted);
+            context
+                .storage
+                .delete_issue("bd-local-delete", "test", "Unflushed local deletion", None)
+                .unwrap();
+            if locally_deleted {
+                // An accepted omission must not suppress a later local deletion.
+                // Comments are supported only while the omitted issue is live.
+                context
+                    .storage
+                    .add_comment(
+                        &original_omitted.id,
+                        "test",
+                        "New local comment before deletion",
+                    )
+                    .unwrap();
+                context
+                    .storage
+                    .delete_issue(
+                        &original_omitted.id,
+                        "test",
+                        "Unflushed local deletion after accepted omission",
+                        None,
+                    )
+                    .unwrap();
+            }
+            if reintroduced {
+                let issue = Issue {
+                    id: original_omitted.id.clone(),
+                    title: "Peer reintroduced a live issue".to_string(),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    ..Issue::default()
+                };
+                let mut source = fs::read_to_string(&context.paths.jsonl_path).unwrap();
+                source.push_str(&serde_json::to_string(&issue).unwrap());
+                source.push('\n');
+                fs::write(&context.paths.jsonl_path, source).unwrap();
+            }
+            let omitted_before = context
+                .storage
+                .get_issue_for_export(&original_omitted.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(omitted_before.status, Status::Tombstone);
+            assert_eq!(
+                context
+                    .storage
+                    .get_dirty_issue_ids()
+                    .unwrap()
+                    .contains(&original_omitted.id),
+                locally_deleted
+            );
+            let local_delete_before = context
+                .storage
+                .get_issue_for_export("bd-local-delete")
+                .unwrap()
+                .unwrap();
+            let source_before = fs::read(&context.paths.jsonl_path).unwrap();
+
+            context.recover_database_from_jsonl().unwrap();
+
+            assert!(context.auto_rebuilt);
+            assert_eq!(fs::read(&context.paths.jsonl_path).unwrap(), source_before);
+            assert_eq!(
+                context
+                    .storage
+                    .get_issue_for_export(&original_omitted.id)
+                    .unwrap()
+                    .unwrap(),
+                omitted_before
+            );
+            assert_eq!(
+                context
+                    .storage
+                    .get_issue_for_export("bd-local-delete")
+                    .unwrap()
+                    .unwrap(),
+                local_delete_before
+            );
+            let should_publish_omitted = locally_deleted || reintroduced;
+            let dirty = context.storage.get_dirty_issue_ids().unwrap();
+            assert_eq!(dirty.len(), 1 + usize::from(should_publish_omitted));
+            assert!(dirty.iter().any(|id| id == "bd-local-delete"));
+            assert_eq!(
+                dirty.contains(&original_omitted.id),
+                should_publish_omitted,
+                "locally_deleted={locally_deleted}, reintroduced={reintroduced}"
+            );
+
+            context
+                .storage
+                .add_comment("bd-shared", "test", "Subsequent command after recovery")
+                .unwrap();
+            let result = crate::sync::auto_flush_with_authority(
+                &mut context.storage,
+                &context.paths.beads_dir,
+                &context.paths.jsonl_path,
+                false,
+                None,
+                crate::sync::history::HistoryConfig::default(),
+                context.jsonl_write_authority.as_deref(),
+            )
+            .unwrap();
+            assert!(result.flushed);
+            let published = crate::sync::read_issues_from_jsonl(&context.paths.jsonl_path).unwrap();
+            assert_eq!(published.len(), 2 + usize::from(should_publish_omitted));
+            assert_eq!(
+                published
+                    .iter()
+                    .any(|issue| issue.id == original_omitted.id),
+                should_publish_omitted
+            );
+            if let Some(omitted) = published
+                .iter()
+                .find(|issue| issue.id == original_omitted.id)
+            {
+                assert!(omitted.sync_equals(&omitted_before));
+            }
+            assert!(
+                published
+                    .iter()
+                    .find(|issue| issue.id == "bd-shared")
+                    .unwrap()
+                    .comments
+                    .iter()
+                    .any(|comment| comment.body == "Subsequent command after recovery")
+            );
+            assert!(
+                published
+                    .iter()
+                    .find(|issue| issue.id == "bd-local-delete")
+                    .unwrap()
+                    .sync_equals(&local_delete_before)
+            );
+            assert_eq!(
+                context
+                    .storage
+                    .get_issue_for_export(&original_omitted.id)
+                    .unwrap()
+                    .unwrap(),
+                omitted_before
+            );
+            assert_eq!(context.storage.get_dirty_issue_count().unwrap(), 0);
+            let omissions: std::collections::BTreeSet<String> = context
+                .storage
+                .get_metadata("import_omitted_ids")
+                .unwrap()
+                .map(|value| serde_json::from_str(&value).unwrap())
+                .unwrap_or_default();
+            assert_eq!(
+                omissions.contains(&original_omitted.id),
+                !should_publish_omitted
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_recovery_refuses_malformed_imported_tombstone_omissions() {
+        for malformed in ["''", "X'5b5d'", "'{\"invalid\":true}'"] {
+            let (_temp, mut context, omitted) = context_with_imported_omission(true);
+            context
+                .storage
+                .execute_raw(&format!(
+                    "UPDATE metadata SET value = {malformed} WHERE key = 'import_omitted_ids'"
+                ))
+                .unwrap();
+            let checkpoint = context
+                .storage
+                .execute_raw_query("PRAGMA wal_checkpoint(TRUNCATE)")
+                .expect("checkpoint the malformed fixture without removing sidecars");
+            assert_eq!(checkpoint[0][0].as_integer(), Some(0), "{checkpoint:?}");
+            let before = database_family_snapshot(&context.paths.db_path).unwrap();
+            let source_before = fs::read(&context.paths.jsonl_path).unwrap();
+            let error = context.recover_database_from_jsonl().unwrap_err();
+            assert!(matches!(error, BeadsError::SyncConflict { .. }));
+            assert!(error.to_string().contains("omission evidence"), "{error}");
+            assert!(!context.auto_rebuilt);
+            assert!(context.pending_recovery_backup.is_none());
+            assert_eq!(
+                database_family_snapshot(&context.paths.db_path).unwrap(),
+                before
+            );
+            assert_eq!(fs::read(&context.paths.jsonl_path).unwrap(), source_before);
+            assert_eq!(
+                context
+                    .storage
+                    .get_issue_for_export(&omitted.id)
+                    .unwrap()
+                    .unwrap(),
+                omitted
+            );
+        }
     }
 
     #[test]

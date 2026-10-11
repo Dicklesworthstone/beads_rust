@@ -3912,7 +3912,7 @@ fn retention_restored_omissions_preserve_local_state_without_republishing() {
         assert_eq!(receipt["created"], 0);
         assert_eq!(receipt["updated"], 0);
         assert_eq!(receipt["skipped"], 1);
-        assert_ne!(get_needs_flush(&ws).as_deref(), Some("true"));
+        assert_eq!(get_needs_flush(&ws).as_deref(), Some("false"));
         assert_eq!(stored_retention_issue(&ws, &protected_id), protected);
         assert_eq!(stored_retention_issue(&ws, &expired_id), expired);
         assert_eq!(all_events_dump(&ws), events);
@@ -3942,7 +3942,7 @@ fn retention_restored_omissions_preserve_local_state_without_republishing() {
                 "Edited after restored export",
                 "--json",
             ],
-            "retention_ordinary_full_flush",
+            "retention_ordinary_incremental_flush",
         );
         assert!(
             update.status.success(),
@@ -3958,6 +3958,85 @@ fn retention_restored_omissions_preserve_local_state_without_republishing() {
             .map(|line| serde_json::from_str::<Value>(line).expect("published issue"))
             .find(|issue| issue["id"].as_str() == Some(protected_id.as_str()));
         assert!(published.is_none(), "omitted row must stay unpublished");
+        assert_eq!(
+            parse_json_value(&read_jsonl_lines(&ws)[0])["title"],
+            "Edited after restored export"
+        );
+
+        // Even with genuine pending work, an ordinary full flush must not
+        // silently restore the clean omission. Deliberate force still keeps
+        // the complete local payload and applies the configured retention.
+        let pending = run_br(
+            &ws,
+            [
+                "--no-auto-import",
+                "--no-auto-flush",
+                "update",
+                &anchor_id,
+                "--title",
+                "Local edit for deliberate full export",
+                "--json",
+            ],
+            "retention_pending_explicit_export",
+        );
+        assert!(pending.status.success(), "pending edit failed: {pending:?}");
+        let pending_source = fs::read(jsonl_path(&ws)).expect("pending source bytes");
+        let refused = run_br(
+            &ws,
+            ["--no-auto-import", "sync", "--flush-only", "--json"],
+            "retention_full_flush_refused",
+        );
+        assert!(
+            !refused.status.success(),
+            "ordinary full flush must preserve accepted omissions: {refused:?}"
+        );
+        assert_eq!(fs::read(jsonl_path(&ws)).unwrap(), pending_source);
+        {
+            let storage = SqliteStorage::open(&db_path(&ws)).expect("open refusal witness");
+            assert_eq!(storage.get_dirty_issue_count().unwrap(), 1);
+            assert!(storage.get_export_hash(&protected_id).unwrap().is_none());
+        }
+        assert_eq!(stored_retention_issue(&ws, &protected_id), protected);
+        assert_eq!(stored_retention_issue(&ws, &expired_id), expired);
+
+        let forced = run_br(
+            &ws,
+            [
+                "--no-auto-import",
+                "sync",
+                "--flush-only",
+                "--force",
+                "--json",
+            ],
+            "retention_deliberate_full_flush",
+        );
+        assert!(
+            forced.status.success(),
+            "deliberate export failed: {forced:?}"
+        );
+        assert_retention_export(&ws, &[&anchor_id, &protected_id], &expired_id);
+        assert_eq!(stored_retention_issue(&ws, &protected_id), protected);
+        assert_eq!(stored_retention_issue(&ws, &expired_id), expired);
+        assert_eq!(issue_count(&ws, label), 3);
+        let restored_anchor = read_jsonl_lines(&ws)
+            .into_iter()
+            .find(|line| row_id(line) == anchor_id)
+            .expect("deliberately exported anchor");
+        assert_eq!(
+            parse_json_value(&restored_anchor)["title"],
+            "Local edit for deliberate full export"
+        );
+        let published = read_jsonl_lines(&ws)
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).expect("published issue"))
+            .find(|issue| issue["id"].as_str() == Some(protected_id.as_str()))
+            .expect("deliberately restored local issue");
+        let mut expected = serde_json::to_value(&protected).expect("protected issue JSON");
+        expected.as_object_mut().unwrap().remove("source_repo_path");
+        assert_eq!(
+            published, expected,
+            "complete local issue and comment payload"
+        );
     }
 }
 

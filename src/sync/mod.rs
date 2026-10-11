@@ -12010,11 +12010,101 @@ fn record_jsonl_row_receipts_in_tx(
 }
 
 fn imported_omitted_ids(storage: &SqliteStorage) -> Result<HashSet<String>> {
-    Ok(storage
-        .get_metadata(METADATA_IMPORT_OMITTED_IDS)?
-        .map(|value| serde_json::from_str(&value))
-        .transpose()?
-        .unwrap_or_default())
+    let rows =
+        storage.execute_raw_query("SELECT value FROM metadata WHERE key = 'import_omitted_ids'")?;
+    if rows.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let raw = rows
+        .first()
+        .filter(|_| rows.len() == 1)
+        .and_then(|row| row.first())
+        .and_then(SqliteValue::as_text)
+        .ok_or_else(|| BeadsError::SyncConflict {
+            message: "Cannot verify imported JSONL omissions: expected one text metadata value"
+                .to_string(),
+        })?;
+    let entries: Vec<String> =
+        serde_json::from_str(raw).map_err(|error| BeadsError::SyncConflict {
+            message: format!(
+                "Cannot verify imported JSONL omissions: {error}; refusing automatic restoration"
+            ),
+        })?;
+    let mut ids = HashSet::new();
+    for id in entries {
+        if id.trim().is_empty() || !ids.insert(id) {
+            return Err(BeadsError::SyncConflict {
+                message: "Cannot verify imported JSONL omissions: empty or duplicate issue ID"
+                    .to_string(),
+            });
+        }
+    }
+    Ok(ids)
+}
+
+fn write_imported_omitted_ids_in_tx(storage: &SqliteStorage, ids: &BTreeSet<String>) -> Result<()> {
+    let previous =
+        storage.execute_raw_query("SELECT value FROM metadata WHERE key = 'import_omitted_ids'")?;
+    if ids.is_empty() {
+        if !previous.is_empty() {
+            storage.execute_raw("DELETE FROM metadata WHERE key = 'import_omitted_ids'")?;
+        }
+    } else {
+        let serialized = serde_json::to_string(ids)?;
+        let current = previous
+            .first()
+            .filter(|_| previous.len() == 1)
+            .and_then(|row| row.first())
+            .and_then(SqliteValue::as_text);
+        if current != Some(serialized.as_str()) {
+            storage.set_metadata_in_tx(METADATA_IMPORT_OMITTED_IDS, &serialized)?;
+        }
+    }
+    Ok(())
+}
+
+/// Finish omission bookkeeping after an authorized full publication.
+/// Existing pending receipts include this key in their stable core witness;
+/// retain it through every receipt phase, even when a pending row is malformed.
+/// The terminal receipt-clear transaction calls this again after its exact
+/// checks and deletion, so receipt and omission cleanup commit together.
+pub(crate) fn clear_imported_omissions_after_full_publication_in_tx(
+    storage: &SqliteStorage,
+) -> Result<()> {
+    let pending = storage.execute_raw_query(
+        "SELECT key FROM metadata WHERE key IN ('sync_merge_pending_v2', 'sync_merge_pending_v1')",
+    )?;
+    if pending.is_empty() {
+        write_imported_omitted_ids_in_tx(storage, &BTreeSet::new())?;
+    }
+    Ok(())
+}
+
+/// Preserve accepted clean omissions across later imports and policy changes.
+/// A tombstone already expired when first omitted can follow later retention
+/// expansion, but expiration does not erase an earlier accepted peer purge.
+fn record_imported_omitted_ids_in_tx(
+    storage: &SqliteStorage,
+    source_target_ids: &HashSet<String>,
+    retention_days: Option<u64>,
+    retention_as_of: DateTime<Utc>,
+) -> Result<()> {
+    let previous = imported_omitted_ids(storage)?;
+    let expired = storage.get_expired_tombstone_ids_at(retention_days, retention_as_of)?;
+    let dirty_ids = storage
+        .get_dirty_issue_ids()?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let omitted = storage
+        .get_non_ephemeral_issue_ids()?
+        .into_iter()
+        .filter(|id| {
+            !source_target_ids.contains(id)
+                && !dirty_ids.contains(id)
+                && (!expired.contains(id) || previous.contains(id))
+        })
+        .collect::<BTreeSet<_>>();
+    write_imported_omitted_ids_in_tx(storage, &omitted)
 }
 
 pub(crate) fn verify_full_export_source_loaded(
@@ -12760,6 +12850,10 @@ pub(crate) fn finalize_export_under_authority(
         storage.set_metadata_in_tx("needs_flush", "false")?;
         // The published snapshot no longer contains purged issues (#405).
         storage.clear_purged_ids_pending_export_in_tx()?;
+        // A deliberate full publication establishes its own population.
+        // Retain a pending merge's stable omission witness until its terminal
+        // clear; other full publications finish their cleanup here atomically.
+        clear_imported_omissions_after_full_publication_in_tx(storage)?;
 
         Ok(())
     })?;
@@ -13060,6 +13154,16 @@ fn finalize_incremental_auto_flush(
         )?;
         // The published snapshot no longer contains purged issues (#405).
         storage.clear_purged_ids_pending_export_in_tx()?;
+        let mut omitted = imported_omitted_ids(storage)?;
+        if !omitted.is_empty() {
+            for (issue_id, _) in &changes.issue_hashes {
+                omitted.remove(issue_id);
+            }
+            for issue_id in &changes.removed_hash_ids {
+                omitted.remove(issue_id);
+            }
+            write_imported_omitted_ids_in_tx(storage, &omitted.into_iter().collect())?;
+        }
         Ok(())
     })?;
 
@@ -13731,6 +13835,7 @@ fn collect_incremental_retention_changes(
     retention_days: Option<u64>,
     export_as_of: DateTime<Utc>,
 ) -> Result<Option<BTreeMap<String, String>>> {
+    let omitted_ids = imported_omitted_ids(storage)?;
     let (retained, expired) =
         storage.get_tombstone_retention_ids_at(retention_days, export_as_of)?;
     if retained.is_empty() && expired.is_empty() {
@@ -13738,7 +13843,6 @@ fn collect_incremental_retention_changes(
     }
 
     let lines_by_id = read_jsonl_lines_by_id(source)?;
-    let omitted_ids = imported_omitted_ids(storage)?;
     let mut removed_ids = changes
         .removed_hash_ids
         .iter()
@@ -15698,26 +15802,11 @@ fn stream_import_actions_in_tx(
     // omit previously published rows. Preserve them in the DB, without
     // suppressing future auto-imports or republishing them on a mutation.
     // Remember omissions so retention cannot resurrect missing tombstones.
-    let omitted_ids = if metadata
-        .meta_by_id
-        .keys()
-        .any(|id| !source_target_ids.contains(id))
-    {
-        // Policy omissions and ephemeral rows are not peer purges. A later
-        // retention-policy change may intentionally restore old tombstones.
-        let expired =
-            storage.get_expired_tombstone_ids_at(config.retention_days, retention_as_of)?;
-        storage
-            .get_non_ephemeral_issue_ids()?
-            .into_iter()
-            .filter(|id| !source_target_ids.contains(id) && !expired.contains(id))
-            .collect::<BTreeSet<_>>()
-    } else {
-        BTreeSet::new()
-    };
-    storage.set_metadata_in_tx(
-        METADATA_IMPORT_OMITTED_IDS,
-        &serde_json::to_string(&omitted_ids)?,
+    record_imported_omitted_ids_in_tx(
+        storage,
+        &source_target_ids,
+        config.retention_days,
+        retention_as_of,
     )?;
     let needs_flush = uncertified_local_wins > 0;
     if needs_flush {
@@ -18440,6 +18529,9 @@ pub(crate) struct PreservedIssue {
 pub(crate) struct UnflushedStateSnapshot {
     pub(crate) tombstones: Vec<PreservedIssue>,
     pub(crate) dirty: Vec<PreservedIssue>,
+    /// Clean omitted tombstones carry local history, not a pending deletion.
+    /// Automatic recovery restores these rows without manufacturing dirty work.
+    pub(crate) import_omitted_tombstones: BTreeSet<String>,
     pub(crate) warnings: Vec<String>,
 }
 
@@ -18592,6 +18684,14 @@ pub(crate) fn snapshot_unflushed_state(storage: &SqliteStorage) -> UnflushedStat
     let mut snapshot = UnflushedStateSnapshot::default();
     let tombstone_ids = tombstone_ids_for_preservation(storage, &mut snapshot.warnings);
     let dirty_ids = dirty_ids_for_preservation(storage, &mut snapshot.warnings);
+    let dirty_id_set = dirty_ids.iter().cloned().collect::<HashSet<_>>();
+    match imported_omitted_ids(storage) {
+        Ok(ids) => snapshot.import_omitted_tombstones = ids.into_iter().collect(),
+        Err(error) => record_preservation_warning(
+            &mut snapshot.warnings,
+            format!("imported tombstone omission evidence could not be preserved: {error}"),
+        ),
+    }
     let mut attempted_ids = HashSet::new();
     for id in tombstone_ids {
         if !attempted_ids.insert(id.clone()) {
@@ -18623,6 +18723,17 @@ pub(crate) fn snapshot_unflushed_state(storage: &SqliteStorage) -> UnflushedStat
             }
         }
     }
+    let captured_tombstones = snapshot
+        .tombstones
+        .iter()
+        .filter(|entry| {
+            entry.labels.is_some() && entry.dependencies.is_some() && entry.comments.is_some()
+        })
+        .map(|entry| entry.issue.id.as_str())
+        .collect::<HashSet<_>>();
+    snapshot
+        .import_omitted_tombstones
+        .retain(|id| captured_tombstones.contains(id.as_str()) && !dirty_id_set.contains(id));
     snapshot
 }
 
@@ -18689,20 +18800,33 @@ pub(crate) fn restore_tombstones_after_rebuild(
     storage: &mut SqliteStorage,
     tombstones: &[PreservedIssue],
 ) -> Result<()> {
-    if tombstones.is_empty() {
+    restore_tombstones_after_automatic_rebuild(storage, tombstones, &BTreeSet::new())
+}
+
+/// Restore automatic-recovery tombstones while keeping accepted clean
+/// omissions local to the database. The omission set must refer only to
+/// completely captured tombstones that are restored by this transaction.
+pub(crate) fn restore_tombstones_after_automatic_rebuild(
+    storage: &mut SqliteStorage,
+    tombstones: &[PreservedIssue],
+    import_omitted_tombstones: &BTreeSet<String>,
+) -> Result<()> {
+    if tombstones.is_empty() && import_omitted_tombstones.is_empty() {
         return Ok(());
     }
     let count = tombstones.len();
-    restore_preserved_issues(storage, tombstones).map_err(|err| BeadsError::WithContext {
-        context: format!(
-            "Rebuild from JSONL succeeded, but failed to restore {count} preserved \
+    restore_preserved_issues_with_omissions(storage, tombstones, import_omitted_tombstones).map_err(
+        |err| BeadsError::WithContext {
+            context: format!(
+                "Rebuild from JSONL succeeded, but failed to restore {count} preserved \
              tombstone(s) and refresh their blocked-state cache. Issue restoration \
              is atomic, but a cache-refresh failure can occur after restored rows \
              have committed. Inspect the retained recovery evidence before \
              attempting another repair."
-        ),
-        source: Box::new(err),
-    })
+            ),
+            source: Box::new(err),
+        },
+    )
 }
 
 /// Restore preserved dirty live issues after a successful rebuild, wrapping
@@ -18751,6 +18875,35 @@ pub(crate) fn restore_preserved_issues(
     storage: &mut SqliteStorage,
     preserved: &[PreservedIssue],
 ) -> Result<()> {
+    restore_preserved_issues_with_omissions(storage, preserved, &BTreeSet::new())
+}
+
+fn restore_preserved_issues_with_omissions(
+    storage: &mut SqliteStorage,
+    preserved: &[PreservedIssue],
+    import_omitted_tombstones: &BTreeSet<String>,
+) -> Result<()> {
+    if !import_omitted_tombstones.is_empty() {
+        let complete_tombstones = preserved
+            .iter()
+            .filter(|entry| {
+                entry.issue.status == crate::model::Status::Tombstone
+                    && entry.labels.is_some()
+                    && entry.dependencies.is_some()
+                    && entry.comments.is_some()
+            })
+            .map(|entry| entry.issue.id.as_str())
+            .collect::<HashSet<_>>();
+        if import_omitted_tombstones
+            .iter()
+            .any(|id| !complete_tombstones.contains(id.as_str()))
+        {
+            return Err(BeadsError::SyncConflict {
+                message: "Cannot preserve imported tombstone omissions without their complete restored payloads"
+                    .to_string(),
+            });
+        }
+    }
     if preserved.is_empty() {
         return Ok(());
     }
@@ -18770,7 +18923,14 @@ pub(crate) fn restore_preserved_issues(
             if let Some(comments) = &entry.comments {
                 storage.sync_comments_for_import_in_tx(&entry.issue.id, comments)?;
             }
-            storage.replace_dirty_issue_marker_in_tx(&entry.issue.id, &marked_at)?;
+            if !import_omitted_tombstones.contains(&entry.issue.id) {
+                storage.replace_dirty_issue_marker_in_tx(&entry.issue.id, &marked_at)?;
+            }
+        }
+        if !import_omitted_tombstones.is_empty() {
+            let mut omitted = imported_omitted_ids(storage)?;
+            omitted.extend(import_omitted_tombstones.iter().cloned());
+            write_imported_omitted_ids_in_tx(storage, &omitted.into_iter().collect())?;
         }
         storage.set_metadata_in_tx("blocked_cache_state", "stale")?;
         Ok(())
@@ -18783,7 +18943,8 @@ pub(crate) fn restore_preserved_issues(
 
     tracing::debug!(
         count = preserved.len(),
-        "Restored preserved issues atomically after rebuild and marked them dirty for export"
+        db_only_tombstones = import_omitted_tombstones.len(),
+        "Restored preserved issues atomically after rebuild"
     );
     Ok(())
 }
@@ -18825,9 +18986,9 @@ pub(crate) struct JsonlTombstoneFilter {
 ///    when force-upsert is enabled. Timestamp ordering cannot make a
 ///    deleted issue live again; the operator must reopen it explicitly.
 ///
-/// 3. JSONL doesn't have this ID at all: the deletion has never been
-///    flushed anywhere. Always preserve — otherwise this path would
-///    silently lose the local delete.
+/// 3. JSONL doesn't have this ID at all: preserve the local deletion history.
+///    Automatic restoration separately retains accepted clean omissions so
+///    preserving that history does not turn a peer purge into a dirty delete.
 #[must_use]
 pub(crate) fn tombstones_missing_from_jsonl_tombstones(
     tombstones: Vec<PreservedIssue>,
@@ -25883,6 +26044,309 @@ mod tests {
         }
     }
 
+    fn flush_omission_fixture(
+        storage: &mut SqliteStorage,
+        beads_dir: &Path,
+        jsonl_path: &Path,
+        retention_days: Option<u64>,
+    ) -> AutoFlushResult {
+        auto_flush(
+            storage,
+            beads_dir,
+            jsonl_path,
+            false,
+            retention_days,
+            HistoryConfig::default(),
+        )
+        .unwrap()
+    }
+
+    fn force_publish_omission_fixture(
+        storage: &mut SqliteStorage,
+        beads_dir: &Path,
+        jsonl_path: &Path,
+    ) {
+        let exported = export_to_jsonl(
+            storage,
+            jsonl_path,
+            &ExportConfig {
+                force: true,
+                is_default_path: true,
+                beads_dir: Some(beads_dir.to_path_buf()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        finalize_export(storage, &exported, Some(&exported.issue_hashes), jsonl_path).unwrap();
+    }
+
+    fn seed_clean_omitted_issue(
+        storage: &mut SqliteStorage,
+        beads_dir: &Path,
+        jsonl_path: &Path,
+        delete_before_import: bool,
+    ) -> (Issue, Issue) {
+        let live = make_test_issue("bd-omission-live", "Shared source row");
+        let omitted = make_test_issue("bd-omission-deleted", "Peer purged history");
+        for issue in [&live, &omitted] {
+            storage.create_issue(issue, "tester").unwrap();
+        }
+        storage
+            .add_comment(&omitted.id, "tester", "Preserve the local deletion history")
+            .unwrap();
+        if delete_before_import {
+            storage
+                .delete_issue(
+                    &omitted.id,
+                    "tester",
+                    "Original deletion before peer purge",
+                    Some(Utc::now() - chrono::Duration::days(60)),
+                )
+                .unwrap();
+        }
+        flush_omission_fixture(storage, beads_dir, jsonl_path, None);
+        let omitted = storage.get_issue_for_export(&omitted.id).unwrap().unwrap();
+        let live = read_issues_from_jsonl(jsonl_path)
+            .unwrap()
+            .into_iter()
+            .find(|issue| issue.id == live.id)
+            .unwrap();
+        write_jsonl_issues(jsonl_path, &[&live]);
+        import_from_jsonl(storage, jsonl_path, &ImportConfig::default(), Some("bd")).unwrap();
+        assert_eq!(
+            imported_omitted_ids(storage).unwrap(),
+            HashSet::from([omitted.id.clone()])
+        );
+        assert_eq!(
+            pending_export_state(storage, true).unwrap(),
+            (0, false, false)
+        );
+        (live, omitted)
+    }
+
+    #[test]
+    fn test_imported_omission_survives_expiration_and_later_import() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+        let (mut live, tombstone) =
+            seed_clean_omitted_issue(&mut storage, &beads_dir, &jsonl_path, true);
+        let events = storage.get_events(&tombstone.id, 100).unwrap();
+
+        // Execute a real later import while the accepted peer omission is
+        // expired. A shorter policy must not erase the earlier provenance.
+        live.title = "Peer edit during shorter retention".to_string();
+        live.updated_at += chrono::Duration::days(1);
+        write_jsonl_issues(&jsonl_path, &[&live]);
+        let source_before = fs::read(&jsonl_path).unwrap();
+        let imported = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig {
+                retention_days: Some(30),
+                ..Default::default()
+            },
+            Some("bd"),
+        )
+        .unwrap();
+        assert_eq!(imported.updated_count, 1);
+        assert_eq!(fs::read(&jsonl_path).unwrap(), source_before);
+        assert!(
+            imported_omitted_ids(&storage)
+                .unwrap()
+                .contains(&tombstone.id)
+        );
+
+        // Expanding retention again must not turn that peer purge into a
+        // restored row when unrelated real local mutations are published.
+        for title in ["First unrelated edit", "Second unrelated edit"] {
+            retitle(&mut storage, &live.id, title);
+            assert!(flush_omission_fixture(&mut storage, &beads_dir, &jsonl_path, None).flushed);
+            let exported = read_issues_from_jsonl(&jsonl_path).unwrap();
+            assert_eq!(exported.len(), 1);
+            assert_eq!(exported[0].id, live.id);
+            assert_eq!(exported[0].title, title);
+            assert_eq!(
+                storage.get_issue_for_export(&tombstone.id).unwrap(),
+                Some(tombstone.clone())
+            );
+            assert_eq!(storage.get_events(&tombstone.id, 100).unwrap(), events);
+            assert!(storage.get_export_hash(&tombstone.id).unwrap().is_none());
+            assert!(
+                imported_omitted_ids(&storage)
+                    .unwrap()
+                    .contains(&tombstone.id)
+            );
+            assert_eq!(
+                pending_export_state(&storage, true).unwrap(),
+                (0, false, false)
+            );
+        }
+    }
+
+    #[test]
+    fn test_published_omission_allows_later_retention_expansion() {
+        for full_publication in [false, true] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+            let (live, tombstone) =
+                seed_clean_omitted_issue(&mut storage, &beads_dir, &jsonl_path, full_publication);
+            ensure_full_export_preserves_imported_omissions(&storage).unwrap_err();
+            if full_publication {
+                // Deliberately replacing JSONL from the database establishes
+                // a new population, independent of the old imported omission.
+                force_publish_omission_fixture(&mut storage, &beads_dir, &jsonl_path);
+                assert_eq!(
+                    capture_sync_merge_export_finalization_witness(&storage)
+                        .unwrap()
+                        .export_metadata
+                        .rows,
+                    8
+                );
+            } else {
+                // Accepted omission evidence also applies to live rows. A
+                // supported comment and deletion must make that row pending.
+                storage
+                    .add_comment(
+                        &tombstone.id,
+                        "tester",
+                        "Deliberate edit to omitted history",
+                    )
+                    .unwrap();
+                storage
+                    .delete_issue(
+                        &tombstone.id,
+                        "tester",
+                        "Deliberate local deletion after peer omission",
+                        Some(Utc::now() - chrono::Duration::days(60)),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    storage.get_issue(&tombstone.id).unwrap().unwrap().status,
+                    Status::Tombstone
+                );
+                assert!(
+                    storage
+                        .get_dirty_issue_ids()
+                        .unwrap()
+                        .contains(&tombstone.id)
+                );
+                flush_omission_fixture(&mut storage, &beads_dir, &jsonl_path, None);
+            }
+            assert!(imported_omitted_ids(&storage).unwrap().is_empty());
+            let mut expected = storage
+                .get_issue_for_export(&tombstone.id)
+                .unwrap()
+                .unwrap();
+            normalize_issue_for_export(&mut expected);
+            let events = storage.get_events(&tombstone.id, 100).unwrap();
+
+            retitle(&mut storage, &live.id, "Apply retention contraction");
+            flush_omission_fixture(&mut storage, &beads_dir, &jsonl_path, Some(30));
+            assert_eq!(read_issues_from_jsonl(&jsonl_path).unwrap().len(), 1);
+            assert!(storage.get_export_hash(&tombstone.id).unwrap().is_none());
+
+            retitle(&mut storage, &live.id, "Apply retention expansion");
+            flush_omission_fixture(&mut storage, &beads_dir, &jsonl_path, None);
+            let exported = read_issues_from_jsonl(&jsonl_path).unwrap();
+            assert_eq!(exported.len(), 2);
+            let actual = exported
+                .iter()
+                .find(|issue| issue.id == tombstone.id)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(storage.get_events(&tombstone.id, 100).unwrap(), events);
+            assert!(storage.get_export_hash(&tombstone.id).unwrap().is_some());
+            assert_eq!(
+                pending_export_state(&storage, true).unwrap(),
+                (0, false, false)
+            );
+        }
+    }
+
+    #[test]
+    fn test_auto_flush_refuses_malformed_imported_omission_evidence() {
+        for malformed_sql in [
+            "''",
+            "'{\"unexpected\":true}'",
+            "'[\"duplicate\",\"duplicate\"]'",
+            "'[\"\"]'",
+            "x'5B5D'",
+        ] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+            let issue = make_test_issue("bd-omission-evidence", "Before mutation");
+            storage.create_issue(&issue, "tester").unwrap();
+            flush_omission_fixture(&mut storage, &beads_dir, &jsonl_path, None);
+            storage
+                .set_metadata(METADATA_IMPORT_OMITTED_IDS, "[]")
+                .unwrap();
+            storage
+                .execute_raw(&format!(
+                    "UPDATE metadata SET value = {malformed_sql} WHERE key = 'import_omitted_ids'"
+                ))
+                .unwrap();
+            retitle(&mut storage, &issue.id, "Pending local mutation");
+            let source_before = fs::read(&jsonl_path).unwrap();
+            let dirty_before = storage.get_dirty_issue_metadata().unwrap();
+            let certificate_before = storage.get_export_hash(&issue.id).unwrap();
+            let metadata_before = storage
+                .execute_raw_query("SELECT key, value FROM metadata ORDER BY key, value")
+                .unwrap();
+            let error = auto_flush(
+                &mut storage,
+                &beads_dir,
+                &jsonl_path,
+                false,
+                None,
+                HistoryConfig::default(),
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Cannot verify imported JSONL omissions"),
+                "{error}"
+            );
+            assert_eq!(fs::read(&jsonl_path).unwrap(), source_before);
+            assert_eq!(storage.get_dirty_issue_metadata().unwrap(), dirty_before);
+            assert_eq!(
+                storage.get_export_hash(&issue.id).unwrap(),
+                certificate_before
+            );
+            assert_eq!(
+                storage
+                    .execute_raw_query("SELECT key, value FROM metadata ORDER BY key, value")
+                    .unwrap(),
+                metadata_before
+            );
+            assert!(
+                snapshot_unflushed_state(&storage)
+                    .warnings
+                    .iter()
+                    .any(|warning| {
+                        warning
+                            .contains("imported tombstone omission evidence could not be preserved")
+                    })
+            );
+
+            // Only deliberate full publication replaces unreadable omission
+            // evidence; it must also retain the real pending local mutation.
+            force_publish_omission_fixture(&mut storage, &beads_dir, &jsonl_path);
+            assert!(imported_omitted_ids(&storage).unwrap().is_empty());
+            assert_eq!(
+                pending_export_state(&storage, true).unwrap(),
+                (0, false, false)
+            );
+            assert_eq!(
+                read_issues_from_jsonl(&jsonl_path).unwrap()[0].title,
+                "Pending local mutation"
+            );
+        }
+    }
+
     #[test]
     fn test_auto_import_retention_pruned_export_stays_clean() {
         let mut storage = SqliteStorage::open_memory().unwrap();
@@ -29560,6 +30024,70 @@ mod tests {
             finalization.export_hashes,
             sync_merge_export_hash_mapping_witness(&result.issue_hashes).unwrap()
         );
+    }
+
+    #[test]
+    fn full_export_keeps_omission_witness_while_any_pending_row_exists() {
+        for pending_key in [
+            METADATA_SYNC_MERGE_PENDING,
+            METADATA_SYNC_MERGE_PENDING_LEGACY,
+        ] {
+            for pending_value_sql in ["''", "x'00'"] {
+                let mut storage = SqliteStorage::open_memory().unwrap();
+                let (_temp_dir, _beads_dir, jsonl_path) = counted_workspace();
+                let issue = make_test_issue("bd-pending-omission", "Published local history");
+                storage.create_issue(&issue, "test").unwrap();
+                let result =
+                    export_to_jsonl(&storage, &jsonl_path, &ExportConfig::default()).unwrap();
+                storage
+                    .set_metadata(METADATA_IMPORT_OMITTED_IDS, "[\"bd-pending-omission\"]")
+                    .unwrap();
+                storage.set_metadata(pending_key, "pending").unwrap();
+                storage.execute_raw(&format!(
+                    "UPDATE metadata SET value = {pending_value_sql} WHERE key = '{pending_key}'"
+                )).unwrap();
+                let core_before = capture_sync_merge_core_witness(&storage).unwrap();
+
+                finalize_export(
+                    &mut storage,
+                    &result,
+                    Some(&result.issue_hashes),
+                    &jsonl_path,
+                )
+                .unwrap();
+                assert_eq!(
+                    capture_sync_merge_core_witness(&storage).unwrap(),
+                    core_before,
+                    "pending receipts must retain the stable omission witness"
+                );
+                assert!(imported_omitted_ids(&storage).unwrap().contains(&issue.id));
+                assert_eq!(
+                    capture_sync_merge_export_finalization_witness(&storage)
+                        .unwrap()
+                        .export_metadata
+                        .rows,
+                    8,
+                    "omissions must not change the established receipt layout"
+                );
+
+                // Only the terminal clear owns removal after a pending row
+                // existed. Raw empty and non-text values must still defer it.
+                storage
+                    .with_write_transaction(|storage| {
+                        storage.execute_raw(&format!(
+                            "DELETE FROM metadata WHERE key = '{pending_key}'"
+                        ))?;
+                        clear_imported_omissions_after_full_publication_in_tx(storage)
+                    })
+                    .unwrap();
+                assert!(
+                    storage
+                        .get_metadata(METADATA_IMPORT_OMITTED_IDS)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
     }
 
     #[test]

@@ -138,6 +138,48 @@ worktrees; it has its own operator-facing result and exit-code contract.
 |-------|-----------------|----------|
 | **Empty DB guard** | Exporting 0 issues over a JSONL with N issues | `--force` |
 | **Stale DB guard** | Exporting when DB is missing issues from JSONL | `--force` |
+| **Unimported content guard** | Replacing unread JSONL payloads, including edits and comments on existing issue IDs, or treating preserved peer changes as imported | Explicit `sync --flush-only --force` |
+| **Imported omission guard** | A full export republishing clean local issues omitted by an accepted import | Explicit reconciliation with `sync --merge`, or deliberate `sync --flush-only --force` |
+
+### Branch changes and pending local work
+
+An ordinary import preserves issues that exist only in the local database.
+An omission can come from a different branch or a peer purge; it is not enough
+evidence to delete the local issue or to publish it again. Already-flushed,
+omitted issues therefore stay clean and do not set `needs_flush`. Existing
+dirty markers remain intact, and a later explicit edit to an omitted issue
+publishes that issue and its relations normally.
+
+When an imported row differs from a preserved local version, `needs_flush`
+still records the outstanding reconciliation. That flag does not authorize a
+full export to overwrite unread peer changes or restore unrelated clean
+omissions. If a full automatic export would do either, it refuses while keeping
+the local changes pending.
+
+Incremental automatic export checks complete row receipts before replacing or
+removing a source row. These receipts include comments, relations, timestamps,
+and other fields excluded by the issue content hash. It can publish unrelated
+local changes while preserving unread peer rows byte-for-byte. Those peer rows
+remain pending for the next auto-import, even after the exporter records the
+new file's hash. A later edit to the same issue still requires reconciliation;
+an unrelated publication cannot certify the peer's unread version.
+
+Full automatic export and non-forced explicit export also verify the complete
+source generation. Publication remains bound to the captured file and database
+authority. A retry after publication but before bookkeeping or merge-anchor
+finalization can be certified only when the complete intended export matches
+the source payload. Narrow issue hashes cannot establish that equality.
+A CLI mutation that has already succeeded keeps its successful exit status
+when automatic export fails. Without `--quiet`, stderr reports a warning;
+JSON and TOON modes include the structured `AUTO_FLUSH_FAILED` warning code.
+The local change stays committed, with JSONL export still pending.
+
+Run `br sync --merge` to reconcile both sides. `br sync --import-only` reads the
+current JSONL under the normal rules for local winners and append-only comments;
+clean imported omissions can still prevent a later full flush. Use
+`br sync --flush-only --force` only when deliberately choosing the database's
+full contents over the external file. An empty JSONL before the workspace's
+first synchronization is safe to initialize without a prior source receipt.
 
 ### Tombstone retention
 
@@ -151,11 +193,31 @@ changes the JSONL population without deleting the database record or its history
 is clean. Shortening retention can remove expired tombstones from JSONL;
 lengthening or disabling it can restore clean tombstones previously omitted.
 Automatic export applies those same population changes when local work is
-pending. With no pending work, automatic export remains a no-op; use the explicit
-flush command to apply a policy change immediately.
+pending against the same synchronized source generation. With no pending work,
+automatic export remains a no-op; use the explicit flush command to apply a
+policy change immediately.
 
 Incremental export preserves untouched source rows while restoring eligible
-tombstones. Before removing a clean expired database tombstone, it also checks
+tombstones omitted by the local retention policy. A successful import remembers
+clean retained tombstones absent from the incoming source, so an unrelated
+mutation cannot undo a peer purge by restoring them. That omission remains
+remembered even if the tombstone later ages past retention. A later local edit
+or deletion of a preserved live issue updates that evidence. Receiving an issue
+again in JSONL or performing a deliberate full export also updates it.
+Tombstones already expired under the import
+policy remain eligible for a later intentional retention expansion. If the
+policy was expanded before importing a different generation, an absent retained
+tombstone cannot be distinguished from a peer purge; automatic export preserves
+that accepted omission. Reconcile explicitly with `br sync --merge`, or use
+`br sync --flush-only --force` to deliberately publish the database's retained
+history.
+
+Automatic database recovery carries accepted clean omissions with the restored
+tombstone history. It keeps genuine unflushed local deletions dirty, and refuses
+replacement if the omission evidence or preserved relations cannot be read
+completely.
+
+Before removing a clean expired database tombstone, incremental export also checks
 that the captured JSONL row is an expired tombstone under the same policy.
 A newer live row, recent deletion, unknown deletion time, or unreadable payload
 causes refusal and requires reconciliation with `br sync --merge`.

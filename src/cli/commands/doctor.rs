@@ -3970,6 +3970,7 @@ fn preserved_state_for_doctor_rebuild(
         tombstones: tombstone_snapshot,
         dirty: dirty_snapshot,
         warnings,
+        ..
     } = snapshot_unflushed_state(&storage);
     drop(storage);
     if tombstone_snapshot.is_empty() && dirty_snapshot.is_empty() {

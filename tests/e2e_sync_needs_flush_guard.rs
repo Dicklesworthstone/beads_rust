@@ -19,9 +19,12 @@
 mod common;
 
 use beads_rust::franken_sync::Connection;
-use common::cli::{BrWorkspace, run_br};
+use beads_rust::model::Issue;
+use beads_rust::util::content_hash;
+use common::cli::{BrWorkspace, extract_json_payload, run_br};
 use fsqlite_types::SqliteValue;
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
 fn checked_br(workspace: &BrWorkspace, args: &[&str], label: &str) -> common::cli::BrRun {
@@ -33,19 +36,212 @@ fn checked_br(workspace: &BrWorkspace, args: &[&str], label: &str) -> common::cl
 fn git(workspace: &BrWorkspace, args: &[&str]) {
     let result = std::process::Command::new("git")
         .current_dir(&workspace.root)
+        .args([
+            "-c",
+            "user.name=br-sync-e2e",
+            "-c",
+            "user.email=br-sync-e2e@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ])
         .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", workspace.root.join(".gitconfig"))
         .output()
         .expect("run git fixture");
     assert!(result.status.success(), "git {args:?}: {result:?}");
 }
 
 fn jsonl_records(path: &std::path::Path) -> Vec<Value> {
-    fs::read_to_string(path)
+    let records: Vec<Value> = fs::read_to_string(path)
         .expect("read JSONL")
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("JSONL record"))
+        .collect();
+    let mut ids = BTreeSet::new();
+    for record in &records {
+        let id = record["id"].as_str().expect("issue ID");
+        assert!(ids.insert(id), "duplicate issue ID {id}");
+    }
+    records
+}
+
+fn jsonl_record(path: &std::path::Path, id: &str) -> Value {
+    jsonl_records(path)
+        .into_iter()
+        .find(|record| record["id"] == id)
+        .expect("issue in JSONL")
+}
+
+fn show_without_sync(workspace: &BrWorkspace, id: &str, label: &str) -> Value {
+    let output = checked_br(
+        workspace,
+        &["show", id, "--json", "--no-auto-import", "--no-auto-flush"],
+        label,
+    );
+    let issues: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&output.stdout)).expect("shown issue JSON");
+    assert_eq!(issues.len(), 1, "expected exactly issue {id}");
+    issues.into_iter().next().expect("shown issue")
+}
+
+fn database(workspace: &BrWorkspace) -> Connection {
+    Connection::open(
+        workspace
+            .root
+            .join(".beads/beads.db")
+            .to_string_lossy()
+            .into_owned(),
+    )
+    .expect("open database for sync evidence")
+}
+
+/// Read evidence directly so the assertion cannot trigger an import or
+/// certify the generation whose preservation it is checking.
+fn sync_metadata(workspace: &BrWorkspace) -> BTreeMap<String, String> {
+    database(workspace)
+        .query(
+            "SELECT key, value FROM metadata WHERE key IN \
+             ('jsonl_content_hash', 'jsonl_mtime', 'jsonl_size', 'jsonl_fast_witness', \
+              'last_import_time', 'last_export_time', 'needs_flush', \
+              'purged_ids_pending_export', 'import_omitted_ids', 'jsonl_row_hashes', \
+              'jsonl_row_receipt_version', 'jsonl_unimported_source') ORDER BY key",
+        )
+        .expect("read sync metadata")
+        .iter()
+        .map(|row| {
+            (
+                row.get(0)
+                    .and_then(SqliteValue::as_text)
+                    .expect("metadata key")
+                    .to_string(),
+                row.get(1)
+                    .and_then(SqliteValue::as_text)
+                    .expect("metadata value")
+                    .to_string(),
+            )
+        })
         .collect()
+}
+
+fn dirty_ids(workspace: &BrWorkspace) -> Vec<String> {
+    database(workspace)
+        .query("SELECT issue_id FROM dirty_issues ORDER BY issue_id")
+        .expect("read dirty IDs")
+        .iter()
+        .map(|row| {
+            row.get(0)
+                .and_then(SqliteValue::as_text)
+                .expect("dirty issue ID")
+                .to_string()
+        })
+        .collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SyncWitness {
+    source: Vec<u8>,
+    anchor: Vec<u8>,
+    metadata: BTreeMap<String, String>,
+    certificates: Vec<(String, String, String)>,
+}
+
+fn sync_witness(workspace: &BrWorkspace) -> SyncWitness {
+    let certificates = database(workspace)
+        .query("SELECT issue_id, content_hash, exported_at FROM export_hashes ORDER BY issue_id")
+        .expect("read export certificates")
+        .iter()
+        .map(|row| {
+            let field = |index| {
+                row.get(index)
+                    .and_then(SqliteValue::as_text)
+                    .expect("certificate field")
+                    .to_string()
+            };
+            (field(0), field(1), field(2))
+        })
+        .collect();
+    SyncWitness {
+        source: fs::read(workspace.root.join(".beads/issues.jsonl")).expect("source bytes"),
+        anchor: fs::read(workspace.root.join(".beads/beads.base.jsonl")).expect("merge anchor"),
+        metadata: sync_metadata(workspace),
+        certificates,
+    }
+}
+
+fn assert_comment_only_change(before: &Value, after: &Value) {
+    assert_eq!(before["updated_at"], after["updated_at"]);
+    let before: Issue = serde_json::from_value(before.clone()).expect("issue before comment");
+    let after: Issue = serde_json::from_value(after.clone()).expect("issue after comment");
+    assert_ne!(before.comments, after.comments, "peer added a comment");
+    assert_eq!(
+        content_hash(&before),
+        content_hash(&after),
+        "comment-only changes must exercise fields absent from the issue content hash"
+    );
+}
+
+fn add_peer_comment(path: &std::path::Path, id: &str) -> Value {
+    let mut rows = jsonl_records(path);
+    let row = rows.iter_mut().find(|row| row["id"] == id).unwrap();
+    let before = row.clone();
+    row["comments"] = serde_json::json!([{
+        "id": 101,
+        "issue_id": id,
+        "author": "Peer",
+        "text": "Unread peer comment",
+        "created_at": "2026-01-01T00:00:00Z"
+    }]);
+    assert_comment_only_change(&before, row);
+    let peer_row = row.clone();
+    let bytes = rows
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(path, bytes).expect("peer comment-only generation");
+    peer_row
+}
+
+fn git_workspace() -> BrWorkspace {
+    let workspace = BrWorkspace::new();
+    git(&workspace, &["init", "--initial-branch=main"]);
+    checked_br(&workspace, &["init", "--prefix", "bd"], "init");
+    for name in ["config.yaml", "metadata.json", ".gitignore"] {
+        let path = format!(".beads/{name}");
+        if workspace.root.join(&path).exists() {
+            git(&workspace, &["add", "--", &path]);
+        }
+    }
+    workspace
+}
+
+fn commit_jsonl(workspace: &BrWorkspace, message: &str) {
+    git(workspace, &["add", "--", ".beads/issues.jsonl"]);
+    git(workspace, &["commit", "-m", message]);
+}
+
+/// A real clone receives only tracked files and reconstructs its independent
+/// database through normal CLI startup.
+fn clone_peer(workspace: &BrWorkspace) -> BrWorkspace {
+    let mut peer = BrWorkspace::new();
+    let checkout = peer.root.join("checkout");
+    git(
+        workspace,
+        &["clone", "--no-hardlinks", ".", checkout.to_str().unwrap()],
+    );
+    peer.root = checkout;
+    checked_br(&peer, &["list", "--json"], "peer_rebuild_database");
+    peer
+}
+
+fn pull_peer(workspace: &BrWorkspace, peer: &BrWorkspace) {
+    git(
+        workspace,
+        &["pull", "--ff-only", peer.root.to_str().unwrap(), "main"],
+    );
 }
 
 #[test]
@@ -86,28 +282,42 @@ fn incremental_export_preserves_unread_peer_comments_until_import() {
         "dirty",
     );
     let path = workspace.root.join(".beads/issues.jsonl");
-    let mut rows = jsonl_records(&path);
-    let row = rows.iter_mut().find(|row| row["id"] == peer).unwrap();
-    row["comments"] = serde_json::json!([{"id": 101, "issue_id": peer, "author": "Peer", "text": "Unread peer comment", "created_at": "2026-01-01T00:00:00Z"}]);
-    let peer_row = row.clone();
-    let bytes = rows
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n";
-    fs::write(&path, bytes).unwrap();
-    checked_br(
+    let receipts_before: Value =
+        serde_json::from_str(&sync_metadata(&workspace)["jsonl_row_hashes"]).unwrap();
+    let peer_row = add_peer_comment(&path, &peer);
+    let append = checked_br(
         &workspace,
         &["create", "Safe append", "--no-auto-import", "--allow-stale"],
         "append",
     );
+    assert!(!append.stderr.contains("automatic JSONL export failed"));
+    let appended = parse_created_id(&append.stdout);
+    assert_eq!(jsonl_record(&path, &local)["title"], "Local edit");
+    assert_eq!(jsonl_record(&path, &appended)["title"], "Safe append");
     assert_eq!(
         jsonl_records(&path).iter().find(|row| row["id"] == peer),
         Some(&peer_row)
     );
+    assert!(dirty_ids(&workspace).is_empty());
+    let metadata_after = sync_metadata(&workspace);
+    assert_eq!(metadata_after["jsonl_unimported_source"], "true");
+    let receipts_after: Value = serde_json::from_str(&metadata_after["jsonl_row_hashes"]).unwrap();
+    let peer_receipt_before = receipts_before
+        .get(&peer)
+        .and_then(Value::as_str)
+        .expect("peer row has a synchronized receipt before the external comment");
+    let peer_receipt_after = receipts_after
+        .get(&peer)
+        .and_then(Value::as_str)
+        .expect("unrelated publication retains the peer's previous receipt");
+    assert_eq!(peer_receipt_after, peer_receipt_before);
+    let unread: Issue =
+        serde_json::from_value(show_without_sync(&workspace, &peer, "still_unread"))
+            .expect("unimported peer issue");
+    assert!(unread.comments.is_empty());
     let preserved = fs::read(&path).unwrap();
-    checked_br(
+    let witness = sync_witness(&workspace);
+    let conflict = checked_br(
         &workspace,
         &[
             "update",
@@ -119,10 +329,24 @@ fn incremental_export_preserves_unread_peer_comments_until_import() {
         ],
         "conflict",
     );
+    assert!(
+        conflict
+            .stderr
+            .contains("Warning: Mutation succeeded, but automatic JSONL export failed.")
+            && conflict.stderr.contains("Sync conflict:")
+            && conflict.stderr.contains("JSONL changed"),
+        "expected a visible human sync-conflict warning: {conflict:?}"
+    );
     assert_eq!(
         fs::read(&path).unwrap(),
         preserved,
         "comment-only peer changes must block replacement even after an unrelated export"
+    );
+    assert_eq!(sync_witness(&workspace), witness);
+    assert!(dirty_ids(&workspace).contains(&peer));
+    assert_eq!(
+        show_without_sync(&workspace, &peer, "local_conflict_preserved")["title"],
+        "Pending local peer edit"
     );
     checked_br(&workspace, &["sync", "--merge", "--force"], "merge");
     let shown = checked_br(&workspace, &["show", &peer, "--json"], "show");
@@ -153,32 +377,27 @@ fn incremental_export_keeps_unrelated_peer_changes_pending_for_auto_import() {
 /// changes to an existing ID (including comments) must still be imported.
 #[test]
 fn branch_switch_imports_peer_edits_and_comments_before_mutation() {
-    let workspace = BrWorkspace::new();
-    checked_br(&workspace, &["init", "--prefix", "bd"], "init");
+    let workspace = git_workspace();
     let shared = checked_br(&workspace, &["create", "Shared issue"], "shared");
     let shared_id = parse_created_id(&shared.stdout);
     let path = workspace.root.join(".beads/issues.jsonl");
-    git(&workspace, &["init", "-b", "main"]);
-    git(&workspace, &["config", "user.name", "Sync regression"]);
-    git(
-        &workspace,
-        &["config", "user.email", "sync@example.invalid"],
-    );
-    git(&workspace, &["add", "-f", ".beads/issues.jsonl"]);
-    git(&workspace, &["commit", "-m", "shared seed"]);
+    commit_jsonl(&workspace, "shared seed");
     git(&workspace, &["checkout", "-b", "feature"]);
     let local = checked_br(&workspace, &["create", "Branch local issue"], "local");
     let local_id = parse_created_id(&local.stdout);
-    git(&workspace, &["add", ".beads/issues.jsonl"]);
-    git(&workspace, &["commit", "-m", "feature issue"]);
+    commit_jsonl(&workspace, "feature issue");
     git(&workspace, &["checkout", "main"]);
     checked_br(&workspace, &["list", "--json"], "after_checkout");
+    assert!(dirty_ids(&workspace).is_empty());
+    assert_eq!(sync_metadata(&workspace)["needs_flush"], "false");
 
-    // A peer uses an independent database and normal CLI mutations.
-    let peer = BrWorkspace::new();
-    checked_br(&peer, &["init", "--prefix", "bd"], "peer_init");
-    fs::copy(&path, peer.root.join(".beads/issues.jsonl")).expect("peer source");
-    checked_br(&peer, &["sync", "--import-only"], "peer_import");
+    // A real clone reconstructs an independent database from tracked JSONL.
+    let peer = clone_peer(&workspace);
+    checked_br(
+        &peer,
+        &["update", &shared_id, "--title", "Peer revised shared issue"],
+        "peer_title",
+    );
     checked_br(&peer, &["close", &shared_id], "peer_close");
     checked_br(
         &peer,
@@ -186,7 +405,8 @@ fn branch_switch_imports_peer_edits_and_comments_before_mutation() {
         "peer_comment",
     );
     let peer_records = jsonl_records(&peer.root.join(".beads/issues.jsonl"));
-    fs::copy(peer.root.join(".beads/issues.jsonl"), &path).expect("pull peer JSONL");
+    commit_jsonl(&peer, "peer title, close, and discussion");
+    pull_peer(&workspace, &peer);
     checked_br(&workspace, &["create", "Subsequent mutation"], "after_pull");
     let records = jsonl_records(&path);
     let shared_after = records
@@ -438,10 +658,261 @@ fn first_mutation_without_auto_import_can_publish_to_empty_jsonl() {
         &["create", "First local issue", "--no-auto-import"],
         "first_export",
     );
-    assert!(!created.stderr.contains("AUTO_FLUSH_FAILED"));
+    assert!(!created.stderr.contains("automatic JSONL export failed"));
     let records = jsonl_records(&workspace.root.join(".beads/issues.jsonl"));
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["title"], "First local issue");
+}
+
+fn recover_comment_and_local_creation(
+    workspace: &BrWorkspace,
+    shared: &str,
+    local_only: &str,
+    automatic: bool,
+) {
+    checked_br(
+        workspace,
+        &["sync", "--import-only", "--no-auto-flush"],
+        "recovery_import_comment",
+    );
+    assert!(dirty_ids(workspace).contains(&local_only.to_string()));
+    checked_br(
+        workspace,
+        &["sync", "--flush-only", "--no-auto-import"],
+        "recovery_flush_comment",
+    );
+    let path = workspace.root.join(".beads/issues.jsonl");
+    let shared_row = jsonl_record(&path, shared);
+    assert_eq!(shared_row["title"], "Local issue");
+    let comments = shared_row["comments"].as_array().expect("peer comments");
+    assert_eq!(comments.len(), 1, "peer comment survived exactly once");
+    assert_eq!(comments[0]["author"], "Peer");
+    assert_eq!(comments[0]["text"], "Unread peer comment");
+    let local_row = jsonl_record(&path, local_only);
+    assert_eq!(local_row["title"], "Legitimate pending local work");
+    if automatic {
+        assert_eq!(local_row["description"], "Local mutation survives refusal");
+    }
+    assert!(dirty_ids(workspace).is_empty());
+    assert_eq!(sync_metadata(workspace)["needs_flush"], "false");
+    assert_eq!(sync_metadata(workspace)["jsonl_unimported_source"], "false");
+}
+
+/// Full exports must detect an unread comment even when the issue's scalar
+/// content hash and timestamp are unchanged. Explicit import enables recovery.
+#[test]
+fn needs_flush_preserves_comment_only_peer_change_until_explicit_import() {
+    for automatic in [false, true] {
+        let workspace = BrWorkspace::new();
+        checked_br(&workspace, &["init", "--prefix", "bd"], "init");
+        let shared =
+            parse_created_id(&checked_br(&workspace, &["create", "Local issue"], "shared").stdout);
+        let path = workspace.root.join(".beads/issues.jsonl");
+        checked_br(&workspace, &["sync", "--flush-only"], "seed_anchor");
+        make_jsonl_record_stale(&path, &shared);
+        checked_br(
+            &workspace,
+            &["sync", "--import-only", "--no-auto-flush"],
+            "arm_local_win",
+        );
+        assert!(dirty_ids(&workspace).is_empty());
+        assert_eq!(sync_metadata(&workspace)["needs_flush"], "true");
+        let local_only = parse_created_id(
+            &checked_br(
+                &workspace,
+                &[
+                    "create",
+                    "Legitimate pending local work",
+                    "--no-auto-import",
+                    "--no-auto-flush",
+                ],
+                "pending_local",
+            )
+            .stdout,
+        );
+        add_peer_comment(&path, &shared);
+        let witness = sync_witness(&workspace);
+        if automatic {
+            let mutation = checked_br(
+                &workspace,
+                &[
+                    "update",
+                    &local_only,
+                    "--description",
+                    "Local mutation survives refusal",
+                    "--no-auto-import",
+                    "--allow-stale",
+                ],
+                "automatic_comment_conflict",
+            );
+            assert!(
+                mutation
+                    .stderr
+                    .contains("Warning: Mutation succeeded, but automatic JSONL export failed.")
+                    && mutation.stderr.contains("Sync conflict:")
+                    && mutation.stderr.contains("JSONL changed"),
+                "expected a visible human sync-conflict warning: {mutation:?}"
+            );
+        } else {
+            let flush = run_br(
+                &workspace,
+                ["sync", "--flush-only", "--no-auto-import"],
+                "explicit_comment_conflict",
+            );
+            assert!(!flush.status.success(), "comment conflict: {flush:?}");
+            assert!(flush.stderr.contains("JSONL changed since"));
+        }
+        assert_eq!(
+            sync_witness(&workspace),
+            witness,
+            "refusal must preserve source, anchor, receipts, and export certificates"
+        );
+        assert!(dirty_ids(&workspace).contains(&local_only));
+        let local = show_without_sync(&workspace, &local_only, "local_work_preserved");
+        assert_eq!(local["title"], "Legitimate pending local work");
+        if automatic {
+            assert_eq!(local["description"], "Local mutation survives refusal");
+        }
+        recover_comment_and_local_creation(&workspace, &shared, &local_only, automatic);
+    }
+}
+
+fn assert_peer_purge_preserves_preexisting_dirty_work(tombstone: bool) {
+    let workspace = git_workspace();
+    let victim = parse_created_id(
+        &checked_br(&workspace, &["create", "Peer purge target"], "victim").stdout,
+    );
+    let keeper =
+        parse_created_id(&checked_br(&workspace, &["create", "Shared keeper"], "keeper").stdout);
+    if tombstone {
+        checked_br(
+            &workspace,
+            &[
+                "delete",
+                &victim,
+                "--force",
+                "--reason",
+                "Deletion history predating the peer purge",
+            ],
+            "soft_delete_victim",
+        );
+    }
+    let history = show_without_sync(&workspace, &victim, "original_history");
+    commit_jsonl(&workspace, "Shared baseline before purge");
+    let peer = clone_peer(&workspace);
+    let local_only = parse_created_id(
+        &checked_br(
+            &workspace,
+            &["create", "Unflushed local issue", "--no-auto-flush"],
+            "pending_before_pull",
+        )
+        .stdout,
+    );
+    checked_br(
+        &peer,
+        &["delete", &victim, "--hard", "--force"],
+        "peer_hard_delete",
+    );
+    commit_jsonl(&peer, "Peer purged an issue");
+    pull_peer(&workspace, &peer);
+    checked_br(
+        &workspace,
+        &["sync", "--import-only", "--no-auto-flush"],
+        "import_purge_with_dirty_local_work",
+    );
+    assert_eq!(sync_metadata(&workspace)["needs_flush"], "false");
+    assert!(dirty_ids(&workspace).contains(&local_only));
+    assert_eq!(
+        show_without_sync(&workspace, &victim, "history_after_import"),
+        history,
+        "import preserves the complete omitted issue and deletion history"
+    );
+    let mutation = checked_br(
+        &workspace,
+        &["update", &keeper, "--title", "Legitimate local keeper edit"],
+        "mutate_after_peer_purge",
+    );
+    assert!(!mutation.stderr.contains("automatic JSONL export failed"));
+    let path = workspace.root.join(".beads/issues.jsonl");
+    assert!(!jsonl_records(&path).iter().any(|row| row["id"] == victim));
+    assert_eq!(
+        jsonl_record(&path, &local_only)["title"],
+        "Unflushed local issue"
+    );
+    assert_eq!(
+        jsonl_record(&path, &keeper)["title"],
+        "Legitimate local keeper edit"
+    );
+    assert!(dirty_ids(&workspace).is_empty());
+    assert_eq!(
+        show_without_sync(&workspace, &victim, "history_after_mutation"),
+        history,
+        "publishing legitimate local work must retain omitted local history"
+    );
+}
+
+/// Pending local-only work predates a real peer purge and explicit import.
+/// Both live issues and tombstones stay omitted without losing local history.
+#[test]
+fn peer_purge_keeps_preexisting_dirty_local_only_work_publishable() {
+    for tombstone in [false, true] {
+        assert_peer_purge_preserves_preexisting_dirty_work(tombstone);
+    }
+}
+
+/// A pending purge belongs to the deleted incarnation, not a replacement
+/// reintroduced under the same ID before the next automatic export.
+#[test]
+fn hard_delete_then_reimport_same_id_auto_flush_publishes_replacement() {
+    let workspace = BrWorkspace::new();
+    checked_br(&workspace, &["init", "--prefix", "bd"], "init");
+    let victim = parse_created_id(
+        &checked_br(
+            &workspace,
+            &["create", "Original issue before purge"],
+            "original",
+        )
+        .stdout,
+    );
+    let path = workspace.root.join(".beads/issues.jsonl");
+    checked_br(
+        &workspace,
+        &["delete", &victim, "--hard", "--force", "--no-auto-flush"],
+        "pending_purge",
+    );
+    assert_eq!(sync_metadata(&workspace)["needs_flush"], "true");
+    assert!(dirty_ids(&workspace).is_empty());
+    let mut replacement = jsonl_record(&path, &victim);
+    assert_eq!(replacement["title"], "Original issue before purge");
+    replacement["title"] = Value::from("Replacement after intentional purge");
+    replacement.as_object_mut().unwrap().remove("content_hash");
+    fs::write(&path, format!("{replacement}\n")).expect("peer reintroduces the exact ID");
+    checked_br(
+        &workspace,
+        &["sync", "--import-only", "--no-auto-flush"],
+        "reimport_before_purge_flush",
+    );
+    checked_br(
+        &workspace,
+        &[
+            "update",
+            &victim,
+            "--description",
+            "New incarnation remains publishable",
+        ],
+        "mutate_replacement",
+    );
+    let rows = jsonl_records(&path);
+    assert_eq!(rows.len(), 1, "replacement must be exported exactly once");
+    assert_eq!(rows[0]["id"], victim);
+    assert_eq!(rows[0]["title"], "Replacement after intentional purge");
+    assert_eq!(rows[0]["status"], "open");
+    assert_eq!(
+        rows[0]["description"],
+        "New incarnation remains publishable"
+    );
+    assert!(dirty_ids(&workspace).is_empty());
+    assert_eq!(sync_metadata(&workspace)["needs_flush"], "false");
 }
 
 fn parse_created_id(stdout: &str) -> String {

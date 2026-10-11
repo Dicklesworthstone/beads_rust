@@ -22192,6 +22192,7 @@ impl SqliteStorage {
                     SqliteValue::from(expected_serialized.as_str()),
                 ],
             )?;
+            crate::sync::clear_imported_omissions_after_full_publication_in_tx(storage)?;
             Ok(())
         })
     }
@@ -42849,6 +42850,10 @@ required_fields:
     #[allow(clippy::too_many_lines)]
     fn sync_merge_pending_receipt_clear_requires_exact_terminal_value() {
         let mut storage = SqliteStorage::open_memory().unwrap();
+        let preserved_omissions = r#"["bd-merge-clear"]"#;
+        storage
+            .set_metadata("import_omitted_ids", preserved_omissions)
+            .unwrap();
         let now = Utc.with_ymd_and_hms(2026, 7, 27, 8, 45, 0).unwrap();
         let issue = make_issue(
             "bd-merge-clear",
@@ -43001,11 +43006,25 @@ required_fields:
             Some(finalized.clone()),
             "all rejected finalization drift must preserve the exact receipt"
         );
+        assert_eq!(
+            storage
+                .get_metadata("import_omitted_ids")
+                .unwrap()
+                .as_deref(),
+            Some(preserved_omissions),
+            "omission evidence remains in the stable witness until terminal cleanup"
+        );
 
         storage
             .compare_and_clear_pending_sync_merge_receipt(&finalized)
             .unwrap();
         assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+        assert!(
+            storage
+                .get_metadata("import_omitted_ids")
+                .unwrap()
+                .is_none()
+        );
         assert!(matches!(
             storage.compare_and_clear_pending_sync_merge_receipt(&finalized),
             Err(BeadsError::SyncConflict { .. })
@@ -43030,6 +43049,7 @@ required_fields:
             ("unrelated_sync_merge_metadata", "baseline"),
             ("project", "baseline-project"),
             (METADATA_LAST_IMPORT_TIME, "2026-07-27T08:59:00+00:00"),
+            ("import_omitted_ids", r#"["bd-merge-core"]"#),
         ] {
             storage.set_metadata(key, value).unwrap();
         }
@@ -43072,6 +43092,7 @@ required_fields:
             ("unrelated_sync_merge_metadata", "must-be-bound"),
             ("project", "different-project"),
             (METADATA_LAST_IMPORT_TIME, "2026-07-27T09:02:00+00:00"),
+            ("import_omitted_ids", "[]"),
         ] {
             let original = storage.get_metadata(key).unwrap();
             storage.set_metadata(key, replacement).unwrap();

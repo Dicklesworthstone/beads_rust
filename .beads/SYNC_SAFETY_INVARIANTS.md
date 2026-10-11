@@ -59,6 +59,8 @@ These are explicit design exclusions. br sync is intentionally less invasive tha
 | DL-5 | MEDIUM | Any operation that could discard/override data logs a warning at INFO level | Log assertion test |
 | DL-6 | CRITICAL | With a local-export merge anchor, absence from incoming JSONL never deletes a local record without `--force-jsonl`; tombstone retention alone is not deletion evidence | Deterministic merge unit and CLI tests for missing exported and subsequently modified records with unset, zero, and positive retention |
 | DL-7 | CRITICAL | A differing external-only revision with a non-advancing timestamp requires explicit resolution; refusal preserves both source generations and local issue state | `AmbiguousBase` tests for older exports, equal timestamps, slow remote clocks, branch close/reopen/create, and explicit winners |
+| DL-8 | CRITICAL | Automatic row replacements require complete source receipts or an identical already-published payload; untouched unread peer rows remain pending import. Non-forced full exports require source verification or exact full-payload retry proof | E2E same-ID/comment conflicts, safe unrelated publication, subsequent auto-import, legacy receipts, and durable publication retry tests |
+| DL-9 | CRITICAL | Import preserves omitted local issues without dirtying clean rows or requesting republication; automatic export cannot restore unrelated clean omissions, including imported tombstone omissions across expiry and automatic database recovery | Real branch-switch/peer-clone/purge E2E tests and retention-omission/recovery unit tests, with positive dirty-local and retention-expansion controls |
 
 ### 2.4 Input Validation Invariants
 
