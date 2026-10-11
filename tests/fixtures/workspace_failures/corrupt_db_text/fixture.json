@@ -18,7 +18,7 @@
     },
     {
       "surface": "doctor --repair",
-      "outcome": "repair_applied"
+      "outcome": "repair_partial"
     },
     {
       "surface": "sync --status",
@@ -33,6 +33,6 @@
   "notes": [
     "Represents the simplest non-SQLite database corruption case.",
     "Ordinary storage-backed commands refuse replacement because the unreadable primary cannot establish preservation of unflushed state.",
-    "Explicit doctor repair reports the unavailable snapshot; list --no-db remains a supported JSONL-only bypass."
+    "Explicit doctor repair reconstructs SQLite but cannot verify preservation of the unreadable primary: verified=false, exit 2, verification_failed audit and retained marker; list --no-db remains a supported JSONL-only bypass."
   ]
 }

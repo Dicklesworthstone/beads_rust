@@ -130,6 +130,7 @@ pub enum WorkspaceFailureCommandOutcome {
     DoctorClean,
     ReportsErrors,
     RepairApplied,
+    RepairPartial,
     RepairNoop,
     StatusInSync,
     StatusJsonlNewer,

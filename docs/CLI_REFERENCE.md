@@ -2285,6 +2285,16 @@ beside `beads.db`, the shared opener lease and whether it is held, and any
 one finding with its registry entry, a live observation, fixers, and next
 commands; `br doctor explain --list` enumerates the finding ids.
 
+For a JSONL rebuild, `--repair --json` reports `repaired` independently from
+`verified`: reconstruction can complete while preservation fails. The result
+includes `database_verified`, `preservation_verified`, `ok`, `exit_code`, and
+`code`. Nonempty `dirty_preservation_warnings` or `history_preservation_warnings`
+force `verified: false`, audit outcome `verification_failed`, and exit **2**
+(`fix_partial`). One JSON result is emitted. Failure evidence and source files
+remain in `.br_recovery`; another repair refuses with exit **4** until the
+operator reviews the preservation-failure evidence and explicitly permits a
+retry with `--allow-repeated-repair`. See [sync safety](SYNC_SAFETY.md#automatic-recovery-stops-on-preservation-failures).
+
 #### Reviewed schema migration
 
 If read-only planning fails because legacy WAL-index state requires engine

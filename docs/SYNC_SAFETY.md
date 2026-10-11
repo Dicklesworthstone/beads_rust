@@ -409,6 +409,31 @@ warnings (`dirty_preservation_warnings` in `--json` output). Explicit repair
 can restore readable local state and may use the JSONL copy of unreadable
 relationships; inspect the retained files before accepting that result.
 
+Database reconstruction and preservation are verified separately. On the
+JSONL rebuild path, `database_verified` describes the rebuilt database checks,
+and `preservation_verified` requires both `dirty_preservation_warnings` and
+`history_preservation_warnings` to be empty. `verified` and `ok` are true only
+when both checks pass. A known preservation shortfall or an unknown snapshot
+outcome therefore returns `repaired: true, verified: false`, audit outcome
+`verification_failed`, and exit status **2** (`fix_partial`). JSON mode emits
+one result object, including `exit_code` and `code`; it does not append a
+second error document. Human output distinguishes completed reconstruction
+from failed verification and names the preservation warnings.
+
+The `.br_recovery/*.verification-failed.json` marker retains those warnings
+alongside the original recovery files. A subsequent repair refuses with exit
+status **4** while a preservation-failure marker remains, including when the
+rebuilt database is healthy and no new rebuild is needed. Inspect the retained
+evidence before explicitly using `--allow-repeated-repair`; that flag permits
+another attempt and does not recover previously lost state or certify an
+earlier repair. An allowed retry still reports a partial result while
+prior preservation-failure evidence remains; it cannot turn a healthy
+reconstructed database into proof that missing local state was recovered.
+A genuinely missing database with no orphaned data sidecars
+can still be reconstructed and verified from JSONL without preservation
+warnings. Lossless restoration of unflushed changes continues to verify even
+when those restored rows need a later `br sync --flush-only`.
+
 Successful commands retain their existing stdout and JSON result shapes.
 Refused commands use the existing structured error envelope in JSON mode;
 the diagnostic is visible without enabling warning-level logging. The same

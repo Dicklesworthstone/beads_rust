@@ -1880,6 +1880,20 @@ fn repair_rebuild_preserves_dirty_unflushed_issue() {
         jsonl.contains("db-only issue"),
         "flush after repair must export the preserved issue; jsonl:\n{jsonl}"
     );
+    let retry = br_cmd(&root)
+        .args(["doctor", "--repair", "--json"])
+        .output()
+        .expect("repeat lossless repair");
+    assert!(
+        retry.status.success(),
+        "lossless repair must remain repeatable: {retry:?}"
+    );
+    let repeated: Value =
+        serde_json::from_slice(&retry.stdout).expect("one repeated repair result");
+    assert_ne!(
+        repeated["recovery_audit"]["outcome"], "refused",
+        "{repeated}"
+    );
 }
 
 #[test]
@@ -1978,6 +1992,46 @@ fn startup_fixture_succeeds(root: &Path, args: &[&str], label: &str) -> Value {
     assert!(out.status.success(), "fixture command {args:?}: {out:?}");
     serde_json::from_slice(&out.stdout)
         .unwrap_or_else(|err| panic!("whole stdout must be one JSON value: {err}; {out:?}"))
+}
+
+/// #553: reconstruction is useful, but incomplete preservation is not a win.
+/// Parse the entire stream, pin the process status and audit, and inspect the
+/// durable evidence used to refuse an accidental second repair.
+fn assert_partial_rebuild(root: &Path, out: &std::process::Output) -> Value {
+    assert_eq!(out.status.code(), Some(2), "partial repair: {out:?}");
+    let repair: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|err| panic!("single repair JSON value: {err}; {out:?}"));
+    assert_eq!(repair["repaired"], true, "{repair}");
+    assert_eq!(repair["verified"], false, "{repair}");
+    assert_eq!(repair["ok"], false, "{repair}");
+    assert_eq!(repair["preservation_verified"], false, "{repair}");
+    assert_eq!(repair["exit_code"], 2, "{repair}");
+    assert_eq!(
+        repair["recovery_audit"]["outcome"], "verification_failed",
+        "{repair}"
+    );
+    let marker = Path::new(
+        repair["recovery_failure_marker"]
+            .as_str()
+            .expect("failure marker"),
+    );
+    assert!(
+        marker.starts_with(root.join(".beads/.br_recovery")),
+        "{repair}"
+    );
+    let evidence: Value =
+        serde_json::from_slice(&fs::read(marker).expect("retained marker")).expect("marker JSON");
+    assert_eq!(evidence["outcome"], "verification_failed");
+    assert_eq!(evidence["preservation_verified"], false);
+    assert_eq!(
+        evidence["dirty_preservation_warnings"],
+        repair["dirty_preservation_warnings"]
+    );
+    assert_eq!(
+        evidence["history_preservation_warnings"],
+        repair["history_preservation_warnings"]
+    );
+    repair
 }
 
 fn copy_startup_fixture_tree(source: &Path, destination: &Path) {
@@ -2345,6 +2399,169 @@ fn startup_auto_recovery_refuses_unreadable_dirty_markers() {
 }
 
 #[test]
+fn repair_reports_partial_for_unreadable_dirty_state_and_refuses_replay() {
+    for damage in ["dirty-row", "dirty-markers"] {
+        let fixture = StartupRecoveryFixture::new(damage);
+        if damage == "dirty-row" {
+            fixture.damage_issue_timestamp(&fixture.db_only_id);
+        } else {
+            fixture.damage_table_page("dirty_issues");
+        }
+        let source = fs::read(fixture.root.join(".beads/beads.db")).unwrap();
+        let out = startup_fixture_run(
+            &fixture.root,
+            &["doctor", "--repair", "--json"],
+            "partial_repair",
+        );
+        let repair = assert_partial_rebuild(&fixture.root, &out);
+        assert_eq!(
+            repair["database_verified"], true,
+            "reconstruction health is separate from preservation: {repair}"
+        );
+        assert!(
+            repair["dirty_preservation_warnings"]
+                .as_array()
+                .is_some_and(|warnings| {
+                    warnings
+                        .iter()
+                        .any(|warning| warning.as_str().is_some_and(|text| text.contains("dirty")))
+                }),
+            "{repair}"
+        );
+        assert_eq!(
+            fs::read(fixture.root.join(".beads/issues.jsonl")).unwrap(),
+            fixture.jsonl
+        );
+        let recovery = fixture.root.join(".beads/.br_recovery");
+        let hashes = hash_workspace(&recovery);
+        assert!(
+            hashes.values().any(|hash| hash == &sha256_hex(&source)),
+            "original family retained"
+        );
+        let rebuilt = fs::read(fixture.root.join(".beads/beads.db")).unwrap();
+        let retry = startup_fixture_run(
+            &fixture.root,
+            &["doctor", "--repair", "--json"],
+            "refused_replay",
+        );
+        assert_eq!(retry.status.code(), Some(4), "{retry:?}");
+        let refused: Value = serde_json::from_slice(&retry.stdout).expect("one refusal JSON value");
+        assert_eq!(refused["repaired"], false, "{refused}");
+        assert_eq!(refused["verified"], false, "{refused}");
+        assert_eq!(refused["recovery_audit"]["outcome"], "refused", "{refused}");
+        assert_eq!(
+            refused["recovery_failure_marker"],
+            repair["recovery_failure_marker"]
+        );
+        assert_eq!(
+            hash_workspace(&recovery),
+            hashes,
+            "retry must retain all evidence"
+        );
+        assert_eq!(
+            fs::read(fixture.root.join(".beads/beads.db")).unwrap(),
+            rebuilt
+        );
+        let allowed = startup_fixture_run(
+            &fixture.root,
+            &["doctor", "--repair", "--allow-repeated-repair", "--json"],
+            "qualified_replay",
+        );
+        assert_eq!(allowed.status.code(), Some(2), "{allowed:?}");
+        let qualified: Value =
+            serde_json::from_slice(&allowed.stdout).expect("one qualified result");
+        assert_eq!(qualified["verified"], false, "{qualified}");
+        assert_eq!(qualified["preservation_verified"], false, "{qualified}");
+        assert_eq!(
+            qualified["recovery_audit"]["outcome"], "verification_failed",
+            "{qualified}"
+        );
+        assert_eq!(
+            hash_workspace(&recovery),
+            hashes,
+            "override must retain prior evidence"
+        );
+    }
+}
+
+#[test]
+fn repair_human_output_names_incomplete_preservation_and_fails() {
+    let fixture = StartupRecoveryFixture::new("human-partial");
+    fixture.damage_issue_timestamp(&fixture.db_only_id);
+    let out = startup_fixture_run(&fixture.root, &["doctor", "--repair"], "human_partial");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("Database reconstruction complete"), "{text}");
+    assert!(
+        text.contains("Unflushed change NOT fully preserved"),
+        "{text}"
+    );
+    assert!(text.contains(&fixture.db_only_id), "{text}");
+    assert!(text.contains("preservation_verified=false"), "{text}");
+}
+
+#[test]
+fn repair_missing_database_without_orphan_data_verifies() {
+    let tmp = isolated_tempdir();
+    let root = tmp.path();
+    br_init(root);
+    let created = startup_fixture_succeeds(root, &["create", "exported issue", "--json"], "create");
+    startup_fixture_succeeds(root, &["sync", "--flush-only", "--json"], "flush");
+    let beads = root.join(".beads");
+    checkpoint_fixture_database(&beads.join("beads.db"));
+    let jsonl = fs::read(beads.join("issues.jsonl")).unwrap();
+    let retained = root.join("retained-missing-family");
+    fs::create_dir_all(&retained).unwrap();
+    for entry in fs::read_dir(&beads).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name().to_string_lossy().starts_with("beads.db") {
+            fs::rename(entry.path(), retained.join(entry.file_name())).unwrap();
+        }
+    }
+    let repair =
+        startup_fixture_succeeds(root, &["doctor", "--repair", "--json"], "missing_repair");
+    assert_eq!(repair["repaired"], true, "{repair}");
+    assert_eq!(repair["verified"], true, "{repair}");
+    assert_eq!(repair["database_verified"], true, "{repair}");
+    assert_eq!(repair["preservation_verified"], true, "{repair}");
+    assert_eq!(repair["recovery_audit"]["outcome"], "verified", "{repair}");
+    assert!(repair["recovery_failure_marker"].is_null(), "{repair}");
+    assert_eq!(fs::read(beads.join("issues.jsonl")).unwrap(), jsonl);
+    startup_fixture_succeeds(
+        root,
+        &["show", created["id"].as_str().unwrap(), "--json"],
+        "show_restored",
+    );
+    assert!(retained.join("beads.db").is_file());
+}
+
+#[test]
+fn repair_does_not_verify_unreadable_database_only_history() {
+    let fixture = StartupRecoveryFixture::new("history-partial");
+    fixture.damage_table_page("events");
+    let out = startup_fixture_run(
+        &fixture.root,
+        &["doctor", "--repair", "--json"],
+        "history_partial",
+    );
+    let repair = assert_partial_rebuild(&fixture.root, &out);
+    assert!(
+        repair["history_preservation_warnings"]
+            .as_array()
+            .is_some_and(|warnings| {
+                warnings
+                    .iter()
+                    .any(|warning| warning.as_str().is_some_and(|text| text.contains("events")))
+            }),
+        "{repair}"
+    );
+}
+
+#[test]
 fn startup_auto_recovery_refuses_unreadable_relationships() {
     for table in ["comments", "labels", "dependencies"] {
         let fixture = StartupRecoveryFixture::new(table);
@@ -2358,13 +2575,14 @@ fn startup_auto_recovery_refuses_unreadable_relationships() {
             );
             let repair: Value = serde_json::from_slice(&out.stdout)
                 .unwrap_or_else(|err| panic!("doctor JSON contract: {err}; {out:?}"));
+            assert_partial_rebuild(&fixture.root, &out);
             assert_eq!(
                 repair["repaired"], true,
                 "explicit repair remains available: {repair}"
             );
             assert_eq!(
-                repair["verified"], true,
-                "restored dependencies must be reflected in the verified cache: {repair}"
+                repair["verified"], false,
+                "unreadable comments prevent a verified preservation verdict: {repair}"
             );
             assert!(
                 repair["dirty_preservation_warnings"]
@@ -2416,6 +2634,7 @@ fn startup_auto_recovery_refuses_open_error() {
     );
     let repair: Value = serde_json::from_slice(&out.stdout)
         .unwrap_or_else(|err| panic!("doctor JSON contract: {err}; {out:?}"));
+    assert_partial_rebuild(&fixture.root, &out);
     assert_eq!(
         repair["repaired"], true,
         "explicit repair remains available: {repair}"
@@ -2495,6 +2714,7 @@ fn startup_auto_recovery_refuses_orphan_wal_before_explicit_repair() {
     );
     let repair: Value = serde_json::from_slice(&out.stdout)
         .unwrap_or_else(|err| panic!("doctor JSON contract: {err}; {out:?}"));
+    assert_partial_rebuild(&fixture.root, &out);
     assert_eq!(repair["repaired"], true, "{repair}");
     assert!(
         repair["dirty_preservation_warnings"]
@@ -2677,6 +2897,7 @@ fn repair_rebuild_keeps_dirty_rows_and_names_unreadable_comments() {
         .expect("br doctor --repair spawned");
     let repair = parse_trailing_json(&String::from_utf8_lossy(&out.stdout));
     assert_eq!(repair["repaired"], true, "repair payload: {repair}");
+    assert_partial_rebuild(&root, &out);
     assert!(
         repair["preserved_dirty_issue_ids"]
             .as_array()

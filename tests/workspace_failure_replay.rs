@@ -1061,6 +1061,31 @@ fn assert_surface_outcome(
             let json = parse_stdout_json(&run, &context);
             assert_repair_applied_surface(&context, &json);
         }
+        WorkspaceFailureCommandOutcome::RepairPartial => {
+            assert_eq!(run.status.code(), Some(2), "{context}: {run:?}");
+            let json: Value = serde_json::from_str(&run.stdout).expect("one partial repair result");
+            assert_eq!(json["repaired"], true, "{context}: {json}");
+            assert_eq!(json["verified"], false, "{context}: {json}");
+            assert_eq!(json["database_verified"], true, "{context}: {json}");
+            assert_eq!(json["preservation_verified"], false, "{context}: {json}");
+            assert_eq!(
+                json["recovery_audit"]["outcome"], "verification_failed",
+                "{context}: {json}"
+            );
+            assert!(
+                json["dirty_preservation_warnings"]
+                    .as_array()
+                    .is_some_and(|warnings| !warnings.is_empty()),
+                "{context}: {json}"
+            );
+            let marker = Path::new(
+                json["recovery_failure_marker"]
+                    .as_str()
+                    .expect("partial repair marker"),
+            );
+            assert!(marker.is_file(), "{context}: {}", marker.display());
+            assert_sqlite_header(&current_database_path(fixture), &context);
+        }
         WorkspaceFailureCommandOutcome::RepairNoop => {
             assert!(run.status.success(), "{context} failed: {}", run.stderr);
             let json = parse_stdout_json(&run, &context);
