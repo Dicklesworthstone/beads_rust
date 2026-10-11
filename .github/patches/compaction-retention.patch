@@ -9,7 +9,7 @@ diff --git a/src/config/mod.rs b/src/config/mod.rs
  pub mod routing;
  
  use crate::error::{BeadsError, Result, ResultExt};
-@@ -3343,4 +3345,20 @@
+@@ -3343,4 +3345,22 @@
      match post_install_result {
 -        Ok(reopened) => Ok(reopened),
 +        Ok(reopened) => {
@@ -20,6 +20,7 @@ diff --git a/src/config/mod.rs b/src/config/mod.rs
 +            if let Err(error) = compaction_retention::complete_and_prune(
 +                &retained_family,
 +                write_authority,
++                &reopened,
 +                Utc::now(),
 +            ) {
 +                warn!(

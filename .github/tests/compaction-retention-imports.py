@@ -48,7 +48,8 @@ def main() -> None:
                 assert current.get(name) == contents, f"recent completion proof changed: {name}"
             for name, contents in current.items():
                 receipt = json.loads(contents)
-                assert receipt["schema_version"] == "br.compaction.complete.v1", name
+                assert receipt["schema_version"] == "br.compaction.complete.v2", name
+                assert receipt["integrity_check"] == "ok", name
                 database = pathlib.Path(receipt["database_path"]).name
                 for member in receipt["members"]:
                     backup = recovery / f'{database}{member["suffix"]}.{receipt["stamp"]}.bak'

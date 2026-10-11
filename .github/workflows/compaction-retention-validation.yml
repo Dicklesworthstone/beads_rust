@@ -48,7 +48,7 @@ jobs:
         run: |
           set -euo pipefail
           if ! grep -q '^mod compaction_retention;$' src/config/mod.rs; then
-            test "$(git hash-object src/config/mod.rs)" = fcb95f51ee2dab19b26f7f7ba9c3a192f439d54e
+            test "$(git hash-object src/config/mod.rs)" = ac56e3a7c592f32110006e856ba51f3cb7fb7093
             git apply --check --recount .github/patches/compaction-retention.patch
             git apply --recount .github/patches/compaction-retention.patch
           fi
@@ -69,7 +69,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --locked --lib config::compaction_retention::tests:: -- --list | tee "$RUNNER_TEMP/retention-tests.txt"
-          test "$(grep -c '^config::compaction_retention::tests::.*: test$' "$RUNNER_TEMP/retention-tests.txt")" = 15
+          test "$(grep -c '^config::compaction_retention::tests::.*: test$' "$RUNNER_TEMP/retention-tests.txt")" = 24
           cargo test --locked --lib config::compaction_retention::tests:: -- --test-threads=1 --nocapture
       - name: Check and lint all targets
         shell: bash

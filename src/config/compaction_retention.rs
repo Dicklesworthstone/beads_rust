@@ -11,6 +11,7 @@
 
 use super::{RecoveryBackupSet, db_sidecar_suffixes, verify_recovery_backup_manifest};
 use crate::error::{BeadsError, Result};
+use crate::storage::SqliteStorage;
 use crate::sync::DatabaseFamilyWriteLock;
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use rustix::fs::{
@@ -19,7 +20,7 @@ use rustix::fs::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, Metadata};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -27,7 +28,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
-const SCHEMA: &str = "br.compaction.complete.v1";
+// v1 did not attest the reopened database's integrity. Never retroactively
+// upgrade its receipts: an old filename or receipt is not fresh success proof.
+const SCHEMA: &str = "br.compaction.complete.v2";
 const KEEP: usize = 5;
 const MIN_AGE_DAYS: i64 = 7;
 const RECEIPT_LIMIT: u64 = 64 * 1024;
@@ -58,6 +61,7 @@ struct Receipt {
     database_path: String,
     stamp: String,
     completed_at: DateTime<Utc>,
+    integrity_check: String,
     // An exact catalog also records absent sidecars and refuses future formats.
     family_suffixes: Vec<String>,
     members: Vec<Member>,
@@ -67,6 +71,54 @@ struct Candidate {
     receipt: Receipt,
     marker: String,
     marker_witness: Witness,
+}
+
+struct HeldMember<'a> {
+    name: String,
+    file: File,
+    expected: &'a Witness,
+}
+
+/// One discovery scan, indexed by generation. This is selection data, never
+/// unlink authority: every selected keeper/victim is checked afresh below.
+#[derive(Default)]
+struct FamilyInventory {
+    generations: HashMap<String, HashSet<OsString>>,
+}
+
+impl FamilyInventory {
+    fn collect(names: &HashSet<OsString>, database: &str) -> Self {
+        const DELIMITER: &[u8] = b".vacuum-";
+        let mut inventory = Self::default();
+        for name in names {
+            let Some(tail) = name.as_bytes().strip_prefix(database.as_bytes()) else {
+                continue;
+            };
+            if !matches!(tail.first(), Some(b'.' | b'-')) {
+                continue;
+            }
+            // Index every generation mentioned by an ambiguous name. Using
+            // only the last delimiter could hide additional recovery evidence
+            // from a different generation. Preserve opaque filename bytes too.
+            for (offset, window) in tail.windows(DELIMITER.len()).enumerate() {
+                if window != DELIMITER {
+                    continue;
+                }
+                let remainder = &tail[offset + 1..];
+                let Some(end) = remainder.iter().position(|byte| *byte == b'.') else {
+                    continue;
+                };
+                let Ok(stamp) = std::str::from_utf8(&remainder[..end]) else {
+                    continue;
+                };
+                if stamp_time(stamp).is_some() {
+                    inventory.generations.entry(stamp.to_string()).or_default()
+                        .insert(name.clone());
+                }
+            }
+        }
+        inventory
+    }
 }
 
 struct Directory {
@@ -100,7 +152,9 @@ fn regular(metadata: &Metadata) -> bool {
 
 fn safe_name(name: &OsStr) -> bool {
     let mut components = Path::new(name).components();
-    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+    matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none()
+        && Path::new(name).file_name() == Some(name)
 }
 
 impl Directory {
@@ -262,7 +316,8 @@ fn suffixes() -> Vec<String> {
 
 fn stamp_time(stamp: &str) -> Option<DateTime<Utc>> {
     let (pid, time) = stamp.strip_prefix("vacuum-")?.split_once('-')?;
-    if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) || pid.parse::<u32>().ok()? == 0 {
+    let parsed_pid = pid.parse::<u32>().ok()?;
+    if parsed_pid == 0 || parsed_pid.to_string() != pid {
         return None;
     }
     let time = NaiveDateTime::parse_from_str(time, "%Y%m%d_%H%M%S_%f").ok()?;
@@ -289,7 +344,8 @@ fn valid_receipt(receipt: &Receipt, db_path: &Path, marker: &str, now: DateTime<
     let known = suffixes();
     let mut seen = HashSet::new();
     receipt.schema_version == SCHEMA
-        && receipt.database_path == db_path.to_string_lossy().as_ref()
+        && db_path.to_str() == Some(receipt.database_path.as_str())
+        && receipt.integrity_check == "ok"
         && marker == marker_name(database, &receipt.stamp)
         && created <= receipt.completed_at && receipt.completed_at <= now
         && receipt.family_suffixes == known
@@ -305,13 +361,8 @@ fn valid_receipt(receipt: &Receipt, db_path: &Path, marker: &str, now: DateTime<
 /// Check the exact flat generation, including the absence of omitted sidecars.
 /// Unknown sidecars or a failure/partial marker veto removal of the whole set.
 fn family_names(directory: &Directory, database: &str, stamp: &str) -> Result<HashSet<OsString>> {
-    let generation = format!(".{stamp}.");
-    Ok(directory.names()?.into_iter().filter(|name| {
-        let name = name.to_string_lossy();
-        name.strip_prefix(database).is_some_and(|tail| {
-            (tail.starts_with('.') || tail.starts_with('-')) && tail.contains(&generation)
-        })
-    }).collect())
+    let names = directory.names()?;
+    Ok(FamilyInventory::collect(&names, database).generations.remove(stamp).unwrap_or_default())
 }
 
 fn expected_names(receipt: &Receipt, database: &str, marker: &str) -> HashSet<OsString> {
@@ -320,7 +371,13 @@ fn expected_names(receipt: &Receipt, database: &str, marker: &str) -> HashSet<Os
     })).collect()
 }
 
-fn load_candidate(root: &Directory, db_path: &Path, marker: &str, now: DateTime<Utc>) -> Result<Candidate> {
+fn load_candidate(
+    root: &Directory,
+    db_path: &Path,
+    marker: &str,
+    now: DateTime<Utc>,
+    inventory: &FamilyInventory,
+) -> Result<Candidate> {
     let mut file = root.open_member(marker)?;
     if file.metadata()?.len() > RECEIPT_LIMIT { return Err(refused("oversized completion receipt")); }
     let marker_witness = witness(&mut file)?;
@@ -335,12 +392,12 @@ fn load_candidate(root: &Directory, db_path: &Path, marker: &str, now: DateTime<
     let receipt: Receipt = serde_json::from_slice(&bytes)?;
     if !valid_receipt(&receipt, db_path, marker, now) { return Err(refused("unrecognized completion receipt")); }
     let database = database_name(db_path)?;
-    if family_names(root, database, &receipt.stamp)? != expected_names(&receipt, database, marker) {
+    if inventory.generations.get(&receipt.stamp) != Some(&expected_names(&receipt, database, marker)) {
         return Err(refused("incomplete or ambiguous compaction family"));
     }
     for member in &receipt.members {
-        // Protect recent generations without rehashing a week's backups on
-        // every import. Hash every eligible victim again before and after claim.
+        // Discovery does not grant a protected-history slot. If an old victim
+        // exists, both keepers and victims require full content verification.
         open_verified(root, &backup_name(database, &receipt.stamp, &member.suffix), &member.witness, false)?;
     }
     open_verified(root, marker, &marker_witness, true)?;
@@ -349,6 +406,8 @@ fn load_candidate(root: &Directory, db_path: &Path, marker: &str, now: DateTime<
 
 fn seal_completed(root: &Directory, backup_set: &RecoveryBackupSet, now: DateTime<Utc>) -> Result<String> {
     verify_recovery_backup_manifest(backup_set)?;
+    let database_path = backup_set.db_path.to_str()
+        .ok_or_else(|| refused("database route cannot be represented without loss"))?;
     let database = database_name(&backup_set.db_path)?;
     let created = stamp_time(&backup_set.stamp).ok_or_else(|| refused("unrecognized compaction stamp"))?;
     if !backup_set.had_original_database || created > now { return Err(refused("incomplete compaction manifest")); }
@@ -373,8 +432,9 @@ fn seal_completed(root: &Directory, backup_set: &RecoveryBackupSet, now: DateTim
     }
     let marker = marker_name(database, &backup_set.stamp);
     let receipt = Receipt {
-        schema_version: SCHEMA.to_string(), database_path: backup_set.db_path.to_string_lossy().into_owned(),
-        stamp: backup_set.stamp.clone(), completed_at: now, family_suffixes: known, members,
+        schema_version: SCHEMA.to_string(), database_path: database_path.to_string(),
+        stamp: backup_set.stamp.clone(), completed_at: now, integrity_check: "ok".to_string(),
+        family_suffixes: known, members,
     };
     if !valid_receipt(&receipt, &backup_set.db_path, &marker, now) { return Err(refused("invalid completed family")); }
     let mut expected = expected_names(&receipt, database, &marker);
@@ -390,8 +450,30 @@ fn seal_completed(root: &Directory, backup_set: &RecoveryBackupSet, now: DateTim
 pub(super) fn complete_and_prune(
     backup_set: &RecoveryBackupSet,
     authority: &DatabaseFamilyWriteLock,
+    reopened: &SqliteStorage,
     now: DateTime<Utc>,
 ) -> Result<usize> {
+    let attached = reopened.attached_write_authority()
+        .ok_or_else(|| refused("reopened storage has no database-family authority"))?;
+    if !std::ptr::eq(attached.as_ref(), authority) {
+        return Err(refused("reopened storage belongs to a different write authority"));
+    }
+    complete_and_prune_with_integrity_check(backup_set, authority, now, || {
+        reopened.integrity_check_messages()
+    })
+}
+
+fn complete_and_prune_with_integrity_check(
+    backup_set: &RecoveryBackupSet,
+    authority: &DatabaseFamilyWriteLock,
+    now: DateTime<Utc>,
+    check_integrity: impl FnOnce() -> Result<Vec<String>>,
+) -> Result<usize> {
+    authority.verify_database_authority()?;
+    // An engine connection opening successfully is not an integrity verdict.
+    // No completion proof or pruning may follow an error, empty response, or
+    // mixed diagnostic response. Failure here only defers retention.
+    require_clean_integrity(&check_integrity()?)?;
     authority.verify_database_authority()?;
     let root = Directory::open(&backup_set.recovery_dir)?;
     seal_completed(&root, backup_set, now)?;
@@ -399,28 +481,86 @@ pub(super) fn complete_and_prune(
     prune(&root, &backup_set.db_path, &backup_set.stamp, authority, now)
 }
 
+fn require_clean_integrity(messages: &[String]) -> Result<()> {
+    if matches!(messages, [message] if message.trim().eq_ignore_ascii_case("ok")) {
+        return Ok(());
+    }
+    Err(refused("reopened compacted database did not pass integrity_check"))
+}
+
 fn prune(root: &Directory, db_path: &Path, current: &str, authority: &DatabaseFamilyWriteLock, now: DateTime<Utc>) -> Result<usize> {
+    authority.verify_database_authority()?;
+    root.verify_route()?;
     let mut candidates = Vec::new();
-    let prefix = format!("{}.vacuum-", database_name(db_path)?);
-    for name in root.names()? {
+    let database = database_name(db_path)?;
+    let prefix = format!("{database}.vacuum-");
+    let names = root.names()?;
+    let inventory = FamilyInventory::collect(&names, database);
+    for name in &names {
         let Some(name) = name.to_str() else { continue; };
         if !name.starts_with(&prefix) || !name.ends_with(RECEIPT_SUFFIX) { continue; }
-        if let Ok(candidate) = load_candidate(root, db_path, name, now) { candidates.push(candidate); }
+        if let Ok(candidate) = load_candidate(root, db_path, name, now, &inventory) { candidates.push(candidate); }
     }
     candidates.sort_by(|left, right| {
         right.receipt.completed_at.cmp(&left.receipt.completed_at).then_with(|| right.marker.cmp(&left.marker))
     });
+    // No deletion is possible yet: avoid hashing all recent database payloads.
+    if !candidates.iter().skip(KEEP).any(|candidate| {
+        candidate.receipt.stamp != current
+            && now - candidate.receipt.completed_at >= Duration::days(MIN_AGE_DAYS)
+    }) {
+        return Ok(0);
+    }
     let mut removed = 0;
-    for candidate in candidates.into_iter().skip(KEEP) {
-        if candidate.receipt.stamp == current || now - candidate.receipt.completed_at < Duration::days(MIN_AGE_DAYS) { continue; }
+    let mut kept = 0;
+    for candidate in &candidates {
         authority.verify_database_authority()?;
         root.verify_route()?;
-        match remove_candidate(root, db_path, &candidate, authority, |_| Ok(())) {
+        if kept < KEEP {
+            match verified_members(root, db_path, candidate) {
+                Ok(_) => kept += 1,
+                Err(error) => tracing::warn!(%error, stamp = %candidate.receipt.stamp,
+                    "Unverified compaction evidence does not displace intact retained history"),
+            }
+            continue;
+        }
+        if candidate.receipt.stamp == current
+            || now - candidate.receipt.completed_at < Duration::days(MIN_AGE_DAYS)
+        {
+            continue;
+        }
+        match remove_candidate(root, db_path, candidate, authority, |_| Ok(())) {
             Ok(()) => removed += 1,
             Err(error) => tracing::warn!(%error, stamp = %candidate.receipt.stamp, "Preserved uncertain compaction recovery evidence"),
         }
     }
     Ok(removed)
+}
+
+fn verified_members<'a>(
+    root: &Directory,
+    db_path: &Path,
+    candidate: &'a Candidate,
+) -> Result<Vec<HeldMember<'a>>> {
+    let database = database_name(db_path)?;
+    let receipt = &candidate.receipt;
+    let expected = expected_names(receipt, database, &candidate.marker);
+    if family_names(root, database, &receipt.stamp)? != expected {
+        return Err(refused("family changed before verification"));
+    }
+    let mut held = vec![HeldMember {
+        name: candidate.marker.clone(),
+        file: open_verified(root, &candidate.marker, &candidate.marker_witness, true)?,
+        expected: &candidate.marker_witness,
+    }];
+    for member in &receipt.members {
+        let name = backup_name(database, &receipt.stamp, &member.suffix);
+        let file = open_verified(root, &name, &member.witness, true)?;
+        held.push(HeldMember { name, file, expected: &member.witness });
+    }
+    // Recheck the marker after reading payloads: it supplies deletion authority.
+    open_verified(root, &candidate.marker, &candidate.marker_witness, true)?;
+    Ok(held)
 }
 
 /// Claim and verify every member before the first unlink. A failed/interrupted
@@ -435,18 +575,11 @@ fn remove_candidate(
     let database = database_name(db_path)?;
     let receipt = &candidate.receipt;
     let expected = expected_names(receipt, database, &candidate.marker);
-    if family_names(root, database, &receipt.stamp)? != expected { return Err(refused("family changed before claim")); }
-    let mut held = Vec::new();
-    held.push((candidate.marker.clone(), open_verified(root, &candidate.marker, &candidate.marker_witness, true)?, &candidate.marker_witness));
-    for member in &receipt.members {
-        let name = backup_name(database, &receipt.stamp, &member.suffix);
-        let file = open_verified(root, &name, &member.witness, true)?;
-        held.push((name, file, &member.witness));
-    }
+    let mut held = verified_members(root, db_path, candidate)?;
     authority.verify_database_authority()?;
     root.verify_route()?;
     let claimed = root.claim_directory(&candidate.marker)?;
-    for (name, _, _) in &held { root.move_to(name, &claimed)?; }
+    for member in &held { root.move_to(&member.name, &claimed)?; }
     root.file.sync_all()?;
     claimed.file.sync_all()?;
     after_claim(&claimed.path)?;
@@ -456,20 +589,23 @@ fn remove_candidate(
     if claimed.names()? != expected || !family_names(root, database, &receipt.stamp)?.is_empty() {
         return Err(refused("family changed during claim"));
     }
-    for (name, file, expected) in &mut held {
-        if witness(file)? != **expected { return Err(refused("claimed descriptor changed")); }
-        open_verified(&claimed, name, expected, true)?;
+    for member in &mut held {
+        if witness(&mut member.file)? != *member.expected { return Err(refused("claimed descriptor changed")); }
+        open_verified(&claimed, &member.name, member.expected, true)?;
     }
     // The completion receipt is last. Never recursively descend into an entry,
     // and never let a pathname substitution redirect removal outside this fd.
-    for (name, _, expected) in held.iter().skip(1) {
+    for member in held.iter().skip(1) {
         authority.verify_database_authority()?;
         root.verify_route()?;
         claimed.verify_route()?;
-        open_verified(&claimed, name, expected, false)?;
-        claimed.unlink(name)?;
+        open_verified(&claimed, &member.name, member.expected, false)?;
+        claimed.unlink(&member.name)?;
     }
     claimed.file.sync_all()?;
+    authority.verify_database_authority()?;
+    root.verify_route()?;
+    claimed.verify_route()?;
     open_verified(&claimed, &candidate.marker, &candidate.marker_witness, true)?;
     claimed.unlink(&candidate.marker)?;
     claimed.file.sync_all()?;
@@ -484,7 +620,6 @@ fn remove_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::SqliteStorage;
     use crate::sync::blocking_database_family_write_lock_with_timeout;
     use chrono::TimeZone;
     use std::fs;
@@ -566,6 +701,132 @@ mod tests {
 
     fn assert_retained(saved: &RecoveryBackupSet) {
         for (_, path) in &saved.files { assert!(path.symlink_metadata().is_ok(), "missing {}", path.display()); }
+    }
+
+    fn candidate(root: &Directory, db: &Path, marker: &str, now: DateTime<Utc>) -> Candidate {
+        let inventory = FamilyInventory::collect(&root.names().unwrap(), database_name(db).unwrap());
+        load_candidate(root, db, marker, now, &inventory).unwrap()
+    }
+
+    fn corrupt_without_metadata_change(path: &Path) {
+        let before = fs::metadata(path).unwrap();
+        let mut bytes = fs::read(path).unwrap();
+        bytes[0] ^= 1;
+        fs::write(path, bytes).unwrap();
+        File::options().write(true).open(path).unwrap().set_times(
+            fs::FileTimes::new().set_modified(before.modified().unwrap()),
+        ).unwrap();
+        let after = fs::metadata(path).unwrap();
+        assert!(same_inode(&before, &after));
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.mtime(), after.mtime());
+        assert_eq!(before.mtime_nsec(), after.mtime_nsec());
+    }
+
+    #[test]
+    fn corrupt_newer_backup_does_not_displace_intact_history() {
+        let f = fixture();
+        let saved: Vec<_> = (0..7).map(|hour| completed(&f, base() + Duration::hours(hour))).collect();
+        corrupt_without_metadata_change(&saved[6].files[0].1);
+        // Demonstrate why metadata-only discovery cannot authorize a keeper.
+        let root = Directory::open(&f.root).unwrap();
+        let found = candidate(&root, &f.db, marker(&f, &saved[6]).file_name().unwrap().to_str().unwrap(), base() + Duration::days(30));
+        assert!(verified_members(&root, &f.db, &found).is_err());
+        assert_eq!(sweep(&f, base() + Duration::days(30)), 1);
+        assert!(!marker(&f, &saved[0]).exists());
+        for saved in &saved[1..] { assert_retained(saved); }
+    }
+
+    #[test]
+    fn fewer_than_five_intact_families_never_authorize_deletion() {
+        let f = fixture();
+        let saved: Vec<_> = (0..9).map(|hour| completed(&f, base() + Duration::hours(hour))).collect();
+        for damaged in &saved[4..] {
+            corrupt_without_metadata_change(&damaged.files[1].1);
+        }
+        assert_eq!(sweep(&f, base() + Duration::days(30)), 0);
+        for saved in &saved { assert_retained(saved); }
+    }
+
+    #[test]
+    fn completion_requires_one_clean_integrity_verdict() {
+        for messages in [vec![], vec![""], vec!["corrupt"], vec!["ok", "corrupt"], vec!["ok", "ok"]] {
+            let messages = messages.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(require_clean_integrity(&messages).is_err());
+        }
+        assert!(require_clean_integrity(&["ok".to_string()]).is_ok());
+        assert!(require_clean_integrity(&[" OK\n".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn failed_integrity_verification_neither_seals_nor_prunes() {
+        for verdict in [Err(refused("injected integrity I/O failure")), Ok(vec![]), Ok(vec!["ok".to_string(), "corrupt".to_string()])] {
+            let f = fixture();
+            let previous: Vec<_> = (0..7).map(|hour| completed(&f, base() + Duration::hours(hour))).collect();
+            let current = backup(&f.db, &f.root, base() + Duration::days(30));
+            assert!(complete_and_prune_with_integrity_check(
+                &current, &f.authority, base() + Duration::days(30), || verdict,
+            ).is_err());
+            assert!(!marker(&f, &current).exists());
+            for saved in previous.iter().chain(std::iter::once(&current)) { assert_retained(saved); }
+        }
+    }
+
+    #[test]
+    fn old_receipt_without_integrity_attestation_is_never_upgraded() {
+        let f = fixture();
+        let saved = completed(&f, base());
+        protect_five(&f);
+        let path = marker(&f, &saved);
+        let mut receipt: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        receipt["schema_version"] = "br.compaction.complete.v1".into();
+        receipt.as_object_mut().unwrap().remove("integrity_check");
+        fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        assert_eq!(sweep(&f, base() + Duration::days(30)), 0);
+        assert_retained(&saved);
+    }
+
+    #[test]
+    fn discovery_indexes_opaque_and_ambiguous_names_without_losing_evidence() {
+        let first = stamp(base());
+        let second = stamp(base() + Duration::hours(1));
+        let ordinary = OsString::from(backup_name("beads.db", &first, ""));
+        let mut opaque = OsString::from("beads.db-");
+        opaque.push(OsStr::from_bytes(b"\xff"));
+        opaque.push(format!(".{first}.bak"));
+        let ambiguous = OsString::from(format!("beads.db.{first}.note.{second}.bak"));
+        let foreign = OsString::from(backup_name("beads.db2", &first, ""));
+        let names = HashSet::from([ordinary.clone(), opaque.clone(), ambiguous.clone(), foreign]);
+        let inventory = FamilyInventory::collect(&names, "beads.db");
+        assert_eq!(inventory.generations[&first], HashSet::from([ordinary, opaque, ambiguous.clone()]));
+        assert_eq!(inventory.generations[&second], HashSet::from([ambiguous]));
+    }
+
+    #[test]
+    fn non_utf8_database_routes_cannot_receive_lossy_receipts() {
+        let f = fixture();
+        let parent = f._temp.path().join(OsStr::from_bytes(b"route-\xff"));
+        fs::create_dir(&parent).unwrap();
+        let db = parent.join("beads.db");
+        let root_path = parent.join(".br_recovery");
+        fs::create_dir(&root_path).unwrap();
+        let saved = backup(&db, &root_path, base());
+        let root = Directory::open(&root_path).unwrap();
+        assert!(seal_completed(&root, &saved, base()).is_err());
+        assert_retained(&saved);
+        assert!(!root.names().unwrap().iter().any(|name| name.to_string_lossy().ends_with(RECEIPT_SUFFIX)));
+    }
+
+    #[test]
+    fn only_canonical_stamps_and_local_names_are_accepted() {
+        assert!(stamp_time(&stamp(base())).is_some());
+        for stamp in ["vacuum-0-20260901_000000_000000000", "vacuum-0554-20260901_000000_000000000", "vacuum-+554-20260901_000000_000000000", "vacuum-554-20260901_000000_000000", "vacuum-554-../../outside"] {
+            assert!(stamp_time(stamp).is_none(), "{stamp}");
+        }
+        for name in ["", ".", "..", "member/", "member/.", "../member", "/member"] {
+            assert!(!safe_name(OsStr::new(name)), "{name}");
+        }
+        assert!(safe_name(OsStr::new("beads.db.vacuum-554.bak")));
     }
 
     #[test]
@@ -673,7 +934,7 @@ mod tests {
                 _ => {}
             }
             let bytes = match damage {
-                "duplicate-field" => original.replacen('{', "{\"schema_version\":\"br.compaction.complete.v1\",", 1).into_bytes(),
+                "duplicate-field" => original.replacen('{', "{\"schema_version\":\"br.compaction.complete.v2\",", 1).into_bytes(),
                 "oversized" => vec![b' '; usize::try_from(RECEIPT_LIMIT).unwrap() + 1],
                 _ => serde_json::to_vec(&value).unwrap(),
             };
@@ -751,7 +1012,7 @@ mod tests {
         let saved = completed(&f, base());
         let root = Directory::open(&f.root).unwrap();
         let marker = marker_name("beads.db", &saved.stamp);
-        let candidate = load_candidate(&root, &f.db, &marker, base()).unwrap();
+        let candidate = candidate(&root, &f.db, &marker, base());
         let result = remove_candidate(&root, &f.db, &candidate, &f.authority, |claimed| {
             let member = claimed.join(saved.files[1].1.file_name().unwrap());
             let retained = claimed.join("unexpected-retained-evidence");
@@ -775,7 +1036,7 @@ mod tests {
         let saved = completed(&f, base());
         let root = Directory::open(&f.root).unwrap();
         let marker = marker_name("beads.db", &saved.stamp);
-        let candidate = load_candidate(&root, &f.db, &marker, base()).unwrap();
+        let candidate = candidate(&root, &f.db, &marker, base());
         let staged = root.claim_directory(&marker).unwrap();
         fs::write(staged.path.join("operator-evidence"), b"preserve").unwrap();
         assert!(remove_candidate(&root, &f.db, &candidate, &f.authority, |_| Ok(())).is_err());
@@ -798,7 +1059,7 @@ mod tests {
             .filter(|name| name.to_string_lossy().ends_with(RECEIPT_SUFFIX)).collect();
         assert_eq!(markers.len(), 8);
         let now = Utc::now();
-        for marker in &markers { load_candidate(&root, &f.db, marker.to_str().unwrap(), now).unwrap(); }
+        for marker in &markers { candidate(&root, &f.db, marker.to_str().unwrap(), now); }
         assert_eq!(prune(&root, &f.db, "none", &f.authority, now + Duration::days(8)).unwrap(), 3);
         assert_eq!(root.names().unwrap().iter().filter(|name| name.to_string_lossy().ends_with(RECEIPT_SUFFIX)).count(), 5);
         assert_eq!(storage.get_config("retention_generation").unwrap().as_deref(), Some("7"));
@@ -832,13 +1093,44 @@ mod tests {
     #[test]
     fn retention_refusal_does_not_turn_successful_compaction_into_rollback() {
         let mut f = fixture();
-        fs::set_permissions(&f.root, fs::Permissions::from_mode(0o777)).unwrap();
-        let storage = super::super::compact_database_via_vacuum_into_in_place(
-            f.storage.take().unwrap(), &f.db, Some(1_000),
+        let before = fs::metadata(&f.db).unwrap();
+        let storage = super::super::compact_database_via_vacuum_into_in_place_with_reopener(
+            f.storage.take().unwrap(), &f.db, Some(1_000), &f.authority,
+            |path, timeout| {
+                let reopened = SqliteStorage::open_with_timeout_under_write_authority(path, timeout, &f.authority)?;
+                // Inject refusal after opening; do not accidentally fail the
+                // engine's private-source admission before retention is reached.
+                fs::set_permissions(&f.root, fs::Permissions::from_mode(0o777))?;
+                Ok(reopened)
+            },
+            || Ok(()), || Ok(()),
+            |from, to| crate::util::sync_rename_parent_directories(from, to).map_err(BeadsError::Io),
         ).unwrap();
+        assert!(!same_inode(&before, &fs::metadata(&f.db).unwrap()));
         assert_eq!(storage.get_config("issue_prefix").unwrap().as_deref(), Some("retention"));
         assert!(Directory::open(&f.root).is_err());
         assert!(fs::read_dir(&f.root).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().ends_with(".bak")));
         assert!(!fs::read_dir(&f.root).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().ends_with(RECEIPT_SUFFIX)));
+    }
+
+    #[test]
+    fn successful_real_compaction_automatically_prunes_expired_families() {
+        let mut f = fixture();
+        let start = Utc::now() - Duration::days(10);
+        let previous: Vec<_> = (0..7).map(|hour| completed(&f, start + Duration::hours(hour))).collect();
+        let unfinished = backup(&f.db, &f.root, start - Duration::days(1));
+        let storage = super::super::compact_database_via_vacuum_into_in_place(
+            f.storage.take().unwrap(), &f.db, Some(1_000),
+        ).unwrap();
+        // Seven old completed generations plus the just-completed generation:
+        // exactly the three oldest are removed by the real success hook.
+        for saved in &previous[..3] {
+            assert!(!marker(&f, saved).exists());
+            for (_, path) in &saved.files { assert!(!path.exists()); }
+        }
+        for saved in previous[3..].iter().chain(std::iter::once(&unfinished)) { assert_retained(saved); }
+        let root = Directory::open(&f.root).unwrap();
+        assert_eq!(root.names().unwrap().iter().filter(|name| name.to_string_lossy().ends_with(RECEIPT_SUFFIX)).count(), KEEP);
+        assert_eq!(storage.get_config("issue_prefix").unwrap().as_deref(), Some("retention"));
     }
 }
