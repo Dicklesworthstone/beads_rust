@@ -30,6 +30,8 @@
 //!    omitted from that audit. A rebuild that cannot restore an unreadable
 //!    payload requires explicit `--discard-db-only` authorization; a retained
 //!    backup alone is not permission to remove data from the live tracker.
+//!    That authorization applies only to unrestorable payloads and orphan
+//!    relations: recoverable database-only issues are always re-added.
 
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
@@ -171,6 +173,36 @@ impl StaleSchemaAudit {
         }
         shown.join(", ")
     }
+
+    /// Explain which live issues a rebuild will restore, independently of
+    /// permission to leave unreadable payloads and orphans in the backup.
+    fn restoration_notice(&self) -> String {
+        if self.restorable.is_empty() {
+            return "No recoverable database-only issues were found to re-add".to_owned();
+        }
+        let mut ids: Vec<&str> = self
+            .restorable
+            .iter()
+            .map(|entry| entry.issue.id.as_str())
+            .collect();
+        ids.sort_unstable();
+        let shown = ids
+            .iter()
+            .take(DB_ONLY_IDS_SHOWN)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let remaining = if ids.len() > DB_ONLY_IDS_SHOWN {
+            format!(", and {} more", ids.len() - DB_ONLY_IDS_SHOWN)
+        } else {
+            String::new()
+        };
+        format!(
+            "{} recoverable database-only issue(s) ({shown}{remaining}) will still be \
+             re-added as unflushed changes, including with --discard-db-only",
+            ids.len()
+        )
+    }
 }
 
 /// How [`heal_stale_schema`] was invoked.
@@ -179,8 +211,9 @@ pub enum HealMode {
     /// Ordinary command startup: prefer a reviewed lossless migration;
     /// rebuild only when the audit is clean and no orphan relations are lost.
     Automatic,
-    /// `br doctor migrate-schema heal`: re-add the restorable database-only
-    /// issues. A rebuild with unreadable payloads requires `discard_db_only`.
+    /// `br doctor migrate-schema heal`: always re-add restorable database-only
+    /// issues. `discard_db_only` authorizes backup-only retention of unreadable
+    /// payloads and orphan relations, not omission of recoverable issues.
     Explicit { discard_db_only: bool },
 }
 
@@ -227,7 +260,7 @@ impl HealOutcome {
         }
         if !self.backup_only_db_only.is_empty() {
             line.push_str(&format!(
-                "; {} superseded database-only edit(s) kept only in the backup",
+                "; {} database-only issue(s) not restored; kept only in the backup",
                 self.backup_only_db_only.len()
             ));
         }
@@ -303,14 +336,18 @@ pub fn refusal_error(audit: &StaleSchemaAudit) -> BeadsError {
         .iter()
         .any(|issue| issue.reason == DbOnlyReason::Unreadable)
     {
-        "refuses a JSONL rebuild that cannot restore unreadable issues; inspect and repair \
-         those original payloads before attempting a lossless rebuild"
-            .to_string()
+        format!(
+            "refuses a JSONL rebuild that cannot restore unreadable issues; repair those \
+             original payloads first, or use `{HEAL_COMMAND} --discard-db-only` to keep \
+             unreadable payloads and orphan relations only in the retained backup. {}",
+            audit.restoration_notice()
+        )
     } else if audit.has_orphan_relations() {
         format!(
             "refuses a JSONL rebuild that would drop those relation rows; `{HEAL_COMMAND} \
              --discard-db-only` is the explicit choice to rebuild and keep them only in the \
-             retained .beads/.br_recovery backup"
+             retained .beads/.br_recovery backup. {}",
+            audit.restoration_notice()
         )
     } else {
         "rebuilds the database from issues.jsonl, re-adds the database-only issues as \
@@ -1065,11 +1102,10 @@ pub fn heal_stale_schema(ctx: &HealContext<'_>, mode: HealMode) -> Result<HealRe
         })
         .unwrap_or_else(|| config::recovery_dir_for_db_path(&paths.db_path, ctx.beads_dir));
 
-    let restore: &[PreservedIssue] = if discard_db_only {
-        &[]
-    } else {
-        &audit.restorable
-    };
+    // GH #550: authorizing backup-only retention for an unreadable payload
+    // or orphan relation must not also omit unrelated, recoverable work.
+    // Superseded edits are already excluded by the audit's restore plan.
+    let restore = audit.restorable.as_slice();
     crate::sync::restore_dirty_issues_after_rebuild(&mut storage, restore)?;
     drop(storage);
 
@@ -1130,9 +1166,11 @@ fn require_lossless_rebuild(audit: &StaleSchemaAudit, discard_db_only: bool) -> 
         return Err(BeadsError::Config(format!(
             "schema-heal rebuild refused: unreadable database-only payloads cannot be \
              restored ({}). The rebuild was not started. Repair the original payloads first; \
-             `{HEAL_COMMAND} --discard-db-only` is an explicit choice to keep database-only \
-             data only in the retained backup, not in the rebuilt tracker",
-            audit.db_only_summary()
+             `{HEAL_COMMAND} --discard-db-only` is an explicit choice to keep unreadable \
+             payloads and orphan relations only in the retained backup, not in the rebuilt \
+             tracker. {}",
+            audit.db_only_summary(),
+            audit.restoration_notice()
         )));
     }
     if !discard_db_only && audit.has_orphan_relations() {
@@ -1140,8 +1178,9 @@ fn require_lossless_rebuild(audit: &StaleSchemaAudit, discard_db_only: bool) -> 
             "schema-heal rebuild refused: the database holds relation rows without an owning \
              issue ({}), which a rebuild from issues.jsonl cannot carry. The rebuild was not \
              started. `{HEAL_COMMAND} --discard-db-only` is an explicit choice to keep them \
-             only in the retained backup, not in the rebuilt tracker",
-            audit.orphan_summary()
+             only in the retained backup, not in the rebuilt tracker. {}",
+            audit.orphan_summary(),
+            audit.restoration_notice()
         )));
     }
     Ok(())
@@ -1162,17 +1201,12 @@ fn planned_action(audit: &StaleSchemaAudit, discard_db_only: bool) -> String {
         .count();
     let tail = if audit.db_only.is_empty() {
         String::new()
-    } else if discard_db_only {
-        format!(
-            "; {} database-only issue(s) kept only in the backup",
-            audit.db_only.len()
-        )
     } else {
         format!(
             "; re-add {restorable} database-only issue(s) as unflushed changes{}",
             if restorable < audit.db_only.len() {
                 format!(
-                    " ({} superseded by newer JSONL edits stay only in the backup)",
+                    "; {} unreadable or superseded database-only issue(s) kept only in the backup",
                     audit.db_only.len() - restorable
                 )
             } else {
@@ -1796,5 +1830,65 @@ mod tests {
             assert!(require_lossless_rebuild(&audit, discard).is_err());
             assert!(planned_action(&audit, discard).starts_with("refuse rebuild:"));
         }
+    }
+
+    #[test]
+    fn discard_plan_separates_recoverable_issues_from_unreadable_rows_and_orphans() {
+        let (conn, _) = legacy_audit_fixture();
+        for sql in [
+            "INSERT INTO issues VALUES ('a-2', 'unreadable', 'open', 2, 'task', \
+             '2026-01-01T00:00:00Z', 'not a timestamp')",
+            "CREATE TABLE labels (issue_id TEXT, label TEXT)",
+            "INSERT INTO labels VALUES ('missing-owner', 'orphan')",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let audit = audit_connection(&conn, Some(std::io::Cursor::new(Vec::<u8>::new())))
+            .expect("auditable identities with one unreadable payload");
+        assert_eq!(audit.db_only.len(), 2);
+        assert_eq!(audit.restorable.len(), 1);
+        assert_eq!(audit.restorable[0].issue.id, "a-1");
+        assert!(!audit.automatic_rebuild_allowed());
+        let refusal = require_lossless_rebuild(&audit, false).unwrap_err();
+        assert!(refusal.to_string().contains("unreadable"));
+        assert!(refusal.to_string().contains("1 recoverable database-only issue(s) (a-1)"));
+        assert!(refusal_error(&audit).to_string().contains("--discard-db-only"));
+        require_lossless_rebuild(&audit, true).expect("explicit authorization for unrestorable data");
+        let action = planned_action(&audit, true);
+        assert!(action.contains("re-add 1 database-only issue(s)"), "{action}");
+        assert!(
+            action.contains("1 unreadable or superseded database-only issue(s) kept only in the backup"),
+            "{action}"
+        );
+        assert!(action.contains("1 labels row(s) without an owning issue"), "{action}");
+    }
+
+    #[test]
+    fn discard_plan_still_restores_issues_when_no_data_is_unreadable() {
+        let (conn, _) = legacy_audit_fixture();
+        let audit = audit_connection(&conn, Some(std::io::Cursor::new(Vec::<u8>::new())))
+            .expect("recoverable database-only issue");
+        require_lossless_rebuild(&audit, false).unwrap();
+        require_lossless_rebuild(&audit, true).unwrap();
+        assert_eq!(planned_action(&audit, false), planned_action(&audit, true));
+        assert!(planned_action(&audit, true).contains("re-add 1 database-only issue(s)"));
+    }
+
+    #[test]
+    fn backup_only_notice_does_not_call_unreadable_payloads_superseded() {
+        let outcome = HealOutcome {
+            from_version: 4,
+            to_version: current_version(),
+            action: "rebuilt",
+            backup: "retained-backup".to_owned(),
+            restored_db_only: vec!["a-1".to_owned()],
+            backup_only_db_only: vec!["a-2".to_owned()],
+            backup_only_orphan_relations: Vec::new(),
+            migration_fallback_reason: None,
+        };
+        let notice = outcome.notice();
+        assert!(notice.contains("re-added 1 database-only issue(s)"));
+        assert!(notice.contains("1 database-only issue(s) not restored"));
+        assert!(!notice.contains("superseded"));
     }
 }
