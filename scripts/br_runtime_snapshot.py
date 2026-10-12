@@ -26,6 +26,9 @@ import sys
 import time
 
 SCHEMA = "br.runtime-snapshot.v1"
+SET_SCHEMA = "br.runtime-snapshot-set.v1"
+MAX_SET_MEMBERS = 64
+MEMBER_NAME = re.compile(r"[a-z][a-z0-9_-]{0,47}\Z")
 MANIFEST_LIMIT = 32 * 1024 * 1024
 MAX_ENTRIES = 100_000
 MAX_DEPTH = 64
@@ -251,7 +254,11 @@ def capture(source: Path, bundle: Path, *, writers_stopped: bool = False,
     platform_check()
     if not writers_stopped:
         raise SnapshotFailure("stop_all_tracker_users_and_pass_writers_stopped")
-    budget = Budget(timeout, max_bytes)
+    return _capture(source, bundle, Budget(timeout, max_bytes))
+
+
+def _capture(source: Path, bundle: Path, budget: Budget) -> dict:
+    """Internal capture sharing the caller's deadline and byte budget."""
     source, bundle = absolute(source), absolute(bundle)
     with directory(source) as root:
         before = inventory(root, budget)
@@ -417,6 +424,29 @@ def verify_materialized(data: int, entries: list[dict], budget: Budget) -> None:
         raise SnapshotFailure("materialized_directory_changed")
 
 
+def _populate_materialized(data: int, entries: list[dict], payload: int, budget: Budget) -> None:
+    """Copy and read back one complete family into an already-new directory."""
+    for record in entries[1:]:
+        budget.check()
+        path = bytes.fromhex(record["path_hex"])
+        parent_path, _, name = path.rpartition(b"/")
+        with member(data, parent_path, is_directory=True) as parent:
+            if record["kind"] == "directory":
+                os.mkdir(name, 0o700, dir_fd=parent)
+            else:
+                with member(payload, record["object"].encode()) as saved, new_file(parent, name) as restored:
+                    digest = stream(saved, record["size"], budget, restored)
+                    if digest != record["sha256"]:
+                        raise SnapshotFailure("payload_changed_during_materialization")
+            os.fsync(parent)
+    verify_materialized(data, entries, budget)
+    # Synchronize children before their directory entries/parents.
+    for record in reversed(entries):
+        if record["kind"] == "directory":
+            with member(data, bytes.fromhex(record["path_hex"]), is_directory=True) as child:
+                os.fsync(child)
+
+
 def materialize(bundle: Path, destination: Path, expected: str, *,
                 timeout: float = 300, max_bytes: int = 4 * 1024**3) -> dict:
     """Recover an indivisible snapshot to NEW private output, never a live tree.
@@ -438,25 +468,7 @@ def materialize(bundle: Path, destination: Path, expected: str, *,
             output = outputs.enter_context(external_output(destination, bundle, source))
             os.mkdir(b"data", 0o700, dir_fd=output)
             with member(output, b"data", is_directory=True) as data:
-                for record in entries[1:]:
-                    budget.check()
-                    path = bytes.fromhex(record["path_hex"])
-                    parent_path, _, name = path.rpartition(b"/")
-                    with member(data, parent_path, is_directory=True) as parent:
-                        if record["kind"] == "directory":
-                            os.mkdir(name, 0o700, dir_fd=parent)
-                        else:
-                            with member(payload, record["object"].encode()) as saved, new_file(parent, name) as restored:
-                                digest = stream(saved, record["size"], budget, restored)
-                                if digest != record["sha256"]:
-                                    raise SnapshotFailure("payload_changed_during_materialization")
-                        os.fsync(parent)
-                verify_materialized(data, entries, budget)
-                # Synchronize children before their directory entries/parents.
-                for record in reversed(entries):
-                    if record["kind"] == "directory":
-                        with member(data, bytes.fromhex(record["path_hex"]), is_directory=True) as child:
-                            os.fsync(child)
+                _populate_materialized(data, entries, payload, budget)
                 assert_bound(destination / "data", data)
         # Exit verified_bundle BEFORE publishing a success receipt.
         budget.check()
@@ -469,6 +481,262 @@ def materialize(bundle: Path, destination: Path, expected: str, *,
         with new_file(output, b"recovery.json") as receipt:
             write_all(receipt, encode_manifest(result))
     return result
+
+
+def _set_sources(sources: list[tuple[str, Path]]) -> list[tuple[str, Path]]:
+    """Require an explicit, unique, nonoverlapping set; never infer coverage."""
+    if not 1 <= len(sources) <= MAX_SET_MEMBERS:
+        raise SnapshotFailure("invalid_snapshot_set_size")
+    normalized = []
+    names = set()
+    for name, path in sources:
+        if not isinstance(name, str) or not MEMBER_NAME.fullmatch(name) or name in names:
+            raise SnapshotFailure("invalid_or_duplicate_member_name")
+        path = absolute(path)
+        if any(path == prior or path in prior.parents or prior in path.parents
+               for _, prior in normalized):
+            raise SnapshotFailure("snapshot_sources_overlap")
+        names.add(name)
+        normalized.append((name, path))
+    return sorted(normalized)
+
+
+def _check_set_totals(entry_count: int, byte_count: int, budget: Budget) -> None:
+    budget.check()
+    if entry_count > MAX_ENTRIES:
+        raise SnapshotFailure("inventory_limit_exceeded")
+    if byte_count > budget.max_bytes:
+        raise SnapshotFailure("byte_limit_exceeded")
+
+
+def capture_set(sources: list[tuple[str, Path]], bundle: Path, *,
+                writers_stopped: bool = False, timeout: float = 300,
+                max_bytes: int = 4 * 1024**3) -> dict:
+    """Capture selected metadata/external DB roots with one completion receipt.
+
+    Pin every source before copying any. Recheck ALL original identities and
+    bytes after the last member, not merely at each member's own completion.
+    Partial member bundles remain on error but no set receipt is published.
+    This still requires stopped users across the whole interval, not just for
+    each individual directory: the copies are not an atomic engine snapshot.
+    """
+    platform_check()
+    if not writers_stopped:
+        raise SnapshotFailure("stop_all_tracker_users_and_pass_writers_stopped")
+    budget = Budget(timeout, max_bytes)
+    sources = _set_sources(sources)
+    bundle = absolute(bundle)
+    with ExitStack() as handles:
+        pinned = []
+        seen_directories = set()
+        total_entries = total_bytes = 0
+        for name, path in sources:
+            root = handles.enter_context(directory(path))
+            before = inventory(root, budget)
+            directories = {witness[:2] for kind, witness in before.values() if kind == "directory"}
+            if directories & seen_directories:
+                raise SnapshotFailure("snapshot_sources_overlap")
+            seen_directories.update(directories)
+            total_entries += len(before)
+            total_bytes += sum(witness[4] for kind, witness in before.values() if kind == "file")
+            _check_set_totals(total_entries, total_bytes, budget)
+            pinned.append((name, path, root, before))
+
+        with external_output(bundle, *(path for _, path in sources)) as output:
+            os.mkdir(b"members", 0o700, dir_fd=output)
+            records = []
+            for name, path, root, before in pinned:
+                assert_bound(path, root)
+                if inventory(root, budget) != before:
+                    raise SnapshotFailure("source_changed")
+                receipt = _capture(path, bundle / "members" / name, budget)
+                records.append({"name": name, "source_path_hex": os.fsencode(path).hex(),
+                                "manifest_sha256": receipt["manifest_sha256"]})
+
+            # A member can change after its local capture. Revalidate the entire
+            # selected set before publishing its single completion marker.
+            with verified_set_members(bundle, records, budget) as saved:
+                for (_, path, root, before), (_, entries, _) in zip(pinned, saved):
+                    if inventory(root, budget) != before:
+                        raise SnapshotFailure("source_changed")
+                    verify_materialized(root, entries, budget)
+                    assert_bound(path, root)
+                for _, path, root, before in pinned:
+                    if inventory(root, budget) != before:
+                        raise SnapshotFailure("source_changed")
+                    assert_bound(path, root)
+            raw = encode_manifest({"schema": SET_SCHEMA, "quiescence": "operator_asserted",
+                                   "capture_atomic": False, "members": records})
+            budget.check()
+            with new_file(output, b"set.json") as manifest:
+                write_all(manifest, raw)
+    return {"status": "captured_set", "bundle": str(bundle),
+            "set_sha256": hashlib.sha256(raw).hexdigest(), "members": records,
+            "bytes": total_bytes, "entries": total_entries,
+            "quiescence": "operator_asserted", "capture_atomic": False,
+            "engine_validated": False}
+
+
+def _read_set(root: int, expected: str, budget: Budget) -> list[dict]:
+    if not isinstance(expected, str) or not DIGEST.fullmatch(expected):
+        raise SnapshotFailure("trusted_set_sha256_required")
+    with member(root, b"set.json") as file:
+        info = os.fstat(file)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > MANIFEST_LIMIT:
+            raise SnapshotFailure("invalid_set_manifest_file")
+        with os.fdopen(os.dup(file), "rb") as reader:
+            raw = reader.read(MANIFEST_LIMIT + 1)
+        if identity(os.fstat(file)) != identity(info):
+            raise SnapshotFailure("manifest_changed")
+    budget.check()
+    if hashlib.sha256(raw).hexdigest() != expected:
+        raise SnapshotFailure("set_digest_mismatch")
+    try:
+        document = json.loads(raw, object_pairs_hook=unique_members)
+        if (set(document) != {"schema", "quiescence", "capture_atomic", "members"}
+                or document["schema"] != SET_SCHEMA
+                or document["quiescence"] != "operator_asserted"
+                or document["capture_atomic"] is not False):
+            raise SnapshotFailure("invalid_snapshot_set")
+        records = document["members"]
+        if type(records) is not list or not 1 <= len(records) <= MAX_SET_MEMBERS:
+            raise SnapshotFailure("invalid_snapshot_set")
+        sources = []
+        for record in records:
+            budget.check()
+            if (set(record) != {"name", "source_path_hex", "manifest_sha256"}
+                    or not DIGEST.fullmatch(record["manifest_sha256"])):
+                raise SnapshotFailure("invalid_snapshot_set")
+            raw_path = bytes.fromhex(record["source_path_hex"])
+            source = Path(os.fsdecode(raw_path))
+            if (not source.is_absolute() or b"\0" in raw_path
+                    or record["source_path_hex"] != raw_path.hex()
+                    or os.fsencode(absolute(source)) != raw_path):
+                raise SnapshotFailure("invalid_snapshot_set_source")
+            sources.append((record["name"], source))
+        if _set_sources(sources) != sources:
+            raise SnapshotFailure("unordered_snapshot_set")
+        return records
+    except (KeyError, TypeError, ValueError, RecursionError) as error:
+        raise SnapshotFailure("invalid_snapshot_set") from error
+
+
+@contextmanager
+def verified_set_members(bundle: Path, records: list[dict], budget: Budget):
+    """Keep all member verifiers alive until the aggregate operation completes."""
+    with directory(bundle / "members") as members, ExitStack() as handles:
+        before = identity(os.fstat(members))
+        if set(directory_names(members, budget, len(records))) != {
+                record["name"].encode() for record in records}:
+            raise SnapshotFailure("snapshot_set_members_mismatch")
+        saved = []
+        total_entries = total_bytes = 0
+        for record in records:
+            path = bundle / "members" / record["name"]
+            entries, payload, source = handles.enter_context(
+                verified_bundle(path, record["manifest_sha256"], budget))
+            if os.fsencode(source).hex() != record["source_path_hex"]:
+                raise SnapshotFailure("snapshot_set_source_mismatch")
+            total_entries += len(entries)
+            total_bytes += sum(entry.get("size", 0) for entry in entries)
+            _check_set_totals(total_entries, total_bytes, budget)
+            saved.append((record, entries, payload))
+        # A later member's preflight must not hide a change to an earlier one.
+        # Finish this whole-set check BEFORE the caller may create output.
+        _verify_set_payloads(saved, budget)
+        yield saved
+        # An early member may have changed while a later member was processed.
+        # Check its bytes again before any aggregate receipt can be emitted.
+        _verify_set_payloads(saved, budget)
+        if identity(os.fstat(members)) != before:
+            raise SnapshotFailure("snapshot_set_changed")
+        assert_bound(bundle / "members", members)
+
+
+def _verify_set_payloads(saved: list, budget: Budget) -> None:
+    for _, entries, payload in saved:
+        for entry in entries:
+            if entry["kind"] == "file":
+                with member(payload, entry["object"].encode()) as file:
+                    if stream(file, entry["size"], budget) != entry["sha256"]:
+                        raise SnapshotFailure("payload_digest_mismatch")
+
+
+@contextmanager
+def verified_set(bundle: Path, expected: str, budget: Budget):
+    bundle = absolute(bundle)
+    with directory(bundle) as root:
+        before = identity(os.fstat(root))
+        if set(directory_names(root, budget, 2)) != {b"set.json", b"members"}:
+            raise SnapshotFailure("incomplete_or_unexpected_set_members")
+        records = _read_set(root, expected, budget)
+        with verified_set_members(bundle, records, budget) as saved:
+            yield saved
+        if _read_set(root, expected, budget) != records or identity(os.fstat(root)) != before:
+            raise SnapshotFailure("snapshot_set_changed")
+        assert_bound(bundle, root)
+
+
+def _set_result(status: str, expected: str, saved: list) -> dict:
+    return {"schema": SET_SCHEMA, "status": status, "set_sha256": expected,
+            "members": [{"name": record["name"], "source_path_hex": record["source_path_hex"],
+                         "files": sum(entry["kind"] == "file" for entry in entries),
+                         "bytes": sum(entry.get("size", 0) for entry in entries)}
+                        for record, entries, _ in saved],
+            "engine_validated": False, "capture_atomic": False,
+            "live_installation_performed": False}
+
+
+def verify_set(bundle: Path, expected: str, *, timeout: float = 300,
+               max_bytes: int = 4 * 1024**3) -> dict:
+    platform_check()
+    with verified_set(bundle, expected, Budget(timeout, max_bytes)) as saved:
+        result = _set_result("verified_set", expected, saved)
+    return result
+
+
+def materialize_set(bundle: Path, destination: Path, expected: str, *,
+                    timeout: float = 300, max_bytes: int = 4 * 1024**3) -> dict:
+    """Recover every selected root together, or publish no aggregate receipt."""
+    platform_check()
+    budget = Budget(timeout, max_bytes)
+    bundle, destination = absolute(bundle), absolute(destination)
+    with ExitStack() as outputs:
+        # Validate the complete set BEFORE creating any destination.
+        with verified_set(bundle, expected, budget) as saved:
+            sources = [Path(os.fsdecode(bytes.fromhex(record["source_path_hex"])))
+                       for record, _, _ in saved]
+            output = outputs.enter_context(external_output(destination, bundle, *sources))
+            os.mkdir(b"data", 0o700, dir_fd=output)
+            with member(output, b"data", is_directory=True) as data:
+                for record, entries, payload in saved:
+                    name = record["name"].encode()
+                    os.mkdir(name, 0o700, dir_fd=data)
+                    with member(data, name, is_directory=True) as restored:
+                        _populate_materialized(restored, entries, payload, budget)
+                # Recheck earlier outputs after all members have been written.
+                for record, entries, _ in saved:
+                    with member(data, record["name"].encode(), is_directory=True) as restored:
+                        verify_materialized(restored, entries, budget)
+                if set(directory_names(data, budget, len(saved))) != {
+                        record["name"].encode() for record, _, _ in saved}:
+                    raise SnapshotFailure("materialized_set_members_mismatch")
+                os.fsync(data)
+                assert_bound(destination / "data", data)
+            result = _set_result("materialized_set", expected, saved)
+            result.update(data_directory=str(destination / "data"), permissions="private_0700_0600")
+        # All member verifiers and the set verifier must finish before success.
+        budget.check()
+        with new_file(output, b"recovery.json") as receipt:
+            write_all(receipt, encode_manifest(result))
+    return result
+
+
+def _source_argument(value: str) -> tuple[str, Path]:
+    name, separator, path = value.partition("=")
+    if not separator or not path or not MEMBER_NAME.fullmatch(name):
+        raise argparse.ArgumentTypeError("expected lowercase-name=directory")
+    return name, Path(path)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -485,7 +753,18 @@ def main(argv: list[str] | None = None) -> int:
     restore.add_argument("bundle", type=Path)
     restore.add_argument("destination", type=Path)
     restore.add_argument("--manifest-sha256", required=True)
-    for command in (pack, check, restore):
+    pack_set = commands.add_parser("capture-set", help="capture all selected stopped roots as one set")
+    pack_set.add_argument("bundle", type=Path)
+    pack_set.add_argument("--source", type=_source_argument, action="append", required=True)
+    pack_set.add_argument("--writers-stopped", action="store_true")
+    check_set = commands.add_parser("verify-set", help="verify every member against one trusted set receipt")
+    check_set.add_argument("bundle", type=Path)
+    check_set.add_argument("--set-sha256", required=True)
+    restore_set = commands.add_parser("materialize-set", help="recover all selected roots to NEW output")
+    restore_set.add_argument("bundle", type=Path)
+    restore_set.add_argument("destination", type=Path)
+    restore_set.add_argument("--set-sha256", required=True)
+    for command in (pack, check, restore, pack_set, check_set, restore_set):
         command.add_argument("--timeout", type=float, default=300)
         command.add_argument("--max-bytes", type=int, default=4 * 1024**3)
     args = parser.parse_args(argv)
@@ -493,6 +772,12 @@ def main(argv: list[str] | None = None) -> int:
         options = {"timeout": args.timeout, "max_bytes": args.max_bytes}
         if args.command == "capture":
             result = capture(args.source, args.bundle, writers_stopped=args.writers_stopped, **options)
+        elif args.command == "capture-set":
+            result = capture_set(args.source, args.bundle, writers_stopped=args.writers_stopped, **options)
+        elif args.command == "verify-set":
+            result = verify_set(args.bundle, args.set_sha256, **options)
+        elif args.command == "materialize-set":
+            result = materialize_set(args.bundle, args.destination, args.set_sha256, **options)
         elif args.command == "materialize":
             result = materialize(args.bundle, args.destination, args.manifest_sha256, **options)
         else:

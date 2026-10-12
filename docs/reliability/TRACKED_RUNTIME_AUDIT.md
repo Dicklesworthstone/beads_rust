@@ -167,3 +167,69 @@ WAL-only rows; the recovered copies reopen with those rows and pass
 certificate sentinels prove byte preservation, not FrankenSQLite certificate
 validity. These tests never open production trackers and are not native
 FrankenSQLite, native `br`, or release qualification.
+
+## Complete sets for metadata plus external databases
+
+When a tracker uses more than one directory, use `capture-set`, `verify-set`,
+and `materialize-set`. They bind every **explicitly selected** root into one
+`br.runtime-snapshot-set.v1` manifest and one separately retained `set_sha256`.
+The tool does not discover omitted external databases or reachable remote clones.
+Supply every required local directory; each must contain its complete family.
+
+```sh
+python3 scripts/br_runtime_snapshot.py capture-set /private/backups/clone-b-set \
+  --source metadata=/path/to/clone-b/.beads \
+  --source database=/path/to/clone-b-cache \
+  --writers-stopped
+
+# Save set_sha256 outside the bundle, then use that exact receipt.
+python3 scripts/br_runtime_snapshot.py verify-set /private/backups/clone-b-set \
+  --set-sha256 "$SAVED_SET_SHA256"
+
+python3 scripts/br_runtime_snapshot.py materialize-set \
+  /private/backups/clone-b-set /private/backups/clone-b-set-recovered \
+  --set-sha256 "$SAVED_SET_SHA256"
+```
+
+Capture opens and inventories every selected source before creating output.
+After the last member is copied, it rechecks **all** original source identities,
+directory contents and bytes. A change to an earlier member invalidates the set
+even if that member's individual capture completed. Missing or overlapping
+sources, duplicate/unsafe names, links and aggregate budget overruns refuse the
+set. The 4 GiB default byte budget, 100,000-entry limit and cooperative deadline
+apply to the entire set rather than restarting for each member. At most 64
+members are permitted. Names use a lowercase letter followed by up to 47
+lowercase letters, digits, underscores or hyphens; output order is deterministic.
+
+A bundle has `members/<name>/` single-directory bundles and a `set.json`
+completion marker written only after the whole selected set passes. A failure
+can leave independently complete members, but these are **not** evidence that
+the complete set was preserved. Never synthesize a replacement set hash from
+an incomplete or untrusted bundle.
+
+Verification checks exact member membership, source bindings, manifest hashes
+and every payload. Materialization validates the complete set before creating
+output, recovers every selected root, and rechecks both early outputs and saved
+payloads after the last copy. The new destination contains `data/metadata/`,
+`data/database/` (using the selected names), and one `recovery.json` receipt only
+after all checks and data synchronization succeed. A late error preserves
+partial output without a success receipt; it never installs over a live root.
+
+The set is **not an atomic online snapshot**. `capture_atomic` remains false and
+`--writers-stopped` is still an operator assertion, not a lock. All selected
+users must remain stopped for the entire operation and subsequent controlled
+transition. Checks detect observed changes, not every concurrent filesystem
+race. This feature does not run Git/SQLite, stop remote users, install recovered
+directories, merge newly pulled shared state, or validate native certificates.
+
+```sh
+python3 -m unittest discover -s tests -p 'test_br_runtime_snapshot*.py' -v
+```
+
+Set regressions include a counterfactual in which independent captures both
+verify despite a between-capture source change, late source and destination
+changes, partial capture/recovery failures, aggregate limits, and an external
+stock-SQLite database containing committed WAL-only issues and audit events.
+Full recovery retains the rows and passes `integrity_check`; main-only and
+metadata-only controls cannot supply them. These results do not substitute for
+native `br`/FrankenSQLite or release qualification.
