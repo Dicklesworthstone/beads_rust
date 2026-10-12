@@ -359,8 +359,12 @@ def parse_manifest(raw: bytes, expected: str, budget: Budget) -> tuple[list[dict
                 if total > budget.max_bytes:
                     raise SnapshotFailure("byte_limit_exceeded")
             seen[path] = kind
-        source = Path(os.fsdecode(bytes.fromhex(document["source_path_hex"])))
-        return entries, absolute(source)
+        raw_source = bytes.fromhex(document["source_path_hex"])
+        source = absolute(Path(os.fsdecode(raw_source)))
+        if (b"\0" in raw_source or document["source_path_hex"] != raw_source.hex()
+                or os.fsencode(source) != raw_source):
+            raise SnapshotFailure("invalid_manifest_source")
+        return entries, source
     except (KeyError, TypeError, ValueError, RecursionError) as error:
         raise SnapshotFailure("invalid_manifest") from error
 
@@ -769,6 +773,191 @@ def materialize_set(bundle: Path, destination: Path, expected: str, *,
     return result
 
 
+def _pin_comparison_roots(items: list, handles: ExitStack, budget: Budget,
+                          *, recovered: bool) -> list:
+    """Pin every compared root before hashing any of them; never open an engine."""
+    _set_sources([(name, path) for name, path, _ in items])
+    opened = [(name, path, entries, handles.enter_context(directory(path)))
+              for name, path, entries in items]
+    pinned = []
+    directories = set()
+    total_entries = total_bytes = 0
+    for name, path, entries, root in opened:
+        before = inventory(root, budget)
+        identities = {info[:2] for kind, info in before.values() if kind == "directory"}
+        if directories & identities:
+            raise SnapshotFailure("comparison_roots_overlap")
+        directories.update(identities)
+        total_entries += len(before)
+        total_bytes += sum(info[4] for kind, info in before.values() if kind == "file")
+        _check_set_totals(total_entries, total_bytes, budget)
+        wanted = {bytes.fromhex(entry["path_hex"]): entry for entry in entries}
+        if before.keys() != wanted.keys():
+            raise SnapshotFailure(f"comparison_inventory_mismatch:{name}")
+        for leaf, record in wanted.items():
+            kind, info = before[leaf]
+            if kind != record["kind"]:
+                raise SnapshotFailure(f"comparison_kind_mismatch:{name}")
+            mode = (0o700 if kind == "directory" else 0o600) if recovered else record["mode"]
+            # Captures store rwx bits, not owners/ACLs/xattrs or special mode
+            # bits. Refuse special bits rather than silently certifying them.
+            if stat.S_IMODE(info[2]) != mode:
+                raise SnapshotFailure(f"comparison_permissions_mismatch:{name}")
+        pinned.append((name, path, entries, root, before))
+    return pinned
+
+
+def _hash_comparison_roots(pinned: list, budget: Budget) -> None:
+    for name, _path, entries, root, before in pinned:
+        for record in entries:
+            budget.check()
+            if record["kind"] == "file":
+                leaf = bytes.fromhex(record["path_hex"])
+                with member(root, leaf) as current:
+                    if identity(os.fstat(current)) != before[leaf][1]:
+                        raise SnapshotFailure(f"comparison_changed:{name}")
+                    if stream(current, record["size"], budget) != record["sha256"]:
+                        raise SnapshotFailure(f"comparison_digest_mismatch:{name}")
+
+
+def _finish_comparison(pinned: list, budget: Budget) -> None:
+    # Run AFTER the bundle verifiers have exited too. Their later reads must
+    # not conceal drift to an already-compared source or recovered member.
+    for name, path, _entries, root, before in pinned:
+        assert_bound(path, root)
+        if inventory(root, budget) != before:
+            raise SnapshotFailure(f"comparison_changed:{name}")
+        assert_bound(path, root)
+    budget.check()
+
+
+def _comparison_receipt(mode: str, expected: str, pinned: list, *, is_set: bool) -> dict:
+    return {"schema": "br.runtime-comparison.v1", "status": "matches_snapshot",
+            "compared": mode, "set_sha256" if is_set else "manifest_sha256": expected,
+            "members": [{"name": name, "path_hex": os.fsencode(path).hex(),
+                         "files": sum(entry["kind"] == "file" for entry in entries),
+                         "bytes": sum(entry.get("size", 0) for entry in entries)}
+                        for name, path, entries, _root, _before in pinned],
+            "comparison_atomic": False, "quiescence": "operator_asserted",
+            "capture_inode_continuity_verified": False, "engine_validated": False,
+            "source_writes_performed": False, "output_writes_performed": False,
+            "live_installation_performed": False}
+
+
+def check_sources(bundle: Path, expected: str, *, is_set: bool = False,
+                  writers_stopped: bool = False, timeout: float = 300,
+                  max_bytes: int = 4 * 1024**3) -> dict:
+    """Compare the recorded originals NOW, not just their valid saved copies.
+
+    Bind paths to the separately trusted manifest. Verify every saved payload
+    before following any source binding. Keep every original descriptor and
+    inventory until the bundle's final checks have completed. A match describes
+    bytes, kinds, names and rwx permissions, not continuous inode identity since
+    capture, engine validity, quiescence, or permission for a Git update.
+    """
+    platform_check()
+    if not writers_stopped:
+        raise SnapshotFailure("stop_all_tracker_users_and_pass_writers_stopped")
+    budget = Budget(timeout, max_bytes)
+    with ExitStack() as handles:
+        with ExitStack() as evidence:
+            if is_set:
+                saved = evidence.enter_context(verified_set(bundle, expected, budget))
+                items = [(record["name"], Path(os.fsdecode(bytes.fromhex(record["source_path_hex"]))), entries)
+                         for record, entries, _payload in saved]
+            else:
+                entries, _payload, source = evidence.enter_context(verified_bundle(bundle, expected, budget))
+                items = [("source", source, entries)]
+            pinned = _pin_comparison_roots(items, handles, budget, recovered=False)
+            _hash_comparison_roots(pinned, budget)
+        _finish_comparison(pinned, budget)
+        return _comparison_receipt("original_sources", expected, pinned, is_set=is_set)
+
+
+def _recovery_marker(root: int, expected_result: dict, budget: Budget) -> tuple[int, ...]:
+    """The recovery marker is checked, but never substitutes for hashing data."""
+    budget.check()
+    with member(root, b"recovery.json") as file:
+        info = os.fstat(file)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > MANIFEST_LIMIT:
+            raise SnapshotFailure("invalid_recovery_receipt")
+        with os.fdopen(os.dup(file), "rb") as reader:
+            raw = reader.read(MANIFEST_LIMIT + 1)
+        if identity(os.fstat(file)) != identity(info):
+            raise SnapshotFailure("recovery_receipt_changed")
+        try:
+            value = json.loads(raw, object_pairs_hook=unique_members)
+        except (ValueError, TypeError, RecursionError) as error:
+            raise SnapshotFailure("invalid_recovery_receipt") from error
+        if type(value) is not dict or encode_manifest(value) != encode_manifest(expected_result):
+            raise SnapshotFailure("recovery_receipt_mismatch")
+        if stat.S_IMODE(info.st_mode) != 0o600:
+            raise SnapshotFailure("recovery_receipt_permissions_mismatch")
+        budget.check()
+        return identity(info)
+
+
+def check_recovery(bundle: Path, destination: Path, expected: str, *,
+                   is_set: bool = False, writers_stopped: bool = False,
+                   timeout: float = 300, max_bytes: int = 4 * 1024**3) -> dict:
+    """Independently recheck previously materialized output without changing it.
+
+    The separately trusted bundle hash is mandatory. A recovery.json alone is
+    not trusted; derive its expected contents from verified saved evidence and
+    hash the full recovered namespace, including absence and empty directories.
+    Read only the named output, never the original source directories.
+    """
+    platform_check()
+    if not writers_stopped:
+        raise SnapshotFailure("stop_all_tracker_users_and_pass_writers_stopped")
+    budget = Budget(timeout, max_bytes)
+    destination = absolute(destination)
+    with ExitStack() as handles:
+        with ExitStack() as evidence:
+            if is_set:
+                saved = evidence.enter_context(verified_set(bundle, expected, budget))
+                items = [(record["name"], destination / "data" / record["name"], entries)
+                         for record, entries, _payload in saved]
+                result = _set_result("materialized_set", expected, saved)
+                result.update(data_directory=str(destination / "data"), permissions="private_0700_0600")
+            else:
+                entries, _payload, _source = evidence.enter_context(verified_bundle(bundle, expected, budget))
+                items = [("source", destination / "data", entries)]
+                result = {"schema": "br.runtime-materialization.v1", "status": "materialized",
+                          "manifest_sha256": expected, "data_directory": str(destination / "data"),
+                          "files": sum(record["kind"] == "file" for record in entries),
+                          "bytes": sum(record.get("size", 0) for record in entries),
+                          "permissions": "private_0700_0600", "engine_validated": False,
+                          "live_installation_performed": False}
+            root = handles.enter_context(directory(destination))
+            root_before = identity(os.fstat(root))
+            if stat.S_IMODE(root_before[2]) != 0o700:
+                raise SnapshotFailure("recovery_directory_permissions_mismatch")
+            if set(directory_names(root, budget, 2)) != {b"data", b"recovery.json"}:
+                raise SnapshotFailure("recovery_inventory_mismatch")
+            marker_before = _recovery_marker(root, result, budget)
+            if is_set:
+                data = handles.enter_context(member(root, b"data", is_directory=True))
+                data_before = identity(os.fstat(data))
+                if stat.S_IMODE(data_before[2]) != 0o700:
+                    raise SnapshotFailure("recovery_directory_permissions_mismatch")
+                if set(directory_names(data, budget, len(items))) != {name.encode() for name, _, _ in items}:
+                    raise SnapshotFailure("recovery_set_members_mismatch")
+            pinned = _pin_comparison_roots(items, handles, budget, recovered=True)
+            _hash_comparison_roots(pinned, budget)
+        if _recovery_marker(root, result, budget) != marker_before:
+            raise SnapshotFailure("recovery_receipt_changed")
+        if identity(os.fstat(root)) != root_before:
+            raise SnapshotFailure("recovery_directory_changed")
+        assert_bound(destination, root)
+        if is_set:
+            if identity(os.fstat(data)) != data_before:
+                raise SnapshotFailure("recovery_directory_changed")
+            assert_bound(destination / "data", data)
+        _finish_comparison(pinned, budget)
+        return _comparison_receipt("recovered_directories", expected, pinned, is_set=is_set)
+
+
 def _source_argument(value: str) -> tuple[str, Path]:
     name, separator, path = value.partition("=")
     if not separator or not path or not MEMBER_NAME.fullmatch(name):
@@ -801,7 +990,16 @@ def main(argv: list[str] | None = None) -> int:
     restore_set.add_argument("bundle", type=Path)
     restore_set.add_argument("destination", type=Path)
     restore_set.add_argument("--set-sha256", required=True)
-    for command in (pack, check, restore, pack_set, check_set, restore_set):
+    comparisons = []
+    for name in ("check-source", "check-source-set", "check-recovery", "check-recovery-set"):
+        command = commands.add_parser(name, help="compare current stopped directories to trusted saved evidence")
+        command.add_argument("bundle", type=Path)
+        if name.startswith("check-recovery"):
+            command.add_argument("destination", type=Path)
+        command.add_argument("--set-sha256" if name.endswith("-set") else "--manifest-sha256", required=True)
+        command.add_argument("--writers-stopped", action="store_true")
+        comparisons.append(command)
+    for command in (pack, check, restore, pack_set, check_set, restore_set, *comparisons):
         command.add_argument("--timeout", type=float, default=300)
         command.add_argument("--max-bytes", type=int, default=4 * 1024**3)
     args = parser.parse_args(argv)
@@ -817,11 +1015,22 @@ def main(argv: list[str] | None = None) -> int:
             result = materialize_set(args.bundle, args.destination, args.set_sha256, **options)
         elif args.command == "materialize":
             result = materialize(args.bundle, args.destination, args.manifest_sha256, **options)
+        elif args.command.startswith("check-"):
+            is_set = args.command.endswith("-set")
+            expected = args.set_sha256 if is_set else args.manifest_sha256
+            options.update(is_set=is_set, writers_stopped=args.writers_stopped)
+            if args.command.startswith("check-source"):
+                result = check_sources(args.bundle, expected, **options)
+            else:
+                result = check_recovery(args.bundle, args.destination, expected, **options)
         else:
             result = verify(args.bundle, args.manifest_sha256, **options)
     except (SnapshotFailure, OSError) as error:
-        print(json.dumps({"status": "refused_or_incomplete", "reason": str(error),
-                          "source_writes_performed": False, "partial_output_retained": True}, ensure_ascii=True))
+        failure = {"status": "refused_or_incomplete", "reason": str(error),
+                   "source_writes_performed": False, "partial_output_retained": True}
+        if args.command.startswith("check-"):
+            failure.update(output_writes_performed=False, partial_output_retained=False)
+        print(json.dumps(failure, ensure_ascii=True))
         return 2
     print(json.dumps(result, indent=2, ensure_ascii=True))
     return 0

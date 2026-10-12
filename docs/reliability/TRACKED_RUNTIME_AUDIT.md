@@ -233,3 +233,72 @@ stock-SQLite database containing committed WAL-only issues and audit events.
 Full recovery retains the rows and passes `integrity_check`; main-only and
 metadata-only controls cannot supply them. These results do not substitute for
 native `br`/FrankenSQLite or release qualification.
+
+
+## Check originals before updating, and recovered copies before installation
+
+A successful `verify` or `verify-set` establishes the saved bundle's contents,
+not whether new work has appeared in its original directories since capture.
+Likewise, an existing `recovery.json` does not establish that recovered files
+have remained intact. Use the independent read-only comparisons at those two
+boundaries, retaining the original trusted hash separately:
+
+```sh
+# All tracker users must remain stopped. Compare the original bound paths NOW.
+python3 scripts/br_runtime_snapshot.py check-source-set /private/backups/clone-b-set \
+  --set-sha256 "$SAVED_SET_SHA256" --writers-stopped
+
+# After materialize-set, independently compare ALL recovered members.
+python3 scripts/br_runtime_snapshot.py check-recovery-set \
+  /private/backups/clone-b-set /private/backups/clone-b-set-recovered \
+  --set-sha256 "$SAVED_SET_SHA256" --writers-stopped
+
+# The equivalent checks for a single-directory bundle:
+python3 scripts/br_runtime_snapshot.py check-source /private/backups/clone-b-before \
+  --manifest-sha256 "$SAVED_SHA256" --writers-stopped
+python3 scripts/br_runtime_snapshot.py check-recovery \
+  /private/backups/clone-b-before /private/backups/clone-b-recovered \
+  --manifest-sha256 "$SAVED_SHA256" --writers-stopped
+```
+
+Both checks validate the entire saved bundle before opening compared directories.
+`check-source[-set]` uses the source paths bound to that trusted bundle; it does
+not let a different directory substitute for a changed or missing original.
+It checks every filename, file/directory kind, empty directory, file byte and
+recorded rwx permission bit. Added, missing, changed or unreadable members fail
+closed. A mismatch means the old snapshot does not cover the current originals:
+keep users stopped and capture a new complete set before reconsidering the
+transition. After an intentional Git change, a source mismatch is expected and
+must not be worked around by rewriting a trusted manifest or its hash.
+
+`check-recovery[-set]` validates the completed materialization wrapper and its
+receipt against the trusted bundle, then independently hashes the whole recovered
+namespace. It requires private 0700 directory and 0600 file permissions. It does
+not read the original sources, which may legitimately be absent after an update.
+Wrong or missing receipts, extra members, changed payloads and partial output
+are refused; a plausible receipt alone is never evidence of complete recovery.
+A relocated materialization whose receipt names the old destination is refused;
+materialize again into a fresh destination instead of editing its receipt.
+
+Every compared root stays open across the complete operation. Before reporting
+success, all inventories and current path identities are rechecked, including
+after the saved bundle's final verification. This detects observed changes to
+an early member while later members are read. Aggregate byte/entry limits and
+one cooperative deadline cover the whole selected set. Existing snapshots,
+outputs and sources are never modified; normal filesystem access-time updates
+may still occur on reads. The checks do not create new on-disk receipts.
+
+Exit 0 emits `br.runtime-comparison.v1` with `status: "matches_snapshot"`, the
+trusted hash and member counts. Exit 2 indicates refusal or incomplete evidence,
+never a partial match. A match describes bytes, names, kinds and permissions at
+this observation; it does **not** attest continuous inode identity since capture,
+ACLs, ownership, xattrs, timestamps, database health or native certificate validity.
+Same-byte original replacements can match, and the receipt explicitly sets
+`capture_inode_continuity_verified: false`. Special permission bits are refused
+rather than certified from manifests that only record rwx bits.
+
+These comparisons are not atomic, locks, online backup, an untracking protocol,
+or authorization to install over a live database. All users must remain stopped
+through the separately controlled transition, and native engine validation of a
+recovered generation remains necessary. A matching selected set says nothing
+about omitted external databases or remote clones.
