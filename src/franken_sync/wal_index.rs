@@ -1206,6 +1206,10 @@ pub mod tests {
             }
             fs::write(sidecar(&db, "-shm"), changed).unwrap();
             assert!(!stock_empty_probe(&db, true).unwrap(), "{label}");
+            if offset == 40 {
+                assert!(poisoned_index_present_for_engine(&db, true).unwrap());
+                assert!(stale_index_present_for_engine(&db, true).unwrap());
+            }
         }
 
         // Any WAL byte past the header (a frame, or part of one) makes the

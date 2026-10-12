@@ -337,12 +337,10 @@ fn wal_index_quarantine_count(workspace: &BrWorkspace) -> usize {
         .count()
 }
 
-/// An ordinary command still rebuilds the stock SQLite index in place, after
-/// which reads take the engine's own path again. FrankenSQLite 0.4.7 reads
-/// through that index but refuses the first commit through it, so writes keep
-/// this index-only recovery.
+/// GH#555: an ordinary write binds stock's valid empty index in place. It
+/// must not quarantine it or retain a recovery family after every bv read.
 #[test]
-fn ordinary_command_rebuilds_a_stock_sqlite_index() {
+fn ordinary_command_accepts_a_stock_sqlite_index_without_recovery() {
     let workspace = settled_workspace();
     let installed = install_stock_sqlite_index(&workspace);
     let create = run_br(&workspace, ["create", "after the SQLite reader"], "create");
@@ -355,43 +353,10 @@ fn ordinary_command_rebuilds_a_stock_sqlite_index() {
     let rebuilt = fs::read(beads_file(&workspace, "beads.db-shm")).expect("rebuilt -shm");
     assert_ne!(rebuilt[..96], installed[..96], "the live index was rebuilt");
 
-    // The WAL held no frames, so the index was all recovery had to rebuild:
-    // the run retains that index and its receipts, not two copies of the
-    // whole database (a backup plus a private rehearsal).
-    assert_eq!(migration_run_count(&workspace), 1);
-    let run = fs::read_dir(beads_file(&workspace, ".br_recovery/schema-migrations"))
-        .expect("runs")
-        .next()
-        .expect("one run")
-        .expect("run entry")
-        .path();
-    let mut retained: Vec<String> = fs::read_dir(run.join("recovery-before"))
-        .expect("retained pre-state")
-        .map(|entry| {
-            entry
-                .expect("entry")
-                .file_name()
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect();
-    retained.sort();
-    assert_eq!(retained, ["beads.db-shm"]);
-    assert_eq!(
-        fs::read(run.join("recovery-before/beads.db-shm")).expect("retained index"),
-        installed,
-        "the retained index is the one the SQLite reader left"
-    );
-    assert!(!run.join("recovery-probe").exists());
-    let receipt: Value = serde_json::from_slice(
-        &fs::read(run.join("recovery-complete.json")).expect("completion receipt"),
-    )
-    .expect("receipt JSON");
-    assert_eq!(receipt["backup_scope"], "wal-index-only");
-    assert_eq!(receipt["stage"], "complete");
-    assert_eq!(receipt["logical_after"]["integrity_check"], "ok");
+    assert_eq!(migration_run_count(&workspace), 0);
+    assert_eq!(wal_index_quarantine_count(&workspace), 0);
 
-    // Another stock SQLite read and write repeats the cheap path.
+    // Another stock SQLite read and write must also avoid recovery.
     let second = install_stock_sqlite_index(&workspace);
     let again = run_br(
         &workspace,
@@ -399,7 +364,7 @@ fn ordinary_command_rebuilds_a_stock_sqlite_index() {
         "create_again",
     );
     assert!(again.status.success(), "{} {}", again.stdout, again.stderr);
-    assert_eq!(migration_run_count(&workspace), 2);
+    assert_eq!(migration_run_count(&workspace), 0);
     assert_ne!(
         fs::read(beads_file(&workspace, "beads.db-shm")).expect("rebuilt -shm")[..96],
         second[..96]
@@ -423,25 +388,79 @@ fn ordinary_command_rebuilds_a_stock_sqlite_index() {
         "{titles:?}"
     );
 
-    // Each rebuild set the live index aside once, and marked it finished so
-    // retention can remove it once it is old enough.
-    let quarantines: Vec<PathBuf> = fs::read_dir(workspace.root.join(".beads"))
-        .expect(".beads")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with(".br-wal-index-"))
+    assert_eq!(wal_index_quarantine_count(&workspace), 0);
+}
+
+/// Run the reporter's CLI sequence with bv's modernc SQLite driver, rather
+/// than installing synthetic headers. Keep metadata and certificate sidecars
+/// at their real paths and require each read to preserve durable bytes.
+#[test]
+#[ignore = "requires BR_TEST_BV_BIN pointing to a built bv"]
+fn repeated_bv_robot_reads_do_not_trigger_br_recovery_gh555() {
+    let bv = std::env::var_os("BR_TEST_BV_BIN").expect("BR_TEST_BV_BIN");
+    let workspace = settled_workspace();
+    let db = beads_file(&workspace, "beads.db");
+    let protected = || {
+        [
+            "beads.db",
+            "beads.db-wal",
+            "beads.db-wal-cert",
+            "beads.db-wal-cert-head",
+        ]
+        .map(|name| match fs::read(beads_file(&workspace, name)) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("read {name}: {error}"),
         })
-        .collect();
-    assert_eq!(quarantines.len(), 2, "{quarantines:?}");
-    for quarantine in &quarantines {
+    };
+    for index in 0..12 {
+        let before = protected();
+        let read = std::process::Command::new(&bv)
+            .args(["--db", db.to_str().unwrap(), "--robot-next"])
+            .current_dir(&workspace.root)
+            .env("BEADS_DIR", workspace.root.join(".beads"))
+            .output()
+            .expect("run bv");
         assert!(
-            quarantine.join("quarantine-complete.json").is_file(),
-            "{}",
-            quarantine.display()
+            read.status.success(),
+            "bv: {}",
+            String::from_utf8_lossy(&read.stderr)
         );
+        let next: Value = serde_json::from_slice(&read.stdout).expect("bv robot JSON");
+        assert!(
+            next["id"].is_string(),
+            "bv must select a live issue: {next}"
+        );
+        assert_eq!(protected(), before, "bv must not change durable payloads");
+        let titles = listed_titles(
+            &workspace,
+            &["list", "--all", "--json"],
+            &format!("bv_list_{index}"),
+        );
+        assert_eq!(
+            titles.len(),
+            index + 1,
+            "every previous write remains visible"
+        );
+        let title = format!("after bv read {index}");
+        let create = run_br(
+            &workspace,
+            ["create", &title],
+            &format!("bv_create_{index}"),
+        );
+        assert!(
+            create.status.success(),
+            "{} {}",
+            create.stdout,
+            create.stderr
+        );
+        assert_eq!(migration_run_count(&workspace), 0);
+        assert_eq!(wal_index_quarantine_count(&workspace), 0);
     }
+    assert_eq!(
+        listed_titles(&workspace, &["list", "--all", "--json"], "bv_final").len(),
+        13
+    );
 }
 
 /// Index damage outside the shapes read-only commands read around (#507,

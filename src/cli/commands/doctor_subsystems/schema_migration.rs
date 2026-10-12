@@ -1008,13 +1008,13 @@ const RECOVERY_SUPERSEDED_RECEIPT: &str = "recovery-superseded.json";
 const PRUNING_PREFIX: &str = ".pruning-";
 
 /// Whether recovery only has to rebuild the WAL index: the index has the
-/// zero-page shape stock SQLite leaves on a family whose WAL holds no frames
-/// (#507), the WAL is its bare 32-byte header, and there is no rollback
+/// malformed zero-page shape (#507), the WAL is its bare 32-byte header, and
+/// there is no rollback
 /// journal. The main database file is then the entire committed state, and
 /// rebuilding the index cannot change it, so copying the whole family (twice:
 /// backup and private rehearsal) on every such recovery bought nothing but
-/// disk use. That happened after every stock SQLite read of the tracker (bv,
-/// the sqlite3 shell).
+/// disk use. Stock's checksum-valid empty index no longer enters recovery
+/// at all: the pinned engine binds it on the first write (GH #555).
 fn index_only_recovery_applies(db_path: &Path, raw_before: &RawFamilyWitness) -> Result<bool> {
     let wal = component_for_suffix(raw_before, "-wal")?;
     let shm = component_for_suffix(raw_before, "-shm")?;
@@ -6104,14 +6104,11 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let db = temp.path().join("beads.db");
         crate::franken_sync::wal_index::tests::write_stock_header_only_family(&db);
-        // Only reads go through stock SQLite's empty index on FrankenSQLite
-        // 0.4.7 (GH#431); the first commit still needs it rebuilt.
-        assert!(wal_index_needs_recovery_for_engine(&db, true).unwrap());
+        // GH#443 admits commits too: stock's empty index is valid on both
+        // platform models and must not trigger GH#555's recovery loop.
+        assert!(!wal_index_needs_recovery_for_engine(&db, true).unwrap());
         assert!(!wal_index_needs_recovery_for_engine(&db, false).unwrap());
-        assert_eq!(
-            wal_index_needs_recovery(&db).unwrap(),
-            crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY
-        );
+        assert!(!wal_index_needs_recovery(&db).unwrap());
 
         // Same split for a complete WAL whose index file is absent.
         let shm = family_component_path(&db, "-shm");

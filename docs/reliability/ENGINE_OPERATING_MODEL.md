@@ -137,6 +137,16 @@ disposable numeric UIDs/GID without modifying system accounts.
 
 ### Missing shared WAL index at startup
 
+Stock SQLite readers, including `bv`, may update `-shm` even with `mode=ro`
+and `query_only=1`. A checksum-valid initialized empty index beside a
+header-only WAL is valid SQLite state (GH #555). The pinned engine binds it
+to the WAL generation on its first write under SQLite WAL locks (upstream
+GH #443); br does not quarantine it or start automatic recovery. An invalid
+checksum or any WAL bytes beyond the header do not receive this exemption.
+Never restore old `-shm` bytes over a live reader's locks or use `immutable=1`
+on the live tracker: those approaches can invalidate reader state or hide
+new WAL commits.
+
 Ordinary startup can reconstruct a missing `-shm` index for an existing WAL
 family before inspecting pending sync-merge metadata. It holds database-family
 write authority and an exclusive opener lease, retains a complete backup, and
