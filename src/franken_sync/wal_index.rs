@@ -9,6 +9,8 @@
 //!
 //! A read-only open only reports an advisory diagnosis. BusyRecovery by itself,
 //! differing salts, and a missing/short index are NOT quarantine authority.
+//! Neither is stock SQLite's checksummed empty index beside a header-only WAL:
+//! the pinned engine admits it and binds its first write normally (GH #555).
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek, Write};
@@ -205,7 +207,11 @@ fn probe_for_engine(path: &Path, engine_reads_on_disk_index: bool) -> io::Result
     let Some(shm) = prefix::<96>(&sidecar(path, "-shm"))? else {
         return Ok(false);
     };
-    Ok(poisoned_headers(&wal, &shm))
+    // Stock readers legitimately leave this checksummed, unbound index when
+    // the WAL has no frames. The pinned engine handles its first write now.
+    // This probe is advisory; quarantine rechecks the exemption under locks
+    // using the retained WAL descriptor before it can rename anything.
+    Ok(poisoned_headers(&wal, &shm) && !stock_empty_probe(path, engine_reads_on_disk_index)?)
 }
 
 pub fn poisoned_index_present(path: &Path) -> io::Result<bool> {
@@ -260,10 +266,10 @@ fn stock_empty_probe(path: &Path, engine_reads_on_disk_index: bool) -> io::Resul
 /// Whether the index beside `path` is stock SQLite's unindexed empty index
 /// beside a header-only WAL: #507's shape as every stock reader of the
 /// tracker (bv, the sqlite3 shell) leaves it. FrankenSQLite 0.4.6+ admits it
-/// for reads (fsqlite GH#431), so read-only commands read the live family
-/// instead of a private snapshot. The first commit through that index still
-/// fails with `BusyRecovery` on 0.4.7, so writable startup keeps rebuilding
-/// it ([`poisoned_index_present`] matches it too).
+/// for reads (fsqlite GH#431). The pinned 0.4.10 also carries GH#443's first
+/// commit fix, so neither read-only snapshots nor writable quarantine are
+/// needed for this valid state (br GH#555). Leave normal WAL locking and
+/// generation binding to the engine, not an application-level SHM rewrite.
 ///
 /// # Errors
 /// Returns an error when a family member exists but cannot be read.
@@ -330,6 +336,11 @@ fn stale_probe_for_engine(path: &Path, engine_reads_on_disk_index: bool) -> io::
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
+    // Do not round a partial first frame down to an empty WAL. Only exactly
+    // 32 bytes can exempt the valid stock header from the stale-index path.
+    if wal_len == 32 && unindexed_empty_headers(&wal, &shm) {
+        return Ok(false);
+    }
     let wal_frames = wal_len.saturating_sub(32) / (u64::from(page_size) + 24);
     Ok(stale_headers(&wal, &shm, wal_frames))
 }
@@ -529,7 +540,11 @@ pub(super) fn quarantine_poisoned_index(
     let mut shm_headers = [0; 96];
     wal.read_exact(&mut wal_header)?;
     shm.read_exact(&mut shm_headers)?;
-    if !poisoned_headers(&wal_header, &shm_headers) {
+    // Recheck using the locked family's retained descriptors: a stock reader
+    // may have initialized a valid empty index since the advisory probe.
+    if !poisoned_headers(&wal_header, &shm_headers)
+        || (wal.metadata()?.len() == 32 && unindexed_empty_headers(&wal_header, &shm_headers))
+    {
         return Ok(false);
     }
     validate_wal(&mut locked.file, &mut wal)?;
@@ -1177,7 +1192,8 @@ pub mod tests {
         assert!(!stock_empty_probe(&db, true).unwrap());
 
         fs::write(sidecar(&db, "-shm"), stock_empty_index()).unwrap();
-        assert!(poisoned_index_present_for_engine(&db, true).unwrap());
+        assert!(!poisoned_index_present_for_engine(&db, true).unwrap());
+        assert!(!stale_probe_for_engine(&db, true).unwrap());
         assert!(stock_empty_probe(&db, true).unwrap());
         // Where the engine keeps its index in memory, nothing is classified.
         assert!(!stock_empty_probe(&db, false).unwrap());
@@ -1199,9 +1215,52 @@ pub mod tests {
         wal.push(0);
         fs::write(sidecar(&db, "-wal"), &wal).unwrap();
         assert!(poisoned_index_present_for_engine(&db, true).unwrap());
+        assert!(stale_probe_for_engine(&db, true).unwrap());
+        assert!(!stock_empty_probe(&db, true).unwrap());
+        fs::write(sidecar(&db, "-wal"), one_frame_wal(true, false)).unwrap();
+        assert!(poisoned_index_present_for_engine(&db, true).unwrap());
+        assert!(stale_probe_for_engine(&db, true).unwrap());
         assert!(!stock_empty_probe(&db, true).unwrap());
         fs::remove_file(sidecar(&db, "-wal")).unwrap();
         assert!(!stock_empty_probe(&db, true).unwrap());
+    }
+
+    #[test]
+    fn stock_empty_index_is_not_quarantined_even_with_a_live_namespace() {
+        let (temp, db, id) = fixture();
+        fs::write(sidecar(&db, "-shm"), stock_empty_index()).unwrap();
+        let before = payload(&db);
+        let _peer =
+            PendingNamespaceOpen::begin(&db, NamespaceOpenIntent::ReservedExclusive).unwrap();
+        // A valid index must not even request the exclusive recovery locks,
+        // let alone replace an index a live reader may have mapped.
+        for _ in 0..12 {
+            assert!(!quarantine_poisoned_index(db.to_str().unwrap(), id).unwrap());
+            assert_eq!(payload(&db), before);
+        }
+        assert!(fs::read_dir(temp.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(QUARANTINE_PREFIX)
+        }));
+    }
+
+    #[test]
+    fn stock_empty_exemption_handles_wal_byte_order_and_page_sizes() {
+        let (_temp, db, _) = fixture();
+        fs::write(sidecar(&db, "-shm"), stock_empty_index()).unwrap();
+        for big_endian in [false, true] {
+            for size in [512, 4096, 65_536] {
+                fs::write(sidecar(&db, "-wal"), wal_header(size, big_endian)).unwrap();
+                assert!(!probe_for_engine(&db, true).unwrap());
+                assert!(!stale_probe_for_engine(&db, true).unwrap());
+            }
+        }
+        fs::write(sidecar(&db, "-shm"), poison()).unwrap();
+        assert!(probe_for_engine(&db, true).unwrap());
+        assert!(stale_probe_for_engine(&db, true).unwrap());
     }
 
     #[test]
@@ -1618,17 +1677,12 @@ pub mod tests {
         main[16..18].copy_from_slice(&4096_u16.to_be_bytes());
         fs::write(db, main).unwrap();
         fs::write(sidecar(db, "-wal"), wal_header(4096, false)).unwrap();
-        fs::write(sidecar(db, "-shm"), stock_sqlite_header_only_index()).unwrap();
+        fs::write(sidecar(db, "-shm"), stock_empty_index()).unwrap();
     }
 
-    /// The engine's reaction to the index stock SQLite writes beside a
-    /// header-only WAL, on a real database. fsqlite 0.4.4 refused it
-    /// read-only with `BusyRecovery`; 0.4.6+ admits it for reads
-    /// (Dicklesworthstone/frankensqlite#431), so read-only commands no longer
-    /// copy the family. On 0.4.7 the first commit through it still fails
-    /// with `BusyRecovery`, which is why writable startup keeps rebuilding
-    /// it. When the engine starts accepting that commit, this test still
-    /// passes and the startup recovery for this shape becomes removable.
+    /// The pinned engine must admit both reads and the first write through
+    /// stock's unindexed empty header (fsqlite GH#431/GH#443, br GH#555).
+    /// BusyRecovery is no longer an acceptable outcome for this valid state.
     #[cfg(unix)]
     #[test]
     fn engine_reaction_to_stock_header_only_index() {
@@ -1645,7 +1699,7 @@ pub mod tests {
             // A full 32 KiB region as stock leaves it: the header copies,
             // then reader mark 0 at zero and marks 1..=4 unused.
             let mut shm = vec![0_u8; 32 * 1024];
-            shm[..96].copy_from_slice(&stock_sqlite_header_only_index());
+            shm[..96].copy_from_slice(&stock_empty_index());
             shm[104..120].fill(0xFF);
             fs::write(sidecar(&db, "-shm"), shm).unwrap();
         };
@@ -1655,9 +1709,7 @@ pub mod tests {
         };
 
         install_stock_family();
-        if cfg!(target_endian = "little") {
-            assert!(stock_empty_index_present(&db).unwrap());
-        }
+        assert!(stock_empty_index_present(&db).unwrap());
         let read_only = crate::franken_sync::compat::open_with_flags(
             &path,
             crate::franken_sync::compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -1666,23 +1718,18 @@ pub mod tests {
         assert_eq!(count(&read_only).unwrap(), Some(1));
         read_only.close().unwrap();
 
-        // A writable open reads through it too; its first commit either
-        // lands (a future engine) or is refused as recovery, never lost.
+        // A writable open must bind the first commit, without quarantine.
         install_stock_family();
         let conn = crate::franken_sync::Connection::open(path.clone()).unwrap();
         assert_eq!(count(&conn).unwrap(), Some(1));
-        let expected = match conn.execute("INSERT INTO t VALUES (2)") {
-            Ok(_) => Some(2),
-            Err(FrankenError::BusyRecovery) => Some(1),
-            Err(error) => panic!("commit through the stock index failed otherwise: {error:?}"),
-        };
-        let _ = conn.close();
+        conn.execute("INSERT INTO t VALUES (2)").unwrap();
+        conn.close().unwrap();
         let read_only = crate::franken_sync::compat::open_with_flags(
             &path,
             crate::franken_sync::compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .unwrap();
-        assert_eq!(count(&read_only).unwrap(), expected);
+        assert_eq!(count(&read_only).unwrap(), Some(2));
         read_only.close().unwrap();
     }
 
@@ -1691,6 +1738,10 @@ pub mod tests {
         let temp = tempfile::tempdir().unwrap();
         let db = temp.path().join("beads.db");
         write_stock_header_only_family(&db);
+        assert!(!probe_for_engine(&db, true).unwrap());
+        // Preserve the platform negative control with an actually malformed
+        // index, not the valid stock empty header now admitted on Unix too.
+        fs::write(sidecar(&db, "-shm"), poison()).unwrap();
         let before = payload(&db);
         // An engine that maps -shm (Unix) reads these bytes: #507 unchanged.
         assert!(probe_for_engine(&db, true).unwrap());
