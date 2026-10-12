@@ -398,6 +398,14 @@ fn ordinary_command_accepts_a_stock_sqlite_index_without_recovery() {
 #[ignore = "requires BR_TEST_BV_BIN pointing to a built bv"]
 fn repeated_bv_robot_reads_do_not_trigger_br_recovery_gh555() {
     let bv = std::env::var_os("BR_TEST_BV_BIN").expect("BR_TEST_BV_BIN");
+    // bv verifies its claim route by resolving br through PATH. Pin that
+    // lookup to this Cargo build, even when no br is installed globally.
+    let br = PathBuf::from(env!("CARGO_BIN_EXE_br"));
+    let mut search_paths = vec![br.parent().expect("br binary directory").to_path_buf()];
+    search_paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let viewer_path = std::env::join_paths(search_paths).expect("viewer PATH");
     let workspace = settled_workspace();
     let db = beads_file(&workspace, "beads.db");
     let protected = || {
@@ -419,6 +427,7 @@ fn repeated_bv_robot_reads_do_not_trigger_br_recovery_gh555() {
             .args(["--db", db.to_str().unwrap(), "--robot-next"])
             .current_dir(&workspace.root)
             .env("BEADS_DIR", workspace.root.join(".beads"))
+            .env("PATH", &viewer_path)
             .output()
             .expect("run bv");
         assert!(

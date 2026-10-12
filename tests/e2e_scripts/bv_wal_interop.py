@@ -180,6 +180,11 @@ class Scenario:
         self.db = root / ".beads/beads.db"
         self.env = {key: value for key, value in os.environ.items()
                     if not key.startswith(("BR_", "BV_", "BD_", "BEADS_", "GIT_"))}
+        # bv validates its br claim route through PATH. Use the exact binary
+        # under test, not an absent or older independently installed br.
+        self.env["PATH"] = os.pathsep.join((str(Path(br).resolve().parent),
+                                           str(Path(bv).resolve().parent),
+                                           self.env.get("PATH", "")))
         self.env.update(HOME=str(root / "home"), XDG_CONFIG_HOME=str(root / "home/config"),
                         BEADS_DIR=str(self.db.parent), GIT_CONFIG_NOSYSTEM="1",
                         TERM="xterm-256color", CI="1", BV_TEST_MODE="1", BV_THEME="dark")

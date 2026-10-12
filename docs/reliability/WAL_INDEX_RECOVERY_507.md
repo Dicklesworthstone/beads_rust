@@ -93,6 +93,31 @@ GitHub cloning was blocked in the environment. No GitHub Actions runs were
 present for the initial fix/test commits when checked. This distinction is
 intentional; the added cross-product regression is not reported as passing.
 
+Follow-up binary validation on 2026-10-12 passed against the rebuilt br
+source tree and bv v0.25.2. The br package still reports 0.7.4, but this build
+links the pinned FrankenSQLite 0.4.10, rather than the released 0.7.4 binary's
+0.4.7. The build disabled only the optional self-update feature and used a
+lower-memory Asupersync compilation profile after repeated compiler OOMs.
+
+The released binary reproduced twelve quarantines in twelve independent
+viewer-reader/write cycles, a quarantine with the actual bv TUI open, and
+the reporter's exact SHM hash in three additional CLI cycles. The rebuilt
+binary passed `bv_wal_interop.py` with twelve CLI and twelve TUI update cycles,
+zero recovery directories, observed CLI/TUI freshness, two concurrent
+main-file/WAL snapshots that stayed stable until renewed, and `integrity_check`
+equal to `ok`. The viewer's br subprocess tests also passed with the race
+detector for both repeated and persistent readers, including a pinned
+transaction during a br commit; its real TUI test passed eight read/write
+cycles. Viewer build, vet, and datasource race tests passed.
+
+Negative CLI controls retained the safety boundary: malformed index
+checksums and legacy zero indexes recovered without losing either issue,
+while a partial WAL tail refused the write without changing main, WAL, or
+certificate bytes. Rust all-target compilation checking passed, as did
+production library/CLI Clippy with warnings denied and self-update disabled.
+These are bounded binary regressions, not a claim that the complete Rust
+runtime test suite was run.
+
 ## Implemented containment
 
 The existing `br doctor migrate-schema recover` workflow already holds br
