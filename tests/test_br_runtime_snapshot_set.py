@@ -466,6 +466,126 @@ class SnapshotSetTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(result["status"], "materialized_set")
 
+    def change_manifest_in_place(self, path):
+        # Keep valid JSON, length, inode, and parent-directory metadata. Merely
+        # checking the directory cannot notice this broken trusted receipt.
+        before = snapshot.identity(path.parent.stat())
+        info = path.stat()
+        with path.open("r+b") as file:
+            file.seek(-1, os.SEEK_END)
+            file.write(b" ")
+        self.assertEqual(snapshot.identity(path.parent.stat()), before)
+        self.assertEqual((path.stat().st_ino, path.stat().st_size), (info.st_ino, info.st_size))
+
+    def manifest_drift_during_preflight(self, materialize):
+        receipt = self.capture()
+        before = self.source_witnesses()
+        original = snapshot.verified_bundle
+        changed = []
+
+        @contextlib.contextmanager
+        def change_later(bundle, expected, budget):
+            with original(bundle, expected, budget) as verified:
+                if bundle.name == "metadata":
+                    self.change_manifest_in_place(self.bundle / "members" / "database" / "manifest.json")
+                    changed.append(True)
+                yield verified
+
+        with mock.patch.object(snapshot, "verified_bundle", side_effect=change_later):
+            with self.assertRaisesRegex(snapshot.SnapshotFailure, "manifest"):
+                if materialize:
+                    snapshot.materialize_set(self.bundle, self.output, receipt["set_sha256"])
+                else:
+                    snapshot.verify_set(self.bundle, receipt["set_sha256"])
+        self.assertEqual(changed, [True])
+        self.assertFalse(self.output.exists(), "manifest drift during preflight must precede output")
+        self.assertEqual(before, self.source_witnesses())
+
+    def test_evidence_verify_set_rechecks_manifest_after_later_member_preflight(self):
+        self.manifest_drift_during_preflight(False)
+
+    def test_evidence_materialize_set_rechecks_manifest_before_any_output(self):
+        self.manifest_drift_during_preflight(True)
+
+    def test_evidence_single_materialization_rejects_manifest_drift_during_copy(self):
+        receipt = snapshot.capture(self.database, self.bundle, writers_stopped=True)
+        before = self.source_witnesses()
+        original = snapshot._populate_materialized
+        changed = []
+
+        def change(data, entries, payload, budget):
+            original(data, entries, payload, budget)
+            self.change_manifest_in_place(self.bundle / "manifest.json")
+            changed.append(True)
+
+        with mock.patch.object(snapshot, "_populate_materialized", side_effect=change):
+            with self.assertRaisesRegex(snapshot.SnapshotFailure, "manifest"):
+                snapshot.materialize(self.bundle, self.output, receipt["manifest_sha256"])
+        self.assertEqual(changed, [True])
+        self.assertTrue((self.output / "data").is_dir())
+        self.assertFalse((self.output / "recovery.json").exists())
+        self.assertEqual(before, self.source_witnesses())
+
+    def test_evidence_single_verification_rechecks_early_payload_after_last_object(self):
+        receipt = snapshot.capture(self.database, self.bundle, writers_stopped=True)
+        before = self.source_witnesses()
+        entries = json.loads((self.bundle / "manifest.json").read_bytes())["entries"]
+        objects = [self.bundle / "payload" / entry["object"]
+                   for entry in entries if entry["kind"] == "file"]
+        last = snapshot.identity(objects[-1].stat())[:2]
+        original = snapshot.stream
+        changed = []
+
+        def change(file, size, budget, destination=None):
+            result = original(file, size, budget, destination)
+            if snapshot.identity(os.fstat(file))[:2] == last and not changed:
+                objects[0].write_bytes(b"X" * objects[0].stat().st_size)
+                changed.append(True)
+            return result
+
+        with mock.patch.object(snapshot, "stream", side_effect=change):
+            with self.assertRaisesRegex(snapshot.SnapshotFailure, "payload"):
+                snapshot.verify(self.bundle, receipt["manifest_sha256"])
+        self.assertEqual(changed, [True])
+        self.assertEqual(before, self.source_witnesses())
+
+    def test_evidence_set_materialization_rejects_member_manifest_drift_during_copy(self):
+        receipt = self.capture()
+        before = self.source_witnesses()
+        original = snapshot._populate_materialized
+        calls = []
+
+        def change(data, entries, payload, budget):
+            original(data, entries, payload, budget)
+            calls.append(True)
+            if len(calls) == 2:
+                self.change_manifest_in_place(self.bundle / "members" / "database" / "manifest.json")
+
+        with mock.patch.object(snapshot, "_populate_materialized", side_effect=change):
+            with self.assertRaisesRegex(snapshot.SnapshotFailure, "manifest"):
+                snapshot.materialize_set(self.bundle, self.output, receipt["set_sha256"])
+        self.assertEqual(len(calls), 2)
+        self.assertFalse((self.output / "recovery.json").exists())
+        self.assertEqual(before, self.source_witnesses())
+
+    def test_evidence_set_capture_rejects_member_manifest_drift_before_completion(self):
+        before = self.source_witnesses()
+        original = snapshot.verify_materialized
+        calls = []
+
+        def change(data, entries, budget):
+            original(data, entries, budget)
+            calls.append(True)
+            if len(calls) == 2:
+                self.change_manifest_in_place(self.bundle / "members" / "database" / "manifest.json")
+
+        with mock.patch.object(snapshot, "verify_materialized", side_effect=change):
+            with self.assertRaisesRegex(snapshot.SnapshotFailure, "manifest"):
+                self.capture()
+        self.assertEqual(len(calls), 2)
+        self.assertFalse((self.bundle / "set.json").exists())
+        self.assertEqual(before, self.source_witnesses())
+
     def test_real_wal_only_external_database_roundtrip_and_metadata_only_negative(self):
         # Entirely separate stopped writer: opening the database in the tool
         # would be an error. Only the independent test driver uses SQLite.

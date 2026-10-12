@@ -365,6 +365,32 @@ def parse_manifest(raw: bytes, expected: str, budget: Budget) -> tuple[list[dict
         raise SnapshotFailure("invalid_manifest") from error
 
 
+def _verify_manifest_digest(root: int, expected: str, budget: Budget) -> tuple[int, ...]:
+    """Recheck the actual completion marker, not its parent directory alone."""
+    with member(root, b"manifest.json") as file:
+        info = os.fstat(file)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > MANIFEST_LIMIT:
+            raise SnapshotFailure("invalid_manifest_file")
+        if stream(file, info.st_size, budget) != expected:
+            raise SnapshotFailure("manifest_digest_mismatch")
+        return identity(info)
+
+
+def _check_bundle_evidence(root: int, payload: int, expected: str,
+                           manifest_identity: tuple[int, ...], objects: dict,
+                           budget: Budget) -> None:
+    if _verify_manifest_digest(root, expected, budget) != manifest_identity:
+        raise SnapshotFailure("manifest_changed")
+    # File content writes need not change directory metadata. Pin every hashed
+    # object's identity/content metadata and recheck after the last read and
+    # after the consumer. This detects observed drift, not arbitrary races.
+    for name, before in objects.items():
+        budget.check()
+        with member(payload, name) as saved:
+            if identity(os.fstat(saved)) != before:
+                raise SnapshotFailure("payload_changed")
+
+
 @contextmanager
 def verified_bundle(bundle: Path, expected: str, budget: Budget):
     with directory(bundle) as root:
@@ -379,19 +405,26 @@ def verified_bundle(bundle: Path, expected: str, budget: Budget):
                 raw = reader.read(MANIFEST_LIMIT + 1)
             if identity(os.fstat(file)) != identity(info):
                 raise SnapshotFailure("manifest_changed")
+        manifest_identity = identity(info)
         entries, source = parse_manifest(raw, expected, budget)
         with member(root, b"payload", is_directory=True) as payload:
             payload_before = identity(os.fstat(payload))
             objects = {record["object"] for record in entries if record["kind"] == "file"}
             if set(directory_names(payload, budget, len(objects))) != {name.encode() for name in objects}:
                 raise SnapshotFailure("payload_inventory_mismatch")
+            object_identities = {}
             for record in entries:
                 if record["kind"] == "file":
                     with member(payload, record["object"].encode()) as saved:
+                        object_identities[record["object"].encode()] = identity(os.fstat(saved))
                         if stream(saved, record["size"], budget) != record["sha256"]:
                             raise SnapshotFailure("payload_digest_mismatch")
+            _check_bundle_evidence(root, payload, expected, manifest_identity, object_identities, budget)
+            if identity(os.fstat(root)) != before or identity(os.fstat(payload)) != payload_before:
+                raise SnapshotFailure("bundle_changed")
+            assert_bound(absolute(bundle), root)
             yield entries, payload, source
-            budget.check()
+            _check_bundle_evidence(root, payload, expected, manifest_identity, object_identities, budget)
             if identity(os.fstat(root)) != before or identity(os.fstat(payload)) != payload_before:
                 raise SnapshotFailure("bundle_changed")
         assert_bound(absolute(bundle), root)
@@ -643,18 +676,22 @@ def verified_set_members(bundle: Path, records: list[dict], budget: Budget):
             saved.append((record, entries, payload))
         # A later member's preflight must not hide a change to an earlier one.
         # Finish this whole-set check BEFORE the caller may create output.
-        _verify_set_payloads(saved, budget)
+        _verify_set_payloads(saved, budget, members)
         yield saved
         # An early member may have changed while a later member was processed.
         # Check its bytes again before any aggregate receipt can be emitted.
-        _verify_set_payloads(saved, budget)
+        _verify_set_payloads(saved, budget, members)
         if identity(os.fstat(members)) != before:
             raise SnapshotFailure("snapshot_set_changed")
         assert_bound(bundle / "members", members)
 
 
-def _verify_set_payloads(saved: list, budget: Budget) -> None:
-    for _, entries, payload in saved:
+def _verify_set_payloads(saved: list, budget: Budget, members: int) -> None:
+    for record, entries, payload in saved:
+        # A member's manifest can be edited in place while a later member is
+        # checked. Reject that during aggregate preflight, before any output.
+        with member(members, record["name"].encode(), is_directory=True) as root:
+            _verify_manifest_digest(root, record["manifest_sha256"], budget)
         for entry in entries:
             if entry["kind"] == "file":
                 with member(payload, entry["object"].encode()) as file:
