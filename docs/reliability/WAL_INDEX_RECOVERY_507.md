@@ -15,18 +15,83 @@ engine sequence still requires an interruption reproducer.
 
 Stock SQLite writes the same zero-page header, with a valid checksum, whenever
 it is the first connection to a family whose WAL is only its 32-byte header,
-so every stock reader of the tracker (bv, the sqlite3 shell) leaves it behind.
+so stock readers of the tracker (bv, the sqlite3 shell) can leave it behind.
 FrankenSQLite 0.4.6+ admits that exact shape for reads (fsqlite GH#431,
-`e85717e0a`), so since the 0.4.7 bump read-only commands read the live family
-through it (`stock_empty_index_present` keeps it out of the private-snapshot
-fallback). The first commit through it still fails with `BusyRecovery` on
-0.4.7, so writable startup keeps the index-only recovery for it. The poison
-beside a WAL that holds frames, or without a valid stock checksum, is
-unchanged and takes every path below.
+`e85717e0a`). The first commit still failed with `BusyRecovery` on 0.4.7, which
+was why br retained writable quarantine after enabling live read-only access.
+The pinned 0.4.10 also includes fsqlite GH#443's first-commit fix: this valid
+empty index now needs neither a private read snapshot nor application-level
+quarantine. br's poison and stale probes exclude it, and the operative
+quarantine path repeats the exclusion under its existing locks using the
+retained WAL descriptor. A WAL containing even one byte past the header, or
+an index without a valid native-order checksum, does not get this exemption.
 
 The index contains regenerable state. Committed, unexported records can remain
 in the WAL. Never discard the WAL or rebuild from an older JSONL snapshot to
 work around this admission failure.
+
+## bv interoperability (#555)
+
+The reported reader-produced index is valid stock SQLite state, not proof of
+corruption. With a checksummed header-only WAL, 12 independent stock SQLite
+3.46.1 read-only opens reproduced the reporter's complete 32768-byte SHM hash:
+
+```
+fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb
+```
+
+Both index-header copies agree and their native-order checksums validate.
+Main database and WAL bytes stayed unchanged. A stock writer subsequently
+committed through the index while a reader retained its old snapshot; a new
+read saw the commit. These are stock-SQLite observations, not a claim that a
+br build was executed in the authoring environment.
+
+The viewer already uses `mode=ro` and per-connection `query_only(1)`. These
+protect logical database contents, not immutable SHM bytes. Leave the live
+SQLite reader in place. Do not use `immutable=1`, restore saved SHM bytes,
+copy a live main file without its consistent WAL, or redirect to stale JSONL.
+Normal engine WAL locking and first-frame generation binding must remain in
+charge. The checksummed empty-header exemption does not authorize rewriting
+SHM, bypass pending merges, or weaken the strict corrupt-WAL recovery guards.
+
+Regression coverage:
+
+- `franken_sync::wal_index::tests` distinguishes the valid empty index from
+  malformed checksums and frame-bearing/partial WALs, covers both WAL checksum
+  byte orders and 512/4096/65536-byte pages, refuses unnecessary quarantine
+  even with a live namespace, and requires the first engine commit to succeed.
+  The old test no longer accepts `BusyRecovery` as an alternative success.
+- In beads_viewer, `TestSQLiteWALReaderInteroperability` uses the actual
+  `NewSQLiteReader` against zero-byte and header-only WALs, repeating reads
+  and testing a persistent reader, WAL-only updates, snapshot isolation,
+  rejected viewer writes, SHM inode preservation, and integrity.
+- `tests/e2e_scripts/bv_wal_interop.py` requires actual br and bv binaries.
+  It exercises repeated `bv --robot-next` reads, subsequent br reads/writes,
+  a real interactive bv in a PTY with observed title refreshes, concurrent
+  processes pinning main-file and WAL snapshots, and writes after TUI exit.
+  The fixture is never exported to JSONL. It requires zero quarantines and
+  retains its workspace, command log, terminal transcript, and receipt.
+  Missing prerequisites fail rather than silently skip.
+
+Run after building the changed repositories:
+
+```sh
+rch exec -- cargo test --lib franken_sync::wal_index::tests
+# In the beads_viewer checkout:
+go test ./internal/datasource -run TestSQLiteWALReaderInteroperability -count=12
+go test -race ./internal/datasource -run TestSQLiteWALReaderInteroperability
+# In the beads_rust checkout, with the freshly built binaries:
+python3 tests/e2e_scripts/bv_wal_interop.py --br /absolute/path/br --bv /absolute/path/bv
+```
+
+Validation at authoring: the independent 12-read stock-SQLite reproducer,
+cross-process harness support checks with 12 stock writes and two pinned
+snapshots, PTY handshake/shutdown, Python compilation, and Go formatting
+checks passed. The full Rust/Go repository tests and the actual br/bv binary
+scenario were not run: Rust/RCH and those binaries were unavailable, and
+GitHub cloning was blocked in the environment. No GitHub Actions runs were
+present for the initial fix/test commits when checked. This distinction is
+intentional; the added cross-product regression is not reported as passing.
 
 ## Implemented containment
 
@@ -39,11 +104,12 @@ index as well as on the live one.
 
 The sync bridge now adds a narrowly gated preflight to that identity-bound
 writable open. Only the exact duplicate initialized, zero-page signature beside
-a valid WAL header qualifies; `BusyRecovery` alone never does. The preflight
-runs before opening the poisoned family, avoiding dependence on cleanup of a
-partially failed engine admission. Ordinary and read-only opens remain
-non-repairing; they can log `WAL_INDEX_POISONED` without changing the error type
-or bypassing pending-merge checks.
+a valid WAL header qualifies, excluding the valid empty state above;
+`BusyRecovery` alone never does. The preflight runs before opening the poisoned
+family, avoiding dependence on cleanup of a partially failed engine admission.
+Ordinary and read-only opens remain non-repairing; they can log
+`WAL_INDEX_POISONED` without changing the error type or bypassing pending-merge
+checks.
 
 Before quarantining any index, the preflight:
 
@@ -141,12 +207,14 @@ remain unexecuted in this environment; no passing-Rust-test claim is made.
 
 ## Remaining engine work
 
-This containment makes the explicit recovery entry point capable of dealing
-with the reported cache signature; it does not claim to prevent the engine
-from producing that signature. The durable upstream repair should publish only
-a fully valid initialized WAL-index header and perform canonical reconstruction
-from the committed WAL prefix under the engine's recovery locks. Read-only
-observation must not be converted into an implicit writer.
+The normal stock empty-index state is handled by the pinned engine's GH#443
+fix. For genuinely malformed indexes, this containment makes the explicit
+recovery entry point capable of dealing with the reported cache signature;
+it does not claim to prevent the engine from producing malformed indexes.
+The durable upstream repair should publish only a fully valid initialized
+WAL-index header and perform canonical reconstruction from the committed WAL
+prefix under the engine's recovery locks. Read-only observation must not be
+converted into an implicit writer.
 
 The migration VACUUM path also needs fault-injection coverage at source open,
 VACUUM INTO, source close, candidate maintenance, and candidate installation.
@@ -158,9 +226,9 @@ artifact sweep or upstream dependency change is part of this containment.
 
 ## Doctor routing
 
-`br doctor` and generic doctor mutation refusal detect #507's exact bounded WAL/index signature without opening the engine. They report `wal_index_state=initialized_zero_page_poison`, name `br doctor migrate-schema recover`, and explicitly keep generic `doctor --repair` fail-closed so WAL-only data cannot be replaced from stale JSONL.
+`br doctor` and generic doctor mutation refusal detect #507's exact bounded WAL/index signature, excluding the valid stock empty state, without opening the engine. They report `wal_index_state=initialized_zero_page_poison`, name `br doctor migrate-schema recover`, and explicitly keep generic `doctor --repair` fail-closed so WAL-only data cannot be replaced from stale JSONL.
 
 
 ## Automatic writable startup recovery
 
-Writable startup now treats the exact initialized-zero-page poison the same way it already treats a missing WAL index: before pending-merge inspection or storage open, it acquires database-family authority and a verified sole-opener lease, runs the full private recovery rehearsal, preserves main/WAL/journal bytes, and then re-runs the actual pending-merge gate. Observational read-only commands remain non-mutating. A recovered index never clears or bypasses pending merge metadata; the mutation is still refused when that durable gate is present.
+Writable startup now treats the exact initialized-zero-page poison, excluding the valid stock empty state, the same way it already treats a missing WAL index: before pending-merge inspection or storage open, it acquires database-family authority and a verified sole-opener lease, runs the full private recovery rehearsal, preserves main/WAL/journal bytes, and then re-runs the actual pending-merge gate. Observational read-only commands remain non-mutating. A recovered index never clears or bypasses pending merge metadata; the mutation is still refused when that durable gate is present.
