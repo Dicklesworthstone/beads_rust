@@ -179,8 +179,9 @@ class Scenario:
         self.root, self.br, self.bv, self.timeout = root, br, bv, timeout
         self.db = root / ".beads/beads.db"
         self.env = {key: value for key, value in os.environ.items()
-                    if not key.startswith(("BR_", "BV_", "BD_", "BEADS_"))}
+                    if not key.startswith(("BR_", "BV_", "BD_", "BEADS_", "GIT_"))}
         self.env.update(HOME=str(root / "home"), XDG_CONFIG_HOME=str(root / "home/config"),
+                        BEADS_DIR=str(self.db.parent), GIT_CONFIG_NOSYSTEM="1",
                         TERM="xterm-256color", CI="1", BV_TEST_MODE="1", BV_THEME="dark")
         (root / "home/config").mkdir(parents=True)
         self.serial = 0
@@ -198,7 +199,10 @@ class Scenario:
         return json.loads(result.stdout) if parse else result.stdout.strip()
 
     def command(self, *args: str):
-        return self.run([self.br, *args, "--json", "--no-auto-import", "--no-auto-flush"])
+        # TMPDIR can itself live inside another tracked repository. Never let
+        # init or later mutations discover a parent tracker or inherit its DB.
+        return self.run([self.br, "--db", str(self.db), "--no-auto-import",
+                         "--no-auto-flush", *args, "--json"])
 
     def protected(self) -> dict[str, str | None]:
         paths = [self.db, Path(str(self.db) + "-wal"), Path(str(self.db) + "-journal"),
@@ -227,19 +231,33 @@ class Scenario:
         self.no_quarantine()
 
 
+def checksum(data: bytes, byteorder: str) -> tuple[int, int]:
+    require(len(data) % 8 == 0, "invalid checksum input length")
+    a = b = 0
+    for i in range(0, len(data), 8):
+        a = (a + int.from_bytes(data[i:i + 4], byteorder) + b) & 0xffffffff
+        b = (b + int.from_bytes(data[i + 4:i + 8], byteorder) + a) & 0xffffffff
+    return a, b
+
+
 def check_empty_index(db: Path) -> str:
     wal = Path(str(db) + "-wal").read_bytes()
     require(len(wal) == 32, f"fixture must exercise a header-only WAL, got {len(wal)} bytes")
+    magic, version, page_size = struct.unpack(">III", wal[:12])
+    require(magic in (0x377f0682, 0x377f0683) and version == 3007000,
+            "fixture WAL header has an unsupported format")
+    require(512 <= page_size <= 65536 and page_size & (page_size - 1) == 0,
+            "fixture WAL page size is invalid")
+    order = "big" if magic & 1 else "little"
+    require(checksum(wal[:24], order) == struct.unpack(">II", wal[24:32]),
+            "fixture WAL header checksum is invalid")
     shm = Path(str(db) + "-shm").read_bytes()
     require(len(shm) >= 136 and shm[:48] == shm[48:96], "index headers are not settled")
     require(int.from_bytes(shm[:4], sys.byteorder) == 3007000 and shm[12] == 1,
             "index is not stock's initialized header")
     require(shm[14:40] == bytes(26), "reader did not produce the unindexed empty header")
-    a = b = 0
-    for i in range(0, 40, 8):
-        a = (a + int.from_bytes(shm[i:i + 4], sys.byteorder) + b) & 0xffffffff
-        b = (b + int.from_bytes(shm[i + 4:i + 8], sys.byteorder) + a) & 0xffffffff
-    require((a, b) == struct.unpack("=II", shm[40:48]), "stock header checksum is invalid")
+    require(checksum(shm[:40], sys.byteorder) == struct.unpack("=II", shm[40:48]),
+            "stock header checksum is invalid")
     return hashlib.sha256(shm).hexdigest()
 
 
