@@ -26,7 +26,9 @@
 #
 set -euo pipefail
 umask 022
-shopt -s lastpipe 2>/dev/null || true
+# Do not enable `shopt -s lastpipe`: no loop here needs it (they read via process
+# substitution), and Bash 5.2.21 can crash in append_process with it enabled
+# (mcp_agent_mail_rust#342).
 
 # ============================================================================
 # Curl|bash self-protection: re-download and re-exec from an on-disk copy
