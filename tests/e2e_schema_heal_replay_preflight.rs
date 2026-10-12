@@ -4,13 +4,17 @@
 
 mod common;
 
-use beads_rust::franken_sync::Connection;
+use beads_rust::franken_sync::{Connection, SqliteValue};
 use common::cli::{BrWorkspace, run_br};
 use flate2::read::GzDecoder;
 use serde_json::Value;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+
+const LOCAL_CONTEXT: &str = "{\"constraints\":[\"keep governing instructions\"]}";
+const LOCAL_PATH: &str = "/original/legacy/workspace";
+const LOCAL_PREREQUISITES: &str = "- [ ] Review before implementation";
 
 fn fixture(workspace: &BrWorkspace) -> PathBuf {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/schema_migration");
@@ -29,6 +33,25 @@ fn fixture(workspace: &BrWorkspace) -> PathBuf {
     .unwrap();
     fs::write(beads.join("config.yaml"), "issue_prefix: leg\n").unwrap();
     let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+    // Extend the released fixture with later legacy payload columns while
+    // retaining the pre-reviewed schema marker. The schema-agnostic rebuild
+    // must preserve these values rather than silently projecting them away.
+    let columns = conn.query("PRAGMA table_info(issues)").unwrap();
+    for column in ["agent_context", "source_repo_path", "prerequisites"] {
+        if !columns
+            .iter()
+            .any(|row| row.get(1).and_then(SqliteValue::as_text) == Some(column))
+        {
+            conn.execute(&format!("ALTER TABLE issues ADD COLUMN {column} TEXT"))
+                .unwrap();
+        }
+    }
+    conn.execute(&format!(
+        "UPDATE issues SET agent_context = '{LOCAL_CONTEXT}', \
+         source_repo_path = '{LOCAL_PATH}', prerequisites = '{LOCAL_PREREQUISITES}' \
+         WHERE id = 'leg-u4i'"
+    ))
+    .unwrap();
     for sql in [
         "UPDATE issues SET external_ref = 'replay-conflict' WHERE id = 'leg-u4i'",
         "INSERT INTO labels (issue_id, label) VALUES ('leg-u4i', 'preserve-local')",
@@ -124,6 +147,27 @@ fn show(workspace: &BrWorkspace, id: &str) -> Value {
     json(&result.stdout)[0].clone()
 }
 
+fn assert_stored_governance(db: &Path) {
+    let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+    let rows = conn
+        .query(
+            "SELECT agent_context, source_repo_path, prerequisites \
+             FROM issues WHERE id = 'leg-u4i'",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get(0).and_then(SqliteValue::as_text),
+        Some(LOCAL_CONTEXT)
+    );
+    assert_eq!(rows[0].get(1).and_then(SqliteValue::as_text), Some(LOCAL_PATH));
+    assert_eq!(
+        rows[0].get(2).and_then(SqliteValue::as_text),
+        Some(LOCAL_PREREQUISITES)
+    );
+    conn.close().unwrap();
+}
+
 #[test]
 fn resolving_the_conflict_allows_a_lossless_retry_and_export() {
     let workspace = BrWorkspace::new();
@@ -146,6 +190,7 @@ fn resolving_the_conflict_allows_a_lossless_retry_and_export() {
         header_version(&db),
         u32::try_from(beads_rust::storage::schema::CURRENT_SCHEMA_VERSION).unwrap()
     );
+    assert_stored_governance(&db);
     let local = show(&workspace, "leg-u4i");
     assert_eq!(local["title"], "Unflushed legacy issue");
     assert_eq!(local["external_ref"], "replay-conflict");
@@ -168,6 +213,13 @@ fn resolving_the_conflict_allows_a_lossless_retry_and_export() {
     assert_eq!(local["labels"], serde_json::json!(["preserve-local"]));
     assert_eq!(local["comments"][0]["text"], "preserve this comment");
     assert_eq!(local["dependencies"][0]["depends_on_id"], "leg-n57");
+    assert_eq!(local["agent_context"], LOCAL_CONTEXT);
+    assert_eq!(local["prerequisites"], LOCAL_PREREQUISITES);
+    assert!(
+        local.get("source_repo_path").is_none(),
+        "machine-local paths stay local"
+    );
+    assert_stored_governance(&db);
     let upstream = rows.iter().find(|row| row["id"] == "leg-n57").unwrap();
     assert_eq!(upstream["title"], "Superseding upstream title");
 }

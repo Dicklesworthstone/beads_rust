@@ -43,6 +43,7 @@ impl RebuildWitness {
                 )));
             }
         }
+        self.verify_local_provenance(storage)?;
         let dirty: BTreeSet<String> = storage
             .execute_raw_query("SELECT issue_id FROM dirty_issues")?
             .iter()
@@ -67,6 +68,49 @@ impl RebuildWitness {
         if integrity.len() != 1 || !integrity[0].eq_ignore_ascii_case("ok") {
             return Err(BeadsError::Config(format!(
                 "schema-heal preservation failed: rebuilt integrity is not clean: {integrity:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Local provenance is not a cross-clone sync key. Read the actual SQL
+    /// column rather than relying on an export projection to retain it.
+    fn verify_local_provenance(&self, storage: &SqliteStorage) -> Result<()> {
+        let expected: BTreeMap<&str, &str> = self
+            .issues
+            .iter()
+            .filter(|(id, _)| self.restored_ids.contains(*id))
+            .filter_map(|(id, issue)| {
+                issue
+                    .source_repo_path
+                    .as_deref()
+                    .map(|path| (id.as_str(), path))
+            })
+            .collect();
+        if expected.is_empty() {
+            // An absent local value makes no claim about an imported value.
+            return Ok(());
+        }
+        let mut unseen: BTreeSet<&str> = expected.keys().copied().collect();
+        for row in storage.execute_raw_query("SELECT id, source_repo_path FROM issues")? {
+            let id = row.first().and_then(|value| value.as_text()).ok_or_else(|| {
+                BeadsError::Config(
+                    "schema-heal preservation failed: unreadable provenance issue ID".to_owned(),
+                )
+            })?;
+            let Some(path) = expected.get(id) else {
+                continue;
+            };
+            if row.get(1).and_then(|value| value.as_text()) != Some(*path) {
+                return Err(BeadsError::Config(format!(
+                    "schema-heal preservation failed: restored issue {id} lost its local source_repo_path"
+                )));
+            }
+            unseen.remove(id);
+        }
+        if !unseen.is_empty() {
+            return Err(BeadsError::Config(format!(
+                "schema-heal preservation failed: restored provenance rows are missing: {unseen:?}"
             )));
         }
         Ok(())
@@ -255,6 +299,8 @@ mod tests {
         let source = sync::capture_jsonl_source_snapshot(&path).unwrap();
         let mut local = issue("pf-def");
         local.labels.push("unflushed".to_owned());
+        local.agent_context = Some("{\"constraints\":[\"retain governance\"]}".to_owned());
+        local.source_repo_path = Some("/original/workspace".to_owned());
         let witness = rehearse(
             &source,
             &[preserved(local)],
@@ -266,7 +312,70 @@ mod tests {
         assert_eq!(witness.issues.len(), 2);
         assert_eq!(witness.issues["pf-abc"].title, imported.title);
         assert_eq!(witness.issues["pf-def"].labels, ["unflushed"]);
+        assert_eq!(
+            witness.issues["pf-def"].agent_context.as_deref(),
+            Some("{\"constraints\":[\"retain governance\"]}")
+        );
+        assert_eq!(
+            witness.issues["pf-def"].source_repo_path.as_deref(),
+            Some("/original/workspace")
+        );
         assert_eq!(witness.restored_ids, BTreeSet::from(["pf-def".to_owned()]));
         assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn replay_witness_rejects_dropped_governance_and_known_local_provenance() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut local = issue("pf-local");
+        local.agent_context = Some("{\"constraints\":[\"retain\"]}".to_owned());
+        local.source_repo_path = Some("/original/workspace".to_owned());
+        storage.create_issue(&local, "test").unwrap();
+        let mut expected = read_payloads(&storage).unwrap();
+        expected
+            .get_mut(&local.id)
+            .unwrap()
+            .source_repo_path
+            .clone_from(&local.source_repo_path);
+        let witness = RebuildWitness {
+            issues: expected,
+            restored_ids: BTreeSet::from([local.id.clone()]),
+        };
+        witness.verify(&storage).unwrap();
+
+        storage
+            .execute_raw("UPDATE issues SET source_repo_path = NULL WHERE id = 'pf-local'")
+            .unwrap();
+        let error = witness.verify(&storage).unwrap_err();
+        assert!(error.to_string().contains("source_repo_path"), "{error}");
+        storage
+            .execute_raw(
+                "UPDATE issues SET source_repo_path = '/original/workspace', \
+                 agent_context = NULL WHERE id = 'pf-local'",
+            )
+            .unwrap();
+        let error = witness.verify(&storage).unwrap_err();
+        assert!(error.to_string().contains("planned payload"), "{error}");
+    }
+
+    #[test]
+    fn imported_paths_and_absent_local_paths_are_not_cross_clone_sync_keys() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let imported = issue("pf-imported");
+        storage.create_issue(&imported, "test").unwrap();
+        let mut witness = RebuildWitness {
+            issues: read_payloads(&storage).unwrap(),
+            restored_ids: BTreeSet::new(),
+        };
+        storage
+            .execute_raw(
+                "UPDATE issues SET source_repo_path = '/this/clone' WHERE id = 'pf-imported'",
+            )
+            .unwrap();
+        witness.verify(&storage).unwrap();
+        // With no saved local path, preserving a path supplied by import is
+        // valid even when the issue is in the restore set for another field.
+        witness.restored_ids.insert(imported.id);
+        witness.verify(&storage).unwrap();
     }
 }
