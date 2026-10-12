@@ -523,12 +523,16 @@ fn norm(value: Option<&String>) -> Option<&str> {
 }
 
 /// Content equivalence over what the JSONL carries: the database copy must
-/// hold nothing the JSONL copy lacks.
+/// hold nothing the JSONL copy lacks. Compare the complete synced scalar
+/// payload, not just display fields. Machine-local source_repo_path and
+/// derived/audit-only fields follow Issue::sync_equals and are not sync keys.
 fn issues_equivalent(db: &Issue, jsonl: &Issue) -> bool {
-    let scalar_fields_match = db.title == jsonl.title
+    let scalar_fields_match = db.id == jsonl.id
+        && db.title == jsonl.title
         && norm(db.description.as_ref()) == norm(jsonl.description.as_ref())
         && norm(db.design.as_ref()) == norm(jsonl.design.as_ref())
         && norm(db.acceptance_criteria.as_ref()) == norm(jsonl.acceptance_criteria.as_ref())
+        && norm(db.prerequisites.as_ref()) == norm(jsonl.prerequisites.as_ref())
         && norm(db.notes.as_ref()) == norm(jsonl.notes.as_ref())
         && db.status == jsonl.status
         && db.priority == jsonl.priority
@@ -536,36 +540,90 @@ fn issues_equivalent(db: &Issue, jsonl: &Issue) -> bool {
         && norm(db.assignee.as_ref()) == norm(jsonl.assignee.as_ref())
         && norm(db.owner.as_ref()) == norm(jsonl.owner.as_ref())
         && db.estimated_minutes == jsonl.estimated_minutes
+        && norm(db.created_by.as_ref()) == norm(jsonl.created_by.as_ref())
         && norm(db.close_reason.as_ref()) == norm(jsonl.close_reason.as_ref())
+        && norm(db.closed_by_session.as_ref()) == norm(jsonl.closed_by_session.as_ref())
         && norm(db.external_ref.as_ref()) == norm(jsonl.external_ref.as_ref())
+        && norm(db.source_system.as_ref()) == norm(jsonl.source_system.as_ref())
+        && db.source_repo.as_deref().unwrap_or(".")
+            == jsonl.source_repo.as_deref().unwrap_or(".")
+        && norm(db.agent_context.as_ref()) == norm(jsonl.agent_context.as_ref())
+        && norm(db.deleted_by.as_ref()) == norm(jsonl.deleted_by.as_ref())
+        && norm(db.delete_reason.as_ref()) == norm(jsonl.delete_reason.as_ref())
+        && norm(db.original_type.as_ref()) == norm(jsonl.original_type.as_ref())
+        && db.compaction_level.unwrap_or(0) == jsonl.compaction_level.unwrap_or(0)
+        && norm(db.compacted_at_commit.as_ref()) == norm(jsonl.compacted_at_commit.as_ref())
+        && db.original_size == jsonl.original_size
+        && norm(db.sender.as_ref()) == norm(jsonl.sender.as_ref())
+        && db.ephemeral == jsonl.ephemeral
+        && db.pinned == jsonl.pinned
+        && db.is_template == jsonl.is_template
+        && micros(db.created_at) == micros(jsonl.created_at)
         && micros(db.updated_at) == micros(jsonl.updated_at)
         && opt_micros(db.closed_at) == opt_micros(jsonl.closed_at)
         && opt_micros(db.due_at) == opt_micros(jsonl.due_at)
-        && opt_micros(db.defer_until) == opt_micros(jsonl.defer_until);
+        && opt_micros(db.defer_until) == opt_micros(jsonl.defer_until)
+        && opt_micros(db.deleted_at) == opt_micros(jsonl.deleted_at)
+        && opt_micros(db.compacted_at) == opt_micros(jsonl.compacted_at);
     if !scalar_fields_match {
         return false;
     }
     let jsonl_labels: HashSet<&str> = jsonl.labels.iter().map(String::as_str).collect();
-    let jsonl_deps: HashSet<(&str, String)> = jsonl
-        .dependencies
-        .iter()
-        .map(|dep| (dep.depends_on_id.as_str(), dep.dep_type.to_string()))
-        .collect();
-    let jsonl_comments: HashSet<(&str, &str)> = jsonl
-        .comments
-        .iter()
-        .map(|comment| (comment.author.as_str(), comment.body.as_str()))
-        .collect();
     db.labels
         .iter()
         .all(|label| jsonl_labels.contains(label.as_str()))
-        && db
-            .dependencies
-            .iter()
-            .all(|dep| jsonl_deps.contains(&(dep.depends_on_id.as_str(), dep.dep_type.to_string())))
-        && db.comments.iter().all(|comment| {
-            jsonl_comments.contains(&(comment.author.as_str(), comment.body.as_str()))
-        })
+        && multiset_is_subset(
+            db.dependencies.iter().map(dependency_payload_key),
+            jsonl.dependencies.iter().map(dependency_payload_key),
+        )
+        && multiset_is_subset(
+            db.comments.iter().map(Comment::sync_key),
+            jsonl.comments.iter().map(Comment::sync_key),
+        )
+}
+
+/// Defaulted relation fields have the same persisted meaning, but populated
+/// metadata, thread ownership, creator and timestamp must all survive. The
+/// old (target, type) key certified losses in those fields as equivalence.
+fn dependency_payload_key(
+    dependency: &Dependency,
+) -> (&str, &str, &str, DateTime<Utc>, Option<&str>, &str, Option<&str>) {
+    (
+        &dependency.issue_id,
+        &dependency.depends_on_id,
+        dependency.dep_type.as_str(),
+        dependency.created_at,
+        norm(dependency.created_by.as_ref()),
+        dependency
+            .metadata
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or("{}"),
+        norm(dependency.thread_id.as_ref()),
+    )
+}
+
+/// A source superset is safe, but one serialized child cannot certify two
+/// distinct stored occurrences. Comment rowids are deliberately not keys:
+/// they are database-local; Comment::sync_key supplies the portable identity.
+fn multiset_is_subset<K: Eq + std::hash::Hash>(
+    mut required: impl Iterator<Item = K>,
+    present: impl Iterator<Item = K>,
+) -> bool {
+    let mut counts = HashMap::<K, usize>::new();
+    for key in present {
+        *counts.entry(key).or_default() += 1;
+    }
+    required.all(|key| {
+        let Some(count) = counts.get_mut(&key) else {
+            return false;
+        };
+        if *count == 0 {
+            return false;
+        }
+        *count -= 1;
+        true
+    })
 }
 
 fn parse_jsonl(mut reader: impl BufRead) -> Result<HashMap<String, Issue>> {
@@ -642,6 +700,8 @@ const STRING_FIELDS: &[&str] = &[
     "external_ref",
     "source_system",
     "source_repo",
+    "source_repo_path",
+    "agent_context",
     "deleted_by",
     "delete_reason",
     "original_type",
@@ -1901,5 +1961,155 @@ mod tests {
         assert!(notice.contains("re-added 1 database-only issue(s)"));
         assert!(notice.contains("1 database-only issue(s) not restored"));
         assert!(!notice.contains("superseded"));
+    }
+
+    #[test]
+    fn legacy_governance_and_local_provenance_survive_decoding() {
+        let (conn, _) = legacy_audit_fixture();
+        for sql in [
+            "ALTER TABLE issues ADD COLUMN agent_context TEXT",
+            "ALTER TABLE issues ADD COLUMN source_repo_path TEXT",
+            "ALTER TABLE issues ADD COLUMN prerequisites TEXT",
+            "UPDATE issues SET agent_context = '{\"constraints\":[\"keep local work\"]}', \
+             source_repo_path = '/original/workspace', prerequisites = '- [ ] review'",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let audit = audit_connection(&conn, Some(std::io::Cursor::new(Vec::<u8>::new())))
+            .expect("decode a database-only issue");
+        assert_eq!(audit.restorable.len(), 1);
+        let restored = &audit.restorable[0].issue;
+        assert_eq!(
+            restored.agent_context.as_deref(),
+            Some("{\"constraints\":[\"keep local work\"]}")
+        );
+        assert_eq!(restored.source_repo_path.as_deref(), Some("/original/workspace"));
+        assert_eq!(restored.prerequisites.as_deref(), Some("- [ ] review"));
+    }
+
+    #[test]
+    fn governance_only_dirty_difference_is_not_certified_as_equivalent() {
+        let (conn, jsonl) = legacy_audit_fixture();
+        for sql in [
+            "ALTER TABLE issues ADD COLUMN agent_context TEXT",
+            "UPDATE issues SET agent_context = '{\"constraints\":[\"local\"]}'",
+            "CREATE TABLE dirty_issues (issue_id TEXT)",
+            "INSERT INTO dirty_issues VALUES ('a-1')",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let audit = audit_connection(&conn, Some(std::io::Cursor::new(jsonl))).unwrap();
+        assert!(!audit.is_clean());
+        assert!(!audit.automatic_rebuild_allowed());
+        assert_eq!(audit.db_only[0].reason, DbOnlyReason::UnflushedEdit);
+    }
+
+    #[test]
+    fn nontext_governance_cannot_masquerade_as_an_absent_field() {
+        for column in ["agent_context", "source_repo_path"] {
+            let (conn, jsonl) = legacy_audit_fixture();
+            conn.execute(&format!("ALTER TABLE issues ADD COLUMN {column} BLOB"))
+                .unwrap();
+            conn.execute(&format!("UPDATE issues SET {column} = X'FEED'"))
+                .unwrap();
+            let audit = audit_connection(&conn, Some(std::io::Cursor::new(jsonl))).unwrap();
+            assert_eq!(audit.db_only[0].reason, DbOnlyReason::Unreadable, "{column}");
+            assert!(audit.restorable.is_empty());
+            assert!(require_lossless_rebuild(&audit, false).is_err());
+        }
+    }
+
+    #[test]
+    fn synced_scalar_fields_do_not_disappear_from_equivalence() {
+        let baseline = issue("a-1", "2026-01-01T00:00:00Z");
+        for (field, changed) in [
+            ("prerequisites", serde_json::json!("- [ ] review")),
+            ("agent_context", serde_json::json!("{\"instructions\":[\"keep\"]}")),
+            ("created_by", serde_json::json!("another agent")),
+            ("closed_by_session", serde_json::json!("session-1")),
+            ("source_system", serde_json::json!("upstream")),
+            ("source_repo", serde_json::json!("repo")),
+            ("deleted_by", serde_json::json!("agent")),
+            ("delete_reason", serde_json::json!("retention decision")),
+            ("original_type", serde_json::json!("feature")),
+            ("compaction_level", serde_json::json!(2)),
+            ("compacted_at_commit", serde_json::json!("abc123")),
+            ("original_size", serde_json::json!(42)),
+            ("sender", serde_json::json!("agent")),
+            ("ephemeral", serde_json::json!(true)),
+            ("pinned", serde_json::json!(true)),
+            ("is_template", serde_json::json!(true)),
+            ("created_at", serde_json::json!("2025-12-01T00:00:00Z")),
+            ("deleted_at", serde_json::json!("2025-12-01T00:00:00Z")),
+            ("compacted_at", serde_json::json!("2025-12-01T00:00:00Z")),
+        ] {
+            let mut value = serde_json::to_value(&baseline).unwrap();
+            value[field] = changed;
+            let local: Issue = serde_json::from_value(value).unwrap();
+            assert!(!issues_equivalent(&local, &baseline), "lost field: {field}");
+            assert_eq!(
+                classify(&local, Some(&baseline), true),
+                Some((DbOnlyReason::UnflushedEdit, false)),
+                "timestamp precedence must remain unchanged for {field}"
+            );
+        }
+        let mut persisted = baseline.clone();
+        persisted.source_repo = Some(".".to_owned());
+        persisted.compaction_level = Some(0);
+        persisted.source_repo_path = Some("/local/path".to_owned());
+        assert!(issues_equivalent(&persisted, &baseline));
+    }
+
+    #[test]
+    fn comment_equivalence_uses_portable_identity_and_preserves_multiplicity() {
+        let mut local = issue("a-1", "2026-01-01T00:00:00Z");
+        local.comments.push(Comment {
+            id: 1,
+            issue_id: local.id.clone(),
+            author: "agent".to_owned(),
+            body: "same words at a different time".to_owned(),
+            created_at: local.created_at,
+        });
+        let mut exported = local.clone();
+        exported.comments[0].id = 99;
+        assert!(issues_equivalent(&local, &exported), "rowids are local");
+        exported.comments[0].created_at += chrono::Duration::seconds(1);
+        assert!(!issues_equivalent(&local, &exported));
+        exported.comments.push(local.comments[0].clone());
+        assert!(issues_equivalent(&local, &exported), "a superset is safe");
+        local.comments.push(local.comments[0].clone());
+        assert!(!issues_equivalent(&local, &exported), "one match is not two");
+        exported.comments.push(local.comments[0].clone());
+        assert!(issues_equivalent(&local, &exported));
+    }
+
+    #[test]
+    fn dependency_equivalence_requires_the_complete_payload() {
+        let mut local = issue("a-1", "2026-01-01T00:00:00Z");
+        let dependency: Dependency = serde_json::from_value(serde_json::json!({
+            "issue_id": "a-1", "depends_on_id": "a-2", "type": "blocks",
+            "created_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        local.dependencies.push(dependency.clone());
+        let mut exported = local.clone();
+        exported.dependencies[0].metadata = Some("{}".to_owned());
+        exported.dependencies[0].created_by = Some(String::new());
+        exported.dependencies[0].thread_id = Some(String::new());
+        assert!(issues_equivalent(&local, &exported), "persisted defaults");
+        for (field, changed) in [
+            ("metadata", serde_json::json!("{\"reason\":\"local\"}")),
+            ("thread_id", serde_json::json!("thread-1")),
+            ("created_by", serde_json::json!("another-agent")),
+            ("created_at", serde_json::json!("2026-01-01T00:00:01Z")),
+            ("issue_id", serde_json::json!("a-3")),
+        ] {
+            let mut value = serde_json::to_value(&dependency).unwrap();
+            value[field] = changed;
+            exported.dependencies = vec![serde_json::from_value(value).unwrap()];
+            assert!(!issues_equivalent(&local, &exported), "lost field: {field}");
+            exported.dependencies.push(dependency.clone());
+            assert!(issues_equivalent(&local, &exported), "superset: {field}");
+        }
     }
 }
