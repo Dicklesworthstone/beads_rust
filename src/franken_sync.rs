@@ -292,11 +292,13 @@ fn recovery_configuration_failure(error: FrankenError) -> FrankenError {
 impl Connection {
     /// Open an existing database only when its VFS handle matches the retained identity.
     ///
-    /// The explicit recovery workflow rehearses this open on a private copy
-    /// before using it on the live family. Before admitting #507's exact
-    /// poisoned-index signature to the engine, quarantine only the derived
-    /// index under independent engine and SQLite exclusion. Ordinary and
-    /// read-only opens never take this filesystem-recovery path.
+    /// Doctor uses this low-level writable opener only on private copies.
+    /// Admission can modify WAL bytes even when it returns an error, so a
+    /// post-open byte comparison cannot make a live recovery safe. Doctor
+    /// publishes only a verified private index under live exclusion instead.
+    /// Before admitting #507's exact poisoned-index signature to the engine,
+    /// quarantine only the derived index under independent engine and SQLite
+    /// exclusion. Ordinary and read-only opens never take this path.
     ///
     /// Every handle returned here closes without checkpointing, including
     /// retries after quarantine or missing-index reconstruction. Recovery may
