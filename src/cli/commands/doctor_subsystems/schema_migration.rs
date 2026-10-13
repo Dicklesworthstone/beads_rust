@@ -967,7 +967,9 @@ fn recover_live_index_from_private_copy(
         )
     })();
     if let Err(error) = operation {
-        if live_stage.as_deref().is_some_and(|stage| stage == "live-recovery")
+        if live_stage
+            .as_deref()
+            .is_some_and(|stage| stage == "live-recovery")
             && live_recovery_contention(&error)
         {
             return Err(error);
@@ -1258,9 +1260,10 @@ fn recover_index_only(
             return Ok(true);
         }
         receipt.stage = "reinstate-index".to_string();
-        let installed = receipt.raw_after.as_ref().ok_or_else(|| {
-            BeadsError::internal("recovery omitted the installed index witness")
-        })?;
+        let installed = receipt
+            .raw_after
+            .as_ref()
+            .ok_or_else(|| BeadsError::internal("recovery omitted the installed index witness"))?;
         install_recovery_index(
             db_path,
             &index_backup,
