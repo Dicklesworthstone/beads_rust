@@ -23,7 +23,8 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 SHARDS=(lib e2e-a-l e2e-m-z storage misc bench)
-CARGO_TEST=(cargo test --locked --all-features)
+# --no-fail-fast: run every test binary of the shard even after one fails (#560).
+CARGO_TEST=(cargo test --locked --all-features --no-fail-fast)
 
 shard_files() {
     case "$1" in
