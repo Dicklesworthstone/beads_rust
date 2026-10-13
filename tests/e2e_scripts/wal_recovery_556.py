@@ -14,15 +14,27 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
+import queue
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+HAS_LINUX_OFD = (sys.platform.startswith("linux") and ctypes.sizeof(ctypes.c_void_p) == 8
+                 and fcntl is not None and hasattr(fcntl, "F_OFD_SETLK"))
 
 SUFFIXES = ("", "-wal", "-shm", "-journal", "-wal-cert", "-wal-cert-head")
 PROTECTED = tuple(suffix for suffix in SUFFIXES if suffix != "-shm")
@@ -89,41 +101,106 @@ def issue_state(conn: sqlite3.Connection, issue_id: str) -> tuple:
 
 
 @contextlib.contextmanager
-def pinned_closure(db: Path):
-    """Keep both connections alive until the caller records recovery's result."""
-    writer = sqlite3.connect(db.resolve().as_uri() + "?mode=rw", uri=True, timeout=1)
-    reader = None
-    try:
-        require(writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal",
-                "fixture needs WAL mode")
-        writer.execute("PRAGMA wal_autocheckpoint=0")
-        require(writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0,
-                "fixture's initial checkpoint did not complete")
-        found = writer.execute("SELECT id FROM issues WHERE title = ?", (TITLE,)).fetchall()
-        require(len(found) == 1, "fixture must contain exactly one sentinel issue")
-        issue_id = found[0][0]
-        reader = readonly(db)
-        reader.execute("BEGIN")
-        initial = issue_state(reader, issue_id)  # BEGIN alone does not pin a snapshot.
-        require(initial[0] == "open", f"fixture must start open: {initial}")
-        main_before = db.read_bytes()
-        writer.execute(
-            "UPDATE issues SET status='closed', closed_at=?, close_reason=? WHERE id=?",
-            (STAMP, REASON, issue_id),
-        )
+def pinned_closure(db: Path, *, leave_wal: bool = False):
+    """Hold SQLite connections in a child; byte observers stay in this process.
+
+    Closing ANY raw descriptor for an inode can release the calling process's
+    SQLite POSIX locks. Keeping connection holders separate from family() and
+    db.read_bytes() is therefore part of the fixture, not an optimization.
+    """
+    script = r"""
+import contextlib, json, os, sqlite3, sys
+from pathlib import Path
+db, title, stamp, reason = sys.argv[1:]
+uri = Path(db).as_uri()
+writer = sqlite3.connect(uri + '?mode=rw', uri=True, timeout=1)
+reader = None
+def state(conn, issue_id):
+    return conn.execute('SELECT status, closed_at, close_reason FROM issues WHERE id=?',
+                        (issue_id,)).fetchone()
+try:
+    assert writer.execute('PRAGMA journal_mode=WAL').fetchone()[0] == 'wal'
+    writer.execute('PRAGMA wal_autocheckpoint=0')
+    assert writer.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0] == 0
+    found = writer.execute('SELECT id FROM issues WHERE title=?', (title,)).fetchall()
+    assert len(found) == 1
+    issue_id = found[0][0]
+    reader = sqlite3.connect(uri + '?mode=ro', uri=True, timeout=1)
+    reader.execute('BEGIN')
+    initial = state(reader, issue_id)  # BEGIN alone does not pin a snapshot.
+    assert initial[0] == 'open'
+    print(json.dumps({'stage': 'pinned', 'issue_id': issue_id}), flush=True)
+    if sys.stdin.readline().strip() == 'commit':
+        writer.execute("UPDATE issues SET status='closed', closed_at=?, close_reason=? WHERE id=?",
+                       (stamp, reason, issue_id))
         writer.commit()
-        require(issue_state(reader, issue_id) == initial, "reader snapshot is not pinned")
+        assert state(reader, issue_id) == initial
+        with contextlib.closing(sqlite3.connect(uri + '?mode=ro', uri=True)) as fresh:
+            assert state(fresh, issue_id) == ('closed', stamp, reason)
+        print(json.dumps({'stage': 'committed', 'issue_id': issue_id}), flush=True)
+        command = sys.stdin.readline().strip()
+        if command == 'abandon':
+            os._exit(0)  # Committed WAL survives; no close-time checkpoint.
+        assert state(reader, issue_id) == initial
+finally:
+    if reader is not None:
+        reader.close()
+    writer.close()
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-I", "-u", "-c", script, str(db.resolve()), TITLE, STAMP, REASON],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    messages = queue.Queue()
+
+    def read_messages():
+        for line in child.stdout:
+            messages.put(line)
+        messages.put(None)
+
+    observer = threading.Thread(target=read_messages, daemon=True)
+    observer.start()
+
+    def receive(stage: str):
+        try:
+            line = messages.get(timeout=10)
+        except queue.Empty as error:
+            raise AssertionError(f"SQLite holder did not reach {stage}") from error
+        require(line is not None, f"SQLite holder exited before {stage}")
+        message = json.loads(line)
+        require(message["stage"] == stage, f"unexpected SQLite holder message: {message}")
+        return message["issue_id"]
+
+    def send(command: str):
+        child.stdin.write(command + "\n")
+        child.stdin.flush()
+
+    committed = False
+    try:
+        issue_id = receive("pinned")
+        main_before = db.read_bytes()  # A different process owns the SQLite locks.
+        send("commit")
+        require(receive("committed") == issue_id, "fixture issue changed")
+        committed = True
         require(db.read_bytes() == main_before, "closure unexpectedly reached the main file")
         require(len(component(db, "-wal").read_bytes()) > 32, "no WAL frames were produced")
-        with contextlib.closing(readonly(db)) as current:
-            require(issue_state(current, issue_id) == ("closed", STAMP, REASON),
-                    "a fresh connection cannot see the committed closure")
-        # All precondition reads finish before the caller snapshots the SHM.
         yield issue_id
     finally:
-        if reader is not None:
-            reader.close()
-        writer.close()
+        try:
+            if child.poll() is None:
+                send("abandon" if committed and leave_wal else "release")
+            child.wait(timeout=10)
+        except (BrokenPipeError, subprocess.TimeoutExpired):
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+        finally:
+            child.stdin.close()
+            observer.join(timeout=5)
+            child.stdout.close()
+            error = child.stderr.read()
+            child.stderr.close()
+        require(child.returncode == 0, f"SQLite holder failed: {child.returncode}: {error}")
 
 
 def assert_refusal(result: subprocess.CompletedProcess, before: Family, after: Family) -> None:
@@ -132,6 +209,34 @@ def assert_refusal(result: subprocess.CompletedProcess, before: Family, after: F
     require(result.returncode != 0, "unsafe recovery was reported successful")
     require(REFUSAL in result.stdout + result.stderr,
             f"expected a pre-open WAL refusal, not an unrelated error: {result.stdout}{result.stderr}")
+
+
+def orphaned_closure(db: Path) -> str:
+    """Commit on a disposable copy, then exit without a close-time checkpoint."""
+    with pinned_closure(db, leave_wal=True) as issue_id:
+        pass
+    require(len(component(db, "-wal").read_bytes()) > 32, "child checkpointed away the WAL")
+    return issue_id
+
+
+@contextlib.contextmanager
+def sqlite_main_exclusion(db: Path):
+    """Probe the existing Rust RecoveryLock's Linux syscall, NOT Rust or br."""
+    require(HAS_LINUX_OFD, "this syscall probe requires 64-bit Linux with OFD locks")
+
+    class Flock(ctypes.Structure):
+        _fields_ = [("l_type", ctypes.c_short), ("l_whence", ctypes.c_short),
+                    ("l_start", ctypes.c_longlong), ("l_len", ctypes.c_longlong),
+                    ("l_pid", ctypes.c_int)]
+
+    fd = os.open(db, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        # Same range and ownership as src/sync/db_inode_lock.rs::RecoveryLock.
+        lock = Flock(fcntl.F_WRLCK, os.SEEK_SET, 0x40000000, 512, 0)
+        fcntl.fcntl(fd, fcntl.F_OFD_SETLK, bytes(lock))
+        yield
+    finally:
+        os.close(fd)
 
 
 def run_br(br: Path, cwd: Path, beads: Path, args: list[str], label: str):
@@ -170,6 +275,7 @@ def test_pinned_wal(br: Path, seed: Path, ambient: Path, root: Path) -> None:
     retain(family(seed), db)
     with pinned_closure(db) as issue_id:
         before = family(db)
+        ambient_before = recovery_files(ambient)
         retain(before, root / "before" / db.name)
         for attempt in range(3):
             result = run_br(br, root, ambient, ["--db", str(db), "--no-auto-import",
@@ -180,9 +286,49 @@ def test_pinned_wal(br: Path, seed: Path, ambient: Path, root: Path) -> None:
             observed = root / f"after-{attempt}" / db.name
             retain(after, observed)
             assert_refusal(result, before, after)
-            with contextlib.closing(readonly(observed)) as recovered:
+            require(not (db.parent / ".br_recovery").exists(),
+                    "WAL refusal must not allocate another recovery run")
+            require(recovery_files(ambient) == ambient_before,
+                    "WAL refusal must not write into the ambient workspace")
+            inspection = root / f"oracle-{attempt}" / db.name
+            retain(after, inspection)  # SQLite must not modify the retained observation's SHM.
+            with contextlib.closing(readonly(inspection)) as recovered:
                 require(issue_state(recovered, issue_id) == ("closed", STAMP, REASON),
                         "a fresh reader of the post-recovery copy lost the committed closure")
+
+
+def test_orphaned_wal(br: Path, seed: Path, ambient: Path, root: Path,
+                      automatic: bool = False) -> None:
+    db = root / "copy" / "selected.db"
+    retain(family(seed), db)
+    issue_id = orphaned_closure(db)
+    if automatic:
+        # No process holds this disposable copy now. Give ordinary startup
+        # the known legacy-index signature without changing the WAL payload.
+        legacy = bytearray(32 * 1024)
+        legacy[108:120] = b"\xff" * 12
+        component(db, "-shm").write_bytes(legacy)
+    before = family(db)
+    retain(before, root / "before" / db.name)
+    ambient_before = recovery_files(ambient)
+    for attempt in range(3):
+        command = (["list", "--all", "--json"] if automatic else
+                   ["--no-auto-import", "--no-auto-flush",
+                    "doctor", "migrate-schema", "recover", "--json"])
+        result = run_br(br, root, ambient, ["--db", str(db), *command],
+                        f"orphaned-recover-{attempt}")
+        after = family(db)
+        observed = root / f"after-{attempt}" / db.name
+        retain(after, observed)
+        assert_refusal(result, before, after)
+        require(not (db.parent / ".br_recovery").exists(),
+                "refusing an idle frame-bearing WAL must not allocate recovery runs")
+        require(recovery_files(ambient) == ambient_before, "ambient evidence changed")
+        inspection = root / f"oracle-{attempt}" / db.name
+        retain(after, inspection)
+        with contextlib.closing(readonly(inspection)) as current:
+            require(issue_state(current, issue_id) == ("closed", STAMP, REASON),
+                    "idle WAL-only closure was lost")
 
 
 def recovery_files(root: Path) -> dict[str, bytes]:
@@ -255,6 +401,75 @@ class FixtureChecks(unittest.TestCase):
             with contextlib.closing(readonly(observed)) as conn:
                 self.assertEqual(issue_state(conn, issue_id), ("closed", STAMP, REASON))
 
+    def test_orphaned_wal_has_a_committed_closure_without_live_openers(self):
+        issue_id = orphaned_closure(self.db)
+        before = family(self.db)
+        observed = self.root / "observed" / self.db.name
+        retain(before, observed)
+        with contextlib.closing(readonly(observed)) as conn:
+            self.assertEqual(issue_state(conn, issue_id), ("closed", STAMP, REASON))
+        main_only = self.root / "main-only.db"
+        main_only.write_bytes(before[""])
+        with contextlib.closing(sqlite3.connect(
+                main_only.as_uri() + "?immutable=1", uri=True)) as conn:
+            self.assertEqual(issue_state(conn, issue_id)[0], "open")
+        unchanged(before, family(self.db))
+
+    @unittest.skipUnless(HAS_LINUX_OFD, "requires Linux OFD locks")
+    def test_ofd_exclusion_refuses_a_pinned_stock_sqlite_reader(self):
+        with pinned_closure(self.db):
+            before = family(self.db)
+            with self.assertRaises(OSError) as caught:
+                with sqlite_main_exclusion(self.db):
+                    self.fail("live stock SQLite peer was not excluded")
+            self.assertIn(caught.exception.errno, (errno.EAGAIN, errno.EACCES))
+            unchanged(before, family(self.db))
+
+    @unittest.skipUnless(HAS_LINUX_OFD, "requires Linux OFD locks")
+    def test_ofd_exclusion_blocks_an_arriving_writer_and_survives_unrelated_close(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+        before = family(self.db)
+        writer = """
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1], timeout=0)
+try:
+    conn.execute("UPDATE issues SET title='arriving writer'")
+    conn.commit()
+except sqlite3.OperationalError as error:
+    if error.sqlite_errorcode == sqlite3.SQLITE_BUSY:
+        print('SQLITE_BUSY', flush=True)
+        sys.exit(42)
+    raise
+finally:
+    conn.close()
+"""
+        with sqlite_main_exclusion(self.db):
+            with self.db.open("rb") as unrelated:
+                unrelated.read(1)
+            result = subprocess.run([sys.executable, "-I", "-c", writer, str(self.db)],
+                                    capture_output=True, text=True, timeout=5, check=False)
+            self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.strip(), "SQLITE_BUSY")
+            unchanged(before, family(self.db))
+        result = subprocess.run([sys.executable, "-I", "-c", writer, str(self.db)],
+                                capture_output=True, text=True, timeout=5, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with contextlib.closing(readonly(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT title FROM issues").fetchone()[0],
+                             "arriving writer")
+
+    @unittest.skipUnless(HAS_LINUX_OFD, "requires Linux OFD locks")
+    def test_a_writable_private_copy_does_not_conflict_with_live_exclusion(self):
+        before = family(self.db)
+        with sqlite_main_exclusion(self.db):
+            private = self.root / "private" / self.db.name
+            retain(before, private)
+            with contextlib.closing(sqlite3.connect(private, timeout=0)) as conn:
+                conn.execute("UPDATE issues SET title='private copy only'")
+                conn.commit()
+            unchanged(before, family(self.db))
+
     def test_nonzero_exit_does_not_hide_wal_mutation(self):
         with pinned_closure(self.db):
             before = family(self.db)
@@ -305,7 +520,11 @@ def main() -> int:
     seed = setup_seed(br, root / "seed")
     ambient_db = setup_seed(br, root / "ambient-workspace")
     cases = [("pinned-wal", lambda directory: test_pinned_wal(
-        br, seed, ambient_db.parent, directory))]
+        br, seed, ambient_db.parent, directory)),
+             ("orphaned-wal", lambda directory: test_orphaned_wal(
+        br, seed, ambient_db.parent, directory)),
+             ("automatic-orphaned-wal", lambda directory: test_orphaned_wal(
+        br, seed, ambient_db.parent, directory, automatic=True))]
     for relative in (False, True):
         for fail in (False, True):
             label = f"artifacts-{'relative' if relative else 'absolute'}-{'failure' if fail else 'success'}"
