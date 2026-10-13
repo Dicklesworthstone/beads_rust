@@ -603,7 +603,7 @@ pub struct TornWalQuarantine {
 /// # Errors
 /// Refuses mismatched authority, unsafe paths, or a failed verified rename.
 pub fn quarantine_torn_wal_for_startup(
-    beads_dir: &Path,
+    _beads_dir: &Path,
     db_path: &Path,
     authority: &Arc<DatabaseFamilyWriteLock>,
 ) -> Result<Option<TornWalQuarantine>> {
@@ -633,9 +633,10 @@ pub fn quarantine_torn_wal_for_startup(
         if !is_torn_wal_length(wal_length) {
             return Ok(None);
         }
+        let recovery_dir = recovery_artifacts_dir(db_path)?;
         let quarantined_paths = config::quarantine_database_artifacts(
             db_path,
-            beads_dir,
+            &recovery_dir,
             [wal_path, family_component_path(db_path, "-shm")],
             "truncated-wal",
         )?;
@@ -712,7 +713,8 @@ pub fn recover_wal_index_for_startup(
     // over those bytes: retain its evidence, but allow the next command to
     // retry after the holder exits. Never retry a mutation within this call.
     let raw_before = recovery_family_witness(db_path)?;
-    if let Some(prior) = prior_failed_recovery(beads_dir, &raw_before)? {
+    let recovery_dir = recovery_artifacts_dir(db_path)?;
+    if let Some(prior) = prior_failed_recovery(&recovery_dir, &raw_before)? {
         return Err(BeadsError::SyncConflict {
             message: format!(
                 "automatic WAL index recovery already failed for this exact database family \
@@ -818,11 +820,29 @@ fn prior_failed_recovery(
     Ok(None)
 }
 
+/// Evidence belongs to the selected database, not an ambient workspace.
+/// Resolve relative selections once; do not rebind database write authority.
+fn recovery_artifacts_dir(db_path: &Path) -> Result<PathBuf> {
+    let parent = db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(fs::canonicalize(parent)?)
+}
+
 fn recover_engine_admission_with_lease(
     migration: &MigrationContext,
     strict_wal: bool,
     policy: PreexistingIndexCorruption,
 ) -> Result<EngineRecoveryReceipt> {
+    // Only recovery's artifact scope changes. Keep the exact, already-bound
+    // database authority; migration apply/undo/heal still use their own context.
+    let recovery = MigrationContext {
+        beads_dir: recovery_artifacts_dir(&migration.db_path)?,
+        db_path: migration.db_path.clone(),
+        write_authority: Arc::clone(&migration.write_authority),
+    };
+    let migration = &recovery;
     let mut lease = crate::sync::DatabaseOpenerLease::register(&migration.db_path)?;
     let exclusive = lease
         .try_exclusive()
@@ -858,11 +878,24 @@ fn require_recovery_payload_unchanged(
     Ok(())
 }
 
+/// WAL recovery refusal is a conflict, never authority to rebuild from JSONL.
+fn require_frame_free_engine_recovery(path: &Path) -> Result<()> {
+    crate::franken_sync::wal_index::require_frame_free_recovery(path).map_err(|error| {
+        BeadsError::SyncConflict {
+            message: error.to_string(),
+        }
+    })
+}
+
 fn recover_existing_family(
     path: &Path,
     authority: Option<&DatabaseFamilyWriteLock>,
     mut live_stage: Option<&mut String>,
 ) -> Result<()> {
+    require_frame_free_engine_recovery(path)?;
+    if let Some(authority) = authority {
+        return recover_live_index_from_private_copy(path, authority, live_stage);
+    }
     let metadata = secure_file_metadata(path)?
         .ok_or_else(|| BeadsError::internal("recovery database disappeared"))?;
     let retained = File::open(path)?;
@@ -899,6 +932,143 @@ fn recover_existing_family(
         ));
     }
     Ok(())
+}
+
+/// Rehearse writable recovery against a disposable complete family copy, then
+/// publish only the verified derived WAL index to the live database.
+fn recover_live_index_from_private_copy(
+    db_path: &Path,
+    authority: &DatabaseFamilyWriteLock,
+    mut live_stage: Option<&mut String>,
+) -> Result<()> {
+    authority.verify_database_authority()?;
+    let raw_before = recovery_family_witness(db_path)?;
+    let scratch_root = recovery_artifacts_dir(db_path)?.join(".br_recovery");
+    fs::create_dir_all(&scratch_root)?;
+    let scratch = tempfile::Builder::new()
+        .prefix("index-rehearsal-")
+        .tempdir_in(&scratch_root)?;
+    let probe_db = backup_component_path(scratch.path(), db_path, "")?;
+    let operation = (|| -> Result<()> {
+        copy_family_to_backup(db_path, scratch.path(), &raw_before)?;
+        verify_backup_family(db_path, scratch.path(), &raw_before)?;
+        if let Some(stage) = live_stage.as_deref_mut() {
+            *stage = "private-recovery".to_string();
+        }
+        recover_existing_family(&probe_db, None, None)?;
+        require_recovery_payload_unchanged(&raw_before, &recovery_family_witness(&probe_db)?)?;
+        let _logical = logical_witness(&probe_db)?;
+        publish_recovered_index(
+            db_path,
+            &probe_db,
+            &raw_before,
+            authority,
+            live_stage.as_deref_mut(),
+        )
+    })();
+    if let Err(error) = operation {
+        if live_stage.as_deref().is_some_and(|stage| stage == "live-recovery")
+            && live_recovery_contention(&error)
+        {
+            return Err(error);
+        }
+        let evidence = scratch.keep();
+        return Err(BeadsError::WithContext {
+            context: format!("private index rehearsal retained at {}", evidence.display()),
+            source: Box::new(error),
+        });
+    }
+    Ok(())
+}
+
+fn publish_recovered_index(
+    db_path: &Path,
+    probe_db: &Path,
+    expected: &RawFamilyWitness,
+    authority: &DatabaseFamilyWriteLock,
+    live_stage: Option<&mut String>,
+) -> Result<()> {
+    let probe_after = recovery_family_witness(probe_db)?;
+    require_recovery_payload_unchanged(expected, &probe_after)?;
+    if !crate::franken_sync::wal_index::ENGINE_READS_ON_DISK_WAL_INDEX {
+        authority.verify_database_authority()?;
+        require_frame_free_engine_recovery(db_path)?;
+        if &recovery_family_witness(db_path)? != expected {
+            return Err(BeadsError::internal(
+                "database family changed before recovery verification",
+            ));
+        }
+        return Ok(());
+    }
+    let mut index = component_for_suffix(&probe_after, "-shm")?.clone();
+    if !index.present {
+        return Err(BeadsError::internal(
+            "private recovery produced no WAL index to install",
+        ));
+    }
+    if let Some(mode) = component_for_suffix(expected, "-shm")?.unix_mode {
+        index.unix_mode = Some(mode);
+    }
+    install_recovery_index(
+        db_path,
+        &family_component_path(probe_db, "-shm"),
+        &index,
+        expected,
+        authority,
+        live_stage,
+    )
+}
+
+fn install_recovery_index(
+    db_path: &Path,
+    retained_index: &Path,
+    index: &RawComponentWitness,
+    expected: &RawFamilyWitness,
+    authority: &DatabaseFamilyWriteLock,
+    mut live_stage: Option<&mut String>,
+) -> Result<()> {
+    require_frame_free_engine_recovery(db_path)?;
+    authority.verify_database_authority()?;
+    let metadata = secure_file_metadata(db_path)?
+        .ok_or_else(|| BeadsError::internal("recovery database disappeared"))?;
+    let retained = File::open(db_path)?;
+    if !same_file_identity(&metadata, &retained.metadata()?) {
+        return Err(BeadsError::internal(
+            "recovery database changed before identity binding",
+        ));
+    }
+    let identity = fsqlite_vfs::FileIdentity::from_file(&retained)?
+        .ok_or_else(|| BeadsError::internal("recovery database identity is unavailable"))?;
+    if let Some(stage) = live_stage.as_deref_mut() {
+        *stage = "live-recovery".to_string();
+    }
+    crate::franken_sync::wal_index::with_recovery_exclusion(db_path, identity, || -> Result<()> {
+        if let Some(stage) = live_stage {
+            *stage = "live-index-install".to_string();
+        }
+        authority.verify_database_authority()?;
+        require_frame_free_engine_recovery(db_path)?;
+        if &recovery_family_witness(db_path)? != expected {
+            return Err(BeadsError::internal(
+                "database family changed before recovered-index installation; live family untouched",
+            ));
+        }
+        verify_retained_component(retained_index, index)?;
+        install_retained_index(db_path, retained_index, index)?;
+        authority.verify_database_authority()?;
+        let after = recovery_family_witness(db_path)?;
+        for component in &expected.components {
+            if component.suffix != "-shm"
+                && component_for_suffix(&after, &component.suffix)? != component
+            {
+                return Err(BeadsError::internal(format!(
+                    "index installation changed protected component {:?}; retain recovery evidence",
+                    component.suffix
+                )));
+            }
+        }
+        verify_retained_component(&family_component_path(db_path, "-shm"), index)
+    })?
 }
 
 fn recover_engine_admission(
@@ -1088,7 +1258,17 @@ fn recover_index_only(
             return Ok(true);
         }
         receipt.stage = "reinstate-index".to_string();
-        reinstate_retained_index(db_path, &index_backup, &shm_witness)?;
+        let installed = receipt.raw_after.as_ref().ok_or_else(|| {
+            BeadsError::internal("recovery omitted the installed index witness")
+        })?;
+        install_recovery_index(
+            db_path,
+            &index_backup,
+            &shm_witness,
+            installed,
+            &migration.write_authority,
+            None,
+        )?;
         migration.write_authority.verify_database_authority()?;
         let reinstated = recovery_family_witness(db_path)?;
         for suffix in ["", "-wal", "-shm", "-journal"] {
@@ -1146,10 +1326,9 @@ fn verify_retained_component(copy: &Path, witness: &RawComponentWitness) -> Resu
     Ok(())
 }
 
-/// Put the retained pre-recovery index back as the live `-shm`, atomically
-/// and with its original permissions. Runs only under the held family write
-/// authority and sole-opener lease of the recovery that removed it.
-fn reinstate_retained_index(
+/// Copy an already-verified index to the live -shm name atomically, preserving
+/// permissions. Called only while recovery exclusion and family authority hold.
+fn install_retained_index(
     db_path: &Path,
     retained: &Path,
     witness: &RawComponentWitness,
@@ -2005,9 +2184,11 @@ fn recover_engine_admission_with_complete_backup(
             ));
         }
         verify_backup_family(&migration.db_path, &before_dir, &receipt.raw_before)?;
-        recover_existing_family(
+        publish_recovered_index(
             &migration.db_path,
-            Some(&migration.write_authority),
+            &probe_db,
+            &receipt.raw_before,
+            &migration.write_authority,
             Some(&mut receipt.stage),
         )?;
         migration.write_authority.verify_database_authority()?;
@@ -6167,6 +6348,47 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn recovery_556_evidence_follows_nondefault_database_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let ambient = root.path().join("ambient/.beads");
+        let selected = root.path().join("external");
+        fs::create_dir_all(&ambient).unwrap();
+        fs::create_dir_all(&selected).unwrap();
+        let directory = recovery_artifacts_dir(&selected.join("nondefault.db")).unwrap();
+        assert_eq!(directory, fs::canonicalize(&selected).unwrap());
+        assert_ne!(directory, fs::canonicalize(&ambient).unwrap());
+        assert!(!ambient.join(".br_recovery").exists());
+    }
+
+    #[test]
+    fn recovery_556_bare_relative_filename_uses_current_directory_without_chdir() {
+        let directory = recovery_artifacts_dir(Path::new("nondefault.db")).unwrap();
+        assert_eq!(directory, fs::canonicalize(".").unwrap());
+    }
+
+    #[test]
+    fn recovery_556_evidence_resolution_does_not_create_a_missing_database() {
+        let root = tempfile::tempdir().unwrap();
+        let selected = root.path().join("missing.db");
+        assert_eq!(
+            recovery_artifacts_dir(&selected).unwrap(),
+            fs::canonicalize(root.path()).unwrap()
+        );
+        assert!(!selected.exists());
+    }
+
+    #[test]
+    fn recovery_556_frame_refusal_is_a_conflict_not_corruption() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("framed.db");
+        fs::write(family_component_path(&db, "-wal"), [0_u8; 33]).unwrap();
+        let error = require_frame_free_engine_recovery(&db).unwrap_err();
+        assert!(matches!(error, BeadsError::SyncConflict { .. }));
+        assert!(!db.exists());
+        assert!(!family_component_path(&db, "-shm").exists());
+    }
+
     /// GH #520: on Windows the engine keeps its WAL index in private memory,
     /// so a stock-SQLite index beside a header-only WAL (or no index at all)
     /// must never start automatic recovery, whose quarantine step cannot run
@@ -7372,7 +7594,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_532_close_contention_is_post_open_and_fail_closed() {
+    fn recovery_532_private_close_contention_is_fail_closed_before_live_install() {
         let (_temp, migration) = reviewed_source_migration_context("beads.db", 17);
         let before = recovery_family_witness(&migration.db_path).unwrap();
         let mut stage = "live-preflight".to_string();
@@ -7389,15 +7611,20 @@ mod tests {
             "the injected error must occur during close, after open"
         );
         let error = result.unwrap_err();
+        let BeadsError::WithContext { context, source } = &error else {
+            panic!("private close failure must retain its rehearsal evidence: {error}");
+        };
+        assert!(context.contains("private index rehearsal retained at"));
         assert!(matches!(
-            error,
+            source.as_ref(),
             BeadsError::Database(fsqlite_error::FrankenError::BusyRecovery)
         ));
-        assert_eq!(stage, "live-verification");
+        assert_eq!(stage, "private-recovery");
         assert_eq!(
             RecoveryFailureKind::for_error(&stage, &error),
             RecoveryFailureKind::FailClosed
         );
+        assert_eq!(recovery_family_witness(&migration.db_path).unwrap(), before);
         require_recovery_payload_unchanged(
             &before,
             &recovery_family_witness(&migration.db_path).unwrap(),

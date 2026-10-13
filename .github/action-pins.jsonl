@@ -33,3 +33,5 @@
 {"workflow":".github/workflows/release.yml","action":"Swatinem/rust-cache","sha":"f0d9c3887740aee45f6153b24b3a6b815192ec16","tag":"master-head-2026-08-17","source":"verified upstream default-branch commit snapshot dated 2026-08-17; 51 commits after tag v2.9.1"}
 {"workflow":".github/workflows/update-package-manifests.yml","action":"actions/checkout","sha":"3d3c42e5aac5ba805825da76410c181273ba90b1","tag":"v7.0.1","source":"verified upstream tag refs/tags/v7.0.1"}
 {"workflow":".github/workflows/update-package-manifests.yml","action":"peter-evans/create-pull-request","sha":"5f6978faf089d4d20b00c7766989d076bb2fc7f1","tag":"v8.1.1","source":"current workflow ref; inline tag comment"}
+{"workflow":".github/workflows/wal-recovery.yml","action":"actions/checkout","sha":"3d3c42e5aac5ba805825da76410c181273ba90b1","tag":"v7.0.1","source":"reuse the reviewed CI checkout pin for the #556 executable regression"}
+{"workflow":".github/workflows/wal-recovery.yml","action":"actions/upload-artifact","sha":"043fb46d1a93c77aae656e7c1c64a875d1fc6a0a","tag":"v7.0.1","source":"reuse the reviewed CI artifact pin to retain #556 binary and database evidence"}
