@@ -80,7 +80,7 @@ fn identity(file: &File) -> io::Result<FileIdentity> {
 /// Refuse recovery before any writable engine open when the WAL carries frames.
 /// The WAL index is the damaged component, so its counters cannot establish
 /// that those frames are expendable.
-pub(crate) fn require_frame_free_recovery(path: &Path) -> io::Result<()> {
+pub fn require_frame_free_recovery(path: &Path) -> io::Result<()> {
     let wal = match open_regular(&sidecar(path, "-wal"), false) {
         Ok(wal) => wal,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -96,7 +96,7 @@ pub(crate) fn require_frame_free_recovery(path: &Path) -> io::Result<()> {
 
 /// Exclude both engine namespace admission and stock SQLite openers while a
 /// verified derived WAL index is installed. The callback must stay filesystem-only.
-pub(crate) fn with_recovery_exclusion<T>(
+pub fn with_recovery_exclusion<T>(
     requested: &Path,
     expected_identity: FileIdentity,
     operation: impl FnOnce() -> T,
