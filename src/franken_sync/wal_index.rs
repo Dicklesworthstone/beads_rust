@@ -266,9 +266,9 @@ fn stock_empty_probe(path: &Path, engine_reads_on_disk_index: bool) -> io::Resul
 /// Whether the index beside `path` is stock SQLite's unindexed empty index
 /// beside a header-only WAL: #507's shape as every stock reader of the
 /// tracker (bv, the sqlite3 shell) leaves it. FrankenSQLite 0.4.6+ admits it
-/// for reads (fsqlite GH#431). The pinned engine (0.4.10 and later) also
-/// carries GH#443's first commit fix, so neither read-only snapshots nor
-/// writable quarantine are needed for this valid state (br GH#555). Leave normal WAL locking and
+/// for reads (fsqlite GH#431). The pinned 0.4.10 also carries GH#443's first
+/// commit fix, so neither read-only snapshots nor writable quarantine are
+/// needed for this valid state (br GH#555). Leave normal WAL locking and
 /// generation binding to the engine, not an application-level SHM rewrite.
 ///
 /// # Errors

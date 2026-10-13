@@ -19,7 +19,7 @@ so stock readers of the tracker (bv, the sqlite3 shell) can leave it behind.
 FrankenSQLite 0.4.6+ admits that exact shape for reads (fsqlite GH#431,
 `e85717e0a`). The first commit still failed with `BusyRecovery` on 0.4.7, which
 was why br retained writable quarantine after enabling live read-only access.
-FrankenSQLite 0.4.10 and later also include fsqlite GH#443's first-commit fix: this valid
+The pinned 0.4.10 also includes fsqlite GH#443's first-commit fix: this valid
 empty index now needs neither a private read snapshot nor application-level
 quarantine. br's poison and stale probes exclude it, and the operative
 quarantine path repeats the exclusion under its existing locks using the
