@@ -77,6 +77,62 @@ fn identity(file: &File) -> io::Result<FileIdentity> {
         .ok_or_else(|| invalid("WAL-index recovery cannot verify the file identity"))
 }
 
+/// Refuse recovery before any writable engine open when the WAL carries frames.
+/// The WAL index is the damaged component, so its counters cannot establish
+/// that those frames are expendable.
+pub(crate) fn require_frame_free_recovery(path: &Path) -> io::Result<()> {
+    let wal = match open_regular(&sidecar(path, "-wal"), false) {
+        Ok(wal) => wal,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if wal.metadata()?.len() > 32 {
+        return Err(invalid(
+            "engine recovery refused before opening: WAL contains frames that may hold committed, uncheckpointed changes; close other database readers/writers and have the owning SQLite engine complete a truncating checkpoint before retrying; do not delete or replace the WAL or rebuild this database from JSONL",
+        ));
+    }
+    Ok(())
+}
+
+/// Exclude both engine namespace admission and stock SQLite openers while a
+/// verified derived WAL index is installed. The callback must stay filesystem-only.
+pub(crate) fn with_recovery_exclusion<T>(
+    requested: &Path,
+    expected_identity: FileIdentity,
+    operation: impl FnOnce() -> T,
+) -> Result<T, FrankenError> {
+    let parent = requested
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let path = fs::canonicalize(parent)?.join(
+        requested
+            .file_name()
+            .ok_or_else(|| invalid("missing database filename"))?,
+    );
+    let main = open_regular(&path, true)?;
+    if identity(&main)? != expected_identity {
+        return Err(invalid("recovery database no longer matches the retained identity").into());
+    }
+    let pending = PendingNamespaceOpen::begin(&path, NamespaceOpenIntent::Shared)?;
+    if pending.expected_identity().is_some() {
+        return Err(FrankenError::BusyRecovery);
+    }
+    let locked = RecoveryLock::acquire(main).map_err(|error| match error {
+        TryLockError::WouldBlock => FrankenError::BusyRecovery,
+        TryLockError::Error(error) => error.into(),
+    })?;
+    verify_name(&path, &locked.file)?;
+    let _namespace = if pending.has_quiescent_record_bytes()? {
+        pending.bind_replacing_quiescent_record(expected_identity)?
+    } else {
+        pending.bind(expected_identity)?
+    };
+    let result = operation();
+    verify_name(&path, &locked.file)?;
+    Ok(result)
+}
+
 fn verify_name(path: &Path, retained: &File) -> io::Result<()> {
     if identity(&open_regular(path, false)?)? != identity(retained)? {
         return Err(invalid("WAL-index recovery path changed identity"));
@@ -1084,6 +1140,39 @@ pub mod tests {
         target_os = "ios"
     ))]
     use crate::franken_sync::{Connection, SqliteValue, compat};
+
+    #[test]
+    fn recovery_556_frame_free_probe_preserves_header_only_wals() {
+        let root = tempfile::tempdir().unwrap();
+        for length in [None, Some(0), Some(1), Some(31), Some(32)] {
+            let db = root.path().join(format!("wal-{length:?}.db"));
+            let wal = sidecar(&db, "-wal");
+            if let Some(length) = length {
+                fs::write(&wal, vec![0_u8; length]).unwrap();
+            }
+            let before = fs::read(&wal).ok();
+            require_frame_free_recovery(&db).unwrap();
+            assert_eq!(fs::read(&wal).ok(), before);
+            assert!(!db.exists());
+            assert!(!sidecar(&db, "-shm").exists());
+        }
+    }
+
+    #[test]
+    fn recovery_556_frame_bearing_wal_refuses_without_opening_database() {
+        let root = tempfile::tempdir().unwrap();
+        for length in [33, 56, 568, 4_152, 8_272] {
+            let db = root.path().join(format!("framed-{length}.db"));
+            let wal = sidecar(&db, "-wal");
+            let bytes = vec![0x55_u8; length];
+            fs::write(&wal, &bytes).unwrap();
+            let error = require_frame_free_recovery(&db).unwrap_err();
+            assert!(error.to_string().contains("engine recovery refused before opening"));
+            assert_eq!(fs::read(&wal).unwrap(), bytes);
+            assert!(!db.exists());
+            assert!(!sidecar(&db, "-shm").exists());
+        }
+    }
 
     const CRASH_STAGE_ENV: &str = "BR_TEST_507_CRASH_STAGE";
 
