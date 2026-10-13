@@ -238,8 +238,9 @@ could lose unflushed or locally exported work without saying so.
   (RUSTSEC-2026-0306); `cargo audit --deny warnings` is clean.
 - **Release binaries are built with `opt-level = 3`** instead of the size
   profile `z` (`CARGO_PROFILE_RELEASE_OPT_LEVEL=3` in the release build; the
-  repository's profile is unchanged).
-  The measured speedup and size change are in the release notes.
+  repository's profile is unchanged). On a 10,000-issue tracker `ready`,
+  `list`, `show`, `create` and `update` run 1.6 to 1.9 times faster than at
+  `z`; the binary is about twice as large (macOS arm64: 17.3 MB to 34.8 MB).
 
 ### Known issues
 
@@ -254,20 +255,30 @@ could lose unflushed or locally exported work without saying so.
 - `br doctor migrate-schema recover` refuses when engine admission recovery
   would change `-wal`, keeping the pre-state; investigation of a reported
   reverted close is open (#556).
+- Every automatic export re-hashes all JSONL rows for the #548 row receipts,
+  so the cost of `create`, `update` and other mutations grows with tracker
+  size (#559). At 10,000 issues the export step adds about 25 to 45 ms per
+  command to what v0.7.4 needed at the same optimization level; the
+  `opt-level = 3` release binaries are still faster than v0.7.4 on every
+  measured command.
 - Still open: #539, #540, #541, #542.
 
 ### Qualification
 
-- Release gate on the release commit, mirroring CI: `cargo fmt --check`,
+- Release gate, mirroring CI: `cargo fmt --check` and
+  `cargo audit --deny warnings`; on Linux x86_64,
   `cargo clippy --all-targets -- -D warnings` with all features and with no
   default features, the five test shards of `scripts/test-shard.sh`
-  (`lib`, `e2e-a-l`, `e2e-m-z`, `storage`, `misc`) with all features on Linux
-  x86_64, clippy for aarch64-apple-darwin and `cargo check` for the other
-  shipped triples, and `cargo audit --deny warnings`. Pass and fail counts are
-  in the GitHub release notes.
-- Performance against v0.7.4 with the repository's ABBA release-CLI harness
-  (`release_cli_abba_1k_10k`, 1k and 10k issues); results are in the release
-  notes.
+  (`lib`, `e2e-a-l`, `e2e-m-z`, `storage`, `misc`), a release build for
+  x86_64-unknown-linux-musl and `cargo check` for x86_64-pc-windows-msvc; on
+  macOS, clippy (all targets, all features) for aarch64-apple-darwin and
+  `cargo check` for x86_64-apple-darwin. The release build then compiles all
+  seven shipped targets. Pass and fail counts are in the GitHub release notes.
+- Red/green checks for the #545, #546 and #547 fixes: each new test passes with
+  the fix and, for #545 and #547, fails with only the fix removed.
+- Performance against v0.7.4: hyperfine ABBA rounds (A/A control, 80 measured
+  runs per side and command) on the 10,000-issue corpus of the repository's
+  `release_abba` generator, on macOS arm64; results are in the release notes.
 
 ## v0.7.4 — 2026-10-01
 
