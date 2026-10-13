@@ -14,10 +14,12 @@
 //!    (plain `SELECT`s over whatever columns exist) and compares every issue
 //!    row against the JSONL snapshot. An issue is *represented* when the JSONL
 //!    carries it as a tombstone, carries equivalent content, or carries a
-//!    copy at least as new while the database never marked the row dirty.
+//!    copy at least as new while the database never marked the row dirty and
+//!    every local comment occurrence survives in the JSONL. A newer issue
+//!    timestamp alone cannot supersede an append-only comment history.
 //!    Anything else — absent from the JSONL, an unflushed (dirty) edit that
-//!    differs, a row newer than its JSONL copy, or a row that cannot be read —
-//!    is database-only data.
+//!    differs, missing comments, a row newer than its JSONL copy, or a row
+//!    that cannot be read — is database-only data.
 //! 2. [`heal_stale_schema`] first attempts the reviewed in-place migration for
 //!    supported source schemas (lossless, recovery bundle, undo). This preserves
 //!    raw SQL values without requiring that they can be encoded in JSONL. Only
@@ -69,6 +71,8 @@ pub enum DbOnlyReason {
     UnflushedEdit,
     /// The row is not marked dirty but is newer than, and differs from, the JSONL.
     NewerThanJsonl,
+    /// The JSONL supersedes the issue revision but lacks local comment occurrences.
+    CommentsAbsentFromJsonl,
     /// The row could not be decoded, so its representation cannot be proven.
     Unreadable,
 }
@@ -79,6 +83,7 @@ impl DbOnlyReason {
             Self::AbsentFromJsonl => "absent from JSONL",
             Self::UnflushedEdit => "unflushed edit",
             Self::NewerThanJsonl => "newer than JSONL",
+            Self::CommentsAbsentFromJsonl => "comments absent from JSONL",
             Self::Unreadable => "unreadable row",
         }
     }
@@ -90,8 +95,9 @@ pub struct DbOnlyIssue {
     pub id: String,
     pub reason: DbOnlyReason,
     /// Whether the explicit heal re-adds this row after the rebuild. Unflushed
-    /// edits that a newer JSONL edit already superseded stay in the backup
-    /// only, matching the automatic-rebuild rule of GitHub #394.
+    /// scalar edits that a newer JSONL edit superseded stay in the backup,
+    /// matching GitHub #394. A comments-only restore keeps the JSONL's newer
+    /// issue payload instead of reviving those superseded scalar edits.
     pub restorable: bool,
 }
 
@@ -484,11 +490,63 @@ fn audit_connection(
                 restorable,
             });
             if restorable {
+                let preserved = if reason == DbOnlyReason::CommentsAbsentFromJsonl {
+                    let jsonl = jsonl_issues.get(&preserved.issue.id).ok_or_else(|| {
+                        BeadsError::Config(
+                            "comment-only restore lost its audited JSONL issue".to_owned(),
+                        )
+                    })?;
+                    comment_only_restore(preserved, jsonl)?
+                } else {
+                    preserved
+                };
                 audit.restorable.push(preserved);
             }
         }
     }
     Ok(audit)
+}
+
+/// Keep the winning JSONL payload while carrying the missing local history
+/// into the shared comment-completion step. Restoring the entire older issue
+/// would undo a peer's close, title, labels, or dependency edits. Local path
+/// provenance is not a cross-clone scalar and keeps its known local value.
+fn comment_only_restore(mut local: PreservedIssue, jsonl: &Issue) -> Result<PreservedIssue> {
+    if local.issue.id != jsonl.id || jsonl.status == Status::Tombstone {
+        return Err(BeadsError::Config(
+            "comment-only restore requires the same non-tombstone JSONL issue".to_owned(),
+        ));
+    }
+    // As in the audit's scalar comparison, normalize legacy timestamp
+    // precision. A reused ID with a different creation time is another issue,
+    // not permission to transfer the original issue's comments (#512).
+    if micros(local.issue.created_at) != micros(jsonl.created_at) {
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "schema-heal ID collision for {}: creation timestamps differ; cannot assign \
+                 local comments to a different issue. Reconcile the issue identities before \
+                 healing; the rebuild was not started",
+                jsonl.id
+            ),
+        });
+    }
+    let comments = local.comments.as_ref().ok_or_else(|| {
+        BeadsError::Config(format!(
+            "comment-only restore cannot certify unreadable comments for {}",
+            local.issue.id
+        ))
+    })?;
+    let mut issue = jsonl.clone();
+    issue.comments.clone_from(comments);
+    if local.issue.source_repo_path.is_some() {
+        issue
+            .source_repo_path
+            .clone_from(&local.issue.source_repo_path);
+    }
+    local.labels = Some(issue.labels.clone());
+    local.dependencies = Some(issue.dependencies.clone());
+    local.issue = issue;
+    Ok(local)
 }
 
 /// `None` when represented; otherwise the reason and whether the explicit
@@ -502,6 +560,17 @@ fn classify(db: &Issue, jsonl: Option<&Issue>, is_dirty: bool) -> Option<(DbOnly
         return None;
     }
     let db_newer = micros(db.updated_at) > micros(jsonl.updated_at);
+    if !db_newer
+        && !multiset_is_subset(
+            db.comments.iter().map(Comment::sync_key),
+            jsonl.comments.iter().map(Comment::sync_key),
+        )
+    {
+        // Scalar last-write-wins cannot prove an append-only history was
+        // carried. Include this issue in the restore plan, but project the
+        // winning JSONL scalars instead of replaying the superseded row.
+        return Some((DbOnlyReason::CommentsAbsentFromJsonl, true));
+    }
     if is_dirty {
         // Re-add only when the local edit is newer; an older unflushed edit
         // was superseded by the JSONL and stays in the backup (#394 rule).
@@ -2116,5 +2185,278 @@ mod tests {
             exported.dependencies.push(dependency.clone());
             assert!(issues_equivalent(&local, &exported), "superset: {field}");
         }
+    }
+
+    fn local_comment(id: i64, body: &str) -> Comment {
+        Comment {
+            id,
+            issue_id: "a-1".to_owned(),
+            author: "local-agent".to_owned(),
+            body: body.to_owned(),
+            created_at: issue("a-1", "2026-01-01T00:00:00Z").created_at,
+        }
+    }
+
+    #[test]
+    fn comment_preservation_is_independent_of_scalar_age_and_dirty_tracking() {
+        for equal_revision in [false, true] {
+            for dirty in [false, true] {
+                let mut local = issue("a-1", "2026-01-01T00:00:00Z");
+                local.comments = vec![local_comment(1, "retained"), local_comment(2, "retained")];
+                let mut jsonl = local.clone();
+                jsonl.title = "peer's winning title".to_owned();
+                if !equal_revision {
+                    jsonl.updated_at += chrono::Duration::hours(1);
+                }
+                jsonl.comments = vec![local_comment(99, "retained")];
+                assert_eq!(
+                    classify(&local, Some(&jsonl), dirty),
+                    Some((DbOnlyReason::CommentsAbsentFromJsonl, true)),
+                    "one exported occurrence cannot supersede two local occurrences"
+                );
+                jsonl.comments.push(local_comment(100, "retained"));
+                assert_eq!(
+                    classify(&local, Some(&jsonl), dirty),
+                    dirty.then_some((DbOnlyReason::UnflushedEdit, false)),
+                    "complete history must preserve existing scalar precedence"
+                );
+                jsonl.comments.clear();
+                jsonl.status = Status::Tombstone;
+                assert_eq!(classify(&local, Some(&jsonl), dirty), None);
+            }
+        }
+        let mut local = issue("a-1", "2026-02-01T00:00:00Z");
+        local.comments.push(local_comment(1, "newer local"));
+        let older = issue("a-1", "2026-01-01T00:00:00Z");
+        for dirty in [false, true] {
+            let reason = if dirty {
+                DbOnlyReason::UnflushedEdit
+            } else {
+                DbOnlyReason::NewerThanJsonl
+            };
+            assert_eq!(classify(&local, Some(&older), dirty), Some((reason, true)));
+        }
+    }
+
+    fn older_comment_fixture(dirty_mode: u8, equal_revision: bool) -> (Connection, Issue) {
+        let (conn, _) = legacy_audit_fixture();
+        for sql in [
+            "CREATE TABLE comments (id INTEGER, issue_id TEXT, author TEXT, text TEXT, created_at TEXT)",
+            "INSERT INTO comments VALUES (1, 'a-1', 'local-agent', 'local-only', '2026-01-01T00:00:00Z')",
+            "ALTER TABLE issues ADD COLUMN notes TEXT",
+            "ALTER TABLE issues ADD COLUMN source_repo_path TEXT",
+            "UPDATE issues SET notes = 'superseded local notes', source_repo_path = '/local/workspace'",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        if dirty_mode != 0 {
+            conn.execute("CREATE TABLE dirty_issues (issue_id TEXT)")
+                .unwrap();
+        }
+        if dirty_mode == 2 {
+            conn.execute("INSERT INTO dirty_issues VALUES ('a-1')")
+                .unwrap();
+        }
+        let mut peer = issue("a-1", "2026-01-01T00:00:00Z");
+        if !equal_revision {
+            peer.updated_at += chrono::Duration::hours(1);
+        }
+        peer.title = "peer's completed issue".to_owned();
+        peer.status = Status::Closed;
+        peer.closed_at = Some(peer.updated_at);
+        peer.close_reason = Some("completed by peer".to_owned());
+        peer.notes = Some("peer's winning notes".to_owned());
+        peer.labels = vec!["peer-label".to_owned()];
+        peer.source_repo_path = Some("/other/clone".to_owned());
+        peer.comments = vec![local_comment(1, "peer-only")];
+        (conn, peer)
+    }
+
+    #[test]
+    fn audit_projects_newer_issue_payload_for_comments_only_restoration() {
+        for dirty_mode in 0..3 {
+            for equal_revision in [false, true] {
+                let (conn, mut peer) = older_comment_fixture(dirty_mode, equal_revision);
+                peer.dependencies.push(
+                    serde_json::from_value(serde_json::json!({
+                        "issue_id": "a-1", "depends_on_id": "a-2", "type": "blocks",
+                        "created_at": "2026-01-01T00:00:00Z", "metadata": "{\"peer\":true}"
+                    }))
+                    .unwrap(),
+                );
+                let bytes = serde_json::to_vec(&peer).unwrap();
+                let audit = audit_connection(&conn, Some(std::io::Cursor::new(bytes))).unwrap();
+                assert!(!audit.is_clean());
+                assert!(!audit.automatic_rebuild_allowed());
+                assert_eq!(audit.db_only.len(), 1);
+                assert_eq!(audit.db_only[0].reason, DbOnlyReason::CommentsAbsentFromJsonl);
+                assert!(audit.db_only[0].restorable);
+                assert!(
+                    refusal_error(&audit)
+                        .to_string()
+                        .contains("comments absent from JSONL")
+                );
+                for discard in [false, true] {
+                    require_lossless_rebuild(&audit, discard).unwrap();
+                    assert!(planned_action(&audit, discard).contains("re-add 1 database-only"));
+                }
+                let restore = &audit.restorable[0];
+                assert_eq!(restore.issue.title, peer.title);
+                assert_eq!(restore.issue.status, Status::Closed);
+                assert_eq!(restore.issue.closed_at, peer.closed_at);
+                assert_eq!(restore.issue.close_reason, peer.close_reason);
+                assert_eq!(restore.issue.updated_at, peer.updated_at);
+                assert_eq!(restore.issue.notes, peer.notes);
+                assert_eq!(restore.labels.as_ref(), Some(&peer.labels));
+                assert_eq!(restore.dependencies.as_ref(), Some(&peer.dependencies));
+                assert_eq!(
+                    restore.issue.source_repo_path.as_deref(),
+                    Some("/local/workspace")
+                );
+                assert_eq!(
+                    restore.comments.as_ref().unwrap(),
+                    &[local_comment(1, "local-only")]
+                );
+                let original = conn
+                    .query_row("SELECT title, status, notes FROM issues")
+                    .unwrap();
+                assert_eq!(
+                    original.get(0).and_then(SqliteValue::as_text),
+                    Some("title a-1")
+                );
+                assert_eq!(original.get(1).and_then(SqliteValue::as_text), Some("open"));
+                assert_eq!(
+                    original.get(2).and_then(SqliteValue::as_text),
+                    Some("superseded local notes")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn comment_only_projection_refuses_unknown_history_or_a_different_issue() {
+        let local = issue("a-1", "2026-01-01T00:00:00Z");
+        let preserved = PreservedIssue {
+            labels: Some(Vec::new()),
+            dependencies: Some(Vec::new()),
+            comments: None,
+            issue: local.clone(),
+        };
+        assert!(comment_only_restore(preserved.clone(), &local).is_err());
+        let mut known = preserved;
+        known.comments = Some(vec![local_comment(1, "retained")]);
+        let other = issue("a-2", "2026-01-01T00:00:00Z");
+        assert!(comment_only_restore(known.clone(), &other).is_err());
+        let mut reused = local.clone();
+        reused.created_at += chrono::Duration::microseconds(1);
+        assert!(matches!(
+            comment_only_restore(known.clone(), &reused),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        let mut deleted = local;
+        deleted.status = Status::Tombstone;
+        assert!(comment_only_restore(known, &deleted).is_err());
+    }
+
+    #[test]
+    fn audit_refuses_reused_id_before_transferring_local_comments() {
+        let (conn, mut peer) = older_comment_fixture(1, false);
+        peer.created_at += chrono::Duration::seconds(1);
+        let bytes = serde_json::to_vec(&peer).unwrap();
+        let error = audit_connection(&conn, Some(std::io::Cursor::new(bytes))).unwrap_err();
+        assert!(matches!(&error, BeadsError::SyncConflict { message }
+            if message.contains("ID collision") && message.contains("rebuild was not started")));
+        let original = conn.query_row("SELECT text FROM comments").unwrap();
+        assert_eq!(
+            original.get(0).and_then(SqliteValue::as_text),
+            Some("local-only")
+        );
+    }
+
+    #[test]
+    fn audited_older_comments_survive_rehearsal_and_replay() {
+        const NAME: &str = "cli::commands::doctor_subsystems::schema_heal::tests::audited_older_comments_survive_rehearsal_and_replay";
+        const CHILD_ENV: &str = "BR_TEST_ISOLATED_HEAL_OLDER_COMMENTS";
+        if std::env::var(CHILD_ENV).as_deref() != Ok(NAME) {
+            // #506: isolate before any nested rebuild can acquire an opener lease.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    NAME,
+                    "--test-threads=1",
+                    "--format=pretty",
+                    "--color=never",
+                ])
+                .env(CHILD_ENV, NAME)
+                .env_remove("RUST_TEST_NOCAPTURE")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let passed = format!("test {NAME} ... ok");
+            assert!(
+                output.status.success() && stdout.lines().any(|line| line == passed),
+                "isolated older-comment regression failed or did not run: {}\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (conn, peer) = older_comment_fixture(1, false);
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("issues.jsonl");
+        let bytes = format!("{}\n", serde_json::to_string(&peer).unwrap());
+        std::fs::write(&path, &bytes).unwrap();
+        let source = crate::sync::capture_jsonl_source_snapshot(&path).unwrap();
+        let audit = audit_connection(&conn, Some(source.reader())).unwrap();
+        assert_eq!(
+            audit.restorable.len(),
+            1,
+            "an older clean row still owns its comments"
+        );
+        let plan =
+            rebuild_preflight::complete_comment_restore_plan(&source, &audit.restorable).unwrap();
+        assert_eq!(plan[0].issue.title, peer.title);
+        assert_eq!(plan[0].issue.status, Status::Closed);
+        let bodies: HashSet<_> = plan[0]
+            .issue
+            .comments
+            .iter()
+            .map(|comment| comment.body.as_str())
+            .collect();
+        assert_eq!(bodies, HashSet::from(["local-only", "peer-only"]));
+        let witness = rebuild_preflight::rehearse(
+            &source,
+            &plan,
+            &config::ConfigLayer::default(),
+            Some(5_000),
+        )
+        .unwrap()
+        .unwrap();
+        let mut storage = crate::storage::SqliteStorage::open_memory().unwrap();
+        storage.create_issue(&peer, "test").unwrap();
+        storage
+            .sync_comments_for_import(&peer.id, &peer.comments)
+            .unwrap();
+        for _ in 0..2 {
+            crate::sync::restore_dirty_issues_after_rebuild(&mut storage, &plan).unwrap();
+            witness.verify(&storage).unwrap();
+            let restored = storage.get_issue(&peer.id).unwrap().unwrap();
+            assert_eq!(restored.status, Status::Closed);
+            assert_eq!(restored.title, peer.title);
+            assert_eq!(restored.updated_at, peer.updated_at);
+        }
+        storage
+            .sync_comments_for_import(&peer.id, &peer.comments)
+            .unwrap();
+        assert!(
+            witness.verify(&storage).is_err(),
+            "losing the older local comment must fail verification"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+        let original = conn.query_row("SELECT text FROM comments").unwrap();
+        assert_eq!(
+            original.get(0).and_then(SqliteValue::as_text),
+            Some("local-only")
+        );
     }
 }
