@@ -15560,7 +15560,9 @@ fn stream_import_actions_in_tx(
     // list proves the immutable source will only skip rows using the same
     // frozen classification metadata. Build the row-location index once in
     // this transaction; mixed imports keep their ordered, live-state reads.
-    let skip_lookup = if comment_owner_ids_to_replace.is_empty() {
+    // A skip that unions comments rewrites relation rows, which ends the
+    // lookup's validity; certification then falls back to live reads.
+    let mut skip_lookup = if comment_owner_ids_to_replace.is_empty() {
         Some(storage.build_import_issue_lookup()?)
     } else {
         None
@@ -15672,6 +15674,12 @@ fn stream_import_actions_in_tx(
                         invalidated_certificate |= export_hash_ids.remove(&target_id);
                         export_hash_batch.retain(|(id, _)| id != &target_id);
                         storage.sync_comments_for_import_in_tx(&target_id, &union)?;
+                        // The rewrite deletes and re-inserts this target's
+                        // comment rows. The lookup still holds the old rowids,
+                        // and one of them can now hold an incoming comment with
+                        // a shared id, which would certify the stale export
+                        // (GH#547). Certify the rest of this import from live rows.
+                        skip_lookup = None;
                         tx_result.comments_imported += union.len() - db_comments.len();
                     }
                 }
@@ -28560,6 +28568,71 @@ mod tests {
             pending_export_state(&storage, true).unwrap(),
             (0, true, true)
         );
+    }
+
+    #[test]
+    fn test_import_skip_comment_union_with_shared_comment_id_is_not_certified() {
+        // GH#547: two clones minted the same comment id for different
+        // comments. A skip-only import unions them, and the rewrite moves the
+        // local comment off that rowid. Certification must not read the
+        // frozen lookup's rowids, where it would find only the incoming
+        // comment and certify the stale export.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+        let mut original = make_issue_at("bd-x", "Shared issue", fixed_time(100));
+        original.comments.push(Comment {
+            id: 1,
+            issue_id: original.id.clone(),
+            author: "both".to_string(),
+            body: "synced fact".to_string(),
+            created_at: fixed_time(100),
+        });
+        write_additive_issues(&path, std::slice::from_ref(&original));
+        import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+
+        // Clone B adds its own comment (the next id, 2) and flushes.
+        let local = storage
+            .add_comment("bd-x", "clone-b", "local fact")
+            .unwrap();
+        assert_eq!(local.id, 2);
+        storage
+            .clear_dirty_issues_legacy(&["bd-x".to_string()])
+            .unwrap();
+        storage.set_metadata("needs_flush", "false").unwrap();
+
+        // B's JSONL now holds clone A's older version, whose own comment also
+        // got id 2 and sorts before B's.
+        let mut theirs = original.clone();
+        theirs.updated_at = fixed_time(200);
+        theirs.comments.push(Comment {
+            id: 2,
+            issue_id: theirs.id.clone(),
+            author: "clone-a".to_string(),
+            body: "remote fact".to_string(),
+            created_at: fixed_time(200),
+        });
+        write_additive_issues(&path, std::slice::from_ref(&theirs));
+        let imported =
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+
+        assert_eq!(imported.skipped_count, 1);
+        let bodies = storage
+            .get_comments("bd-x")
+            .unwrap()
+            .into_iter()
+            .map(|comment| comment.body)
+            .collect::<Vec<_>>();
+        assert_eq!(bodies.len(), 3, "{bodies:?}");
+        assert!(bodies.iter().any(|body| body == "local fact"));
+        assert!(bodies.iter().any(|body| body == "remote fact"));
+        // The database now differs from the JSONL row, so the row must be
+        // exported again rather than certified as current.
+        assert_eq!(imported.export_hashes_recorded, 0);
+        assert!(storage.get_export_hash("bd-x").unwrap().is_none());
+        let (_, needs_flush, pending) = pending_export_state(&storage, true).unwrap();
+        assert!(needs_flush);
+        assert!(pending);
     }
 
     #[test]
