@@ -1142,11 +1142,16 @@ pub fn heal_stale_schema(ctx: &HealContext<'_>, mode: HealMode) -> Result<HealRe
         .lock_timeout
         .or_else(|| config::lock_timeout_from_layer(&merged))
         .or(Some(30000));
+    // Complete append-only comment histories without changing the audited
+    // scalar precedence. Rehearse and install the same combined restore plan;
+    // neither the pinned source nor the original audited payloads are mutated.
+    let restore_plan =
+        rebuild_preflight::complete_comment_restore_plan(&source, &audit.restorable)?;
     // A readable legacy payload can still conflict with imported rows or
     // current constraints. Prove the complete replay on private state before
     // replacing the live family, then verify the real result against it.
     let rebuild_witness =
-        rebuild_preflight::rehearse(&source, &audit.restorable, &merged, lock_timeout)?;
+        rebuild_preflight::rehearse(&source, &restore_plan, &merged, lock_timeout)?;
     let (mut storage, _import, backups) =
         config::repair_database_from_jsonl_snapshot_under_write_authority(
             ctx.beads_dir,
@@ -1173,7 +1178,7 @@ pub fn heal_stale_schema(ctx: &HealContext<'_>, mode: HealMode) -> Result<HealRe
     // GH #550: authorizing backup-only retention for an unreadable payload
     // or orphan relation must not also omit unrelated, recoverable work.
     // Superseded edits are already excluded by the audit's restore plan.
-    let restore = audit.restorable.as_slice();
+    let restore = restore_plan.as_slice();
     crate::sync::restore_dirty_issues_after_rebuild(&mut storage, restore)?;
     if let Some(witness) = rebuild_witness {
         witness.verify(&storage)?;

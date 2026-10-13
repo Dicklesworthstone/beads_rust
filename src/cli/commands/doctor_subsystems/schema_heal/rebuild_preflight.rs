@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::config::{self, ConfigLayer};
 use crate::error::{BeadsError, Result};
-use crate::model::{Comment, Issue};
+use crate::model::{Comment, Issue, Status};
 use crate::storage::SqliteStorage;
 use crate::sync::{self, JsonlSourceSnapshot, PreservedIssue};
 
@@ -115,6 +115,86 @@ impl RebuildWitness {
         }
         Ok(())
     }
+}
+
+/// Complete append-only histories for the audit's selected local restores.
+/// This only builds an in-memory plan from the pinned source; it neither
+/// changes scalar precedence nor modifies either original input. The same
+/// result must be used by the rehearsal and the eventual live restoration.
+pub(super) fn complete_comment_restore_plan(
+    source: &JsonlSourceSnapshot,
+    restorable: &[PreservedIssue],
+) -> Result<Vec<PreservedIssue>> {
+    if restorable.is_empty() {
+        return Ok(Vec::new());
+    }
+    let imported = super::parse_jsonl(source.reader())?;
+    let mut plan = restorable.to_vec();
+    for preserved in &mut plan {
+        let Some(peer) = imported.get(&preserved.issue.id) else {
+            continue;
+        };
+        // The audit normally excludes these rows. Planning must not turn a
+        // stale caller's restore list into permission to resurrect a deletion.
+        if peer.status == Status::Tombstone {
+            return Err(BeadsError::Config(format!(
+                "schema-heal comment plan refuses to restore {} over an imported tombstone",
+                peer.id
+            )));
+        }
+        let local = preserved.comments.as_ref().ok_or_else(|| {
+            BeadsError::Config(format!(
+                "schema-heal cannot combine unreadable local comments for {}; rebuild not started",
+                peer.id
+            ))
+        })?;
+        if local
+            .iter()
+            .chain(&peer.comments)
+            .any(|comment| comment.issue_id != peer.id)
+        {
+            return Err(BeadsError::Config(format!(
+                "schema-heal comment ownership mismatch for {}; rebuild not started",
+                peer.id
+            )));
+        }
+        let combined = merge_comment_histories(local, &peer.comments);
+        // Keep the independent loss guard, including occurrence counts. The
+        // rehearsal checks it again against the normalized imported baseline.
+        require_imported_comments_preserved(peer, &combined)?;
+        preserved.issue.comments.clone_from(&combined);
+        preserved.comments = Some(combined);
+    }
+    Ok(plan)
+}
+
+/// Multiset union by portable identity, never by clone-local rowid. Shared
+/// occurrences appear once, but the larger occurrence count from either
+/// history survives. Conflicting positive rowids request fresh IDs on replay.
+fn merge_comment_histories(local: &[Comment], imported: &[Comment]) -> Vec<Comment> {
+    let mut unmatched = BTreeMap::<_, usize>::new();
+    for comment in local {
+        *unmatched.entry(comment.sync_key()).or_default() += 1;
+    }
+    let mut combined = local.to_vec();
+    for comment in imported {
+        match unmatched.get_mut(&comment.sync_key()) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => combined.push(comment.clone()),
+        }
+    }
+    combined.sort_by(|left, right| {
+        left.sync_key()
+            .cmp(&right.sync_key())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let mut ids = BTreeSet::new();
+    for comment in &mut combined {
+        if comment.id <= 0 || !ids.insert(comment.id) {
+            comment.id = 0;
+        }
+    }
+    combined
 }
 
 /// Rehearse against an isolated database and an isolated copy of the pinned
@@ -551,5 +631,133 @@ mod tests {
         // valid even when the issue is in the restore set for another field.
         witness.restored_ids.insert(imported.id);
         witness.verify(&storage).unwrap();
+    }
+
+    #[test]
+    fn comment_union_is_lossless_idempotent_and_keeps_occurrence_counts() {
+        for counts in 0_usize..256 {
+            let local_shared = counts % 4;
+            let local_only = (counts / 4) % 4;
+            let peer_shared = (counts / 16) % 4;
+            let peer_only = counts / 64;
+            let mut local = vec![comment(7, "shared"); local_shared];
+            local.extend(vec![comment(7, "local-only"); local_only]);
+            let mut peer = vec![comment(7, "shared"); peer_shared];
+            peer.extend(vec![comment(7, "peer-only"); peer_only]);
+            let combined = merge_comment_histories(&local, &peer);
+            for (body, expected) in [
+                ("shared", local_shared.max(peer_shared)),
+                ("local-only", local_only),
+                ("peer-only", peer_only),
+            ] {
+                assert_eq!(
+                    combined.iter().filter(|comment| comment.body == body).count(),
+                    expected,
+                    "{counts}: {body}"
+                );
+            }
+            let positive: Vec<_> = combined.iter().filter(|comment| comment.id > 0).collect();
+            assert_eq!(
+                positive
+                    .iter()
+                    .map(|comment| comment.id)
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                positive.len(),
+                "colliding rowids must request allocation, never overwrite another comment"
+            );
+            let again = merge_comment_histories(&combined, &peer);
+            let reverse = merge_comment_histories(&peer, &local);
+            let keys: Vec<_> = combined.iter().map(Comment::sync_key).collect();
+            assert_eq!(keys, again.iter().map(Comment::sync_key).collect::<Vec<_>>());
+            assert_eq!(keys, reverse.iter().map(Comment::sync_key).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn comment_plan_refuses_unknown_histories_foreign_owners_and_tombstones() {
+        let original = tempfile::tempdir().unwrap();
+        let path = original.path().join("issues.jsonl");
+        for mode in 0..4 {
+            let mut imported = issue("pf-abc");
+            imported.comments = vec![comment(1, "peer-only")];
+            let mut local = preserved(issue("pf-abc"));
+            match mode {
+                0 => local.comments = None,
+                1 => {
+                    local.comments = Some(vec![Comment {
+                        issue_id: "pf-other".to_owned(),
+                        ..comment(2, "local-only")
+                    }]);
+                }
+                2 => imported.comments[0].issue_id = "pf-other".to_owned(),
+                _ => imported.status = Status::Tombstone,
+            }
+            let bytes = format!("{}\n", serde_json::to_string(&imported).unwrap());
+            fs::write(&path, &bytes).unwrap();
+            let source = sync::capture_jsonl_source_snapshot(&path).unwrap();
+            assert!(
+                complete_comment_restore_plan(&source, &[local]).is_err(),
+                "{mode}"
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn completed_comment_plan_survives_rehearsal_and_replay() {
+        if isolated_rehearsal(concat!(
+            "cli::commands::doctor_subsystems::schema_heal::rebuild_preflight::tests::",
+            "completed_comment_plan_survives_rehearsal_and_replay"
+        )) {
+            return;
+        }
+        let original = tempfile::tempdir().unwrap();
+        let path = original.path().join("issues.jsonl");
+        let mut imported = issue("pf-abc");
+        imported.comments = vec![comment(1, "shared"), comment(2, "peer-only")];
+        let bytes = format!("{}\n", serde_json::to_string(&imported).unwrap());
+        fs::write(&path, &bytes).unwrap();
+        let source = sync::capture_jsonl_source_snapshot(&path).unwrap();
+        let mut local = imported.clone();
+        local.title = "newer unflushed local title".to_owned();
+        local.updated_at += chrono::Duration::seconds(1);
+        local.source_repo_path = Some("/original/workspace".to_owned());
+        local.comments = vec![comment(1, "shared"), comment(2, "local-only")];
+        let audited = vec![preserved(local.clone())];
+        let plan = complete_comment_restore_plan(&source, &audited).unwrap();
+        assert_eq!(audited[0].comments.as_ref().unwrap(), &local.comments);
+        assert_eq!(plan[0].issue.title, local.title);
+        assert_eq!(Some(&plan[0].issue.comments), plan[0].comments.as_ref());
+        let bodies: BTreeSet<_> = plan[0]
+            .issue
+            .comments
+            .iter()
+            .map(|comment| comment.body.as_str())
+            .collect();
+        assert_eq!(bodies, BTreeSet::from(["shared", "peer-only", "local-only"]));
+        let witness = rehearse(&source, &plan, &ConfigLayer::default(), Some(5_000))
+            .unwrap()
+            .unwrap();
+        // Replay the identical plan into a separate destination. Its verifier
+        // must detect a later loss; completing the plan is not a weaker proof.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage.create_issue(&imported, "test").unwrap();
+        storage
+            .sync_comments_for_import(&imported.id, &imported.comments)
+            .unwrap();
+        sync::restore_dirty_issues_after_rebuild(&mut storage, &plan).unwrap();
+        witness.verify(&storage).unwrap();
+        sync::restore_dirty_issues_after_rebuild(&mut storage, &plan).unwrap();
+        witness.verify(&storage).unwrap();
+        storage
+            .sync_comments_for_import(&local.id, &local.comments)
+            .unwrap();
+        assert!(
+            witness.verify(&storage).is_err(),
+            "dropping the peer comment must fail verification"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
+        assert!(!original.path().join("beads.db").exists());
     }
 }
