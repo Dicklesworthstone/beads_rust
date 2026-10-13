@@ -2035,6 +2035,7 @@ fn recovery_run_status(
     if !index_only
         && !recovery_pruning_probe_matches(
             &run_dir.join("recovery-probe"),
+            recorded_dir,
             db_path,
             &prepared.raw_before,
         )?
@@ -2465,6 +2466,7 @@ fn recovery_pruning_backup_matches(
 
 fn recovery_pruning_probe_matches(
     dir: &Path,
+    recorded_run: &Path,
     db_path: &Path,
     before: &RawFamilyWitness,
 ) -> Result<bool> {
@@ -2479,7 +2481,13 @@ fn recovery_pruning_probe_matches(
         }
         drop(file);
     }
-    if !recovery_pruning_directory_contents(dir, &names, &[])? {
+    let quarantine = match recovery_probe_directories(dir, recorded_run, db_path)? {
+        ProbeDirectories::Empty => None,
+        ProbeDirectories::FinishedQuarantine(name) => Some(name),
+        ProbeDirectories::Unrecognized => return Ok(false),
+    };
+    let directories: Vec<&str> = quarantine.as_deref().into_iter().collect();
+    if !recovery_pruning_directory_contents(dir, &names, &directories)? {
         return Ok(false);
     }
     for suffix in ["", "-wal", "-journal"] {
@@ -2494,6 +2502,70 @@ fn recovery_pruning_probe_matches(
         }
     }
     Ok(true)
+}
+
+/// The subdirectories of a run's private `recovery-probe/` copy.
+enum ProbeDirectories {
+    Empty,
+    /// The rehearsal opens its probe copy like a live database, so a #507
+    /// poisoned index there is quarantined beside it (GH#545).
+    FinishedQuarantine(String),
+    /// Anything else keeps the run.
+    Unrecognized,
+}
+
+/// Admit exactly one finished quarantine of the probe database, checked by
+/// the same evidence rules that retain or remove live quarantines.
+fn recovery_probe_directories(
+    dir: &Path,
+    recorded_run: &Path,
+    db_path: &Path,
+) -> Result<ProbeDirectories> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // The directory check that follows refuses a missing probe.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProbeDirectories::Empty);
+        }
+        Err(error) => return Err(BeadsError::Io(error)),
+    };
+    let mut directories = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            directories.push(entry.file_name());
+        }
+    }
+    let name = match directories.as_slice() {
+        [] => return Ok(ProbeDirectories::Empty),
+        [name] => match name.to_str() {
+            Some(name) => name.to_string(),
+            None => return Ok(ProbeDirectories::Unrecognized),
+        },
+        _ => return Ok(ProbeDirectories::Unrecognized),
+    };
+    // The quarantine recorded the probe's canonical path at its original run
+    // name; a run being pruned may already be renamed aside.
+    let (Some(root), Some(run_name)) = (recorded_run.parent(), recorded_run.file_name()) else {
+        return Ok(ProbeDirectories::Unrecognized);
+    };
+    let Ok(root) = fs::canonicalize(root) else {
+        return Ok(ProbeDirectories::Unrecognized);
+    };
+    let recorded_probe = root.join(run_name).join("recovery-probe");
+    let probe_db = backup_component_path(dir, db_path, "")?;
+    let Some(db_name) = probe_db.file_name() else {
+        return Ok(ProbeDirectories::Unrecognized);
+    };
+    if crate::franken_sync::wal_index::is_finished_quarantine(
+        &dir.join(&name),
+        &recorded_probe.join(&name),
+        &recorded_probe.join(db_name).display().to_string(),
+    )? {
+        Ok(ProbeDirectories::FinishedQuarantine(name))
+    } else {
+        Ok(ProbeDirectories::Unrecognized)
+    }
 }
 
 /// Detect observed replacement and evidence drift before recursive removal.
@@ -7103,6 +7175,65 @@ mod tests {
             .unwrap();
         }
         run
+    }
+
+    /// GH#545: a complete-family recovery's private rehearsal quarantines a
+    /// #507-poisoned probe index into `recovery-probe/.br-wal-index-*`. A
+    /// finished run holding exactly that finished quarantine is prunable; any
+    /// other directory in the probe still keeps the run.
+    #[test]
+    fn recovery_retention_admits_the_probe_quarantine_of_a_finished_run_gh545() {
+        use crate::franken_sync::wal_index::tests::write_quarantine_layout;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let database = db_path.display().to_string();
+        let root = migration_runs_root(&beads_dir);
+        fs::create_dir_all(&root).unwrap();
+        let now = Utc::now();
+        let receipts = ["recovery-prepared.json", "recovery-complete.json"];
+        let status = |run: &Path| recovery_run_status(run, run, &db_path).unwrap();
+        let run = |counter| make_run(&root, &run_name(now, 30, counter), &database, &receipts);
+        let probe = |run: &Path| run.join("recovery-probe");
+
+        let plain = run(0);
+        assert_eq!(status(&plain), Some(RecoveryRunStatus::Finished));
+
+        // Older than the five runs below, which pruning always keeps.
+        let quarantined = make_run(&root, &run_name(now, 40, 1), &database, &receipts);
+        write_quarantine_layout(&probe(&quarantined), "probe", "beads.db", true);
+        assert_eq!(status(&quarantined), Some(RecoveryRunStatus::Finished));
+
+        let unfinished = run(2);
+        write_quarantine_layout(&probe(&unfinished), "probe", "beads.db", false);
+        assert_eq!(status(&unfinished), Some(RecoveryRunStatus::Retained));
+
+        let two = run(3);
+        write_quarantine_layout(&probe(&two), "a", "beads.db", true);
+        write_quarantine_layout(&probe(&two), "b", "beads.db", true);
+        assert_eq!(status(&two), Some(RecoveryRunStatus::Retained));
+
+        let foreign = run(4);
+        write_quarantine_layout(&probe(&foreign), "probe", "other.db", true);
+        assert_eq!(status(&foreign), Some(RecoveryRunStatus::Retained));
+
+        let stray = run(5);
+        fs::create_dir(probe(&stray).join("stray")).unwrap();
+        assert_eq!(status(&stray), Some(RecoveryRunStatus::Retained));
+
+        // Pruning removes the finished quarantined run like any finished run.
+        let pruned = prune_recovery_runs(&beads_dir, &db_path, &plain, now).unwrap();
+        assert!(
+            pruned
+                .iter()
+                .any(|path| path.ends_with(quarantined.file_name().unwrap())),
+            "{pruned:?}"
+        );
+        assert!(!quarantined.exists());
+        for kept in [&unfinished, &two, &foreign, &stray] {
+            assert!(kept.exists(), "{}", kept.display());
+        }
     }
 
     fn run_name(now: chrono::DateTime<Utc>, days_ago: i64, counter: u32) -> String {
