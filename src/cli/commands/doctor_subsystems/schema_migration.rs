@@ -7669,15 +7669,7 @@ mod tests {
     #[test]
     fn recovery_532_private_close_contention_is_fail_closed_before_live_install() {
         let (_temp, migration) = reviewed_source_migration_context("beads.db", 17);
-        // Recovery refuses a frame-bearing WAL before opening anything (GH
-        // #556), so the private close is only reached over a truncated WAL.
-        let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-        close_connection(conn).unwrap();
-        let wal_size = fs::metadata(family_component_path(&migration.db_path, "-wal"))
-            .unwrap()
-            .len();
-        assert!(wal_size <= 32, "fixture WAL must hold no frames");
+        truncate_fixture_wal(&migration.db_path);
         let before = recovery_family_witness(&migration.db_path).unwrap();
         let mut stage = "live-preflight".to_string();
         crate::franken_sync::tests::FAIL_NEXT_CLOSE.with(|fault| fault.set(true));
@@ -8026,6 +8018,19 @@ mod tests {
         reviewed_v14_migration_context_with_database_name("beads.db")
     }
 
+    /// Recovery refuses a frame-bearing WAL before it opens or copies anything
+    /// (GH #556). Tests of a later recovery stage start from a truncated WAL so
+    /// that refusal does not answer first.
+    fn truncate_fixture_wal(db_path: &Path) {
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        close_connection(conn).unwrap();
+        let wal_size = fs::metadata(family_component_path(db_path, "-wal"))
+            .unwrap()
+            .len();
+        assert!(wal_size <= 32, "fixture WAL must hold no frames");
+    }
+
     #[test]
     fn vacuum_candidate_never_opens_or_rewrites_live_wal_family() {
         let (_temp, migration) = reviewed_source_migration_context("beads.db", 17);
@@ -8181,6 +8186,7 @@ mod tests {
     #[test]
     fn engine_recovery_refuses_peer_before_creating_backup() {
         let (_temp, migration) = reviewed_v14_migration_context();
+        truncate_fixture_wal(&migration.db_path);
         let peer = crate::sync::DatabaseOpenerLease::register(&migration.db_path).unwrap();
         assert!(peer.is_registered());
         let before = recovery_family_witness(&migration.db_path).unwrap();
@@ -8195,6 +8201,7 @@ mod tests {
     #[test]
     fn engine_recovery_refuses_engine_sidecar_symlink() {
         let (_temp, migration) = reviewed_v14_migration_context();
+        truncate_fixture_wal(&migration.db_path);
         let outside = migration.beads_dir.join("outside-marker");
         fs::write(&outside, b"untouched").unwrap();
         let marker = family_component_path(&migration.db_path, ".fsqlite-migration-state");
@@ -8212,6 +8219,7 @@ mod tests {
     #[test]
     fn engine_recovery_preserves_prestate_when_private_open_fails() {
         let (_temp, migration) = reviewed_v14_migration_context();
+        truncate_fixture_wal(&migration.db_path);
         fs::write(&migration.db_path, b"not a database").unwrap();
         let before = recovery_family_witness(&migration.db_path).unwrap();
         let error =
