@@ -1,0 +1,57 @@
+name: WAL recovery regression
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/wal-recovery.yml'
+      - 'src/cli/commands/doctor_subsystems/schema_migration*'
+      - 'src/cli/commands/doctor_subsystems/schema_migration/**'
+      - 'src/franken_sync*'
+      - 'src/franken_sync/**'
+      - 'src/sync/db_inode_lock.rs'
+      - 'tests/e2e_scripts/wal_recovery_556.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wal-recovery-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_TERM_COLOR: never
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the repository's CI toolchain
+        run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt,clippy
+      - name: Build br
+        run: cargo +nightly-2026-08-31 build --locked --bin br
+      - name: Validate fixtures and native exclusion
+        run: python3 tests/e2e_scripts/wal_recovery_556.py --self-test
+      - name: Exercise the actual executable
+        run: python3 tests/e2e_scripts/wal_recovery_556.py --br "$PWD/target/debug/br"
+      - name: Retain the binary, fixtures, and recovery evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wal-recovery-${{ github.sha }}
+          include-hidden-files: true
+          if-no-files-found: warn
+          path: |
+            target/debug/br
+            /tmp/br-recovery-556-*
+            /tmp/br-556-selftest-*
