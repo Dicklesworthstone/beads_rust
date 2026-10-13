@@ -331,6 +331,151 @@ def test_orphaned_wal(br: Path, seed: Path, ambient: Path, root: Path,
                     "idle WAL-only closure was lost")
 
 
+def poison_index_headers(db: Path) -> None:
+    """Install #507's signature only in a disposable fixture's two headers.
+
+    Do not truncate or replace a file mapped by the stock reader. Its read
+    marks and lock region stay intact, and its child exits without more SQL.
+    """
+    before = family(db)
+    require(before["-shm"] is not None and len(before["-shm"]) >= 136,
+            "fixture requires both WAL-index headers and read marks")
+    header = bytearray(48)
+    header[:4] = (3_007_000).to_bytes(4, sys.byteorder)
+    header[12] = 1
+    with component(db, "-shm").open("r+b") as out:
+        out.write(header + header)
+    after = family(db)
+    unchanged(before, after, PROTECTED)
+    require(before["-shm"][96:] == after["-shm"][96:], "fixture changed lock/read-mark bytes")
+
+
+def assert_closed_observation(state: Family, root: Path, issue_id: str) -> None:
+    observed = root / "observation.db"
+    inspection = root / "oracle" / "observation.db"
+    retain(state, observed)
+    retain(state, inspection)
+    with contextlib.closing(readonly(inspection)) as current:
+        require(issue_state(current, issue_id) == ("closed", STAMP, REASON),
+                "post-refusal observation lost the committed WAL-only closure")
+    unchanged(state, family(observed))
+
+
+def test_pinned_automatic(br: Path, seed: Path, ambient: Path, root: Path,
+                          writing: bool) -> None:
+    db = root / "copy" / "selected.db"
+    retain(family(seed), db)
+    # The holder must not read a deliberately poisoned index or checkpoint on
+    # exit; its committed bytes remain available for post-mortem inspection.
+    with pinned_closure(db, leave_wal=True) as issue_id:
+        poison_index_headers(db)
+        before = family(db)
+        ambient_before = family(ambient / "beads.db")
+        ambient_artifacts = recovery_files(ambient)
+        command = (["comments", "add", issue_id, "GH556 forbidden write"] if writing
+                   else ["list", "--all", "--json"])
+        for attempt in range(3):
+            # No opt-out from normal automatic import/flush/startup behavior.
+            result = run_br(br, root, ambient, ["--db", str(db), *command],
+                            f"automatic-{attempt}")
+            after = family(db)
+            retain(after, root / f"after-{attempt}" / db.name)
+            assert_refusal(result, before, after)
+            assert_closed_observation(after, root / f"record-{attempt}", issue_id)
+            unchanged(ambient_before, family(ambient / "beads.db"))
+            require(recovery_files(ambient) == ambient_artifacts, "ambient evidence changed")
+            require(not (db.parent / ".br_recovery").exists(),
+                    "automatic WAL refusal allocated recovery artifacts")
+
+
+@contextlib.contextmanager
+def pinned_header_only_reader(db: Path):
+    """A real stock reader in another process; never checkpoint on release."""
+    script = r"""
+import json, os, sqlite3, sys
+from pathlib import Path
+conn = sqlite3.connect(Path(sys.argv[1]).as_uri() + '?mode=ro', uri=True, timeout=1)
+conn.execute('BEGIN')
+row = conn.execute('SELECT id, status, closed_at, close_reason FROM issues WHERE title=?',
+                   (sys.argv[2],)).fetchone()
+assert row is not None
+print(json.dumps(row), flush=True)
+assert sys.stdin.readline().strip() == 'release'
+os._exit(0)
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-I", "-u", "-c", script, str(db.resolve()), TITLE],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    messages = queue.Queue()
+    observer = threading.Thread(target=lambda: messages.put(child.stdout.readline()), daemon=True)
+    observer.start()
+    try:
+        try:
+            line = messages.get(timeout=10)
+        except queue.Empty as error:
+            raise AssertionError("header-only reader failed to pin its snapshot") from error
+        require(bool(line), "header-only reader exited before pinning its snapshot")
+        require(len(component(db, "-wal").read_bytes()) == 32, "fixture WAL is not header-only")
+        yield json.loads(line)
+    finally:
+        try:
+            if child.poll() is None:
+                child.stdin.write("release\n")
+                child.stdin.flush()
+            child.wait(timeout=10)
+        except (BrokenPipeError, subprocess.TimeoutExpired):
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+        finally:
+            child.stdin.close()
+            observer.join(timeout=5)
+            child.stdout.close()
+            error = child.stderr.read()
+            child.stderr.close()
+        require(child.returncode == 0, f"header-only reader failed: {error}")
+
+
+def test_header_only_contention_and_retry(br: Path, seed: Path, ambient: Path, root: Path) -> None:
+    db = root / "copy" / "nondefault.db"
+    retain(family(seed), db)
+    ambient_before = recovery_files(ambient)
+    ambient_db_before = family(ambient / "beads.db")
+    command = ["--db", str(db), "--no-auto-import", "--no-auto-flush",
+               "doctor", "migrate-schema", "recover", "--json"]
+    with pinned_header_only_reader(db) as row:
+        poison_index_headers(db)
+        before = family(db)
+        result = run_br(br, root, ambient, command, "held-reader")
+        after = family(db)
+        retain(after, root / "after-refusal" / db.name)
+        unchanged(before, after)
+        require(result.returncode != 0, "recovery admitted a mapped stock-SQLite index")
+        require("transient contention" in result.stdout + result.stderr,
+                f"expected typed contention, not another error: {result.stdout}{result.stderr}")
+        assert_artifact_scope(db, ambient, ambient_before, "failed", before)
+        inspection = root / "oracle-refusal" / db.name
+        retain(after, inspection)
+        with contextlib.closing(readonly(inspection)) as reader:
+            require(issue_state(reader, row[0]) == tuple(row[1:]), "failed recovery lost a record")
+    retained_failure = recovery_files(db.parent)
+    result = run_br(br, root, ambient, command, "after-reader-release")
+    after = family(db)
+    retain(after, root / "after-success" / db.name)
+    unchanged(before, after, PROTECTED)
+    require(result.returncode == 0, f"legitimate recovery could not retry: {result.stdout}{result.stderr}")
+    assert_artifact_scope(db, ambient, ambient_before, "complete", before)
+    retained_after = recovery_files(db.parent)
+    require(all(retained_after.get(name) == data for name, data in retained_failure.items()),
+            "successful retry changed or removed retained failure evidence")
+    unchanged(ambient_db_before, family(ambient / "beads.db"))
+    inspection = root / "oracle-success" / db.name
+    retain(after, inspection)
+    with contextlib.closing(readonly(inspection)) as reader:
+        require(issue_state(reader, row[0]) == tuple(row[1:]), "successful recovery lost a record")
+
+
 def recovery_files(root: Path) -> dict[str, bytes]:
     recovery = root / ".br_recovery"
     return {str(path.relative_to(recovery)): path.read_bytes()
@@ -349,7 +494,15 @@ def assert_artifact_scope(db: Path, ambient: Path, ambient_before: dict[str, byt
     backup = Path(receipt["backup_path"])
     require(backup.resolve() == (receipts[0].parent / "recovery-before").resolve(),
             "backup path does not belong to the selected database's recovery run")
-    unchanged(original, family(backup / db.name))
+    saved = family(backup / db.name)
+    scope = receipt.get("backup_scope")
+    require(scope in ("complete-family", "wal-index-only"), f"unknown backup scope: {scope}")
+    if scope == "wal-index-only":
+        unchanged(original, saved, ("-shm",))
+        require(all(saved[suffix] is None for suffix in PROTECTED),
+                "an index-only backup unexpectedly contains durable payloads")
+    else:
+        unchanged(original, saved)
 
 
 def test_artifact_location(br: Path, seed: Path, ambient: Path, root: Path,
@@ -470,6 +623,67 @@ finally:
                 conn.commit()
             unchanged(before, family(self.db))
 
+    @unittest.skipUnless(HAS_LINUX_OFD, "requires Linux OFD locks")
+    def test_poison_fixture_keeps_real_reader_locks_and_committed_records(self):
+        with pinned_closure(self.db, leave_wal=True) as issue_id:
+            before = family(self.db)
+            poison_index_headers(self.db)
+            after = family(self.db)
+            unchanged(before, after, PROTECTED)
+            self.assertEqual(before["-shm"][96:], after["-shm"][96:])
+            self.assertEqual(after["-shm"][:48], after["-shm"][48:96])
+            with self.assertRaises(OSError) as caught:
+                with sqlite_main_exclusion(self.db):
+                    self.fail("poison setup released the stock reader's lock")
+            self.assertIn(caught.exception.errno, (errno.EAGAIN, errno.EACCES))
+            unchanged(after, family(self.db))
+            assert_closed_observation(after, self.root / "retained", issue_id)
+
+    @unittest.skipUnless(HAS_LINUX_OFD, "requires Linux OFD locks")
+    def test_header_only_reader_fixture_really_excludes_recovery(self):
+        # Save a valid header from SQLite, then settle all frames before
+        # installing that empty-generation header on this disposable copy.
+        with contextlib.closing(sqlite3.connect(self.db)) as writer:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("UPDATE issues SET close_reason='fixture'")
+            writer.commit()
+            header = component(self.db, "-wal").read_bytes()[:32]
+            self.assertEqual(len(header), 32)
+            self.assertEqual(writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0], 0)
+        # No SQLite connection is alive here. This reproduces a settled br
+        # header-only family without requiring or pretending to test br.
+        component(self.db, "-wal").write_bytes(header)
+        with pinned_header_only_reader(self.db) as row:
+            self.assertEqual(row[1:], ["open", None, "fixture"])
+            poison_index_headers(self.db)
+            before = family(self.db)
+            with self.assertRaises(OSError) as caught:
+                with sqlite_main_exclusion(self.db):
+                    self.fail("header-only reader did not exclude recovery")
+            self.assertIn(caught.exception.errno, (errno.EAGAIN, errno.EACCES))
+            unchanged(before, family(self.db))
+        with sqlite_main_exclusion(self.db):
+            unchanged(before, family(self.db))
+
+    def test_record_oracle_rejects_a_discarded_committed_wal(self):
+        issue_id = orphaned_closure(self.db)
+        state = family(self.db)
+        state["-wal"] = None
+        state["-shm"] = None
+        with self.assertRaisesRegex(AssertionError, "lost the committed WAL-only closure"):
+            assert_closed_observation(state, self.root / "discarded", issue_id)
+
+    def test_refusal_oracle_checks_every_family_component(self):
+        state = family(self.db)
+        result = subprocess.CompletedProcess([], 1, "", REFUSAL)
+        for suffix in SUFFIXES:
+            with self.subTest(suffix=suffix):
+                changed = dict(state)
+                changed[suffix] = (changed[suffix] or b"") + b"changed"
+                with self.assertRaisesRegex(AssertionError, "changed file bytes"):
+                    assert_refusal(result, state, changed)
+
     def test_nonzero_exit_does_not_hide_wal_mutation(self):
         with pinned_closure(self.db):
             before = family(self.db)
@@ -524,7 +738,13 @@ def main() -> int:
              ("orphaned-wal", lambda directory: test_orphaned_wal(
         br, seed, ambient_db.parent, directory)),
              ("automatic-orphaned-wal", lambda directory: test_orphaned_wal(
-        br, seed, ambient_db.parent, directory, automatic=True))]
+        br, seed, ambient_db.parent, directory, automatic=True)),
+             ("pinned-automatic-list", lambda directory: test_pinned_automatic(
+        br, seed, ambient_db.parent, directory, writing=False)),
+             ("pinned-automatic-comments", lambda directory: test_pinned_automatic(
+        br, seed, ambient_db.parent, directory, writing=True)),
+             ("header-only-contention-retry", lambda directory: test_header_only_contention_and_retry(
+        br, seed, ambient_db.parent, directory))]
     for relative in (False, True):
         for fail in (False, True):
             label = f"artifacts-{'relative' if relative else 'absolute'}-{'failure' if fail else 'success'}"
