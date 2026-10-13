@@ -6306,6 +6306,17 @@ mod tests {
         assert!(!selected.exists());
     }
 
+    #[test]
+    fn recovery_556_frame_refusal_is_a_conflict_not_corruption() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("framed.db");
+        fs::write(family_component_path(&db, "-wal"), [0_u8; 33]).unwrap();
+        let error = require_frame_free_engine_recovery(&db).unwrap_err();
+        assert!(matches!(error, BeadsError::SyncConflict { .. }));
+        assert!(!db.exists());
+        assert!(!family_component_path(&db, "-shm").exists());
+    }
+
     /// GH #520: on Windows the engine keeps its WAL index in private memory,
     /// so a stock-SQLite index beside a header-only WAL (or no index at all)
     /// must never start automatic recovery, whose quarantine step cannot run
@@ -7452,7 +7463,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_532_close_contention_is_post_open_and_fail_closed() {
+    fn recovery_532_private_close_contention_is_fail_closed_before_live_install() {
         let (_temp, migration) = reviewed_source_migration_context("beads.db", 17);
         let before = recovery_family_witness(&migration.db_path).unwrap();
         let mut stage = "live-preflight".to_string();
@@ -7469,15 +7480,20 @@ mod tests {
             "the injected error must occur during close, after open"
         );
         let error = result.unwrap_err();
+        let BeadsError::WithContext { context, source } = &error else {
+            panic!("private close failure must retain its rehearsal evidence: {error}");
+        };
+        assert!(context.contains("private index rehearsal retained at"));
         assert!(matches!(
-            error,
+            source.as_ref(),
             BeadsError::Database(fsqlite_error::FrankenError::BusyRecovery)
         ));
-        assert_eq!(stage, "live-verification");
+        assert_eq!(stage, "private-recovery");
         assert_eq!(
             RecoveryFailureKind::for_error(&stage, &error),
             RecoveryFailureKind::FailClosed
         );
+        assert_eq!(recovery_family_witness(&migration.db_path).unwrap(), before);
         require_recovery_payload_unchanged(
             &before,
             &recovery_family_witness(&migration.db_path).unwrap(),
