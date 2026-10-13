@@ -31,7 +31,7 @@ explicitly corrected during this audit.
 
 | Version | Date | Kind | Headline |
 |---|---|---|---|
-| [v0.7.5](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.5) | 2026-10-13 | Release | FrankenSQLite 0.4.12; imports and `sync --merge` keep newer and locally exported work (#535, #547, #548); automatic rebuilds and `doctor --repair` refuse instead of dropping unflushed changes (#546, #553); WAL-index recovery under a stock SQLite reader retries instead of latching (#532); stale-schema heal fixes (#550, #551); `vcs-status --runtime-files`; opt-level 3 release binaries |
+| [v0.7.5](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.5) | 2026-10-13 | Release | FrankenSQLite 0.4.10; `doctor migrate-schema recover` no longer rewrites the WAL (#556); imports and `sync --merge` keep newer and locally exported work (#535, #547, #548); automatic rebuilds and `doctor --repair` refuse instead of dropping unflushed changes (#546, #553); WAL-index recovery under a stock SQLite reader retries instead of latching (#532); stale-schema heal fixes (#550, #551); `vcs-status --runtime-files`; opt-level 3 release binaries |
 | [v0.7.4](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.4) | 2026-10-01 | Release | `--exclude-label` for list/ready/search/count (#522); FrankenSQLite 0.4.7, so reads after a SQLite reader such as bv no longer copy the database; bounded `.br_recovery` and `.br-wal-index-*` retention; provenance-backed create entry routes (#503); "recovery in progress" names `br doctor migrate-schema recover` |
 | [v0.7.3](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.3) | 2026-09-29 | Release | Read-only commands (`--no-auto-import --no-auto-flush`, the form bv generates) no longer fail with "recovery in progress" after a SQLite reader such as bv opened the tracker |
 | [v0.7.2](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.2) | 2026-09-29 | Release | WAL-index recovery no longer locked out by pre-existing index damage, and warns when rows may be lost (#523); `br update` reports label changes (#527) |
@@ -92,8 +92,9 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 [Release](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.5).
 A patch release. The database schema is unchanged at 19. It moves br to
-FrankenSQLite 0.4.12 and closes a set of sync, recovery and repair paths that
-could lose unflushed or locally exported work without saying so.
+FrankenSQLite 0.4.10, stops `br doctor migrate-schema recover` from rewriting
+the WAL (#556), and closes a set of sync, recovery and repair paths that could
+lose unflushed or locally exported work without saying so.
 
 ### Sync and import keep local work
 
@@ -131,6 +132,17 @@ could lose unflushed or locally exported work without saying so.
 
 ### Recovery and repair refuse instead of dropping data
 
+- **`br doctor migrate-schema recover` no longer rewrites the WAL** (#556).
+  WAL-index recovery runs the engine on a private copy and publishes only a
+  verified WAL index to the live database; a WAL that still carries frames is
+  refused before any writable engine open, as a conflict rather than as
+  corruption; and recovery evidence is scoped to the selected database
+  ([cc343351](https://github.com/Dicklesworthstone/beads_rust/commit/cc343351), [e4ad53c3](https://github.com/Dicklesworthstone/beads_rust/commit/e4ad53c3),
+  [1b533989](https://github.com/Dicklesworthstone/beads_rust/commit/1b533989), [b4f2f809](https://github.com/Dicklesworthstone/beads_rust/commit/b4f2f809)).
+  A checkpoint that another checkpointer keeps from starting is reported as
+  busy instead of as an internal error, and never authorizes truncating the
+  WAL ([acf11098](https://github.com/Dicklesworthstone/beads_rust/commit/acf11098)). #556 stays open until the reporter's
+  reproduction is confirmed against this release.
 - **Automatic rebuilds from JSONL refuse when preservation is unknown.** The
   snapshot of dirty issues, tombstones and relations taken before a rebuild
   now reports every row it could not read, and automatic startup recovery and
@@ -221,17 +233,18 @@ could lose unflushed or locally exported work without saying so.
 
 ### Engine and dependencies
 
-- **FrankenSQLite 0.4.12** (from 0.4.7 in v0.7.4)
-  ([5f0b8fc1](https://github.com/Dicklesworthstone/beads_rust/commit/5f0b8fc1);
-  0.4.10 on main via [fba10795](https://github.com/Dicklesworthstone/beads_rust/commit/fba10795)).
-  Main had moved to a git revision of the engine that did not build on macOS
-  (#538); the release is back on a published crate that does. 0.4.8 through
-  0.4.12 carry the engine's SQL, constraint and durability fixes of that
-  period (see the [FrankenSQLite CHANGELOG](https://github.com/Dicklesworthstone/frankensqlite/blob/main/CHANGELOG.md)),
-  including a `DELETE ... WHERE EXISTS` over the same table that deleted the
-  wrong rows. On Linux a full filesystem while the WAL index grows is an I/O
-  error, not a SIGBUS. `id IN (...)` now seeks the primary-key index, so br's
-  batched issue reads no longer scan the table.
+- **FrankenSQLite 0.4.10** (from 0.4.7 in v0.7.4;
+  [fba10795](https://github.com/Dicklesworthstone/beads_rust/commit/fba10795)). Main had moved to a git revision of the engine
+  that did not build on macOS (#538); the release is on a published crate that
+  does. 0.4.8 through 0.4.10 carry the engine's SQL, constraint and durability
+  fixes of that period (see the [FrankenSQLite CHANGELOG](https://github.com/Dicklesworthstone/frankensqlite/blob/main/CHANGELOG.md)).
+- FrankenSQLite 0.4.12 was evaluated for this release and deferred (#561): with
+  it, a tracker whose WAL is zero bytes and whose `-shm` is missing can no
+  longer be opened, and its recovery command fails too. The pin
+  ([5f0b8fc1](https://github.com/Dicklesworthstone/beads_rust/commit/5f0b8fc1)) is reverted by [9269a922](https://github.com/Dicklesworthstone/beads_rust/commit/9269a922).
+  The three defects that 0.4.12 fixes in 0.4.10 do not reach br: it has no
+  index with a `DESC` column, does not set `autocommit_retain`, and issues no
+  `DELETE ... WHERE EXISTS` over the same table.
 - fastmcp 0.13.0 (optional `mcp` feature), tru 0.2.5, insta 1.49 (dev),
   libc 0.2.190, signal-hook 0.4.5, schemars 1.2.3. Lockfile security fixes:
   quinn-proto 0.11.19 (RUSTSEC-2026-0338 to -0342) and faster-hex 0.10.1
@@ -252,9 +265,9 @@ could lose unflushed or locally exported work without saying so.
   run `br sync --merge`.
 - `br vcs-status --runtime-files` reports the inventory unavailable in large
   nested repositories and under slow hosts (#552).
-- `br doctor migrate-schema recover` refuses when engine admission recovery
-  would change `-wal`, keeping the pre-state; investigation of a reported
-  reverted close is open (#556).
+- `br doctor migrate-schema recover` refuses a WAL that still carries frames;
+  have the owning SQLite engine complete a truncating checkpoint, then retry
+  (#556).
 - Every automatic export re-hashes all JSONL rows for the #548 row receipts,
   so the cost of `create`, `update` and other mutations grows with tracker
   size (#559). At 10,000 issues the export step adds about 25 to 45 ms per
