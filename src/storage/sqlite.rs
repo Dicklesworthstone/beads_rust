@@ -35524,6 +35524,7 @@ required_fields:
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn missing_wal_index_recovery_preserves_valid_wal_only_pending_receipt() {
         let temp = TempDir::new().unwrap();
