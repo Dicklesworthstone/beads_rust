@@ -179,6 +179,32 @@ fn create_restore_rollback_snapshot(
     )))
 }
 
+/// Install only into an absent name. A prior exists() check is not authority
+/// to overwrite an export that arrives while the backup is being copied, nor
+/// to replace a dangling symlink during rollback. Never fall back to a
+/// replacing rename when the filesystem lacks the atomic primitive.
+fn durable_restore_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    let renamed = {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE).map_err(io::Error::from)
+    };
+    #[cfg(windows)]
+    let renamed = crate::sync::rename_path_no_replace_windows(from, to);
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    )))]
+    let renamed: io::Result<()> = Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "history restore requires atomic no-replace rename support on this platform",
+    ));
+    renamed?;
+    crate::util::sync_rename_parent_directories(from, to)
+}
+
 fn commit_restored_target_with_rollback<R>(
     temp_path: &Path,
     target_path: &Path,
@@ -193,7 +219,7 @@ where
         Err(rename_err) => {
             if let Some(rollback_guard) = rollback_guard {
                 if !target_path.exists() {
-                    return match crate::util::durable_rename(&rollback_guard.path, target_path) {
+                    return match durable_restore_no_replace(&rollback_guard.path, target_path) {
                         Ok(()) => Err(BeadsError::Config(format!(
                             "Failed to replace '{}' with the restored backup: {rename_err}. The original target was restored.",
                             history_display_path(target_path)
@@ -579,6 +605,26 @@ fn restore_backup(
     active_jsonl_path: Option<&Path>,
     ctx: &OutputContext,
 ) -> Result<()> {
+    restore_backup_with_before_commit(
+        beads_dir,
+        history_dir,
+        filename,
+        force,
+        active_jsonl_path,
+        ctx,
+        |_| Ok(()),
+    )
+}
+
+fn restore_backup_with_before_commit(
+    beads_dir: &Path,
+    history_dir: &Path,
+    filename: &str,
+    force: bool,
+    active_jsonl_path: Option<&Path>,
+    ctx: &OutputContext,
+    before_commit: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     let backup_name = validated_backup_filename(filename)?;
     let backup_path = history_dir.join(&backup_name);
     ensure_regular_backup_file(&backup_path, &backup_name)?;
@@ -612,6 +658,9 @@ fn restore_backup(
     io::copy(&mut reader, &mut writer)?;
     writer.sync_all()?;
     drop(writer);
+    // A test can publish a competing name here without sleeps or timing bets.
+    // The production call is a no-op; the final syscall enforces absence.
+    before_commit(&target_path)?;
     let mut rollback_guard = None;
     if force && target_path.exists() {
         require_safe_sync_overwrite_path(
@@ -626,7 +675,13 @@ fn restore_backup(
         &temp_path,
         &target_path,
         rollback_guard.as_mut(),
-        crate::util::durable_rename,
+        |from, to| {
+            if force {
+                crate::util::durable_rename(from, to)
+            } else {
+                durable_restore_no_replace(from, to)
+            }
+        },
     )?;
     temp_guard.persist();
     emit_restore_output(ctx, &backup_name, &target_path, &target_name, beads_dir);
@@ -1756,5 +1811,165 @@ mod tests {
             "original\n",
             "target should be unchanged after failed rename"
         );
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    ))]
+    mod no_clobber {
+        use super::*;
+        use std::cell::Cell;
+
+        const BACKUP_NAME: &str = "issues.20260101_000000.jsonl";
+        const BACKUP: &[u8] = b"{\"id\":\"bd-before\",\"title\":\"backup\"}\n";
+        const METADATA: &str =
+            r#"{"target":{"kind":"relative","path":"issues.jsonl"}}"#;
+
+        fn fixture() -> (TempDir, PathBuf, PathBuf) {
+            let temp = TempDir::new().unwrap();
+            let beads = temp.path().join(".beads");
+            let history = beads.join(".br_history");
+            fs::create_dir_all(&history).unwrap();
+            let backup = history.join(BACKUP_NAME);
+            fs::write(&backup, BACKUP).unwrap();
+            fs::write(backup.with_extension("jsonl.meta.json"), METADATA).unwrap();
+            fs::write(beads.join("beads.db"), b"database remains untouched").unwrap();
+            (temp, beads, history)
+        }
+
+        fn assert_evidence_unchanged(beads: &Path, history: &Path) {
+            let backup = history.join(BACKUP_NAME);
+            assert_eq!(fs::read(&backup).unwrap(), BACKUP);
+            assert_eq!(
+                fs::read_to_string(backup.with_extension("jsonl.meta.json")).unwrap(),
+                METADATA
+            );
+            assert_eq!(
+                fs::read(beads.join("beads.db")).unwrap(),
+                b"database remains untouched"
+            );
+            assert!(fs::read_dir(beads).unwrap().all(|entry| {
+                !entry.unwrap().path().extension().is_some_and(|ext| ext == "tmp")
+            }));
+        }
+
+        #[test]
+        fn restore_without_force_installs_only_when_target_stays_absent() {
+            let (_temp, beads, history) = fixture();
+            let target = beads.join("issues.jsonl");
+            let ctx = OutputContext::from_flags(false, true, true);
+            restore_backup(&beads, &history, BACKUP_NAME, false, None, &ctx).unwrap();
+            assert_eq!(fs::read(&target).unwrap(), BACKUP);
+            assert_evidence_unchanged(&beads, &history);
+            // A subsequent non-force invocation still refuses the existing name.
+            fs::write(&target, b"later export").unwrap();
+            assert!(restore_backup(&beads, &history, BACKUP_NAME, false, None, &ctx).is_err());
+            assert_eq!(fs::read(&target).unwrap(), b"later export");
+            assert_evidence_unchanged(&beads, &history);
+        }
+
+        #[test]
+        fn restore_without_force_preserves_names_arriving_after_the_absence_check() {
+            for directory in [false, true] {
+                let (_temp, beads, history) = fixture();
+                let target = beads.join("issues.jsonl");
+                let arrived = Cell::new(false);
+                let ctx = OutputContext::from_flags(false, true, true);
+                let result = restore_backup_with_before_commit(
+                    &beads,
+                    &history,
+                    BACKUP_NAME,
+                    false,
+                    None,
+                    &ctx,
+                    |path| {
+                        assert!(!path.exists());
+                        if directory {
+                            fs::create_dir(path)?;
+                            fs::write(path.join("keep"), b"concurrent evidence")?;
+                        } else {
+                            fs::write(path, b"concurrent export")?;
+                        }
+                        arrived.set(true);
+                        Ok(())
+                    },
+                );
+                assert!(arrived.get(), "the race boundary must actually be exercised");
+                assert!(matches!(result, Err(BeadsError::Io(_))), "{result:?}");
+                if directory {
+                    assert_eq!(fs::read(target.join("keep")).unwrap(), b"concurrent evidence");
+                } else {
+                    assert_eq!(fs::read(&target).unwrap(), b"concurrent export");
+                }
+                assert_evidence_unchanged(&beads, &history);
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn restore_without_force_preserves_an_arriving_dangling_symlink() {
+            use std::os::unix::fs::symlink;
+
+            let (_temp, beads, history) = fixture();
+            let target = beads.join("issues.jsonl");
+            let referent = beads.join("absent.jsonl");
+            let arrived = Cell::new(false);
+            let ctx = OutputContext::from_flags(false, true, true);
+            let result = restore_backup_with_before_commit(
+                &beads,
+                &history,
+                BACKUP_NAME,
+                false,
+                None,
+                &ctx,
+                |path| {
+                    symlink(&referent, path)?;
+                    assert!(!path.exists(), "exists() follows the dangling link");
+                    arrived.set(true);
+                    Ok(())
+                },
+            );
+            assert!(arrived.get());
+            assert!(result.is_err());
+            assert_eq!(fs::read_link(&target).unwrap(), referent);
+            assert!(!referent.exists());
+            assert_evidence_unchanged(&beads, &history);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn failed_restore_preserves_dangling_target_and_rollback_evidence() {
+            use std::os::unix::fs::symlink;
+
+            let temp = TempDir::new().unwrap();
+            let target = temp.path().join("issues.jsonl");
+            let candidate = temp.path().join("restore.tmp");
+            let rollback = temp.path().join("rollback.tmp");
+            let referent = temp.path().join("absent.jsonl");
+            fs::write(&candidate, b"restored state").unwrap();
+            fs::write(&rollback, b"original state").unwrap();
+            {
+                let mut guard = TempRestoreGuard::new(rollback.clone());
+                let error = commit_restored_target_with_rollback(
+                    &candidate,
+                    &target,
+                    Some(&mut guard),
+                    |_from, to| {
+                        symlink(&referent, to)?;
+                        Err(io::Error::other("injected replacement failure"))
+                    },
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains("also failed"), "{error}");
+                assert!(guard.persist, "refused rollback must retain the original snapshot");
+            }
+            assert_eq!(fs::read_link(&target).unwrap(), referent);
+            assert!(!referent.exists());
+            assert_eq!(fs::read(&rollback).unwrap(), b"original state");
+            assert_eq!(fs::read(&candidate).unwrap(), b"restored state");
+        }
     }
 }
