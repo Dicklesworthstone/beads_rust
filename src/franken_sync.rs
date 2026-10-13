@@ -477,7 +477,7 @@ impl Connection {
     }
 
     /// Close the connection (rolls back any active transaction, then runs the
-    /// final passive WAL checkpoint, except for cache-recovery handles).
+    /// final passive WAL checkpoint, except for read-only and cache-recovery handles).
     pub fn close(mut self) -> Result<(), FrankenError> {
         self.close_in_place()
     }
@@ -633,7 +633,11 @@ pub mod compat {
                 wal_index::warn_if_poisoned(path);
             }
         })?;
-        Connection::from_inner(inner, serialized, true)
+        // Read-only witnesses must not acquire checkpoint authority on close.
+        // In particular, recovery verifies the live family through this path
+        // after installing its private WAL index. The no-checkpoint policy is
+        // sticky across close errors and retries; writable opens keep theirs.
+        Connection::from_inner(inner, serialized, serialized)
     }
 }
 
@@ -867,6 +871,89 @@ pub(crate) mod tests {
         connection.close().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), main_before);
         assert_eq!(std::fs::read(&wal_path).unwrap(), wal_before);
+    }
+
+    #[test]
+    fn read_only_compat_closes_preserve_committed_wal() {
+        if run_recovery_test_in_subprocess(
+            "franken_sync::tests::read_only_compat_closes_preserve_committed_wal",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("read-only-close.db");
+        let path = db.to_string_lossy().into_owned();
+        let sentinel = "GH556 read-only close must leave this committed row in WAL";
+        let mut writer = Connection::open(path.clone()).unwrap();
+        writer.execute("PRAGMA journal_mode = WAL").unwrap();
+        writer.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+        writer.execute("CREATE TABLE t (v TEXT)").unwrap();
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        writer
+            .execute_with_params("INSERT INTO t VALUES (?1)", &[SqliteValue::from(sentinel)])
+            .unwrap();
+        writer.close_without_checkpoint_in_place().unwrap();
+        drop(writer);
+        let payload = || {
+            ["", "-wal", "-journal", "-wal-cert", "-wal-cert-head"].map(|suffix| {
+                let mut component = db.as_os_str().to_os_string();
+                component.push(suffix);
+                match std::fs::read(component) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("read protected component {suffix}: {error}"),
+                }
+            })
+        };
+        let before = payload();
+        assert!(before[1].as_ref().unwrap().len() > 32);
+        assert!(
+            !before[0]
+                .as_ref()
+                .unwrap()
+                .windows(sentinel.len())
+                .any(|bytes| bytes == sentinel.as_bytes())
+        );
+        assert!(
+            before[1]
+                .as_ref()
+                .unwrap()
+                .windows(sentinel.len())
+                .any(|bytes| bytes == sentinel.as_bytes())
+        );
+        for close_mode in 0..4 {
+            let mut reader =
+                compat::open_with_flags(&path, compat::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            assert!(
+                !reader.checkpoint_on_close,
+                "read-only admission must not acquire checkpoint authority"
+            );
+            assert_eq!(
+                reader.query_row("SELECT v FROM t").unwrap().values(),
+                &[SqliteValue::from(sentinel)]
+            );
+            assert_eq!(payload(), before, "read-only open/query changed payload");
+            match close_mode {
+                0 => reader.close().unwrap(),
+                1 => {
+                    reader.close_in_place().unwrap();
+                    reader.close_in_place().unwrap();
+                    drop(reader);
+                }
+                2 => drop(reader),
+                _ => {
+                    FAIL_NEXT_CLOSE.with(|fault| fault.set(true));
+                    assert!(matches!(
+                        reader.close_in_place(),
+                        Err(FrankenError::BusyRecovery)
+                    ));
+                    assert!(!reader.checkpoint_on_close);
+                    assert_eq!(payload(), before, "failed close changed payload");
+                    reader.close().unwrap();
+                }
+            }
+            assert_eq!(payload(), before, "read-only close path {close_mode}");
+        }
     }
 
     pub(super) fn run_recovery_test_in_subprocess(name: &str) -> bool {
@@ -1105,6 +1192,10 @@ pub(crate) mod tests {
 
         let conn = compat::open_with_flags(&path, compat::OpenFlags::SQLITE_OPEN_READ_WRITE)
             .expect("open writable compat connection");
+        assert!(
+            conn.checkpoint_on_close,
+            "writable compat keeps its close policy"
+        );
         let row = conn
             .query_row("PRAGMA fsqlite.concurrent_mode")
             .expect("query compat engine mode");
