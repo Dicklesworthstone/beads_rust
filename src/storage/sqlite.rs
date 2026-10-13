@@ -8557,29 +8557,34 @@ impl SqliteStorage {
     ///
     /// Recovery uses this stricter decoder before it may replace the live
     /// database. Ordinary display readers retain their compatibility behavior.
-    /// A damaged page in another table can break FrankenSQLite's keyed lookup
-    /// while the batched query still reads the intact issue row, so both query
-    /// shapes use the same strict decoder before reporting preservation failure.
+    /// The keyed lookup seeks the `issues` primary-key index. A damaged index
+    /// page can make it fail, and an index that lost an entry makes it miss a
+    /// live row (GH#546). Both cases are confirmed with a table scan that
+    /// cannot use that index (`NOT INDEXED`; `id IN (...)` seeks the index too
+    /// since FrankenSQLite 0.4.12), with the same strict decoder, before the
+    /// row is reported missing or preservation fails.
     pub(crate) fn get_issue_for_preservation(&self, id: &str) -> Result<Option<Issue>> {
         let issue = match Self::get_issue_row_from_conn(&self.conn, id) {
             Ok(Some(row)) => Self::issue_from_row_for_preservation(&row)?,
-            Ok(None) => return Ok(None),
+            Ok(None) => match self.get_issue_rows_without_key_index(id)?.as_slice() {
+                [] => return Ok(None),
+                [row] => {
+                    tracing::warn!(
+                        id = %id,
+                        "issue key index missed a live row; preserving the row the table scan found"
+                    );
+                    Self::issue_from_row_for_preservation(row)?
+                }
+                _ => return Err(Self::multiple_preservation_rows(id)),
+            },
             Err(keyed_error) => {
-                let Ok(issues) = self.get_issues_by_ids_with_decoder(
-                    &[id.to_string()],
-                    Self::issue_from_row_for_preservation,
-                ) else {
+                let Ok(rows) = self.get_issue_rows_without_key_index(id) else {
                     return Err(keyed_error);
                 };
-                let mut issues = issues.into_iter();
-                match (issues.next(), issues.next()) {
-                    (None, None) => return Ok(None),
-                    (Some(issue), None) => issue,
-                    _ => {
-                        return Err(BeadsError::Config(format!(
-                            "multiple issue rows match {id}; no unique row can be snapshotted"
-                        )));
-                    }
+                match rows.as_slice() {
+                    [] => return Ok(None),
+                    [row] => Self::issue_from_row_for_preservation(row)?,
+                    _ => return Err(Self::multiple_preservation_rows(id)),
                 }
             }
         };
@@ -8590,6 +8595,30 @@ impl SqliteStorage {
             )));
         }
         Ok(Some(issue))
+    }
+
+    /// Every `issues` row with this ID, read by a full table scan.
+    fn get_issue_rows_without_key_index(&self, id: &str) -> Result<Vec<Row>> {
+        let sql = r"
+            SELECT id, content_hash, title, description, design,
+                   acceptance_criteria, notes, status, priority, issue_type,
+                   assignee, owner, estimated_minutes, created_at, created_by,
+                   updated_at, closed_at, close_reason, closed_by_session,
+                   due_at, defer_until, external_ref, source_system, source_repo,
+                   deleted_at, deleted_by, delete_reason, original_type,
+                   compaction_level, compacted_at, compacted_at_commit, original_size,
+                   sender, ephemeral, pinned, is_template, source_repo_path, agent_context,
+                   prerequisites
+            FROM issues NOT INDEXED
+            WHERE id = ?
+        ";
+        Ok(self.conn.query_with_params(sql, &[SqliteValue::from(id)])?)
+    }
+
+    fn multiple_preservation_rows(id: &str) -> BeadsError {
+        BeadsError::Config(format!(
+            "multiple issue rows match {id}; no unique row can be snapshotted"
+        ))
     }
 
     /// Get metadata for all issues to optimize import collision detection.
@@ -23877,6 +23906,83 @@ required_fields:
             .conn
             .execute("PRAGMA wal_checkpoint(TRUNCATE)")
             .unwrap();
+    }
+
+    /// GH#546: the `issues` primary-key index lost the entry of a live row, so
+    /// the keyed lookup misses it. Preservation must find the row by a table
+    /// scan instead of treating its dirty marker as an orphan.
+    #[test]
+    fn preservation_reads_a_live_row_the_issue_key_index_lost() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let (root_page, page_size) = {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            for id in ["bd-aaa", "bd-mmm", "bd-zzz"] {
+                let issue = make_issue(
+                    id,
+                    "key index fixture",
+                    Status::Open,
+                    2,
+                    None,
+                    Utc::now(),
+                    None,
+                );
+                storage.create_issue(&issue, "tester").unwrap();
+            }
+            let integer = |sql: &str| {
+                storage.conn.query(sql).unwrap()[0]
+                    .get(0)
+                    .and_then(SqliteValue::as_integer)
+                    .unwrap()
+            };
+            let root = integer(
+                "SELECT rootpage FROM sqlite_master WHERE name = 'sqlite_autoindex_issues_1'",
+            );
+            let page_size = integer("PRAGMA page_size");
+            storage
+                .conn
+                .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            (
+                usize::try_from(root).unwrap(),
+                usize::try_from(page_size).unwrap(),
+            )
+        };
+
+        // Three keys fit in one index leaf page, sorted by id. One fewer cell
+        // in its header drops "bd-zzz" from the index and leaves the table row.
+        let mut bytes = fs::read(&db_path).unwrap();
+        let header = (root_page - 1) * page_size;
+        assert_eq!(bytes[header], 0x0a, "the key index is a single leaf page");
+        let cells = u16::from_be_bytes([bytes[header + 3], bytes[header + 4]]);
+        assert_eq!(cells, 3);
+        bytes[header + 3..header + 5].copy_from_slice(&(cells - 1).to_be_bytes());
+        fs::write(&db_path, &bytes).unwrap();
+
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        assert!(
+            !matches!(
+                SqliteStorage::get_issue_row_from_conn(&storage.conn, "bd-zzz"),
+                Ok(Some(_))
+            ),
+            "fixture: the keyed lookup must no longer find bd-zzz"
+        );
+        let preserved = storage.get_issue_for_preservation("bd-zzz").unwrap();
+        assert_eq!(preserved.map(|issue| issue.id).as_deref(), Some("bd-zzz"));
+        assert_eq!(
+            storage
+                .get_issue_for_preservation("bd-aaa")
+                .unwrap()
+                .map(|issue| issue.id)
+                .as_deref(),
+            Some("bd-aaa")
+        );
+        assert!(
+            storage
+                .get_issue_for_preservation("bd-absent")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Resets the chmod-ignored emulation when a test unwinds.
