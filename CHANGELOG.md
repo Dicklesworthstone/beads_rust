@@ -94,7 +94,11 @@ this repo): commits `55c186682` + `5946b3b7c` in
 A patch release. The database schema is unchanged at 19. It moves br to
 FrankenSQLite 0.4.10, stops `br doctor migrate-schema recover` from rewriting
 the WAL (#556), and closes a set of sync, recovery and repair paths that could
-lose unflushed or locally exported work without saying so.
+lose unflushed or locally exported work without saying so. The heal and
+history work that reached main after
+[acf11098](https://github.com/Dicklesworthstone/beads_rust/commit/acf11098)
+(b8cbd5e1, 45db7aa1, 8e1b2f15, 6203898a, f0f065ea) is not in this release; it
+ships in the next one.
 
 ### Sync and import keep local work
 
@@ -134,11 +138,19 @@ lose unflushed or locally exported work without saying so.
 
 - **`br doctor migrate-schema recover` no longer rewrites the WAL** (#556).
   WAL-index recovery runs the engine on a private copy and publishes only a
-  verified WAL index to the live database; a WAL that still carries frames is
-  refused before any writable engine open, as a conflict rather than as
-  corruption; and recovery evidence is scoped to the selected database
+  verified WAL index to the live database, and recovery evidence is scoped to
+  the selected database
   ([cc343351](https://github.com/Dicklesworthstone/beads_rust/commit/cc343351), [e4ad53c3](https://github.com/Dicklesworthstone/beads_rust/commit/e4ad53c3),
   [1b533989](https://github.com/Dicklesworthstone/beads_rust/commit/1b533989), [b4f2f809](https://github.com/Dicklesworthstone/beads_rust/commit/b4f2f809)).
+  A WAL that still carries frames is refused, as a conflict rather than as
+  corruption, before any engine open and before any recovery copy is made, so
+  a refused attempt leaves nothing behind; the private copy's contents are
+  verified unchanged before its index is published
+  ([983f000d](https://github.com/Dicklesworthstone/beads_rust/commit/983f000d), from 4632bb11).
+  Installing the recovered index no longer mistakes the engine's namespace
+  coordination files, which the install itself creates, for a change to the
+  database; every other file of the family is still compared
+  ([cf6b6d59](https://github.com/Dicklesworthstone/beads_rust/commit/cf6b6d59)).
   A checkpoint that another checkpointer keeps from starting is reported as
   busy instead of as an internal error, and never authorizes truncating the
   WAL ([acf11098](https://github.com/Dicklesworthstone/beads_rust/commit/acf11098)). #556 stays open until the reporter's
@@ -252,8 +264,8 @@ lose unflushed or locally exported work without saying so.
 - **Release binaries are built with `opt-level = 3`** instead of the size
   profile `z` (`CARGO_PROFILE_RELEASE_OPT_LEVEL=3` in the release build; the
   repository's profile is unchanged). On a 10,000-issue tracker `ready`,
-  `list`, `show`, `create` and `update` run 1.6 to 1.9 times faster than at
-  `z`; the binary is about twice as large (macOS arm64: 17.3 MB to 34.8 MB).
+  `list`, `show`, `create` and `update` run 1.5 to 2 times faster than at
+  `z`; the binary is about twice as large (macOS arm64: 17.2 MB to 34.5 MB).
 
 ### Known issues
 
@@ -265,12 +277,20 @@ lose unflushed or locally exported work without saying so.
   run `br sync --merge`.
 - `br vcs-status --runtime-files` reports the inventory unavailable in large
   nested repositories and under slow hosts (#552).
-- `br doctor migrate-schema recover` refuses a WAL that still carries frames;
-  have the owning SQLite engine complete a truncating checkpoint, then retry
-  (#556).
+- After a crash that loses the `-shm` file while the WAL still holds
+  committed, uncheckpointed changes, `br list` still works but `br create`
+  and other writes, and `br doctor migrate-schema recover`, are refused with
+  `SYNC_CONFLICT` "engine recovery refused before opening: WAL contains
+  frames…" (#556, #562). With no `br` running and no other program
+  holding the tracker open, run
+  `sqlite3 .beads/beads.db 'PRAGMA wal_checkpoint(TRUNCATE);'` with stock
+  SQLite, then retry; the committed changes are kept.
+- A `br doctor migrate-schema recover` that fails after it copied the
+  pre-recovery state keeps that copy under `.br_recovery/` as evidence; prune
+  it by hand once the tracker is healthy.
 - Every automatic export re-hashes all JSONL rows for the #548 row receipts,
   so the cost of `create`, `update` and other mutations grows with tracker
-  size (#559). At 10,000 issues the export step adds about 25 to 45 ms per
+  size (#559). At 10,000 issues the export step adds about 30 ms per
   command to what v0.7.4 needed at the same optimization level; the
   `opt-level = 3` release binaries are still faster than v0.7.4 on every
   measured command.
@@ -289,6 +309,9 @@ lose unflushed or locally exported work without saying so.
   seven shipped targets. Pass and fail counts are in the GitHub release notes.
 - Red/green checks for the #545, #546 and #547 fixes: each new test passes with
   the fix and, for #545 and #547, fails with only the fix removed.
+- The #556 regression harness (`tests/e2e_scripts/wal_recovery_556.py`)
+  passes all 14 cases against the Linux x86_64 release build, with no unsafe
+  success, and its 15 fixture self-tests pass.
 - Performance against v0.7.4: hyperfine ABBA rounds (A/A control, 80 measured
   runs per side and command) on the 10,000-issue corpus of the repository's
   `release_abba` generator, on macOS arm64; results are in the release notes.
