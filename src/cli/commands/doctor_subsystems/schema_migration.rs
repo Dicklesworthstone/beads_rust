@@ -878,11 +878,24 @@ fn require_recovery_payload_unchanged(
     Ok(())
 }
 
+/// WAL recovery refusal is a conflict, never authority to rebuild from JSONL.
+fn require_frame_free_engine_recovery(path: &Path) -> Result<()> {
+    crate::franken_sync::wal_index::require_frame_free_recovery(path).map_err(|error| {
+        BeadsError::SyncConflict {
+            message: error.to_string(),
+        }
+    })
+}
+
 fn recover_existing_family(
     path: &Path,
     authority: Option<&DatabaseFamilyWriteLock>,
     mut live_stage: Option<&mut String>,
 ) -> Result<()> {
+    require_frame_free_engine_recovery(path)?;
+    if let Some(authority) = authority {
+        return recover_live_index_from_private_copy(path, authority, live_stage);
+    }
     let metadata = secure_file_metadata(path)?
         .ok_or_else(|| BeadsError::internal("recovery database disappeared"))?;
     let retained = File::open(path)?;
@@ -919,6 +932,143 @@ fn recover_existing_family(
         ));
     }
     Ok(())
+}
+
+/// Rehearse writable recovery against a disposable complete family copy, then
+/// publish only the verified derived WAL index to the live database.
+fn recover_live_index_from_private_copy(
+    db_path: &Path,
+    authority: &DatabaseFamilyWriteLock,
+    mut live_stage: Option<&mut String>,
+) -> Result<()> {
+    authority.verify_database_authority()?;
+    let raw_before = recovery_family_witness(db_path)?;
+    let scratch_root = recovery_artifacts_dir(db_path)?.join(".br_recovery");
+    fs::create_dir_all(&scratch_root)?;
+    let scratch = tempfile::Builder::new()
+        .prefix("index-rehearsal-")
+        .tempdir_in(&scratch_root)?;
+    let probe_db = backup_component_path(scratch.path(), db_path, "")?;
+    let operation = (|| -> Result<()> {
+        copy_family_to_backup(db_path, scratch.path(), &raw_before)?;
+        verify_backup_family(db_path, scratch.path(), &raw_before)?;
+        if let Some(stage) = live_stage.as_deref_mut() {
+            *stage = "private-recovery".to_string();
+        }
+        recover_existing_family(&probe_db, None, None)?;
+        require_recovery_payload_unchanged(&raw_before, &recovery_family_witness(&probe_db)?)?;
+        let _logical = logical_witness(&probe_db)?;
+        publish_recovered_index(
+            db_path,
+            &probe_db,
+            &raw_before,
+            authority,
+            live_stage.as_deref_mut(),
+        )
+    })();
+    if let Err(error) = operation {
+        if live_stage.as_deref().is_some_and(|stage| stage == "live-recovery")
+            && live_recovery_contention(&error)
+        {
+            return Err(error);
+        }
+        let evidence = scratch.keep();
+        return Err(BeadsError::WithContext {
+            context: format!("private index rehearsal retained at {}", evidence.display()),
+            source: Box::new(error),
+        });
+    }
+    Ok(())
+}
+
+fn publish_recovered_index(
+    db_path: &Path,
+    probe_db: &Path,
+    expected: &RawFamilyWitness,
+    authority: &DatabaseFamilyWriteLock,
+    live_stage: Option<&mut String>,
+) -> Result<()> {
+    let probe_after = recovery_family_witness(probe_db)?;
+    require_recovery_payload_unchanged(expected, &probe_after)?;
+    if !crate::franken_sync::wal_index::ENGINE_READS_ON_DISK_WAL_INDEX {
+        authority.verify_database_authority()?;
+        require_frame_free_engine_recovery(db_path)?;
+        if &recovery_family_witness(db_path)? != expected {
+            return Err(BeadsError::internal(
+                "database family changed before recovery verification",
+            ));
+        }
+        return Ok(());
+    }
+    let mut index = component_for_suffix(&probe_after, "-shm")?.clone();
+    if !index.present {
+        return Err(BeadsError::internal(
+            "private recovery produced no WAL index to install",
+        ));
+    }
+    if let Some(mode) = component_for_suffix(expected, "-shm")?.unix_mode {
+        index.unix_mode = Some(mode);
+    }
+    install_recovery_index(
+        db_path,
+        &family_component_path(probe_db, "-shm"),
+        &index,
+        expected,
+        authority,
+        live_stage,
+    )
+}
+
+fn install_recovery_index(
+    db_path: &Path,
+    retained_index: &Path,
+    index: &RawComponentWitness,
+    expected: &RawFamilyWitness,
+    authority: &DatabaseFamilyWriteLock,
+    mut live_stage: Option<&mut String>,
+) -> Result<()> {
+    require_frame_free_engine_recovery(db_path)?;
+    authority.verify_database_authority()?;
+    let metadata = secure_file_metadata(db_path)?
+        .ok_or_else(|| BeadsError::internal("recovery database disappeared"))?;
+    let retained = File::open(db_path)?;
+    if !same_file_identity(&metadata, &retained.metadata()?) {
+        return Err(BeadsError::internal(
+            "recovery database changed before identity binding",
+        ));
+    }
+    let identity = fsqlite_vfs::FileIdentity::from_file(&retained)?
+        .ok_or_else(|| BeadsError::internal("recovery database identity is unavailable"))?;
+    if let Some(stage) = live_stage.as_deref_mut() {
+        *stage = "live-recovery".to_string();
+    }
+    crate::franken_sync::wal_index::with_recovery_exclusion(db_path, identity, || -> Result<()> {
+        if let Some(stage) = live_stage {
+            *stage = "live-index-install".to_string();
+        }
+        authority.verify_database_authority()?;
+        require_frame_free_engine_recovery(db_path)?;
+        if &recovery_family_witness(db_path)? != expected {
+            return Err(BeadsError::internal(
+                "database family changed before recovered-index installation; live family untouched",
+            ));
+        }
+        verify_retained_component(retained_index, index)?;
+        install_retained_index(db_path, retained_index, index)?;
+        authority.verify_database_authority()?;
+        let after = recovery_family_witness(db_path)?;
+        for component in &expected.components {
+            if component.suffix != "-shm"
+                && component_for_suffix(&after, &component.suffix)? != component
+            {
+                return Err(BeadsError::internal(format!(
+                    "index installation changed protected component {:?}; retain recovery evidence",
+                    component.suffix
+                )));
+            }
+        }
+        verify_retained_component(&family_component_path(db_path, "-shm"), index)
+    })?
 }
 
 fn recover_engine_admission(
@@ -1108,7 +1258,17 @@ fn recover_index_only(
             return Ok(true);
         }
         receipt.stage = "reinstate-index".to_string();
-        reinstate_retained_index(db_path, &index_backup, &shm_witness)?;
+        let installed = receipt.raw_after.as_ref().ok_or_else(|| {
+            BeadsError::internal("recovery omitted the installed index witness")
+        })?;
+        install_recovery_index(
+            db_path,
+            &index_backup,
+            &shm_witness,
+            installed,
+            &migration.write_authority,
+            None,
+        )?;
         migration.write_authority.verify_database_authority()?;
         let reinstated = recovery_family_witness(db_path)?;
         for suffix in ["", "-wal", "-shm", "-journal"] {
@@ -1166,10 +1326,9 @@ fn verify_retained_component(copy: &Path, witness: &RawComponentWitness) -> Resu
     Ok(())
 }
 
-/// Put the retained pre-recovery index back as the live `-shm`, atomically
-/// and with its original permissions. Runs only under the held family write
-/// authority and sole-opener lease of the recovery that removed it.
-fn reinstate_retained_index(
+/// Copy an already-verified index to the live -shm name atomically, preserving
+/// permissions. Called only while recovery exclusion and family authority hold.
+fn install_retained_index(
     db_path: &Path,
     retained: &Path,
     witness: &RawComponentWitness,
