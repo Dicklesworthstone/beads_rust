@@ -783,6 +783,28 @@ fn quarantine_status(
     )?))
 }
 
+/// Whether `dir` (recorded at `recorded_dir`) is a finished quarantine of the
+/// database at `database_path`, by the same evidence rules as
+/// [`prune_quarantined_indexes`]. A recovery rehearsal leaves one inside its
+/// private `recovery-probe/` copy when the probe's index was poisoned
+/// (GH#545); recovery-run retention needs to recognize it there.
+///
+/// # Errors
+/// Returns an error when the directory or its receipts cannot be read.
+pub(crate) fn is_finished_quarantine(
+    dir: &Path,
+    recorded_dir: &Path,
+    database_path: &str,
+) -> io::Result<bool> {
+    let Some(name) = dir.file_name().and_then(|name| name.to_str()) else {
+        return Ok(false);
+    };
+    if !name.starts_with(QUARANTINE_PREFIX) {
+        return Ok(false);
+    }
+    Ok(quarantine_status(dir, recorded_dir, database_path, &[])? == Some(true))
+}
+
 fn quarantine_is_finished(
     dir: &Path,
     recorded_dir: &Path,
@@ -1671,6 +1693,44 @@ pub mod tests {
                 .copy_from_slice(&[0x38, 0x07, 0x18, 0x06, 0x35, 0x93, 0xdb, 0x09]);
         }
         shm
+    }
+
+    /// Write `<parent>/.br-wal-index-<suffix>` with the receipts and retained
+    /// index a quarantine of the database `<parent>/<db_name>` leaves:
+    /// finished when `complete`, otherwise prepared only. Returns its path.
+    pub fn write_quarantine_layout(
+        parent: &Path,
+        suffix: &str,
+        db_name: &str,
+        complete: bool,
+    ) -> PathBuf {
+        let parent = fs::canonicalize(parent).unwrap();
+        let dir = parent.join(format!("{QUARANTINE_PREFIX}{suffix}"));
+        fs::create_dir(&dir).unwrap();
+        let index = poison();
+        fs::write(dir.join(QUARANTINED_INDEX), &index).unwrap();
+        let index_sha = hash_file(&mut File::open(dir.join(QUARANTINED_INDEX)).unwrap()).unwrap();
+        let retained_index = dir.join(QUARANTINED_INDEX).display().to_string();
+        let receipt = serde_json::json!({
+            "schema_version": "br.wal_index.quarantine.v1",
+            "database_path": parent.join(db_name).display().to_string(),
+            "reason": "initialized-zero-page-wal-index",
+            "main_sha256": &index_sha,
+            "wal_sha256": &index_sha,
+            "shm_sha256": &index_sha,
+            "retained_index": &retained_index,
+            "completion_marker": QUARANTINE_COMPLETE,
+        });
+        fs::write(dir.join(QUARANTINE_PREPARED), receipt.to_string()).unwrap();
+        if complete {
+            let completion = serde_json::json!({
+                "schema_version": "br.wal_index.quarantine.v1",
+                "stage": "complete",
+                "retained_index": &retained_index,
+            });
+            fs::write(dir.join(QUARANTINE_COMPLETE), completion.to_string()).unwrap();
+        }
+        dir
     }
 
     /// Lay out the GH #520 reporter's family at `db`: a main file, a 32-byte
