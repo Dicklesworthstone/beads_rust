@@ -23909,8 +23909,8 @@ required_fields:
     }
 
     /// GH#546: the `issues` primary-key index lost the entry of a live row, so
-    /// the keyed lookup misses it. Preservation must find the row by a table
-    /// scan instead of treating its dirty marker as an orphan.
+    /// a lookup through that index misses it. Preservation must find the row
+    /// by a table scan instead of treating its dirty marker as an orphan.
     #[test]
     fn preservation_reads_a_live_row_the_issue_key_index_lost() {
         let temp = TempDir::new().unwrap();
@@ -23960,12 +23960,27 @@ required_fields:
         fs::write(&db_path, &bytes).unwrap();
 
         let storage = SqliteStorage::open(&db_path).unwrap();
+        // A lookup forced through the key index misses the row. FrankenSQLite
+        // 0.4.12 still answers the bound `WHERE id = ?` of the keyed lookup
+        // from the table, although EXPLAIN reports the index, so the scan
+        // reader is pinned directly as well as through preservation.
         assert!(
-            !matches!(
-                SqliteStorage::get_issue_row_from_conn(&storage.conn, "bd-zzz"),
-                Ok(Some(_))
-            ),
-            "fixture: the keyed lookup must no longer find bd-zzz"
+            storage
+                .conn
+                .query(
+                    "SELECT id FROM issues INDEXED BY sqlite_autoindex_issues_1 WHERE id = 'bd-zzz'",
+                )
+                .unwrap()
+                .is_empty(),
+            "fixture: the key index must no longer find bd-zzz"
+        );
+        assert_eq!(
+            storage
+                .get_issue_rows_without_key_index("bd-zzz")
+                .unwrap()
+                .len(),
+            1,
+            "the table scan must find the live row"
         );
         let preserved = storage.get_issue_for_preservation("bd-zzz").unwrap();
         assert_eq!(preserved.map(|issue| issue.id).as_deref(), Some("bd-zzz"));
