@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::config::{self, ConfigLayer};
 use crate::error::{BeadsError, Result};
-use crate::model::Issue;
+use crate::model::{Comment, Issue};
 use crate::storage::SqliteStorage;
 use crate::sync::{self, JsonlSourceSnapshot, PreservedIssue};
 
@@ -190,6 +190,9 @@ pub(super) fn rehearse(
                 expected.dependencies.clone_from(dependencies);
             }
             if let Some(comments) = &preserved.comments {
+                if let Some(imported) = witness.issues.get(&expected.id) {
+                    require_imported_comments_preserved(imported, comments)?;
+                }
                 expected.comments.clone_from(comments);
             }
             witness.restored_ids.insert(expected.id.clone());
@@ -207,6 +210,25 @@ pub(super) fn rehearse(
             .to_owned(),
         source: Box::new(source),
     })
+}
+
+/// Restoring a newer local issue replaces its comment rows, not just its
+/// scalar fields. A newer timestamp is not authority to erase peer comments
+/// that exist only in the pinned JSONL. Check the imported baseline before
+/// overlaying it; otherwise replay and its witness can agree on the same loss.
+fn require_imported_comments_preserved(imported: &Issue, restored: &[Comment]) -> Result<()> {
+    if !super::multiset_is_subset(
+        imported.comments.iter().map(Comment::sync_key),
+        restored.iter().map(Comment::sync_key),
+    ) {
+        return Err(BeadsError::Config(format!(
+            "schema-heal preservation failed: restoring local issue {} would discard imported \
+             comments; reconcile the local and JSONL comment histories before healing. \
+             The live database rebuild was not started",
+            imported.id
+        )));
+    }
+    Ok(())
 }
 
 fn read_payloads(storage: &SqliteStorage) -> Result<BTreeMap<String, Issue>> {
@@ -260,6 +282,158 @@ mod tests {
             comments: Some(issue.comments.clone()),
             issue,
         }
+    }
+
+    fn comment(id: i64, text: &str) -> Comment {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "issue_id": "pf-abc",
+            "author": "peer",
+            "text": text,
+            "created_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap()
+    }
+
+    fn isolated_rehearsal(name: &str) -> bool {
+        // As in #506, spawn before any fixture lease can be inherited by
+        // unrelated tests. The nested rebuild performs sole-opener checkpoints.
+        const CHILD_ENV: &str = "BR_TEST_ISOLATED_HEAL_COMMENTS";
+        if std::env::var(CHILD_ENV).as_deref() == Ok(name) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                name,
+                "--test-threads=1",
+                "--format=pretty",
+                "--color=never",
+            ])
+            .env(CHILD_ENV, name)
+            .env_remove("RUST_TEST_NOCAPTURE")
+            .output()
+            .expect("run isolated heal rehearsal");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let passed = format!("test {name} ... ok");
+        assert!(
+            output.status.success() && stdout.lines().any(|line| line == passed),
+            "isolated rehearsal failed or did not run: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    #[test]
+    fn imported_comment_guard_uses_payloads_and_preserves_multiplicity() {
+        let mut imported = issue("pf-abc");
+        imported.comments = vec![comment(1, "shared"), comment(2, "peer-only")];
+        assert!(require_imported_comments_preserved(&imported, &[]).is_err());
+        assert!(require_imported_comments_preserved(&imported, &[comment(1, "shared")]).is_err());
+        // Equal rowids are not evidence of equal comments across clones.
+        let collision = [comment(1, "shared"), comment(2, "different local comment")];
+        assert!(require_imported_comments_preserved(&imported, &collision).is_err());
+        let mut complete = vec![comment(99, "peer-only"), comment(98, "shared")];
+        complete.push(comment(100, "local-only"));
+        require_imported_comments_preserved(&imported, &complete).unwrap();
+        for field in 0..3 {
+            let mut changed = complete.clone();
+            match field {
+                0 => changed[0].author = "another author".to_owned(),
+                1 => changed[0].created_at += chrono::Duration::seconds(1),
+                _ => changed[0].issue_id = "pf-other".to_owned(),
+            }
+            assert!(require_imported_comments_preserved(&imported, &changed).is_err());
+        }
+        imported.comments = vec![comment(1, "same payload"), comment(2, "same payload")];
+        assert!(
+            require_imported_comments_preserved(&imported, &[comment(99, "same payload")]).is_err()
+        );
+        require_imported_comments_preserved(
+            &imported,
+            &[comment(99, "same payload"), comment(100, "same payload")],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rehearsal_refuses_local_restore_that_would_drop_a_peer_comment() {
+        if isolated_rehearsal(concat!(
+            "cli::commands::doctor_subsystems::schema_heal::rebuild_preflight::tests::",
+            "rehearsal_refuses_local_restore_that_would_drop_a_peer_comment"
+        )) {
+            return;
+        }
+        let original = tempfile::tempdir().unwrap();
+        let path = original.path().join("issues.jsonl");
+        let mut imported = issue("pf-abc");
+        imported.comments = vec![comment(1, "shared"), comment(2, "peer-only")];
+        let bytes = format!("{}\n", serde_json::to_string(&imported).unwrap());
+        fs::write(&path, &bytes).unwrap();
+        let source = sync::capture_jsonl_source_snapshot(&path).unwrap();
+        let mut local = imported.clone();
+        local.title = "newer unflushed local title".to_owned();
+        local.updated_at += chrono::Duration::seconds(1);
+        local.comments = vec![comment(1, "shared"), comment(2, "local-only")];
+        // Both payloads are valid and the local scalar edit is newer, but
+        // replacing the imported comments would lose the peer's addition.
+        let result = rehearse(
+            &source,
+            &[preserved(local)],
+            &ConfigLayer::default(),
+            Some(5_000),
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a matching replay witness must not certify lost peer comments"),
+        };
+        let diagnostic = format!("{error:?}");
+        assert!(
+            diagnostic.contains("would discard imported comments"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("pf-abc"), "{diagnostic}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
+        assert!(!original.path().join("beads.db").exists());
+    }
+
+    #[test]
+    fn rehearsal_accepts_complete_comment_history_with_renumbered_ids() {
+        if isolated_rehearsal(concat!(
+            "cli::commands::doctor_subsystems::schema_heal::rebuild_preflight::tests::",
+            "rehearsal_accepts_complete_comment_history_with_renumbered_ids"
+        )) {
+            return;
+        }
+        let original = tempfile::tempdir().unwrap();
+        let path = original.path().join("issues.jsonl");
+        let mut imported = issue("pf-abc");
+        imported.comments = vec![comment(1, "shared"), comment(2, "peer-only")];
+        let bytes = format!("{}\n", serde_json::to_string(&imported).unwrap());
+        fs::write(&path, &bytes).unwrap();
+        let source = sync::capture_jsonl_source_snapshot(&path).unwrap();
+        let mut local = imported.clone();
+        local.title = "newer unflushed local title".to_owned();
+        local.updated_at += chrono::Duration::seconds(1);
+        local.comments = vec![
+            comment(99, "peer-only"),
+            comment(98, "shared"),
+            comment(100, "local-only"),
+        ];
+        let witness = rehearse(
+            &source,
+            &[preserved(local.clone())],
+            &ConfigLayer::default(),
+            Some(5_000),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(witness.issues.len(), 1);
+        assert_eq!(witness.issues[&local.id].title, local.title);
+        assert_eq!(witness.issues[&local.id].comments, local.comments);
+        assert_eq!(witness.restored_ids, BTreeSet::from([local.id]));
+        assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
     }
 
     #[test]
