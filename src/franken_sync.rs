@@ -242,7 +242,13 @@ fn completed_checkpoint_affected_rows<'a>(
     if *busy == 0 && *frames >= -1 && frames == backfilled {
         return Ok(0);
     }
-    if (0..=1).contains(busy) && *frames >= 0 && (0..=*frames).contains(backfilled) {
+    // SQLite leaves both counters at -1 when a competing checkpointer
+    // prevents it from starting. That is contention, not a malformed receipt,
+    // and must never authorize copying only the main database or truncating WAL.
+    let checkpoint_not_started = *busy == 1 && *frames == -1 && *backfilled == -1;
+    if checkpoint_not_started
+        || ((0..=1).contains(busy) && *frames >= 0 && (0..=*frames).contains(backfilled))
+    {
         tracing::debug!(busy, frames, backfilled, "WAL checkpoint did not complete");
         // Do not turn contention or partial backfill into a corruption error:
         // callers must not respond by rebuilding from potentially stale JSONL.
@@ -1221,7 +1227,7 @@ pub(crate) mod tests {
     fn checkpoint_execute_rejects_partial_query_rows_but_queries_keep_them() {
         let conn = Connection::open(":memory:").unwrap();
         let sql = "PRAGMA wal_checkpoint(TRUNCATE)";
-        for status in [[1, 23, 0], [0, 23, 7], [1, 23, 23]] {
+        for status in [[1, 23, 0], [0, 23, 7], [1, 23, 23], [1, -1, -1]] {
             checkpoint_fault::with_results(conn.inner.path(), vec![(sql, status); 6], || {
                 assert!(matches!(conn.execute(sql), Err(FrankenError::Busy)));
                 assert!(matches!(
@@ -1259,6 +1265,14 @@ pub(crate) mod tests {
                     assert_eq!(result.is_ok(), complete, "{values:?}: {result:?}");
                     if complete {
                         assert_eq!(result.unwrap(), 0, "a PRAGMA affects no table rows");
+                    } else if (busy == 1 && frames == -1 && backfilled == -1)
+                        || ((0..=1).contains(&busy)
+                            && frames >= 0
+                            && (0..=frames).contains(&backfilled))
+                    {
+                        assert!(matches!(result, Err(FrankenError::Busy)), "{values:?}");
+                    } else {
+                        assert!(matches!(result, Err(FrankenError::Internal(_))), "{values:?}");
                     }
                 }
             }
@@ -1267,7 +1281,7 @@ pub(crate) mod tests {
 
     #[test]
     fn incomplete_checkpoint_is_contention_not_corruption() {
-        for values in [[1, 23, 0], [1, 23, 23], [0, 23, 7]] {
+        for values in [[1, 23, 0], [1, 23, 23], [0, 23, 7], [1, -1, -1]] {
             let values = values.map(SqliteValue::Integer);
             assert!(matches!(
                 completed_checkpoint_affected_rows([values.as_slice()]),
@@ -1295,6 +1309,68 @@ pub(crate) mod tests {
             let result = completed_checkpoint_affected_rows(rows.iter().map(Vec::as_slice));
             assert!(matches!(result, Err(FrankenError::Internal(_))), "{rows:?}");
         }
+    }
+
+    #[test]
+    fn checkpoint_busy_without_counts_preserves_wal_and_recovers() {
+        if run_recovery_test_in_subprocess(
+            "franken_sync::tests::checkpoint_busy_without_counts_preserves_wal_and_recovers",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("checkpoint-busy.db");
+        let wal = temp.path().join("checkpoint-busy.db-wal");
+        let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        let sentinel = "committed WAL-only row behind checkpoint contention";
+        conn.execute("PRAGMA journal_mode = WAL").unwrap();
+        conn.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+        conn.execute("CREATE TABLE t (value TEXT)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_with_params("INSERT INTO t VALUES (?1)", &[SqliteValue::from(sentinel)])
+            .unwrap();
+        let main_before = std::fs::read(&db).unwrap();
+        let wal_before = std::fs::read(&wal).unwrap();
+        assert!(
+            !main_before
+                .windows(sentinel.len())
+                .any(|b| b == sentinel.as_bytes())
+        );
+        assert!(
+            wal_before
+                .windows(sentinel.len())
+                .any(|b| b == sentinel.as_bytes())
+        );
+
+        for sql in [
+            "PRAGMA wal_checkpoint(PASSIVE)",
+            "PRAGMA wal_checkpoint(FULL)",
+            "PRAGMA wal_checkpoint(RESTART)",
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+        ] {
+            checkpoint_fault::with_results(conn.inner.path(), vec![(sql, [1, -1, -1]); 4], || {
+                let statement = conn.prepare(sql).unwrap();
+                for result in [
+                    conn.execute(sql),
+                    conn.execute_with_params(sql, &[]),
+                    statement.execute(),
+                    statement.execute_with_params(&[]),
+                ] {
+                    assert!(matches!(result, Err(FrankenError::Busy)), "{sql}: {result:?}");
+                }
+            });
+            assert_eq!(std::fs::read(&db).unwrap(), main_before);
+            assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
+        }
+        // No injected result remains. A later real checkpoint may succeed,
+        // but no earlier busy result was accepted as proof of WAL backfill.
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        assert_ne!(std::fs::read(&db).unwrap(), main_before);
+        assert_eq!(
+            conn.query_row("SELECT value FROM t").unwrap().values(),
+            &[SqliteValue::from(sentinel)]
+        );
+        conn.close().unwrap();
     }
 
     #[test]
@@ -1376,7 +1452,7 @@ pub(crate) mod tests {
         let conn = Connection::open(":memory:").unwrap();
         let sql = "PRAGMA wal_checkpoint(PASSIVE)";
         let statement = conn.prepare(sql).unwrap();
-        for status in [[0, 23, 7], [1, 23, 0], [1, 23, 23]] {
+        for status in [[0, 23, 7], [1, 23, 0], [1, 23, 23], [1, -1, -1]] {
             checkpoint_fault::with_results(conn.inner.path(), vec![(sql, status); 6], || {
                 assert_eq!(
                     statement.query().unwrap()[0].values(),
