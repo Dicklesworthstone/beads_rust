@@ -1060,6 +1060,33 @@ fn publish_recovered_index(
     )
 }
 
+/// Engine namespace coordination sidecars. They hold no database content, and
+/// installing a recovered index creates them itself when it takes the engine
+/// exclusion, so the family comparisons at `live-index-install` leave them out.
+/// Every other component, the main file and the WAL included, is compared.
+/// Kept as a literal so the exclusion cannot widen silently; a test pins it to
+/// `config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES`.
+const NAMESPACE_COORDINATION_SUFFIXES: [&str; 2] = ["-fsqlite-ns-gate", "-fsqlite-ns-use"];
+
+/// Whether `observed` matches `expected` in every component except the
+/// namespace coordination sidecars.
+fn family_matches_outside_namespace_coordination(
+    expected: &RawFamilyWitness,
+    observed: &RawFamilyWitness,
+) -> bool {
+    let content =
+        |component: &&RawComponentWitness| !is_namespace_coordination_suffix(&component.suffix);
+    expected
+        .components
+        .iter()
+        .filter(content)
+        .eq(observed.components.iter().filter(content))
+}
+
+fn is_namespace_coordination_suffix(suffix: &str) -> bool {
+    NAMESPACE_COORDINATION_SUFFIXES.contains(&suffix)
+}
+
 fn install_recovery_index(
     db_path: &Path,
     retained_index: &Path,
@@ -1089,7 +1116,10 @@ fn install_recovery_index(
         }
         authority.verify_database_authority()?;
         require_frame_free_engine_recovery(db_path)?;
-        if &recovery_family_witness(db_path)? != expected {
+        if !family_matches_outside_namespace_coordination(
+            expected,
+            &recovery_family_witness(db_path)?,
+        ) {
             return Err(BeadsError::internal(
                 "database family changed before recovered-index installation; live family untouched",
             ));
@@ -1100,6 +1130,7 @@ fn install_recovery_index(
         let after = recovery_family_witness(db_path)?;
         for component in &expected.components {
             if component.suffix != "-shm"
+                && !is_namespace_coordination_suffix(&component.suffix)
                 && component_for_suffix(&after, &component.suffix)? != component
             {
                 return Err(BeadsError::internal(format!(
@@ -7797,6 +7828,66 @@ mod tests {
         assert!(
             stable_raw_eq(&before_probe, &after_probe),
             "post-open validation must explicitly exclude only the volatile shm component"
+        );
+    }
+
+    #[test]
+    fn live_index_install_ignores_only_namespace_coordination_sidecars() {
+        assert_eq!(
+            NAMESPACE_COORDINATION_SUFFIXES.as_slice(),
+            config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES
+        );
+        let component = |suffix: &str, sha256: &str| RawComponentWitness {
+            suffix: suffix.to_string(),
+            present: true,
+            length: Some(4096),
+            sha256: Some(sha256.repeat(64)),
+            unix_mode: Some(0o644),
+        };
+        let absent = |suffix: &str| RawComponentWitness {
+            suffix: suffix.to_string(),
+            present: false,
+            length: None,
+            sha256: None,
+            unix_mode: None,
+        };
+        let family = |main: &str, wal: &str, namespace_present: bool| RawFamilyWitness {
+            components: vec![
+                component("", main),
+                component("-wal", wal),
+                component("-shm", "c"),
+                absent("-journal"),
+                if namespace_present {
+                    component("-fsqlite-ns-gate", "d")
+                } else {
+                    absent("-fsqlite-ns-gate")
+                },
+                if namespace_present {
+                    component("-fsqlite-ns-use", "e")
+                } else {
+                    absent("-fsqlite-ns-use")
+                },
+            ],
+        };
+        let expected = family("a", "b", false);
+
+        assert!(
+            family_matches_outside_namespace_coordination(&expected, &family("a", "b", true)),
+            "sidecars created by taking the engine exclusion are not a family change"
+        );
+        assert!(
+            !family_matches_outside_namespace_coordination(&expected, &family("f", "b", true)),
+            "a main-file change must still be detected while the sidecars appear"
+        );
+        assert!(
+            !family_matches_outside_namespace_coordination(&expected, &family("a", "f", true)),
+            "a WAL change must still be detected while the sidecars appear"
+        );
+        let mut journal_appeared = family("a", "b", true);
+        journal_appeared.components[3] = component("-journal", "f");
+        assert!(
+            !family_matches_outside_namespace_coordination(&expected, &journal_appeared),
+            "every other sidecar is still compared"
         );
     }
 
