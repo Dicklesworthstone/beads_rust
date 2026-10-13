@@ -545,8 +545,7 @@ fn issues_equivalent(db: &Issue, jsonl: &Issue) -> bool {
         && norm(db.closed_by_session.as_ref()) == norm(jsonl.closed_by_session.as_ref())
         && norm(db.external_ref.as_ref()) == norm(jsonl.external_ref.as_ref())
         && norm(db.source_system.as_ref()) == norm(jsonl.source_system.as_ref())
-        && db.source_repo.as_deref().unwrap_or(".")
-            == jsonl.source_repo.as_deref().unwrap_or(".")
+        && db.source_repo.as_deref().unwrap_or(".") == jsonl.source_repo.as_deref().unwrap_or(".")
         && norm(db.agent_context.as_ref()) == norm(jsonl.agent_context.as_ref())
         && norm(db.deleted_by.as_ref()) == norm(jsonl.deleted_by.as_ref())
         && norm(db.delete_reason.as_ref()) == norm(jsonl.delete_reason.as_ref())
@@ -587,7 +586,15 @@ fn issues_equivalent(db: &Issue, jsonl: &Issue) -> bool {
 /// old (target, type) key certified losses in those fields as equivalence.
 fn dependency_payload_key(
     dependency: &Dependency,
-) -> (&str, &str, &str, DateTime<Utc>, Option<&str>, &str, Option<&str>) {
+) -> (
+    &str,
+    &str,
+    &str,
+    DateTime<Utc>,
+    Option<&str>,
+    &str,
+    Option<&str>,
+) {
     (
         &dependency.issue_id,
         &dependency.depends_on_id,
@@ -1922,16 +1929,33 @@ mod tests {
         assert!(!audit.automatic_rebuild_allowed());
         let refusal = require_lossless_rebuild(&audit, false).unwrap_err();
         assert!(refusal.to_string().contains("unreadable"));
-        assert!(refusal.to_string().contains("1 recoverable database-only issue(s) (a-1)"));
-        assert!(refusal_error(&audit).to_string().contains("--discard-db-only"));
-        require_lossless_rebuild(&audit, true).expect("explicit authorization for unrestorable data");
-        let action = planned_action(&audit, true);
-        assert!(action.contains("re-add 1 database-only issue(s)"), "{action}");
         assert!(
-            action.contains("1 unreadable or superseded database-only issue(s) kept only in the backup"),
+            refusal
+                .to_string()
+                .contains("1 recoverable database-only issue(s) (a-1)")
+        );
+        assert!(
+            refusal_error(&audit)
+                .to_string()
+                .contains("--discard-db-only")
+        );
+        require_lossless_rebuild(&audit, true)
+            .expect("explicit authorization for unrestorable data");
+        let action = planned_action(&audit, true);
+        assert!(
+            action.contains("re-add 1 database-only issue(s)"),
             "{action}"
         );
-        assert!(action.contains("1 labels row(s) without an owning issue"), "{action}");
+        assert!(
+            action.contains(
+                "1 unreadable or superseded database-only issue(s) kept only in the backup"
+            ),
+            "{action}"
+        );
+        assert!(
+            action.contains("1 labels row(s) without an owning issue"),
+            "{action}"
+        );
     }
 
     #[test]
@@ -1983,7 +2007,10 @@ mod tests {
             restored.agent_context.as_deref(),
             Some("{\"constraints\":[\"keep local work\"]}")
         );
-        assert_eq!(restored.source_repo_path.as_deref(), Some("/original/workspace"));
+        assert_eq!(
+            restored.source_repo_path.as_deref(),
+            Some("/original/workspace")
+        );
         assert_eq!(restored.prerequisites.as_deref(), Some("- [ ] review"));
     }
 
@@ -2013,7 +2040,11 @@ mod tests {
             conn.execute(&format!("UPDATE issues SET {column} = X'FEED'"))
                 .unwrap();
             let audit = audit_connection(&conn, Some(std::io::Cursor::new(jsonl))).unwrap();
-            assert_eq!(audit.db_only[0].reason, DbOnlyReason::Unreadable, "{column}");
+            assert_eq!(
+                audit.db_only[0].reason,
+                DbOnlyReason::Unreadable,
+                "{column}"
+            );
             assert!(audit.restorable.is_empty());
             assert!(require_lossless_rebuild(&audit, false).is_err());
         }
@@ -2024,7 +2055,10 @@ mod tests {
         let baseline = issue("a-1", "2026-01-01T00:00:00Z");
         for (field, changed) in [
             ("prerequisites", serde_json::json!("- [ ] review")),
-            ("agent_context", serde_json::json!("{\"instructions\":[\"keep\"]}")),
+            (
+                "agent_context",
+                serde_json::json!("{\"instructions\":[\"keep\"]}"),
+            ),
             ("created_by", serde_json::json!("another agent")),
             ("closed_by_session", serde_json::json!("session-1")),
             ("source_system", serde_json::json!("upstream")),
@@ -2078,7 +2112,10 @@ mod tests {
         exported.comments.push(local.comments[0].clone());
         assert!(issues_equivalent(&local, &exported), "a superset is safe");
         local.comments.push(local.comments[0].clone());
-        assert!(!issues_equivalent(&local, &exported), "one match is not two");
+        assert!(
+            !issues_equivalent(&local, &exported),
+            "one match is not two"
+        );
         exported.comments.push(local.comments[0].clone());
         assert!(issues_equivalent(&local, &exported));
     }

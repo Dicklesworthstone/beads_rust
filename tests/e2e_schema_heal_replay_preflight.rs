@@ -121,8 +121,15 @@ fn assert_refused_before_replacement(workspace: &BrWorkspace, db: &Path, discard
         .expect("structured error")
         .to_owned();
     assert!(message.contains("restore rehearsal failed"), "{message}");
-    assert!(message.contains("live database rebuild was not started"), "{message}");
-    assert_eq!(header_version(db), 4, "failure must not mark the tracker current");
+    assert!(
+        message.contains("live database rebuild was not started"),
+        "{message}"
+    );
+    assert_eq!(
+        header_version(db),
+        4,
+        "failure must not mark the tracker current"
+    );
     assert_eq!(fs::read(db).unwrap(), before, "original database bytes");
     assert_eq!(optional_bytes(&wal), before_wal, "original committed WAL");
     assert_eq!(fs::read(export).unwrap(), before_export, "original JSONL");
@@ -143,7 +150,12 @@ fn show(workspace: &BrWorkspace, id: &str) -> Value {
         ["show", id, "--json", "--no-auto-import", "--no-auto-flush"],
         &format!("show_{id}"),
     );
-    assert!(result.status.success(), "{} {}", result.stdout, result.stderr);
+    assert!(
+        result.status.success(),
+        "{} {}",
+        result.stdout,
+        result.stderr
+    );
     json(&result.stdout)[0].clone()
 }
 
@@ -160,7 +172,10 @@ fn assert_stored_governance(db: &Path) {
         rows[0].get(0).and_then(SqliteValue::as_text),
         Some(LOCAL_CONTEXT)
     );
-    assert_eq!(rows[0].get(1).and_then(SqliteValue::as_text), Some(LOCAL_PATH));
+    assert_eq!(
+        rows[0].get(1).and_then(SqliteValue::as_text),
+        Some(LOCAL_PATH)
+    );
     assert_eq!(
         rows[0].get(2).and_then(SqliteValue::as_text),
         Some(LOCAL_PREREQUISITES)
@@ -180,11 +195,19 @@ fn resolving_the_conflict_allows_a_lossless_retry_and_export() {
         ["doctor", "migrate-schema", "heal", "--json"],
         "heal_after_resolving_conflict",
     );
-    assert!(result.status.success(), "{} {}", result.stdout, result.stderr);
+    assert!(
+        result.status.success(),
+        "{} {}",
+        result.stdout,
+        result.stderr
+    );
     let receipt = json(&result.stdout);
     assert_eq!(receipt["action"], "rebuilt");
     assert_eq!(receipt["restored_db_only"], serde_json::json!(["leg-u4i"]));
-    assert_eq!(receipt["backup_only_db_only"], serde_json::json!(["leg-n57"]));
+    assert_eq!(
+        receipt["backup_only_db_only"],
+        serde_json::json!(["leg-n57"])
+    );
     assert!(Path::new(receipt["backup"].as_str().unwrap()).is_dir());
     assert_eq!(
         header_version(&db),
@@ -201,7 +224,11 @@ fn resolving_the_conflict_allows_a_lossless_retry_and_export() {
     assert_eq!(upstream["title"], "Superseding upstream title");
     assert_eq!(upstream["external_ref"], "different-upstream-reference");
 
-    let flush = run_br(&workspace, ["sync", "--flush-only", "--json"], "flush_retry");
+    let flush = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--json"],
+        "flush_retry",
+    );
     assert!(flush.status.success(), "{} {}", flush.stdout, flush.stderr);
     let rows: Vec<Value> = fs::read_to_string(workspace.root.join(".beads/issues.jsonl"))
         .unwrap()

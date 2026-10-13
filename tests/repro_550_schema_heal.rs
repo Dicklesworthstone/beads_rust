@@ -88,7 +88,12 @@ fn show_without_sync(workspace: &BrWorkspace, id: &str) -> Value {
         ["show", id, "--json", "--no-auto-import", "--no-auto-flush"],
         &format!("show_{id}"),
     );
-    assert!(result.status.success(), "{} {}", result.stdout, result.stderr);
+    assert!(
+        result.status.success(),
+        "{} {}",
+        result.stdout,
+        result.stderr
+    );
     json(&result.stdout)[0].clone()
 }
 
@@ -217,7 +222,10 @@ fn discard_unreadable_payload_does_not_omit_a_different_recoverable_issue() {
 
     let preview = flagged_heal(&workspace, true);
     let action = preview["planned_action"].as_str().unwrap();
-    assert!(action.contains("re-add 1 database-only issue(s)"), "{action}");
+    assert!(
+        action.contains("re-add 1 database-only issue(s)"),
+        "{action}"
+    );
     assert!(
         action.contains("1 unreadable or superseded database-only issue(s)"),
         "{action}"
@@ -226,7 +234,10 @@ fn discard_unreadable_payload_does_not_omit_a_different_recoverable_issue() {
 
     let outcome = flagged_heal(&workspace, false);
     assert_eq!(outcome["restored_db_only"], serde_json::json!(["leg-u4i"]));
-    assert_eq!(outcome["backup_only_db_only"], serde_json::json!(["leg-n57"]));
+    assert_eq!(
+        outcome["backup_only_db_only"],
+        serde_json::json!(["leg-n57"])
+    );
     assert!(Path::new(outcome["backup"].as_str().unwrap()).is_dir());
     let _ = assert_recoverable_issue_and_flush(&workspace, &db_path);
 }
@@ -253,7 +264,10 @@ fn discard_preservation_does_not_overwrite_a_superseding_jsonl_edit() {
 
     let outcome = flagged_heal(&workspace, false);
     assert_eq!(outcome["restored_db_only"], serde_json::json!(["leg-u4i"]));
-    assert_eq!(outcome["backup_only_db_only"], serde_json::json!(["leg-n57"]));
+    assert_eq!(
+        outcome["backup_only_db_only"],
+        serde_json::json!(["leg-n57"])
+    );
     assert_eq!(
         show_without_sync(&workspace, "leg-n57")["title"],
         "Newer upstream edit"

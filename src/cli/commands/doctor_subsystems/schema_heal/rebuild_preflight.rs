@@ -93,11 +93,15 @@ impl RebuildWitness {
         }
         let mut unseen: BTreeSet<&str> = expected.keys().copied().collect();
         for row in storage.execute_raw_query("SELECT id, source_repo_path FROM issues")? {
-            let id = row.first().and_then(|value| value.as_text()).ok_or_else(|| {
-                BeadsError::Config(
-                    "schema-heal preservation failed: unreadable provenance issue ID".to_owned(),
-                )
-            })?;
+            let id = row
+                .first()
+                .and_then(|value| value.as_text())
+                .ok_or_else(|| {
+                    BeadsError::Config(
+                        "schema-heal preservation failed: unreadable provenance issue ID"
+                            .to_owned(),
+                    )
+                })?;
             let Some(path) = expected.get(id) else {
                 continue;
             };
@@ -157,10 +161,8 @@ pub(super) fn rehearse(
             &db_path,
             lock_timeout,
         )?);
-        let jsonl_authority = sync::blocking_jsonl_family_write_lock_with_timeout(
-            &jsonl_path,
-            lock_timeout,
-        )?;
+        let jsonl_authority =
+            sync::blocking_jsonl_family_write_lock_with_timeout(&jsonl_path, lock_timeout)?;
         let private_source = sync::capture_jsonl_source_snapshot(&jsonl_path)?;
         let (mut storage, _, _) =
             config::repair_database_from_jsonl_snapshot_under_write_authority(
@@ -284,7 +286,11 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("replay must not silently discard either claimant"),
         };
-        assert!(error.to_string().contains("live database rebuild was not started"));
+        assert!(
+            error
+                .to_string()
+                .contains("live database rebuild was not started")
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
         assert!(!original.path().join("beads.db").exists());
     }
