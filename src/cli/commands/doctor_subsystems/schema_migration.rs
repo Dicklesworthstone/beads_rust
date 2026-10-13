@@ -706,6 +706,9 @@ pub fn recover_wal_index_for_startup(
     if !wal_index_needs_recovery(db_path)? {
         return Ok(());
     }
+    // A frame-bearing WAL is not a repairable index-only incident. Refuse
+    // before scanning or allocating recovery runs on ordinary commands.
+    require_frame_free_engine_recovery(db_path)?;
     // Every automatic attempt retains its pre-state in a new `.br_recovery`
     // run (the complete family, unless only the index had to be rebuilt).
     // Content/verification failures over identical bytes must not accumulate
@@ -835,6 +838,18 @@ fn recover_engine_admission_with_lease(
     strict_wal: bool,
     policy: PreexistingIndexCorruption,
 ) -> Result<EngineRecoveryReceipt> {
+    // Reject a frame-bearing WAL before creating any recovery artifacts.
+    // This also covers automatic recovery invoked by ordinary commands.
+    if crate::sync::database_write_authority_sha256(&migration.db_path)?
+        != migration.write_authority.authority_path_sha256()
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "engine recovery path does not match the held database-family authority"
+                .to_string(),
+        });
+    }
+    migration.write_authority.verify_database_authority()?;
+    require_frame_free_engine_recovery(&migration.db_path)?;
     // Only recovery's artifact scope changes. Keep the exact, already-bound
     // database authority; migration apply/undo/heal still use their own context.
     let recovery = MigrationContext {
@@ -872,6 +887,29 @@ fn require_recovery_payload_unchanged(
             return Err(BeadsError::internal(format!(
                 "engine admission recovery changed protected database component {suffix:?}; \
                  retained the complete pre-state and recovery evidence"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Private backups may intentionally have stricter permissions than live
+/// database files. Compare their payloads, not their copy-only modes.
+/// Live before/after checks continue to compare complete witnesses.
+fn require_private_recovery_payload_unchanged(
+    before: &RawFamilyWitness,
+    private: &RawFamilyWitness,
+) -> Result<()> {
+    for suffix in ["", "-wal", "-journal"] {
+        let expected = component_for_suffix(before, suffix)?;
+        let observed = component_for_suffix(private, suffix)?;
+        if expected.present != observed.present
+            || expected.length != observed.length
+            || expected.sha256 != observed.sha256
+        {
+            return Err(BeadsError::internal(format!(
+                "private recovery changed protected database component {suffix:?}; \\
+                 refusing index publication"
             )));
         }
     }
@@ -955,8 +993,9 @@ fn recover_live_index_from_private_copy(
         if let Some(stage) = live_stage.as_deref_mut() {
             *stage = "private-recovery".to_string();
         }
+        let probe_before = recovery_family_witness(&probe_db)?;
         recover_existing_family(&probe_db, None, None)?;
-        require_recovery_payload_unchanged(&raw_before, &recovery_family_witness(&probe_db)?)?;
+        require_recovery_payload_unchanged(&probe_before, &recovery_family_witness(&probe_db)?)?;
         let _logical = logical_witness(&probe_db)?;
         publish_recovered_index(
             db_path,
@@ -991,7 +1030,7 @@ fn publish_recovered_index(
     live_stage: Option<&mut String>,
 ) -> Result<()> {
     let probe_after = recovery_family_witness(probe_db)?;
-    require_recovery_payload_unchanged(expected, &probe_after)?;
+    require_private_recovery_payload_unchanged(expected, &probe_after)?;
     if !crate::franken_sync::wal_index::ENGINE_READS_ON_DISK_WAL_INDEX {
         authority.verify_database_authority()?;
         require_frame_free_engine_recovery(db_path)?;
