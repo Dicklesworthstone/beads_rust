@@ -563,9 +563,8 @@ mod tests {
             &ConfigLayer::default(),
             Some(5_000),
         );
-        let error = match result {
-            Err(error) => error,
-            Ok(_) => panic!("replay must not silently discard either claimant"),
+        let Err(error) = result else {
+            panic!("replay must not silently discard either claimant");
         };
         assert!(error.to_string().contains("live database rebuild was not started"));
         assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
