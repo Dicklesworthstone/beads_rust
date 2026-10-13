@@ -847,7 +847,7 @@ fn quarantine_status(
 ///
 /// # Errors
 /// Returns an error when the directory or its receipts cannot be read.
-pub(crate) fn is_finished_quarantine(
+pub fn is_finished_quarantine(
     dir: &Path,
     recorded_dir: &Path,
     database_path: &str,
@@ -1797,7 +1797,7 @@ pub mod tests {
         let dir = parent.join(format!("{QUARANTINE_PREFIX}{suffix}"));
         fs::create_dir(&dir).unwrap();
         let index = poison();
-        fs::write(dir.join(QUARANTINED_INDEX), &index).unwrap();
+        fs::write(dir.join(QUARANTINED_INDEX), index).unwrap();
         let index_sha = hash_file(&mut File::open(dir.join(QUARANTINED_INDEX)).unwrap()).unwrap();
         let retained_index = dir.join(QUARANTINED_INDEX).display().to_string();
         let receipt = serde_json::json!({
