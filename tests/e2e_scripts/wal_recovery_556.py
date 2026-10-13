@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 import queue
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -86,6 +87,21 @@ def unchanged(before: Family, after: Family, suffixes=SUFFIXES) -> None:
     changed = [suffix or "main" for suffix in suffixes if before[suffix] != after[suffix]]
     require(not changed, f"recovery changed file bytes/presence: {changed}; "
             f"before={describe(before)} after={describe(after)}")
+
+
+def family_modes(db: Path) -> dict[str, int | None]:
+    """Record live permission bits without opening any database descriptor."""
+    modes = {}
+    for suffix in SUFFIXES:
+        try:
+            modes[suffix] = stat.S_IMODE(component(db, suffix).stat().st_mode)
+        except FileNotFoundError:
+            modes[suffix] = None
+    return modes
+
+
+def unchanged_modes(before: dict[str, int | None], after: dict[str, int | None]) -> None:
+    require(before == after, f"recovery changed live permissions/presence: {before} -> {after}")
 
 
 def readonly(db: Path) -> sqlite3.Connection:
@@ -506,18 +522,28 @@ def assert_artifact_scope(db: Path, ambient: Path, ambient_before: dict[str, byt
 
 
 def test_artifact_location(br: Path, seed: Path, ambient: Path, root: Path,
-                           relative: bool, fail: bool) -> None:
+                           relative: bool, fail: bool, unix_mode: int | None = None,
+                           index_only: bool = False) -> None:
     db = root / "external-copy" / "nondefault.db"
     retain(family(seed), db)
-    shm = bytearray(component(db, "-shm").read_bytes())
-    require(len(shm) >= 96, "fixture needs both WAL-index headers")
-    shm[16] ^= 0xFF  # Existing unrecognized-index-damage regression uses this shape.
-    component(db, "-shm").write_bytes(shm)
+    if index_only:
+        poison_index_headers(db)
+    else:
+        shm = bytearray(component(db, "-shm").read_bytes())
+        require(len(shm) >= 96, "fixture needs both WAL-index headers")
+        shm[16] ^= 0xFF  # Existing unrecognized-index-damage regression uses this shape.
+        component(db, "-shm").write_bytes(shm)
     if fail:
         # Deliberately damage only this newly allocated disposable copy.
         image = bytearray(db.read_bytes())
         image[:16] = b"GH556 bad header"
         db.write_bytes(image)
+    if unix_mode is not None:
+        for suffix in SUFFIXES:
+            path = component(db, suffix)
+            if path.exists():
+                path.chmod(unix_mode)
+    modes_before = family_modes(db)
     before = family(db)
     retain(before, root / "before" / db.name)
     ambient_before = recovery_files(ambient)
@@ -532,6 +558,32 @@ def test_artifact_location(br: Path, seed: Path, ambient: Path, root: Path,
     require((result.returncode != 0) == fail,
             f"unexpected recovery result: {result.returncode}: {result.stdout}{result.stderr}")
     assert_artifact_scope(db, ambient, ambient_before, "failed" if fail else "complete", before)
+    if unix_mode is not None:
+        unchanged_modes(modes_before, family_modes(db))
+    if not fail:
+        # Query distinct copies; never let the oracle repair the observations.
+        rows = []
+        for label, observed in (("before", before), ("after", after)):
+            inspection = root / f"oracle-{label}" / db.name
+            retain(observed, inspection)
+            with contextlib.closing(readonly(inspection)) as reader:
+                found = reader.execute(
+                    "SELECT id, status, closed_at, close_reason FROM issues WHERE title=?",
+                    (TITLE,),
+                ).fetchall()
+                require(len(found) == 1, "recovery lost or duplicated the committed sentinel")
+                rows.append(found)
+        require(rows[0] == rows[1], "successful recovery changed committed issue state")
+        unchanged(after, family(db))
+        if unix_mode is not None:
+            runs = db.parent / ".br_recovery" / "schema-migrations"
+            receipt = json.loads(next(runs.glob("*/recovery-complete.json")).read_text())
+            expected_scope = "wal-index-only" if index_only else "complete-family"
+            require(receipt["backup_scope"] == expected_scope,
+                    f"permission regression exercised the wrong recovery branch: {receipt}")
+            backup = Path(receipt["backup_path"]) / db.name
+            for mode in family_modes(backup).values():
+                require(mode is None or mode == 0o600, "recovery backup is not private")
 
 
 class FixtureChecks(unittest.TestCase):
@@ -553,6 +605,22 @@ class FixtureChecks(unittest.TestCase):
             retain(state, observed)
             with contextlib.closing(readonly(observed)) as conn:
                 self.assertEqual(issue_state(conn, issue_id), ("closed", STAMP, REASON))
+
+    @unittest.skipUnless(os.name == "posix", "requires Unix permission bits")
+    def test_permission_oracle_rejects_live_mode_drift_but_keeps_copy_bytes_equal(self):
+        self.db.chmod(0o640)
+        before = family(self.db)
+        modes = family_modes(self.db)
+        private = self.root / "private" / self.db.name
+        retain(before, private)
+        private.chmod(0o600)
+        unchanged(before, family(private))
+        with self.assertRaisesRegex(AssertionError, "live permissions"):
+            unchanged_modes(modes, family_modes(private))
+        private.chmod(0o640)
+        unchanged_modes(modes, family_modes(private))
+        unchanged_modes(modes, family_modes(self.db))
+        unchanged(before, family(self.db))
 
     def test_orphaned_wal_has_a_committed_closure_without_live_openers(self):
         issue_id = orphaned_closure(self.db)
@@ -674,6 +742,32 @@ finally:
         with self.assertRaisesRegex(AssertionError, "lost the committed WAL-only closure"):
             assert_closed_observation(state, self.root / "discarded", issue_id)
 
+    @unittest.skipUnless(HAS_LINUX_OFD, "requires Linux OFD locks")
+    def test_torn_wal_probe_does_not_remove_a_stock_readers_exclusion(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as writer:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("UPDATE issues SET close_reason='settled in main'")
+            writer.commit()
+            header = component(self.db, "-wal").read_bytes()[:32]
+            self.assertEqual(writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0], 0)
+        component(self.db, "-wal").write_bytes(header)
+        with pinned_header_only_reader(self.db) as row:
+            self.assertEqual(row[1:], ["open", None, "settled in main"])
+            # Only a disposable, fully checkpointed fixture is damaged. The
+            # reader never runs SQL again and exits without a checkpoint.
+            with component(self.db, "-wal").open("r+b") as fixture:
+                fixture.truncate(4)
+            before = family(self.db)
+            self.assertEqual(len(before["-wal"]), 4)
+            with self.assertRaises(OSError) as caught:
+                with sqlite_main_exclusion(self.db):
+                    self.fail("a torn WAL probe bypassed the stock reader's lock")
+            self.assertIn(caught.exception.errno, (errno.EAGAIN, errno.EACCES))
+            unchanged(before, family(self.db))
+        with sqlite_main_exclusion(self.db):
+            unchanged(before, family(self.db))
+
     def test_refusal_oracle_checks_every_family_component(self):
         state = family(self.db)
         result = subprocess.CompletedProcess([], 1, "", REFUSAL)
@@ -751,6 +845,13 @@ def main() -> int:
             cases.append((label, lambda directory, r=relative, f=fail: test_artifact_location(
                 br, seed, ambient_db.parent, directory, r, f)))
     failures = []
+    if os.name == "posix":
+        for relative in (False, True):
+            for index_only in (False, True):
+                label = (f"mode-0640-{'relative' if relative else 'absolute'}-"
+                         f"{'index-only' if index_only else 'complete-family'}")
+                cases.append((label, lambda directory, r=relative, i=index_only: test_artifact_location(
+                    br, seed, ambient_db.parent, directory, r, False, 0o640, i)))
     for label, test in cases:
         directory = root / label
         directory.mkdir()
