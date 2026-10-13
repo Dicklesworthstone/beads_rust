@@ -603,7 +603,7 @@ pub struct TornWalQuarantine {
 /// # Errors
 /// Refuses mismatched authority, unsafe paths, or a failed verified rename.
 pub fn quarantine_torn_wal_for_startup(
-    beads_dir: &Path,
+    _beads_dir: &Path,
     db_path: &Path,
     authority: &Arc<DatabaseFamilyWriteLock>,
 ) -> Result<Option<TornWalQuarantine>> {
@@ -633,9 +633,10 @@ pub fn quarantine_torn_wal_for_startup(
         if !is_torn_wal_length(wal_length) {
             return Ok(None);
         }
+        let recovery_dir = recovery_artifacts_dir(db_path)?;
         let quarantined_paths = config::quarantine_database_artifacts(
             db_path,
-            beads_dir,
+            &recovery_dir,
             [wal_path, family_component_path(db_path, "-shm")],
             "truncated-wal",
         )?;
@@ -712,7 +713,8 @@ pub fn recover_wal_index_for_startup(
     // over those bytes: retain its evidence, but allow the next command to
     // retry after the holder exits. Never retry a mutation within this call.
     let raw_before = recovery_family_witness(db_path)?;
-    if let Some(prior) = prior_failed_recovery(beads_dir, &raw_before)? {
+    let recovery_dir = recovery_artifacts_dir(db_path)?;
+    if let Some(prior) = prior_failed_recovery(&recovery_dir, &raw_before)? {
         return Err(BeadsError::SyncConflict {
             message: format!(
                 "automatic WAL index recovery already failed for this exact database family \
@@ -818,11 +820,29 @@ fn prior_failed_recovery(
     Ok(None)
 }
 
+/// Evidence belongs to the selected database, not an ambient workspace.
+/// Resolve relative selections once; do not rebind database write authority.
+fn recovery_artifacts_dir(db_path: &Path) -> Result<PathBuf> {
+    let parent = db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(fs::canonicalize(parent)?)
+}
+
 fn recover_engine_admission_with_lease(
     migration: &MigrationContext,
     strict_wal: bool,
     policy: PreexistingIndexCorruption,
 ) -> Result<EngineRecoveryReceipt> {
+    // Only recovery's artifact scope changes. Keep the exact, already-bound
+    // database authority; migration apply/undo/heal still use their own context.
+    let recovery = MigrationContext {
+        beads_dir: recovery_artifacts_dir(&migration.db_path)?,
+        db_path: migration.db_path.clone(),
+        write_authority: Arc::clone(&migration.write_authority),
+    };
+    let migration = &recovery;
     let mut lease = crate::sync::DatabaseOpenerLease::register(&migration.db_path)?;
     let exclusive = lease
         .try_exclusive()
@@ -6094,6 +6114,36 @@ fn sync_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn recovery_556_evidence_follows_nondefault_database_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let ambient = root.path().join("ambient/.beads");
+        let selected = root.path().join("external");
+        fs::create_dir_all(&ambient).unwrap();
+        fs::create_dir_all(&selected).unwrap();
+        let directory = recovery_artifacts_dir(&selected.join("nondefault.db")).unwrap();
+        assert_eq!(directory, fs::canonicalize(&selected).unwrap());
+        assert_ne!(directory, fs::canonicalize(&ambient).unwrap());
+        assert!(!ambient.join(".br_recovery").exists());
+    }
+
+    #[test]
+    fn recovery_556_bare_relative_filename_uses_current_directory_without_chdir() {
+        let directory = recovery_artifacts_dir(Path::new("nondefault.db")).unwrap();
+        assert_eq!(directory, fs::canonicalize(".").unwrap());
+    }
+
+    #[test]
+    fn recovery_556_evidence_resolution_does_not_create_a_missing_database() {
+        let root = tempfile::tempdir().unwrap();
+        let selected = root.path().join("missing.db");
+        assert_eq!(
+            recovery_artifacts_dir(&selected).unwrap(),
+            fs::canonicalize(root.path()).unwrap()
+        );
+        assert!(!selected.exists());
+    }
 
     /// GH #520: on Windows the engine keeps its WAL index in private memory,
     /// so a stock-SQLite index beside a header-only WAL (or no index at all)
