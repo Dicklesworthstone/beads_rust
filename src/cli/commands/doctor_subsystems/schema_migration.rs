@@ -2112,9 +2112,11 @@ fn recover_engine_admission_with_complete_backup(
             ));
         }
         verify_backup_family(&migration.db_path, &before_dir, &receipt.raw_before)?;
-        recover_existing_family(
+        publish_recovered_index(
             &migration.db_path,
-            Some(&migration.write_authority),
+            &probe_db,
+            &receipt.raw_before,
+            &migration.write_authority,
             Some(&mut receipt.stage),
         )?;
         migration.write_authority.verify_database_authority()?;
