@@ -142,6 +142,7 @@ pub(super) fn complete_comment_restore_plan(
                 peer.id
             )));
         }
+        require_same_restore_identity(&preserved.issue, peer)?;
         let local = preserved.comments.as_ref().ok_or_else(|| {
             BeadsError::Config(format!(
                 "schema-heal cannot combine unreadable local comments for {}; rebuild not started",
@@ -166,6 +167,29 @@ pub(super) fn complete_comment_restore_plan(
         preserved.comments = Some(combined);
     }
     Ok(plan)
+}
+
+/// Revision precedence applies only to copies of the same task. In particular,
+/// a newer local row can reach this plan without the audit's comments-only
+/// identity check. A comment union must not legitimize replacing a different
+/// task that happens to have the same ID (#512).
+fn require_same_restore_identity(local: &Issue, imported: &Issue) -> Result<()> {
+    // Match the legacy audit's persisted microsecond precision, including its
+    // comments-only identity check; updated_at and comment rowids are not IDs.
+    if local.id != imported.id
+        || super::micros(local.created_at) != super::micros(imported.created_at)
+    {
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "schema-heal ID collision: local issue {} (created {}) and imported issue {} \
+                 (created {}) are not the same task; refusing to replace an imported issue \
+                 or combine its comments. Reconcile the identities before healing; \
+                 the live database rebuild was not started",
+                local.id, local.created_at, imported.id, imported.created_at
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Multiset union by portable identity, never by clone-local rowid. Shared
@@ -263,6 +287,11 @@ pub(super) fn rehearse(
         };
         for preserved in restorable {
             let mut expected = preserved.issue.clone();
+            if let Some(imported) = witness.issues.get(&expected.id) {
+                // Validate the normalized import too, before replacing the
+                // baseline that the final replay verifier will trust.
+                require_same_restore_identity(&expected, imported)?;
+            }
             if let Some(labels) = &preserved.labels {
                 expected.labels.clone_from(labels);
             }
@@ -702,6 +731,95 @@ mod tests {
             );
             assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
         }
+    }
+
+    #[test]
+    fn restore_identity_uses_persisted_creation_not_revision() {
+        let imported = issue("pf-abc");
+        let mut local = imported.clone();
+        local.title = "a legitimate later edit".to_owned();
+        local.updated_at += chrono::Duration::days(1);
+        local.created_at += chrono::Duration::nanoseconds(999);
+        require_same_restore_identity(&local, &imported).unwrap();
+        local.created_at += chrono::Duration::nanoseconds(1);
+        assert!(matches!(
+            require_same_restore_identity(&local, &imported),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        local.created_at = imported.created_at;
+        local.id = "pf-other".to_owned();
+        assert!(require_same_restore_identity(&local, &imported).is_err());
+    }
+
+    #[test]
+    fn comment_plan_rejects_reused_ids_even_when_no_comments_would_be_lost() {
+        for comments in [Vec::new(), vec![comment(1, "same complete history")]] {
+            let original = tempfile::tempdir().unwrap();
+            let path = original.path().join("issues.jsonl");
+            let mut imported = issue("pf-abc");
+            imported.comments = comments;
+            let bytes = format!("{}\n", serde_json::to_string(&imported).unwrap());
+            fs::write(&path, &bytes).unwrap();
+            let source = sync::capture_jsonl_source_snapshot(&path).unwrap();
+            let mut local = imported.clone();
+            local.title = "newer local task".to_owned();
+            local.updated_at += chrono::Duration::seconds(2);
+            // A real edit of the same task is still accepted, with or without
+            // comments. The following failure must be identity-specific.
+            complete_comment_restore_plan(&source, &[preserved(local.clone())]).unwrap();
+            for delta in [-1, 1] {
+                local.created_at = imported.created_at + chrono::Duration::microseconds(delta);
+                let restored = [preserved(local.clone())];
+                let error = match complete_comment_restore_plan(&source, &restored) {
+                    Err(error) => error,
+                    Ok(_) => panic!("a newer revision cannot authorize a reused task ID"),
+                };
+                assert!(matches!(&error, BeadsError::SyncConflict { message }
+                    if message.contains("schema-heal ID collision") && message.contains("pf-abc")));
+                assert_eq!(restored[0].issue, local);
+                assert_eq!(restored[0].comments.as_ref(), Some(&local.comments));
+                assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn rehearsal_rechecks_identity_before_replacing_the_imported_witness() {
+        if isolated_rehearsal(concat!(
+            "cli::commands::doctor_subsystems::schema_heal::rebuild_preflight::tests::",
+            "rehearsal_rechecks_identity_before_replacing_the_imported_witness"
+        )) {
+            return;
+        }
+        let original = tempfile::tempdir().unwrap();
+        let path = original.path().join("issues.jsonl");
+        let mut imported = issue("pf-abc");
+        imported.comments = vec![comment(1, "complete imported history")];
+        let bytes = format!("{}\n", serde_json::to_string(&imported).unwrap());
+        fs::write(&path, &bytes).unwrap();
+        let source = sync::capture_jsonl_source_snapshot(&path).unwrap();
+        let mut local = imported.clone();
+        local.created_at += chrono::Duration::seconds(1);
+        local.updated_at += chrono::Duration::seconds(2);
+        local.title = "different task under the reused ID".to_owned();
+        // Bypass the planner deliberately: complete comments and a matching
+        // post-replay payload must not certify replacement of another task.
+        let error = match rehearse(
+            &source,
+            &[preserved(local)],
+            &ConfigLayer::default(),
+            Some(5_000),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a local overlay must not erase the imported task's identity"),
+        };
+        let BeadsError::WithContext { source, .. } = &error else {
+            panic!("expected a rehearsal failure: {error:?}");
+        };
+        assert!(matches!(source.as_ref(), BeadsError::SyncConflict { message }
+            if message.contains("schema-heal ID collision") && message.contains("pf-abc")));
+        assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
+        assert!(!original.path().join("beads.db").exists());
     }
 
     #[test]
