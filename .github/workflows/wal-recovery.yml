@@ -13,6 +13,7 @@ on:
       - 'src/sync/db_inode_lock.rs'
       - 'tests/e2e_scripts/wal_recovery_556.py'
       - 'tests/e2e_scripts/wal_recovery_562.py'
+      - 'tests/e2e_scripts/wal_admission_561.py'
       - 'Cargo.toml'
       - 'Cargo.lock'
   workflow_dispatch:
@@ -44,7 +45,9 @@ jobs:
         id: build
         run: cargo +nightly-2026-08-31 build --locked --bin br
       - name: Validate fixtures and native exclusion
-        run: python3 tests/e2e_scripts/wal_recovery_556.py --self-test
+        run: |
+          python3 tests/e2e_scripts/wal_recovery_556.py --self-test
+          python3 tests/e2e_scripts/wal_admission_561.py --self-test
       - name: Exercise the actual executable
         run: python3 tests/e2e_scripts/wal_recovery_556.py --br "$PWD/target/debug/br"
       - name: Validate orphaned-WAL checkpoint oracles
@@ -56,6 +59,9 @@ jobs:
       - name: Test engine diagnostic boundaries and path handling
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: cargo +nightly-2026-08-31 test --locked --lib cli::commands::doctor_subsystems::engine::tests
+      - name: Exercise empty-WAL admission and preservation
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 tests/e2e_scripts/wal_admission_561.py --br "$PWD/target/debug/br"
       - name: Retain the binary, fixtures, and recovery evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -69,3 +75,5 @@ jobs:
             /tmp/br-556-selftest-*
             /tmp/br-recovery-562-*
             /tmp/br-562-selftest-*
+            /tmp/br-admission-561-*
+            /tmp/br-561-selftest-*

@@ -1,0 +1,138 @@
+name: FrankenSQLite admission qualification
+
+# Candidate manifests and lockfiles exist only in these disposable checkouts.
+# This workflow never pushes, upgrades main, or calls an expected failure a pass.
+on:
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: Published FrankenSQLite family version to qualify
+        required: true
+        default: '0.4.12'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  qualification:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        engine: [locked, candidate]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      ENGINE_LANE: ${{ matrix.engine }}
+      CANDIDATE_VERSION: ${{ inputs.candidate }}
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_TERM_COLOR: never
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the repository's CI toolchain
+        run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt,clippy
+      - name: Validate and prepare the entire direct engine family
+        run: |
+          python3 - <<'PY'
+          import json, os, re, tomllib
+          from pathlib import Path
+          path = Path('Cargo.toml')
+          source = path.read_text()
+          dependencies = tomllib.loads(source)['dependencies']
+          family = {name: spec for name, spec in dependencies.items()
+                    if name == 'fsqlite' or name.startswith('fsqlite-')}
+          assert 'fsqlite' in family and 'fsqlite-vfs' in family and 'fsqlite-wal' in family
+          assert all(isinstance(spec, dict) and set(spec).isdisjoint({'git', 'path'})
+                     and re.fullmatch(r'=\d+\.\d+\.\d+', spec.get('version', ''))
+                     for spec in family.values()), 'unrecognized or unpinned engine source'
+          versions = {spec['version'] for spec in family.values()}
+          assert len(versions) == 1, 'main already mixes engine-family pins'
+          candidate = os.environ['CANDIDATE_VERSION']
+          assert re.fullmatch(r'\d+\.\d+\.\d+', candidate), 'candidate must be a release version'
+          version = next(iter(versions))[1:]
+          if os.environ['ENGINE_LANE'] == 'candidate':
+              version = candidate
+              for name in family:
+                  pattern = r'(?m)^(' + re.escape(name) + r'\s*=\s*\{\s*version\s*=\s*")=[^"]+(".*)$'
+                  source, count = re.subn(pattern, lambda match: match[1] + '=' + version + match[2], source)
+                  assert count == 1, f'cannot safely replace the pin for {name}'
+              path.write_text(source)
+          actual = tomllib.loads(path.read_text())['dependencies']
+          assert all(actual[name]['version'] == '=' + version for name in family)
+          Path('expected-family.json').write_text(json.dumps({'version': version, 'direct': sorted(family)}, indent=2))
+          PY
+      - name: Resolve candidate without changing production pins
+        if: matrix.engine == 'candidate'
+        run: cargo +nightly-2026-08-31 update --package fsqlite --precise "$CANDIDATE_VERSION"
+      - name: Verify the complete resolved family, including transitive crates
+        run: |
+          cargo +nightly-2026-08-31 metadata --locked --format-version 1 --all-features > engine-metadata.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          expected = json.loads(Path('expected-family.json').read_text())
+          metadata = json.loads(Path('engine-metadata.json').read_text())
+          family = [p for p in metadata['packages'] if p['name'] == 'fsqlite' or p['name'].startswith('fsqlite-')]
+          assert family and set(expected['direct']) <= {p['name'] for p in family}
+          assert all(p['version'] == expected['version'] for p in family), 'mixed engine-family versions'
+          sources = {p.get('source') for p in family}
+          assert len(sources) == 1 and next(iter(sources), '').startswith('registry+'), 'mixed/unpublished engine sources'
+          assert len({p['name'] for p in family}) == len(family), 'duplicate engine crate identities'
+          Path('resolved-family.json').write_text(json.dumps(
+              [{'name': p['name'], 'version': p['version'], 'source': p['source'], 'id': p['id']}
+               for p in sorted(family, key=lambda p: p['name'])], indent=2))
+          PY
+      - name: Validate the independent fixture oracles
+        run: |
+          python3 tests/e2e_scripts/wal_recovery_556.py --self-test
+          python3 tests/e2e_scripts/wal_admission_561.py --self-test
+          python3 tests/e2e_scripts/wal_recovery_562.py --self-test
+      - name: Build the actual br executable
+        id: build
+        run: cargo +nightly-2026-08-31 build --locked --bin br
+      - name: Preserve issue 556 protections
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 tests/e2e_scripts/wal_recovery_556.py --br "$PWD/target/debug/br"
+      - name: Qualify zero-byte and header-only admission
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 tests/e2e_scripts/wal_admission_561.py --br "$PWD/target/debug/br"
+      - name: Preserve orphaned-WAL diagnostic and checkpoint boundaries
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 tests/e2e_scripts/wal_recovery_562.py --br "$PWD/target/debug/br"
+      - name: Run all Rust test targets, including torn WAL and workspace commands
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: cargo +nightly-2026-08-31 test --locked --all-targets
+      - name: Check formatting and Clippy
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          cargo +nightly-2026-08-31 fmt --check
+          cargo +nightly-2026-08-31 clippy --locked --all-targets -- -D warnings
+      - name: Retain exact resolution and all recovery evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fsqlite-admission-${{ matrix.os }}-${{ matrix.engine }}-${{ github.sha }}
+          include-hidden-files: true
+          if-no-files-found: warn
+          path: |
+            Cargo.toml
+            Cargo.lock
+            expected-family.json
+            resolved-family.json
+            engine-metadata.json
+            target/debug/br
+            /tmp/br-recovery-556-*
+            /tmp/br-556-selftest-*
+            /tmp/br-recovery-562-*
+            /tmp/br-562-selftest-*
+            /tmp/br-admission-561-*
+            /tmp/br-561-selftest-*
