@@ -1870,7 +1870,11 @@ mod tests {
                 b"database remains untouched"
             );
             assert!(fs::read_dir(beads).unwrap().all(|entry| {
-                !entry.unwrap().path().extension().is_some_and(|ext| ext == "tmp")
+                entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_none_or(|ext| ext != "tmp")
             }));
         }
 
@@ -2033,7 +2037,11 @@ mod tests {
                     assert_eq!(fs::read(backup.with_extension("jsonl.meta.json")).unwrap(), metadata);
                     assert_eq!(fs::read(beads.join("beads.db")).unwrap(), b"database remains untouched");
                     assert!(fs::read_dir(&beads).unwrap().all(|entry| {
-                        !entry.unwrap().path().extension().is_some_and(|ext| ext == "tmp")
+                        entry
+                            .unwrap()
+                            .path()
+                            .extension()
+                            .is_none_or(|ext| ext != "tmp")
                     }));
                 }
             }

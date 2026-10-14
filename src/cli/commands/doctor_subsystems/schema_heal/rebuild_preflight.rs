@@ -493,9 +493,8 @@ mod tests {
             &ConfigLayer::default(),
             Some(5_000),
         );
-        let error = match result {
-            Err(error) => error,
-            Ok(_) => panic!("a matching replay witness must not certify lost peer comments"),
+        let Err(error) = result else {
+            panic!("a matching replay witness must not certify lost peer comments");
         };
         let diagnostic = format!("{error:?}");
         assert!(
@@ -769,9 +768,8 @@ mod tests {
             for delta in [-1, 1] {
                 local.created_at = imported.created_at + chrono::Duration::microseconds(delta);
                 let restored = [preserved(local.clone())];
-                let error = match complete_comment_restore_plan(&source, &restored) {
-                    Err(error) => error,
-                    Ok(_) => panic!("a newer revision cannot authorize a reused task ID"),
+                let Err(error) = complete_comment_restore_plan(&source, &restored) else {
+                    panic!("a newer revision cannot authorize a reused task ID");
                 };
                 assert!(matches!(&error, BeadsError::SyncConflict { message }
                     if message.contains("schema-heal ID collision") && message.contains("pf-abc")));
@@ -803,14 +801,13 @@ mod tests {
         local.title = "different task under the reused ID".to_owned();
         // Bypass the planner deliberately: complete comments and a matching
         // post-replay payload must not certify replacement of another task.
-        let error = match rehearse(
+        let Err(error) = rehearse(
             &source,
             &[preserved(local)],
             &ConfigLayer::default(),
             Some(5_000),
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("a local overlay must not erase the imported task's identity"),
+        ) else {
+            panic!("a local overlay must not erase the imported task's identity");
         };
         let BeadsError::WithContext { source, .. } = &error else {
             panic!("expected a rehearsal failure: {error:?}");

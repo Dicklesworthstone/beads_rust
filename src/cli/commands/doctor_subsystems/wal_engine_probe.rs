@@ -21,7 +21,7 @@ use beads_rust::franken_sync::{Connection, Row, SqliteValue};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-pub(super) const SCHEMA: &str = "br.orphaned_wal.native_probe.v1";
+pub const SCHEMA: &str = "br.orphaned_wal.native_probe.v1";
 const RECEIPT_LIMIT: u64 = 4 * 1024 * 1024;
 const WRITE_SCHEMA: &str = "br.orphaned_wal.native_write.v1";
 
@@ -88,7 +88,7 @@ fn file_digest(file: &mut File, max_bytes: u64) -> Result<(u64, String)> {
     file.seek(SeekFrom::Start(0))?;
     let mut hash = Sha256::new();
     let mut length = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let count = file.read(&mut buffer)?;
         if count == 0 {
@@ -427,7 +427,7 @@ fn verify(conn: &Connection, manifest: &Manifest, max_bytes: u64) -> Result<()> 
     Ok(())
 }
 
-pub(super) fn execute(db: &Path, expected: &Path, max_bytes: u64) -> Result<serde_json::Value> {
+pub fn execute(db: &Path, expected: &Path, max_bytes: u64) -> Result<serde_json::Value> {
     let path = db.to_str().context("native probe refuses a non-UTF-8 path instead of retargeting it")?;
     let mut bytes = Vec::new();
     File::open(expected)?.take(RECEIPT_LIMIT + 1).read_to_end(&mut bytes)?;
@@ -518,7 +518,7 @@ mod tests {
             SqliteValue::Text("λ".into()), SqliteValue::Blob(vec![0, 255].into())];
         let expected = "00000000000000056e69fffffffffffffffe728000000000000000740000000000000002cebb62000000000000000200ff";
         let actual = encoded_row(&row, 1024).unwrap();
-        assert_eq!(actual.iter().map(|byte| format!("{byte:02x}")).collect::<String>(), expected);
+        assert_eq!(lower_hex(&actual), expected);
         assert!(encoded_row(&row, 8).is_err());
         assert_ne!(encoded_row(&[SqliteValue::Integer(1)], 1024).unwrap(),
                    encoded_row(&[SqliteValue::Float(1.0)], 1024).unwrap());

@@ -991,7 +991,7 @@ fn sqlite_database_page_size(path: &Path) -> Result<u32> {
 }
 
 fn sqlite_wal_checksum(bytes: &[u8], mut state: [u32; 2], big_endian: bool) -> [u32; 2] {
-    for pair in bytes.chunks_exact(8) {
+    for pair in bytes.as_chunks::<8>().0 {
         let word = |slice: &[u8]| {
             let value: [u8; 4] = slice.try_into().expect("fixed-width WAL checksum word");
             if big_endian {
@@ -1222,13 +1222,14 @@ fn publish_recovered_index(
     if let Some(mode) = component_for_suffix(expected, "-shm")?.unix_mode {
         index.unix_mode = Some(mode);
     }
+    let bound_wal = bound_wal
+        .as_ref()
+        .map(|witness| (family_component_path(probe_db, "-wal"), witness));
     install_recovery_index(
         db_path,
         &family_component_path(probe_db, "-shm"),
         &index,
-        bound_wal
-            .as_ref()
-            .map(|witness| (family_component_path(probe_db, "-wal"), witness)),
+        bound_wal.as_ref(),
         expected,
         authority,
         live_stage,
@@ -1266,7 +1267,7 @@ fn install_recovery_index(
     db_path: &Path,
     retained_index: &Path,
     index: &RawComponentWitness,
-    bound_wal: Option<(PathBuf, &RawComponentWitness)>,
+    bound_wal: Option<&(PathBuf, &RawComponentWitness)>,
     expected: &RawFamilyWitness,
     authority: &DatabaseFamilyWriteLock,
     mut live_stage: Option<&mut String>,
@@ -1505,6 +1506,7 @@ fn index_only_recovery_applies(db_path: &Path, raw_before: &RawFamilyWitness) ->
 /// so the original index is reinstated, byte for byte, and the caller runs
 /// the complete-backup rehearsal, which classifies and reports it exactly as
 /// before.
+#[allow(clippy::too_many_lines)]
 fn recover_index_only(
     migration: &MigrationContext,
     raw_before: &RawFamilyWitness,
