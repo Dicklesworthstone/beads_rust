@@ -22,7 +22,7 @@
 mod common;
 
 use beads_rust::franken_sync::{Connection, SqliteValue};
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrRun, BrWorkspace, extract_json_payload, run_br};
 use flate2::read::GzDecoder;
 use serde_json::Value;
 use std::fs;
@@ -37,6 +37,40 @@ fn fixture_dir() -> PathBuf {
 }
 
 const WAL_ONLY_TITLE: &str = "committed sentinel present only in WAL";
+const FRAMED_WAL_REFUSAL: &str = "engine recovery refused before opening: WAL contains frames \
+                                  that may hold committed, uncheckpointed changes";
+
+/// GH #556: a WAL that still carries committed frames is refused before
+/// anything is opened, copied or rewritten. No index is created, nothing is
+/// quarantined, and the main file and the WAL keep every byte.
+fn assert_framed_wal_refusal(
+    workspace: &BrWorkspace,
+    run: &BrRun,
+    main_before: &[u8],
+    wal_before: &[u8],
+) {
+    assert!(!run.status.success(), "{} {}", run.stdout, run.stderr);
+    let output = format!("{}{}", run.stdout, run.stderr);
+    assert!(
+        output.contains(FRAMED_WAL_REFUSAL),
+        "unexpected refusal: {output}"
+    );
+    assert!(!workspace.root.join(".beads/beads.db-shm").exists());
+    assert!(
+        !workspace
+            .root
+            .join(".beads/.br_recovery/schema-migrations")
+            .exists()
+    );
+    assert_eq!(
+        fs::read(workspace.root.join(".beads/beads.db")).unwrap(),
+        main_before
+    );
+    assert_eq!(
+        fs::read(workspace.root.join(".beads/beads.db-wal")).unwrap(),
+        wal_before
+    );
+}
 
 fn current_workspace_without_wal_index(pending_merge: bool) -> BrWorkspace {
     let workspace = BrWorkspace::new();
@@ -93,54 +127,37 @@ fn current_workspace_without_wal_index(pending_merge: bool) -> BrWorkspace {
 }
 
 #[test]
-fn missing_wal_index_startup_preserves_committed_rows() {
+fn missing_wal_index_startup_refuses_framed_wal_and_preserves_family() {
+    // The committed rows stay in the WAL; recovering them is the owning
+    // engine's checkpoint, not an index-only recovery (#562).
     let workspace = current_workspace_without_wal_index(false);
-    let list = run_br(&workspace, ["list", "--all", "--json"], "recovered_list");
-    assert!(list.status.success(), "{} {}", list.stdout, list.stderr);
-    assert!(list.stdout.contains(WAL_ONLY_TITLE));
-    assert!(workspace.root.join(".beads/beads.db-shm").is_file());
-    let create = run_br(
-        &workspace,
-        ["create", "after index recovery", "--json"],
-        "recovered_create",
-    );
-    assert!(
-        create.status.success(),
-        "{} {}",
-        create.stdout,
-        create.stderr
-    );
+    let main_before = fs::read(workspace.root.join(".beads/beads.db")).unwrap();
+    let wal_before = fs::read(workspace.root.join(".beads/beads.db-wal")).unwrap();
+    for (args, label) in [
+        (["list", "--all", "--json"], "framed_list"),
+        (
+            ["create", "must never be created", "--json"],
+            "framed_create",
+        ),
+    ] {
+        let run = run_br(&workspace, args, label);
+        assert_framed_wal_refusal(&workspace, &run, &main_before, &wal_before);
+    }
 }
 
 #[test]
-fn missing_wal_index_startup_preserves_pending_merge_gate() {
+fn missing_wal_index_pending_merge_create_refuses_framed_wal() {
+    // The frame refusal precedes the pending-receipt gate, so the receipt in
+    // the WAL is never read and nothing is created.
     let workspace = current_workspace_without_wal_index(true);
-    let main_path = workspace.root.join(".beads/beads.db");
-    let wal_path = workspace.root.join(".beads/beads.db-wal");
-    let main_before = fs::read(&main_path).unwrap();
-    let wal_before = fs::read(&wal_path).unwrap();
+    let main_before = fs::read(workspace.root.join(".beads/beads.db")).unwrap();
+    let wal_before = fs::read(workspace.root.join(".beads/beads.db-wal")).unwrap();
     let create = run_br(
         &workspace,
         ["create", "must never be created", "--json"],
         "pending_refusal",
     );
-    assert!(
-        !create.status.success(),
-        "{} {}",
-        create.stdout,
-        create.stderr
-    );
-    assert!(
-        workspace.root.join(".beads/beads.db-shm").is_file(),
-        "recovery must precede the real pending-receipt refusal"
-    );
-    let error = format!("{}{}", create.stdout, create.stderr);
-    assert!(
-        error.contains("legacy") && error.contains("pending"),
-        "{error}"
-    );
-    assert_eq!(fs::read(main_path).unwrap(), main_before);
-    assert_eq!(fs::read(wal_path).unwrap(), wal_before);
+    assert_framed_wal_refusal(&workspace, &create, &main_before, &wal_before);
 }
 
 #[test]
@@ -220,35 +237,31 @@ fn missing_wal_index_doctor_reads_pending_receipt_without_live_repair() {
 
 #[test]
 fn missing_wal_index_live_peer_prevents_recovery() {
+    // Recovery only runs without frames, so the framed WAL is refused before
+    // the sole-opener check is reached; the lib test
+    // `engine_recovery_refuses_peer_before_creating_backup` covers that check
+    // over a truncated WAL.
     let workspace = current_workspace_without_wal_index(false);
     let db_path = workspace.root.join(".beads/beads.db");
-    let wal_path = workspace.root.join(".beads/beads.db-wal");
     let main_before = fs::read(&db_path).unwrap();
-    let wal_before = fs::read(&wal_path).unwrap();
+    let wal_before = fs::read(workspace.root.join(".beads/beads.db-wal")).unwrap();
     let _peer = beads_rust::sync::DatabaseOpenerLease::register(&db_path).unwrap();
     let list = run_br(&workspace, ["list", "--json"], "peer_refusal");
-    assert!(!list.status.success());
-    assert!(format!("{}{}", list.stdout, list.stderr).contains("sole opener"));
-    assert!(!workspace.root.join(".beads/beads.db-shm").exists());
-    assert_eq!(fs::read(db_path).unwrap(), main_before);
-    assert_eq!(fs::read(wal_path).unwrap(), wal_before);
+    assert_framed_wal_refusal(&workspace, &list, &main_before, &wal_before);
 }
 
 #[test]
 fn missing_wal_index_corrupt_wal_refuses_without_live_mutation() {
+    // A corrupt frame checksum still leaves a frame-bearing WAL, which is
+    // refused before any checksum scan; the family keeps the corrupt bytes.
     let workspace = current_workspace_without_wal_index(false);
-    let db_path = workspace.root.join(".beads/beads.db");
     let wal_path = workspace.root.join(".beads/beads.db-wal");
-    let main_before = fs::read(&db_path).unwrap();
+    let main_before = fs::read(workspace.root.join(".beads/beads.db")).unwrap();
     let mut wal_before = fs::read(&wal_path).unwrap();
     wal_before[48] ^= 1; // First frame's checksum; a tolerant scan would ignore it.
     fs::write(&wal_path, &wal_before).unwrap();
     let list = run_br(&workspace, ["list", "--json"], "corrupt_refusal");
-    assert!(!list.status.success());
-    assert!(format!("{}{}", list.stdout, list.stderr).contains("checksum"));
-    assert!(!workspace.root.join(".beads/beads.db-shm").exists());
-    assert_eq!(fs::read(db_path).unwrap(), main_before);
-    assert_eq!(fs::read(wal_path).unwrap(), wal_before);
+    assert_framed_wal_refusal(&workspace, &list, &main_before, &wal_before);
 }
 
 fn install_fixture_workspace(workspace: &BrWorkspace, db_gz: &str, issues: &str, config: &str) {
