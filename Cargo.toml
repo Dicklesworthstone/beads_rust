@@ -4,6 +4,7 @@ version = "0.7.4"
 edition = "2024"
 rust-version = "1.89"
 autobenches = false
+default-run = "br"
 description = "Agent-first issue tracker (SQLite + JSONL)"
 license-file = "LICENSE"
 repository = "https://github.com/Dicklesworthstone/beads_rust"
@@ -19,7 +20,8 @@ exclude = [
     ".ntm/",
     "agent_baseline/",
     "docs/",
-    "scripts/",
+    "scripts/*",
+    "!scripts/recover_orphaned_wal.py",
     "skills/",
     "temp_test/",
     "temp_test_2/",
@@ -35,6 +37,10 @@ exclude = [
 [[bin]]
 name = "br"
 path = "src/main.rs"
+
+[[bin]]
+name = "br-wal-recover"
+path = "src/cli/commands/doctor_subsystems/wal_recover_main.rs"
 
 [dependencies]
 # CLI
