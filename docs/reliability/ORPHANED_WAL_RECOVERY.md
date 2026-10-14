@@ -7,6 +7,83 @@ with `SYNC_CONFLICT`. The WAL may contain the only copy of committed changes.
 This is the intentional protection for [GH #556](https://github.com/Dicklesworthstone/beads_rust/issues/556),
 not permission to discard the WAL or rebuild the database from JSONL.
 
+## Packaged recovery companion
+
+`br-wal-recover` embeds the same reviewed helper into a separate Cargo binary,
+so it does not need a source checkout or a sqlite3 shell at runtime. Install
+the target from an updated checkout:
+
+```sh
+cargo install --path . --locked --bin br-wal-recover
+```
+
+The runtime still requires **Python 3.10+ with its standard sqlite3 module on
+64-bit Linux**. This is not a Rust-only recovery engine. Existing released br
+archives are not changed by adding this source-install target. `cargo run`
+still selects `br`; the companion is selected explicitly with `--bin`.
+
+With all database users stopped, rehearse on a disposable family copy first:
+
+```sh
+br-wal-recover \
+  --db '/absolute/path/to/selected-copy.db' \
+  --output '/absolute/path/to/new-copy-evidence'
+```
+
+The default only produces a verified standalone database and its evidence.
+After qualifying the binary and the original family, an explicit restoration
+uses a different, nonexistent evidence directory:
+
+```sh
+br-wal-recover \
+  --db '/absolute/path/to/selected.db' \
+  --output '/absolute/path/to/new-index-evidence' \
+  --restore-shm
+```
+
+The eligibility, exclusion, validation and evidence rules in the following
+sections apply unchanged. An existing SHM is never replaced, even when empty
+or short. Neither mode rewrites or checkpoints the source main/WAL. All
+successes emit JSON; a failed or interrupted restoration may already have
+installed its verified SHM, so retain evidence and do not delete it to retry.
+
+The launcher opens no database, discovers no workspace, and acquires no
+parent-side lease. Explicit path arguments are forwarded without a shell or
+lossy string conversion. Isolated Python startup (`-I -S`) ignores Python
+environment injection and sitecustomize hooks. On supported hosts, exec
+replaces the launcher rather than creating a waiting parent, preserving the
+recovery process's exit status and direct signal delivery. Missing Python or
+an unsupported platform is a prelaunch failure; help remains available.
+
+This is a **separate companion command**, not a new `br doctor migrate-schema
+recover --output` subcommand or automatic startup recovery. The ordinary
+`br` executable, FrankenSQLite dependency family and #556 guards are unchanged.
+
+### Companion qualification
+
+```sh
+python3 tests/e2e_scripts/test_packaged_wal_recovery.py --payload-only
+cargo test --locked --bin br-wal-recover
+python3 tests/e2e_scripts/test_packaged_wal_recovery.py \
+  --recovery-binary '/absolute/path/to/installed/br-wal-recover' \
+  --br '/absolute/path/to/br'
+```
+
+The ten payload-mode tests passed on Linux with SQLite 3.46.1. They execute
+the embedded launch recipe against real WAL-only commits, preserving source
+bytes and identities, restoring only missing SHM, refusing readers and unsafe
+inputs, and resisting Python/workspace environment injection. **They do not
+execute a Rust binary.** Five Rust argument/parser tests are also present.
+
+Binary mode copies the actual executable away from the checkout and requires
+both recovery modes to work there. It adds missing-Python/help boundaries;
+`--br` adds real tracker read/write/read checks and requires br to consume a
+restored index before any stock source reader can repair it. There is no
+payload fallback when an executable is absent. CI checks source-package
+inclusion, installs the actual Cargo target, and invokes these native modes.
+Cargo, Clippy, rustfmt, installation and native execution were unavailable in
+the editing environment; these qualifications remain pending, not passed.
+
 ## Recover into a new database without changing the original
 
 From a repository checkout, on 64-bit Linux with Python 3.10+ and its stock
