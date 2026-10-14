@@ -21,7 +21,7 @@
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -1578,15 +1578,59 @@ fn bind_live_wal_header(
             "live WAL identity or length changed before generation binding",
         ));
     }
-    live_file.write_all(&header)?;
-    live_file.sync_all()?;
-    drop(live_file);
-    let live_metadata = secure_file_metadata(&live)?
-        .ok_or_else(|| BeadsError::internal("generation-bound WAL disappeared after sync"))?;
-    verify_component_bytes(&live, &live_metadata, witness)?;
-    if let Some(parent) = live.parent() {
-        sync_directory(parent)?;
+    // Until the header has been written, synced, and read back through this
+    // retained descriptor, every failure is rolled back to the exact original
+    // zero-byte WAL. This is the only protected-payload mutation in #561's
+    // recovery exception. A failed rollback is reported as indeterminate
+    // rather than pretending the recovery preserved its pre-state.
+    let binding = (|| -> std::io::Result<()> {
+        live_file.write_all(&header)?;
+        live_file.sync_all()?;
+        if live_file.metadata()?.len() != WAL_HEADER_BYTES {
+            return Err(std::io::Error::other(
+                "generation-bound WAL has an unexpected length after sync",
+            ));
+        }
+        live_file.rewind()?;
+        let mut observed = [0_u8; 32];
+        live_file.read_exact(&mut observed)?;
+        if observed != header {
+            return Err(std::io::Error::other(
+                "generation-bound WAL read-back differs from the rehearsed header",
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(error) = binding {
+        let rollback = (|| -> std::io::Result<()> {
+            live_file.set_len(0)?;
+            live_file.sync_all()?;
+            if live_file.metadata()?.len() != 0 {
+                return Err(std::io::Error::other(
+                    "generation-binding rollback did not restore a zero-byte WAL",
+                ));
+            }
+            Ok(())
+        })();
+        return match rollback {
+            Ok(()) => Err(BeadsError::WithContext {
+                context:
+                    "WAL generation binding failed before commit; restored the original zero-byte WAL"
+                        .to_string(),
+                source: Box::new(BeadsError::Io(error)),
+            }),
+            Err(rollback_error) => Err(BeadsError::internal(format!(
+                "WAL generation binding failed ({error}) and restoring the original zero-byte WAL \
+                 also failed ({rollback_error}); live WAL disposition is indeterminate"
+            ))),
+        };
     }
+
+    // No fallible filesystem operation follows the commit point. The exact
+    // bytes were validated before the write and read back after the durable
+    // sync while namespace/main-file exclusion is still held by the caller.
+    drop(live_file);
+    let _ = witness;
     Ok(())
 }
 
