@@ -128,6 +128,53 @@ verification. It does not acquire native proof merely because the packaged
 companion supports this gate. Its hidden verifier hook is the companion's
 internal handoff, not a claim that an arbitrary external program is trusted.
 
+## Integrity checks and committed free pages
+
+The native witness now follows the same transaction-phase contract as
+`schema_migration::logical_witness`. FrankenSQLite's integrity walker can
+report false orphan pages when an explicit read transaction has a different
+freelist projection from the committed database. The native write rehearsal
+itself can create free pages by dropping its disposable probe table.
+
+Integrity must be clean in autocommit both before and after the schema/row
+snapshot. Schema, typed rows, table membership and metadata are still compared
+inside one read transaction, using exactly the original manifest checks.
+The source family remains excluded by the parent; writable and main-only
+rehearsals are separately owned copies. No integrity diagnostic is ignored,
+no freelist count is treated as an exemption, and no source file is repaired.
+
+A failed snapshot comparison still attempts to roll back the probe's own
+read transaction before returning the original failure. A caller-owned
+transaction is refused before changing `query_only` or issuing `ROLLBACK`.
+The integrity helper independently refuses to run inside a transaction.
+Successful verification leaves the connection in autocommit; a failed
+rollback or either integrity check cannot produce native success.
+
+The regression suite constructs a database with nonempty committed free pages
+and a separate WAL-only closure/blob commit, then omits SHM only when creating
+a disposable source copy. Its stock-SQLite controls also corrupt only the
+freelist pointer of a separate checkpointed copy: table rows remain readable,
+but integrity must fail. This guards against turning the transaction-phase
+fix into permission to waive actual corruption.
+
+```sh
+python3 tests/e2e_scripts/test_wal_native_freelist.py --self-test
+cargo test --locked --bin br-wal-recover witness_tests
+python3 tests/e2e_scripts/test_wal_native_freelist.py \
+  --recovery-binary /absolute/path/to/installed/br-wal-recover
+```
+
+All five stock-SQLite fixture/oracle controls passed on Linux, Python 3.13.5
+and SQLite 3.46.1. They do not execute or reproduce a FrankenSQLite failure.
+Four Rust regressions cover the healthy freelist, failed-snapshot cleanup,
+caller-owned transactions and the integrity-phase guard. Three separate
+actual-companion cases require restore/resume with native write evidence and
+an independently verified main-only result, plus genuine corruption refusal.
+There is no interpreter fallback. Those Rust/native cases, full-suite and
+power-loss qualification were not run in the editing environment. CI runs
+the fixture controls independently and gates native cases on a successful
+companion installation; it retains both successful and failed fixtures.
+
 ## Qualification and limits
 
 `python3 tests/e2e_scripts/test_wal_native_gate.py` runs explicitly labelled

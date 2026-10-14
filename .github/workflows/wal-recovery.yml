@@ -10,6 +10,7 @@ on:
       - 'src/cli/commands/doctor_subsystems/engine.rs'
       - 'src/cli/commands/doctor_subsystems/wal_recover_main.rs'
       - 'src/cli/commands/doctor_subsystems/wal_engine_probe.rs'
+      - 'src/cli/commands/doctor_subsystems/wal_engine_probe_tests.rs'
       - 'src/cli/commands/doctor_subsystems/schema_migration*'
       - 'src/cli/commands/doctor_subsystems/schema_migration/**'
       - 'src/franken_sync*'
@@ -26,6 +27,7 @@ on:
       - 'tests/e2e_scripts/test_wal_native_gate.py'
       - 'tests/e2e_scripts/test_wal_page_image.py'
       - 'tests/e2e_scripts/test_wal_native_write.py'
+      - 'tests/e2e_scripts/test_wal_native_freelist.py'
       - 'Cargo.toml'
       - 'Cargo.lock'
   workflow_dispatch:
@@ -65,6 +67,9 @@ jobs:
       - name: Check native-write receipt oracles with stock SQLite only
         if: ${{ !cancelled() }}
         run: python3 tests/e2e_scripts/test_wal_native_write.py --self-test
+      - name: Validate committed freelist fixtures with stock SQLite only
+        if: ${{ !cancelled() }}
+        run: python3 tests/e2e_scripts/test_wal_native_freelist.py --self-test
       - name: Install the repository's CI toolchain
         run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt,clippy
       - name: Verify interrupted index recovery without replacing source files
@@ -128,6 +133,11 @@ jobs:
         run: |
           python3 tests/e2e_scripts/test_wal_native_write.py \
             --recovery-binary "$RUNNER_TEMP/br-wal-install/bin/br-wal-recover"
+      - name: Qualify native recovery and corruption refusal with committed free pages
+        if: ${{ !cancelled() && steps.recovery_build.outcome == 'success' }}
+        run: |
+          python3 tests/e2e_scripts/test_wal_native_freelist.py \
+            --recovery-binary "$RUNNER_TEMP/br-wal-install/bin/br-wal-recover"
       - name: Qualify installed recovery with real br reads and writes
         if: ${{ !cancelled() && steps.recovery_build.outcome == 'success' }}
         run: |
@@ -176,3 +186,5 @@ jobs:
             /tmp/native-copy-test-*
             /tmp/native-owned-test-*
             /tmp/native-links-test-*
+            /tmp/native-freelist-test-*
+            /tmp/br-wal-freelist-*
