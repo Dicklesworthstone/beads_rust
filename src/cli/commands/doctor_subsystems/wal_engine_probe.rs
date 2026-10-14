@@ -385,13 +385,45 @@ fn integer_pragma(conn: &Connection, sql: &str) -> Result<i64> {
     Ok(*value)
 }
 
-fn verify(conn: &Connection, manifest: &Manifest, max_bytes: u64) -> Result<()> {
-    conn.execute("PRAGMA query_only=ON")?;
-    conn.execute("BEGIN")?;
+fn verify_integrity(conn: &Connection) -> Result<()> {
+    ensure!(
+        !conn.as_async().in_transaction(),
+        "native integrity check requires autocommit state"
+    );
     let integrity = conn.query("PRAGMA integrity_check")?;
     ensure!(integrity.len() == 1, "native integrity check did not return one row");
     ensure!(matches!(integrity[0].values(), [SqliteValue::Text(text)] if text.as_bytes() == b"ok"),
             "native integrity check failed");
+    Ok(())
+}
+
+fn verify(conn: &Connection, manifest: &Manifest, max_bytes: u64) -> Result<()> {
+    // Never roll back or change query_only inside a transaction owned by a
+    // caller. All three probe callers arrive after committing/closing theirs.
+    ensure!(
+        !conn.as_async().in_transaction(),
+        "native witness requires an autocommit connection"
+    );
+    conn.execute("PRAGMA query_only=ON")?;
+    // Match schema_migration::logical_witness: FrankenSQLite's integrity
+    // walker uses a transaction-local freelist inside BEGIN, which can report
+    // healthy committed free pages as orphans. DROP of our disposable probe
+    // table itself creates free pages. Check integrity in autocommit BEFORE
+    // and AFTER the stable row/schema snapshot, never suppress an error.
+    // The supplied family is excluded by the parent; writable/main-only
+    // rehearsals are private owned copies, not concurrently writable sources.
+    verify_integrity(conn)?;
+    conn.execute("BEGIN")?;
+    let verified = verify_snapshot(conn, manifest, max_bytes);
+    // Evaluate rollback on failure too; a mismatch must not leak our read
+    // transaction into the caller's close or next verification attempt.
+    let rolled_back = conn.execute("ROLLBACK");
+    verified?;
+    rolled_back.context("could not end native witness snapshot")?;
+    verify_integrity(conn)
+}
+
+fn verify_snapshot(conn: &Connection, manifest: &Manifest, max_bytes: u64) -> Result<()> {
     ensure!(manifest.schema_rows.rows <= max_bytes, "implausible expected schema row count");
     let schema_limit = manifest.schema_rows.rows.checked_add(1).context("schema row count overflow")?;
     let schema = conn.query(&format!(
@@ -423,7 +455,6 @@ fn verify(conn: &Connection, manifest: &Manifest, max_bytes: u64) -> Result<()> 
     ensure!(integer_pragma(conn, "PRAGMA user_version")? == manifest.user_version
             && integer_pragma(conn, "PRAGMA application_id")? == manifest.application_id,
             "native database metadata differs from the independent witness");
-    conn.execute("ROLLBACK")?;
     Ok(())
 }
 
@@ -546,3 +577,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "wal_engine_probe_tests.rs"]
+mod witness_tests;
