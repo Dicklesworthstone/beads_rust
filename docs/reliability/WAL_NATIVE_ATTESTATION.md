@@ -90,6 +90,34 @@ expectation or private main/WAL/index mutation refuses before source install.
 Only normal private read-mark changes are allowed. Full WAL/index validation
 and original source/evidence re-attestation still run independently.
 
+The parent also requires the native write evidence at runtime, not only in
+CI. A `verified: true` native-probe response without `native-write.json` is
+refused. Preparation, completion, manifest binding, sandbox-specific probe
+table, exact integer checkpoint tuple and the main-only image witness must
+agree; conflicting failure evidence is a refusal. Evidence directories and
+files must be owner-controlled, regular/no-follow where applicable, and bound
+to their retained descriptors. Path traversal, extra hard links, ambiguous
+JSON and an existing independent-check directory are not admitted.
+
+After those checks the parent creates `native-rehearsal/independent-checkpoint/`
+and copies only the native checkpoint's main file there. Stock SQLite reads
+this fresh private image with `mode=ro&immutable=1`, checks integrity, and
+recomputes the complete original schema/typed-row/metadata manifest. Native
+sidecars cannot mask a missing main-file commit. Matching image hashes or a
+healthy integrity result are insufficient if the original WAL-only data,
+accessible rowids, value types or schema changed. No source SQL or checkpoint
+is performed by this independent check. It finishes while source and namespace
+exclusion is still held, before SHM installation or resume completion.
+
+The retained `independent-checkpoint/verified.json` and the recovery receipt's
+`native_probe.independent_write` contain schema
+`br.orphaned_wal.native_write_check.v1`, the independent SQLite version,
+manifest hash, native write-receipt hash, and verified main-only length/hash.
+The parent rechecks native evidence identities and bytes after observation.
+The independent image and proof remain with successful or failed evidence;
+prior runs are never overwritten. Older read-only native replies cannot
+satisfy this write-evidence requirement just by using the same v1 schema.
+
 Receipts retain `native_probe`; its manifest, stdout/stderr logs and private
 write evidence live in the new evidence directory. Source installation still
 uses the existing no-replace, evidence-first path. A refusal is not permission
@@ -109,6 +137,18 @@ stock-SQLite fixture/receipt-oracle controls, **not the Rust implementation**.
 The latter passed during this change, including deliberate lost-WAL data with
 valid integrity and matching image hashes, read-only-success substitution,
 incomplete checkpoint tuples, incorrect manifest binding and path escape.
+
+The parent-verification update ran all 30 gate controls and 21 existing resume
+helper regressions on Linux, Python 3.13.5 and SQLite 3.46.1. Gate controls use
+an explicitly fake native responder and real stock-SQLite checkpoint images;
+they do not execute Rust. On the exact previous helper, two planted cases
+were accepted: a read-only reply with no write evidence and a matching-hash,
+integrity-valid main image missing its WAL-only commit. The updated runtime
+rejects both. These are injected controls, not observed production data loss.
+The existing workflow already invokes both the expanded controls and their
+separate installed-executable mode. No workflow change is needed. Native
+companion/actual-br execution, full-suite and power-loss qualification were
+not performed during this parent-verification update.
 
 Native qualification has no fake or interpreter fallback:
 

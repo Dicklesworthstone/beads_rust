@@ -47,6 +47,7 @@ RESUME_SCHEMA = "br.orphaned_wal.resume.v1"
 RECEIPT_MAX_BYTES = 4 * CHUNK
 NATIVE_PROBE_SCHEMA = "br.orphaned_wal.native_probe.v1"
 NATIVE_PROBE_TIMEOUT = 60
+NATIVE_WRITE_SCHEMA = "br.orphaned_wal.native_write.v1"
 
 
 class RecoveryError(Exception):
@@ -650,10 +651,10 @@ def native_rows_digest(rows, max_bytes: int) -> dict:
     return dict(rows=len(encoded), sha256=result.hexdigest())
 
 
-def native_manifest(oracle: Path, expected: dict, max_bytes: int) -> dict:
+def native_manifest(oracle: Path, expected: dict, max_bytes: int, *, immutable: bool = False) -> dict:
     """Independent stock-SQLite expectation; no native engine supplied values."""
-    with contextlib.closing(sqlite3.connect(oracle.as_uri() + "?mode=ro", uri=True,
-                                          timeout=0)) as conn:
+    uri = oracle.as_uri() + ("?mode=ro&immutable=1" if immutable else "?mode=ro")
+    with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=0)) as conn:
         conn.execute("PRAGMA trusted_schema=OFF")
         conn.execute("PRAGMA query_only=ON")
         conn.execute("BEGIN")
@@ -675,6 +676,133 @@ def native_manifest(oracle: Path, expected: dict, max_bytes: int) -> dict:
                     tables=tables, skipped_virtual=skipped,
                     user_version=conn.execute("PRAGMA user_version").fetchone()[0],
                     application_id=conn.execute("PRAGMA application_id").fetchone()[0])
+
+
+def verify_native_write(directory: Path, input_db: Path, manifest: dict, manifest_hash: str,
+                        expected: dict, max_bytes: int) -> dict:
+    """Independently read the native checkpoint image BEFORE installing SHM.
+
+    Native verified:true alone only binds its self-report. Require durable
+    write-stage evidence, then use stock SQLite on a NEW main-only copy to
+    detect corruption or WAL-only data loss the same engine might not see.
+    No source path or receipt-selected path is ever opened through SQLite.
+    """
+    with contextlib.ExitStack() as stack:
+        files, directories = {}, {}
+
+        def hold_directory(path):
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            stack.callback(os.close, fd)
+            st = os.fstat(fd)
+            require(st.st_uid == os.geteuid() and not st.st_mode & 0o022,
+                    "native write evidence directory is not owner-controlled")
+            directories[path] = (fd, metadata(st))
+
+        def hold_file(path, limit):
+            file = stack.enter_context(open_regular(path))
+            st = os.fstat(file.fileno())
+            require(st.st_uid == os.geteuid() and not st.st_mode & 0o022,
+                    "native write evidence file is not owner-controlled")
+            require(st.st_size <= limit, "native write evidence exceeds its byte limit")
+            witness = dict(**metadata(st), sha256=digest(file))
+            files[path] = (file, witness)
+            return file, witness
+
+        def document(path):
+            file, witness = hold_file(path, RECEIPT_MAX_BYTES)
+            file.seek(0)
+            def unique(pairs):
+                result = {}
+                for key, value in pairs:
+                    require(key not in result, "duplicate native write receipt key")
+                    result[key] = value
+                return result
+            def nonfinite(value):
+                raise RecoveryError(f"non-finite native write receipt value: {value}")
+            try:
+                value = json.loads(file.read(RECEIPT_MAX_BYTES + 1), object_pairs_hook=unique,
+                                   parse_constant=nonfinite)
+            except (ValueError, RecursionError) as error:
+                raise RecoveryError("invalid native write receipt") from error
+            require(isinstance(value, dict), "native write receipt must be an object")
+            return value, witness
+
+        receipt, receipt_file = document(directory / "native-write.json")
+        require(set(receipt) == {
+                    "schema", "verified", "scope", "source_checkpoint_performed", "manifest_sha256",
+                    "sandbox", "probe_table", "input_family_unchanged", "committed_write_reopened",
+                    "rollback_verified", "checkpoint", "main_only_verified", "main_only_bytes",
+                    "main_only_sha256"}
+                and receipt["schema"] == NATIVE_WRITE_SCHEMA
+                and receipt["scope"] == "fresh-private-copy"
+                and receipt["source_checkpoint_performed"] is False
+                and receipt["manifest_sha256"] == manifest_hash
+                and all(receipt[key] is True for key in ("verified", "input_family_unchanged",
+                    "committed_write_reopened", "rollback_verified", "main_only_verified")),
+                "native write receipt lacks bound commit/rollback/checkpoint evidence")
+        require(same_json(receipt["checkpoint"], [0, 0, 0]), "incomplete native write checkpoint")
+        relative = receipt["sandbox"]
+        require(isinstance(relative, str) and re.fullmatch(r"native-write-[A-Za-z0-9_-]+", relative),
+                "unsafe native write sandbox reference")
+        require(receipt["probe_table"] == f"__br_wal_probe_{relative}",
+                "native write probe table is not sandbox-bound")
+        sandbox = directory / relative
+        hold_directory(sandbox)
+        hold_directory(sandbox / "main-only")
+        require(not os.path.lexists(sandbox / "failed.json"), "native write rehearsal has failure evidence")
+        completed, _ = document(sandbox / "complete.json")
+        require(same_json(completed, receipt), "native write completion evidence disagrees")
+        prepared, _ = document(sandbox / "prepared.json")
+        require(same_json(prepared, dict(schema=NATIVE_WRITE_SCHEMA, manifest_sha256=manifest_hash,
+                    input_family=str(input_db), sql_write_target=str(sandbox / "beads.db"))),
+                "native write preparation does not bind this private family")
+        size, sha256 = receipt["main_only_bytes"], receipt["main_only_sha256"]
+        require(type(size) is int and 0 < size <= max_bytes
+                and isinstance(sha256, str) and re.fullmatch(r"[0-9a-f]{64}", sha256),
+                "invalid native write image witness")
+        image, image_file = hold_file(sandbox / "main-only" / "beads.db", max_bytes)
+        require(image_file["bytes"] == size and image_file["sha256"] == sha256,
+                "native write image differs from its receipt")
+
+        # Never use the engine's potentially sidecar-bearing directory as the
+        # independent reader target. This fresh directory contains ONLY main.
+        checked_dir = directory / "independent-checkpoint"
+        checked_dir.mkdir(mode=0o700)
+        checked = checked_dir / "beads.db"
+        require(copy_new(image, checked, limit=size) == sha256,
+                "native write image changed during independent capture")
+        with contextlib.closing(sqlite3.connect(checked.as_uri() + "?mode=ro&immutable=1",
+                                              uri=True, timeout=0)) as conn:
+            conn.execute("PRAGMA trusted_schema=OFF")
+            conn.execute("PRAGMA query_only=ON")
+            require(conn.execute("PRAGMA integrity_check").fetchall() == [("ok",)],
+                    "independent native checkpoint integrity check failed")
+        observed = native_manifest(checked, expected, max_bytes, immutable=True)
+        require(same_json(observed, manifest),
+                "independent native checkpoint lost or changed original schema/rows/metadata")
+        with open_regular(checked) as file:
+            require(os.fstat(file.fileno()).st_size == size and digest(file) == sha256,
+                    "independent checkpoint reader changed main bytes")
+        for path, (fd, witness) in directories.items():
+            require(metadata(os.fstat(fd)) == witness
+                    and metadata(os.stat(path, follow_symlinks=False)) == witness,
+                    "native write evidence directory changed during verification")
+        for path, (file, witness) in files.items():
+            st, named = os.fstat(file.fileno()), os.stat(path, follow_symlinks=False)
+            expected_metadata = {key: value for key, value in witness.items() if key != "sha256"}
+            require(st.st_nlink == named.st_nlink == 1 and stat.S_ISREG(named.st_mode)
+                    and metadata(st) == metadata(named) == expected_metadata
+                    and digest(file) == witness["sha256"]
+                    and metadata(os.fstat(file.fileno())) == expected_metadata
+                    and metadata(os.stat(path, follow_symlinks=False)) == expected_metadata,
+                    "native write evidence changed during verification")
+        proof = dict(schema="br.orphaned_wal.native_write_check.v1", verified=True,
+                     verifier="stock-sqlite", sqlite_version=sqlite3.sqlite_version,
+                     manifest_sha256=manifest_hash, native_receipt_sha256=receipt_file["sha256"],
+                     main_only_bytes=size, main_only_sha256=sha256)
+        write_json(checked_dir / "verified.json", proof)
+        sync_directory(checked_dir)
+        return proof
 
 
 def probe_native_index(staging: Path, template_family: Path, oracle: Path, plan: dict, raw: dict,
@@ -756,9 +884,10 @@ def probe_native_index(staging: Path, template_family: Path, oracle: Path, plan:
     validate_private_index(db, plan, raw)
     with open_regular(manifest_path) as retained:
         require(digest(retained) == manifest_hash, "native expectation changed during rehearsal")
+    independent_write = verify_native_write(directory, db, manifest, manifest_hash, expected, max_bytes)
     sync_directory(directory)
     return dict(**receipt, executable_sha256=executable["sha256"],
-                protected_private_bytes_unchanged=True)
+                protected_private_bytes_unchanged=True, independent_write=independent_write)
 
 
 def rehearse_private_index(staging: Path, oracle: Path, plan: dict, raw: dict,
@@ -1139,7 +1268,7 @@ def main() -> int:
     parser.add_argument("--db", required=True, type=Path, help="original database; existing files never modified")
     parser.add_argument("--output", required=True, type=Path, help="NEW recovery directory; must not exist")
     parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES,
-                        help="maximum bytes per input component and recovered database (default 1 GiB)")
+                        help="maximum bytes per input family component and recovered database (default 1 GiB)")
     parser.add_argument("--engine-verifier", type=Path, help=argparse.SUPPRESS)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--restore-shm", action="store_true",
