@@ -9,6 +9,7 @@ on:
       - 'tests/test_fsqlite_family_gate.py'
       - 'src/cli/commands/doctor_subsystems/engine.rs'
       - 'src/cli/commands/doctor_subsystems/wal_recover_main.rs'
+      - 'src/cli/commands/doctor_subsystems/wal_engine_probe.rs'
       - 'src/cli/commands/doctor_subsystems/schema_migration*'
       - 'src/cli/commands/doctor_subsystems/schema_migration/**'
       - 'src/franken_sync*'
@@ -22,6 +23,8 @@ on:
       - 'tests/e2e_scripts/test_packaged_wal_recovery.py'
       - 'tests/e2e_scripts/test_wal_recovery_resume.py'
       - 'tests/e2e_scripts/test_wal_committed_copy.py'
+      - 'tests/e2e_scripts/test_wal_native_gate.py'
+      - 'tests/e2e_scripts/test_wal_page_image.py'
       - 'Cargo.toml'
       - 'Cargo.lock'
   workflow_dispatch:
@@ -52,6 +55,12 @@ jobs:
       - name: Exercise isolated embedded recovery payload
         if: ${{ !cancelled() }}
         run: python3 tests/e2e_scripts/test_packaged_wal_recovery.py --payload-only
+      - name: Check native gate refusal and ordering with fake responder controls
+        if: ${{ !cancelled() }}
+        run: python3 tests/e2e_scripts/test_wal_native_gate.py
+      - name: Verify exact pager images and search/spatial recovery
+        if: ${{ !cancelled() }}
+        run: python3 tests/e2e_scripts/test_wal_page_image.py
       - name: Install the repository's CI toolchain
         run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt,clippy
       - name: Verify interrupted index recovery without replacing source files
@@ -98,6 +107,18 @@ jobs:
       - name: Test packaged recovery argument and platform boundaries
         if: ${{ !cancelled() && steps.recovery_build.outcome == 'success' }}
         run: cargo +nightly-2026-08-31 test --locked --bin br-wal-recover
+      - name: Require the installed FrankenSQLite to attest before source index installation
+        if: ${{ !cancelled() && steps.recovery_build.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          grep -Fx 'src/cli/commands/doctor_subsystems/wal_engine_probe.rs' "$RUNNER_TEMP/br-package-files.txt"
+          python3 tests/e2e_scripts/test_wal_native_gate.py \
+            --recovery-binary "$RUNNER_TEMP/br-wal-install/bin/br-wal-recover"
+      - name: Qualify exact-image recovery with the installed companion
+        if: ${{ !cancelled() && steps.recovery_build.outcome == 'success' }}
+        run: |
+          python3 tests/e2e_scripts/test_wal_page_image.py \
+            --recovery-binary "$RUNNER_TEMP/br-wal-install/bin/br-wal-recover"
       - name: Qualify installed recovery with real br reads and writes
         if: ${{ !cancelled() && steps.recovery_build.outcome == 'success' }}
         run: |
@@ -139,3 +160,5 @@ jobs:
             /tmp/br-wal-resume-test-*
             /tmp/br-wal-resume-native-*
             /tmp/br-wal-committed-copy-*
+            /tmp/br-native-gate-*
+            /tmp/br-wal-page-*
