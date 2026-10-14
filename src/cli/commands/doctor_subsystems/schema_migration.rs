@@ -6561,6 +6561,126 @@ mod tests {
         assert!(!family_component_path(&db, "-shm").exists());
     }
 
+    fn recovery_561_main(path: &Path, page_size: u32) {
+        let mut bytes = vec![0_u8; usize::try_from(page_size).unwrap()];
+        bytes[..16].copy_from_slice(b"SQLite format 3\0");
+        let encoded = if page_size == 65_536 {
+            1_u16
+        } else {
+            u16::try_from(page_size).unwrap()
+        };
+        bytes[16..18].copy_from_slice(&encoded.to_be_bytes());
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn recovery_561_wal_header(page_size: u32, big_endian: bool, sequence: u32) -> [u8; 32] {
+        let mut header = [0_u8; 32];
+        let magic = if big_endian { 0x377f_0683_u32 } else { 0x377f_0682_u32 };
+        header[..4].copy_from_slice(&magic.to_be_bytes());
+        header[4..8].copy_from_slice(&3_007_000_u32.to_be_bytes());
+        header[8..12].copy_from_slice(&page_size.to_be_bytes());
+        header[12..16].copy_from_slice(&sequence.to_be_bytes());
+        header[16..24].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        let sum = sqlite_wal_checksum(&header[..24], [0, 0], big_endian);
+        header[24..28].copy_from_slice(&sum[0].to_be_bytes());
+        header[28..32].copy_from_slice(&sum[1].to_be_bytes());
+        header
+    }
+
+    #[test]
+    fn recovery_561_accepts_only_zero_wal_to_valid_matching_header() {
+        let root = tempfile::tempdir().unwrap();
+        for big_endian in [false, true] {
+            let db = root.path().join(format!("binding-{big_endian}.db"));
+            recovery_561_main(&db, 4096);
+            let wal = family_component_path(&db, "-wal");
+            fs::write(&wal, []).unwrap();
+            let before = recovery_family_witness(&db).unwrap();
+
+            let header = recovery_561_wal_header(4096, big_endian, 17);
+            fs::write(&wal, header).unwrap();
+            let after = recovery_family_witness(&db).unwrap();
+            let accepted =
+                require_private_recovery_payload_compatible(&db, &before, &after).unwrap();
+            let accepted = accepted.expect("zero-byte WAL must admit one valid bound header");
+            assert_eq!(accepted.length, Some(WAL_HEADER_BYTES));
+            verify_retained_component(&wal, &accepted).unwrap();
+
+            let mut trailing = header.to_vec();
+            trailing.push(0);
+            fs::write(&wal, trailing).unwrap();
+            let framed = recovery_family_witness(&db).unwrap();
+            assert!(
+                require_private_recovery_payload_compatible(&db, &before, &framed).is_err(),
+                "a byte beyond the header is never frame-free recovery authority"
+            );
+
+            fs::write(&wal, []).unwrap();
+            let empty_again = recovery_family_witness(&db).unwrap();
+            let mut corrupt = header;
+            corrupt[24] ^= 1;
+            fs::write(&wal, corrupt).unwrap();
+            let corrupt_after = recovery_family_witness(&db).unwrap();
+            assert!(
+                require_private_recovery_payload_compatible(&db, &empty_again, &corrupt_after)
+                    .is_err(),
+                "a malformed header must never be admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_561_rejects_header_reset_and_database_page_mismatch() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("reset.db");
+        recovery_561_main(&db, 4096);
+        let wal = family_component_path(&db, "-wal");
+        fs::write(&wal, recovery_561_wal_header(4096, false, 1)).unwrap();
+        let before = recovery_family_witness(&db).unwrap();
+        fs::write(&wal, recovery_561_wal_header(4096, false, 2)).unwrap();
+        let after = recovery_family_witness(&db).unwrap();
+        assert!(require_private_recovery_payload_compatible(&db, &before, &after).is_err());
+
+        fs::write(&wal, []).unwrap();
+        let empty = recovery_family_witness(&db).unwrap();
+        fs::write(&wal, recovery_561_wal_header(8192, false, 3)).unwrap();
+        let mismatch = recovery_family_witness(&db).unwrap();
+        assert!(require_private_recovery_payload_compatible(&db, &empty, &mismatch).is_err());
+    }
+
+    #[test]
+    fn recovery_561_live_binding_copies_exact_header_without_touching_main() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("live.db");
+        recovery_561_main(&db, 4096);
+        let main_before = fs::read(&db).unwrap();
+        let wal = family_component_path(&db, "-wal");
+        fs::write(&wal, []).unwrap();
+        let expected = recovery_family_witness(&db).unwrap();
+        let expected_wal = component_for_suffix(&expected, "-wal").unwrap().clone();
+
+        let retained = root.path().join("retained-wal");
+        let header = recovery_561_wal_header(4096, true, 9);
+        fs::write(&retained, header).unwrap();
+        let metadata = fs::symlink_metadata(&retained).unwrap();
+        let (length, sha256) = hash_regular_file(&retained, &metadata).unwrap();
+        let witness = RawComponentWitness {
+            suffix: "-wal".to_string(),
+            present: true,
+            length: Some(length),
+            sha256: Some(sha256),
+            unix_mode: expected_wal.unix_mode,
+        };
+
+        bind_live_wal_header(&db, &retained, &witness, &expected_wal).unwrap();
+        assert_eq!(fs::read(&wal).unwrap(), header);
+        assert_eq!(fs::read(&db).unwrap(), main_before);
+        assert!(
+            bind_live_wal_header(&db, &retained, &witness, &expected_wal).is_err(),
+            "generation binding is single-use: a nonempty live WAL must refuse"
+        );
+    }
+
     /// GH #520: on Windows the engine keeps its WAL index in private memory,
     /// so a stock-SQLite index beside a header-only WAL (or no index at all)
     /// must never start automatic recovery, whose quarantine step cannot run
