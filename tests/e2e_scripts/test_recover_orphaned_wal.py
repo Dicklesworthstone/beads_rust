@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""Execute the copy-recovery implementation against real disposable SQLite WALs.
+
+This tests scripts/recover_orphaned_wal.py, not a br binary. All fixtures and
+failure evidence are retained. No existing/user-supplied database is accepted.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import ctypes
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sqlite3
+import struct
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "recover_orphaned_wal.py"
+SPEC = importlib.util.spec_from_file_location("wal_copy", SCRIPT)
+recovery = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(recovery)
+
+STAMP = "2026-10-13T00:00:00Z"
+REASON = "committed only in WAL; must survive"
+
+
+def family(db: Path) -> dict:
+    return {suffix: recovery.component(db, suffix).read_bytes()
+            if recovery.component(db, suffix).exists() else None
+            for suffix in recovery.SUFFIXES}
+
+
+def fixture(root: Path, *, page_size: int = 4096, shrink: bool = False) -> Path:
+    original = root / "writer.db"
+    script = r'''
+import os, sqlite3, sys
+db, page_size, shrink, stamp, reason = sys.argv[1:]
+conn = sqlite3.connect(db)
+conn.execute('PRAGMA page_size=' + page_size)
+conn.execute('PRAGMA auto_vacuum=FULL')
+conn.execute('CREATE TABLE issues (id TEXT PRIMARY KEY, status TEXT, closed_at TEXT, close_reason TEXT)')
+conn.execute("INSERT INTO issues VALUES ('case-1', 'open', NULL, '')")
+conn.execute('CREATE TABLE extra (id INTEGER PRIMARY KEY AUTOINCREMENT, n, payload BLOB, note TEXT)')
+conn.execute('CREATE INDEX extra_note ON extra(note COLLATE NOCASE)')
+conn.executemany('INSERT INTO extra(n,payload,note) VALUES (?,?,?)',
+                 [(i, b'\x00\xff' * 600, "text ' λ " + str(i)) for i in range(80)])
+conn.execute('CREATE TABLE keyed (k TEXT PRIMARY KEY, v BLOB) WITHOUT ROWID')
+conn.execute("INSERT INTO keyed VALUES ('key', x'0001ff')")
+conn.execute('CREATE TABLE generated (a INT, b INT GENERATED ALWAYS AS (a*2) STORED)')
+conn.execute('INSERT INTO generated(a) VALUES (4)')
+conn.execute('CREATE TABLE audit (event TEXT)')
+conn.execute("CREATE TRIGGER issue_audit AFTER UPDATE ON issues BEGIN INSERT INTO audit VALUES ('closed'); END")
+conn.execute('PRAGMA user_version=123')
+conn.execute('PRAGMA application_id=456')
+conn.commit()
+assert conn.execute('PRAGMA journal_mode=WAL').fetchone()[0] == 'wal'
+conn.execute('PRAGMA wal_autocheckpoint=0')
+assert conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone() == (0,0,0)
+conn.execute("UPDATE issues SET status='closed', closed_at=?, close_reason=? WHERE id='case-1'", (stamp,reason))
+conn.execute("INSERT INTO extra(n,payload,note) VALUES (?, ?, ?)", (3.125,b'wal blob', 'WAL only'))
+conn.commit()
+conn.execute("UPDATE extra SET n='changed', payload=x'beef' WHERE id=1")
+conn.commit()
+if shrink == 'True':
+    conn.execute('DELETE FROM extra WHERE id>2')
+    conn.commit()
+os._exit(0)
+'''
+    subprocess.run([sys.executable, "-I", "-c", script, str(original), str(page_size),
+                    str(shrink), STAMP, REASON], check=True, timeout=20)
+    source_dir = root / "source"
+    source_dir.mkdir()
+    source = source_dir / "-selected ' $HOME ; λ.db"
+    # Omit SHM in a NEW copy; never remove a sidecar from an open family.
+    for suffix, data in family(original).items():
+        if data is not None and suffix != "-shm":
+            with recovery.component(source, suffix).open("xb") as out:
+                out.write(data)
+    return source
+
+
+def rows(db: Path, query: str, *, immutable: bool = True):
+    uri = db.as_uri() + ("?mode=ro&immutable=1" if immutable else "?mode=ro")
+    with contextlib.closing(sqlite3.connect(uri, uri=True)) as conn:
+        return conn.execute(query).fetchall()
+
+
+def rewrite_checksums(wal: bytearray, *, big_endian: bool = False) -> None:
+    wal[:4] = (0x377F0683 if big_endian else 0x377F0682).to_bytes(4, "big")
+    state = recovery.checksum(wal[:24], (0, 0), big_endian)
+    wal[24:32] = struct.pack(">II", *state)
+    size = int.from_bytes(wal[8:12], 'big') + 24
+    for start in range(32, len(wal), size):
+        state = recovery.checksum(wal[start:start + 8], state, big_endian)
+        state = recovery.checksum(wal[start + 24:start + size], state, big_endian)
+        wal[start + 16:start + 24] = struct.pack(">II", *state)
+
+
+@unittest.skipUnless(sys.platform.startswith("linux") and ctypes.sizeof(ctypes.c_void_p) == 8,
+                     "qualified recovery requires 64-bit Linux")
+class RecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="br-wal-copy-test-"))
+        self.db = fixture(self.root)
+        self.output = self.root / "recovered"
+
+    def assert_refused(self, pattern: str, **kwargs):
+        before = family(self.db)
+        with self.assertRaisesRegex(recovery.RecoveryError, pattern):
+            recovery.recover_copy(self.db, self.output, **kwargs)
+        self.assertEqual(before, family(self.db))
+        self.assertFalse(self.output.exists())
+
+    def test_wal_only_changes_whole_database_and_hidden_rowids_survive(self):
+        before = family(self.db)
+        self.assertEqual(rows(self.db, 'SELECT status FROM issues'), [('open',)])
+        report = recovery.recover_copy(self.db, self.output)
+        recovered = self.output / "beads.db"
+        self.assertEqual(rows(recovered, 'SELECT status,closed_at,close_reason FROM issues'),
+                         [('closed', STAMP, REASON)])
+        self.assertEqual(rows(recovered, 'SELECT n,payload FROM extra WHERE id=1'), [('changed', b'\xbe\xef')])
+        self.assertEqual(rows(recovered, 'SELECT COUNT(*) FROM extra'), [(81,)])
+        self.assertEqual(rows(recovered, 'SELECT * FROM keyed'), [('key', b'\x00\x01\xff')])
+        self.assertEqual(rows(recovered, 'SELECT * FROM generated'), [(4, 8)])
+        self.assertEqual(rows(recovered, 'SELECT * FROM audit'), [('closed',)])
+        self.assertEqual(rows(recovered, 'PRAGMA integrity_check'), [('ok',)])
+        self.assertEqual(rows(recovered, 'PRAGMA user_version'), [(123,)])
+        self.assertEqual(rows(recovered, 'PRAGMA application_id'), [(456,)])
+        self.assertEqual(before, family(self.db))
+        self.assertFalse(recovery.component(recovered, '-wal').exists())
+        self.assertEqual(report, json.loads((self.output / 'complete.json').read_text()))
+        self.assertEqual(report['wal']['commits'], 2)
+        self.assertIn('rowid', next(t for t in report['logical']['tables'] if t['name'] == 'extra')['projection'])
+        for suffix, data in before.items():
+            if data is not None:
+                self.assertEqual(recovery.component(self.output / 'before' / 'beads.db', suffix).read_bytes(), data)
+        # A real post-recovery transaction is possible; only the new copy is written.
+        with contextlib.closing(sqlite3.connect(recovered)) as conn:
+            conn.execute("INSERT INTO audit VALUES ('post-recovery write')")
+            conn.commit()
+        self.assertEqual(rows(recovered, 'SELECT COUNT(*) FROM audit'), [(2,)])
+        self.assertEqual(before, family(self.db))
+
+    def test_page_size_boundaries_and_committed_shrink(self):
+        for size in (512, 65536):
+            with self.subTest(page_size=size):
+                root = self.root / str(size)
+                root.mkdir()
+                source = fixture(root, page_size=size, shrink=True)
+                before = family(source)
+                output = root / 'recovered'
+                report = recovery.recover_copy(source, output)
+                self.assertEqual(rows(output / 'beads.db', 'SELECT COUNT(*) FROM extra'), [(2,)])
+                self.assertEqual(rows(output / 'beads.db', 'PRAGMA page_size'), [(size,)])
+                self.assertEqual((output / 'beads.db').stat().st_size, size * report['wal']['database_pages'])
+                self.assertLess((output / 'beads.db').stat().st_size, len(before['']))
+                self.assertEqual(before, family(source))
+
+    def test_big_endian_wal_checksums_match_stock_reader(self):
+        wal_path = recovery.component(self.db, '-wal')
+        data = bytearray(wal_path.read_bytes())
+        rewrite_checksums(data, big_endian=True)
+        wal_path.write_bytes(data)
+        report = recovery.recover_copy(self.db, self.output)
+        self.assertTrue(report['wal']['checksum_big_endian'])
+        self.assertEqual(rows(self.output / 'beads.db', 'SELECT status FROM issues'), [('closed',)])
+
+    def test_partial_frame_rejected_without_source_mutation(self):
+        wal = recovery.component(self.db, '-wal')
+        wal.write_bytes(wal.read_bytes()[:-1])
+        self.assert_refused('partial frame')
+
+    def test_header_and_frame_damage_rejected(self):
+        wal = recovery.component(self.db, '-wal')
+        original = wal.read_bytes()
+        for index, pattern in ((0, 'magic'), (24, 'header checksum'),
+                               (40, 'salt mismatch'), (56, 'frame checksum')):
+            with self.subTest(index=index):
+                data = bytearray(original)
+                data[index] ^= 1
+                wal.write_bytes(data)
+                self.assert_refused(pattern)
+
+    def test_complete_but_uncommitted_tail_rejected(self):
+        wal = recovery.component(self.db, '-wal')
+        data = bytearray(wal.read_bytes())
+        size = int.from_bytes(data[8:12], 'big') + 24
+        data[len(data) - size + 4:len(data) - size + 8] = b'\0' * 4
+        rewrite_checksums(data)
+        wal.write_bytes(data)
+        self.assert_refused('uncommitted WAL tail')
+
+    def test_nonempty_rollback_journal_is_not_ignored(self):
+        recovery.component(self.db, '-journal').write_bytes(b'pending rollback')
+        self.assert_refused('engine-specific recovery')
+
+    def test_migration_bookkeeping_is_not_ignored(self):
+        recovery.component(self.db, '.fsqlite-migration-state').write_bytes(b'pending')
+        self.assert_refused('engine-specific recovery')
+
+    def test_unknown_sidecar_is_not_silently_discarded(self):
+        recovery.component(self.db, '-future-format').write_bytes(b'unknown')
+        self.assert_refused('unknown database sidecars')
+
+    def test_certificates_and_namespace_bytes_retained_not_reused(self):
+        for suffix in ('-wal-cert', '-wal-cert-head', '-fsqlite-ns-gate', '-fsqlite-ns-use'):
+            recovery.component(self.db, suffix).write_bytes(b'engine evidence' + suffix.encode())
+        before = family(self.db)
+        recovery.recover_copy(self.db, self.output)
+        for suffix in ('-wal-cert', '-wal-cert-head', '-fsqlite-ns-gate', '-fsqlite-ns-use'):
+            self.assertEqual(recovery.component(self.output / 'before' / 'beads.db', suffix).read_bytes(), before[suffix])
+            self.assertFalse(recovery.component(self.output / 'beads.db', suffix).exists())
+        self.assertEqual(before, family(self.db))
+
+    def test_hardlinked_source_refused(self):
+        os.link(self.db, self.root / 'alias.db')
+        self.assert_refused('hard-linked')
+
+    def test_symlinked_source_refused(self):
+        alias = self.root / 'alias.db'
+        alias.symlink_to(self.db)
+        with self.assertRaisesRegex(recovery.RecoveryError, 'Too many levels|symbolic link'):
+            recovery.recover_copy(alias, self.output)
+        self.assertFalse(self.output.exists())
+
+    def test_nonregular_sidecar_refused(self):
+        os.mkfifo(recovery.component(self.db, '-shm'))
+        # Do not use family(): opening a FIFO there would block the test.
+        with self.assertRaisesRegex(recovery.RecoveryError, 'non-regular'):
+            recovery.recover_copy(self.db, self.output)
+        self.assertFalse(self.output.exists())
+
+    def test_existing_destination_is_never_overwritten(self):
+        self.output.mkdir()
+        sentinel = self.output / 'sentinel'
+        sentinel.write_bytes(b'keep me')
+        before = family(self.db)
+        with self.assertRaisesRegex(recovery.RecoveryError, 'already exists'):
+            recovery.recover_copy(self.db, self.output)
+        self.assertEqual(sentinel.read_bytes(), b'keep me')
+        self.assertEqual(before, family(self.db))
+
+    def test_destination_race_is_atomic_no_replace(self):
+        publish = recovery.publish_no_replace
+        def race(staging, destination):
+            destination.mkdir()
+            (destination / 'sentinel').write_bytes(b'racing entry')
+            publish(staging, destination)
+        with mock.patch.object(recovery, 'publish_no_replace', side_effect=race):
+            with self.assertRaisesRegex(recovery.RecoveryError, 'File exists'):
+                recovery.recover_copy(self.db, self.output)
+        self.assertEqual((self.output / 'sentinel').read_bytes(), b'racing entry')
+        self.assertFalse((self.output / 'beads.db').exists())
+        self.assertTrue(any(self.root.glob('.br-wal-copy-*/failed.json')))
+
+    def test_injected_failure_keeps_source_and_partial_evidence(self):
+        with mock.patch.object(recovery, 'replay', side_effect=OSError('injected disk failure')):
+            self.assert_refused('injected disk failure')
+        self.assertTrue(any(self.root.glob('.br-wal-copy-*/before/beads.db-wal')))
+        self.assertTrue(any(self.root.glob('.br-wal-copy-*/failed.json')))
+
+    def test_integrity_success_without_the_commit_is_rejected(self):
+        def discard_wal(main, wal, plan, destination):
+            recovery.copy_new(main, destination)
+        with mock.patch.object(recovery, 'replay', side_effect=discard_wal):
+            self.assert_refused('differs from the WAL-aware oracle')
+
+    def test_source_change_before_publication_refused(self):
+        witness = recovery.logical_witness
+        def changing(db, *, immutable):
+            result = witness(db, immutable=immutable)
+            if immutable:
+                recovery.component(self.db, '-shm').write_bytes(b'changed by noncooperating I/O')
+            return result
+        with mock.patch.object(recovery, 'logical_witness', side_effect=changing):
+            with self.assertRaisesRegex(recovery.RecoveryError, 'source component appeared'):
+                recovery.recover_copy(self.db, self.output)
+        self.assertFalse(self.output.exists())
+
+    def test_max_bytes_refuses_oversized_input(self):
+        self.assert_refused('exceeds --max-bytes', max_bytes=512)
+
+    def test_forged_commit_size_refused_before_output_allocation(self):
+        wal = recovery.component(self.db, '-wal')
+        data = bytearray(wal.read_bytes())
+        size = int.from_bytes(data[8:12], 'big') + 24
+        data[len(data) - size + 4:len(data) - size + 8] = (0xFFFFFFFE).to_bytes(4, 'big')
+        rewrite_checksums(data)
+        wal.write_bytes(data)
+        self.assert_refused('commit exceeds --max-bytes')
+        self.assertFalse(any(self.root.glob('.br-wal-copy-*/beads.db')))
+
+    def test_recovered_files_are_private_source_modes_unchanged(self):
+        self.db.chmod(0o640)
+        recovery.component(self.db, '-wal').chmod(0o640)
+        recovery.recover_copy(self.db, self.output)
+        self.assertEqual(self.db.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(recovery.component(self.db, '-wal').stat().st_mode & 0o777, 0o640)
+        self.assertEqual(self.output.stat().st_mode & 0o777, 0o700)
+        for path in self.output.rglob('*'):
+            if path.is_file():
+                self.assertEqual(path.stat().st_mode & 0o077, 0, str(path))
+
+    def test_existing_stock_reader_excludes_recovery(self):
+        script = """
+import os, sqlite3, sys
+conn = sqlite3.connect(sys.argv[1], timeout=0)
+conn.execute('BEGIN')
+conn.execute('SELECT * FROM issues').fetchall()
+print('pinned', flush=True)
+sys.stdin.readline()
+os._exit(0)
+"""
+        with subprocess.Popen([sys.executable, '-I', '-u', '-c', script, str(self.db)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as child:
+            try:
+                self.assertEqual(child.stdout.readline().strip(), 'pinned')
+                self.assert_refused('database busy')
+                self.assertFalse(any(self.root.glob('.br-wal-copy-*')))
+            finally:
+                child.stdin.write('exit\n')
+                child.stdin.flush()
+                child.wait(timeout=10)
+        # After peer exit, the source is recoverable without weakening the lock.
+        recovery.recover_copy(self.db, self.output)
+
+    def test_arriving_writer_is_blocked_during_copy_and_attestation(self):
+        attest = recovery.attest_source
+        def probe(*args):
+            # An unrelated open/close must not release the held OFD locks.
+            self.db.read_bytes()
+            script = """
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1], timeout=0)
+try:
+    conn.execute("UPDATE issues SET status='lost'")
+    conn.commit()
+except sqlite3.OperationalError as error:
+    assert error.sqlite_errorcode == sqlite3.SQLITE_BUSY
+    sys.exit(42)
+sys.exit(99)
+"""
+            child = subprocess.run([sys.executable, '-I', '-c', script, str(self.db)],
+                                   capture_output=True, text=True, timeout=10, check=False)
+            self.assertEqual(child.returncode, 42, child.stderr)
+            attest(*args)
+        with mock.patch.object(recovery, 'attest_source', side_effect=probe):
+            recovery.recover_copy(self.db, self.output)
+
+    def test_cli_uses_argv_paths_not_shell_interpolation(self):
+        output = self.root / "output ' $HOME ; λ"
+        result = subprocess.run([sys.executable, str(SCRIPT), '--db', str(self.db), '--output', str(output)],
+                                capture_output=True, text=True, timeout=20, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertTrue(report['ok'])
+        self.assertEqual(Path(report['database_path']), output / 'beads.db')
+        self.assertFalse(report['live_recovery'])
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

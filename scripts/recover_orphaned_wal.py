@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""Recover a classic SQLite WAL into a NEW directory, never into the source.
+
+Linux 64-bit only; Python 3.10+ and its stock sqlite3 module are required.
+Run --help for the explicit source/destination interface. This is an operator
+tool, NOT a br backend or an automatic live checkpoint. No input is deleted,
+renamed, chmodded, checkpointed, or opened through a SQLite connection.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import ctypes
+import errno
+import hashlib
+import json
+import os
+from pathlib import Path
+import sqlite3
+import stat
+import struct
+import sys
+import tempfile
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+SUFFIXES = ("", "-wal", "-shm", "-journal", "-wal-cert", "-wal-cert-head",
+            "-ns", "-fsqlite-ns-gate", "-fsqlite-ns-use", ".fsqlite-migration-state")
+DEFAULT_MAX_BYTES = 1024 * 1024 * 1024
+CHUNK = 1024 * 1024
+SCHEMA = "br.orphaned_wal.copy.v1"
+
+
+class RecoveryError(Exception):
+    """A failed recovery never authorizes publication or alteration of input."""
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise RecoveryError(message)
+
+
+def component(db: Path, suffix: str) -> Path:
+    return db.with_name(db.name + suffix)
+
+
+def metadata(st: os.stat_result) -> dict:
+    return dict(device=st.st_dev, inode=st.st_ino, bytes=st.st_size,
+                mode=stat.S_IMODE(st.st_mode), uid=st.st_uid, gid=st.st_gid,
+                mtime_ns=st.st_mtime_ns, ctime_ns=st.st_ctime_ns)
+
+
+def digest(file) -> str:
+    file.seek(0)
+    result = hashlib.sha256()
+    for data in iter(lambda: file.read(CHUNK), b""):
+        result.update(data)
+    return result.hexdigest()
+
+
+def open_regular(path: Path, *, writable: bool = False):
+    flags = (os.O_RDWR if writable else os.O_RDONLY)
+    flags |= os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        require(stat.S_ISREG(st.st_mode) and st.st_nlink == 1,
+                f"refusing non-regular or hard-linked input: {path}")
+        require(metadata(os.stat(path, follow_symlinks=False)) == metadata(st),
+                f"input name changed identity: {path}")
+        return os.fdopen(fd, "r+b" if writable else "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def platform_check() -> None:
+    require(sys.platform.startswith("linux") and ctypes.sizeof(ctypes.c_void_p) == 8
+            and ctypes.sizeof(ctypes.c_long) == 8 and fcntl is not None
+            and hasattr(fcntl, "F_OFD_SETLK"),
+            "recovery requires 64-bit Linux OFD locks; no flock fallback is safe")
+    require(hasattr(ctypes.CDLL(None), "renameat2"),
+            "atomic no-replace directory publication is unavailable")
+
+
+@contextlib.contextmanager
+def source_exclusion(main):
+    """Same br authority byte and SQLite main range as db_inode_lock.rs.
+
+    OFD ownership survives unrelated descriptor closes. Both locks remain held
+    through source copying, independent verification, and final source attestation.
+    These advisory locks are not protection against hostile non-cooperating I/O.
+    """
+    class Flock(ctypes.Structure):
+        _fields_ = [("l_type", ctypes.c_short), ("l_whence", ctypes.c_short),
+                    ("l_start", ctypes.c_longlong), ("l_len", ctypes.c_longlong),
+                    ("l_pid", ctypes.c_int)]
+
+    acquired = []
+    try:
+        for offset, length in ((2**63 - 2, 1), (0x40000000, 512)):
+            lock = Flock(fcntl.F_WRLCK, os.SEEK_SET, offset, length, 0)
+            try:
+                fcntl.fcntl(main.fileno(), fcntl.F_OFD_SETLK, bytes(lock))
+            except OSError as error:
+                if error.errno in (errno.EAGAIN, errno.EACCES):
+                    raise RecoveryError("database busy: stop ALL br and SQLite users; "
+                                        "no source files were changed") from error
+                raise
+            acquired.append((offset, length))
+        yield
+    finally:
+        for offset, length in reversed(acquired):
+            lock = Flock(fcntl.F_UNLCK, os.SEEK_SET, offset, length, 0)
+            fcntl.fcntl(main.fileno(), fcntl.F_OFD_SETLK, bytes(lock))
+
+
+def sync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_json(path: Path, value: dict) -> None:
+    with path.open("x", encoding="utf-8") as out:
+        out.write(json.dumps(value, indent=2, ensure_ascii=True, allow_nan=False) + "\n")
+        out.flush()
+        os.fsync(out.fileno())
+
+
+def copy_new(source, destination: Path, *, limit: int = DEFAULT_MAX_BYTES) -> str:
+    source.seek(0)
+    result = hashlib.sha256()
+    count = 0
+    with destination.open("xb") as out:
+        for data in iter(lambda: source.read(CHUNK), b""):
+            count += len(data)
+            require(count <= limit, "input grew or exceeded its copy bound")
+            out.write(data)
+            result.update(data)
+        out.flush()
+        os.fsync(out.fileno())
+    return result.hexdigest()
+
+
+def check_sidecars(source: Path) -> None:
+    # Unknown family members cannot silently disappear from the evidence.
+    known = {source.name + suffix for suffix in SUFFIXES}
+    unknown = [p.name for p in source.parent.iterdir()
+               if p.name.startswith(source.name + "-") and p.name not in known]
+    require(not unknown, f"unknown database sidecars require review: {unknown}")
+
+
+def capture(source: Path, before: Path, main, stack, max_bytes: int):
+    handles = {"": main}
+    witnesses = {}
+    check_sidecars(source)
+    for suffix in SUFFIXES:
+        path = component(source, suffix)
+        if suffix:
+            try:
+                handles[suffix] = stack.enter_context(open_regular(path))
+            except FileNotFoundError:
+                witnesses[suffix] = None
+                continue
+        file = handles[suffix]
+        st = os.fstat(file.fileno())
+        require(st.st_size <= max_bytes, f"input exceeds --max-bytes: {path}")
+        witness = metadata(st)
+        witness["sha256"] = copy_new(file, component(before, suffix), limit=st.st_size)
+        witnesses[suffix] = witness
+    sync_directory(before.parent)
+    attest_source(source, handles, witnesses)
+    return handles, witnesses
+
+
+def attest_source(source: Path, handles: dict, witnesses: dict) -> None:
+    check_sidecars(source)
+    for suffix, expected in witnesses.items():
+        path = component(source, suffix)
+        if expected is None:
+            require(not os.path.lexists(path), f"source component appeared: {path}")
+            continue
+        file = handles[suffix]
+        observed = metadata(os.stat(path, follow_symlinks=False))
+        named = os.stat(path, follow_symlinks=False)
+        require(stat.S_ISREG(named.st_mode) and named.st_nlink == 1,
+                f"source component is no longer regular: {path}")
+        require(observed == metadata(os.fstat(file.fileno())),
+                f"source name changed identity: {path}")
+        observed["sha256"] = digest(file)
+        require(observed == expected, f"source changed during recovery: {path}")
+        require(metadata(os.fstat(file.fileno())) == {k: v for k, v in expected.items()
+                                                    if k != "sha256"},
+                f"source changed while hashing: {path}")
+        require(metadata(os.stat(path, follow_symlinks=False)) == metadata(os.fstat(file.fileno())),
+                f"source name changed while hashing: {path}")
+
+
+def checksum(data: bytes, state: tuple[int, int], big_endian: bool) -> tuple[int, int]:
+    require(len(data) % 8 == 0, "unaligned WAL checksum input")
+    a, b = state
+    for x, y in struct.iter_unpack(">II" if big_endian else "<II", data):
+        a = (a + x + b) & 0xFFFFFFFF
+        b = (b + y + a) & 0xFFFFFFFF
+    return a, b
+
+
+def wal_plan(main, wal, max_bytes: int) -> dict:
+    """Validate EVERY frame; no valid-prefix salvage or tail truncation.
+
+    SQLite fileformat2.html sections 4.1/4.2/4.5: last frame per page through
+    the final commit defines the reader image; the commit defines its size.
+    Checksums cannot establish provenance of a foreign but valid WAL.
+    """
+    main.seek(0)
+    db_header = main.read(100)
+    require(len(db_header) == 100 and db_header[:16] == b"SQLite format 3\0",
+            "invalid main database header")
+    encoded = int.from_bytes(db_header[16:18], "big")
+    page_size = 65536 if encoded == 1 else encoded
+    require(512 <= page_size <= 65536 and page_size & (page_size - 1) == 0,
+            "invalid main database page size")
+    require(db_header[18:20] == b"\x02\x02", "source is not a classic WAL-mode database")
+    main_bytes = os.fstat(main.fileno()).st_size
+    require(main_bytes % page_size == 0, "partial main database page")
+    wal.seek(0)
+    header = wal.read(32)
+    require(len(header) == 32, "partial WAL header")
+    magic, version, wal_page_size, _, salt1, salt2, a, b = struct.unpack(">8I", header)
+    require(magic in (0x377F0682, 0x377F0683) and version == 3007000,
+            "unsupported WAL magic or version")
+    require(wal_page_size == page_size, "WAL/main page-size mismatch")
+    big_endian = bool(magic & 1)
+    require(checksum(header[:24], (0, 0), big_endian) == (a, b),
+            "invalid WAL header checksum")
+    length = os.fstat(wal.fileno()).st_size
+    frame_size = page_size + 24
+    require(length > 32 and (length - 32) % frame_size == 0,
+            "WAL has no frames or has a partial frame")
+    latest = {}
+    commits = 0
+    final_pages = 0
+    frame_count = (length - 32) // frame_size
+    for index in range(frame_count):
+        frame = wal.read(frame_size)
+        require(len(frame) == frame_size, "WAL changed while validating")
+        page, committed_pages, s1, s2, ca, cb = struct.unpack(">6I", frame[:24])
+        require((s1, s2) == (salt1, salt2), "WAL frame salt mismatch")
+        require(0 < page < 0xFFFFFFFF and committed_pages < 0xFFFFFFFF,
+                "invalid WAL page number or commit size")
+        require(page * page_size <= max_bytes and committed_pages * page_size <= max_bytes,
+                "WAL page or commit exceeds --max-bytes")
+        a, b = checksum(frame[:8], (a, b), big_endian)
+        a, b = checksum(frame[24:], (a, b), big_endian)
+        require((a, b) == (ca, cb), "invalid WAL frame checksum")
+        latest[page] = 32 + index * frame_size + 24
+        if committed_pages:
+            commits += 1
+        final_pages = committed_pages
+    require(final_pages > 0, "uncommitted WAL tail; no prefix-only recovery is allowed")
+    return dict(page_size=page_size, frame_count=frame_count, commits=commits,
+                database_pages=final_pages, latest=latest, checksum_big_endian=big_endian)
+
+
+def replay(main, wal, plan: dict, destination: Path) -> None:
+    size = plan["page_size"]
+    with destination.open("xb") as out:
+        for page in range(1, plan["database_pages"] + 1):
+            offset = plan["latest"].get(page)
+            source = main if offset is None else wal
+            source.seek((page - 1) * size if offset is None else offset)
+            data = source.read(size)
+            require(len(data) == size, f"page {page} absent from both main and committed WAL")
+            out.write(data)
+        out.flush()
+        os.fsync(out.fileno())
+
+
+def quote_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def typed_row(row) -> bytes:
+    values = []
+    for value in row:
+        if value is None:
+            values.append(["null"])
+        elif isinstance(value, bytes):
+            values.append(["blob", value.hex()])
+        elif isinstance(value, float):
+            values.append(["real", value.hex()])
+        elif isinstance(value, int):
+            values.append(["integer", str(value)])
+        else:
+            values.append(["text", value])
+    return json.dumps(values, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+
+
+def logical_witness(db: Path, *, immutable: bool) -> dict:
+    uri = db.as_uri() + ("?immutable=1&mode=ro" if immutable else "?mode=ro")
+    with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=0)) as conn:
+        conn.execute("PRAGMA trusted_schema=OFF")
+        conn.execute("PRAGMA query_only=ON")
+        integrity = conn.execute("PRAGMA integrity_check").fetchall()
+        require(integrity == [("ok",)], f"integrity check failed on private copy: {integrity[:8]}")
+        schema = conn.execute("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema "
+                              "ORDER BY type COLLATE BINARY,name COLLATE BINARY").fetchall()
+        tables = []
+        for kind, name, _, _, sql in schema:
+            if kind != "table":
+                continue
+            require(not sql or not sql.lstrip().upper().startswith("CREATE VIRTUAL TABLE"),
+                    f"virtual table requires engine-specific verification: {name}")
+            ident = quote_identifier(name)
+            columns = [r[1] for r in conn.execute(f"PRAGMA table_xinfo({ident})")]
+            require(bool(columns), f"cannot inspect columns: {name}")
+            aliases = [alias for alias in ("rowid", "_rowid_", "oid")
+                       if alias not in {column.lower() for column in columns}]
+            require(bool(aliases), f"all hidden-rowid aliases are shadowed: {name}")
+            select = [quote_identifier(column) for column in columns]
+            try:
+                conn.execute(f"SELECT {aliases[0]} FROM {ident} LIMIT 0")
+            except sqlite3.OperationalError as error:
+                require("no such column" in str(error), f"rowid inspection failed: {error}")
+            else:
+                select.insert(0, aliases[0])
+            query = f"SELECT {','.join(select)} FROM {ident} ORDER BY " + ",".join(
+                f"{index + 1} COLLATE BINARY" for index in range(len(select)))
+            rows_hash = hashlib.sha256()
+            count = 0
+            for row in conn.execute(query):
+                encoded = typed_row(row)
+                rows_hash.update(len(encoded).to_bytes(8, "big"))
+                rows_hash.update(encoded)
+                count += 1
+            tables.append(dict(name=name, projection=select, rows=count, sha256=rows_hash.hexdigest()))
+        return dict(schema_sha256=hashlib.sha256(typed_row(
+                        [json.dumps(schema, ensure_ascii=True)])).hexdigest(), tables=tables,
+                    user_version=conn.execute("PRAGMA user_version").fetchone()[0],
+                    application_id=conn.execute("PRAGMA application_id").fetchone()[0])
+
+
+def publish_no_replace(staging: Path, destination: Path) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    rename = libc.renameat2
+    rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    rename.restype = ctypes.c_int
+    # RENAME_NOREPLACE, with both paths on the destination parent's filesystem.
+    if rename(-100, os.fsencode(staging), -100, os.fsencode(destination), 1) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), str(destination))
+
+
+def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MAX_BYTES) -> dict:
+    platform_check()
+    require(max_bytes > 0, "--max-bytes must be positive")
+    source = source.parent.resolve(strict=True) / source.name
+    destination = destination.parent.resolve(strict=True) / destination.name
+    require(not os.path.lexists(destination), "destination already exists; nothing will be overwritten")
+    staging = None
+    old_umask = os.umask(0o077)
+    try:
+        with contextlib.ExitStack() as stack:
+            main = stack.enter_context(open_regular(source, writable=True))
+            stack.enter_context(source_exclusion(main))
+            staging = Path(tempfile.mkdtemp(prefix=".br-wal-copy-", dir=destination.parent))
+            before_dir = staging / "before"
+            before_dir.mkdir(mode=0o700)
+            before = before_dir / "beads.db"
+            handles, raw = capture(source, before, main, stack, max_bytes)
+            write_json(staging / "prepared.json", dict(schema=SCHEMA, source=str(source), raw=raw))
+            require(raw["-wal"] is not None, "source WAL is missing")
+            for suffix in ("-journal", ".fsqlite-migration-state"):
+                require(raw[suffix] is None or raw[suffix]["bytes"] == 0,
+                        f"nonempty {suffix} requires engine-specific recovery")
+            with before.open("rb") as saved_main, component(before, "-wal").open("rb") as saved_wal:
+                plan = wal_plan(saved_main, saved_wal, max_bytes)
+                replay(saved_main, saved_wal, plan, staging / "beads.db")
+                oracle_dir = staging / "oracle"
+                oracle_dir.mkdir(mode=0o700)
+                oracle = oracle_dir / "beads.db"
+                copy_new(saved_main, oracle, limit=max_bytes)
+                copy_new(saved_wal, component(oracle, "-wal"), limit=max_bytes)
+            # Independent SQLite WAL reader vs native reconstructed main-only image.
+            expected = logical_witness(oracle, immutable=False)
+            actual = logical_witness(staging / "beads.db", immutable=True)
+            require(actual == expected, "reconstructed database differs from the WAL-aware oracle")
+            attest_source(source, handles, raw)
+            for suffix, witness in raw.items():
+                if witness is not None:
+                    with component(before, suffix).open("rb") as retained:
+                        require(digest(retained) == witness["sha256"], "retained evidence changed")
+            with (staging / "beads.db").open("rb") as recovered:
+                recovered_sha256 = digest(recovered)
+            report = dict(schema=SCHEMA, source=str(source), source_unchanged=True,
+                          live_recovery=False, database_path=str(destination / "beads.db"),
+                          sqlite_version=sqlite3.sqlite_version, recovered_sha256=recovered_sha256,
+                          wal={k: v for k, v in plan.items() if k != "latest"}, logical=actual,
+                          raw=raw, scope="classic SQLite WAL; engine certificates retained, not reused")
+            write_json(staging / "verified.json", report)
+            sync_directory(oracle_dir)
+            sync_directory(staging)
+            # Source names/hashes must still match immediately before publication.
+            attest_source(source, handles, raw)
+            publish_no_replace(staging, destination)
+            staging = destination
+            sync_directory(destination.parent)
+            write_json(destination / "complete.json", report)
+            sync_directory(destination)
+            return report
+    except (OSError, sqlite3.Error, RecoveryError, ValueError) as error:
+        if staging is not None:
+            try:
+                write_json(staging / "failed.json", dict(schema=SCHEMA, error=str(error),
+                                                        source=str(source), live_recovery=False))
+                sync_directory(staging)
+            except OSError:
+                pass
+        raise RecoveryError(f"{error}; evidence retained at {staging}" if staging else str(error)) from error
+    finally:
+        os.umask(old_umask)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--db", required=True, type=Path, help="original database; never modified")
+    parser.add_argument("--output", required=True, type=Path, help="NEW recovery directory; must not exist")
+    parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES,
+                        help="maximum bytes per input component and recovered database (default 1 GiB)")
+    args = parser.parse_args()
+    try:
+        report = recover_copy(args.db, args.output, max_bytes=args.max_bytes)
+    except (RecoveryError, OSError) as error:
+        print(json.dumps(dict(ok=False, error=str(error))), file=sys.stderr)
+        return 1
+    print(json.dumps(dict(ok=True, **report), indent=2, ensure_ascii=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
