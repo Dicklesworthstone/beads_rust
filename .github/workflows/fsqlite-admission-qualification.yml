@@ -10,12 +10,19 @@ on:
         required: true
         default: '0.4.12'
         type: string
+  issue_comment:
+    types: [created]
 
 permissions:
   contents: read
 
 jobs:
   qualification:
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (github.event.issue.number == 561 &&
+           github.event.comment.author_association == 'OWNER' &&
+           github.event.comment.body == '/qualify-fsqlite-561') }}
     strategy:
       fail-fast: false
       matrix:
@@ -28,7 +35,7 @@ jobs:
         shell: bash
     env:
       ENGINE_LANE: ${{ matrix.engine }}
-      CANDIDATE_VERSION: ${{ inputs.candidate }}
+      CANDIDATE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate || '0.4.12' }}
       CARGO_BUILD_JOBS: 2
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
