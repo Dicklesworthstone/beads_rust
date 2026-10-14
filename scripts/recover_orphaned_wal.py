@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import stat
 import struct
@@ -396,34 +397,129 @@ def typed_row(row) -> bytes:
     return json.dumps(values, ensure_ascii=True, separators=(",", ":")).encode("ascii")
 
 
-def logical_witness(db: Path, *, immutable: bool) -> dict:
+def serialized_image_witness(conn, max_bytes: int) -> dict:
+    """Hash SQLite's committed pager image, not an application-chosen WAL prefix.
+
+    Only private connections are passed here. Bound allocation before asking
+    SQLite to serialize, and do not normalize any header or unused-page bytes.
+    The caller owns a read transaction for the complete observation.
+    """
+    serialize = getattr(conn, "serialize", None)
+    require(callable(serialize),
+            "page-image verification requires Python 3.11+ with SQLite serialization support")
+    pages = conn.execute("PRAGMA main.page_count").fetchone()[0]
+    size = conn.execute("PRAGMA main.page_size").fetchone()[0]
+    require(type(pages) is int and type(size) is int and pages > 0
+            and 512 <= size <= 65536 and size & (size - 1) == 0,
+            "invalid private pager dimensions")
+    length = pages * size
+    require(length <= max_bytes, "private pager image exceeds --max-bytes")
+    image = serialize(name="main")
+    require(len(image) == length, "SQLite serialized image has an unexpected size")
+    return dict(schema="br.orphaned_wal.page_image.v1", bytes=length,
+                page_size=size, database_pages=pages, sha256=hashlib.sha256(image).hexdigest())
+
+
+def verify_page_image(oracle: Path, candidate: Path, raw: dict, plan: dict,
+                      max_bytes: int) -> dict | None:
+    """Require exact replay equivalence when the independent pager API exists.
+
+    Python 3.10 keeps the existing logical-row verification for ordinary
+    tables; no absent API is represented as a successful physical proof.
+    Once available, every serialization error or mismatch is a refusal.
+    """
+    with contextlib.closing(sqlite3.connect(oracle.as_uri() + "?mode=ro", uri=True,
+                                          timeout=0)) as conn:
+        conn.execute("PRAGMA trusted_schema=OFF")
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("BEGIN")
+        witness = (serialized_image_witness(conn, max_bytes)
+                   if callable(getattr(conn, "serialize", None)) else None)
+    # Also enforce this on strict copy and restoration, not just salvage.
+    for suffix in ("", "-wal"):
+        with open_regular(component(oracle, suffix)) as retained:
+            require(digest(retained) == raw[suffix]["sha256"],
+                    "page-image oracle changed protected bytes")
+    if witness is not None:
+        require(witness["database_pages"] == plan["database_pages"]
+                and witness["page_size"] == plan["page_size"],
+                "WAL plan differs from SQLite's committed pager dimensions")
+        with open_regular(candidate) as image:
+            require(os.fstat(image.fileno()).st_size == witness["bytes"]
+                    and digest(image) == witness["sha256"],
+                    "reconstructed page image differs from the WAL-aware SQLite pager")
+    return witness
+
+
+def builtin_virtual_module(sql: str) -> str | None:
+    """Recognize only stored FTS5/RTree schemas; do not load arbitrary modules.
+
+    Metadata establishes that this is a virtual table. This conservative SQL
+    tokenization only identifies its module, including quoted table names and
+    comments; an unfamiliar declaration remains refused.
+    """
+    tokens = re.findall(r"--[^\n]*(?:\n|$)|/\*[\s\S]*?\*/|\"(?:[^\"]|\"\")*\"|"
+                        r"'(?:[^']|'')*'|`(?:[^`]|``)*`|\[[^\]]*\]|[^\s().,]+|[().,]", sql)
+    tokens = [token for token in tokens if not token.startswith(("--", "/*"))]
+    if [token.upper() for token in tokens[:3]] != ["CREATE", "VIRTUAL", "TABLE"]:
+        return None
+    position = 3
+    if [token.upper() for token in tokens[position:position + 3]] == ["IF", "NOT", "EXISTS"]:
+        position += 3
+    position += 1  # The engine has already parsed the table identifier.
+    if tokens[position:position + 1] == ["."]:
+        position += 2
+    if len(tokens) <= position + 2 or tokens[position].upper() != "USING":
+        return None
+    module = tokens[position + 1]
+    if len(module) >= 2 and (module[0], module[-1]) in (("'", "'"), ('"', '"'), ("`", "`"), ("[", "]")):
+        module = module[1:-1]
+    module = module.lower()
+    return module if module in ("fts5", "rtree", "rtree_i32") and tokens[position + 2] == "(" else None
+
+
+def logical_witness(db: Path, *, immutable: bool, max_bytes: int = DEFAULT_MAX_BYTES) -> dict:
     uri = db.as_uri() + ("?immutable=1&mode=ro" if immutable else "?mode=ro")
     with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=0)) as conn:
         conn.execute("PRAGMA trusted_schema=OFF")
         conn.execute("PRAGMA query_only=ON")
+        conn.execute("BEGIN")
         integrity = conn.execute("PRAGMA integrity_check").fetchall()
         require(integrity == [("ok",)], f"integrity check failed on private copy: {integrity[:8]}")
         schema = conn.execute("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema "
                               "ORDER BY type COLLATE BINARY,name COLLATE BINARY").fetchall()
         tables = []
+        page_verified = []
+        table_kinds = {row[1]: row[2] for row in conn.execute("PRAGMA main.table_list")
+                       if row[0] == "main"}
         for kind, name, _, _, sql in schema:
             if kind != "table":
                 continue
-            require(not sql or not sql.lstrip().upper().startswith("CREATE VIRTUAL TABLE"),
-                    f"virtual table requires engine-specific verification: {name}")
+            if table_kinds.get(name) == "virtual" or (sql and sql.lstrip().upper().startswith("CREATE VIRTUAL TABLE")):
+                module = builtin_virtual_module(sql or "")
+                require(module is not None,
+                        f"virtual table requires engine-specific verification: {name}")
+                # Never SELECT virtual hidden columns: FTS5's table-name
+                # column is a process-local cursor handle, not stored data.
+                # Its real shadow tables are still witnessed below. Every
+                # stored page must additionally match the independent pager.
+                page_verified.append(dict(name=name, kind="virtual", module=module))
+                continue
             ident = quote_identifier(name)
             columns = [r[1] for r in conn.execute(f"PRAGMA table_xinfo({ident})")]
             require(bool(columns), f"cannot inspect columns: {name}")
             aliases = [alias for alias in ("rowid", "_rowid_", "oid")
                        if alias not in {column.lower() for column in columns}]
-            require(bool(aliases), f"all hidden-rowid aliases are shadowed: {name}")
+            if not aliases:
+                page_verified.append(dict(name=name, kind="shadowed-rowid"))
             select = [quote_identifier(column) for column in columns]
-            try:
-                conn.execute(f"SELECT {aliases[0]} FROM {ident} LIMIT 0")
-            except sqlite3.OperationalError as error:
-                require("no such column" in str(error), f"rowid inspection failed: {error}")
-            else:
-                select.insert(0, aliases[0])
+            if aliases:
+                try:
+                    conn.execute(f"SELECT {aliases[0]} FROM {ident} LIMIT 0")
+                except sqlite3.OperationalError as error:
+                    require("no such column" in str(error), f"rowid inspection failed: {error}")
+                else:
+                    select.insert(0, aliases[0])
             query = f"SELECT {','.join(select)} FROM {ident} ORDER BY " + ",".join(
                 f"{index + 1} COLLATE BINARY" for index in range(len(select)))
             rows_hash = hashlib.sha256()
@@ -434,10 +530,16 @@ def logical_witness(db: Path, *, immutable: bool) -> dict:
                 rows_hash.update(encoded)
                 count += 1
             tables.append(dict(name=name, projection=select, rows=count, sha256=rows_hash.hexdigest()))
-        return dict(schema_sha256=hashlib.sha256(typed_row(
+        witness = dict(schema_sha256=hashlib.sha256(typed_row(
                         [json.dumps(schema, ensure_ascii=True)])).hexdigest(), tables=tables,
                     user_version=conn.execute("PRAGMA user_version").fetchone()[0],
                     application_id=conn.execute("PRAGMA application_id").fetchone()[0])
+        if page_verified:
+            # These schemas were refused before this image-bound path existed.
+            # Missing serialization support cannot fall back to row-only proof.
+            witness.update(page_verified_tables=page_verified,
+                           page_image=serialized_image_witness(conn, max_bytes))
+        return witness
 
 
 def validate_private_index(oracle: Path, plan: dict, raw: dict) -> dict:
@@ -523,7 +625,7 @@ def rehearse_private_index(staging: Path, oracle: Path, plan: dict, raw: dict,
         # consume the transferred index, not silently repair a bad template.
         ofd_lock(pin, fcntl.F_RDLCK, 128, 1)
         ofd_lock(pin, fcntl.F_WRLCK, 120, 3)
-        require(logical_witness(rehearsal, immutable=False) == expected,
+        require(logical_witness(rehearsal, immutable=False, max_bytes=max_bytes) == expected,
                 "transferred SHM changed the logical database")
         require(digest(pin) == index["sha256"], "transferred SHM was rewritten during rehearsal")
     validate_private_index(rehearsal, plan, raw)
@@ -777,7 +879,7 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
                 copy_new(saved_main, oracle, limit=max_bytes)
                 copy_new(saved_wal, component(oracle, "-wal"), limit=max_bytes)
             # Independent SQLite WAL reader vs native reconstructed main-only image.
-            expected = logical_witness(oracle, immutable=False)
+            expected = logical_witness(oracle, immutable=False, max_bytes=max_bytes)
             if copy_last_commit:
                 # The independent reader sees the ORIGINAL full WAL, not a
                 # prefix manufactured from our decision. It must not repair
@@ -786,8 +888,9 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
                     with open_regular(component(oracle, suffix)) as observed:
                         require(digest(observed) == raw[suffix]["sha256"],
                                 "last-commit oracle changed protected bytes")
-            actual = logical_witness(staging / "beads.db", immutable=True)
+            actual = logical_witness(staging / "beads.db", immutable=True, max_bytes=max_bytes)
             require(actual == expected, "reconstructed database differs from the WAL-aware oracle")
+            page_image = verify_page_image(oracle, staging / "beads.db", raw, plan, max_bytes)
             # Resume rehearses the installed SHM copied from the source, not
             # the freshly regenerated oracle index. Recovery locks on that
             # private copy prevent SQLite from silently repairing the template.
@@ -801,6 +904,10 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
                         require(digest(retained) == witness["sha256"], "retained evidence changed")
             with (staging / "beads.db").open("rb") as recovered:
                 recovered_sha256 = digest(recovered)
+                require(page_image is None or (
+                    recovered_sha256 == page_image["sha256"]
+                    and os.fstat(recovered.fileno()).st_size == page_image["bytes"]),
+                    "verified page image changed before publication")
             if resume:
                 resume.verify_result(plan, index, actual, recovered_sha256)
                 # A crash may have occurred before the original directory
@@ -814,6 +921,8 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
                           sqlite_version=sqlite3.sqlite_version, recovered_sha256=recovered_sha256,
                           wal={k: v for k, v in plan.items() if k != "latest"}, logical=actual,
                           raw=raw, scope="classic SQLite WAL; engine certificates retained, not reused")
+            if page_image is not None:
+                report["page_image"] = page_image
             if copy_last_commit:
                 report.update(copy_last_commit_requested=True, checkpoint_performed=False,
                               recovery_scope="last-validated-commit",
