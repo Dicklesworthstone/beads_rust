@@ -15560,7 +15560,7 @@ fn stream_import_actions_in_tx(
     // list proves the immutable source will only skip rows using the same
     // frozen classification metadata. Build the row-location index once in
     // this transaction; mixed imports keep their ordered, live-state reads.
-    let skip_lookup = if comment_owner_ids_to_replace.is_empty() {
+    let mut skip_lookup = if comment_owner_ids_to_replace.is_empty() {
         Some(storage.build_import_issue_lookup()?)
     } else {
         None
@@ -15672,6 +15672,8 @@ fn stream_import_actions_in_tx(
                         invalidated_certificate |= export_hash_ids.remove(&target_id);
                         export_hash_batch.retain(|(id, _)| id != &target_id);
                         storage.sync_comments_for_import_in_tx(&target_id, &union)?;
+                        // Row IDs may be reassigned by the union: cached hydration is stale.
+                        skip_lookup = None;
                         tx_result.comments_imported += union.len() - db_comments.len();
                     }
                 }
