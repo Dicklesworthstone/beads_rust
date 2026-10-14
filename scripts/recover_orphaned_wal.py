@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Recover a classic SQLite WAL into a NEW directory, never into the source.
+"""Recover a classic SQLite WAL, preserving every existing source file.
 
 Linux 64-bit only; Python 3.10+ and its stock sqlite3 module are required.
 Run --help for the explicit source/destination interface. This is an operator
 tool, NOT a br backend or an automatic live checkpoint. No input is deleted,
 renamed, chmodded, checkpointed, or opened through a SQLite connection.
+By default only a NEW recovery directory is created. Explicit --restore-shm
+also installs a verified missing index beside the original, without replacing
+any existing file or writing/truncating the main database or WAL.
 """
 
 from __future__ import annotations
@@ -33,6 +36,8 @@ SUFFIXES = ("", "-wal", "-shm", "-journal", "-wal-cert", "-wal-cert-head",
 DEFAULT_MAX_BYTES = 1024 * 1024 * 1024
 CHUNK = 1024 * 1024
 SCHEMA = "br.orphaned_wal.copy.v1"
+SHM_SCHEMA = "br.orphaned_wal.missing_index.v1"
+SHM_REGION_BYTES = 32768
 
 
 class RecoveryError(Exception):
@@ -87,6 +92,17 @@ def platform_check() -> None:
             "atomic no-replace directory publication is unavailable")
 
 
+def ofd_lock(file, kind: int, offset: int, length: int) -> None:
+    """Linux 64-bit flock ABI, checked by platform_check before recovery."""
+    class Flock(ctypes.Structure):
+        _fields_ = [("l_type", ctypes.c_short), ("l_whence", ctypes.c_short),
+                    ("l_start", ctypes.c_longlong), ("l_len", ctypes.c_longlong),
+                    ("l_pid", ctypes.c_int)]
+
+    lock = Flock(kind, os.SEEK_SET, offset, length, 0)
+    fcntl.fcntl(file.fileno(), fcntl.F_OFD_SETLK, bytes(lock))
+
+
 @contextlib.contextmanager
 def source_exclusion(main):
     """Same br authority byte and SQLite main range as db_inode_lock.rs.
@@ -95,17 +111,11 @@ def source_exclusion(main):
     through source copying, independent verification, and final source attestation.
     These advisory locks are not protection against hostile non-cooperating I/O.
     """
-    class Flock(ctypes.Structure):
-        _fields_ = [("l_type", ctypes.c_short), ("l_whence", ctypes.c_short),
-                    ("l_start", ctypes.c_longlong), ("l_len", ctypes.c_longlong),
-                    ("l_pid", ctypes.c_int)]
-
     acquired = []
     try:
         for offset, length in ((2**63 - 2, 1), (0x40000000, 512)):
-            lock = Flock(fcntl.F_WRLCK, os.SEEK_SET, offset, length, 0)
             try:
-                fcntl.fcntl(main.fileno(), fcntl.F_OFD_SETLK, bytes(lock))
+                ofd_lock(main, fcntl.F_WRLCK, offset, length)
             except OSError as error:
                 if error.errno in (errno.EAGAIN, errno.EACCES):
                     raise RecoveryError("database busy: stop ALL br and SQLite users; "
@@ -115,8 +125,44 @@ def source_exclusion(main):
         yield
     finally:
         for offset, length in reversed(acquired):
-            lock = Flock(fcntl.F_UNLCK, os.SEEK_SET, offset, length, 0)
-            fcntl.fcntl(main.fileno(), fcntl.F_OFD_SETLK, bytes(lock))
+            ofd_lock(main, fcntl.F_UNLCK, offset, length)
+
+
+@contextlib.contextmanager
+def namespace_exclusion(source: Path, main):
+    """Exclude idle FrankenSQLite bindings as well as SQLite main-file users.
+
+    Hold both Linux lock families on existing gate/use sidecars, so neither
+    flock nor POSIX/OFD namespace users can overlap the repair. Never create,
+    rebind, or remove namespace records. An incomplete pair is not a
+    repairable missing-SHM incident. Shared/group-owned repair is not supported.
+    The source main-file exclusion must already be held, including when a
+    stock-SQLite family has no namespace yet.
+    """
+    st = os.fstat(main.fileno())
+    require(st.st_uid == os.geteuid() and not st.st_mode & 0o022,
+            "SHM restoration requires an owner-controlled, non-shared database")
+    suffixes = ("-fsqlite-ns-gate", "-fsqlite-ns-use")
+    paths = [component(source, suffix) for suffix in suffixes]
+    present = [os.path.lexists(path) for path in paths]
+    require(present[0] == present[1], "incomplete engine namespace; refusing SHM restoration")
+    with contextlib.ExitStack() as stack:
+        handles = dict.fromkeys(suffixes)
+        if present[0]:
+            for suffix, path in zip(suffixes, paths):
+                file = stack.enter_context(open_regular(path, writable=True))
+                st = os.fstat(file.fileno())
+                require(st.st_uid == os.geteuid() and not st.st_mode & 0o022,
+                        "SHM restoration refuses a shared or foreign-owned engine namespace")
+                try:
+                    fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    ofd_lock(file, fcntl.F_WRLCK, 0, 0)
+                except OSError as error:
+                    if error.errno in (errno.EAGAIN, errno.EACCES):
+                        raise RecoveryError("engine namespace busy: close ALL database users") from error
+                    raise
+                handles[suffix] = file
+        yield handles
 
 
 def sync_directory(path: Path) -> None:
@@ -157,13 +203,20 @@ def check_sidecars(source: Path) -> None:
     require(not unknown, f"unknown database sidecars require review: {unknown}")
 
 
-def capture(source: Path, before: Path, main, stack, max_bytes: int):
+def capture(source: Path, before: Path, main, stack, max_bytes: int, *, locked_handles=None):
     handles = {"": main}
     witnesses = {}
     check_sidecars(source)
     for suffix in SUFFIXES:
         path = component(source, suffix)
-        if suffix:
+        if locked_handles is not None and suffix in locked_handles:
+            file = locked_handles[suffix]
+            if file is None:
+                require(not os.path.lexists(path), f"source component appeared: {path}")
+                witnesses[suffix] = None
+                continue
+            handles[suffix] = file
+        elif suffix:
             try:
                 handles[suffix] = stack.enter_context(open_regular(path))
             except FileNotFoundError:
@@ -347,6 +400,135 @@ def logical_witness(db: Path, *, immutable: bool) -> dict:
                     application_id=conn.execute("PRAGMA application_id").fetchone()[0])
 
 
+def validate_private_index(oracle: Path, plan: dict, raw: dict) -> dict:
+    """Validate the entire SQLite-generated index against every retained frame.
+
+    See sqlite.org/walformat.html and fsqlite-wal/src/wal_index.rs. SHM scalars
+    and hash entries are native endian; salts are raw big-endian WAL bytes.
+    A checksummed header alone is NOT evidence of a correct page/hash map.
+    """
+    for suffix in ("", "-wal"):
+        with open_regular(component(oracle, suffix)) as file:
+            require(digest(file) == raw[suffix]["sha256"],
+                    f"private SQLite reader changed protected component {suffix or 'main'}")
+    with open_regular(component(oracle, "-wal")) as wal, \
+            open_regular(component(oracle, "-shm")) as shm:
+        frame_count = plan["frame_count"]
+        require(0 < frame_count < 0xFFFFFFFF, "WAL frame count cannot fit a shared index")
+        regions = 1 + (max(0, frame_count - 4062) + 4095) // 4096
+        require(os.fstat(shm.fileno()).st_size == regions * SHM_REGION_BYTES,
+                "private SHM has an unexpected segment count")
+        header = shm.read(136)
+        wal_header = wal.read(32)
+        native32 = lambda offset: struct.unpack_from("=I", header, offset)[0]
+        require(header[:48] == header[48:96] and native32(0) == 3007000
+                and native32(4) == 0 and header[12] == 1,
+                "private SHM headers are uninitialized or disagree")
+        require(checksum(header[:40], (0, 0), sys.byteorder == "big") ==
+                struct.unpack_from("=II", header, 40), "private SHM header checksum mismatch")
+        encoded_size = 1 if plan["page_size"] == 65536 else plan["page_size"]
+        require(header[13] == int(plan["checksum_big_endian"])
+                and struct.unpack_from("=H", header, 14)[0] == encoded_size
+                and native32(16) == frame_count and native32(20) == plan["database_pages"]
+                and header[32:40] == wal_header[16:24], "private SHM does not bind the complete WAL")
+        frame_size = plan["page_size"] + 24
+        wal.seek(32 + (frame_count - 1) * frame_size + 16)
+        require(struct.unpack_from("=II", header, 24) == struct.unpack(">II", wal.read(8)),
+                "private SHM final frame checksum mismatch")
+        # Never assert that any source pages were checkpointed. SQLite may set
+        # nBackfillAttempted to mxFrame during recovery; that is not nBackfill.
+        require(native32(96) == 0 and native32(100) == 0
+                and native32(128) <= frame_count and native32(132) == 0
+                and header[120:128] == b"\0" * 8,
+                "private SHM checkpoint or lock state is not a fresh recovery")
+        require(all(mark == 0xFFFFFFFF or mark <= frame_count
+                    for mark in struct.unpack_from("=5I", header, 100)),
+                "private SHM has an invalid reader mark")
+        next_frame = 0
+        for region in range(regions):
+            expected = bytearray(SHM_REGION_BYTES)
+            start = 136 if region == 0 else 0
+            capacity = 4062 if region == 0 else 4096
+            count = min(capacity, frame_count - next_frame)
+            for local in range(1, count + 1):
+                wal.seek(32 + next_frame * frame_size)
+                page = struct.unpack(">I", wal.read(4))[0]
+                struct.pack_into("=I", expected, start + 4 * (local - 1), page)
+                slot = (page * 383) & 8191
+                while struct.unpack_from("=H", expected, 16384 + 2 * slot)[0]:
+                    slot = (slot + 1) & 8191
+                struct.pack_into("=H", expected, 16384 + 2 * slot, local)
+                next_frame += 1
+            shm.seek(region * SHM_REGION_BYTES)
+            actual = shm.read(SHM_REGION_BYTES)
+            require(actual[start:] == expected[start:],
+                    f"private SHM page/hash map differs from WAL in segment {region}")
+        return dict(schema=SHM_SCHEMA, bytes=regions * SHM_REGION_BYTES,
+                    sha256=digest(shm), frame_count=frame_count, segments=regions,
+                    byte_order=sys.byteorder, checkpoint_performed=False)
+
+
+def rehearse_private_index(staging: Path, oracle: Path, plan: dict, raw: dict,
+                           expected: dict, max_bytes: int) -> dict:
+    index = validate_private_index(oracle, plan, raw)
+    rehearsal_dir = staging / "index-rehearsal"
+    rehearsal_dir.mkdir(mode=0o700)
+    rehearsal = rehearsal_dir / "beads.db"
+    for suffix in ("", "-wal", "-shm"):
+        with open_regular(component(oracle, suffix)) as file:
+            copy_new(file, component(rehearsal, suffix), limit=max(max_bytes, index["bytes"]))
+    with open_regular(component(rehearsal, "-shm"), writable=True) as pin:
+        # The Unix DMS lock prevents the first SQLite attachment from resetting
+        # SHM. Deny write/checkpoint/recovery locks too: the reader must actually
+        # consume the transferred index, not silently repair a bad template.
+        ofd_lock(pin, fcntl.F_RDLCK, 128, 1)
+        ofd_lock(pin, fcntl.F_WRLCK, 120, 3)
+        require(logical_witness(rehearsal, immutable=False) == expected,
+                "transferred SHM changed the logical database")
+        require(digest(pin) == index["sha256"], "transferred SHM was rewritten during rehearsal")
+    validate_private_index(rehearsal, plan, raw)
+    with open_regular(component(oracle, "-shm")) as template:
+        require(copy_new(template, staging / "verified-shm", limit=index["bytes"]) == index["sha256"],
+                "private SHM changed before retention")
+    sync_directory(rehearsal_dir)
+    return index
+
+
+def restore_missing_index(source: Path, evidence: Path, handles: dict, raw: dict,
+                          index: dict) -> dict:
+    """Called ONLY with source_exclusion and namespace_exclusion still held.
+
+    All evidence is durable before installing one complete, absent SHM file.
+    Failure after the rename must retain the installed cache, never roll back
+    over an arriving user or discard any durable database component.
+    """
+    require(raw["-shm"] is None, "SHM already exists; refusing to replace it")
+    scratch = Path(tempfile.mkdtemp(prefix=".br-wal-shm-", dir=source.parent))
+    staged_index = scratch / "index"
+    with open_regular(evidence / "verified-shm") as template:
+        require(copy_new(template, staged_index, limit=index["bytes"]) == index["sha256"],
+                "verified SHM template changed before installation")
+    with open_regular(staged_index) as retained:
+        receipt = dict(**index, database_path=str(source), staging_path=str(scratch),
+                       evidence_path=str(evidence), installed_path=str(component(source, "-shm")))
+        write_json(evidence / "shm-install-prepared.json", receipt)
+        sync_directory(evidence)
+        sync_directory(scratch)
+        sync_directory(source.parent)
+        attest_source(source, handles, raw)
+        publish_no_replace(staged_index, component(source, "-shm"))
+        sync_directory(source.parent)
+        sync_directory(scratch)
+        # Preserve all original identities, permissions, timestamps and bytes.
+        # Only -shm, which was absent, has a new descriptor/witness.
+        installed = metadata(os.fstat(retained.fileno()))
+        installed["sha256"] = index["sha256"]
+        attest_source(source, {**handles, "-shm": retained}, {**raw, "-shm": installed})
+        write_json(evidence / "shm-install-complete.json", receipt)
+        sync_directory(evidence)
+        return receipt
+
+
 def publish_no_replace(staging: Path, destination: Path) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     rename = libc.renameat2
@@ -358,7 +540,8 @@ def publish_no_replace(staging: Path, destination: Path) -> None:
         raise OSError(code, os.strerror(code), str(destination))
 
 
-def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MAX_BYTES) -> dict:
+def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MAX_BYTES,
+                 restore_shm: bool = False) -> dict:
     platform_check()
     require(max_bytes > 0, "--max-bytes must be positive")
     source = source.parent.resolve(strict=True) / source.name
@@ -370,11 +553,16 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
         with contextlib.ExitStack() as stack:
             main = stack.enter_context(open_regular(source, writable=True))
             stack.enter_context(source_exclusion(main))
+            namespace = None
+            if restore_shm:
+                namespace = stack.enter_context(namespace_exclusion(source, main))
+                require(not os.path.lexists(component(source, "-shm")),
+                        "SHM already exists; refusing to replace it")
             staging = Path(tempfile.mkdtemp(prefix=".br-wal-copy-", dir=destination.parent))
             before_dir = staging / "before"
             before_dir.mkdir(mode=0o700)
             before = before_dir / "beads.db"
-            handles, raw = capture(source, before, main, stack, max_bytes)
+            handles, raw = capture(source, before, main, stack, max_bytes, locked_handles=namespace)
             write_json(staging / "prepared.json", dict(schema=SCHEMA, source=str(source), raw=raw))
             require(raw["-wal"] is not None, "source WAL is missing")
             for suffix in ("-journal", ".fsqlite-migration-state"):
@@ -392,6 +580,8 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
             expected = logical_witness(oracle, immutable=False)
             actual = logical_witness(staging / "beads.db", immutable=True)
             require(actual == expected, "reconstructed database differs from the WAL-aware oracle")
+            index = (rehearse_private_index(staging, oracle, plan, raw, expected, max_bytes)
+                     if restore_shm else None)
             attest_source(source, handles, raw)
             for suffix, witness in raw.items():
                 if witness is not None:
@@ -404,6 +594,9 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
                           sqlite_version=sqlite3.sqlite_version, recovered_sha256=recovered_sha256,
                           wal={k: v for k, v in plan.items() if k != "latest"}, logical=actual,
                           raw=raw, scope="classic SQLite WAL; engine certificates retained, not reused")
+            if restore_shm:
+                report["restore_shm_requested"] = True
+                report["verified_index"] = index
             write_json(staging / "verified.json", report)
             sync_directory(oracle_dir)
             sync_directory(staging)
@@ -412,6 +605,11 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
             publish_no_replace(staging, destination)
             staging = destination
             sync_directory(destination.parent)
+            if restore_shm:
+                report["restored_shm"] = restore_missing_index(source, destination, handles, raw, index)
+                report.update(source_unchanged=False, existing_source_files_unchanged=True,
+                              live_recovery=True, database_path=str(source),
+                              recovered_copy_path=str(destination / "beads.db"))
             write_json(destination / "complete.json", report)
             sync_directory(destination)
             return report
@@ -419,7 +617,8 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
         if staging is not None:
             try:
                 write_json(staging / "failed.json", dict(schema=SCHEMA, error=str(error),
-                                                        source=str(source), live_recovery=False))
+                                                        source=str(source), live_recovery=restore_shm,
+                                                        restore_shm_requested=restore_shm))
                 sync_directory(staging)
             except OSError:
                 pass
@@ -430,13 +629,15 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--db", required=True, type=Path, help="original database; never modified")
+    parser.add_argument("--db", required=True, type=Path, help="original database; existing files never modified")
     parser.add_argument("--output", required=True, type=Path, help="NEW recovery directory; must not exist")
     parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES,
                         help="maximum bytes per input component and recovered database (default 1 GiB)")
+    parser.add_argument("--restore-shm", action="store_true",
+                        help="also restore an absent source SHM under continuous exclusion; never checkpoint WAL")
     args = parser.parse_args()
     try:
-        report = recover_copy(args.db, args.output, max_bytes=args.max_bytes)
+        report = recover_copy(args.db, args.output, max_bytes=args.max_bytes, restore_shm=args.restore_shm)
     except (RecoveryError, OSError) as error:
         print(json.dumps(dict(ok=False, error=str(error))), file=sys.stderr)
         return 1

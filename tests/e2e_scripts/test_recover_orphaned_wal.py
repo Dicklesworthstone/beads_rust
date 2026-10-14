@@ -469,6 +469,390 @@ os._exit(0)
         self.assertEqual(unrelated.read_bytes(), b'unrelated data')
 
 
+    def test_restore_missing_shm_preserves_existing_files_and_same_database_identity(self):
+        before = family(self.db)
+        modes = {suffix: recovery.metadata(recovery.component(self.db, suffix).stat())
+                 for suffix, data in before.items() if data is not None}
+        report = recovery.recover_copy(self.db, self.output, restore_shm=True)
+        after = family(self.db)
+        self.assertEqual([suffix for suffix in before if before[suffix] != after[suffix]], ['-shm'])
+        self.assertEqual(Path(report['database_path']), self.db)
+        self.assertTrue(report['live_recovery'])
+        self.assertTrue(report['existing_source_files_unchanged'])
+        self.assertFalse(report['source_unchanged'])
+        self.assertFalse(report['verified_index']['checkpoint_performed'])
+        self.assertEqual(after['-shm'], (self.output / 'verified-shm').read_bytes())
+        self.assertEqual(recovery.component(self.db, '-shm').stat().st_mode & 0o777, 0o600)
+        self.assertEqual(report, json.loads((self.output / 'complete.json').read_text()))
+        self.assertTrue((self.output / 'shm-install-complete.json').is_file())
+        for suffix, expected in modes.items():
+            self.assertEqual(recovery.metadata(recovery.component(self.db, suffix).stat()), expected)
+        # Force consumption of the restored index; no implicit SHM recovery.
+        with recovery.open_regular(recovery.component(self.db, '-shm'), writable=True) as pin:
+            recovery.ofd_lock(pin, recovery.fcntl.F_RDLCK, 128, 1)
+            recovery.ofd_lock(pin, recovery.fcntl.F_WRLCK, 120, 3)
+            self.assertEqual(recovery.logical_witness(self.db, immutable=False), report['logical'])
+        self.assertEqual(before['-wal'], recovery.component(self.db, '-wal').read_bytes())
+        self.assertEqual(rows(self.db, 'SELECT status FROM issues'), [('open',)])
+        # Deliberate post-repair write to this disposable original, not its copy.
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute('SELECT status,closed_at,close_reason FROM issues').fetchall(),
+                             [('closed', STAMP, REASON)])
+            conn.execute("INSERT INTO audit VALUES ('write on repaired source')")
+            conn.commit()
+        self.assertEqual(rows(self.db, 'SELECT COUNT(*) FROM audit'), [(2,)])
+        self.assertEqual(rows(self.db, 'SELECT status,closed_at,close_reason FROM issues'),
+                         [('closed', STAMP, REASON)])
+        # The original WAL evidence survives even after the stock writer checkpoints.
+        self.assertEqual((self.output / 'before' / 'beads.db-wal').read_bytes(), before['-wal'])
+
+    def test_restore_shm_page_sizes_endianness_and_committed_shrink(self):
+        for size, big in ((512, False), (512, True), (65536, False), (65536, True)):
+            with self.subTest(page_size=size, big_endian=big):
+                root = self.root / f'{size}-{big}'
+                root.mkdir()
+                db = fixture(root, page_size=size, shrink=True)
+                wal = recovery.component(db, '-wal')
+                data = bytearray(wal.read_bytes())
+                rewrite_checksums(data, big_endian=big)
+                wal.write_bytes(data)
+                before = family(db)
+                report = recovery.recover_copy(db, root / 'out', restore_shm=True)
+                self.assertEqual(report['verified_index']['byte_order'], sys.byteorder)
+                self.assertEqual(report['wal']['checksum_big_endian'], big)
+                self.assertEqual(rows(db, 'SELECT COUNT(*) FROM extra', immutable=False), [(2,)])
+                self.assertEqual(rows(db, 'SELECT status FROM issues', immutable=False), [('closed',)])
+                after = family(db)
+                self.assertEqual({k: v for k, v in after.items() if k != '-shm'},
+                                 {k: v for k, v in before.items() if k != '-shm'})
+
+    def test_restore_never_replaces_an_existing_index_even_when_short(self):
+        for length in (0, 1, 64, 32768):
+            with self.subTest(length=length):
+                root = self.root / str(length)
+                root.mkdir()
+                db = fixture(root)
+                recovery.component(db, '-shm').write_bytes(b'x' * length)
+                before = family(db)
+                with self.assertRaisesRegex(recovery.RecoveryError, 'SHM already exists'):
+                    recovery.recover_copy(db, root / 'out', restore_shm=True)
+                self.assertEqual(family(db), before)
+                self.assertFalse((root / 'out').exists())
+                self.assertFalse(any(root.glob('.br-wal-copy-*')))
+
+    def test_restore_refuses_incomplete_or_shared_namespace(self):
+        for case in ('incomplete', 'shared-main', 'shared-namespace'):
+            with self.subTest(case=case):
+                root = self.root / case
+                root.mkdir()
+                db = fixture(root)
+                gate = recovery.component(db, '-fsqlite-ns-gate')
+                use = recovery.component(db, '-fsqlite-ns-use')
+                if case == 'shared-main':
+                    db.chmod(0o660)
+                else:
+                    gate.write_bytes(b'namespace gate')
+                    if case == 'shared-namespace':
+                        use.write_bytes(b'namespace use')
+                        use.chmod(0o660)
+                before = family(db)
+                with self.assertRaisesRegex(recovery.RecoveryError, 'incomplete|shared'):
+                    recovery.recover_copy(db, root / 'out', restore_shm=True)
+                self.assertEqual(before, family(db))
+                self.assertFalse((root / 'out').exists())
+
+    def test_restore_preserves_namespace_and_certificate_evidence(self):
+        for suffix in ('-fsqlite-ns-gate', '-fsqlite-ns-use', '-wal-cert', '-wal-cert-head'):
+            recovery.component(self.db, suffix).write_bytes(b'opaque evidence ' + suffix.encode())
+        before = family(self.db)
+        recovery.recover_copy(self.db, self.output, restore_shm=True)
+        for suffix, data in before.items():
+            if suffix != '-shm':
+                self.assertEqual(family(self.db)[suffix], data)
+            if data is not None:
+                self.assertEqual(recovery.component(self.output / 'before' / 'beads.db', suffix).read_bytes(), data)
+
+    def test_restore_rejects_private_index_header_and_page_hash_corruption(self):
+        witness = recovery.logical_witness
+        for offset in (12, 40, 96, 136, 16384):
+            with self.subTest(offset=offset):
+                def corrupt(db, *, immutable):
+                    result = witness(db, immutable=immutable)
+                    if not immutable and db.parent.name == 'oracle':
+                        path = recovery.component(db, '-shm')
+                        with path.open('r+b') as file:
+                            file.seek(offset)
+                            old = file.read(1)
+                            file.seek(offset)
+                            file.write(bytes([old[0] ^ 1]))
+                    return result
+                with mock.patch.object(recovery, 'logical_witness', side_effect=corrupt):
+                    self.assert_refused('private SHM', restore_shm=True)
+
+    def test_transferred_index_rehearsal_cannot_silently_repair_invalid_headers(self):
+        copy = recovery.copy_new
+        def corrupt_transfer(source, destination, **kwargs):
+            result = copy(source, destination, **kwargs)
+            if destination.parent.name == 'index-rehearsal' and destination.name.endswith('-shm'):
+                with destination.open('r+b') as file:
+                    file.seek(12)
+                    file.write(b'\0')
+            return result
+        with mock.patch.object(recovery, 'copy_new', side_effect=corrupt_transfer):
+            self.assert_refused('locked', restore_shm=True)
+
+    def test_restore_rejects_private_reader_wal_rewrite(self):
+        witness = recovery.logical_witness
+        def change_wal(db, *, immutable):
+            result = witness(db, immutable=immutable)
+            if not immutable and db.parent.name == 'oracle':
+                with recovery.component(db, '-wal').open('ab') as file:
+                    file.write(b'private engine changed WAL')
+            return result
+        with mock.patch.object(recovery, 'logical_witness', side_effect=change_wal):
+            self.assert_refused('private SQLite reader changed protected component', restore_shm=True)
+
+    def test_restore_large_real_wal_crosses_both_hash_segment_boundaries(self):
+        script = r'''
+import os, sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+conn.execute('PRAGMA wal_autocheckpoint=0')
+conn.execute('PRAGMA synchronous=OFF')  # Disposable process-crash fixture, not power-loss evidence.
+conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+for n in range(8200):
+    conn.execute('UPDATE extra SET n=? WHERE id=1', (n,))
+    conn.commit()
+os._exit(0)
+'''
+        subprocess.run([sys.executable, '-I', '-c', script, str(self.db)], check=True, timeout=20)
+        copy_dir = self.root / 'large-missing'
+        copy_dir.mkdir()
+        db = copy_dir / 'beads.db'
+        for suffix, data in family(self.db).items():
+            if data is not None and suffix != '-shm':
+                recovery.component(db, suffix).write_bytes(data)
+        before = family(db)
+        report = recovery.recover_copy(db, self.output, restore_shm=True)
+        self.assertGreater(report['wal']['frame_count'], 8158)
+        self.assertGreaterEqual(report['verified_index']['segments'], 3)
+        with recovery.open_regular(recovery.component(db, '-shm'), writable=True) as pin:
+            recovery.ofd_lock(pin, recovery.fcntl.F_RDLCK, 128, 1)
+            recovery.ofd_lock(pin, recovery.fcntl.F_WRLCK, 120, 3)
+            self.assertEqual(rows(db, 'SELECT n FROM extra WHERE id=1', immutable=False), [(8199,)])
+        self.assertEqual(before['-wal'], recovery.component(db, '-wal').read_bytes())
+        self.assertEqual(before[''], db.read_bytes())
+
+    def test_restore_refuses_live_namespace_peers_in_both_lock_families(self):
+        for suffix in ('-fsqlite-ns-gate', '-fsqlite-ns-use'):
+            recovery.component(self.db, suffix).write_bytes(b'retained namespace')
+        script = r'''
+import fcntl, os, sys
+file = open(sys.argv[1], 'rb')
+if sys.argv[2] == 'flock':
+    fcntl.flock(file, fcntl.LOCK_SH | fcntl.LOCK_NB)
+else:
+    fcntl.lockf(file, fcntl.LOCK_SH | fcntl.LOCK_NB)
+print('held', flush=True)
+sys.stdin.readline()
+os._exit(0)
+'''
+        for suffix in ('-fsqlite-ns-gate', '-fsqlite-ns-use'):
+            for kind in ('flock', 'posix'):
+                with self.subTest(suffix=suffix, kind=kind):
+                    path = recovery.component(self.db, suffix)
+                    with subprocess.Popen([sys.executable, '-I', '-u', '-c', script, str(path), kind],
+                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as child:
+                        try:
+                            self.assertEqual(ready_line(child), 'held')
+                            self.assert_refused('engine namespace busy', restore_shm=True)
+                            self.assertFalse(any(self.root.glob('.br-wal-copy-*')))
+                        finally:
+                            child.stdin.write('release\n')
+                            child.stdin.flush()
+                            child.wait(timeout=10)
+
+    def test_restore_excludes_arriving_users_through_install_and_completion(self):
+        for suffix in ('-fsqlite-ns-gate', '-fsqlite-ns-use'):
+            recovery.component(self.db, suffix).write_bytes(b'retained namespace')
+        script = r'''
+import errno, fcntl, sqlite3, sys
+path, kind = sys.argv[1:]
+if kind == 'sqlite':
+    conn = sqlite3.connect(path, timeout=0)
+    try:
+        conn.execute("UPDATE issues SET status='lost'")
+        conn.commit()
+    except sqlite3.OperationalError as error:
+        assert error.sqlite_errorcode == sqlite3.SQLITE_BUSY
+        sys.exit(42)
+else:
+    with open(path, 'r+b') as file:
+        try:
+            if kind == 'flock':
+                fcntl.flock(file, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            else:
+                fcntl.lockf(file, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError as error:
+            assert error.errno in (errno.EACCES, errno.EAGAIN)
+            sys.exit(42)
+sys.exit(99)
+'''
+        def probe():
+            targets = [(self.db, 'sqlite')]
+            for suffix in ('-fsqlite-ns-gate', '-fsqlite-ns-use'):
+                targets.extend((recovery.component(self.db, suffix), kind)
+                               for kind in ('flock', 'posix'))
+            for path, kind in targets:
+                path.read_bytes()  # Unrelated closes must not drop our locks.
+                result = subprocess.run([sys.executable, '-I', '-c', script, str(path), kind],
+                                        capture_output=True, text=True, timeout=10, check=False)
+                self.assertEqual(result.returncode, 42, f'{kind}: {result.stderr}')
+        publish = recovery.publish_no_replace
+        write_json = recovery.write_json
+        stages = []
+        def before_install(staged, destination):
+            if destination == recovery.component(self.db, '-shm'):
+                self.assertTrue((self.output / 'verified.json').is_file())
+                self.assertTrue((self.output / 'shm-install-prepared.json').is_file())
+                probe()
+                stages.append('install')
+            publish(staged, destination)
+        def before_complete(path, report):
+            if path == self.output / 'complete.json':
+                self.assertTrue(recovery.component(self.db, '-shm').is_file())
+                probe()
+                stages.append('complete')
+            write_json(path, report)
+        with mock.patch.object(recovery, 'publish_no_replace', side_effect=before_install), \
+                mock.patch.object(recovery, 'write_json', side_effect=before_complete):
+            recovery.recover_copy(self.db, self.output, restore_shm=True)
+        self.assertEqual(stages, ['install', 'complete'])
+
+    def test_restore_refuses_replaced_namespace_inode_before_capture(self):
+        for suffix in ('-fsqlite-ns-gate', '-fsqlite-ns-use'):
+            recovery.component(self.db, suffix).write_bytes(b'retained namespace')
+        capture = recovery.capture
+        def exchange(*args, **kwargs):
+            path = recovery.component(self.db, '-fsqlite-ns-use')
+            path.rename(self.root / 'old-namespace')
+            path.write_bytes(b'retained namespace')
+            return capture(*args, **kwargs)
+        with mock.patch.object(recovery, 'capture', side_effect=exchange):
+            with self.assertRaisesRegex(recovery.RecoveryError, 'source name changed identity'):
+                recovery.recover_copy(self.db, self.output, restore_shm=True)
+        self.assertFalse(recovery.component(self.db, '-shm').exists())
+        self.assertFalse(self.output.exists())
+
+    def test_restore_atomic_install_never_overwrites_a_racing_index(self):
+        before = family(self.db)
+        publish = recovery.publish_no_replace
+        def race(staged, destination):
+            if destination == recovery.component(self.db, '-shm'):
+                destination.write_bytes(b'noncooperating racing index')
+            publish(staged, destination)
+        with mock.patch.object(recovery, 'publish_no_replace', side_effect=race):
+            with self.assertRaisesRegex(recovery.RecoveryError, 'File exists'):
+                recovery.recover_copy(self.db, self.output, restore_shm=True)
+        after = family(self.db)
+        self.assertEqual(after['-shm'], b'noncooperating racing index')
+        for suffix in before:
+            if suffix != '-shm':
+                self.assertEqual(before[suffix], after[suffix])
+        self.assertEqual((self.output / 'before/beads.db-wal').read_bytes(), before['-wal'])
+        self.assertTrue((self.output / 'failed.json').exists())
+        self.assertFalse((self.output / 'complete.json').exists())
+
+    def test_restore_sync_failure_never_rolls_back_an_installed_index(self):
+        before = family(self.db)
+        sync = recovery.sync_directory
+        def fail_after_install(path):
+            if path == self.db.parent and recovery.component(self.db, '-shm').exists():
+                raise OSError('injected post-install sync failure')
+            sync(path)
+        with mock.patch.object(recovery, 'sync_directory', side_effect=fail_after_install):
+            with self.assertRaisesRegex(recovery.RecoveryError, 'post-install sync failure'):
+                recovery.recover_copy(self.db, self.output, restore_shm=True)
+        self.assertEqual(recovery.component(self.db, '-shm').read_bytes(),
+                         (self.output / 'verified-shm').read_bytes())
+        for suffix, data in before.items():
+            if suffix != '-shm':
+                self.assertEqual(family(self.db)[suffix], data)
+        self.assertTrue((self.output / 'failed.json').is_file())
+        self.assertFalse((self.output / 'complete.json').exists())
+        with recovery.open_regular(recovery.component(self.db, '-shm'), writable=True) as pin:
+            recovery.ofd_lock(pin, recovery.fcntl.F_RDLCK, 128, 1)
+            recovery.ofd_lock(pin, recovery.fcntl.F_WRLCK, 120, 3)
+            self.assertEqual(rows(self.db, 'SELECT status FROM issues', immutable=False), [('closed',)])
+
+    def test_restore_process_death_leaves_absent_or_complete_index_and_all_wal_bytes(self):
+        script = r'''
+import importlib.util, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('recovery', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+source, output = Path(sys.argv[2]), Path(sys.argv[3])
+stage = sys.argv[4]
+publish = module.publish_no_replace
+def crash(staging, destination):
+    if destination == module.component(source, '-shm'):
+        assert (output / 'before' / 'beads.db-wal').is_file()
+        assert (output / 'shm-install-prepared.json').is_file()
+        if stage == 'before-install':
+            os._exit(73)
+        publish(staging, destination)
+        os._exit(73)
+    publish(staging, destination)
+module.publish_no_replace = crash
+module.recover_copy(source, output, restore_shm=True)
+raise AssertionError('crash injection was not reached')
+'''
+        for stage in ('before-install', 'after-install'):
+            with self.subTest(stage=stage):
+                root = self.root / stage
+                root.mkdir()
+                db = fixture(root)
+                before = family(db)
+                output = root / 'out'
+                result = subprocess.run([sys.executable, '-I', '-c', script, str(SCRIPT),
+                                         str(db), str(output), stage], capture_output=True,
+                                        text=True, timeout=20, check=False)
+                self.assertEqual(result.returncode, 73, result.stderr)
+                after = family(db)
+                for suffix in before:
+                    if suffix != '-shm':
+                        self.assertEqual(before[suffix], after[suffix])
+                self.assertEqual((output / 'before/beads.db-wal').read_bytes(), before['-wal'])
+                self.assertFalse((output / 'complete.json').exists())
+                self.assertFalse((output / 'shm-install-complete.json').exists())
+                if stage == 'before-install':
+                    self.assertIsNone(after['-shm'])
+                    recovery.recover_copy(db, root / 'retry', restore_shm=True)
+                else:
+                    self.assertEqual(after['-shm'], (output / 'verified-shm').read_bytes())
+                    with self.assertRaisesRegex(recovery.RecoveryError, 'SHM already exists'):
+                        recovery.recover_copy(db, root / 'retry', restore_shm=True)
+                with recovery.open_regular(recovery.component(db, '-shm'), writable=True) as pin:
+                    recovery.ofd_lock(pin, recovery.fcntl.F_RDLCK, 128, 1)
+                    recovery.ofd_lock(pin, recovery.fcntl.F_WRLCK, 120, 3)
+                    self.assertEqual(rows(db, 'SELECT status FROM issues', immutable=False), [('closed',)])
+
+    def test_restore_cli_names_the_original_and_preserves_all_existing_files(self):
+        before = family(self.db)
+        result = subprocess.run([sys.executable, str(SCRIPT), '--db', str(self.db),
+                                 '--output', str(self.output), '--restore-shm'],
+                                capture_output=True, text=True, timeout=20, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertTrue(report['ok'])
+        self.assertTrue(report['existing_source_files_unchanged'])
+        self.assertEqual(Path(report['database_path']), self.db)
+        self.assertEqual(Path(report['recovered_copy_path']), self.output / 'beads.db')
+        for suffix in before:
+            if suffix != '-shm':
+                self.assertEqual(before[suffix], family(self.db)[suffix])
+
+
 def qualify_br(br: Path) -> None:
     """Run only on an explicitly supplied real binary; never substitute SQLite."""
     spec = importlib.util.spec_from_file_location('fixture_556', SCRIPT.parents[1] /
@@ -518,6 +902,48 @@ def qualify_br(br: Path) -> None:
     recovery.require(family(ambient) == ambient_before, 'ambient database changed')
     recovery.require(base.recovery_files(ambient.parent) == ambient_artifacts, 'ambient artifacts changed')
     print('Actual br: recovered closure, successful new write, and unchanged source/ambient verified.')
+
+    # Qualify same-path restoration separately. The original is still missing
+    # SHM here. Do NOT let stock SQLite open it before br: that would repair
+    # the index itself and hide whether FrankenSQLite consumed our template.
+    identity = source.stat().st_dev, source.stat().st_ino
+    restored_output = root / 'same-path-evidence'
+    result = subprocess.run([sys.executable, str(SCRIPT), '--db', str(source),
+                             '--output', str(restored_output), '--restore-shm'],
+                            capture_output=True, text=True, timeout=60, check=False)
+    (root / 'restore-shm.stdout').write_text(result.stdout)
+    (root / 'restore-shm.stderr').write_text(result.stderr)
+    recovery.require(result.returncode == 0, f'SHM restoration failed: {result.stderr}')
+    report = json.loads(result.stdout)
+    recovery.require(Path(report['database_path']) == source and report['live_recovery'],
+                     'restoration did not target the original database')
+    recovery.require((source.stat().st_dev, source.stat().st_ino) == identity, 'source inode changed')
+    restored = family(source)
+    recovery.require(restored['-shm'] == (restored_output / 'verified-shm').read_bytes(),
+                     'installed index differs from the verified template')
+    recovery.require(all(restored[suffix] == data for suffix, data in missing.items() if suffix != '-shm'),
+                     'SHM restoration changed an existing database component')
+    flags = ['--db', str(source), '--no-auto-import', '--no-auto-flush']
+    listed = base.run_br(br, root, ambient.parent, [*flags, 'list', '--all', '--json'], 'restored-list')
+    recovery.require(listed.returncode == 0, f'br could not read restored SHM: {listed.stderr}')
+    recovery.require(any(row['id'] == issue_id and row['status'] == 'closed'
+                         for row in json.loads(listed.stdout)['issues']), 'restored br read lost the closure')
+    recovery.require(source.read_bytes() == missing[''] and
+                     recovery.component(source, '-wal').read_bytes() == missing['-wal'],
+                     'initial br read changed protected main/WAL bytes')
+    created = base.run_br(br, root, ambient.parent,
+                          [*flags, 'create', 'GH562 same-path restored write', '--json'], 'restored-create')
+    recovery.require(created.returncode == 0, f'br could not write after SHM restoration: {created.stderr}')
+    listed = base.run_br(br, root, ambient.parent, [*flags, 'list', '--all', '--json'], 'restored-list-after')
+    recovery.require(listed.returncode == 0, f'restored post-write list failed: {listed.stderr}')
+    recovery.require(any(row['title'] == 'GH562 same-path restored write'
+                         for row in json.loads(listed.stdout)['issues']), 'same-path br write did not persist')
+    recovery.require(rows(source, 'SELECT status,closed_at,close_reason FROM issues WHERE id=' +
+                          "'" + issue_id.replace("'", "''") + "'", immutable=False) ==
+                     [('closed', base.STAMP, base.REASON)], 'same-path br write lost the committed closure')
+    recovery.require(family(ambient) == ambient_before, 'same-path recovery changed ambient data')
+    recovery.require(base.recovery_files(ambient.parent) == ambient_artifacts, 'ambient artifacts changed')
+    print('Actual br: same-inode SHM restoration, committed closure, and subsequent write verified.')
 
 
 if __name__ == '__main__':
