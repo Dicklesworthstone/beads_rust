@@ -8,6 +8,9 @@ renamed, chmodded, checkpointed, or opened through a SQLite connection.
 By default only a NEW recovery directory is created. Explicit --restore-shm
 also installs a verified missing index beside the original, without replacing
 any existing file or writing/truncating the main database or WAL.
+Explicit --copy-last-commit recovers only into a NEW database when a crashed
+transaction left an unfinished tail. It stops at the first invalid frame,
+never skips it, and retains the entire original WAL, including that tail.
 """
 
 from __future__ import annotations
@@ -267,8 +270,8 @@ def checksum(data: bytes, state: tuple[int, int], big_endian: bool) -> tuple[int
     return a, b
 
 
-def wal_plan(main, wal, max_bytes: int) -> dict:
-    """Validate EVERY frame; no valid-prefix salvage or tail truncation.
+def wal_plan(main, wal, max_bytes: int, *, copy_last_commit: bool = False) -> dict:
+    """Strict recovery validates EVERY frame. Explicit copy stops at damage.
 
     SQLite fileformat2.html sections 4.1/4.2/4.5: last frame per page through
     the final commit defines the reader image; the commit defines its size.
@@ -297,31 +300,66 @@ def wal_plan(main, wal, max_bytes: int) -> dict:
             "invalid WAL header checksum")
     length = os.fstat(wal.fileno()).st_size
     frame_size = page_size + 24
-    require(length > 32 and (length - 32) % frame_size == 0,
+    require(length > 32 and (copy_last_commit or (length - 32) % frame_size == 0),
             "WAL has no frames or has a partial frame")
     latest = {}
+    pending = {}
     commits = 0
     final_pages = 0
+    last_commit_frame = 0
+    validated_frames = 0
     frame_count = (length - 32) // frame_size
+    stopped = "partial-frame" if (length - 32) % frame_size else "eof"
     for index in range(frame_count):
         frame = wal.read(frame_size)
         require(len(frame) == frame_size, "WAL changed while validating")
         page, committed_pages, s1, s2, ca, cb = struct.unpack(">6I", frame[:24])
-        require((s1, s2) == (salt1, salt2), "WAL frame salt mismatch")
-        require(0 < page < 0xFFFFFFFF and committed_pages < 0xFFFFFFFF,
-                "invalid WAL page number or commit size")
+        invalid = None
+        if (s1, s2) != (salt1, salt2):
+            invalid = ("salt-mismatch", "WAL frame salt mismatch")
+        elif not (0 < page < 0xFFFFFFFF and committed_pages < 0xFFFFFFFF):
+            invalid = ("invalid-page-number", "invalid WAL page number or commit size")
+        if invalid is not None:
+            require(copy_last_commit, invalid[1])
+            stopped = invalid[0]
+            break
         require(page * page_size <= max_bytes and committed_pages * page_size <= max_bytes,
                 "WAL page or commit exceeds --max-bytes")
         a, b = checksum(frame[:8], (a, b), big_endian)
         a, b = checksum(frame[24:], (a, b), big_endian)
-        require((a, b) == (ca, cb), "invalid WAL frame checksum")
-        latest[page] = 32 + index * frame_size + 24
+        if (a, b) != (ca, cb):
+            require(copy_last_commit, "invalid WAL frame checksum")
+            stopped = "checksum-mismatch"
+            break
+        validated_frames = index + 1
+        # Pages in an unfinished transaction must not shadow their previous
+        # committed images, even when every trailing checksum is valid.
+        pending[page] = 32 + index * frame_size + 24
         if committed_pages:
+            latest.update(pending)
+            pending.clear()
             commits += 1
-        final_pages = committed_pages
-    require(final_pages > 0, "uncommitted WAL tail; no prefix-only recovery is allowed")
-    return dict(page_size=page_size, frame_count=frame_count, commits=commits,
+            final_pages = committed_pages
+            last_commit_frame = index + 1
+    if copy_last_commit:
+        require(last_commit_frame > 0, "no committed WAL frame; refusing last-commit copy")
+    else:
+        require(last_commit_frame == frame_count and final_pages > 0,
+                "uncommitted WAL tail; no prefix-only recovery is allowed")
+    plan = dict(page_size=page_size, frame_count=last_commit_frame, commits=commits,
                 database_pages=final_pages, latest=latest, checksum_big_endian=big_endian)
+    if copy_last_commit:
+        end = 32 + last_commit_frame * frame_size
+        plan["excluded_tail"] = dict(
+            offset=end, bytes=length - end,
+            physical_complete_frames=frame_count - last_commit_frame,
+            validated_uncommitted_frames=validated_frames - last_commit_frame,
+            partial_frame_bytes=(length - 32) % frame_size,
+            unverified_bytes=length - (32 + validated_frames * frame_size),
+            validation_stopped=stopped,
+            source_bytes_retained=True,
+        )
+    return plan
 
 
 def replay(main, wal, plan: dict, destination: Path) -> None:
@@ -690,11 +728,14 @@ class ResumeEvidence:
 
 
 def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MAX_BYTES,
-                 restore_shm: bool = False, resume_from: Path | None = None) -> dict:
+                 restore_shm: bool = False, resume_from: Path | None = None,
+                 copy_last_commit: bool = False) -> dict:
     platform_check()
     require(max_bytes > 0, "--max-bytes must be positive")
     require(not (restore_shm and resume_from is not None),
             "--restore-shm and --resume-from are mutually exclusive")
+    require(not (copy_last_commit and (restore_shm or resume_from is not None)),
+            "--copy-last-commit is copy-only; it cannot restore or resume a source index")
     source = source.parent.resolve(strict=True) / source.name
     destination = destination.parent.resolve(strict=True) / destination.name
     if resume_from is not None:
@@ -727,7 +768,8 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
                 require(raw[suffix] is None or raw[suffix]["bytes"] == 0,
                         f"nonempty {suffix} requires engine-specific recovery")
             with before.open("rb") as saved_main, component(before, "-wal").open("rb") as saved_wal:
-                plan = wal_plan(saved_main, saved_wal, max_bytes)
+                plan = wal_plan(saved_main, saved_wal, max_bytes,
+                                copy_last_commit=copy_last_commit)
                 replay(saved_main, saved_wal, plan, staging / "beads.db")
                 oracle_dir = staging / "oracle"
                 oracle_dir.mkdir(mode=0o700)
@@ -736,6 +778,14 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
                 copy_new(saved_wal, component(oracle, "-wal"), limit=max_bytes)
             # Independent SQLite WAL reader vs native reconstructed main-only image.
             expected = logical_witness(oracle, immutable=False)
+            if copy_last_commit:
+                # The independent reader sees the ORIGINAL full WAL, not a
+                # prefix manufactured from our decision. It must not repair
+                # main/WAL bytes to make the comparison pass.
+                for suffix in ("", "-wal"):
+                    with open_regular(component(oracle, suffix)) as observed:
+                        require(digest(observed) == raw[suffix]["sha256"],
+                                "last-commit oracle changed protected bytes")
             actual = logical_witness(staging / "beads.db", immutable=True)
             require(actual == expected, "reconstructed database differs from the WAL-aware oracle")
             # Resume rehearses the installed SHM copied from the source, not
@@ -764,6 +814,13 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
                           sqlite_version=sqlite3.sqlite_version, recovered_sha256=recovered_sha256,
                           wal={k: v for k, v in plan.items() if k != "latest"}, logical=actual,
                           raw=raw, scope="classic SQLite WAL; engine certificates retained, not reused")
+            if copy_last_commit:
+                report.update(copy_last_commit_requested=True, checkpoint_performed=False,
+                              recovery_scope="last-validated-commit",
+                              note="Only the last validated commit is reconstructed; unverified tail "
+                                   "bytes may contain later changes that this copy does not recover. All trailing "
+                                   "source WAL bytes remain in before/beads.db-wal. "
+                                   "This is not authority to restore SHM or replace the source.")
             if restore_shm:
                 report["restore_shm_requested"] = True
                 report["verified_index"] = index
@@ -798,6 +855,7 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
                 write_json(staging / "failed.json", dict(schema=SCHEMA, error=str(error),
                                                         source=str(source), live_recovery=restore_shm,
                                                         resume_from=str(resume_from) if resume_from else None,
+                                                        copy_last_commit_requested=copy_last_commit,
                                                         restore_shm_requested=restore_shm))
                 sync_directory(staging)
             except OSError:
@@ -818,10 +876,14 @@ def main() -> int:
                         help="also restore an absent source SHM under continuous exclusion; never checkpoint WAL")
     mode.add_argument("--resume-from", type=Path, metavar="PRIOR_EVIDENCE",
                       help="revalidate an interrupted SHM install into NEW evidence; never replace the existing SHM")
+    mode.add_argument("--copy-last-commit", action="store_true",
+                      help="copy the last validated commit despite an unfinished final transaction; "
+                           "stop at the first invalid frame and retain all source WAL bytes")
     args = parser.parse_args()
     try:
         report = recover_copy(args.db, args.output, max_bytes=args.max_bytes,
-                              restore_shm=args.restore_shm, resume_from=args.resume_from)
+                              restore_shm=args.restore_shm, resume_from=args.resume_from,
+                              copy_last_commit=args.copy_last_commit)
     except (RecoveryError, OSError) as error:
         print(json.dumps(dict(ok=False, error=str(error))), file=sys.stderr)
         return 1
