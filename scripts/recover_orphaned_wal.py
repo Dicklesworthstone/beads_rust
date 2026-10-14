@@ -38,6 +38,8 @@ CHUNK = 1024 * 1024
 SCHEMA = "br.orphaned_wal.copy.v1"
 SHM_SCHEMA = "br.orphaned_wal.missing_index.v1"
 SHM_REGION_BYTES = 32768
+RESUME_SCHEMA = "br.orphaned_wal.resume.v1"
+RECEIPT_MAX_BYTES = 4 * CHUNK
 
 
 class RecoveryError(Exception):
@@ -540,12 +542,165 @@ def publish_no_replace(staging: Path, destination: Path) -> None:
         raise OSError(code, os.strerror(code), str(destination))
 
 
+def same_json(left, right) -> bool:
+    """Compare JSON types too: True is not the integer 1 in recovery evidence."""
+    options = dict(sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+    return json.dumps(left, **options) == json.dumps(right, **options)
+
+
+class ResumeEvidence:
+    """Bind old installation evidence; never alter it or trust its path fields.
+
+    The source and engine-namespace exclusions must already be held. Old
+    receipts identify a generation, not permission to replace an existing SHM.
+    Fresh WAL validation and protected-read rehearsal remain mandatory.
+    """
+
+    def __init__(self, source: Path, evidence: Path, raw: dict, stack, max_bytes: int):
+        self.path = evidence
+        self.stack = stack
+        self.files = {}
+        self.directories = {}
+        self.hold_directory(evidence)
+        self.hold_directory(evidence / "before")
+        self.prepared = self.document("prepared.json")
+        self.verified = self.document("verified.json")
+        for document in (self.prepared, self.verified):
+            require(document.get("schema") == SCHEMA and document.get("source") == str(source),
+                    "restoration evidence does not name this source and schema")
+        require(self.verified.get("restore_shm_requested") is True
+                and self.verified.get("source_unchanged") is True
+                and self.verified.get("live_recovery") is False,
+                "resume requires pre-install restoration evidence, not copy-only evidence")
+        self.install = self.document("shm-install-prepared.json")
+        prior = self.prepared.get("raw")
+        require(isinstance(prior, dict) and set(prior) == set(SUFFIXES)
+                and prior["-shm"] is None and same_json(self.verified.get("raw"), prior),
+                "restoration evidence manifests do not match")
+        require(same_json(prior, {**raw, "-shm": None}),
+                "source files no longer match the interrupted restoration generation")
+        require(raw["-shm"] is not None,
+                "installed SHM is missing; use a fresh --restore-shm run, not resume")
+        require(raw["-shm"]["uid"] == os.geteuid() and not raw["-shm"]["mode"] & 0o022,
+                "resume requires an owner-controlled installed SHM")
+        index = self.verified.get("verified_index")
+        require(isinstance(index, dict) and index.get("schema") == SHM_SCHEMA
+                and index.get("checkpoint_performed") is False,
+                "restoration evidence lacks a verified index")
+        require(same_json(index.get("bytes"), raw["-shm"]["bytes"])
+                and index.get("sha256") == raw["-shm"]["sha256"],
+                "installed SHM does not match the retained verified index")
+        require(set(self.install) == set(index) | {
+                    "database_path", "staging_path", "evidence_path", "installed_path"}
+                and same_json({key: self.install.get(key) for key in index}, index)
+                and self.install.get("database_path") == str(source)
+                and self.install.get("installed_path") == str(component(source, "-shm"))
+                and self.install.get("evidence_path") == str(evidence)
+                and isinstance(self.install.get("staging_path"), str),
+                "installation evidence does not match this source and verified index")
+        # Only fixed paths beneath the explicitly selected evidence directory
+        # are opened. No path supplied by a receipt is followed.
+        for suffix, witness in prior.items():
+            archived = component(evidence / "before" / "beads.db", suffix)
+            if witness is None:
+                require(not os.path.lexists(archived), "unexpected prior evidence component")
+            else:
+                self.payload(archived, witness["bytes"], witness["sha256"], max_bytes)
+        self.payload(evidence / "verified-shm", index["bytes"], index["sha256"], max_bytes)
+        require(self.verified.get("database_path") == str(evidence / "beads.db"),
+                "verified evidence names an unexpected recovered copy")
+        image = self.hold_file(evidence / "beads.db", max_bytes)
+        require(image["sha256"] == self.verified.get("recovered_sha256"),
+                "recovered evidence image no longer matches its receipt")
+        self.attest()
+
+    def hold_directory(self, path):
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        self.stack.callback(os.close, fd)
+        st = os.fstat(fd)
+        require(st.st_uid == os.geteuid() and not st.st_mode & 0o022,
+                "resume requires owner-controlled evidence directories")
+        self.directories[path] = (fd, metadata(st))
+
+    def hold_file(self, path, limit):
+        file = self.stack.enter_context(open_regular(path))
+        st = os.fstat(file.fileno())
+        require(st.st_uid == os.geteuid() and not st.st_mode & 0o022,
+                "resume requires owner-controlled evidence files")
+        require(st.st_size <= limit, "recovery evidence exceeds its size bound")
+        witness = dict(**metadata(st), sha256=digest(file))
+        self.files[path] = (file, witness)
+        return witness
+
+    def document(self, name):
+        path = self.path / name
+        self.hold_file(path, RECEIPT_MAX_BYTES)
+        file = self.files[path][0]
+        file.seek(0)
+
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                require(key not in result, f"duplicate recovery receipt key: {key}")
+                result[key] = value
+            return result
+
+        def nonfinite(value):
+            raise RecoveryError(f"non-finite recovery receipt value: {value}")
+
+        try:
+            value = json.loads(file.read(RECEIPT_MAX_BYTES + 1), object_pairs_hook=unique,
+                               parse_constant=nonfinite)
+        except (ValueError, RecursionError) as error:
+            raise RecoveryError(f"invalid recovery receipt {name}: {error}") from error
+        require(isinstance(value, dict), "recovery receipt must be an object")
+        return value
+
+    def payload(self, path, size, sha256, limit):
+        witness = self.hold_file(path, limit)
+        require(same_json(witness["bytes"], size) and witness["sha256"] == sha256,
+                f"retained evidence payload does not match: {path}")
+
+    def verify_result(self, plan, index, logical, image_sha256):
+        require(same_json(index, self.verified["verified_index"])
+                and same_json(logical, self.verified.get("logical"))
+                and same_json({key: value for key, value in plan.items() if key != "latest"},
+                              self.verified.get("wal"))
+                and image_sha256 == self.verified.get("recovered_sha256"),
+                "fresh recovery does not match the interrupted restoration evidence")
+
+    def attest(self):
+        for path, (fd, expected) in self.directories.items():
+            require(metadata(os.fstat(fd)) == expected
+                    and metadata(os.stat(path, follow_symlinks=False)) == expected,
+                    "recovery evidence directory changed identity or metadata")
+        for path, (file, expected) in self.files.items():
+            observed = dict(**metadata(os.fstat(file.fileno())), sha256=digest(file))
+            require(observed == expected
+                    and metadata(os.fstat(file.fileno())) == {key: value for key, value
+                        in expected.items() if key != "sha256"}
+                    and metadata(os.stat(path, follow_symlinks=False)) == metadata(os.fstat(file.fileno())),
+                    "recovery evidence changed during revalidation")
+
+    def receipt(self):
+        return dict(schema=RESUME_SCHEMA, evidence_path=str(self.path),
+                    existing_index_revalidated=True, prior_evidence_unchanged=True,
+                    receipts_sha256={name: self.files[self.path / name][1]["sha256"]
+                        for name in ("prepared.json", "verified.json", "shm-install-prepared.json")})
+
+
 def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MAX_BYTES,
-                 restore_shm: bool = False) -> dict:
+                 restore_shm: bool = False, resume_from: Path | None = None) -> dict:
     platform_check()
     require(max_bytes > 0, "--max-bytes must be positive")
+    require(not (restore_shm and resume_from is not None),
+            "--restore-shm and --resume-from are mutually exclusive")
     source = source.parent.resolve(strict=True) / source.name
     destination = destination.parent.resolve(strict=True) / destination.name
+    if resume_from is not None:
+        resume_from = resume_from.parent.resolve(strict=True) / resume_from.name
+        require(not destination.is_relative_to(resume_from),
+                "new output must be outside prior recovery evidence")
     require(not os.path.lexists(destination), "destination already exists; nothing will be overwritten")
     staging = None
     old_umask = os.umask(0o077)
@@ -554,8 +709,9 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
             main = stack.enter_context(open_regular(source, writable=True))
             stack.enter_context(source_exclusion(main))
             namespace = None
-            if restore_shm:
+            if restore_shm or resume_from is not None:
                 namespace = stack.enter_context(namespace_exclusion(source, main))
+            if restore_shm:
                 require(not os.path.lexists(component(source, "-shm")),
                         "SHM already exists; refusing to replace it")
             staging = Path(tempfile.mkdtemp(prefix=".br-wal-copy-", dir=destination.parent))
@@ -563,6 +719,8 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
             before_dir.mkdir(mode=0o700)
             before = before_dir / "beads.db"
             handles, raw = capture(source, before, main, stack, max_bytes, locked_handles=namespace)
+            resume = (ResumeEvidence(source, resume_from, raw, stack, max_bytes)
+                      if resume_from is not None else None)
             write_json(staging / "prepared.json", dict(schema=SCHEMA, source=str(source), raw=raw))
             require(raw["-wal"] is not None, "source WAL is missing")
             for suffix in ("-journal", ".fsqlite-migration-state"):
@@ -580,8 +738,12 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
             expected = logical_witness(oracle, immutable=False)
             actual = logical_witness(staging / "beads.db", immutable=True)
             require(actual == expected, "reconstructed database differs from the WAL-aware oracle")
-            index = (rehearse_private_index(staging, oracle, plan, raw, expected, max_bytes)
-                     if restore_shm else None)
+            # Resume rehearses the installed SHM copied from the source, not
+            # the freshly regenerated oracle index. Recovery locks on that
+            # private copy prevent SQLite from silently repairing the template.
+            index = (rehearse_private_index(staging, before if resume else oracle,
+                                           plan, raw, expected, max_bytes)
+                     if restore_shm or resume else None)
             attest_source(source, handles, raw)
             for suffix, witness in raw.items():
                 if witness is not None:
@@ -589,6 +751,14 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
                         require(digest(retained) == witness["sha256"], "retained evidence changed")
             with (staging / "beads.db").open("rb") as recovered:
                 recovered_sha256 = digest(recovered)
+            if resume:
+                resume.verify_result(plan, index, actual, recovered_sha256)
+                # A crash may have occurred before the original directory
+                # sync. Flush this exact retained index and its name, without
+                # changing a byte or taking the old no-replace install path.
+                os.fsync(handles["-shm"].fileno())
+                sync_directory(source.parent)
+                resume.attest()
             report = dict(schema=SCHEMA, source=str(source), source_unchanged=True,
                           live_recovery=False, database_path=str(destination / "beads.db"),
                           sqlite_version=sqlite3.sqlite_version, recovered_sha256=recovered_sha256,
@@ -597,11 +767,17 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
             if restore_shm:
                 report["restore_shm_requested"] = True
                 report["verified_index"] = index
+            if resume:
+                report.update(resume=resume.receipt(), verified_index=index,
+                              checkpoint_performed=False, database_path=str(source),
+                              recovered_copy_path=str(destination / "beads.db"))
             write_json(staging / "verified.json", report)
             sync_directory(oracle_dir)
             sync_directory(staging)
             # Source names/hashes must still match immediately before publication.
             attest_source(source, handles, raw)
+            if resume:
+                resume.attest()
             publish_no_replace(staging, destination)
             staging = destination
             sync_directory(destination.parent)
@@ -610,6 +786,9 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
                 report.update(source_unchanged=False, existing_source_files_unchanged=True,
                               live_recovery=True, database_path=str(source),
                               recovered_copy_path=str(destination / "beads.db"))
+            if resume:
+                attest_source(source, handles, raw)
+                resume.attest()
             write_json(destination / "complete.json", report)
             sync_directory(destination)
             return report
@@ -618,6 +797,7 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
             try:
                 write_json(staging / "failed.json", dict(schema=SCHEMA, error=str(error),
                                                         source=str(source), live_recovery=restore_shm,
+                                                        resume_from=str(resume_from) if resume_from else None,
                                                         restore_shm_requested=restore_shm))
                 sync_directory(staging)
             except OSError:
@@ -633,11 +813,15 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=Path, help="NEW recovery directory; must not exist")
     parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES,
                         help="maximum bytes per input component and recovered database (default 1 GiB)")
-    parser.add_argument("--restore-shm", action="store_true",
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--restore-shm", action="store_true",
                         help="also restore an absent source SHM under continuous exclusion; never checkpoint WAL")
+    mode.add_argument("--resume-from", type=Path, metavar="PRIOR_EVIDENCE",
+                      help="revalidate an interrupted SHM install into NEW evidence; never replace the existing SHM")
     args = parser.parse_args()
     try:
-        report = recover_copy(args.db, args.output, max_bytes=args.max_bytes, restore_shm=args.restore_shm)
+        report = recover_copy(args.db, args.output, max_bytes=args.max_bytes,
+                              restore_shm=args.restore_shm, resume_from=args.resume_from)
     except (RecoveryError, OSError) as error:
         print(json.dumps(dict(ok=False, error=str(error))), file=sys.stderr)
         return 1
