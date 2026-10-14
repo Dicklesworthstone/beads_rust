@@ -31,6 +31,7 @@ const DEFAULT_MAX_BYTES: u64 = 1_073_741_824;
         Stop ALL br and external SQLite users first and keep them stopped.\n\
         The default creates a verified copy and leaves the source family unchanged.\n\
         --restore-shm additionally installs only an absent shared-memory index.\n\
+        --resume-from revalidates a prior installation without replacing its index.\n\
         Neither mode checkpoints or replaces the source main file or WAL.\n\n\
         Success emits the helper's JSON completion receipt. On error or interruption,\n\
         retain all evidence and any installed SHM; do not delete sidecars to retry.\n\
@@ -49,6 +50,10 @@ struct Args {
     #[arg(long)]
     restore_shm: bool,
 
+    /// Prior restoration evidence; revalidate its existing SHM, never reinstall it.
+    #[arg(long, value_name = "PRIOR_EVIDENCE", conflicts_with = "restore_shm")]
+    resume_from: Option<PathBuf>,
+
     /// Maximum bytes per input family component and reconstructed database.
     #[arg(
         long,
@@ -60,6 +65,12 @@ struct Args {
 }
 
 fn helper_command(args: &Args) -> io::Result<Command> {
+    if args.restore_shm && args.resume_from.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--restore-shm and --resume-from are mutually exclusive",
+        ));
+    }
     // Absolute spellings cannot become Python option tokens even if a basename
     // starts with '-'. No lossy path conversion, shell, or runtime file lookup.
     let source = std::path::absolute(&args.db)?;
@@ -77,6 +88,11 @@ fn helper_command(args: &Args) -> io::Result<Command> {
     // directory. -S also disables system sitecustomize startup hooks.
     if args.restore_shm {
         command.arg("--restore-shm");
+    }
+    if let Some(evidence) = &args.resume_from {
+        command
+            .arg("--resume-from")
+            .arg(std::path::absolute(evidence)?);
     }
     Ok(command)
 }
@@ -145,6 +161,7 @@ mod tests {
     fn copy_is_default_and_restore_requires_explicit_consent() {
         let args = arguments();
         assert!(!args.restore_shm);
+        assert!(args.resume_from.is_none());
         assert_eq!(args.max_bytes, DEFAULT_MAX_BYTES);
         let restored = Args::try_parse_from([
             "br-wal-recover",
@@ -207,6 +224,35 @@ mod tests {
         assert_eq!(values.len(), 12);
         assert_eq!(values[10], "1234");
         assert_eq!(values[11], "--restore-shm");
+    }
+
+    #[test]
+    fn resume_is_explicit_and_conflicts_with_restoration() {
+        let argv = [
+            "br-wal-recover", "--db", "source", "--output", "new", "--resume-from", "prior",
+        ];
+        let args = Args::try_parse_from(argv).unwrap();
+        assert_eq!(args.resume_from, Some(PathBuf::from("prior")));
+        assert!(!args.restore_shm);
+        assert!(Args::try_parse_from(argv.into_iter().chain(["--restore-shm"])).is_err());
+        let mut conflicting = args;
+        conflicting.restore_shm = true;
+        assert_eq!(
+            helper_command(&conflicting).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn resume_evidence_is_one_lossless_absolute_argument() {
+        let mut args = arguments();
+        let evidence = PathBuf::from("./-prior ' λ $HOME evidence");
+        args.resume_from = Some(evidence.clone());
+        let command = helper_command(&args).unwrap();
+        let values: Vec<_> = command.get_args().collect();
+        assert_eq!(values.len(), 13);
+        assert_eq!(values[11], "--resume-from");
+        assert_eq!(values[12], std::path::absolute(&evidence).unwrap().as_os_str());
     }
 
     #[cfg(unix)]

@@ -8,6 +8,8 @@ copies. Retain every fixture, including failed evidence, for inspection.
 from __future__ import annotations
 
 import contextlib
+import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -288,6 +290,99 @@ class ResumeTests(unittest.TestCase):
                                   resume_from=self.evidence)
         self.assertFalse(self.output.exists())
 
+    def test_matching_forged_hashes_cannot_hide_a_bad_page_map(self):
+        self.crashed()
+        shm = recovery.component(self.db, '-shm')
+        bad = bytearray(shm.read_bytes())
+        bad[136:140] = (9999).to_bytes(4, sys.byteorder)
+        shm.write_bytes(bad)
+        (self.evidence / 'verified-shm').write_bytes(bad)
+        sha = hashlib.sha256(bad).hexdigest()
+        path = self.evidence / 'verified.json'
+        doc = json.loads(path.read_text())
+        doc['verified_index']['sha256'] = sha
+        path.write_text(json.dumps(doc))
+        path = self.evidence / 'shm-install-prepared.json'
+        doc = json.loads(path.read_text())
+        doc['sha256'] = sha
+        path.write_text(json.dumps(doc))
+        self.assert_refused('page/hash map differs')
+
+    def test_directory_sync_failure_never_becomes_completion(self):
+        self.crashed()
+        original = recovery.sync_directory
+        def fail_source_sync(path):
+            if path == self.db.parent:
+                raise OSError('injected source-directory sync failure')
+            original(path)
+        with mock.patch.object(recovery, 'sync_directory', side_effect=fail_source_sync):
+            self.assert_refused('source-directory sync failure')
+        # The same untouched generation can be retried into another new output.
+        self.output = self.root / 'retry-after-sync-failure'
+        self.assert_resumed()
+
+    def test_output_cannot_be_nested_in_prior_evidence(self):
+        self.crashed()
+        self.output = self.evidence / 'forbidden-new-output'
+        self.assert_refused('outside prior recovery evidence')
+
+    def test_shared_installed_index_is_not_accepted(self):
+        self.crashed()
+        recovery.component(self.db, '-shm').chmod(0o666)
+        self.assert_refused('owner-controlled installed SHM')
+
+    def test_subsequent_real_sqlite_write_keeps_the_recovered_closure(self):
+        self.crashed()
+        self.assert_resumed()
+        with contextlib.closing(sqlite3.connect(self.db, timeout=0)) as conn:
+            self.assertEqual(conn.execute(QUERY).fetchall(), EXPECTED)
+            conn.execute("INSERT INTO issues VALUES ('new', 'open', NULL, '', X'00')")
+            conn.commit()
+            self.assertEqual(conn.execute(QUERY + " WHERE id='w562-1'").fetchall(), EXPECTED)
+            self.assertEqual(conn.execute('PRAGMA integrity_check').fetchall(), [('ok',)])
+
+
+def qualify_installed(binary: Path) -> None:
+    """No interpreter fallback: exercise an explicitly supplied real executable."""
+    binary = binary.resolve(strict=True)
+    recovery.require(binary.is_file() and os.access(binary, os.X_OK), 'not an executable companion')
+    root = Path(tempfile.mkdtemp(prefix='br-wal-resume-native-'))
+    print(f'Retaining installed-companion qualification at {root}', flush=True)
+    source = make_orphan(root)
+    prior, output = root / 'interrupted', root / 'native-resumed'
+    interrupt_restore(source, prior)
+    before, ids, evidence = family(source), identity(source), evidence_bytes(prior)
+    result = subprocess.run([str(binary), '--db', str(source), '--output', str(output),
+                             '--resume-from', str(prior)], capture_output=True, text=True,
+                            check=False, timeout=60)
+    (root / 'resume.stdout').write_text(result.stdout)
+    (root / 'resume.stderr').write_text(result.stderr)
+    recovery.require(result.returncode == 0, f'installed resume failed: {result.stderr}')
+    report = json.loads(result.stdout)
+    recovery.require(report.get('ok') is True and report.get('source_unchanged') is True
+                     and report.get('live_recovery') is False
+                     and report.get('checkpoint_performed') is False
+                     and report['resume'].get('existing_index_revalidated') is True,
+                     'installed binary did not report verified observational completion')
+    recorded = json.loads((output / 'complete.json').read_text())
+    recovery.require(report == dict(ok=True, **recorded), 'stdout differs from durable completion')
+    recovery.require(family(source) == before and identity(source) == ids, 'source changed')
+    recovery.require(evidence_bytes(prior) == evidence, 'prior evidence changed')
+    candidate = Path(report['recovered_copy_path'])
+    with contextlib.closing(sqlite3.connect(candidate.as_uri() + '?immutable=1', uri=True)) as conn:
+        recovery.require(conn.execute(QUERY).fetchall() == EXPECTED, 'native resume lost WAL-only data')
+    result = subprocess.run([str(binary), '--db', str(source), '--output', str(root / 'conflict'),
+                             '--restore-shm', '--resume-from', str(prior)],
+                            capture_output=True, text=True, check=False, timeout=10)
+    recovery.require(result.returncode != 0 and not (root / 'conflict').exists(),
+                     'native launcher accepted conflicting recovery operations')
+    print('Installed companion: resume, source preservation, committed data and mode conflict passed.')
+
 
 if __name__ == '__main__':
-    unittest.main(verbosity=2)
+    if '--recovery-binary' in sys.argv[1:]:
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument('--recovery-binary', type=Path, required=True)
+        qualify_installed(parser.parse_args().recovery_binary)
+    else:
+        unittest.main(verbosity=2)
