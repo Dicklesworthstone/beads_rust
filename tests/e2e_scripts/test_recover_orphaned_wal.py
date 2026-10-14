@@ -3,16 +3,19 @@
 
 This tests scripts/recover_orphaned_wal.py, not a br binary. All fixtures and
 failure evidence are retained. No existing/user-supplied database is accepted.
+Optional actual-br qualification: python3 ... --br /absolute/path/to/br
 """
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import ctypes
 import importlib.util
 import json
 import os
 from pathlib import Path
+import selectors
 import sqlite3
 import struct
 import subprocess
@@ -28,6 +31,13 @@ SPEC.loader.exec_module(recovery)
 
 STAMP = "2026-10-13T00:00:00Z"
 REASON = "committed only in WAL; must survive"
+
+
+def ready_line(child: subprocess.Popen) -> str:
+    with selectors.DefaultSelector() as selector:
+        selector.register(child.stdout, selectors.EVENT_READ)
+        recovery.require(bool(selector.select(timeout=10)), 'fixture process did not become ready')
+        return child.stdout.readline().strip()
 
 
 def family(db: Path) -> dict:
@@ -320,7 +330,7 @@ os._exit(0)
         with subprocess.Popen([sys.executable, '-I', '-u', '-c', script, str(self.db)],
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as child:
             try:
-                self.assertEqual(child.stdout.readline().strip(), 'pinned')
+                self.assertEqual(ready_line(child), 'pinned')
                 self.assert_refused('database busy')
                 self.assertFalse(any(self.root.glob('.br-wal-copy-*')))
             finally:
@@ -364,5 +374,156 @@ sys.exit(99)
         self.assertFalse(report['live_recovery'])
 
 
+    def test_process_death_retains_source_and_never_marks_partial_output_complete(self):
+        script = r'''
+import importlib.util, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('recovery', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+stage = sys.argv[4]
+if stage == 'replay':
+    def crash(main, wal, plan, destination):
+        with destination.open('xb') as out:
+            out.write(b'partial candidate')
+            out.flush()
+            os.fsync(out.fileno())
+        os._exit(73)
+    module.replay = crash
+elif stage == 'verify':
+    witness = module.logical_witness
+    def crash(db, *, immutable):
+        result = witness(db, immutable=immutable)
+        if immutable:
+            os._exit(73)
+        return result
+    module.logical_witness = crash
+else:
+    publish = module.publish_no_replace
+    def crash(staging, destination):
+        publish(staging, destination)
+        os._exit(73)
+    module.publish_no_replace = crash
+module.recover_copy(Path(sys.argv[2]), Path(sys.argv[3]))
+raise AssertionError('crash injection was not reached')
+'''
+        before = family(self.db)
+        for stage in ('replay', 'verify', 'publish'):
+            with self.subTest(stage=stage):
+                parent = self.root / stage
+                parent.mkdir()
+                output = parent / 'result'
+                result = subprocess.run([sys.executable, '-I', '-c', script, str(SCRIPT),
+                                         str(self.db), str(output), stage], capture_output=True,
+                                        text=True, timeout=20, check=False)
+                self.assertEqual(result.returncode, 73, result.stderr)
+                self.assertEqual(before, family(self.db))
+                retained = output if output.exists() else next(parent.glob('.br-wal-copy-*'))
+                self.assertFalse((retained / 'complete.json').exists())
+                self.assertEqual((retained / 'before' / 'beads.db-wal').read_bytes(), before['-wal'])
+                # Kernel releases the dead process's locks; a fresh copy can recover.
+                recovery.recover_copy(self.db, parent / 'retry')
+                self.assertEqual(before, family(self.db))
+
+    def test_br_inode_authority_alone_excludes_recovery(self):
+        script = r'''
+import ctypes, fcntl, os, sys
+class Flock(ctypes.Structure):
+    _fields_ = [('kind', ctypes.c_short), ('whence', ctypes.c_short),
+                ('offset', ctypes.c_longlong), ('length', ctypes.c_longlong), ('pid', ctypes.c_int)]
+fd = os.open(sys.argv[1], os.O_RDWR)
+lock = Flock(fcntl.F_WRLCK, os.SEEK_SET, 2**63 - 2, 1, 0)
+fcntl.fcntl(fd, fcntl.F_OFD_SETLK, bytes(lock))
+print('held', flush=True)
+sys.stdin.readline()
+os._exit(0)
+'''
+        with subprocess.Popen([sys.executable, '-I', '-u', '-c', script, str(self.db)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as child:
+            try:
+                self.assertEqual(ready_line(child), 'held')
+                self.assert_refused('database busy')
+                self.assertFalse(any(self.root.glob('.br-wal-copy-*')))
+            finally:
+                child.stdin.write('release\n')
+                child.stdin.flush()
+                child.wait(timeout=10)
+
+    def test_input_path_exchange_detected_before_publication(self):
+        replay = recovery.replay
+        def exchange(*args):
+            replay(*args)
+            saved = self.root / 'original-inode.db'
+            self.db.rename(saved)
+            self.db.write_bytes(saved.read_bytes())
+        with mock.patch.object(recovery, 'replay', side_effect=exchange):
+            with self.assertRaisesRegex(recovery.RecoveryError, 'source name changed identity'):
+                recovery.recover_copy(self.db, self.output)
+        self.assertFalse(self.output.exists())
+
+    def test_symlinked_sidecar_is_not_followed(self):
+        unrelated = self.root / 'unrelated'
+        unrelated.write_bytes(b'unrelated data')
+        recovery.component(self.db, '-shm').symlink_to(unrelated)
+        self.assert_refused('Too many levels|symbolic link')
+        self.assertEqual(unrelated.read_bytes(), b'unrelated data')
+
+
+def qualify_br(br: Path) -> None:
+    """Run only on an explicitly supplied real binary; never substitute SQLite."""
+    spec = importlib.util.spec_from_file_location('fixture_556', SCRIPT.parents[1] /
+                                                'tests/e2e_scripts/wal_recovery_556.py')
+    base = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(base)
+    br = br.resolve(strict=True)
+    recovery.require(br.is_file() and os.access(br, os.X_OK), 'not an executable br')
+    root = Path(tempfile.mkdtemp(prefix='br-wal-copy-br-'))
+    print(f'Retaining actual-br recovery qualification at {root}', flush=True)
+    seed = base.setup_seed(br, root / 'seed')
+    ambient = base.setup_seed(br, root / 'ambient')
+    orphan = root / 'orphan' / 'selected.db'
+    base.retain(family(seed), orphan)
+    issue_id = base.orphaned_closure(orphan)
+    missing = family(orphan)
+    missing['-shm'] = None
+    source = root / 'source' / "-selected ' λ.db"
+    base.retain(missing, source)
+    ambient_before = family(ambient)
+    ambient_artifacts = base.recovery_files(ambient.parent)
+    output = root / 'recovered'
+    result = subprocess.run([sys.executable, str(SCRIPT), '--db', str(source), '--output', str(output)],
+                            capture_output=True, text=True, timeout=60, check=False)
+    (root / 'recovery.stdout').write_text(result.stdout)
+    (root / 'recovery.stderr').write_text(result.stderr)
+    recovery.require(result.returncode == 0, f'copy recovery failed: {result.stderr}')
+    report = json.loads(result.stdout)
+    db = Path(report['database_path'])
+    flags = ['--db', str(db), '--no-auto-import', '--no-auto-flush']
+    listed = base.run_br(br, root, ambient.parent, [*flags, 'list', '--all', '--json'], 'list-before')
+    recovery.require(listed.returncode == 0, f'recovered br list failed: {listed.stderr}')
+    issues = json.loads(listed.stdout)['issues']
+    recovery.require(any(row['id'] == issue_id and row['status'] == 'closed' for row in issues),
+                     'br did not observe the recovered WAL-only closure')
+    created = base.run_br(br, root, ambient.parent,
+                          [*flags, 'create', 'GH562 deliberate post-copy write', '--json'], 'create-after')
+    recovery.require(created.returncode == 0, f'recovered br write failed: {created.stderr}')
+    listed = base.run_br(br, root, ambient.parent, [*flags, 'list', '--all', '--json'], 'list-after')
+    recovery.require(listed.returncode == 0, f'post-write br list failed: {listed.stderr}')
+    recovery.require(any(row['title'] == 'GH562 deliberate post-copy write'
+                         for row in json.loads(listed.stdout)['issues']), 'br write did not persist')
+    recovery.require(rows(db, 'SELECT status,closed_at,close_reason FROM issues WHERE id=' +
+                          "'" + issue_id.replace("'", "''") + "'", immutable=False) ==
+                     [('closed', base.STAMP, base.REASON)], 'br write lost the WAL-only closure')
+    recovery.require(family(source) == missing, 'source family changed')
+    recovery.require(family(ambient) == ambient_before, 'ambient database changed')
+    recovery.require(base.recovery_files(ambient.parent) == ambient_artifacts, 'ambient artifacts changed')
+    print('Actual br: recovered closure, successful new write, and unchanged source/ambient verified.')
+
+
 if __name__ == '__main__':
-    unittest.main(verbosity=2)
+    if '--br' in sys.argv[1:]:
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument('--br', type=Path, required=True)
+        qualify_br(parser.parse_args().br)
+    else:
+        unittest.main(verbosity=2)

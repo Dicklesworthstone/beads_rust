@@ -16,6 +16,8 @@ on:
       - 'tests/e2e_scripts/wal_recovery_556.py'
       - 'tests/e2e_scripts/wal_recovery_562.py'
       - 'tests/e2e_scripts/wal_admission_561.py'
+      - 'scripts/recover_orphaned_wal.py'
+      - 'tests/e2e_scripts/test_recover_orphaned_wal.py'
       - 'Cargo.toml'
       - 'Cargo.lock'
   workflow_dispatch:
@@ -41,6 +43,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Exercise copy recovery, crash boundaries, and source preservation
+        run: python3 tests/e2e_scripts/test_recover_orphaned_wal.py
       - name: Install the repository's CI toolchain
         run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt,clippy
       - name: Build br
@@ -65,6 +69,9 @@ jobs:
       - name: Exercise empty-WAL admission and preservation
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: python3 tests/e2e_scripts/wal_admission_561.py --br "$PWD/target/debug/br"
+      - name: Qualify recovered copies with actual br reads and writes
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 tests/e2e_scripts/test_recover_orphaned_wal.py --br "$PWD/target/debug/br"
       - name: Retain the binary, fixtures, and recovery evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -80,3 +87,5 @@ jobs:
             /tmp/br-562-selftest-*
             /tmp/br-admission-561-*
             /tmp/br-561-selftest-*
+            /tmp/br-wal-copy-test-*
+            /tmp/br-wal-copy-br-*
