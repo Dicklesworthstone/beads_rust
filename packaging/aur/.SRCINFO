@@ -1,6 +1,6 @@
 pkgbase = br-bin
 	pkgdesc = Agent-first issue tracker (SQLite + JSONL)
-	pkgver = 0.7.4
+	pkgver = 0.7.5
 	pkgrel = 1
 	url = https://github.com/Dicklesworthstone/beads_rust
 	arch = x86_64
@@ -12,9 +12,9 @@ pkgbase = br-bin
 	conflicts = br-git
 	options = !strip
 	options = !debug
-	source_x86_64 = br-bin-0.7.4-x86_64.tar.gz::https://github.com/Dicklesworthstone/beads_rust/releases/download/v0.7.4/br-0.7.4-linux_amd64.tar.gz
-	sha256sums_x86_64 = ba9e493175a1859b4d0427ad32e8636b26a128416041ed7bc7d41ab81ddc3333
-	source_aarch64 = br-bin-0.7.4-aarch64.tar.gz::https://github.com/Dicklesworthstone/beads_rust/releases/download/v0.7.4/br-0.7.4-linux_arm64.tar.gz
-	sha256sums_aarch64 = 7e9dd1da447ae663534fe46f1fd778a6bce1f0e36b4e3e9844770e3579dc7bd5
+	source_x86_64 = br-bin-0.7.5-x86_64.tar.gz::https://github.com/Dicklesworthstone/beads_rust/releases/download/v0.7.5/br-0.7.5-linux_amd64.tar.gz
+	sha256sums_x86_64 = 02f2765793894d7dbea24f8cc84f48d375e244674cdf3425dd2d04e2ef119d92
+	source_aarch64 = br-bin-0.7.5-aarch64.tar.gz::https://github.com/Dicklesworthstone/beads_rust/releases/download/v0.7.5/br-0.7.5-linux_arm64.tar.gz
+	sha256sums_aarch64 = c304b15b0156dbd26faa979dc83a0109d010005675cbb76b220cd302f2dc6a16
 
 pkgname = br-bin
