@@ -35447,6 +35447,7 @@ required_fields:
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn missing_wal_index_recovery_preserves_valid_wal_only_pending_receipt() {
         let temp = TempDir::new().unwrap();
@@ -35528,23 +35529,45 @@ required_fields:
             )
             .unwrap(),
         );
-        crate::cli::commands::doctor_subsystems::schema_migration::recover_wal_index_for_startup(
-            temp.path(),
-            &db_path,
-            &authority,
-        )
-        .unwrap();
-        // An engine with a private in-memory index (Windows) needs no file
-        // and must not be sent through recovery for its absence (GH #520).
-        assert_eq!(
-            shm_path.is_file(),
-            crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY
+        let family_bytes = || {
+            std::iter::once("")
+                .chain(crate::config::db_sidecar_suffixes().copied())
+                .map(|suffix| fs::read(database_sidecar_path(&db_path, suffix)).ok())
+                .collect::<Vec<_>>()
+        };
+        let family_before = family_bytes();
+        let recovered =
+            crate::cli::commands::doctor_subsystems::schema_migration::recover_wal_index_for_startup(
+                temp.path(),
+                &db_path,
+                &authority,
+            );
+        if crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY {
+            // GH #556: the receipt's frames are committed but uncheckpointed,
+            // so this is not an index-only incident. Startup refuses before
+            // copying or opening anything and leaves the receipt in the WAL.
+            let error = recovered.expect_err("framed WAL must refuse index-only recovery");
+            assert!(
+                error.to_string().contains(
+                    "engine recovery refused before opening: WAL contains frames that may \
+                     hold committed, uncheckpointed changes"
+                ),
+                "unexpected refusal: {error}"
+            );
+            assert!(!temp.path().join(".br_recovery").exists());
+        } else {
+            // An engine with a private in-memory index (Windows) needs no file
+            // and must not be sent through recovery for its absence (GH #520).
+            recovered.unwrap();
+        }
+        assert!(
+            !shm_path.exists(),
+            "no index may be rebuilt over WAL frames"
         );
         assert_eq!(
-            SqliteStorage::inspect_pending_sync_merge_under_authority(&db_path, &authority)
-                .unwrap(),
-            expected,
-            "index recovery must preserve the exact valid pending receipt",
+            family_bytes(),
+            family_before,
+            "the pending receipt's family must stay byte-identical"
         );
         assert_eq!(fs::read(&db_path).unwrap(), main_before);
         assert_eq!(fs::read(&wal_path).unwrap(), wal_before);

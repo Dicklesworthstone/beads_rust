@@ -8263,6 +8263,7 @@ mod tests {
     #[test]
     fn recovery_532_private_close_contention_is_fail_closed_before_live_install() {
         let (_temp, migration) = reviewed_source_migration_context("beads.db", 17);
+        truncate_fixture_wal(&migration.db_path);
         let before = recovery_family_witness(&migration.db_path).unwrap();
         let mut stage = "live-preflight".to_string();
         crate::franken_sync::tests::FAIL_NEXT_CLOSE.with(|fault| fault.set(true));
@@ -8611,6 +8612,19 @@ mod tests {
         reviewed_v14_migration_context_with_database_name("beads.db")
     }
 
+    /// Recovery refuses a frame-bearing WAL before it opens or copies anything
+    /// (GH #556). Tests of a later recovery stage start from a truncated WAL so
+    /// that refusal does not answer first.
+    fn truncate_fixture_wal(db_path: &Path) {
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        close_connection(conn).unwrap();
+        let wal_size = fs::metadata(family_component_path(db_path, "-wal"))
+            .unwrap()
+            .len();
+        assert!(wal_size <= 32, "fixture WAL must hold no frames");
+    }
+
     #[test]
     fn vacuum_candidate_never_opens_or_rewrites_live_wal_family() {
         let (_temp, migration) = reviewed_source_migration_context("beads.db", 17);
@@ -8668,37 +8682,32 @@ mod tests {
     }
 
     #[test]
-    fn engine_recovery_preserves_wal_rows_and_complete_backup() {
-        assert_engine_recovery_preserves_family(false);
+    fn engine_recovery_refuses_framed_wal_and_preserves_family() {
+        // GH #556: committed, uncheckpointed WAL frames are not an index-only
+        // incident. Recovery refuses before copying, opening or rewriting
+        // anything; the owning engine has to checkpoint first.
+        let (_temp, migration, _expected) = engine_recovery_fixture(false);
+        let before = recovery_family_witness(&migration.db_path).unwrap();
+        let error = execute_recover(&DoctorMigrateSchemaRecoverArgs { json: true }, &migration)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "engine recovery refused before opening: WAL contains frames that may hold \
+                 committed, uncheckpointed changes"
+            ),
+            "unexpected refusal: {error}"
+        );
+        assert_eq!(
+            recovery_family_witness(&migration.db_path).unwrap(),
+            before,
+            "the refusal must leave every family byte and mode unchanged"
+        );
+        assert!(!migration_runs_root(&migration.beads_dir).exists());
     }
 
     #[test]
     fn engine_recovery_admits_legacy_empty_wal_before_migration() {
-        assert_engine_recovery_preserves_family(true);
-    }
-
-    fn assert_engine_recovery_preserves_family(checkpoint: bool) {
-        let (_temp, migration) = reviewed_source_migration_context("beads.db", 17);
-        let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
-        conn.execute("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("UPDATE issues SET title='committed WAL recovery row'")
-            .unwrap();
-        if checkpoint {
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-        }
-        close_connection(conn).unwrap();
-        let wal_size = fs::metadata(family_component_path(&migration.db_path, "-wal"))
-            .unwrap()
-            .len();
-        if checkpoint {
-            assert!(wal_size <= 32, "checkpointed fixture has no WAL frames");
-        } else {
-            assert!(wal_size > 32, "fixture must retain committed WAL frames");
-        }
-        let expected = logical_witness(&migration.db_path).unwrap();
-        let shm = family_component_path(&migration.db_path, "-shm");
-        fs::write(&shm, vec![0_u8; 32_768]).unwrap();
-        assert!(open_read_only(&migration.db_path).is_err());
+        let (_temp, migration, expected) = engine_recovery_fixture(true);
         let before = recovery_family_witness(&migration.db_path).unwrap();
         execute_recover(&DoctorMigrateSchemaRecoverArgs { json: true }, &migration).unwrap();
         let after = logical_witness(&migration.db_path).unwrap();
@@ -8722,27 +8731,56 @@ mod tests {
         assert!(run.join("recovery-complete.json").is_file());
         let plan = build_plan(&migration.db_path).unwrap();
         assert!(plan.eligible);
-        if checkpoint {
-            execute_apply(
-                &DoctorMigrateSchemaApplyArgs {
-                    plan_token: plan.plan_token.unwrap(),
-                    json: true,
-                },
-                &migration,
-            )
+        execute_apply(
+            &DoctorMigrateSchemaApplyArgs {
+                plan_token: plan.plan_token.unwrap(),
+                json: true,
+            },
+            &migration,
+        )
+        .unwrap();
+        let migrated = logical_witness(&migration.db_path).unwrap();
+        assert_eq!(
+            migrated.user_version,
+            u32::try_from(CURRENT_SCHEMA_VERSION).unwrap()
+        );
+        assert_eq!(migrated.integrity_check, "ok");
+    }
+
+    /// A v17 WAL family whose index is poisoned, with committed WAL frames
+    /// (`checkpoint == false`) or truncated to its header (`true`), plus its
+    /// logical contents before the index was poisoned.
+    fn engine_recovery_fixture(
+        checkpoint: bool,
+    ) -> (TempDir, MigrationContext, LogicalDatabaseWitness) {
+        let (temp, migration) = reviewed_source_migration_context("beads.db", 17);
+        let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("UPDATE issues SET title='committed WAL recovery row'")
             .unwrap();
-            let migrated = logical_witness(&migration.db_path).unwrap();
-            assert_eq!(
-                migrated.user_version,
-                u32::try_from(CURRENT_SCHEMA_VERSION).unwrap()
-            );
-            assert_eq!(migrated.integrity_check, "ok");
+        if checkpoint {
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
         }
+        close_connection(conn).unwrap();
+        let wal_size = fs::metadata(family_component_path(&migration.db_path, "-wal"))
+            .unwrap()
+            .len();
+        if checkpoint {
+            assert!(wal_size <= 32, "checkpointed fixture has no WAL frames");
+        } else {
+            assert!(wal_size > 32, "fixture must retain committed WAL frames");
+        }
+        let expected = logical_witness(&migration.db_path).unwrap();
+        let shm = family_component_path(&migration.db_path, "-shm");
+        fs::write(&shm, vec![0_u8; 32_768]).unwrap();
+        assert!(open_read_only(&migration.db_path).is_err());
+        (temp, migration, expected)
     }
 
     #[test]
     fn engine_recovery_refuses_peer_before_creating_backup() {
         let (_temp, migration) = reviewed_v14_migration_context();
+        truncate_fixture_wal(&migration.db_path);
         let peer = crate::sync::DatabaseOpenerLease::register(&migration.db_path).unwrap();
         assert!(peer.is_registered());
         let before = recovery_family_witness(&migration.db_path).unwrap();
@@ -8757,6 +8795,7 @@ mod tests {
     #[test]
     fn engine_recovery_refuses_engine_sidecar_symlink() {
         let (_temp, migration) = reviewed_v14_migration_context();
+        truncate_fixture_wal(&migration.db_path);
         let outside = migration.beads_dir.join("outside-marker");
         fs::write(&outside, b"untouched").unwrap();
         let marker = family_component_path(&migration.db_path, ".fsqlite-migration-state");
@@ -8774,6 +8813,7 @@ mod tests {
     #[test]
     fn engine_recovery_preserves_prestate_when_private_open_fails() {
         let (_temp, migration) = reviewed_v14_migration_context();
+        truncate_fixture_wal(&migration.db_path);
         fs::write(&migration.db_path, b"not a database").unwrap();
         let before = recovery_family_witness(&migration.db_path).unwrap();
         let error =
