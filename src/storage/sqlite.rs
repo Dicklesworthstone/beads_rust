@@ -8563,24 +8563,14 @@ impl SqliteStorage {
     pub(crate) fn get_issue_for_preservation(&self, id: &str) -> Result<Option<Issue>> {
         let issue = match Self::get_issue_row_from_conn(&self.conn, id) {
             Ok(Some(row)) => Self::issue_from_row_for_preservation(&row)?,
-            Ok(None) => return Ok(None),
+            Ok(None) => {
+                // #546: a damaged primary-key index can report a miss for a
+                // live table row. Re-prove absence with the batched scan shape
+                // before treating a dirty marker as orphaned.
+                return self.get_issue_for_preservation_by_scan(id, None);
+            }
             Err(keyed_error) => {
-                let Ok(issues) = self.get_issues_by_ids_with_decoder(
-                    &[id.to_string()],
-                    Self::issue_from_row_for_preservation,
-                ) else {
-                    return Err(keyed_error);
-                };
-                let mut issues = issues.into_iter();
-                match (issues.next(), issues.next()) {
-                    (None, None) => return Ok(None),
-                    (Some(issue), None) => issue,
-                    _ => {
-                        return Err(BeadsError::Config(format!(
-                            "multiple issue rows match {id}; no unique row can be snapshotted"
-                        )));
-                    }
-                }
+                return self.get_issue_for_preservation_by_scan(id, Some(keyed_error));
             }
         };
         if issue.id != id {
@@ -8590,6 +8580,32 @@ impl SqliteStorage {
             )));
         }
         Ok(Some(issue))
+    }
+
+    fn get_issue_for_preservation_by_scan(
+        &self,
+        id: &str,
+        keyed_error: Option<BeadsError>,
+    ) -> Result<Option<Issue>> {
+        let issues = match self.get_issues_by_ids_with_decoder(
+            &[id.to_string()],
+            Self::issue_from_row_for_preservation,
+        ) {
+            Ok(issues) => issues,
+            Err(scan_error) => return Err(keyed_error.unwrap_or(scan_error)),
+        };
+        let mut issues = issues.into_iter();
+        match (issues.next(), issues.next()) {
+            (None, None) => Ok(None),
+            (Some(issue), None) if issue.id == id => Ok(Some(issue)),
+            (Some(issue), None) => Err(BeadsError::internal(format!(
+                "storage consistency: preservation scan requested {id:?} but row returned id {:?}",
+                issue.id
+            ))),
+            _ => Err(BeadsError::Config(format!(
+                "multiple issue rows match {id}; no unique row can be snapshotted"
+            ))),
+        }
     }
 
     /// Get metadata for all issues to optimize import collision detection.
@@ -22720,6 +22736,34 @@ mod tests {
             dependencies: vec![],
             comments: vec![],
         }
+    }
+
+    #[test]
+    fn preservation_scan_recovers_a_row_independently_of_the_keyed_lookup() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let at = Utc.with_ymd_and_hms(2026, 10, 14, 1, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-preservation-scan",
+            "Must survive a damaged primary-key index",
+            Status::Open,
+            2,
+            None,
+            at,
+            None,
+        );
+        storage.create_issue(&issue, "test").unwrap();
+
+        let recovered = storage
+            .get_issue_for_preservation_by_scan(&issue.id, None)
+            .unwrap()
+            .expect("table-scan fallback must find the live issue row");
+        assert_eq!(recovered.id, issue.id);
+        assert_eq!(recovered.title, issue.title);
+
+        assert!(storage
+            .get_issue_for_preservation_by_scan("bd-definitely-absent", None)
+            .unwrap()
+            .is_none());
     }
 
     fn sync_merge_test_intent(
