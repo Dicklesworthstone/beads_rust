@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/wal-recovery.yml'
+      - '.github/workflows/fsqlite-admission-qualification.yml'
+      - 'tests/test_fsqlite_family_gate.py'
       - 'src/cli/commands/doctor_subsystems/engine.rs'
       - 'src/cli/commands/doctor_subsystems/schema_migration*'
       - 'src/cli/commands/doctor_subsystems/schema_migration/**'
@@ -48,6 +50,7 @@ jobs:
         run: |
           python3 tests/e2e_scripts/wal_recovery_556.py --self-test
           python3 tests/e2e_scripts/wal_admission_561.py --self-test
+          python3 tests/test_fsqlite_family_gate.py
       - name: Exercise the actual executable
         run: python3 tests/e2e_scripts/wal_recovery_556.py --br "$PWD/target/debug/br"
       - name: Validate orphaned-WAL checkpoint oracles

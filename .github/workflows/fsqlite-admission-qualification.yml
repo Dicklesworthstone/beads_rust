@@ -34,15 +34,18 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_TERM_COLOR: never
       RUST_BACKTRACE: 1
+      TMPDIR: /tmp
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install the repository's CI toolchain
         run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt,clippy
+      - name: Test the exact preparation and resolution gates
+        run: python3 tests/test_fsqlite_family_gate.py
       - name: Validate and prepare the entire direct engine family
         run: |
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import json, os, re, tomllib
           from pathlib import Path
           path = Path('Cargo.toml')
@@ -76,7 +79,7 @@ jobs:
       - name: Verify the complete resolved family, including transitive crates
         run: |
           cargo +nightly-2026-08-31 metadata --locked --format-version 1 --all-features > engine-metadata.json
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import json
           from pathlib import Path
           expected = json.loads(Path('expected-family.json').read_text())
@@ -85,7 +88,8 @@ jobs:
           assert family and set(expected['direct']) <= {p['name'] for p in family}
           assert all(p['version'] == expected['version'] for p in family), 'mixed engine-family versions'
           sources = {p.get('source') for p in family}
-          assert len(sources) == 1 and next(iter(sources), '').startswith('registry+'), 'mixed/unpublished engine sources'
+          source = next(iter(sources)) if len(sources) == 1 else None
+          assert isinstance(source, str) and source.startswith('registry+'), 'mixed/unpublished engine sources'
           assert len({p['name'] for p in family}) == len(family), 'duplicate engine crate identities'
           Path('resolved-family.json').write_text(json.dumps(
               [{'name': p['name'], 'version': p['version'], 'source': p['source'], 'id': p['id']}
