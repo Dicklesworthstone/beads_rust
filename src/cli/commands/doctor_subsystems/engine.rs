@@ -172,7 +172,6 @@ pub struct EngineBlock {
     pub crate_name: &'static str,
     /// The `fsqlite` version from Cargo.lock at build time.
     pub version: &'static str,
-    pub version: &'static str,
     pub database: String,
     pub sidecars: Vec<EngineFile>,
     pub sole_opener_lease: Option<OpenerLease>,
