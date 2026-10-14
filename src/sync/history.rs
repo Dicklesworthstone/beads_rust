@@ -494,6 +494,13 @@ fn target_key_for_path(beads_dir: &Path, target_path: &Path) -> String {
 }
 
 pub(crate) fn resolve_backup_target_path(beads_dir: &Path, backup_path: &Path) -> Result<PathBuf> {
+    resolve_backup_target(beads_dir, backup_path).map(|(target, _)| target)
+}
+
+fn resolve_backup_target(
+    beads_dir: &Path,
+    backup_path: &Path,
+) -> Result<(PathBuf, BackupMetadata)> {
     let backup_name = backup_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -516,7 +523,43 @@ pub(crate) fn resolve_backup_target_path(beads_dir: &Path, backup_path: &Path) -
     let target_path = metadata.target.resolve_path(beads_dir)?;
 
     validate_sync_path_with_external(&target_path, beads_dir, true)?;
-    Ok(target_path)
+    Ok((target_path, metadata))
+}
+
+/// Bind the restore target and recorded digest from one metadata read, then
+/// capture the backup through the shared no-follow immutable-source path.
+/// Callers must copy this snapshot, never reopen the mutable backup pathname.
+/// A recorded digest is an integrity check, not authentication of the backup.
+/// Legacy metadata without a digest remains readable; a present but malformed
+/// or mismatched digest is never treated as a legacy backup or bypassed by force.
+pub(crate) fn capture_backup_restore_source(
+    beads_dir: &Path,
+    backup_path: &Path,
+) -> Result<(PathBuf, JsonlSourceSnapshot)> {
+    let (target_path, metadata) = resolve_backup_target(beads_dir, backup_path)?;
+    if let Some(expected) = &metadata.raw_sha256
+        && (expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(BeadsError::Config(format!(
+            "History backup '{}' has an invalid recorded SHA-256; restore was not started",
+            backup_path.display()
+        )));
+    }
+    let source = capture_optional_jsonl_source(backup_path)?.ok_or_else(|| {
+        BeadsError::Config(format!("History backup '{}' is missing", backup_path.display()))
+    })?;
+    if let Some(expected) = &metadata.raw_sha256
+        && !expected.eq_ignore_ascii_case(source.raw_sha256())
+    {
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "History backup '{}' failed its recorded SHA-256 integrity check; \
+                 backup bytes and metadata disagree. Restore was not started",
+                backup_path.display()
+            ),
+        });
+    }
+    Ok((target_path, source))
 }
 
 /// Backup the JSONL file before export.
@@ -1759,5 +1802,78 @@ mod tests {
             fs::read_dir(&outside_dir).unwrap().next().is_none(),
             "symlinked history directory must not receive backups"
         );
+    }
+
+    #[test]
+    fn restore_source_checks_raw_bytes_and_retains_the_verified_snapshot() {
+        for protected in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let beads = temp.path().canonicalize().unwrap().join(".beads");
+            fs::create_dir(&beads).unwrap();
+            let target = beads.join("issues.jsonl");
+            let original = b" {\"id\":\"bd-one\",\"title\":\"kept\"}\r\n\n";
+            fs::write(&target, original).unwrap();
+            let source = capture_optional_jsonl_source(&target).unwrap().unwrap();
+            let backup = if protected {
+                backup_before_jsonl_salvage(&beads, &target, &source).unwrap()
+            } else {
+                backup_before_export_snapshot(&beads, &HistoryConfig::default(), &target, &source)
+                    .unwrap();
+                list_backups(&beads.join(".br_history"), None).unwrap()[0].path.clone()
+            };
+            fs::write(&target, b"current export must stay untouched").unwrap();
+            let metadata_before = fs::read(backup_metadata_path(&backup)).unwrap();
+            let (resolved, captured) = capture_backup_restore_source(&beads, &backup).unwrap();
+            assert_eq!(resolved, target);
+            assert_eq!(captured.raw_sha256(), source.raw_sha256());
+
+            // Change only formatting: canonical content equality is not a raw
+            // backup-integrity proof. The already captured spool remains exact.
+            let changed = b"{\"id\":\"bd-one\",\"title\":\"kept\"}\n";
+            fs::write(&backup, changed).unwrap();
+            let changed_source = capture_optional_jsonl_source(&backup).unwrap().unwrap();
+            assert_eq!(changed_source.content_sha256(), source.content_sha256());
+            let error = capture_backup_restore_source(&beads, &backup).unwrap_err();
+            assert!(matches!(error, BeadsError::SyncConflict { .. }));
+            let mut copied = Vec::new();
+            io::copy(&mut captured.reader(), &mut copied).unwrap();
+            assert_eq!(copied, original);
+            assert_eq!(fs::read(&backup).unwrap(), changed);
+            assert_eq!(fs::read(backup_metadata_path(&backup)).unwrap(), metadata_before);
+            assert_eq!(fs::read(&target).unwrap(), b"current export must stay untouched");
+        }
+    }
+
+    #[test]
+    fn restore_source_distinguishes_legacy_absence_from_invalid_digest() {
+        let temp = TempDir::new().unwrap();
+        let beads = temp.path().canonicalize().unwrap().join(".beads");
+        let history = beads.join(".br_history");
+        fs::create_dir_all(&history).unwrap();
+        let target = beads.join("issues.jsonl");
+        let backup = history.join("issues.20260101_000000.jsonl");
+        let bytes = b"retained non-JSON bytes\xff\n";
+        fs::write(&backup, bytes).unwrap();
+        write_backup_metadata(&beads, &target, &backup, None).unwrap();
+        let (resolved, legacy) = capture_backup_restore_source(&beads, &backup).unwrap();
+        assert_eq!(resolved, target);
+        let mut copied = Vec::new();
+        io::copy(&mut legacy.reader(), &mut copied).unwrap();
+        assert_eq!(copied, bytes, "history restore is byte-preserving, not a JSON parser");
+
+        let mut metadata = read_backup_metadata(&backup).unwrap().unwrap();
+        for invalid in [String::new(), "0".repeat(63), "z".repeat(64)] {
+            metadata.raw_sha256 = Some(invalid);
+            fs::write(backup_metadata_path(&backup), serde_json::to_vec(&metadata).unwrap()).unwrap();
+            let error = capture_backup_restore_source(&beads, &backup).unwrap_err();
+            assert!(matches!(error, BeadsError::Config(message)
+                if message.contains("invalid recorded SHA-256")));
+        }
+        metadata.raw_sha256 = Some(legacy.raw_sha256().to_ascii_uppercase());
+        fs::write(backup_metadata_path(&backup), serde_json::to_vec(&metadata).unwrap()).unwrap();
+        let (_, verified) = capture_backup_restore_source(&beads, &backup).unwrap();
+        assert_eq!(verified.raw_sha256(), legacy.raw_sha256());
+        assert_eq!(fs::read(&backup).unwrap(), bytes);
+        assert!(!target.exists());
     }
 }

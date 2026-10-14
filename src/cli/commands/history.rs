@@ -629,7 +629,14 @@ fn restore_backup_with_before_commit(
     let backup_path = history_dir.join(&backup_name);
     ensure_regular_backup_file(&backup_path, &backup_name)?;
 
-    let target_path = current_jsonl_path_for_backup(beads_dir, &backup_name, active_jsonl_path)?;
+    let (target_path, source) = history::capture_backup_restore_source(beads_dir, &backup_path)?;
+    let cwd = std::env::current_dir().ok();
+    let target_path = validate_backup_active_target(
+        beads_dir,
+        target_path,
+        active_jsonl_path,
+        cwd.as_deref(),
+    )?;
     let target_name = target_path
         .file_name()
         .unwrap_or_default()
@@ -652,7 +659,9 @@ fn restore_backup_with_before_commit(
     if let Some(parent) = target_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut reader = File::open(&backup_path)?;
+    // The digest was checked against this immutable spool. Reopening the
+    // backup path here would let a later replacement supply unverified bytes.
+    let mut reader = source.reader();
     let (temp_path, mut writer, mut temp_guard) =
         create_restore_temp_file(&target_path, beads_dir)?;
     io::copy(&mut reader, &mut writer)?;
@@ -906,6 +915,15 @@ fn current_jsonl_path_for_backup_with_cwd(
         beads_dir,
         &beads_dir.join(".br_history").join(backup_name),
     )?;
+    validate_backup_active_target(beads_dir, target_path, active_jsonl_path, cwd)
+}
+
+fn validate_backup_active_target(
+    beads_dir: &Path,
+    target_path: PathBuf,
+    active_jsonl_path: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Result<PathBuf> {
     let is_external_target = is_external_jsonl_target(beads_dir, &target_path);
 
     if is_external_target {
@@ -1970,6 +1988,79 @@ mod tests {
             assert!(!referent.exists());
             assert_eq!(fs::read(&rollback).unwrap(), b"original state");
             assert_eq!(fs::read(&candidate).unwrap(), b"restored state");
+        }
+
+        fn record_fixture_digest(history: &Path) -> Vec<u8> {
+            use sha2::{Digest, Sha256};
+
+            let mut metadata: serde_json::Value = serde_json::from_str(METADATA).unwrap();
+            metadata["raw_sha256"] = json!(crate::util::hex_encode(&Sha256::digest(BACKUP)));
+            let bytes = serde_json::to_vec(&metadata).unwrap();
+            fs::write(history.join(BACKUP_NAME).with_extension("jsonl.meta.json"), &bytes).unwrap();
+            bytes
+        }
+
+        #[test]
+        fn corrupt_backup_never_reaches_restore_installation_even_with_force() {
+            for force in [false, true] {
+                for changed in [Vec::new(), vec![b'x'; BACKUP.len()], b"different snapshot\n".to_vec()] {
+                    let (_temp, beads, history) = fixture();
+                    let metadata = record_fixture_digest(&history);
+                    let backup = history.join(BACKUP_NAME);
+                    fs::write(&backup, &changed).unwrap();
+                    let target = beads.join("issues.jsonl");
+                    if force {
+                        fs::write(&target, b"current unique export").unwrap();
+                    }
+                    let reached_install = Cell::new(false);
+                    let ctx = OutputContext::from_flags(false, true, true);
+                    let result = restore_backup_with_before_commit(
+                        &beads, &history, BACKUP_NAME, force, None, &ctx,
+                        |_| {
+                            reached_install.set(true);
+                            Ok(())
+                        },
+                    );
+                    assert!(matches!(&result, Err(BeadsError::SyncConflict { message })
+                        if message.contains("SHA-256 integrity check")), "{result:?}");
+                    assert!(!reached_install.get(), "refuse before staging a live replacement");
+                    if force {
+                        assert_eq!(fs::read(&target).unwrap(), b"current unique export");
+                    } else {
+                        assert!(!target.exists());
+                    }
+                    assert_eq!(fs::read(&backup).unwrap(), changed);
+                    assert_eq!(fs::read(backup.with_extension("jsonl.meta.json")).unwrap(), metadata);
+                    assert_eq!(fs::read(beads.join("beads.db")).unwrap(), b"database remains untouched");
+                    assert!(fs::read_dir(&beads).unwrap().all(|entry| {
+                        !entry.unwrap().path().extension().is_some_and(|ext| ext == "tmp")
+                    }));
+                }
+            }
+        }
+
+        #[test]
+        fn valid_recorded_digest_restores_without_bypassing_active_target_policy() {
+            let (_temp, beads, history) = fixture();
+            record_fixture_digest(&history);
+            let target = beads.join("issues.jsonl");
+            fs::write(&target, b"current export").unwrap();
+            let ctx = OutputContext::from_flags(false, true, true);
+            restore_backup(&beads, &history, BACKUP_NAME, true, None, &ctx).unwrap();
+            assert_eq!(fs::read(&target).unwrap(), BACKUP);
+
+            let external = beads.parent().unwrap().join("external.jsonl");
+            fs::write(&external, b"external current export").unwrap();
+            let metadata_path = history.join(BACKUP_NAME).with_extension("jsonl.meta.json");
+            let mut metadata: serde_json::Value = serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+            metadata["target"] = json!({"kind": "absolute", "path": external});
+            fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+            let error = restore_backup(&beads, &history, BACKUP_NAME, true, Some(&target), &ctx).unwrap_err();
+            assert!(error.to_string().contains("does not match the active JSONL path"), "{error}");
+            assert_eq!(fs::read(&external).unwrap(), b"external current export");
+            assert_eq!(fs::read(&target).unwrap(), BACKUP);
+            assert_eq!(fs::read(history.join(BACKUP_NAME)).unwrap(), BACKUP);
+            assert_eq!(fs::read(beads.join("beads.db")).unwrap(), b"database remains untouched");
         }
     }
 }
