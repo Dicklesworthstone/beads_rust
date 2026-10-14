@@ -527,6 +527,14 @@ fn execute_recover(
 /// Bytes in a SQLite WAL header. A WAL shorter than this cannot hold a frame.
 const WAL_HEADER_BYTES: u64 = 32;
 
+/// FrankenSQLite 0.4.12+ treats an existing zero-byte WAL as headerless and
+/// requires its owner to bind a generation before a writable append. The
+/// currently pinned 0.4.10 does not have that state: forcing zero-byte families
+/// through writable recovery would regress them. Flip this only in the same
+/// commit that moves the complete engine family to a release with headerless
+/// WAL semantics.
+const ENGINE_REQUIRES_HEADERLESS_WAL_GENERATION_BINDING: bool = false;
+
 /// Whether an existing WAL family lacks its regenerable shared index.
 /// This is only an advisory probe; recovery repeats it under family authority.
 ///
@@ -543,10 +551,23 @@ pub fn missing_wal_index(db_path: &Path) -> Result<bool> {
     )
 }
 
-/// [`missing_wal_index`] for an engine that does (or does not) read the
-/// on-disk index. An engine that rebuilds its index privately on every open
-/// never needs the file, so its absence is not a recovery case (GH #520).
+/// [`missing_wal_index`] for the currently pinned engine behavior.
 fn missing_wal_index_for_engine(db_path: &Path, engine_reads_on_disk_index: bool) -> Result<bool> {
+    missing_wal_index_for_engine_capability(
+        db_path,
+        engine_reads_on_disk_index,
+        ENGINE_REQUIRES_HEADERLESS_WAL_GENERATION_BINDING,
+    )
+}
+
+/// Probe a concrete engine capability so the 0.4.10 locked lane and 0.4.12
+/// candidate behavior are independently testable without pretending one
+/// release has the other's writable-admission contract.
+fn missing_wal_index_for_engine_capability(
+    db_path: &Path,
+    engine_reads_on_disk_index: bool,
+    headerless_generation_binding_required: bool,
+) -> Result<bool> {
     if !engine_reads_on_disk_index
         || secure_file_metadata(db_path)?.is_none()
         || secure_file_metadata(&family_component_path(db_path, "-shm"))?.is_some()
@@ -555,11 +576,12 @@ fn missing_wal_index_for_engine(db_path: &Path, engine_reads_on_disk_index: bool
     }
     Ok(
         secure_file_metadata(&family_component_path(db_path, "-wal"))?.is_some_and(|metadata| {
-            // GH #561 / FrankenSQLite #515: 0.4.12 requires an owner to bind a
-            // generation before it can recreate a missing index beside an
-            // existing zero-byte WAL. A partial 1..31-byte WAL remains the
-            // separate torn-WAL path and is never generation-binding authority.
-            metadata.len() == 0 || metadata.len() >= WAL_HEADER_BYTES
+            // Header-only and framed WALs already require an index on engines
+            // that consume on-disk SHM. Zero bytes join that set only for the
+            // headerless-WAL engine generation. Partial 1..31-byte WALs remain
+            // the separate torn-WAL path and are never binding authority.
+            metadata.len() >= WAL_HEADER_BYTES
+                || (headerless_generation_binding_required && metadata.len() == 0)
         }),
     )
 }
@@ -6933,8 +6955,18 @@ mod tests {
         // the dedicated quarantine path and Windows/private-index engines do
         // not recover an index they never read.
         fs::write(family_component_path(&db, "-wal"), []).unwrap();
-        assert!(missing_wal_index_for_engine(&db, true).unwrap());
-        assert!(!missing_wal_index_for_engine(&db, false).unwrap());
+        assert!(
+            !missing_wal_index_for_engine(&db, true).unwrap(),
+            "the still-pinned 0.4.10 lane must not be forced through headerless recovery"
+        );
+        assert!(
+            missing_wal_index_for_engine_capability(&db, true, true).unwrap(),
+            "the 0.4.12 headerless capability must enter generation-binding recovery"
+        );
+        assert!(
+            !missing_wal_index_for_engine_capability(&db, false, true).unwrap(),
+            "an engine that never consumes on-disk SHM still needs no index recovery"
+        );
         for length in 1..WAL_HEADER_BYTES {
             fs::write(
                 family_component_path(&db, "-wal"),
@@ -6942,7 +6974,7 @@ mod tests {
             )
             .unwrap();
             assert!(
-                !missing_wal_index_for_engine(&db, true).unwrap(),
+                !missing_wal_index_for_engine_capability(&db, true, true).unwrap(),
                 "partial WAL length {length} must stay on torn-WAL handling"
             );
         }
