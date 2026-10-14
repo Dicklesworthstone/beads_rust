@@ -621,31 +621,66 @@ pub fn quarantine_torn_wal_for_startup(
     let Some(exclusive) = lease.try_exclusive() else {
         return Ok(None);
     };
+
+    // The br opener lease excludes only cooperating br processes. A stock
+    // SQLite reader or writer does not participate in it, and can finish a
+    // WAL header between the advisory length check above and a sidecar rename.
+    // Bind the live database identity and hold SQLite's native lock range plus
+    // the FrankenSQLite namespace guard across the final check and quarantine.
     let result = (|| -> Result<Option<TornWalQuarantine>> {
         authority.verify_database_authority()?;
-        let wal_path = family_component_path(db_path, "-wal");
-        // Re-read under sole-opener admission: a peer may have finished
-        // writing the header between the advisory probe and the lease.
-        let Some(metadata) = secure_file_metadata(&wal_path)? else {
-            return Ok(None);
-        };
-        let wal_length = metadata.len();
-        if !is_torn_wal_length(wal_length) {
-            return Ok(None);
+        let metadata = secure_file_metadata(db_path)?
+            .ok_or_else(|| BeadsError::internal("torn-WAL database disappeared"))?;
+        let retained = File::open(db_path)?;
+        if !same_file_identity(&metadata, &retained.metadata()?) {
+            return Err(BeadsError::internal(
+                "torn-WAL database changed before identity binding",
+            ));
         }
-        let recovery_dir = recovery_artifacts_dir(db_path)?;
-        let quarantined_paths = config::quarantine_database_artifacts(
+        let identity = fsqlite_vfs::FileIdentity::from_file(&retained)?
+            .ok_or_else(|| BeadsError::internal("torn-WAL database identity is unavailable"))?;
+
+        let excluded = crate::franken_sync::wal_index::with_recovery_exclusion(
             db_path,
-            &recovery_dir,
-            [wal_path, family_component_path(db_path, "-shm")],
-            "truncated-wal",
-        )?;
-        authority.verify_database_authority()?;
-        Ok(Some(TornWalQuarantine {
-            wal_length,
-            quarantined_paths,
-        }))
+            identity,
+            || -> Result<Option<TornWalQuarantine>> {
+                authority.verify_database_authority()?;
+                let wal_path = family_component_path(db_path, "-wal");
+                // Re-read while external SQLite openers are excluded. If a
+                // writer completed the header before exclusion was acquired,
+                // this is no longer a torn-WAL incident and nothing moves.
+                let Some(metadata) = secure_file_metadata(&wal_path)? else {
+                    return Ok(None);
+                };
+                let wal_length = metadata.len();
+                if !is_torn_wal_length(wal_length) {
+                    return Ok(None);
+                }
+                let recovery_dir = recovery_artifacts_dir(db_path)?;
+                let quarantined_paths = config::quarantine_database_artifacts(
+                    db_path,
+                    &recovery_dir,
+                    [wal_path, family_component_path(db_path, "-shm")],
+                    "truncated-wal",
+                )?;
+                authority.verify_database_authority()?;
+                Ok(Some(TornWalQuarantine {
+                    wal_length,
+                    quarantined_paths,
+                }))
+            },
+        );
+
+        match excluded {
+            Ok(quarantine) => quarantine,
+            // A live external SQLite user is not authority to rename either
+            // sidecar. Preserve the family and let normal startup contend/read
+            // exactly as it would have without quarantine.
+            Err(error) if engine_recovery_contention(&error) => Ok(None),
+            Err(error) => Err(BeadsError::Database(error)),
+        }
     })();
+
     let released = lease.release_exclusive(exclusive);
     result.and_then(|quarantine| released.map(|()| quarantine))
 }
