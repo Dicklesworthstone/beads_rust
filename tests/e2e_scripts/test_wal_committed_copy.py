@@ -237,6 +237,12 @@ class CommittedCopyTests(unittest.TestCase):
             file.truncate(self.info['committed_length'])
         report = self.assert_copy()
         self.assertEqual(report['wal']['excluded_tail']['bytes'], 0)
+        self.output = self.root / 'strict-complete'
+        strict = self.invoke(enabled=False)
+        self.assertNotIn('copy_last_commit_requested', strict)
+        self.assertNotIn('excluded_tail', strict['wal'])
+        self.assertEqual(strict['recovered_sha256'], report['recovered_sha256'])
+        self.assertEqual(strict['wal'], {k: v for k, v in report['wal'].items() if k != 'excluded_tail'})
 
     def test_65536_byte_pages(self):
         root = self.root / 'large-pages'
@@ -401,13 +407,98 @@ class CommittedCopyTests(unittest.TestCase):
         self.assertGreater(report['wal']['excluded_tail']['validated_uncommitted_frames'], 1)
 
 
+def qualify_br(br):
+    """Use real br schema/commands; source and ambient families are never adopted."""
+    import wal_recovery_556 as base
+
+    br = br.resolve(strict=True)
+    if not br.is_file() or not os.access(br, os.X_OK) or NATIVE is None:
+        raise AssertionError('both actual br and the installed companion are required')
+    root = Path(tempfile.mkdtemp(prefix='br-wal-committed-copy-'))
+    print(f'Actual-br committed-prefix qualification retained at {root}', flush=True)
+    seed = base.setup_seed(br, root / 'seed')
+    ambient = base.setup_seed(br, root / 'ambient')
+    orphan = root / 'orphan' / 'selected.db'
+    retain(family(seed), orphan)
+    issue_id = base.orphaned_closure(orphan)
+    program = r'''
+import os, sqlite3, sys
+db, issue = sys.argv[1:]
+conn = sqlite3.connect(db)
+conn.execute('PRAGMA wal_autocheckpoint=0')
+conn.execute('PRAGMA cache_size=5')
+conn.execute('PRAGMA cache_spill=ON')
+before = os.path.getsize(db + '-wal')
+conn.execute('BEGIN IMMEDIATE')
+conn.execute("UPDATE issues SET status='open', closed_at=NULL, close_reason='' WHERE id=?", (issue,))
+conn.execute('CREATE TABLE uncommitted_copy_probe (id INTEGER PRIMARY KEY, payload BLOB)')
+conn.executemany('INSERT INTO uncommitted_copy_probe VALUES (?, ?)',
+                 [(i, b'uncommitted' * 4096) for i in range(32)])
+assert os.path.getsize(db + '-wal') > before
+os._exit(0)
+'''
+    subprocess.run([sys.executable, '-I', '-S', '-c', program, str(orphan), issue_id],
+                   capture_output=True, text=True, timeout=30, check=True)
+    original = family(orphan)
+    original['-shm'] = None
+    source = root / 'source' / "selected ' λ.db"
+    retain(original, source)
+    ambient_before = family(ambient)
+    ambient_evidence = base.recovery_files(ambient.parent)
+    output = root / 'candidate'
+    result = subprocess.run([str(NATIVE), '--db', str(source), '--output', str(output),
+                             '--copy-last-commit'], capture_output=True, text=True,
+                            timeout=60, check=False)
+    (root / 'native.stdout').write_text(result.stdout)
+    (root / 'native.stderr').write_text(result.stderr)
+    base.require(result.returncode == 0, f'companion failed: {result.stderr}')
+    report = json.loads(result.stdout)
+    base.require(report['recovery_scope'] == 'last-validated-commit', 'wrong recovery mode')
+    base.require(report['wal']['excluded_tail']['bytes'] > 0, 'fixture had no excluded tail')
+    db = Path(report['database_path'])
+    flags = ['--db', str(db), '--no-auto-import', '--no-auto-flush']
+    for stage in ('before', 'after'):
+        listed = base.run_br(br, root, ambient.parent,
+                             [*flags, 'list', '--all', '--json'], 'list-' + stage)
+        base.require(listed.returncode == 0, f'br list failed: {listed.stderr}')
+        rows = json.loads(listed.stdout)['issues']
+        base.require(any(row['id'] == issue_id and row['status'] == 'closed' for row in rows),
+                     'br lost the WAL-only closure or exposed the uncommitted update')
+        if stage == 'before':
+            created = base.run_br(br, root, ambient.parent,
+                                 [*flags, 'create', 'post-prefix deliberate write', '--json'], 'create')
+            base.require(created.returncode == 0, f'br create failed: {created.stderr}')
+        else:
+            base.require(any(row['title'] == 'post-prefix deliberate write' for row in rows),
+                         'br did not retain the deliberate write')
+    inspection = root / 'inspection' / 'beads.db'
+    retain(family(db), inspection)
+    with contextlib.closing(sqlite3.connect(inspection.as_uri() + '?mode=ro', uri=True)) as conn:
+        base.require(base.issue_state(conn, issue_id) == ('closed', base.STAMP, base.REASON),
+                     'native write lost the exact committed closure fields')
+        base.require(conn.execute("SELECT count(*) FROM sqlite_schema WHERE name='uncommitted_copy_probe'").fetchone() == (0,),
+                     'uncommitted schema changes leaked into the candidate')
+        base.require(conn.execute('PRAGMA integrity_check').fetchall() == [('ok',)],
+                     'native post-copy write failed integrity')
+    base.require(family(source) == original, 'source changed')
+    base.require(family(ambient) == ambient_before, 'ambient database changed')
+    base.require(base.recovery_files(ambient.parent) == ambient_evidence, 'ambient evidence changed')
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--recovery-binary', type=Path)
+    parser.add_argument('--br', type=Path)
     args, rest = parser.parse_known_args()
     if args.recovery_binary:
         NATIVE = args.recovery_binary.resolve(strict=True)
         if not NATIVE.is_file() or not os.access(NATIVE, os.X_OK):
             raise SystemExit('an actual executable recovery companion is required')
+    if args.br and NATIVE is None:
+        parser.error('--br requires --recovery-binary; no helper fallback is permitted')
     print('Actual companion: ' + str(NATIVE) if NATIVE else 'Production Python helper only; not a Rust binary.', flush=True)
-    unittest.main(argv=[sys.argv[0], *rest], verbosity=2)
+    result = unittest.main(argv=[sys.argv[0], *rest], verbosity=2, exit=False).result
+    if not result.wasSuccessful():
+        raise SystemExit(1)
+    if args.br:
+        qualify_br(args.br)

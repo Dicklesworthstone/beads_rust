@@ -32,7 +32,10 @@ const DEFAULT_MAX_BYTES: u64 = 1_073_741_824;
         The default creates a verified copy and leaves the source family unchanged.\n\
         --restore-shm additionally installs only an absent shared-memory index.\n\
         --resume-from revalidates a prior installation without replacing its index.\n\
-        Neither mode checkpoints or replaces the source main file or WAL.\n\n\
+        No mode checkpoints or replaces the source main file or WAL.\n\n\
+        --copy-last-commit copies through the last validated commit despite a crashed\n\
+        transaction or damaged tail; it never restores a source index. Unverified\n\
+        tail bytes may contain later changes not present in the recovered copy.\n\n\
         Success emits the helper's JSON completion receipt. On error or interruption,\n\
         retain all evidence and any installed SHM; do not delete sidecars to retry.\n\
         This is explicit operator recovery, not automatic startup repair."
@@ -54,6 +57,10 @@ struct Args {
     #[arg(long, value_name = "PRIOR_EVIDENCE", conflicts_with = "restore_shm")]
     resume_from: Option<PathBuf>,
 
+    /// Copy through the last validated WAL commit; retain but do not replay damaged tails.
+    #[arg(long, conflicts_with_all = ["restore_shm", "resume_from"])]
+    copy_last_commit: bool,
+
     /// Maximum bytes per input family component and reconstructed database.
     #[arg(
         long,
@@ -65,6 +72,12 @@ struct Args {
 }
 
 fn helper_command(args: &Args) -> io::Result<Command> {
+    if args.copy_last_commit && (args.restore_shm || args.resume_from.is_some()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--copy-last-commit is copy-only; it cannot restore or resume a source index",
+        ));
+    }
     if args.restore_shm && args.resume_from.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -88,6 +101,9 @@ fn helper_command(args: &Args) -> io::Result<Command> {
     // directory. -S also disables system sitecustomize startup hooks.
     if args.restore_shm {
         command.arg("--restore-shm");
+    }
+    if args.copy_last_commit {
+        command.arg("--copy-last-commit");
     }
     if let Some(evidence) = &args.resume_from {
         command
@@ -161,6 +177,7 @@ mod tests {
     fn copy_is_default_and_restore_requires_explicit_consent() {
         let args = arguments();
         assert!(!args.restore_shm);
+        assert!(!args.copy_last_commit);
         assert!(args.resume_from.is_none());
         assert_eq!(args.max_bytes, DEFAULT_MAX_BYTES);
         let restored = Args::try_parse_from([
@@ -263,5 +280,36 @@ mod tests {
         args.db = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/source-\xff.db".to_vec()));
         let command = helper_command(&args).unwrap();
         assert_eq!(command.get_args().nth(6).unwrap(), args.db.as_os_str());
+    }
+
+    #[test]
+    fn last_commit_copy_is_explicit_and_forwarded_once() {
+        let args = Args::try_parse_from([
+            "br-wal-recover", "--db", "source", "--output", "new", "--copy-last-commit",
+        ])
+        .unwrap();
+        assert!(args.copy_last_commit);
+        let command = helper_command(&args).unwrap();
+        let values: Vec<_> = command.get_args().collect();
+        assert_eq!(values.len(), 12);
+        assert_eq!(values[11], "--copy-last-commit");
+    }
+
+    #[test]
+    fn last_commit_copy_cannot_enter_live_restoration_or_resume() {
+        for mode in [vec!["--restore-shm"], vec!["--resume-from", "prior"]] {
+            let mut argv = vec![
+                "br-wal-recover", "--db", "source", "--output", "new", "--copy-last-commit",
+            ];
+            argv.extend(mode);
+            assert!(Args::try_parse_from(argv).is_err());
+        }
+        let mut args = arguments();
+        args.copy_last_commit = true;
+        args.restore_shm = true;
+        assert!(helper_command(&args).is_err());
+        args.restore_shm = false;
+        args.resume_from = Some(PathBuf::from("prior"));
+        assert!(helper_command(&args).is_err());
     }
 }

@@ -21,6 +21,7 @@ on:
       - 'tests/e2e_scripts/test_recover_orphaned_wal.py'
       - 'tests/e2e_scripts/test_packaged_wal_recovery.py'
       - 'tests/e2e_scripts/test_wal_recovery_resume.py'
+      - 'tests/e2e_scripts/test_wal_committed_copy.py'
       - 'Cargo.toml'
       - 'Cargo.lock'
   workflow_dispatch:
@@ -56,6 +57,9 @@ jobs:
       - name: Verify interrupted index recovery without replacing source files
         if: ${{ !cancelled() }}
         run: python3 tests/e2e_scripts/test_wal_recovery_resume.py
+      - name: Recover last committed state from real abandoned WAL transactions
+        if: ${{ !cancelled() }}
+        run: python3 tests/e2e_scripts/test_wal_committed_copy.py
       - name: Build br
         id: build
         run: cargo +nightly-2026-08-31 build --locked --bin br
@@ -105,6 +109,12 @@ jobs:
         run: |
           python3 tests/e2e_scripts/test_wal_recovery_resume.py \
             --recovery-binary "$RUNNER_TEMP/br-wal-install/bin/br-wal-recover"
+      - name: Qualify last-commit copies with the installed companion
+        if: ${{ !cancelled() && steps.recovery_build.outcome == 'success' }}
+        run: |
+          python3 tests/e2e_scripts/test_wal_committed_copy.py \
+            --recovery-binary "$RUNNER_TEMP/br-wal-install/bin/br-wal-recover" \
+            --br "$PWD/target/debug/br"
       - name: Retain the binary, fixtures, and recovery evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -128,3 +138,4 @@ jobs:
             /tmp/br-packaged-wal-*
             /tmp/br-wal-resume-test-*
             /tmp/br-wal-resume-native-*
+            /tmp/br-wal-committed-copy-*
