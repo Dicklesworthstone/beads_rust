@@ -1252,18 +1252,30 @@ fn install_recovery_index(
         if let Some((retained_wal, wal_witness)) = bound_wal.as_ref() {
             verify_retained_component(retained_wal, wal_witness)?;
         }
-        // Publish the derived index first. If the process dies before the WAL
-        // header is bound, the protected WAL is still the original zero-byte
-        // file and a later recovery can regenerate the index. The header write
-        // is the final protected-payload mutation.
-        install_retained_index(db_path, retained_index, index)?;
         if let Some((retained_wal, wal_witness)) = bound_wal.as_ref() {
-            bind_live_wal_header(
-                db_path,
-                retained_wal,
-                wal_witness,
-                component_for_suffix(expected, "-wal")?,
-            )?;
+            // Bind the frame-free WAL first. A process death before the SHM
+            // rename then leaves a normal header-only WAL beside a missing or
+            // stale regenerable index, which existing startup recovery already
+            // recognizes. The opposite order could strand a zero-byte WAL
+            // beside a freshly valid SHM without a reason to re-enter recovery.
+            let expected_empty = component_for_suffix(expected, "-wal")?;
+            bind_live_wal_header(db_path, retained_wal, wal_witness, expected_empty)?;
+            if let Err(error) = install_retained_index(db_path, retained_index, index) {
+                return match rollback_bound_live_wal(db_path, wal_witness, expected_empty) {
+                    Ok(()) => Err(BeadsError::WithContext {
+                        context: "WAL-index publication failed after generation binding; restored the original zero-byte WAL"
+                            .to_string(),
+                        source: Box::new(error),
+                    }),
+                    Err(rollback_error) => Err(BeadsError::internal(format!(
+                        "WAL-index publication failed after generation binding ({error}) and \
+                         restoring the original zero-byte WAL also failed ({rollback_error}); \
+                         live WAL disposition is indeterminate"
+                    ))),
+                };
+            }
+        } else {
+            install_retained_index(db_path, retained_index, index)?;
         }
         authority.verify_database_authority()?;
         let after = recovery_family_witness(db_path)?;
@@ -1631,6 +1643,52 @@ fn bind_live_wal_header(
     // sync while namespace/main-file exclusion is still held by the caller.
     drop(live_file);
     let _ = witness;
+    Ok(())
+}
+
+fn rollback_bound_live_wal(
+    db_path: &Path,
+    bound: &RawComponentWitness,
+    expected_empty: &RawComponentWitness,
+) -> Result<()> {
+    if !(expected_empty.present && expected_empty.length == Some(0)) {
+        return Err(BeadsError::internal(
+            "generation-binding rollback requires an originally present zero-byte WAL",
+        ));
+    }
+    let live = family_component_path(db_path, "-wal");
+    let metadata = secure_file_metadata(&live)?
+        .ok_or_else(|| BeadsError::internal("generation-bound WAL disappeared before rollback"))?;
+    verify_component_bytes(&live, &metadata, bound)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(
+            windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+        );
+    }
+    let file = options.open(&live)?;
+    if !same_file_identity(&metadata, &file.metadata()?)
+        || file.metadata()?.len() != WAL_HEADER_BYTES
+    {
+        return Err(BeadsError::internal(
+            "generation-bound WAL changed identity or length before rollback",
+        ));
+    }
+    file.set_len(0)?;
+    file.sync_all()?;
+    if file.metadata()?.len() != 0 {
+        return Err(BeadsError::internal(
+            "generation-binding rollback did not restore a zero-byte WAL",
+        ));
+    }
     Ok(())
 }
 
