@@ -492,6 +492,58 @@ def test_header_only_contention_and_retry(br: Path, seed: Path, ambient: Path, r
         require(issue_state(reader, row[0]) == tuple(row[1:]), "successful recovery lost a record")
 
 
+def test_torn_wal_reader_exclusion(br: Path, seed: Path, ambient: Path, root: Path,
+                                   relative: bool) -> None:
+    """A stock SQLite reader must prevent torn-WAL sidecars from being detached."""
+    db = root / "copy" / "selected.db"
+    retain(family(seed), db)
+    ambient_before = recovery_files(ambient)
+    spelling = os.path.relpath(db, root) if relative else str(db)
+    command = ["--db", spelling, "--no-auto-import", "--no-auto-flush",
+               "list", "--all", "--json"]
+
+    with pinned_header_only_reader(db) as row:
+        # Create the crash shape only on this disposable copy after the reader
+        # has mapped the family. The reader remains in another process so raw
+        # observations here cannot release its POSIX locks.
+        with component(db, "-wal").open("r+b") as wal:
+            wal.truncate(4)
+        before = family(db)
+        require(len(before["-wal"]) == 4, "fixture did not create a torn WAL")
+
+        held = run_br(br, root, ambient, command, "torn-held-reader")
+        after = family(db)
+        retain(after, root / "held-observation" / db.name)
+        unchanged(before, after)
+        require(recovery_files(ambient) == ambient_before,
+                "contended torn-WAL startup wrote ambient recovery evidence")
+        require(not (db.parent / ".br_recovery").exists(),
+                "contended torn-WAL startup quarantined sidecars despite a stock reader")
+        if held.returncode == 0:
+            require(TITLE in held.stdout, "successful contended read lost the seeded issue")
+        else:
+            output = held.stdout + held.stderr
+            require("busy" in output.lower() or "recovery" in output.lower(),
+                    f"contended torn-WAL startup failed for an unrelated reason: {output}")
+
+    # With the reader gone, the exact same torn bytes are eligible for the
+    # guarded quarantine and ordinary startup should recover.
+    released = run_br(br, root, ambient, command, "torn-after-reader-release")
+    require(released.returncode == 0,
+            f"torn WAL could not recover after reader release: {released.stdout}{released.stderr}")
+    require(TITLE in released.stdout, "post-quarantine read lost the seeded issue")
+    require(recovery_files(ambient) == ambient_before,
+            "selected --db torn-WAL recovery leaked into ambient BEADS_DIR")
+
+    retained = [
+        path for path in (db.parent / ".br_recovery").rglob("*")
+        if path.is_file() and "truncated-wal" in path.name and "wal" in path.name
+    ]
+    require(len(retained) == 1, f"expected one retained torn WAL beside selected --db: {retained}")
+    require(retained[0].read_bytes() == before["-wal"],
+            "quarantine did not retain the exact torn WAL bytes")
+
+
 def recovery_files(root: Path) -> dict[str, bytes]:
     recovery = root / ".br_recovery"
     return {str(path.relative_to(recovery)): path.read_bytes()
@@ -838,7 +890,11 @@ def main() -> int:
              ("pinned-automatic-comments", lambda directory: test_pinned_automatic(
         br, seed, ambient_db.parent, directory, writing=True)),
              ("header-only-contention-retry", lambda directory: test_header_only_contention_and_retry(
-        br, seed, ambient_db.parent, directory))]
+        br, seed, ambient_db.parent, directory)),
+             ("torn-wal-reader-absolute", lambda directory: test_torn_wal_reader_exclusion(
+        br, seed, ambient_db.parent, directory, relative=False)),
+             ("torn-wal-reader-relative", lambda directory: test_torn_wal_reader_exclusion(
+        br, seed, ambient_db.parent, directory, relative=True))]
     for relative in (False, True):
         for fail in (False, True):
             label = f"artifacts-{'relative' if relative else 'absolute'}-{'failure' if fail else 'success'}"
