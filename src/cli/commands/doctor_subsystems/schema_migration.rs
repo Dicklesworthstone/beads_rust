@@ -1261,9 +1261,22 @@ fn install_recovery_index(
             let expected_empty = component_for_suffix(expected, "-wal")?;
             bind_live_wal_header(db_path, retained_wal, wal_witness, expected_empty)?;
             if let Err(error) = install_retained_index(db_path, retained_index, index) {
+                // The recovered index rename precedes its final parent-directory
+                // fsync. If only that durability barrier failed, rolling the WAL
+                // back to zero would recreate the incompatible state #561 fixes.
+                // Keep a live index only when it still matches the rehearsed
+                // witness byte-for-byte; otherwise restore the original WAL.
+                if verify_retained_component(&family_component_path(db_path, "-shm"), index).is_ok()
+                {
+                    return Err(BeadsError::WithContext {
+                        context: "WAL-index publication reached a coherent header+index generation, but its final directory durability barrier failed; retained the coherent generation"
+                            .to_string(),
+                        source: Box::new(error),
+                    });
+                }
                 return match rollback_bound_live_wal(db_path, wal_witness, expected_empty) {
                     Ok(()) => Err(BeadsError::WithContext {
-                        context: "WAL-index publication failed after generation binding; restored the original zero-byte WAL"
+                        context: "WAL-index publication failed before the recovered index became live; restored the original zero-byte WAL"
                             .to_string(),
                         source: Box::new(error),
                     }),
