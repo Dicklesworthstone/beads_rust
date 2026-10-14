@@ -27,6 +27,7 @@ import re
 import sqlite3
 import stat
 import struct
+import subprocess
 import sys
 import tempfile
 
@@ -44,6 +45,8 @@ SHM_SCHEMA = "br.orphaned_wal.missing_index.v1"
 SHM_REGION_BYTES = 32768
 RESUME_SCHEMA = "br.orphaned_wal.resume.v1"
 RECEIPT_MAX_BYTES = 4 * CHUNK
+NATIVE_PROBE_SCHEMA = "br.orphaned_wal.native_probe.v1"
+NATIVE_PROBE_TIMEOUT = 60
 
 
 class RecoveryError(Exception):
@@ -610,6 +613,154 @@ def validate_private_index(oracle: Path, plan: dict, raw: dict) -> dict:
                     byte_order=sys.byteorder, checkpoint_performed=False)
 
 
+def native_row(row) -> bytes:
+    """Versioned wire encoding shared with wal_engine_probe.rs, not SQL text.
+
+    Preserve NULL, integers, IEEE float bits, UTF-8 text and arbitrary blobs.
+    Length framing and sorting complete encoded rows preserve duplicates while
+    making witness equality independent of query plans and row ordering.
+    """
+    encoded = bytearray(len(row).to_bytes(8, "big"))
+    for value in row:
+        if value is None:
+            encoded += b"n"
+        elif type(value) is int:
+            encoded += b"i" + struct.pack(">q", value)
+        elif type(value) is float:
+            encoded += b"r" + struct.pack(">d", value)
+        else:
+            require(isinstance(value, (str, bytes)), "unsupported native witness value")
+            data = value.encode("utf-8") if isinstance(value, str) else value
+            encoded += (b"t" if isinstance(value, str) else b"b")
+            encoded += len(data).to_bytes(8, "big") + data
+    return bytes(encoded)
+
+
+def native_rows_digest(rows, max_bytes: int) -> dict:
+    encoded, total = [], 0
+    for row in rows:
+        data = native_row(row)
+        total += len(data) + 8
+        require(total <= max_bytes, "native row witness exceeds --max-bytes")
+        encoded.append(data)
+    result = hashlib.sha256()
+    for data in sorted(encoded):
+        result.update(len(data).to_bytes(8, "big"))
+        result.update(data)
+    return dict(rows=len(encoded), sha256=result.hexdigest())
+
+
+def native_manifest(oracle: Path, expected: dict, max_bytes: int) -> dict:
+    """Independent stock-SQLite expectation; no native engine supplied values."""
+    with contextlib.closing(sqlite3.connect(oracle.as_uri() + "?mode=ro", uri=True,
+                                          timeout=0)) as conn:
+        conn.execute("PRAGMA trusted_schema=OFF")
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("BEGIN")
+        schema = conn.execute("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema").fetchall()
+        tables = []
+        for table in expected["tables"]:
+            name = table["name"]
+            columns = [row[1] for row in conn.execute(f"PRAGMA table_xinfo({quote_identifier(name)})")]
+            alias = table["projection"][0]
+            alias = alias if alias in ("rowid", "_rowid_", "oid") else None
+            projection = ([alias] if alias else []) + [quote_identifier(column) for column in columns]
+            witness = native_rows_digest(conn.execute(
+                f"SELECT {','.join(projection)} FROM {quote_identifier(name)}"), max_bytes)
+            require(witness["rows"] == table["rows"], "native expectation changed row count")
+            tables.append(dict(name=name, columns=columns, rowid_alias=alias, **witness))
+        skipped = [item["name"] for item in expected.get("page_verified_tables", [])
+                   if item["kind"] == "virtual"]
+        return dict(schema=NATIVE_PROBE_SCHEMA, schema_rows=native_rows_digest(schema, max_bytes),
+                    tables=tables, skipped_virtual=skipped,
+                    user_version=conn.execute("PRAGMA user_version").fetchone()[0],
+                    application_id=conn.execute("PRAGMA application_id").fetchone()[0])
+
+
+def probe_native_index(staging: Path, template_family: Path, oracle: Path, plan: dict, raw: dict,
+                       expected: dict, max_bytes: int, verifier: Path) -> dict:
+    """Require the actual linked engine to consume the proposed private index.
+
+    Source and namespace exclusion are still held by recover_copy. The child
+    only receives a NEW private family; it cannot repair the template because
+    the parent's OFD locks prohibit its recovery/checkpoint/write operations.
+    No native success, timeout, malformed output or engine failure can skip the
+    independent protected-byte and index checks before installation.
+    """
+    directory = staging / "native-rehearsal"
+    directory.mkdir(mode=0o700)
+    db = directory / "beads.db"
+    for suffix in ("", "-wal", "-shm"):
+        with open_regular(component(template_family, suffix)) as source:
+            copy_new(source, component(db, suffix), limit=max_bytes)
+    manifest = native_manifest(oracle, expected, max_bytes)
+    manifest_path = directory / "expected.json"
+    write_json(manifest_path, manifest)
+    with open_regular(manifest_path) as retained:
+        require(os.fstat(retained.fileno()).st_size <= RECEIPT_MAX_BYTES,
+                "native manifest exceeds receipt bound")
+        manifest_hash = digest(retained)
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith(("BEADS_", "BD_", "BR_", "FSQLITE_"))}
+    env.update(HOME=str(directory), USERPROFILE=str(directory),
+               XDG_CONFIG_HOME=str(directory / "config"), NO_COLOR="1")
+    stdout, stderr = directory / "probe.stdout", directory / "probe.stderr"
+    with open_regular(verifier) as binary, open_regular(component(db, "-shm"), writable=True) as pin:
+        executable = dict(**metadata(os.fstat(binary.fileno())), sha256=digest(binary))
+        pin.seek(0)
+        pinned = pin.read()
+        ofd_lock(pin, fcntl.F_RDLCK, 128, 1)
+        ofd_lock(pin, fcntl.F_WRLCK, 120, 3)
+        with stdout.open("xb") as out, stderr.open("xb") as err:
+            try:
+                result = subprocess.run([str(verifier), "--native-probe", str(manifest_path),
+                                         "--db", str(db), "--max-bytes", str(max_bytes)],
+                                        stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                        cwd=directory, env=env, timeout=NATIVE_PROBE_TIMEOUT,
+                                        check=False)
+            except subprocess.TimeoutExpired as error:
+                raise RecoveryError("native engine rehearsal timed out; source index not installed") from error
+        require(result.returncode == 0,
+                f"native engine rehearsal failed ({result.returncode}); inspect {stderr}")
+        require(stdout.stat().st_size <= RECEIPT_MAX_BYTES, "oversized native engine receipt")
+        def unique(pairs):
+            value = {}
+            for key, item in pairs:
+                require(key not in value, "duplicate native receipt key")
+                value[key] = item
+            return value
+        def nonfinite(value):
+            raise RecoveryError(f"non-finite native receipt value: {value}")
+        try:
+            receipt = json.loads(stdout.read_bytes(), object_pairs_hook=unique,
+                                 parse_constant=nonfinite)
+        except (ValueError, RecursionError) as error:
+            raise RecoveryError("invalid native engine receipt") from error
+        require(isinstance(receipt, dict) and set(receipt) == {
+                    "schema", "verified", "engine", "manifest_sha256", "engine_version"}
+                and receipt.get("schema") == NATIVE_PROBE_SCHEMA
+                and receipt.get("verified") is True and receipt.get("engine") == "frankensqlite"
+                and receipt.get("manifest_sha256") == manifest_hash
+                and isinstance(receipt.get("engine_version"), str)
+                and receipt["engine_version"] not in ("", "unknown"),
+                "native engine receipt does not attest this manifest")
+        pin.seek(0)
+        after = pin.read()
+        # Normal readers may update only read marks, never headers/page maps.
+        require(after[:100] == pinned[:100] and after[120:] == pinned[120:]
+                and len(after) == len(pinned), "native engine rewrote the proposed index")
+        require(dict(**metadata(os.fstat(binary.fileno())), sha256=digest(binary)) == executable
+                and metadata(os.stat(verifier, follow_symlinks=False)) ==
+                    {key: value for key, value in executable.items() if key != "sha256"},
+                "native verifier executable changed during rehearsal")
+    validate_private_index(db, plan, raw)
+    with open_regular(manifest_path) as retained:
+        require(digest(retained) == manifest_hash, "native expectation changed during rehearsal")
+    sync_directory(directory)
+    return dict(**receipt, executable_sha256=executable["sha256"],
+                protected_private_bytes_unchanged=True)
+
+
 def rehearse_private_index(staging: Path, oracle: Path, plan: dict, raw: dict,
                            expected: dict, max_bytes: int) -> dict:
     index = validate_private_index(oracle, plan, raw)
@@ -831,13 +982,17 @@ class ResumeEvidence:
 
 def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MAX_BYTES,
                  restore_shm: bool = False, resume_from: Path | None = None,
-                 copy_last_commit: bool = False) -> dict:
+                 copy_last_commit: bool = False, engine_verifier: Path | None = None) -> dict:
     platform_check()
     require(max_bytes > 0, "--max-bytes must be positive")
     require(not (restore_shm and resume_from is not None),
             "--restore-shm and --resume-from are mutually exclusive")
     require(not (copy_last_commit and (restore_shm or resume_from is not None)),
             "--copy-last-commit is copy-only; it cannot restore or resume a source index")
+    require(engine_verifier is None or restore_shm or resume_from is not None,
+            "native index rehearsal is only valid with restoration or resume")
+    if engine_verifier is not None:
+        engine_verifier = engine_verifier.resolve(strict=True)
     source = source.parent.resolve(strict=True) / source.name
     destination = destination.parent.resolve(strict=True) / destination.name
     if resume_from is not None:
@@ -897,6 +1052,9 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
             index = (rehearse_private_index(staging, before if resume else oracle,
                                            plan, raw, expected, max_bytes)
                      if restore_shm or resume else None)
+            native_probe = (probe_native_index(staging, before if resume else oracle, oracle,
+                                              plan, raw, expected, max_bytes, engine_verifier)
+                            if engine_verifier is not None else None)
             attest_source(source, handles, raw)
             for suffix, witness in raw.items():
                 if witness is not None:
@@ -923,6 +1081,8 @@ def recover_copy(source: Path, destination: Path, *, max_bytes: int = DEFAULT_MA
                           raw=raw, scope="classic SQLite WAL; engine certificates retained, not reused")
             if page_image is not None:
                 report["page_image"] = page_image
+            if native_probe is not None:
+                report["native_probe"] = native_probe
             if copy_last_commit:
                 report.update(copy_last_commit_requested=True, checkpoint_performed=False,
                               recovery_scope="last-validated-commit",
@@ -980,6 +1140,7 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=Path, help="NEW recovery directory; must not exist")
     parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES,
                         help="maximum bytes per input component and recovered database (default 1 GiB)")
+    parser.add_argument("--engine-verifier", type=Path, help=argparse.SUPPRESS)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--restore-shm", action="store_true",
                         help="also restore an absent source SHM under continuous exclusion; never checkpoint WAL")
@@ -992,7 +1153,7 @@ def main() -> int:
     try:
         report = recover_copy(args.db, args.output, max_bytes=args.max_bytes,
                               restore_shm=args.restore_shm, resume_from=args.resume_from,
-                              copy_last_commit=args.copy_last_commit)
+                              copy_last_commit=args.copy_last_commit, engine_verifier=args.engine_verifier)
     except (RecoveryError, OSError) as error:
         print(json.dumps(dict(ok=False, error=str(error))), file=sys.stderr)
         return 1

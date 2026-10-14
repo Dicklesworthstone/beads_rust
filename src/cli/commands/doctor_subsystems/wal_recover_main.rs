@@ -1,7 +1,8 @@
 //! Packaged operator recovery, deliberately independent of ordinary br startup.
 //!
-//! This companion binary embeds the one reviewed Python helper. It never opens
+//! This companion embeds the reviewed helper. Ordinary launch never opens
 //! storage, discovers a workspace, imports JSONL, or holds a parent-side lease.
+//! Its separate internal probe reads only the helper's private index rehearsal.
 //! On supported Linux hosts, exec transfers the process to the helper so signal
 //! delivery and the recovery exit status are not obscured by a waiting wrapper.
 //! Existing br commands and the frame-bearing-WAL admission guard are unchanged.
@@ -13,6 +14,8 @@ use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 
 use clap::Parser;
+
+mod wal_engine_probe;
 
 const HELPER: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -31,6 +34,8 @@ const DEFAULT_MAX_BYTES: u64 = 1_073_741_824;
         Stop ALL br and external SQLite users first and keep them stopped.\n\
         The default creates a verified copy and leaves the source family unchanged.\n\
         --restore-shm additionally installs only an absent shared-memory index.\n\
+        Restoration and resume first require this binary's linked engine to read\n\
+        the proposed index on a locked private copy; probe failures refuse recovery.\n\
         --resume-from revalidates a prior installation without replacing its index.\n\
         No mode checkpoints or replaces the source main file or WAL.\n\n\
         --copy-last-commit copies through the last validated commit despite a crashed\n\
@@ -110,7 +115,37 @@ fn helper_command(args: &Args) -> io::Result<Command> {
             .arg("--resume-from")
             .arg(std::path::absolute(evidence)?);
     }
+    if args.restore_shm || args.resume_from.is_some() {
+        // There is no user-selected verifier or environment override in the
+        // companion: every source-index operation probes this linked engine.
+        command.arg("--engine-verifier").arg(std::env::current_exe()?);
+    }
     Ok(command)
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "br-wal-recover", about = "Internal read-only private-family probe")]
+struct NativeProbeArgs {
+    #[arg(long)]
+    native_probe: PathBuf,
+    #[arg(long)]
+    db: PathBuf,
+    #[arg(long, default_value_t = DEFAULT_MAX_BYTES, value_parser = clap::value_parser!(u64).range(1..))]
+    max_bytes: u64,
+}
+
+fn run_native_probe(args: &NativeProbeArgs) -> ExitCode {
+    match wal_engine_probe::execute(&args.db, &args.native_probe, args.max_bytes) {
+        Ok(receipt) => {
+            println!("{receipt}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{}", serde_json::json!({"schema": wal_engine_probe::SCHEMA,
+                "verified": false, "error": format!("{error:#}")}));
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -141,6 +176,11 @@ fn launch(args: &Args) -> io::Error {
 }
 
 fn main() -> ExitCode {
+    // Only this first-token internal invocation enters native read-only SQL.
+    // Its parser has no restore/output flags and cannot recurse into recovery.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--native-probe")) {
+        return run_native_probe(&NativeProbeArgs::parse());
+    }
     let args = Args::parse();
     // On success exec does not return. No database handles or recovery state
     // exist in this process before it, and no output is reinterpreted afterward.
@@ -238,9 +278,11 @@ mod tests {
         args.max_bytes = 1234;
         let command = helper_command(&args).unwrap();
         let values: Vec<_> = command.get_args().collect();
-        assert_eq!(values.len(), 12);
+        assert_eq!(values.len(), 14);
         assert_eq!(values[10], "1234");
         assert_eq!(values[11], "--restore-shm");
+        assert_eq!(values[12], "--engine-verifier");
+        assert_eq!(values[13], std::env::current_exe().unwrap().as_os_str());
     }
 
     #[test]
@@ -267,9 +309,11 @@ mod tests {
         args.resume_from = Some(evidence.clone());
         let command = helper_command(&args).unwrap();
         let values: Vec<_> = command.get_args().collect();
-        assert_eq!(values.len(), 13);
+        assert_eq!(values.len(), 15);
         assert_eq!(values[11], "--resume-from");
         assert_eq!(values[12], std::path::absolute(&evidence).unwrap().as_os_str());
+        assert_eq!(values[13], "--engine-verifier");
+        assert_eq!(values[14], std::env::current_exe().unwrap().as_os_str());
     }
 
     #[cfg(unix)]
@@ -311,5 +355,14 @@ mod tests {
         args.restore_shm = false;
         args.resume_from = Some(PathBuf::from("prior"));
         assert!(helper_command(&args).is_err());
+    }
+
+    #[test]
+    fn internal_probe_cannot_enter_any_source_mutation_mode() {
+        let argv = ["br-wal-recover", "--native-probe", "expected.json", "--db", "private.db"];
+        assert!(NativeProbeArgs::try_parse_from(argv).is_ok());
+        for mode in ["--restore-shm", "--resume-from", "--output", "--copy-last-commit"] {
+            assert!(NativeProbeArgs::try_parse_from(argv.into_iter().chain([mode])).is_err());
+        }
     }
 }
