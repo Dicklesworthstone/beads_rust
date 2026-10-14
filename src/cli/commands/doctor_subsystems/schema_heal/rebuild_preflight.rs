@@ -815,8 +815,10 @@ mod tests {
         let BeadsError::WithContext { source, .. } = &error else {
             panic!("expected a rehearsal failure: {error:?}");
         };
-        assert!(matches!(source.as_ref(), BeadsError::SyncConflict { message }
-            if message.contains("schema-heal ID collision") && message.contains("pf-abc")));
+        assert!(
+            matches!(source.downcast_ref::<BeadsError>(), Some(BeadsError::SyncConflict { message })
+            if message.contains("schema-heal ID collision") && message.contains("pf-abc"))
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
         assert!(!original.path().join("beads.db").exists());
     }

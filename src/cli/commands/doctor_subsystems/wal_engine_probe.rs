@@ -7,6 +7,7 @@
 //! installed here, and neither path imports JSONL or opens ordinary br storage.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -97,7 +98,7 @@ fn file_digest(file: &mut File, max_bytes: u64) -> Result<(u64, String)> {
         ensure!(length <= max_bytes, "native rehearsal exceeds --max-bytes");
         hash.update(&buffer[..count]);
     }
-    Ok((length, format!("{:x}", hash.finalize())))
+    Ok((length, lower_hex(&hash.finalize())))
 }
 
 fn copy_component(source: &Path, destination: &Path, max_bytes: u64) -> Result<(u64, String)> {
@@ -364,7 +365,16 @@ fn rows_digest(rows: &[Row], max_bytes: u64) -> Result<String> {
         hash.update(u64::try_from(row.len())?.to_be_bytes());
         hash.update(row);
     }
-    Ok(format!("{:x}", hash.finalize()))
+    Ok(lower_hex(&hash.finalize()))
+}
+
+/// sha2 0.11 digests are `hybrid_array::Array`s, which do not implement `LowerHex`.
+fn lower_hex(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hex
 }
 
 fn integer_pragma(conn: &Connection, sql: &str) -> Result<i64> {
@@ -434,7 +444,7 @@ pub(super) fn execute(db: &Path, expected: &Path, max_bytes: u64) -> Result<serd
     // #562's original family was readable but unwritable. Reading the
     // proposed index alone therefore cannot be the companion's success gate.
     // Never write to db: the rehearsal allocates its OWN database first.
-    let manifest_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let manifest_sha256 = lower_hex(&Sha256::digest(&bytes));
     rehearse_writes(db, expected, &manifest, &manifest_sha256, max_bytes)?;
     Ok(serde_json::json!({
         "schema": SCHEMA,

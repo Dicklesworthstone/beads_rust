@@ -8281,8 +8281,10 @@ mod tests {
         };
         assert!(context.contains("private index rehearsal retained at"));
         assert!(matches!(
-            source.as_ref(),
-            BeadsError::Database(fsqlite_error::FrankenError::BusyRecovery)
+            source.downcast_ref::<BeadsError>(),
+            Some(BeadsError::Database(
+                fsqlite_error::FrankenError::BusyRecovery
+            ))
         ));
         assert_eq!(stage, "private-recovery");
         assert_eq!(
