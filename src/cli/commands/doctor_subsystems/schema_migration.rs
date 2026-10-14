@@ -554,8 +554,13 @@ fn missing_wal_index_for_engine(db_path: &Path, engine_reads_on_disk_index: bool
         return Ok(false);
     }
     Ok(
-        secure_file_metadata(&family_component_path(db_path, "-wal"))?
-            .is_some_and(|metadata| metadata.len() >= WAL_HEADER_BYTES),
+        secure_file_metadata(&family_component_path(db_path, "-wal"))?.is_some_and(|metadata| {
+            // GH #561 / FrankenSQLite #515: 0.4.12 requires an owner to bind a
+            // generation before it can recreate a missing index beside an
+            // existing zero-byte WAL. A partial 1..31-byte WAL remains the
+            // separate torn-WAL path and is never generation-binding authority.
+            metadata.len() == 0 || metadata.len() >= WAL_HEADER_BYTES
+        }),
     )
 }
 
@@ -6742,6 +6747,26 @@ mod tests {
             missing_wal_index(&db).unwrap(),
             crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY
         );
+
+        // GH #561: an existing zero-byte WAL plus a missing SHM is exactly
+        // the 0.4.12 generation-binding case. It enters recovery on engines
+        // that consume the on-disk index, while torn partial headers stay on
+        // the dedicated quarantine path and Windows/private-index engines do
+        // not recover an index they never read.
+        fs::write(family_component_path(&db, "-wal"), []).unwrap();
+        assert!(missing_wal_index_for_engine(&db, true).unwrap());
+        assert!(!missing_wal_index_for_engine(&db, false).unwrap());
+        for length in 1..WAL_HEADER_BYTES {
+            fs::write(
+                family_component_path(&db, "-wal"),
+                vec![0_u8; usize::try_from(length).unwrap()],
+            )
+            .unwrap();
+            assert!(
+                !missing_wal_index_for_engine(&db, true).unwrap(),
+                "partial WAL length {length} must stay on torn-WAL handling"
+            );
+        }
     }
 
     /// A complete byte-witnessed run with the same receipt and directory
