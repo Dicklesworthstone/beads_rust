@@ -25,6 +25,7 @@ on:
       - 'tests/e2e_scripts/test_wal_committed_copy.py'
       - 'tests/e2e_scripts/test_wal_native_gate.py'
       - 'tests/e2e_scripts/test_wal_page_image.py'
+      - 'tests/e2e_scripts/test_wal_native_write.py'
       - 'Cargo.toml'
       - 'Cargo.lock'
   workflow_dispatch:
@@ -61,6 +62,9 @@ jobs:
       - name: Verify exact pager images and search/spatial recovery
         if: ${{ !cancelled() }}
         run: python3 tests/e2e_scripts/test_wal_page_image.py
+      - name: Check native-write receipt oracles with stock SQLite only
+        if: ${{ !cancelled() }}
+        run: python3 tests/e2e_scripts/test_wal_native_write.py --self-test
       - name: Install the repository's CI toolchain
         run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt,clippy
       - name: Verify interrupted index recovery without replacing source files
@@ -119,6 +123,11 @@ jobs:
         run: |
           python3 tests/e2e_scripts/test_wal_page_image.py \
             --recovery-binary "$RUNNER_TEMP/br-wal-install/bin/br-wal-recover"
+      - name: Require native commit rollback checkpoint and main-only preservation
+        if: ${{ !cancelled() && steps.recovery_build.outcome == 'success' }}
+        run: |
+          python3 tests/e2e_scripts/test_wal_native_write.py \
+            --recovery-binary "$RUNNER_TEMP/br-wal-install/bin/br-wal-recover"
       - name: Qualify installed recovery with real br reads and writes
         if: ${{ !cancelled() && steps.recovery_build.outcome == 'success' }}
         run: |
@@ -162,3 +171,8 @@ jobs:
             /tmp/br-wal-committed-copy-*
             /tmp/br-native-gate-*
             /tmp/br-wal-page-*
+            /tmp/br-wal-native-write-*
+            /tmp/br-wal-write-oracle-*
+            /tmp/native-copy-test-*
+            /tmp/native-owned-test-*
+            /tmp/native-links-test-*
