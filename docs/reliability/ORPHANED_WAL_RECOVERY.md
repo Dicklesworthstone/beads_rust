@@ -21,6 +21,8 @@ The runtime still requires **Python 3.10+ with its standard sqlite3 module on
 64-bit Linux**. This is not a Rust-only recovery engine. Existing released br
 archives are not changed by adding this source-install target. `cargo run`
 still selects `br`; the companion is selected explicitly with `--bin`.
+FTS5/RTree and fully shadowed-rowid schemas additionally require Python 3.11+
+with SQLite serialization support, as described under page-image verification.
 
 With all database users stopped, rehearse on a disposable family copy first:
 
@@ -118,8 +120,9 @@ salvaging a valid prefix. It independently reads a private main-plus-WAL copy
 with stock SQLite and requires both integrity checks and equality of schema,
 typed table data, accessible hidden rowids, user version and application ID.
 A main-only copy that is structurally valid but lacks the WAL commit fails.
-Virtual tables, inaccessible hidden rowids, nonempty rollback/migration state,
-and unknown `database-name-*` sidecars require separate engine review.
+FTS5/RTree and fully shadowed-rowid schemas use the page-image verification
+below. Other virtual modules, nonempty rollback/migration state, and unknown
+`database-name-*` sidecars still require separate engine review.
 
 The default `--max-bytes` is 1073741824 (1 GiB) per input family component and
 for the recovered database; an explicit larger value is possible. Allow space
@@ -158,6 +161,69 @@ Keep the original and all evidence. Do not overwrite the original file, copy
 old namespace/certificate sidecars over the new identity, or resume a shared
 workspace against the new database until its br reads and a deliberate write
 have been qualified. The tool does not switch a workspace automatically.
+
+## Complete page-image verification and search/spatial schemas
+
+On a serialization-capable Python/SQLite build, recovery now compares the
+reconstructed file to SQLite's independent committed pager image of the
+private **complete main/WAL pair**. SQLite, not the replay algorithm, decides
+which WAL commit its reader sees. The page count, page size, exact byte length
+and SHA-256 must match. No counters, reserved bytes, freelist pages or other
+header fields are normalized away. The private oracle's main/WAL hashes must
+also stay unchanged, and the candidate hash is rechecked before publication.
+
+The receipt includes `page_image` with schema
+`br.orphaned_wal.page_image.v1`, `database_pages`, `page_size`, `bytes` and
+`sha256`. This is additional evidence, not a replacement for integrity and
+typed-row checks. An unavailable serialization API retains the original
+ordinary-table verification contract and emits no `page_image`. Once the API
+is available, a serialization error or mismatch is a refusal, never a fallback.
+
+This stronger witness permits previously refused database schemas:
+
+- FTS5 tables, including internal, external-content and contentless variants;
+- RTree and integer-RTree spatial indexes;
+- ordinary tables that declare all three `rowid`, `_rowid_` and `oid` aliases.
+
+Their exact database pages must match. FTS/RTree shadow tables still receive
+typed-row witnesses. The verifier does not select virtual hidden columns
+whose values may be process-local cursor handles. The logical witness records
+these schema classes under `page_verified_tables` and binds their full image.
+Other virtual modules remain refused; no extension is loaded to admit them.
+Unknown declaration forms fail conservatively rather than guessing a module.
+
+These schemas require **Python 3.11+ and a SQLite build exposing serialization**;
+there is no row-only fallback for them. The same proof applies to strict copy,
+explicit last-commit copies, missing-index restoration and resume. Existing
+ordinary-table resume evidence stays compatible because its logical witness
+format is unchanged. Serialization temporarily allocates a complete image,
+and SQLite/Python may hold multiple copies of it. Its size is checked against
+`--max-bytes` before allocation; choose that bound to fit available memory.
+
+Page equality proves fidelity to the supplied family's SQLite-readable state.
+It does not establish WAL provenance, restore commits beyond a damaged tail,
+repair preexisting search-index inconsistency, or qualify FrankenSQLite's own
+subsequent writes. Source exclusion, no-clobber publication, explicit source
+SHM consent and all #556 guards remain unchanged. This is not automatic
+in-place checkpointing inside `br`.
+
+```sh
+python3 tests/e2e_scripts/test_wal_page_image.py
+python3 tests/e2e_scripts/test_wal_page_image.py \
+  --recovery-binary '/absolute/path/to/installed/br-wal-recover'
+```
+
+The 21 helper tests passed on Linux with Python 3.13.5 and SQLite 3.46.1,
+alongside all 21 existing resume tests. They use real abandoned WAL families,
+verify recovered FTS searches and spatial queries, exercise UTF-16 and
+512/65536-byte pages, preserve search data through restoration/resume and a
+later write, and reject unsupported modules or missing serialization. On the
+exact pre-change source, three planted row-equivalent image alterations were
+accepted and the FTS5 fixture was refused; the new code rejects those altered
+images and recovers that fixture. These controls do not claim observed
+production corruption. The installed-executable mode is separate, has no
+interpreter fallback, and was not run locally. Run it against the installed
+companion; native `br`, full-suite and power-loss qualification remain outstanding.
 
 ## Restore only a missing index at the original path
 
