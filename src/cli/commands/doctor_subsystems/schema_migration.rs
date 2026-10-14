@@ -6823,6 +6823,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recovery_561_bound_header_rollback_restores_exact_zero_byte_wal() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("rollback.db");
+        recovery_561_main(&db, 4096);
+        let wal = family_component_path(&db, "-wal");
+        fs::write(&wal, []).unwrap();
+        let before = recovery_family_witness(&db).unwrap();
+        let expected_empty = component_for_suffix(&before, "-wal").unwrap().clone();
+
+        let retained = root.path().join("retained-wal");
+        let header = recovery_561_wal_header(4096, false, 23);
+        fs::write(&retained, header).unwrap();
+        let metadata = fs::symlink_metadata(&retained).unwrap();
+        let (length, sha256) = hash_regular_file(&retained, &metadata).unwrap();
+        let bound = RawComponentWitness {
+            suffix: "-wal".to_string(),
+            present: true,
+            length: Some(length),
+            sha256: Some(sha256),
+            unix_mode: expected_empty.unix_mode,
+        };
+
+        bind_live_wal_header(&db, &retained, &bound, &expected_empty).unwrap();
+        rollback_bound_live_wal(&db, &bound, &expected_empty).unwrap();
+        assert_eq!(fs::read(&wal).unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            component_for_suffix(&recovery_family_witness(&db).unwrap(), "-wal").unwrap(),
+            &expected_empty
+        );
+
+        fs::write(&wal, header).unwrap();
+        let mut changed = header;
+        changed[16] ^= 1;
+        fs::write(&wal, changed).unwrap();
+        assert!(
+            rollback_bound_live_wal(&db, &bound, &expected_empty).is_err(),
+            "rollback authority is bound to the exact rehearsed header"
+        );
+        assert_eq!(
+            fs::read(&wal).unwrap(),
+            changed,
+            "a mismatched live WAL must be retained rather than truncated"
+        );
+    }
+
     /// GH #520: on Windows the engine keeps its WAL index in private memory,
     /// so a stock-SQLite index beside a header-only WAL (or no index at all)
     /// must never start automatic recovery, whose quarantine step cannot run
