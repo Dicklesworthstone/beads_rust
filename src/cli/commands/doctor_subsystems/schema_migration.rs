@@ -1583,6 +1583,15 @@ fn bind_live_wal_header(
             "live WAL changed before verified generation binding",
         ));
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(BeadsError::internal(
+                "WAL generation binding refuses a hard-linked live WAL",
+            ));
+        }
+    }
     let mut options = OpenOptions::new();
     options.read(true).write(true);
     #[cfg(unix)]
@@ -1672,6 +1681,15 @@ fn rollback_bound_live_wal(
     let live = family_component_path(db_path, "-wal");
     let metadata = secure_file_metadata(&live)?
         .ok_or_else(|| BeadsError::internal("generation-bound WAL disappeared before rollback"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(BeadsError::internal(
+                "generation-binding rollback refuses a hard-linked live WAL",
+            ));
+        }
+    }
     verify_component_bytes(&live, &metadata, bound)?;
     let mut options = OpenOptions::new();
     options.read(true).write(true);
