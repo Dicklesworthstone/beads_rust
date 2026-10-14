@@ -5,12 +5,14 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/wal-recovery.yml'
+      - 'src/cli/commands/doctor_subsystems/engine.rs'
       - 'src/cli/commands/doctor_subsystems/schema_migration*'
       - 'src/cli/commands/doctor_subsystems/schema_migration/**'
       - 'src/franken_sync*'
       - 'src/franken_sync/**'
       - 'src/sync/db_inode_lock.rs'
       - 'tests/e2e_scripts/wal_recovery_556.py'
+      - 'tests/e2e_scripts/wal_recovery_562.py'
       - 'Cargo.toml'
       - 'Cargo.lock'
   workflow_dispatch:
@@ -39,11 +41,21 @@ jobs:
       - name: Install the repository's CI toolchain
         run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt,clippy
       - name: Build br
+        id: build
         run: cargo +nightly-2026-08-31 build --locked --bin br
       - name: Validate fixtures and native exclusion
         run: python3 tests/e2e_scripts/wal_recovery_556.py --self-test
       - name: Exercise the actual executable
         run: python3 tests/e2e_scripts/wal_recovery_556.py --br "$PWD/target/debug/br"
+      - name: Validate orphaned-WAL checkpoint oracles
+        if: ${{ !cancelled() }}
+        run: python3 tests/e2e_scripts/wal_recovery_562.py --self-test
+      - name: Exercise orphaned-WAL advice and recovery rehearsal
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 tests/e2e_scripts/wal_recovery_562.py --br "$PWD/target/debug/br"
+      - name: Test engine diagnostic boundaries and path handling
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: cargo +nightly-2026-08-31 test --locked --lib cli::commands::doctor_subsystems::engine::tests
       - name: Retain the binary, fixtures, and recovery evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -55,3 +67,5 @@ jobs:
             target/debug/br
             /tmp/br-recovery-556-*
             /tmp/br-556-selftest-*
+            /tmp/br-recovery-562-*
+            /tmp/br-562-selftest-*
