@@ -692,6 +692,13 @@ mod tests {
             .tempdir()
             .unwrap()
             .keep();
+        // tempfile follows the umask, so under 002 the root is 0775 and fails
+        // allocate's owner-controlled, non-shared parent check (#570).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let sandbox = WriteSandbox::allocate(&root).unwrap();
         assert_eq!(sandbox.database.parent(), Some(sandbox.directory.as_path()));
         assert_eq!(sandbox.directory.parent(), Some(root.as_path()));
