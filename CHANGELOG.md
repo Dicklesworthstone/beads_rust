@@ -101,6 +101,9 @@ this repo): commits `55c186682` + `5946b3b7c` in
   (shorter is torn, #228): it is moved to `.br_recovery` and br rebuilds from
   JSONL as v0.7.4 did. A WAL with any byte past its header, and any non-empty
   rollback journal, still refuse.
+- Tests read an issue id's hash as its last `-` segment, so a hyphenated
+  workspace prefix no longer breaks the error, quick-capture and routing
+  checks (#563, in part: the doctor snapshot is not addressed here).
 
 ---
 

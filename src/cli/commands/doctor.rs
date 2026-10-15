@@ -28831,8 +28831,21 @@ version = "2026-05-11-abc123"
         std::fs::write(&cert_file, b"test-cert").unwrap();
         let _ = git_run(&["add", ".beads/beads.db-wal-cert"]);
 
+        // The inventory's Git probes share a one-second budget (#552). On a
+        // loaded host it can expire and report `inspected: false`, which says
+        // nothing about tracking, so retry a few times before asserting.
         let mut checks = Vec::new();
-        check_git_tracked_runtime_files(&beads_dir, None, &mut checks);
+        for _ in 0..5 {
+            checks.clear();
+            check_git_tracked_runtime_files(&beads_dir, None, &mut checks);
+            let inspected = find_check(&checks, "git.tracked_runtime_files")
+                .and_then(|check| check.details.as_ref())
+                .and_then(|details| details.get("inspected"))
+                .and_then(serde_json::Value::as_bool);
+            if inspected != Some(false) {
+                break;
+            }
+        }
         let check = find_check(&checks, "git.tracked_runtime_files")
             .expect("check present when file tracked");
         assert_eq!(check.status, CheckStatus::Ok);
