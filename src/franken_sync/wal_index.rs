@@ -1189,7 +1189,11 @@ pub mod tests {
             let bytes = vec![0x55_u8; length];
             fs::write(&wal, &bytes).unwrap();
             let error = require_frame_free_recovery(&db).unwrap_err();
-            assert!(error.to_string().contains("engine recovery refused before opening"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("engine recovery refused before opening")
+            );
             assert_eq!(fs::read(&wal).unwrap(), bytes);
             assert!(!db.exists());
             assert!(!sidecar(&db, "-shm").exists());

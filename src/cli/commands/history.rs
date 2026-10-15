@@ -631,12 +631,8 @@ fn restore_backup_with_before_commit(
 
     let (target_path, source) = history::capture_backup_restore_source(beads_dir, &backup_path)?;
     let cwd = std::env::current_dir().ok();
-    let target_path = validate_backup_active_target(
-        beads_dir,
-        target_path,
-        active_jsonl_path,
-        cwd.as_deref(),
-    )?;
+    let target_path =
+        validate_backup_active_target(beads_dir, target_path, active_jsonl_path, cwd.as_deref())?;
     let target_name = target_path
         .file_name()
         .unwrap_or_default()
@@ -1843,8 +1839,7 @@ mod tests {
 
         const BACKUP_NAME: &str = "issues.20260101_000000.jsonl";
         const BACKUP: &[u8] = b"{\"id\":\"bd-before\",\"title\":\"backup\"}\n";
-        const METADATA: &str =
-            r#"{"target":{"kind":"relative","path":"issues.jsonl"}}"#;
+        const METADATA: &str = r#"{"target":{"kind":"relative","path":"issues.jsonl"}}"#;
 
         fn fixture() -> (TempDir, PathBuf, PathBuf) {
             let temp = TempDir::new().unwrap();
@@ -1919,10 +1914,16 @@ mod tests {
                         Ok(())
                     },
                 );
-                assert!(arrived.get(), "the race boundary must actually be exercised");
+                assert!(
+                    arrived.get(),
+                    "the race boundary must actually be exercised"
+                );
                 assert!(matches!(result, Err(BeadsError::Io(_))), "{result:?}");
                 if directory {
-                    assert_eq!(fs::read(target.join("keep")).unwrap(), b"concurrent evidence");
+                    assert_eq!(
+                        fs::read(target.join("keep")).unwrap(),
+                        b"concurrent evidence"
+                    );
                 } else {
                     assert_eq!(fs::read(&target).unwrap(), b"concurrent export");
                 }
@@ -1986,7 +1987,10 @@ mod tests {
                 )
                 .unwrap_err();
                 assert!(error.to_string().contains("also failed"), "{error}");
-                assert!(guard.persist, "refused rollback must retain the original snapshot");
+                assert!(
+                    guard.persist,
+                    "refused rollback must retain the original snapshot"
+                );
             }
             assert_eq!(fs::read_link(&target).unwrap(), referent);
             assert!(!referent.exists());
@@ -2000,14 +2004,22 @@ mod tests {
             let mut metadata: serde_json::Value = serde_json::from_str(METADATA).unwrap();
             metadata["raw_sha256"] = json!(crate::util::hex_encode(&Sha256::digest(BACKUP)));
             let bytes = serde_json::to_vec(&metadata).unwrap();
-            fs::write(history.join(BACKUP_NAME).with_extension("jsonl.meta.json"), &bytes).unwrap();
+            fs::write(
+                history.join(BACKUP_NAME).with_extension("jsonl.meta.json"),
+                &bytes,
+            )
+            .unwrap();
             bytes
         }
 
         #[test]
         fn corrupt_backup_never_reaches_restore_installation_even_with_force() {
             for force in [false, true] {
-                for changed in [Vec::new(), vec![b'x'; BACKUP.len()], b"different snapshot\n".to_vec()] {
+                for changed in [
+                    Vec::new(),
+                    vec![b'x'; BACKUP.len()],
+                    b"different snapshot\n".to_vec(),
+                ] {
                     let (_temp, beads, history) = fixture();
                     let metadata = record_fixture_digest(&history);
                     let backup = history.join(BACKUP_NAME);
@@ -2019,23 +2031,40 @@ mod tests {
                     let reached_install = Cell::new(false);
                     let ctx = OutputContext::from_flags(false, true, true);
                     let result = restore_backup_with_before_commit(
-                        &beads, &history, BACKUP_NAME, force, None, &ctx,
+                        &beads,
+                        &history,
+                        BACKUP_NAME,
+                        force,
+                        None,
+                        &ctx,
                         |_| {
                             reached_install.set(true);
                             Ok(())
                         },
                     );
-                    assert!(matches!(&result, Err(BeadsError::SyncConflict { message })
-                        if message.contains("SHA-256 integrity check")), "{result:?}");
-                    assert!(!reached_install.get(), "refuse before staging a live replacement");
+                    assert!(
+                        matches!(&result, Err(BeadsError::SyncConflict { message })
+                        if message.contains("SHA-256 integrity check")),
+                        "{result:?}"
+                    );
+                    assert!(
+                        !reached_install.get(),
+                        "refuse before staging a live replacement"
+                    );
                     if force {
                         assert_eq!(fs::read(&target).unwrap(), b"current unique export");
                     } else {
                         assert!(!target.exists());
                     }
                     assert_eq!(fs::read(&backup).unwrap(), changed);
-                    assert_eq!(fs::read(backup.with_extension("jsonl.meta.json")).unwrap(), metadata);
-                    assert_eq!(fs::read(beads.join("beads.db")).unwrap(), b"database remains untouched");
+                    assert_eq!(
+                        fs::read(backup.with_extension("jsonl.meta.json")).unwrap(),
+                        metadata
+                    );
+                    assert_eq!(
+                        fs::read(beads.join("beads.db")).unwrap(),
+                        b"database remains untouched"
+                    );
                     assert!(fs::read_dir(&beads).unwrap().all(|entry| {
                         entry
                             .unwrap()
@@ -2060,15 +2089,25 @@ mod tests {
             let external = beads.parent().unwrap().join("external.jsonl");
             fs::write(&external, b"external current export").unwrap();
             let metadata_path = history.join(BACKUP_NAME).with_extension("jsonl.meta.json");
-            let mut metadata: serde_json::Value = serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+            let mut metadata: serde_json::Value =
+                serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
             metadata["target"] = json!({"kind": "absolute", "path": external});
             fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
-            let error = restore_backup(&beads, &history, BACKUP_NAME, true, Some(&target), &ctx).unwrap_err();
-            assert!(error.to_string().contains("does not match the active JSONL path"), "{error}");
+            let error = restore_backup(&beads, &history, BACKUP_NAME, true, Some(&target), &ctx)
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not match the active JSONL path"),
+                "{error}"
+            );
             assert_eq!(fs::read(&external).unwrap(), b"external current export");
             assert_eq!(fs::read(&target).unwrap(), BACKUP);
             assert_eq!(fs::read(history.join(BACKUP_NAME)).unwrap(), BACKUP);
-            assert_eq!(fs::read(beads.join("beads.db")).unwrap(), b"database remains untouched");
+            assert_eq!(
+                fs::read(beads.join("beads.db")).unwrap(),
+                b"database remains untouched"
+            );
         }
     }
 }

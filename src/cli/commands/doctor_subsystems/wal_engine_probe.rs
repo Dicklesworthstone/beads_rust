@@ -41,13 +41,18 @@ impl WriteSandbox {
         #[cfg(unix)]
         {
             let parent_metadata = fs::symlink_metadata(parent)?;
-            ensure!(parent_metadata.is_dir()
+            ensure!(
+                parent_metadata.is_dir()
                     && parent_metadata.uid() == fs::metadata(&directory)?.uid()
                     && parent_metadata.mode() & 0o022 == 0,
-                    "native write evidence parent must be owner-controlled and non-shared");
+                "native write evidence parent must be owner-controlled and non-shared"
+            );
         }
         let database = directory.join("beads.db");
-        Ok(Self { directory, database })
+        Ok(Self {
+            directory,
+            database,
+        })
     }
 
     fn open_writer(&self) -> Result<Connection> {
@@ -70,9 +75,15 @@ fn regular_file(path: &Path) -> Result<File> {
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     let file = options.open(path)?;
-    ensure!(file.metadata()?.is_file(), "probe input is not a regular file");
+    ensure!(
+        file.metadata()?.is_file(),
+        "probe input is not a regular file"
+    );
     #[cfg(unix)]
-    ensure!(file.metadata()?.nlink() == 1, "probe input has extra hard links");
+    ensure!(
+        file.metadata()?.nlink() == 1,
+        "probe input has extra hard links"
+    );
     Ok(file)
 }
 
@@ -94,7 +105,9 @@ fn file_digest(file: &mut File, max_bytes: u64) -> Result<(u64, String)> {
         if count == 0 {
             break;
         }
-        length = length.checked_add(u64::try_from(count)?).context("file length overflow")?;
+        length = length
+            .checked_add(u64::try_from(count)?)
+            .context("file length overflow")?;
         ensure!(length <= max_bytes, "native rehearsal exceeds --max-bytes");
         hash.update(&buffer[..count]);
     }
@@ -106,12 +119,24 @@ fn copy_component(source: &Path, destination: &Path, max_bytes: u64) -> Result<(
     let expected = file_digest(&mut input, max_bytes)?;
     input.seek(SeekFrom::Start(0))?;
     let mut output = new_file(destination)?;
-    let copied = std::io::copy(&mut (&mut input).take(max_bytes.saturating_add(1)), &mut output)?;
-    ensure!(copied == expected.0, "native rehearsal input changed during copy");
+    let copied = std::io::copy(
+        &mut (&mut input).take(max_bytes.saturating_add(1)),
+        &mut output,
+    )?;
+    ensure!(
+        copied == expected.0,
+        "native rehearsal input changed during copy"
+    );
     output.sync_all()?;
-    ensure!(file_digest(&mut input, max_bytes)? == expected, "native rehearsal input changed");
+    ensure!(
+        file_digest(&mut input, max_bytes)? == expected,
+        "native rehearsal input changed"
+    );
     let mut retained = regular_file(destination)?;
-    ensure!(file_digest(&mut retained, max_bytes)? == expected, "native rehearsal copy differs");
+    ensure!(
+        file_digest(&mut retained, max_bytes)? == expected,
+        "native rehearsal copy differs"
+    );
     Ok(expected)
 }
 
@@ -125,19 +150,36 @@ fn write_receipt(path: &Path, value: &serde_json::Value) -> Result<()> {
 }
 
 fn truncate_completed(values: &[SqliteValue]) -> bool {
-    matches!(values, [SqliteValue::Integer(0), SqliteValue::Integer(0), SqliteValue::Integer(0)])
+    matches!(
+        values,
+        [
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(0)
+        ]
+    )
 }
 
 fn probe_values() -> Vec<SqliteValue> {
-    vec![SqliteValue::Integer(1), SqliteValue::Null, SqliteValue::Float(0.5),
+    vec![
+        SqliteValue::Integer(1),
+        SqliteValue::Null,
+        SqliteValue::Float(0.5),
         SqliteValue::Text("native WAL commit ' λ".into()),
-        SqliteValue::Blob([0_u8, 255].repeat(2048).into())]
+        SqliteValue::Blob([0_u8, 255].repeat(2048).into()),
+    ]
 }
 
 fn verify_probe_row(conn: &Connection, table: &str, max_bytes: u64) -> Result<()> {
-    let rows = conn.query(&format!("SELECT id,missing,ratio,note,payload FROM {table} LIMIT 2"))?;
-    ensure!(rows.len() == 1 && encoded_row(rows[0].values(), max_bytes)? ==
-            encoded_row(&probe_values(), max_bytes)?, "native committed probe row was lost or changed");
+    let rows = conn.query(&format!(
+        "SELECT id,missing,ratio,note,payload FROM {table} LIMIT 2"
+    ))?;
+    ensure!(
+        rows.len() == 1
+            && encoded_row(rows[0].values(), max_bytes)?
+                == encoded_row(&probe_values(), max_bytes)?,
+        "native committed probe row was lost or changed"
+    );
     Ok(())
 }
 
@@ -147,7 +189,10 @@ fn commit_probe(sandbox: &WriteSandbox, table: &str, max_bytes: u64) -> Result<(
         conn.execute("PRAGMA wal_autocheckpoint=0")?;
         conn.execute("BEGIN IMMEDIATE")?;
         conn.execute(&format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, missing, ratio REAL, note TEXT, payload BLOB)"))?;
-        conn.execute_with_params(&format!("INSERT INTO {table} VALUES (?1,?2,?3,?4,?5)"), &probe_values())?;
+        conn.execute_with_params(
+            &format!("INSERT INTO {table} VALUES (?1,?2,?3,?4,?5)"),
+            &probe_values(),
+        )?;
         conn.execute("COMMIT")?;
         verify_probe_row(&conn, table, max_bytes)
     })();
@@ -157,15 +202,21 @@ fn commit_probe(sandbox: &WriteSandbox, table: &str, max_bytes: u64) -> Result<(
     Ok(())
 }
 
-fn rollback_and_checkpoint(sandbox: &WriteSandbox, table: &str,
-                           manifest: &Manifest, max_bytes: u64) -> Result<()> {
+fn rollback_and_checkpoint(
+    sandbox: &WriteSandbox,
+    table: &str,
+    manifest: &Manifest,
+    max_bytes: u64,
+) -> Result<()> {
     let mut conn = sandbox.open_writer()?;
     let operation = (|| -> Result<()> {
         conn.execute("PRAGMA wal_autocheckpoint=0")?;
         // A fresh connection, not a retained pager cache, must see the commit.
         verify_probe_row(&conn, table, max_bytes)?;
         conn.execute("BEGIN IMMEDIATE")?;
-        conn.execute(&format!("UPDATE {table} SET note='must roll back', payload=X'00' WHERE id=1"))?;
+        conn.execute(&format!(
+            "UPDATE {table} SET note='must roll back', payload=X'00' WHERE id=1"
+        ))?;
         conn.execute("ROLLBACK")?;
         verify_probe_row(&conn, table, max_bytes)?;
         conn.execute("BEGIN IMMEDIATE")?;
@@ -176,8 +227,10 @@ fn rollback_and_checkpoint(sandbox: &WriteSandbox, table: &str,
         verify(&conn, manifest, max_bytes)?;
         conn.execute("PRAGMA query_only=OFF")?;
         let checkpoint = conn.query("PRAGMA wal_checkpoint(TRUNCATE)")?;
-        ensure!(checkpoint.len() == 1 && truncate_completed(checkpoint[0].values()),
-                "private native TRUNCATE did not return exactly (0,0,0)");
+        ensure!(
+            checkpoint.len() == 1 && truncate_completed(checkpoint[0].values()),
+            "private native TRUNCATE did not return exactly (0,0,0)"
+        );
         Ok(())
     })();
     let closed = conn.close_without_checkpoint_in_place();
@@ -186,24 +239,37 @@ fn rollback_and_checkpoint(sandbox: &WriteSandbox, table: &str,
     Ok(())
 }
 
-fn verify_main_only(sandbox: &WriteSandbox, manifest: &Manifest, max_bytes: u64) -> Result<(u64, String)> {
+fn verify_main_only(
+    sandbox: &WriteSandbox,
+    manifest: &Manifest,
+    max_bytes: u64,
+) -> Result<(u64, String)> {
     let directory = sandbox.directory.join("main-only");
     fs::create_dir(&directory)?;
     let db = directory.join("beads.db");
     let witness = copy_component(&sandbox.database, &db, max_bytes)?;
-    let mut conn = open_with_flags(db.to_str().context("non-UTF-8 main-only path")?,
-                                   OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut conn = open_with_flags(
+        db.to_str().context("non-UTF-8 main-only path")?,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
     let verified = verify(&conn, manifest, max_bytes);
     let closed = conn.close_without_checkpoint_in_place();
     verified?;
     closed?;
-    ensure!(file_digest(&mut regular_file(&db)?, max_bytes)? == witness,
-            "main-only native read changed checkpointed data");
+    ensure!(
+        file_digest(&mut regular_file(&db)?, max_bytes)? == witness,
+        "main-only native read changed checkpointed data"
+    );
     Ok(witness)
 }
 
-fn rehearse_writes(input: &Path, expected: &Path, manifest: &Manifest,
-                   manifest_sha256: &str, max_bytes: u64) -> Result<()> {
+fn rehearse_writes(
+    input: &Path,
+    expected: &Path,
+    manifest: &Manifest,
+    manifest_sha256: &str,
+    max_bytes: u64,
+) -> Result<()> {
     let evidence = expected.parent().context("native manifest has no parent")?;
     let sandbox = WriteSandbox::allocate(evidence)?;
     let mut stage = "capture";
@@ -211,17 +277,24 @@ fn rehearse_writes(input: &Path, expected: &Path, manifest: &Manifest,
         let mut inputs = Vec::new();
         for suffix in ["", "-wal", "-shm"] {
             let source = component(input, suffix);
-            let witness = copy_component(&source, &component(&sandbox.database, suffix), max_bytes)?;
+            let witness =
+                copy_component(&source, &component(&sandbox.database, suffix), max_bytes)?;
             inputs.push((source, witness));
         }
-        write_receipt(&sandbox.directory.join("prepared.json"), &serde_json::json!({
-            "schema": WRITE_SCHEMA, "manifest_sha256": manifest_sha256,
-            "input_family": input.to_str().context("non-UTF-8 input path")?,
-            "sql_write_target": sandbox.database.to_str().context("non-UTF-8 sandbox path")?,
-        }))?;
+        write_receipt(
+            &sandbox.directory.join("prepared.json"),
+            &serde_json::json!({
+                "schema": WRITE_SCHEMA, "manifest_sha256": manifest_sha256,
+                "input_family": input.to_str().context("non-UTF-8 input path")?,
+                "sql_write_target": sandbox.database.to_str().context("non-UTF-8 sandbox path")?,
+            }),
+        )?;
         // A random sandbox-bound identifier avoids user objects. CREATE has
         // no IF NOT EXISTS: even a coincident name must fail, not reuse data.
-        let relative = sandbox.directory.file_name().and_then(|name| name.to_str())
+        let relative = sandbox
+            .directory
+            .file_name()
+            .and_then(|name| name.to_str())
             .context("invalid sandbox name")?;
         let name = format!("__br_wal_probe_{relative}");
         let table = quoted(&name)?;
@@ -233,8 +306,10 @@ fn rehearse_writes(input: &Path, expected: &Path, manifest: &Manifest,
         let (bytes, sha256) = verify_main_only(&sandbox, manifest, max_bytes)?;
         stage = "input-preservation";
         for (path, witness) in inputs {
-            ensure!(file_digest(&mut regular_file(&path)?, max_bytes)? == witness,
-                    "native write rehearsal changed its read-only input");
+            ensure!(
+                file_digest(&mut regular_file(&path)?, max_bytes)? == witness,
+                "native write rehearsal changed its read-only input"
+            );
         }
         Ok(serde_json::json!({
             "schema": WRITE_SCHEMA, "verified": true,
@@ -254,12 +329,17 @@ fn rehearse_writes(input: &Path, expected: &Path, manifest: &Manifest,
             write_receipt(&evidence.join("native-write.json"), &receipt)
         }
         Err(error) => {
-            let _ = write_receipt(&sandbox.directory.join("failed.json"), &serde_json::json!({
-                "schema": WRITE_SCHEMA, "verified": false, "stage": stage,
-                "manifest_sha256": manifest_sha256, "error": format!("{error:#}"),
-            }));
-            Err(error.context(format!("native write rehearsal failed at {stage}; retained {}",
-                                       sandbox.directory.display())))
+            let _ = write_receipt(
+                &sandbox.directory.join("failed.json"),
+                &serde_json::json!({
+                    "schema": WRITE_SCHEMA, "verified": false, "stage": stage,
+                    "manifest_sha256": manifest_sha256, "error": format!("{error:#}"),
+                }),
+            );
+            Err(error.context(format!(
+                "native write rehearsal failed at {stage}; retained {}",
+                sandbox.directory.display()
+            )))
         }
     }
 }
@@ -293,7 +373,10 @@ struct Manifest {
 }
 
 fn quoted(name: &str) -> Result<String> {
-    ensure!(!name.is_empty() && !name.contains('\0'), "invalid SQL identifier");
+    ensure!(
+        !name.is_empty() && !name.contains('\0'),
+        "invalid SQL identifier"
+    );
     Ok(format!("\"{}\"", name.replace('"', "\"\"")))
 }
 
@@ -301,14 +384,21 @@ fn table_query(table: &TableWitness) -> Result<String> {
     ensure!(!table.columns.is_empty(), "empty column projection");
     let mut projection = Vec::new();
     if let Some(alias) = &table.rowid_alias {
-        ensure!(matches!(alias.as_str(), "rowid" | "_rowid_" | "oid"), "invalid rowid alias");
+        ensure!(
+            matches!(alias.as_str(), "rowid" | "_rowid_" | "oid"),
+            "invalid rowid alias"
+        );
         projection.push(alias.clone());
     }
     for column in &table.columns {
         projection.push(quoted(column)?);
     }
     let limit = table.rows.checked_add(1).context("row count overflow")?;
-    Ok(format!("SELECT {} FROM {} LIMIT {limit}", projection.join(","), quoted(&table.name)?))
+    Ok(format!(
+        "SELECT {} FROM {} LIMIT {limit}",
+        projection.join(","),
+        quoted(&table.name)?
+    ))
 }
 
 fn encoded_row(values: &[SqliteValue], max_bytes: u64) -> Result<Vec<u8>> {
@@ -334,15 +424,20 @@ fn encoded_row(values: &[SqliteValue], max_bytes: u64) -> Result<Vec<u8>> {
                 append_bytes(&mut encoded, blob, max_bytes)?;
             }
         }
-        ensure!(u64::try_from(encoded.len())? <= max_bytes, "row exceeds witness byte limit");
+        ensure!(
+            u64::try_from(encoded.len())? <= max_bytes,
+            "row exceeds witness byte limit"
+        );
     }
     Ok(encoded)
 }
 
 fn append_bytes(encoded: &mut Vec<u8>, bytes: &[u8], max_bytes: u64) -> Result<()> {
     let length = u64::try_from(bytes.len())?;
-    let required = u64::try_from(encoded.len())?.checked_add(8)
-        .and_then(|size| size.checked_add(length)).context("row length overflow")?;
+    let required = u64::try_from(encoded.len())?
+        .checked_add(8)
+        .and_then(|size| size.checked_add(length))
+        .context("row length overflow")?;
     ensure!(required <= max_bytes, "value exceeds witness byte limit");
     encoded.extend_from_slice(&length.to_be_bytes());
     encoded.extend_from_slice(bytes);
@@ -354,7 +449,9 @@ fn rows_digest(rows: &[Row], max_bytes: u64) -> Result<String> {
     let mut total = 0_u64;
     for row in rows {
         let data = encoded_row(row.values(), max_bytes)?;
-        total = total.checked_add(u64::try_from(data.len())?).and_then(|size| size.checked_add(8))
+        total = total
+            .checked_add(u64::try_from(data.len())?)
+            .and_then(|size| size.checked_add(8))
             .context("row witness length overflow")?;
         ensure!(total <= max_bytes, "row witness exceeds byte limit");
         encoded.push(data);
@@ -391,9 +488,14 @@ fn verify_integrity(conn: &Connection) -> Result<()> {
         "native integrity check requires autocommit state"
     );
     let integrity = conn.query("PRAGMA integrity_check")?;
-    ensure!(integrity.len() == 1, "native integrity check did not return one row");
-    ensure!(matches!(integrity[0].values(), [SqliteValue::Text(text)] if text.as_bytes() == b"ok"),
-            "native integrity check failed");
+    ensure!(
+        integrity.len() == 1,
+        "native integrity check did not return one row"
+    );
+    ensure!(
+        matches!(integrity[0].values(), [SqliteValue::Text(text)] if text.as_bytes() == b"ok"),
+        "native integrity check failed"
+    );
     Ok(())
 }
 
@@ -424,14 +526,23 @@ fn verify(conn: &Connection, manifest: &Manifest, max_bytes: u64) -> Result<()> 
 }
 
 fn verify_snapshot(conn: &Connection, manifest: &Manifest, max_bytes: u64) -> Result<()> {
-    ensure!(manifest.schema_rows.rows <= max_bytes, "implausible expected schema row count");
-    let schema_limit = manifest.schema_rows.rows.checked_add(1).context("schema row count overflow")?;
+    ensure!(
+        manifest.schema_rows.rows <= max_bytes,
+        "implausible expected schema row count"
+    );
+    let schema_limit = manifest
+        .schema_rows
+        .rows
+        .checked_add(1)
+        .context("schema row count overflow")?;
     let schema = conn.query(&format!(
         "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema LIMIT {schema_limit}"
     ))?;
-    ensure!(u64::try_from(schema.len())? == manifest.schema_rows.rows
+    ensure!(
+        u64::try_from(schema.len())? == manifest.schema_rows.rows
             && rows_digest(&schema, max_bytes)? == manifest.schema_rows.sha256,
-            "native schema differs from the independent SQLite witness");
+        "native schema differs from the independent SQLite witness"
+    );
     let mut actual_names = BTreeSet::new();
     for row in &schema {
         if let [SqliteValue::Text(kind), SqliteValue::Text(name), ..] = row.values()
@@ -441,30 +552,56 @@ fn verify_snapshot(conn: &Connection, manifest: &Manifest, max_bytes: u64) -> Re
         }
     }
     let mut expected_names = BTreeSet::new();
-    for name in manifest.tables.iter().map(|table| &table.name).chain(&manifest.skipped_virtual) {
-        ensure!(expected_names.insert(name.clone()), "duplicate table in native manifest");
+    for name in manifest
+        .tables
+        .iter()
+        .map(|table| &table.name)
+        .chain(&manifest.skipped_virtual)
+    {
+        ensure!(
+            expected_names.insert(name.clone()),
+            "duplicate table in native manifest"
+        );
     }
-    ensure!(actual_names == expected_names, "native manifest omitted or added a table");
+    ensure!(
+        actual_names == expected_names,
+        "native manifest omitted or added a table"
+    );
     for table in &manifest.tables {
         ensure!(table.rows <= max_bytes, "implausible expected row count");
         let rows = conn.query(&table_query(table)?)?;
-        ensure!(u64::try_from(rows.len())? == table.rows
+        ensure!(
+            u64::try_from(rows.len())? == table.rows
                 && rows_digest(&rows, max_bytes)? == table.sha256,
-                "native table differs from the independent witness: {}", table.name);
+            "native table differs from the independent witness: {}",
+            table.name
+        );
     }
-    ensure!(integer_pragma(conn, "PRAGMA user_version")? == manifest.user_version
+    ensure!(
+        integer_pragma(conn, "PRAGMA user_version")? == manifest.user_version
             && integer_pragma(conn, "PRAGMA application_id")? == manifest.application_id,
-            "native database metadata differs from the independent witness");
+        "native database metadata differs from the independent witness"
+    );
     Ok(())
 }
 
 pub fn execute(db: &Path, expected: &Path, max_bytes: u64) -> Result<serde_json::Value> {
-    let path = db.to_str().context("native probe refuses a non-UTF-8 path instead of retargeting it")?;
+    let path = db
+        .to_str()
+        .context("native probe refuses a non-UTF-8 path instead of retargeting it")?;
     let mut bytes = Vec::new();
-    File::open(expected)?.take(RECEIPT_LIMIT + 1).read_to_end(&mut bytes)?;
-    ensure!(u64::try_from(bytes.len())? <= RECEIPT_LIMIT, "oversized native manifest");
+    File::open(expected)?
+        .take(RECEIPT_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        u64::try_from(bytes.len())? <= RECEIPT_LIMIT,
+        "oversized native manifest"
+    );
     let manifest: Manifest = serde_json::from_slice(&bytes)?;
-    ensure!(manifest.schema == SCHEMA, "unsupported native manifest schema");
+    ensure!(
+        manifest.schema == SCHEMA,
+        "unsupported native manifest schema"
+    );
     let mut conn = open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let verified = verify(&conn, &manifest, max_bytes);
     // Close on BOTH paths. No admitted native read can silently authorize a
@@ -492,19 +629,31 @@ mod tests {
 
     #[test]
     fn only_exact_truncate_completion_is_accepted() {
-        let success = [SqliteValue::Integer(0), SqliteValue::Integer(0), SqliteValue::Integer(0)];
+        let success = [
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(0),
+        ];
         assert!(truncate_completed(&success));
         for tuple in [[1, 0, 0], [0, 2, 2], [0, -1, -1], [1, -1, -1], [0, 2, 1]] {
             assert!(!truncate_completed(&tuple.map(SqliteValue::Integer)));
         }
         assert!(!truncate_completed(&[]));
         assert!(!truncate_completed(&success[..2]));
-        assert!(!truncate_completed(&[SqliteValue::Float(0.0), success[1].clone(), success[2].clone()]));
+        assert!(!truncate_completed(&[
+            SqliteValue::Float(0.0),
+            success[1].clone(),
+            success[2].clone()
+        ]));
     }
 
     #[test]
     fn sandbox_copy_is_exact_bounded_and_never_clobbers() {
-        let root = tempfile::Builder::new().prefix("native-copy-test-").tempdir().unwrap().keep();
+        let root = tempfile::Builder::new()
+            .prefix("native-copy-test-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let source = root.join("source");
         let target = root.join("target");
         fs::write(&source, b"database bytes").unwrap();
@@ -521,7 +670,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sandbox_capture_refuses_symlinks_and_extra_links() {
-        let root = tempfile::Builder::new().prefix("native-links-test-").tempdir().unwrap().keep();
+        let root = tempfile::Builder::new()
+            .prefix("native-links-test-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let source = root.join("source");
         fs::write(&source, b"keep this input").unwrap();
         let symlink = root.join("symlink");
@@ -534,34 +687,54 @@ mod tests {
 
     #[test]
     fn allocated_writer_cannot_fall_back_to_an_input_path() {
-        let root = tempfile::Builder::new().prefix("native-owned-test-").tempdir().unwrap().keep();
+        let root = tempfile::Builder::new()
+            .prefix("native-owned-test-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let sandbox = WriteSandbox::allocate(&root).unwrap();
         assert_eq!(sandbox.database.parent(), Some(sandbox.directory.as_path()));
         assert_eq!(sandbox.directory.parent(), Some(root.as_path()));
         assert!(!sandbox.database.exists());
         assert!(sandbox.open_writer().is_err());
-        assert!(!sandbox.database.exists(), "read-write-only opener must not create a DB");
+        assert!(
+            !sandbox.database.exists(),
+            "read-write-only opener must not create a DB"
+        );
     }
 
     #[test]
     fn wire_encoding_preserves_types_boundaries_and_float_bits() {
-        let row = [SqliteValue::Null, SqliteValue::Integer(-2), SqliteValue::Float(-0.0),
-            SqliteValue::Text("λ".into()), SqliteValue::Blob(vec![0, 255].into())];
+        let row = [
+            SqliteValue::Null,
+            SqliteValue::Integer(-2),
+            SqliteValue::Float(-0.0),
+            SqliteValue::Text("λ".into()),
+            SqliteValue::Blob(vec![0, 255].into()),
+        ];
         let expected = "00000000000000056e69fffffffffffffffe728000000000000000740000000000000002cebb62000000000000000200ff";
         let actual = encoded_row(&row, 1024).unwrap();
         assert_eq!(lower_hex(&actual), expected);
         assert!(encoded_row(&row, 8).is_err());
-        assert_ne!(encoded_row(&[SqliteValue::Integer(1)], 1024).unwrap(),
-                   encoded_row(&[SqliteValue::Float(1.0)], 1024).unwrap());
+        assert_ne!(
+            encoded_row(&[SqliteValue::Integer(1)], 1024).unwrap(),
+            encoded_row(&[SqliteValue::Float(1.0)], 1024).unwrap()
+        );
     }
 
     #[test]
     fn table_identifiers_are_data_not_executable_sql() {
-        let mut table = TableWitness { name: "a\"; DROP TABLE issues;--".into(),
-            columns: vec!["b\"c".into()], rowid_alias: Some("rowid".into()), rows: 0,
-            sha256: String::new() };
-        assert_eq!(table_query(&table).unwrap(),
-            "SELECT rowid,\"b\"\"c\" FROM \"a\"\"; DROP TABLE issues;--\" LIMIT 1");
+        let mut table = TableWitness {
+            name: "a\"; DROP TABLE issues;--".into(),
+            columns: vec!["b\"c".into()],
+            rowid_alias: Some("rowid".into()),
+            rows: 0,
+            sha256: String::new(),
+        };
+        assert_eq!(
+            table_query(&table).unwrap(),
+            "SELECT rowid,\"b\"\"c\" FROM \"a\"\"; DROP TABLE issues;--\" LIMIT 1"
+        );
         table.rowid_alias = Some("rowid FROM issues; DELETE".into());
         assert!(table_query(&table).is_err());
         table.rowid_alias = None;
@@ -571,8 +744,10 @@ mod tests {
 
     #[test]
     fn malformed_duplicate_or_unknown_manifest_fields_are_refused() {
-        for value in [r#"{"schema":"a","schema":"b"}"#,
-                      r#"{"schema":"a","unexpected":true}"#] {
+        for value in [
+            r#"{"schema":"a","schema":"b"}"#,
+            r#"{"schema":"a","unexpected":true}"#,
+        ] {
             assert!(serde_json::from_str::<Manifest>(value).is_err());
         }
     }

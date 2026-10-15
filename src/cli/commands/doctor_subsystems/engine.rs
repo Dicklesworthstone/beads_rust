@@ -507,7 +507,9 @@ mod tests {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
         let temp = tempfile::tempdir().unwrap();
-        let db = temp.path().join(OsString::from_vec(b"selected-\xff.db".to_vec()));
+        let db = temp
+            .path()
+            .join(OsString::from_vec(b"selected-\xff.db".to_vec()));
         std::fs::write(&db, b"db").unwrap();
         std::fs::write(sidecar_path(&db, "-wal"), [0; 33]).unwrap();
         let advice = wal_recovery_advice(&db, true).unwrap();

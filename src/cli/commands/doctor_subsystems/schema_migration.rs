@@ -958,13 +958,8 @@ fn require_recovery_payload_unchanged(
 /// Private backups may intentionally have stricter permissions than live
 /// database files. Compare their payloads, not their copy-only modes.
 /// Live before/after checks continue to compare complete witnesses.
-fn recovery_component_payload_eq(
-    left: &RawComponentWitness,
-    right: &RawComponentWitness,
-) -> bool {
-    left.present == right.present
-        && left.length == right.length
-        && left.sha256 == right.sha256
+fn recovery_component_payload_eq(left: &RawComponentWitness, right: &RawComponentWitness) -> bool {
+    left.present == right.present && left.length == right.length && left.sha256 == right.sha256
 }
 
 fn sqlite_database_page_size(path: &Path) -> Result<u32> {
@@ -1179,7 +1174,9 @@ fn recover_live_index_from_private_copy(
         )
     })();
     if let Err(error) = operation {
-        if live_stage.as_deref().is_some_and(|stage| stage == "live-recovery")
+        if live_stage
+            .as_deref()
+            .is_some_and(|stage| stage == "live-recovery")
             && live_recovery_contention(&error)
         {
             return Err(error);
@@ -1201,8 +1198,7 @@ fn publish_recovered_index(
     live_stage: Option<&mut String>,
 ) -> Result<()> {
     let probe_after = recovery_family_witness(probe_db)?;
-    let bound_wal =
-        require_private_recovery_payload_compatible(probe_db, expected, &probe_after)?;
+    let bound_wal = require_private_recovery_payload_compatible(probe_db, expected, &probe_after)?;
     if !crate::franken_sync::wal_index::ENGINE_READS_ON_DISK_WAL_INDEX {
         authority.verify_database_authority()?;
         require_frame_free_engine_recovery(db_path)?;
@@ -1563,9 +1559,10 @@ fn recover_index_only(
             return Ok(true);
         }
         receipt.stage = "reinstate-index".to_string();
-        let installed = receipt.raw_after.as_ref().ok_or_else(|| {
-            BeadsError::internal("recovery omitted the installed index witness")
-        })?;
+        let installed = receipt
+            .raw_after
+            .as_ref()
+            .ok_or_else(|| BeadsError::internal("recovery omitted the installed index witness"))?;
         install_recovery_index(
             db_path,
             &index_backup,
@@ -1656,9 +1653,7 @@ fn bind_live_wal_header(
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(
-            windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
-        );
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let mut live_file = options.open(&live)?;
     if !same_file_identity(&metadata, &live_file.metadata()?) || live_file.metadata()?.len() != 0 {
@@ -1755,9 +1750,7 @@ fn rollback_bound_live_wal(
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(
-            windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
-        );
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = options.open(&live)?;
     if !same_file_identity(&metadata, &file.metadata()?)
@@ -6874,7 +6867,11 @@ mod tests {
 
     fn recovery_561_wal_header(page_size: u32, big_endian: bool, sequence: u32) -> [u8; 32] {
         let mut header = [0_u8; 32];
-        let magic = if big_endian { 0x377f_0683_u32 } else { 0x377f_0682_u32 };
+        let magic = if big_endian {
+            0x377f_0683_u32
+        } else {
+            0x377f_0682_u32
+        };
         header[..4].copy_from_slice(&magic.to_be_bytes());
         header[4..8].copy_from_slice(&3_007_000_u32.to_be_bytes());
         header[8..12].copy_from_slice(&page_size.to_be_bytes());

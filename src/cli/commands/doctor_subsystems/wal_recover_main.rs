@@ -118,13 +118,18 @@ fn helper_command(args: &Args) -> io::Result<Command> {
     if args.restore_shm || args.resume_from.is_some() {
         // There is no user-selected verifier or environment override in the
         // companion: every source-index operation probes this linked engine.
-        command.arg("--engine-verifier").arg(std::env::current_exe()?);
+        command
+            .arg("--engine-verifier")
+            .arg(std::env::current_exe()?);
     }
     Ok(command)
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "br-wal-recover", about = "Internal read-only private-family probe")]
+#[command(
+    name = "br-wal-recover",
+    about = "Internal read-only private-family probe"
+)]
 struct NativeProbeArgs {
     #[arg(long)]
     native_probe: PathBuf,
@@ -141,8 +146,11 @@ fn run_native_probe(args: &NativeProbeArgs) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("{}", serde_json::json!({"schema": wal_engine_probe::SCHEMA,
-                "verified": false, "error": format!("{error:#}")}));
+            eprintln!(
+                "{}",
+                serde_json::json!({"schema": wal_engine_probe::SCHEMA,
+                "verified": false, "error": format!("{error:#}")})
+            );
             ExitCode::FAILURE
         }
     }
@@ -238,10 +246,22 @@ mod tests {
             vec!["br-wal-recover", "--output", "new"],
             vec!["br-wal-recover", "--db", "source"],
             vec![
-                "br-wal-recover", "--db", "source", "--output", "new", "--max-bytes", "0",
+                "br-wal-recover",
+                "--db",
+                "source",
+                "--output",
+                "new",
+                "--max-bytes",
+                "0",
             ],
             vec![
-                "br-wal-recover", "--db", "source", "--output", "new", "--max-bytes", "-1",
+                "br-wal-recover",
+                "--db",
+                "source",
+                "--output",
+                "new",
+                "--max-bytes",
+                "-1",
             ],
         ] {
             assert!(Args::try_parse_from(argv).is_err());
@@ -261,7 +281,10 @@ mod tests {
         assert_eq!(values[3], OsStr::new("-c"));
         assert_eq!(values[4], HELPER);
         assert_eq!(values[5], "--db");
-        assert_eq!(values[6], std::path::absolute(&args.db).unwrap().as_os_str());
+        assert_eq!(
+            values[6],
+            std::path::absolute(&args.db).unwrap().as_os_str()
+        );
         assert_eq!(values[7], "--output");
         assert_eq!(
             values[8],
@@ -288,7 +311,13 @@ mod tests {
     #[test]
     fn resume_is_explicit_and_conflicts_with_restoration() {
         let argv = [
-            "br-wal-recover", "--db", "source", "--output", "new", "--resume-from", "prior",
+            "br-wal-recover",
+            "--db",
+            "source",
+            "--output",
+            "new",
+            "--resume-from",
+            "prior",
         ];
         let args = Args::try_parse_from(argv).unwrap();
         assert_eq!(args.resume_from, Some(PathBuf::from("prior")));
@@ -311,7 +340,10 @@ mod tests {
         let values: Vec<_> = command.get_args().collect();
         assert_eq!(values.len(), 15);
         assert_eq!(values[11], "--resume-from");
-        assert_eq!(values[12], std::path::absolute(&evidence).unwrap().as_os_str());
+        assert_eq!(
+            values[12],
+            std::path::absolute(&evidence).unwrap().as_os_str()
+        );
         assert_eq!(values[13], "--engine-verifier");
         assert_eq!(values[14], std::env::current_exe().unwrap().as_os_str());
     }
@@ -321,7 +353,9 @@ mod tests {
     fn non_utf8_paths_are_not_lossily_retargeted() {
         use std::os::unix::ffi::OsStringExt;
         let mut args = arguments();
-        args.db = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/source-\xff.db".to_vec()));
+        args.db = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/tmp/source-\xff.db".to_vec(),
+        ));
         let command = helper_command(&args).unwrap();
         assert_eq!(command.get_args().nth(6).unwrap(), args.db.as_os_str());
     }
@@ -329,7 +363,12 @@ mod tests {
     #[test]
     fn last_commit_copy_is_explicit_and_forwarded_once() {
         let args = Args::try_parse_from([
-            "br-wal-recover", "--db", "source", "--output", "new", "--copy-last-commit",
+            "br-wal-recover",
+            "--db",
+            "source",
+            "--output",
+            "new",
+            "--copy-last-commit",
         ])
         .unwrap();
         assert!(args.copy_last_commit);
@@ -343,7 +382,12 @@ mod tests {
     fn last_commit_copy_cannot_enter_live_restoration_or_resume() {
         for mode in [vec!["--restore-shm"], vec!["--resume-from", "prior"]] {
             let mut argv = vec![
-                "br-wal-recover", "--db", "source", "--output", "new", "--copy-last-commit",
+                "br-wal-recover",
+                "--db",
+                "source",
+                "--output",
+                "new",
+                "--copy-last-commit",
             ];
             argv.extend(mode);
             assert!(Args::try_parse_from(argv).is_err());
@@ -359,9 +403,20 @@ mod tests {
 
     #[test]
     fn internal_probe_cannot_enter_any_source_mutation_mode() {
-        let argv = ["br-wal-recover", "--native-probe", "expected.json", "--db", "private.db"];
+        let argv = [
+            "br-wal-recover",
+            "--native-probe",
+            "expected.json",
+            "--db",
+            "private.db",
+        ];
         assert!(NativeProbeArgs::try_parse_from(argv).is_ok());
-        for mode in ["--restore-shm", "--resume-from", "--output", "--copy-last-commit"] {
+        for mode in [
+            "--restore-shm",
+            "--resume-from",
+            "--output",
+            "--copy-last-commit",
+        ] {
             assert!(NativeProbeArgs::try_parse_from(argv.into_iter().chain([mode])).is_err());
         }
     }

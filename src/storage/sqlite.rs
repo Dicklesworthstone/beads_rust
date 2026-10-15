@@ -22760,10 +22760,12 @@ mod tests {
         assert_eq!(recovered.id, issue.id);
         assert_eq!(recovered.title, issue.title);
 
-        assert!(storage
-            .get_issue_for_preservation_by_scan("bd-definitely-absent", None)
-            .unwrap()
-            .is_none());
+        assert!(
+            storage
+                .get_issue_for_preservation_by_scan("bd-definitely-absent", None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     fn sync_merge_test_intent(

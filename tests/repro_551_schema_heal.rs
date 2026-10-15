@@ -19,9 +19,8 @@ fn workspace() -> (BrWorkspace, PathBuf) {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/schema_migration");
     let beads = workspace.root.join(".beads");
     fs::create_dir_all(&beads).unwrap();
-    let mut decoder = GzDecoder::new(
-        fs::File::open(fixtures.join("schema16_v0219_release.db.gz")).unwrap(),
-    );
+    let mut decoder =
+        GzDecoder::new(fs::File::open(fixtures.join("schema16_v0219_release.db.gz")).unwrap());
     let mut bytes = Vec::new();
     decoder.read_to_end(&mut bytes).unwrap();
     assert_eq!(u32::from_be_bytes(bytes[60..64].try_into().unwrap()), 16);
@@ -104,7 +103,9 @@ fn labels(db: &Path) -> Vec<Vec<SqliteValue>> {
 fn assert_current(db: &Path) {
     assert_eq!(
         query_copy(db, "PRAGMA user_version")[0][0].as_integer(),
-        Some(i64::from(beads_rust::storage::schema::CURRENT_SCHEMA_VERSION))
+        Some(i64::from(
+            beads_rust::storage::schema::CURRENT_SCHEMA_VERSION
+        ))
     );
 }
 
@@ -272,9 +273,7 @@ fn failed_reviewed_migration_cannot_automatically_drop_well_formed_orphans() {
         "551_orphans",
     );
     assert!(!run.status.success(), "{} {}", run.stdout, run.stderr);
-    assert!(
-        format!("{}{}", run.stdout, run.stderr).contains("without an owning issue")
-    );
+    assert!(format!("{}{}", run.stdout, run.stderr).contains("without an owning issue"));
     assert_eq!(protected_bytes(&db), before);
     assert_eq!(labels(&db).len(), 1);
 }

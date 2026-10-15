@@ -546,7 +546,10 @@ pub(crate) fn capture_backup_restore_source(
         )));
     }
     let source = capture_optional_jsonl_source(backup_path)?.ok_or_else(|| {
-        BeadsError::Config(format!("History backup '{}' is missing", backup_path.display()))
+        BeadsError::Config(format!(
+            "History backup '{}' is missing",
+            backup_path.display()
+        ))
     })?;
     if let Some(expected) = &metadata.raw_sha256
         && !expected.eq_ignore_ascii_case(source.raw_sha256())
@@ -1819,7 +1822,9 @@ mod tests {
             } else {
                 backup_before_export_snapshot(&beads, &HistoryConfig::default(), &target, &source)
                     .unwrap();
-                list_backups(&beads.join(".br_history"), None).unwrap()[0].path.clone()
+                list_backups(&beads.join(".br_history"), None).unwrap()[0]
+                    .path
+                    .clone()
             };
             fs::write(&target, b"current export must stay untouched").unwrap();
             let metadata_before = fs::read(backup_metadata_path(&backup)).unwrap();
@@ -1839,8 +1844,14 @@ mod tests {
             io::copy(&mut captured.reader(), &mut copied).unwrap();
             assert_eq!(copied, original);
             assert_eq!(fs::read(&backup).unwrap(), changed);
-            assert_eq!(fs::read(backup_metadata_path(&backup)).unwrap(), metadata_before);
-            assert_eq!(fs::read(&target).unwrap(), b"current export must stay untouched");
+            assert_eq!(
+                fs::read(backup_metadata_path(&backup)).unwrap(),
+                metadata_before
+            );
+            assert_eq!(
+                fs::read(&target).unwrap(),
+                b"current export must stay untouched"
+            );
         }
     }
 
@@ -1859,18 +1870,29 @@ mod tests {
         assert_eq!(resolved, target);
         let mut copied = Vec::new();
         io::copy(&mut legacy.reader(), &mut copied).unwrap();
-        assert_eq!(copied, bytes, "history restore is byte-preserving, not a JSON parser");
+        assert_eq!(
+            copied, bytes,
+            "history restore is byte-preserving, not a JSON parser"
+        );
 
         let mut metadata = read_backup_metadata(&backup).unwrap().unwrap();
         for invalid in [String::new(), "0".repeat(63), "z".repeat(64)] {
             metadata.raw_sha256 = Some(invalid);
-            fs::write(backup_metadata_path(&backup), serde_json::to_vec(&metadata).unwrap()).unwrap();
+            fs::write(
+                backup_metadata_path(&backup),
+                serde_json::to_vec(&metadata).unwrap(),
+            )
+            .unwrap();
             let error = capture_backup_restore_source(&beads, &backup).unwrap_err();
             assert!(matches!(error, BeadsError::Config(message)
                 if message.contains("invalid recorded SHA-256")));
         }
         metadata.raw_sha256 = Some(legacy.raw_sha256().to_ascii_uppercase());
-        fs::write(backup_metadata_path(&backup), serde_json::to_vec(&metadata).unwrap()).unwrap();
+        fs::write(
+            backup_metadata_path(&backup),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
         let (_, verified) = capture_backup_restore_source(&beads, &backup).unwrap();
         assert_eq!(verified.raw_sha256(), legacy.raw_sha256());
         assert_eq!(fs::read(&backup).unwrap(), bytes);

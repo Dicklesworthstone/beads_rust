@@ -1363,7 +1363,10 @@ pub(crate) mod tests {
                     {
                         assert!(matches!(result, Err(FrankenError::Busy)), "{values:?}");
                     } else {
-                        assert!(matches!(result, Err(FrankenError::Internal(_))), "{values:?}");
+                        assert!(
+                            matches!(result, Err(FrankenError::Internal(_))),
+                            "{values:?}"
+                        );
                     }
                 }
             }
@@ -1447,7 +1450,10 @@ pub(crate) mod tests {
                     statement.execute(),
                     statement.execute_with_params(&[]),
                 ] {
-                    assert!(matches!(result, Err(FrankenError::Busy)), "{sql}: {result:?}");
+                    assert!(
+                        matches!(result, Err(FrankenError::Busy)),
+                        "{sql}: {result:?}"
+                    );
                 }
             });
             assert_eq!(std::fs::read(&db).unwrap(), main_before);

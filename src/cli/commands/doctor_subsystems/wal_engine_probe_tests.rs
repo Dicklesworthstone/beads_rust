@@ -19,7 +19,8 @@ fn fixture() -> (PathBuf, Manifest) {
         .unwrap();
     conn.execute("INSERT INTO items VALUES(1, 'preserved')")
         .unwrap();
-    conn.execute("CREATE TABLE discarded(payload BLOB)").unwrap();
+    conn.execute("CREATE TABLE discarded(payload BLOB)")
+        .unwrap();
     conn.execute("BEGIN IMMEDIATE").unwrap();
     for _ in 0..16 {
         conn.execute_with_params(
@@ -64,26 +65,30 @@ fn fixture() -> (PathBuf, Manifest) {
 fn committed_freelist_is_not_misclassified_by_the_native_witness() {
     let (db, manifest) = fixture();
     let before = file_digest(&mut regular_file(&db).unwrap(), LIMIT).unwrap();
-    let mut conn = open_with_flags(db.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .unwrap();
+    let mut conn = open_with_flags(db.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     assert!(integer_pragma(&conn, "PRAGMA freelist_count").unwrap() > 0);
     verify(&conn, &manifest, LIMIT).unwrap();
     assert!(!conn.as_async().in_transaction());
     verify(&conn, &manifest, LIMIT).unwrap();
     conn.close_without_checkpoint_in_place().unwrap();
-    assert_eq!(file_digest(&mut regular_file(&db).unwrap(), LIMIT).unwrap(), before);
+    assert_eq!(
+        file_digest(&mut regular_file(&db).unwrap(), LIMIT).unwrap(),
+        before
+    );
 }
 
 #[test]
 fn failed_snapshot_ends_its_transaction_and_keeps_the_mismatch() {
     let (db, mut manifest) = fixture();
-    let mut conn = open_with_flags(db.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .unwrap();
+    let mut conn = open_with_flags(db.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     let correct_hash = manifest.schema_rows.sha256.clone();
     manifest.schema_rows.sha256 = "0".repeat(64);
     let error = verify(&conn, &manifest, LIMIT).unwrap_err();
     assert!(error.to_string().contains("native schema differs"));
-    assert!(!conn.as_async().in_transaction(), "failed witness left a transaction open");
+    assert!(
+        !conn.as_async().in_transaction(),
+        "failed witness left a transaction open"
+    );
     manifest.schema_rows.sha256 = correct_hash;
     verify(&conn, &manifest, LIMIT).unwrap();
     conn.close_without_checkpoint_in_place().unwrap();
@@ -92,8 +97,8 @@ fn failed_snapshot_ends_its_transaction_and_keeps_the_mismatch() {
 #[test]
 fn caller_transaction_is_not_rolled_back_or_reconfigured() {
     let (db, manifest) = fixture();
-    let mut conn = open_with_flags(db.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .unwrap();
+    let mut conn =
+        open_with_flags(db.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
     assert_eq!(integer_pragma(&conn, "PRAGMA query_only").unwrap(), 0);
     conn.execute("BEGIN IMMEDIATE").unwrap();
     conn.execute("UPDATE items SET note='caller-owned' WHERE id=1")
@@ -113,8 +118,7 @@ fn caller_transaction_is_not_rolled_back_or_reconfigured() {
 #[test]
 fn integrity_helper_refuses_transaction_local_freelist_projection() {
     let (db, _) = fixture();
-    let mut conn = open_with_flags(db.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .unwrap();
+    let mut conn = open_with_flags(db.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     conn.execute("BEGIN").unwrap();
     let error = verify_integrity(&conn).unwrap_err();
     assert!(error.to_string().contains("autocommit state"));
