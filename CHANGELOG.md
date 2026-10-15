@@ -88,6 +88,22 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
+## Unreleased
+
+### Recovery
+
+- **A missing database rebuilds again past a header-only WAL** (#569). In
+  v0.7.5, a missing `.beads/beads.db` with an orphaned `-wal` that held only
+  its 32-byte header made every command, reads included, fail with exit 6.
+  That is the normal state after a checkpoint. Automatic recovery treated any
+  non-empty WAL as unflushed state, but a WAL keeps pages only in frames after
+  its header. A WAL no longer than its header is now frame-less for this check
+  (shorter is torn, #228): it is moved to `.br_recovery` and br rebuilds from
+  JSONL as v0.7.4 did. A WAL with any byte past its header, and any non-empty
+  rollback journal, still refuse.
+
+---
+
 ## v0.7.5 — 2026-10-14
 
 [Release](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.5).

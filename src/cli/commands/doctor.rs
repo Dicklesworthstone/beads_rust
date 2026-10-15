@@ -16082,7 +16082,9 @@ mod tests {
             let db_path = fixture_root.join("beads.db");
             let sidecar_path = fixture_root.join(format!("beads.db{suffix}"));
             let jsonl_path = fixture_root.join("issues.jsonl");
-            let sidecar_bytes = b"retained orphan database pages";
+            // Longer than a WAL header: a WAL of 32 bytes or less holds no
+            // frame and is not a preservation warning.
+            let sidecar_bytes = b"retained orphan database pages past the 32-byte WAL header";
             fs::write(&sidecar_path, sidecar_bytes).unwrap();
             fs::write(&jsonl_path, "").unwrap();
             let source = capture_jsonl_source_snapshot(&jsonl_path).unwrap();
