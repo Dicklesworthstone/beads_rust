@@ -6245,13 +6245,17 @@ fn check_br_history_size(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
 /// Pass-5 cycle 17: detector for
 /// `fm-state_files-jsonl-oversized`.
 ///
-/// Warns when `.beads/issues.jsonl` exceeds
-/// `JSONL_OVERSIZED_THRESHOLD_BYTES` (100MB). At that scale the sync
-/// engine's full-file read on every flush becomes slow and the
-/// in-memory parse can pressure low-RAM hosts. Detect-only —
-/// compaction (closing stale issues, archiving old comments) is
-/// operator-decided.
-const JSONL_OVERSIZED_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024;
+/// Warns when `.beads/issues.jsonl` reaches
+/// `JSONL_OVERSIZED_THRESHOLD_BYTES` (50 MiB), the size at which GitHub
+/// starts warning on push. The file is committed, and GitHub rejects
+/// any push containing a file over `JSONL_PUSH_REJECT_BYTES` (100 MiB),
+/// so a workspace that crosses it can no longer push code either; the
+/// warning has to arrive while there is still room to shrink. Large
+/// files also make the sync engine's full-file read on every flush slow.
+/// Detect-only — compaction (closing stale issues, archiving old
+/// comments) is operator-decided.
+const JSONL_OVERSIZED_THRESHOLD_BYTES: u64 = 50 * 1024 * 1024;
+const JSONL_PUSH_REJECT_BYTES: u64 = 100 * 1024 * 1024;
 
 fn check_jsonl_oversized(jsonl_path: Option<&Path>, checks: &mut Vec<CheckResult>) {
     let Some(path) = jsonl_path else {
@@ -6267,22 +6271,29 @@ fn check_jsonl_oversized(jsonl_path: Option<&Path>, checks: &mut Vec<CheckResult
         return;
     }
     let bytes = meta.len();
-    if bytes > JSONL_OVERSIZED_THRESHOLD_BYTES {
+    if bytes >= JSONL_OVERSIZED_THRESHOLD_BYTES {
+        let over_push_limit = bytes > JSONL_PUSH_REJECT_BYTES;
+        let consequence = if over_push_limit {
+            "over GitHub's 100 MiB file limit: any push that includes it is rejected"
+        } else {
+            "GitHub warns on push from 50 MiB and rejects files over 100 MiB"
+        };
         push_check(
             checks,
             "jsonl_size",
             CheckStatus::Warn,
             Some(format!(
-                "{} is {} MB (>{} MB threshold); flushes will be slow and may pressure low-RAM hosts",
+                "{} is {} MiB; {consequence}",
                 path.display(),
                 bytes / (1024 * 1024),
-                JSONL_OVERSIZED_THRESHOLD_BYTES / (1024 * 1024)
             )),
             Some(serde_json::json!({
                 "path": path.display().to_string(),
                 "size_bytes": bytes,
                 "threshold_bytes": JSONL_OVERSIZED_THRESHOLD_BYTES,
-                "remediation": "Close stale issues, archive old comments, or split the workspace",
+                "push_reject_bytes": JSONL_PUSH_REJECT_BYTES,
+                "over_push_limit": over_push_limit,
+                "remediation": "Shrink it before it passes 100 MiB: close stale issues, move long reports out of comments, or split the workspace",
             })),
         );
     } else {
@@ -20638,6 +20649,36 @@ mod tests {
             .and_then(|d| d.get("size_bytes"))
             .and_then(serde_json::Value::as_u64);
         assert_eq!(size_bytes, Some(JSONL_OVERSIZED_THRESHOLD_BYTES + 1));
+        let details = check.details.as_ref().expect("details");
+        assert_eq!(details["over_push_limit"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn test_check_jsonl_oversized_flags_files_github_rejects() {
+        // A committed issues.jsonl over 100 MiB makes every push fail.
+        let temp = TempDir::new().unwrap();
+        let jsonl = temp.path().join("issues.jsonl");
+        let f = fs::File::create(&jsonl).unwrap();
+        f.set_len(JSONL_PUSH_REJECT_BYTES + 1).unwrap();
+        drop(f);
+
+        let mut checks = Vec::new();
+        check_jsonl_oversized(Some(&jsonl), &mut checks);
+        let check = find_check(&checks, "jsonl_size").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        assert!(
+            check
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("rejected")),
+            "{check:?}"
+        );
+        let details = check.details.as_ref().expect("details");
+        assert_eq!(details["over_push_limit"], serde_json::json!(true));
+        assert_eq!(
+            details["push_reject_bytes"],
+            serde_json::json!(JSONL_PUSH_REJECT_BYTES)
+        );
     }
 
     #[test]
