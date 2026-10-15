@@ -6,7 +6,7 @@
 # The separately maintained beads-rust-bin package is not this recipe.
 
 pkgname=br-bin
-pkgver=0.7.5
+pkgver=0.7.6
 pkgrel=1
 pkgdesc="Agent-first issue tracker (SQLite + JSONL)"
 arch=('x86_64' 'aarch64')
@@ -21,8 +21,8 @@ options=('!strip' '!debug')
 source_x86_64=("${pkgname}-${pkgver}-x86_64.tar.gz::https://github.com/Dicklesworthstone/beads_rust/releases/download/v${pkgver}/br-${pkgver}-linux_amd64.tar.gz")
 source_aarch64=("${pkgname}-${pkgver}-aarch64.tar.gz::https://github.com/Dicklesworthstone/beads_rust/releases/download/v${pkgver}/br-${pkgver}-linux_arm64.tar.gz")
 
-sha256sums_x86_64=('02f2765793894d7dbea24f8cc84f48d375e244674cdf3425dd2d04e2ef119d92')
-sha256sums_aarch64=('c304b15b0156dbd26faa979dc83a0109d010005675cbb76b220cd302f2dc6a16')
+sha256sums_x86_64=('56baae2df5e7cc6f6537e05fd5f560192a9d5ceb02659c61b10b9610b45eb3ef')
+sha256sums_aarch64=('22c27c037ceb9663d2d532c7974b81d2c0efbcdc48995dbff46589a1b31b2fab')
 
 package() {
     install -Dm755 "${srcdir}/br" "${pkgdir}/usr/bin/br"
