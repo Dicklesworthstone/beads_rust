@@ -257,8 +257,8 @@ fn e2e_history_restore_json_output() {
 // =============================================================================
 
 #[test]
-fn e2e_history_restore_corrupt_backup_succeeds_copy() {
-    let _log = common::test_log("e2e_history_restore_corrupt_backup_succeeds_copy");
+fn e2e_history_restore_corrupt_backup_is_refused() {
+    let _log = common::test_log("e2e_history_restore_corrupt_backup_is_refused");
     let workspace = setup_workspace_with_jsonl();
 
     // Create issue to trigger backup
@@ -278,25 +278,31 @@ fn e2e_history_restore_corrupt_backup_succeeds_copy() {
     fs::write(&backup_path, "{ this is not valid json }\n{ also broken }")
         .expect("write corrupt backup");
 
-    // Restore should succeed (it just copies the file)
-    // The corruption would be detected on import, not restore
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let before = fs::read(&jsonl_path).expect("read issues.jsonl before restore");
+
+    // The backup's recorded SHA-256 no longer matches its bytes, so restore
+    // refuses before touching the destination; --force does not bypass it.
     let restore = run_br(
         &workspace,
         ["history", "restore", backup_file, "--force"],
         "history_restore_corrupt",
     );
     assert!(
-        restore.status.success(),
-        "restore should succeed (it's just a copy): {}",
+        !restore.status.success(),
+        "restore of a backup that fails its recorded digest must be refused: {}",
+        restore.stdout
+    );
+    assert!(
+        restore.stderr.contains("failed its recorded SHA-256"),
+        "refusal should name the digest check: {}",
         restore.stderr
     );
 
-    // The restored issues.jsonl should contain the corrupt content
-    let restored_content = fs::read_to_string(workspace.root.join(".beads").join("issues.jsonl"))
-        .expect("read restored");
-    assert!(
-        restored_content.contains("this is not valid json"),
-        "restored file should contain the corrupt content"
+    let after = fs::read(&jsonl_path).expect("read issues.jsonl after refused restore");
+    assert_eq!(
+        before, after,
+        "a refused restore must leave issues.jsonl unchanged"
     );
 }
 

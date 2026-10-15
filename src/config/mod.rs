@@ -1120,6 +1120,9 @@ fn require_no_unreadable_orphan_state(beads_dir: &Path, db_path: &Path) -> Resul
     }
 }
 
+/// Size of a WAL header; frames, the only place a WAL keeps pages, follow it.
+const WAL_HEADER_BYTES: u64 = 32;
+
 /// Capture unknown state before any missing-database sidecar quarantine.
 /// Doctor retains the same warnings across its explicit best-effort repair.
 pub(crate) fn missing_database_preservation_warnings(db_path: &Path) -> Vec<String> {
@@ -1138,14 +1141,18 @@ pub(crate) fn missing_database_preservation_warnings(db_path: &Path) -> Vec<Stri
         }
     }
     let mut warnings = Vec::new();
-    for suffix in ["-wal", "-journal"] {
+    // WAL frames start after the 32-byte header, so a WAL no longer than
+    // that holds no page: header-only is the normal state after a passive
+    // checkpoint, and shorter is torn (#228). A rollback journal gets no
+    // such allowance.
+    for (suffix, frameless_len) in [("-wal", WAL_HEADER_BYTES), ("-journal", 0)] {
         let mut name = db_path.as_os_str().to_os_string();
         name.push(suffix);
         let sidecar = PathBuf::from(name);
         match fs::symlink_metadata(&sidecar) {
-            Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {}
+            Ok(metadata) if metadata.is_file() && metadata.len() <= frameless_len => {}
             Ok(_) => warnings.push(format!(
-                "the main database is missing, but orphaned sidecar '{}' is nonempty or is not a regular file; its unflushed state cannot be read",
+                "the main database is missing, but orphaned sidecar '{}' holds more than an empty header or is not a regular file; its unflushed state cannot be read",
                 sidecar.display()
             )),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -13228,6 +13235,32 @@ routing:
             !recovery_dir_for_db_path(&db_path, &beads_dir).exists(),
             "valid-sized wal should not create a recovery quarantine"
         );
+    }
+
+    #[test]
+    fn missing_database_preservation_allows_only_frameless_sidecars() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        let journal_db_path = temp.path().join("journaled.db");
+        let journal_path = PathBuf::from(format!("{}-journal", journal_db_path.to_string_lossy()));
+
+        for frameless in [0_usize, 7, 32] {
+            fs::write(&wal_path, vec![0_u8; frameless]).expect("write frameless wal");
+            assert!(
+                missing_database_preservation_warnings(&db_path).is_empty(),
+                "a {frameless}-byte wal holds no frame"
+            );
+        }
+        fs::write(&wal_path, [0_u8; 33]).expect("write wal past its header");
+        let warnings = missing_database_preservation_warnings(&db_path);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("beads.db-wal"), "{warnings:?}");
+
+        fs::write(&journal_path, [0_u8; 1]).expect("write nonempty journal");
+        let warnings = missing_database_preservation_warnings(&journal_db_path);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("journaled.db-journal"), "{warnings:?}");
     }
 
     #[test]

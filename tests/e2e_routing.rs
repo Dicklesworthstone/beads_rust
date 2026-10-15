@@ -99,7 +99,8 @@ fn switch_workspace_to_custom_database(workspace: &BrWorkspace, database_name: &
 }
 
 fn routed_partial_id(issue_id: &str) -> String {
-    let (prefix, hash) = issue_id.split_once('-').expect("issue id with prefix");
+    // Prefixes may contain `-`; the hash is the last segment.
+    let (prefix, hash) = issue_id.rsplit_once('-').expect("issue id with prefix");
     let partial_hash = hash.chars().take(2).collect::<String>();
     format!("{prefix}-{partial_hash}")
 }

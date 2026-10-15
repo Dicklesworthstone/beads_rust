@@ -710,11 +710,12 @@ resolve_version() {
                 --connect-timeout 10 \
                 --max-time 30 \
                 -H "Accept: application/vnd.github.v3+json" \
-                "$latest_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || echo "")
+                "$latest_url" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -n 1 | sed -E 's/.*"([^"]*)"$/\1/' || echo "")
         elif command -v wget &>/dev/null; then
-            tag=$(wget -qO- --timeout=30 "$latest_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || echo "")
+            tag=$(wget -qO- --timeout=30 "$latest_url" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -n 1 | sed -E 's/.*"([^"]*)"$/\1/' || echo "")
         fi
 
+        case "$tag" in v[0-9]*|[0-9]*) ;; *) tag="" ;; esac
         [ -z "$tag" ] && [ $attempts -lt $MAX_RETRIES ] && sleep 2
     done
 

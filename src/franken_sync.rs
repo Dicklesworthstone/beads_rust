@@ -242,7 +242,13 @@ fn completed_checkpoint_affected_rows<'a>(
     if *busy == 0 && *frames >= -1 && frames == backfilled {
         return Ok(0);
     }
-    if (0..=1).contains(busy) && *frames >= 0 && (0..=*frames).contains(backfilled) {
+    // SQLite leaves both counters at -1 when a competing checkpointer
+    // prevents it from starting. That is contention, not a malformed receipt,
+    // and must never authorize copying only the main database or truncating WAL.
+    let checkpoint_not_started = *busy == 1 && *frames == -1 && *backfilled == -1;
+    if checkpoint_not_started
+        || ((0..=1).contains(busy) && *frames >= 0 && (0..=*frames).contains(backfilled))
+    {
         tracing::debug!(busy, frames, backfilled, "WAL checkpoint did not complete");
         // Do not turn contention or partial backfill into a corruption error:
         // callers must not respond by rebuilding from potentially stale JSONL.
@@ -292,11 +298,13 @@ fn recovery_configuration_failure(error: FrankenError) -> FrankenError {
 impl Connection {
     /// Open an existing database only when its VFS handle matches the retained identity.
     ///
-    /// The explicit recovery workflow rehearses this open on a private copy
-    /// before using it on the live family. Before admitting #507's exact
-    /// poisoned-index signature to the engine, quarantine only the derived
-    /// index under independent engine and SQLite exclusion. Ordinary and
-    /// read-only opens never take this filesystem-recovery path.
+    /// Doctor uses this low-level writable opener only on private copies.
+    /// Admission can modify WAL bytes even when it returns an error, so a
+    /// post-open byte comparison cannot make a live recovery safe. Doctor
+    /// publishes only a verified private index under live exclusion instead.
+    /// Before admitting #507's exact poisoned-index signature to the engine,
+    /// quarantine only the derived index under independent engine and SQLite
+    /// exclusion. Ordinary and read-only opens never take this path.
     ///
     /// Every handle returned here closes without checkpointing, including
     /// retries after quarantine or missing-index reconstruction. Recovery may
@@ -469,7 +477,7 @@ impl Connection {
     }
 
     /// Close the connection (rolls back any active transaction, then runs the
-    /// final passive WAL checkpoint, except for cache-recovery handles).
+    /// final passive WAL checkpoint, except for read-only and cache-recovery handles).
     pub fn close(mut self) -> Result<(), FrankenError> {
         self.close_in_place()
     }
@@ -625,7 +633,11 @@ pub mod compat {
                 wal_index::warn_if_poisoned(path);
             }
         })?;
-        Connection::from_inner(inner, serialized, true)
+        // Read-only witnesses must not acquire checkpoint authority on close.
+        // In particular, recovery verifies the live family through this path
+        // after installing its private WAL index. The no-checkpoint policy is
+        // sticky across close errors and retries; writable opens keep theirs.
+        Connection::from_inner(inner, serialized, serialized)
     }
 }
 
@@ -859,6 +871,89 @@ pub(crate) mod tests {
         connection.close().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), main_before);
         assert_eq!(std::fs::read(&wal_path).unwrap(), wal_before);
+    }
+
+    #[test]
+    fn read_only_compat_closes_preserve_committed_wal() {
+        if run_recovery_test_in_subprocess(
+            "franken_sync::tests::read_only_compat_closes_preserve_committed_wal",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("read-only-close.db");
+        let path = db.to_string_lossy().into_owned();
+        let sentinel = "GH556 read-only close must leave this committed row in WAL";
+        let mut writer = Connection::open(path.clone()).unwrap();
+        writer.execute("PRAGMA journal_mode = WAL").unwrap();
+        writer.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+        writer.execute("CREATE TABLE t (v TEXT)").unwrap();
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        writer
+            .execute_with_params("INSERT INTO t VALUES (?1)", &[SqliteValue::from(sentinel)])
+            .unwrap();
+        writer.close_without_checkpoint_in_place().unwrap();
+        drop(writer);
+        let payload = || {
+            ["", "-wal", "-journal", "-wal-cert", "-wal-cert-head"].map(|suffix| {
+                let mut component = db.as_os_str().to_os_string();
+                component.push(suffix);
+                match std::fs::read(component) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("read protected component {suffix}: {error}"),
+                }
+            })
+        };
+        let before = payload();
+        assert!(before[1].as_ref().unwrap().len() > 32);
+        assert!(
+            !before[0]
+                .as_ref()
+                .unwrap()
+                .windows(sentinel.len())
+                .any(|bytes| bytes == sentinel.as_bytes())
+        );
+        assert!(
+            before[1]
+                .as_ref()
+                .unwrap()
+                .windows(sentinel.len())
+                .any(|bytes| bytes == sentinel.as_bytes())
+        );
+        for close_mode in 0..4 {
+            let mut reader =
+                compat::open_with_flags(&path, compat::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            assert!(
+                !reader.checkpoint_on_close,
+                "read-only admission must not acquire checkpoint authority"
+            );
+            assert_eq!(
+                reader.query_row("SELECT v FROM t").unwrap().values(),
+                &[SqliteValue::from(sentinel)]
+            );
+            assert_eq!(payload(), before, "read-only open/query changed payload");
+            match close_mode {
+                0 => reader.close().unwrap(),
+                1 => {
+                    reader.close_in_place().unwrap();
+                    reader.close_in_place().unwrap();
+                    drop(reader);
+                }
+                2 => drop(reader),
+                _ => {
+                    FAIL_NEXT_CLOSE.with(|fault| fault.set(true));
+                    assert!(matches!(
+                        reader.close_in_place(),
+                        Err(FrankenError::BusyRecovery)
+                    ));
+                    assert!(!reader.checkpoint_on_close);
+                    assert_eq!(payload(), before, "failed close changed payload");
+                    reader.close().unwrap();
+                }
+            }
+            assert_eq!(payload(), before, "read-only close path {close_mode}");
+        }
     }
 
     pub(super) fn run_recovery_test_in_subprocess(name: &str) -> bool {
@@ -1097,6 +1192,10 @@ pub(crate) mod tests {
 
         let conn = compat::open_with_flags(&path, compat::OpenFlags::SQLITE_OPEN_READ_WRITE)
             .expect("open writable compat connection");
+        assert!(
+            conn.checkpoint_on_close,
+            "writable compat keeps its close policy"
+        );
         let row = conn
             .query_row("PRAGMA fsqlite.concurrent_mode")
             .expect("query compat engine mode");
@@ -1219,7 +1318,7 @@ pub(crate) mod tests {
     fn checkpoint_execute_rejects_partial_query_rows_but_queries_keep_them() {
         let conn = Connection::open(":memory:").unwrap();
         let sql = "PRAGMA wal_checkpoint(TRUNCATE)";
-        for status in [[1, 23, 0], [0, 23, 7], [1, 23, 23]] {
+        for status in [[1, 23, 0], [0, 23, 7], [1, 23, 23], [1, -1, -1]] {
             checkpoint_fault::with_results(conn.inner.path(), vec![(sql, status); 6], || {
                 assert!(matches!(conn.execute(sql), Err(FrankenError::Busy)));
                 assert!(matches!(
@@ -1257,6 +1356,17 @@ pub(crate) mod tests {
                     assert_eq!(result.is_ok(), complete, "{values:?}: {result:?}");
                     if complete {
                         assert_eq!(result.unwrap(), 0, "a PRAGMA affects no table rows");
+                    } else if (busy == 1 && frames == -1 && backfilled == -1)
+                        || ((0..=1).contains(&busy)
+                            && frames >= 0
+                            && (0..=frames).contains(&backfilled))
+                    {
+                        assert!(matches!(result, Err(FrankenError::Busy)), "{values:?}");
+                    } else {
+                        assert!(
+                            matches!(result, Err(FrankenError::Internal(_))),
+                            "{values:?}"
+                        );
                     }
                 }
             }
@@ -1265,7 +1375,7 @@ pub(crate) mod tests {
 
     #[test]
     fn incomplete_checkpoint_is_contention_not_corruption() {
-        for values in [[1, 23, 0], [1, 23, 23], [0, 23, 7]] {
+        for values in [[1, 23, 0], [1, 23, 23], [0, 23, 7], [1, -1, -1]] {
             let values = values.map(SqliteValue::Integer);
             assert!(matches!(
                 completed_checkpoint_affected_rows([values.as_slice()]),
@@ -1293,6 +1403,71 @@ pub(crate) mod tests {
             let result = completed_checkpoint_affected_rows(rows.iter().map(Vec::as_slice));
             assert!(matches!(result, Err(FrankenError::Internal(_))), "{rows:?}");
         }
+    }
+
+    #[test]
+    fn checkpoint_busy_without_counts_preserves_wal_and_recovers() {
+        if run_recovery_test_in_subprocess(
+            "franken_sync::tests::checkpoint_busy_without_counts_preserves_wal_and_recovers",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("checkpoint-busy.db");
+        let wal = temp.path().join("checkpoint-busy.db-wal");
+        let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        let sentinel = "committed WAL-only row behind checkpoint contention";
+        conn.execute("PRAGMA journal_mode = WAL").unwrap();
+        conn.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+        conn.execute("CREATE TABLE t (value TEXT)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_with_params("INSERT INTO t VALUES (?1)", &[SqliteValue::from(sentinel)])
+            .unwrap();
+        let main_before = std::fs::read(&db).unwrap();
+        let wal_before = std::fs::read(&wal).unwrap();
+        assert!(
+            !main_before
+                .windows(sentinel.len())
+                .any(|b| b == sentinel.as_bytes())
+        );
+        assert!(
+            wal_before
+                .windows(sentinel.len())
+                .any(|b| b == sentinel.as_bytes())
+        );
+
+        for sql in [
+            "PRAGMA wal_checkpoint(PASSIVE)",
+            "PRAGMA wal_checkpoint(FULL)",
+            "PRAGMA wal_checkpoint(RESTART)",
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+        ] {
+            checkpoint_fault::with_results(conn.inner.path(), vec![(sql, [1, -1, -1]); 4], || {
+                let statement = conn.prepare(sql).unwrap();
+                for result in [
+                    conn.execute(sql),
+                    conn.execute_with_params(sql, &[]),
+                    statement.execute(),
+                    statement.execute_with_params(&[]),
+                ] {
+                    assert!(
+                        matches!(result, Err(FrankenError::Busy)),
+                        "{sql}: {result:?}"
+                    );
+                }
+            });
+            assert_eq!(std::fs::read(&db).unwrap(), main_before);
+            assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
+        }
+        // No injected result remains. A later real checkpoint may succeed,
+        // but no earlier busy result was accepted as proof of WAL backfill.
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        assert_ne!(std::fs::read(&db).unwrap(), main_before);
+        assert_eq!(
+            conn.query_row("SELECT value FROM t").unwrap().values(),
+            &[SqliteValue::from(sentinel)]
+        );
+        conn.close().unwrap();
     }
 
     #[test]
@@ -1374,7 +1549,7 @@ pub(crate) mod tests {
         let conn = Connection::open(":memory:").unwrap();
         let sql = "PRAGMA wal_checkpoint(PASSIVE)";
         let statement = conn.prepare(sql).unwrap();
-        for status in [[0, 23, 7], [1, 23, 0], [1, 23, 23]] {
+        for status in [[0, 23, 7], [1, 23, 0], [1, 23, 23], [1, -1, -1]] {
             checkpoint_fault::with_results(conn.inner.path(), vec![(sql, status); 6], || {
                 assert_eq!(
                     statement.query().unwrap()[0].values(),

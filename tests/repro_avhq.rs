@@ -1,8 +1,9 @@
 //! beads_rust-avhq: engine sidecars left behind without their database file
 //! (`beads.db-wal-cert`, `beads.db-fsqlite-ns-gate`, `beads.db-wal`, ...)
-//! retain their bytes. An ordinary mutation must refuse a nonempty orphan
-//! WAL because its unflushed state cannot be established without the main
-//! database. Explicit `br init` still quarantines the orphans before
+//! retain their bytes. An ordinary mutation must refuse an orphan WAL that
+//! holds frames because its unflushed state cannot be established without
+//! the main database; a header-only WAL holds none, so the rebuild from
+//! JSONL proceeds. Explicit `br init` still quarantines the orphans before
 //! creating a fresh database.
 mod common;
 
@@ -170,6 +171,90 @@ fn mutation_refuses_unreadable_orphaned_wal_before_reinstalling_database() {
         fs::read(beads_dir.join("issues.jsonl")).expect("retained JSONL"),
         jsonl
     );
+}
+
+/// A WAL holding only its 32-byte header and no frames: the shape a WAL
+/// keeps after a passive checkpoint (big-endian checksum variant).
+fn header_only_wal() -> [u8; 32] {
+    let fields: [u32; 6] = [0x377f_0683, 3_007_000, 4096, 0, 0x1234_5678, 0x9abc_def0];
+    let (mut s0, mut s1) = (0_u32, 0_u32);
+    for [first, second] in fields.as_chunks::<2>().0 {
+        s0 = s0.wrapping_add(*first).wrapping_add(s1);
+        s1 = s1.wrapping_add(*second).wrapping_add(s0);
+    }
+    let mut header = [0_u8; 32];
+    for (word, value) in header
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(fields.into_iter().chain([s0, s1]))
+    {
+        *word = value.to_be_bytes();
+    }
+    header
+}
+
+#[test]
+fn missing_database_with_header_only_wal_is_rebuilt_from_jsonl() {
+    let _log = common::test_log("missing_database_with_header_only_wal_is_rebuilt_from_jsonl");
+    let retained_root = TempDir::new_in(common::cli::isolated_temp_root())
+        .expect("tempdir")
+        .keep();
+    let root = retained_root.as_path();
+    let init = br(root, &["init"]);
+    assert!(init.status.success(), "{}", rendered(&init));
+    let created = br(root, &["create", "survives the lost database", "--json"]);
+    assert!(created.status.success(), "{}", rendered(&created));
+    let flushed = br(root, &["sync", "--flush-only"]);
+    assert!(flushed.status.success(), "{}", rendered(&flushed));
+    let beads_dir = root.join(".beads");
+    let retained_family = root.join("retained-original-database");
+    fs::create_dir(&retained_family).expect("retained original family directory");
+
+    // Move the database family aside (as `mv .beads/beads.db ...` does) and
+    // leave the frame-less WAL a checkpointed workspace keeps. No page can
+    // live in it, so nothing needs preserving and the rebuild may proceed.
+    for entry in fs::read_dir(&beads_dir).expect("list .beads") {
+        let entry = entry.expect("original family entry");
+        if entry.file_name().to_string_lossy().starts_with("beads.db") {
+            fs::rename(entry.path(), retained_family.join(entry.file_name()))
+                .expect("retain original database family member");
+        }
+    }
+    let wal = header_only_wal();
+    fs::write(beads_dir.join("beads.db-wal"), wal).expect("plant header-only wal");
+
+    let listed = br(root, &["list", "--json"]);
+    fs::write(root.join("list.log"), rendered(&listed)).expect("retain list output");
+    assert!(listed.status.success(), "{}", rendered(&listed));
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("survives the lost database"),
+        "rebuilt database lost the flushed issue: {}",
+        rendered(&listed)
+    );
+    assert!(
+        beads_dir.join("beads.db").is_file(),
+        "the database was not rebuilt"
+    );
+
+    // The header bytes are quarantined, not discarded.
+    let recovery = beads_dir.join(".br_recovery");
+    let quarantined: Vec<String> = fs::read_dir(&recovery)
+        .unwrap_or_else(|err| panic!("{} missing: {err}", recovery.display()))
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .collect();
+    assert!(
+        quarantined
+            .iter()
+            .any(|file| file.starts_with("beads.db-wal.")
+                && fs::read(recovery.join(file)).is_ok_and(|copy| copy == wal)),
+        "header-only wal bytes missing from {}: {quarantined:?}",
+        recovery.display()
+    );
+
+    let created = br(root, &["create", "usable after the rebuild", "--json"]);
+    assert!(created.status.success(), "{}", rendered(&created));
 }
 
 #[test]

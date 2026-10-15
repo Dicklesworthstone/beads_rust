@@ -1,0 +1,190 @@
+name: WAL recovery regression
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/wal-recovery.yml'
+      - '.github/workflows/fsqlite-admission-qualification.yml'
+      - 'tests/test_fsqlite_family_gate.py'
+      - 'src/cli/commands/doctor_subsystems/engine.rs'
+      - 'src/cli/commands/doctor_subsystems/wal_recover_main.rs'
+      - 'src/cli/commands/doctor_subsystems/wal_engine_probe.rs'
+      - 'src/cli/commands/doctor_subsystems/wal_engine_probe_tests.rs'
+      - 'src/cli/commands/doctor_subsystems/schema_migration*'
+      - 'src/cli/commands/doctor_subsystems/schema_migration/**'
+      - 'src/franken_sync*'
+      - 'src/franken_sync/**'
+      - 'src/sync/db_inode_lock.rs'
+      - 'tests/e2e_scripts/wal_recovery_556.py'
+      - 'tests/e2e_scripts/wal_recovery_562.py'
+      - 'tests/e2e_scripts/wal_admission_561.py'
+      - 'scripts/recover_orphaned_wal.py'
+      - 'tests/e2e_scripts/test_recover_orphaned_wal.py'
+      - 'tests/e2e_scripts/test_packaged_wal_recovery.py'
+      - 'tests/e2e_scripts/test_wal_recovery_resume.py'
+      - 'tests/e2e_scripts/test_wal_committed_copy.py'
+      - 'tests/e2e_scripts/test_wal_native_gate.py'
+      - 'tests/e2e_scripts/test_wal_page_image.py'
+      - 'tests/e2e_scripts/test_wal_native_write.py'
+      - 'tests/e2e_scripts/test_wal_native_freelist.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wal-recovery-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_TERM_COLOR: never
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Exercise copy recovery, crash boundaries, and source preservation
+        run: python3 tests/e2e_scripts/test_recover_orphaned_wal.py
+      - name: Exercise isolated embedded recovery payload
+        if: ${{ !cancelled() }}
+        run: python3 tests/e2e_scripts/test_packaged_wal_recovery.py --payload-only
+      - name: Check native gate refusal and ordering with fake responder controls
+        if: ${{ !cancelled() }}
+        run: python3 tests/e2e_scripts/test_wal_native_gate.py
+      - name: Verify exact pager images and search/spatial recovery
+        if: ${{ !cancelled() }}
+        run: python3 tests/e2e_scripts/test_wal_page_image.py
+      - name: Check native-write receipt oracles with stock SQLite only
+        if: ${{ !cancelled() }}
+        run: python3 tests/e2e_scripts/test_wal_native_write.py --self-test
+      - name: Validate committed freelist fixtures with stock SQLite only
+        if: ${{ !cancelled() }}
+        run: python3 tests/e2e_scripts/test_wal_native_freelist.py --self-test
+      - name: Install the repository's CI toolchain
+        run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt,clippy
+      - name: Verify interrupted index recovery without replacing source files
+        if: ${{ !cancelled() }}
+        run: python3 tests/e2e_scripts/test_wal_recovery_resume.py
+      - name: Recover last committed state from real abandoned WAL transactions
+        if: ${{ !cancelled() }}
+        run: python3 tests/e2e_scripts/test_wal_committed_copy.py
+      - name: Build br
+        id: build
+        run: cargo +nightly-2026-08-31 build --locked --bin br
+      - name: Validate fixtures and native exclusion
+        run: |
+          python3 tests/e2e_scripts/wal_recovery_556.py --self-test
+          python3 tests/e2e_scripts/wal_admission_561.py --self-test
+          python3 tests/test_fsqlite_family_gate.py
+      - name: Exercise the actual executable
+        run: python3 tests/e2e_scripts/wal_recovery_556.py --br "$PWD/target/debug/br"
+      - name: Validate orphaned-WAL checkpoint oracles
+        if: ${{ !cancelled() }}
+        run: python3 tests/e2e_scripts/wal_recovery_562.py --self-test
+      - name: Exercise orphaned-WAL advice and recovery rehearsal
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 tests/e2e_scripts/wal_recovery_562.py --br "$PWD/target/debug/br"
+      - name: Test engine diagnostic boundaries and path handling
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: cargo +nightly-2026-08-31 test --locked --lib cli::commands::doctor_subsystems::engine::tests
+      - name: Exercise empty-WAL admission and preservation
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 tests/e2e_scripts/wal_admission_561.py --br "$PWD/target/debug/br"
+      - name: Qualify recovered copies with actual br reads and writes
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 tests/e2e_scripts/test_recover_orphaned_wal.py --br "$PWD/target/debug/br"
+      - name: Build and install packaged recovery companion
+        id: recovery_build
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          cargo +nightly-2026-08-31 package --locked --list > "$RUNNER_TEMP/br-package-files.txt"
+          grep -Fx 'scripts/recover_orphaned_wal.py' "$RUNNER_TEMP/br-package-files.txt"
+          test ! -e "$RUNNER_TEMP/br-wal-install"
+          CARGO_TARGET_DIR="$PWD/target" cargo +nightly-2026-08-31 install \
+            --path . --locked --debug --bin br-wal-recover --root "$RUNNER_TEMP/br-wal-install"
+      - name: Test packaged recovery argument and platform boundaries
+        if: ${{ !cancelled() && steps.recovery_build.outcome == 'success' }}
+        run: cargo +nightly-2026-08-31 test --locked --bin br-wal-recover
+      - name: Require the installed FrankenSQLite to attest before source index installation
+        if: ${{ !cancelled() && steps.recovery_build.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          grep -Fx 'src/cli/commands/doctor_subsystems/wal_engine_probe.rs' "$RUNNER_TEMP/br-package-files.txt"
+          python3 tests/e2e_scripts/test_wal_native_gate.py \
+            --recovery-binary "$RUNNER_TEMP/br-wal-install/bin/br-wal-recover"
+      - name: Qualify exact-image recovery with the installed companion
+        if: ${{ !cancelled() && steps.recovery_build.outcome == 'success' }}
+        run: |
+          python3 tests/e2e_scripts/test_wal_page_image.py \
+            --recovery-binary "$RUNNER_TEMP/br-wal-install/bin/br-wal-recover"
+      - name: Require native commit rollback checkpoint and main-only preservation
+        if: ${{ !cancelled() && steps.recovery_build.outcome == 'success' }}
+        run: |
+          python3 tests/e2e_scripts/test_wal_native_write.py \
+            --recovery-binary "$RUNNER_TEMP/br-wal-install/bin/br-wal-recover"
+      - name: Qualify native recovery and corruption refusal with committed free pages
+        if: ${{ !cancelled() && steps.recovery_build.outcome == 'success' }}
+        run: |
+          python3 tests/e2e_scripts/test_wal_native_freelist.py \
+            --recovery-binary "$RUNNER_TEMP/br-wal-install/bin/br-wal-recover"
+      - name: Qualify installed recovery with real br reads and writes
+        if: ${{ !cancelled() && steps.recovery_build.outcome == 'success' }}
+        run: |
+          python3 tests/e2e_scripts/test_packaged_wal_recovery.py \
+            --recovery-binary "$RUNNER_TEMP/br-wal-install/bin/br-wal-recover" \
+            --br "$PWD/target/debug/br"
+      - name: Qualify interrupted recovery with the installed companion
+        if: ${{ !cancelled() && steps.recovery_build.outcome == 'success' }}
+        run: |
+          python3 tests/e2e_scripts/test_wal_recovery_resume.py \
+            --recovery-binary "$RUNNER_TEMP/br-wal-install/bin/br-wal-recover"
+      - name: Qualify last-commit copies with the installed companion
+        if: ${{ !cancelled() && steps.recovery_build.outcome == 'success' }}
+        run: |
+          python3 tests/e2e_scripts/test_wal_committed_copy.py \
+            --recovery-binary "$RUNNER_TEMP/br-wal-install/bin/br-wal-recover" \
+            --br "$PWD/target/debug/br"
+      - name: Retain the binary, fixtures, and recovery evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wal-recovery-${{ github.sha }}
+          include-hidden-files: true
+          if-no-files-found: warn
+          path: |
+            target/debug/br
+            target/debug/br-wal-recover
+            ${{ runner.temp }}/br-wal-install/bin/br-wal-recover
+            ${{ runner.temp }}/br-package-files.txt
+            /tmp/br-recovery-556-*
+            /tmp/br-556-selftest-*
+            /tmp/br-recovery-562-*
+            /tmp/br-562-selftest-*
+            /tmp/br-admission-561-*
+            /tmp/br-561-selftest-*
+            /tmp/br-wal-copy-test-*
+            /tmp/br-wal-copy-br-*
+            /tmp/br-packaged-wal-*
+            /tmp/br-wal-resume-test-*
+            /tmp/br-wal-resume-native-*
+            /tmp/br-wal-committed-copy-*
+            /tmp/br-native-gate-*
+            /tmp/br-wal-page-*
+            /tmp/br-wal-native-write-*
+            /tmp/br-wal-write-oracle-*
+            /tmp/native-copy-test-*
+            /tmp/native-owned-test-*
+            /tmp/native-links-test-*
+            /tmp/native-freelist-test-*
+            /tmp/br-wal-freelist-*

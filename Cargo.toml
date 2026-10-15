@@ -1,9 +1,10 @@
 [package]
 name = "beads_rust"
-version = "0.7.5"
+version = "0.7.6"
 edition = "2024"
 rust-version = "1.89"
 autobenches = false
+default-run = "br"
 description = "Agent-first issue tracker (SQLite + JSONL)"
 license-file = "LICENSE"
 repository = "https://github.com/Dicklesworthstone/beads_rust"
@@ -19,7 +20,8 @@ exclude = [
     ".ntm/",
     "agent_baseline/",
     "docs/",
-    "scripts/",
+    "scripts/*",
+    "!scripts/recover_orphaned_wal.py",
     "skills/",
     "temp_test/",
     "temp_test_2/",
@@ -36,6 +38,10 @@ exclude = [
 name = "br"
 path = "src/main.rs"
 
+[[bin]]
+name = "br-wal-recover"
+path = "src/cli/commands/doctor_subsystems/wal_recover_main.rs"
+
 [dependencies]
 # CLI
 clap = { version = "4.6.7", features = ["derive", "env", "unstable-ext"] }
@@ -49,11 +55,11 @@ clap_complete = { version = "4.6.11", features = ["unstable-dynamic"] }
 # only serde_json's `preserve_order`; the old viral `arbitrary_precision`
 # feature no longer affects br's JSON/TOON serializers.
 # GH#533/GH#538: pin the entire engine to one audited published release
-# (=0.4.12, frankensqlite tag v0.4.12 = 26aa19afc; the trusted-sharing
-# validator and the macOS build arrived in 0.4.10) so the namespace policy
-# used by br's preflight and by its engine cannot diverge, and crates.io and
-# git installs resolve the same engine.
-fsqlite = { version = "=0.4.12", default-features = false, features = [
+# (=0.4.10, frankensqlite tag v0.4.10 = 92aeb2b97, which carries the
+# trusted-sharing validator and builds on macOS) so the namespace policy used
+# by br's preflight and by its engine cannot diverge, and crates.io and git
+# installs resolve the same engine.
+fsqlite = { version = "=0.4.10", default-features = false, features = [
     "native",
     "linux-asupersync-uring",
     "fts5",
@@ -61,20 +67,20 @@ fsqlite = { version = "=0.4.12", default-features = false, features = [
     "icu",
     "misc",
 ] }
-fsqlite-types = { version = "=0.4.12" }
-fsqlite-error = { version = "=0.4.12" }
-fsqlite-core = { version = "=0.4.12" }
-fsqlite-func = { version = "=0.4.12" }
-fsqlite-vdbe = { version = "=0.4.12" }
-fsqlite-vfs = { version = "=0.4.12" }
-fsqlite-pager = { version = "=0.4.12" }
-fsqlite-parser = { version = "=0.4.12" }
-fsqlite-planner = { version = "=0.4.12" }
-fsqlite-wal = { version = "=0.4.12" }
-fsqlite-btree = { version = "=0.4.12" }
-fsqlite-ast = { version = "=0.4.12" }
-fsqlite-mvcc = { version = "=0.4.12" }
-fsqlite-observability = { version = "=0.4.12" }
+fsqlite-types = { version = "=0.4.10" }
+fsqlite-error = { version = "=0.4.10" }
+fsqlite-core = { version = "=0.4.10" }
+fsqlite-func = { version = "=0.4.10" }
+fsqlite-vdbe = { version = "=0.4.10" }
+fsqlite-vfs = { version = "=0.4.10" }
+fsqlite-pager = { version = "=0.4.10" }
+fsqlite-parser = { version = "=0.4.10" }
+fsqlite-planner = { version = "=0.4.10" }
+fsqlite-wal = { version = "=0.4.10" }
+fsqlite-btree = { version = "=0.4.10" }
+fsqlite-ast = { version = "=0.4.10" }
+fsqlite-mvcc = { version = "=0.4.10" }
+fsqlite-observability = { version = "=0.4.10" }
 
 # Current-thread runtime that drives fsqlite 0.4's async (!Send) futures to
 # completion behind the synchronous `franken_sync::Connection` bridge.
@@ -229,8 +235,8 @@ self_update = [
 # NOTE: no `[patch.crates-io]` here.
 #
 # Asupersync 0.5 and the optional FastMCP family resolve from crates.io.
-# The SQLite family is pinned exactly (=0.4.12) to one published release
-# (the trusted-group namespace API is in 0.4.10 and later).
+# The SQLite family is pinned exactly (=0.4.10) to the published release
+# that carries the trusted-group namespace API.
 # This lets
 # `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked`
 # work without requiring sibling `frankensqlite` or `fastmcp_rust`

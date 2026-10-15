@@ -285,11 +285,14 @@ fn q_output_is_valid_id() {
 
     // ID should match bd-XXXX format (prefix-hash)
     assert!(id.contains('-'), "ID should contain hyphen separator");
-    let parts: Vec<&str> = id.split('-').collect();
-    assert!(parts.len() >= 2, "ID should have prefix and hash parts");
+    // The prefix may itself contain `-` (a workspace named
+    // `br-workspace-test-x`), so the hash is the last segment.
+    let (prefix, hash_part) = id
+        .rsplit_once('-')
+        .expect("ID should have prefix and hash parts");
+    assert!(!prefix.is_empty(), "ID should have a prefix part");
 
     // The hash part should be alphanumeric (base36)
-    let hash_part = parts[1..].join("-"); // In case of multiple hyphens
     assert!(
         hash_part.chars().all(|c| c.is_ascii_alphanumeric()),
         "hash part should be alphanumeric: {hash_part}"
@@ -335,7 +338,7 @@ fn q_parent_accepts_short_parent_id() {
     );
     let parent_id = parent_create.stdout.trim().to_string();
     let short_parent_id = parent_id
-        .split_once('-')
+        .rsplit_once('-')
         .map(|(_, hash)| hash)
         .expect("parent id should contain hash segment");
 

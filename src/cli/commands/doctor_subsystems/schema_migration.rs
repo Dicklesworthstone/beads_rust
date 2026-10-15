@@ -21,7 +21,7 @@
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -527,6 +527,14 @@ fn execute_recover(
 /// Bytes in a SQLite WAL header. A WAL shorter than this cannot hold a frame.
 const WAL_HEADER_BYTES: u64 = 32;
 
+/// FrankenSQLite 0.4.12+ treats an existing zero-byte WAL as headerless and
+/// requires its owner to bind a generation before a writable append. The
+/// currently pinned 0.4.10 does not have that state: forcing zero-byte families
+/// through writable recovery would regress them. Flip this only in the same
+/// commit that moves the complete engine family to a release with headerless
+/// WAL semantics.
+const ENGINE_REQUIRES_HEADERLESS_WAL_GENERATION_BINDING: bool = false;
+
 /// Whether an existing WAL family lacks its regenerable shared index.
 /// This is only an advisory probe; recovery repeats it under family authority.
 ///
@@ -543,10 +551,23 @@ pub fn missing_wal_index(db_path: &Path) -> Result<bool> {
     )
 }
 
-/// [`missing_wal_index`] for an engine that does (or does not) read the
-/// on-disk index. An engine that rebuilds its index privately on every open
-/// never needs the file, so its absence is not a recovery case (GH #520).
+/// [`missing_wal_index`] for the currently pinned engine behavior.
 fn missing_wal_index_for_engine(db_path: &Path, engine_reads_on_disk_index: bool) -> Result<bool> {
+    missing_wal_index_for_engine_capability(
+        db_path,
+        engine_reads_on_disk_index,
+        ENGINE_REQUIRES_HEADERLESS_WAL_GENERATION_BINDING,
+    )
+}
+
+/// Probe a concrete engine capability so the 0.4.10 locked lane and 0.4.12
+/// candidate behavior are independently testable without pretending one
+/// release has the other's writable-admission contract.
+fn missing_wal_index_for_engine_capability(
+    db_path: &Path,
+    engine_reads_on_disk_index: bool,
+    headerless_generation_binding_required: bool,
+) -> Result<bool> {
     if !engine_reads_on_disk_index
         || secure_file_metadata(db_path)?.is_none()
         || secure_file_metadata(&family_component_path(db_path, "-shm"))?.is_some()
@@ -554,8 +575,14 @@ fn missing_wal_index_for_engine(db_path: &Path, engine_reads_on_disk_index: bool
         return Ok(false);
     }
     Ok(
-        secure_file_metadata(&family_component_path(db_path, "-wal"))?
-            .is_some_and(|metadata| metadata.len() >= WAL_HEADER_BYTES),
+        secure_file_metadata(&family_component_path(db_path, "-wal"))?.is_some_and(|metadata| {
+            // Header-only and framed WALs already require an index on engines
+            // that consume on-disk SHM. Zero bytes join that set only for the
+            // headerless-WAL engine generation. Partial 1..31-byte WALs remain
+            // the separate torn-WAL path and are never binding authority.
+            metadata.len() >= WAL_HEADER_BYTES
+                || (headerless_generation_binding_required && metadata.len() == 0)
+        }),
     )
 }
 
@@ -603,7 +630,7 @@ pub struct TornWalQuarantine {
 /// # Errors
 /// Refuses mismatched authority, unsafe paths, or a failed verified rename.
 pub fn quarantine_torn_wal_for_startup(
-    beads_dir: &Path,
+    _beads_dir: &Path,
     db_path: &Path,
     authority: &Arc<DatabaseFamilyWriteLock>,
 ) -> Result<Option<TornWalQuarantine>> {
@@ -621,30 +648,66 @@ pub fn quarantine_torn_wal_for_startup(
     let Some(exclusive) = lease.try_exclusive() else {
         return Ok(None);
     };
+
+    // The br opener lease excludes only cooperating br processes. A stock
+    // SQLite reader or writer does not participate in it, and can finish a
+    // WAL header between the advisory length check above and a sidecar rename.
+    // Bind the live database identity and hold SQLite's native lock range plus
+    // the FrankenSQLite namespace guard across the final check and quarantine.
     let result = (|| -> Result<Option<TornWalQuarantine>> {
         authority.verify_database_authority()?;
-        let wal_path = family_component_path(db_path, "-wal");
-        // Re-read under sole-opener admission: a peer may have finished
-        // writing the header between the advisory probe and the lease.
-        let Some(metadata) = secure_file_metadata(&wal_path)? else {
-            return Ok(None);
-        };
-        let wal_length = metadata.len();
-        if !is_torn_wal_length(wal_length) {
-            return Ok(None);
+        let metadata = secure_file_metadata(db_path)?
+            .ok_or_else(|| BeadsError::internal("torn-WAL database disappeared"))?;
+        let retained = File::open(db_path)?;
+        if !same_file_identity(&metadata, &retained.metadata()?) {
+            return Err(BeadsError::internal(
+                "torn-WAL database changed before identity binding",
+            ));
         }
-        let quarantined_paths = config::quarantine_database_artifacts(
+        let identity = fsqlite_vfs::FileIdentity::from_file(&retained)?
+            .ok_or_else(|| BeadsError::internal("torn-WAL database identity is unavailable"))?;
+
+        let excluded = crate::franken_sync::wal_index::with_recovery_exclusion(
             db_path,
-            beads_dir,
-            [wal_path, family_component_path(db_path, "-shm")],
-            "truncated-wal",
-        )?;
-        authority.verify_database_authority()?;
-        Ok(Some(TornWalQuarantine {
-            wal_length,
-            quarantined_paths,
-        }))
+            identity,
+            || -> Result<Option<TornWalQuarantine>> {
+                authority.verify_database_authority()?;
+                let wal_path = family_component_path(db_path, "-wal");
+                // Re-read while external SQLite openers are excluded. If a
+                // writer completed the header before exclusion was acquired,
+                // this is no longer a torn-WAL incident and nothing moves.
+                let Some(metadata) = secure_file_metadata(&wal_path)? else {
+                    return Ok(None);
+                };
+                let wal_length = metadata.len();
+                if !is_torn_wal_length(wal_length) {
+                    return Ok(None);
+                }
+                let recovery_dir = recovery_artifacts_dir(db_path)?;
+                let quarantined_paths = config::quarantine_database_artifacts(
+                    db_path,
+                    &recovery_dir,
+                    [wal_path, family_component_path(db_path, "-shm")],
+                    "truncated-wal",
+                )?;
+                authority.verify_database_authority()?;
+                Ok(Some(TornWalQuarantine {
+                    wal_length,
+                    quarantined_paths,
+                }))
+            },
+        );
+
+        match excluded {
+            Ok(quarantine) => quarantine,
+            // A live external SQLite user is not authority to rename either
+            // sidecar. Preserve the family and let normal startup contend/read
+            // exactly as it would have without quarantine.
+            Err(error) if engine_recovery_contention(&error) => Ok(None),
+            Err(error) => Err(BeadsError::Database(error)),
+        }
     })();
+
     let released = lease.release_exclusive(exclusive);
     result.and_then(|quarantine| released.map(|()| quarantine))
 }
@@ -705,6 +768,9 @@ pub fn recover_wal_index_for_startup(
     if !wal_index_needs_recovery(db_path)? {
         return Ok(());
     }
+    // A frame-bearing WAL is not a repairable index-only incident. Refuse
+    // before scanning or allocating recovery runs on ordinary commands.
+    require_frame_free_engine_recovery(db_path)?;
     // Every automatic attempt retains its pre-state in a new `.br_recovery`
     // run (the complete family, unless only the index had to be rebuilt).
     // Content/verification failures over identical bytes must not accumulate
@@ -712,7 +778,8 @@ pub fn recover_wal_index_for_startup(
     // over those bytes: retain its evidence, but allow the next command to
     // retry after the holder exits. Never retry a mutation within this call.
     let raw_before = recovery_family_witness(db_path)?;
-    if let Some(prior) = prior_failed_recovery(beads_dir, &raw_before)? {
+    let recovery_dir = recovery_artifacts_dir(db_path)?;
+    if let Some(prior) = prior_failed_recovery(&recovery_dir, &raw_before)? {
         return Err(BeadsError::SyncConflict {
             message: format!(
                 "automatic WAL index recovery already failed for this exact database family \
@@ -818,11 +885,41 @@ fn prior_failed_recovery(
     Ok(None)
 }
 
+/// Evidence belongs to the selected database, not an ambient workspace.
+/// Resolve relative selections once; do not rebind database write authority.
+fn recovery_artifacts_dir(db_path: &Path) -> Result<PathBuf> {
+    let parent = db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(fs::canonicalize(parent)?)
+}
+
 fn recover_engine_admission_with_lease(
     migration: &MigrationContext,
     strict_wal: bool,
     policy: PreexistingIndexCorruption,
 ) -> Result<EngineRecoveryReceipt> {
+    // Reject a frame-bearing WAL before creating any recovery artifacts.
+    // This also covers automatic recovery invoked by ordinary commands.
+    if crate::sync::database_write_authority_sha256(&migration.db_path)?
+        != migration.write_authority.authority_path_sha256()
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "engine recovery path does not match the held database-family authority"
+                .to_string(),
+        });
+    }
+    migration.write_authority.verify_database_authority()?;
+    require_frame_free_engine_recovery(&migration.db_path)?;
+    // Only recovery's artifact scope changes. Keep the exact, already-bound
+    // database authority; migration apply/undo/heal still use their own context.
+    let recovery = MigrationContext {
+        beads_dir: recovery_artifacts_dir(&migration.db_path)?,
+        db_path: migration.db_path.clone(),
+        write_authority: Arc::clone(&migration.write_authority),
+    };
+    let migration = &recovery;
     let mut lease = crate::sync::DatabaseOpenerLease::register(&migration.db_path)?;
     let exclusive = lease
         .try_exclusive()
@@ -858,11 +955,152 @@ fn require_recovery_payload_unchanged(
     Ok(())
 }
 
+/// Private backups may intentionally have stricter permissions than live
+/// database files. Compare their payloads, not their copy-only modes.
+/// Live before/after checks continue to compare complete witnesses.
+fn recovery_component_payload_eq(left: &RawComponentWitness, right: &RawComponentWitness) -> bool {
+    left.present == right.present && left.length == right.length && left.sha256 == right.sha256
+}
+
+fn sqlite_database_page_size(path: &Path) -> Result<u32> {
+    let mut file = File::open(path)?;
+    let mut header = [0_u8; 100];
+    file.read_exact(&mut header)?;
+    if &header[..16] != b"SQLite format 3\0" {
+        return Err(BeadsError::internal(
+            "frame-free recovery cannot verify the main database header",
+        ));
+    }
+    let encoded = u16::from_be_bytes([header[16], header[17]]);
+    let page_size = if encoded == 1 {
+        65_536
+    } else {
+        u32::from(encoded)
+    };
+    if !(512..=65_536).contains(&page_size) || !page_size.is_power_of_two() {
+        return Err(BeadsError::internal(
+            "frame-free recovery observed an invalid main database page size",
+        ));
+    }
+    Ok(page_size)
+}
+
+fn sqlite_wal_checksum(bytes: &[u8], mut state: [u32; 2], big_endian: bool) -> [u32; 2] {
+    for pair in bytes.as_chunks::<8>().0 {
+        let word = |slice: &[u8]| {
+            let value: [u8; 4] = slice.try_into().expect("fixed-width WAL checksum word");
+            if big_endian {
+                u32::from_be_bytes(value)
+            } else {
+                u32::from_le_bytes(value)
+            }
+        };
+        state[0] = state[0]
+            .wrapping_add(word(&pair[..4]))
+            .wrapping_add(state[1]);
+        state[1] = state[1]
+            .wrapping_add(word(&pair[4..]))
+            .wrapping_add(state[0]);
+    }
+    state
+}
+
+fn validate_bound_wal_header(db_path: &Path, wal_path: &Path) -> Result<[u8; 32]> {
+    let metadata = secure_file_metadata(wal_path)?
+        .ok_or_else(|| BeadsError::internal("generation-bound WAL disappeared during recovery"))?;
+    if metadata.len() != WAL_HEADER_BYTES {
+        return Err(BeadsError::internal(
+            "frame-free recovery requires exactly one 32-byte WAL header",
+        ));
+    }
+    let mut file = File::open(wal_path)?;
+    let mut header = [0_u8; 32];
+    file.read_exact(&mut header)?;
+    let magic = u32::from_be_bytes(header[..4].try_into().expect("WAL magic"));
+    let version = u32::from_be_bytes(header[4..8].try_into().expect("WAL version"));
+    let page_size = u32::from_be_bytes(header[8..12].try_into().expect("WAL page size"));
+    let expected_page_size = sqlite_database_page_size(db_path)?;
+    if !matches!(magic, 0x377f_0682 | 0x377f_0683)
+        || version != 3_007_000
+        || page_size != expected_page_size
+    {
+        return Err(BeadsError::internal(
+            "private recovery produced an invalid or database-mismatched WAL header",
+        ));
+    }
+    let big_endian = magic & 1 != 0;
+    let expected = sqlite_wal_checksum(&header[..24], [0, 0], big_endian);
+    let observed = [
+        u32::from_be_bytes(header[24..28].try_into().expect("WAL checksum 1")),
+        u32::from_be_bytes(header[28..32].try_into().expect("WAL checksum 2")),
+    ];
+    if expected != observed {
+        return Err(BeadsError::internal(
+            "private recovery produced a WAL header with an invalid checksum",
+        ));
+    }
+    Ok(header)
+}
+
+/// Accept only byte preservation, except for the one #561 transition whose
+/// absence of frames is independently provable: an existing zero-byte WAL may
+/// gain exactly one valid header for this database. Main and rollback-journal
+/// payloads remain byte-identical. A missing WAL, partial header, header reset,
+/// any trailing byte/frame, or malformed header stays fail-closed.
+fn require_private_recovery_payload_compatible(
+    private_db: &Path,
+    before: &RawFamilyWitness,
+    private: &RawFamilyWitness,
+) -> Result<Option<RawComponentWitness>> {
+    for suffix in ["", "-journal"] {
+        let expected = component_for_suffix(before, suffix)?;
+        let observed = component_for_suffix(private, suffix)?;
+        if !recovery_component_payload_eq(expected, observed) {
+            return Err(BeadsError::internal(format!(
+                "private recovery changed protected database component {suffix:?}; \
+                 refusing index publication"
+            )));
+        }
+    }
+
+    let expected_wal = component_for_suffix(before, "-wal")?;
+    let observed_wal = component_for_suffix(private, "-wal")?;
+    if recovery_component_payload_eq(expected_wal, observed_wal) {
+        return Ok(None);
+    }
+    if !(expected_wal.present
+        && expected_wal.length == Some(0)
+        && observed_wal.present
+        && observed_wal.length == Some(WAL_HEADER_BYTES))
+    {
+        return Err(BeadsError::internal(
+            "private recovery changed the WAL outside the verified zero-byte-to-header transition",
+        ));
+    }
+    validate_bound_wal_header(private_db, &family_component_path(private_db, "-wal"))?;
+    let mut witness = observed_wal.clone();
+    witness.unix_mode = expected_wal.unix_mode;
+    Ok(Some(witness))
+}
+
+/// WAL recovery refusal is a conflict, never authority to rebuild from JSONL.
+fn require_frame_free_engine_recovery(path: &Path) -> Result<()> {
+    crate::franken_sync::wal_index::require_frame_free_recovery(path).map_err(|error| {
+        BeadsError::SyncConflict {
+            message: error.to_string(),
+        }
+    })
+}
+
 fn recover_existing_family(
     path: &Path,
     authority: Option<&DatabaseFamilyWriteLock>,
     mut live_stage: Option<&mut String>,
 ) -> Result<()> {
+    require_frame_free_engine_recovery(path)?;
+    if let Some(authority) = authority {
+        return recover_live_index_from_private_copy(path, authority, live_stage);
+    }
     let metadata = secure_file_metadata(path)?
         .ok_or_else(|| BeadsError::internal("recovery database disappeared"))?;
     let retained = File::open(path)?;
@@ -899,6 +1137,234 @@ fn recover_existing_family(
         ));
     }
     Ok(())
+}
+
+/// Rehearse writable recovery against a disposable complete family copy, then
+/// publish only the verified derived WAL index to the live database.
+fn recover_live_index_from_private_copy(
+    db_path: &Path,
+    authority: &DatabaseFamilyWriteLock,
+    mut live_stage: Option<&mut String>,
+) -> Result<()> {
+    authority.verify_database_authority()?;
+    let raw_before = recovery_family_witness(db_path)?;
+    let scratch_root = recovery_artifacts_dir(db_path)?.join(".br_recovery");
+    fs::create_dir_all(&scratch_root)?;
+    let scratch = tempfile::Builder::new()
+        .prefix("index-rehearsal-")
+        .tempdir_in(&scratch_root)?;
+    let probe_db = backup_component_path(scratch.path(), db_path, "")?;
+    let operation = (|| -> Result<()> {
+        copy_family_to_backup(db_path, scratch.path(), &raw_before)?;
+        verify_backup_family(db_path, scratch.path(), &raw_before)?;
+        if let Some(stage) = live_stage.as_deref_mut() {
+            *stage = "private-recovery".to_string();
+        }
+        let probe_before = recovery_family_witness(&probe_db)?;
+        recover_existing_family(&probe_db, None, None)?;
+        let probe_after = recovery_family_witness(&probe_db)?;
+        require_private_recovery_payload_compatible(&probe_db, &probe_before, &probe_after)?;
+        let _logical = logical_witness(&probe_db)?;
+        publish_recovered_index(
+            db_path,
+            &probe_db,
+            &raw_before,
+            authority,
+            live_stage.as_deref_mut(),
+        )
+    })();
+    if let Err(error) = operation {
+        if live_stage
+            .as_deref()
+            .is_some_and(|stage| stage == "live-recovery")
+            && live_recovery_contention(&error)
+        {
+            return Err(error);
+        }
+        let evidence = scratch.keep();
+        return Err(BeadsError::WithContext {
+            context: format!("private index rehearsal retained at {}", evidence.display()),
+            source: Box::new(error),
+        });
+    }
+    Ok(())
+}
+
+fn publish_recovered_index(
+    db_path: &Path,
+    probe_db: &Path,
+    expected: &RawFamilyWitness,
+    authority: &DatabaseFamilyWriteLock,
+    live_stage: Option<&mut String>,
+) -> Result<()> {
+    let probe_after = recovery_family_witness(probe_db)?;
+    let bound_wal = require_private_recovery_payload_compatible(probe_db, expected, &probe_after)?;
+    if !crate::franken_sync::wal_index::ENGINE_READS_ON_DISK_WAL_INDEX {
+        authority.verify_database_authority()?;
+        require_frame_free_engine_recovery(db_path)?;
+        if &recovery_family_witness(db_path)? != expected {
+            return Err(BeadsError::internal(
+                "database family changed before recovery verification",
+            ));
+        }
+        return Ok(());
+    }
+    let mut index = component_for_suffix(&probe_after, "-shm")?.clone();
+    if !index.present {
+        return Err(BeadsError::internal(
+            "private recovery produced no WAL index to install",
+        ));
+    }
+    if let Some(mode) = component_for_suffix(expected, "-shm")?.unix_mode {
+        index.unix_mode = Some(mode);
+    }
+    let bound_wal = bound_wal
+        .as_ref()
+        .map(|witness| (family_component_path(probe_db, "-wal"), witness));
+    install_recovery_index(
+        db_path,
+        &family_component_path(probe_db, "-shm"),
+        &index,
+        bound_wal.as_ref(),
+        expected,
+        authority,
+        live_stage,
+    )
+}
+
+/// Engine namespace coordination sidecars. They hold no database content, and
+/// installing a recovered index creates them itself when it takes the engine
+/// exclusion, so the family comparisons at `live-index-install` leave them out.
+/// Every other component, the main file and the WAL included, is compared.
+/// Kept as a literal so the exclusion cannot widen silently; a test pins it to
+/// `config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES`.
+const NAMESPACE_COORDINATION_SUFFIXES: [&str; 2] = ["-fsqlite-ns-gate", "-fsqlite-ns-use"];
+
+/// Whether `observed` matches `expected` in every component except the
+/// namespace coordination sidecars.
+fn family_matches_outside_namespace_coordination(
+    expected: &RawFamilyWitness,
+    observed: &RawFamilyWitness,
+) -> bool {
+    let content =
+        |component: &&RawComponentWitness| !is_namespace_coordination_suffix(&component.suffix);
+    expected
+        .components
+        .iter()
+        .filter(content)
+        .eq(observed.components.iter().filter(content))
+}
+
+fn is_namespace_coordination_suffix(suffix: &str) -> bool {
+    NAMESPACE_COORDINATION_SUFFIXES.contains(&suffix)
+}
+
+fn install_recovery_index(
+    db_path: &Path,
+    retained_index: &Path,
+    index: &RawComponentWitness,
+    bound_wal: Option<&(PathBuf, &RawComponentWitness)>,
+    expected: &RawFamilyWitness,
+    authority: &DatabaseFamilyWriteLock,
+    mut live_stage: Option<&mut String>,
+) -> Result<()> {
+    require_frame_free_engine_recovery(db_path)?;
+    authority.verify_database_authority()?;
+    let metadata = secure_file_metadata(db_path)?
+        .ok_or_else(|| BeadsError::internal("recovery database disappeared"))?;
+    let retained = File::open(db_path)?;
+    if !same_file_identity(&metadata, &retained.metadata()?) {
+        return Err(BeadsError::internal(
+            "recovery database changed before identity binding",
+        ));
+    }
+    let identity = fsqlite_vfs::FileIdentity::from_file(&retained)?
+        .ok_or_else(|| BeadsError::internal("recovery database identity is unavailable"))?;
+    if let Some(stage) = live_stage.as_deref_mut() {
+        *stage = "live-recovery".to_string();
+    }
+    crate::franken_sync::wal_index::with_recovery_exclusion(db_path, identity, || -> Result<()> {
+        if let Some(stage) = live_stage {
+            *stage = "live-index-install".to_string();
+        }
+        authority.verify_database_authority()?;
+        require_frame_free_engine_recovery(db_path)?;
+        if !family_matches_outside_namespace_coordination(
+            expected,
+            &recovery_family_witness(db_path)?,
+        ) {
+            return Err(BeadsError::internal(
+                "database family changed before recovered-index installation; live family untouched",
+            ));
+        }
+        verify_retained_component(retained_index, index)?;
+        if let Some((retained_wal, wal_witness)) = bound_wal.as_ref() {
+            verify_retained_component(retained_wal, wal_witness)?;
+        }
+        if let Some((retained_wal, wal_witness)) = bound_wal.as_ref() {
+            // Bind the frame-free WAL first. A process death before the SHM
+            // rename then leaves a normal header-only WAL beside a missing or
+            // stale regenerable index, which existing startup recovery already
+            // recognizes. The opposite order could strand a zero-byte WAL
+            // beside a freshly valid SHM without a reason to re-enter recovery.
+            let expected_empty = component_for_suffix(expected, "-wal")?;
+            bind_live_wal_header(db_path, retained_wal, wal_witness, expected_empty)?;
+            if let Err(error) = install_retained_index(db_path, retained_index, index) {
+                // The recovered index rename precedes its final parent-directory
+                // fsync. If only that durability barrier failed, rolling the WAL
+                // back to zero would recreate the incompatible state #561 fixes.
+                // Keep a live index only when it still matches the rehearsed
+                // witness byte-for-byte; otherwise restore the original WAL.
+                if verify_retained_component(&family_component_path(db_path, "-shm"), index).is_ok()
+                {
+                    return Err(BeadsError::WithContext {
+                        context: "WAL-index publication reached a coherent header+index generation, but its final directory durability barrier failed; retained the coherent generation"
+                            .to_string(),
+                        source: Box::new(error),
+                    });
+                }
+                return match rollback_bound_live_wal(db_path, wal_witness, expected_empty) {
+                    Ok(()) => Err(BeadsError::WithContext {
+                        context: "WAL-index publication failed before the recovered index became live; restored the original zero-byte WAL"
+                            .to_string(),
+                        source: Box::new(error),
+                    }),
+                    Err(rollback_error) => Err(BeadsError::internal(format!(
+                        "WAL-index publication failed after generation binding ({error}) and \
+                         restoring the original zero-byte WAL also failed ({rollback_error}); \
+                         live WAL disposition is indeterminate"
+                    ))),
+                };
+            }
+        } else {
+            install_retained_index(db_path, retained_index, index)?;
+        }
+        authority.verify_database_authority()?;
+        let after = recovery_family_witness(db_path)?;
+        for component in &expected.components {
+            if component.suffix == "-shm" || is_namespace_coordination_suffix(&component.suffix) {
+                continue;
+            }
+            let required = if component.suffix == "-wal" {
+                bound_wal
+                    .as_ref()
+                    .map_or(component, |(_, witness)| *witness)
+            } else {
+                component
+            };
+            if component_for_suffix(&after, &component.suffix)? != required {
+                return Err(BeadsError::internal(format!(
+                    "recovery publication changed protected component {:?} outside its verified witness",
+                    component.suffix
+                )));
+            }
+        }
+        verify_retained_component(&family_component_path(db_path, "-shm"), index)?;
+        if let Some((_, wal_witness)) = bound_wal.as_ref() {
+            verify_retained_component(&family_component_path(db_path, "-wal"), wal_witness)?;
+        }
+        Ok(())
+    })?
 }
 
 fn recover_engine_admission(
@@ -1036,6 +1502,7 @@ fn index_only_recovery_applies(db_path: &Path, raw_before: &RawFamilyWitness) ->
 /// so the original index is reinstated, byte for byte, and the caller runs
 /// the complete-backup rehearsal, which classifies and reports it exactly as
 /// before.
+#[allow(clippy::too_many_lines)]
 fn recover_index_only(
     migration: &MigrationContext,
     raw_before: &RawFamilyWitness,
@@ -1078,7 +1545,11 @@ fn recover_index_only(
         )?;
         migration.write_authority.verify_database_authority()?;
         let raw_after = recovery_family_witness(db_path)?;
-        require_recovery_payload_unchanged(&receipt.raw_before, &raw_after)?;
+        require_private_recovery_payload_compatible(
+            &migration.db_path,
+            &receipt.raw_before,
+            &raw_after,
+        )?;
         receipt.raw_after = Some(raw_after);
         let logical_after = logical_witness(db_path)?;
         let clean = integrity_check_is_clean(&logical_after.integrity_check);
@@ -1088,7 +1559,19 @@ fn recover_index_only(
             return Ok(true);
         }
         receipt.stage = "reinstate-index".to_string();
-        reinstate_retained_index(db_path, &index_backup, &shm_witness)?;
+        let installed = receipt
+            .raw_after
+            .as_ref()
+            .ok_or_else(|| BeadsError::internal("recovery omitted the installed index witness"))?;
+        install_recovery_index(
+            db_path,
+            &index_backup,
+            &shm_witness,
+            None,
+            installed,
+            &migration.write_authority,
+            None,
+        )?;
         migration.write_authority.verify_database_authority()?;
         let reinstated = recovery_family_witness(db_path)?;
         for suffix in ["", "-wal", "-shm", "-journal"] {
@@ -1131,6 +1614,162 @@ fn recover_index_only(
     }
 }
 
+fn bind_live_wal_header(
+    db_path: &Path,
+    retained_wal: &Path,
+    witness: &RawComponentWitness,
+    expected_empty: &RawComponentWitness,
+) -> Result<()> {
+    if !(expected_empty.present && expected_empty.length == Some(0)) {
+        return Err(BeadsError::internal(
+            "generation binding requires an existing zero-byte live WAL",
+        ));
+    }
+    let header = validate_bound_wal_header(db_path, retained_wal)?;
+    let live = family_component_path(db_path, "-wal");
+    let metadata = secure_file_metadata(&live)?
+        .ok_or_else(|| BeadsError::internal("live zero-byte WAL disappeared before binding"))?;
+    if metadata.len() != 0 {
+        return Err(BeadsError::internal(
+            "live WAL changed before verified generation binding",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(BeadsError::internal(
+                "WAL generation binding refuses a hard-linked live WAL",
+            ));
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut live_file = options.open(&live)?;
+    if !same_file_identity(&metadata, &live_file.metadata()?) || live_file.metadata()?.len() != 0 {
+        return Err(BeadsError::internal(
+            "live WAL identity or length changed before generation binding",
+        ));
+    }
+    // Until the header has been written, synced, and read back through this
+    // retained descriptor, every failure is rolled back to the exact original
+    // zero-byte WAL. This is the only protected-payload mutation in #561's
+    // recovery exception. A failed rollback is reported as indeterminate
+    // rather than pretending the recovery preserved its pre-state.
+    let binding = (|| -> std::io::Result<()> {
+        live_file.write_all(&header)?;
+        live_file.sync_all()?;
+        if live_file.metadata()?.len() != WAL_HEADER_BYTES {
+            return Err(std::io::Error::other(
+                "generation-bound WAL has an unexpected length after sync",
+            ));
+        }
+        live_file.rewind()?;
+        let mut observed = [0_u8; 32];
+        live_file.read_exact(&mut observed)?;
+        if observed != header {
+            return Err(std::io::Error::other(
+                "generation-bound WAL read-back differs from the rehearsed header",
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(error) = binding {
+        let rollback = (|| -> std::io::Result<()> {
+            live_file.set_len(0)?;
+            live_file.sync_all()?;
+            if live_file.metadata()?.len() != 0 {
+                return Err(std::io::Error::other(
+                    "generation-binding rollback did not restore a zero-byte WAL",
+                ));
+            }
+            Ok(())
+        })();
+        return match rollback {
+            Ok(()) => Err(BeadsError::WithContext {
+                context:
+                    "WAL generation binding failed before commit; restored the original zero-byte WAL"
+                        .to_string(),
+                source: Box::new(BeadsError::Io(error)),
+            }),
+            Err(rollback_error) => Err(BeadsError::internal(format!(
+                "WAL generation binding failed ({error}) and restoring the original zero-byte WAL \
+                 also failed ({rollback_error}); live WAL disposition is indeterminate"
+            ))),
+        };
+    }
+
+    // No fallible filesystem operation follows the commit point. The exact
+    // bytes were validated before the write and read back after the durable
+    // sync while namespace/main-file exclusion is still held by the caller.
+    drop(live_file);
+    let _ = witness;
+    Ok(())
+}
+
+fn rollback_bound_live_wal(
+    db_path: &Path,
+    bound: &RawComponentWitness,
+    expected_empty: &RawComponentWitness,
+) -> Result<()> {
+    if !(expected_empty.present && expected_empty.length == Some(0)) {
+        return Err(BeadsError::internal(
+            "generation-binding rollback requires an originally present zero-byte WAL",
+        ));
+    }
+    let live = family_component_path(db_path, "-wal");
+    let metadata = secure_file_metadata(&live)?
+        .ok_or_else(|| BeadsError::internal("generation-bound WAL disappeared before rollback"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(BeadsError::internal(
+                "generation-binding rollback refuses a hard-linked live WAL",
+            ));
+        }
+    }
+    verify_component_bytes(&live, &metadata, bound)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(&live)?;
+    if !same_file_identity(&metadata, &file.metadata()?)
+        || file.metadata()?.len() != WAL_HEADER_BYTES
+    {
+        return Err(BeadsError::internal(
+            "generation-bound WAL changed identity or length before rollback",
+        ));
+    }
+    file.set_len(0)?;
+    file.sync_all()?;
+    if file.metadata()?.len() != 0 {
+        return Err(BeadsError::internal(
+            "generation-binding rollback did not restore a zero-byte WAL",
+        ));
+    }
+    Ok(())
+}
+
 /// Check a retained copy against the witness it was taken under.
 fn verify_retained_component(copy: &Path, witness: &RawComponentWitness) -> Result<()> {
     let metadata = secure_file_metadata(copy)?.ok_or_else(|| {
@@ -1146,10 +1785,9 @@ fn verify_retained_component(copy: &Path, witness: &RawComponentWitness) -> Resu
     Ok(())
 }
 
-/// Put the retained pre-recovery index back as the live `-shm`, atomically
-/// and with its original permissions. Runs only under the held family write
-/// authority and sole-opener lease of the recovery that removed it.
-fn reinstate_retained_index(
+/// Copy an already-verified index to the live -shm name atomically, preserving
+/// permissions. Called only while recovery exclusion and family authority hold.
+fn install_retained_index(
     db_path: &Path,
     retained: &Path,
     witness: &RawComponentWitness,
@@ -1987,7 +2625,8 @@ fn recover_engine_admission_with_complete_backup(
             crate::storage::sqlite::validate_wal_for_index_recovery(&probe_db)?;
         }
         recover_existing_family(&probe_db, None, None)?;
-        require_recovery_payload_unchanged(&probe_before, &recovery_family_witness(&probe_db)?)?;
+        let probe_after = recovery_family_witness(&probe_db)?;
+        require_private_recovery_payload_compatible(&probe_db, &probe_before, &probe_after)?;
         let expected = logical_witness(&probe_db)?;
         if !integrity_check_is_clean(&expected.integrity_check) {
             receipt.index_corruption = Some(admit_preexisting_index_damage(
@@ -2005,14 +2644,20 @@ fn recover_engine_admission_with_complete_backup(
             ));
         }
         verify_backup_family(&migration.db_path, &before_dir, &receipt.raw_before)?;
-        recover_existing_family(
+        publish_recovered_index(
             &migration.db_path,
-            Some(&migration.write_authority),
+            &probe_db,
+            &receipt.raw_before,
+            &migration.write_authority,
             Some(&mut receipt.stage),
         )?;
         migration.write_authority.verify_database_authority()?;
         let raw_after = recovery_family_witness(&migration.db_path)?;
-        require_recovery_payload_unchanged(&receipt.raw_before, &raw_after)?;
+        require_private_recovery_payload_compatible(
+            &migration.db_path,
+            &receipt.raw_before,
+            &raw_after,
+        )?;
         receipt.raw_after = Some(raw_after);
         receipt.logical_after = Some(logical_witness(&migration.db_path)?);
         if receipt.logical_after.as_ref() != Some(&expected) {
@@ -6167,6 +6812,217 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn recovery_556_evidence_follows_nondefault_database_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let ambient = root.path().join("ambient/.beads");
+        let selected = root.path().join("external");
+        fs::create_dir_all(&ambient).unwrap();
+        fs::create_dir_all(&selected).unwrap();
+        let directory = recovery_artifacts_dir(&selected.join("nondefault.db")).unwrap();
+        assert_eq!(directory, fs::canonicalize(&selected).unwrap());
+        assert_ne!(directory, fs::canonicalize(&ambient).unwrap());
+        assert!(!ambient.join(".br_recovery").exists());
+    }
+
+    #[test]
+    fn recovery_556_bare_relative_filename_uses_current_directory_without_chdir() {
+        let directory = recovery_artifacts_dir(Path::new("nondefault.db")).unwrap();
+        assert_eq!(directory, fs::canonicalize(".").unwrap());
+    }
+
+    #[test]
+    fn recovery_556_evidence_resolution_does_not_create_a_missing_database() {
+        let root = tempfile::tempdir().unwrap();
+        let selected = root.path().join("missing.db");
+        assert_eq!(
+            recovery_artifacts_dir(&selected).unwrap(),
+            fs::canonicalize(root.path()).unwrap()
+        );
+        assert!(!selected.exists());
+    }
+
+    #[test]
+    fn recovery_556_frame_refusal_is_a_conflict_not_corruption() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("framed.db");
+        fs::write(family_component_path(&db, "-wal"), [0_u8; 33]).unwrap();
+        let error = require_frame_free_engine_recovery(&db).unwrap_err();
+        assert!(matches!(error, BeadsError::SyncConflict { .. }));
+        assert!(!db.exists());
+        assert!(!family_component_path(&db, "-shm").exists());
+    }
+
+    fn recovery_561_main(path: &Path, page_size: u32) {
+        let mut bytes = vec![0_u8; usize::try_from(page_size).unwrap()];
+        bytes[..16].copy_from_slice(b"SQLite format 3\0");
+        let encoded = if page_size == 65_536 {
+            1_u16
+        } else {
+            u16::try_from(page_size).unwrap()
+        };
+        bytes[16..18].copy_from_slice(&encoded.to_be_bytes());
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn recovery_561_wal_header(page_size: u32, big_endian: bool, sequence: u32) -> [u8; 32] {
+        let mut header = [0_u8; 32];
+        let magic = if big_endian {
+            0x377f_0683_u32
+        } else {
+            0x377f_0682_u32
+        };
+        header[..4].copy_from_slice(&magic.to_be_bytes());
+        header[4..8].copy_from_slice(&3_007_000_u32.to_be_bytes());
+        header[8..12].copy_from_slice(&page_size.to_be_bytes());
+        header[12..16].copy_from_slice(&sequence.to_be_bytes());
+        header[16..24].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        let sum = sqlite_wal_checksum(&header[..24], [0, 0], big_endian);
+        header[24..28].copy_from_slice(&sum[0].to_be_bytes());
+        header[28..32].copy_from_slice(&sum[1].to_be_bytes());
+        header
+    }
+
+    #[test]
+    fn recovery_561_accepts_only_zero_wal_to_valid_matching_header() {
+        let root = tempfile::tempdir().unwrap();
+        for big_endian in [false, true] {
+            let db = root.path().join(format!("binding-{big_endian}.db"));
+            recovery_561_main(&db, 4096);
+            let wal = family_component_path(&db, "-wal");
+            fs::write(&wal, []).unwrap();
+            let before = recovery_family_witness(&db).unwrap();
+
+            let header = recovery_561_wal_header(4096, big_endian, 17);
+            fs::write(&wal, header).unwrap();
+            let after = recovery_family_witness(&db).unwrap();
+            let accepted =
+                require_private_recovery_payload_compatible(&db, &before, &after).unwrap();
+            let accepted = accepted.expect("zero-byte WAL must admit one valid bound header");
+            assert_eq!(accepted.length, Some(WAL_HEADER_BYTES));
+            verify_retained_component(&wal, &accepted).unwrap();
+
+            let mut trailing = header.to_vec();
+            trailing.push(0);
+            fs::write(&wal, trailing).unwrap();
+            let framed = recovery_family_witness(&db).unwrap();
+            assert!(
+                require_private_recovery_payload_compatible(&db, &before, &framed).is_err(),
+                "a byte beyond the header is never frame-free recovery authority"
+            );
+
+            fs::write(&wal, []).unwrap();
+            let empty_again = recovery_family_witness(&db).unwrap();
+            let mut corrupt = header;
+            corrupt[24] ^= 1;
+            fs::write(&wal, corrupt).unwrap();
+            let corrupt_after = recovery_family_witness(&db).unwrap();
+            assert!(
+                require_private_recovery_payload_compatible(&db, &empty_again, &corrupt_after)
+                    .is_err(),
+                "a malformed header must never be admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_561_rejects_header_reset_and_database_page_mismatch() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("reset.db");
+        recovery_561_main(&db, 4096);
+        let wal = family_component_path(&db, "-wal");
+        fs::write(&wal, recovery_561_wal_header(4096, false, 1)).unwrap();
+        let before = recovery_family_witness(&db).unwrap();
+        fs::write(&wal, recovery_561_wal_header(4096, false, 2)).unwrap();
+        let after = recovery_family_witness(&db).unwrap();
+        assert!(require_private_recovery_payload_compatible(&db, &before, &after).is_err());
+
+        fs::write(&wal, []).unwrap();
+        let empty = recovery_family_witness(&db).unwrap();
+        fs::write(&wal, recovery_561_wal_header(8192, false, 3)).unwrap();
+        let mismatch = recovery_family_witness(&db).unwrap();
+        assert!(require_private_recovery_payload_compatible(&db, &empty, &mismatch).is_err());
+    }
+
+    #[test]
+    fn recovery_561_live_binding_copies_exact_header_without_touching_main() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("live.db");
+        recovery_561_main(&db, 4096);
+        let main_before = fs::read(&db).unwrap();
+        let wal = family_component_path(&db, "-wal");
+        fs::write(&wal, []).unwrap();
+        let expected = recovery_family_witness(&db).unwrap();
+        let expected_wal = component_for_suffix(&expected, "-wal").unwrap().clone();
+
+        let retained = root.path().join("retained-wal");
+        let header = recovery_561_wal_header(4096, true, 9);
+        fs::write(&retained, header).unwrap();
+        let metadata = fs::symlink_metadata(&retained).unwrap();
+        let (length, sha256) = hash_regular_file(&retained, &metadata).unwrap();
+        let witness = RawComponentWitness {
+            suffix: "-wal".to_string(),
+            present: true,
+            length: Some(length),
+            sha256: Some(sha256),
+            unix_mode: expected_wal.unix_mode,
+        };
+
+        bind_live_wal_header(&db, &retained, &witness, &expected_wal).unwrap();
+        assert_eq!(fs::read(&wal).unwrap(), header);
+        assert_eq!(fs::read(&db).unwrap(), main_before);
+        assert!(
+            bind_live_wal_header(&db, &retained, &witness, &expected_wal).is_err(),
+            "generation binding is single-use: a nonempty live WAL must refuse"
+        );
+    }
+
+    #[test]
+    fn recovery_561_bound_header_rollback_restores_exact_zero_byte_wal() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("rollback.db");
+        recovery_561_main(&db, 4096);
+        let wal = family_component_path(&db, "-wal");
+        fs::write(&wal, []).unwrap();
+        let before = recovery_family_witness(&db).unwrap();
+        let expected_empty = component_for_suffix(&before, "-wal").unwrap().clone();
+
+        let retained = root.path().join("retained-wal");
+        let header = recovery_561_wal_header(4096, false, 23);
+        fs::write(&retained, header).unwrap();
+        let metadata = fs::symlink_metadata(&retained).unwrap();
+        let (length, sha256) = hash_regular_file(&retained, &metadata).unwrap();
+        let bound = RawComponentWitness {
+            suffix: "-wal".to_string(),
+            present: true,
+            length: Some(length),
+            sha256: Some(sha256),
+            unix_mode: expected_empty.unix_mode,
+        };
+
+        bind_live_wal_header(&db, &retained, &bound, &expected_empty).unwrap();
+        rollback_bound_live_wal(&db, &bound, &expected_empty).unwrap();
+        assert_eq!(fs::read(&wal).unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            component_for_suffix(&recovery_family_witness(&db).unwrap(), "-wal").unwrap(),
+            &expected_empty
+        );
+
+        fs::write(&wal, header).unwrap();
+        let mut changed = header;
+        changed[16] ^= 1;
+        fs::write(&wal, changed).unwrap();
+        assert!(
+            rollback_bound_live_wal(&db, &bound, &expected_empty).is_err(),
+            "rollback authority is bound to the exact rehearsed header"
+        );
+        assert_eq!(
+            fs::read(&wal).unwrap(),
+            changed,
+            "a mismatched live WAL must be retained rather than truncated"
+        );
+    }
+
     /// GH #520: on Windows the engine keeps its WAL index in private memory,
     /// so a stock-SQLite index beside a header-only WAL (or no index at all)
     /// must never start automatic recovery, whose quarantine step cannot run
@@ -6193,6 +7049,36 @@ mod tests {
             missing_wal_index(&db).unwrap(),
             crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY
         );
+
+        // GH #561: an existing zero-byte WAL plus a missing SHM is exactly
+        // the 0.4.12 generation-binding case. It enters recovery on engines
+        // that consume the on-disk index, while torn partial headers stay on
+        // the dedicated quarantine path and Windows/private-index engines do
+        // not recover an index they never read.
+        fs::write(family_component_path(&db, "-wal"), []).unwrap();
+        assert!(
+            !missing_wal_index_for_engine(&db, true).unwrap(),
+            "the still-pinned 0.4.10 lane must not be forced through headerless recovery"
+        );
+        assert!(
+            missing_wal_index_for_engine_capability(&db, true, true).unwrap(),
+            "the 0.4.12 headerless capability must enter generation-binding recovery"
+        );
+        assert!(
+            !missing_wal_index_for_engine_capability(&db, false, true).unwrap(),
+            "an engine that never consumes on-disk SHM still needs no index recovery"
+        );
+        for length in 1..WAL_HEADER_BYTES {
+            fs::write(
+                family_component_path(&db, "-wal"),
+                vec![0_u8; usize::try_from(length).unwrap()],
+            )
+            .unwrap();
+            assert!(
+                !missing_wal_index_for_engine_capability(&db, true, true).unwrap(),
+                "partial WAL length {length} must stay on torn-WAL handling"
+            );
+        }
     }
 
     /// A complete byte-witnessed run with the same receipt and directory
@@ -7372,8 +8258,9 @@ mod tests {
     }
 
     #[test]
-    fn recovery_532_close_contention_is_post_open_and_fail_closed() {
+    fn recovery_532_private_close_contention_is_fail_closed_before_live_install() {
         let (_temp, migration) = reviewed_source_migration_context("beads.db", 17);
+        truncate_fixture_wal(&migration.db_path);
         let before = recovery_family_witness(&migration.db_path).unwrap();
         let mut stage = "live-preflight".to_string();
         crate::franken_sync::tests::FAIL_NEXT_CLOSE.with(|fault| fault.set(true));
@@ -7389,15 +8276,22 @@ mod tests {
             "the injected error must occur during close, after open"
         );
         let error = result.unwrap_err();
+        let BeadsError::WithContext { context, source } = &error else {
+            panic!("private close failure must retain its rehearsal evidence: {error}");
+        };
+        assert!(context.contains("private index rehearsal retained at"));
         assert!(matches!(
-            error,
-            BeadsError::Database(fsqlite_error::FrankenError::BusyRecovery)
+            source.downcast_ref::<BeadsError>(),
+            Some(BeadsError::Database(
+                fsqlite_error::FrankenError::BusyRecovery
+            ))
         ));
-        assert_eq!(stage, "live-verification");
+        assert_eq!(stage, "private-recovery");
         assert_eq!(
             RecoveryFailureKind::for_error(&stage, &error),
             RecoveryFailureKind::FailClosed
         );
+        assert_eq!(recovery_family_witness(&migration.db_path).unwrap(), before);
         require_recovery_payload_unchanged(
             &before,
             &recovery_family_witness(&migration.db_path).unwrap(),
@@ -7530,6 +8424,66 @@ mod tests {
     }
 
     #[test]
+    fn live_index_install_ignores_only_namespace_coordination_sidecars() {
+        assert_eq!(
+            NAMESPACE_COORDINATION_SUFFIXES.as_slice(),
+            config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES
+        );
+        let component = |suffix: &str, sha256: &str| RawComponentWitness {
+            suffix: suffix.to_string(),
+            present: true,
+            length: Some(4096),
+            sha256: Some(sha256.repeat(64)),
+            unix_mode: Some(0o644),
+        };
+        let absent = |suffix: &str| RawComponentWitness {
+            suffix: suffix.to_string(),
+            present: false,
+            length: None,
+            sha256: None,
+            unix_mode: None,
+        };
+        let family = |main: &str, wal: &str, namespace_present: bool| RawFamilyWitness {
+            components: vec![
+                component("", main),
+                component("-wal", wal),
+                component("-shm", "c"),
+                absent("-journal"),
+                if namespace_present {
+                    component("-fsqlite-ns-gate", "d")
+                } else {
+                    absent("-fsqlite-ns-gate")
+                },
+                if namespace_present {
+                    component("-fsqlite-ns-use", "e")
+                } else {
+                    absent("-fsqlite-ns-use")
+                },
+            ],
+        };
+        let expected = family("a", "b", false);
+
+        assert!(
+            family_matches_outside_namespace_coordination(&expected, &family("a", "b", true)),
+            "sidecars created by taking the engine exclusion are not a family change"
+        );
+        assert!(
+            !family_matches_outside_namespace_coordination(&expected, &family("f", "b", true)),
+            "a main-file change must still be detected while the sidecars appear"
+        );
+        assert!(
+            !family_matches_outside_namespace_coordination(&expected, &family("a", "f", true)),
+            "a WAL change must still be detected while the sidecars appear"
+        );
+        let mut journal_appeared = family("a", "b", true);
+        journal_appeared.components[3] = component("-journal", "f");
+        assert!(
+            !family_matches_outside_namespace_coordination(&expected, &journal_appeared),
+            "every other sidecar is still compared"
+        );
+    }
+
+    #[test]
     fn index_entries_without_table_rows_are_recognized() {
         // GH #523 review: these diagnostics can mean a row was lost from its
         // table, which an index rebuild would silently accept.
@@ -7655,6 +8609,19 @@ mod tests {
         reviewed_v14_migration_context_with_database_name("beads.db")
     }
 
+    /// Recovery refuses a frame-bearing WAL before it opens or copies anything
+    /// (GH #556). Tests of a later recovery stage start from a truncated WAL so
+    /// that refusal does not answer first.
+    fn truncate_fixture_wal(db_path: &Path) {
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        close_connection(conn).unwrap();
+        let wal_size = fs::metadata(family_component_path(db_path, "-wal"))
+            .unwrap()
+            .len();
+        assert!(wal_size <= 32, "fixture WAL must hold no frames");
+    }
+
     #[test]
     fn vacuum_candidate_never_opens_or_rewrites_live_wal_family() {
         let (_temp, migration) = reviewed_source_migration_context("beads.db", 17);
@@ -7712,37 +8679,32 @@ mod tests {
     }
 
     #[test]
-    fn engine_recovery_preserves_wal_rows_and_complete_backup() {
-        assert_engine_recovery_preserves_family(false);
+    fn engine_recovery_refuses_framed_wal_and_preserves_family() {
+        // GH #556: committed, uncheckpointed WAL frames are not an index-only
+        // incident. Recovery refuses before copying, opening or rewriting
+        // anything; the owning engine has to checkpoint first.
+        let (_temp, migration, _expected) = engine_recovery_fixture(false);
+        let before = recovery_family_witness(&migration.db_path).unwrap();
+        let error = execute_recover(&DoctorMigrateSchemaRecoverArgs { json: true }, &migration)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "engine recovery refused before opening: WAL contains frames that may hold \
+                 committed, uncheckpointed changes"
+            ),
+            "unexpected refusal: {error}"
+        );
+        assert_eq!(
+            recovery_family_witness(&migration.db_path).unwrap(),
+            before,
+            "the refusal must leave every family byte and mode unchanged"
+        );
+        assert!(!migration_runs_root(&migration.beads_dir).exists());
     }
 
     #[test]
     fn engine_recovery_admits_legacy_empty_wal_before_migration() {
-        assert_engine_recovery_preserves_family(true);
-    }
-
-    fn assert_engine_recovery_preserves_family(checkpoint: bool) {
-        let (_temp, migration) = reviewed_source_migration_context("beads.db", 17);
-        let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
-        conn.execute("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("UPDATE issues SET title='committed WAL recovery row'")
-            .unwrap();
-        if checkpoint {
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-        }
-        close_connection(conn).unwrap();
-        let wal_size = fs::metadata(family_component_path(&migration.db_path, "-wal"))
-            .unwrap()
-            .len();
-        if checkpoint {
-            assert!(wal_size <= 32, "checkpointed fixture has no WAL frames");
-        } else {
-            assert!(wal_size > 32, "fixture must retain committed WAL frames");
-        }
-        let expected = logical_witness(&migration.db_path).unwrap();
-        let shm = family_component_path(&migration.db_path, "-shm");
-        fs::write(&shm, vec![0_u8; 32_768]).unwrap();
-        assert!(open_read_only(&migration.db_path).is_err());
+        let (_temp, migration, expected) = engine_recovery_fixture(true);
         let before = recovery_family_witness(&migration.db_path).unwrap();
         execute_recover(&DoctorMigrateSchemaRecoverArgs { json: true }, &migration).unwrap();
         let after = logical_witness(&migration.db_path).unwrap();
@@ -7766,27 +8728,56 @@ mod tests {
         assert!(run.join("recovery-complete.json").is_file());
         let plan = build_plan(&migration.db_path).unwrap();
         assert!(plan.eligible);
-        if checkpoint {
-            execute_apply(
-                &DoctorMigrateSchemaApplyArgs {
-                    plan_token: plan.plan_token.unwrap(),
-                    json: true,
-                },
-                &migration,
-            )
+        execute_apply(
+            &DoctorMigrateSchemaApplyArgs {
+                plan_token: plan.plan_token.unwrap(),
+                json: true,
+            },
+            &migration,
+        )
+        .unwrap();
+        let migrated = logical_witness(&migration.db_path).unwrap();
+        assert_eq!(
+            migrated.user_version,
+            u32::try_from(CURRENT_SCHEMA_VERSION).unwrap()
+        );
+        assert_eq!(migrated.integrity_check, "ok");
+    }
+
+    /// A v17 WAL family whose index is poisoned, with committed WAL frames
+    /// (`checkpoint == false`) or truncated to its header (`true`), plus its
+    /// logical contents before the index was poisoned.
+    fn engine_recovery_fixture(
+        checkpoint: bool,
+    ) -> (TempDir, MigrationContext, LogicalDatabaseWitness) {
+        let (temp, migration) = reviewed_source_migration_context("beads.db", 17);
+        let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("UPDATE issues SET title='committed WAL recovery row'")
             .unwrap();
-            let migrated = logical_witness(&migration.db_path).unwrap();
-            assert_eq!(
-                migrated.user_version,
-                u32::try_from(CURRENT_SCHEMA_VERSION).unwrap()
-            );
-            assert_eq!(migrated.integrity_check, "ok");
+        if checkpoint {
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
         }
+        close_connection(conn).unwrap();
+        let wal_size = fs::metadata(family_component_path(&migration.db_path, "-wal"))
+            .unwrap()
+            .len();
+        if checkpoint {
+            assert!(wal_size <= 32, "checkpointed fixture has no WAL frames");
+        } else {
+            assert!(wal_size > 32, "fixture must retain committed WAL frames");
+        }
+        let expected = logical_witness(&migration.db_path).unwrap();
+        let shm = family_component_path(&migration.db_path, "-shm");
+        fs::write(&shm, vec![0_u8; 32_768]).unwrap();
+        assert!(open_read_only(&migration.db_path).is_err());
+        (temp, migration, expected)
     }
 
     #[test]
     fn engine_recovery_refuses_peer_before_creating_backup() {
         let (_temp, migration) = reviewed_v14_migration_context();
+        truncate_fixture_wal(&migration.db_path);
         let peer = crate::sync::DatabaseOpenerLease::register(&migration.db_path).unwrap();
         assert!(peer.is_registered());
         let before = recovery_family_witness(&migration.db_path).unwrap();
@@ -7801,6 +8792,7 @@ mod tests {
     #[test]
     fn engine_recovery_refuses_engine_sidecar_symlink() {
         let (_temp, migration) = reviewed_v14_migration_context();
+        truncate_fixture_wal(&migration.db_path);
         let outside = migration.beads_dir.join("outside-marker");
         fs::write(&outside, b"untouched").unwrap();
         let marker = family_component_path(&migration.db_path, ".fsqlite-migration-state");
@@ -7818,6 +8810,7 @@ mod tests {
     #[test]
     fn engine_recovery_preserves_prestate_when_private_open_fails() {
         let (_temp, migration) = reviewed_v14_migration_context();
+        truncate_fixture_wal(&migration.db_path);
         fs::write(&migration.db_path, b"not a database").unwrap();
         let before = recovery_family_witness(&migration.db_path).unwrap();
         let error =

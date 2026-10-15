@@ -1893,11 +1893,12 @@ fn e2e_ambiguous_id() {
         ids.push(id);
 
         // Check for first-character collisions (matches how the resolver
-        // uses contains() -- a single char matches any hash containing it)
+        // uses contains() -- a single char matches any hash containing it).
+        // The hash is the last `-` segment: workspace prefixes contain `-`.
         for i in 0..ids.len() {
             for j in (i + 1)..ids.len() {
-                let hash_i = ids[i].split('-').nth(1).unwrap_or("");
-                let hash_j = ids[j].split('-').nth(1).unwrap_or("");
+                let hash_i = ids[i].rsplit('-').next().unwrap_or("");
+                let hash_j = ids[j].rsplit('-').next().unwrap_or("");
                 if !hash_i.is_empty()
                     && !hash_j.is_empty()
                     && hash_i.chars().next() == hash_j.chars().next()
@@ -4245,11 +4246,12 @@ fn e2e_structured_error_ambiguous_id() {
         let id = parse_created_id(&create.stdout);
         ids.push(id);
 
-        // Check for prefix collisions
+        // Check for prefix collisions in the hash, the last `-` segment
+        // (workspace prefixes such as `br-workspace-test-x` contain `-`)
         for i in 0..ids.len() {
             for j in (i + 1)..ids.len() {
-                let hash_i = ids[i].split('-').nth(1).unwrap_or("");
-                let hash_j = ids[j].split('-').nth(1).unwrap_or("");
+                let hash_i = ids[i].rsplit('-').next().unwrap_or("");
+                let hash_j = ids[j].rsplit('-').next().unwrap_or("");
                 if !hash_i.is_empty()
                     && !hash_j.is_empty()
                     && hash_i.chars().next() == hash_j.chars().next()

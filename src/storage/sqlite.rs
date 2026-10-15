@@ -8621,6 +8621,32 @@ impl SqliteStorage {
         ))
     }
 
+    fn get_issue_for_preservation_by_scan(
+        &self,
+        id: &str,
+        keyed_error: Option<BeadsError>,
+    ) -> Result<Option<Issue>> {
+        let issues = match self.get_issues_by_ids_with_decoder(
+            &[id.to_string()],
+            Self::issue_from_row_for_preservation,
+        ) {
+            Ok(issues) => issues,
+            Err(scan_error) => return Err(keyed_error.unwrap_or(scan_error)),
+        };
+        let mut issues = issues.into_iter();
+        match (issues.next(), issues.next()) {
+            (None, None) => Ok(None),
+            (Some(issue), None) if issue.id == id => Ok(Some(issue)),
+            (Some(issue), None) => Err(BeadsError::internal(format!(
+                "storage consistency: preservation scan requested {id:?} but row returned id {:?}",
+                issue.id
+            ))),
+            _ => Err(BeadsError::Config(format!(
+                "multiple issue rows match {id}; no unique row can be snapshotted"
+            ))),
+        }
+    }
+
     /// Get metadata for all issues to optimize import collision detection.
     ///
     /// # Errors
@@ -22751,6 +22777,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn preservation_scan_recovers_a_row_independently_of_the_keyed_lookup() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let at = Utc.with_ymd_and_hms(2026, 10, 14, 1, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-preservation-scan",
+            "Must survive a damaged primary-key index",
+            Status::Open,
+            2,
+            None,
+            at,
+            None,
+        );
+        storage.create_issue(&issue, "test").unwrap();
+
+        let recovered = storage
+            .get_issue_for_preservation_by_scan(&issue.id, None)
+            .unwrap()
+            .expect("table-scan fallback must find the live issue row");
+        assert_eq!(recovered.id, issue.id);
+        assert_eq!(recovered.title, issue.title);
+
+        assert!(
+            storage
+                .get_issue_for_preservation_by_scan("bd-definitely-absent", None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     fn sync_merge_test_intent(
         storage: &SqliteStorage,
         kept: &[Issue],
@@ -35524,6 +35580,7 @@ required_fields:
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn missing_wal_index_recovery_preserves_valid_wal_only_pending_receipt() {
         let temp = TempDir::new().unwrap();
@@ -35605,23 +35662,45 @@ required_fields:
             )
             .unwrap(),
         );
-        crate::cli::commands::doctor_subsystems::schema_migration::recover_wal_index_for_startup(
-            temp.path(),
-            &db_path,
-            &authority,
-        )
-        .unwrap();
-        // An engine with a private in-memory index (Windows) needs no file
-        // and must not be sent through recovery for its absence (GH #520).
-        assert_eq!(
-            shm_path.is_file(),
-            crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY
+        let family_bytes = || {
+            std::iter::once("")
+                .chain(crate::config::db_sidecar_suffixes().copied())
+                .map(|suffix| fs::read(database_sidecar_path(&db_path, suffix)).ok())
+                .collect::<Vec<_>>()
+        };
+        let family_before = family_bytes();
+        let recovered =
+            crate::cli::commands::doctor_subsystems::schema_migration::recover_wal_index_for_startup(
+                temp.path(),
+                &db_path,
+                &authority,
+            );
+        if crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY {
+            // GH #556: the receipt's frames are committed but uncheckpointed,
+            // so this is not an index-only incident. Startup refuses before
+            // copying or opening anything and leaves the receipt in the WAL.
+            let error = recovered.expect_err("framed WAL must refuse index-only recovery");
+            assert!(
+                error.to_string().contains(
+                    "engine recovery refused before opening: WAL contains frames that may \
+                     hold committed, uncheckpointed changes"
+                ),
+                "unexpected refusal: {error}"
+            );
+            assert!(!temp.path().join(".br_recovery").exists());
+        } else {
+            // An engine with a private in-memory index (Windows) needs no file
+            // and must not be sent through recovery for its absence (GH #520).
+            recovered.unwrap();
+        }
+        assert!(
+            !shm_path.exists(),
+            "no index may be rebuilt over WAL frames"
         );
         assert_eq!(
-            SqliteStorage::inspect_pending_sync_merge_under_authority(&db_path, &authority)
-                .unwrap(),
-            expected,
-            "index recovery must preserve the exact valid pending receipt",
+            family_bytes(),
+            family_before,
+            "the pending receipt's family must stay byte-identical"
         );
         assert_eq!(fs::read(&db_path).unwrap(), main_before);
         assert_eq!(fs::read(&wal_path).unwrap(), wal_before);
