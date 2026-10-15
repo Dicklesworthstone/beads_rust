@@ -227,11 +227,13 @@ ships in the next one.
   ([db2b3841](https://github.com/Dicklesworthstone/beads_rust/commit/db2b3841));
   a finished recovery run whose private rehearsal quarantined its probe index
   is prunable like any finished run (#545,
-  [74e1ede2](https://github.com/Dicklesworthstone/beads_rust/commit/74e1ede2));
-  post-import compaction backups get receipt-verified retention that needs an
-  intact history and an integrity proof before pruning (#554,
-  [c9d5fcd4](https://github.com/Dicklesworthstone/beads_rust/commit/c9d5fcd4),
-  [823adb1e](https://github.com/Dicklesworthstone/beads_rust/commit/823adb1e)).
+  [74e1ede2](https://github.com/Dicklesworthstone/beads_rust/commit/74e1ede2)).
+  Retention for post-import compaction backups (#554) is **not in this
+  release**. Its module was staged
+  ([c9d5fcd4](https://github.com/Dicklesworthstone/beads_rust/commit/c9d5fcd4),
+  [823adb1e](https://github.com/Dicklesworthstone/beads_rust/commit/823adb1e))
+  but is not wired into compaction, so those backups are still never pruned.
+  #554 tracks the qualification findings and activation.
 
 ### Stale-schema heal
 
