@@ -14,7 +14,7 @@ This changelog is organized by capability rather than diff order. Each version s
 - Release links: `https://github.com/Dicklesworthstone/beads_rust/releases/tag/<TAG>`
 
 **Scope window:** every version from inception (v0.1.0, 2026-01-18) through the current
-release (v0.7.5, 2026-10-13).
+release (v0.7.6, 2026-10-15).
 The full per-version detail is in the sections below; the timeline names the
 recent line and the milestone anchors. The September 8 audit examined all 79
 commits in `v0.5.10..v0.5.11` and six subsequent commits against Git diffs,
@@ -31,6 +31,7 @@ explicitly corrected during this audit.
 
 | Version | Date | Kind | Headline |
 |---|---|---|---|
+| [v0.7.6](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.6) | 2026-10-15 | Release | Patch on v0.7.5: a missing database with a header-only WAL rebuilds from JSONL again instead of refusing every command (#569); rustls 0.23.46 (RUSTSEC-2026-0346..0349) |
 | [v0.7.5](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.5) | 2026-10-13 | Release | FrankenSQLite 0.4.10; `doctor migrate-schema recover` no longer rewrites the WAL (#556); imports and `sync --merge` keep newer and locally exported work (#535, #547, #548); automatic rebuilds and `doctor --repair` refuse instead of dropping unflushed changes (#546, #553); WAL-index recovery under a stock SQLite reader retries instead of latching (#532); stale-schema heal fixes (#550, #551); `vcs-status --runtime-files`; opt-level 3 release binaries |
 | [v0.7.4](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.4) | 2026-10-01 | Release | `--exclude-label` for list/ready/search/count (#522); FrankenSQLite 0.4.7, so reads after a SQLite reader such as bv no longer copy the database; bounded `.br_recovery` and `.br-wal-index-*` retention; provenance-backed create entry routes (#503); "recovery in progress" names `br doctor migrate-schema recover` |
 | [v0.7.3](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.3) | 2026-09-29 | Release | Read-only commands (`--no-auto-import --no-auto-flush`, the form bv generates) no longer fail with "recovery in progress" after a SQLite reader such as bv opened the tracker |
@@ -85,6 +86,34 @@ per-version detail is in the sections below.
 The engine-side fix itself lives in FrankenSQLite (cross-repo, so not linked to
 this repo): commits `55c186682` + `5946b3b7c` in
 <https://github.com/Dicklesworthstone/frankensqlite>, shipped as fsqlite 0.3.12.
+
+---
+
+## v0.7.6 — 2026-10-15
+
+[Release](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.6).
+A patch release on the v0.7.5 line: v0.7.5 plus the two changes below. The
+database schema is unchanged at 19 and br stays on FrankenSQLite 0.4.10. The
+recovery and heal work that reached main after v0.7.5 (#561, #562 and the
+rest) is not in this release; it ships in the next one.
+
+### Recovery
+
+- **A missing database rebuilds again past a header-only WAL** (#569,
+  [5dde7c81](https://github.com/Dicklesworthstone/beads_rust/commit/5dde7c81)). In v0.7.5, a missing `.beads/beads.db` with an
+  orphaned `-wal` that held only its 32-byte header made every command, reads
+  included, fail with exit 6. That is the normal state after a checkpoint.
+  Automatic recovery treated any non-empty WAL as unflushed state, but a WAL
+  keeps pages only in frames after its header. A WAL no longer than its header
+  is now frame-less for this check (shorter is torn, #228): it is moved to
+  `.br_recovery` and br rebuilds from JSONL as v0.7.4 did. A WAL with any byte
+  past its header, and any non-empty rollback journal, still refuse.
+
+### Dependencies
+
+- rustls 0.23.45 → 0.23.46 for RUSTSEC-2026-0346 to 0349, which were published
+  after v0.7.5. They are low severity, and br reaches rustls only through
+  `br upgrade` ([e51dd443](https://github.com/Dicklesworthstone/beads_rust/commit/e51dd443)).
 
 ---
 

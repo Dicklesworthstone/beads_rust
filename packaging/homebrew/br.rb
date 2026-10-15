@@ -14,7 +14,7 @@ class Br < Formula
   desc "Agent-first issue tracker (SQLite + JSONL)"
   homepage "https://github.com/Dicklesworthstone/beads_rust"
   license :cannot_represent
-  version "0.7.5"
+  version "0.7.6"
 
   on_macos do
     on_arm do
