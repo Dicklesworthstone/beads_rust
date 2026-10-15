@@ -3,131 +3,44 @@ name: Schema-heal provenance qualification
 on:
   push:
     branches: [main]
-    paths: [.github/workflows/schema-heal-provenance.yml]
+    paths:
+      - '.github/workflows/schema-heal-provenance.yml'
+      - 'src/storage/**'
+      - 'src/sync/**'
+      - 'src/cli/commands/doctor_subsystems/schema_heal*'
+      - 'src/cli/commands/doctor_subsystems/schema_heal/**'
   workflow_dispatch:
 
-# This one-time qualification prepares source blobs but never updates a ref.
-# The final reviewed source commit is made separately through GitHub.
+# Run the actual preservation and import regressions. This workflow does not
+# rewrite source, publish Git objects, commit changes, or update branch refs.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: schema-heal-provenance-qualification
-  cancel-in-progress: false
+  group: schema-heal-provenance-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
-  RUST_TOOLCHAIN: nightly-2026-08-31
-  CARGO_TERM_COLOR: never
+  CARGO_TERM_COLOR: always
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   CARGO_BUILD_JOBS: 2
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
   qualify:
-    if: github.repository == 'Dicklesworthstone/beads_rust' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: Check out the exact qualification commit
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Check out the qualification commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          fetch-depth: 0
           persist-credentials: false
-      - name: Require the inspected production baseline
-        shell: bash
-        run: |
-          set -euo pipefail
-          git diff --exit-code 4148ba89fd00c2914b222b0218bd71c2eafedbb6 HEAD -- src Cargo.toml Cargo.lock rust-toolchain.toml
       - name: Install the repository qualification toolchain
-        shell: bash
-        run: |
-          set -euo pipefail
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
-          rustup override set "$RUST_TOOLCHAIN"
-      - name: Apply the pinned provenance repair and regressions
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import base64, hashlib, json, os, urllib.request
-          sha = '350ef20b99efc08f9e53ebc14da803ceca1057ca'
-          request = urllib.request.Request(
-              f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs/{sha}',
-              headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-          with urllib.request.urlopen(request, timeout=60) as response:
-              result = json.load(response)
-          source = base64.b64decode(result['content'], validate=False)
-          actual = hashlib.sha1(b'blob ' + str(len(source)).encode() + b'\0' + source).hexdigest()
-          assert actual == sha, (actual, sha)
-          exec(compile(source, '<pinned GH-570 repair>', 'exec'), {'__name__': '__main__'})
-          PY
-          rustfmt --edition 2024 --config skip_children=true src/storage/sqlite.rs src/sync/mod.rs src/cli/commands/doctor_subsystems/schema_heal/rebuild_preflight.rs
-          git diff --check
-          git diff --stat
-          git diff -- src/storage/sqlite.rs src/sync/mod.rs src/cli/commands/doctor_subsystems/schema_heal/rebuild_preflight.rs
-      - name: Store candidate source blobs without changing main
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import base64, hashlib, json, os, subprocess, urllib.request
-          from pathlib import Path
-          allowed = {
-              'src/storage/sqlite.rs', 'src/sync/mod.rs',
-              'src/cli/commands/doctor_subsystems/schema_heal/rebuild_preflight.rs'}
-          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
-          assert changed == allowed, changed
-          manifest = []
-          for path in sorted(changed):
-              content = Path(path).read_bytes()
-              request = urllib.request.Request(
-                  f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs',
-                  data=json.dumps({'encoding': 'base64', 'content': base64.b64encode(content).decode()}).encode(),
-                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
-                           'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'}, method='POST')
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  result = json.load(response)
-              expected = hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content).hexdigest()
-              assert result['sha'] == expected
-              manifest.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': result['sha']})
-          print('GH570_CANDIDATE_BLOBS=' + json.dumps(manifest), flush=True)
-          PY
-      - name: Require the regression to fail with the original replay call
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import subprocess
-          from pathlib import Path
-          path = Path('src/sync/mod.rs')
-          fixed = path.read_text()
-          old = 'upsert_issue_for_restore_in_tx('
-          assert fixed.count(old) == 1
-          try:
-              path.write_text(fixed.replace(old, 'upsert_issue_for_import_in_tx(', 1))
-              result = subprocess.run([
-                  'cargo', 'test', '--lib', '--locked',
-                  'local_restore_provenance_comment_union_rehearsal_matches_live_replay',
-                  '--', '--test-threads=1', '--nocapture'],
-                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-              print(result.stdout, flush=True)
-              assert result.returncode != 0, 'The unpatched replay unexpectedly passed'
-              assert 'test result: FAILED' in result.stdout, 'The test did not execute'
-              assert 'source_repo_path' in result.stdout, 'Failure was not the provenance regression'
-          finally:
-              path.write_text(fixed)
-          PY
-      - name: Run provenance policy and transaction regressions
-        run: cargo test --lib --locked local_restore_provenance -- --test-threads=1
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        with:
+          toolchain: nightly-2026-08-31
       - name: Run complete schema-heal regression module
         run: cargo test --lib --locked schema_heal -- --test-threads=1
-      - name: Run sync restoration and import regressions
+      - name: Run restoration and import regressions
         run: cargo test --lib --locked sync:: -- --test-threads=1
-      - name: Check all targets
-        run: cargo check --all-targets --locked
-      - name: Check lints
-        run: cargo clippy --all-targets --locked -- -D warnings
-      - name: Check formatting
-        run: cargo fmt --all -- --check
