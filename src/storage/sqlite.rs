@@ -20990,8 +20990,9 @@ impl SqliteStorage {
     /// row's own path wins, and an incoming value only fills a row that has
     /// none. A legacy row exported by an older br carries the exporting
     /// machine's path, which never names this machine's workspace, so it must
-    /// not replace the local one. Only the explicit source_repo_path migration
-    /// passes [`ImportSourceRepoPath::Overwrite`].
+    /// not replace the local one. Explicit source_repo_path migration and
+    /// schema-heal replay of a known saved local path use
+    /// [`ImportSourceRepoPath::Overwrite`].
     fn update_issue_row_for_import(
         &self,
         issue: &Issue,

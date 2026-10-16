@@ -480,6 +480,10 @@ mod tests {
         let path = original.path().join("issues.jsonl");
         let mut imported = issue("pf-abc");
         imported.comments = vec![comment(1, "shared"), comment(2, "peer-only")];
+        // Reproduce #570 exactly: legacy JSONL can carry another clone's
+        // provenance path, while the audited local row has this clone's path.
+        // Restoration must replace the foreign value, not merely fill NULL.
+        imported.source_repo_path = Some("/other/clone".to_owned());
         let bytes = format!("{}\n", serde_json::to_string(&imported).unwrap());
         fs::write(&path, &bytes).unwrap();
         let source = sync::capture_jsonl_source_snapshot(&path).unwrap();
@@ -880,10 +884,18 @@ mod tests {
         storage
             .sync_comments_for_import(&imported.id, &imported.comments)
             .unwrap();
-        sync::restore_dirty_issues_after_rebuild(&mut storage, &plan).unwrap();
-        witness.verify(&storage).unwrap();
-        sync::restore_dirty_issues_after_rebuild(&mut storage, &plan).unwrap();
-        witness.verify(&storage).unwrap();
+        for _ in 0..2 {
+            sync::restore_dirty_issues_after_rebuild(&mut storage, &plan).unwrap();
+            witness.verify(&storage).unwrap();
+            let persisted = storage
+                .execute_raw_query("SELECT source_repo_path FROM issues WHERE id = 'pf-abc'")
+                .unwrap();
+            assert_eq!(
+                persisted[0][0].as_text(),
+                Some("/original/workspace"),
+                "saved local provenance must replace the imported clone path"
+            );
+        }
         storage
             .sync_comments_for_import(&local.id, &local.comments)
             .unwrap();
