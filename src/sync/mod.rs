@@ -18919,7 +18919,7 @@ fn restore_preserved_issues_with_omissions(
     let marked_at = Utc::now().to_rfc3339();
     storage.with_write_transaction(|storage| {
         for entry in preserved {
-            storage.upsert_issue_for_import_in_tx(&entry.issue)?;
+            storage.upsert_issue_for_local_restore_in_tx(&entry.issue)?;
         }
         for entry in preserved {
             if let Some(labels) = &entry.labels {

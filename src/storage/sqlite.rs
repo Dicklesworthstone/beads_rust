@@ -21088,6 +21088,19 @@ impl SqliteStorage {
         )
     }
 
+    /// Replay a locally preserved issue during schema healing. A saved local
+    /// provenance path wins over a legacy imported clone path; an absent saved
+    /// path leaves the destination value unchanged. Ordinary imports retain
+    /// their existing keep-local policy.
+    pub(crate) fn upsert_issue_for_local_restore_in_tx(&self, issue: &Issue) -> Result<bool> {
+        let policy = if issue.source_repo_path.is_some() {
+            ImportSourceRepoPath::Overwrite
+        } else {
+            ImportSourceRepoPath::KeepLocal
+        };
+        self.upsert_issue_for_import_with_source_repo_path_in_tx(issue, policy)
+    }
+
     fn upsert_issue_for_import_with_source_repo_path_in_tx(
         &self,
         issue: &Issue,
