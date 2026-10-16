@@ -14,6 +14,8 @@
 
 pub mod events;
 mod lint;
+#[cfg(test)]
+mod local_restore_tests;
 pub mod schema;
 mod search;
 pub mod sqlite;
