@@ -27,13 +27,12 @@ env:
 
 jobs:
   prepare-reviewed-restoration:
-    # Temporary, exact-input source qualification. This job publishes only
-    # immutable blobs for review through the GitHub integration. It never
-    # creates commits, changes refs, or pushes. Remove this job once the
-    # reviewed source blobs are committed; retain the read-only regressions.
-    if: github.repository == 'Dicklesworthstone/beads_rust' && github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # Temporary exact-input preparation. This job only publishes immutable
+    # blobs. It never commits, pushes, or updates refs. Remove this job once
+    # the reviewed source blobs are committed; retain read-only regressions.
+    if: github.repository == 'Dicklesworthstone/beads_rust' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
       contents: write
     outputs:
@@ -43,6 +42,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt
       - name: Prepare exactly the reviewed local-restoration change
         id: prepare
         env:
@@ -72,37 +75,30 @@ jobs:
           path = 'src/storage/sqlite.rs'
           text = texts[path]
           enum = re.search(r'enum ImportSourceRepoPath\s*\{([^}]+)\}', text)
-          if enum is None:
-              raise SystemExit('Missing reviewed source-path policy enum')
-          policies = [name for name in ('KeepLocal', 'Preserve') if re.search(r'\b' + name + r'\s*,', enum.group(1))]
-          if len(policies) != 1 or not re.search(r'\bOverwrite\s*,', enum.group(1)):
+          if enum is None or not all(re.search(r'\b' + name + r'\s*,', enum.group(1)) for name in ('KeepLocal', 'Overwrite')):
               raise SystemExit('Unrecognized source-path policy; refusing to guess')
           anchor = '    fn upsert_issue_for_import_with_source_repo_path_in_tx(\n'
           if text.count(anchor) != 1 or 'fn upsert_issue_for_local_restore_in_tx(' in text:
               raise SystemExit('Restoration insertion point changed')
-          method = '''    /// Replay an issue captured from this database before a rebuild.
-              ///
-              /// A known saved local path is authoritative, unlike a legacy path
-              /// imported from another clone. An absent saved path makes no claim
-              /// and must not erase the destination value. Only preserved local
-              /// state may use this policy; normal JSONL imports must not.
-              /// The caller owns the transaction for rows, relations and markers.
-              pub(crate) fn upsert_issue_for_local_restore_in_tx(&self, issue: &Issue) -> Result<bool> {
-                  let source_repo_path = if issue.source_repo_path.is_some() {
-                      ImportSourceRepoPath::Overwrite
-                  } else {
-                      ImportSourceRepoPath::POLICY
-                  };
-                  self.upsert_issue_for_import_with_source_repo_path_in_tx(issue, source_repo_path)
-              }
-
-          '''
-          # The literal's first line is indented four columns, subsequent
-          # lines fourteen because it is embedded in Python. Normalize only
-          # this newly added method; do not reformat unrelated source.
-          lines = method.splitlines(keepends=True)
-          method = lines[0] + ''.join(line[10:] if line.startswith('          ') else line for line in lines[1:])
-          method = method.replace('ImportSourceRepoPath::POLICY', 'ImportSourceRepoPath::' + policies[0])
+          method = '\n'.join([
+              '    /// Replay an issue captured from this database before a rebuild.',
+              '    ///',
+              '    /// A known saved local path is authoritative, unlike a legacy path',
+              '    /// imported from another clone. An absent saved path makes no claim',
+              '    /// and must not erase the destination value. Only preserved local',
+              '    /// state may use this policy; normal JSONL imports must not.',
+              '    /// The caller owns the transaction for rows, relations and markers.',
+              '    pub(crate) fn upsert_issue_for_local_restore_in_tx(&self, issue: &Issue) -> Result<bool> {',
+              '        let source_repo_path = if issue.source_repo_path.is_some() {',
+              '            ImportSourceRepoPath::Overwrite',
+              '        } else {',
+              '            ImportSourceRepoPath::KeepLocal',
+              '        };',
+              '        self.upsert_issue_for_import_with_source_repo_path_in_tx(issue, source_repo_path)',
+              '    }',
+              '',
+              '',
+          ])
           Path(path).write_text(text.replace(anchor, method + anchor, 1))
           path = 'src/sync/mod.rs'
           old = 'storage.upsert_issue_for_import_in_tx(&entry.issue)?;'
@@ -111,6 +107,9 @@ jobs:
               raise SystemExit('Batch restoration call site changed')
           Path(path).write_text(texts[path].replace(old, new, 1))
           subprocess.run(['git', 'diff', '--check'], check=True)
+          # Parse the complete prepared files without rewriting unrelated code.
+          for path in expected:
+              subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', '--emit', 'stdout', path], stdout=subprocess.DEVNULL, check=True)
           subprocess.run(['git', 'diff', '--', *expected], check=True)
           for path, key in [('src/storage/sqlite.rs', 'sqlite_sha'), ('src/sync/mod.rs', 'sync_sha')]:
               data = Path(path).read_bytes()
@@ -125,7 +124,7 @@ jobs:
                   remote_sha = json.load(response)['sha']
               if remote_sha != local_sha:
                   raise SystemExit('Published blob does not match reviewed bytes')
-              print(json.dumps({'path': path, 'sha': remote_sha, 'tested': False}), flush=True)
+              print(json.dumps({'path': path, 'sha': remote_sha, 'compiled': False}), flush=True)
               with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
                   output.write(f'{key}={remote_sha}\n')
           PY
@@ -134,8 +133,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: Check out the qualification commit
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Load the exact reviewed source blobs
@@ -162,8 +160,7 @@ jobs:
                   raise SystemExit('Qualification source mismatch')
               Path(path).write_bytes(data)
           PY
-      - name: Install the repository qualification toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
           toolchain: nightly-2026-08-31
           components: rustfmt
