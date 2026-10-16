@@ -5,6 +5,9 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/schema-heal-provenance.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain*'
       - 'src/storage/**'
       - 'src/sync/**'
       - 'src/cli/commands/doctor_subsystems/schema_heal*'
@@ -26,147 +29,26 @@ env:
   CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
-  prepare-reviewed-restoration:
-    # Temporary exact-input preparation. This job only publishes immutable
-    # blobs. It never commits, pushes, or updates refs. Remove this job once
-    # the reviewed source blobs are committed; retain read-only regressions.
-    if: github.repository == 'Dicklesworthstone/beads_rust' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    outputs:
-      sqlite_sha: ${{ steps.prepare.outputs.sqlite_sha }}
-      sync_sha: ${{ steps.prepare.outputs.sync_sha }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
-        with:
-          toolchain: nightly-2026-08-31
-          components: rustfmt
-      - name: Prepare exactly the reviewed local-restoration change
-        id: prepare
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import base64
-          import hashlib
-          import json
-          import os
-          import re
-          import subprocess
-          import urllib.request
-          from pathlib import Path
-
-          expected = {
-              'src/storage/sqlite.rs': '4044395d098eea69c29ad8a1b7d4e05e5841dfc2',
-              'src/sync/mod.rs': '10bc39155514a623aa9c968ae3497c26f6258f80',
-          }
-          texts = {}
-          for path, sha in expected.items():
-              actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
-              if actual != sha:
-                  raise SystemExit(f'Refusing changed input: {path}: {actual} != {sha}')
-              texts[path] = Path(path).read_text()
-          path = 'src/storage/sqlite.rs'
-          text = texts[path]
-          enum = re.search(r'enum ImportSourceRepoPath\s*\{([^}]+)\}', text)
-          if enum is None or not all(re.search(r'\b' + name + r'\s*,', enum.group(1)) for name in ('KeepLocal', 'Overwrite')):
-              raise SystemExit('Unrecognized source-path policy; refusing to guess')
-          anchor = '    fn upsert_issue_for_import_with_source_repo_path_in_tx(\n'
-          if text.count(anchor) != 1 or 'fn upsert_issue_for_local_restore_in_tx(' in text:
-              raise SystemExit('Restoration insertion point changed')
-          method = '\n'.join([
-              '    /// Replay an issue captured from this database before a rebuild.',
-              '    ///',
-              '    /// A known saved local path is authoritative, unlike a legacy path',
-              '    /// imported from another clone. An absent saved path makes no claim',
-              '    /// and must not erase the destination value. Only preserved local',
-              '    /// state may use this policy; normal JSONL imports must not.',
-              '    /// The caller owns the transaction for rows, relations and markers.',
-              '    pub(crate) fn upsert_issue_for_local_restore_in_tx(&self, issue: &Issue) -> Result<bool> {',
-              '        let source_repo_path = if issue.source_repo_path.is_some() {',
-              '            ImportSourceRepoPath::Overwrite',
-              '        } else {',
-              '            ImportSourceRepoPath::KeepLocal',
-              '        };',
-              '        self.upsert_issue_for_import_with_source_repo_path_in_tx(issue, source_repo_path)',
-              '    }',
-              '',
-              '',
-          ])
-          Path(path).write_text(text.replace(anchor, method + anchor, 1))
-          path = 'src/sync/mod.rs'
-          old = 'storage.upsert_issue_for_import_in_tx(&entry.issue)?;'
-          new = 'storage.upsert_issue_for_local_restore_in_tx(&entry.issue)?;'
-          if texts[path].count(old) != 1:
-              raise SystemExit('Batch restoration call site changed')
-          Path(path).write_text(texts[path].replace(old, new, 1))
-          subprocess.run(['git', 'diff', '--check'], check=True)
-          # Parse the complete prepared files without rewriting unrelated code.
-          for path in expected:
-              subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', '--emit', 'stdout', path], stdout=subprocess.DEVNULL, check=True)
-          subprocess.run(['git', 'diff', '--', *expected], check=True)
-          for path, key in [('src/storage/sqlite.rs', 'sqlite_sha'), ('src/sync/mod.rs', 'sync_sha')]:
-              data = Path(path).read_bytes()
-              local_sha = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-              request = urllib.request.Request(
-                  'https://api.github.com/repos/Dicklesworthstone/beads_rust/git/blobs',
-                  data=json.dumps({'encoding': 'base64', 'content': base64.b64encode(data).decode()}).encode(),
-                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json', 'X-GitHub-Api-Version': '2022-11-28'},
-                  method='POST',
-              )
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  remote_sha = json.load(response)['sha']
-              if remote_sha != local_sha:
-                  raise SystemExit('Published blob does not match reviewed bytes')
-              print(json.dumps({'path': path, 'sha': remote_sha, 'compiled': False}), flush=True)
-              with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-                  output.write(f'{key}={remote_sha}\n')
-          PY
   qualify:
-    needs: prepare-reviewed-restoration
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Check out exactly the commit being qualified
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Load the exact reviewed source blobs
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SQLITE_SHA: ${{ needs.prepare-reviewed-restoration.outputs.sqlite_sha }}
-          SYNC_SHA: ${{ needs.prepare-reviewed-restoration.outputs.sync_sha }}
-        run: |
-          python3 - <<'PY'
-          import base64, hashlib, json, os, re, urllib.request
-          from pathlib import Path
-          for path, variable in [('src/storage/sqlite.rs', 'SQLITE_SHA'), ('src/sync/mod.rs', 'SYNC_SHA')]:
-              sha = os.environ[variable]
-              if not re.fullmatch('[0-9a-f]{40}', sha):
-                  raise SystemExit('Invalid reviewed blob SHA')
-              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/beads_rust/git/blobs/' + sha, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  blob = json.load(response)
-              if blob['encoding'] != 'base64':
-                  raise SystemExit('Unexpected blob encoding')
-              data = base64.b64decode(blob['content'])
-              actual = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-              if actual != sha:
-                  raise SystemExit('Qualification source mismatch')
-              Path(path).write_bytes(data)
-          PY
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+      - name: Install the repository qualification toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
           toolchain: nightly-2026-08-31
-          components: rustfmt
+      # These checks deliberately use only checked-in production code. A
+      # failing replay regression must not be hidden by patching the source
+      # during CI, skipping a known-failing case, or weakening the witness.
       - name: Run local restoration and rollback regressions
         run: cargo test --lib --locked storage::local_restore_tests -- --test-threads=1
       - name: Run complete schema-heal regression module
+        if: ${{ !cancelled() }}
         run: cargo test --lib --locked schema_heal -- --test-threads=1
       - name: Run restoration and import regressions
+        if: ${{ !cancelled() }}
         run: cargo test --lib --locked sync:: -- --test-threads=1
