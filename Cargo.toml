@@ -68,11 +68,11 @@ fsqlite = { version = "=0.4.10", default-features = false, features = [
     "misc",
 ] }
 fsqlite-types = { version = "=0.4.10" }
-fsqlite-error = { version = "=0.4.10" }
+fsqlite-error = { version = "=0.4.12" }
 fsqlite-core = { version = "=0.4.10" }
 fsqlite-func = { version = "=0.4.10" }
 fsqlite-vdbe = { version = "=0.4.10" }
-fsqlite-vfs = { version = "=0.4.10" }
+fsqlite-vfs = { version = "=0.4.11" }
 fsqlite-pager = { version = "=0.4.10" }
 fsqlite-parser = { version = "=0.4.10" }
 fsqlite-planner = { version = "=0.4.10" }
