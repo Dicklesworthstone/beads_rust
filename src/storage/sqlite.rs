@@ -8621,6 +8621,7 @@ impl SqliteStorage {
         ))
     }
 
+    #[cfg(test)]
     fn get_issue_for_preservation_by_scan(
         &self,
         id: &str,

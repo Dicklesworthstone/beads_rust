@@ -310,11 +310,18 @@ fn workspace_with_exported_issues(issues: &[Value]) -> BrWorkspace {
         ["sync", "--import-only"],
         "import_fixed_issues",
     ));
+    // Publish the database's persisted defaults so the base represents the
+    // local export used by these merge fixtures, even after a clean import.
     success(run_br(
         &workspace,
-        ["sync", "--flush-only"],
+        ["sync", "--flush-only", "--force"],
         "export_fixed_issues",
     ));
+    assert_eq!(
+        fs::read(workspace.root.join(".beads/beads.base.jsonl")).expect("read exported base"),
+        fs::read(workspace.root.join(".beads/issues.jsonl")).expect("read exported issues"),
+        "merge fixture must start with the published local export as its base"
+    );
     workspace
 }
 

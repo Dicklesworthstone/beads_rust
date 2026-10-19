@@ -3763,6 +3763,14 @@ impl Default for ImportConfig {
     }
 }
 
+// Only an explicit sync may choose the existing timestamp-based local winner
+// when that choice would discard a different source payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportMode {
+    Explicit,
+    Automatic,
+}
+
 /// Orphan handling behavior for import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrphanMode {
@@ -8489,7 +8497,7 @@ fn plan_additive_reconcile_in_snapshot(
     );
     expected_metadata.insert(
         METADATA_JSONL_ROW_RECEIPT_VERSION.to_string(),
-        "1".to_string(),
+        CURRENT_JSONL_ROW_RECEIPT_VERSION.to_string(),
     );
     expected_metadata.insert(
         METADATA_JSONL_UNIMPORTED_SOURCE.to_string(),
@@ -11981,6 +11989,10 @@ pub const METADATA_JSONL_CONTENT_HASH: &str = "jsonl_content_hash";
 const METADATA_IMPORT_OMITTED_IDS: &str = "import_omitted_ids";
 const METADATA_JSONL_ROW_HASHES: &str = "jsonl_row_hashes";
 const METADATA_JSONL_ROW_RECEIPT_VERSION: &str = "jsonl_row_receipt_version";
+// Version 1 could certify an automatic import that silently kept local rows
+// over divergent older/equal source payloads. Version 2 requires those conflicts
+// to be resolved explicitly before authorizing replacement (GitHub #571).
+const CURRENT_JSONL_ROW_RECEIPT_VERSION: &str = "2";
 const METADATA_JSONL_UNIMPORTED_SOURCE: &str = "jsonl_unimported_source";
 
 fn jsonl_row_hashes(source: &JsonlSourceSnapshot) -> Result<BTreeMap<String, String>> {
@@ -12004,7 +12016,10 @@ fn record_jsonl_row_receipts_in_tx(
         METADATA_JSONL_ROW_HASHES,
         &serde_json::to_string(&jsonl_row_hashes(source)?)?,
     )?;
-    storage.set_metadata_in_tx(METADATA_JSONL_ROW_RECEIPT_VERSION, "1")?;
+    storage.set_metadata_in_tx(
+        METADATA_JSONL_ROW_RECEIPT_VERSION,
+        CURRENT_JSONL_ROW_RECEIPT_VERSION,
+    )?;
     storage.set_metadata_in_tx(METADATA_JSONL_UNIMPORTED_SOURCE, "false")?;
     Ok(())
 }
@@ -12130,7 +12145,7 @@ pub(crate) fn verify_full_export_source_loaded(
             && storage
                 .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?
                 .as_deref()
-                != Some("1"));
+                != Some(CURRENT_JSONL_ROW_RECEIPT_VERSION));
     if unverified && !full_export_matches_source(storage, source, retention_days, export_as_of)? {
         return Err(BeadsError::SyncConflict {
             message: "JSONL contains changes that have not been imported; refusing full export. Run `br sync --merge` to preserve local and peer changes".to_string(),
@@ -12204,7 +12219,7 @@ fn automatic_full_export_previous_hash(
         if storage
             .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?
             .as_deref()
-            != Some("1")
+            != Some(CURRENT_JSONL_ROW_RECEIPT_VERSION)
             && storage
                 .get_metadata(METADATA_JSONL_CONTENT_HASH)?
                 .is_some_and(|hash| !hash.trim().is_empty())
@@ -12376,7 +12391,7 @@ pub fn auto_import_probe_refreshing_witnesses(
             && storage
                 .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?
                 .as_deref()
-                != Some("1")))
+                != Some(CURRENT_JSONL_ROW_RECEIPT_VERSION)))
 }
 
 /// Check whether auto-import needs to inspect JSONL contents without mutating metadata.
@@ -12406,7 +12421,7 @@ pub fn auto_import_probe(
             && storage
                 .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?
                 .as_deref()
-                != Some("1")))
+                != Some(CURRENT_JSONL_ROW_RECEIPT_VERSION)))
 }
 
 fn compute_staleness_impl(
@@ -12686,7 +12701,7 @@ pub fn auto_import_if_stale(
         || storage
             .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?
             .as_deref()
-            != Some("1");
+            != Some(CURRENT_JSONL_ROW_RECEIPT_VERSION);
     if !(staleness.jsonl_newer || staleness.jsonl_exists && pending_source) {
         return Ok(AutoImportResult::default());
     }
@@ -12721,7 +12736,15 @@ pub fn auto_import_if_stale(
         ..Default::default()
     };
 
-    let result = import_from_jsonl(storage, jsonl_path, &import_config, expected_prefix)?;
+    let source = capture_jsonl_source_snapshot(jsonl_path)?;
+    let result = import_from_jsonl_snapshot_impl(
+        storage,
+        &source,
+        &import_config,
+        expected_prefix,
+        ImportMode::Automatic,
+        None,
+    )?;
 
     tracing::debug!(
         imported_count = result.imported_count,
@@ -13143,7 +13166,10 @@ fn finalize_incremental_auto_flush(
             METADATA_JSONL_ROW_HASHES,
             &serde_json::to_string(&changes.source_row_hashes)?,
         )?;
-        storage.set_metadata_in_tx(METADATA_JSONL_ROW_RECEIPT_VERSION, "1")?;
+        storage.set_metadata_in_tx(
+            METADATA_JSONL_ROW_RECEIPT_VERSION,
+            CURRENT_JSONL_ROW_RECEIPT_VERSION,
+        )?;
         storage.set_metadata_in_tx(
             METADATA_JSONL_UNIMPORTED_SOURCE,
             if changes.source_has_unimported_changes {
@@ -13710,12 +13736,26 @@ fn certify_incremental_source_changes(
     changes: &mut IncrementalAutoFlushChanges,
 ) -> Result<()> {
     let current = jsonl_row_hashes(source)?;
-    let known: BTreeMap<String, String> = storage
-        .get_metadata(METADATA_JSONL_ROW_HASHES)?
-        .map(|value| serde_json::from_str(&value))
-        .transpose()?
-        .unwrap_or_default();
-    let mut baseline = known;
+    let trusted_version = storage
+        .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?
+        .as_deref()
+        == Some(CURRENT_JSONL_ROW_RECEIPT_VERSION);
+    let source_was_unimported = storage
+        .get_metadata(METADATA_JSONL_UNIMPORTED_SOURCE)?
+        .as_deref()
+        == Some("true");
+    let mut baseline: BTreeMap<String, String> = if trusted_version {
+        storage
+            .get_metadata(METADATA_JSONL_ROW_HASHES)?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?
+            .unwrap_or_default()
+    } else {
+        // An older receipt proves bytes were read, not that a divergent
+        // implicit import was resolved. Publish only independently safe rows;
+        // untouched source rows must remain pending a guarded import.
+        BTreeMap::new()
+    };
     for id in changes
         .replacement_lines
         .keys()
@@ -13746,7 +13786,12 @@ fn certify_incremental_source_changes(
         published.remove(id);
     }
     changes.source_row_hashes = baseline;
-    changes.source_has_unimported_changes = published != changes.source_row_hashes;
+    // Even an empty source or exact row retry cannot prove that legacy
+    // DB-only rows are intentional local additions rather than peer purges.
+    // A guarded import must record that population's omission evidence. Keep
+    // this pending across further incremental writes until that import occurs.
+    changes.source_has_unimported_changes =
+        !trusted_version || source_was_unimported || published != changes.source_row_hashes;
     Ok(())
 }
 
@@ -13828,6 +13873,7 @@ fn apply_incremental_auto_flush_changes(
 /// A retention change can exclude a clean tombstone or make a previously
 /// omitted one exportable again. Merge those population changes into the
 /// captured source without overwriting any unrelated source payload.
+#[allow(clippy::too_many_lines)]
 fn collect_incremental_retention_changes(
     storage: &SqliteStorage,
     source: &JsonlSourceSnapshot,
@@ -13857,6 +13903,20 @@ fn collect_incremental_retention_changes(
                 && !removed_ids.contains(id)
         })
         .collect::<Vec<_>>();
+    if !missing.is_empty()
+        && (storage
+            .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?
+            .as_deref()
+            != Some(CURRENT_JSONL_ROW_RECEIPT_VERSION)
+            || storage
+                .get_metadata(METADATA_JSONL_UNIMPORTED_SOURCE)?
+                .as_deref()
+                == Some("true"))
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "JSONL population has not been imported; refusing automatic restoration of missing tombstones. Run `br sync --merge` to reconcile branch-local issues and peer purges".to_string(),
+        });
+    }
     missing.sort_unstable();
     for ids in missing.chunks(EXPORT_ISSUE_BATCH_SIZE) {
         let issues = storage.get_issues_for_export(ids)?;
@@ -15415,6 +15475,7 @@ fn export_hash_entry_for_import_action(
 fn certify_skipped_imports(
     storage: &SqliteStorage,
     lookup: Option<&ImportIssueLookup>,
+    mode: ImportMode,
     close_audit: &mut ImportCloseBypassAudit,
     skipped: &mut Vec<(String, Issue, String)>,
     hashes: &mut Vec<(String, String)>,
@@ -15437,6 +15498,26 @@ fn certify_skipped_imports(
     let mut uncertified = 0;
     for (id, mut incoming, hash) in skipped.drain(..) {
         if !skipped_import_matches_stored_issue(stored.get(&id), &id, &incoming) {
+            if mode == ImportMode::Automatic {
+                let preserves_source = stored.get(&id).is_some_and(|stored| {
+                    let mut stored = stored.clone();
+                    let mut incoming = incoming.clone();
+                    // Comments are append-only facts. Their union preserves
+                    // both sources even when the issue clock did not advance.
+                    stored.comments.clear();
+                    incoming.comments.clear();
+                    skipped_import_matches_stored_issue(Some(&stored), &id, &incoming)
+                });
+                if !preserves_source {
+                    // This error rolls back the entire import transaction,
+                    // including earlier rows, comments, and source receipts.
+                    return Err(BeadsError::SyncConflict {
+                        message: format!(
+                            "JSONL and the local database contain different revisions of issue '{id}' that automatic import cannot reconcile; no import was applied. Run `br sync --merge` and review the conflict, using `--force-jsonl` or `--force-db` to choose an explicit winner if needed"
+                        ),
+                    });
+                }
+            }
             // An older close's audit must not attach to a different local
             // payload, such as a reopened issue or a later closure.
             uncertified += 1;
@@ -15521,6 +15602,7 @@ fn stream_import_actions_in_tx(
     storage: &SqliteStorage,
     source: &JsonlSourceSnapshot,
     config: &ImportConfig,
+    mode: ImportMode,
     prefix_renames: &HashMap<String, String>,
     collision_renames: &HashMap<String, String>,
     comment_owner_ids_to_replace: &[String],
@@ -15664,6 +15746,7 @@ fn stream_import_actions_in_tx(
                         uncertified_local_wins += certify_skipped_imports(
                             storage,
                             skip_lookup.as_ref(),
+                            mode,
                             &mut close_audit,
                             &mut skipped,
                             &mut export_hash_batch,
@@ -15706,6 +15789,7 @@ fn stream_import_actions_in_tx(
                 uncertified_local_wins += certify_skipped_imports(
                     storage,
                     skip_lookup.as_ref(),
+                    mode,
                     &mut close_audit,
                     &mut skipped,
                     &mut export_hash_batch,
@@ -15754,6 +15838,7 @@ fn stream_import_actions_in_tx(
                 uncertified_local_wins += certify_skipped_imports(
                     storage,
                     skip_lookup.as_ref(),
+                    mode,
                     &mut close_audit,
                     &mut skipped,
                     &mut export_hash_batch,
@@ -15776,6 +15861,7 @@ fn stream_import_actions_in_tx(
     uncertified_local_wins += certify_skipped_imports(
         storage,
         skip_lookup.as_ref(),
+        mode,
         &mut close_audit,
         &mut skipped,
         &mut export_hash_batch,
@@ -16116,7 +16202,14 @@ pub(crate) fn import_from_jsonl_snapshot(
     config: &ImportConfig,
     expected_prefix: Option<&str>,
 ) -> Result<ImportResult> {
-    import_from_jsonl_snapshot_impl(storage, source, config, expected_prefix, None)
+    import_from_jsonl_snapshot_impl(
+        storage,
+        source,
+        config,
+        expected_prefix,
+        ImportMode::Explicit,
+        None,
+    )
 }
 
 /// Import into the exact empty replacement installed by a database-family
@@ -16130,7 +16223,14 @@ pub(crate) fn import_from_jsonl_snapshot_into_fresh_replacement(
     expected_prefix: Option<&str>,
     witness: FreshDatabaseReplacementWitness,
 ) -> Result<ImportResult> {
-    import_from_jsonl_snapshot_impl(storage, source, config, expected_prefix, Some(witness))
+    import_from_jsonl_snapshot_impl(
+        storage,
+        source,
+        config,
+        expected_prefix,
+        ImportMode::Explicit,
+        Some(witness),
+    )
 }
 
 // Taking ownership is deliberate: callers must relinquish the linear witness,
@@ -16141,6 +16241,7 @@ fn import_from_jsonl_snapshot_impl(
     source: &JsonlSourceSnapshot,
     config: &ImportConfig,
     expected_prefix: Option<&str>,
+    mode: ImportMode,
     fresh_witness: Option<FreshDatabaseReplacementWitness>,
 ) -> Result<ImportResult> {
     // Reject a displaced fresh replacement before any metadata or collision
@@ -16253,6 +16354,7 @@ fn import_from_jsonl_snapshot_impl(
             storage,
             source,
             config,
+            mode,
             &prefix_renames,
             &collision_plan.renames,
             &collision_plan.comment_owner_ids_to_replace,
@@ -16993,6 +17095,7 @@ fn run_reconcile_apply_tx(
                 outcome.uncertified_local_wins += certify_skipped_imports(
                     storage,
                     skip_lookup.as_ref(),
+                    ImportMode::Explicit,
                     &mut close_audit,
                     &mut skipped,
                     &mut export_hash_batch,
@@ -17032,6 +17135,7 @@ fn run_reconcile_apply_tx(
                 outcome.uncertified_local_wins += certify_skipped_imports(
                     storage,
                     skip_lookup.as_ref(),
+                    ImportMode::Explicit,
                     &mut close_audit,
                     &mut skipped,
                     &mut export_hash_batch,
@@ -17051,6 +17155,7 @@ fn run_reconcile_apply_tx(
     outcome.uncertified_local_wins += certify_skipped_imports(
         storage,
         skip_lookup.as_ref(),
+        ImportMode::Explicit,
         &mut close_audit,
         &mut skipped,
         &mut export_hash_batch,
@@ -25921,6 +26026,75 @@ mod tests {
     }
 
     #[test]
+    fn test_auto_import_preserves_skipped_defaults_and_authoritative_close_audit() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+        let target = make_issue_at("bd-auto-target", "Dependency target", fixed_time(100));
+        let mut issue = make_issue_at("bd-auto-sparse", "Closed sparse issue", fixed_time(100));
+        issue.status = Status::Closed;
+        issue.closed_at = Some(fixed_time(100));
+        issue.bypassed_policy = Some(true);
+        issue.bypass_reason = Some("Authoritative local audit".to_string());
+        issue.labels = vec!["first".to_string(), "second".to_string()];
+        issue.source_repo_path = Some("/local/workspace".to_string());
+        issue.dependencies.push(Dependency {
+            issue_id: issue.id.clone(),
+            depends_on_id: target.id.clone(),
+            dep_type: DependencyType::Related,
+            created_at: fixed_time(50),
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        });
+        write_jsonl_issues(&jsonl_path, &[&target, &issue]);
+        import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd"),
+        )
+        .unwrap();
+        let ids = vec![target.id.clone(), issue.id.clone()];
+        let before = storage.get_issues_for_export(&ids).unwrap();
+        let audit_before = storage.get_close_metadata(&issue.id).unwrap();
+
+        issue.updated_at = fixed_time(80);
+        issue.labels.reverse();
+        issue.source_repo_path = Some("/peer/workspace".to_string());
+        issue.bypass_reason = Some("Source audit must not replace local evidence".to_string());
+        write_jsonl_issues(&jsonl_path, &[&target, &issue]);
+        let source_before = fs::read(&jsonl_path).unwrap();
+        let result = auto_import_if_stale(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            Some("bd"),
+            None,
+            false,
+            false,
+            false,
+        )
+        .expect("defaults, row order, local paths, and authoritative audit are not conflicts");
+        assert!(result.attempted);
+        assert_eq!(result.imported_count, 0);
+        assert_eq!(storage.get_issues_for_export(&ids).unwrap(), before);
+        assert_eq!(storage.get_close_metadata(&issue.id).unwrap(), audit_before);
+        assert_eq!(fs::read(&jsonl_path).unwrap(), source_before);
+        assert_eq!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true"),
+            "existing close-audit precedence still schedules publication"
+        );
+        assert_eq!(
+            storage
+                .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)
+                .unwrap()
+                .as_deref(),
+            Some(CURRENT_JSONL_ROW_RECEIPT_VERSION)
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn test_auto_import_restored_export_preserves_database_only_issues_without_flush() {
         for (empty_source, missing_certificates) in
@@ -27561,6 +27735,7 @@ mod tests {
                                 certify_skipped_imports(
                                     storage,
                                     lookup,
+                                    ImportMode::Explicit,
                                     &mut close_audit,
                                     &mut skipped,
                                     &mut hashes,
@@ -30211,6 +30386,45 @@ mod tests {
     }
 
     #[test]
+    fn test_legacy_receipt_full_export_requires_exact_payload_retry() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+        let issue = make_test_issue("bd-legacy-retry", "Already published payload");
+        storage.create_issue(&issue, "test").unwrap();
+        auto_flush(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            false,
+            None,
+            HistoryConfig::default(),
+        )
+        .unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION, "1")
+            .unwrap();
+        storage.set_metadata("needs_flush", "true").unwrap();
+        let source = capture_jsonl_source_snapshot(&jsonl_path).unwrap();
+        let before = fs::read(&jsonl_path).unwrap();
+
+        verify_full_export_source_loaded(&storage, &source, None, Utc::now())
+            .expect("an exact full-payload retry does not need legacy receipt authority");
+        retitle(&mut storage, &issue.id, "New unpublished local title");
+        let error = verify_full_export_source_loaded(&storage, &source, None, Utc::now())
+            .expect_err("legacy receipts cannot authorize a different full export");
+        assert!(matches!(error, BeadsError::SyncConflict { .. }));
+        assert_eq!(fs::read(&jsonl_path).unwrap(), before);
+        assert_eq!(storage.get_dirty_issue_ids().unwrap(), vec![issue.id]);
+        assert_eq!(
+            storage
+                .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
     fn test_auto_flush_clears_byte_identical_dirty_marker_without_rewrite() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -30233,25 +30447,64 @@ mod tests {
         assert!(first.flushed);
         let before = fs::read_to_string(&output_path).unwrap();
 
-        storage
-            .replace_dirty_issue_marker("bd-noop", "manual-dirty-marker")
-            .unwrap();
+        for version in ["1", CURRENT_JSONL_ROW_RECEIPT_VERSION] {
+            storage
+                .set_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION, version)
+                .unwrap();
+            storage
+                .replace_dirty_issue_marker("bd-noop", "manual-dirty-marker")
+                .unwrap();
 
-        let second = auto_flush(
-            &mut storage,
-            &beads_dir,
-            &output_path,
-            false,
-            None,
-            HistoryConfig::default(),
-        )
-        .unwrap();
-        assert!(
-            !second.flushed,
-            "byte-identical dirty markers should not rewrite JSONL"
-        );
-        assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
-        assert_eq!(fs::read_to_string(&output_path).unwrap(), before);
+            let second = auto_flush(
+                &mut storage,
+                &beads_dir,
+                &output_path,
+                false,
+                None,
+                HistoryConfig::default(),
+            )
+            .unwrap();
+            assert!(
+                !second.flushed,
+                "byte-identical dirty markers should not rewrite JSONL"
+            );
+            assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
+            assert_eq!(fs::read_to_string(&output_path).unwrap(), before);
+            assert_eq!(
+                storage
+                    .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)
+                    .unwrap()
+                    .as_deref(),
+                Some(CURRENT_JSONL_ROW_RECEIPT_VERSION)
+            );
+            assert_eq!(
+                storage
+                    .get_metadata(METADATA_JSONL_UNIMPORTED_SOURCE)
+                    .unwrap()
+                    .as_deref(),
+                Some(if version == CURRENT_JSONL_ROW_RECEIPT_VERSION {
+                    "false"
+                } else {
+                    "true"
+                }),
+                "an exact legacy row retry does not certify the omitted database population"
+            );
+            if version != CURRENT_JSONL_ROW_RECEIPT_VERSION {
+                let imported = auto_import_if_stale(
+                    &mut storage,
+                    &beads_dir,
+                    &output_path,
+                    Some("bd"),
+                    None,
+                    false,
+                    false,
+                    false,
+                )
+                .unwrap();
+                assert!(imported.attempted);
+                assert_eq!(fs::read_to_string(&output_path).unwrap(), before);
+            }
+        }
     }
 
     #[test]
@@ -30402,6 +30655,22 @@ mod tests {
         assert_eq!(writer_report.issues_exported, file_report.issues_exported);
         assert!(writer_result.exported_ids.contains(&boundary.id));
         assert!(writer_result.skipped_tombstone_ids.contains(&expired.id));
+
+        // Finalize the full publication, then restore its unchanged dirty
+        // markers so the same-cutoff retry still reconciles dirty rows.
+        let retry_dirty_metadata = storage.get_dirty_issue_metadata().unwrap();
+        finalize_export(
+            &mut storage,
+            &file_result,
+            Some(&file_result.issue_hashes),
+            &output_path,
+        )
+        .unwrap();
+        for (issue_id, marked_at) in retry_dirty_metadata {
+            storage
+                .replace_dirty_issue_marker(&issue_id, &marked_at)
+                .unwrap();
+        }
 
         let config = ExportConfig {
             force: false,

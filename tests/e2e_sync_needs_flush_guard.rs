@@ -15,6 +15,11 @@
 //! is `br delete --hard` (purge): the DB intentionally holds fewer issues
 //! than the JSONL. That flow is covered here too and must keep working via
 //! explicit purged-ID tracking rather than a blanket force.
+//!
+//! #571 also guards the import side: an implicit command cannot authorize a
+//! local winner over a differing older/equal external revision. A rejected
+//! import rolls back its writes and preserves publication receipts. Legacy
+//! receipts produced before that guard existed cannot authorize a full export.
 
 mod common;
 
@@ -242,6 +247,872 @@ fn pull_peer(workspace: &BrWorkspace, peer: &BrWorkspace) {
         workspace,
         &["pull", "--ff-only", peer.root.to_str().unwrap(), "main"],
     );
+}
+
+const IMPORT_FIXTURE_TIME: &str = "2020-01-01T00:00:00Z";
+
+fn parse_created_json_id(stdout: &str) -> String {
+    let created: Value =
+        serde_json::from_str(&extract_json_payload(stdout)).expect("created issue JSON");
+    created
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .expect("created issue has a nonempty JSON ID")
+        .to_string()
+}
+
+fn write_jsonl_records(path: &std::path::Path, records: &[Value]) {
+    let bytes = records
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(path, bytes).expect("write external JSONL fixture generation");
+}
+
+fn import_authority_workspace() -> BrWorkspace {
+    let workspace = BrWorkspace::new();
+    checked_br(&workspace, &["init", "--prefix", "bd"], "init");
+    let issue = |id: &str, title: &str| {
+        serde_json::json!({
+            "id": id,
+            "title": title,
+            "status": "open",
+            "priority": 2,
+            "issue_type": "task",
+            "created_at": IMPORT_FIXTURE_TIME,
+            "updated_at": IMPORT_FIXTURE_TIME
+        })
+    };
+    let mut reopen = issue("bd-reopen", "Reopen on another branch");
+    reopen["status"] = Value::from("closed");
+    reopen["closed_at"] = Value::from(IMPORT_FIXTURE_TIME);
+    write_jsonl_records(
+        &workspace.root.join(".beads/issues.jsonl"),
+        &[
+            issue("bd-control", "Unchanged control"),
+            reopen,
+            issue("bd-shared", "Shared original revision"),
+        ],
+    );
+    checked_br(
+        &workspace,
+        &["sync", "--import-only", "--no-auto-flush"],
+        "seed_fixed_revision",
+    );
+    // This force establishes a clean, canonical fixture and merge anchor.
+    // All operations under test below use ordinary guarded publication.
+    checked_br(
+        &workspace,
+        &["sync", "--flush-only", "--force"],
+        "seed_canonical_export",
+    );
+    assert!(dirty_ids(&workspace).is_empty());
+    assert_eq!(sync_metadata(&workspace)["needs_flush"], "false");
+    workspace
+}
+
+fn import_database_state(workspace: &BrWorkspace) -> BTreeMap<&'static str, Vec<Vec<SqliteValue>>> {
+    let connection = database(workspace);
+    [
+        "issues",
+        "labels",
+        "dependencies",
+        "comments",
+        "events",
+        "dirty_issues",
+        "close_metadata",
+        "blocked_issues_cache",
+        "child_counters",
+    ]
+    .into_iter()
+    .map(|table| {
+        let rows = connection
+            .query(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .expect("read complete logical import state")
+            .into_iter()
+            .map(|row| row.values().to_vec())
+            .collect();
+        (table, rows)
+    })
+    .collect()
+}
+
+fn assert_sync_conflict(result: &common::cli::BrRun) {
+    assert!(
+        !result.status.success(),
+        "expected sync refusal: {result:?}"
+    );
+    let error: Value =
+        serde_json::from_str(&extract_json_payload(&result.stdout)).expect("structured sync error");
+    assert_eq!(error["error"]["code"], "SYNC_CONFLICT", "{result:?}");
+}
+
+fn assert_implicit_import_preserves_conflict(workspace: &BrWorkspace) {
+    let witness = sync_witness(workspace);
+    let database_before = import_database_state(workspace);
+    for (arguments, label) in [
+        (vec!["list", "--json"], "refused_implicit_read"),
+        (
+            vec!["create", "Must not run after ambiguous import", "--json"],
+            "refused_implicit_mutation",
+        ),
+    ] {
+        let result = run_br(workspace, arguments, label);
+        assert_sync_conflict(&result);
+        assert_eq!(
+            sync_witness(workspace),
+            witness,
+            "{label} changed source, anchor, receipts, or export certificates"
+        );
+        assert_eq!(
+            import_database_state(workspace),
+            database_before,
+            "{label} applied part of the import or ran the requested mutation"
+        );
+    }
+}
+
+fn raw_jsonl_records(path: &std::path::Path) -> BTreeMap<String, String> {
+    let mut result = BTreeMap::new();
+    for line in fs::read_to_string(path).expect("read raw JSONL").lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: Value = serde_json::from_str(line).expect("raw JSONL record");
+        let id = row["id"].as_str().expect("raw issue ID").to_string();
+        assert!(
+            result.insert(id.clone(), line.to_string()).is_none(),
+            "duplicate raw issue ID {id}"
+        );
+    }
+    result
+}
+
+fn set_legacy_row_receipt_version(workspace: &BrWorkspace) {
+    let mut storage =
+        beads_rust::storage::SqliteStorage::open(&workspace.root.join(".beads/beads.db"))
+            .expect("open legacy receipt fixture");
+    storage
+        .set_metadata("jsonl_row_receipt_version", "1")
+        .expect("model receipts produced by pre-guard import");
+}
+
+/// A Git revert is newer repository history containing an older issue row.
+/// Ordinary commands must not silently replace either side of that decision.
+#[test]
+fn implicit_import_refuses_git_revert_until_explicit_resolution() {
+    for (resolution, expected_status) in [("--force-jsonl", "open"), ("--force-db", "closed")] {
+        let workspace = import_authority_workspace();
+        let path = workspace.root.join(".beads/issues.jsonl");
+        git(&workspace, &["init", "--initial-branch=main"]);
+        commit_jsonl(&workspace, "original open issue");
+        let original = fs::read(&path).expect("original committed JSONL");
+        checked_br(
+            &workspace,
+            &["close", "bd-shared", "--reason", "Completed locally"],
+            "local_close",
+        );
+        checked_br(&workspace, &["sync", "--flush-only"], "anchor_local_close");
+        commit_jsonl(&workspace, "close shared issue");
+        git(&workspace, &["revert", "--no-edit", "HEAD"]);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(
+            show_without_sync(&workspace, "bd-shared", "closed_local_revision")["status"],
+            "closed"
+        );
+
+        assert_implicit_import_preserves_conflict(&workspace);
+        checked_br(
+            &workspace,
+            &["sync", "--merge", resolution, "--json"],
+            "explicit_revert_resolution",
+        );
+        let mutation = checked_br(
+            &workspace,
+            &["create", "Mutation after deliberate resolution", "--json"],
+            "mutation_after_revert_resolution",
+        );
+        assert!(!mutation.stderr.contains("AUTO_FLUSH_FAILED"));
+        assert_eq!(jsonl_record(&path, "bd-shared")["status"], expected_status);
+        assert_eq!(
+            show_without_sync(&workspace, "bd-shared", "resolved_local_revision")["status"],
+            expected_status
+        );
+        assert!(dirty_ids(&workspace).is_empty());
+        assert_eq!(sync_metadata(&workspace)["jsonl_row_receipt_version"], "2");
+    }
+}
+
+/// A clean local export can belong to a different branch. Clean markers do
+/// not authorize replacing the branch's legitimate close, reopen, or creation.
+#[test]
+fn implicit_import_refuses_branch_restoration_without_losing_local_work() {
+    let workspace = import_authority_workspace();
+    let path = workspace.root.join(".beads/issues.jsonl");
+    git(&workspace, &["init", "--initial-branch=main"]);
+    commit_jsonl(&workspace, "main issue revisions");
+    git(&workspace, &["switch", "-c", "feature"]);
+    checked_br(&workspace, &["close", "bd-shared"], "branch_close");
+    checked_br(&workspace, &["reopen", "bd-reopen"], "branch_reopen");
+    let created = checked_br(
+        &workspace,
+        &["create", "Created only on feature", "--json"],
+        "branch_creation",
+    );
+    let branch_id = parse_created_json_id(&created.stdout);
+    checked_br(&workspace, &["sync", "--flush-only"], "anchor_branch_work");
+    commit_jsonl(&workspace, "feature close, reopen, and creation");
+    git(&workspace, &["switch", "main"]);
+    let mut incoming = jsonl_records(&path);
+    let control = incoming
+        .iter_mut()
+        .find(|row| row["id"] == "bd-control")
+        .unwrap();
+    control["title"] = Value::from("New peer work on main");
+    control["updated_at"] = Value::from("2099-01-01T00:00:00Z");
+    write_jsonl_records(&path, &incoming);
+    commit_jsonl(&workspace, "new peer work on main");
+
+    assert_implicit_import_preserves_conflict(&workspace);
+    assert_eq!(
+        show_without_sync(&workspace, "bd-shared", "branch_close_preserved")["status"],
+        "closed"
+    );
+    assert_eq!(
+        show_without_sync(&workspace, "bd-reopen", "branch_reopen_preserved")["status"],
+        "open"
+    );
+    assert_eq!(
+        show_without_sync(&workspace, &branch_id, "branch_creation_preserved")["title"],
+        "Created only on feature"
+    );
+    checked_br(
+        &workspace,
+        &["sync", "--merge", "--force-db", "--json"],
+        "explicit_branch_resolution",
+    );
+    let mutation = checked_br(
+        &workspace,
+        &["create", "After deliberate branch merge", "--json"],
+        "mutation_after_branch_resolution",
+    );
+    assert!(!mutation.stderr.contains("AUTO_FLUSH_FAILED"));
+    assert_eq!(jsonl_record(&path, "bd-shared")["status"], "closed");
+    assert_eq!(jsonl_record(&path, "bd-reopen")["status"], "open");
+    assert_eq!(
+        jsonl_record(&path, &branch_id)["title"],
+        "Created only on feature"
+    );
+    assert_eq!(
+        jsonl_record(&path, "bd-control")["title"],
+        "New peer work on main"
+    );
+}
+
+/// The conflict occurs after an insertion and a newer peer row carrying a
+/// comment. None of those earlier actions may survive the import refusal.
+#[test]
+fn implicit_import_rolls_back_newer_rows_before_equal_timestamp_drift() {
+    for field in ["description", "due_at", "labels", "dependencies"] {
+        let workspace = import_authority_workspace();
+        let path = workspace.root.join(".beads/issues.jsonl");
+        let mut incoming = jsonl_records(&path);
+        let control = incoming
+            .iter_mut()
+            .find(|row| row["id"] == "bd-control")
+            .unwrap();
+        control["title"] = Value::from("Newer peer update must roll back");
+        control["updated_at"] = Value::from("2099-01-01T00:00:00Z");
+        control["comments"] = serde_json::json!([{
+            "id": 101,
+            "issue_id": "bd-control",
+            "author": "Peer",
+            "text": "Earlier peer comment must roll back",
+            "created_at": "2025-01-01T00:00:00Z"
+        }]);
+        let shared = incoming
+            .iter_mut()
+            .find(|row| row["id"] == "bd-shared")
+            .unwrap();
+        let before: Issue = serde_json::from_value(shared.clone()).expect("shared local payload");
+        shared[field] = match field {
+            "description" => Value::from("Peer field merge with unchanged timestamp"),
+            "due_at" => Value::from("2030-01-01T00:00:00Z"),
+            "labels" => serde_json::json!(["peer-label"]),
+            "dependencies" => serde_json::json!([{
+                "issue_id": "bd-shared",
+                "depends_on_id": "bd-control",
+                "type": "blocks",
+                "created_at": IMPORT_FIXTURE_TIME,
+                "created_by": "Peer"
+            }]),
+            _ => unreachable!("fixed field matrix"),
+        };
+        let after: Issue = serde_json::from_value(shared.clone()).expect("shared peer payload");
+        assert_eq!(before.updated_at, after.updated_at);
+        assert!(
+            !before.sync_equals(&after),
+            "{field} must differ semantically"
+        );
+        if field != "description" {
+            assert_eq!(
+                content_hash(&before),
+                content_hash(&after),
+                "{field} must exercise drift absent from the narrow content hash"
+            );
+        }
+        incoming.insert(
+            0,
+            serde_json::json!({
+                "id": "bd-added",
+                "title": "Earlier inserted peer issue must roll back",
+                "status": "open",
+                "priority": 2,
+                "issue_type": "task",
+                "created_at": IMPORT_FIXTURE_TIME,
+                "updated_at": IMPORT_FIXTURE_TIME
+            }),
+        );
+        write_jsonl_records(&path, &incoming);
+        assert_implicit_import_preserves_conflict(&workspace);
+    }
+}
+
+#[test]
+fn implicit_import_refuses_tombstone_and_live_revision_ambiguity() {
+    for local_tombstone in [false, true] {
+        let workspace = import_authority_workspace();
+        let path = workspace.root.join(".beads/issues.jsonl");
+        let mut incoming = jsonl_records(&path);
+        if local_tombstone {
+            checked_br(
+                &workspace,
+                &["delete", "bd-shared", "--force"],
+                "local_tombstone",
+            );
+            checked_br(
+                &workspace,
+                &["sync", "--flush-only"],
+                "anchor_local_tombstone",
+            );
+        } else {
+            let shared = incoming
+                .iter_mut()
+                .find(|row| row["id"] == "bd-shared")
+                .unwrap();
+            shared["status"] = Value::from("tombstone");
+            shared["deleted_at"] = Value::from(IMPORT_FIXTURE_TIME);
+            shared["deleted_by"] = Value::from("Peer");
+            shared["delete_reason"] = Value::from("Peer deletion with unchanged timestamp");
+        }
+        write_jsonl_records(&path, &incoming);
+        assert_implicit_import_preserves_conflict(&workspace);
+        assert_eq!(
+            show_without_sync(&workspace, "bd-shared", "lifecycle_state_preserved")["status"],
+            if local_tombstone { "tombstone" } else { "open" }
+        );
+    }
+}
+
+/// Append-only comments can be combined without deciding which scalar
+/// revision is newer, including collisions in database-local comment IDs.
+#[test]
+fn implicit_import_combines_comments_with_non_advancing_issue_timestamps() {
+    for older in [false, true] {
+        let workspace = import_authority_workspace();
+        let path = workspace.root.join(".beads/issues.jsonl");
+        checked_br(
+            &workspace,
+            &["comments", "add", "bd-shared", "Local comment survives"],
+            "local_comment",
+        );
+        let mut incoming = jsonl_records(&path);
+        let shared = incoming
+            .iter_mut()
+            .find(|row| row["id"] == "bd-shared")
+            .unwrap();
+        let before: Issue = serde_json::from_value(shared.clone()).expect("local comment row");
+        assert_eq!(before.comments.len(), 1);
+        let mut peer_comment = shared["comments"][0].clone();
+        peer_comment["author"] = Value::from("Peer");
+        peer_comment["text"] = Value::from("Peer comment survives");
+        peer_comment["created_at"] = Value::from("2021-01-01T00:00:00Z");
+        shared["comments"] = serde_json::json!([peer_comment]);
+        if older {
+            shared["updated_at"] = Value::from(IMPORT_FIXTURE_TIME);
+        }
+        let after: Issue = serde_json::from_value(shared.clone()).expect("peer comment row");
+        assert_eq!(before.comments[0].id, after.comments[0].id);
+        assert_eq!(content_hash(&before), content_hash(&after));
+        if older {
+            assert!(after.updated_at < before.updated_at);
+        } else {
+            assert_eq!(after.updated_at, before.updated_at);
+        }
+        write_jsonl_records(&path, &incoming);
+        let source_before = fs::read(&path).expect("incoming comment bytes");
+        checked_br(&workspace, &["list", "--json"], "import_comment_union");
+        assert_eq!(fs::read(&path).unwrap(), source_before);
+        let stored: Issue = serde_json::from_value(show_without_sync(
+            &workspace,
+            "bd-shared",
+            "combined_comments_in_database",
+        ))
+        .expect("combined comment payload");
+        let expected_bodies = BTreeSet::from(["Local comment survives", "Peer comment survives"]);
+        assert_eq!(stored.comments.len(), 2);
+        assert_eq!(
+            stored
+                .comments
+                .iter()
+                .map(|comment| comment.body.as_str())
+                .collect::<BTreeSet<_>>(),
+            expected_bodies
+        );
+        assert_eq!(
+            stored
+                .comments
+                .iter()
+                .map(|comment| comment.id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2,
+            "colliding comment row IDs must be remapped"
+        );
+        assert_eq!(sync_metadata(&workspace)["needs_flush"], "true");
+        let mutation = checked_br(
+            &workspace,
+            &["create", "After safe comment union", "--json"],
+            "publish_comment_union",
+        );
+        assert!(!mutation.stderr.contains("AUTO_FLUSH_FAILED"));
+        let published: Issue = serde_json::from_value(jsonl_record(&path, "bd-shared"))
+            .expect("published comment union");
+        assert_eq!(published.comments.len(), 2);
+        assert_eq!(
+            published
+                .comments
+                .iter()
+                .map(|comment| comment.body.as_str())
+                .collect::<BTreeSet<_>>(),
+            expected_bodies
+        );
+        assert_eq!(published.title, before.title);
+        assert!(dirty_ids(&workspace).is_empty());
+        let metadata = sync_metadata(&workspace);
+        assert_eq!(metadata["needs_flush"], "false");
+        assert_eq!(metadata["jsonl_unimported_source"], "false");
+        assert_eq!(metadata["jsonl_row_receipt_version"], "2");
+    }
+}
+
+/// Old imports could set needs_flush after accepting a divergent source.
+/// Upgrading must not promote that old receipt into publication authority.
+#[test]
+fn legacy_armed_import_receipts_cannot_authorize_full_publication() {
+    let workspace = import_authority_workspace();
+    let path = workspace.root.join(".beads/issues.jsonl");
+    let mut incoming = jsonl_records(&path);
+    incoming
+        .iter_mut()
+        .find(|row| row["id"] == "bd-shared")
+        .unwrap()["description"] = Value::from("Deliberate peer field change with equal timestamp");
+    write_jsonl_records(&path, &incoming);
+    checked_br(
+        &workspace,
+        &["sync", "--import-only", "--no-auto-flush"],
+        "model_legacy_import_policy",
+    );
+    assert_eq!(sync_metadata(&workspace)["needs_flush"], "true");
+    assert!(dirty_ids(&workspace).is_empty());
+    set_legacy_row_receipt_version(&workspace);
+    let witness = sync_witness(&workspace);
+    let database_before = import_database_state(&workspace);
+    let flush = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--no-auto-import", "--json"],
+        "refuse_legacy_full_flush",
+    );
+    assert_sync_conflict(&flush);
+    assert_eq!(sync_witness(&workspace), witness);
+    assert_eq!(import_database_state(&workspace), database_before);
+
+    let mutation = checked_br(
+        &workspace,
+        &["create", "Legitimate pending work after upgrade", "--json"],
+        "preserve_legacy_pending_mutation",
+    );
+    assert!(
+        mutation.stderr.contains("AUTO_FLUSH_FAILED"),
+        "{mutation:?}"
+    );
+    let pending_id = parse_created_json_id(&mutation.stdout);
+    assert_eq!(sync_witness(&workspace), witness);
+    assert_eq!(dirty_ids(&workspace), vec![pending_id.clone()]);
+    checked_br(
+        &workspace,
+        &["sync", "--merge", "--force-jsonl", "--json"],
+        "explicit_legacy_recovery",
+    );
+    assert_eq!(
+        jsonl_record(&path, "bd-shared")["description"],
+        "Deliberate peer field change with equal timestamp"
+    );
+    assert_eq!(
+        jsonl_record(&path, &pending_id)["title"],
+        "Legitimate pending work after upgrade"
+    );
+    assert!(dirty_ids(&workspace).is_empty());
+    assert_eq!(sync_metadata(&workspace)["jsonl_row_receipt_version"], "2");
+    let after_recovery = checked_br(
+        &workspace,
+        &["create", "After legacy recovery", "--json"],
+        "mutation_after_legacy_recovery",
+    );
+    assert!(!after_recovery.stderr.contains("AUTO_FLUSH_FAILED"));
+    assert_eq!(
+        jsonl_record(&path, "bd-shared")["description"],
+        "Deliberate peer field change with equal timestamp"
+    );
+}
+
+#[test]
+fn legacy_clean_receipts_publish_disjoint_work_before_guarded_import() {
+    for divergent in [false, true] {
+        let workspace = import_authority_workspace();
+        let path = workspace.root.join(".beads/issues.jsonl");
+        if divergent {
+            let mut incoming = jsonl_records(&path);
+            incoming
+                .iter_mut()
+                .find(|row| row["id"] == "bd-shared")
+                .unwrap()["description"] =
+                Value::from("Peer equal-timestamp change remains unread");
+            write_jsonl_records(&path, &incoming);
+        }
+        let previous_rows = raw_jsonl_records(&path);
+        set_legacy_row_receipt_version(&workspace);
+        let mutation = checked_br(
+            &workspace,
+            &[
+                "create",
+                "Safe disjoint publication during upgrade",
+                "--json",
+                "--no-auto-import",
+                "--allow-stale",
+            ],
+            "legacy_disjoint_publication",
+        );
+        assert!(!mutation.stderr.contains("AUTO_FLUSH_FAILED"));
+        let new_id = parse_created_json_id(&mutation.stdout);
+        let published_rows = raw_jsonl_records(&path);
+        assert_eq!(published_rows.len(), previous_rows.len() + 1);
+        for (id, row) in &previous_rows {
+            assert_eq!(
+                published_rows.get(id),
+                Some(row),
+                "old raw row {id} changed"
+            );
+        }
+        let metadata = sync_metadata(&workspace);
+        assert_eq!(metadata["jsonl_row_receipt_version"], "2");
+        assert_eq!(metadata["jsonl_unimported_source"], "true");
+        let receipts: BTreeMap<String, String> =
+            serde_json::from_str(&metadata["jsonl_row_hashes"]).expect("new row receipt map");
+        assert_eq!(receipts.keys().collect::<Vec<_>>(), vec![&new_id]);
+        assert!(!receipts[&new_id].is_empty());
+        assert!(dirty_ids(&workspace).is_empty());
+
+        if divergent {
+            assert_implicit_import_preserves_conflict(&workspace);
+            assert_eq!(
+                show_without_sync(&workspace, &new_id, "safe_new_issue_preserved")["title"],
+                "Safe disjoint publication during upgrade"
+            );
+        } else {
+            let source_before = fs::read(&path).expect("upgraded source");
+            checked_br(
+                &workspace,
+                &["list", "--json"],
+                "certify_unchanged_legacy_rows",
+            );
+            assert_eq!(fs::read(&path).unwrap(), source_before);
+            let metadata = sync_metadata(&workspace);
+            assert_eq!(metadata["jsonl_unimported_source"], "false");
+            let receipts: BTreeMap<String, String> =
+                serde_json::from_str(&metadata["jsonl_row_hashes"])
+                    .expect("fully imported row receipt map");
+            assert_eq!(receipts.len(), published_rows.len());
+            for id in published_rows.keys() {
+                assert!(receipts.get(id).is_some_and(|hash| !hash.is_empty()));
+            }
+            let update = checked_br(
+                &workspace,
+                &[
+                    "update",
+                    "bd-shared",
+                    "--title",
+                    "Local work after safe upgrade",
+                    "--json",
+                ],
+                "mutate_after_safe_legacy_import",
+            );
+            assert!(!update.stderr.contains("AUTO_FLUSH_FAILED"));
+            assert_eq!(
+                jsonl_record(&path, "bd-shared")["title"],
+                "Local work after safe upgrade"
+            );
+            assert_eq!(
+                jsonl_record(&path, &new_id)["title"],
+                "Safe disjoint publication during upgrade"
+            );
+        }
+    }
+}
+
+/// An empty legacy source has no untouched rows to flag as unread, but the
+/// old database rows still require a guarded import to record their omission.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn legacy_empty_source_records_omissions_before_later_full_flush() {
+    let workspace = import_authority_workspace();
+    let path = workspace.root.join(".beads/issues.jsonl");
+    let original = jsonl_records(&path);
+    let omitted_ids = original
+        .iter()
+        .map(|row| row["id"].as_str().expect("original ID").to_string())
+        .collect::<BTreeSet<_>>();
+    set_legacy_row_receipt_version(&workspace);
+    fs::write(&path, []).expect("peer purged every old source row");
+    let creation = checked_br(
+        &workspace,
+        &[
+            "create",
+            "New keeper after peer purge",
+            "--json",
+            "--no-auto-import",
+            "--allow-stale",
+        ],
+        "publish_after_legacy_empty_source",
+    );
+    assert!(!creation.stderr.contains("AUTO_FLUSH_FAILED"));
+    let keeper_id = parse_created_json_id(&creation.stdout);
+    assert_eq!(jsonl_records(&path).len(), 1);
+    let metadata = sync_metadata(&workspace);
+    assert_eq!(metadata["jsonl_row_receipt_version"], "2");
+    assert_eq!(metadata["jsonl_unimported_source"], "true");
+    let second = checked_br(
+        &workspace,
+        &[
+            "create",
+            "Second disjoint keeper before import",
+            "--json",
+            "--no-auto-import",
+            "--allow-stale",
+        ],
+        "second_publication_before_legacy_omission_import",
+    );
+    assert!(!second.stderr.contains("AUTO_FLUSH_FAILED"));
+    let second_id = parse_created_json_id(&second.stdout);
+    assert_eq!(jsonl_records(&path).len(), 2);
+    assert_eq!(
+        sync_metadata(&workspace)["jsonl_unimported_source"],
+        "true",
+        "a partial v2 receipt must not clear pending omissions without importing"
+    );
+    checked_br(&workspace, &["list", "--json"], "record_legacy_omissions");
+    let metadata = sync_metadata(&workspace);
+    assert_eq!(metadata["jsonl_unimported_source"], "false");
+    let recorded: BTreeSet<String> = serde_json::from_str(&metadata["import_omitted_ids"])
+        .expect("accepted legacy omission IDs");
+    assert_eq!(recorded, omitted_ids);
+    assert_eq!(metadata["needs_flush"], "false");
+    assert!(dirty_ids(&workspace).is_empty());
+
+    checked_br(
+        &workspace,
+        &["comments", "add", &keeper_id, "Local keeper comment"],
+        "keeper_local_comment",
+    );
+    add_peer_comment(&path, &keeper_id);
+    checked_br(&workspace, &["list", "--json"], "keeper_comment_union");
+    let witness = sync_witness(&workspace);
+    assert_eq!(witness.metadata["needs_flush"], "true");
+    let mutation = checked_br(
+        &workspace,
+        &[
+            "create",
+            "Pending work after protected peer purge",
+            "--json",
+        ],
+        "refuse_full_flush_after_legacy_omission",
+    );
+    assert!(
+        mutation.stderr.contains("AUTO_FLUSH_FAILED"),
+        "{mutation:?}"
+    );
+    assert!(
+        mutation.stderr.contains("republish rows omitted"),
+        "{mutation:?}"
+    );
+    let pending_id = parse_created_json_id(&mutation.stdout);
+    assert_eq!(sync_witness(&workspace), witness);
+    let source = jsonl_records(&path);
+    assert_eq!(source.len(), 2);
+    assert_eq!(
+        source
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([keeper_id.as_str(), second_id.as_str()])
+    );
+    assert_eq!(dirty_ids(&workspace), vec![pending_id.clone()]);
+    assert_eq!(
+        show_without_sync(&workspace, &pending_id, "pending_creation_retained")["title"],
+        "Pending work after protected peer purge"
+    );
+    for row in original {
+        let id = row["id"].as_str().expect("omitted issue ID");
+        let stored = show_without_sync(&workspace, id, "omitted_legacy_row_retained");
+        assert_eq!(stored["title"], row["title"]);
+        assert_eq!(stored["status"], row["status"]);
+    }
+    let keeper: Issue = serde_json::from_value(show_without_sync(
+        &workspace,
+        &keeper_id,
+        "keeper_comments_retained",
+    ))
+    .expect("keeper comment union retained");
+    assert_eq!(keeper.comments.len(), 2);
+    assert_eq!(
+        keeper
+            .comments
+            .iter()
+            .map(|comment| comment.body.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["Local keeper comment", "Unread peer comment"])
+    );
+}
+
+/// Retention restoration runs before ordinary row certification. A retained
+/// tombstone missing from an unimported source cannot be synthesized into the
+/// first export during upgrade, or a later export using partial v2 receipts.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn legacy_retained_tombstone_requires_import_before_disjoint_export() {
+    for partial_current_receipt in [false, true] {
+        let workspace = import_authority_workspace();
+        let path = workspace.root.join(".beads/issues.jsonl");
+        checked_br(
+            &workspace,
+            &["delete", "bd-shared", "--force"],
+            "legacy_retained_tombstone",
+        );
+        checked_br(
+            &workspace,
+            &["sync", "--flush-only"],
+            "anchor_retained_tombstone",
+        );
+        let tombstone =
+            show_without_sync(&workspace, "bd-shared", "retained_tombstone_before_purge");
+        assert_eq!(tombstone["status"], "tombstone");
+        set_legacy_row_receipt_version(&workspace);
+        if partial_current_receipt {
+            let first = checked_br(
+                &workspace,
+                &[
+                    "create",
+                    "Safe row while tombstone remains present",
+                    "--json",
+                    "--no-auto-import",
+                    "--allow-stale",
+                ],
+                "partial_current_receipt_before_peer_purge",
+            );
+            assert!(!first.stderr.contains("AUTO_FLUSH_FAILED"));
+            assert_eq!(sync_metadata(&workspace)["jsonl_row_receipt_version"], "2");
+            assert_eq!(sync_metadata(&workspace)["jsonl_unimported_source"], "true");
+            assert_eq!(jsonl_record(&path, "bd-shared")["status"], "tombstone");
+        }
+        fs::write(&path, []).expect("peer purged retained tombstone and old live rows");
+        let witness = sync_witness(&workspace);
+        let mutation = checked_br(
+            &workspace,
+            &[
+                "create",
+                "Pending work while peer tombstone purge is unread",
+                "--json",
+                "--no-auto-import",
+                "--allow-stale",
+            ],
+            "refuse_retained_tombstone_republication",
+        );
+        assert!(
+            mutation.stderr.contains("AUTO_FLUSH_FAILED"),
+            "{mutation:?}"
+        );
+        let pending_id = parse_created_json_id(&mutation.stdout);
+        assert_eq!(sync_witness(&workspace), witness);
+        assert_eq!(dirty_ids(&workspace), vec![pending_id.clone()]);
+        assert!(jsonl_records(&path).is_empty());
+        assert_eq!(
+            show_without_sync(
+                &workspace,
+                "bd-shared",
+                "tombstone_after_publication_refusal"
+            ),
+            tombstone
+        );
+
+        checked_br(
+            &workspace,
+            &["sync", "--import-only", "--no-auto-flush", "--json"],
+            "explicitly_accept_peer_tombstone_omission",
+        );
+        let metadata = sync_metadata(&workspace);
+        assert_eq!(metadata["jsonl_row_receipt_version"], "2");
+        assert_eq!(metadata["jsonl_unimported_source"], "false");
+        let omissions: BTreeSet<String> = serde_json::from_str(&metadata["import_omitted_ids"])
+            .expect("accepted tombstone omission");
+        assert!(omissions.contains("bd-shared"));
+        assert!(
+            !omissions.contains(&pending_id),
+            "real dirty local work is not a clean omission"
+        );
+        assert_eq!(dirty_ids(&workspace), vec![pending_id.clone()]);
+        let resumed = checked_br(
+            &workspace,
+            &[
+                "create",
+                "Work after accepting peer tombstone purge",
+                "--json",
+            ],
+            "publish_after_explicit_tombstone_omission_import",
+        );
+        assert!(!resumed.stderr.contains("AUTO_FLUSH_FAILED"));
+        let resumed_id = parse_created_json_id(&resumed.stdout);
+        let source = jsonl_records(&path);
+        assert_eq!(source.len(), 2);
+        assert_eq!(
+            source
+                .iter()
+                .map(|row| row["id"].as_str().unwrap())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([pending_id.as_str(), resumed_id.as_str()])
+        );
+        assert!(dirty_ids(&workspace).is_empty());
+        assert_eq!(
+            show_without_sync(
+                &workspace,
+                "bd-shared",
+                "retained_tombstone_after_safe_publication"
+            ),
+            tombstone
+        );
+    }
 }
 
 #[test]

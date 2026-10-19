@@ -150,11 +150,21 @@ omitted issues therefore stay clean and do not set `needs_flush`. Existing
 dirty markers remain intact, and a later explicit edit to an omitted issue
 publishes that issue and its relations normally.
 
-When an imported row differs from a preserved local version, `needs_flush`
-still records the outstanding reconciliation. That flag does not authorize a
-full export to overwrite unread peer changes or restore unrelated clean
-omissions. If a full automatic export would do either, it refuses while keeping
-the local changes pending.
+Automatic import refuses when it would keep a local version whose synchronized
+payload differs from the incoming row, apart from append-only comments. This
+includes older or equal-timestamp external edits and attempts to restore a live
+row over a local tombstone. A restored file may represent an intentional Git
+revert or an older branch; timestamps and a clean database cannot distinguish
+those intentions. The refusal occurs before the requested command and rolls
+back the whole import, including earlier rows and synchronization receipts.
+JSONL and the merge anchor remain intact for explicit reconciliation.
+
+An explicit import still uses the normal local-winner and tombstone rules. When
+an imported row differs from a preserved local version, `needs_flush` records
+the outstanding reconciliation. That flag does not authorize a full export to
+overwrite unread peer changes or restore unrelated clean omissions. If a full
+automatic export would do either, it refuses while keeping the local changes
+pending.
 
 Incremental automatic export checks complete row receipts before replacing or
 removing a source row. These receipts include comments, relations, timestamps,
@@ -163,6 +173,16 @@ local changes while preserving unread peer rows byte-for-byte. Those peer rows
 remain pending for the next auto-import, even after the exporter records the
 new file's hash. A later edit to the same issue still requires reconciliation;
 an unrelated publication cannot certify the peer's unread version.
+
+Row receipt version 2 also protects upgrades from older binaries that could
+acknowledge a conflicting source without resolving it. Legacy receipts do not
+authorize row replacements or a full automatic export. A safe incremental
+publication may add a new issue while keeping untouched legacy rows pending
+import; publishing that issue does not promote the older receipts. A current
+import or explicit reconciliation establishes the authority needed for later
+publication. Even an exact row retry cannot prove that omitted database issues
+were reconciled. The unread-source flag therefore stays set across incremental
+publications until import or a verified full publication resolves it.
 
 Full automatic export and non-forced explicit export also verify the complete
 source generation. Publication remains bound to the captured file and database
@@ -196,6 +216,12 @@ Automatic export applies those same population changes when local work is
 pending against the same synchronized source generation. With no pending work,
 automatic export remains a no-op; use the explicit flush command to apply a
 policy change immediately.
+
+Restoring a clean retained tombstone that is absent from JSONL requires current
+receipts with no unread source pending. If that population has not been
+reconciled, automatic export refuses and keeps the local mutation pending.
+This prevents an upgrade or repeated import-skipping commands from restoring a
+peer purge before import has recorded the omission.
 
 Incremental export preserves untouched source rows while restoring eligible
 tombstones omitted by the local retention policy. A successful import remembers
@@ -235,6 +261,7 @@ reconciliation. Existing explicit `--force` behavior is unchanged.
 |-------|-----------------|----------|
 | **Conflict marker scan** | Importing unresolved merge conflicts | **None** - must resolve conflicts |
 | **Schema validation** | Importing malformed JSON | **None** - must fix JSONL |
+| **Ambiguous automatic import** | A skipped conflicting row being acknowledged and later silently overwritten, including older or equal-timestamp external edits | Explicit reconciliation with `sync --merge`; review `--force-db` or `--force-jsonl` when a winner is required |
 | **Payload comment identity** | Treating a database-local comment rowid as global identity: two clones both mint comment id `1`, so a merged JSONL routinely carries one id for two issues; import reassigns the local rowid and verifies comments by `(issue, created_at, author, text)` instead of refusing the file | n/a - never refuses; same-issue duplicate payloads are still rejected |
 | **Tombstone protection** | Resurrecting deleted issues | **None** - by design |
 
