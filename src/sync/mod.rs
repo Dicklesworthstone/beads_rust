@@ -17530,7 +17530,7 @@ pub fn merge_issue(
         // Case 6: In all three (potentially modified in one or both)
         (Some(b), Some(l), Some(r)) => {
             if l.sync_equals(r) {
-                return MergeResult::Keep(l.clone());
+                return MergeResult::Keep(converged_equal_revision(l, r));
             }
 
             let left_changed = !l.sync_equals(b);
@@ -17571,9 +17571,9 @@ pub fn merge_issue(
 
         // Case 7: In left and right but not base (convergent creation)
         (None, Some(l), Some(r)) => {
-            // Same content? Keep one (use left by convention)
+            // Same content: keep the local copy at the later revision.
             if l.sync_equals(r) {
-                MergeResult::Keep(l.clone())
+                MergeResult::Keep(converged_equal_revision(l, r))
             } else {
                 // Different content - both created independently
                 match strategy {
@@ -17608,6 +17608,21 @@ pub fn merge_issue(
         // Case 8: Not in any (impossible in practice, but handle gracefully)
         (None, None, None) => MergeResult::NoAction,
     }
+}
+
+/// The copy to keep when both sides hold equal synchronized content.
+///
+/// `sync_equals` ignores `updated_at`, so two clones can hold the same issue
+/// at different revision times: a comment union is stamped just past both of
+/// its inputs, and clones union in different orders. Keeping the local copy
+/// unchanged would leave each clone on its own timestamp, so their exports
+/// would never become identical (GitHub #542). Take the later of the two
+/// timestamps instead, which every clone agrees on, and keep everything else
+/// from the local copy, including its database-local comment rowids.
+fn converged_equal_revision(local: &Issue, external: &Issue) -> Issue {
+    let mut kept = local.clone();
+    kept.updated_at = local.updated_at.max(external.updated_at);
+    kept
 }
 
 /// A workspace export is not proof that the external side ever contained its
@@ -32928,6 +32943,106 @@ mod tests {
         assert!(
             merged.updated_at > left.updated_at && merged.updated_at > right.updated_at,
             "the combined record must be newer than both inputs"
+        );
+    }
+
+    /// Two copies with equal synchronized content can still carry different
+    /// `updated_at` values, for example after clones unioned the same
+    /// comments in different orders. Whichever side is local, the merge must
+    /// settle on the later revision, or the clones' exports never converge
+    /// (GitHub #542). Everything else, including database-local comment
+    /// rowids, comes from the local copy.
+    #[test]
+    fn equal_content_merges_adopt_the_later_revision_on_every_clone() {
+        let base = created_issue("bd-rev", "same", 10);
+        let mut older = with_comment(base.clone(), 7, "note", 20);
+        older.updated_at = fixed_time_merge(20);
+        let mut newer = with_comment(base.clone(), 9, "note", 20);
+        newer.updated_at = fixed_time_merge(20) + chrono::Duration::microseconds(1);
+        assert!(
+            older.sync_equals(&newer),
+            "the fixture must differ only in revision"
+        );
+
+        for (anchor, shape) in [(Some(&base), "common base"), (None, "convergent creation")] {
+            for (local, external) in [(&older, &newer), (&newer, &older)] {
+                for local_export in [false, true] {
+                    let context = MergeContext::new(
+                        anchor.map_or_else(HashMap::new, |base| issue_map(&[base])),
+                        issue_map(&[local]),
+                        issue_map(&[external]),
+                    );
+                    let context = if local_export {
+                        context.with_local_export_base()
+                    } else {
+                        context
+                    };
+                    let case = format!(
+                        "{shape}, local_export={local_export}, local updated_at {}",
+                        local.updated_at
+                    );
+                    let report = three_way_merge(&context, ConflictResolution::Manual, None);
+                    assert!(
+                        report.conflicts.is_empty(),
+                        "{case}: {:?}",
+                        report.conflicts
+                    );
+                    let merged = kept(&report, "bd-rev");
+                    assert_eq!(merged.updated_at, newer.updated_at, "{case}");
+                    assert_eq!(merged.comments, local.comments, "{case}");
+                }
+            }
+        }
+    }
+
+    /// The reported loop: three clones each comment on one issue, then each
+    /// merges the next clone's export in a ring. Once they hold the same
+    /// comments they must also agree on `updated_at`, so that a further round
+    /// changes nothing (GitHub #542).
+    #[test]
+    fn ring_merges_of_comment_unions_converge_to_one_revision() {
+        let base = created_issue("bd-ring", "shared", 10);
+        let commented = |body: &str, at: i64| {
+            let mut issue = with_comment(base.clone(), 1, body, at);
+            issue.updated_at = fixed_time_merge(at);
+            issue
+        };
+        // Each clone's state is also its last export, i.e. its merge anchor.
+        let mut clones = [
+            commented("from A", 20),
+            commented("from B", 30),
+            commented("from C", 30),
+        ];
+        let merge_ring = |clones: &mut [Issue; 3]| {
+            for (local, external) in [(0, 1), (1, 2), (2, 0)] {
+                let context = MergeContext::new(
+                    issue_map(&[&clones[local]]),
+                    issue_map(&[&clones[local]]),
+                    issue_map(&[&clones[external]]),
+                )
+                .with_local_export_base();
+                let report = three_way_merge(&context, ConflictResolution::Manual, None);
+                assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+                clones[local] = kept(&report, "bd-ring").clone();
+            }
+        };
+
+        for _ in 0..3 {
+            merge_ring(&mut clones);
+        }
+        let settled = clones.clone().map(|clone| clone.updated_at);
+        for clone in &clones {
+            assert_eq!(comment_bodies(clone), ["from A", "from B", "from C"]);
+        }
+        assert!(
+            settled.iter().all(|updated_at| *updated_at == settled[0]),
+            "clones hold the same content but disagree on updated_at: {settled:?}"
+        );
+        merge_ring(&mut clones);
+        assert_eq!(
+            clones.map(|clone| clone.updated_at),
+            settled,
+            "a further round must change nothing"
         );
     }
 
