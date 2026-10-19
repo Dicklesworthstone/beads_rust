@@ -93,6 +93,10 @@ fn execute_dep_add(
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let actor = config::resolve_actor(&config_layer);
+    let external_warning = unresolvable_external_dependency_warning(
+        &args.depends_on,
+        &config::external_projects_from_layer(&config_layer, &storage_ctx.paths.beads_dir),
+    );
     dep_add(
         args,
         &mut storage_ctx,
@@ -101,7 +105,53 @@ fn execute_dep_add(
         ctx,
         local_beads_dir,
         auto_flush_external,
+        external_warning,
     )
+}
+
+/// Explain why an `external:` dependency target can never resolve, if it
+/// cannot (GitHub #531).
+///
+/// The edge is still added: `external:` targets have long been accepted
+/// verbatim, the project may be configured later, and other tools write such
+/// markers as plain references. But an edge whose project segment names no
+/// configured `external_projects` entry stays blocked forever, silently, so
+/// the caller is told — including the near miss where the configured name
+/// differs only in case or `-`/`_`, which is how #531 was found.
+fn unresolvable_external_dependency_warning(
+    depends_on: &str,
+    external_projects: &HashMap<String, PathBuf>,
+) -> Option<String> {
+    if !depends_on.starts_with("external:") {
+        return None;
+    }
+    let Some((project, capability)) = parse_external_dep_id(depends_on) else {
+        return Some(format!(
+            "{depends_on} is not of the form external:<project>:<capability>, so it can never resolve and the issue stays blocked"
+        ));
+    };
+    if external_projects.contains_key(&project) {
+        return None;
+    }
+    let fold = |name: &str| name.to_ascii_lowercase().replace('-', "_");
+    let mut configured: Vec<&str> = external_projects.keys().map(String::as_str).collect();
+    configured.sort_unstable();
+    let detail = configured
+        .iter()
+        .find(|name| fold(name) == fold(&project))
+        .map_or_else(
+            || {
+                if configured.is_empty() {
+                    "no external_projects are configured".to_string()
+                } else {
+                    format!("configured: {}", configured.join(", "))
+                }
+            },
+            |name| format!("did you mean external:{name}:{capability}?"),
+        );
+    Some(format!(
+        "external project '{project}' is not configured under external_projects ({detail}); {depends_on} stays blocked until it is"
+    ))
 }
 
 fn execute_dep_remove(
@@ -327,6 +377,10 @@ struct DepActionResult {
     #[serde(rename = "type")]
     dep_type: String,
     action: String,
+    /// Non-fatal problems with the edge, e.g. an `external:` target that can
+    /// never resolve (#531). Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 /// JSON output for dep import operations.
@@ -542,6 +596,7 @@ struct CyclesResult {
     archived_closed_cycles: Vec<Vec<String>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dep_add(
     args: &DepAddArgs,
     storage_ctx: &mut config::OpenStorageResult,
@@ -550,6 +605,7 @@ fn dep_add(
     ctx: &OutputContext,
     local_beads_dir: &Path,
     auto_flush_external: bool,
+    external_warning: Option<String>,
 ) -> Result<()> {
     let issue_id = resolve_issue_id(&storage_ctx.storage, resolver, &args.issue)?;
 
@@ -601,6 +657,7 @@ fn dep_add(
             depends_on_id: depends_on_id.clone(),
             dep_type: dep_type.as_str().to_string(),
             action: if added { "added" } else { "already_exists" }.to_string(),
+            warnings: external_warning.iter().cloned().collect(),
         };
         if ctx.is_toon() {
             ctx.toon(&result);
@@ -648,6 +705,11 @@ fn dep_add(
         ctx.info(&format!(
             "Dependency already exists: {issue_id_display} → {depends_on_id_display}"
         ));
+    }
+    // Human modes only: `warning` is silent in JSON/TOON, which carry it in
+    // the result's `warnings` field instead.
+    if let Some(warning) = &external_warning {
+        ctx.warning(warning);
     }
 
     Ok(())
@@ -772,6 +834,7 @@ fn dep_remove(
             depends_on_id: depends_on_id.clone(),
             dep_type,
             action: if removed { "removed" } else { "not_found" }.to_string(),
+            warnings: Vec::new(),
         };
         if ctx.is_toon() {
             ctx.toon(&result);
@@ -3056,13 +3119,91 @@ mod tests {
             depends_on_id: "bd-002".to_string(),
             dep_type: "blocks".to_string(),
             action: "added".to_string(),
+            warnings: Vec::new(),
         };
 
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"status\":\"ok\""));
         assert!(json.contains("\"issue_id\":\"bd-001\""));
         assert!(json.contains("\"type\":\"blocks\"")); // Note: renamed field
+        assert!(!json.contains("warnings"), "empty warnings are omitted");
         info!("test_dep_action_result_json: assertions passed");
+    }
+
+    // === external: targets that can never resolve (GitHub #531) ===
+
+    fn configured_projects(names: &[&str]) -> HashMap<String, PathBuf> {
+        names
+            .iter()
+            .map(|name| ((*name).to_string(), PathBuf::from("/projects").join(name)))
+            .collect()
+    }
+
+    #[test]
+    fn external_dependency_on_a_configured_project_is_silent() {
+        let projects = configured_projects(&["platform-infra"]);
+        assert_eq!(
+            unresolvable_external_dependency_warning("external:platform-infra:prod-env", &projects),
+            None
+        );
+        assert_eq!(
+            unresolvable_external_dependency_warning("bd-002", &projects),
+            None,
+            "local targets are not external"
+        );
+    }
+
+    #[test]
+    fn external_dependency_near_miss_names_the_configured_spelling() {
+        let projects = configured_projects(&["platform_infra", "billing"]);
+        let warning =
+            unresolvable_external_dependency_warning("external:Platform-Infra:prod-env", &projects)
+                .expect("an unconfigured project must be reported");
+        assert!(
+            warning.contains("did you mean external:platform_infra:prod-env?"),
+            "{warning}"
+        );
+    }
+
+    #[test]
+    fn external_dependency_on_an_unknown_project_lists_the_configured_ones() {
+        let warning = unresolvable_external_dependency_warning(
+            "external:payments:ledger",
+            &configured_projects(&["platform-infra", "billing"]),
+        )
+        .expect("an unconfigured project must be reported");
+        assert!(
+            warning.contains("'payments'")
+                && warning.contains("configured: billing, platform-infra"),
+            "{warning}"
+        );
+
+        let warning =
+            unresolvable_external_dependency_warning("external:payments:ledger", &HashMap::new())
+                .expect("an unconfigured project must be reported");
+        assert!(
+            warning.contains("no external_projects are configured"),
+            "{warning}"
+        );
+    }
+
+    #[test]
+    fn malformed_external_dependency_is_reported() {
+        for target in [
+            "external:payments",
+            "external::ledger",
+            "external:payments:",
+        ] {
+            let warning = unresolvable_external_dependency_warning(
+                target,
+                &configured_projects(&["payments"]),
+            )
+            .unwrap_or_else(|| panic!("{target} must be reported"));
+            assert!(
+                warning.contains("external:<project>:<capability>"),
+                "{warning}"
+            );
+        }
     }
 
     #[test]

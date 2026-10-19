@@ -1229,6 +1229,62 @@ fn e2e_external_project_names_preserve_config_and_dependency_identity() {
     }
 }
 
+/// `dep add` still records an `external:` edge whose project segment names no
+/// configured project, but it must say that the edge can never resolve rather
+/// than accept it silently (#531's second ask).
+#[test]
+fn e2e_dep_add_reports_an_external_project_that_is_not_configured() {
+    let _log = common::test_log("e2e_dep_add_reports_unconfigured_external_project");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init", "--prefix", "bd"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let yaml = serde_yml::to_string(&serde_json::json!({
+        "issue_prefix": "bd",
+        "external_projects": { "platform_infra": "../platform-infra" }
+    }))
+    .expect("consumer config");
+    fs::write(workspace.root.join(".beads/config.yaml"), yaml).expect("write consumer config");
+    let create = run_br(&workspace, ["create", "Needs prod-env"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let id = parse_created_id(&create.stdout);
+
+    let dep_json = |target: &str, label: &str| -> Value {
+        let dep = run_br(&workspace, ["dep", "add", &id, target, "--json"], label);
+        assert!(dep.status.success(), "dep add failed: {}", dep.stderr);
+        serde_json::from_str(&extract_json_payload(&dep.stdout)).expect("dep add JSON")
+    };
+
+    let near_miss = dep_json("external:platform-infra:prod-env", "near_miss");
+    assert_eq!(near_miss["action"], "added", "the edge is still recorded");
+    let warnings = near_miss["warnings"].to_string();
+    assert!(
+        warnings.contains("did you mean external:platform_infra:prod-env?"),
+        "{near_miss}"
+    );
+
+    let configured = dep_json("external:platform_infra:prod-env", "configured");
+    assert!(
+        configured.get("warnings").is_none(),
+        "a configured project must not warn: {configured}"
+    );
+
+    // Plain output carries the same warning on stderr.
+    let plain = run_br(
+        &workspace,
+        ["dep", "add", &id, "external:payments:ledger"],
+        "plain_unknown",
+    );
+    assert!(plain.status.success(), "dep add failed: {}", plain.stderr);
+    assert!(
+        plain
+            .stderr
+            .contains("external project 'payments' is not configured"),
+        "stdout: {} stderr: {}",
+        plain.stdout,
+        plain.stderr
+    );
+}
+
 #[test]
 fn e2e_close_suggest_next_unblocks() {
     common::init_test_logging();

@@ -798,7 +798,8 @@ MCP serve uses the same local storage contract as the CLI:
 `update_issue` takes `if_unchanged`, the CLI's `--if-unchanged` precondition
 (see [`--if-unchanged`: lost updates](CLI_REFERENCE.md#if-unchanged-lost-updates)):
 pass the `updated_at` you read and the write applies only if the record has not
-moved since.
+moved since. `close_issue` takes the same field with `id` (not with `ids`),
+like `br close --if-unchanged`.
 
 ```json
 {"id": "bd-abc123", "description": "...revised...", "if_unchanged": "2026-09-17T02:22:26.950413390Z"}

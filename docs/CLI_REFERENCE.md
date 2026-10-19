@@ -540,6 +540,12 @@ on a stale token instead of applying the label. Passing the flag with no edit
 at all is a verified no-op: a current token exits 0 and writes nothing (not
 even `updated_at`), a stale one still exits 6.
 
+`br close --if-unchanged` takes the same token with the same match/mismatch
+behaviour, exit code and JSON error (#573). A close on a moved record is
+refused before any other close check, so a caller whose read is stale hears
+`UPDATE_PRECONDITION_FAILED` even if someone else has since closed the issue,
+rather than an "already closed" skip computed from a record it never saw.
+
 ---
 
 ### close
@@ -557,6 +563,7 @@ br close [OPTIONS] [IDS]...
 | `--transition-comment <TEXT>` | Add a fresh comment atomically with the close transition |
 | `-f, --force` | Close even if blocked by open dependencies |
 | `--suggest-next` | Return newly unblocked issues |
+| `--if-unchanged <UPDATED_AT>` | Close only if the issue still carries this `updated_at` (same precondition as `update --if-unchanged`, see [lost updates](#if-unchanged-lost-updates)); one issue at a time |
 | `--session <ID>` | Session ID for tracking |
 | `--robot` | Machine-readable output |
 
@@ -564,6 +571,10 @@ br close [OPTIONS] [IDS]...
 ```bash
 # Close with reason
 br close bd-abc123 -r "Completed in PR #42"
+
+# Close only if nobody changed the issue since you read it (#573)
+token=$(br show bd-abc123 --json | jq -r '.[0].updated_at')
+br close bd-abc123 -r "Reviewed" --if-unchanged "$token"
 
 # Close multiple
 br close bd-abc123 bd-def456 -r "Sprint complete"
@@ -1243,6 +1254,16 @@ that exact name takes precedence over aliases. MCP `manage_dependencies`
 uses the optional `dep_type` field for the same selection, including in
 `operations[]`. Omitting it defaults to `blocks` for add and requires a unique
 edge for remove.
+
+A cross-project target has the form `external:<project>:<capability>`, where
+`<project>` is a key under `external_projects` (matched exactly: case, `-` and
+`_` are part of the name) and the edge is satisfied once that project has a
+closed issue labelled `provides:<capability>`. `dep add` still records a
+target whose project is not configured, or that is not of that form, but it
+warns that the edge cannot resolve: on stderr in text output, and in a
+`warnings` array in `--json` output. A name that differs from a configured one
+only in case or `-`/`_` gets a "did you mean" suggestion
+([#531](https://github.com/Dicklesworthstone/beads_rust/issues/531)).
 
 An issue reachable through more than one parent (a diamond) is listed under
 every parent, but only its first occurrence expands the subtree beneath it.

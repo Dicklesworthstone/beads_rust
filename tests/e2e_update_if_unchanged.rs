@@ -1,4 +1,5 @@
-//! E2E: `br update --if-unchanged` (GitHub #500).
+//! E2E: `br update --if-unchanged` (GitHub #500) and `br close --if-unchanged`
+//! (GitHub #573, at the end of this file).
 //!
 //! The lost update this guards against needs no concurrency to reproduce —
 //! only a stale read. Two writers read the same prose field, each revises it,
@@ -399,4 +400,120 @@ fn e2e_if_unchanged_refuses_a_batch_and_a_malformed_token() {
         "an unparseable token must not be ignored: {}",
         malformed.stdout
     );
+}
+
+// === `br close --if-unchanged` (GitHub #573) ===
+//
+// A grader reads a bead, a concurrent writer moves it, and the grader's close
+// must not apply on the stale base. Same token, same exit code and the same
+// JSON error as `update`.
+
+fn status_and_token(workspace: &BrWorkspace, id: &str, label: &str) -> (String, String) {
+    let shown = run_br(workspace, ["show", id, "--json"], label);
+    let value: Value = serde_json::from_str(&extract_json_payload(&shown.stdout)).unwrap();
+    (
+        value[0]["status"].as_str().unwrap_or("").to_string(),
+        value[0]["updated_at"].as_str().unwrap_or("").to_string(),
+    )
+}
+
+#[test]
+fn e2e_close_if_unchanged_refuses_a_stale_close_then_applies_a_fresh_one() {
+    let label = "e2e_close_if_unchanged_stale";
+    let _log = common::test_log(label);
+    let workspace = BrWorkspace::new();
+    init(&workspace, label);
+    let (id, stale_token) = seed(&workspace, label);
+
+    // Another writer moves the record after the grader's read.
+    let note = run_br(
+        &workspace,
+        ["comments", "add", id.as_str(), "concurrent grader note"],
+        label,
+    );
+    assert!(note.status.success(), "comment failed: {}", note.stderr);
+
+    let refused = run_br(
+        &workspace,
+        [
+            "close",
+            id.as_str(),
+            "--reason",
+            "graded on a stale read",
+            "--if-unchanged",
+            stale_token.as_str(),
+            "--json",
+        ],
+        label,
+    );
+    assert_eq!(
+        refused.status.code(),
+        Some(6),
+        "a stale close must exit 6 (stdout: {}, stderr: {})",
+        refused.stdout,
+        refused.stderr
+    );
+    let combined = format!("{}{}", refused.stdout, refused.stderr);
+    let payload: Value = serde_json::from_str(&extract_json_payload(&combined))
+        .unwrap_or_else(|e| panic!("expected JSON error, got {combined:?} ({e})"));
+    let text = payload.to_string();
+    assert!(text.contains("UPDATE_PRECONDITION_FAILED"), "{text}");
+    assert!(text.contains(&stale_token), "{text}");
+
+    let (status, fresh_token) = status_and_token(&workspace, &id, label);
+    assert_eq!(status, "open", "the refused close was applied anyway");
+    assert_ne!(fresh_token, stale_token);
+
+    let closed = run_br(
+        &workspace,
+        [
+            "close",
+            id.as_str(),
+            "--reason",
+            "graded on a fresh read",
+            "--if-unchanged",
+            fresh_token.as_str(),
+        ],
+        label,
+    );
+    assert!(
+        closed.status.success(),
+        "a current token must close: {}",
+        closed.stderr
+    );
+    assert_eq!(status_and_token(&workspace, &id, label).0, "closed");
+}
+
+#[test]
+fn e2e_close_if_unchanged_refuses_a_batch() {
+    let label = "e2e_close_if_unchanged_batch";
+    let _log = common::test_log(label);
+    let workspace = BrWorkspace::new();
+    init(&workspace, label);
+    let (first, token) = seed(&workspace, label);
+    let (second, _) = seed(&workspace, label);
+
+    let batch = run_br(
+        &workspace,
+        [
+            "close",
+            first.as_str(),
+            second.as_str(),
+            "--if-unchanged",
+            token.as_str(),
+        ],
+        label,
+    );
+    assert!(
+        !batch.status.success(),
+        "one token cannot describe two issues: {}",
+        batch.stdout
+    );
+    for id in [&first, &second] {
+        assert_eq!(
+            status_and_token(&workspace, id, label).0,
+            "open",
+            "refused batch closed {id}"
+        );
+    }
 }

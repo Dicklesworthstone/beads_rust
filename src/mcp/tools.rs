@@ -2599,13 +2599,23 @@ fn close_issue_json(
     id: &str,
     args: &crate::cli::commands::close::CloseArgs,
     policy: &crate::close_policy::PolicyDocument,
+    expected_updated_at: Option<DateTime<Utc>>,
 ) -> McpResult<Value> {
     require_valid_issue(storage, id)?;
 
-    // Idempotency: if already closed, return existing state without error.
-    if let Some(details) = storage
+    let details = storage
         .get_issue_details(id, false, false, 0)
-        .map_err(beads_to_mcp)?
+        .map_err(beads_to_mcp)?;
+    // `if_unchanged` (#573) is checked before the already-closed shortcut: a
+    // caller whose read is stale must learn that its base moved, not receive
+    // an idempotent success computed from a record it never saw. The close
+    // below checks the same token again inside its write transaction.
+    if let Some(details) = &details {
+        ensure_update_precondition(id, &details.issue, expected_updated_at)?;
+    }
+
+    // Idempotency: if already closed, return existing state without error.
+    if let Some(details) = details
         && details.issue.status == Status::Closed
     {
         let issue = details.issue;
@@ -2635,6 +2645,7 @@ fn close_issue_json(
         closed_at: Some(Some(now)),
         close_reason: Some(Some(reason.to_string())),
         transition_comment: args.transition_comment.clone(),
+        expect_updated_at: expected_updated_at,
         ..IssueUpdate::default()
     };
 
@@ -2730,7 +2741,7 @@ fn close_issue_batch_json(
         .enumerate()
         .map(|(index, id)| {
             match super::with_item_outcome(storage, |storage| {
-                close_issue_json(storage, state, id, args, policy)
+                close_issue_json(storage, state, id, args, policy, None)
             }) {
                 Ok(result) => {
                     ok_count += 1;
@@ -2775,7 +2786,8 @@ impl ToolHandler for CloseIssueTool {
                  Do: Provide id for the legacy single-issue response, or ids[] for a per-item batch envelope.\n\
                  Don't: Close issues without checking open blockers first.\n\
                  Batch semantics: ids[] uses one write lock/storage open/auto-flush and returns {items,count,ok_count,error_count}; each item has ok:true with the legacy result or ok:false with a structured error.\n\
-                 Idempotency: Safe to retry — closing an already-closed issue is a no-op."
+                 Idempotency: Safe to retry — closing an already-closed issue is a no-op.\n\
+                 Stale reads: pass if_unchanged with the updated_at you read (single id only) to close only if nobody has edited the issue since."
                     .into(),
             ),
             input_schema: json!({
@@ -2799,6 +2811,10 @@ impl ToolHandler for CloseIssueTool {
                     "transition_comment": {
                         "type": "string",
                         "description": "Comment committed atomically with the close; satisfies configured transition comment requirements"
+                    },
+                    "if_unchanged": {
+                        "type": "string",
+                        "description": "Close only if the issue still carries this updated_at (RFC 3339, read it from show_issue). On a mismatch nothing is written and the call fails with UPDATE_PRECONDITION_FAILED naming both timestamps. Single id only; not accepted with ids."
                     },
                     "agent_name": {"type": "string", "description": "Agent attribution for the close event"},
                     "harness": {"type": "string", "description": "Harness attribution for the close event"},
@@ -2835,7 +2851,22 @@ impl ToolHandler for CloseIssueTool {
             model: optional_str_arg(&args, "model")?,
             ..Default::default()
         };
+        // Optimistic concurrency, same contract as `br close --if-unchanged`
+        // (#573) and `update_issue`'s `if_unchanged` (#500, #505).
+        let expected_updated_at = crate::cli::commands::update::parse_if_unchanged_surface(
+            optional_str_arg(&args, "if_unchanged")?.as_deref(),
+            "if_unchanged",
+            "`show_issue`",
+        )
+        .map_err(beads_to_mcp)?;
         if let Some(ids) = close_issue_batch_ids(&args)? {
+            // One updated_at describes one record; checking it against only
+            // the first id would falsely assure the rest.
+            if expected_updated_at.is_some() {
+                return Err(McpError::invalid_params(
+                    "'if_unchanged' applies to one issue: pass it with 'id', not 'ids'",
+                ));
+            }
             let result = self.0.with_mutation(|storage, policy| {
                 Ok(close_issue_batch_json(
                     storage,
@@ -2850,7 +2881,14 @@ impl ToolHandler for CloseIssueTool {
 
         let id = required_str_arg(&args, "id")?;
         let result = self.0.with_mutation(|storage, policy| {
-            close_issue_json(storage, &self.0, &id, &close_args, policy)
+            close_issue_json(
+                storage,
+                &self.0,
+                &id,
+                &close_args,
+                policy,
+                expected_updated_at,
+            )
         })?;
 
         Ok(vec![Content::text(result.to_string())])
@@ -3510,7 +3548,7 @@ mod tests {
     use crate::mcp::{BeadsState, McpReadSnapshotCache};
     use crate::model::{DependencyType, Issue, IssueType, Priority, Status};
     use crate::storage::{IssueUpdate, SqliteStorage};
-    use chrono::{TimeZone, Utc};
+    use chrono::{SecondsFormat, TimeZone, Utc};
     use fastmcp_rust::{Content, Cx, McpContext, McpErrorCode, Tool, ToolHandler};
     use serde_json::{Value, json};
     use std::{cell::Cell, fs, sync::Arc, time::Instant};
@@ -4910,6 +4948,69 @@ mod tests {
 
         assert_eq!(err.code, McpErrorCode::InvalidParams);
         assert!(err.message.contains("either 'id'"));
+    }
+
+    /// `close_issue` takes `if_unchanged` like `update_issue` (#573): a close
+    /// on a record that moved since the caller's read writes nothing.
+    #[test]
+    fn close_issue_if_unchanged_refuses_a_stale_close_and_accepts_a_current_one() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        insert_test_issue(&state, "br-mcp-close-cas", "conditional close");
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = CloseIssueTool::new(Arc::clone(&state));
+        let read_issue = || {
+            SqliteStorage::open(&state.db_path)
+                .expect("open storage")
+                .get_issue("br-mcp-close-cas")
+                .expect("get issue")
+                .expect("issue exists")
+        };
+
+        let stale = read_issue().updated_at;
+        SqliteStorage::open(&state.db_path)
+            .expect("open storage")
+            .add_comment("br-mcp-close-cas", "other-writer", "concurrent note")
+            .expect("concurrent comment");
+        let moved = read_issue().updated_at;
+        assert_ne!(stale, moved, "the comment must move updated_at");
+
+        let err = tool
+            .call(
+                &ctx,
+                json!({
+                    "id": "br-mcp-close-cas",
+                    "if_unchanged": stale.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                }),
+            )
+            .expect_err("a stale if_unchanged must refuse the close");
+        let text = format!("{err:?}");
+        assert!(text.contains("UPDATE_PRECONDITION_FAILED"), "{text}");
+        assert_eq!(read_issue().status, Status::Open, "refused close applied");
+
+        let batch = tool
+            .call(
+                &ctx,
+                json!({
+                    "ids": ["br-mcp-close-cas"],
+                    "if_unchanged": moved.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                }),
+            )
+            .expect_err("if_unchanged is single-id only");
+        assert_eq!(batch.code, McpErrorCode::InvalidParams);
+        assert_eq!(read_issue().status, Status::Open, "refused batch applied");
+
+        let content = tool
+            .call(
+                &ctx,
+                json!({
+                    "id": "br-mcp-close-cas",
+                    "if_unchanged": moved.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                }),
+            )
+            .expect("a current if_unchanged closes");
+        assert_eq!(content_json(&content)["status"].as_str(), Some("closed"));
+        assert_eq!(read_issue().status, Status::Closed);
     }
 
     fn time_repeated_json_reads<F>(

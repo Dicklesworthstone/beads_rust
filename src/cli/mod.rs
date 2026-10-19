@@ -2896,6 +2896,16 @@ pub struct CloseArgs {
     #[arg(long)]
     pub suggest_next: bool,
 
+    /// Only close the issue if it has not changed since you read it
+    /// (GitHub #573).
+    ///
+    /// Pass the `updated_at` that `br show <id> --json` reported. If the
+    /// record has moved since, nothing is written and the command exits 6
+    /// naming both timestamps, exactly like `br update --if-unchanged`. One
+    /// issue per invocation.
+    #[arg(long, value_name = "UPDATED_AT")]
+    pub if_unchanged: Option<String>,
+
     /// Session ID for tracking
     #[arg(long)]
     pub session: Option<String>,

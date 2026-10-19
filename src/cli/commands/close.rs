@@ -18,7 +18,7 @@ use crate::model::{Issue, IssueType, Status};
 use crate::output::OutputContext;
 use crate::storage::{EventAttribution, IssueUpdate, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
-use chrono::Utc;
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -38,6 +38,8 @@ pub struct CloseArgs {
     pub session: Option<String>,
     /// Return newly unblocked issues (single ID only)
     pub suggest_next: bool,
+    /// `--if-unchanged`: the `updated_at` the caller read (GitHub #573).
+    pub if_unchanged: Option<String>,
     /// Tier 1 attribution: agent name (issue #274 Phase 1).
     pub agent_name: Option<String>,
     /// Tier 1 attribution: harness identifier.
@@ -59,6 +61,7 @@ impl From<&CliCloseArgs> for CloseArgs {
             force: cli.force,
             session: cli.session.clone(),
             suggest_next: cli.suggest_next,
+            if_unchanged: cli.if_unchanged.clone(),
             agent_name: cli.agent_name.clone(),
             harness: cli.harness.clone(),
             model: cli.model.clone(),
@@ -101,6 +104,17 @@ fn validate_bypass_args(args: &CloseArgs) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Parse `--if-unchanged` (GitHub #573): the optimistic-concurrency
+/// precondition `br update --if-unchanged` has carried since #500, with the
+/// same parsing, error and exit code.
+fn close_precondition(args: &CloseArgs) -> Result<Option<DateTime<Utc>>> {
+    crate::cli::commands::update::parse_if_unchanged_surface(
+        args.if_unchanged.as_deref(),
+        "--if-unchanged",
+        "`br show <id> --json`",
+    )
 }
 
 /// Resolve attribution values for the close. CLI flags take precedence over
@@ -637,6 +651,9 @@ pub fn execute_with_args_and_storage(
     // Up-front bypass argument-pair validation. Done before any storage IO so
     // a misuse of the bypass flag never silently slips past policy gates.
     validate_bypass_args(args)?;
+    // Likewise a malformed `--if-unchanged` token is refused before any IO
+    // rather than silently ignored.
+    let expect_updated_at = close_precondition(args)?;
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut target_inputs = args.ids.clone();
@@ -652,6 +669,19 @@ pub fn execute_with_args_and_storage(
         return Err(BeadsError::validation(
             "suggest-next",
             "--suggest-next only works with a single issue ID",
+        ));
+    }
+    // One `updated_at` describes one record: it cannot hold for several
+    // issues at once, and checking it against only the first would give the
+    // rest the false assurance the flag exists to remove (#500, #573).
+    if expect_updated_at.is_some() && target_inputs.len() > 1 {
+        return Err(BeadsError::validation_with_hint(
+            "if-unchanged",
+            format!(
+                "--if-unchanged applies to one issue, but {} were given",
+                target_inputs.len()
+            ),
+            "Run one `br close --if-unchanged` per issue, each with that issue's own updated_at.",
         ));
     }
     let routed_batches = config::routing::group_issue_inputs_by_route(&target_inputs, &beads_dir)?;
@@ -869,6 +899,21 @@ fn execute_route_with_storage(
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let resolved_ids = resolve_issue_ids(&storage_ctx.storage, &resolver, &args.ids)?;
 
+    // The caller-facing guard counts the inputs; this one counts what they
+    // resolved to, which is the number that matters (#500, #573).
+    let expect_updated_at = close_precondition(args)?;
+    if expect_updated_at.is_some() && resolved_ids.len() > 1 {
+        return Err(BeadsError::validation_with_hint(
+            "if-unchanged",
+            format!(
+                "--if-unchanged applies to one issue, but the given input resolved to {}: {}",
+                resolved_ids.len(),
+                resolved_ids.join(", ")
+            ),
+            "Run one `br close --if-unchanged` per issue, each with that issue's own updated_at.",
+        ));
+    }
+
     // Closure-time policy gates (issue #274 Phase 1). Loading happens once per
     // route; if the file is absent the doc is the all-off default.
     let policy_doc = close_policy::load_for_beads_dir(beads_dir)?;
@@ -930,6 +975,23 @@ fn execute_route_with_storage(
             skipped_issues.push(skipped);
             continue;
         };
+
+        // Optimistic-concurrency precondition (GitHub #573). Checked before
+        // any skip or gate decision: a caller whose read is stale must learn
+        // that its base moved, so it can re-read and decide again, rather than
+        // receive an outcome computed from a record it never saw. The close
+        // transaction checks the same token again (`expect_updated_at` below).
+        if let Some(expected) = expect_updated_at
+            && issue.updated_at != expected
+        {
+            return Err(BeadsError::UpdatePreconditionFailed {
+                id: id.clone(),
+                expected: expected.to_rfc3339_opts(SecondsFormat::AutoSi, true),
+                actual: issue
+                    .updated_at
+                    .to_rfc3339_opts(SecondsFormat::AutoSi, true),
+            });
+        }
 
         if issue.status.is_terminal() {
             let skipped = SkippedIssue {
@@ -1142,6 +1204,7 @@ fn execute_route_with_storage(
             } else {
                 None
             },
+            expect_updated_at,
             ..Default::default()
         };
 
@@ -1450,6 +1513,154 @@ mod tests {
         );
     }
 
+    // === --if-unchanged (GitHub #573) ===
+
+    fn read_updated_at(beads_dir: &Path, cli: &CliOverrides) -> DateTime<Utc> {
+        config::open_storage_with_cli(beads_dir, cli)
+            .expect("open storage")
+            .storage
+            .get_issue("bd-cl")
+            .expect("read issue")
+            .expect("issue exists")
+            .updated_at
+    }
+
+    fn read_status(beads_dir: &Path, cli: &CliOverrides) -> Status {
+        config::open_storage_with_cli(beads_dir, cli)
+            .expect("open storage")
+            .storage
+            .get_issue("bd-cl")
+            .expect("read issue")
+            .expect("issue exists")
+            .status
+    }
+
+    fn preconditioned_close(token: &str) -> CloseArgs {
+        CloseArgs {
+            ids: vec!["bd-cl".to_string()],
+            reason: Some("graded".to_string()),
+            if_unchanged: Some(token.to_string()),
+            ..CloseArgs::default()
+        }
+    }
+
+    #[test]
+    fn if_unchanged_refuses_a_close_on_a_moved_record_and_writes_nothing() {
+        let (_temp, beads_dir) = reuse_workspace();
+        let cli = CliOverrides {
+            db: Some(beads_dir.join("beads.db")),
+            ..CliOverrides::default()
+        };
+        let ctx = OutputContext::from_flags(true, false, true);
+        let stale = read_updated_at(&beads_dir, &cli);
+
+        // A concurrent writer moves the record after the grader's read.
+        config::open_storage_with_cli(&beads_dir, &cli)
+            .expect("open storage")
+            .storage
+            .add_comment("bd-cl", "other-writer", "concurrent note")
+            .expect("concurrent comment");
+        let moved = read_updated_at(&beads_dir, &cli);
+        assert_ne!(stale, moved, "the comment must move updated_at");
+
+        let stale_token = stale.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let err = execute_with_args(&preconditioned_close(&stale_token), true, &cli, &ctx)
+            .expect_err("a close on a stale base must be refused");
+        match err {
+            BeadsError::UpdatePreconditionFailed {
+                id,
+                expected,
+                actual,
+            } => {
+                assert_eq!(id, "bd-cl");
+                assert_eq!(
+                    DateTime::parse_from_rfc3339(&expected).unwrap(),
+                    stale,
+                    "expected names the caller's token"
+                );
+                assert_eq!(
+                    DateTime::parse_from_rfc3339(&actual).unwrap(),
+                    moved,
+                    "actual names the current record"
+                );
+            }
+            other => panic!("expected UpdatePreconditionFailed, got {other:?}"),
+        }
+        assert_eq!(read_status(&beads_dir, &cli), Status::Open);
+        assert_eq!(
+            read_updated_at(&beads_dir, &cli),
+            moved,
+            "a refused close must not touch the record"
+        );
+
+        // Re-read and retry: the current token closes it.
+        let fresh_token = moved.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        execute_with_args(&preconditioned_close(&fresh_token), true, &cli, &ctx)
+            .expect("a current token closes");
+        assert_eq!(read_status(&beads_dir, &cli), Status::Closed);
+    }
+
+    #[test]
+    fn if_unchanged_reports_a_moved_base_before_already_closed() {
+        let (_temp, beads_dir) = reuse_workspace();
+        let cli = CliOverrides {
+            db: Some(beads_dir.join("beads.db")),
+            ..CliOverrides::default()
+        };
+        let ctx = OutputContext::from_flags(true, false, true);
+        let stale = read_updated_at(&beads_dir, &cli);
+
+        // Another writer closes the issue first.
+        let other = CloseArgs {
+            ids: vec!["bd-cl".to_string()],
+            ..CloseArgs::default()
+        };
+        execute_with_args(&other, true, &cli, &ctx).expect("other writer closes");
+
+        let err = execute_with_args(
+            &preconditioned_close(&stale.to_rfc3339_opts(SecondsFormat::Nanos, true)),
+            true,
+            &cli,
+            &ctx,
+        )
+        .expect_err("a stale close must not read as a no-op");
+        assert!(
+            matches!(err, BeadsError::UpdatePreconditionFailed { .. }),
+            "the caller must learn its base moved, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn if_unchanged_refuses_a_batch_and_a_malformed_token_before_writing() {
+        let (_temp, beads_dir) = reuse_workspace();
+        let cli = CliOverrides {
+            db: Some(beads_dir.join("beads.db")),
+            ..CliOverrides::default()
+        };
+        let ctx = OutputContext::from_flags(true, false, true);
+        let token = read_updated_at(&beads_dir, &cli).to_rfc3339_opts(SecondsFormat::Nanos, true);
+
+        let batch = CloseArgs {
+            ids: vec!["bd-cl".to_string(), "bd-other".to_string()],
+            if_unchanged: Some(token),
+            ..CloseArgs::default()
+        };
+        let err = execute_with_args(&batch, true, &cli, &ctx)
+            .expect_err("one token cannot describe two issues");
+        assert!(
+            err.to_string().contains("applies to one issue"),
+            "unexpected error: {err}"
+        );
+
+        let err = execute_with_args(&preconditioned_close("yesterday"), true, &cli, &ctx)
+            .expect_err("an unparseable token must not be ignored");
+        assert!(
+            err.to_string().contains("RFC 3339"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(read_status(&beads_dir, &cli), Status::Open);
+    }
+
     #[test]
     fn execute_with_args_and_storage_leaves_a_foreign_pre_opened_connection_alone() {
         let (_temp_a, beads_dir_a) = reuse_workspace();
@@ -1524,6 +1735,7 @@ mod tests {
             force: true,
             session: Some("session-456".to_string()),
             suggest_next: true,
+            if_unchanged: Some("2026-10-19T17:05:33Z".to_string()),
             agent_name: Some("agent-1".to_string()),
             harness: Some("codex-cli".to_string()),
             model: Some("gpt-5".to_string()),
@@ -1540,6 +1752,7 @@ mod tests {
         assert!(args.force);
         assert_eq!(args.session.as_deref(), Some("session-456"));
         assert!(args.suggest_next);
+        assert_eq!(args.if_unchanged.as_deref(), Some("2026-10-19T17:05:33Z"));
         assert_eq!(args.agent_name.as_deref(), Some("agent-1"));
         assert_eq!(args.harness.as_deref(), Some("codex-cli"));
         assert_eq!(args.model.as_deref(), Some("gpt-5"));
@@ -1959,6 +2172,7 @@ mod tests {
             force: true,
             session: Some("sess".to_string()),
             suggest_next: true,
+            if_unchanged: None,
             agent_name: Some("agent-clone".to_string()),
             harness: Some("harness-clone".to_string()),
             model: Some("model-clone".to_string()),

@@ -985,7 +985,9 @@ fn classify_close(args: &CloseArgs) -> CommandCompatibility {
     if args.ids.is_empty() {
         return CommandCompatibility::DirectOnly(DirectOnlyReason::MissingExplicitTarget);
     }
-    if args.force || args.suggest_next {
+    // A preconditioned close (`--if-unchanged`, #573) must be checked against
+    // the record as it is when this command runs, never folded into a batch.
+    if args.force || args.suggest_next || args.if_unchanged.is_some() {
         return CommandCompatibility::DirectOnly(DirectOnlyReason::UnsupportedOption);
     }
     CommandCompatibility::Candidate(CompatibleMutation::CloseIssue)
