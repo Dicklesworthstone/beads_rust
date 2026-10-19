@@ -42,6 +42,7 @@
 | `--force` / `-f` | No | `false` | Override safety guards | Forced |
 | `--force-db` | No | `false` | Resolve `--merge` conflicts by keeping local SQLite rows | Forced |
 | `--force-jsonl` | No | `false` | Resolve `--merge` conflicts by keeping JSONL rows | Forced |
+| `--base <PATH>` | With `--merge` | Anchor | Read a caller-supplied common ancestor instead of `beads.base.jsonl`; never written | Explicit |
 | `--dry-run` | No | `false` | With `--reconcile`: read-only plan preview, zero mutation | Implicit |
 | `--manifest` | No | `false` | Write export manifest | Explicit |
 | `--error-policy` | No | `strict` | Error handling mode | Explicit |
@@ -127,6 +128,17 @@ revision regardless of timestamp, and `--force` picks the newer revision
 (local wins equal timestamps). Newer external-only updates still merge
 normally. Neither timestamps nor the anchor establish an authoritative common
 ancestor, and br does not run Git to look one up.
+
+A caller that knows the real ancestor supplies it with `--merge --base <PATH>`
+(for example the tracker file at `git merge-base`, written to a file by the
+caller). That file is only read. It follows the operator-path policy: `.git/`
+is always refused, a path inside `.beads/` must pass the internal allowlist,
+and a path outside `.beads/` needs `--allow-external-jsonl`. A missing file is
+an error, never an empty ancestor. With a supplied ancestor the ordinary
+three-way rules apply, so a row the ancestor holds but the JSONL lacks is a
+deletion and `AmbiguousBase` does not arise. The anchor's lock, witness and
+pending-merge receipt are unchanged, the merge result still replaces the
+anchor, and a resumed merge replays its receipt without reading `--base`.
 
 ### 3.4 Non-Bypassable Guards
 
@@ -314,6 +326,7 @@ FLAGS:
     --force, -f         Override safety guards (use with caution)
     --force-db          Resolve --merge conflicts by keeping SQLite
     --force-jsonl       Resolve --merge conflicts by keeping JSONL
+    --base PATH         Common ancestor for --merge (read-only)
     --manifest          Write manifest file with export summary
     --error-policy      Error handling: strict|best-effort|partial|required-core
     --orphans           Orphan handling: strict|skip|allow|resurrect

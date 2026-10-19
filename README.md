@@ -1212,6 +1212,20 @@ the newer local work while accepting unrelated newer JSONL updates. Use
 `--force-jsonl` only when the external version should win regardless of time.
 Timestamps cannot prove ancestry; br does not obtain one from Git.
 
+If you know the real common ancestor, write that version of the JSONL to a
+file and pass it with `--base`. br only reads the file, so you run Git
+yourself, for example with `issues.jsonl` holding the other side's version:
+
+```bash
+git show "$(git merge-base HEAD MERGE_HEAD)":.beads/issues.jsonl > ../merge-base.jsonl
+br sync --merge --base ../merge-base.jsonl --allow-external-jsonl
+```
+
+With a supplied ancestor the ordinary three-way rules apply: a row the
+ancestor holds but the JSONL lacks was deleted on that side, and a change made
+only in the JSONL is taken without an `AmbiguousBase` stop. A path outside
+`.beads/` needs `--allow-external-jsonl`; a path inside `.git/` is refused.
+
 Comments are append-only, so the merge keeps every comment either side added.
 Two clones can also mint the same id for different issues (child ids such as
 `<parent>.1` come from each database's own counter). The merge treats a

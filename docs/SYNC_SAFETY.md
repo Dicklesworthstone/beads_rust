@@ -294,7 +294,7 @@ still refused.
 | **Delete vs modify conflict** | Silently deleting one side's edit | `--force`, `--force-db`, `--force-jsonl` |
 | **Convergent creation conflict** | Silently choosing between independently created same-ID issues | `--force`, `--force-db`, `--force-jsonl` |
 | **Ambiguous export anchor** | A differing external-only row with an older or equal timestamp silently undoing exported local work, or silently discarding a legitimate clock-skewed edit | `--force`, `--force-db`, `--force-jsonl` |
-| **Missing external row** | Treating an issue absent from an older export as a deletion | `--force-jsonl` |
+| **Missing external row** | Treating an issue absent from an older export as a deletion | `--force-jsonl`, or a supplied `--base` ancestor that holds the row |
 
 The saved `beads.base.jsonl` is the last local export. It is not proof that the
 incoming JSONL contains that export. A missing external row preserves the
@@ -304,6 +304,17 @@ An explicit external tombstone remains a deletion, and local tombstones retain
 their protection against resurrection under every resolution policy. Keeping
 an absent local tombstone does not refresh its deletion time; normal export
 retention still applies.
+
+A caller that knows the real common ancestor can supply it with
+`--merge --base <PATH>`. br reads that file and never runs Git to find it. It
+follows the operator-path policy: `.git/` is always refused, a path inside
+`.beads/` must pass the internal allowlist, and a path outside `.beads/`
+needs `--allow-external-jsonl`. A missing file is an error rather than an
+empty ancestor. Because the supplied ancestor is authoritative, the ordinary
+three-way rules apply to it: a row it holds that the JSONL lacks is a
+deletion, and an external-only change is merged without the ambiguity check
+below. The anchor is still what the merge result replaces, and the supplied
+file is never written.
 
 When the local payload equals the anchor but a differing external payload's
 `updated_at` does not advance beyond both the anchor and local timestamps,

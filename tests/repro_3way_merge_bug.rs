@@ -370,7 +370,10 @@ fn assert_merge_conflict_preserves_inputs(workspace: &BrWorkspace, expected_conf
     assert_eq!(fs::read(&base_path).unwrap(), base_before);
 }
 
-fn switched_branch_workspace() -> (BrWorkspace, String) {
+/// Returns the workspace, the id created on the branch, and main's export
+/// from before the branch diverged: the true common ancestor that a caller
+/// running git could supply with `--base` (#543).
+fn switched_branch_workspace() -> (BrWorkspace, String, Vec<Value>) {
     let workspace = workspace_with_exported_issues(&[
         fixed_issue(
             "rp-close",
@@ -388,6 +391,7 @@ fn switched_branch_workspace() -> (BrWorkspace, String) {
     ]);
     let jsonl_path = workspace.root.join(".beads/issues.jsonl");
     let mut incoming_main = read_issue_rows(&jsonl_path);
+    let common_ancestor = incoming_main.clone();
 
     // Real CLI transitions and export on a feature branch. The initial
     // timestamps are fixed, so this needs no sleep or filesystem-mtime race.
@@ -429,12 +433,12 @@ fn switched_branch_workspace() -> (BrWorkspace, String) {
     teammate["description"] = json!("Teammate update on main");
     teammate["updated_at"] = json!("2999-01-01T00:00:00Z");
     write_issue_rows(&jsonl_path, &incoming_main);
-    (workspace, created_id)
+    (workspace, created_id, common_ancestor)
 }
 
 #[test]
 fn repro_branch_switch_merge_preserves_exported_close_reopen_and_creation() {
-    let (workspace, created_id) = switched_branch_workspace();
+    let (workspace, created_id, _) = switched_branch_workspace();
     let jsonl_path = workspace.root.join(".beads/issues.jsonl");
     assert_merge_conflict_preserves_inputs(&workspace, "AmbiguousBase");
     assert_eq!(
@@ -478,6 +482,144 @@ fn repro_branch_switch_merge_preserves_exported_close_reopen_and_creation() {
         published,
         "resolved merge must be idempotent"
     );
+}
+
+/// GitHub #543: the branch switch above is ambiguous against the anchor
+/// alone. A caller that knows the real common ancestor (main's export from
+/// before the branch diverged) supplies it with `--base`, and the merge then
+/// needs no winner: the branch's exported close, reopen and creation stay,
+/// and main's newer edit lands. The supplied file is only read, and the
+/// anchor still becomes the merge result.
+#[test]
+fn repro_supplied_common_ancestor_merges_the_branch_switch_without_conflict() {
+    let (workspace, created_id, common_ancestor) = switched_branch_workspace();
+    let jsonl_path = workspace.root.join(".beads/issues.jsonl");
+    let ancestor_path = workspace.root.join("merge-base.jsonl");
+    write_issue_rows(&ancestor_path, &common_ancestor);
+    let ancestor_bytes = fs::read(&ancestor_path).expect("read supplied ancestor");
+    let ancestor_arg = ancestor_path.to_str().expect("UTF-8 temp path");
+
+    let refused = run_br(
+        &workspace,
+        ["sync", "--merge", "--base", ancestor_arg, "--json"],
+        "merge_base_outside_beads_without_opt_in",
+    );
+    assert!(
+        !refused.status.success(),
+        "an ancestor outside .beads needs --allow-external-jsonl: {refused:?}"
+    );
+    assert!(
+        format!("{}{}", refused.stdout, refused.stderr).contains("--allow-external-jsonl"),
+        "the refusal should name the opt-in: {refused:?}"
+    );
+    assert_eq!(
+        show_stored_issue(&workspace, "rp-close")["status"],
+        "closed",
+        "a refused merge must not change the database"
+    );
+
+    let merge = success(run_br(
+        &workspace,
+        [
+            "sync",
+            "--merge",
+            "--base",
+            ancestor_arg,
+            "--allow-external-jsonl",
+            "--json",
+        ],
+        "merge_with_supplied_ancestor",
+    ));
+    let report: Value = serde_json::from_str(&merge.stdout).expect("merge report");
+    assert_eq!(report["conflicts"], 0, "{report}");
+    assert_eq!(report["deleted_issues"], 0, "{report}");
+    assert_eq!(
+        show_stored_issue(&workspace, "rp-close")["status"],
+        "closed"
+    );
+    assert_eq!(show_stored_issue(&workspace, "rp-reopen")["status"], "open");
+    assert_eq!(show_stored_issue(&workspace, &created_id)["status"], "open");
+    assert_eq!(
+        show_stored_issue(&workspace, "rp-main")["description"],
+        "Teammate update on main"
+    );
+
+    assert_eq!(
+        fs::read(&ancestor_path).unwrap(),
+        ancestor_bytes,
+        "--base is read-only"
+    );
+    assert_eq!(
+        fs::read(workspace.root.join(".beads/beads.base.jsonl")).unwrap(),
+        fs::read(&jsonl_path).unwrap(),
+        "the anchor becomes the merge result"
+    );
+}
+
+/// With a supplied common ancestor, a row the ancestor holds but the JSONL
+/// lacks was removed on the JSONL side, so an unmodified local copy is
+/// deleted, as in any true three-way merge (#543). Against the anchor alone
+/// the same absence is not deletion evidence (#541). A missing ancestor file
+/// is an error, never an empty ancestor.
+#[test]
+fn repro_supplied_common_ancestor_carries_deletion_evidence() {
+    let workspace = workspace_with_exported_issues(&[
+        fixed_issue(
+            "rp-gone",
+            "Removed upstream",
+            "open",
+            "2020-01-01T00:00:00Z",
+        ),
+        fixed_issue("rp-shared", "Shared issue", "open", "2020-01-01T00:00:00Z"),
+    ]);
+    let jsonl_path = workspace.root.join(".beads/issues.jsonl");
+    let ancestor = read_issue_rows(&jsonl_path);
+    // Inside .beads/, the internal allowlist applies and no opt-in is needed.
+    let ancestor_path = workspace.root.join(".beads/merge-ancestor.jsonl");
+    write_issue_rows(&ancestor_path, &ancestor);
+    let shared = ancestor
+        .iter()
+        .find(|issue| issue["id"] == "rp-shared")
+        .unwrap()
+        .clone();
+    write_issue_rows(&jsonl_path, &[shared]);
+
+    let missing = workspace.root.join(".beads/no-such-ancestor.jsonl");
+    let refused = run_br(
+        &workspace,
+        [
+            "sync",
+            "--merge",
+            "--base",
+            missing.to_str().expect("UTF-8 temp path"),
+            "--json",
+        ],
+        "merge_with_missing_ancestor",
+    );
+    assert!(
+        !refused.status.success(),
+        "a missing ancestor must not read as empty: {refused:?}"
+    );
+    assert_eq!(show_stored_issue(&workspace, "rp-gone")["status"], "open");
+
+    let merge = success(run_br(
+        &workspace,
+        [
+            "sync",
+            "--merge",
+            "--base",
+            ancestor_path.to_str().expect("UTF-8 temp path"),
+            "--json",
+        ],
+        "merge_with_supplied_ancestor",
+    ));
+    let report: Value = serde_json::from_str(&merge.stdout).expect("merge report");
+    assert_eq!(report["deleted_issues"], 1, "{report}");
+    assert_eq!(
+        show_stored_issue(&workspace, "rp-gone")["status"],
+        "tombstone"
+    );
+    assert_eq!(show_stored_issue(&workspace, "rp-shared")["status"], "open");
 }
 
 #[test]

@@ -1788,6 +1788,7 @@ br sync [OPTIONS]
 | `-f, --force` | Override safety guards (use with caution) |
 | `--force-db` | With `--merge`, resolve conflicts by keeping the local SQLite version |
 | `--force-jsonl` | With `--merge`, resolve conflicts by keeping the JSONL version |
+| `--base <PATH>` | With `--merge`, use this file as the common ancestor instead of `.beads/beads.base.jsonl` (read-only; outside `.beads/` needs `--allow-external-jsonl`) |
 | `--allow-external-jsonl` | Allow JSONL path outside `.beads/` |
 | `--manifest` | Write manifest file with export summary |
 | `--error-policy <POLICY>` | Export error handling: strict, best-effort, partial, required-core |
@@ -1802,7 +1803,8 @@ br sync [OPTIONS]
 | `--robot` | Machine-readable output |
 
 **Merge semantics:**
-- `--merge` uses `.beads/beads.base.jsonl` as the common ancestor and compares it with the local SQLite database and current JSONL file.
+- `--merge` compares the local SQLite database and the current JSONL file against `.beads/beads.base.jsonl`, the workspace's last local export. That anchor is not proof that the JSONL ever contained the export, so a row missing from the JSONL is kept, and a differing JSONL row whose timestamp does not advance past the anchor and the local copy is reported as `AmbiguousBase`.
+- `--base <PATH>` supplies the real common ancestor instead, for example the tracker file at `git merge-base HEAD MERGE_HEAD` written to a file (br reads it and never runs git). The ordinary three-way rules then apply: a row the ancestor holds but the JSONL lacks was deleted there, and a change made only in the JSONL is taken. The merge result still replaces `.beads/beads.base.jsonl`, and the supplied file is never written. A missing file is an error.
 - Without an explicit conflict policy, semantic conflicts stop the command. This covers both-modified, delete-vs-modify, and convergent same-ID creation conflicts.
 - `--force-db` keeps local SQLite changes for conflicts, `--force-jsonl` keeps JSONL changes for conflicts, and `--force` chooses the side with the newer timestamp.
 - `--force-db`, `--force-jsonl`, and `--force` are mutually exclusive for `--merge`.

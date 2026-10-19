@@ -996,6 +996,13 @@ pub fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
         });
     }
 
+    if args.merge_base.is_some() && !args.merge {
+        return Err(BeadsError::Validation {
+            field: "base".to_string(),
+            reason: "--base can only be used with --merge".to_string(),
+        });
+    }
+
     if args.force_db && args.force_jsonl {
         return Err(BeadsError::Validation {
             field: "merge-resolution".to_string(),
@@ -5318,6 +5325,38 @@ fn execute_source_repo_path_migration(
     })
 }
 
+/// Read the common ancestor named by `br sync --merge --base <PATH>` (#543).
+///
+/// The file is only read; br never runs git to find an ancestor. It follows
+/// the policy for an operator-named JSONL: `.git/` is always refused, a path
+/// inside `.beads/` must pass the internal allowlist, and a path outside it
+/// needs an explicit `--allow-external-jsonl`. A missing file is an error,
+/// never an empty ancestor, because an empty ancestor would make every row on
+/// both sides look newly created.
+fn load_supplied_merge_base(
+    requested: &Path,
+    beads_dir: &Path,
+    allow_external: bool,
+) -> Result<HashMap<String, crate::model::Issue>> {
+    validate_operator_requested_sync_path(beads_dir, requested)?;
+    let canonical_beads = dunce::canonicalize(beads_dir).map_err(|e| {
+        BeadsError::Config(format!(
+            "Failed to resolve .beads directory {}: {e}",
+            beads_dir.display()
+        ))
+    })?;
+    let path = std::path::absolute(requested)
+        .map_err(|e| BeadsError::Config(format!("Failed to resolve the --base path: {e}")))?;
+    validate_sync_path_with_external(&path, &canonical_beads, allow_external)?;
+    let source = crate::sync::capture_optional_jsonl_source(&path)?.ok_or_else(|| {
+        BeadsError::Config(
+            "The --base file does not exist; write the common ancestor's JSONL to a file and pass that path"
+                .to_string(),
+        )
+    })?;
+    load_base_snapshot_from_source(Some(&source))
+}
+
 /// Execute the --merge operation.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn execute_merge(
@@ -5403,10 +5442,21 @@ fn execute_merge(
 
     let database_before = capture_sync_database_witness(storage)?;
 
-    // 1. Load the last local export from the exact retained generation. It
-    // need not be an ancestor of a JSONL restored from an older branch.
-    let base = load_base_snapshot_from_source(base_source.as_ref())?;
-    debug!(base_count = base.len(), "Loaded base snapshot");
+    // 1. Load the merge ancestor. By default that is the last local export
+    // from the exact retained generation, which need not be an ancestor of a
+    // JSONL restored from an older branch. A caller that knows the real
+    // common ancestor supplies it with --base (#543); the anchor is still
+    // what the merge result replaces below.
+    let supplied_base = args.merge_base.as_deref();
+    let base = supplied_base.map_or_else(
+        || load_base_snapshot_from_source(base_source.as_ref()),
+        |path| load_supplied_merge_base(path, beads_dir, args.allow_external_jsonl),
+    )?;
+    debug!(
+        base_count = base.len(),
+        supplied = supplied_base.is_some(),
+        "Loaded merge ancestor"
+    );
 
     // 2. Load Left State (local DB)
     let mut left_issues = storage.get_all_issues_for_export()?;
@@ -5481,7 +5531,12 @@ fn execute_merge(
                     .to_string(),
         });
     }
-    if base_source.is_none() && left != right && !args.force_db && !args.force_jsonl {
+    if supplied_base.is_none()
+        && base_source.is_none()
+        && left != right
+        && !args.force_db
+        && !args.force_jsonl
+    {
         return Err(BeadsError::SyncConflict {
             message:
                 "beads.base.jsonl is missing and the database differs from JSONL; choose --force-db or --force-jsonl explicitly instead of guessing a merge ancestor"
@@ -5492,8 +5547,15 @@ fn execute_merge(
     // 4. Perform Merge. Export updates the anchor without proving that the
     // external source ever contained it. Missing rows therefore do not imply
     // deletion, and non-advancing external revisions need explicit resolution.
-    // Tombstone retention only controls export population, not merge ancestry.
-    let context = MergeContext::new(base, left, right).with_local_export_base();
+    // A caller-supplied --base is a proven common ancestor, so it gets the
+    // ordinary three-way rules. Tombstone retention only controls export
+    // population, not merge ancestry.
+    let context = MergeContext::new(base, left, right);
+    let context = if supplied_base.is_some() {
+        context
+    } else {
+        context.with_local_export_base()
+    };
     let strategy = merge_conflict_resolution(args);
     let resolution = merge_conflict_resolution_label(strategy);
     let local_tombstones: HashSet<String> = context

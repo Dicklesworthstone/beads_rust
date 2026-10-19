@@ -3156,6 +3156,19 @@ pub struct SyncArgs {
     #[arg(long, requires = "merge", conflicts_with_all = ["force", "force_db"])]
     pub force_jsonl: bool,
 
+    /// Merge against this common ancestor instead of `.beads/beads.base.jsonl`
+    ///
+    /// For callers that know the real common ancestor of the database and
+    /// the JSONL, such as the tracker file at `git merge-base HEAD
+    /// MERGE_HEAD`: write that version to a file and name it here. br only
+    /// reads the file and never runs git. Because the ancestor is known, a
+    /// row it holds that the JSONL lacks counts as deleted there, and a
+    /// change made only in the JSONL is taken. The merge result still
+    /// replaces `.beads/beads.base.jsonl`. A path outside `.beads/` needs
+    /// --allow-external-jsonl; paths inside `.git/` are always refused.
+    #[arg(long = "base", value_name = "PATH", requires = "merge")]
+    pub merge_base: Option<PathBuf>,
+
     /// Allow using a JSONL path outside the .beads directory.
     ///
     /// This flag enables paths set via `BEADS_JSONL` environment variable.

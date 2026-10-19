@@ -476,6 +476,9 @@ fn e2e_every_sync_mode_has_zero_git_authority_and_zero_git_mutation() {
 
     let jsonl_path = workspace.root.join(".beads/issues.jsonl");
     fs::copy(&jsonl_path, workspace.root.join(".beads/beads.base.jsonl")).expect("seed merge base");
+    let supplied_base = workspace.root.join(".beads/merge-ancestor.jsonl");
+    fs::copy(&jsonl_path, &supplied_base).expect("seed supplied merge ancestor");
+    let supplied_base = supplied_base.to_str().expect("UTF-8 temp path").to_string();
     // Merge correctness has dedicated semantic tests. This matrix exercises
     // every conflict-resolution dispatch policy under the no-process/no-.git
     // authority sentinel, even when the converged fixture has no conflict.
@@ -495,6 +498,10 @@ fn e2e_every_sync_mode_has_zero_git_authority_and_zero_git_mutation() {
         (
             "matrix_merge_force_newer",
             strings(&["sync", "--merge", "--force", "--json"]),
+        ),
+        (
+            "matrix_merge_supplied_base",
+            strings(&["sync", "--merge", "--base", &supplied_base, "--json"]),
         ),
     ] {
         let merge = guarded_sync(&workspace, &sentinel_path, &sentinel_dir, &args, &[], label);
