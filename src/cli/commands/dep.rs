@@ -105,7 +105,7 @@ fn execute_dep_add(
         ctx,
         local_beads_dir,
         auto_flush_external,
-        external_warning,
+        external_warning.as_deref(),
     )
 }
 
@@ -605,7 +605,7 @@ fn dep_add(
     ctx: &OutputContext,
     local_beads_dir: &Path,
     auto_flush_external: bool,
-    external_warning: Option<String>,
+    external_warning: Option<&str>,
 ) -> Result<()> {
     let issue_id = resolve_issue_id(&storage_ctx.storage, resolver, &args.issue)?;
 
@@ -657,7 +657,7 @@ fn dep_add(
             depends_on_id: depends_on_id.clone(),
             dep_type: dep_type.as_str().to_string(),
             action: if added { "added" } else { "already_exists" }.to_string(),
-            warnings: external_warning.iter().cloned().collect(),
+            warnings: external_warning.into_iter().map(str::to_string).collect(),
         };
         if ctx.is_toon() {
             ctx.toon(&result);
@@ -708,7 +708,7 @@ fn dep_add(
     }
     // Human modes only: `warning` is silent in JSON/TOON, which carry it in
     // the result's `warnings` field instead.
-    if let Some(warning) = &external_warning {
+    if let Some(warning) = external_warning {
         ctx.warning(warning);
     }
 
