@@ -57,14 +57,24 @@ fn schema_heal_restore_preserves_known_local_source_repo_path() {
             let plan = [preserved(local)];
             for _ in 0..2 {
                 sync::restore_dirty_issues_after_rebuild(&mut storage, &plan).unwrap();
-                assert_eq!(stored_path(&storage, &imported.id).as_deref(), Some(local_path));
-                assert_eq!(stored_path(&storage, &unrelated.id).as_deref(), Some("/unrelated/workspace"));
+                assert_eq!(
+                    stored_path(&storage, &imported.id).as_deref(),
+                    Some(local_path)
+                );
+                assert_eq!(
+                    stored_path(&storage, &unrelated.id).as_deref(),
+                    Some("/unrelated/workspace")
+                );
                 assert_eq!(storage.get_issue(&unrelated.id).unwrap(), unrelated_before);
             }
             let dirty = storage
                 .execute_raw_query("SELECT issue_id FROM dirty_issues")
                 .unwrap();
-            assert!(dirty.iter().any(|row| row[0].as_text() == Some(imported.id.as_str())));
+            assert!(
+                dirty
+                    .iter()
+                    .any(|row| row[0].as_text() == Some(imported.id.as_str()))
+            );
         }
     }
 }
@@ -79,8 +89,14 @@ fn ordinary_import_still_keeps_the_existing_local_source_repo_path() {
     incoming.updated_at += chrono::Duration::seconds(1);
     incoming.source_repo_path = Some("/foreign/clone".to_owned());
     storage.upsert_issue_for_import(&incoming).unwrap();
-    assert_eq!(storage.get_issue(&local.id).unwrap().unwrap().title, incoming.title);
-    assert_eq!(stored_path(&storage, &local.id).as_deref(), Some("/this/clone"));
+    assert_eq!(
+        storage.get_issue(&local.id).unwrap().unwrap().title,
+        incoming.title
+    );
+    assert_eq!(
+        stored_path(&storage, &local.id).as_deref(),
+        Some("/this/clone")
+    );
 }
 
 #[test]
@@ -93,9 +109,13 @@ fn schema_heal_restore_with_absent_local_path_keeps_imported_provenance() {
         local.title = "saved local edit".to_owned();
         local.source_repo_path = None;
         for _ in 0..2 {
-            sync::restore_dirty_issues_after_rebuild(&mut storage, &[preserved(local.clone())]).unwrap();
+            sync::restore_dirty_issues_after_rebuild(&mut storage, &[preserved(local.clone())])
+                .unwrap();
             assert_eq!(stored_path(&storage, &local.id).as_deref(), imported_path);
-            assert_eq!(storage.get_issue(&local.id).unwrap().unwrap().title, local.title);
+            assert_eq!(
+                storage.get_issue(&local.id).unwrap().unwrap().title,
+                local.title
+            );
         }
     }
 }
@@ -105,8 +125,12 @@ fn schema_heal_restore_inserts_a_missing_local_issue_with_its_provenance() {
     let mut storage = SqliteStorage::open_memory().unwrap();
     let local = issue("lp-new", Some("/local/workspace"));
     for _ in 0..2 {
-        sync::restore_dirty_issues_after_rebuild(&mut storage, &[preserved(local.clone())]).unwrap();
-        assert_eq!(stored_path(&storage, &local.id).as_deref(), Some("/local/workspace"));
+        sync::restore_dirty_issues_after_rebuild(&mut storage, &[preserved(local.clone())])
+            .unwrap();
+        assert_eq!(
+            stored_path(&storage, &local.id).as_deref(),
+            Some("/local/workspace")
+        );
     }
 }
 
@@ -124,29 +148,54 @@ fn schema_heal_restore_rolls_back_local_provenance_on_later_conflict() {
     .unwrap();
     imported.comments.push(peer_comment);
     storage.create_issue(&imported, "test").unwrap();
-    storage.sync_comments_for_import(&imported.id, &imported.comments).unwrap();
+    storage
+        .sync_comments_for_import(&imported.id, &imported.comments)
+        .unwrap();
     let mut owner = issue("lp-owner", Some("/owner/workspace"));
     owner.external_ref = Some("unique-restoration-reference".to_owned());
     storage.create_issue(&owner, "test").unwrap();
-    let issues_before = storage.execute_raw_query("SELECT * FROM issues ORDER BY id").unwrap();
-    let dirty_before = storage.execute_raw_query("SELECT * FROM dirty_issues ORDER BY issue_id").unwrap();
+    let issues_before = storage
+        .execute_raw_query("SELECT * FROM issues ORDER BY id")
+        .unwrap();
+    let dirty_before = storage
+        .execute_raw_query("SELECT * FROM dirty_issues ORDER BY issue_id")
+        .unwrap();
     let comments_before = storage.get_comments(&imported.id).unwrap();
     let mut local = imported.clone();
     local.title = "this change must roll back".to_owned();
     local.source_repo_path = Some("/local/workspace".to_owned());
     let mut conflicting = issue("lp-new", None);
     conflicting.external_ref.clone_from(&owner.external_ref);
-    assert!(sync::restore_dirty_issues_after_rebuild(
-        &mut storage,
-        &[preserved(local.clone()), preserved(conflicting)],
-    ).is_err());
-    assert_eq!(storage.execute_raw_query("SELECT * FROM issues ORDER BY id").unwrap(), issues_before);
-    assert_eq!(storage.execute_raw_query("SELECT * FROM dirty_issues ORDER BY issue_id").unwrap(), dirty_before);
+    assert!(
+        sync::restore_dirty_issues_after_rebuild(
+            &mut storage,
+            &[preserved(local.clone()), preserved(conflicting)],
+        )
+        .is_err()
+    );
+    assert_eq!(
+        storage
+            .execute_raw_query("SELECT * FROM issues ORDER BY id")
+            .unwrap(),
+        issues_before
+    );
+    assert_eq!(
+        storage
+            .execute_raw_query("SELECT * FROM dirty_issues ORDER BY issue_id")
+            .unwrap(),
+        dirty_before
+    );
     assert_eq!(storage.get_comments(&imported.id).unwrap(), comments_before);
-    assert_eq!(stored_path(&storage, &imported.id).as_deref(), Some("/other/clone"));
+    assert_eq!(
+        stored_path(&storage, &imported.id).as_deref(),
+        Some("/other/clone")
+    );
     // Positive control: neither a permanently quarantined connection nor an
     // invalid first payload may masquerade as successful rollback coverage.
     sync::restore_dirty_issues_after_rebuild(&mut storage, &[preserved(local)]).unwrap();
-    assert_eq!(stored_path(&storage, &imported.id).as_deref(), Some("/local/workspace"));
+    assert_eq!(
+        stored_path(&storage, &imported.id).as_deref(),
+        Some("/local/workspace")
+    );
     assert_eq!(storage.get_comments(&imported.id).unwrap(), comments_before);
 }
