@@ -1250,6 +1250,18 @@ that database and older than seven days. Failed or interrupted recovery runs,
 and schema-migration runs (which `br doctor migrate-schema undo` needs), are
 never removed automatically.
 
+### Error: "fsqlite refused its namespace sidecar ... not the current user"
+
+**Cause:** a tracker belongs to one Unix user by default. FrankenSQLite admits
+its namespace sidecars (`beads.db-fsqlite-ns-gate`, `beads.db-fsqlite-ns-use`)
+only when the user running br owns them, so a second account is refused even
+when group permissions would let it read and write the files. Run br as the
+workspace owner. Unix users who trust each other can share one tracker by
+opting in explicitly with `FSQLITE_TRUSTED_UNIX_DATABASE` and
+`FSQLITE_TRUSTED_UNIX_GID`; the required group, ownership and modes, and what
+stays refused, are in
+[Explicit trusted Unix group sharing](docs/reliability/ENGINE_OPERATING_MODEL.md#explicit-trusted-unix-group-sharing-533).
+
 ### Command Output is Garbled
 
 ```bash

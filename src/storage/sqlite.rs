@@ -17771,7 +17771,7 @@ fn explain_engine_open_error(
             let mode = metadata.permissions().mode();
             if metadata.uid() != effective_uid() {
                 return BeadsError::Config(format!(
-                    "fsqlite refused its namespace sidecar {} because it is owned by uid {}, not the current user (uid {}). Database integrity remains unverified. Run br as the workspace owner, or have that owner correct the database-family ownership while no br process is using the workspace",
+                    "fsqlite refused its namespace sidecar {} because it is owned by uid {}, not the current user (uid {}). Database integrity remains unverified. Run br as the workspace owner, or have that owner correct the database-family ownership while no br process is using the workspace. Separate Unix users who trust each other can share one tracker only through the explicit FSQLITE_TRUSTED_UNIX_DATABASE / FSQLITE_TRUSTED_UNIX_GID opt-in (see docs/reliability/ENGINE_OPERATING_MODEL.md)",
                     path.display(),
                     metadata.uid(),
                     effective_uid(),
