@@ -159,6 +159,21 @@ those intentions. The refusal occurs before the requested command and rolls
 back the whole import, including earlier rows and synchronization receipts.
 JSONL and the merge anchor remain intact for explicit reconciliation.
 
+A newer row is held to the project workflow policy when `.beads/policy.yaml`
+enforces `workflow.transitions` (GitHub #540). Import sees only the status
+another clone ended at, so it asks whether any sequence of permitted moves
+leads from the local status to the incoming one. With `open: [in_progress]`
+and `in_progress: [closed]`, an `open` issue may arrive `closed`; with
+`closed: []`, nothing may follow `closed`. A row that fails this check is not
+applied. Automatic import refuses, as above, naming the issue and both
+statuses. Explicit `sync --import-only` and `sync --reconcile` keep the local
+row, apply every other row, list the kept rows (`workflow_refused` in import
+JSON, `skipped_workflow` and `workflow_kept_ids` in the reconcile receipt),
+and leave the local row for the next flush to republish. Deletions and closes
+recorded with an audited `--bypass-policy` reason are not refused.
+`sync --import-only --force` rebuilds the database from JSONL when the JSONL
+should win instead.
+
 An explicit import still uses the normal local-winner and tombstone rules. When
 an imported row differs from a preserved local version, `needs_flush` records
 the outstanding reconciliation. That flag does not authorize a full export to

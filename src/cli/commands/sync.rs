@@ -234,6 +234,12 @@ pub struct ImportResultOutput {
     /// Omitted entirely when no rename happened (legacy JSON shape).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub prefix_renames: Vec<crate::sync::ImportPrefixRename>,
+    /// Newer JSONL rows not applied because the workflow policy cannot reach
+    /// their status from the local one (GitHub #540); also counted in
+    /// `skipped`. The local rows are republished on the next flush. Omitted
+    /// when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub workflow_refused: Vec<crate::sync::ImportWorkflowRefusal>,
     /// Present when --skip-invalid-records published a recovered JSONL source.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub salvage: Option<JsonlSalvageReceipt>,
@@ -387,6 +393,10 @@ pub struct ReconcilePlanCounts {
     pub skipped_older: usize,
     /// Rows skipped by tombstone protection.
     pub skipped_tombstone: usize,
+    /// Newer rows skipped because the workflow policy cannot reach their
+    /// status from the DB status (GitHub #540). Omitted when zero.
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub skipped_workflow: usize,
     /// Always 0: additive reconciliation cannot delete.
     pub deleted: usize,
     /// Exportable DB issues absent from the JSONL row set (never touched).
@@ -402,6 +412,10 @@ pub struct ReconcileIdPreviews {
     pub updated_ids: Vec<String>,
     /// First exportable DB-only ids (sorted).
     pub db_only_ids: Vec<String>,
+    /// First ids (sorted) whose DB status the workflow policy kept.
+    /// Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub workflow_kept_ids: Vec<String>,
     /// Per-list truncation cap; counts in `plan` reflect true totals.
     pub preview_limit: usize,
 }
@@ -3467,6 +3481,7 @@ fn emit_auto_rebuild_import_result(
         blocked_cache_rebuilt: true,
         exact_duplicate_comments_deduplicated: 0,
         prefix_renames: Vec::new(),
+        workflow_refused: Vec::new(),
         salvage: None,
     };
     if use_json {
@@ -3563,6 +3578,7 @@ fn execute_import(
                 blocked_cache_rebuilt: false,
                 exact_duplicate_comments_deduplicated: 0,
                 prefix_renames: Vec::new(),
+                workflow_refused: Vec::new(),
                 salvage: None,
             };
             ctx.json_pretty(&result);
@@ -3732,6 +3748,7 @@ fn execute_import(
                         blocked_cache_rebuilt: false,
                         exact_duplicate_comments_deduplicated: 0,
                         prefix_renames: Vec::new(),
+                        workflow_refused: Vec::new(),
                         salvage: salvage_receipt.clone(),
                     };
                     ctx.json_pretty(&result);
@@ -4034,6 +4051,7 @@ fn execute_import(
         blocked_cache_rebuilt: true,
         exact_duplicate_comments_deduplicated: import_result.exact_duplicate_comments_deduplicated,
         prefix_renames: import_result.prefix_renames.clone(),
+        workflow_refused: import_result.workflow_refusals.clone(),
         salvage: salvage_receipt.clone(),
     };
 
@@ -4068,6 +4086,9 @@ fn execute_import(
                     salvage.database_records_requiring_export
                 ));
             }
+        }
+        for line in workflow_refusal_report(&result.workflow_refused) {
+            ctx.warning(&line);
         }
     } else {
         let processed = import_result.imported_count
@@ -4143,10 +4164,44 @@ fn execute_import(
                 );
             }
         }
+        for line in workflow_refusal_report(&result.workflow_refused) {
+            println!("  {line}");
+        }
         println!("  Rebuilt blocked cache");
     }
 
     Ok(published_salvage_source)
+}
+
+/// Human-readable lines for newer JSONL rows the workflow policy kept out
+/// (GitHub #540), bounded like the other import witnesses.
+fn workflow_refusal_report(refusals: &[crate::sync::ImportWorkflowRefusal]) -> Vec<String> {
+    if refusals.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "Kept the local status of {} issue(s): .beads/policy.yaml workflow.transitions does not allow the JSONL status after it",
+        refusals.len()
+    )];
+    lines.extend(refusals.iter().take(HUMAN_WITNESS_LIMIT).map(|refusal| {
+        format!(
+            "  {}: kept '{}', JSONL has '{}'",
+            sanitize_terminal_inline(&refusal.id),
+            sanitize_terminal_inline(&refusal.local_status),
+            sanitize_terminal_inline(&refusal.jsonl_status)
+        )
+    }));
+    if refusals.len() > HUMAN_WITNESS_LIMIT {
+        lines.push(format!(
+            "  ... {} more; use --json for the complete list",
+            refusals.len() - HUMAN_WITNESS_LIMIT
+        ));
+    }
+    lines.push(
+        "The next flush republishes the kept rows; `br sync --import-only --force` rebuilds the database from the JSONL instead"
+            .to_string(),
+    );
+    lines
 }
 
 /// Render import result with rich formatting.
@@ -4366,6 +4421,7 @@ fn build_reconcile_receipt(
             skipped_equal: plan.count_kind(ReconcileActionKind::SkipEqual),
             skipped_older: plan.count_kind(ReconcileActionKind::SkipOlder),
             skipped_tombstone: plan.count_kind(ReconcileActionKind::SkipTombstone),
+            skipped_workflow: plan.count_kind(ReconcileActionKind::SkipWorkflow),
             deleted: 0,
             db_only: plan.db_only_ids.len(),
         },
@@ -4373,6 +4429,9 @@ fn build_reconcile_receipt(
             created_ids: truncate(plan.target_ids_for_kind(ReconcileActionKind::Create)),
             updated_ids: truncate(plan.target_ids_for_kind(ReconcileActionKind::Update)),
             db_only_ids: db_only_preview,
+            workflow_kept_ids: truncate(
+                plan.target_ids_for_kind(ReconcileActionKind::SkipWorkflow),
+            ),
             preview_limit: RECONCILE_PREVIEW_LIMIT,
         },
         relations: ReconcileRelationCounts {
@@ -4412,6 +4471,19 @@ fn render_reconcile_receipt_text(receipt: &SyncReconcileReceipt) {
         "  Skipped: {} equal, {} older-in-JSONL, {} tombstone-protected",
         receipt.plan.skipped_equal, receipt.plan.skipped_older, receipt.plan.skipped_tombstone
     );
+    if receipt.plan.skipped_workflow > 0 {
+        let ids = receipt
+            .previews
+            .workflow_kept_ids
+            .iter()
+            .map(|id| sanitize_terminal_inline(id).into_owned())
+            .collect::<Vec<_>>();
+        println!(
+            "  Workflow-protected: {} (local status kept; workflow.transitions does not allow the JSONL status after it): {}",
+            receipt.plan.skipped_workflow,
+            ids.join(", ")
+        );
+    }
     if receipt.plan.db_only > 0 {
         println!(
             "  DB-only issues (absent from JSONL, untouched): {}",

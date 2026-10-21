@@ -3802,6 +3802,20 @@ pub struct ImportPrefixRename {
     pub fallback: Option<String>,
 }
 
+/// A newer JSONL row that import did not apply because the project workflow
+/// policy cannot reach its status from the local one (GitHub #540), such as
+/// a reopen under `closed: []`. The local row is kept and republished on the
+/// next flush.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ImportWorkflowRefusal {
+    /// Local issue id the JSONL row matched.
+    pub id: String,
+    /// Status kept from the local database.
+    pub local_status: String,
+    /// Status the JSONL row carries.
+    pub jsonl_status: String,
+}
+
 /// Result of a JSONL import.
 #[derive(Debug, Clone, Default)]
 pub struct ImportResult {
@@ -3839,6 +3853,10 @@ pub struct ImportResult {
     /// Old-id -> new-id receipt for `--rename-prefix` rewrites (empty when
     /// the flag was off or no id needed renaming).
     pub prefix_renames: Vec<ImportPrefixRename>,
+    /// Newer JSONL rows kept out because the workflow policy cannot reach
+    /// their status from the local one. Each is also counted in
+    /// `skipped_count`.
+    pub workflow_refusals: Vec<ImportWorkflowRefusal>,
     /// Complete semantic post-state expected for every issue row written by
     /// this import. Fresh-family rebuilds verify these witnesses after all
     /// VACUUM/REINDEX/compaction work so a storage-engine field shift cannot
@@ -14527,8 +14545,13 @@ pub enum CollisionAction {
     Insert,
     /// Update the existing issue.
     Update { existing_id: String },
-    /// Skip this issue (existing is newer or it's a tombstone).
-    Skip { reason: String },
+    /// Skip this issue (existing is newer or it's a tombstone, or the
+    /// workflow policy cannot reach the incoming status).
+    Skip {
+        reason: String,
+        /// Set when a newer row was kept out by the workflow policy.
+        workflow_refusal: Option<ImportWorkflowRefusal>,
+    },
 }
 
 /// Detect collision for an incoming issue using the 4-phase algorithm with preloaded metadata maps.
@@ -14654,12 +14677,54 @@ fn detect_import_collision(
     }
 }
 
+/// A newer JSONL row whose status the workflow policy cannot reach from the
+/// local status (GitHub #540), such as a stale open copy of an issue closed
+/// under `closed: []`. Reachability, not a single edge, is the test: import
+/// sees only the end state of a peer's sequence of permitted moves.
+/// Deletion is not a workflow transition, and a close recorded with an
+/// audited policy bypass is taken as recorded, as `br close --bypass-policy`
+/// is at the storage chokepoint.
+fn workflow_import_refusal(
+    workflow: &crate::close_policy::Workflow,
+    existing_id: &str,
+    existing: &crate::storage::sqlite::IssueMetadata,
+    incoming: &Issue,
+) -> Option<ImportWorkflowRefusal> {
+    let audited_bypass_close = incoming.status == crate::model::Status::Closed
+        && incoming.bypassed_policy == Some(true)
+        && incoming
+            .bypass_reason
+            .as_deref()
+            .is_some_and(|reason| !reason.trim().is_empty());
+    if incoming.status == crate::model::Status::Tombstone
+        || audited_bypass_close
+        || workflow.status_reachable(
+            existing.status.as_str(),
+            incoming.status.as_str(),
+            &[existing.issue_type.as_str(), incoming.issue_type.as_str()],
+        )
+    {
+        return None;
+    }
+    Some(ImportWorkflowRefusal {
+        id: existing_id.to_string(),
+        local_status: existing.status.as_str().to_string(),
+        jsonl_status: incoming.status.as_str().to_string(),
+    })
+}
+
 /// Determine the action to take based on collision result.
+///
+/// `workflow` is the installed policy when it enforces transitions; a newer
+/// row it cannot reach is skipped like a row the local database wins, so the
+/// local revision is kept and republished. `force_upsert` (an explicit
+/// "JSONL wins") bypasses that check as it bypasses timestamps.
 fn determine_action(
     collision: &CollisionResult,
     incoming: &Issue,
     meta_by_id: &std::collections::HashMap<String, crate::storage::sqlite::IssueMetadata>,
     force_upsert: bool,
+    workflow: Option<&crate::close_policy::Workflow>,
 ) -> Result<CollisionAction> {
     match collision {
         CollisionResult::NewIssue => Ok(CollisionAction::Insert),
@@ -14682,6 +14747,7 @@ fn determine_action(
             if existing_meta.status == crate::model::Status::Tombstone {
                 return Ok(CollisionAction::Skip {
                     reason: format!("Tombstone protection: {existing_id}"),
+                    workflow_refusal: None,
                 });
             }
 
@@ -14694,14 +14760,29 @@ fn determine_action(
 
             // Last-write-wins: compare updated_at
             match incoming.updated_at.cmp(&existing_meta.updated_at) {
-                std::cmp::Ordering::Greater => Ok(CollisionAction::Update {
-                    existing_id: existing_id.clone(),
-                }),
+                std::cmp::Ordering::Greater => Ok(workflow
+                    .and_then(|workflow| {
+                        workflow_import_refusal(workflow, existing_id, existing_meta, incoming)
+                    })
+                    .map_or_else(
+                        || CollisionAction::Update {
+                            existing_id: existing_id.clone(),
+                        },
+                        |refusal| CollisionAction::Skip {
+                            reason: format!(
+                                "Workflow policy cannot reach '{}' from '{}': {existing_id}",
+                                refusal.jsonl_status, refusal.local_status
+                            ),
+                            workflow_refusal: Some(refusal),
+                        },
+                    )),
                 std::cmp::Ordering::Equal => Ok(CollisionAction::Skip {
                     reason: format!("Equal timestamps: {existing_id}"),
+                    workflow_refusal: None,
                 }),
                 std::cmp::Ordering::Less => Ok(CollisionAction::Skip {
                     reason: format!("Existing is newer: {existing_id}"),
+                    workflow_refusal: None,
                 }),
             }
         }
@@ -14955,6 +15036,10 @@ struct ImportMetadataMaps {
     /// `Some` for imports; enables the ID-collision checks in
     /// `detect_import_collision`.
     incoming_identity: Option<IncomingIssueIdentity>,
+    /// The installed workflow policy, when it enforces transitions. Every
+    /// classifier (import scan, import apply, reconcile plan and apply) reads
+    /// it from here, so they agree on which rows are applied (GitHub #540).
+    workflow: Option<crate::close_policy::Workflow>,
 }
 
 #[derive(Debug, Default)]
@@ -15240,11 +15325,13 @@ fn load_import_metadata_maps(storage: &SqliteStorage) -> Result<ImportMetadataMa
         meta_by_id.insert(issue_id, metadata);
     }
 
+    let workflow = storage.workflow_policy();
     Ok(ImportMetadataMaps {
         meta_by_id,
         id_by_ext_ref,
         id_by_hash,
         incoming_identity: None,
+        workflow: workflow.transitions_enforced().then_some(workflow),
     })
 }
 
@@ -15306,6 +15393,7 @@ fn scan_import_collision_renames(
             &issue,
             &metadata.meta_by_id,
             config.force_upsert,
+            metadata.workflow.as_ref(),
         )?;
         let target_id = match &collision {
             CollisionResult::Match { existing_id, .. } => existing_id.clone(),
@@ -15680,7 +15768,26 @@ fn stream_import_actions_in_tx(
                 &issue,
                 &metadata.meta_by_id,
                 config.force_upsert,
+                metadata.workflow.as_ref(),
             )?;
+            // Like any other skipped row that differs from the database
+            // (GitHub #571), automatic import cannot keep the local revision
+            // on its own authority. This error rolls back the whole import.
+            if mode == ImportMode::Automatic
+                && let CollisionAction::Skip {
+                    workflow_refusal: Some(refusal),
+                    ..
+                } = &action
+            {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "JSONL issue '{id}' has status '{jsonl}', which the project workflow policy (.beads/policy.yaml workflow.transitions) does not allow after the local status '{local}'; no import was applied. Run `br sync --import-only` to import the other rows and keep the local status (the next flush republishes it), or `br sync --import-only --force` to rebuild the database from the JSONL",
+                        id = refusal.id,
+                        jsonl = refusal.jsonl_status,
+                        local = refusal.local_status,
+                    ),
+                });
+            }
             let target_id = match &collision {
                 CollisionResult::Match { existing_id, .. } => existing_id.clone(),
                 CollisionResult::NewIssue => issue.id.clone(),
@@ -16457,12 +16564,24 @@ fn process_import_action(
             result.updated_count += 1;
             record_imported_relation_counts(result, issue);
         }
-        CollisionAction::Skip { reason } => {
+        CollisionAction::Skip {
+            reason,
+            workflow_refusal,
+        } => {
             tracing::debug!(id = %issue.id, reason = %reason, "Skipping issue");
             if reason.starts_with("Tombstone") {
                 result.tombstone_skipped += 1;
             } else {
                 result.skipped_count += 1;
+            }
+            if let Some(refusal) = workflow_refusal {
+                tracing::warn!(
+                    id = %refusal.id,
+                    local_status = %refusal.local_status,
+                    jsonl_status = %refusal.jsonl_status,
+                    "Import kept the local status: the workflow policy cannot reach the JSONL status"
+                );
+                result.workflow_refusals.push(refusal.clone());
             }
         }
     }
@@ -16577,6 +16696,9 @@ pub enum ReconcileActionKind {
     SkipEqual,
     /// DB counterpart is a tombstone; tombstone protection wins.
     SkipTombstone,
+    /// JSONL row is newer, but the workflow policy cannot reach its status
+    /// from the DB status (GitHub #540); leave the DB row alone.
+    SkipWorkflow,
 }
 
 /// One planned JSONL-row action bound to a target issue id.
@@ -16719,7 +16841,11 @@ fn reconcile_kind_for_action(action: &CollisionAction) -> ReconcileActionKind {
     match action {
         CollisionAction::Insert => ReconcileActionKind::Create,
         CollisionAction::Update { .. } => ReconcileActionKind::Update,
-        CollisionAction::Skip { reason } => {
+        CollisionAction::Skip {
+            workflow_refusal: Some(_),
+            ..
+        } => ReconcileActionKind::SkipWorkflow,
+        CollisionAction::Skip { reason, .. } => {
             if reason.starts_with("Tombstone") {
                 ReconcileActionKind::SkipTombstone
             } else if reason.starts_with("Equal timestamps") {
@@ -16772,7 +16898,13 @@ where
             &metadata.meta_by_id,
             &computed_hash,
         );
-        let action = determine_action(&collision, &issue, &metadata.meta_by_id, false)?;
+        let action = determine_action(
+            &collision,
+            &issue,
+            &metadata.meta_by_id,
+            false,
+            metadata.workflow.as_ref(),
+        )?;
         let target_id = match &collision {
             CollisionResult::Match { existing_id, .. } => existing_id.clone(),
             CollisionResult::NewIssue => issue.id.clone(),
@@ -17057,6 +17189,7 @@ fn run_reconcile_apply_tx(
                 ReconcileActionKind::SkipOlder
                     | ReconcileActionKind::SkipEqual
                     | ReconcileActionKind::SkipTombstone
+                    | ReconcileActionKind::SkipWorkflow
             )
         }) {
         Some(storage.build_import_issue_lookup()?)
@@ -17110,7 +17243,8 @@ fn run_reconcile_apply_tx(
                 }
                 ReconcileActionKind::SkipOlder
                 | ReconcileActionKind::SkipEqual
-                | ReconcileActionKind::SkipTombstone => {}
+                | ReconcileActionKind::SkipTombstone
+                | ReconcileActionKind::SkipWorkflow => {}
             }
 
             if let Some((export_id, export_hash)) = export_hash_entry_for_import_action(
@@ -26040,6 +26174,105 @@ mod tests {
         );
     }
 
+    /// GitHub #540: a newer JSONL row whose status the workflow policy cannot
+    /// reach from the local status is a conflict for automatic import and a
+    /// local win for explicit import, like a divergent older row (#571).
+    #[test]
+    fn test_import_keeps_a_closed_issue_the_workflow_cannot_reopen() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage.set_workflow_policy(issue_540_workflow());
+        let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+        let mut closed = make_issue_at("bd-closed", "Closed here", fixed_time(100));
+        closed.status = Status::Closed;
+        closed.closed_at = Some(fixed_time(100));
+        let other = make_issue_at("bd-other", "Unrelated", fixed_time(100));
+        write_jsonl_issues(&jsonl_path, &[&closed, &other]);
+        import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd"),
+        )
+        .unwrap();
+        storage.set_metadata("needs_flush", "false").unwrap();
+
+        // Another clone edited the issue before it saw the close, and also
+        // retitled an unrelated issue.
+        let mut stale_open = make_issue_at("bd-closed", "Edited while open", fixed_time(200));
+        stale_open.status = Status::Open;
+        let mut retitled = other.clone();
+        retitled.title = "Retitled by the peer".to_string();
+        retitled.updated_at = fixed_time(200);
+        // The applicable row comes first, so a refusal must undo a write.
+        write_jsonl_issues(&jsonl_path, &[&retitled, &stale_open]);
+
+        let error = auto_import_if_stale(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            Some("bd"),
+            None,
+            false,
+            false,
+            false,
+        )
+        .expect_err("automatic import must not keep or replace the close on its own");
+        let BeadsError::SyncConflict { message } = &error else {
+            panic!("expected SYNC_CONFLICT, got {error:?}");
+        };
+        assert!(
+            message.contains("'bd-closed'")
+                && message.contains("'open'")
+                && message.contains("'closed'")
+                && message.contains("workflow.transitions"),
+            "{message}"
+        );
+        // The whole import rolled back, including the unrelated newer row.
+        let kept = storage.get_issue("bd-closed").unwrap().unwrap();
+        assert_eq!(kept.status, Status::Closed);
+        assert_eq!(kept.closed_at, Some(fixed_time(100)));
+        assert_eq!(
+            storage.get_issue("bd-other").unwrap().unwrap().title,
+            "Unrelated"
+        );
+        assert_eq!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("false")
+        );
+
+        // An explicit import keeps the local status, applies everything else
+        // and schedules the kept row for republication.
+        let result = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd"),
+        )
+        .unwrap();
+        assert_eq!(result.updated_count, 1);
+        assert_eq!(result.skipped_count, 1);
+        assert_eq!(
+            result.workflow_refusals,
+            vec![ImportWorkflowRefusal {
+                id: "bd-closed".to_string(),
+                local_status: "closed".to_string(),
+                jsonl_status: "open".to_string(),
+            }]
+        );
+        let kept = storage.get_issue("bd-closed").unwrap().unwrap();
+        assert_eq!(kept.status, Status::Closed);
+        assert_eq!(kept.title, "Closed here");
+        assert_eq!(kept.closed_at, Some(fixed_time(100)));
+        assert_eq!(
+            storage.get_issue("bd-other").unwrap().unwrap().title,
+            "Retitled by the peer"
+        );
+        assert_eq!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true")
+        );
+    }
+
     #[test]
     fn test_auto_import_preserves_skipped_defaults_and_authoritative_close_audit() {
         let mut storage = SqliteStorage::open_memory().unwrap();
@@ -29869,12 +30102,12 @@ mod tests {
             phase: 3,
         };
         let (_, _, meta_by_id) = build_collision_maps(&storage);
-        let action = determine_action(&collision, &incoming, &meta_by_id, false).unwrap();
+        let action = determine_action(&collision, &incoming, &meta_by_id, false, None).unwrap();
         assert!(
             matches!(action, CollisionAction::Skip { .. }),
             "expected tombstone skip"
         );
-        if let CollisionAction::Skip { reason } = action {
+        if let CollisionAction::Skip { reason, .. } = action {
             assert!(reason.contains("Tombstone protection"));
         }
     }
@@ -29893,31 +30126,182 @@ mod tests {
         let (_, _, meta_by_id) = build_collision_maps(&storage);
 
         let newer = make_issue_at("bd-1", "Incoming", fixed_time(200));
-        let action = determine_action(&collision, &newer, &meta_by_id, false).unwrap();
+        let action = determine_action(&collision, &newer, &meta_by_id, false, None).unwrap();
         assert!(
             matches!(action, CollisionAction::Update { .. }),
             "expected update action"
         );
 
         let equal = make_issue_at("bd-1", "Incoming", fixed_time(100));
-        let action = determine_action(&collision, &equal, &meta_by_id, false).unwrap();
+        let action = determine_action(&collision, &equal, &meta_by_id, false, None).unwrap();
         assert!(
             matches!(action, CollisionAction::Skip { .. }),
             "expected equal timestamp skip"
         );
-        if let CollisionAction::Skip { reason } = action {
+        if let CollisionAction::Skip { reason, .. } = action {
             assert!(reason.contains("Equal timestamps"));
         }
 
         let older = make_issue_at("bd-1", "Incoming", fixed_time(50));
-        let action = determine_action(&collision, &older, &meta_by_id, false).unwrap();
+        let action = determine_action(&collision, &older, &meta_by_id, false, None).unwrap();
         assert!(
             matches!(action, CollisionAction::Skip { .. }),
             "expected older timestamp skip"
         );
-        if let CollisionAction::Skip { reason } = action {
+        if let CollisionAction::Skip { reason, .. } = action {
             assert!(reason.contains("Existing is newer"));
         }
+    }
+
+    /// GitHub #540's policy, plus a dead-end `blocked` status.
+    fn issue_540_workflow() -> crate::close_policy::Workflow {
+        serde_yml::from_str(
+            r"strict: true
+statuses: [open, in_progress, blocked, closed]
+transitions:
+  initial: [open]
+  open: [in_progress]
+  in_progress: [closed, open, blocked]
+  blocked: []
+  closed: []
+",
+        )
+        .unwrap()
+    }
+
+    /// Store `local` and classify each newer `incoming` row against it by ID.
+    fn classify_against_local(
+        local: &[&Issue],
+    ) -> impl Fn(&Issue, bool, Option<&crate::close_policy::Workflow>) -> CollisionAction + use<>
+    {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for issue in local {
+            storage.create_issue(issue, "test").unwrap();
+        }
+        let (_, _, meta_by_id) = build_collision_maps(&storage);
+        move |incoming, force, workflow| {
+            let collision = CollisionResult::Match {
+                existing_id: incoming.id.clone(),
+                match_type: MatchType::Id,
+                phase: 2,
+            };
+            determine_action(&collision, incoming, &meta_by_id, force, workflow).unwrap()
+        }
+    }
+
+    #[test]
+    fn test_determine_action_keeps_a_status_the_workflow_cannot_reach() {
+        let mut closed = make_issue_at("bd-closed", "Closed locally", fixed_time(100));
+        closed.status = Status::Closed;
+        closed.closed_at = Some(fixed_time(100));
+        let open = make_issue_at("bd-open", "Open locally", fixed_time(100));
+        let classify = classify_against_local(&[&closed, &open]);
+        let workflow = issue_540_workflow();
+
+        // A newer stale open copy of the closed issue is kept out.
+        let mut reopened = make_issue_at("bd-closed", "Edited before the close", fixed_time(200));
+        reopened.status = Status::Open;
+        match classify(&reopened, false, Some(&workflow)) {
+            CollisionAction::Skip {
+                reason,
+                workflow_refusal: Some(refusal),
+            } => {
+                assert!(reason.starts_with("Workflow policy"), "{reason}");
+                assert_eq!(
+                    refusal,
+                    ImportWorkflowRefusal {
+                        id: "bd-closed".to_string(),
+                        local_status: "closed".to_string(),
+                        jsonl_status: "open".to_string(),
+                    }
+                );
+            }
+            other => panic!("expected a workflow skip, got {other:?}"),
+        }
+        // Without an enforced policy, or with an explicit JSONL winner, the
+        // newer row is applied as before.
+        for (force, policy) in [(false, None), (true, Some(&workflow))] {
+            assert!(
+                matches!(
+                    classify(&reopened, force, policy),
+                    CollisionAction::Update { .. }
+                ),
+                "force={force} policy={}",
+                policy.is_some()
+            );
+        }
+
+        // Same status, deletion, and multi-step progressions are permitted.
+        let mut retitled = closed.clone();
+        retitled.title = "Retitled after the close".to_string();
+        retitled.updated_at = fixed_time(200);
+        let mut deleted = closed.clone();
+        deleted.status = Status::Tombstone;
+        deleted.updated_at = fixed_time(200);
+        let mut finished = open.clone();
+        finished.status = Status::Closed;
+        finished.closed_at = Some(fixed_time(200));
+        finished.updated_at = fixed_time(200);
+        for incoming in [&retitled, &deleted, &finished] {
+            assert!(
+                matches!(
+                    classify(incoming, false, Some(&workflow)),
+                    CollisionAction::Update { .. }
+                ),
+                "{} -> {}",
+                incoming.id,
+                incoming.status.as_str()
+            );
+        }
+
+        // An older or equal row keeps its ordinary skip reason.
+        let mut stale = reopened;
+        stale.updated_at = fixed_time(50);
+        assert!(matches!(
+            classify(&stale, false, Some(&workflow)),
+            CollisionAction::Skip {
+                workflow_refusal: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_determine_action_admits_only_an_audited_bypass_close_from_a_dead_end() {
+        let mut blocked = make_issue_at("bd-blocked", "Blocked locally", fixed_time(100));
+        blocked.status = Status::Blocked;
+        let classify = classify_against_local(&[&blocked]);
+        let workflow = issue_540_workflow();
+
+        // `blocked: []` is a dead end; only a close recorded with a bypass
+        // reason, as `br close --bypass-policy` writes it, leaves it.
+        let mut bypassed = blocked.clone();
+        bypassed.status = Status::Closed;
+        bypassed.closed_at = Some(fixed_time(200));
+        bypassed.updated_at = fixed_time(200);
+        bypassed.bypassed_policy = Some(true);
+        assert!(matches!(
+            classify(&bypassed, false, Some(&workflow)),
+            CollisionAction::Skip {
+                workflow_refusal: Some(_),
+                ..
+            }
+        ));
+        bypassed.bypass_reason = Some("Abandoned upstream".to_string());
+        assert!(matches!(
+            classify(&bypassed, false, Some(&workflow)),
+            CollisionAction::Update { .. }
+        ));
+        let mut unblocked = blocked;
+        unblocked.status = Status::Open;
+        unblocked.updated_at = fixed_time(200);
+        assert!(matches!(
+            classify(&unblocked, false, Some(&workflow)),
+            CollisionAction::Skip {
+                workflow_refusal: Some(_),
+                ..
+            }
+        ));
     }
 
     #[test]

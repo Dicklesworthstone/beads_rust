@@ -1952,6 +1952,52 @@ impl Workflow {
             }
         }
     }
+
+    /// True when `to` can follow `from` through zero or more permitted
+    /// transitions (GitHub #540).
+    ///
+    /// Import sees only the end state another clone reached, so it cannot
+    /// require a single direct edge: `open -> closed` is a legitimate
+    /// result of `open -> in_progress -> closed`. A status that no sequence
+    /// of permitted moves can reach from `from` (reopening under
+    /// `closed: []`, for example) cannot be a later revision of the local
+    /// row under this policy. Class edges count for every listed issue type,
+    /// so a row whose type changed is judged by both its local and incoming
+    /// type. Always true when transition enforcement is off.
+    #[must_use]
+    pub fn status_reachable(&self, from: &str, to: &str, issue_types: &[&str]) -> bool {
+        if !self.transitions_enforced() || from.to_lowercase() == to.to_lowercase() {
+            return true;
+        }
+        let target = to.to_lowercase();
+        let issue_types: Vec<String> = issue_types.iter().map(|t| t.to_lowercase()).collect();
+        let mut seen = std::collections::HashSet::from([from.to_lowercase()]);
+        let mut frontier = vec![from.to_lowercase()];
+        while let Some(status) = frontier.pop() {
+            let class_targets = self
+                .class_transitions
+                .iter()
+                .filter(|rule| {
+                    rule.from.to_lowercase() == status
+                        && issue_types.contains(&rule.issue_type.to_lowercase())
+                })
+                .map(|rule| rule.to.clone());
+            for next in self
+                .allowed_targets_from(&status)
+                .into_iter()
+                .chain(class_targets)
+            {
+                let next = next.to_lowercase();
+                if next == target {
+                    return true;
+                }
+                if seen.insert(next.clone()) {
+                    frontier.push(next);
+                }
+            }
+        }
+        false
+    }
 }
 
 fn capacity_validation_error(reason: impl Into<String>) -> BeadsError {
@@ -5322,6 +5368,66 @@ capacity:
                 "deferred".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn status_reachable_follows_multi_step_paths_but_not_forbidden_reopens() {
+        // GitHub #540: the reporter's policy.
+        let workflow: Workflow = serde_yml::from_str(
+            r"strict: true
+statuses: [open, in_progress, closed]
+transitions:
+  initial: [open]
+  open: [in_progress]
+  in_progress: [closed, open]
+  closed: []
+",
+        )
+        .unwrap();
+        // A peer may legitimately close an open issue in two steps.
+        assert!(workflow.status_reachable("open", "closed", &["task"]));
+        assert!(workflow.status_reachable("in_progress", "open", &["task"]));
+        assert!(workflow.status_reachable("CLOSED", "closed", &["task"]));
+        // Nothing leaves `closed`, whatever the path.
+        for to in ["open", "in_progress"] {
+            assert!(!workflow.status_reachable("closed", to, &["task"]), "{to}");
+        }
+        // A status no rule names is unreachable.
+        assert!(!workflow.status_reachable("open", "deferred", &["task"]));
+
+        // The wildcard source applies at every step.
+        let mut wildcard = workflow.clone();
+        wildcard
+            .transitions
+            .insert("any".to_string(), vec!["open".to_string()]);
+        assert!(wildcard.status_reachable("closed", "in_progress", &[]));
+
+        // Advisory mode never refuses.
+        let mut advisory = workflow;
+        advisory.strict = false;
+        assert!(advisory.status_reachable("closed", "open", &[]));
+    }
+
+    #[test]
+    fn status_reachable_uses_class_edges_only_for_listed_types() {
+        let workflow = class_transition_workflow();
+        // draft -> planning -> open is global; draft -> open is bug-only, but
+        // reachable either way. Nothing leaves `open` or `closed`.
+        assert!(workflow.status_reachable("draft", "open", &["task"]));
+        assert!(!workflow.status_reachable("open", "draft", &["bug"]));
+        assert!(!workflow.status_reachable("closed", "open", &["bug", "task"]));
+
+        let mut workflow = class_transition_workflow();
+        workflow.class_transitions.push(ClassTransition {
+            issue_type: "Bug".to_string(),
+            from: "closed".to_string(),
+            to: "planning".to_string(),
+        });
+        // closed -> planning -> open exists only for bugs; either side of a
+        // type change may supply the class edge.
+        assert!(!workflow.status_reachable("closed", "open", &["task"]));
+        assert!(workflow.status_reachable("closed", "open", &["task", "BUG"]));
+        assert!(!workflow.status_reachable("closed", "draft", &["bug"]));
     }
 
     #[test]

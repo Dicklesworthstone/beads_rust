@@ -2549,6 +2549,11 @@ schemas:
             type: integer
             format: uint
             minimum: 0
+          skipped_workflow:
+            description: "Newer rows skipped because the workflow policy cannot reach their\nstatus from the DB status (GitHub #540). Omitted when zero."
+            type: integer
+            format: uint
+            minimum: 0
           deleted:
             description: "Always 0: additive reconciliation cannot delete."
             type: integer
@@ -2574,6 +2579,10 @@ schemas:
             items.type: string
           db_only_ids:
             description: First exportable DB-only ids (sorted).
+            type: array
+            items.type: string
+          workflow_kept_ids:
+            description: "First ids (sorted) whose DB status the workflow policy kept.\nOmitted when empty."
             type: array
             items.type: string
           preview_limit:

@@ -20,6 +20,10 @@
 //! local winner over a differing older/equal external revision. A rejected
 //! import rolls back its writes and preserves publication receipts. Legacy
 //! receipts produced before that guard existed cannot authorize a full export.
+//!
+//! #540 applies the same rule to a newer row whose status the workflow policy
+//! cannot reach from the local one: implicit import refuses, explicit import
+//! and reconcile keep the local status and republish it.
 
 mod common;
 
@@ -2179,4 +2183,174 @@ fn e2e_hard_delete_removes_capacity_occupancy_and_preserves_db_health() {
         reconcile.stdout,
         reconcile.stderr
     );
+}
+
+const ISSUE_540_POLICY: &str = "workflow:\n  strict: true\n  statuses: [open, in_progress, closed]\n  transitions:\n    initial: [open]\n    open: [in_progress]\n    in_progress: [closed, open]\n    closed: []\n";
+
+struct Issue540Workspace {
+    workspace: BrWorkspace,
+    path: std::path::PathBuf,
+    /// Closed here; the peer's newer row has it open.
+    id: String,
+    /// Retitled by the peer.
+    other: String,
+    closed_at: Value,
+}
+
+/// The reporter's sequence: create, publish, claim and close under
+/// `closed: []`, then receive a peer generation made of the pre-close rows
+/// with newer timestamps (the peer edited them before it saw the close).
+fn issue_540_workspace() -> Issue540Workspace {
+    let workspace = BrWorkspace::new();
+    checked_br(&workspace, &["init", "--prefix", "t"], "init");
+    fs::write(workspace.root.join(".beads/policy.yaml"), ISSUE_540_POLICY)
+        .expect("write workflow policy");
+    let create = |title: &str, label: &str| {
+        parse_created_json_id(
+            &checked_br(
+                &workspace,
+                &["create", title, "--type", "task", "--json"],
+                label,
+            )
+            .stdout,
+        )
+    };
+    let id = create("Probe", "create_probe");
+    let other = create("Unrelated", "create_other");
+    let path = workspace.root.join(".beads/issues.jsonl");
+    checked_br(&workspace, &["sync", "--flush-only"], "flush_open");
+    let stale = jsonl_records(&path);
+
+    checked_br(
+        &workspace,
+        &["update", &id, "--status", "in_progress"],
+        "claim",
+    );
+    checked_br(&workspace, &["close", &id, "--reason", "done"], "close");
+    let reopen = run_br(&workspace, ["reopen", &id, "--reason", "test"], "reopen");
+    assert!(
+        !reopen.status.success(),
+        "the policy must refuse a reopen: {reopen:?}"
+    );
+    checked_br(&workspace, &["sync", "--flush-only"], "flush_closed");
+    let closed_at = show_without_sync(&workspace, &id, "closed")["closed_at"].clone();
+    assert!(closed_at.is_string(), "close time recorded: {closed_at}");
+
+    let peer: Vec<Value> = stale
+        .into_iter()
+        .map(|mut row| {
+            row["updated_at"] = Value::from("2030-01-01T00:00:00Z");
+            if row["id"] == other.as_str() {
+                row["title"] = Value::from("Retitled by the peer");
+            }
+            row
+        })
+        .collect();
+    assert_eq!(
+        peer.iter().find(|row| row["id"] == id.as_str()).unwrap()["status"],
+        "open"
+    );
+    write_jsonl_records(&path, &peer);
+    Issue540Workspace {
+        workspace,
+        path,
+        id,
+        other,
+        closed_at,
+    }
+}
+
+/// GitHub #540: a clone that edited an issue before it saw the close
+/// publishes a newer open row. Under `closed: []` no command may reopen the
+/// issue, and import must not do it either.
+#[test]
+fn import_keeps_a_close_that_the_workflow_policy_cannot_undo() {
+    for resolution in [
+        vec!["sync", "--import-only", "--json"],
+        vec!["sync", "--reconcile", "--json"],
+    ] {
+        let Issue540Workspace {
+            workspace,
+            path,
+            id,
+            other,
+            closed_at,
+        } = issue_540_workspace();
+        let peer_bytes = fs::read(&path).expect("peer generation");
+
+        // An ordinary command refuses before it runs and changes nothing.
+        let refused = run_br(&workspace, ["list", "--json"], "implicit_import");
+        assert_sync_conflict(&refused);
+        assert!(
+            refused.stdout.contains("workflow.transitions") && refused.stdout.contains(&id),
+            "the refusal names the issue and the policy: {refused:?}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), peer_bytes);
+        let kept = show_without_sync(&workspace, &id, "after_refusal");
+        assert_eq!(kept["status"], "closed");
+        assert_eq!(kept["closed_at"], closed_at);
+        assert_eq!(
+            show_without_sync(&workspace, &other, "other_after_refusal")["title"],
+            "Unrelated"
+        );
+
+        // A reconcile preview reports the protected row.
+        let preview: Value = serde_json::from_str(&extract_json_payload(
+            &checked_br(
+                &workspace,
+                &["sync", "--reconcile", "--dry-run", "--json"],
+                "reconcile_preview",
+            )
+            .stdout,
+        ))
+        .expect("reconcile preview JSON");
+        assert_eq!(preview["plan"]["skipped_workflow"], 1, "{preview}");
+        assert_eq!(preview["plan"]["updated"], 1, "{preview}");
+        assert_eq!(
+            preview["previews"]["workflow_kept_ids"],
+            serde_json::json!([id]),
+            "{preview}"
+        );
+
+        // An explicit import (or reconcile) keeps the close, applies the
+        // other row, and reports what it kept.
+        let label = resolution[1];
+        let output: Value = serde_json::from_str(&extract_json_payload(
+            &checked_br(&workspace, &resolution, label).stdout,
+        ))
+        .expect("explicit sync JSON");
+        if label == "--import-only" {
+            assert_eq!(output["updated"], 1, "{output}");
+            assert_eq!(output["skipped"], 1, "{output}");
+            assert_eq!(
+                output["workflow_refused"],
+                serde_json::json!([{
+                    "id": id,
+                    "local_status": "closed",
+                    "jsonl_status": "open"
+                }]),
+                "{output}"
+            );
+        } else {
+            assert_eq!(output["plan"]["skipped_workflow"], 1, "{output}");
+            assert_eq!(output["apply"]["needs_flush_set"], true, "{output}");
+        }
+        let kept = show_without_sync(&workspace, &id, "after_explicit");
+        assert_eq!(kept["status"], "closed");
+        assert_eq!(kept["closed_at"], closed_at);
+        assert_eq!(
+            show_without_sync(&workspace, &other, "other_after_explicit")["title"],
+            "Retitled by the peer"
+        );
+
+        // The next flush republishes the close; later commands run normally.
+        checked_br(&workspace, &["sync", "--flush-only"], "republish");
+        assert_eq!(jsonl_record(&path, &id)["status"], "closed");
+        assert_eq!(jsonl_record(&path, &other)["title"], "Retitled by the peer");
+        checked_br(&workspace, &["list", "--json"], "list_after_resolution");
+        assert_eq!(
+            show_without_sync(&workspace, &id, "final")["status"],
+            "closed"
+        );
+    }
 }
