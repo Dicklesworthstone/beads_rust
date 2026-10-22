@@ -10,9 +10,10 @@ use crate::config::{
 };
 use crate::error::Result;
 use crate::format::{BlockedIssue, BlockedIssueOutput, BlockedPage, sanitize_terminal_inline};
-use crate::model::IssueType;
+use crate::model::{Issue, IssueType};
 use crate::output::{JsonArrayPageMeta, OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
+use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -242,10 +243,33 @@ fn execute_inner(
         }
         OutputFormat::Text | OutputFormat::Csv => {
             let max_width = if args.wrap { ctx.width() } else { 0 };
-            if matches!(ctx.mode(), OutputMode::Rich) {
-                render_blocked_rich(&blocked_issues, total, args.detailed, storage, max_width);
+            // Hydrate only the displayed page, after filtering and limiting.
+            // Structured, quiet and non-detailed output need no extra reads.
+            let blocker_details = if args.detailed {
+                load_blocker_details(
+                    &blocked_issues,
+                    |ids| storage.get_issues_by_ids(ids),
+                    |id| storage.get_issue(id),
+                )
             } else {
-                print_text_output(&blocked_issues, total, args.detailed, storage, max_width);
+                HashMap::new()
+            };
+            if matches!(ctx.mode(), OutputMode::Rich) {
+                render_blocked_rich(
+                    &blocked_issues,
+                    total,
+                    args.detailed,
+                    &blocker_details,
+                    max_width,
+                );
+            } else {
+                print_text_output(
+                    &blocked_issues,
+                    total,
+                    args.detailed,
+                    &blocker_details,
+                    max_width,
+                );
             }
         }
     }
@@ -374,11 +398,46 @@ fn filter_by_labels(
     Ok(())
 }
 
+/// Load each displayed blocker once, not once per edge (GitHub #574).
+/// The storage batch reader owns SQLite parameter-limit chunking. On a
+/// failed batch, retain the existing best-effort per-issue presentation:
+/// one unreadable row must not hide the other blockers' details.
+fn load_blocker_details(
+    blocked_issues: &[BlockedIssue],
+    mut load_batch: impl FnMut(&[String]) -> Result<Vec<Issue>>,
+    mut load_one: impl FnMut(&str) -> Result<Option<Issue>>,
+) -> HashMap<String, Issue> {
+    let mut ids: Vec<String> = blocked_issues
+        .iter()
+        .flat_map(|blocked| &blocked.blocked_by)
+        .map(|reference| blocker_id_from_ref(reference).to_string())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return HashMap::new();
+    }
+
+    let issues = match load_batch(&ids) {
+        Ok(issues) => issues,
+        Err(error) => {
+            tracing::debug!(%error, "Batch blocker details unavailable; reading individually");
+            ids.iter()
+                .filter_map(|id| load_one(id).ok().flatten())
+                .collect()
+        }
+    };
+    issues
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect()
+}
+
 fn print_text_output(
     blocked_issues: &[BlockedIssue],
     total: usize,
     verbose: bool,
-    storage: &crate::storage::SqliteStorage,
+    blocker_details: &HashMap<String, Issue>,
     max_width: usize,
 ) {
     use crate::format::{format_status_label, sanitize_terminal_inline, truncate_title};
@@ -413,7 +472,7 @@ fn print_text_output(
             for blocker_ref in &bi.blocked_by {
                 // blocker_ref format is "id:status", extract just the id for lookup
                 let blocker_id = blocker_id_from_ref(blocker_ref);
-                if let Ok(Some(blocker)) = storage.get_issue(blocker_id) {
+                if let Some(blocker) = blocker_details.get(blocker_id) {
                     let blocker_title = if max_width > 0 {
                         truncate_title(&blocker.title, max_width.saturating_sub(30))
                     } else {
@@ -470,7 +529,7 @@ fn render_blocked_rich(
     blocked_issues: &[BlockedIssue],
     total: usize,
     verbose: bool,
-    storage: &crate::storage::SqliteStorage,
+    blocker_details: &HashMap<String, Issue>,
     max_width: usize,
 ) {
     use crate::format::{format_status_label, sanitize_terminal_inline, truncate_title};
@@ -551,7 +610,7 @@ fn render_blocked_rich(
                     Style::new().color(color("cyan")),
                 );
 
-                if let Ok(Some(blocker)) = storage.get_issue(blocker_id) {
+                if let Some(blocker) = blocker_details.get(blocker_id) {
                     let blocker_title = if max_width > 0 {
                         truncate_title(&blocker.title, max_width.saturating_sub(40))
                     } else {
@@ -652,6 +711,114 @@ mod tests {
             issue: make_issue(id, title, priority, IssueType::Task),
             blocked_by_count: blocker_count,
             blocked_by: (0..blocker_count).map(|i| format!("blocker-{i}")).collect(),
+        }
+    }
+
+    #[test]
+    fn blocker_details_batch_deduplicates_page_edges_and_preserves_external_ids() {
+        let mut first = make_blocked_issue("page-a", "First", 1, 0);
+        first.blocked_by = vec![
+            "shared:open".to_string(),
+            "missing:open".to_string(),
+            "external:proj:cap:blocked".to_string(),
+        ];
+        let mut second = make_blocked_issue("page-b", "Second", 2, 0);
+        second.blocked_by = vec!["shared:in_progress".to_string(), "other".to_string()];
+        let mut calls = 0;
+        let details = load_blocker_details(
+            &[first, second],
+            |ids| {
+                calls += 1;
+                assert_eq!(ids, &["external:proj:cap", "missing", "other", "shared"]);
+                // Return rows out of request order, as a batched SQL read may.
+                Ok(vec![
+                    make_issue("shared", "Shared title", 0, IssueType::Bug),
+                    make_issue("other", "Other title", 3, IssueType::Task),
+                ])
+            },
+            |_| panic!("a successful batch must not perform point lookups"),
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(details.len(), 2);
+        assert_eq!(details["shared"].title, "Shared title");
+        assert_eq!(details["shared"].priority, Priority(0));
+        assert_eq!(details["other"].title, "Other title");
+        assert!(!details.contains_key("missing"));
+        assert!(!details.contains_key("external:proj:cap"));
+    }
+
+    #[test]
+    fn blocker_details_empty_page_performs_no_reads() {
+        for page in [Vec::new(), vec![make_blocked_issue("empty", "Empty", 2, 0)]] {
+            let details = load_blocker_details(
+                &page,
+                |_| panic!("empty blocker set must not issue a batch read"),
+                |_| panic!("empty blocker set must not issue a point read"),
+            );
+            assert!(details.is_empty());
+        }
+    }
+
+    #[test]
+    fn blocker_details_failed_batch_falls_back_once_per_unique_id() {
+        let mut blocked = make_blocked_issue("page", "Page", 2, 0);
+        blocked.blocked_by = vec![
+            "good:open".to_string(),
+            "bad:open".to_string(),
+            "missing:open".to_string(),
+            "good:open".to_string(),
+        ];
+        let mut point_reads = Vec::new();
+        let details = load_blocker_details(
+            &[blocked],
+            |_| Err(crate::error::BeadsError::Config("batch failed".to_string())),
+            |id| {
+                point_reads.push(id.to_string());
+                match id {
+                    "good" => Ok(Some(make_issue("good", "Readable", 1, IssueType::Task))),
+                    "missing" => Ok(None),
+                    _ => Err(crate::error::BeadsError::Config("row failed".to_string())),
+                }
+            },
+        );
+        assert_eq!(point_reads, vec!["bad", "good", "missing"]);
+        assert_eq!(details.len(), 1);
+        assert_eq!(details["good"].title, "Readable");
+    }
+
+    #[test]
+    fn blocker_details_large_page_uses_the_storage_batch_reader() {
+        // Cross the storage reader's parameter boundary with real rows.
+        // Setup is outside the measured loader calls. Repeated edges must
+        // neither multiply point reads nor change the returned details.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut blocked = make_blocked_issue("page", "Page", 2, 0);
+        for index in 0..1001 {
+            let id = format!("bd-blocker-{index:04}");
+            let issue = make_issue(&id, &format!("Blocker {index}"), 2, IssueType::Task);
+            storage.create_issue(&issue, "test").unwrap();
+            blocked.blocked_by.push(format!("{id}:open"));
+            blocked.blocked_by.push(format!("{id}:open"));
+        }
+        let mut batch_calls = 0;
+        let details = load_blocker_details(
+            &[blocked],
+            |ids| {
+                batch_calls += 1;
+                assert_eq!(ids.len(), 1001);
+                storage.get_issues_by_ids(ids)
+            },
+            |_| panic!("healthy multi-chunk storage read must not use point lookups"),
+        );
+        assert_eq!(batch_calls, 1);
+        assert_eq!(details.len(), 1001);
+        for index in 0..1001 {
+            let id = format!("bd-blocker-{index:04}");
+            let issue = &details[&id];
+            assert_eq!(issue.id, id);
+            assert_eq!(issue.title, format!("Blocker {index}"));
+            assert_eq!(issue.priority, Priority(2));
+            assert_eq!(issue.status, Status::Open);
         }
     }
 
