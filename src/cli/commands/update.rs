@@ -928,6 +928,7 @@ fn execute_prepared_route_with_resources(
     let has_notes_writes = notes_appends.values().any(|plan| plan.output.applied);
 
     let mut capacity_warnings = Vec::new();
+    let mut issues_after: HashMap<String, Issue> = HashMap::new();
     if !prepared.update.is_empty()
         || has_acceptance_writes
         || has_notes_writes
@@ -964,12 +965,16 @@ fn execute_prepared_route_with_resources(
             &atomic_updates,
             &prepared.actor,
         );
-        preserve_blocked_cache_on_error(
+        let updated = preserve_blocked_cache_on_error(
             &mut prepared.storage_ctx.storage,
             false,
             "update",
             update_result,
         )?;
+        issues_after = updated
+            .into_iter()
+            .map(|issue| (issue.id.clone(), issue))
+            .collect();
         capacity_warnings = prepared.storage_ctx.storage.take_capacity_warnings();
         if defer_blocked_cache_rebuild && prepared.update.status.is_some() {
             blocked_cache_dirty = true;
@@ -1001,12 +1006,17 @@ fn execute_prepared_route_with_resources(
             blocked_cache_dirty = true;
         }
 
-        // Re-read post-mutation state for JSON/TOON machine output only.
-        // For human-readable diff rendering we synthesize the diff from
-        // `(issue_before, update)` below instead of trusting a second read,
-        // to defend against the "unrelated bead's fields leak into diff"
-        // regression reported in issue #256.
-        let issue_after_result = prepared.storage_ctx.storage.get_issue(id);
+        // Storage already read the atomic batch's post-state (#574). Parent
+        // writes happen afterwards and need a fresh read, as do no-op targets
+        // excluded from the batch. Human diffs still use the validated before
+        // snapshot plus the requested update, preserving the #256 defense.
+        let issue_after_result = if !parent_changes_cache
+            && let Some(issue) = issues_after.remove(id)
+        {
+            Ok(Some(issue))
+        } else {
+            prepared.storage_ctx.storage.get_issue(id)
+        };
         let issue_after = preserve_blocked_cache_on_error(
             &mut prepared.storage_ctx.storage,
             blocked_cache_dirty,
@@ -1720,7 +1730,7 @@ fn classify_text_field_overwrite(current: &str, incoming: &str) -> OverwriteTier
 /// failures all shrink the field severely, so that is the case that requires
 /// `--force`: clearing it, or replacing it with content shorter than half its
 /// current length. A revision that keeps at least half the length passes;
-/// when it also keeps fewer than half the current words it is reported as an
+/// when it also keeps fewer than half the words it is reported as an
 /// advisory (returned here, printed by the caller) rather than refused.
 /// Writing into an empty field and re-writing the identical value stay
 /// silent so legitimate idempotent scripts keep working.
@@ -2212,7 +2222,7 @@ mod tests {
     fn if_unchanged_compares_instants_not_spellings() {
         // The same moment written three ways must not read as "the record
         // moved" — a caller may round-trip the token through a tool that
-        // normalises the offset or trims trailing zeros.
+        // normalises the offset.
         let z = parse_if_unchanged(Some("2026-09-17T02:22:26.5Z"))
             .unwrap()
             .unwrap();
@@ -3989,6 +3999,34 @@ because downstream tooling links to them.\n\n- [ ] schema migration applied\n\
         info!("test_execute_prepared_route_rolls_back_fields_when_labels_fail: assertions passed");
     }
 
+    fn prepared_cache_status_route(
+        storage_ctx: config::OpenStorageResult,
+        status: Status,
+    ) -> PreparedUpdateRoute {
+        PreparedUpdateRoute {
+            storage_ctx,
+            actor: "tester".to_string(),
+            resolved_ids: vec!["bd-local-a".to_string(), "bd-local-b".to_string()],
+            update: IssueUpdate {
+                closed_at: Some((status == Status::Closed).then(Utc::now)),
+                status: Some(status),
+                ..IssueUpdate::default()
+            },
+            has_updates: true,
+            add_labels: Vec::new(),
+            remove_labels: Vec::new(),
+            set_labels: false,
+            valid_set_labels: Vec::new(),
+            resolved_parent: ParentUpdatePlan::Unchanged,
+            acceptance_edits: Vec::new(),
+            notes_appends: Vec::new(),
+            overwrite_advisories: Vec::new(),
+            auto_flush_external: false,
+            attribution: EventAttribution::default(),
+            routed_write_lock: RoutedWorkspaceWriteLock::local(),
+        }
+    }
+
     #[test]
     fn status_batch_refresh_preserves_unrelated_cache_entries() {
         let temp = TempDir::new().unwrap();
@@ -3997,8 +4035,13 @@ because downstream tooling links to them.\n\n- [ ] schema migration applied\n\
         let mut storage_ctx =
             config::open_storage_with_cli(&beads_dir, &CliOverrides::default()).unwrap();
         for id in [
-            "bd-local-a", "bd-local-b", "bd-blocks", "bd-conditional",
-            "bd-waits", "bd-other", "bd-unrelated",
+            "bd-local-a",
+            "bd-local-b",
+            "bd-blocks",
+            "bd-conditional",
+            "bd-waits",
+            "bd-other",
+            "bd-unrelated",
         ] {
             let now = Utc::now();
             let issue = Issue {
@@ -4026,42 +4069,37 @@ because downstream tooling links to them.\n\n- [ ] schema migration applied\n\
                 .unwrap();
         }
         assert_eq!(storage_ctx.storage.get_blocked_ids().unwrap().len(), 4);
-        storage_ctx.storage.execute_raw(
-            "UPDATE blocked_issues_cache SET blocked_at = '2000-01-01T00:00:00Z' \
-             WHERE issue_id = 'bd-unrelated'",
-        ).unwrap();
+        storage_ctx
+            .storage
+            .execute_raw(
+                "UPDATE blocked_issues_cache SET blocked_at = '2000-01-01T00:00:00Z' \
+                 WHERE issue_id = 'bd-unrelated'",
+            )
+            .unwrap();
 
         // Exercise the internal atomic route, as the rollback test above
         // does. The public CLI's terminal-status guard remains unchanged.
-        for status in [Status::Closed, Status::Open] {
-            let expect_blocked = status == Status::Open;
-            let prepared = PreparedUpdateRoute {
-                storage_ctx,
-                actor: "tester".to_string(),
-                resolved_ids: vec!["bd-local-a".to_string(), "bd-local-b".to_string()],
-                update: IssueUpdate {
-                    closed_at: Some((status == Status::Closed).then(Utc::now)),
-                    status: Some(status),
-                    ..IssueUpdate::default()
-                },
-                has_updates: true,
-                add_labels: Vec::new(),
-                remove_labels: Vec::new(),
-                set_labels: false,
-                valid_set_labels: Vec::new(),
-                resolved_parent: ParentUpdatePlan::Unchanged,
-                acceptance_edits: Vec::new(),
-                notes_appends: Vec::new(),
-                overwrite_advisories: Vec::new(),
-                auto_flush_external: false,
-                attribution: EventAttribution::default(),
-                routed_write_lock: RoutedWorkspaceWriteLock::local(),
-            };
+        for status in [Status::InProgress, Status::Closed, Status::Open] {
+            let expect_blocked = status != Status::Closed;
+            let expected_status = status.as_str().to_string();
+            let prepared = prepared_cache_status_route(storage_ctx, status);
             let (output, resources) = execute_prepared_route_with_resources(
                 prepared,
                 &OutputContext::from_flags(true, false, true),
-            ).unwrap();
-            assert_eq!(output.updated_issues.len(), 2);
+            )
+            .unwrap();
+            assert_eq!(
+                output
+                    .updated_issues
+                    .iter()
+                    .map(|issue| issue.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["bd-local-a", "bd-local-b"]
+            );
+            for issue in &output.updated_issues {
+                assert_eq!(issue.status, expected_status);
+                assert_eq!(issue.title, format!("Cache fixture {}", issue.id));
+            }
             storage_ctx = resources.storage_ctx;
             let blocked = storage_ctx.storage.get_blocked_ids().unwrap();
             for id in ["bd-blocks", "bd-conditional", "bd-waits"] {
@@ -4072,10 +4110,13 @@ because downstream tooling links to them.\n\n- [ ] schema migration applied\n\
 
             let witness = crate::franken_sync::Connection::open(
                 beads_dir.join("beads.db").to_string_lossy().into_owned(),
-            ).unwrap();
-            let row = witness.query_row(
-                "SELECT blocked_at FROM blocked_issues_cache WHERE issue_id = 'bd-unrelated'",
-            ).unwrap();
+            )
+            .unwrap();
+            let row = witness
+                .query_row(
+                    "SELECT blocked_at FROM blocked_issues_cache WHERE issue_id = 'bd-unrelated'",
+                )
+                .unwrap();
             assert_eq!(
                 row.get(0).and_then(crate::franken_sync::SqliteValue::as_text),
                 Some("2000-01-01T00:00:00Z"),
