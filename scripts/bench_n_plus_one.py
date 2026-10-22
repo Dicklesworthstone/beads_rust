@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproduce import/status/reopen/detailed-blocker workloads for GitHub #574.
+"""Reproduce import/status/defer/reopen/blocker workloads for GitHub #574.
 
 Run matched, prebuilt binaries; compilation is deliberately outside measurement:
 
@@ -12,9 +12,11 @@ that probe. Zero trace records are an error, never a zero-statement result.
 Counts follow the report's convention: direct facade calls plus prepares,
 not engine VM executions or prepared-statement executions. Instrumented runs
 are separate from the uninstrumented timing samples. --enforce-hot-paths checks
-only detailed-blocker and localized status/reopen optimizations, not all of #574.
+only detailed-blocker and localized status optimizations, not all of #574.
 Reopen setup closes one blocker and warms the cache outside the measured call;
 the measured command must really reopen it, not take an already-open skip path.
+Defer and undefer likewise require a real transition. Undefer's prerequisite
+deferral, export and cache warmup are excluded from its timing and SQL sample.
 
 All fixtures, copies, raw stdout/stderr, and receipts are retained in a NEW
 output directory. No user workspace is accepted, modified or deleted. Timings
@@ -47,7 +49,8 @@ from unittest import mock
 
 
 STAMP = "2026-10-01T00:00:00Z"
-CASES = ("import_one_changed", "status_change", "reopen_one", "blocked_detailed")
+CASES = ("import_one_changed", "status_change", "reopen_one",
+         "defer_one", "undefer_one", "blocked_detailed")
 
 
 def fixture(blocked_count: int) -> list[dict]:
@@ -142,7 +145,7 @@ def check_hot_paths(counts: dict, plain: dict, blocked_count: int) -> None:
     extra = counts["blocked_detailed"]["total"] - plain["total"]
     if extra < 0 or extra > math.ceil(2 * blocked_count / 900):
         raise AssertionError(f"detailed blocker SQL is not chunk-bounded: extra={extra}")
-    for case in ("status_change", "reopen_one"):
+    for case in ("status_change", "reopen_one", "defer_one", "undefer_one"):
         status = counts[case]
         if status["full_cache_deletes"] != 0 or status["cache_inserts"] > 1:
             raise AssertionError(f"{case} rewrites unrelated cache rows: {status}")
@@ -239,6 +242,26 @@ def scenario(runner: Runner, template: Path, workspace: Path, case: str,
             raise AssertionError("reopen setup did not close the target")
         runner.run(workspace, ["blocked", "--json", "--limit", "0"])
         return ["reopen", "nb-k00000", "--json"], expected
+    if case == "defer_one":
+        target = next(row for row in expected if row["id"] == "nb-k00000")
+        if target["status"] != "open" or target.get("defer_until") is not None:
+            raise AssertionError("defer setup target is not open and undeferred")
+        target["status"] = "deferred"
+        return ["defer", "nb-k00000", "--json"], expected
+    if case == "undefer_one":
+        # Indefinite deferral avoids wall-clock dependencies in this workload.
+        # Setup must succeed before measurement, not disappear into a skip.
+        stdout, _, _ = runner.run(workspace, ["defer", "nb-k00000", "--json"])
+        verify_defer_receipt(stdout, "defer_one")
+        runner.run(workspace, ["sync", "--flush-only", "--json"])
+        seeded = read_jsonl(workspace / ".beads" / "issues.jsonl")
+        deferred = copy.deepcopy(expected)
+        target = next(row for row in deferred if row["id"] == "nb-k00000")
+        target["status"] = "deferred"
+        if semantic_rows(seeded) != semantic_rows(deferred):
+            raise AssertionError("undefer setup did not persist exactly the expected deferral")
+        runner.run(workspace, ["blocked", "--json", "--limit", "0"])
+        return ["undefer", "nb-k00000", "--json"], expected
     if case == "blocked_detailed":
         return ["blocked", "--detailed", "--limit", "0"], expected
     raise ValueError(case)
@@ -255,6 +278,24 @@ def verify_reopen_receipt(stdout: str) -> None:
     if (not isinstance(issue, dict) or issue.get("id") != "nb-k00000"
             or issue.get("status") != "open" or issue.get("closed_at") is not None):
         raise AssertionError("reopen receipt has the wrong target or terminal metadata")
+
+
+def verify_defer_receipt(stdout: str, case: str) -> None:
+    key, previous, status = {
+        "defer_one": ("deferred", "open", "deferred"),
+        "undefer_one": ("undeferred", "deferred", "open"),
+    }[case]
+    result = json.loads(stdout)
+    if not isinstance(result, dict) or result.get("skipped"):
+        raise AssertionError(f"{case} workload was skipped or returned an invalid receipt")
+    changed = result.get(key)
+    if not isinstance(changed, list) or len(changed) != 1:
+        raise AssertionError(f"{case} did not change exactly one issue")
+    issue = changed[0]
+    if (not isinstance(issue, dict) or issue.get("id") != "nb-k00000"
+            or issue.get("previous_status") != previous or issue.get("status") != status
+            or issue.get("defer_until") is not None):
+        raise AssertionError(f"{case} receipt has the wrong target, transition or defer date")
 
 
 def verify(runner: Runner, workspace: Path, expected: list[dict], blocked_count: int) -> None:
@@ -322,6 +363,8 @@ def run_benchmarks(args: argparse.Namespace) -> dict:
                                 raise AssertionError("detailed output lost blocker titles")
                         elif case == "reopen_one":
                             verify_reopen_receipt(stdout)
+                        elif case in ("defer_one", "undefer_one"):
+                            verify_defer_receipt(stdout, case)
                         verify(runner, ws, expected, count)
                         samples.append(elapsed)
                     receipt = {"side": side, "blocked_count": count, "issue_count": 3 * count,
@@ -344,6 +387,8 @@ def run_benchmarks(args: argparse.Namespace) -> dict:
                         stdout, stderr, _ = trace_runner.run(ws, command, trace=True)
                         if case == "reopen_one":
                             verify_reopen_receipt(stdout)
+                        elif case in ("defer_one", "undefer_one"):
+                            verify_defer_receipt(stdout, case)
                         counts[case] = trace_counts(stderr)
                         receipt["sql"] = counts[case]
                         verify(trace_runner, ws, expected, count)
@@ -419,13 +464,19 @@ class HarnessTests(unittest.TestCase):
     def test_sql_gate_rejects_planted_n_plus_one_and_cache_rebuild(self):
         good = {"blocked_detailed": {"total": 18},
                 "status_change": {"full_cache_deletes": 0, "cache_inserts": 1},
-                "reopen_one": {"full_cache_deletes": 0, "cache_inserts": 1}}
+                "reopen_one": {"full_cache_deletes": 0, "cache_inserts": 1},
+                "defer_one": {"full_cache_deletes": 0, "cache_inserts": 1},
+                "undefer_one": {"full_cache_deletes": 0, "cache_inserts": 1}}
         check_hot_paths(good, {"total": 16}, 500)
         for case, field, value in (("blocked_detailed", "total", 1016),
                                    ("status_change", "full_cache_deletes", 1),
                                    ("status_change", "cache_inserts", 500),
                                    ("reopen_one", "full_cache_deletes", 1),
-                                   ("reopen_one", "cache_inserts", 500)):
+                                   ("reopen_one", "cache_inserts", 500),
+                                   ("defer_one", "full_cache_deletes", 1),
+                                   ("defer_one", "cache_inserts", 500),
+                                   ("undefer_one", "full_cache_deletes", 1),
+                                   ("undefer_one", "cache_inserts", 500)):
             bad = copy.deepcopy(good)
             bad[case][field] = value
             with self.assertRaises(AssertionError):
@@ -477,6 +528,59 @@ class HarnessTests(unittest.TestCase):
         for bad in bad_receipts:
             with self.assertRaises(AssertionError):
                 verify_reopen_receipt(json.dumps(bad))
+
+    def test_defer_scenario_changes_only_the_expected_status(self):
+        rows = fixture(2)
+        runner = mock.Mock(spec=Runner)
+        with mock.patch.object(shutil, "copytree"):
+            command, expected = scenario(runner, Path("template"), Path("unused"),
+                                         "defer_one", rows)
+        self.assertEqual(command, ["defer", "nb-k00000", "--json"])
+        runner.run.assert_not_called()
+        desired = copy.deepcopy(rows)
+        next(row for row in desired if row["id"] == "nb-k00000")["status"] = "deferred"
+        self.assertEqual(expected, desired)
+        self.assertEqual(next(row for row in rows if row["id"] == "nb-k00000")["status"], "open")
+
+    def test_undefer_setup_is_verified_and_outside_the_measured_command(self):
+        rows = fixture(2)
+        deferred = copy.deepcopy(rows)
+        next(row for row in deferred if row["id"] == "nb-k00000")["status"] = "deferred"
+        runner = mock.Mock(spec=Runner)
+        runner.run.return_value = (json.dumps({"deferred": [{
+            "id": "nb-k00000", "previous_status": "open", "status": "deferred",
+        }]}), "", 0.0)
+        with mock.patch.object(shutil, "copytree"), \
+                mock.patch(f"{__name__}.read_jsonl", return_value=deferred):
+            command, expected = scenario(runner, Path("template"), Path("unused"),
+                                         "undefer_one", rows)
+        self.assertEqual(command, ["undefer", "nb-k00000", "--json"])
+        self.assertEqual(expected, rows)
+        self.assertEqual([call.args[1][0] for call in runner.run.call_args_list],
+                         ["defer", "sync", "blocked"])
+        self.assertTrue(all(not call.kwargs.get("trace") for call in runner.run.call_args_list))
+        for bad in (rows, deferred[:-1]):
+            with mock.patch.object(shutil, "copytree"), \
+                    mock.patch(f"{__name__}.read_jsonl", return_value=bad):
+                with self.assertRaisesRegex(AssertionError, "did not persist"):
+                    scenario(runner, Path("template"), Path("unused"), "undefer_one", rows)
+
+    def test_defer_receipts_reject_skips_wrong_ids_dates_and_transitions(self):
+        for case, key, previous, status in (
+                ("defer_one", "deferred", "open", "deferred"),
+                ("undefer_one", "undeferred", "deferred", "open")):
+            good = {key: [{"id": "nb-k00000", "previous_status": previous, "status": status}]}
+            verify_defer_receipt(json.dumps(good), case)
+            bad_receipts = [[], {}, {key: []}, {key: [None]},
+                            {key: good[key] * 2}, {**good, "skipped": [{"id": "nb-k00000"}]}]
+            for field, value in (("id", "wrong"), ("status", previous),
+                                 ("previous_status", status), ("defer_until", STAMP)):
+                bad = copy.deepcopy(good)
+                bad[key][0][field] = value
+                bad_receipts.append(bad)
+            for bad in bad_receipts:
+                with self.subTest(case=case, receipt=bad), self.assertRaises(AssertionError):
+                    verify_defer_receipt(json.dumps(bad), case)
 
 
 def main() -> int:
