@@ -315,6 +315,9 @@ pub fn execute(
     let jsonl_path = beads_dir.join("issues.jsonl");
     let jsonl_existed = path_entry_exists(&jsonl_path)?;
     let jsonl_created = !jsonl_existed && write_init_file_if_missing(&jsonl_path, b"")?;
+    if !db_existed && !jsonl_existed {
+        storage.set_metadata(crate::portable_history::WARNINGS_KEY, "[]")?;
+    }
 
     if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());

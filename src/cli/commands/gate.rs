@@ -160,6 +160,11 @@ fn execute_report(
     )?;
 
     crate::util::set_last_touched_id(beads_dir, &issue_id);
+    // Gate verdicts are portable audit evidence even though they do not
+    // mutate the issue row itself. Force the normal persistence path.
+    storage_ctx.storage.set_metadata("needs_flush", "true")?;
+    storage_ctx.flush_no_db_if_dirty()?;
+    storage_ctx.auto_flush_if_enabled()?;
 
     let output = GateReportOutput {
         id: record.id,

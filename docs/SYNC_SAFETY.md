@@ -841,3 +841,29 @@ For technical details, see:
 ---
 
 *This document is part of the br safety hardening initiative.*
+
+## Portable workflow history
+
+`issues.jsonl` remains the classic issue-interchange payload. Beads Rust also
+publishes `issues.history.jsonl` beside it for database-only workflow evidence:
+audit events, scoped/current gate verdicts, close metadata, and capacity
+occupancy/exemption history.
+
+The history companion is checksum-bound to stable issue identity/status/update
+anchors and uses per-issue sequence numbers rather than SQLite row ids. Imports
+validate the entire checkpoint before replay and remap gate status revisions to
+the destination database's local event ids. Repeated replay is idempotent;
+divergent append-only histories fail closed rather than choosing a winner.
+
+Publication writes the history generation before `issues.jsonl` and retains the
+previous matching generation. An interruption between those writes therefore
+leaves the old issue generation paired with its old history. For trackers that
+predate this format, the first companion includes an explicitly incomplete
+legacy checkpoint: missing historical evidence is reported and is never
+fabricated.
+
+Git synchronization should track `issues.jsonl` and `issues.history.jsonl`
+together. A fresh clone or deleted-database rebuild restores portable evidence
+when a matching checkpoint is present. If it is absent for a historical
+tracker, Beads Rust records and surfaces a preservation warning instead of
+presenting the reconstructed database as a complete audit record.

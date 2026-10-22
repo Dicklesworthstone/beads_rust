@@ -41,6 +41,7 @@ pub mod logging;
 pub mod model;
 pub mod output;
 pub mod policy;
+pub(crate) mod portable_history;
 pub mod shutdown;
 pub mod storage;
 pub mod sync;

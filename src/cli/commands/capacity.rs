@@ -148,7 +148,7 @@ fn execute_exempt(
 ) -> Result<()> {
     let (kind, name) = resolve_capacity_flags(args.status.as_deref(), args.group.as_deref())?;
     let expires_at = parse_expires(args.expires.as_deref())?;
-    let (setup, _lock) = mutation_setup(&args.id, cli, beads_dir)?;
+    let (mut setup, _lock) = mutation_setup(&args.id, cli, beads_dir)?;
     let record = setup.storage_ctx.storage.grant_capacity_exemption(
         &setup.issue_id,
         kind,
@@ -159,6 +159,9 @@ fn execute_exempt(
         &setup.actor,
     )?;
     crate::util::set_last_touched_id(beads_dir, &setup.issue_id);
+    setup.storage_ctx.storage.set_metadata("needs_flush", "true")?;
+    setup.storage_ctx.flush_no_db_if_dirty()?;
+    setup.storage_ctx.auto_flush_if_enabled()?;
     emit_exemption_record(ctx, args.robot, &record, "Granted");
     Ok(())
 }
@@ -171,7 +174,7 @@ fn execute_renew(
 ) -> Result<()> {
     let (kind, name) = resolve_capacity_flags(args.status.as_deref(), args.group.as_deref())?;
     let expires_at = parse_expires(args.expires.as_deref())?;
-    let (setup, _lock) = mutation_setup(&args.id, cli, beads_dir)?;
+    let (mut setup, _lock) = mutation_setup(&args.id, cli, beads_dir)?;
     let record = setup.storage_ctx.storage.renew_capacity_exemption(
         &setup.issue_id,
         kind,
@@ -182,6 +185,9 @@ fn execute_renew(
         &setup.actor,
     )?;
     crate::util::set_last_touched_id(beads_dir, &setup.issue_id);
+    setup.storage_ctx.storage.set_metadata("needs_flush", "true")?;
+    setup.storage_ctx.flush_no_db_if_dirty()?;
+    setup.storage_ctx.auto_flush_if_enabled()?;
     emit_exemption_record(ctx, args.robot, &record, "Renewed");
     Ok(())
 }
@@ -193,7 +199,7 @@ fn execute_revoke(
     beads_dir: &Path,
 ) -> Result<()> {
     let (kind, name) = resolve_capacity_flags(args.status.as_deref(), args.group.as_deref())?;
-    let (setup, _lock) = mutation_setup(&args.id, cli, beads_dir)?;
+    let (mut setup, _lock) = mutation_setup(&args.id, cli, beads_dir)?;
     let record = setup.storage_ctx.storage.revoke_capacity_exemption(
         &setup.issue_id,
         kind,
@@ -203,6 +209,9 @@ fn execute_revoke(
         &setup.actor,
     )?;
     crate::util::set_last_touched_id(beads_dir, &setup.issue_id);
+    setup.storage_ctx.storage.set_metadata("needs_flush", "true")?;
+    setup.storage_ctx.flush_no_db_if_dirty()?;
+    setup.storage_ctx.auto_flush_if_enabled()?;
     emit_exemption_record(ctx, args.robot, &record, "Revoked");
     Ok(())
 }

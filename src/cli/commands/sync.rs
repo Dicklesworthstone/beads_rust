@@ -2805,6 +2805,7 @@ fn execute_flush(
         )?;
     }
     info!(path = %jsonl_path.display(), "Writing issues.jsonl");
+    crate::portable_history::publish_before_export(storage, jsonl_path)?;
     let (export_result, report) = export_to_jsonl_with_policy_expected_under_authority(
         storage,
         jsonl_path,
@@ -2873,6 +2874,7 @@ fn execute_flush(
         operation: "flush JSONL export finalization".to_string(),
         source: Box::new(source),
     })?;
+    crate::portable_history::finalize_export(storage, jsonl_path)?;
     info!("Export complete, cleared dirty flags");
 
     // Write manifest if requested (atomic: temp + fsync + durable_rename)
@@ -3837,6 +3839,7 @@ fn execute_import(
     let import_used_backup_rebuild = args.force || args.rebuild;
     let force_import_target_was_empty = false;
     info!(path = %jsonl_path.display(), "Importing from JSONL");
+    crate::portable_history::preflight_import(jsonl_path)?;
     let mut import_result = if import_used_backup_rebuild {
         replace_database_from_jsonl_snapshot(
             storage,
@@ -3852,6 +3855,10 @@ fn execute_import(
     } else {
         import_from_jsonl_snapshot(storage, source, &import_config, target_prefix.as_deref())?
     };
+    let history_warnings = crate::portable_history::replay_after_import(storage, jsonl_path)?;
+    for warning in &history_warnings {
+        warn!(warning = %warning, "Workflow history coverage is incomplete");
+    }
 
     if let Some(salvage) = salvage_receipt.as_mut() {
         let exportable_records = storage.count_exportable_issues()?;
@@ -4672,6 +4679,7 @@ fn reconcile_pending_sync_merge_artifacts(
                 ExpectedJsonlSourceRef::Missing,
                 ExpectedJsonlSourceRef::Present,
             );
+            crate::portable_history::publish_before_export(storage, jsonl_path)?;
             let (export_result, _) = if let Some(database_authority) = database_authority.as_deref()
             {
                 export_to_jsonl_with_policy_expected_under_authorities(
@@ -4716,6 +4724,7 @@ fn reconcile_pending_sync_merge_artifacts(
                 jsonl_path,
                 jsonl_authority,
             )?;
+            crate::portable_history::finalize_export(storage, jsonl_path)?;
             let (database_core, export_finalization) =
                 storage.with_read_transaction(|storage| {
                     Ok((

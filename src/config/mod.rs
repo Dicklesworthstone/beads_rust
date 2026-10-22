@@ -1766,17 +1766,22 @@ fn rebuild_database_from_jsonl_snapshot(
     jsonl_authority: &crate::sync::JsonlFamilyWriteLock,
     write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
 ) -> Result<SqliteStorage> {
-    repair_database_from_jsonl_snapshot_with_import_config_under_write_authority(
-        beads_dir,
-        &paths.db_path,
-        lock_timeout,
-        bootstrap_layer,
-        import_config,
-        source,
-        jsonl_authority,
-        write_authority,
-    )
-    .map(|(storage, _, _)| storage)
+    crate::portable_history::preflight_import(&paths.jsonl_path)?;
+    let (mut storage, _, _) =
+        repair_database_from_jsonl_snapshot_with_import_config_under_write_authority(
+            beads_dir,
+            &paths.db_path,
+            lock_timeout,
+            bootstrap_layer,
+            import_config,
+            source,
+            jsonl_authority,
+            write_authority,
+        )?;
+    for warning in crate::portable_history::replay_after_import(&mut storage, &paths.jsonl_path)? {
+        tracing::warn!(warning = %warning, "Workflow history coverage is incomplete");
+    }
+    Ok(storage)
 }
 
 /// Snapshot local tombstones and dirty live issues that have not yet been
@@ -5020,6 +5025,10 @@ impl OpenStorageResult {
                 });
             }
         };
+        crate::portable_history::publish_before_export(
+            &self.storage,
+            &self.paths.jsonl_path,
+        )?;
         let (export_result, _report) = export_to_jsonl_with_policy_expected_under_authority(
             &self.storage,
             &self.paths.jsonl_path,
@@ -5037,6 +5046,7 @@ impl OpenStorageResult {
             &self.paths.jsonl_path,
             jsonl_write_authority,
         )?;
+        crate::portable_history::finalize_export(&mut self.storage, &self.paths.jsonl_path)?;
 
         Ok(())
     }
@@ -5085,6 +5095,7 @@ impl OpenStorageResult {
         let jsonl_path = self.paths.jsonl_path.clone();
         let allow_external_jsonl = self.allow_external_jsonl;
         let retention_days = self.paths.metadata.deletions_retention_days;
+        crate::portable_history::publish_before_export(&self.storage, &jsonl_path)?;
         self.auto_flush_under_retained_authority(
             &beads_dir,
             &jsonl_path,
@@ -5092,6 +5103,7 @@ impl OpenStorageResult {
             retention_days,
             history,
         )?;
+        crate::portable_history::finalize_export(&mut self.storage, &jsonl_path)?;
         Ok(())
     }
 
@@ -5498,8 +5510,15 @@ fn open_storage_with_startup_config_impl(
             import_config.show_progress =
                 !cli.quiet.unwrap_or(false) && std::io::stderr().is_terminal();
             let import_started = std::time::Instant::now();
+            crate::portable_history::preflight_import(&paths.jsonl_path)?;
             let import_result =
                 import_from_jsonl_snapshot(&mut storage, source, &import_config, Some(&prefix))?;
+            for warning in crate::portable_history::replay_after_import(
+                &mut storage,
+                &paths.jsonl_path,
+            )? {
+                tracing::warn!(warning = %warning, "Workflow history coverage is incomplete");
+            }
             tracing::debug!(
                 imported = import_result.imported_count,
                 elapsed_ms = import_started.elapsed().as_millis(),

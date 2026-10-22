@@ -320,7 +320,8 @@ beads_rust/
 │   │   ├── mod.rs                 # Concrete SqliteStorage and storage-type exports
 │   │   ├── sqlite.rs              # FrankenSQLite backend (the core engine)
 │   │   ├── schema.rs              # DDL migrations
-│   │   └── events.rs              # Append-only audit log
+│   │   ├── events.rs              # Append-only audit log
+│   │   └── portable_history.rs    # Portable audit snapshots and deterministic replay
 │   ├── sync/
 │   │   ├── mod.rs                 # JSONL import/export, publication, reconcile
 │   │   ├── path.rs                # .beads/ directory discovery
@@ -364,6 +365,7 @@ beads_rust/
 │   │   └── markdown_import.rs     # Markdown file import
 │   ├── close_policy.rs            # Close-time policy gates (policy.yaml)
 │   ├── policy.rs                  # policy.yaml documents (workflow gates, capacity, adaptive policy)
+│   ├── portable_history.rs        # Repository-managed issues.history.jsonl companion
 │   ├── coordination.rs            # br coordination status (stale-claim diagnosis)
 │   ├── health.rs                  # Workspace health vocabulary
 │   ├── inheritance.rs             # Inherited context (BR_INHERITED_CONTEXT)
@@ -392,7 +394,9 @@ beads_rust/
 | `model` | `model/mod.rs` | `Issue`, `Dependency`, `Comment`, `Event`, `Label` types, content hashing, serde derives |
 | `storage` | `storage/sqlite.rs` | Core FrankenSQLite engine: CRUD, filtered queries, dependency graph, search, events, integrity probes |
 | `storage` | `storage/schema.rs` | DDL migrations, table creation, index management |
+| `storage` | `storage/portable_history.rs` | Portable audit snapshots and deterministic replay |
 | `storage` | `storage/events.rs` | Append-only audit log for all issue mutations |
+| `portable_history` | `portable_history.rs` | Checksum-bound `issues.history.jsonl` publication and recovery |
 | `sync` | `sync/mod.rs` | JSONL import/export engine: merge, dedup, conflict resolution, witness-checked publication |
 | `sync` | `sync/path.rs` | `.beads/` directory discovery and path resolution |
 | `sync` | `sync/history.rs` | Snapshot-based history: restore, prune, diff |
