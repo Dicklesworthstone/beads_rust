@@ -2,8 +2,8 @@
 
 use crate::cli::commands::{
     acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
-    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
-    report_auto_flush_failure, resolve_issue_ids, update_issues_atomically_with_recovery,
+    preserve_blocked_cache_on_error, report_auto_flush_failure, resolve_issue_ids,
+    update_issues_atomically_with_recovery,
 };
 use crate::cli::{DeferArgs, UndeferArgs};
 use crate::config;
@@ -255,11 +255,19 @@ fn execute_defer_route(
         .transpose()?;
 
     let resolved_ids = resolve_issue_ids(&storage_ctx.storage, &resolver, &args.ids)?;
+    // Preflight snapshots only: the atomic writer still validates live rows.
+    // The batch reader chunks at the parameter limit; key by ID rather than
+    // relying on SQL result order, so changed/skipped receipts keep input order.
+    let issues_by_id = storage_ctx
+        .storage
+        .get_issues_by_ids(&resolved_ids)?
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect::<HashMap<_, _>>();
 
     let mut deferred_issues: Vec<DeferredIssue> = Vec::new();
     let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
     let mut ordered_outcomes = Vec::with_capacity(resolved_ids.len());
-    let mut cache_dirty = false;
     let mut atomic_updates = Vec::new();
     let mut planned_changes = Vec::new();
 
@@ -268,14 +276,7 @@ fn execute_defer_route(
         ordered_outcomes.push(None);
         tracing::info!(id = %id, until = ?defer_until, "Deferring issue");
 
-        let issue_result = storage_ctx.storage.get_issue(id);
-        let Some(issue) = preserve_blocked_cache_on_error(
-            &mut storage_ctx.storage,
-            cache_dirty,
-            "defer",
-            issue_result,
-        )?
-        else {
+        let Some(issue) = issues_by_id.get(id) else {
             let skipped = SkippedIssue {
                 id: id.clone(),
                 reason: "issue not found".to_string(),
@@ -311,7 +312,10 @@ fn execute_defer_route(
             status: Some(Status::Deferred),
             defer_until: Some(defer_until),
             transition_comment: args.transition_comment.clone(),
-            skip_cache_rebuild: true,
+            // One atomic batch already gathers direct dependents and refreshes
+            // their components. Deferral would lose those seeds and force the
+            // CLI's whole-cache rebuild (#574).
+            skip_cache_rebuild: false,
             ..Default::default()
         };
 
@@ -338,7 +342,6 @@ fn execute_defer_route(
         );
         preserve_blocked_cache_on_error(&mut storage_ctx.storage, false, "defer", update_result)?;
         capacity_warnings = storage_ctx.storage.take_capacity_warnings();
-        cache_dirty = true;
     }
 
     for (outcome_index, id, issue) in planned_changes {
@@ -361,14 +364,6 @@ fn execute_defer_route(
             outcome.ok_or_else(|| BeadsError::internal("defer batch outcome was not populated"))
         })
         .collect::<Result<Vec<_>>>()?;
-
-    if cache_dirty {
-        tracing::info!(
-            "Rebuilding blocked cache after deferring {} issues",
-            deferred_issues.len()
-        );
-        finalize_batched_blocked_cache_refresh(&mut storage_ctx.storage, cache_dirty, "defer")?;
-    }
 
     storage_ctx.flush_no_db_if_dirty()?;
     if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
@@ -551,11 +546,18 @@ fn execute_undefer_route(
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let resolved_ids = resolve_issue_ids(&storage_ctx.storage, &resolver, &args.ids)?;
+    // Preserve input order and terminal/no-op skips without one read per ID.
+    // Policy admission and writes still use live rows inside the transaction.
+    let issues_by_id = storage_ctx
+        .storage
+        .get_issues_by_ids(&resolved_ids)?
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect::<HashMap<_, _>>();
 
     let mut undeferred_issues: Vec<DeferredIssue> = Vec::new();
     let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
     let mut ordered_outcomes = Vec::with_capacity(resolved_ids.len());
-    let mut cache_dirty = false;
     let mut atomic_updates = Vec::new();
     let mut planned_changes = Vec::new();
 
@@ -564,14 +566,7 @@ fn execute_undefer_route(
         ordered_outcomes.push(None);
         tracing::info!(id = %id, "Undeferring issue");
 
-        let issue_result = storage_ctx.storage.get_issue(id);
-        let Some(issue) = preserve_blocked_cache_on_error(
-            &mut storage_ctx.storage,
-            cache_dirty,
-            "undefer",
-            issue_result,
-        )?
-        else {
+        let Some(issue) = issues_by_id.get(id) else {
             let skipped = SkippedIssue {
                 id: id.clone(),
                 reason: "issue not found".to_string(),
@@ -603,7 +598,7 @@ fn execute_undefer_route(
             continue;
         }
 
-        let restored_status = restored_status_after_undefer(&issue);
+        let restored_status = restored_status_after_undefer(issue);
         let status_update = if issue.status == Status::Deferred {
             Some(Status::Open)
         } else {
@@ -617,7 +612,9 @@ fn execute_undefer_route(
                 .cloned(),
             status: status_update,
             defer_until: Some(None),
-            skip_cache_rebuild: true,
+            // Let the shared mutation refresh affected components once. A
+            // soft undefer only clears its date and needs no status rebuild.
+            skip_cache_rebuild: false,
             ..Default::default()
         };
 
@@ -644,7 +641,6 @@ fn execute_undefer_route(
         );
         preserve_blocked_cache_on_error(&mut storage_ctx.storage, false, "undefer", update_result)?;
         capacity_warnings = storage_ctx.storage.take_capacity_warnings();
-        cache_dirty = true;
     }
 
     for (outcome_index, id, issue, restored_status) in planned_changes {
@@ -667,14 +663,6 @@ fn execute_undefer_route(
             outcome.ok_or_else(|| BeadsError::internal("undefer batch outcome was not populated"))
         })
         .collect::<Result<Vec<_>>>()?;
-
-    if cache_dirty {
-        tracing::info!(
-            "Rebuilding blocked cache after undeferring {} issues",
-            undeferred_issues.len()
-        );
-        finalize_batched_blocked_cache_refresh(&mut storage_ctx.storage, cache_dirty, "undefer")?;
-    }
 
     storage_ctx.flush_no_db_if_dirty()?;
     if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
@@ -1406,5 +1394,329 @@ mod tests {
         assert!(updated.defer_until.is_some());
 
         Ok(())
+    }
+
+    fn cache_regression_workspace() -> (TempDir, std::path::PathBuf) {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        let mut storage = SqliteStorage::open(&beads_dir.join("beads.db")).unwrap();
+        storage.set_config("issue_prefix", "bd").unwrap();
+        for id in [
+            "bd-a",
+            "bd-b",
+            "bd-blocks",
+            "bd-conditional",
+            "bd-waits",
+            "bd-child",
+            "bd-grandchild",
+            "bd-other",
+            "bd-unrelated",
+        ] {
+            storage.create_issue(&make_issue(id, id), "tester").unwrap();
+        }
+        for (dependent, blocker, kind) in [
+            ("bd-blocks", "bd-a", "blocks"),
+            ("bd-blocks", "bd-b", "blocks"),
+            ("bd-conditional", "bd-b", "conditional-blocks"),
+            ("bd-waits", "bd-a", "waits-for"),
+            ("bd-child", "bd-blocks", "parent-child"),
+            ("bd-grandchild", "bd-child", "parent-child"),
+            ("bd-unrelated", "bd-other", "blocks"),
+        ] {
+            storage
+                .add_dependency(dependent, blocker, kind, "tester")
+                .unwrap();
+        }
+        storage.rebuild_blocked_cache(true).unwrap();
+        (temp, beads_dir)
+    }
+
+    fn regression_cli() -> CliOverrides {
+        CliOverrides {
+            no_auto_import: Some(true),
+            no_auto_flush: Some(true),
+            ..CliOverrides::default()
+        }
+    }
+
+    fn cache_rows(storage: &SqliteStorage) -> Vec<(String, String, String)> {
+        storage
+            .execute_raw_query(
+                "SELECT issue_id, blocked_by, blocked_at FROM blocked_issues_cache ORDER BY issue_id",
+            )
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row[0].as_text().unwrap().to_string(),
+                    row[1].as_text().unwrap().to_string(),
+                    row[2].as_text().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn stamp_unrelated_cache(storage: &SqliteStorage) {
+        storage
+            .execute_raw(
+                "UPDATE blocked_issues_cache SET blocked_at = '2000-01-01T00:00:00Z' \
+                 WHERE issue_id = 'bd-unrelated'",
+            )
+            .unwrap();
+        assert_unrelated_cache_untouched(storage);
+    }
+
+    fn assert_unrelated_cache_untouched(storage: &SqliteStorage) {
+        let rows = cache_rows(storage);
+        let witness = rows
+            .iter()
+            .find(|(id, _, _)| id == "bd-unrelated")
+            .unwrap();
+        assert_eq!(witness.2, "2000-01-01T00:00:00Z");
+    }
+
+    fn assert_cache_matches_rebuild(storage: &mut SqliteStorage) {
+        let contents = |storage: &SqliteStorage| {
+            let mut rows = storage
+                .get_blocked_issues()
+                .unwrap()
+                .into_iter()
+                .map(|(issue, mut blockers)| {
+                    blockers.sort();
+                    (issue.id, blockers)
+                })
+                .collect::<Vec<_>>();
+            rows.sort();
+            rows
+        };
+        let incremental = contents(storage);
+        assert!(incremental.iter().any(|(id, _)| id == "bd-grandchild"));
+        storage.rebuild_blocked_cache(true).unwrap();
+        assert_eq!(incremental, contents(storage));
+    }
+
+    #[test]
+    fn defer_and_undefer_refresh_only_affected_components() {
+        let (_temp, beads_dir) = cache_regression_workspace();
+        let db_path = beads_dir.join("beads.db");
+        let cli = regression_cli();
+        let ctx = OutputContext::from_flags(true, false, true);
+        let ids = vec!["bd-b".to_string(), "bd-a".to_string()];
+        let until = "2030-01-01T00:00:00Z";
+        {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            stamp_unrelated_cache(&storage);
+        }
+        let args = DeferArgs {
+            ids: ids.clone(),
+            until: Some(until.to_string()),
+            ..Default::default()
+        };
+        let deferred = execute_defer_route(&args, &cli, &ctx, &beads_dir, false).unwrap();
+        assert!(deferred.skipped.is_empty());
+        assert_eq!(
+            deferred.deferred.iter().map(|row| &row.id).collect::<Vec<_>>(),
+            ids.iter().collect::<Vec<_>>()
+        );
+        for row in &deferred.deferred {
+            assert_eq!(row.previous_status, "open");
+            assert_eq!(row.status, "deferred");
+            assert_eq!(row.title, row.id);
+        }
+        let before_repeat = {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            assert_unrelated_cache_untouched(&storage);
+            for id in &ids {
+                let issue = storage.get_issue(id).unwrap().unwrap();
+                assert_eq!(issue.status, Status::Deferred);
+                assert_eq!(
+                    issue.defer_until,
+                    Some(parse_flexible_timestamp(until, "defer_until").unwrap())
+                );
+            }
+            cache_rows(&storage)
+        };
+        let repeat = execute_defer_route(&args, &cli, &ctx, &beads_dir, false).unwrap();
+        assert!(repeat.deferred.is_empty());
+        assert_eq!(repeat.skipped.len(), ids.len());
+        {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            assert_eq!(before_repeat, cache_rows(&storage));
+            assert_cache_matches_rebuild(&mut storage);
+            stamp_unrelated_cache(&storage);
+        }
+        let args = UndeferArgs {
+            ids: ids.clone(),
+            ..Default::default()
+        };
+        let undeferred = execute_undefer_route(&args, &cli, &ctx, &beads_dir, false).unwrap();
+        assert!(undeferred.skipped.is_empty());
+        assert_eq!(
+            undeferred.undeferred.iter().map(|row| &row.id).collect::<Vec<_>>(),
+            ids.iter().collect::<Vec<_>>()
+        );
+        let before_repeat = {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            assert_unrelated_cache_untouched(&storage);
+            for id in &ids {
+                let issue = storage.get_issue(id).unwrap().unwrap();
+                assert_eq!(issue.status, Status::Open);
+                assert!(issue.defer_until.is_none());
+            }
+            cache_rows(&storage)
+        };
+        let repeat = execute_undefer_route(&args, &cli, &ctx, &beads_dir, false).unwrap();
+        assert!(repeat.undeferred.is_empty());
+        assert_eq!(repeat.skipped.len(), ids.len());
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(before_repeat, cache_rows(&storage));
+        assert_cache_matches_rebuild(&mut storage);
+    }
+
+    #[test]
+    fn batched_defer_reads_preserve_mixed_outcome_order_and_soft_status() {
+        let (_temp, beads_dir) = cache_regression_workspace();
+        let db_path = beads_dir.join("beads.db");
+        {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            let mut closed = make_issue("bd-closed", "Closed");
+            closed.status = Status::Closed;
+            closed.closed_at = Some(Utc::now());
+            closed.defer_until = Some(Utc::now() + Duration::days(1));
+            storage.create_issue(&closed, "tester").unwrap();
+            let mut soft = make_issue("bd-soft", "In progress");
+            soft.status = Status::InProgress;
+            soft.defer_until = closed.defer_until;
+            storage.create_issue(&soft, "tester").unwrap();
+        }
+        let cli = regression_cli();
+        let ctx = OutputContext::from_flags(true, false, true);
+        let args = DeferArgs {
+            ids: vec![
+                "bd-b".to_string(),
+                "bd-closed".to_string(),
+                "bd-a".to_string(),
+            ],
+            ..Default::default()
+        };
+        let result = execute_defer_route(&args, &cli, &ctx, &beads_dir, false).unwrap();
+        assert!(matches!(
+            &result.ordered_outcomes[..],
+            [DeferredOutcome::Changed(b), DeferredOutcome::Skipped(closed), DeferredOutcome::Changed(a)]
+                if b.id == "bd-b" && closed.id == "bd-closed" && a.id == "bd-a"
+        ));
+        let args = UndeferArgs {
+            ids: vec![
+                "bd-closed".to_string(),
+                "bd-soft".to_string(),
+                "bd-a".to_string(),
+                "bd-b".to_string(),
+            ],
+            ..Default::default()
+        };
+        let result = execute_undefer_route(&args, &cli, &ctx, &beads_dir, false).unwrap();
+        assert!(matches!(
+            &result.ordered_outcomes[..],
+            [DeferredOutcome::Skipped(closed), DeferredOutcome::Changed(soft),
+             DeferredOutcome::Changed(a), DeferredOutcome::Changed(b)]
+                if closed.id == "bd-closed" && soft.id == "bd-soft"
+                    && soft.status == "in_progress" && a.id == "bd-a" && b.id == "bd-b"
+        ));
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let soft = storage.get_issue("bd-soft").unwrap().unwrap();
+        assert_eq!(soft.status, Status::InProgress);
+        assert!(soft.defer_until.is_none());
+        let closed = storage.get_issue("bd-closed").unwrap().unwrap();
+        assert_eq!(closed.status, Status::Closed);
+        assert!(closed.closed_at.is_some() && closed.defer_until.is_some());
+    }
+
+    #[test]
+    fn defer_and_undefer_policy_refusals_leave_the_whole_batch_unchanged() {
+        for undefer in [false, true] {
+            let (_temp, beads_dir) = cache_regression_workspace();
+            let db_path = beads_dir.join("beads.db");
+            let ids = vec!["bd-a".to_string(), "bd-b".to_string()];
+            let (before_issues, before_cache, before_events, before_dirty) = {
+                let mut storage = SqliteStorage::open(&db_path).unwrap();
+                for (id, status) in if undefer {
+                    [("bd-a", Status::InProgress), ("bd-b", Status::Deferred)]
+                } else {
+                    [("bd-a", Status::Open), ("bd-b", Status::InProgress)]
+                } {
+                    storage
+                        .update_issue(
+                            id,
+                            &IssueUpdate {
+                                status: Some(status),
+                                defer_until: Some(Some(Utc::now() + Duration::days(1))),
+                                ..Default::default()
+                            },
+                            "tester",
+                        )
+                        .unwrap();
+                }
+                stamp_unrelated_cache(&storage);
+                let mut dirty = storage.get_dirty_issue_ids().unwrap();
+                dirty.sort();
+                (
+                    serde_json::to_value(storage.get_issues_by_ids(&ids).unwrap()).unwrap(),
+                    cache_rows(&storage),
+                    storage
+                        .execute_raw_query("SELECT * FROM events ORDER BY id")
+                        .unwrap(),
+                    dirty,
+                )
+            };
+            std::fs::write(
+                beads_dir.join("policy.yaml"),
+                "workflow:\n  strict: true\n  statuses: [open, in_progress, deferred]\n  transitions:\n    initial: [open, in_progress, deferred]\n    open: [deferred]\n    in_progress: []\n    deferred: []\n",
+            )
+            .unwrap();
+            let cli = regression_cli();
+            let ctx = OutputContext::from_flags(true, false, true);
+            let error = if undefer {
+                // The first target is a permitted date-only edit. The second
+                // requests a forbidden status move; neither may be applied.
+                execute_undefer_route(
+                    &UndeferArgs {
+                        ids: ids.clone(),
+                        ..Default::default()
+                    },
+                    &cli,
+                    &ctx,
+                    &beads_dir,
+                    false,
+                )
+                .unwrap_err()
+            } else {
+                execute_defer_route(
+                    &DeferArgs {
+                        ids: ids.clone(),
+                        ..Default::default()
+                    },
+                    &cli,
+                    &ctx,
+                    &beads_dir,
+                    false,
+                )
+                .unwrap_err()
+            };
+            assert!(error.to_string().contains("workflow"), "{error}");
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            assert_eq!(
+                before_issues,
+                serde_json::to_value(storage.get_issues_by_ids(&ids).unwrap()).unwrap()
+            );
+            assert_eq!(before_cache, cache_rows(&storage));
+            assert_eq!(
+                before_events,
+                storage.execute_raw_query("SELECT * FROM events ORDER BY id").unwrap()
+            );
+            let mut dirty = storage.get_dirty_issue_ids().unwrap();
+            dirty.sort();
+            assert_eq!(before_dirty, dirty);
+        }
     }
 }
