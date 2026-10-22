@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproduce the import/status/detailed-blocker workloads from GitHub #574.
+"""Reproduce import/status/reopen/detailed-blocker workloads for GitHub #574.
 
 Run matched, prebuilt binaries; compilation is deliberately outside measurement:
 
@@ -12,7 +12,9 @@ that probe. Zero trace records are an error, never a zero-statement result.
 Counts follow the report's convention: direct facade calls plus prepares,
 not engine VM executions or prepared-statement executions. Instrumented runs
 are separate from the uninstrumented timing samples. --enforce-hot-paths checks
-only the detailed-blocker and localized-status optimizations, not all of #574.
+only detailed-blocker and localized status/reopen optimizations, not all of #574.
+Reopen setup closes one blocker and warms the cache outside the measured call;
+the measured command must really reopen it, not take an already-open skip path.
 
 All fixtures, copies, raw stdout/stderr, and receipts are retained in a NEW
 output directory. No user workspace is accepted, modified or deleted. Timings
@@ -41,10 +43,11 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
 
 
 STAMP = "2026-10-01T00:00:00Z"
-CASES = ("import_one_changed", "status_change", "blocked_detailed")
+CASES = ("import_one_changed", "status_change", "reopen_one", "blocked_detailed")
 
 
 def fixture(blocked_count: int) -> list[dict]:
@@ -94,6 +97,13 @@ def semantic_rows(rows: list[dict]) -> dict:
             "title": row["title"], "status": row["status"],
             "description": row.get("description"), "priority": row["priority"],
             "issue_type": row["issue_type"],
+            "closed_at": row.get("closed_at"),
+            "close_reason": row.get("close_reason"),
+            "closed_by_session": row.get("closed_by_session"),
+            "defer_until": row.get("defer_until"),
+            "deleted_at": row.get("deleted_at"),
+            "deleted_by": row.get("deleted_by"),
+            "delete_reason": row.get("delete_reason"),
             "labels": sorted(row.get("labels", [])),
             "dependencies": sorted((dep["depends_on_id"], dep["type"])
                                    for dep in row.get("dependencies", [])),
@@ -109,16 +119,19 @@ def trace_counts(stderr: str) -> dict:
     if not statements or any(not sql for sql in statements):
         raise ValueError("missing/empty BR_SQL records; an instrumented binary is required")
     upper = [sql.upper() for sql in statements]
+    # Preparing a cache rewrite must not evade the operation-specific gates.
+    # Total/prepares still follow the reporter's facade-call convention.
+    operations = [sql.removeprefix("PREPARE ") for sql in upper]
     return {
         "convention": "direct_facade_calls_plus_prepares_as_in_issue_574",
         "total": len(statements),
         "prepares": sum(sql.startswith("PREPARE ") for sql in upper),
         "full_cache_deletes": sum(bool(re.fullmatch(
-            r"DELETE FROM BLOCKED_ISSUES_CACHE\s*;?", sql)) for sql in upper),
+            r"DELETE FROM BLOCKED_ISSUES_CACHE\s*;?", sql)) for sql in operations),
         "cache_inserts": sum(bool(re.match(
-            r"INSERT(?: OR \w+)? INTO BLOCKED_ISSUES_CACHE\b", sql)) for sql in upper),
+            r"INSERT(?: OR \w+)? INTO BLOCKED_ISSUES_CACHE\b", sql)) for sql in operations),
         "export_hash_inserts": sum(bool(re.match(
-            r"INSERT(?: OR \w+)? INTO EXPORT_HASHES\b", sql)) for sql in upper),
+            r"INSERT(?: OR \w+)? INTO EXPORT_HASHES\b", sql)) for sql in operations),
         "frequencies": dict(Counter(statements).most_common()),
     }
 
@@ -129,9 +142,10 @@ def check_hot_paths(counts: dict, plain: dict, blocked_count: int) -> None:
     extra = counts["blocked_detailed"]["total"] - plain["total"]
     if extra < 0 or extra > math.ceil(2 * blocked_count / 900):
         raise AssertionError(f"detailed blocker SQL is not chunk-bounded: extra={extra}")
-    status = counts["status_change"]
-    if status["full_cache_deletes"] != 0 or status["cache_inserts"] > 1:
-        raise AssertionError(f"one blocker status edit rewrites unrelated cache rows: {status}")
+    for case in ("status_change", "reopen_one"):
+        status = counts[case]
+        if status["full_cache_deletes"] != 0 or status["cache_inserts"] > 1:
+            raise AssertionError(f"{case} rewrites unrelated cache rows: {status}")
 
 
 def binary_info(path: Path) -> dict:
@@ -201,7 +215,7 @@ def prepare(runner: Runner, workspace: Path, rows: list[dict]) -> list[dict]:
     return exported
 
 
-def scenario(template: Path, workspace: Path, case: str,
+def scenario(runner: Runner, template: Path, workspace: Path, case: str,
              exported: list[dict]) -> tuple[list[str], list[dict]]:
     shutil.copytree(template, workspace)
     expected = copy.deepcopy(exported)
@@ -214,9 +228,33 @@ def scenario(template: Path, workspace: Path, case: str,
         target = next(row for row in expected if row["id"] == "nb-k00000")
         target["status"] = "in_progress"
         return ["update", "nb-k00000", "--status", "in_progress", "--json"], expected
+    if case == "reopen_one":
+        # These calls are fixture setup, never the timing or SQL sample.
+        runner.run(workspace, ["close", "nb-k00000", "--reason",
+                               "reopen benchmark setup", "--json"])
+        runner.run(workspace, ["sync", "--flush-only", "--json"])
+        seeded = read_jsonl(workspace / ".beads" / "issues.jsonl")
+        closed = next((row for row in seeded if row["id"] == "nb-k00000"), None)
+        if closed is None or closed["status"] != "closed":
+            raise AssertionError("reopen setup did not close the target")
+        runner.run(workspace, ["blocked", "--json", "--limit", "0"])
+        return ["reopen", "nb-k00000", "--json"], expected
     if case == "blocked_detailed":
         return ["blocked", "--detailed", "--limit", "0"], expected
     raise ValueError(case)
+
+
+def verify_reopen_receipt(stdout: str) -> None:
+    result = json.loads(stdout)
+    if not isinstance(result, dict) or result.get("skipped"):
+        raise AssertionError("reopen workload was skipped or returned an invalid receipt")
+    reopened = result.get("reopened")
+    if not isinstance(reopened, list) or len(reopened) != 1:
+        raise AssertionError("reopen workload did not reopen exactly one issue")
+    issue = reopened[0]
+    if (not isinstance(issue, dict) or issue.get("id") != "nb-k00000"
+            or issue.get("status") != "open" or issue.get("closed_at") is not None):
+        raise AssertionError("reopen receipt has the wrong target or terminal metadata")
 
 
 def verify(runner: Runner, workspace: Path, expected: list[dict], blocked_count: int) -> None:
@@ -274,7 +312,7 @@ def run_benchmarks(args: argparse.Namespace) -> dict:
                     samples = []
                     for sample in range(args.repeats):
                         ws = side_root / f"{case}-{sample}"
-                        command, expected = scenario(template, ws, case, exported)
+                        command, expected = scenario(runner, template, ws, case, exported)
                         stdout, _, elapsed = runner.run(ws, command)
                         if case == "blocked_detailed":
                             if "(not found)" in stdout or any(
@@ -282,6 +320,8 @@ def run_benchmarks(args: argparse.Namespace) -> dict:
                                 for i in range(2 * count)
                             ):
                                 raise AssertionError("detailed output lost blocker titles")
+                        elif case == "reopen_one":
+                            verify_reopen_receipt(stdout)
                         verify(runner, ws, expected, count)
                         samples.append(elapsed)
                     receipt = {"side": side, "blocked_count": count, "issue_count": 3 * count,
@@ -299,15 +339,18 @@ def run_benchmarks(args: argparse.Namespace) -> dict:
                         version, _, _ = trace_runner.run(trace_template, ["--version"])
                         traces[side]["version_stdout"] = version.strip()
                         ws = trace_root / "measured"
-                        command, expected = scenario(trace_template, ws, case, trace_exported)
-                        _, stderr, _ = trace_runner.run(ws, command, trace=True)
+                        command, expected = scenario(
+                            trace_runner, trace_template, ws, case, trace_exported)
+                        stdout, stderr, _ = trace_runner.run(ws, command, trace=True)
+                        if case == "reopen_one":
+                            verify_reopen_receipt(stdout)
                         counts[case] = trace_counts(stderr)
                         receipt["sql"] = counts[case]
                         verify(trace_runner, ws, expected, count)
                         if case == "blocked_detailed":
                             plain_ws = trace_root / "plain"
                             _, plain_expected = scenario(
-                                trace_template, plain_ws, case, trace_exported)
+                                trace_runner, trace_template, plain_ws, case, trace_exported)
                             _, stderr, _ = trace_runner.run(
                                 plain_ws, ["blocked", "--limit", "0"], trace=True)
                             plain = trace_counts(stderr)
@@ -315,7 +358,7 @@ def run_benchmarks(args: argparse.Namespace) -> dict:
                             verify(trace_runner, plain_ws, plain_expected, count)
                     if case == "import_one_changed":
                         ws = side_root / "import-warnings"
-                        command, expected = scenario(template, ws, case, exported)
+                        command, expected = scenario(runner, template, ws, case, exported)
                         _, stderr, _ = runner.run(ws, command, warn=True)
                         receipt["import_skip_warnings"] = stderr.count("Import skip:")
                         verify(runner, ws, expected, count)
@@ -348,7 +391,11 @@ class HarnessTests(unittest.TestCase):
     def test_semantic_check_detects_data_loss(self):
         original = fixture(2)
         for field, value in (("title", "wrong"), ("status", "closed"),
-                             ("labels", []), ("dependencies", [])):
+                             ("labels", []), ("dependencies", []),
+                             ("closed_at", STAMP), ("close_reason", "stale"),
+                             ("closed_by_session", "stale"), ("defer_until", STAMP),
+                             ("deleted_at", STAMP), ("deleted_by", "stale"),
+                             ("delete_reason", "stale")):
             changed = copy.deepcopy(original)
             changed[0][field] = value
             self.assertNotEqual(semantic_rows(original), semantic_rows(changed))
@@ -371,15 +418,65 @@ class HarnessTests(unittest.TestCase):
 
     def test_sql_gate_rejects_planted_n_plus_one_and_cache_rebuild(self):
         good = {"blocked_detailed": {"total": 18},
-                "status_change": {"full_cache_deletes": 0, "cache_inserts": 1}}
+                "status_change": {"full_cache_deletes": 0, "cache_inserts": 1},
+                "reopen_one": {"full_cache_deletes": 0, "cache_inserts": 1}}
         check_hot_paths(good, {"total": 16}, 500)
         for case, field, value in (("blocked_detailed", "total", 1016),
                                    ("status_change", "full_cache_deletes", 1),
-                                   ("status_change", "cache_inserts", 500)):
+                                   ("status_change", "cache_inserts", 500),
+                                   ("reopen_one", "full_cache_deletes", 1),
+                                   ("reopen_one", "cache_inserts", 500)):
             bad = copy.deepcopy(good)
             bad[case][field] = value
             with self.assertRaises(AssertionError):
                 check_hot_paths(bad, {"total": 16}, 500)
+
+    def test_prepared_cache_rewrites_are_classified_without_changing_total(self):
+        result = trace_counts("BR_SQL\tPREPARE DELETE FROM blocked_issues_cache;\n"
+                              "BR_SQL\tPREPARE INSERT INTO blocked_issues_cache VALUES (?)\n"
+                              "BR_SQL\tPREPARE INSERT OR REPLACE INTO export_hashes VALUES (?)\n")
+        self.assertEqual(result["total"], 3)
+        self.assertEqual(result["prepares"], 3)
+        self.assertEqual(result["full_cache_deletes"], 1)
+        self.assertEqual(result["cache_inserts"], 1)
+        self.assertEqual(result["export_hash_inserts"], 1)
+
+    def test_reopen_setup_is_outside_the_measured_command(self):
+        rows = fixture(2)
+        closed = copy.deepcopy(rows)
+        next(row for row in closed if row["id"] == "nb-k00000")["status"] = "closed"
+        runner = mock.Mock(spec=Runner)
+        workspace = Path("unwritten-measured-workspace")
+        with mock.patch.object(shutil, "copytree") as copytree, \
+                mock.patch(f"{__name__}.read_jsonl", return_value=closed):
+            command, expected = scenario(runner, Path("template"), workspace, "reopen_one", rows)
+        copytree.assert_called_once_with(Path("template"), workspace)
+        self.assertEqual(command, ["reopen", "nb-k00000", "--json"])
+        self.assertEqual(expected, rows)
+        self.assertEqual([call.args[1][0] for call in runner.run.call_args_list],
+                         ["close", "sync", "blocked"])
+        self.assertTrue(all(not call.kwargs.get("trace") for call in runner.run.call_args_list))
+        self.assertEqual(next(row for row in rows if row["id"] == "nb-k00000")["status"], "open")
+
+    def test_reopen_setup_rejects_an_already_open_target(self):
+        with mock.patch.object(shutil, "copytree"), \
+                mock.patch(f"{__name__}.read_jsonl", return_value=fixture(2)):
+            with self.assertRaisesRegex(AssertionError, "did not close"):
+                scenario(mock.Mock(spec=Runner), Path("template"), Path("unused"),
+                         "reopen_one", fixture(2))
+
+    def test_reopen_receipt_rejects_skips_wrong_ids_and_stale_close_fields(self):
+        good = {"reopened": [{"id": "nb-k00000", "status": "open"}]}
+        verify_reopen_receipt(json.dumps(good))
+        bad_receipts = [[], {}, {"reopened": []},
+                        {**good, "skipped": [{"id": "nb-k00000"}]}]
+        for field, value in (("id", "wrong"), ("status", "closed"), ("closed_at", STAMP)):
+            bad = copy.deepcopy(good)
+            bad["reopened"][0][field] = value
+            bad_receipts.append(bad)
+        for bad in bad_receipts:
+            with self.assertRaises(AssertionError):
+                verify_reopen_receipt(json.dumps(bad))
 
 
 def main() -> int:
