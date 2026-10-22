@@ -858,9 +858,12 @@ fn execute_prepared_route_with_resources(
     let use_human_output = update_uses_human_output(ctx);
     let mut route_has_mutated = false;
     let mut blocked_cache_dirty = false;
-    let defer_blocked_cache_rebuild = prepared.update.status.is_some()
-        || !matches!(prepared.resolved_parent, ParentUpdatePlan::Unchanged);
     let parent_changes_cache = !matches!(prepared.resolved_parent, ParentUpdatePlan::Unchanged);
+    // Field, status and label edits already commit in one atomic batch. Let
+    // storage refresh that batch's affected components, including direct
+    // dependents, rather than discarding its seeds in the full-rebuild CLI
+    // finalizer (#574). Only the separate parent rewrites need deferral.
+    let defer_blocked_cache_rebuild = parent_changes_cache;
 
     // Snapshot every row before the atomic field/label transaction. Human
     // diffs are derived from these validated snapshots, preserving the #256
@@ -968,7 +971,7 @@ fn execute_prepared_route_with_resources(
             update_result,
         )?;
         capacity_warnings = prepared.storage_ctx.storage.take_capacity_warnings();
-        if prepared.update.status.is_some() {
+        if defer_blocked_cache_rebuild && prepared.update.status.is_some() {
             blocked_cache_dirty = true;
         }
         route_has_mutated = true;
@@ -2209,7 +2212,7 @@ mod tests {
     fn if_unchanged_compares_instants_not_spellings() {
         // The same moment written three ways must not read as "the record
         // moved" — a caller may round-trip the token through a tool that
-        // normalises the offset.
+        // normalises the offset or trims trailing zeros.
         let z = parse_if_unchanged(Some("2026-09-17T02:22:26.5Z"))
             .unwrap()
             .unwrap();
@@ -3984,5 +3987,101 @@ because downstream tooling links to them.\n\n- [ ] schema migration applied\n\
         );
 
         info!("test_execute_prepared_route_rolls_back_fields_when_labels_fail: assertions passed");
+    }
+
+    #[test]
+    fn status_batch_refresh_preserves_unrelated_cache_entries() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let mut storage_ctx =
+            config::open_storage_with_cli(&beads_dir, &CliOverrides::default()).unwrap();
+        for id in [
+            "bd-local-a", "bd-local-b", "bd-blocks", "bd-conditional",
+            "bd-waits", "bd-other", "bd-unrelated",
+        ] {
+            let now = Utc::now();
+            let issue = Issue {
+                id: id.to_string(),
+                title: format!("Cache fixture {id}"),
+                status: Status::Open,
+                priority: Priority::MEDIUM,
+                issue_type: IssueType::Task,
+                created_at: now,
+                updated_at: now,
+                ..Issue::default()
+            };
+            storage_ctx.storage.create_issue(&issue, "tester").unwrap();
+        }
+        for (dependent, blocker, kind) in [
+            ("bd-blocks", "bd-local-a", "blocks"),
+            ("bd-blocks", "bd-local-b", "blocks"),
+            ("bd-conditional", "bd-local-b", "conditional-blocks"),
+            ("bd-waits", "bd-local-a", "waits-for"),
+            ("bd-unrelated", "bd-other", "blocks"),
+        ] {
+            storage_ctx
+                .storage
+                .add_dependency(dependent, blocker, kind, "tester")
+                .unwrap();
+        }
+        assert_eq!(storage_ctx.storage.get_blocked_ids().unwrap().len(), 4);
+        storage_ctx.storage.execute_raw(
+            "UPDATE blocked_issues_cache SET blocked_at = '2000-01-01T00:00:00Z' \
+             WHERE issue_id = 'bd-unrelated'",
+        ).unwrap();
+
+        // Exercise the internal atomic route, as the rollback test above
+        // does. The public CLI's terminal-status guard remains unchanged.
+        for status in [Status::Closed, Status::Open] {
+            let expect_blocked = status == Status::Open;
+            let prepared = PreparedUpdateRoute {
+                storage_ctx,
+                actor: "tester".to_string(),
+                resolved_ids: vec!["bd-local-a".to_string(), "bd-local-b".to_string()],
+                update: IssueUpdate {
+                    closed_at: Some((status == Status::Closed).then(Utc::now)),
+                    status: Some(status),
+                    ..IssueUpdate::default()
+                },
+                has_updates: true,
+                add_labels: Vec::new(),
+                remove_labels: Vec::new(),
+                set_labels: false,
+                valid_set_labels: Vec::new(),
+                resolved_parent: ParentUpdatePlan::Unchanged,
+                acceptance_edits: Vec::new(),
+                notes_appends: Vec::new(),
+                overwrite_advisories: Vec::new(),
+                auto_flush_external: false,
+                attribution: EventAttribution::default(),
+                routed_write_lock: RoutedWorkspaceWriteLock::local(),
+            };
+            let (output, resources) = execute_prepared_route_with_resources(
+                prepared,
+                &OutputContext::from_flags(true, false, true),
+            ).unwrap();
+            assert_eq!(output.updated_issues.len(), 2);
+            storage_ctx = resources.storage_ctx;
+            let blocked = storage_ctx.storage.get_blocked_ids().unwrap();
+            for id in ["bd-blocks", "bd-conditional", "bd-waits"] {
+                assert_eq!(blocked.contains(id), expect_blocked, "{id}");
+            }
+            assert!(blocked.contains("bd-unrelated"));
+            assert_eq!(blocked.len(), if expect_blocked { 4 } else { 1 });
+
+            let witness = crate::franken_sync::Connection::open(
+                beads_dir.join("beads.db").to_string_lossy().into_owned(),
+            ).unwrap();
+            let row = witness.query_row(
+                "SELECT blocked_at FROM blocked_issues_cache WHERE issue_id = 'bd-unrelated'",
+            ).unwrap();
+            assert_eq!(
+                row.get(0).and_then(crate::franken_sync::SqliteValue::as_text),
+                Some("2000-01-01T00:00:00Z"),
+                "a localized status batch must not rewrite an unrelated cache component",
+            );
+            witness.close().unwrap();
+        }
     }
 }
