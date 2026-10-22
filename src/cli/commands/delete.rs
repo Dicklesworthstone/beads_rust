@@ -17,7 +17,7 @@ use crate::storage::SqliteStorage;
 use crate::util::id::{IdResolver, ResolverConfig};
 use rich_rust::prelude::*;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -131,22 +131,17 @@ pub fn execute(
     let result = {
         // 3. Check for dependents (if not --force and not --cascade)
         let delete_set: HashSet<String> = ids.iter().cloned().collect();
-        let blocked_dependents = collect_direct_dependents(&storage_ctx.storage, &ids)?;
-        let cascade_dependents = if args.cascade {
-            Some(collect_sorted_cascade_dependents(
-                &storage_ctx.storage,
-                &ids,
-            )?)
-        } else {
-            None
-        };
+        let DeleteDependents {
+            direct: blocked_dependents,
+            cascade: planned_cascade,
+        } = plan_delete_dependents(&storage_ctx.storage, &ids, args.cascade || !args.force)?;
+        let cascade_dependents = args.cascade.then(|| planned_cascade.clone());
 
         if !blocked_dependents.is_empty() && !args.force && !args.cascade {
             // Preview mode: show what would happen.
             // Compute the full transitive closure so the user sees the true blast
             // radius of --cascade (not just first-level dependents).
-            let full_cascade: Vec<String> =
-                collect_sorted_cascade_dependents(&storage_ctx.storage, &ids)?;
+            let full_cascade = planned_cascade;
             if ctx.is_json() || ctx.is_toon() {
                 let preview = DeletePreviewResult {
                     preview: true,
@@ -639,8 +634,14 @@ fn prepare_delete_route(
         &resolver,
         issue_inputs,
     )?);
-    let blocked_dependents = collect_direct_dependents(&storage_ctx.storage, &resolved_ids)?;
-    let cascade_delete = collect_sorted_cascade_dependents(&storage_ctx.storage, &resolved_ids)?;
+    let DeleteDependents {
+        direct: blocked_dependents,
+        cascade: cascade_delete,
+    } = plan_delete_dependents(
+        &storage_ctx.storage,
+        &resolved_ids,
+        args.cascade || !args.force,
+    )?;
     let final_delete_ids = if args.cascade {
         sorted_unique_strings(
             resolved_ids
@@ -869,7 +870,105 @@ fn read_ids_from_file(path: &Path) -> Result<Vec<String>> {
     Ok(ids)
 }
 
+/// A single plan shared by previews and actual cascade deletion.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DeleteDependents {
+    direct: Vec<String>,
+    cascade: Vec<String>,
+}
+
+fn plan_delete_dependents(
+    storage: &SqliteStorage,
+    initial_ids: &[String],
+    include_cascade: bool,
+) -> Result<DeleteDependents> {
+    plan_delete_dependents_with(
+        initial_ids,
+        include_cascade,
+        |id| storage.get_blocked_issue_ids(id),
+        || {
+            // This reader filters raw SQL dependency types and retains missing
+            // endpoints. Do not use parsed export records or filter by status:
+            // either could change the deletion set relative to the ID query.
+            let mut graph: HashMap<String, Vec<String>> = HashMap::new();
+            for (target, dependents) in storage.prefetch_blocking_dependents()? {
+                for dependent in dependents {
+                    let (root, blocked) = match dependent.dep_type.as_str() {
+                        // Parents are blocked by children, not vice versa.
+                        "parent-child" => (dependent.id, target.clone()),
+                        "blocks" | "conditional-blocks" | "waits-for" => {
+                            (target.clone(), dependent.id)
+                        }
+                        _ => continue,
+                    };
+                    graph.entry(root).or_default().push(blocked);
+                }
+            }
+            Ok(graph)
+        },
+    )
+}
+
+/// Keep isolated/single-target forced deletes cheap. Larger plans read the
+/// graph once (#574), instead of issuing a SQL query for every visited node.
+/// Loader injection makes the read bound testable without timing assertions.
+fn plan_delete_dependents_with(
+    initial_ids: &[String],
+    include_cascade: bool,
+    mut load_one: impl FnMut(&str) -> Result<Vec<String>>,
+    load_graph: impl FnOnce() -> Result<HashMap<String, Vec<String>>>,
+) -> Result<DeleteDependents> {
+    let roots = sorted_unique_strings(initial_ids.to_vec());
+    if roots.is_empty() {
+        return Ok(DeleteDependents::default());
+    }
+    if roots.len() == 1 {
+        let direct = sorted_unique_strings(
+            load_one(&roots[0])?
+                .into_iter()
+                .filter(|id| id != &roots[0])
+                .collect(),
+        );
+        if !include_cascade || direct.is_empty() {
+            return Ok(DeleteDependents {
+                direct,
+                cascade: Vec::new(),
+            });
+        }
+    }
+
+    // Recompute direct edges from the same snapshot as the closure. The
+    // optional point read above only chooses the cheap single-root path.
+    let graph = load_graph()?;
+    let root_set: HashSet<&str> = roots.iter().map(String::as_str).collect();
+    let mut direct = HashSet::new();
+    for root in &roots {
+        for dependent in graph.get(root).into_iter().flatten() {
+            if !root_set.contains(dependent.as_str()) {
+                direct.insert(dependent.clone());
+            }
+        }
+    }
+    let mut cascade = HashSet::new();
+    if include_cascade {
+        cascade.clone_from(&direct);
+        let mut pending: Vec<String> = direct.iter().cloned().collect();
+        while let Some(id) = pending.pop() {
+            for dependent in graph.get(&id).into_iter().flatten() {
+                if !root_set.contains(dependent.as_str()) && cascade.insert(dependent.clone()) {
+                    pending.push(dependent.clone());
+                }
+            }
+        }
+    }
+    Ok(DeleteDependents {
+        direct: sorted_unique_strings(direct.into_iter().collect()),
+        cascade: sorted_unique_strings(cascade.into_iter().collect()),
+    })
+}
+
 /// Recursively collect all blocked issues for cascade deletion.
+#[cfg(test)]
 fn collect_cascade_dependents(
     storage: &SqliteStorage,
     initial_ids: &[String],
@@ -895,6 +994,7 @@ fn collect_cascade_dependents(
     Ok(all_ids)
 }
 
+#[cfg(test)]
 fn collect_direct_dependents(
     storage: &SqliteStorage,
     initial_ids: &[String],
@@ -916,6 +1016,7 @@ fn collect_direct_dependents(
     Ok(dependents)
 }
 
+#[cfg(test)]
 fn collect_sorted_cascade_dependents(
     storage: &SqliteStorage,
     initial_ids: &[String],
@@ -1347,10 +1448,10 @@ mod tests {
             .unwrap();
 
         // Collect cascade from A
-        let cascade = collect_cascade_dependents(&storage, &["bd-a".to_string()]).unwrap();
-        assert!(cascade.contains("bd-b"));
-        assert!(cascade.contains("bd-c"));
-        assert!(!cascade.contains("bd-a")); // Initial ID not included
+        let cascade = plan_delete_dependents(&storage, &["bd-a".to_string()], true)
+            .unwrap()
+            .cascade;
+        assert_eq!(cascade, vec!["bd-b", "bd-c"]); // Initial ID not included
         info!("test_cascade_dependents_collection: assertions passed");
     }
 
@@ -1382,7 +1483,9 @@ mod tests {
             })
             .unwrap();
 
-        let direct = collect_direct_dependents(&storage, &["bd-a".to_string()]).unwrap();
+        let direct = plan_delete_dependents(&storage, &["bd-a".to_string()], false)
+            .unwrap()
+            .direct;
         assert_eq!(direct, vec!["bd-b".to_string()]);
         info!("test_direct_dependents_collection_is_shallow: assertions passed");
     }
@@ -1415,7 +1518,9 @@ mod tests {
             })
             .unwrap();
 
-        let cascade = collect_sorted_cascade_dependents(&storage, &["bd-a".to_string()]).unwrap();
+        let cascade = plan_delete_dependents(&storage, &["bd-a".to_string()], true)
+            .unwrap()
+            .cascade;
         assert_eq!(cascade, vec!["bd-b".to_string(), "bd-c".to_string()]);
         info!("test_sorted_cascade_dependents_include_transitive_dependents: assertions passed");
     }
@@ -1456,11 +1561,15 @@ mod tests {
             .unwrap();
 
         // Direct dependents of A: only B (first-level)
-        let direct = collect_direct_dependents(&storage, &["bd-a".to_string()]).unwrap();
+        let direct = plan_delete_dependents(&storage, &["bd-a".to_string()], false)
+            .unwrap()
+            .direct;
         assert_eq!(direct, vec!["bd-b".to_string()]);
 
         // Full cascade closure: B, C, and D (the complete transitive set)
-        let cascade = collect_sorted_cascade_dependents(&storage, &["bd-a".to_string()]).unwrap();
+        let cascade = plan_delete_dependents(&storage, &["bd-a".to_string()], true)
+            .unwrap()
+            .cascade;
         assert_eq!(
             cascade,
             vec!["bd-b".to_string(), "bd-c".to_string(), "bd-d".to_string()]
@@ -1473,5 +1582,193 @@ mod tests {
             assert!(cascade.contains(dep));
         }
         info!("test_preview_cascade_closure_exceeds_direct_dependents: assertions passed");
+    }
+
+    #[test]
+    fn delete_plan_empty_and_single_root_fast_paths_do_not_load_graph() {
+        let empty = plan_delete_dependents_with(
+            &[],
+            true,
+            |_| panic!("empty plan must not read a root"),
+            || panic!("empty plan must not read the graph"),
+        )
+        .unwrap();
+        assert_eq!(empty, DeleteDependents::default());
+
+        for include_cascade in [false, true] {
+            let mut reads = 0;
+            let plan = plan_delete_dependents_with(
+                &["a".to_string(), "a".to_string()],
+                include_cascade,
+                |id| {
+                    reads += 1;
+                    assert_eq!(id, "a");
+                    // An imported self-edge must not force graph hydration.
+                    Ok(vec!["a".to_string()])
+                },
+                || panic!("isolated root must not read the graph"),
+            )
+            .unwrap();
+            assert_eq!(reads, 1);
+            assert_eq!(plan, DeleteDependents::default());
+        }
+    }
+
+    #[test]
+    fn delete_plan_forced_single_root_only_reads_direct_dependents() {
+        let plan = plan_delete_dependents_with(
+            &["a".to_string()],
+            false,
+            |_| Ok(vec!["c".to_string(), "b".to_string(), "b".to_string()]),
+            || panic!("non-cascade force must not load a transitive graph"),
+        )
+        .unwrap();
+        assert_eq!(plan.direct, vec!["b", "c"]);
+        assert!(plan.cascade.is_empty());
+    }
+
+    #[test]
+    fn delete_plan_large_cycle_uses_one_graph_read() {
+        let mut point_reads = 0;
+        let mut graph_reads = 0;
+        let plan = plan_delete_dependents_with(
+            &["node-0000".to_string()],
+            true,
+            |_| {
+                point_reads += 1;
+                Ok(vec!["node-0001".to_string()])
+            },
+            || {
+                graph_reads += 1;
+                let mut graph = HashMap::new();
+                for index in 0..1001 {
+                    let next = format!("node-{:04}", (index + 1) % 1001);
+                    graph.insert(format!("node-{index:04}"), vec![next.clone(), next]);
+                }
+                Ok(graph)
+            },
+        )
+        .unwrap();
+        assert_eq!(point_reads, 1);
+        assert_eq!(graph_reads, 1);
+        assert_eq!(plan.direct, vec!["node-0001"]);
+        assert_eq!(plan.cascade.len(), 1000);
+        assert_eq!(plan.cascade.first().unwrap(), "node-0001");
+        assert_eq!(plan.cascade.last().unwrap(), "node-1000");
+    }
+
+    #[test]
+    fn delete_plan_multiple_roots_share_one_snapshot_and_exclude_each_other() {
+        for include_cascade in [false, true] {
+            let mut graph_reads = 0;
+            let plan = plan_delete_dependents_with(
+                &["b".to_string(), "a".to_string(), "b".to_string()],
+                include_cascade,
+                |_| panic!("multi-root planning must not issue point reads"),
+                || {
+                    graph_reads += 1;
+                    Ok(HashMap::from([
+                        ("a".to_string(), vec!["b".to_string(), "c".to_string()]),
+                        ("b".to_string(), vec!["c".to_string(), "a".to_string()]),
+                        ("c".to_string(), vec!["d".to_string(), "a".to_string()]),
+                    ]))
+                },
+            )
+            .unwrap();
+            assert_eq!(graph_reads, 1);
+            assert_eq!(plan.direct, vec!["c"]);
+            if include_cascade {
+                assert_eq!(plan.cascade, vec!["c", "d"]);
+            } else {
+                assert!(plan.cascade.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn delete_plan_recomputes_direct_edges_from_the_loaded_snapshot() {
+        let plan = plan_delete_dependents_with(
+            &["a".to_string()],
+            true,
+            |_| Ok(vec!["old".to_string()]),
+            || Ok(HashMap::from([("a".to_string(), vec!["new".to_string()])])),
+        )
+        .unwrap();
+        assert_eq!(plan.direct, vec!["new"]);
+        assert_eq!(plan.cascade, vec!["new"]);
+    }
+
+    #[test]
+    fn delete_plan_propagates_read_failures_before_any_deletion() {
+        let error = plan_delete_dependents_with(
+            &["a".to_string()],
+            true,
+            |_| Err(BeadsError::Config("point read failed".to_string())),
+            || panic!("failed root read must stop planning"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("point read failed"));
+        let error = plan_delete_dependents_with(
+            &["a".to_string()],
+            true,
+            |_| Ok(vec!["b".to_string()]),
+            || Err(BeadsError::Config("graph read failed".to_string())),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("graph read failed"));
+    }
+
+    #[test]
+    fn delete_plan_matches_point_query_semantics_for_mixed_persisted_edges() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for id in ["bd-a", "bd-b", "bd-c", "bd-parent", "bd-related"] {
+            storage.create_issue(&create_test_issue(id, id), "tester").unwrap();
+        }
+        // Insert directly to cover legacy/imported cycles, dangling endpoints
+        // and raw case-sensitive type strings, not just API-normalized data.
+        storage
+            .mutate("test_delete_plan_edges", "tester", |tx, _ctx| {
+                let stamp = Utc::now().to_rfc3339();
+                for (source, target, kind) in [
+                    ("bd-b", "bd-a", "blocks"),
+                    ("bd-c", "bd-b", "conditional-blocks"),
+                    ("bd-a", "bd-c", "waits-for"),
+                    ("bd-b", "bd-parent", "parent-child"),
+                    ("bd-related", "bd-a", "relates-to"),
+                    ("bd-related", "bd-b", "BLOCKS"),
+                    ("bd-related", "bd-c", "custom-link"),
+                    ("bd-missing", "bd-a", "blocks"),
+                ] {
+                    tx.execute_with_params(
+                        "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
+                        &[
+                            fsqlite_types::SqliteValue::from(source),
+                            fsqlite_types::SqliteValue::from(target),
+                            fsqlite_types::SqliteValue::from(kind),
+                            fsqlite_types::SqliteValue::from(stamp.as_str()),
+                        ],
+                    )?;
+                }
+                tx.execute("UPDATE issues SET status = 'closed' WHERE id = 'bd-c'")?;
+                tx.execute("UPDATE issues SET status = 'tombstone' WHERE id = 'bd-b'")?;
+                Ok(())
+            })
+            .unwrap();
+        for roots in [
+            vec!["bd-a".to_string()],
+            vec!["bd-b".to_string()],
+            vec!["bd-parent".to_string()],
+            vec!["bd-a".to_string(), "bd-b".to_string()],
+            vec!["bd-parent".to_string(), "bd-related".to_string()],
+            vec!["bd-missing".to_string()],
+        ] {
+            let plan = plan_delete_dependents(&storage, &roots, true).unwrap();
+            assert_eq!(plan.direct, collect_direct_dependents(&storage, &roots).unwrap());
+            assert_eq!(plan.cascade, collect_sorted_cascade_dependents(&storage, &roots).unwrap());
+            assert!(!plan.cascade.contains(&"bd-related".to_string()));
+        }
+        let plan = plan_delete_dependents(&storage, &["bd-a".to_string()], true).unwrap();
+        assert_eq!(plan.direct, vec!["bd-b", "bd-missing"]);
+        assert_eq!(plan.cascade, vec!["bd-b", "bd-c", "bd-missing", "bd-parent"]);
     }
 }
