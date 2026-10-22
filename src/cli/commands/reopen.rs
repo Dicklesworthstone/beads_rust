@@ -3,7 +3,6 @@
 use crate::cli::ReopenArgs;
 use crate::cli::commands::{
     acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
-    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
     report_auto_flush_failure, resolve_issue_ids, update_issues_atomically_with_recovery,
 };
 use crate::config;
@@ -219,10 +218,20 @@ fn execute_route(
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let resolved_ids = resolve_issue_ids(&storage_ctx.storage, &resolver, &args.ids)?;
 
+    // This is a preflight snapshot, not the mutation's authority. Storage
+    // still validates live rows and policy inside the atomic transaction.
+    // Use its parameter-limited reader rather than one SELECT per target
+    // (#574), and retain request order independently of SQL row order.
+    let issues_by_id: HashMap<_, _> = storage_ctx
+        .storage
+        .get_issues_by_ids(&resolved_ids)?
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect();
+
     let mut reopened_issues: Vec<ReopenedIssue> = Vec::new();
     let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
     let mut ordered_outcomes = Vec::with_capacity(resolved_ids.len());
-    let mut cache_dirty = false;
     let mut atomic_updates = Vec::new();
     let mut planned_reopens = Vec::new();
 
@@ -231,14 +240,7 @@ fn execute_route(
         ordered_outcomes.push(None);
         tracing::info!(id = %id, "Reopening issue");
 
-        let issue_result = storage_ctx.storage.get_issue(id);
-        let Some(issue) = preserve_blocked_cache_on_error(
-            &mut storage_ctx.storage,
-            cache_dirty,
-            "reopen",
-            issue_result,
-        )?
-        else {
+        let Some(issue) = issues_by_id.get(id) else {
             let skipped = SkippedIssue {
                 id: id.clone(),
                 reason: "issue not found".to_string(),
@@ -285,7 +287,11 @@ fn execute_route(
                 .reason
                 .as_ref()
                 .map(|reason| format!("Reopened: {reason}")),
-            skip_cache_rebuild: true,
+            // One atomic status batch already supplies the changed issues
+            // and their direct dependents to incremental cache refresh.
+            // Deferring here would discard those seeds in the CLI's full
+            // rebuild finalizer, rewriting unrelated components (#574).
+            skip_cache_rebuild: false,
             ..Default::default()
         };
 
@@ -303,16 +309,14 @@ fn execute_route(
                 args.model.as_deref(),
                 super::session_attribution_from_env().as_deref(),
             ));
-        let update_result = update_issues_atomically_with_recovery(
+        update_issues_atomically_with_recovery(
             &mut storage_ctx,
             true,
             "reopen",
             &atomic_updates,
             &actor,
-        );
-        preserve_blocked_cache_on_error(&mut storage_ctx.storage, false, "reopen", update_result)?;
+        )?;
         capacity_warnings = storage_ctx.storage.take_capacity_warnings();
-        cache_dirty = true;
     }
 
     for (outcome_index, id, issue) in planned_reopens {
@@ -334,14 +338,6 @@ fn execute_route(
             outcome.ok_or_else(|| BeadsError::internal("reopen batch outcome was not populated"))
         })
         .collect::<Result<Vec<_>>>()?;
-
-    if cache_dirty {
-        tracing::info!(
-            "Rebuilding blocked cache after reopening {} issues",
-            reopened_issues.len()
-        );
-        finalize_batched_blocked_cache_refresh(&mut storage_ctx.storage, cache_dirty, "reopen")?;
-    }
 
     storage_ctx.flush_no_db_if_dirty()?;
     if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
@@ -616,6 +612,222 @@ mod tests {
 
         assert_eq!(issue.status, Status::Tombstone);
         assert!(issue.deleted_at.is_some());
+    }
+
+    fn blocked_snapshot(
+        storage: &SqliteStorage,
+    ) -> std::collections::BTreeMap<String, Vec<String>> {
+        storage
+            .get_blocked_issues()
+            .expect("blocked issues")
+            .into_iter()
+            .map(|(issue, mut blockers)| {
+                blockers.sort();
+                (issue.id, blockers)
+            })
+            .collect()
+    }
+
+    fn assert_unrelated_cache_witness(db_path: &Path) {
+        let connection =
+            crate::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())
+                .expect("witness connection");
+        let row = connection
+            .query_row(
+                "SELECT blocked_at FROM blocked_issues_cache WHERE issue_id = 'bd-unrelated'",
+            )
+            .expect("unrelated cache row");
+        assert_eq!(
+            row.get(0).and_then(crate::franken_sync::SqliteValue::as_text),
+            Some("2000-01-01T00:00:00Z"),
+            "reopen must not rewrite an unrelated cache component",
+        );
+        connection.close().expect("close witness connection");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reopen_batch_refreshes_dependents_without_rewriting_unrelated_components() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(true, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        for id in [
+            "bd-reopen-a",
+            "bd-reopen-b",
+            "bd-blocks",
+            "bd-conditional",
+            "bd-waits",
+            "bd-child",
+            "bd-other",
+            "bd-unrelated",
+            "bd-tombstone",
+        ] {
+            let mut issue = make_closed_deferred_issue(id, id);
+            if !matches!(id, "bd-reopen-a" | "bd-reopen-b") {
+                issue.status = Status::Open;
+                issue.closed_at = None;
+                issue.defer_until = None;
+            }
+            storage.create_issue(&issue, "tester").expect("create issue");
+        }
+        storage
+            .delete_issue("bd-tombstone", "tester", "test skip", None)
+            .expect("tombstone fixture");
+        for (dependent, blocker, kind) in [
+            ("bd-blocks", "bd-reopen-a", "blocks"),
+            ("bd-conditional", "bd-reopen-b", "conditional-blocks"),
+            ("bd-waits", "bd-reopen-a", "waits-for"),
+            ("bd-child", "bd-blocks", "parent-child"),
+            ("bd-unrelated", "bd-other", "blocks"),
+        ] {
+            storage
+                .add_dependency(dependent, blocker, kind, "tester")
+                .expect("dependency");
+        }
+        storage.rebuild_blocked_cache(true).expect("fresh seed cache");
+        storage
+            .execute_raw(
+                "UPDATE blocked_issues_cache SET blocked_at = '2000-01-01T00:00:00Z' \
+                 WHERE issue_id = 'bd-unrelated'",
+            )
+            .expect("seed unrelated witness");
+        drop(storage);
+
+        let args = ReopenArgs {
+            // Mixed outcomes and non-SQL order must survive the batched read.
+            ids: ["bd-reopen-b", "bd-other", "bd-tombstone", "bd-reopen-a"]
+                .map(str::to_string)
+                .to_vec(),
+            reason: Some("exercise incremental reopen".to_string()),
+            ..Default::default()
+        };
+        let overrides = CliOverrides {
+            db: Some(db_path.clone()),
+            no_auto_import: Some(true),
+            no_auto_flush: Some(true),
+            ..CliOverrides::default()
+        };
+        let result = execute_route(&args, &overrides, &ctx, &beads_dir, false)
+            .expect("atomic mixed reopen batch");
+        assert_eq!(
+            result
+                .reopened
+                .iter()
+                .map(|issue| issue.id.as_str())
+                .collect::<Vec<_>>(),
+            ["bd-reopen-b", "bd-reopen-a"],
+        );
+        assert_eq!(
+            result
+                .skipped
+                .iter()
+                .map(|issue| issue.id.as_str())
+                .collect::<Vec<_>>(),
+            ["bd-other", "bd-tombstone"],
+        );
+        assert_eq!(result.skipped[0].reason, "already open");
+        assert_eq!(result.skipped[1].reason, "cannot reopen tombstone issue");
+        let outcome_ids = result
+            .ordered_outcomes
+            .iter()
+            .map(|outcome| match outcome {
+                ReopenOutcome::Reopened(issue) => issue.id.as_str(),
+                ReopenOutcome::Skipped(issue) => issue.id.as_str(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcome_ids,
+            args.ids.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+
+        let mut storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        for id in ["bd-reopen-a", "bd-reopen-b"] {
+            let issue = storage.get_issue(id).unwrap().unwrap();
+            assert_eq!(issue.status, Status::Open);
+            assert!(issue.closed_at.is_none());
+            assert!(issue.defer_until.is_none());
+        }
+        let incremental = blocked_snapshot(&storage);
+        for id in ["bd-blocks", "bd-conditional", "bd-waits", "bd-unrelated"] {
+            assert!(incremental.contains_key(id), "{id} must be blocked");
+        }
+        assert_unrelated_cache_witness(&db_path);
+        drop(storage);
+
+        let skipped = execute_route(&args, &overrides, &ctx, &beads_dir, false)
+            .expect("all-skipped repeat");
+        assert!(skipped.reopened.is_empty());
+        assert_eq!(skipped.skipped.len(), args.ids.len());
+        assert_unrelated_cache_witness(&db_path);
+
+        storage = SqliteStorage::open(&db_path).expect("storage for full-rebuild oracle");
+        storage.rebuild_blocked_cache(true).expect("reference rebuild");
+        assert_eq!(
+            incremental,
+            blocked_snapshot(&storage),
+            "incremental membership and blocker details must match a full rebuild, \
+             including parent-child propagation",
+        );
+    }
+
+    #[test]
+    fn reopen_refused_by_workflow_keeps_the_batch_closed() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(true, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        let issues = [
+            make_closed_deferred_issue("bd-refused-a", "First closed issue"),
+            make_closed_deferred_issue("bd-refused-b", "Second closed issue"),
+        ];
+        for issue in &issues {
+            storage.create_issue(issue, "tester").expect("create issue");
+        }
+        let before_issues = storage
+            .get_issues_by_ids(&issues.iter().map(|issue| issue.id.clone()).collect::<Vec<_>>())
+            .expect("persisted pre-mutation rows");
+        let before = blocked_snapshot(&storage);
+        drop(storage);
+        std::fs::write(
+            beads_dir.join("policy.yaml"),
+            "workflow:\n  strict: true\n  statuses: [open, in_progress, closed]\n  \
+             transitions:\n    initial: [open]\n    open: [in_progress]\n    \
+             in_progress: [closed, open]\n    closed: []\n",
+        )
+        .expect("terminal workflow policy");
+        let args = ReopenArgs {
+            ids: issues.iter().map(|issue| issue.id.clone()).collect(),
+            ..Default::default()
+        };
+        let overrides = CliOverrides {
+            db: Some(db_path.clone()),
+            no_auto_import: Some(true),
+            no_auto_flush: Some(true),
+            ..CliOverrides::default()
+        };
+        let error = execute_route(&args, &overrides, &ctx, &beads_dir, false)
+            .expect_err("closed has no permitted outgoing transition");
+        assert!(error.to_string().contains("transition"), "{error}");
+        let storage = SqliteStorage::open(&db_path).expect("storage after refusal");
+        for original in before_issues {
+            let current = storage.get_issue(&original.id).unwrap().unwrap();
+            assert_eq!(current.status, Status::Closed);
+            assert_eq!(current.closed_at, original.closed_at);
+            assert_eq!(current.defer_until, original.defer_until);
+            assert_eq!(current.updated_at, original.updated_at);
+        }
+        assert_eq!(blocked_snapshot(&storage), before);
     }
 
     #[test]
