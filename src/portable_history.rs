@@ -788,6 +788,29 @@ mod tests {
         Ok(())
     }
 
+    /// Import accepts an empty custom status and stores it as it is. Such an
+    /// issue still has a well-defined anchor, so it must not stop
+    /// publication, which every export runs.
+    #[test]
+    fn publication_accepts_an_issue_with_an_empty_status() -> Result<()> {
+        let temp = TempDir::new()?;
+        let jsonl = temp.path().join("issues.jsonl");
+        let mut storage = SqliteStorage::open_memory()?;
+        storage.set_metadata(WARNINGS_KEY, "[]")?;
+        let blank = issue("ph-blank", &serde_json::json!({ "status": "" }));
+        assert_eq!(blank.status.as_str(), "");
+        storage.upsert_issue_for_import(&blank)?;
+
+        publish_before_export(&storage, &jsonl)?;
+        write_rows(&jsonl, &[storage.get_issue("ph-blank")?.expect("issue")]);
+        finalize_export(&mut storage, &jsonl)?;
+        let checkpoints = read_lines(&sidecar_path(&jsonl))?;
+        let newest = checkpoints.last().expect("a generation");
+        assert_eq!(newest.history.issues["ph-blank"].status, "");
+        assert_eq!(stored_warnings(&storage)?, Vec::<String>::new());
+        Ok(())
+    }
+
     /// An incremental export rewrites only this database's dirty rows and can
     /// leave a peer's newer row in place while it is still pending import.
     /// The generation published for the replaced file describes that row, so

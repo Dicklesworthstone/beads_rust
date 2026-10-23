@@ -305,9 +305,10 @@ pub fn validate(snapshot: &PortableHistorySnapshot) -> Result<()> {
     }
     for (id, anchor) in &snapshot.issues {
         // Anchors are compared as strings, so only the canonical spelling of
-        // each instant is accepted.
+        // each instant is accepted. Any status is: import stores an empty
+        // custom status as it is, and refusing that anchor would stop every
+        // export of the database holding it.
         if id.is_empty()
-            || anchor.status.is_empty()
             || canonical_time(&anchor.created_at).as_deref() != Some(anchor.created_at.as_str())
             || canonical_time(&anchor.updated_at).as_deref() != Some(anchor.updated_at.as_str())
         {
