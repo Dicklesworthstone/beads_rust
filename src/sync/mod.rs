@@ -14713,7 +14713,11 @@ fn detect_import_collision(
 /// sees only the end state of a peer's sequence of permitted moves.
 /// Deletion is not a workflow transition, and a close recorded with an
 /// audited policy bypass is taken as recorded, as `br close --bypass-policy`
-/// is at the storage chokepoint.
+/// is at the storage chokepoint. The audit describes the row's latest close,
+/// and it travels with every later edit of the closed issue, so it can only
+/// explain leaving the local status when that close happened after the local
+/// revision. A peer that kept an older bypassed close and merely edited it
+/// later publishes a newer row whose close predates the local state.
 fn workflow_import_refusal(
     workflow: &crate::close_policy::Workflow,
     existing_id: &str,
@@ -14725,7 +14729,10 @@ fn workflow_import_refusal(
         && incoming
             .bypass_reason
             .as_deref()
-            .is_some_and(|reason| !reason.trim().is_empty());
+            .is_some_and(|reason| !reason.trim().is_empty())
+        && incoming
+            .closed_at
+            .is_some_and(|closed_at| closed_at > existing.updated_at);
     if incoming.status == crate::model::Status::Tombstone
         || audited_bypass_close
         || workflow.status_reachable(
@@ -30331,6 +30338,47 @@ transitions:
                 workflow_refusal: Some(_),
                 ..
             }
+        ));
+    }
+
+    /// A bypass audit describes the latest close and stays on every later
+    /// edit of the closed issue. A peer that kept an old bypassed close and
+    /// only retitled it publishes a newer row whose close predates the local
+    /// reopen-and-progress into a dead end; it must not be admitted.
+    #[test]
+    fn test_determine_action_refuses_a_stale_bypass_close_older_than_the_local_row() {
+        // Closed with a bypass at 100, reopened and parked in `blocked` at 300.
+        let mut blocked = make_issue_at("bd-reparked", "Parked locally", fixed_time(300));
+        blocked.status = Status::Blocked;
+        let classify = classify_against_local(&[&blocked]);
+        let workflow = issue_540_workflow();
+
+        let mut stale = blocked.clone();
+        stale.title = "Retitled while closed".to_string();
+        stale.status = Status::Closed;
+        stale.closed_at = Some(fixed_time(100));
+        stale.close_reason = Some("short".to_string());
+        stale.updated_at = fixed_time(400);
+        stale.bypassed_policy = Some(true);
+        stale.bypass_reason = Some("reason gate waived".to_string());
+        match classify(&stale, false, Some(&workflow)) {
+            CollisionAction::Skip {
+                workflow_refusal: Some(refusal),
+                ..
+            } => assert_eq!(
+                (refusal.local_status.as_str(), refusal.jsonl_status.as_str()),
+                ("blocked", "closed")
+            ),
+            other => panic!("a close older than the local row was admitted: {other:?}"),
+        }
+
+        // The same audit on a close made after the local revision still
+        // leaves the dead end.
+        let mut fresh = stale;
+        fresh.closed_at = Some(fixed_time(350));
+        assert!(matches!(
+            classify(&fresh, false, Some(&workflow)),
+            CollisionAction::Update { .. }
         ));
     }
 
