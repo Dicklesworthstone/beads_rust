@@ -2787,3 +2787,58 @@ fn transition_only_bypass_close_reaches_a_peer() {
         ]]
     );
 }
+
+/// GitHub #576: a tracker that predates the workflow history companion has no
+/// coverage warnings recorded, so its first export records the enrollment
+/// warning. When that export is the one `br sync --merge` finalizes, the
+/// warning is export bookkeeping, not merged state: the merge must complete
+/// instead of reporting that merge-authoritative state changed, and ordinary
+/// commands export normally afterwards.
+#[test]
+fn merge_completes_when_its_export_records_the_first_coverage_warning() {
+    let workspace = import_authority_workspace();
+    let path = workspace.root.join(".beads/issues.jsonl");
+    git(&workspace, &["init", "--initial-branch=main"]);
+    commit_jsonl(&workspace, "original open issue");
+    checked_br(
+        &workspace,
+        &["close", "bd-shared", "--reason", "Completed locally"],
+        "local_close",
+    );
+    checked_br(&workspace, &["sync", "--flush-only"], "anchor_local_close");
+    commit_jsonl(&workspace, "close shared issue");
+    git(&workspace, &["revert", "--no-edit", "HEAD"]);
+
+    // The database as a release before the companion left it.
+    let mut storage =
+        beads_rust::storage::SqliteStorage::open(&workspace.root.join(".beads/beads.db"))
+            .expect("open the tracker database");
+    assert!(
+        storage
+            .delete_metadata("portable_history_warnings")
+            .expect("model a tracker that predates the companion")
+    );
+    drop(storage);
+
+    checked_br(
+        &workspace,
+        &["sync", "--merge", "--force-jsonl", "--json"],
+        "merge",
+    );
+    assert_eq!(jsonl_record(&path, "bd-shared")["status"], "open");
+    let warnings = coverage_warnings(&workspace).expect("coverage warnings recorded");
+    assert!(
+        warnings.contains("predates portable workflow history"),
+        "{warnings}"
+    );
+    let mutation = checked_br(
+        &workspace,
+        &["create", "After the merge", "--json"],
+        "mutation_after_merge",
+    );
+    assert!(
+        !mutation.stderr.contains("AUTO_FLUSH_FAILED"),
+        "{mutation:?}"
+    );
+    assert!(dirty_ids(&workspace).is_empty());
+}

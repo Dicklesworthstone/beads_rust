@@ -6850,6 +6850,15 @@ pub(crate) fn capture_sync_merge_core_witness(
     capture_sync_database_witness(storage).map(Into::into)
 }
 
+/// Metadata that the merge saga and its export bookkeeping rewrite, which is
+/// therefore not part of the merge-authoritative database state. The workflow
+/// history coverage warnings are export bookkeeping: finalizing an export
+/// records the warnings of the companion generation it published (such as the
+/// enrollment warning of a tracker that predates the companion, or a
+/// diverged-history warning), so a merge whose own export records them has
+/// not changed merged state (GitHub #576). They stay out of
+/// `is_sync_merge_export_metadata_key`, whose exact row layout (five or
+/// eight rows) pending receipts require.
 fn is_sync_merge_mutable_metadata_key(key: &str) -> bool {
     matches!(
         key,
@@ -6862,6 +6871,7 @@ fn is_sync_merge_mutable_metadata_key(key: &str) -> bool {
             | METADATA_JSONL_ROW_RECEIPT_VERSION
             | METADATA_JSONL_UNIMPORTED_SOURCE
             | METADATA_LAST_EXPORT_TIME
+            | crate::portable_history::WARNINGS_KEY
             | "needs_flush"
             | "purged_ids_pending_export"
     )
