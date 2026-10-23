@@ -5025,10 +5025,7 @@ impl OpenStorageResult {
                 });
             }
         };
-        crate::portable_history::publish_before_export(
-            &self.storage,
-            &self.paths.jsonl_path,
-        )?;
+        crate::portable_history::publish_before_export(&self.storage, &self.paths.jsonl_path)?;
         let (export_result, _report) = export_to_jsonl_with_policy_expected_under_authority(
             &self.storage,
             &self.paths.jsonl_path,
@@ -5095,7 +5092,8 @@ impl OpenStorageResult {
         let jsonl_path = self.paths.jsonl_path.clone();
         let allow_external_jsonl = self.allow_external_jsonl;
         let retention_days = self.paths.metadata.deletions_retention_days;
-        crate::portable_history::publish_before_export(&self.storage, &jsonl_path)?;
+        // The automatic exporter publishes and verifies the workflow history
+        // companion itself (GitHub #576).
         self.auto_flush_under_retained_authority(
             &beads_dir,
             &jsonl_path,
@@ -5103,7 +5101,6 @@ impl OpenStorageResult {
             retention_days,
             history,
         )?;
-        crate::portable_history::finalize_export(&mut self.storage, &jsonl_path)?;
         Ok(())
     }
 
@@ -5513,10 +5510,9 @@ fn open_storage_with_startup_config_impl(
             crate::portable_history::preflight_import(&paths.jsonl_path)?;
             let import_result =
                 import_from_jsonl_snapshot(&mut storage, source, &import_config, Some(&prefix))?;
-            for warning in crate::portable_history::replay_after_import(
-                &mut storage,
-                &paths.jsonl_path,
-            )? {
+            for warning in
+                crate::portable_history::replay_after_import(&mut storage, &paths.jsonl_path)?
+            {
                 tracing::warn!(warning = %warning, "Workflow history coverage is incomplete");
             }
             tracing::debug!(

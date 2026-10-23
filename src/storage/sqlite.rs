@@ -3338,6 +3338,23 @@ impl SqliteStorage {
         Ok(())
     }
 
+    /// Execute one raw SQL statement with bound parameters and return the
+    /// number of affected rows. Values are never spliced into the SQL text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the statement fails.
+    pub(crate) fn execute_raw_with_params(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<usize> {
+        self.verify_attached_database_authority()?;
+        let rows = self.conn.execute_with_params(sql, params)?;
+        self.verify_attached_database_authority()?;
+        Ok(rows)
+    }
+
     /// Execute a raw SQL query and return all result rows.
     ///
     /// # Errors

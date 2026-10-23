@@ -159,7 +159,10 @@ fn execute_exempt(
         &setup.actor,
     )?;
     crate::util::set_last_touched_id(beads_dir, &setup.issue_id);
-    setup.storage_ctx.storage.set_metadata("needs_flush", "true")?;
+    setup
+        .storage_ctx
+        .storage
+        .set_metadata("needs_flush", "true")?;
     setup.storage_ctx.flush_no_db_if_dirty()?;
     setup.storage_ctx.auto_flush_if_enabled()?;
     emit_exemption_record(ctx, args.robot, &record, "Granted");
@@ -185,7 +188,10 @@ fn execute_renew(
         &setup.actor,
     )?;
     crate::util::set_last_touched_id(beads_dir, &setup.issue_id);
-    setup.storage_ctx.storage.set_metadata("needs_flush", "true")?;
+    setup
+        .storage_ctx
+        .storage
+        .set_metadata("needs_flush", "true")?;
     setup.storage_ctx.flush_no_db_if_dirty()?;
     setup.storage_ctx.auto_flush_if_enabled()?;
     emit_exemption_record(ctx, args.robot, &record, "Renewed");
@@ -209,7 +215,10 @@ fn execute_revoke(
         &setup.actor,
     )?;
     crate::util::set_last_touched_id(beads_dir, &setup.issue_id);
-    setup.storage_ctx.storage.set_metadata("needs_flush", "true")?;
+    setup
+        .storage_ctx
+        .storage
+        .set_metadata("needs_flush", "true")?;
     setup.storage_ctx.flush_no_db_if_dirty()?;
     setup.storage_ctx.auto_flush_if_enabled()?;
     emit_exemption_record(ctx, args.robot, &record, "Revoked");

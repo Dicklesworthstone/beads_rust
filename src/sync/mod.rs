@@ -10667,7 +10667,7 @@ const CONFLICT_END: &str = ">>>>>>>";
 /// # Errors
 ///
 /// Returns an error if the file cannot be read.
-fn scan_conflict_markers_from_reader(
+pub(crate) fn scan_conflict_markers_from_reader(
     display_path: &Path,
     reader: impl BufRead,
 ) -> Result<Vec<ConflictMarker>> {
@@ -14231,6 +14231,24 @@ fn try_incremental_auto_flush(
     }))
 }
 
+/// Take the JSONL-family write authority for an automatic export, creating
+/// the JSONL's directory first, unless the caller already holds it and hands
+/// it in: a second descriptor would block this process on itself until the
+/// write-lock timeout expired (GitHub #487).
+fn acquire_jsonl_authority_unless_provided(
+    jsonl_path: &Path,
+    provided_jsonl_authority: Option<&JsonlFamilyWriteLock>,
+) -> Result<Option<JsonlFamilyWriteLock>> {
+    if provided_jsonl_authority.is_some() {
+        return Ok(None);
+    }
+    let parent_dir = jsonl_path.parent().ok_or_else(|| {
+        BeadsError::Config(format!("Invalid output path: {}", jsonl_path.display()))
+    })?;
+    fs::create_dir_all(parent_dir)?;
+    blocking_jsonl_family_write_lock_with_timeout(jsonl_path, None).map(Some)
+}
+
 /// Result of an auto-flush operation.
 #[derive(Debug, Default)]
 pub struct AutoFlushResult {
@@ -14356,17 +14374,36 @@ pub fn auto_flush_with_authority(
         "Auto-flush: exporting dirty issues"
     );
 
+    // One JSONL-family authority covers the workflow history companion, the
+    // export and both finalizations, so no other writer can publish a
+    // different issues.jsonl or companion between them.
+    let owned_jsonl_authority =
+        acquire_jsonl_authority_unless_provided(jsonl_path, provided_jsonl_authority)?;
+    let jsonl_authority = provided_jsonl_authority
+        .or(owned_jsonl_authority.as_ref())
+        .ok_or_else(|| BeadsError::SyncConflict {
+            message: "Auto-flush has no JSONL-family write authority".to_string(),
+        })?;
+
+    // Every automatic export publishes issues.history.jsonl before the issues
+    // it describes (GitHub #576): the post-command flush, routed commands and
+    // MCP alike. Exporting without it left the companion describing an older
+    // issues.jsonl, so a fresh clone replayed nothing for the changed rows.
+    crate::portable_history::publish_before_automatic_export(storage, jsonl_path)?;
+
     if !needs_flush {
         // The incremental path performs the merge-conflict-marker refusal on
         // the single snapshot it captures, so the scan below only runs when
         // the flush falls through to a full export.
-        match try_incremental_auto_flush(
-            storage,
-            jsonl_path,
-            &export_config,
-            provided_jsonl_authority,
-        ) {
+        match try_incremental_auto_flush(storage, jsonl_path, &export_config, Some(jsonl_authority))
+        {
             Ok(Some(result)) => {
+                // A skipped or unchanged export leaves issues.jsonl as it
+                // was, and the generation published above for that file
+                // still describes it.
+                if result.flushed {
+                    crate::portable_history::finalize_export(storage, jsonl_path)?;
+                }
                 tracing::info!(
                     flushed = result.flushed,
                     exported = result.exported_count,
@@ -14410,27 +14447,20 @@ pub fn auto_flush_with_authority(
         &export_config,
         Some(&expected_previous_jsonl),
         None,
-        provided_jsonl_authority,
+        Some(jsonl_authority),
         None,
     )?;
 
     // Finalize export (clear dirty flags, update metadata) under the same
     // authority the export ran under, for the same reason (GitHub #487).
-    match provided_jsonl_authority {
-        Some(authority) => finalize_export_under_authority(
-            storage,
-            &export_result,
-            Some(&export_result.issue_hashes),
-            jsonl_path,
-            authority,
-        )?,
-        None => finalize_export(
-            storage,
-            &export_result,
-            Some(&export_result.issue_hashes),
-            jsonl_path,
-        )?,
-    }
+    finalize_export_under_authority(
+        storage,
+        &export_result,
+        Some(&export_result.issue_hashes),
+        jsonl_path,
+        jsonl_authority,
+    )?;
+    crate::portable_history::finalize_export(storage, jsonl_path)?;
 
     tracing::info!(
         exported = export_result.exported_count,

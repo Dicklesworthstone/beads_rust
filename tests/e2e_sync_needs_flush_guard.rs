@@ -23,7 +23,8 @@
 //!
 //! #540 applies the same rule to a newer row whose status the workflow policy
 //! cannot reach from the local one: implicit import refuses, explicit import
-//! and reconcile keep the local status and republish it.
+//! and reconcile keep the local status and republish it. The workflow history
+//! companion (#576) replays a peer's evidence only onto rows import applied.
 
 mod common;
 
@@ -2353,4 +2354,354 @@ fn import_keeps_a_close_that_the_workflow_policy_cannot_undo() {
             "closed"
         );
     }
+}
+
+const HISTORY_COMPANION: &str = ".beads/issues.history.jsonl";
+
+/// One issue's rows from `sql` (which binds the issue id once), without the
+/// local row ids that differ between clones.
+fn issue_rows(workspace: &BrWorkspace, sql: &str, id: &str) -> Vec<Vec<SqliteValue>> {
+    database(workspace)
+        .query_with_params(sql, &[SqliteValue::from(id)])
+        .expect("read issue history rows")
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect()
+}
+
+fn issue_events(workspace: &BrWorkspace, id: &str) -> Vec<Vec<SqliteValue>> {
+    issue_rows(
+        workspace,
+        "SELECT event_type, actor, old_value, new_value, comment, created_at, \
+         agent_name, harness, model FROM events WHERE issue_id = ? ORDER BY id",
+        id,
+    )
+}
+
+/// The newest generation of the workflow history companion.
+fn newest_history_checkpoint(workspace: &BrWorkspace) -> Value {
+    let text =
+        fs::read_to_string(workspace.root.join(HISTORY_COMPANION)).expect("history companion");
+    let newest = text
+        .lines()
+        .rfind(|line| !line.trim().is_empty())
+        .expect("a history checkpoint");
+    serde_json::from_str(newest).expect("history checkpoint JSON")
+}
+
+fn commit_publication(workspace: &BrWorkspace, message: &str, policy: bool) {
+    let mut args = vec!["add", "--", ".beads/issues.jsonl", HISTORY_COMPANION];
+    if policy {
+        args.push(".beads/policy.yaml");
+    }
+    git(workspace, &args);
+    git(workspace, &["commit", "-m", message]);
+}
+
+/// GitHub #540 with the workflow history companion (#576). A peer that edited
+/// an issue before it saw the close publishes its issues.jsonl together with
+/// its issues.history.jsonl, and this clone takes both (as resolving a
+/// conflict in the peer's favour would). The companion must not make the
+/// explicit import refuse, must not replay the peer's events onto the close
+/// import kept, and the next flush republishes the close with a companion
+/// that describes it.
+#[test]
+fn explicit_import_with_the_peer_history_companion_keeps_the_protected_close() {
+    let local = git_workspace();
+    fs::write(local.root.join(".beads/policy.yaml"), ISSUE_540_POLICY)
+        .expect("write workflow policy");
+    let create = |title: &str, label: &str| {
+        parse_created_json_id(
+            &checked_br(
+                &local,
+                &["create", title, "--type", "task", "--json"],
+                label,
+            )
+            .stdout,
+        )
+    };
+    let id = create("Probe", "create_probe");
+    let other = create("Unrelated", "create_other");
+    checked_br(&local, &["sync", "--flush-only"], "flush_open");
+    commit_publication(&local, "open issues", true);
+
+    // A fresh clone rebuilds its database and replays the published history.
+    let peer = clone_peer(&local);
+    assert!(!issue_events(&local, &id).is_empty());
+    assert_eq!(issue_events(&peer, &id), issue_events(&local, &id));
+
+    // Here: claim and close under `closed: []`.
+    checked_br(&local, &["update", &id, "--status", "in_progress"], "claim");
+    checked_br(&local, &["close", &id, "--reason", "done"], "close");
+    checked_br(&local, &["sync", "--flush-only"], "flush_closed");
+    let kept_events = issue_events(&local, &id);
+    let other_events_before = issue_events(&local, &other);
+
+    // The peer edits both issues before it sees the close.
+    checked_br(
+        &peer,
+        &["update", &id, "--title", "Edited while open"],
+        "peer_edit_probe",
+    );
+    checked_br(
+        &peer,
+        &["update", &other, "--title", "Retitled by the peer"],
+        "peer_edit_other",
+    );
+    checked_br(&peer, &["sync", "--flush-only"], "peer_flush");
+    let peer_other_events = issue_events(&peer, &other);
+    assert!(peer_other_events.len() > other_events_before.len());
+    for name in ["issues.jsonl", "issues.history.jsonl"] {
+        fs::copy(
+            peer.root.join(".beads").join(name),
+            local.root.join(".beads").join(name),
+        )
+        .expect("take the peer's publication");
+    }
+
+    // Ordinary commands still refuse (#540) ...
+    assert_sync_conflict(&run_br(&local, ["list", "--json"], "implicit_import"));
+
+    // ... and the explicit import neither refuses over the companion nor
+    // replays the peer's events onto the close it keeps.
+    let output: Value = serde_json::from_str(&extract_json_payload(
+        &checked_br(
+            &local,
+            &["sync", "--import-only", "--json"],
+            "explicit_import",
+        )
+        .stdout,
+    ))
+    .expect("explicit import JSON");
+    assert_eq!(
+        output["workflow_refused"],
+        serde_json::json!([{
+            "id": id,
+            "local_status": "closed",
+            "jsonl_status": "open"
+        }]),
+        "{output}"
+    );
+    assert_eq!(show_without_sync(&local, &id, "kept")["status"], "closed");
+    assert_eq!(issue_events(&local, &id), kept_events);
+    // The row import applied receives the peer's history for it.
+    assert_eq!(
+        show_without_sync(&local, &other, "applied")["title"],
+        "Retitled by the peer"
+    );
+    assert_eq!(issue_events(&local, &other), peer_other_events);
+
+    // The next flush republishes the close, and the companion describes it.
+    checked_br(&local, &["sync", "--flush-only"], "republish");
+    assert_eq!(
+        jsonl_record(&local.root.join(".beads/issues.jsonl"), &id)["status"],
+        "closed"
+    );
+    let newest = newest_history_checkpoint(&local);
+    assert_eq!(
+        newest["history"]["issues"][&id]["status"], "closed",
+        "{newest}"
+    );
+    let published_events = newest["history"]["tables"][0]["rows"]
+        .as_array()
+        .expect("event rows")
+        .iter()
+        .filter(|row| row[1] == id.as_str())
+        .count();
+    assert_eq!(published_events, kept_events.len(), "{newest}");
+    checked_br(&local, &["list", "--json"], "list_after_resolution");
+}
+
+/// The persisted workflow history coverage warnings (a JSON array).
+fn coverage_warnings(workspace: &BrWorkspace) -> Option<String> {
+    database(workspace)
+        .query("SELECT value FROM metadata WHERE key = 'portable_history_warnings'")
+        .expect("read coverage warnings")
+        .first()
+        .and_then(|row| row.get(0))
+        .and_then(SqliteValue::as_text)
+        .map(str::to_owned)
+}
+
+/// A command run with `--no-auto-import` exports only this clone's rows and
+/// leaves a peer's newer row in issues.jsonl pending import (DL-8). The flush
+/// must still accept the history companion, which describes the peer's row
+/// through the generation published for the file it replaced, and a fresh
+/// clone of the result replays the history of both rows.
+#[test]
+fn auto_flush_with_a_peer_row_pending_import_keeps_both_histories() {
+    let local = git_workspace();
+    let create = |title: &str| {
+        parse_created_json_id(
+            &checked_br(
+                &local,
+                &["create", title, "--type", "task", "--json"],
+                "create",
+            )
+            .stdout,
+        )
+    };
+    let mine = create("Mine");
+    let theirs = create("Theirs");
+    commit_publication(&local, "two issues", false);
+
+    let peer = clone_peer(&local);
+    checked_br(
+        &peer,
+        &["update", &theirs, "--title", "Retitled by the peer"],
+        "peer_edit",
+    );
+    commit_publication(&peer, "peer edit", false);
+    pull_peer(&local, &peer);
+
+    let edit = checked_br(
+        &local,
+        &[
+            "update",
+            &mine,
+            "--title",
+            "Edited here",
+            "--no-auto-import",
+            "--allow-stale",
+        ],
+        "edit_without_import",
+    );
+    assert!(
+        !edit.stderr.contains("automatic JSONL export failed"),
+        "{edit:?}"
+    );
+    let jsonl = local.root.join(".beads/issues.jsonl");
+    assert_eq!(jsonl_record(&jsonl, &mine)["title"], "Edited here");
+    assert_eq!(
+        jsonl_record(&jsonl, &theirs)["title"],
+        "Retitled by the peer"
+    );
+
+    commit_publication(&local, "edited without importing", false);
+    let fresh = clone_peer(&local);
+    assert_eq!(issue_events(&fresh, &mine), issue_events(&local, &mine));
+    assert_eq!(issue_events(&fresh, &theirs), issue_events(&peer, &theirs));
+    assert_eq!(coverage_warnings(&fresh).as_deref(), Some("[]"));
+}
+
+/// The #576 reporter's gate, enforced (`strict`), so the close needs the
+/// verdict and records close metadata.
+const ISSUE_576_POLICY: &str = "workflow:\n  strict: true\n  gates:\n    \"in_progress -> closed\":\n      require_all:\n        - ci_green\n";
+
+/// The #576 reporter's commands, each published by the ordinary post-command
+/// flush (no explicit sync): create, claim, comment, the gate verdict, close.
+/// Returns the issue id.
+fn record_issue_576_history(local: &BrWorkspace) -> String {
+    let id = parse_created_json_id(
+        &checked_br(
+            local,
+            &[
+                "create", "first", "--type", "task", "--json", "--actor", "a",
+            ],
+            "create",
+        )
+        .stdout,
+    );
+    checked_br(
+        local,
+        &["update", &id, "--status", "in_progress", "--actor", "a"],
+        "claim",
+    );
+    checked_br(
+        local,
+        &["comments", "add", &id, "note", "--actor", "a"],
+        "comment",
+    );
+    checked_br(
+        local,
+        &[
+            "gate",
+            "report",
+            &id,
+            "--gate",
+            "ci_green",
+            "--provider",
+            "ci",
+            "--status",
+            "pass",
+            "--to",
+            "closed",
+            "--actor",
+            "ci",
+        ],
+        "gate_report",
+    );
+    checked_br(
+        local,
+        &[
+            "close",
+            &id,
+            "--reason",
+            "done for the repro test",
+            "--actor",
+            "b",
+        ],
+        "close",
+    );
+    id
+}
+
+/// GitHub #576: a fresh clone rebuilds its database from issues.jsonl and the
+/// issues.history.jsonl companion, so the events, the gate verdict that
+/// authorised the close, and the close metadata survive, and no coverage
+/// warning is raised for a tracker whose history is complete.
+#[test]
+fn fresh_clone_rebuild_restores_workflow_history_from_the_companion() {
+    let local = git_workspace();
+    fs::write(local.root.join(".beads/policy.yaml"), ISSUE_576_POLICY)
+        .expect("write workflow policy");
+    let id = record_issue_576_history(&local);
+    commit_publication(&local, "closed with gate evidence", true);
+
+    let peer = clone_peer(&local);
+    let gate_history = "SELECT g.from_status, g.to_status, g.gate, g.provider, g.passed, g.note, \
+         g.recorded_by, g.recorded_at, e.event_type, e.new_value FROM gate_result_history g \
+         LEFT JOIN events e ON e.id = g.status_revision WHERE g.issue_id = ? ORDER BY g.id";
+    for (sql, expected_rows) in [
+        (
+            "SELECT event_type, actor, old_value, new_value, comment, created_at, agent_name, \
+             harness, model FROM events WHERE issue_id = ? ORDER BY id",
+            None,
+        ),
+        (
+            "SELECT gate, provider, passed, note, recorded_by, recorded_at FROM gate_results \
+             WHERE issue_id = ? ORDER BY gate, provider",
+            Some(1),
+        ),
+        // The gate's status revision points at the equivalent local event.
+        (gate_history, Some(1)),
+        (
+            "SELECT closed_by_agent_name, closed_by_harness, closed_by_model, bypassed_policy, \
+             bypass_reason, policy_gates_fired, recorded_at FROM close_metadata \
+             WHERE issue_id = ?",
+            Some(1),
+        ),
+    ] {
+        let original = issue_rows(&local, sql, &id);
+        assert!(!original.is_empty(), "{sql}");
+        if let Some(count) = expected_rows {
+            assert_eq!(original.len(), count, "{sql}");
+        }
+        assert_eq!(issue_rows(&peer, sql, &id), original, "{sql}");
+    }
+    let revision = issue_rows(&peer, gate_history, &id);
+    assert_eq!(
+        revision[0][8..],
+        [
+            SqliteValue::from("status_changed"),
+            SqliteValue::from("in_progress")
+        ]
+    );
+    let warnings = database(&peer)
+        .query("SELECT value FROM metadata WHERE key = 'portable_history_warnings'")
+        .expect("read coverage warnings");
+    assert_eq!(
+        warnings[0].get(0).and_then(SqliteValue::as_text),
+        Some("[]")
+    );
 }

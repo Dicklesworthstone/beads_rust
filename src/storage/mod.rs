@@ -16,17 +16,17 @@ pub mod events;
 mod lint;
 #[cfg(test)]
 mod local_restore_tests;
-pub mod schema;
 pub(crate) mod portable_history;
+pub mod schema;
 mod search;
 pub mod sqlite;
 
-#[cfg(test)]
-pub(crate) use search::unicode_issue_fields_match;
 pub(crate) use portable_history::{
-    PortableHistoryIssue, PortableHistorySnapshot, PortableHistoryTable,
+    PortableHistoryIssue, PortableHistoryReplay, PortableHistorySnapshot,
     validate as validate_portable_history,
 };
+#[cfg(test)]
+pub(crate) use search::unicode_issue_fields_match;
 pub(crate) use sqlite::{BulkDependencyInsert, ChangelogIssueRow};
 pub use sqlite::{
     CloseMetadataRow, EventAttribution, IssueUpdate, LabelSetChanges, LabelUpdate, ListFilters,
