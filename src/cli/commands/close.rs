@@ -134,6 +134,11 @@ pub(crate) fn resolve_attribution_for_close(
     )
 }
 
+/// Gate name recorded in `policy_gates_fired` when `--bypass-policy` closes
+/// an issue out of a status `workflow.transitions` does not let `closed`
+/// follow.
+pub(crate) const WORKFLOW_TRANSITIONS_GATE: &str = "workflow.transitions";
+
 /// Run every enabled gate against `issue` and produce the (possibly empty)
 /// violation list. This includes the close-policy gates (issue #274) *and* the
 /// workflow gate engine (issue #312, layer 2): closing an issue is a transition
@@ -189,6 +194,23 @@ pub(crate) fn evaluate_close_policy(
     if args.bypass_policy {
         let from = issue.status.as_str();
         let to = Status::Closed.as_str();
+        // A close out of a status that `workflow.transitions` does not let
+        // `closed` follow is a bypass too. Naming it puts the bypass audit on
+        // the close metadata and the exported JSONL row, which is what lets a
+        // peer's import apply this close instead of refusing it as an
+        // unreachable status (GitHub #540).
+        if workflow
+            .validate_transition(Some(from), to, Some(issue.issue_type.as_str()))
+            .is_err()
+        {
+            violations.push(PolicyViolation {
+                gate: WORKFLOW_TRANSITIONS_GATE.to_string(),
+                message: format!(
+                    "transition '{from}' -> '{to}' is not permitted by the project workflow policy (.beads/policy.yaml workflow.transitions)"
+                ),
+                detail: None,
+            });
+        }
         violations.extend(close_policy::evaluate_transition_required_fields(
             workflow,
             issue_id,
@@ -920,9 +942,13 @@ fn execute_route_with_storage(
     // Active when close-policy gates are enabled (issue #274) OR the workflow
     // gate engine is configured (issue #312, layer 2). The latter must also
     // trigger per-issue gate evaluation at close time.
+    // An explicit bypass is also evaluated under a transitions-only workflow,
+    // so a close that leaves a status `closed` may not follow records its
+    // bypass audit (GitHub #540).
     let policy_active = policy_doc.close_policy.is_active()
         || policy_doc.workflow.gates_enforced()
-        || !policy_doc.workflow.required_fields.is_empty();
+        || !policy_doc.workflow.required_fields.is_empty()
+        || (args.bypass_policy && policy_doc.workflow.transitions_enforced());
     let attribution = resolve_attribution_for_close(args, &policy_doc);
     if args.bypass_policy && !policy_doc.allow_bypass {
         return Err(BeadsError::validation(

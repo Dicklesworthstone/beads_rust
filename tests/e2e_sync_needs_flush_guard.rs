@@ -24,7 +24,8 @@
 //! #540 applies the same rule to a newer row whose status the workflow policy
 //! cannot reach from the local one: implicit import refuses, explicit import
 //! and reconcile keep the local status and republish it. The workflow history
-//! companion (#576) replays a peer's evidence only onto rows import applied.
+//! companion (#576) replays a peer's evidence only onto rows import applied,
+//! and a transition-only `--bypass-policy` close carries its audit to peers.
 
 mod common;
 
@@ -2703,5 +2704,86 @@ fn fresh_clone_rebuild_restores_workflow_history_from_the_companion() {
     assert_eq!(
         warnings[0].get(0).and_then(SqliteValue::as_text),
         Some("[]")
+    );
+}
+
+const BYPASS_DEAD_END_POLICY: &str = "workflow:\n  strict: true\n  statuses: [open, in_progress, blocked, closed]\n  transitions:\n    initial: [open]\n    open: [in_progress]\n    in_progress: [closed, open, blocked]\n    blocked: []\n    closed: []\n";
+
+/// GitHub #540: `br close --bypass-policy` out of a dead end that
+/// `workflow.transitions` does not let `closed` follow, with no close policy
+/// or gate configured, records the bypass on the exported row, so a peer's
+/// ordinary command applies the close instead of refusing it as a status the
+/// policy cannot reach.
+#[test]
+fn transition_only_bypass_close_reaches_a_peer() {
+    let local = git_workspace();
+    fs::write(
+        local.root.join(".beads/policy.yaml"),
+        BYPASS_DEAD_END_POLICY,
+    )
+    .expect("write workflow policy");
+    let id = parse_created_json_id(
+        &checked_br(
+            &local,
+            &["create", "Parked", "--type", "task", "--json"],
+            "create",
+        )
+        .stdout,
+    );
+    checked_br(&local, &["update", &id, "--status", "in_progress"], "claim");
+    checked_br(&local, &["update", &id, "--status", "blocked"], "park");
+    checked_br(&local, &["sync", "--flush-only"], "flush_blocked");
+    commit_publication(&local, "parked", true);
+    let peer = clone_peer(&local);
+    assert_eq!(
+        show_without_sync(&peer, &id, "peer_blocked")["status"],
+        "blocked"
+    );
+
+    // Without the bypass the dead end holds; with it the close is audited.
+    let refused = run_br(&local, ["close", &id, "--reason", "done"], "plain_close");
+    assert!(!refused.status.success(), "{refused:?}");
+    checked_br(
+        &local,
+        &[
+            "close",
+            &id,
+            "--reason",
+            "abandoned",
+            "--bypass-policy",
+            "--bypass-reason",
+            "Abandoned upstream",
+        ],
+        "bypass_close",
+    );
+    checked_br(&local, &["sync", "--flush-only"], "flush_bypass");
+    let row = jsonl_record(&local.root.join(".beads/issues.jsonl"), &id);
+    assert_eq!(row["status"], "closed", "{row}");
+    assert_eq!(row["bypassed_policy"], true, "{row}");
+    assert_eq!(row["bypass_reason"], "Abandoned upstream", "{row}");
+    assert_eq!(
+        row["policy_gates_fired"],
+        serde_json::json!(["workflow.transitions"]),
+        "{row}"
+    );
+    commit_publication(&local, "bypassed close", false);
+
+    // The peer's next ordinary command imports the close and its audit.
+    pull_peer(&peer, &local);
+    checked_br(&peer, &["list", "--json"], "peer_auto_import");
+    let shown = show_without_sync(&peer, &id, "peer_closed");
+    assert_eq!(shown["status"], "closed", "{shown}");
+    assert_eq!(
+        issue_rows(
+            &peer,
+            "SELECT bypassed_policy, bypass_reason, policy_gates_fired FROM close_metadata \
+             WHERE issue_id = ?",
+            &id,
+        ),
+        vec![vec![
+            SqliteValue::from(1_i64),
+            SqliteValue::from("Abandoned upstream"),
+            SqliteValue::from("[\"workflow.transitions\"]"),
+        ]]
     );
 }
