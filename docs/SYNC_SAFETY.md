@@ -169,10 +169,19 @@ applied. Automatic import refuses, as above, naming the issue and both
 statuses. Explicit `sync --import-only` and `sync --reconcile` keep the local
 row, apply every other row, list the kept rows (`workflow_refused` in import
 JSON, `skipped_workflow` and `workflow_kept_ids` in the reconcile receipt),
-and leave the local row for the next flush to republish. Deletions and closes
-recorded with an audited `--bypass-policy` reason are not refused.
-`sync --import-only --force` rebuilds the database from JSONL when the JSONL
-should win instead.
+and leave the local row for the next flush to republish. Deletions are not
+refused. A close is not refused when its row carries the audit that
+`br close --bypass-policy` records (`bypassed_policy` with a non-empty
+`bypass_reason`) and its `closed_at` is later than the local row's last
+change. `br close --bypass-policy` writes that audit whenever it overrides a
+close gate or `workflow.transitions`; a transition it overrode is listed as
+`workflow.transitions` in `policy_gates_fired`. The audit stays on a closed
+row through later edits, so a close older than the local revision (a peer
+that kept editing an old bypassed close while this clone reopened the issue)
+is refused like any other unreachable status. The audit is shared repository
+data and is taken as recorded: the importing clone's `allow_bypass: false`
+does not reject it. `sync --import-only --force` rebuilds the database from
+JSONL when the JSONL should win instead.
 
 An explicit import still uses the normal local-winner and tombstone rules. When
 an imported row differs from a preserved local version, `needs_flush` records
@@ -849,21 +858,51 @@ publishes `issues.history.jsonl` beside it for database-only workflow evidence:
 audit events, scoped/current gate verdicts, close metadata, and capacity
 occupancy/exemption history.
 
-The history companion is checksum-bound to stable issue identity/status/update
-anchors and uses per-issue sequence numbers rather than SQLite row ids. Imports
-validate the entire checkpoint before replay and remap gate status revisions to
-the destination database's local event ids. Repeated replay is idempotent;
-divergent append-only histories fail closed rather than choosing a winner.
+Each checkpoint is checksummed, uses per-issue sequence numbers rather than
+SQLite row ids, and binds every issue's evidence to that issue's anchor: its
+id, status, creation time and update time. Evidence is only ever replayed onto,
+or carried forward for, a row at the anchor it describes. Ephemeral issues and
+wisps, which the JSONL export leaves out, keep their evidence local too.
 
-Publication writes the history generation before `issues.jsonl` and retains the
-previous matching generation. An interruption between those writes therefore
-leaves the old issue generation paired with its old history. For trackers that
-predate this format, the first companion includes an explicitly incomplete
-legacy checkpoint: missing historical evidence is reported and is never
-fabricated.
+`br sync --import-only`, `--force` rebuilds, a fresh clone or deleted-database
+rebuild, and no-DB mode replay the companion after importing. A damaged
+companion (malformed, failing its checksum, or not a regular file) stops the
+import before anything changes; restore it from version control, or move it
+aside to re-enroll. A companion that merely does not describe the incoming rows
+is not an error. Replay then works issue by issue and remaps gate status
+revisions to the local event ids:
+
+- A row import kept at its local revision, such as one the workflow policy
+  protected (GitHub #540), keeps its own evidence; the peer's is not attached.
+- An applied row the companion does not describe gets no evidence, and the
+  tracker records a durable coverage warning.
+- Evidence that extends this database's is appended. When two clones recorded
+  diverging evidence for the same revision, neither is chosen: this database
+  keeps its own, and a coverage warning says so.
+
+Repeated replay is idempotent. The automatic import that ordinary commands run
+does not replay history; the next publication still carries forward evidence
+the companion already held for an issue that has not changed here.
+
+Every export publishes the companion: `br sync --flush-only`, no-DB mode, and
+the automatic export after each mutating command (CLI or MCP). Publication
+writes the history generation before `issues.jsonl` and keeps a second
+generation describing the `issues.jsonl` already on disk, so an interruption
+between the two writes leaves the old issue generation paired with its
+history. The same generation keeps describing a peer's row that an
+incremental export leaves in place while it is still pending import. For
+trackers that predate this format, the first companion marks the evidence it
+could not find as incomplete: missing historical evidence is reported and is
+never fabricated.
 
 Git synchronization should track `issues.jsonl` and `issues.history.jsonl`
-together. A fresh clone or deleted-database rebuild restores portable evidence
-when a matching checkpoint is present. If it is absent for a historical
-tracker, Beads Rust records and surfaces a preservation warning instead of
-presenting the reconstructed database as a complete audit record.
+together. The companion is rewritten on every export, so concurrent work in
+two clones usually conflicts in it even when `issues.jsonl` merges cleanly.
+Resolve such a conflict by taking either side's file whole, never by
+committing conflict markers (a damaged companion stops explicit imports,
+rebuilds and exports). Rows that only the discarded side described are then
+imported without their evidence and recorded as a coverage gap. When the
+companion is absent, or does not describe a row, Beads Rust records a
+coverage warning in the database (`portable_history_warnings` metadata; also
+logged with `-v`) instead of presenting the reconstructed database as a
+complete audit record.
