@@ -1,0 +1,328 @@
+diff --git a/src/franken_sync.rs b/src/franken_sync.rs
+--- a/src/franken_sync.rs
++++ b/src/franken_sync.rs
+@@ -144,3 +144,68 @@
++/// Test-only SQL facade observations. Collection is scoped to one thread and
++/// restored on unwind; production builds contain neither the slot nor hooks.
++/// Counts follow #574: direct facade calls and prepares, not engine retries,
++/// VM steps, or executions through an already-prepared statement.
++#[cfg(test)]
++pub(crate) mod sql_capture {
++    use std::cell::RefCell;
++
++    thread_local! {
++        static STATEMENTS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
++    }
++
++    pub(super) fn record(sql: &str, prepared: bool) {
++        STATEMENTS.with(|slot| {
++            if let Some(statements) = slot.borrow_mut().as_mut() {
++                let normalized = sql.split_whitespace().collect::<Vec<_>>().join(" ");
++                statements.push(if prepared {
++                    format!("PREPARE {normalized}")
++                } else {
++                    normalized
++                });
++            }
++        });
++    }
++
++    /// Observe only `operation`; fixture setup and assertions stay outside.
++    /// Nested captures observe their own statements, not their parent's.
++    pub(crate) fn capture<T>(operation: impl FnOnce() -> T) -> (T, Vec<String>) {
++        struct Restore(Option<Vec<String>>);
++        impl Drop for Restore {
++            fn drop(&mut self) {
++                STATEMENTS.with(|slot| {
++                    *slot.borrow_mut() = self.0.take();
++                });
++            }
++        }
++
++        let _restore = Restore(STATEMENTS.with(|slot| slot.replace(Some(Vec::new()))));
++        let result = operation();
++        let statements = STATEMENTS.with(|slot| slot.borrow_mut().take().unwrap_or_default());
++        (result, statements)
++    }
++
++    #[test]
++    fn capture_restores_nested_and_panicking_scopes() {
++        let (_, outer) = capture(|| {
++            record("SELECT 1", false);
++            let (_, inner) = capture(|| record("SELECT 2", true));
++            assert_eq!(inner, vec!["PREPARE SELECT 2"]);
++            assert!(std::panic::catch_unwind(|| {
++                capture(|| {
++                    record("SELECT 3", false);
++                    panic!("exercise capture unwind");
++                });
++            }).is_err());
++            record("SELECT 4", false);
++        });
++        assert_eq!(outer, vec!["SELECT 1", "SELECT 4"]);
++        let (_, next) = capture(|| record("SELECT 5", false));
++        assert_eq!(next, vec!["SELECT 5"]);
++    }
++}
++
+ macro_rules! with_engine_retries {
+     ($conn:expr, $sql:expr, $attempt:expr) => {{
++        #[cfg(test)]
++        sql_capture::record($sql, false);
+         let retry_safety = retry::ReplaySafety::new($sql);
+@@ -453,3 +518,5 @@
+     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_>, FrankenError> {
++        #[cfg(test)]
++        sql_capture::record(sql, true);
+         // A checkpoint row is a receipt for one execution, not reusable data.
+         // Do not hand it to engine prepare, which may process the PRAGMA here.
+diff --git a/src/sync/mod.rs b/src/sync/mod.rs
+--- a/src/sync/mod.rs
++++ b/src/sync/mod.rs
+@@ -15543,3 +15543,221 @@
++#[cfg(test)]
++mod import_sql_regression_tests {
++    use super::*;
++    use crate::franken_sync::sql_capture;
++    use std::io::Write as _;
++    use std::sync::{Arc, Mutex};
++
++    #[derive(Clone, Default)]
++    struct WarningBuffer(Arc<Mutex<Vec<u8>>>);
++
++    impl std::io::Write for WarningBuffer {
++        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
++            self.0.lock().unwrap().extend_from_slice(bytes);
++            Ok(bytes.len())
++        }
++
++        fn flush(&mut self) -> std::io::Result<()> {
++            Ok(())
++        }
++    }
++
++    fn write_rows(path: &Path, issues: &[Issue]) {
++        let mut file = File::create(path).unwrap();
++        for issue in issues {
++            serde_json::to_writer(&mut file, issue).unwrap();
++            writeln!(&mut file).unwrap();
++        }
++    }
++
++    // The reporter's topology: N blocked issues, each with two unique open
++    // blockers; all 3N rows carry a label. Initial import is outside capture.
++    fn fixture(blocked_count: usize) -> (tempfile::TempDir, PathBuf, SqliteStorage, Vec<Issue>) {
++        let temp = tempfile::TempDir::new().unwrap();
++        let path = temp.path().join("issues.jsonl");
++        let stamp = "2026-10-01T00:00:00Z";
++        let issue = |id: String, dependencies: Vec<String>| -> Issue {
++            serde_json::from_value(serde_json::json!({
++                "id": id,
++                "title": format!("Fixture {id}"),
++                "description": "seeded",
++                "status": "open",
++                "priority": 2,
++                "issue_type": "task",
++                "created_at": stamp,
++                "created_by": "seed",
++                "updated_at": stamp,
++                "source_repo": ".",
++                "compaction_level": 0,
++                "original_size": 0,
++                "labels": ["seed"],
++                "comments": [],
++                "dependencies": dependencies.iter().map(|target| serde_json::json!({
++                    "issue_id": id,
++                    "depends_on_id": target,
++                    "type": "blocks",
++                    "created_at": stamp,
++                    "created_by": "seed",
++                    "metadata": "{}",
++                    "thread_id": ""
++                })).collect::<Vec<_>>()
++            })).unwrap()
++        };
++        let mut rows = (0..2 * blocked_count)
++            .map(|index| issue(format!("nb-k{index:05}"), Vec::new()))
++            .collect::<Vec<_>>();
++        rows.extend((0..blocked_count).map(|index| {
++            issue(
++                format!("nb-b{index:05}"),
++                vec![format!("nb-k{:05}", 2 * index), format!("nb-k{:05}", 2 * index + 1)],
++            )
++        }));
++        rows.sort_by(|left, right| left.id.cmp(&right.id));
++        write_rows(&path, &rows);
++        let mut storage = SqliteStorage::open_memory().unwrap();
++        let imported = import_from_jsonl(
++            &mut storage, &path, &ImportConfig::default(), Some("nb"),
++        ).unwrap();
++        assert_eq!(imported.imported_count, rows.len());
++        let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
++        let mut hydrated = storage.get_issues_for_import_comparison_live(&ids).unwrap();
++        hydrated.sort_by(|left, right| left.id.cmp(&right.id));
++        assert_eq!(hydrated.len(), rows.len());
++        (temp, path, storage, hydrated)
++    }
++
++    fn captured_import(storage: &mut SqliteStorage, path: &Path) -> (ImportResult, Vec<String>, String) {
++        let warnings = WarningBuffer::default();
++        let writer = warnings.clone();
++        let subscriber = tracing_subscriber::fmt()
++            .with_max_level(tracing::Level::WARN)
++            .with_ansi(false)
++            .with_writer(move || writer.clone())
++            .finish();
++        let (result, statements) = tracing::subscriber::with_default(subscriber, || {
++            sql_capture::capture(|| {
++                import_from_jsonl(storage, path, &ImportConfig::default(), Some("nb"))
++            })
++        });
++        let text = String::from_utf8(warnings.0.lock().unwrap().clone()).unwrap();
++        eprintln!(
++            "SQL574 total={} issue_point_reads={} export_hash_writes={} skip_warnings={}",
++            statements.len(),
++            statements.iter().filter(|sql| sql.contains("FROM issues WHERE id =")).count(),
++            hash_writes(&statements).len(),
++            text.matches("Import skip:").count(),
++        );
++        (result.unwrap(), statements, text)
++    }
++
++    fn hash_writes(statements: &[String]) -> Vec<&str> {
++        statements.iter().filter_map(|statement| {
++            let sql = statement.strip_prefix("PREPARE ").unwrap_or(statement);
++            ((sql.starts_with("INSERT") || sql.starts_with("DELETE") || sql.starts_with("UPDATE"))
++                && sql.contains("export_hashes"))
++                .then_some(sql)
++        }).collect()
++    }
++
++    #[test]
++    fn one_changed_import_does_not_read_or_rewrite_each_skipped_row() {
++        let (_temp, path, mut storage, mut rows) = fixture(500);
++        let untouched_id = rows.last().unwrap().id.clone();
++        let certificate_before = storage.get_export_hash(&untouched_id).unwrap();
++        assert!(certificate_before.is_some());
++        rows[0].title.push_str(" changed upstream");
++        rows[0].updated_at += chrono::Duration::days(1);
++        write_rows(&path, &rows);
++
++        let (result, statements, warnings) = captured_import(&mut storage, &path);
++        assert_eq!(result.created_count, 0);
++        assert_eq!(result.updated_count, 1);
++        assert_eq!(result.skipped_count, 1499);
++        assert_eq!(result.export_hashes_recorded, 1500);
++        let point_reads = statements.iter().filter(|sql| {
++            sql.contains("FROM issues WHERE id =")
++        }).count();
++        assert!(point_reads <= 16, "unexpected point-read growth: {point_reads}");
++        assert!(!warnings.contains("Import skip:"), "{warnings}");
++        let writes = hash_writes(&statements);
++        assert_eq!(writes.len(), 2, "only the changed certificate is replaced: {writes:?}");
++        assert!(!writes.iter().any(|sql| *sql == "DELETE FROM export_hashes"));
++        assert_eq!(storage.get_export_hash(&untouched_id).unwrap(), certificate_before);
++
++        let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
++        let mut actual = storage.get_issues_for_import_comparison_live(&ids).unwrap();
++        actual.sort_by(|left, right| left.id.cmp(&right.id));
++        assert_eq!(actual.len(), rows.len());
++        for (stored, expected) in actual.iter().zip(&rows) {
++            assert!(skipped_import_matches_stored_issue(Some(stored), &expected.id, expected));
++        }
++
++        // Reimport the actual exported payload, not the stale input hashes.
++        write_rows(&path, &actual);
++        let (result, statements, warnings) = captured_import(&mut storage, &path);
++        assert_eq!(result.updated_count, 0);
++        assert_eq!(result.skipped_count, 1500);
++        assert!(hash_writes(&statements).is_empty());
++        assert!(!warnings.contains("Import skip:"), "{warnings}");
++    }
++
++    #[test]
++    fn timestamp_only_import_keeps_its_existing_certificate() {
++        let (_temp, path, mut storage, mut rows) = fixture(2);
++        let target = rows[0].id.clone();
++        let before = storage.get_export_hash(&target).unwrap();
++        assert!(before.is_some());
++        rows[0].updated_at += chrono::Duration::days(1);
++        write_rows(&path, &rows);
++        let (result, _, warnings) = captured_import(&mut storage, &path);
++        assert_eq!(result.created_count, 0);
++        assert_eq!(result.export_hashes_recorded, rows.len());
++        assert_eq!(storage.get_export_hash(&target).unwrap(), before);
++        assert!(!warnings.contains("Import skip:"), "{warnings}");
++        let stored = storage.get_issues_for_import_comparison_live(&[target.clone()]).unwrap();
++        assert_eq!(stored.len(), 1);
++        assert!(skipped_import_matches_stored_issue(Some(&stored[0]), &target, &rows[0]));
++    }
++
++    #[test]
++    fn full_replacement_retains_the_insert_only_hash_path() {
++        let (_temp, path, mut storage, mut rows) = fixture(2);
++        for row in &mut rows {
++            row.title.push_str(" replaced");
++            row.updated_at += chrono::Duration::days(1);
++        }
++        write_rows(&path, &rows);
++        let (result, statements, warnings) = captured_import(&mut storage, &path);
++        assert_eq!(result.updated_count, rows.len());
++        let writes = hash_writes(&statements);
++        assert_eq!(writes.len(), rows.len() + 1, "{writes:?}");
++        assert_eq!(writes.iter().filter(|sql| **sql == "DELETE FROM export_hashes").count(), 1);
++        assert!(!warnings.contains("Import skip:"), "{warnings}");
++    }
++
++    #[test]
++    fn mixed_import_revokes_omitted_and_uncertified_certificates() {
++        let (_temp, path, mut storage, mut rows) = fixture(2);
++        let omitted = rows.pop().unwrap();
++        let stale_id = rows[1].id.clone();
++        storage.update_issue(
++            &stale_id,
++            &crate::storage::IssueUpdate { title: Some("newer local winner".to_string()), ..Default::default() },
++            "tester",
++        ).unwrap();
++        rows[0].title.push_str(" incoming winner");
++        rows[0].updated_at += chrono::Duration::days(1);
++        write_rows(&path, &rows);
++        let (result, _, _) = captured_import(&mut storage, &path);
++        assert_eq!(result.updated_count, 1);
++        assert!(storage.get_export_hash(&omitted.id).unwrap().is_none());
++        assert!(storage.get_export_hash(&stale_id).unwrap().is_none());
++        assert_eq!(storage.get_issue(&stale_id).unwrap().unwrap().title, "newer local winner");
++        assert!(storage.get_issue(&omitted.id).unwrap().is_some());
++        assert_eq!(storage.get_metadata("needs_flush").unwrap().as_deref(), Some("true"));
++    }
++
++    #[test]
++    fn automatic_conflict_rolls_back_earlier_rows_and_certificates() {
++        let (_temp, path, mut storage, mut rows) = fixture(2);
++        let original_first = rows[0].title.clone();
++        storage.update_issue(
++            &rows[1].id,
++            &crate::storage::IssueUpdate { title: Some("newer local winner".to_string()), ..Default::default() },
++            "tester",
++        ).unwrap();
++        let hashes_before = storage.execute_raw_query(
++            "SELECT issue_id, content_hash, exported_at FROM export_hashes ORDER BY issue_id",
++        ).unwrap();
++        rows[0].title.push_str(" must roll back");
++        rows[0].updated_at += chrono::Duration::days(1);
++        write_rows(&path, &rows);
++        let source = capture_jsonl_source_snapshot(&path).unwrap();
++        let error = import_from_jsonl_snapshot_impl(
++            &mut storage, &source, &ImportConfig::default(), Some("nb"), ImportMode::Automatic, None,
++        ).unwrap_err();
++        assert!(matches!(error, BeadsError::SyncConflict { .. }), "{error}");
++        assert_eq!(storage.get_issue(&rows[0].id).unwrap().unwrap().title, original_first);
++        assert_eq!(storage.execute_raw_query(
++            "SELECT issue_id, content_hash, exported_at FROM export_hashes ORDER BY issue_id",
++        ).unwrap(), hashes_before);
++    }
++}
++
+ fn skipped_import_matches_stored_issue(
+     stored: Option<&Issue>,
+     target_id: &str,

@@ -1,0 +1,56 @@
+diff --git a/src/sync/mod.rs b/src/sync/mod.rs
+--- a/src/sync/mod.rs
++++ b/src/sync/mod.rs
+@@ -15764,7 +15764,26 @@
+-    let mut current_export_hashes = if skip_lookup.is_some() {
+-        Some(load_import_export_hashes(storage)?)
+-    } else {
++    // Reuse certificates for mixed imports too (#574). These hashes only
++    // suppress redundant writes AFTER hydrated payload certification; they
++    // never authorize a skip. Final cleanup below still revokes omitted or
++    // uncertified targets, including aliases invalidated by comment union.
++    let existing_export_hashes = load_import_export_hashes(storage)?;
++    let replaced_targets = comment_owner_ids_to_replace
++        .iter()
++        .map(String::as_str)
++        .collect::<HashSet<_>>();
++    let replaces_every_certificate = !existing_export_hashes.is_empty()
++        && existing_export_hashes
++            .keys()
++            .all(|id| replaced_targets.contains(id.as_str()));
++    let mut current_export_hashes = if replaces_every_certificate {
++        // Retain the original cheap rebuild when every certified target is
++        // being replaced: diffing that case would add a DELETE per row.
+         storage.clear_all_export_hashes_in_tx()?;
+         None
++    } else {
++        (!existing_export_hashes.is_empty()).then_some(existing_export_hashes)
+     };
++    drop(replaced_targets);
++    // An empty map proves the table empty (or the loader repaired it by
++    // clearing it). Keep the insert-only path for fresh imports, avoiding
++    // an unnecessary DELETE for every new certificate.
+     // Include non-bypassed local records: they are authoritative too. Audit
+@@ -15903,17 +15922,8 @@
+-                if let Ok(Some(existing_issue)) = storage.get_issue(&target_id) {
+-                    let differing_fields = sync_mismatch_field_names(&existing_issue, &issue);
+-                    let non_hash_differing: Vec<_> = differing_fields
+-                        .into_iter()
+-                        .filter(|f| f != "content_hash" && f != "comments")
+-                        .collect();
+-                    if !non_hash_differing.is_empty() {
+-                        tracing::warn!(
+-                            id = %target_id,
+-                            differing_fields = ?non_hash_differing,
+-                            "Import skip: existing database row is newer or equal, overriding incoming JSONL scalar fields"
+-                        );
+-                    }
+-                }
++                // The batched certification below compares hydrated rows.
++                // A bare get_issue here cannot compare labels/dependencies
++                // and manufactured a warning for every ordinary skip (#574).
++                // Automatic conflict refusal, explicit local-win accounting,
++                // and post-write semantic verification remain authoritative.
+             }
+ 
+             // Flush before mutations so certification observes exactly the

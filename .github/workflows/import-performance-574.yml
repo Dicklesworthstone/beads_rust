@@ -1,0 +1,199 @@
+name: Verify and land import performance 574
+
+# One-shot, exact-source maintenance operation. No PR execution, arbitrary
+# command input, force push, release, or recurring schedule. Once the source
+# patch lands, its commit does not match these path triggers.
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/import-performance-574.yml
+      - scripts/patches/574-import-regressions.patch
+      - scripts/patches/574-import-performance.patch
+
+permissions:
+  contents: read
+
+concurrency:
+  group: import-performance-574
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.repository == 'Dicklesworthstone/beads_rust' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    outputs:
+      tree: ${{ steps.result.outputs.tree }}
+      patch: ${{ steps.result.outputs.patch }}
+      patch_sha256: ${{ steps.result.outputs.patch_sha256 }}
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: '3'
+    steps:
+      # No external actions: checkout uses the runner's git/gh with a
+      # step-scoped read token. Cargo never receives repository credentials.
+      - name: Check out the exact triggering commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -c credential.helper='!gh auth git-credential' fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD:src/sync/mod.rs)" = ae5dba7b7da8abb23a99f76d7a56c774f48b7090
+          test "$(git rev-parse HEAD:src/franken_sync.rs)" = a54b99cc29f9ee181e6157c930f15714997827e8
+
+      - name: Install the repository-pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          printf 'CARGO_TARGET_DIR=%s\n' "$RUNNER_TEMP/br-574-target" >> "$GITHUB_ENV"
+          rustc --version
+          cargo --version
+          sha256sum Cargo.lock scripts/patches/574-import-*.patch
+
+      - name: Build the unmodified baseline binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --bin br
+          cp "$CARGO_TARGET_DIR/release/br" "$RUNNER_TEMP/br-574-before"
+          sha256sum "$RUNNER_TEMP/br-574-before"
+
+      - name: Prove the SQL regression fails on the baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check --recount scripts/patches/574-import-regressions.patch
+          git apply --recount scripts/patches/574-import-regressions.patch
+          set +e
+          cargo test --locked --lib sync::import_sql_regression_tests::one_changed_import_does_not_read_or_rewrite_each_skipped_row -- --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/br-574-negative.log"
+          exits=("${PIPESTATUS[@]}")
+          set -e
+          test "${exits[0]}" -eq 101
+          test "${exits[1]}" -eq 0
+          grep -F 'unexpected point-read growth:' "$RUNNER_TEMP/br-574-negative.log"
+          grep -E '^test result: FAILED\..*1 failed' "$RUNNER_TEMP/br-574-negative.log"
+          grep -F 'SQL574 total=' "$RUNNER_TEMP/br-574-negative.log" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply the import implementation and format the changed modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check --recount scripts/patches/574-import-performance.patch
+          git apply --recount scripts/patches/574-import-performance.patch
+          rustfmt --edition 2024 --config skip_children=true src/franken_sync.rs src/sync/mod.rs
+          git diff --check
+
+      - name: Run native SQL-count and import correctness regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib sync::import_sql_regression_tests -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/br-574-candidate.log"
+          cargo test --locked --lib franken_sync::sql_capture -- --nocapture --test-threads=1
+          cargo test --locked --lib sync:: -- --test-threads=1
+          cargo test --locked --lib storage:: -- --test-threads=1
+          grep -F 'SQL574 total=' "$RUNNER_TEMP/br-574-candidate.log" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Check every target, Clippy, and repository formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked --all-targets
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo fmt --all --check
+
+      - name: Measure matched uninstrumented baseline and candidate workloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --bin br
+          cp "$CARGO_TARGET_DIR/release/br" "$RUNNER_TEMP/br-574-after"
+          python3 scripts/bench_n_plus_one.py --self-test
+          python3 scripts/bench_n_plus_one.py \
+            --baseline "$RUNNER_TEMP/br-574-before" \
+            --candidate "$RUNNER_TEMP/br-574-after" \
+            --output "$RUNNER_TEMP/br-574-evidence" \
+            --blocked-counts 50 500 2000 --repeats 3
+          # Native unit-test counters and uninstrumented timings are distinct
+          # evidence. No timing threshold or statistical speedup is inferred.
+          cat "$RUNNER_TEMP/br-574-evidence/report.json"
+
+      - name: Bind successful validation to the exact source tree
+        id: result
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git diff --name-only | LC_ALL=C sort)" = "$(printf '%s\n' src/franken_sync.rs src/sync/mod.rs | LC_ALL=C sort)"
+          git add -- src/franken_sync.rs src/sync/mod.rs
+          git diff --cached --check
+          git diff --cached --binary > "$RUNNER_TEMP/br-574-validated.patch"
+          test "$(wc -c < "$RUNNER_TEMP/br-574-validated.patch")" -le 200000
+          printf 'tree=%s\n' "$(git write-tree)" >> "$GITHUB_OUTPUT"
+          printf 'patch_sha256=%s\n' "$(sha256sum "$RUNNER_TEMP/br-574-validated.patch" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          printf 'patch=%s\n' "$(base64 -w0 "$RUNNER_TEMP/br-574-validated.patch")" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: validate
+    if: needs.validate.result == 'success' && github.repository == 'Dicklesworthstone/beads_rust' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      EXPECTED_TREE: ${{ needs.validate.outputs.tree }}
+      VALIDATED_PATCH: ${{ needs.validate.outputs.patch }}
+      PATCH_SHA256: ${{ needs.validate.outputs.patch_sha256 }}
+    steps:
+      - name: Check out the same immutable revision without running project code
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -c credential.helper='!gh auth git-credential' fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD:src/sync/mod.rs)" = ae5dba7b7da8abb23a99f76d7a56c774f48b7090
+          test "$(git rev-parse HEAD:src/franken_sync.rs)" = a54b99cc29f9ee181e6157c930f15714997827e8
+
+      - name: Verify and commit only the natively tested source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$EXPECTED_TREE"
+          test -n "$VALIDATED_PATCH"
+          test -n "$PATCH_SHA256"
+          printf '%s' "$VALIDATED_PATCH" | base64 --decode > "$RUNNER_TEMP/br-574-validated.patch"
+          printf '%s  %s\n' "$PATCH_SHA256" "$RUNNER_TEMP/br-574-validated.patch" | sha256sum --check --status
+          git apply --check --index "$RUNNER_TEMP/br-574-validated.patch"
+          git apply --index "$RUNNER_TEMP/br-574-validated.patch"
+          test "$(git diff --cached --name-only | LC_ALL=C sort)" = "$(printf '%s\n' src/franken_sync.rs src/sync/mod.rs | LC_ALL=C sort)"
+          git diff --cached --check
+          test "$(git write-tree)" = "$EXPECTED_TREE"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit \
+            -m 'perf(sync): avoid skipped-row queries and unchanged certificate rewrites (#574)' \
+            -m "Native checks and before/after evidence: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}. Preserves hydrated certification, conflict rollback and engine-safe per-row writes."
+
+      - name: Fast-forward main only if no intervening commit exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote=$(git -c credential.helper='!gh auth git-credential' ls-remote origin refs/heads/main | cut -f1)
+          test "$remote" = "$GITHUB_SHA"
+          git -c credential.helper='!gh auth git-credential' push origin HEAD:refs/heads/main
+          printf 'Published commit: %s\n' "$(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
