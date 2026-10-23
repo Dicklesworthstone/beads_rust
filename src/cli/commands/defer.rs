@@ -1469,10 +1469,7 @@ mod tests {
 
     fn assert_unrelated_cache_untouched(storage: &SqliteStorage) {
         let rows = cache_rows(storage);
-        let witness = rows
-            .iter()
-            .find(|(id, _, _)| id == "bd-unrelated")
-            .unwrap();
+        let witness = rows.iter().find(|(id, _, _)| id == "bd-unrelated").unwrap();
         assert_eq!(witness.2, "2000-01-01T00:00:00Z");
     }
 
@@ -1516,7 +1513,11 @@ mod tests {
         let deferred = execute_defer_route(&args, &cli, &ctx, &beads_dir, false).unwrap();
         assert!(deferred.skipped.is_empty());
         assert_eq!(
-            deferred.deferred.iter().map(|row| &row.id).collect::<Vec<_>>(),
+            deferred
+                .deferred
+                .iter()
+                .map(|row| &row.id)
+                .collect::<Vec<_>>(),
             ids.iter().collect::<Vec<_>>()
         );
         for row in &deferred.deferred {
@@ -1553,7 +1554,11 @@ mod tests {
         let undeferred = execute_undefer_route(&args, &cli, &ctx, &beads_dir, false).unwrap();
         assert!(undeferred.skipped.is_empty());
         assert_eq!(
-            undeferred.undeferred.iter().map(|row| &row.id).collect::<Vec<_>>(),
+            undeferred
+                .undeferred
+                .iter()
+                .map(|row| &row.id)
+                .collect::<Vec<_>>(),
             ids.iter().collect::<Vec<_>>()
         );
         let before_repeat = {
@@ -1712,7 +1717,9 @@ mod tests {
             assert_eq!(before_cache, cache_rows(&storage));
             assert_eq!(
                 before_events,
-                storage.execute_raw_query("SELECT * FROM events ORDER BY id").unwrap()
+                storage
+                    .execute_raw_query("SELECT * FROM events ORDER BY id")
+                    .unwrap()
             );
             let mut dirty = storage.get_dirty_issue_ids().unwrap();
             dirty.sort();

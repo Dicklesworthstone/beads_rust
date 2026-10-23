@@ -1722,7 +1722,9 @@ mod tests {
     fn delete_plan_matches_point_query_semantics_for_mixed_persisted_edges() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         for id in ["bd-a", "bd-b", "bd-c", "bd-parent", "bd-related"] {
-            storage.create_issue(&create_test_issue(id, id), "tester").unwrap();
+            storage
+                .create_issue(&create_test_issue(id, id), "tester")
+                .unwrap();
         }
         // Insert directly to cover legacy/imported cycles, dangling endpoints
         // and raw case-sensitive type strings, not just API-normalized data.
@@ -1763,12 +1765,21 @@ mod tests {
             vec!["bd-missing".to_string()],
         ] {
             let plan = plan_delete_dependents(&storage, &roots, true).unwrap();
-            assert_eq!(plan.direct, collect_direct_dependents(&storage, &roots).unwrap());
-            assert_eq!(plan.cascade, collect_sorted_cascade_dependents(&storage, &roots).unwrap());
+            assert_eq!(
+                plan.direct,
+                collect_direct_dependents(&storage, &roots).unwrap()
+            );
+            assert_eq!(
+                plan.cascade,
+                collect_sorted_cascade_dependents(&storage, &roots).unwrap()
+            );
             assert!(!plan.cascade.contains(&"bd-related".to_string()));
         }
         let plan = plan_delete_dependents(&storage, &["bd-a".to_string()], true).unwrap();
         assert_eq!(plan.direct, vec!["bd-b", "bd-missing"]);
-        assert_eq!(plan.cascade, vec!["bd-b", "bd-c", "bd-missing", "bd-parent"]);
+        assert_eq!(
+            plan.cascade,
+            vec!["bd-b", "bd-c", "bd-missing", "bd-parent"]
+        );
     }
 }

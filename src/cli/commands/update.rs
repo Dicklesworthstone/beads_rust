@@ -1010,13 +1010,12 @@ fn execute_prepared_route_with_resources(
         // writes happen afterwards and need a fresh read, as do no-op targets
         // excluded from the batch. Human diffs still use the validated before
         // snapshot plus the requested update, preserving the #256 defense.
-        let issue_after_result = if !parent_changes_cache
-            && let Some(issue) = issues_after.remove(id)
-        {
-            Ok(Some(issue))
-        } else {
-            prepared.storage_ctx.storage.get_issue(id)
-        };
+        let issue_after_result =
+            if !parent_changes_cache && let Some(issue) = issues_after.remove(id) {
+                Ok(Some(issue))
+            } else {
+                prepared.storage_ctx.storage.get_issue(id)
+            };
         let issue_after = preserve_blocked_cache_on_error(
             &mut prepared.storage_ctx.storage,
             blocked_cache_dirty,
@@ -4118,7 +4117,8 @@ because downstream tooling links to them.\n\n- [ ] schema migration applied\n\
                 )
                 .unwrap();
             assert_eq!(
-                row.get(0).and_then(crate::franken_sync::SqliteValue::as_text),
+                row.get(0)
+                    .and_then(crate::franken_sync::SqliteValue::as_text),
                 Some("2000-01-01T00:00:00Z"),
                 "a localized status batch must not rewrite an unrelated cache component",
             );

@@ -638,7 +638,8 @@ mod tests {
             )
             .expect("unrelated cache row");
         assert_eq!(
-            row.get(0).and_then(crate::franken_sync::SqliteValue::as_text),
+            row.get(0)
+                .and_then(crate::franken_sync::SqliteValue::as_text),
             Some("2000-01-01T00:00:00Z"),
             "reopen must not rewrite an unrelated cache component",
         );
@@ -674,7 +675,9 @@ mod tests {
                 issue.closed_at = None;
                 issue.defer_until = None;
             }
-            storage.create_issue(&issue, "tester").expect("create issue");
+            storage
+                .create_issue(&issue, "tester")
+                .expect("create issue");
         }
         storage
             .delete_issue("bd-tombstone", "tester", "test skip", None)
@@ -690,7 +693,9 @@ mod tests {
                 .add_dependency(dependent, blocker, kind, "tester")
                 .expect("dependency");
         }
-        storage.rebuild_blocked_cache(true).expect("fresh seed cache");
+        storage
+            .rebuild_blocked_cache(true)
+            .expect("fresh seed cache");
         storage
             .execute_raw(
                 "UPDATE blocked_issues_cache SET blocked_at = '2000-01-01T00:00:00Z' \
@@ -760,14 +765,16 @@ mod tests {
         assert_unrelated_cache_witness(&db_path);
         drop(storage);
 
-        let skipped = execute_route(&args, &overrides, &ctx, &beads_dir, false)
-            .expect("all-skipped repeat");
+        let skipped =
+            execute_route(&args, &overrides, &ctx, &beads_dir, false).expect("all-skipped repeat");
         assert!(skipped.reopened.is_empty());
         assert_eq!(skipped.skipped.len(), args.ids.len());
         assert_unrelated_cache_witness(&db_path);
 
         storage = SqliteStorage::open(&db_path).expect("storage for full-rebuild oracle");
-        storage.rebuild_blocked_cache(true).expect("reference rebuild");
+        storage
+            .rebuild_blocked_cache(true)
+            .expect("reference rebuild");
         assert_eq!(
             incremental,
             blocked_snapshot(&storage),
@@ -795,7 +802,12 @@ mod tests {
             storage.create_issue(issue, "tester").expect("create issue");
         }
         let before_issues = storage
-            .get_issues_by_ids(&issues.iter().map(|issue| issue.id.clone()).collect::<Vec<_>>())
+            .get_issues_by_ids(
+                &issues
+                    .iter()
+                    .map(|issue| issue.id.clone())
+                    .collect::<Vec<_>>(),
+            )
             .expect("persisted pre-mutation rows");
         let before = blocked_snapshot(&storage);
         drop(storage);
