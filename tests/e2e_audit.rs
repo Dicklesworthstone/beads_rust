@@ -978,6 +978,172 @@ fn e2e_audit_log_for_issue() {
     info!("e2e_audit_log_for_issue: done");
 }
 
+/// GitHub #579: `audit log --since <TIME>` without an issue ID reads every
+/// issue's events from that time in one call, each row naming its issue and
+/// actor, including a transition that returned to its starting status.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_audit_log_since_reads_every_issue() {
+    common::init_test_logging();
+    info!("e2e_audit_log_since_reads_every_issue: start");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init", "--prefix", "demo"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let before = run_br(
+        &workspace,
+        ["q", "before the window", "--actor", "zed"],
+        "q_before",
+    );
+    assert!(before.status.success(), "q failed: {}", before.stderr);
+    let before_id = before.stdout.trim().to_string();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let since = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let first = run_br(&workspace, ["q", "first", "--actor", "alice"], "q_first");
+    assert!(first.status.success(), "q failed: {}", first.stderr);
+    let first_id = first.stdout.trim().to_string();
+    let second = run_br(&workspace, ["q", "second", "--actor", "bob"], "q_second");
+    assert!(second.status.success(), "q failed: {}", second.stderr);
+    let second_id = second.stdout.trim().to_string();
+    for (id, status, actor) in [
+        (&first_id, "in_progress", "alice"),
+        (&second_id, "in_progress", "bob"),
+        (&second_id, "open", "carol"),
+    ] {
+        let update = run_br(
+            &workspace,
+            ["update", id, "--status", status, "--actor", actor],
+            "update_status",
+        );
+        assert!(update.status.success(), "update failed: {}", update.stderr);
+    }
+
+    let log = run_br(
+        &workspace,
+        ["audit", "log", "--since", &since, "--json"],
+        "audit_log_since",
+    );
+    assert!(
+        log.status.success(),
+        "audit log --since failed: {}",
+        log.stderr
+    );
+    let json: Value = serde_json::from_str(&extract_json_payload(&log.stdout)).expect("valid json");
+    assert!(
+        json.get("since").is_some(),
+        "the window start is echoed: {json}"
+    );
+    let events = json["events"].as_array().expect("events array");
+    assert!(
+        events
+            .iter()
+            .all(|event| event["issue_id"] != before_id.as_str()),
+        "events before --since are excluded: {json}"
+    );
+    let transitions = events
+        .iter()
+        .filter(|event| event["event_type"] == "status_changed")
+        .map(|event| {
+            (
+                event["issue_id"].as_str().unwrap().to_string(),
+                event["actor"].as_str().unwrap().to_string(),
+                event["old_value"].as_str().unwrap().to_string(),
+                event["new_value"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let expected = |id: &str, actor: &str, old: &str, new: &str| {
+        (
+            id.to_string(),
+            actor.to_string(),
+            old.to_string(),
+            new.to_string(),
+        )
+    };
+    assert_eq!(
+        transitions,
+        vec![
+            expected(&second_id, "carol", "in_progress", "open"),
+            expected(&second_id, "bob", "open", "in_progress"),
+            expected(&first_id, "alice", "open", "in_progress"),
+        ],
+        "every transition in the window, newest first, with its actor"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event_type"] == "created" && event["issue_id"] == first_id.as_str()),
+        "other event types are included: {json}"
+    );
+
+    // With an issue ID, --since filters that issue's log and keeps its shape.
+    let one = run_br(
+        &workspace,
+        ["audit", "log", &before_id, "--since", &since, "--json"],
+        "audit_log_issue_since",
+    );
+    assert!(
+        one.status.success(),
+        "audit log <id> --since failed: {}",
+        one.stderr
+    );
+    let one: Value = serde_json::from_str(&extract_json_payload(&one.stdout)).expect("valid json");
+    assert_eq!(one["issue_id"], before_id.as_str());
+    assert_eq!(one["events"].as_array().map(Vec::len), Some(0));
+
+    let text = run_br(
+        &workspace,
+        ["audit", "log", "--since", &since],
+        "audit_log_since_text",
+    );
+    assert!(
+        text.status.success(),
+        "text audit log failed: {}",
+        text.stderr
+    );
+    assert!(
+        text.stdout.contains(&second_id) && text.stdout.contains("carol"),
+        "text rows name the issue and actor: {}",
+        text.stdout
+    );
+
+    // A relative time is accepted as a separate argument despite its '-'.
+    let relative = run_br(
+        &workspace,
+        ["audit", "log", "--since", "-1h", "--json"],
+        "audit_log_since_relative",
+    );
+    assert!(
+        relative.status.success(),
+        "audit log --since -1h failed: {}",
+        relative.stderr
+    );
+    let relative_json: Value =
+        serde_json::from_str(&extract_json_payload(&relative.stdout)).expect("relative JSON");
+    let relative_ids = relative_json["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter_map(|event| event["issue_id"].as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert!(
+        relative_ids.contains(before_id.as_str()) && relative_ids.contains(second_id.as_str()),
+        "the last hour covers every issue created by this test: {relative_json}"
+    );
+
+    let missing = run_br(&workspace, ["audit", "log"], "audit_log_no_id");
+    assert!(!missing.status.success(), "an ID or --since is required");
+    assert!(
+        missing.stderr.contains("--since"),
+        "usage names --since: {}",
+        missing.stderr
+    );
+
+    info!("e2e_audit_log_since_reads_every_issue: done");
+}
+
 #[test]
 fn e2e_audit_summary() {
     common::init_test_logging();

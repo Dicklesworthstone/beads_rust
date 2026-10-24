@@ -15,6 +15,7 @@ use crate::model::EventType;
 use crate::output::{OutputContext, Theme};
 use crate::sync::require_valid_sync_path;
 use crate::util::id::{IdResolver, ResolverConfig};
+use crate::util::time::parse_flexible_timestamp;
 use chrono::{DateTime, Utc};
 use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -96,8 +97,19 @@ struct AuditLogOutput {
     events: Vec<AuditEventOutput>,
 }
 
+/// `br audit log --since <TIME>` without an issue ID: every issue's events at
+/// or after `since`, newest first, each naming its issue (GitHub #579).
+#[derive(Debug, Serialize)]
+struct AuditLogSinceOutput {
+    since: DateTime<Utc>,
+    events: Vec<AuditEventOutput>,
+}
+
 #[derive(Debug, Serialize)]
 struct AuditEventOutput {
+    /// Set only on the cross-issue log, whose rows come from many issues.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issue_id: Option<String>,
     id: i64,
     event_type: String,
     actor: String,
@@ -175,9 +187,22 @@ fn execute_log(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
+    let since = args
+        .since
+        .as_deref()
+        .map(|since| parse_flexible_timestamp(since, "since"))
+        .transpose()?;
+    let Some(issue_input) = args.id.as_deref() else {
+        let since = since
+            .ok_or_else(|| BeadsError::validation("since", "required when no issue ID is given"))?;
+        return execute_log_since(since, beads_dir, cli, ctx);
+    };
     let (storage_ctx, issue_id, _routed_write_lock) =
-        open_routed_storage_for_issue_input(beads_dir, cli, &args.id)?;
-    let events = storage_ctx.storage.get_events(&issue_id, 0)?;
+        open_routed_storage_for_issue_input(beads_dir, cli, issue_input)?;
+    let mut events = storage_ctx.storage.get_events(&issue_id, 0)?;
+    if let Some(since) = since {
+        events.retain(|event| event.created_at >= since);
+    }
 
     if ctx.is_quiet() {
         return Ok(());
@@ -201,10 +226,64 @@ fn execute_log(
         return Ok(());
     }
 
+    let title = format!("Audit Log: {issue_id}");
     if ctx.is_rich() {
-        render_audit_log_rich(&issue_id, &events, ctx);
+        render_audit_log_rich(&title, &events, false, ctx);
     } else {
-        render_audit_log_plain(&issue_id, &events);
+        render_audit_log_plain(&title, &events, false);
+    }
+
+    Ok(())
+}
+
+/// Every issue's events at or after `since`, newest first, in one read of
+/// the local workspace's events table (GitHub #579).
+fn execute_log_since(
+    since: DateTime<Utc>,
+    beads_dir: &Path,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+    let mut events = storage_ctx.storage.get_all_events(0)?;
+    events.retain(|event| event.created_at >= since);
+
+    if ctx.is_quiet() {
+        return Ok(());
+    }
+
+    let output_events = || -> Vec<AuditEventOutput> {
+        events
+            .iter()
+            .map(|event| AuditEventOutput {
+                issue_id: Some(event.issue_id.clone()),
+                ..map_event_to_output(event)
+            })
+            .collect()
+    };
+    if ctx.is_toon() {
+        ctx.toon(&AuditLogSinceOutput {
+            since,
+            events: output_events(),
+        });
+        return Ok(());
+    }
+    if ctx.is_json() {
+        ctx.json_pretty(&AuditLogSinceOutput {
+            since,
+            events: output_events(),
+        });
+        return Ok(());
+    }
+
+    let title = format!(
+        "Audit Log: all issues since {}",
+        since.format("%Y-%m-%d %H:%M UTC")
+    );
+    if ctx.is_rich() {
+        render_audit_log_rich(&title, &events, true, ctx);
+    } else {
+        render_audit_log_plain(&title, &events, true);
     }
 
     Ok(())
@@ -324,6 +403,7 @@ fn execute_summary(
 
 fn map_event_to_output(event: &crate::model::Event) -> AuditEventOutput {
     AuditEventOutput {
+        issue_id: None,
         id: event.id,
         event_type: event.event_type.as_str().to_string(),
         actor: event.actor.clone(),
@@ -891,7 +971,12 @@ fn new_audit_id() -> String {
     )
 }
 
-fn render_audit_log_rich(issue_id: &str, events: &[crate::model::Event], ctx: &OutputContext) {
+fn render_audit_log_rich(
+    title: &str,
+    events: &[crate::model::Event],
+    with_issue_ids: bool,
+    ctx: &OutputContext,
+) {
     let _console = Console::default();
     let theme = ctx.theme();
     let width = ctx.width();
@@ -913,6 +998,13 @@ fn render_audit_log_rich(issue_id: &str, events: &[crate::model::Event], ctx: &O
         // Event Type
         let type_style = event_type_style(&event.event_type, theme);
         content.append_styled(&format!("{:<15}", event.event_type.as_str()), type_style);
+        if with_issue_ids {
+            content.append("  ");
+            content.append_styled(
+                &sanitize_terminal_inline(&event.issue_id),
+                theme.emphasis.clone(),
+            );
+        }
         content.append("\n");
 
         // Details
@@ -952,7 +1044,7 @@ fn render_audit_log_rich(issue_id: &str, events: &[crate::model::Event], ctx: &O
 
     let panel = Panel::from_rich_text(&content, width)
         .title(Text::styled(
-            format!("Audit Log: {}", issue_id),
+            sanitize_terminal_inline(title),
             theme.panel_title.clone(),
         ))
         .box_style(theme.box_style);
@@ -960,17 +1052,27 @@ fn render_audit_log_rich(issue_id: &str, events: &[crate::model::Event], ctx: &O
     ctx.render(&panel);
 }
 
-fn render_audit_log_plain(issue_id: &str, events: &[crate::model::Event]) {
-    println!("Audit Log: {}", issue_id);
+fn render_audit_log_plain(title: &str, events: &[crate::model::Event], with_issue_ids: bool) {
+    println!("{}", sanitize_terminal_inline(title));
     println!("{}", "-".repeat(40));
 
     for event in events {
-        println!(
-            "{}  @{:<10}  {}",
-            event.created_at.format("%Y-%m-%d %H:%M"),
-            sanitize_terminal_inline(&event.actor),
-            event.event_type.as_str()
-        );
+        if with_issue_ids {
+            println!(
+                "{}  @{:<10}  {:<15}  {}",
+                event.created_at.format("%Y-%m-%d %H:%M"),
+                sanitize_terminal_inline(&event.actor),
+                event.event_type.as_str(),
+                sanitize_terminal_inline(&event.issue_id)
+            );
+        } else {
+            println!(
+                "{}  @{:<10}  {}",
+                event.created_at.format("%Y-%m-%d %H:%M"),
+                sanitize_terminal_inline(&event.actor),
+                event.event_type.as_str()
+            );
+        }
 
         if let Some(old) = &event.old_value {
             if let Some(new) = &event.new_value {

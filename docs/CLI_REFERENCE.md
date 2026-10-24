@@ -2607,8 +2607,26 @@ Appends to `.beads/interactions.jsonl`.
 | `record` | Append one interaction entry |
 | `coordination` | Record coordination status rows as audit interactions |
 | `label` | Label a prior interaction entry |
-| `log` | View audit entries for an issue |
+| `log` | View audit entries for an issue, or for every issue since a time |
 | `summary` | Summarize interaction counts |
+
+#### audit log
+
+`audit log <ID>` lists one issue's events (the append-only `events` table),
+newest first. `--since <TIME>` keeps only events at or after that time
+(RFC 3339, `YYYY-MM-DD`, or relative such as `-1h` or `-7d`). Without an issue
+ID, `--since` is required and the log covers every issue in the workspace in
+one read, so a supervisor can ask what moved since its last look and who moved
+it:
+
+```bash
+br audit log --since 2026-10-23T09:00:00Z --json
+```
+
+The single-issue JSON is `{"issue_id": ..., "events": [...]}`. The cross-issue
+JSON is `{"since": ..., "events": [...]}`, where each event also carries its
+`issue_id`. Events keep the same fields in both: `id`, `event_type`, `actor`,
+`timestamp`, and `old_value`/`new_value`/`comment` when present.
 
 #### audit coordination
 

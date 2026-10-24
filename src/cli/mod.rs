@@ -2466,7 +2466,7 @@ pub enum AuditCommands {
     Coordination(AuditCoordinationArgs),
     /// Append a label entry referencing an existing interaction
     Label(AuditLabelArgs),
-    /// View audit log for an issue
+    /// View audit log for an issue, or for every issue since a time
     Log(AuditLogArgs),
     /// View audit summary
     Summary(AuditSummaryArgs),
@@ -2538,10 +2538,17 @@ pub struct AuditLabelArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+#[group(id = "audit_log_scope", required = true, multiple = true)]
 pub struct AuditLogArgs {
-    /// Issue ID
+    /// Issue ID (omit it, and pass --since, to read every issue's events)
     #[arg(add = ArgValueCompleter::new(issue_id_completer))]
-    pub id: String,
+    pub id: Option<String>,
+
+    /// Only show events at or after this time (RFC 3339, YYYY-MM-DD, or
+    /// relative such as -1h or -7d). Without an issue ID, shows the events of
+    /// every issue, each carrying its issue ID
+    #[arg(long, value_name = "TIME", allow_hyphen_values = true)]
+    pub since: Option<String>,
 }
 
 #[derive(Args, Debug, Clone, Default)]
