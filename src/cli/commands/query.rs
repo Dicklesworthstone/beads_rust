@@ -6,7 +6,7 @@ use crate::cli::{ListArgs, QueryCommands, QueryDeleteArgs, QueryRunArgs, QuerySa
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
-use crate::output::{OutputContext, OutputMode};
+use crate::output::{OutputContext, OutputMode, rich_text_panel};
 use chrono::{DateTime, Utc};
 use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -542,7 +542,7 @@ fn render_query_save_rich(name: &str, description: Option<&str>, ctx: &OutputCon
         content.append("\n");
     }
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Query Saved", theme.panel_title.clone()))
         .box_style(theme.box_style);
 
@@ -600,7 +600,7 @@ fn render_query_list_rich(queries: &[QueryListItem], ctx: &OutputContext) {
         content.append("\n");
     }
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Saved Queries", theme.panel_title.clone()))
         .box_style(theme.box_style);
 
@@ -619,7 +619,7 @@ fn render_query_delete_rich(name: &str, ctx: &OutputContext) {
     content.append_styled(&query_display_text(name), theme.emphasis.clone());
     content.append("\n");
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Query Deleted", theme.panel_title.clone()))
         .box_style(theme.box_style);
 

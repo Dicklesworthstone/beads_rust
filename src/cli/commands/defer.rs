@@ -10,7 +10,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
 use crate::model::{Issue, Status};
-use crate::output::{OutputContext, OutputMode};
+use crate::output::{OutputContext, OutputMode, rich_text_panel};
 use crate::storage::IssueUpdate;
 use crate::util::id::{IdResolver, ResolverConfig};
 use crate::util::time::parse_flexible_timestamp;
@@ -806,7 +806,7 @@ fn render_defer_rich(deferred: &[DeferredIssue], skipped: &[SkippedIssue], ctx: 
         "Defer Results"
     };
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled(title, theme.panel_title.clone()))
         .box_style(theme.box_style);
 
@@ -867,7 +867,7 @@ fn render_undefer_rich(
         "Undefer Results"
     };
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled(title, theme.panel_title.clone()))
         .box_style(theme.box_style);
 

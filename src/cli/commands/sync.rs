@@ -8,7 +8,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
 use crate::health::{AnomalyClass, ReliabilityAuditRecord, WorkspaceClassification};
-use crate::output::{OutputContext, record_pending_exit_code};
+use crate::output::{OutputContext, record_pending_exit_code, rich_text_panel};
 use crate::sync::history::HistoryConfig;
 use crate::sync::witness::{
     JsonlMerkleWitness, JsonlWitnessComparison, JsonlWitnessParallelWorkPlan,
@@ -2261,7 +2261,7 @@ fn render_status_rich(status: &SyncStatus, ctx: &OutputContext) {
         text.append_styled(&display_hash, theme.muted.clone());
     }
 
-    let panel = Panel::from_rich_text(&text, ctx.width())
+    let panel = rich_text_panel(&text, ctx.width())
         .title(Text::new("Sync Status"))
         .box_style(theme.box_style);
     ctx.render(&panel);
@@ -3158,7 +3158,7 @@ fn render_flush_result_rich(result: &FlushResult, errors: &[ExportError], ctx: &
         );
     }
 
-    let panel = Panel::from_rich_text(&text, ctx.width())
+    let panel = rich_text_panel(&text, ctx.width())
         .title(Text::new("Flush (Export)"))
         .box_style(theme.box_style);
     ctx.render(&panel);
@@ -3193,7 +3193,7 @@ fn render_errors_rich(errors: &[ExportError], ctx: &OutputContext) {
         text.append("\n");
     }
 
-    let panel = Panel::from_rich_text(&text, ctx.width())
+    let panel = rich_text_panel(&text, ctx.width())
         .title(Text::new("⚠ Errors"))
         .box_style(theme.box_style);
     ctx.render(&panel);
@@ -4298,7 +4298,7 @@ fn render_import_result_rich(result: &ImportResultOutput, ctx: &OutputContext) {
     text.append_styled("✓ ", theme.success.clone());
     text.append_styled("Blocked cache rebuilt", theme.muted.clone());
 
-    let panel = Panel::from_rich_text(&text, ctx.width())
+    let panel = rich_text_panel(&text, ctx.width())
         .title(Text::new("Import"))
         .box_style(theme.box_style);
     ctx.render(&panel);
@@ -5832,7 +5832,7 @@ fn render_merge_conflicts_rich(
     text.append_styled("Hint: ", theme.dimmed.clone());
     text.append("Use --force-db to keep local DB changes, --force-jsonl to keep JSONL changes, or --force to keep the newer timestamp.");
 
-    let panel = Panel::from_rich_text(&text, ctx.width())
+    let panel = rich_text_panel(&text, ctx.width())
         .title(Text::new("Merge Conflicts"))
         .box_style(theme.box_style);
     console.print_renderable(&panel);
@@ -5914,7 +5914,7 @@ fn render_merge_result_rich(report: &crate::sync::MergeReport, ctx: &OutputConte
     text.append_styled("✓ ", theme.success.clone());
     text.append_styled("JSONL exported", theme.muted.clone());
 
-    let panel = Panel::from_rich_text(&text, ctx.width())
+    let panel = rich_text_panel(&text, ctx.width())
         .title(Text::new("Merge"))
         .box_style(theme.box_style);
     console.print_renderable(&panel);

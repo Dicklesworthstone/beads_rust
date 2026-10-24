@@ -3,7 +3,7 @@
 use super::github_latest_release_api_url;
 use crate::cli::VersionArgs;
 use crate::error::{BeadsError, Result};
-use crate::output::{OutputContext, OutputMode};
+use crate::output::{OutputContext, OutputMode, rich_text_panel};
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::fmt::Write as _;
@@ -202,7 +202,7 @@ fn render_version_rich(
     }
 
     // Wrap in panel
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("br version", theme.panel_title.clone()))
         .box_style(theme.box_style);
 

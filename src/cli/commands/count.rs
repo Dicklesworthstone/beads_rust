@@ -3,7 +3,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
 use crate::model::Status;
-use crate::output::OutputContext;
+use crate::output::{OutputContext, rich_text_panel};
 use crate::storage::{ListFilters, SqliteStorage, StatsIssueRow};
 use rich_rust::prelude::*;
 use serde::Serialize;
@@ -194,7 +194,7 @@ fn render_count_simple_rich(total: usize, ctx: &OutputContext) {
     content.append_styled(&total.to_string(), theme.emphasis.clone());
     content.append("\n");
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Issue Count", theme.panel_title.clone()))
         .box_style(theme.box_style);
 
@@ -249,7 +249,7 @@ fn render_count_grouped_rich(
         CountBy::Label => "Issue Counts by Label",
     };
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled(title, theme.panel_title.clone()))
         .box_style(theme.box_style);
 

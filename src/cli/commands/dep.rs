@@ -14,7 +14,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{sanitize_terminal_inline, truncate_title};
 use crate::model::DependencyType;
-use crate::output::{OutputContext, OutputMode, Theme};
+use crate::output::{OutputContext, OutputMode, Theme, rich_text_panel};
 use crate::storage::{BulkDependencyInsert, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use rich_rust::prelude::*;
@@ -1176,7 +1176,7 @@ fn render_dep_list_rich(
         );
     }
 
-    let panel = Panel::from_rich_text(&content, ctx.width())
+    let panel = rich_text_panel(&content, ctx.width())
         .title(Text::new(dep_list_panel_title(direction, issue_id)))
         .box_style(theme.box_style)
         .border_style(theme.panel_border.clone());
@@ -2120,7 +2120,7 @@ fn render_cycles_rich(
     } else {
         "Dependency Cycles"
     };
-    let panel = Panel::from_rich_text(&content, ctx.width())
+    let panel = rich_text_panel(&content, ctx.width())
         .title(Text::new(title))
         .border_style(theme.error.clone());
 

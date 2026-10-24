@@ -12,7 +12,7 @@ use crate::cli::commands::{
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
-use crate::output::OutputContext;
+use crate::output::{OutputContext, rich_text_panel};
 use crate::storage::SqliteStorage;
 use crate::util::id::{IdResolver, ResolverConfig};
 use rich_rust::prelude::*;
@@ -1114,7 +1114,7 @@ fn render_dependents_warning_rich(
     }
     content.append_styled("No changes made (preview mode).", theme.muted.clone());
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled(
             "\u{26a0} Blocked by Dependents",
             theme.warning.clone(),
@@ -1203,7 +1203,7 @@ fn render_dry_run_rich(
         }
     }
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled(
             "\u{1f4cb} Dry Run Preview",
             theme.info.clone(),
@@ -1280,7 +1280,7 @@ fn render_delete_result_rich(result: &DeleteResult, storage: &SqliteStorage, ctx
         }
     }
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled(
             "\u{1f5d1} Delete Complete",
             theme.success.clone(),

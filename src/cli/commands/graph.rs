@@ -14,7 +14,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{IssueWithDependencyMetadata, format_status_label, sanitize_terminal_inline};
 use crate::model::{Issue, Priority, Status};
-use crate::output::{OutputContext, OutputMode};
+use crate::output::{OutputContext, OutputMode, rich_text_panel};
 use crate::storage::{ListFilters, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use rich_rust::prelude::*;
@@ -23,8 +23,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use tracing::debug;
 use unicode_width::UnicodeWidthStr;
-
-const GRAPH_DEPENDENTS_BATCH_SIZE: usize = 400;
 
 /// JSON output for a single node in the graph.
 #[derive(Debug, Clone, Serialize)]
@@ -51,6 +49,14 @@ struct ConnectedComponent {
     nodes: Vec<GraphNode>,
     edges: Vec<(String, String)>,
     roots: Vec<String>,
+}
+
+impl ConnectedComponent {
+    /// The roots as a set, so renderers can mark each node in O(1) instead
+    /// of scanning `roots` once per node (GitHub #580).
+    fn root_set(&self) -> HashSet<&str> {
+        self.roots.iter().map(String::as_str).collect()
+    }
 }
 
 /// JSON output for --all mode.
@@ -374,33 +380,36 @@ fn graph_all(storage: &SqliteStorage, compact: bool, dot: bool, ctx: &OutputCont
         }
     }
 
-    // Find connected components using BFS
-    let mut visited: HashSet<String> = HashSet::new();
+    // Find connected components using BFS. `component_of` is the visited set
+    // and also records each node's component, so the edges can be handed to
+    // their components in one pass afterwards (GitHub #580).
+    let mut component_of: HashMap<&str, usize> = HashMap::new();
     let mut components: Vec<ConnectedComponent> = Vec::new();
 
     for issue in &issues {
-        if visited.contains(&issue.id) {
+        if component_of.contains_key(issue.id.as_str()) {
             continue;
         }
+        let component_index = components.len();
 
         // BFS to find all nodes in this component
         let mut component_nodes: Vec<String> = Vec::new();
         let mut queue: VecDeque<String> = VecDeque::new();
 
         queue.push_back(issue.id.clone());
-        visited.insert(issue.id.clone());
+        component_of.insert(issue.id.as_str(), component_index);
 
         while let Some(current) = queue.pop_front() {
-            component_nodes.push(current.clone());
-
             if let Some(neighbors) = adj.get(&current) {
                 for neighbor in neighbors {
-                    if !visited.contains(neighbor) {
-                        visited.insert(neighbor.clone());
+                    if !component_of.contains_key(neighbor.as_str()) {
+                        component_of.insert(neighbor.as_str(), component_index);
                         queue.push_back(neighbor.clone());
                     }
                 }
             }
+
+            component_nodes.push(current);
         }
 
         // Calculate depths using longest path from roots
@@ -434,20 +443,25 @@ fn graph_all(storage: &SqliteStorage, compact: bool, dot: bool, ctx: &OutputCont
         });
         roots.sort();
 
-        // Filter edges to this component
-        let component_edges: Vec<(String, String)> = blocking_edges
-            .iter()
-            .filter(|(from, to)| {
-                component_set.contains(from.as_str()) && component_set.contains(to.as_str())
-            })
-            .cloned()
-            .collect();
-
         components.push(ConnectedComponent {
             nodes,
-            edges: component_edges,
+            edges: Vec::new(),
             roots,
         });
+    }
+
+    // Hand every edge to its component in one pass instead of filtering the
+    // whole edge list once per component. An edge's endpoints are always in
+    // the same component (the edges built the adjacency), and walking
+    // `blocking_edges` in order keeps each component's edges in the order the
+    // per-component filter produced.
+    for edge in blocking_edges {
+        if let Some(component) = component_of
+            .get(edge.0.as_str())
+            .and_then(|&index| components.get_mut(index))
+        {
+            component.edges.push(edge);
+        }
     }
 
     // Sort components by size (largest first)
@@ -503,6 +517,7 @@ fn graph_all(storage: &SqliteStorage, compact: bool, dot: bool, ctx: &OutputCont
                         format_id_list(&component.roots)
                     };
                     let parent_map = build_parent_map(&component.edges);
+                    let root_set = component.root_set();
                     // Detailed view
                     println!(
                         "Component {} ({} issues, roots: {}, by depth):",
@@ -513,7 +528,7 @@ fn graph_all(storage: &SqliteStorage, compact: bool, dot: bool, ctx: &OutputCont
 
                     for node in &component.nodes {
                         let indent = "  ".repeat(node.depth + 1);
-                        let root_marker = if component.roots.contains(&node.id) {
+                        let root_marker = if root_set.contains(node.id.as_str()) {
                             " (root)"
                         } else {
                             ""
@@ -613,7 +628,13 @@ fn collect_single_graph(
     let mut queued_nodes: HashSet<String> = HashSet::new();
 
     let metadata_cache = storage.get_active_issues_metadata()?;
-    let mut dependents_cache: HashMap<String, Vec<IssueWithDependencyMetadata>> = HashMap::new();
+    // Load every neighbour list once and walk them in memory. Fetching them
+    // per batch of frontier ids cost one engine join per batch, and each of
+    // those joins scanned the whole dependency table (GitHub #580).
+    let neighbours: HashMap<String, Vec<IssueWithDependencyMetadata>> = match direction {
+        GraphDirection::Dependents => storage.get_all_blocking_dependents()?,
+        GraphDirection::Dependencies => storage.get_all_blocking_dependencies()?,
+    };
 
     let mut stack: Vec<String> = vec![root_id.to_string()];
     queued_nodes.insert(root_id.to_string());
@@ -631,15 +652,7 @@ fn collect_single_graph(
             continue;
         }
 
-        let mut frontier_batch = Vec::with_capacity(stack.len().saturating_add(1));
-        frontier_batch.push(current_id.clone());
-        frontier_batch.extend(stack.iter().rev().cloned());
-        cache_graph_dependents(storage, direction, &mut dependents_cache, &frontier_batch)?;
-
-        let mut dependents: Vec<_> = dependents_cache
-            .get(&current_id)
-            .cloned()
-            .unwrap_or_default();
+        let mut dependents: Vec<_> = neighbours.get(&current_id).cloned().unwrap_or_default();
         dependents.sort_by(|a, b| a.priority.0.cmp(&b.priority.0).then(a.id.cmp(&b.id)));
 
         for dep in dependents.into_iter().rev() {
@@ -731,46 +744,6 @@ impl GraphDirection {
             Self::Dependencies => "Dependencies",
         }
     }
-}
-
-fn cache_graph_dependents(
-    storage: &SqliteStorage,
-    direction: GraphDirection,
-    dependents_cache: &mut HashMap<String, Vec<IssueWithDependencyMetadata>>,
-    issue_ids: &[String],
-) -> Result<()> {
-    let mut missing_ids = Vec::new();
-    let mut seen_ids = HashSet::new();
-    for issue_id in issue_ids {
-        if dependents_cache.contains_key(issue_id.as_str()) || !seen_ids.insert(issue_id.as_str()) {
-            continue;
-        }
-        missing_ids.push(issue_id.clone());
-        if missing_ids.len() == GRAPH_DEPENDENTS_BATCH_SIZE {
-            break;
-        }
-    }
-
-    if missing_ids.is_empty() {
-        return Ok(());
-    }
-
-    let fetched = match direction {
-        GraphDirection::Dependents => {
-            storage.get_blocking_dependents_for_issue_ids(&missing_ids)?
-        }
-        GraphDirection::Dependencies => {
-            storage.get_blocking_dependencies_for_issue_ids(&missing_ids)?
-        }
-    };
-    for issue_id in &missing_ids {
-        dependents_cache.insert(
-            issue_id.clone(),
-            fetched.get(issue_id).cloned().unwrap_or_default(),
-        );
-    }
-
-    Ok(())
 }
 
 fn build_graph_nodes(
@@ -1253,12 +1226,13 @@ fn format_all_graph_dot(components: &[ConnectedComponent]) -> String {
     for (index, component) in components.iter().enumerate() {
         out.push_str(&format!("    subgraph cluster_{index} {{\n"));
         out.push_str(&format!("        label=\"Component {}\";\n", index + 1));
+        let root_set = component.root_set();
         for node in &component.nodes {
             push_dot_node(
                 &mut out,
                 "        ",
                 node,
-                component.roots.contains(&node.id),
+                root_set.contains(node.id.as_str()),
             );
         }
         out.push_str("    }\n");
@@ -1360,7 +1334,7 @@ fn render_single_graph_rich(
         content.append("\n");
     }
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Dependency Graph", theme.panel_title.clone()))
         .box_style(theme.box_style);
 
@@ -1391,7 +1365,7 @@ fn render_no_dependents_rich(
     );
     content.append("\n");
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Dependency Graph", theme.panel_title.clone()))
         .box_style(theme.box_style);
 
@@ -1430,6 +1404,7 @@ fn render_all_graph_rich(
     for (i, component) in components.iter().enumerate() {
         content.append("\n");
         let parent_map = build_parent_map(&component.edges);
+        let root_set = component.root_set();
 
         // Component header
         content.append_styled(&format!("Component {}", i + 1), theme.emphasis.clone());
@@ -1479,7 +1454,7 @@ fn render_all_graph_rich(
                 status_style,
             );
 
-            if component.roots.contains(&node.id) {
+            if root_set.contains(node.id.as_str()) {
                 content.append_styled(" (root)", theme.dimmed.clone());
             } else if let Some(parents) = parent_map.get(&node.id) {
                 content.append_styled(&format_parent_list(Some(parents)), theme.dimmed.clone());
@@ -1488,7 +1463,7 @@ fn render_all_graph_rich(
         }
     }
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Dependency Graph", theme.panel_title.clone()))
         .box_style(theme.box_style);
 
@@ -1508,7 +1483,7 @@ fn render_no_issues_rich(ctx: &OutputContext) {
     );
     content.append("\n");
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Dependency Graph", theme.panel_title.clone()))
         .box_style(theme.box_style);
 
@@ -2207,7 +2182,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_graph_dependents_batches_frontier_roots() {
+    fn test_collect_single_graph_walks_both_directions_in_memory() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = chrono::Utc::now();
 
@@ -2242,30 +2217,37 @@ mod tests {
             ))
             .unwrap();
 
-        let mut cache = HashMap::new();
-        cache_graph_dependents(
-            &storage,
-            GraphDirection::Dependents,
-            &mut cache,
-            &["bd-root".to_string(), "bd-a".to_string()],
-        )
-        .unwrap();
+        let root = storage.get_issue("bd-root").unwrap().unwrap();
+        let dependents =
+            collect_single_graph(&storage, "bd-root", &root, GraphDirection::Dependents).unwrap();
+        assert_eq!(
+            dependents.traversal_order,
+            vec!["bd-root", "bd-a", "bd-c", "bd-b"]
+        );
+        assert_eq!(
+            dependents.edges,
+            vec![
+                ("bd-b".to_string(), "bd-root".to_string()),
+                ("bd-a".to_string(), "bd-root".to_string()),
+                ("bd-c".to_string(), "bd-a".to_string()),
+            ]
+        );
 
-        let root_dependents: Vec<_> = cache.get("bd-root").map_or_else(Vec::new, |dependents| {
-            dependents
-                .iter()
-                .map(|dependent| dependent.id.as_str())
-                .collect()
-        });
-        assert_eq!(root_dependents, vec!["bd-a", "bd-b"]);
-
-        let a_dependents: Vec<_> = cache.get("bd-a").map_or_else(Vec::new, |dependents| {
-            dependents
-                .iter()
-                .map(|dependent| dependent.id.as_str())
-                .collect()
-        });
-        assert_eq!(a_dependents, vec!["bd-c"]);
+        let leaf = storage.get_issue("bd-c").unwrap().unwrap();
+        let dependencies =
+            collect_single_graph(&storage, "bd-c", &leaf, GraphDirection::Dependencies).unwrap();
+        assert_eq!(
+            dependencies.traversal_order,
+            vec!["bd-c", "bd-a", "bd-root"]
+        );
+        assert_eq!(
+            dependencies.edges,
+            vec![
+                ("bd-c".to_string(), "bd-a".to_string()),
+                ("bd-a".to_string(), "bd-root".to_string()),
+            ]
+        );
+        assert_eq!(dependencies.issues_by_id["bd-root"].title, "Root");
     }
 
     #[test]

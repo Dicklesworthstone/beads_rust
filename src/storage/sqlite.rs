@@ -15275,8 +15275,10 @@ impl SqliteStorage {
     /// Returns a map from blocker-graph root ID to dependents. Standard
     /// dependency rows use `depends_on_id` as the root; `parent-child` rows are
     /// reversed because parents are blocked by children.
-    /// Unlike [`Self::prefetch_blocking_dependents`], this keeps focused graph
-    /// traversals from hydrating the entire workspace dependency graph.
+    /// Unlike [`Self::prefetch_blocking_dependents`], this reads only the given
+    /// roots. A walk over many issues should use
+    /// [`Self::get_all_blocking_dependents`], which returns the same lists for
+    /// every id without one join per batch.
     ///
     /// # Errors
     ///
@@ -15377,11 +15379,11 @@ impl SqliteStorage {
     /// Mirror of [`Self::get_blocking_dependents_for_issue_ids`]: for each id,
     /// the issues it *depends on* rather than the issues that depend on it.
     ///
-    /// Backs `br graph --dependencies` (`beads_rust-mf72`), which answers "what
+    /// This is the direction `br graph --dependencies` walks, answering "what
     /// is blocking this?" where the default walk answers "what does closing
-    /// this unblock?". The two queries are exact inverses, including the
-    /// `parent-child` special case, which the dependents query deliberately
-    /// walks the other way round.
+    /// this unblock?". The two queries are exact
+    /// inverses, including the `parent-child` special case, which the
+    /// dependents query deliberately walks the other way round.
     ///
     /// # Errors
     ///
@@ -15474,6 +15476,113 @@ impl SqliteStorage {
 
                 map.entry(root_id.to_string()).or_default().push(meta);
             }
+        }
+
+        Ok(map)
+    }
+
+    /// Every issue's blocking dependents, for walking the blocker graph in
+    /// memory.
+    ///
+    /// For each id this holds the same entries
+    /// [`Self::get_blocking_dependents_for_issue_ids`] returns for it, keyed
+    /// the same way (`parent-child` rows reversed), but it reads them with two
+    /// join-free scans instead of one join per batch of ids. On the pinned
+    /// engine that join evaluates the TEXT `IN` list against every joined
+    /// row, so a wide `br graph <id>` walk spent seconds per batch
+    /// (GitHub #580); these scans are linear in the size of the tracker.
+    ///
+    /// Entries within a list are in no particular order; callers sort.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either scan fails.
+    pub fn get_all_blocking_dependents(
+        &self,
+    ) -> Result<HashMap<String, Vec<IssueWithDependencyMetadata>>> {
+        self.all_blocking_neighbours(true)
+    }
+
+    /// Mirror of [`Self::get_all_blocking_dependents`]: every issue's
+    /// blocking dependencies, matching
+    /// [`Self::get_blocking_dependencies_for_issue_ids`] for each id. Backs
+    /// `br graph --dependencies`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either scan fails.
+    pub fn get_all_blocking_dependencies(
+        &self,
+    ) -> Result<HashMap<String, Vec<IssueWithDependencyMetadata>>> {
+        self.all_blocking_neighbours(false)
+    }
+
+    fn all_blocking_neighbours(
+        &self,
+        dependents: bool,
+    ) -> Result<HashMap<String, Vec<IssueWithDependencyMetadata>>> {
+        let issue_rows = self
+            .conn
+            .query("SELECT id, title, status, priority FROM issues")?;
+        let mut issues: HashMap<&str, &Row> = HashMap::with_capacity(issue_rows.len());
+        for row in &issue_rows {
+            if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {
+                issues.insert(id, row);
+            }
+        }
+
+        let dependency_rows = self
+            .conn
+            .query("SELECT issue_id, depends_on_id, type FROM dependencies")?;
+        let mut map: HashMap<String, Vec<IssueWithDependencyMetadata>> = HashMap::new();
+        for row in &dependency_rows {
+            let (Some(issue_id), Some(depends_on_id), Some(dep_type)) = (
+                row.get(0).and_then(SqliteValue::as_text),
+                row.get(1).and_then(SqliteValue::as_text),
+                row.get(2).and_then(SqliteValue::as_text),
+            ) else {
+                continue;
+            };
+            // The same orientation as the batched queries: a blocking row
+            // points from the blocked issue to its blocker, and a
+            // `parent-child` row points the other way (a parent is blocked by
+            // its children).
+            let blocker_to_blocked = match dep_type {
+                "blocks" | "conditional-blocks" | "waits-for" => (depends_on_id, issue_id),
+                "parent-child" => (issue_id, depends_on_id),
+                _ => continue,
+            };
+            let (root_id, neighbour_id) = if dependents {
+                blocker_to_blocked
+            } else {
+                (blocker_to_blocked.1, blocker_to_blocked.0)
+            };
+
+            let dep_type = dep_type.to_string();
+            let columns = issues.get(neighbour_id).map(|issue| {
+                (
+                    issue.get(1).and_then(SqliteValue::as_text),
+                    issue.get(2).and_then(SqliteValue::as_text),
+                    issue.get(3).and_then(SqliteValue::as_integer),
+                )
+            });
+            let meta = match columns {
+                Some((Some(title), Some(status), Some(priority))) => IssueWithDependencyMetadata {
+                    id: neighbour_id.to_string(),
+                    title: title.to_string(),
+                    status: parse_status(Some(status)),
+                    priority: Priority(i32::try_from(priority).unwrap_or(2)),
+                    dep_type,
+                },
+                _ => IssueWithDependencyMetadata {
+                    id: neighbour_id.to_string(),
+                    title: format!("[missing issue: {neighbour_id}]"),
+                    status: Status::Tombstone,
+                    priority: Priority::MEDIUM,
+                    dep_type,
+                },
+            };
+            map.entry(root_id.to_string()).or_default().push(meta);
         }
 
         Ok(map)

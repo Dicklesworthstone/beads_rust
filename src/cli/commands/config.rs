@@ -17,7 +17,7 @@ use crate::config::{
 };
 use crate::error::{BeadsError, Result};
 use crate::franken_sync::Connection;
-use crate::output::OutputContext;
+use crate::output::{OutputContext, rich_text_panel};
 use crate::util::id::normalize_configured_prefix;
 use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
@@ -975,7 +975,7 @@ fn set_config_value(
         content.append(&config_path.display().to_string());
         content.append("\n");
 
-        let panel = Panel::from_rich_text(&content, ctx.width())
+        let panel = rich_text_panel(&content, ctx.width())
             .title(Text::styled("Config Set", theme.panel_title.clone()))
             .box_style(theme.box_style)
             .border_style(theme.panel_border.clone());
@@ -1182,7 +1182,7 @@ fn delete_config_value(
             content.append(&sources.join(", "));
             content.append("\n");
 
-            let panel = Panel::from_rich_text(&content, ctx.width())
+            let panel = rich_text_panel(&content, ctx.width())
                 .title(Text::styled("Config Delete", theme.panel_title.clone()))
                 .box_style(theme.box_style)
                 .border_style(theme.panel_border.clone());

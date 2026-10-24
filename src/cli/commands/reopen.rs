@@ -9,7 +9,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
 use crate::model::Status;
-use crate::output::{OutputContext, OutputMode};
+use crate::output::{OutputContext, OutputMode, rich_text_panel};
 use crate::storage::IssueUpdate;
 use crate::util::id::{IdResolver, ResolverConfig};
 use rich_rust::prelude::*;
@@ -479,7 +479,7 @@ fn render_reopen_rich(
         "Reopen Results"
     };
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled(title, theme.panel_title.clone()))
         .box_style(theme.box_style);
 

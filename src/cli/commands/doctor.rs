@@ -13,7 +13,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::franken_sync::{Connection, Row};
 use crate::health::{AnomalyClass, ReliabilityAuditRecord, WorkspaceClassification};
-use crate::output::OutputContext;
+use crate::output::{OutputContext, rich_text_panel};
 use crate::storage::SqliteStorage;
 use crate::storage::schema::{CURRENT_SCHEMA_VERSION, REVIEWED_MIGRATION_SOURCE_VERSIONS};
 use crate::storage::sqlite::{PendingSyncMergeInspection, database_header_user_version};
@@ -4832,7 +4832,7 @@ fn render_doctor_rich(report: &DoctorReport, ctx: &OutputContext) {
         }
     }
 
-    let panel = Panel::from_rich_text(&content, ctx.width())
+    let panel = rich_text_panel(&content, ctx.width())
         .title(Text::styled("Doctor", theme.panel_title.clone()))
         .box_style(theme.box_style)
         .border_style(theme.panel_border.clone());

@@ -1570,3 +1570,166 @@ fn blocking_dependencies_batch_handles_empty_input_and_unknown_ids() {
             .is_empty()
     );
 }
+
+/// (id, title, status, priority, dependency type) of one neighbour.
+type NeighbourEntry = (String, String, String, i32, String);
+
+/// A neighbour map with each list sorted and empty lists dropped, so maps
+/// built by different queries compare equal when they hold the same entries.
+fn normalized_neighbours(
+    map: &std::collections::HashMap<String, Vec<beads_rust::format::IssueWithDependencyMetadata>>,
+) -> std::collections::BTreeMap<String, Vec<NeighbourEntry>> {
+    map.iter()
+        .map(|(root, entries)| {
+            let mut entries: Vec<NeighbourEntry> = entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.id.clone(),
+                        entry.title.clone(),
+                        entry.status.as_str().to_string(),
+                        entry.priority.0,
+                        entry.dep_type.clone(),
+                    )
+                })
+                .collect();
+            entries.sort();
+            (root.clone(), entries)
+        })
+        .filter(|(_, entries)| !entries.is_empty())
+        .collect()
+}
+
+/// Issues `wg-a`..`wg-parent` with one edge of every kind the neighbour
+/// queries treat differently, plus edges to a missing and a tombstoned issue.
+/// Returns the storage and every id the edges mention.
+fn seed_neighbour_fixture() -> (SqliteStorage, Vec<String>) {
+    let mut storage = test_db();
+
+    let a = fixtures::IssueBuilder::new("wg-a").with_id("wg-a").build();
+    let b = fixtures::IssueBuilder::new("wg-b")
+        .with_id("wg-b")
+        .with_priority(beads_rust::model::Priority::HIGH)
+        .build();
+    let c = fixtures::IssueBuilder::new("wg-c").with_id("wg-c").build();
+    let closed = fixtures::IssueBuilder::new("wg-closed")
+        .with_id("wg-closed")
+        .with_status(Status::Closed)
+        .build();
+    let gone = fixtures::IssueBuilder::new("wg-gone")
+        .with_id("wg-gone")
+        .build();
+    let parent = fixtures::IssueBuilder::new("wg-parent")
+        .with_id("wg-parent")
+        .build();
+    for issue in [&a, &b, &c, &closed, &gone, &parent] {
+        storage.create_issue(issue, "tester").unwrap();
+    }
+    storage
+        .delete_issue(&gone.id, "tester", "gone", None)
+        .unwrap();
+
+    let edge = |from: &str, to: &str, dep_type: DependencyType| Dependency {
+        issue_id: from.to_string(),
+        depends_on_id: to.to_string(),
+        dep_type,
+        created_at: chrono::Utc::now(),
+        created_by: Some("tester".to_string()),
+        metadata: None,
+        thread_id: None,
+    };
+    let edges_by_issue = [
+        (
+            &a.id,
+            vec![
+                edge(&a.id, &b.id, DependencyType::Blocks),
+                edge(&a.id, &c.id, DependencyType::ConditionalBlocks),
+                edge(&a.id, &closed.id, DependencyType::WaitsFor),
+                edge(&a.id, "wg-missing", DependencyType::Blocks),
+                edge(&a.id, &gone.id, DependencyType::Blocks),
+            ],
+        ),
+        (
+            &b.id,
+            vec![
+                edge(&b.id, &c.id, DependencyType::Related),
+                edge(&b.id, &parent.id, DependencyType::ParentChild),
+            ],
+        ),
+        (
+            &c.id,
+            vec![
+                edge(&c.id, &parent.id, DependencyType::ParentChild),
+                edge(&c.id, &b.id, DependencyType::Blocks),
+            ],
+        ),
+    ];
+    for (issue_id, edges) in &edges_by_issue {
+        storage
+            .sync_dependencies_for_import(issue_id, edges)
+            .unwrap();
+    }
+
+    let mut ids: Vec<String> = [&a, &b, &c, &closed, &gone, &parent]
+        .iter()
+        .map(|issue| issue.id.clone())
+        .collect();
+    ids.push("wg-missing".to_string());
+    (storage, ids)
+}
+
+/// `br graph <id>` walks the blocker graph from the whole-graph maps
+/// (GitHub #580). For every id they must hold exactly the entries the
+/// focused batch queries return: every blocking type, `parent-child` walked
+/// the reverse way, non-blocking types left out, and closed, tombstoned or
+/// missing neighbours described the same way.
+#[test]
+fn whole_graph_neighbour_maps_match_the_batched_queries() {
+    let (storage, ids) = seed_neighbour_fixture();
+
+    let all_dependents = storage.get_all_blocking_dependents().unwrap();
+    let batched_dependents = storage.get_blocking_dependents_for_issue_ids(&ids).unwrap();
+    assert_eq!(
+        normalized_neighbours(&all_dependents),
+        normalized_neighbours(&batched_dependents)
+    );
+
+    let all_dependencies = storage.get_all_blocking_dependencies().unwrap();
+    let batched_dependencies = storage
+        .get_blocking_dependencies_for_issue_ids(&ids)
+        .unwrap();
+    assert_eq!(
+        normalized_neighbours(&all_dependencies),
+        normalized_neighbours(&batched_dependencies)
+    );
+
+    // Spot-check the shape so the comparison above cannot pass vacuously.
+    let dependencies_of_a = &normalized_neighbours(&all_dependencies)["wg-a"];
+    assert_eq!(dependencies_of_a.len(), 5);
+    assert!(
+        dependencies_of_a
+            .iter()
+            .any(|entry| entry.0 == "wg-missing" && entry.1 == "[missing issue: wg-missing]")
+    );
+    assert!(
+        dependencies_of_a
+            .iter()
+            .any(|entry| entry.0 == "wg-closed" && entry.2 == "closed")
+    );
+    // `parent-child` is reversed: the parent depends on its children.
+    let dependencies_of_parent = &normalized_neighbours(&all_dependencies)["wg-parent"];
+    assert_eq!(
+        dependencies_of_parent
+            .iter()
+            .map(|entry| entry.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["wg-b", "wg-c"]
+    );
+    // `related` never appears.
+    assert!(
+        normalized_neighbours(&all_dependents)
+            .values()
+            .flatten()
+            .all(|entry| entry.4 != "related")
+    );
+}

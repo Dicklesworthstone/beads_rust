@@ -7,7 +7,7 @@ use crate::cli::ChangelogArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
-use crate::output::{OutputContext, OutputMode};
+use crate::output::{OutputContext, OutputMode, rich_text_panel};
 use crate::storage::ChangelogIssueRow;
 use crate::util::time::{parse_flexible_timestamp, parse_relative_time};
 use chrono::{DateTime, Utc};
@@ -287,7 +287,7 @@ fn render_changelog_rich(output: &ChangelogOutput, ctx: &OutputContext) {
     );
 
     // Wrap in panel
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Changelog", theme.panel_title.clone()))
         .box_style(theme.box_style);
 

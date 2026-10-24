@@ -5,7 +5,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
 use crate::model::{EpicStatus, IssueType, Status};
-use crate::output::{OutputContext, OutputMode};
+use crate::output::{OutputContext, OutputMode, rich_text_panel};
 use crate::storage::{IssueUpdate, ListFilters, SqliteStorage};
 use chrono::Utc;
 use crossterm::style::Stylize;
@@ -541,7 +541,7 @@ fn render_epic_status_list_rich(epics: &[EpicStatus], ctx: &OutputContext) {
         }
     }
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Epic Status", theme.panel_title.clone()))
         .box_style(theme.box_style);
 
@@ -604,7 +604,7 @@ fn render_empty_epics_rich(ctx: &OutputContext) {
     content.append_styled("No open epics found", theme.dimmed.clone());
     content.append("\n");
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Epic Status", theme.panel_title.clone()))
         .box_style(theme.box_style);
 
@@ -621,7 +621,7 @@ fn render_no_eligible_rich(ctx: &OutputContext) {
     content.append_styled("No epics eligible for closure", theme.dimmed.clone());
     content.append("\n");
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Epic Close", theme.panel_title.clone()))
         .box_style(theme.box_style);
 
@@ -656,7 +656,7 @@ fn render_dry_run_rich(epics: &[EpicStatus], ctx: &OutputContext) {
         content.append("\n");
     }
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled(
             "Epic Close (Dry Run)",
             theme.panel_title.clone(),
@@ -696,7 +696,7 @@ fn render_close_result_rich(closed_ids: &[String], ctx: &OutputContext) {
         }
     }
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Epic Close", theme.panel_title.clone()))
         .box_style(theme.box_style);
 

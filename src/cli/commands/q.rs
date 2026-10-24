@@ -3,7 +3,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
 use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
-use crate::output::{OutputContext, OutputMode};
+use crate::output::{OutputContext, OutputMode, rich_text_panel};
 use crate::util::id::{IdGenerator, IdResolver, ResolverConfig, child_id};
 use crate::validation::{IssueValidator, LabelValidator};
 use chrono::Utc;
@@ -259,7 +259,7 @@ fn render_quick_created_rich(id: &str, title: &str, ctx: &OutputContext) {
     content.append_styled("\"", theme.dimmed.clone());
     content.append("\n");
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Quick Create", theme.panel_title.clone()))
         .box_style(theme.box_style);
 

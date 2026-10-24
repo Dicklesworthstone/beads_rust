@@ -3,15 +3,15 @@
 //! Provides label management: add, remove, list, list-all, and rename.
 
 use super::{
-    RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
+    PartialIdMatcher, RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
     auto_import_storage_ctx_if_stale, cli_for_routed_workspace, report_auto_flush_failure,
-    resolve_issue_id, retry_mutation_with_jsonl_recovery,
+    resolve_issue_id, resolve_issue_id_with, retry_mutation_with_jsonl_recovery,
 };
 use crate::cli::{LabelAddArgs, LabelCommands, LabelListArgs, LabelRemoveArgs, LabelRenameArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
-use crate::output::{OutputContext, OutputMode};
+use crate::output::{OutputContext, OutputMode, rich_text_panel};
 use crate::storage::SqliteStorage;
 use crate::util::id::{IdResolver, ResolverConfig};
 use crate::validation::LabelValidator;
@@ -451,11 +451,12 @@ fn prepare_label_routes(
         let config_layer = storage_ctx.load_config(&batch_cli)?;
         let id_config = config::id_config_from_layer(&config_layer);
         let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+        let matcher = PartialIdMatcher::new(&storage_ctx.storage);
         let resolved_ids = batch
             .issue_inputs
             .iter()
             .map(|input| {
-                resolve_issue_id(&storage_ctx.storage, &resolver, input)
+                resolve_issue_id_with(&storage_ctx.storage, &resolver, &matcher, input)
                     .map_err(|err| label_issue_resolution_error(subcommand, input, err))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -924,7 +925,7 @@ fn render_label_counts_rich(label_counts: &[LabelCount], ctx: &OutputContext) {
         theme.dimmed.clone(),
     );
 
-    let panel = Panel::from_rich_text(&content, ctx.width())
+    let panel = rich_text_panel(&content, ctx.width())
         .title(Text::new("Project Labels"))
         .box_style(theme.box_style);
 

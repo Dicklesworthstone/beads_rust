@@ -1,7 +1,7 @@
 //! Show command implementation.
 
 use crate::cli::commands::{
-    acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
+    PartialIdMatcher, acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
     cli_for_routed_workspace, external_project_db_paths_after_auto_import_if_needed,
 };
 use crate::cli::{ShowArgs, resolve_output_format_basic_with_outer_mode};
@@ -545,12 +545,13 @@ fn load_issue_details_from_storage(
 ) -> Result<Vec<IssueDetails>> {
     let mut external_statuses: Option<HashMap<String, bool>> = None;
     let mut details_list = Vec::with_capacity(target_ids.len());
+    let matcher = PartialIdMatcher::new(storage);
 
     for id_input in target_ids {
         let resolution = match resolver.resolve_fallible(
             id_input,
             |id| storage.id_exists(id),
-            |hash| storage.find_ids_by_hash(hash),
+            |hash| matcher.find_ids_by_hash(hash),
         ) {
             Ok(resolution) => resolution,
             Err(BeadsError::IssueNotFound { id }) => {

@@ -4,7 +4,7 @@ use crate::format::{
     sanitize_terminal_inline, sanitize_terminal_text,
 };
 use crate::model::{Comment, Dependency, Issue};
-use crate::output::{OutputContext, OutputMode, Theme};
+use crate::output::{OutputContext, OutputMode, Theme, rich_text_panel, wrap_rich_lines};
 use rich_rust::cells::cell_len;
 use rich_rust::prelude::*;
 use rich_rust::renderables::markdown::Markdown;
@@ -177,7 +177,7 @@ impl<'a> IssuePanel<'a> {
         } else {
             content
         };
-        let panel = Panel::from_rich_text(&content, panel_width)
+        let panel = rich_text_panel(&content, panel_width)
             .title(Text::styled(
                 issue_id.into_owned(),
                 self.theme.panel_title.clone(),
@@ -410,7 +410,7 @@ fn markdown_hanging_prefix(line: &Text) -> (usize, Text) {
 
 fn wrap_rich_text(text: &Text, panel_width: usize) -> Text {
     let content_width = panel_width.saturating_sub(4).max(1);
-    let lines = text.wrap(content_width);
+    let lines = wrap_rich_lines(text, content_width);
     let mut wrapped = Text::new("");
     for (idx, line) in lines.iter().enumerate() {
         if idx > 0 {

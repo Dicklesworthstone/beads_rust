@@ -4,14 +4,14 @@
 
 use super::{
     acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
-    cli_for_routed_workspace, resolve_issue_id,
+    cli_for_routed_workspace, resolve_issue_ids,
 };
 use crate::cli::LintArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
 use crate::model::{Issue, IssueType, Status};
-use crate::output::OutputContext;
+use crate::output::{OutputContext, rich_text_panel};
 use crate::storage::{ListFilters, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use rich_rust::prelude::*;
@@ -291,7 +291,7 @@ fn render_lint_rich(summary: &LintSummary, ctx: &OutputContext) {
         content.append_styled(lint_tip(&summary.results), theme.dimmed.clone());
     }
 
-    let panel = Panel::from_rich_text(&content, ctx.width())
+    let panel = rich_text_panel(&content, ctx.width())
         .title(Text::styled("Lint Results", theme.panel_title.clone()))
         .box_style(theme.box_style)
         .border_style(theme.panel_border.clone());
@@ -394,10 +394,7 @@ fn resolve_issues(
         let id_config = config::id_config_from_layer(&config_layer);
         let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
 
-        let mut resolved_ids = Vec::with_capacity(batch.issue_inputs.len());
-        for id_input in &batch.issue_inputs {
-            resolved_ids.push(resolve_issue_id(&storage_ctx.storage, &resolver, id_input)?);
-        }
+        let resolved_ids = resolve_issue_ids(&storage_ctx.storage, &resolver, &batch.issue_inputs)?;
 
         let issues = fetch_issues_in_resolved_order(&storage_ctx.storage, &resolved_ids)?;
         for (input, issue) in batch.issue_inputs.into_iter().zip(issues) {

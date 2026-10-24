@@ -7,7 +7,7 @@ use crate::error::Result;
 use crate::format::sanitize_terminal_inline;
 use crate::franken_sync::Connection;
 use crate::franken_sync::compat::{OpenFlags, open_with_flags};
-use crate::output::{OutputContext, OutputMode};
+use crate::output::{OutputContext, OutputMode, rich_text_panel};
 use crate::storage::SqliteStorage;
 use crate::util::parse_id;
 use fsqlite_types::SqliteValue;
@@ -695,7 +695,7 @@ fn render_info_rich(info: &InfoOutput, ctx: &OutputContext) {
         append_projection_rich(&mut content, projections, ctx);
     }
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled(
             "Project Information",
             theme.panel_title.clone(),

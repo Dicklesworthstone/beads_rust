@@ -12,7 +12,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{sanitize_terminal_inline, sanitize_terminal_text};
 use crate::model::EventType;
-use crate::output::{OutputContext, Theme};
+use crate::output::{OutputContext, Theme, rich_text_panel};
 use crate::sync::require_valid_sync_path;
 use crate::util::id::{IdResolver, ResolverConfig};
 use crate::util::time::parse_flexible_timestamp;
@@ -1042,7 +1042,7 @@ fn render_audit_log_rich(
         content.append("\n");
     }
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled(
             sanitize_terminal_inline(title),
             theme.panel_title.clone(),
@@ -1162,7 +1162,7 @@ fn render_audit_summary_rich(
         theme.emphasis.clone(),
     );
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled(
             format!("Audit Summary (last {} days)", days),
             theme.panel_title.clone(),

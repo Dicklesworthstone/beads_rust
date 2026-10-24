@@ -1,4 +1,5 @@
 use super::Theme;
+use super::components::rich_text_panel;
 use crate::cli::{Cli, InheritedOutputMode, OutputFormat, command_requests_robot_json};
 use crate::format::{IssueWithCounts, ListPage};
 use crate::format::{sanitize_terminal_inline, sanitize_terminal_text};
@@ -1326,7 +1327,7 @@ impl OutputContext {
                     text.append("\n");
                 }
 
-                let panel = Panel::from_rich_text(&text, self.width())
+                let panel = rich_text_panel(&text, self.width())
                     .title(Text::new(title.as_ref()))
                     .border_style(self.theme().error.clone());
                 self.console().print_renderable(&panel);

@@ -7,7 +7,7 @@ use crate::cli::commands::{
     GITHUB_REPO_NAME, GITHUB_REPO_OWNER, github_raw_main_url, github_releases_url,
 };
 use crate::error::{BeadsError, Result};
-use crate::output::{OutputContext, OutputMode};
+use crate::output::{OutputContext, OutputMode, rich_text_panel};
 use crate::util::hex_encode;
 use rich_rust::prelude::*;
 use self_update::backends::github;
@@ -682,7 +682,7 @@ fn render_check_rich(result: &UpdateCheckResult, ctx: &OutputContext) {
         content.append("Already up to date\n");
     }
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Upgrade Check", theme.panel_title.clone()))
         .box_style(theme.box_style);
 
@@ -729,7 +729,7 @@ fn render_dry_run_rich(
     content.append_styled("No changes made.", theme.dimmed.clone());
     content.append("\n");
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Upgrade Dry Run", theme.panel_title.clone()))
         .box_style(theme.box_style);
 
@@ -755,7 +755,7 @@ fn render_up_to_date_rich(current_version: &str, latest_version: &str, ctx: &Out
     content.append_styled("✓ ", theme.success.clone());
     content.append("Already up to date\n");
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Upgrade Status", theme.panel_title.clone()))
         .box_style(theme.box_style);
 
@@ -782,7 +782,7 @@ fn render_upgrade_result_rich(result: &UpdateResult, current_version: &str, ctx:
         content.append("Already up to date\n");
     }
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Upgrade Complete", theme.panel_title.clone()))
         .box_style(theme.box_style);
 

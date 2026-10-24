@@ -4,7 +4,7 @@
 //! beads workflow instructions in AGENTS.md or CLAUDE.md files.
 
 use crate::error::{BeadsError, Result};
-use crate::output::{OutputContext, OutputMode};
+use crate::output::{OutputContext, OutputMode, rich_text_panel};
 use regex::Regex;
 use rich_rust::prelude::*;
 use std::fs::{self, File, OpenOptions};
@@ -868,7 +868,7 @@ fn execute_dry_run_inferred(
             );
             content.append_styled(")\n", theme.dimmed.clone());
 
-            let panel = Panel::from_rich_text(&content, width)
+            let panel = rich_text_panel(&content, width)
                 .title(Text::styled("Blurb Preview", theme.panel_title.clone()))
                 .box_style(theme.box_style);
             console.print_renderable(&panel);
@@ -1463,7 +1463,7 @@ fn render_check_rich(
         content.append_styled("  br agents --add", theme.accent.clone());
     }
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled(
             "Agent Instructions",
             theme.panel_title.clone(),
@@ -1499,7 +1499,7 @@ fn render_unreadable_rich(
     content.append_styled("Error       ", theme.dimmed.clone());
     content.append_styled(err, theme.warning.clone());
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled(title, theme.panel_title.clone()))
         .box_style(theme.box_style);
 
@@ -1533,7 +1533,7 @@ fn render_dry_run_add_rich(file_path: &Path, ctx: &OutputContext) {
     );
     content.append_styled(&file_path.display().to_string(), theme.accent.clone());
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Dry Run", theme.panel_title.clone()))
         .box_style(theme.box_style);
 
@@ -1578,7 +1578,7 @@ fn render_dry_run_remove_rich(file_path: &Path, ctx: &OutputContext) {
     );
     content.append_styled(&file_path.display().to_string(), theme.accent.clone());
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Dry Run", theme.panel_title.clone()))
         .box_style(theme.box_style);
 
@@ -1630,7 +1630,7 @@ fn render_dry_run_update_rich(file_path: &Path, from_version: &str, ctx: &Output
     content.append_styled("File: ", theme.dimmed.clone());
     content.append_styled(&file_path.display().to_string(), theme.accent.clone());
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Dry Run", theme.panel_title.clone()))
         .box_style(theme.box_style);
 

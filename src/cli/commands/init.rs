@@ -1,5 +1,5 @@
 use crate::error::{BeadsError, Result};
-use crate::output::{OutputContext, OutputMode};
+use crate::output::{OutputContext, OutputMode, rich_text_panel};
 use crate::storage::SqliteStorage;
 use crate::util::db_path;
 use rich_rust::prelude::*;
@@ -511,7 +511,7 @@ fn render_init_rich(
         );
     }
 
-    let panel = Panel::from_rich_text(&content, ctx.width())
+    let panel = rich_text_panel(&content, ctx.width())
         .title(Text::new("Beads Initialized"))
         .box_style(theme.box_style)
         .border_style(theme.panel_border.clone());

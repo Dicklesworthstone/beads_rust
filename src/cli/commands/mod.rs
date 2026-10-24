@@ -148,16 +148,65 @@ pub(super) fn resolve_issue_id(
         .map(|resolved| resolved.id)
 }
 
+/// Substring matching for partial issue ids over a single read of every id.
+///
+/// An input that is not an exact id is matched against all issue ids.
+/// [`SqliteStorage::find_ids_by_hash`] reads them all for every such input, so
+/// resolving K partial ids cost K full scans (GitHub #580). Ids do not change
+/// while a command resolves its inputs, so one read can serve all of them:
+/// this reads the ids on the first partial input and reuses them after.
+pub(super) struct PartialIdMatcher<'a> {
+    storage: &'a SqliteStorage,
+    all_ids: std::cell::OnceCell<Vec<String>>,
+}
+
+impl<'a> PartialIdMatcher<'a> {
+    pub(super) const fn new(storage: &'a SqliteStorage) -> Self {
+        Self {
+            storage,
+            all_ids: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Same result as [`SqliteStorage::find_ids_by_hash`].
+    pub(super) fn find_ids_by_hash(&self, hash_suffix: &str) -> crate::Result<Vec<String>> {
+        let all_ids = if let Some(all_ids) = self.all_ids.get() {
+            all_ids
+        } else {
+            let loaded = self.storage.get_all_ids()?;
+            self.all_ids.get_or_init(|| loaded)
+        };
+        Ok(crate::util::id::find_matching_ids(all_ids, hash_suffix))
+    }
+}
+
+/// [`resolve_issue_id`] for one input of a batch that shares `matcher`.
+pub(super) fn resolve_issue_id_with(
+    storage: &SqliteStorage,
+    resolver: &IdResolver,
+    matcher: &PartialIdMatcher<'_>,
+    input: &str,
+) -> crate::Result<String> {
+    resolver
+        .resolve_fallible(
+            input,
+            |id| storage.id_exists(id),
+            |hash| matcher.find_ids_by_hash(hash),
+        )
+        .map(|resolved| resolved.id)
+}
+
 pub(super) fn resolve_issue_ids(
     storage: &SqliteStorage,
     resolver: &IdResolver,
     inputs: &[String],
 ) -> crate::Result<Vec<String>> {
+    let matcher = PartialIdMatcher::new(storage);
     resolver
         .resolve_all_fallible(
             inputs,
             |id| storage.id_exists(id),
-            |hash| storage.find_ids_by_hash(hash),
+            |hash| matcher.find_ids_by_hash(hash),
         )
         .map(|resolved| resolved.into_iter().map(|entry| entry.id).collect())
 }

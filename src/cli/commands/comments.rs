@@ -10,7 +10,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{sanitize_terminal_inline, sanitize_terminal_text};
 use crate::model::Comment;
-use crate::output::{OutputContext, OutputMode};
+use crate::output::{OutputContext, OutputMode, rich_text_panel, wrap_rich_lines};
 use crate::storage::SqliteStorage;
 use crate::util::id::{IdResolver, ResolverConfig};
 use crate::util::time::format_relative_time;
@@ -344,7 +344,7 @@ fn render_comments_list_rich(
     } else {
         content
     };
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled(&title, theme.panel_title.clone()))
         .box_style(theme.box_style);
 
@@ -353,7 +353,7 @@ fn render_comments_list_rich(
 
 fn wrap_rich_text(text: &Text, panel_width: usize) -> Text {
     let content_width = panel_width.saturating_sub(4).max(1);
-    let lines = text.wrap(content_width);
+    let lines = wrap_rich_lines(text, content_width);
     let mut wrapped = Text::new("");
     for (idx, line) in lines.iter().enumerate() {
         if idx > 0 {

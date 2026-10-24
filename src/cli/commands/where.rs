@@ -6,7 +6,7 @@ use crate::error::BeadsError;
 use crate::error::Result;
 use crate::format::sanitize_terminal_inline;
 use crate::franken_sync::Connection;
-use crate::output::OutputContext;
+use crate::output::{OutputContext, rich_text_panel};
 use crate::util::parse_id;
 use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
@@ -299,7 +299,7 @@ fn render_where_rich(output: &WhereOutput, ctx: &OutputContext) {
         |p| format!("{} Location", where_display_text(p)),
     );
 
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled(&title, theme.panel_title.clone()))
         .box_style(theme.box_style);
 

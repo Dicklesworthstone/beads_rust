@@ -12,7 +12,7 @@ use crate::format::{
     truncate_title,
 };
 use crate::model::{Issue, IssueType, Status};
-use crate::output::{OutputContext, OutputMode};
+use crate::output::{OutputContext, OutputMode, rich_text_panel};
 use crate::storage::{SqliteStorage, StatsIssueRow};
 use chrono::Utc;
 use rich_rust::prelude::*;
@@ -1436,7 +1436,7 @@ fn render_stats_rich(output: &Statistics, ctx: &OutputContext) {
     }
 
     // Wrap in panel
-    let panel = Panel::from_rich_text(&content, width)
+    let panel = rich_text_panel(&content, width)
         .title(Text::styled("Project Health", theme.panel_title.clone()))
         .box_style(theme.box_style);
 
