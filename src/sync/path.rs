@@ -2976,8 +2976,10 @@ const JSONL_CAPTURE_MAX_BACKOFF: std::time::Duration = std::time::Duration::from
 /// Writers publish `issues.jsonl` by renaming a complete file over it, and a
 /// reader holds no lock against them. Every returned snapshot is still a
 /// generation the path named when its identity was verified; a retry only
-/// moves the read to a newer complete generation. A source that keeps
-/// changing for every attempt is reported as a synchronization conflict.
+/// moves the read to a newer complete generation. `None` means the path
+/// named no file when the first attempt opened it; a source that disappears
+/// after an attempt found it is retried like any other change. A source that
+/// keeps changing for every attempt is reported as a synchronization conflict.
 #[cfg(unix)]
 fn capture_optional_jsonl_source_with_retry(
     path: &Path,
@@ -3015,6 +3017,13 @@ where
     let mut backoff = std::time::Duration::ZERO;
     for attempt_number in 1..=JSONL_CAPTURE_MAX_ATTEMPTS {
         let change = match attempt() {
+            // Every retry follows an attempt that found the source and saw it
+            // change, so a missing path now is one more step of that change,
+            // not an absent source. `git checkout` unlinks the old file and
+            // creates the new one only after inflating its blob. Reporting
+            // the source missing would let a `--no-db` read answer with an
+            // empty issue list instead of either generation.
+            Ok(None) if attempt_number > 1 => jsonl_source_vanished_during_capture(path),
             Ok(snapshot) => return Ok(snapshot),
             Err(CaptureAttemptError::Failed(error)) => return Err(error),
             Err(CaptureAttemptError::Changed(error)) => error,
@@ -3042,6 +3051,14 @@ where
             .min(JSONL_CAPTURE_MAX_BACKOFF);
     }
     unreachable!("the final capture attempt always returns")
+}
+
+#[cfg(unix)]
+fn jsonl_source_vanished_during_capture(display_path: &Path) -> BeadsError {
+    BeadsError::Config(format!(
+        "JSONL source {} disappeared while a replacement was being captured",
+        external_path_descriptor(display_path)
+    ))
 }
 
 /// One open-and-capture of the generation the path names. A path that names
@@ -4430,6 +4447,61 @@ mod tests {
         assert!(
             error.to_string().contains("injected read failure"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// GitHub #578: `git checkout` replaces a file by unlinking it and
+    /// creating the new one only after inflating its blob, so a retry can
+    /// find no file at the path. A capture that already found the source must
+    /// keep retrying until the new generation appears, never report the source
+    /// missing: a `--no-db` read would answer with an empty issue list.
+    #[cfg(unix)]
+    #[test]
+    fn capture_never_reports_a_source_it_found_as_missing() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let path = beads_dir.join("issues.jsonl");
+        std::fs::write(&path, "{\"generation\":2}\n").expect("write new generation");
+        let replaced = || CaptureAttemptError::Changed(jsonl_source_identity_changed(&path));
+
+        // A replacement, then the gap between unlink and create, then the new
+        // file.
+        let mut attempts = 0;
+        let snapshot = capture_with_retry(&path, None, || {
+            attempts += 1;
+            match attempts {
+                1 => Err(replaced()),
+                2 => Ok(None),
+                _ => capture_optional_jsonl_source_attempt(&path, None, &mut || Ok(())),
+            }
+        })
+        .expect("the new generation is captured")
+        .expect("a source this capture found is never reported missing");
+        assert_eq!(attempts, 3);
+        assert_eq!(snapshot_text(&snapshot), "{\"generation\":2}\n");
+
+        // A source that stays missing after it changed is a conflict.
+        let mut attempts = 0_u32;
+        let error = capture_with_retry(&path, None, || {
+            attempts += 1;
+            if attempts == 1 {
+                Err(replaced())
+            } else {
+                Ok(None)
+            }
+        })
+        .expect_err("a source that vanished during capture is not reported missing");
+        assert_eq!(attempts, JSONL_CAPTURE_MAX_ATTEMPTS);
+        assert!(
+            matches!(error, BeadsError::JsonlSourceUnstable { .. }),
+            "unexpected error: {error}"
+        );
+
+        // A path that names no file on the first attempt is still absent.
+        let absent = beads_dir.join("absent.jsonl");
+        assert!(
+            capture_optional_jsonl_source_with_retry(&absent, None)
+                .expect("an absent source is not an error")
+                .is_none()
         );
     }
 
