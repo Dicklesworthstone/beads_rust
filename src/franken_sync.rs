@@ -133,8 +133,49 @@ fn retry_transient<T>(
     }
 }
 
+/// Test-only log of the SQL text this facade hands to the engine on the
+/// current thread, for regression tests that pin statement counts (GitHub
+/// #574). Each call is logged once, before any engine retry; a prepared
+/// statement is logged when it is prepared, not per execution. Production
+/// builds contain none of this.
+#[cfg(test)]
+pub(crate) mod statement_log {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static LOG: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn record(sql: &str) {
+        LOG.with(|log| {
+            if let Some(statements) = log.borrow_mut().as_mut() {
+                statements.push(sql.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+        });
+    }
+
+    /// Run `operation` and return the statements it issued on this thread.
+    /// A capture nested inside another sees only its own statements.
+    pub fn capture<T>(operation: impl FnOnce() -> T) -> (T, Vec<String>) {
+        struct Restore(Option<Vec<String>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let outer = self.0.take();
+                LOG.with(|log| *log.borrow_mut() = outer);
+            }
+        }
+
+        let _restore = Restore(LOG.with(|log| log.replace(Some(Vec::new()))));
+        let result = operation();
+        let statements = LOG.with(|log| log.borrow_mut().take().unwrap_or_default());
+        (result, statements)
+    }
+}
+
 macro_rules! with_engine_retries {
     ($conn:expr, $sql:expr, $attempt:expr) => {{
+        #[cfg(test)]
+        $crate::franken_sync::statement_log::record($sql);
         let retry_safety = retry::ReplaySafety::new($sql);
         let was_in_transaction = $conn.in_transaction();
         let first = retry_transient(&$conn, &retry_safety, || $attempt);
@@ -456,6 +497,8 @@ impl Connection {
 
     /// Prepare a statement for repeated execution.
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_>, FrankenError> {
+        #[cfg(test)]
+        statement_log::record(sql);
         // A checkpoint row is a receipt for one execution, not reusable data.
         // Do not hand it to engine prepare, which may process the PRAGMA here.
         // Retain validated SQL and issue it afresh on every subsequent call.

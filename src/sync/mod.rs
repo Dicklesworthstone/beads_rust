@@ -15582,6 +15582,32 @@ fn skipped_import_matches_stored_issue(
     stored.sync_equals(&expected)
 }
 
+/// Log the fields on which a skipped JSONL record differs from the local row
+/// that import keeps. Both sides are compared hydrated and normalized as skip
+/// certification compares them, so an ordinary unchanged row never reaches
+/// this and the listed fields are ones that really differ (GitHub #574).
+fn warn_skipped_import_keeps_local_fields(stored: &Issue, target_id: &str, incoming: &Issue) {
+    let mut stored = stored.clone();
+    let mut expected = incoming.clone();
+    if expected.id != target_id {
+        expected.id = target_id.to_string();
+    }
+    canonicalize_persisted_issue_defaults(&mut expected);
+    normalize_issue_for_export(&mut stored);
+    normalize_issue_for_export(&mut expected);
+    let differing_fields = sync_mismatch_field_names(&stored, &expected)
+        .into_iter()
+        .filter(|field| !matches!(field.as_str(), "content_hash" | "comments" | "unknown"))
+        .collect::<Vec<_>>();
+    if !differing_fields.is_empty() {
+        tracing::warn!(
+            id = %target_id,
+            differing_fields = ?differing_fields,
+            "Import skip: existing database row is newer or equal, overriding incoming JSONL scalar fields"
+        );
+    }
+}
+
 fn export_hash_entry_for_import_action(
     skipped: &mut Vec<(String, Issue, String)>,
     action: &CollisionAction,
@@ -15652,6 +15678,9 @@ fn certify_skipped_imports(
                         ),
                     });
                 }
+            }
+            if let Some(stored) = stored.get(&id) {
+                warn_skipped_import_keeps_local_fields(stored, &id, &incoming);
             }
             // An older close's audit must not attach to a different local
             // payload, such as a reopened issue or a later closure.
@@ -15784,11 +15813,26 @@ fn stream_import_actions_in_tx(
     } else {
         None
     };
-    let mut current_export_hashes = if skip_lookup.is_some() {
-        Some(load_import_export_hashes(storage)?)
-    } else {
-        storage.clear_all_export_hashes_in_tx()?;
-        None
+    // Certificates only avoid rewriting an unchanged hash once its row has
+    // been certified; they never authorize a skip, and the cleanup after the
+    // stream revokes every certificate this import did not re-certify. A
+    // mixed import that replaces only a few targets therefore diffs against
+    // the existing table instead of rewriting a row per issue (GitHub #574).
+    // Diffing costs a DELETE and an INSERT per changed certificate, so when
+    // most targets are replaced, clearing the table and inserting is cheaper.
+    // An empty map proves the table empty: the loader clears malformed rows.
+    let mut current_export_hashes = {
+        let existing = load_import_export_hashes(storage)?;
+        if existing.is_empty() {
+            None
+        } else if skip_lookup.is_none()
+            && comment_owner_ids_to_replace.len().saturating_mul(2) >= existing.len()
+        {
+            storage.clear_all_export_hashes_in_tx()?;
+            None
+        } else {
+            Some(existing)
+        }
     };
     // Include non-bypassed local records: they are authoritative too. Audit
     // inserts are tracked in this snapshot and never move issue/relation rowids.
@@ -15918,21 +15962,6 @@ fn stream_import_actions_in_tx(
                         // (GH#547). Certify the rest of this import from live rows.
                         skip_lookup = None;
                         tx_result.comments_imported += union.len() - db_comments.len();
-                    }
-                }
-
-                if let Ok(Some(existing_issue)) = storage.get_issue(&target_id) {
-                    let differing_fields = sync_mismatch_field_names(&existing_issue, &issue);
-                    let non_hash_differing: Vec<_> = differing_fields
-                        .into_iter()
-                        .filter(|f| f != "content_hash" && f != "comments")
-                        .collect();
-                    if !non_hash_differing.is_empty() {
-                        tracing::warn!(
-                            id = %target_id,
-                            differing_fields = ?non_hash_differing,
-                            "Import skip: existing database row is newer or equal, overriding incoming JSONL scalar fields"
-                        );
                     }
                 }
             }
@@ -16214,22 +16243,29 @@ pub(crate) fn dangling_dependency_targets<'a>(
     issues: impl Iterator<Item = &'a Issue> + Clone,
 ) -> Result<HashSet<String>> {
     let imported: HashSet<&str> = issues.clone().map(|issue| issue.id.as_str()).collect();
-    let mut dangling = HashSet::new();
-    for issue in issues {
-        for dependency in &issue.dependencies {
-            let target = dependency.depends_on_id.as_str();
-            if target.starts_with("external:")
-                || imported.contains(target)
-                || dangling.contains(target)
-            {
-                continue;
-            }
-            if storage.get_issue(target)?.is_none() {
-                dangling.insert(target.to_string());
-            }
-        }
+    let candidates = issues
+        .flat_map(|issue| issue.dependencies.iter())
+        .map(|dependency| dependency.depends_on_id.as_str())
+        .filter(|target| !target.starts_with("external:") && !imported.contains(target))
+        .collect::<BTreeSet<_>>();
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
     }
-    Ok(dangling)
+    // One parameter-limited read for every candidate instead of a point read
+    // per target (GitHub #574). It decodes the same rows `get_issue` would.
+    let candidate_ids = candidates
+        .iter()
+        .map(|target| (*target).to_string())
+        .collect::<Vec<_>>();
+    let present = storage
+        .get_issues_by_ids(&candidate_ids)?
+        .into_iter()
+        .map(|issue| issue.id)
+        .collect::<HashSet<_>>();
+    Ok(candidate_ids
+        .into_iter()
+        .filter(|target| !present.contains(target))
+        .collect())
 }
 
 /// `issue` with the dependencies on `dangling` targets removed, as the import
@@ -27939,6 +27975,221 @@ mod tests {
             assert_eq!(hash, crate::util::content_hash(&issue));
             assert!(DateTime::parse_from_rfc3339(&exported_at).is_ok());
         }
+    }
+
+    /// Collects the `WARN` events `operation` logs on this thread.
+    fn capture_import_warnings<T>(operation: impl FnOnce() -> T) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, operation);
+        let logged = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        (result, logged)
+    }
+
+    /// The #574 topology: `blocked` issues, each blocked by two blockers of
+    /// its own, every issue labeled.
+    fn blocked_tracker_issues(blocked: usize) -> Vec<Issue> {
+        let issue = |id: String| {
+            let mut issue = make_test_issue(&id, &format!("issue {id}"));
+            issue.created_at = fixed_time(1_700_000_000);
+            issue.updated_at = fixed_time(1_700_000_000);
+            issue.labels = vec!["seed".to_string()];
+            issue
+        };
+        let mut issues = Vec::new();
+        for index in 0..blocked {
+            let mut blocked_issue = issue(format!("bd-b{index:04}"));
+            for blocker in [2 * index, 2 * index + 1] {
+                let blocker = issue(format!("bd-k{blocker:04}"));
+                blocked_issue.dependencies.push(Dependency {
+                    issue_id: blocked_issue.id.clone(),
+                    depends_on_id: blocker.id.clone(),
+                    dep_type: DependencyType::Blocks,
+                    created_at: fixed_time(1_700_000_000),
+                    created_by: Some("seed".to_string()),
+                    metadata: Some("{}".to_string()),
+                    thread_id: Some(String::new()),
+                });
+                issues.push(blocker);
+            }
+            issues.push(blocked_issue);
+        }
+        issues.sort_by(|left, right| left.id.cmp(&right.id));
+        issues
+    }
+
+    /// GitHub #574: an import whose JSONL differs from the database in one
+    /// row did a full point read per skipped row (only to log a warning that
+    /// fired for every one of them) and rewrote the export certificate of
+    /// every row. Both now scale with the rows that changed.
+    #[test]
+    fn one_changed_row_import_does_no_per_row_work_for_skipped_rows() {
+        use crate::franken_sync::statement_log;
+
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+        let mut issues = blocked_tracker_issues(100);
+        let rows = issues.len();
+        write_jsonl_issues(&jsonl_path, &issues.iter().collect::<Vec<_>>());
+        import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+        let certificates = |storage: &SqliteStorage| {
+            storage
+                .execute_raw_query(
+                    "SELECT rowid, issue_id, content_hash, exported_at FROM export_hashes ORDER BY issue_id",
+                )
+                .unwrap()
+        };
+        let before = certificates(&storage);
+        assert_eq!(before.len(), rows);
+
+        let changed_id = issues[0].id.clone();
+        issues[0].title = "changed upstream".to_string();
+        issues[0].updated_at = fixed_time(1_800_000_000);
+        write_jsonl_issues(&jsonl_path, &issues.iter().collect::<Vec<_>>());
+
+        let ((result, statements), warnings) = capture_import_warnings(|| {
+            statement_log::capture(|| {
+                import_from_jsonl(
+                    &mut storage,
+                    &jsonl_path,
+                    &ImportConfig::default(),
+                    Some("bd-"),
+                )
+            })
+        });
+        let result = result.unwrap();
+
+        assert_eq!(result.imported_count, 1);
+        assert_eq!(result.skipped_count, rows - 1);
+        assert_eq!(result.export_hashes_recorded, rows);
+        let point_reads = statements
+            .iter()
+            .filter(|sql| sql.starts_with("SELECT") && sql.contains("FROM issues WHERE id = ?"))
+            .count();
+        assert!(
+            point_reads < 10,
+            "{point_reads} issue point reads for {rows} rows and one change"
+        );
+        let certificate_writes = statements
+            .iter()
+            .filter(|sql| {
+                sql.contains("INTO export_hashes") || sql.starts_with("DELETE FROM export_hashes")
+            })
+            .count();
+        assert!(
+            certificate_writes <= 2,
+            "{certificate_writes} certificate writes for one changed row"
+        );
+        assert!(
+            !warnings.contains("Import skip"),
+            "unchanged rows must not log a skip warning:\n{warnings}"
+        );
+
+        let changed = storage.get_issue(&changed_id).unwrap().unwrap();
+        assert_eq!(changed.title, "changed upstream");
+        let after = certificates(&storage);
+        assert_eq!(after.len(), rows);
+        for (old, new) in before.iter().zip(&after) {
+            assert_eq!(old[1], new[1], "same certified issue set");
+            if old[1].as_text() == Some(changed_id.as_str()) {
+                assert_ne!(old[2], new[2], "the changed row is re-certified");
+            } else {
+                assert_eq!(
+                    old, new,
+                    "an unchanged certificate keeps its row and timestamp"
+                );
+            }
+        }
+        for issue in &issues {
+            assert_eq!(
+                storage.get_export_hash(&issue.id).unwrap().unwrap().0,
+                crate::util::content_hash(issue),
+                "certificate of {}",
+                issue.id
+            );
+        }
+    }
+
+    /// GitHub #574: the skip warning is now derived from the hydrated row
+    /// that skip certification compares, so it fires only when import keeps
+    /// a local row whose synced fields really differ, and names them.
+    #[test]
+    fn skip_warning_names_only_fields_that_differ_from_the_kept_local_row() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+        let issues = blocked_tracker_issues(5);
+        write_jsonl_issues(&jsonl_path, &issues.iter().collect::<Vec<_>>());
+        import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+        let local_id = issues[1].id.clone();
+        storage
+            .update_issue(
+                &local_id,
+                &crate::storage::IssueUpdate {
+                    title: Some("edited locally".to_string()),
+                    ..crate::storage::IssueUpdate::default()
+                },
+                "local",
+            )
+            .unwrap();
+
+        let (result, warnings) = capture_import_warnings(|| {
+            import_from_jsonl(
+                &mut storage,
+                &jsonl_path,
+                &ImportConfig::default(),
+                Some("bd-"),
+            )
+        });
+        result.unwrap();
+
+        assert_eq!(
+            warnings.matches("Import skip").count(),
+            1,
+            "only the locally edited row differs:\n{warnings}"
+        );
+        assert!(
+            warnings.contains(&local_id) && warnings.contains("\"title\""),
+            "the warning names the row and the differing field:\n{warnings}"
+        );
+        assert!(
+            !warnings.contains("\"labels\"") && !warnings.contains("\"dependencies\""),
+            "hydrated relations are compared, not reported as differences:\n{warnings}"
+        );
+        assert_eq!(
+            storage.get_issue(&local_id).unwrap().unwrap().title,
+            "edited locally"
+        );
     }
 
     #[test]
