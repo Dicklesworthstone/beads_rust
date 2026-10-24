@@ -139,6 +139,16 @@ pub enum BeadsError {
     #[error("Sync conflict: {message}")]
     SyncConflict { message: String },
 
+    /// Another process replaced or rewrote a JSONL source during every
+    /// attempt to capture one stable generation of it (GitHub #578).
+    ///
+    /// Nothing was read from a partial or displaced generation, so the
+    /// operation can be retried once the other writer goes quiet.
+    #[error(
+        "Sync conflict: JSONL source {path} changed during each of {attempts} attempts to capture one stable generation; another process is still rewriting it"
+    )]
+    JsonlSourceUnstable { path: String, attempts: u32 },
+
     /// An `--if-unchanged` precondition did not hold: the record moved
     /// between the caller's read and its write (GitHub #500).
     ///
@@ -504,6 +514,9 @@ impl BeadsError {
             Self::AmbiguousId { .. } => Some("Provide more characters of the ID"),
             Self::HasDependents { .. } => Some("Use --force or --cascade to delete anyway"),
             Self::ImportCollision { .. } => Some("Use --force to overwrite or resolve manually"),
+            Self::JsonlSourceUnstable { .. } => {
+                Some("Retry after the process that keeps replacing the JSONL file finishes.")
+            }
             Self::DependencyCycle { .. } => Some(
                 "Remove one dependency to break the cycle. Note: epic containment \
                  participates in blocking cycles — depending on an epic implies \

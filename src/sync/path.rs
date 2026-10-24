@@ -2380,6 +2380,32 @@ fn verify_jsonl_source_path_identity(
     display_path: &Path,
     fd_identity: JsonlFileIdentity,
 ) -> Result<()> {
+    if jsonl_source_path_names(absolute_path, display_path, fd_identity)? {
+        Ok(())
+    } else {
+        Err(jsonl_source_identity_changed(display_path))
+    }
+}
+
+#[cfg(unix)]
+fn jsonl_source_identity_changed(display_path: &Path) -> BeadsError {
+    BeadsError::Config(format!(
+        "JSONL source {} changed between secure open and identity verification",
+        external_path_descriptor(display_path)
+    ))
+}
+
+/// Whether the route still names the file identified by `fd_identity`.
+///
+/// `Ok(false)` means the path now names a different regular file, which is
+/// what a concurrent atomic replacement (`rename` over the path) looks like.
+/// A symlinked route, a non-regular leaf, or an unreadable route is an error.
+#[cfg(unix)]
+fn jsonl_source_path_names(
+    absolute_path: &Path,
+    display_path: &Path,
+    fd_identity: JsonlFileIdentity,
+) -> Result<bool> {
     let descriptor = external_path_descriptor(display_path);
     reject_symlinked_jsonl_source_route(absolute_path, display_path)?;
 
@@ -2394,14 +2420,7 @@ fn verify_jsonl_source_path_identity(
         )));
     }
 
-    let path_identity = jsonl_file_identity(&path_metadata);
-    if path_identity != fd_identity {
-        return Err(BeadsError::Config(format!(
-            "JSONL source {descriptor} changed between secure open and identity verification"
-        )));
-    }
-
-    Ok(())
+    Ok(jsonl_file_identity(&path_metadata) == fd_identity)
 }
 
 #[cfg(unix)]
@@ -2534,14 +2553,6 @@ where
 #[cfg(any(unix, windows))]
 pub fn open_jsonl_source_nofollow(path: &Path) -> Result<OpenedJsonlSource> {
     open_jsonl_source_nofollow_impl(path, || Ok(()))
-}
-
-#[cfg(unix)]
-fn open_optional_jsonl_source_nofollow(path: &Path) -> Result<Option<OpenedJsonlSource>> {
-    let absolute_path = absolute_jsonl_source_path(path)?;
-    open_jsonl_source_via_stable_route(path, &absolute_path)?
-        .map(|file| finish_opened_jsonl_source(path, &absolute_path, file))
-        .transpose()
 }
 
 #[cfg(windows)]
@@ -2795,6 +2806,40 @@ fn open_private_snapshot_backing(parent: Option<&Path>) -> std::io::Result<File>
     }
 }
 
+/// Why one attempt to capture a JSONL generation produced no snapshot.
+#[cfg(any(unix, windows))]
+enum CaptureAttemptError {
+    /// The source was modified while it was read, or its path stopped naming
+    /// the opened file (an atomic replacement). A fresh open can observe one
+    /// stable generation.
+    Changed(BeadsError),
+    /// Anything else: an unsafe route, an I/O failure, an exceeded deadline.
+    Failed(BeadsError),
+}
+
+#[cfg(any(unix, windows))]
+impl CaptureAttemptError {
+    fn into_error(self) -> BeadsError {
+        match self {
+            Self::Changed(error) | Self::Failed(error) => error,
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl From<BeadsError> for CaptureAttemptError {
+    fn from(error: BeadsError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl From<std::io::Error> for CaptureAttemptError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Failed(error.into())
+    }
+}
+
 /// Captures one exact, stable JSONL source generation without following
 /// symlinks.
 ///
@@ -2817,6 +2862,26 @@ fn capture_opened_jsonl_source_snapshot_with_verifier<VerifyIdentity>(
 ) -> Result<JsonlSourceSnapshot>
 where
     VerifyIdentity: FnOnce(JsonlFileIdentity) -> Result<()>,
+{
+    capture_opened_jsonl_source_attempt(path, opened, deadline, |identity| {
+        verify_identity(identity).map_err(CaptureAttemptError::Failed)
+    })
+    .map_err(CaptureAttemptError::into_error)
+}
+
+/// One capture of an opened JSONL source; see
+/// [`capture_opened_jsonl_source_snapshot_with_verifier`]. A modification
+/// observed while reading is reported as [`CaptureAttemptError::Changed`], as
+/// is whatever `verify_identity` reports that way.
+#[cfg(any(unix, windows))]
+fn capture_opened_jsonl_source_attempt<VerifyIdentity>(
+    path: &Path,
+    opened: OpenedJsonlSource,
+    deadline: Option<Instant>,
+    verify_identity: VerifyIdentity,
+) -> std::result::Result<JsonlSourceSnapshot, CaptureAttemptError>
+where
+    VerifyIdentity: FnOnce(JsonlFileIdentity) -> std::result::Result<(), CaptureAttemptError>,
 {
     use std::io::{Read, Write};
 
@@ -2844,11 +2909,11 @@ where
         let read = file.read(&mut buffer[..wanted])?;
         ensure_jsonl_capture_deadline(deadline)?;
         if read == 0 {
-            return Err(BeadsError::SyncConflict {
+            return Err(CaptureAttemptError::Changed(BeadsError::SyncConflict {
                 message:
                     "JSONL source became shorter while its immutable snapshot was being captured"
                         .to_string(),
-            });
+            }));
         }
         backing.write_all(&buffer[..read])?;
         ensure_jsonl_capture_deadline(deadline)?;
@@ -2858,19 +2923,21 @@ where
     ensure_jsonl_capture_deadline(deadline)?;
     let mut eof_probe = [0_u8; 1];
     if file.read(&mut eof_probe)? != 0 {
-        return Err(BeadsError::SyncConflict {
+        return Err(CaptureAttemptError::Changed(BeadsError::SyncConflict {
             message: "JSONL source grew while its immutable snapshot was being captured"
                 .to_string(),
-        });
+        }));
     }
     ensure_jsonl_capture_deadline(deadline)?;
     let after_metadata = regular_jsonl_fd_metadata(&file, path)?;
     let after_witness = jsonl_fd_stability_witness(&after_metadata)?;
     if before_witness != after_witness {
-        return Err(BeadsError::SyncConflict {
+        // Unlinking the file also changes its ctime, so an atomic replacement
+        // of the path during the read lands here as well (GitHub #578).
+        return Err(CaptureAttemptError::Changed(BeadsError::SyncConflict {
             message: "JSONL source changed while its immutable snapshot was being captured"
                 .to_string(),
-        });
+        }));
     }
 
     ensure_jsonl_capture_deadline(deadline)?;
@@ -2892,15 +2959,131 @@ where
     })
 }
 
+/// How many fresh opens a path capture makes while other processes keep
+/// replacing or rewriting the source (GitHub #578).
 #[cfg(unix)]
-fn capture_opened_jsonl_source_snapshot(
+const JSONL_CAPTURE_MAX_ATTEMPTS: u32 = 12;
+
+/// Longest pause between two capture attempts. The first retry is immediate:
+/// a replacement has just been installed, so the next one is furthest away.
+#[cfg(unix)]
+const JSONL_CAPTURE_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(32);
+
+/// Opens and captures the generation the path names, if it exists, retrying
+/// with a fresh open while the source is modified or atomically replaced
+/// during the capture.
+///
+/// Writers publish `issues.jsonl` by renaming a complete file over it, and a
+/// reader holds no lock against them. Every returned snapshot is still a
+/// generation the path named when its identity was verified; a retry only
+/// moves the read to a newer complete generation. A source that keeps
+/// changing for every attempt is reported as a synchronization conflict.
+#[cfg(unix)]
+fn capture_optional_jsonl_source_with_retry(
     path: &Path,
-    opened: OpenedJsonlSource,
-) -> Result<JsonlSourceSnapshot> {
-    let absolute_path = absolute_jsonl_source_path(path)?;
-    capture_opened_jsonl_source_snapshot_with_verifier(path, opened, None, |identity| {
-        verify_jsonl_source_path_identity(&absolute_path, path, identity)
+    deadline: Option<Instant>,
+) -> Result<Option<JsonlSourceSnapshot>> {
+    capture_optional_jsonl_source_with_retry_impl(path, deadline, || Ok(()))
+}
+
+/// `after_read` runs in every attempt once the source has been copied and
+/// found unmodified, just before its path identity is verified again. Tests
+/// use it to replace the source at that exact point.
+#[cfg(unix)]
+fn capture_optional_jsonl_source_with_retry_impl<AfterRead>(
+    path: &Path,
+    deadline: Option<Instant>,
+    mut after_read: AfterRead,
+) -> Result<Option<JsonlSourceSnapshot>>
+where
+    AfterRead: FnMut() -> std::io::Result<()>,
+{
+    capture_with_retry(path, deadline, || {
+        capture_optional_jsonl_source_attempt(path, deadline, &mut after_read)
     })
+}
+
+#[cfg(unix)]
+fn capture_with_retry<Attempt>(
+    path: &Path,
+    deadline: Option<Instant>,
+    mut attempt: Attempt,
+) -> Result<Option<JsonlSourceSnapshot>>
+where
+    Attempt: FnMut() -> std::result::Result<Option<JsonlSourceSnapshot>, CaptureAttemptError>,
+{
+    let mut backoff = std::time::Duration::ZERO;
+    for attempt_number in 1..=JSONL_CAPTURE_MAX_ATTEMPTS {
+        let change = match attempt() {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(CaptureAttemptError::Failed(error)) => return Err(error),
+            Err(CaptureAttemptError::Changed(error)) => error,
+        };
+        if attempt_number == JSONL_CAPTURE_MAX_ATTEMPTS {
+            return Err(BeadsError::JsonlSourceUnstable {
+                path: external_path_descriptor(path),
+                attempts: JSONL_CAPTURE_MAX_ATTEMPTS,
+            });
+        }
+        debug!(
+            attempt = attempt_number,
+            reason = %change,
+            "JSONL source changed during capture; retrying with a fresh open"
+        );
+        ensure_jsonl_capture_deadline(deadline)?;
+        if !backoff.is_zero() {
+            let pause = deadline.map_or(backoff, |deadline| {
+                backoff.min(deadline.saturating_duration_since(Instant::now()))
+            });
+            std::thread::sleep(pause);
+        }
+        backoff = (backoff * 2)
+            .max(std::time::Duration::from_millis(1))
+            .min(JSONL_CAPTURE_MAX_BACKOFF);
+    }
+    unreachable!("the final capture attempt always returns")
+}
+
+/// One open-and-capture of the generation the path names. A path that names
+/// a different file after the open, or after the read, is a concurrent
+/// replacement ([`CaptureAttemptError::Changed`]).
+#[cfg(unix)]
+fn capture_optional_jsonl_source_attempt(
+    path: &Path,
+    deadline: Option<Instant>,
+    after_read: &mut dyn FnMut() -> std::io::Result<()>,
+) -> std::result::Result<Option<JsonlSourceSnapshot>, CaptureAttemptError> {
+    let still_named = |absolute_path: &Path,
+                       identity: JsonlFileIdentity|
+     -> std::result::Result<(), CaptureAttemptError> {
+        if jsonl_source_path_names(absolute_path, path, identity)? {
+            Ok(())
+        } else {
+            Err(CaptureAttemptError::Changed(jsonl_source_identity_changed(
+                path,
+            )))
+        }
+    };
+
+    ensure_jsonl_capture_deadline(deadline)?;
+    let absolute_path = absolute_jsonl_source_path(path)?;
+    ensure_jsonl_capture_deadline(deadline)?;
+    let Some(file) = open_jsonl_source_via_stable_route(path, &absolute_path)? else {
+        return Ok(None);
+    };
+    let identity = jsonl_file_identity(&regular_jsonl_fd_metadata(&file, path)?);
+    still_named(&absolute_path, identity)?;
+    ensure_jsonl_capture_deadline(deadline)?;
+    capture_opened_jsonl_source_attempt(
+        path,
+        OpenedJsonlSource { file, identity },
+        deadline,
+        |identity| {
+            after_read()?;
+            still_named(&absolute_path, identity)
+        },
+    )
+    .map(Some)
 }
 
 #[cfg(windows)]
@@ -2914,20 +3097,6 @@ fn capture_opened_jsonl_source_snapshot(
     })
 }
 
-#[cfg(unix)]
-fn capture_opened_jsonl_source_snapshot_until(
-    path: &Path,
-    opened: OpenedJsonlSource,
-    deadline: Instant,
-) -> Result<JsonlSourceSnapshot> {
-    ensure_jsonl_capture_deadline(Some(deadline))?;
-    let absolute_path = absolute_jsonl_source_path(path)?;
-    ensure_jsonl_capture_deadline(Some(deadline))?;
-    capture_opened_jsonl_source_snapshot_with_verifier(path, opened, Some(deadline), |identity| {
-        verify_jsonl_source_path_identity(&absolute_path, path, identity)
-    })
-}
-
 #[cfg(windows)]
 fn capture_opened_jsonl_source_snapshot_until(
     path: &Path,
@@ -2942,13 +3111,30 @@ fn capture_opened_jsonl_source_snapshot_until(
     })
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
+pub(crate) fn capture_jsonl_source_snapshot(path: &Path) -> Result<JsonlSourceSnapshot> {
+    capture_optional_jsonl_source_with_retry(path, None)?.ok_or_else(|| {
+        BeadsError::Config(format!(
+            "JSONL source {} does not exist",
+            external_path_descriptor(path)
+        ))
+    })
+}
+
+#[cfg(windows)]
 pub(crate) fn capture_jsonl_source_snapshot(path: &Path) -> Result<JsonlSourceSnapshot> {
     let opened = open_jsonl_source_nofollow(path)?;
     capture_opened_jsonl_source_snapshot(path, opened)
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
+pub(crate) fn capture_optional_jsonl_source_snapshot(
+    path: &Path,
+) -> Result<Option<JsonlSourceSnapshot>> {
+    capture_optional_jsonl_source_with_retry(path, None)
+}
+
+#[cfg(windows)]
 pub(crate) fn capture_optional_jsonl_source_snapshot(
     path: &Path,
 ) -> Result<Option<JsonlSourceSnapshot>> {
@@ -2965,7 +3151,16 @@ pub(crate) fn capture_optional_jsonl_source_snapshot(
 /// deadline. The capture checks the deadline before and after every bounded
 /// chunk, throughout both hashes, and around identity verification; an
 /// over-budget result is never returned as a successful snapshot.
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
+pub(crate) fn capture_optional_jsonl_source_snapshot_until(
+    path: &Path,
+    deadline: Instant,
+) -> Result<Option<JsonlSourceSnapshot>> {
+    capture_optional_jsonl_source_with_retry(path, Some(deadline))
+}
+
+/// See the Unix variant above.
+#[cfg(windows)]
 pub(crate) fn capture_optional_jsonl_source_snapshot_until(
     path: &Path,
     deadline: Instant,
@@ -4138,6 +4333,171 @@ mod tests {
             std::fs::read_to_string(&path).expect("read installed replacement"),
             "{\"source\":\"replacement\"}\n"
         );
+    }
+
+    #[cfg(unix)]
+    fn snapshot_text(snapshot: &JsonlSourceSnapshot) -> String {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut snapshot.reader(), &mut text)
+            .expect("read captured snapshot");
+        text
+    }
+
+    /// GitHub #578: writers publish issues.jsonl by renaming a complete file
+    /// over it, and a reader holds no lock against them. A capture that such
+    /// a replacement interrupts starts over and returns the new generation
+    /// instead of failing with SYNC_CONFLICT.
+    #[cfg(unix)]
+    #[test]
+    fn capture_retries_after_an_atomic_replacement_during_the_read() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let path = beads_dir.join("issues.jsonl");
+        let staged = beads_dir.join("issues.jsonl.tmp");
+        std::fs::write(&path, "{\"generation\":1}\n").expect("write first generation");
+
+        let mut attempts = 0;
+        let snapshot = capture_optional_jsonl_source_with_retry_impl(&path, None, || {
+            attempts += 1;
+            if attempts == 1 {
+                std::fs::write(&staged, "{\"generation\":2}\n")?;
+                std::fs::rename(&staged, &path)?;
+            }
+            Ok(())
+        })
+        .expect("an atomic replacement during the read is retried")
+        .expect("the source exists");
+
+        assert_eq!(attempts, 2, "one interrupted attempt and one retry");
+        assert_eq!(snapshot_text(&snapshot), "{\"generation\":2}\n");
+        assert_eq!(
+            snapshot.identity(),
+            jsonl_file_identity(&std::fs::symlink_metadata(&path).expect("stat source")),
+            "the snapshot is the generation the path names"
+        );
+    }
+
+    /// GitHub #578: the retry is bounded. A source replaced during every
+    /// attempt is still refused rather than captured from a stale file.
+    #[cfg(unix)]
+    #[test]
+    fn capture_refuses_a_source_replaced_during_every_attempt() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let path = beads_dir.join("issues.jsonl");
+        let staged = beads_dir.join("issues.jsonl.tmp");
+        std::fs::write(&path, "{\"generation\":0}\n").expect("write first generation");
+
+        let mut attempts = 0_u32;
+        let error = capture_optional_jsonl_source_with_retry_impl(&path, None, || {
+            attempts += 1;
+            std::fs::write(&staged, format!("{{\"generation\":{attempts}}}\n"))?;
+            std::fs::rename(&staged, &path)
+        })
+        .expect_err("a source replaced during every attempt cannot be captured");
+
+        assert_eq!(attempts, JSONL_CAPTURE_MAX_ATTEMPTS);
+        assert!(
+            matches!(
+                error,
+                BeadsError::JsonlSourceUnstable { attempts, .. }
+                    if attempts == JSONL_CAPTURE_MAX_ATTEMPTS
+            ),
+            "unexpected error: {error}"
+        );
+        let structured = crate::error::StructuredError::from_error(&error);
+        assert_eq!(structured.code, crate::error::ErrorCode::SyncConflict);
+        assert!(
+            structured.retryable,
+            "no partial copy was used and nothing was written, so the caller can retry"
+        );
+    }
+
+    /// A failure other than a concurrent change is reported at once.
+    #[cfg(unix)]
+    #[test]
+    fn capture_does_not_retry_a_failure_that_is_not_a_change() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let path = beads_dir.join("issues.jsonl");
+        std::fs::write(&path, "{\"generation\":1}\n").expect("write source");
+
+        let mut attempts = 0;
+        let error = capture_optional_jsonl_source_with_retry_impl(&path, None, || {
+            attempts += 1;
+            Err(std::io::Error::other("injected read failure"))
+        })
+        .expect_err("the injected failure is reported");
+
+        assert_eq!(attempts, 1);
+        assert!(
+            error.to_string().contains("injected read failure"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// GitHub #578: reads racing a writer that keeps publishing complete
+    /// generations by rename each return one complete generation. Without the
+    /// retry, any capture that overlapped a replacement failed.
+    #[cfg(unix)]
+    #[test]
+    fn capture_returns_a_complete_generation_while_a_writer_replaces_the_source() {
+        use std::fmt::Write as _;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let path = beads_dir.join("issues.jsonl");
+        let generations = (0..2)
+            .map(|generation| {
+                let pad = "x".repeat(200);
+                let mut text = String::new();
+                for row in 0..200 {
+                    writeln!(
+                        text,
+                        "{{\"id\":\"t-{row}\",\"generation\":{generation},\"pad\":\"{pad}\"}}"
+                    )
+                    .expect("write to a String");
+                }
+                text
+            })
+            .collect::<Vec<_>>();
+        let digests = generations
+            .iter()
+            .map(|text| crate::util::hex_encode(&Sha256::digest(text.as_bytes())))
+            .collect::<Vec<_>>();
+        std::fs::write(&path, &generations[0]).expect("write first generation");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stop = Arc::clone(&stop);
+            let path = path.clone();
+            let staged = beads_dir.join("issues.jsonl.tmp");
+            std::thread::spawn(move || {
+                let mut published = 0_usize;
+                while !stop.load(Ordering::Relaxed) {
+                    std::fs::write(&staged, &generations[published % 2]).expect("stage");
+                    std::fs::rename(&staged, &path).expect("publish");
+                    published += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                published
+            })
+        };
+
+        let captured = (0..200)
+            .map(|_| capture_optional_jsonl_source_snapshot(&path))
+            .collect::<Vec<_>>();
+        stop.store(true, Ordering::Relaxed);
+        let published = writer.join().expect("writer thread");
+
+        assert!(published > 1, "the writer must actually race the reads");
+        for result in captured {
+            let snapshot = result
+                .expect("a capture racing atomic replacements succeeds")
+                .expect("the source exists");
+            assert!(
+                digests.iter().any(|digest| digest == snapshot.raw_sha256()),
+                "every capture is one complete generation"
+            );
+        }
     }
 
     #[cfg(unix)]

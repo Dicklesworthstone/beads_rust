@@ -328,6 +328,9 @@ impl StructuredError {
         let hint = Self::generate_hint(Self::hint_source(err), context.as_ref());
         let retryable = match Self::innermost_beads_error(err) {
             BeadsError::WriteLockTimeout { retryable, .. } => *retryable,
+            // The JSONL was replaced faster than one generation could be
+            // copied; no partial copy was used and nothing was written (#578).
+            BeadsError::JsonlSourceUnstable { .. } => true,
             _ => code.is_retryable(),
         };
 
@@ -753,6 +756,14 @@ impl StructuredError {
             BeadsError::SyncConflict { message } => {
                 (ErrorCode::SyncConflict, Some(json!({"message": message})))
             }
+            BeadsError::JsonlSourceUnstable { path, attempts } => (
+                ErrorCode::SyncConflict,
+                Some(json!({
+                    "message": err.to_string(),
+                    "path": path,
+                    "attempts": attempts,
+                })),
+            ),
             BeadsError::UpdatePreconditionFailed {
                 id,
                 expected,
