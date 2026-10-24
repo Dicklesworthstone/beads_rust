@@ -2353,11 +2353,17 @@ fn reject_symlinked_jsonl_source_route(absolute_path: &Path, display_path: &Path
     let descriptor = external_path_descriptor(display_path);
 
     for (depth, component_path) in absolute_path.ancestors().enumerate() {
-        let metadata = std::fs::symlink_metadata(component_path).map_err(|error| {
-            BeadsError::Config(format!(
-                "Could not inspect the filesystem route for JSONL source {descriptor}: {error}"
-            ))
-        })?;
+        let metadata = match std::fs::symlink_metadata(component_path) {
+            Ok(metadata) => metadata,
+            // A leaf that names no file is not a symlink. The caller decides
+            // what an unlinked source means.
+            Err(error) if depth == 0 && error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(BeadsError::Config(format!(
+                    "Could not inspect the filesystem route for JSONL source {descriptor}: {error}"
+                )));
+            }
+        };
 
         if metadata.file_type().is_symlink() {
             let route_part = if depth == 0 {
@@ -2398,8 +2404,10 @@ fn jsonl_source_identity_changed(display_path: &Path) -> BeadsError {
 /// Whether the route still names the file identified by `fd_identity`.
 ///
 /// `Ok(false)` means the path now names a different regular file, which is
-/// what a concurrent atomic replacement (`rename` over the path) looks like.
-/// A symlinked route, a non-regular leaf, or an unreadable route is an error.
+/// what a concurrent atomic replacement (`rename` over the path) looks like,
+/// or no file at all: the opened file was unlinked, as `git checkout` does
+/// before it creates the new file. A symlinked route, a non-regular leaf, or
+/// an unreadable route is an error.
 #[cfg(unix)]
 fn jsonl_source_path_names(
     absolute_path: &Path,
@@ -2409,11 +2417,15 @@ fn jsonl_source_path_names(
     let descriptor = external_path_descriptor(display_path);
     reject_symlinked_jsonl_source_route(absolute_path, display_path)?;
 
-    let path_metadata = std::fs::symlink_metadata(absolute_path).map_err(|error| {
-        BeadsError::Config(format!(
-            "Could not re-read filesystem identity for JSONL source {descriptor}: {error}"
-        ))
-    })?;
+    let path_metadata = match std::fs::symlink_metadata(absolute_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(BeadsError::Config(format!(
+                "Could not re-read filesystem identity for JSONL source {descriptor}: {error}"
+            )));
+        }
+    };
     if !path_metadata.is_file() {
         return Err(BeadsError::Config(format!(
             "Filesystem path for JSONL source {descriptor} is not a regular file"
@@ -4502,6 +4514,50 @@ mod tests {
             capture_optional_jsonl_source_with_retry(&absent, None)
                 .expect("an absent source is not an error")
                 .is_none()
+        );
+    }
+
+    /// GitHub #578: `git checkout` can unlink the old file after an attempt
+    /// opened it and before the attempt checks that the path still names it.
+    /// The path naming no file then is a change of the source, retried like a
+    /// replacement, not a failure to inspect the route.
+    #[cfg(unix)]
+    #[test]
+    fn capture_retries_a_source_unlinked_before_its_identity_check() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let path = beads_dir.join("issues.jsonl");
+        std::fs::write(&path, "{\"generation\":1}\n").expect("write first generation");
+
+        // Unlinked after the read, then created again with the new generation.
+        let mut attempts = 0;
+        let snapshot = capture_with_retry(&path, None, || {
+            attempts += 1;
+            if attempts == 1 {
+                capture_optional_jsonl_source_attempt(&path, None, &mut || {
+                    std::fs::remove_file(&path)
+                })
+            } else {
+                std::fs::write(&path, "{\"generation\":2}\n")?;
+                capture_optional_jsonl_source_attempt(&path, None, &mut || Ok(()))
+            }
+        })
+        .expect("an unlinked source is retried")
+        .expect("the new generation is captured");
+        assert_eq!(attempts, 2);
+        assert_eq!(snapshot_text(&snapshot), "{\"generation\":2}\n");
+
+        // Unlinked and never created again: the retryable conflict, not a
+        // route error and not an absent source.
+        let mut reads = 0_u32;
+        let error = capture_optional_jsonl_source_with_retry_impl(&path, None, || {
+            reads += 1;
+            std::fs::remove_file(&path)
+        })
+        .expect_err("a source unlinked during capture is not captured");
+        assert_eq!(reads, 1, "later attempts find no file to read");
+        assert!(
+            matches!(error, BeadsError::JsonlSourceUnstable { .. }),
+            "unexpected error: {error}"
         );
     }
 
