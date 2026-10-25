@@ -3271,16 +3271,102 @@ fn integrity_check_is_clean(messages: &[String]) -> bool {
     matches!(messages, [message] if message.trim().eq_ignore_ascii_case("ok"))
 }
 
-fn fresh_force_import_maintenance_gate_applies(
-    args: &SyncArgs,
-    force_import_target_was_empty: bool,
-    import_rewrote_storage: bool,
-) -> bool {
-    args.force
-        && !args.rebuild
-        && !args.rename_prefix
-        && force_import_target_was_empty
-        && import_rewrote_storage
+/// Free pages below this count never trigger post-import compaction on their
+/// own (4 MiB at the default 4 KiB page size), so small trackers are not
+/// rewritten to reclaim a few pages.
+const POST_IMPORT_COMPACTION_MIN_FREE_PAGES: u64 = 1024;
+
+/// Share of the database (in percent) that free pages must reach before a
+/// post-import compaction is worth a full rewrite.
+const POST_IMPORT_COMPACTION_FREE_PAGE_PERCENT: u64 = 25;
+
+/// What the post-import compaction decision reads from the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PostImportDatabaseProbe {
+    integrity_messages: Vec<String>,
+    page_count: u64,
+    freelist_count: u64,
+}
+
+/// Why `br sync --import-only` compacts after an import (#577).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostImportCompactionReason {
+    /// The full `integrity_check` did not return a single `ok`.
+    IntegrityWarnings,
+    /// The probe itself failed, so the database state is unknown.
+    ProbeFailed,
+    /// Free pages passed the reclaim threshold.
+    Freelist,
+}
+
+impl PostImportCompactionReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::IntegrityWarnings => "integrity_warnings",
+            Self::ProbeFailed => "probe_failed",
+            Self::Freelist => "freelist",
+        }
+    }
+}
+
+fn freelist_warrants_compaction(page_count: u64, freelist_count: u64) -> bool {
+    freelist_count >= POST_IMPORT_COMPACTION_MIN_FREE_PAGES
+        && freelist_count.saturating_mul(100)
+            >= page_count.saturating_mul(POST_IMPORT_COMPACTION_FREE_PAGE_PERCENT)
+}
+
+fn probe_post_import_database(
+    storage: &crate::storage::SqliteStorage,
+) -> Result<PostImportDatabaseProbe> {
+    let integrity_messages = storage.integrity_check_messages()?;
+    let (page_count, freelist_count) = storage.page_and_freelist_counts()?;
+    Ok(PostImportDatabaseProbe {
+        integrity_messages,
+        page_count,
+        freelist_count,
+    })
+}
+
+/// Decide whether an import that wrote rows must be followed by the
+/// VACUUM/REINDEX/VACUUM INTO compaction. `None` means skip it.
+///
+/// A failed probe compacts, so an unknown state takes the pre-#577 path
+/// rather than skipping it.
+fn post_import_compaction_reason(
+    probe: impl FnOnce() -> Result<PostImportDatabaseProbe>,
+) -> Option<PostImportCompactionReason> {
+    match probe() {
+        Err(error) => {
+            warn!(
+                error = %error,
+                "Post-import integrity/freelist probe failed; compacting"
+            );
+            Some(PostImportCompactionReason::ProbeFailed)
+        }
+        Ok(probe) if !integrity_check_is_clean(&probe.integrity_messages) => {
+            warn!(
+                integrity_messages = ?probe.integrity_messages,
+                "Import left SQLite integrity warnings; compacting"
+            );
+            Some(PostImportCompactionReason::IntegrityWarnings)
+        }
+        Ok(probe) if freelist_warrants_compaction(probe.page_count, probe.freelist_count) => {
+            debug!(
+                page_count = probe.page_count,
+                freelist_count = probe.freelist_count,
+                "Freelist passed the post-import reclaim threshold; compacting"
+            );
+            Some(PostImportCompactionReason::Freelist)
+        }
+        Ok(probe) => {
+            debug!(
+                page_count = probe.page_count,
+                freelist_count = probe.freelist_count,
+                "Skipping post-import compaction: integrity_check is clean and the freelist is below the reclaim threshold"
+            );
+            None
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3837,7 +3923,6 @@ fn execute_import(
     // DROP/CREATE pager hazards and, critically, guarantees that any late
     // validation or storage failure restores the complete previous DB family.
     let import_used_backup_rebuild = args.force || args.rebuild;
-    let force_import_target_was_empty = false;
     info!(path = %jsonl_path.display(), "Importing from JSONL");
     crate::portable_history::preflight_import(jsonl_path)?;
     let mut import_result = if import_used_backup_rebuild {
@@ -3953,49 +4038,43 @@ fn execute_import(
         storage.set_metadata(METADATA_JSONL_CONTENT_HASH, &source_content_hash)?;
     }
 
-    // Post-import VACUUM + REINDEX to eliminate B-tree/index corruption
+    // Post-import VACUUM + REINDEX + VACUUM INTO scrubs B-tree/index
     // artifacts that frankensqlite's bulk-insert and metadata-update paths
     // can leave behind.  This mirrors what `rebuild_database_family` (used
     // by `br doctor --repair` and auto recovery) does at the equivalent
     // chokepoint.
     //
-    // Without this, large `br sync --import-only` runs can produce a DB
+    // Without it, large `br sync --import-only` runs could produce a DB
     // where C sqlite3's `PRAGMA integrity_check` reports free-space or
     // index-entry corruption.  Force/rebuild imports hit this through
-    // `reset_data_tables()` + bulk import (issue #248); the FrankenTorch
-    // current-JSONL reproducer hit the plain import path through metadata
-    // table/index churn after importing hundreds of rows.
+    // `reset_data_tables()` + bulk import (issue #248) and now go through
+    // the backup-and-replace rebuild instead; the FrankenTorch current-JSONL
+    // reproducer hit the plain import path through metadata table/index
+    // churn after importing hundreds of rows.
+    //
+    // The scrub copies and rewrites the whole database and retains the
+    // pre-compaction family under `.br_recovery/`, so running it after every
+    // import that touched a row made a one-row pull cost several full copies
+    // on large trackers (#577). The retained family is the post-import
+    // database, so it only undoes the compaction, never the import. The scrub
+    // now runs only when the full `integrity_check` reports warnings (the
+    // condition it exists to clear), when that probe fails, or when the
+    // freelist has grown past the reclaim threshold.
     let import_rewrote_storage = import_result.imported_count > 0
         || import_result.blocked_cache_entries > 0
         || import_result.child_counter_entries > 0;
-    let skip_heavy_import_maintenance = if fresh_force_import_maintenance_gate_applies(
-        args,
-        force_import_target_was_empty,
-        import_rewrote_storage,
-    ) {
-        let messages = storage.integrity_check_messages()?;
-        let clean = integrity_check_is_clean(&messages);
-        if clean {
-            debug!(
-                db_path = %db_path.display(),
-                "Skipping post-import VACUUM/REINDEX: fresh force import already passed integrity_check"
-            );
-        } else {
-            warn!(
-                db_path = %db_path.display(),
-                integrity_messages = ?messages,
-                "Fresh force import reported integrity warnings; running full post-import maintenance"
-            );
-        }
-        clean
+    let compaction_reason = if !import_used_backup_rebuild && import_rewrote_storage {
+        post_import_compaction_reason(|| probe_post_import_database(storage))
     } else {
-        false
+        None
     };
 
-    if !import_used_backup_rebuild
-        && (args.force || args.rebuild || import_rewrote_storage)
-        && !skip_heavy_import_maintenance
-    {
+    if let Some(reason) = compaction_reason {
+        info!(
+            db_path = %db_path.display(),
+            reason = reason.as_str(),
+            "Running post-import compaction"
+        );
         // Final maintenance is isolated from the live tracker. The compaction
         // helper checkpoints once, copies the main database into a private
         // recovery-directory source, and runs VACUUM/REINDEX/VACUUM INTO
@@ -5923,11 +6002,12 @@ fn render_merge_result_rich(report: &crate::sync::MergeReport, ctx: &OutputConte
 #[cfg(test)]
 mod tests {
     use super::{
-        GitExportStatus, SyncOperation, additive_conflict_human_lines,
-        auto_rebuild_semantic_conflict_field, auto_rebuild_semantic_flag_conflict_reason,
-        classify_sync_status_workspace, detect_prefix_from_jsonl,
-        fresh_force_import_maintenance_gate_applies, jsonl_contains_duplicate_external_refs,
-        jsonl_contains_prefix_mismatch, merge_conflict_resolution, prepare_sync_startup,
+        GitExportStatus, PostImportCompactionReason, PostImportDatabaseProbe, SyncOperation,
+        additive_conflict_human_lines, auto_rebuild_semantic_conflict_field,
+        auto_rebuild_semantic_flag_conflict_reason, classify_sync_status_workspace,
+        detect_prefix_from_jsonl, freelist_warrants_compaction,
+        jsonl_contains_duplicate_external_refs, jsonl_contains_prefix_mismatch,
+        merge_conflict_resolution, post_import_compaction_reason, prepare_sync_startup,
         should_defer_jsonl_recovery, should_render_human_sync_output, sync_operation,
         validate_operator_requested_sync_path, validate_sync_mode_args, validate_sync_paths,
         write_manifest_atomically,
@@ -6155,50 +6235,81 @@ mod tests {
         assert!(should_render_human_sync_output(&plain_ctx, true));
     }
 
+    fn clean_probe(page_count: u64, freelist_count: u64) -> PostImportDatabaseProbe {
+        PostImportDatabaseProbe {
+            integrity_messages: vec!["ok".to_string()],
+            page_count,
+            freelist_count,
+        }
+    }
+
     #[test]
-    fn fresh_force_import_maintenance_gate_only_applies_to_clean_empty_force_loads() {
-        let force_import = SyncArgs {
-            import_only: true,
-            force: true,
-            ..SyncArgs::default()
-        };
-        assert!(fresh_force_import_maintenance_gate_applies(
-            &force_import,
-            true,
-            true
-        ));
-        assert!(!fresh_force_import_maintenance_gate_applies(
-            &force_import,
-            false,
-            true
-        ));
-        assert!(!fresh_force_import_maintenance_gate_applies(
-            &force_import,
-            true,
-            false
-        ));
+    fn post_import_compaction_skips_a_clean_database_with_a_small_freelist() {
+        assert_eq!(
+            post_import_compaction_reason(|| Ok(clean_probe(20_000, 0))),
+            None
+        );
+        // A routine import's churn: some free pages, well under the share.
+        assert_eq!(
+            post_import_compaction_reason(|| Ok(clean_probe(20_000, 1_500))),
+            None
+        );
+        // A small tracker whose freelist is a large share but few pages.
+        assert_eq!(
+            post_import_compaction_reason(|| Ok(clean_probe(400, 300))),
+            None
+        );
+    }
 
-        let rebuild = SyncArgs {
-            import_only: true,
-            force: true,
-            rebuild: true,
-            ..SyncArgs::default()
+    #[test]
+    fn post_import_compaction_runs_on_integrity_warnings_or_a_failed_probe() {
+        let dirty = PostImportDatabaseProbe {
+            integrity_messages: vec!["page 7 is never used".to_string()],
+            page_count: 100,
+            freelist_count: 0,
         };
-        assert!(!fresh_force_import_maintenance_gate_applies(
-            &rebuild, true, true
-        ));
+        assert_eq!(
+            post_import_compaction_reason(|| Ok(dirty)),
+            Some(PostImportCompactionReason::IntegrityWarnings)
+        );
+        // `ok` plus anything else is not a clean verdict.
+        let mixed = PostImportDatabaseProbe {
+            integrity_messages: vec!["ok".to_string(), "row 3 missing from index".to_string()],
+            page_count: 100,
+            freelist_count: 0,
+        };
+        assert_eq!(
+            post_import_compaction_reason(|| Ok(mixed)),
+            Some(PostImportCompactionReason::IntegrityWarnings)
+        );
+        assert_eq!(
+            post_import_compaction_reason(|| Err(BeadsError::Config("probe failed".to_string()))),
+            Some(PostImportCompactionReason::ProbeFailed)
+        );
+    }
 
-        let rename_prefix = SyncArgs {
-            import_only: true,
-            force: true,
-            rename_prefix: true,
-            ..SyncArgs::default()
-        };
-        assert!(!fresh_force_import_maintenance_gate_applies(
-            &rename_prefix,
-            true,
-            true
-        ));
+    #[test]
+    fn post_import_compaction_runs_when_the_freelist_passes_both_thresholds() {
+        assert_eq!(
+            post_import_compaction_reason(|| Ok(clean_probe(4_000, 1_000))),
+            None,
+            "1000 free pages is below the minimum page count"
+        );
+        assert_eq!(
+            post_import_compaction_reason(|| Ok(clean_probe(4_096, 1_024))),
+            Some(PostImportCompactionReason::Freelist),
+            "exactly the minimum pages at exactly 25% compacts"
+        );
+        assert_eq!(
+            post_import_compaction_reason(|| Ok(clean_probe(4_100, 1_024))),
+            None,
+            "just under 25% does not compact"
+        );
+        assert_eq!(
+            post_import_compaction_reason(|| Ok(clean_probe(20_000, 9_000))),
+            Some(PostImportCompactionReason::Freelist)
+        );
+        assert!(freelist_warrants_compaction(u64::MAX, u64::MAX));
     }
 
     #[test]

@@ -4286,6 +4286,27 @@ impl SqliteStorage {
         self.database_check_messages("PRAGMA quick_check")
     }
 
+    /// Return `(page_count, freelist_count)` from the database header.
+    ///
+    /// Both values come from page 1 as the current snapshot sees it, so they
+    /// include committed frames still in the WAL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either pragma cannot be executed or does not
+    /// return a non-negative integer.
+    pub(crate) fn page_and_freelist_counts(&self) -> Result<(u64, u64)> {
+        let read = |pragma: &str| -> Result<u64> {
+            let rows = self.conn.query(pragma)?;
+            rows.first()
+                .and_then(|row| row.get(0))
+                .and_then(SqliteValue::as_integer)
+                .and_then(|value| u64::try_from(value).ok())
+                .ok_or_else(|| BeadsError::Config(format!("{pragma} did not return a page count")))
+        };
+        Ok((read("PRAGMA page_count")?, read("PRAGMA freelist_count")?))
+    }
+
     fn database_check_messages(&self, pragma: &str) -> Result<Vec<String>> {
         let rows = self.conn.query(pragma)?;
         let mut messages = Vec::new();

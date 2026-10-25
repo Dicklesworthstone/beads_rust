@@ -1541,6 +1541,183 @@ fn e2e_rebuilt_alt_db_preserves_fresh_lookup_and_mutation_paths() {
     );
 }
 
+/// Completed post-import compactions leave the replaced database generation
+/// in `.br_recovery/` as `beads.db.vacuum-<pid>-<stamp>.bak`; count them.
+fn compaction_backup_count(beads_dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(beads_dir.join(".br_recovery")) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("beads.db.vacuum-") && name.ends_with(".bak")
+        })
+        .count()
+}
+
+/// Rewrite one JSONL row's title with a newer `updated_at`, the shape of a
+/// single-issue change pulled from a peer. Import recomputes `content_hash`.
+fn edit_one_jsonl_row(jsonl_path: &Path, id: &str, title: &str, updated_at: &str) {
+    let body = fs::read_to_string(jsonl_path).expect("read jsonl");
+    let mut found = false;
+    let mut lines = Vec::new();
+    for line in body.lines().filter(|line| !line.trim().is_empty()) {
+        let mut row: serde_json::Value = serde_json::from_str(line).expect("jsonl row");
+        if row["id"] == id {
+            row["title"] = serde_json::json!(title);
+            row["updated_at"] = serde_json::json!(updated_at);
+            found = true;
+        }
+        lines.push(serde_json::to_string(&row).expect("serialize row"));
+    }
+    assert!(found, "{id} must be present in {}", jsonl_path.display());
+    let mut rewritten = lines.join("\n");
+    rewritten.push('\n');
+    fs::write(jsonl_path, rewritten).expect("write jsonl");
+}
+
+fn import_json(workspace: &BrWorkspace, label: &str) -> serde_json::Value {
+    let import = run_br(workspace, ["sync", "--import-only", "--json"], label);
+    assert!(
+        import.status.success(),
+        "{label} failed: stdout={} stderr={}",
+        import.stdout,
+        import.stderr
+    );
+    serde_json::from_str(&common::cli::extract_json_payload(&import.stdout))
+        .expect("import json payload")
+}
+
+fn init_flushed_workspace(prefix: &str, issue_count: usize) -> (BrWorkspace, Vec<String>) {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init", "--prefix", prefix], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let mut ids = Vec::new();
+    for i in 0..issue_count {
+        let title = format!("issue {i}");
+        let create = run_br(
+            &workspace,
+            ["create", &title, "-p", "3", "--silent", "--no-auto-flush"],
+            "create_bulk",
+        );
+        assert!(create.status.success(), "create {i}: {}", create.stderr);
+        ids.push(create.stdout.trim().to_string());
+    }
+    let flush = run_br(&workspace, ["sync", "--flush-only"], "flush");
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+    (workspace, ids)
+}
+
+/// GitHub #577: an import that changes one row must not rewrite the whole
+/// database or retain another full copy of it in `.br_recovery/`.
+#[test]
+fn e2e_sync_import_one_row_change_skips_compaction() {
+    let _log = common::test_log("e2e_sync_import_one_row_change_skips_compaction");
+    let (workspace, ids) = init_flushed_workspace("cmp", 40);
+    let beads_dir = workspace.root.join(".beads");
+    let db_path = beads_dir.join("beads.db");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let backups_before = compaction_backup_count(&beads_dir);
+
+    for (round, index) in [7_usize, 11].into_iter().enumerate() {
+        let title = format!("pulled from a peer {round}");
+        edit_one_jsonl_row(
+            &jsonl_path,
+            &ids[index],
+            &title,
+            &format!("2030-01-0{}T00:00:00Z", round + 1),
+        );
+        let import = import_json(&workspace, &format!("import_one_row_{round}"));
+        assert_eq!(import["updated"], 1, "one row changed: {import}");
+        assert_eq!(
+            compaction_backup_count(&beads_dir),
+            backups_before,
+            "a clean one-row import must not compact the database (round {round})"
+        );
+        let show = run_br(
+            &workspace,
+            ["show", &ids[index], "--json"],
+            "show_after_import",
+        );
+        assert!(show.status.success(), "show failed: {}", show.stderr);
+        assert!(
+            show.stdout.contains(&title),
+            "imported title must be visible: {}",
+            show.stdout
+        );
+    }
+
+    let integrity = run_sqlite3_pragma_integrity_check(&db_path);
+    assert_eq!(
+        integrity.trim(),
+        "ok",
+        "an uncompacted import must leave a database upstream sqlite3 accepts: {integrity}"
+    );
+}
+
+/// GitHub #577: an import still compacts when free pages pass the reclaim
+/// threshold, so skipping routine compactions does not leave a large
+/// freelist in place indefinitely.
+#[test]
+fn e2e_sync_import_compacts_when_the_freelist_passes_the_threshold() {
+    let _log = common::test_log("e2e_sync_import_compacts_when_the_freelist_passes_the_threshold");
+    let (workspace, ids) = init_flushed_workspace("cmf", 10);
+    let beads_dir = workspace.root.join(".beads");
+    let db_path = beads_dir.join("beads.db");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let backups_before = compaction_backup_count(&beads_dir);
+
+    // Free well over 1024 pages, and over a quarter of the file, by filling
+    // and dropping a scratch table.
+    {
+        let conn =
+            beads_rust::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())
+                .expect("open database");
+        conn.execute("CREATE TABLE compaction_filler (payload TEXT)")
+            .expect("create filler");
+        let payload = "x".repeat(4000);
+        conn.execute("BEGIN").expect("begin filler");
+        for _ in 0..2000 {
+            conn.execute_with_params(
+                "INSERT INTO compaction_filler (payload) VALUES (?)",
+                &[fsqlite_types::SqliteValue::from(payload.as_str())],
+            )
+            .expect("insert filler");
+        }
+        conn.execute("COMMIT").expect("commit filler");
+        conn.execute("DROP TABLE compaction_filler")
+            .expect("drop filler");
+    }
+
+    edit_one_jsonl_row(
+        &jsonl_path,
+        &ids[3],
+        "after the drop",
+        "2030-01-01T00:00:00Z",
+    );
+    let import = import_json(&workspace, "import_after_drop");
+    assert_eq!(import["updated"], 1, "one row changed: {import}");
+    assert_eq!(
+        compaction_backup_count(&beads_dir),
+        backups_before + 1,
+        "a freelist past the threshold must trigger post-import compaction"
+    );
+    let conn = beads_rust::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())
+        .expect("reopen database");
+    let freelist = conn
+        .query_row("PRAGMA freelist_count")
+        .expect("freelist_count");
+    assert_eq!(
+        freelist
+            .get(0)
+            .and_then(fsqlite_types::SqliteValue::as_integer),
+        Some(0),
+        "compaction must reclaim the free pages"
+    );
+}
+
 /// Invoke the C `sqlite3` CLI to run `PRAGMA integrity_check` against the
 /// given database.  Returns stdout verbatim (expected to be "ok\n" for a
 /// clean DB).  If the binary is missing the test falls back to the string
