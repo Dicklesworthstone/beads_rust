@@ -2708,8 +2708,29 @@ br changelog [OPTIONS]
 Check issues for missing template sections.
 
 ```bash
-br lint [OPTIONS]
+br lint [OPTIONS] [IDS...]
 ```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `-t, --type <TYPE>` | Only lint this issue type (bug, task, feature, epic) |
+| `-s, --status <STATUS>` | Filter by status (default: open; `all` for every status) |
+
+**Required sections (built in, per issue type):**
+| Type | Sections |
+|------|----------|
+| bug | Steps to Reproduce, Acceptance Criteria |
+| task, feature | Acceptance Criteria |
+| epic | Success Criteria |
+| other types | none |
+
+A section counts as present when the description has a Markdown heading with
+that name (any level, case-insensitive, optional trailing colon) followed by at
+least one non-blank line before the next heading of the same or a higher level.
+Headings inside fenced code blocks don't count. Acceptance Criteria is also
+satisfied by a non-empty `acceptance_criteria` field (`br create
+--acceptance-criteria`). The lists are fixed; they are not configurable.
 
 ---
 
