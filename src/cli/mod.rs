@@ -2644,15 +2644,15 @@ pub struct StaleArgs {
 
 #[derive(Args, Debug, Clone, Default)]
 pub struct LintArgs {
-    /// Issue IDs to lint (defaults to open issues)
+    /// Issue IDs to lint, whatever their type and status (defaults to open issues)
     #[arg(add = ArgValueCompleter::new(issue_id_completer))]
     pub ids: Vec<String>,
 
-    /// Filter by issue type (bug, task, feature, epic)
+    /// Filter by built-in issue type (bug, task, feature, epic, chore, docs, question); ignored with IDs
     #[arg(long, short = 't', add = ArgValueCompleter::new(issue_type_standard_completer))]
     pub type_: Option<String>,
 
-    /// Filter by status (default: open, use 'all' for all)
+    /// Filter by status (default: open, use 'all' for all); ignored with IDs
     #[arg(long, short = 's', add = ArgValueCompleter::new(status_or_all_completer))]
     pub status: Option<String>,
 }

@@ -2711,10 +2711,13 @@ Check issues for missing template sections.
 br lint [OPTIONS] [IDS...]
 ```
 
+With `IDS`, exactly those issues are linted, whatever their type and status;
+`--type` and `--status` apply only when no IDs are given.
+
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `-t, --type <TYPE>` | Only lint this issue type (bug, task, feature, epic) |
+| `-t, --type <TYPE>` | Only lint this built-in issue type (bug, task, feature, epic, chore, docs, question) |
 | `-s, --status <STATUS>` | Filter by status (default: open; `all` for every status) |
 
 **Required sections (built in, per issue type):**
@@ -2725,10 +2728,12 @@ br lint [OPTIONS] [IDS...]
 | epic | Success Criteria |
 | other types | none |
 
-A section counts as present when the description has a Markdown heading with
+A section counts as present when the description has a `#`-style heading with
 that name (any level, case-insensitive, optional trailing colon) followed by at
 least one non-blank line before the next heading of the same or a higher level.
-Headings inside fenced code blocks don't count. Acceptance Criteria is also
+Deeper headings and the fence lines of an empty code block are not content.
+Underlined (setext) headings, and headings inside code blocks or block quotes,
+don't count. Acceptance Criteria is also
 satisfied by a non-empty `acceptance_criteria` field (`br create
 --acceptance-criteria`). The lists are fixed; they are not configurable.
 
