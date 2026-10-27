@@ -2773,7 +2773,9 @@ impl SqliteStorage {
             apply_schema(&conn)?;
             attest_runtime_schema_cookie(&conn)?
         };
-        Self::ensure_known_metadata_defaults(&conn)?;
+        if !crate::storage::schema::has_pending_sync_merge_metadata(&conn)? {
+            Self::ensure_known_metadata_defaults(&conn)?;
+        }
         // A matching witness is already on disk for this cookie; re-writing
         // it would only add a write transaction to every steady-state open.
         if !(witness_matches && attested_cookie == schema_cookie_before)
@@ -16387,6 +16389,146 @@ impl SqliteStorage {
         }
     }
 
+    /// Whether the indexed receipt table has been installed. A legacy pending
+    /// merge keeps its original schema and blob receipts until it finishes.
+    pub(crate) fn jsonl_row_receipts_table_exists(&self) -> Result<bool> {
+        Ok(!self
+            .conn
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jsonl_row_receipts'",
+            )?
+            .is_empty())
+    }
+
+    /// Read all raw JSONL row receipts for a changed-source reconciliation.
+    /// Normal incremental publications update only their changed receipts.
+    ///
+    /// Unlike general metadata reads, ambiguous or malformed receipt rows
+    /// must fail closed: a newest-duplicate policy cannot authorize replacing
+    /// peer content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid receipts or a failed database query.
+    pub(crate) fn get_jsonl_row_receipts(&self) -> Result<BTreeMap<String, String>> {
+        let rows = self
+            .conn
+            .query("SELECT issue_id, row_hash FROM jsonl_row_receipts ORDER BY issue_id")?;
+        let mut receipts = BTreeMap::new();
+        for row in rows {
+            let (Some(id), Some(hash)) = (
+                row.get(0).and_then(SqliteValue::as_text),
+                row.get(1).and_then(SqliteValue::as_text),
+            ) else {
+                return Err(BeadsError::SyncConflict {
+                    message: "Cannot verify JSONL row receipts: expected text key and hash"
+                        .to_string(),
+                });
+            };
+            Self::validate_jsonl_row_receipt(id, hash)?;
+            if receipts.insert(id.to_string(), hash.to_string()).is_some() {
+                return Err(BeadsError::SyncConflict {
+                    message: format!("Cannot verify JSONL row receipts: duplicate issue '{id}'"),
+                });
+            }
+        }
+        Ok(receipts)
+    }
+
+    fn validate_jsonl_row_receipt(id: &str, hash: &str) -> Result<()> {
+        if id.trim_ascii().is_empty()
+            || hash.len() != 64
+            || !hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Cannot verify JSONL row receipt for '{id}': expected an issue ID and lowercase SHA-256"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Replace the complete certified row population in the caller's import
+    /// or full-publication transaction. No issue foreign key is involved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid receipts or a failed database write.
+    pub(crate) fn replace_jsonl_row_receipts_in_tx(
+        &self,
+        receipts: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        for (id, hash) in receipts {
+            Self::validate_jsonl_row_receipt(id, hash)?;
+        }
+        self.conn.execute("DELETE FROM jsonl_row_receipts")?;
+        let entries = receipts.iter().collect::<Vec<_>>();
+        for chunk in entries.chunks(SQLITE_VAR_LIMIT / 2) {
+            let placeholders = vec!["(?, ?)"; chunk.len()].join(", ");
+            let sql = format!(
+                "INSERT INTO jsonl_row_receipts (issue_id, row_hash) VALUES {placeholders}"
+            );
+            let mut params = Vec::with_capacity(chunk.len() * 2);
+            for (id, hash) in chunk {
+                params.push(SqliteValue::from(id.as_str()));
+                params.push(SqliteValue::from(hash.as_str()));
+            }
+            self.conn.execute_with_params(&sql, &params)?;
+        }
+        Ok(())
+    }
+
+    /// Advance only receipts affected by a successful incremental publication,
+    /// in the same transaction as dirty markers and the publication witness.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid receipts or a failed database write.
+    pub(crate) fn update_jsonl_row_receipts_in_tx(
+        &self,
+        receipts: &BTreeMap<String, String>,
+        removed_ids: &[String],
+    ) -> Result<()> {
+        for (id, hash) in receipts {
+            Self::validate_jsonl_row_receipt(id, hash)?;
+            let updated = self.conn.execute_with_params(
+                "UPDATE jsonl_row_receipts SET row_hash = ? WHERE issue_id = ? AND row_hash != ?",
+                &[
+                    SqliteValue::from(hash.as_str()),
+                    SqliteValue::from(id.as_str()),
+                    SqliteValue::from(hash.as_str()),
+                ],
+            )?;
+            if updated == 0
+                && self
+                    .conn
+                    .query_with_params(
+                        "SELECT 1 FROM jsonl_row_receipts WHERE issue_id = ? LIMIT 1",
+                        &[SqliteValue::from(id.as_str())],
+                    )?
+                    .is_empty()
+            {
+                self.conn.execute_with_params(
+                    "INSERT INTO jsonl_row_receipts (issue_id, row_hash) VALUES (?, ?)",
+                    &[
+                        SqliteValue::from(id.as_str()),
+                        SqliteValue::from(hash.as_str()),
+                    ],
+                )?;
+            }
+        }
+        for id in removed_ids {
+            self.conn.execute_with_params(
+                "DELETE FROM jsonl_row_receipts WHERE issue_id = ?",
+                &[SqliteValue::from(id.as_str())],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Read the set of issue IDs that were intentionally purged (hard
     /// deleted) but not yet flushed out of the on-disk JSONL (#405).
     ///
@@ -16473,13 +16615,20 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn delete_metadata(&mut self, key: &str) -> Result<bool> {
-        self.with_write_transaction(|storage| {
-            let count = storage.conn.execute_with_params(
-                "DELETE FROM metadata WHERE key = ?",
-                &[SqliteValue::from(key)],
-            )?;
-            Ok(count > 0)
-        })
+        self.with_write_transaction(|storage| storage.delete_metadata_in_tx(key))
+    }
+
+    /// Delete a metadata key using the caller's active write transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database write fails.
+    pub(crate) fn delete_metadata_in_tx(&self, key: &str) -> Result<bool> {
+        let count = self.conn.execute_with_params(
+            "DELETE FROM metadata WHERE key = ?",
+            &[SqliteValue::from(key)],
+        )?;
+        Ok(count > 0)
     }
 
     /// Count issues in the database.
@@ -41289,6 +41438,270 @@ required_fields:
     }
 
     #[test]
+    fn jsonl_row_receipts_update_only_changed_keys_and_replace_in_batches() {
+        let temp = TempDir::new().unwrap();
+        let mut storage = SqliteStorage::open(&temp.path().join("row-receipts.db")).unwrap();
+        storage
+            .set_metadata("unrelated_metadata", "preserved")
+            .unwrap();
+        storage
+            .set_metadata("jsonl_row_hashes", "legacy-map")
+            .unwrap();
+        let initial = (0..=SQLITE_VAR_LIMIT / 2)
+            .map(|index| (format!("bd-{index:04}"), "a".repeat(64)))
+            .collect::<BTreeMap<_, _>>();
+        storage
+            .with_write_transaction(|storage| storage.replace_jsonl_row_receipts_in_tx(&initial))
+            .unwrap();
+        assert_eq!(storage.get_jsonl_row_receipts().unwrap(), initial);
+
+        let untouched_sql = "SELECT rowid, issue_id, row_hash FROM jsonl_row_receipts \
+            WHERE issue_id NOT IN ('bd-0000', 'bd-0001') ORDER BY rowid";
+        let untouched_before = storage.execute_raw_query(untouched_sql).unwrap();
+        let metadata_before = storage
+            .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
+            .unwrap();
+        let replacement = BTreeMap::from([("bd-0000".to_string(), "b".repeat(64))]);
+        storage
+            .with_write_transaction(|storage| {
+                storage.update_jsonl_row_receipts_in_tx(
+                    &replacement,
+                    &["bd-0001".to_string(), "bd-absent".to_string()],
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            storage.execute_raw_query(untouched_sql).unwrap(),
+            untouched_before,
+            "publishing one row must not rewrite unrelated receipts or metadata"
+        );
+        let mut expected = initial;
+        expected.insert("bd-0000".to_string(), "b".repeat(64));
+        expected.remove("bd-0001");
+        assert_eq!(storage.get_jsonl_row_receipts().unwrap(), expected);
+
+        storage
+            .with_write_transaction(|storage| {
+                storage.replace_jsonl_row_receipts_in_tx(&BTreeMap::new())
+            })
+            .unwrap();
+        assert!(storage.get_jsonl_row_receipts().unwrap().is_empty());
+        assert_eq!(
+            storage
+                .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
+                .unwrap(),
+            metadata_before
+        );
+    }
+
+    #[test]
+    fn jsonl_row_receipts_reject_ambiguous_and_malformed_evidence() {
+        let temp = TempDir::new().unwrap();
+        let mut storage = SqliteStorage::open(&temp.path().join("bad-row-receipts.db")).unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO jsonl_row_receipts (issue_id, row_hash) VALUES (?, ?)",
+                &[
+                    SqliteValue::from("bd-receipt"),
+                    SqliteValue::from("a".repeat(64)),
+                ],
+            )
+            .unwrap();
+        for hash in [
+            String::new(),
+            "a".repeat(63),
+            "A".repeat(64),
+            "g".repeat(64),
+        ] {
+            storage
+                .conn
+                .execute_with_params(
+                    "UPDATE jsonl_row_receipts SET row_hash = ? WHERE issue_id = 'bd-receipt'",
+                    &[SqliteValue::from(hash)],
+                )
+                .unwrap();
+            assert!(matches!(
+                storage.get_jsonl_row_receipts(),
+                Err(BeadsError::SyncConflict { .. })
+            ));
+        }
+        storage
+            .conn
+            .execute("UPDATE jsonl_row_receipts SET row_hash = X'00' WHERE issue_id = 'bd-receipt'")
+            .unwrap();
+        assert!(storage.get_jsonl_row_receipts().is_err());
+        storage
+            .with_write_transaction(|storage| {
+                storage.replace_jsonl_row_receipts_in_tx(&BTreeMap::from([(
+                    "bd-receipt".to_string(),
+                    "a".repeat(64),
+                )]))
+            })
+            .unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO jsonl_row_receipts (issue_id, row_hash) VALUES ('', ?)",
+                &[SqliteValue::from("a".repeat(64))],
+            )
+            .unwrap();
+        assert!(storage.get_jsonl_row_receipts().is_err());
+        storage
+            .conn
+            .execute("DELETE FROM jsonl_row_receipts WHERE issue_id = ''")
+            .unwrap();
+        assert!(
+            storage
+                .conn
+                .execute_with_params(
+                    "INSERT INTO jsonl_row_receipts (issue_id, row_hash) VALUES ('bd-receipt', ?)",
+                    &[SqliteValue::from("a".repeat(64))],
+                )
+                .is_err(),
+            "the table must prevent duplicate receipt keys"
+        );
+        storage
+            .conn
+            .execute("ALTER TABLE jsonl_row_receipts RENAME TO jsonl_row_receipts_original")
+            .unwrap();
+        storage
+            .conn
+            .execute("CREATE TABLE jsonl_row_receipts (issue_id TEXT, row_hash TEXT)")
+            .unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO jsonl_row_receipts (issue_id, row_hash) VALUES ('bd-receipt', ?), ('bd-receipt', ?)",
+                &[
+                    SqliteValue::from("a".repeat(64)),
+                    SqliteValue::from("a".repeat(64)),
+                ],
+            )
+            .unwrap();
+        let error = storage.get_jsonl_row_receipts().unwrap_err();
+        assert!(error.to_string().contains("duplicate issue 'bd-receipt'"));
+    }
+
+    #[test]
+    fn jsonl_row_receipts_survive_purge_and_roll_back_with_publication_metadata() {
+        let temp = TempDir::new().unwrap();
+        let mut storage = SqliteStorage::open(&temp.path().join("receipt-rollback.db")).unwrap();
+        let issue = make_issue(
+            "bd-purged-receipt",
+            "Purge",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        let initial = BTreeMap::from([(issue.id.clone(), "a".repeat(64))]);
+        storage
+            .with_write_transaction(|storage| storage.replace_jsonl_row_receipts_in_tx(&initial))
+            .unwrap();
+        storage.purge_issue(&issue.id, "tester").unwrap();
+        assert!(storage.get_issue(&issue.id).unwrap().is_none());
+        assert_eq!(
+            storage.get_jsonl_row_receipts().unwrap(),
+            initial,
+            "purge must retain the receipt needed to authorize removing the source row"
+        );
+
+        let error = storage.with_write_transaction(|storage| -> Result<()> {
+            storage.update_jsonl_row_receipts_in_tx(
+                &BTreeMap::new(),
+                std::slice::from_ref(&issue.id),
+            )?;
+            storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, "uncommitted")?;
+            Err(BeadsError::Config(
+                "injected finalization failure".to_string(),
+            ))
+        });
+        assert!(error.is_err());
+        assert_eq!(storage.get_jsonl_row_receipts().unwrap(), initial);
+        assert!(
+            storage
+                .get_metadata(METADATA_JSONL_CONTENT_HASH)
+                .unwrap()
+                .is_none()
+        );
+
+        let error = storage.with_write_transaction(|storage| -> Result<()> {
+            storage.replace_jsonl_row_receipts_in_tx(&BTreeMap::from([(
+                "bd-replacement".to_string(),
+                "b".repeat(64),
+            )]))?;
+            Err(BeadsError::Config(
+                "injected replacement failure".to_string(),
+            ))
+        });
+        assert!(error.is_err());
+        assert_eq!(storage.get_jsonl_row_receipts().unwrap(), initial);
+    }
+
+    #[test]
+    fn jsonl_row_receipts_schema_upgrade_waits_for_pending_merge_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("pending-receipt-schema.db");
+        let (metadata_before, catalog_before) = {
+            let mut storage = SqliteStorage::open(&path).unwrap();
+            storage
+                .conn
+                .execute("DROP TABLE jsonl_row_receipts")
+                .unwrap();
+            storage
+                .set_metadata("runtime_schema_witness_v1", "legacy-witness")
+                .unwrap();
+            storage
+                .set_metadata(METADATA_SYNC_MERGE_PENDING, "")
+                .unwrap();
+            // Presence, not a successful receipt parse, must preserve the
+            // frozen state. Even default seeding would change its witness.
+            storage.delete_metadata(METADATA_JSONL_SIZE).unwrap();
+            (
+                storage.execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid").unwrap(),
+                storage.execute_raw_query("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name").unwrap(),
+            )
+        };
+        {
+            let mut storage = SqliteStorage::open(&path).unwrap();
+            assert!(!storage.jsonl_row_receipts_table_exists().unwrap());
+            assert_eq!(
+                storage
+                    .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
+                    .unwrap(),
+                metadata_before,
+                "opening a legacy pending merge must preserve every raw metadata row"
+            );
+            assert_eq!(
+                storage.execute_raw_query("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name").unwrap(),
+                catalog_before,
+                "installing the receipt table must wait until the frozen merge catalog is released"
+            );
+            assert!(storage.fast_open_runtime_schema_is_compatible());
+            storage
+                .delete_metadata(METADATA_SYNC_MERGE_PENDING)
+                .unwrap();
+        }
+        let storage = SqliteStorage::open(&path).unwrap();
+        assert!(storage.jsonl_row_receipts_table_exists().unwrap());
+        assert!(runtime_schema_witness_matches(&storage.conn));
+        assert!(storage.get_jsonl_row_receipts().unwrap().is_empty());
+        assert!(
+            storage
+                .conn
+                .query_row_with_params(
+                    "SELECT value FROM metadata WHERE key = ?",
+                    &[SqliteValue::from(METADATA_JSONL_SIZE)],
+                )
+                .is_ok(),
+            "normal startup resumes default seeding after terminal cleanup"
+        );
+    }
+
+    #[test]
     fn test_ready_readiness_probe_uses_latest_blocked_cache_state_duplicate() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("ready-stale-duplicate.db");
@@ -43431,6 +43844,32 @@ required_fields:
             crate::sync::capture_sync_merge_core_witness(&storage).unwrap(),
             committed.database_after
         );
+
+        let database_before_receipts =
+            crate::sync::capture_sync_database_witness(&storage).unwrap();
+        storage
+            .with_write_transaction(|storage| {
+                storage.update_jsonl_row_receipts_in_tx(
+                    &BTreeMap::from([(issue.id.clone(), "a".repeat(64))]),
+                    &[],
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            crate::sync::capture_sync_merge_core_witness(&storage).unwrap(),
+            committed.database_after,
+            "row receipts are export bookkeeping, not merged issue state"
+        );
+        assert_ne!(
+            crate::sync::capture_sync_database_witness(&storage).unwrap(),
+            database_before_receipts,
+            "the full prestate witness must still bind every raw receipt"
+        );
+        storage
+            .with_write_transaction(|storage| {
+                storage.replace_jsonl_row_receipts_in_tx(&BTreeMap::new())
+            })
+            .unwrap();
 
         storage
             .set_export_hash(&issue.id, "reviewed-export-hash")

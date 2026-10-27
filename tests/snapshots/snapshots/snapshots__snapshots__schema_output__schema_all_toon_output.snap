@@ -301,6 +301,11 @@ schemas:
             format: uint
             minimum: 0
           export_hash_payload_sha256.type: string
+          row_receipts:
+            description: "Complete raw-row receipts, when the database has the indexed receipt\ntable. Older pending merge intents predate that table and must keep\ntheir canonical serialized form for recovery."
+            anyOf[2]:
+              - "$ref": #/$defs/AdditiveTableWitness
+              - type: "null"
           events:
             type: integer
             format: uint

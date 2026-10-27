@@ -5490,6 +5490,7 @@ const LEGACY_V15_NEW_TABLES: &[&str] = &[
     "capacity_exemption_history",
     "capacity_exemptions",
     "capacity_occupancy",
+    "jsonl_row_receipts",
 ];
 
 fn legacy_projection_rowid(conn: &Connection, table: &str) -> Result<Option<&'static str>> {
@@ -8893,6 +8894,11 @@ mod tests {
         assert!(projection.tables.iter().any(|table| {
             table.table.name == "operator_without_rowid" && !table.rowid_included
         }));
+        assert!(projection.tables.iter().any(|table| {
+            table.table.name == "jsonl_row_receipts"
+                && table.table.row_count == 0
+                && table.rowid_included
+        }));
         execute_apply(
             &DoctorMigrateSchemaApplyArgs {
                 plan_token: plan.plan_token.unwrap(),
@@ -9225,9 +9231,16 @@ mod tests {
         assert!(applied.attested, "{:?}", applied.attestation_errors);
         assert!(applied.effects.dependency_type_key_added);
         assert!(!applied.effects.prerequisites_column_added);
+        let mut expected_tables = applied.logical_before.tables.clone();
+        expected_tables.push(
+            legacy_rows_projection("jsonl_row_receipts", true, &[])
+                .unwrap()
+                .table,
+        );
+        expected_tables.sort_by(|left, right| left.name.cmp(&right.name));
         assert_eq!(
             applied.logical_after.as_ref().unwrap().tables,
-            applied.logical_before.tables
+            expected_tables
         );
         let conn = open_read_only(&migration.db_path).unwrap();
         let rows = conn

@@ -21,7 +21,14 @@ const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
 // schema rebuild, overwhelming the compile-time savings of the runtime fast
 // path itself.
 const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str =
-    "v19-typed-dependencies-exact-ddl-version-domain-cookie-fenced";
+    "v19-typed-dependencies-jsonl-row-receipts-exact-ddl-cookie-fenced";
+// Keep this additive receipt table outside SCHEMA_SQL. A pending merge binds
+// the exact schema catalog and must finish against its original layout before
+// an older database can install the indexed receipts (#559).
+const JSONL_ROW_RECEIPTS_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS jsonl_row_receipts (
+        issue_id TEXT PRIMARY KEY,
+        row_hash TEXT NOT NULL
+    )";
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 const GATE_RESULT_HISTORY_MIGRATION_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS gate_result_history (
@@ -820,6 +827,7 @@ pub(crate) fn execute_batch(conn: &Connection, sql: &str) -> Result<()> {
 pub fn apply_schema(conn: &Connection) -> Result<()> {
     validate_schema_version_for_mutation(conn, "schema application")?;
     refuse_persistent_triggers(conn, "schema application")?;
+    refuse_schema_repair_during_pending_merge(conn)?;
 
     // Detect a truly fresh (empty) database before any DDL runs.
     // On a fresh DB, SCHEMA_SQL creates everything at the current version,
@@ -837,6 +845,7 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
     })?;
 
     execute_batch(conn, SCHEMA_SQL)?;
+    apply_jsonl_row_receipts_schema(conn)?;
 
     if is_fresh {
         // Fresh database: SCHEMA_SQL already created everything at the
@@ -1057,6 +1066,7 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
     let prerequisites_column_added = apply_prerequisites_migration_in_transaction(conn)?;
     tracing::info!("Migrating database to schema version 19 (typed dependency identity)");
     let dependency_type_key_added = apply_dependency_type_key_migration_in_transaction(conn, from)?;
+    apply_jsonl_row_receipts_schema(conn)?;
 
     conn.execute(&format!("PRAGMA user_version = {target_version}"))
         .map_err(BeadsError::Database)?;
@@ -1168,10 +1178,12 @@ pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) 
 pub(crate) fn apply_runtime_compatible_schema(conn: &Connection) -> Result<()> {
     validate_schema_version_for_mutation(conn, "runtime schema repair")?;
     refuse_persistent_triggers(conn, "runtime schema repair")?;
+    refuse_schema_repair_during_pending_merge(conn)?;
 
     // The table layouts are already safe to operate on, so we can skip the
     // heavier pre-schema rebuilds and just restore any missing canonical DDL.
     execute_batch(conn, SCHEMA_SQL)?;
+    apply_jsonl_row_receipts_schema(conn)?;
     run_migrations(conn, false)?;
     conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
         .map_err(BeadsError::Database)?;
@@ -1416,6 +1428,10 @@ const EXPORT_HASHES_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
         Some("CURRENT_TIMESTAMP"),
         0,
     ),
+];
+const JSONL_ROW_RECEIPTS_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
+    schema_column("issue_id", "TEXT", false, None, 1),
+    schema_column("row_hash", "TEXT", true, None, 0),
 ];
 const BLOCKED_CACHE_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
     schema_column("issue_id", "TEXT", false, None, 1),
@@ -3036,6 +3052,7 @@ fn attest_reviewed_legacy_v15_source(conn: &Connection) -> Result<()> {
         "capacity_exemptions",
         "capacity_exemption_history",
         "capacity_occupancy",
+        "jsonl_row_receipts",
     ] {
         if table_exists(conn, table) {
             return Err(legacy_v15_refusal(format!(
@@ -3929,6 +3946,65 @@ fn runtime_has_no_persistent_triggers(conn: &Connection) -> bool {
         .is_ok_and(|rows| rows.is_empty())
 }
 
+/// Pending merge receipts bind raw metadata and the schema catalog. Presence
+/// alone freezes those surfaces, including an empty or malformed pending row;
+/// receipt validation belongs to the merge recovery authority.
+pub(crate) fn has_pending_sync_merge_metadata(conn: &Connection) -> Result<bool> {
+    if conn
+        .query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'metadata'")?
+        .is_empty()
+    {
+        return Ok(false);
+    }
+    Ok(!conn
+        .query_with_params(
+            "SELECT 1 FROM metadata WHERE key = ? OR key = ? LIMIT 1",
+            &[
+                SqliteValue::from(crate::sync::METADATA_SYNC_MERGE_PENDING),
+                SqliteValue::from(crate::sync::METADATA_SYNC_MERGE_PENDING_LEGACY),
+            ],
+        )?
+        .is_empty())
+}
+
+fn refuse_schema_repair_during_pending_merge(conn: &Connection) -> Result<()> {
+    if has_pending_sync_merge_metadata(conn)? {
+        return Err(BeadsError::SyncConflict {
+            message: "Cannot repair the database schema while a sync merge is pending; resume `br sync --merge` against its original schema first".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn jsonl_row_receipts_schema_canonical(conn: &Connection) -> bool {
+    core_runtime_table_canonical(
+        conn,
+        "jsonl_row_receipts",
+        JSONL_ROW_RECEIPTS_RUNTIME_COLUMNS,
+        &[],
+        &[],
+        false,
+        None,
+        false,
+    )
+}
+
+fn apply_jsonl_row_receipts_schema(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "jsonl_row_receipts") {
+        if has_pending_sync_merge_metadata(conn)? {
+            return Ok(());
+        }
+        conn.execute(JSONL_ROW_RECEIPTS_SCHEMA_SQL)?;
+    }
+    if !jsonl_row_receipts_schema_canonical(conn) {
+        return Err(BeadsError::Config(
+            "JSONL row receipt table has a noncanonical schema; refusing to trust or replace it"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
     let version_ok = current_schema_version_declared(conn);
@@ -4023,6 +4099,9 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
         None,
         false,
     );
+    let jsonl_row_receipts_ok = jsonl_row_receipts_schema_canonical(conn)
+        || (!table_exists(conn, "jsonl_row_receipts")
+            && has_pending_sync_merge_metadata(conn).unwrap_or(false));
     let blocked_cache_ok = core_runtime_table_canonical(
         conn,
         "blocked_issues_cache",
@@ -4075,6 +4154,7 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
         && metadata_ok
         && dirty_issues_ok
         && export_hashes_ok
+        && jsonl_row_receipts_ok
         && blocked_cache_ok
         && child_counters_ok
         && close_metadata_ok
@@ -4095,6 +4175,7 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
             metadata_ok,
             dirty_issues_ok,
             export_hashes_ok,
+            jsonl_row_receipts_ok,
             blocked_cache_ok,
             child_counters_ok,
             close_metadata_ok,
@@ -4185,6 +4266,12 @@ pub(crate) fn runtime_schema_witness_matches(conn: &Connection) -> bool {
 /// Record an exact schema cookie that was already attested against the complete
 /// runtime contract. This deliberately does not re-read the current cookie.
 pub(crate) fn record_runtime_schema_witness(conn: &Connection, attested_cookie: i64) -> Result<()> {
+    // A legacy pending receipt includes this metadata value in its frozen
+    // core witness. A stale value merely requires re-attestation on the next
+    // open; refreshing it before terminal cleanup would obstruct recovery.
+    if has_pending_sync_merge_metadata(conn)? {
+        return Ok(());
+    }
     let value = runtime_schema_witness_value(attested_cookie);
     let existing = conn.query_with_params(
         "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1",
@@ -4673,6 +4760,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         )?;
     }
 
+    apply_jsonl_row_receipts_schema(conn)?;
     Ok(())
 }
 
@@ -5539,6 +5627,37 @@ mod tests {
             "negative-version refusal must occur before repair DDL"
         );
         assert!(!index_exists(&conn, "idx_comments_created_at"));
+    }
+
+    #[test]
+    fn jsonl_row_receipts_schema_rejects_unkeyed_or_foreign_key_receipts() {
+        for declaration in [
+            "CREATE TABLE jsonl_row_receipts (issue_id TEXT, row_hash TEXT NOT NULL)",
+            "CREATE TABLE jsonl_row_receipts (issue_id TEXT PRIMARY KEY, row_hash TEXT NOT NULL, FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE)",
+        ] {
+            let temp = TempDir::new().unwrap();
+            let path = temp.path().join("receipt-schema-drift.db");
+            let conn = Connection::open(path.to_string_lossy().into_owned()).unwrap();
+            apply_schema(&conn).unwrap();
+            conn.execute("DROP TABLE jsonl_row_receipts").unwrap();
+            conn.execute(declaration).unwrap();
+            let cookie = runtime_schema_cookie(&conn).unwrap();
+            assert!(!runtime_schema_compatible(&conn));
+            assert!(apply_jsonl_row_receipts_schema(&conn).is_err());
+            assert_eq!(runtime_schema_cookie(&conn).unwrap(), cookie);
+            conn.execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, '')",
+                &[SqliteValue::from(crate::sync::METADATA_SYNC_MERGE_PENDING)],
+            )
+            .unwrap();
+            assert!(
+                !runtime_schema_compatible(&conn),
+                "pending merges allow absence, never a malformed receipt table"
+            );
+            assert!(apply_schema(&conn).is_err());
+            assert!(apply_runtime_compatible_schema(&conn).is_err());
+            assert_eq!(runtime_schema_cookie(&conn).unwrap(), cookie);
+        }
     }
 
     #[test]
@@ -6747,6 +6866,7 @@ mod tests {
             "PRAGMA user_version = 16",
             "ALTER TABLE issues ADD COLUMN prerequisites TEXT NOT NULL DEFAULT ''",
             "CREATE TABLE capacity_occupancy (issue_id TEXT)",
+            "CREATE TABLE jsonl_row_receipts (issue_id TEXT PRIMARY KEY, row_hash TEXT NOT NULL); INSERT INTO jsonl_row_receipts VALUES ('bd-legacy', 'operator receipt evidence')",
             "UPDATE dirty_issues SET content_hash = 'unmapped legacy hash' WHERE issue_id = 'bd-legacy'",
             "UPDATE child_counters SET next_child_number = 3",
             "UPDATE child_counters SET last_child = 0",

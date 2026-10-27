@@ -208,6 +208,17 @@ publication. Even an exact row retry cannot prove that omitted database issues
 were reconciled. The unread-source flag therefore stays set across incremental
 publications until import or a verified full publication resolves it.
 
+Version 3 keeps the same complete-row checks in an indexed receipt table.
+When the captured source digest matches the verified publication witness and
+no source changes remain unimported, an incremental flush hashes and updates
+only its replacement rows and removes only the corresponding deleted receipts.
+A changed source still receives the complete comparison; a matching file hash
+alone never clears the unread-source flag. Receipt updates, dirty-marker
+cleanup, and publication bookkeeping commit in one database transaction.
+Version 2 receipts migrate on successful import or publication. An unfinished
+merge from an older binary completes with its original schema and receipt
+format before the new table is installed, preserving its exact recovery witnesses.
+
 Full automatic export and non-forced explicit export also verify the complete
 source generation. Publication remains bound to the captured file and database
 authority. A retry after publication but before bookkeeping or merge-anchor

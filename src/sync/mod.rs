@@ -27,6 +27,8 @@ pub mod io_stats {
     thread_local! {
         static JSONL_SOURCE_OPENS: Cell<u64> = const { Cell::new(0) };
         static JSONL_FULL_WRITES: Cell<u64> = const { Cell::new(0) };
+        #[cfg(test)]
+        static JSONL_RECEIPT_ROW_HASHES: Cell<u64> = const { Cell::new(0) };
     }
 
     pub(crate) fn record_source_open() {
@@ -35,6 +37,16 @@ pub mod io_stats {
 
     pub(crate) fn record_full_write() {
         JSONL_FULL_WRITES.with(|count| count.set(count.get() + 1));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_receipt_row_hash() {
+        JSONL_RECEIPT_ROW_HASHES.with(|count| count.set(count.get() + 1));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn receipt_row_hashes() -> u64 {
+        JSONL_RECEIPT_ROW_HASHES.with(Cell::get)
     }
 
     /// Number of whole-file JSONL reads recorded on this thread since `reset`.
@@ -49,10 +61,12 @@ pub mod io_stats {
         JSONL_FULL_WRITES.with(Cell::get)
     }
 
-    /// Zero both counters for the calling thread.
+    /// Zero the counters for the calling thread.
     pub fn reset() {
         JSONL_SOURCE_OPENS.with(|count| count.set(0));
         JSONL_FULL_WRITES.with(|count| count.set(0));
+        #[cfg(test)]
+        JSONL_RECEIPT_ROW_HASHES.with(|count| count.set(0));
     }
 }
 
@@ -3865,7 +3879,7 @@ pub struct ImportResult {
 }
 
 /// Versioned receipt schema for lossless additive JSONL reconciliation.
-pub const ADDITIVE_RECONCILE_SCHEMA: &str = "br.sync.additive-reconciliation.v2";
+pub const ADDITIVE_RECONCILE_SCHEMA: &str = "br.sync.additive-reconciliation.v3";
 const ADDITIVE_RECONCILE_ALGORITHM: &str =
     "exact-id-additive-create-monotonic-closure-explicit-scalar-v2";
 
@@ -3929,6 +3943,11 @@ pub struct AdditiveDatabaseWitness {
     pub comment_payload_sha256: String,
     pub export_hashes: usize,
     pub export_hash_payload_sha256: String,
+    /// Complete raw-row receipts, when the database has the indexed receipt
+    /// table. Older pending merge intents predate that table and must keep
+    /// their canonical serialized form for recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_receipts: Option<AdditiveTableWitness>,
     pub events: usize,
     pub event_payload_sha256: String,
     pub dirty_issues: usize,
@@ -4130,9 +4149,22 @@ pub(crate) struct SyncMergeExportFinalizationWitness {
     pub jsonl_size: Option<String>,
     pub last_export_time: Option<String>,
     pub needs_flush: Option<String>,
-    /// Exact rows for `jsonl_content_hash`, `jsonl_mtime`, `jsonl_size`,
-    /// `last_export_time`, and `needs_flush`.
+    /// Exact export metadata, including the legacy receipt map when present.
     pub export_metadata: AdditiveTableWitness,
+    /// Version 3 stores receipts in a separate indexed table. Omit this field
+    /// for older generations so already-finalized pending receipts retain
+    /// their original canonical serialization and recovery digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_receipts: Option<AdditiveTableWitness>,
+}
+
+impl SyncMergeExportFinalizationWitness {
+    fn has_complete_metadata_layout(&self, published_issues: usize) -> bool {
+        match &self.row_receipts {
+            None => matches!(self.export_metadata.rows, 5 | 8),
+            Some(receipts) => receipts.rows == published_issues && self.export_metadata.rows == 7,
+        }
+    }
 }
 
 fn sync_merge_capacity_warnings_are_empty(
@@ -4331,13 +4363,13 @@ impl SyncMergePendingReceipt {
                     .to_string(),
             });
         }
-        // Older pending receipts predate the three complete-row bookkeeping
-        // keys. Both exact layouts remain supported; the table digest still
-        // pins every row present during finalization and recovery.
-        if !matches!(export_finalization.export_metadata.rows, 5 | 8) {
+        // Older pending receipts retain their exact metadata layout and
+        // digest. Indexed receipts must cover the entire published population
+        // alongside the seven fixed export-bookkeeping metadata rows.
+        if !export_finalization.has_complete_metadata_layout(self.jsonl_after_issue_count) {
             return Err(BeadsError::SyncConflict {
                 message: format!(
-                    "Pending sync merge finalization requires exactly five export metadata rows (legacy) or eight (complete row receipts), found {}",
+                    "Pending sync merge finalization requires exactly five export metadata rows (legacy), eight (legacy complete row receipts), or seven and one indexed receipt per published issue, found {}",
                     export_finalization.export_metadata.rows
                 ),
             });
@@ -4482,6 +4514,9 @@ impl SyncMergePendingReceipt {
             ] {
                 validate_sync_merge_sha256(field, &witness.payload_sha256)?;
             }
+            if let Some(receipts) = &finalization.row_receipts {
+                validate_sync_merge_sha256("row_receipts", &receipts.payload_sha256)?;
+            }
         }
         validate_sync_merge_sorted_ids("deleted_issue_ids", &self.intent.deleted_issue_ids)?;
         if let Some(overlap) = self.intent.changed_kept_issue_ids.iter().find(|issue_id| {
@@ -4589,7 +4624,7 @@ impl SyncMergePendingReceipt {
                 Some(finalization),
             ) if raw_sha256 == &self.jsonl_after_raw_sha256
                 && finalization.export_hashes == self.jsonl_after_issue_hashes
-                && matches!(finalization.export_metadata.rows, 5 | 8)
+                && finalization.has_complete_metadata_layout(self.jsonl_after_issue_count)
                 && finalization.jsonl_content_hash.as_deref()
                     == Some(self.jsonl_after_content_sha256.as_str())
                 && finalization.jsonl_mtime.as_deref() == Some(mtime.as_str())
@@ -6797,6 +6832,7 @@ fn additive_database_witness(
         comment_payload_sha256: additive_sha256(&comment_rows, "raw database comments")?,
         export_hashes: export_hashes.len(),
         export_hash_payload_sha256: additive_sha256(&export_hashes, "database export hashes")?,
+        row_receipts: capture_jsonl_row_receipts_witness(storage)?,
         events: event_rows.len(),
         event_payload_sha256: additive_sha256(&event_rows, "raw database audit events")?,
         dirty_issues: dirty.len(),
@@ -6857,8 +6893,8 @@ pub(crate) fn capture_sync_merge_core_witness(
 /// enrollment warning of a tracker that predates the companion, or a
 /// diverged-history warning), so a merge whose own export records them has
 /// not changed merged state (GitHub #576). They stay out of
-/// `is_sync_merge_export_metadata_key`, whose exact row layout (five or
-/// eight rows) pending receipts require.
+/// `is_sync_merge_export_metadata_key`, whose fixed metadata layout pending
+/// receipts require.
 fn is_sync_merge_mutable_metadata_key(key: &str) -> bool {
     matches!(
         key,
@@ -6892,6 +6928,29 @@ fn is_sync_merge_export_metadata_key(key: &str) -> bool {
     )
 }
 
+fn capture_jsonl_row_receipts_witness(
+    storage: &SqliteStorage,
+) -> Result<Option<AdditiveTableWitness>> {
+    let schema_rows = storage
+        .execute_raw_query("SELECT type FROM sqlite_master WHERE name = 'jsonl_row_receipts'")?;
+    if schema_rows.is_empty() {
+        return Ok(None);
+    }
+    if schema_rows.len() != 1
+        || schema_rows[0].first().and_then(SqliteValue::as_text) != Some("table")
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "JSONL row receipts require exactly one table in the schema catalog"
+                .to_string(),
+        });
+    }
+    let rows = additive_raw_rows(
+        storage,
+        "SELECT issue_id, row_hash FROM jsonl_row_receipts ORDER BY issue_id, row_hash",
+    )?;
+    additive_table_witness(&rows, "complete JSONL row receipts").map(Some)
+}
+
 /// Capture the exact mutable bookkeeping that export finalization must leave
 /// behind before a pending merge receipt may advance or clear.
 pub(crate) fn capture_sync_merge_export_finalization_witness(
@@ -6905,6 +6964,29 @@ pub(crate) fn capture_sync_merge_export_finalization_witness(
         storage,
         "SELECT key, value FROM metadata ORDER BY key, value",
     )?;
+    let row_receipts = if storage
+        .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?
+        .as_deref()
+        == Some(CURRENT_JSONL_ROW_RECEIPT_VERSION)
+    {
+        // Validate the typed receipt population as well as binding every raw
+        // row, so malformed values cannot disappear from the witness.
+        let receipts = storage.get_jsonl_row_receipts()?;
+        let receipt_witness = capture_jsonl_row_receipts_witness(storage)?.ok_or_else(|| {
+            BeadsError::SyncConflict {
+                message: "Indexed JSONL row receipt version has no receipt table".to_string(),
+            }
+        })?;
+        if receipts.len() != receipt_witness.rows {
+            return Err(BeadsError::SyncConflict {
+                message: "JSONL row receipt population changed while capturing export finalization"
+                    .to_string(),
+            });
+        }
+        Some(receipt_witness)
+    } else {
+        None
+    };
     let export_metadata_rows = all_metadata_rows
         .into_iter()
         .filter(|row| {
@@ -6926,6 +7008,7 @@ pub(crate) fn capture_sync_merge_export_finalization_witness(
             &export_metadata_rows,
             "sync merge finalized export metadata",
         )?,
+        row_receipts,
     })
 }
 
@@ -8518,11 +8601,22 @@ fn plan_additive_reconcile_in_snapshot(
     };
 
     let desired_needs_flush = db_only_preserved != 0;
+    let expected_raw_receipt_rows = source
+        .row_hashes
+        .iter()
+        .map(|(issue_id, row_hash)| {
+            vec![
+                additive_sqlite_value_witness(SqliteValue::from(issue_id.as_str())),
+                additive_sqlite_value_witness(SqliteValue::from(row_hash.as_str())),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let expected_row_receipts = Some(additive_table_witness(
+        &expected_raw_receipt_rows,
+        "expected JSONL row receipts",
+    )?);
     let mut expected_metadata = additive_metadata(storage)?;
-    expected_metadata.insert(
-        METADATA_JSONL_ROW_HASHES.to_string(),
-        serde_json::to_string(&source.row_hashes)?,
-    );
+    expected_metadata.remove(METADATA_JSONL_ROW_HASHES);
     expected_metadata.insert(
         METADATA_JSONL_ROW_RECEIPT_VERSION.to_string(),
         CURRENT_JSONL_ROW_RECEIPT_VERSION.to_string(),
@@ -8553,6 +8647,7 @@ fn plan_additive_reconcile_in_snapshot(
     let metadata_before = additive_metadata(storage)?;
     let metadata_update_planned = expected_metadata != metadata_before;
     let bookkeeping_update_planned = metadata_update_planned
+        || target_before.row_receipts != expected_row_receipts
         || cache_rebuild_planned
         || dirty_markers_clear_planned != 0
         || export_hash_updates_planned != 0;
@@ -8685,6 +8780,7 @@ fn plan_additive_reconcile_in_snapshot(
     expected_target_after.export_hashes = expected_raw_export_hash_rows.len();
     expected_target_after.export_hash_payload_sha256 =
         additive_sha256(&expected_raw_export_hash_rows, "expected raw export hashes")?;
+    expected_target_after.row_receipts = expected_row_receipts;
     expected_target_after.dirty_issues = expected_dirty_issues.len();
     expected_target_after.dirty_payload_sha256 =
         additive_sha256(&expected_dirty_issues, "expected dirty markers")?;
@@ -9195,6 +9291,7 @@ pub(crate) fn apply_additive_reconcile(
         }
         if plan.mutations.is_empty()
             && plan.content_hash_repairs.is_empty()
+            && plan.receipt.target_before.row_receipts == plan.receipt.expected_target_after.row_receipts
             && !plan.receipt.metadata_update_planned
             && !plan.receipt.cache_rebuild_planned
             && plan.receipt.export_hash_updates_planned == 0
@@ -9341,7 +9438,9 @@ pub(crate) fn apply_additive_reconcile(
                 message: "JSONL witness changed during additive reconciliation apply".to_string(),
             });
         }
-        for key in [METADATA_JSONL_ROW_HASHES, METADATA_JSONL_ROW_RECEIPT_VERSION, METADATA_JSONL_UNIMPORTED_SOURCE] {
+        storage.replace_jsonl_row_receipts_in_tx(&source_after.row_hashes)?;
+        storage.delete_metadata_in_tx(METADATA_JSONL_ROW_HASHES)?;
+        for key in [METADATA_JSONL_ROW_RECEIPT_VERSION, METADATA_JSONL_UNIMPORTED_SOURCE] {
             storage.set_metadata_in_tx(key, &plan.expected_metadata[key])?;
         }
         let database_after = hydrate_additive_database_issues(storage)?;
@@ -12020,8 +12119,23 @@ const METADATA_JSONL_ROW_RECEIPT_VERSION: &str = "jsonl_row_receipt_version";
 // Version 1 could certify an automatic import that silently kept local rows
 // over divergent older/equal source payloads. Version 2 requires those conflicts
 // to be resolved explicitly before authorizing replacement (GitHub #571).
-const CURRENT_JSONL_ROW_RECEIPT_VERSION: &str = "2";
+// Version 3 stores those same raw-wire receipts in a dedicated indexed table, so
+// a one-issue mutation does not deserialize/rewrite the entire map (#559).
+const CURRENT_JSONL_ROW_RECEIPT_VERSION: &str = "3";
 const METADATA_JSONL_UNIMPORTED_SOURCE: &str = "jsonl_unimported_source";
+
+fn jsonl_row_receipt_version_is_trusted(version: Option<&str>) -> bool {
+    // Versions 2 and 3 carry the same guarded-import authority. Only their
+    // storage representation differs; pending local work must remain safe to
+    // publish while a version-2 workspace upgrades its receipts.
+    matches!(version, Some("2" | CURRENT_JSONL_ROW_RECEIPT_VERSION))
+}
+
+fn jsonl_row_hash(line: &str) -> String {
+    #[cfg(test)]
+    io_stats::record_receipt_row_hash();
+    hex_encode(&Sha256::digest(line.trim_ascii().as_bytes()))
+}
 
 fn jsonl_row_hashes(source: &JsonlSourceSnapshot) -> Result<BTreeMap<String, String>> {
     let mut hashes = BTreeMap::new();
@@ -12030,7 +12144,7 @@ fn jsonl_row_hashes(source: &JsonlSourceSnapshot) -> Result<BTreeMap<String, Str
         let line = line.trim_ascii();
         if !line.is_empty() {
             let row: PartialId = serde_json::from_str(line)?;
-            hashes.insert(row.id, hex_encode(&Sha256::digest(line.as_bytes())));
+            hashes.insert(row.id, jsonl_row_hash(line));
         }
     }
     Ok(hashes)
@@ -12040,14 +12154,28 @@ fn record_jsonl_row_receipts_in_tx(
     storage: &SqliteStorage,
     source: &JsonlSourceSnapshot,
 ) -> Result<()> {
-    storage.set_metadata_in_tx(
-        METADATA_JSONL_ROW_HASHES,
-        &serde_json::to_string(&jsonl_row_hashes(source)?)?,
-    )?;
-    storage.set_metadata_in_tx(
-        METADATA_JSONL_ROW_RECEIPT_VERSION,
-        CURRENT_JSONL_ROW_RECEIPT_VERSION,
-    )?;
+    let hashes = jsonl_row_hashes(source)?;
+    let version = if storage.jsonl_row_receipts_table_exists()? {
+        storage.replace_jsonl_row_receipts_in_tx(&hashes)?;
+        storage.delete_metadata_in_tx(METADATA_JSONL_ROW_HASHES)?;
+        CURRENT_JSONL_ROW_RECEIPT_VERSION
+    } else {
+        // A pre-upgrade pending merge binds the exact schema catalog and
+        // export metadata layout. Finish that saga using its original format;
+        // the next ordinary open installs the table after the receipt clears.
+        let pending = storage.execute_raw_query(
+            "SELECT key FROM metadata WHERE key IN ('sync_merge_pending_v2', 'sync_merge_pending_v1')",
+        )?;
+        if pending.is_empty() {
+            return Err(BeadsError::SyncConflict {
+                message: "JSONL row-receipt table is missing outside legacy merge recovery"
+                    .to_string(),
+            });
+        }
+        storage.set_metadata_in_tx(METADATA_JSONL_ROW_HASHES, &serde_json::to_string(&hashes)?)?;
+        "2"
+    };
+    storage.set_metadata_in_tx(METADATA_JSONL_ROW_RECEIPT_VERSION, version)?;
     storage.set_metadata_in_tx(METADATA_JSONL_UNIMPORTED_SOURCE, "false")?;
     Ok(())
 }
@@ -12170,10 +12298,11 @@ pub(crate) fn verify_full_export_source_loaded(
             .as_deref()
             == Some("true")
         || (!fresh_empty_source
-            && storage
-                .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?
-                .as_deref()
-                != Some(CURRENT_JSONL_ROW_RECEIPT_VERSION));
+            && !jsonl_row_receipt_version_is_trusted(
+                storage
+                    .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?
+                    .as_deref(),
+            ));
     if unverified && !full_export_matches_source(storage, source, retention_days, export_as_of)? {
         return Err(BeadsError::SyncConflict {
             message: "JSONL contains changes that have not been imported; refusing full export. Run `br sync --merge` to preserve local and peer changes".to_string(),
@@ -12244,13 +12373,13 @@ fn automatic_full_export_previous_hash(
         });
     }
     if jsonl_exists {
-        if storage
-            .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?
-            .as_deref()
-            != Some(CURRENT_JSONL_ROW_RECEIPT_VERSION)
-            && storage
-                .get_metadata(METADATA_JSONL_CONTENT_HASH)?
-                .is_some_and(|hash| !hash.trim().is_empty())
+        if !jsonl_row_receipt_version_is_trusted(
+            storage
+                .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?
+                .as_deref(),
+        ) && storage
+            .get_metadata(METADATA_JSONL_CONTENT_HASH)?
+            .is_some_and(|hash| !hash.trim().is_empty())
         {
             return Err(BeadsError::SyncConflict {
                 message:
@@ -13190,10 +13319,15 @@ fn finalize_incremental_auto_flush(
             record_verified_jsonl_witness_in_tx(storage, observed_jsonl, content_hash)?;
         }
         storage.set_metadata_in_tx("needs_flush", "false")?;
-        storage.set_metadata_in_tx(
-            METADATA_JSONL_ROW_HASHES,
-            &serde_json::to_string(&changes.source_row_hashes)?,
-        )?;
+        if changes.replace_row_receipts {
+            storage.replace_jsonl_row_receipts_in_tx(&changes.row_receipts)?;
+        } else {
+            storage.update_jsonl_row_receipts_in_tx(
+                &changes.row_receipts,
+                &changes.removed_hash_ids,
+            )?;
+        }
+        storage.delete_metadata_in_tx(METADATA_JSONL_ROW_HASHES)?;
         storage.set_metadata_in_tx(
             METADATA_JSONL_ROW_RECEIPT_VERSION,
             CURRENT_JSONL_ROW_RECEIPT_VERSION,
@@ -13701,7 +13835,10 @@ struct IncrementalAutoFlushChanges {
     removed_hash_ids: Vec<String>,
     issue_hashes: Vec<(String, String)>,
     replacement_lines: HashMap<String, String>,
-    source_row_hashes: BTreeMap<String, String>,
+    /// Only changed receipts during normal operation; the complete trusted
+    /// baseline when upgrading the old blob or discarding untrusted receipts.
+    row_receipts: BTreeMap<String, String>,
+    replace_row_receipts: bool,
     source_has_unimported_changes: bool,
 }
 
@@ -13753,7 +13890,8 @@ fn collect_incremental_auto_flush_changes(
         removed_hash_ids,
         issue_hashes,
         replacement_lines,
-        source_row_hashes: BTreeMap::new(),
+        row_receipts: BTreeMap::new(),
+        replace_row_receipts: false,
         source_has_unimported_changes: false,
     })
 }
@@ -13763,16 +13901,40 @@ fn certify_incremental_source_changes(
     source: &JsonlSourceSnapshot,
     changes: &mut IncrementalAutoFlushChanges,
 ) -> Result<()> {
+    let version = storage.get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?;
+    let indexed_receipts = version.as_deref() == Some(CURRENT_JSONL_ROW_RECEIPT_VERSION);
+    let trusted_version = jsonl_row_receipt_version_is_trusted(version.as_deref());
+    let unimported = storage.get_metadata(METADATA_JSONL_UNIMPORTED_SOURCE)?;
+    let source_was_unimported = unimported.as_deref() == Some("true");
+    let replacement_hashes = changes
+        .replacement_lines
+        .iter()
+        .map(|(id, line)| (id.clone(), jsonl_row_hash(line)))
+        .collect::<BTreeMap<_, _>>();
+
+    // The snapshot already computed this digest while pinning the source.
+    // Equal canonical bytes imply equal raw-row receipts (both trim ASCII
+    // whitespace). Crucially, a publication witness alone is insufficient:
+    // an earlier incremental flush may have preserved unimported peer rows.
+    // Only a fully certified source permits this O(changed rows) path.
+    if indexed_receipts
+        && unimported.as_deref() == Some("false")
+        && storage
+            .get_metadata(METADATA_JSONL_CONTENT_HASH)?
+            .as_deref()
+            == Some(source.content_sha256())
+    {
+        changes.row_receipts = replacement_hashes;
+        changes.source_has_unimported_changes = false;
+        return Ok(());
+    }
+
     let current = jsonl_row_hashes(source)?;
-    let trusted_version = storage
-        .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?
-        .as_deref()
-        == Some(CURRENT_JSONL_ROW_RECEIPT_VERSION);
-    let source_was_unimported = storage
-        .get_metadata(METADATA_JSONL_UNIMPORTED_SOURCE)?
-        .as_deref()
-        == Some("true");
-    let mut baseline: BTreeMap<String, String> = if trusted_version {
+    let mut baseline: BTreeMap<String, String> = if indexed_receipts {
+        storage.get_jsonl_row_receipts()?
+    } else if trusted_version {
+        // Migrate a version-2 map only after publication succeeds, in the
+        // same transaction as the dirty markers and verified file witness.
         storage
             .get_metadata(METADATA_JSONL_ROW_HASHES)?
             .map(|value| serde_json::from_str(&value))
@@ -13791,11 +13953,7 @@ fn certify_incremental_source_changes(
     {
         // Raw row receipts cover comments, relationships, clocks, and
         // every other wire field excluded by the narrow content hash.
-        let already_published = changes
-            .replacement_lines
-            .get(id)
-            .map(|line| hex_encode(&Sha256::digest(line.trim_ascii().as_bytes())));
-        if current.get(id) != baseline.get(id) && current.get(id) != already_published.as_ref() {
+        if current.get(id) != baseline.get(id) && current.get(id) != replacement_hashes.get(id) {
             return Err(BeadsError::SyncConflict {
                 message: format!(
                     "JSONL changed for issue '{id}'; refusing automatic export. Run `br sync --merge` to preserve local and peer changes"
@@ -13804,22 +13962,26 @@ fn certify_incremental_source_changes(
         }
     }
     let mut published = current;
-    for (id, line) in &changes.replacement_lines {
-        let hash = hex_encode(&Sha256::digest(line.trim_ascii().as_bytes()));
+    for (id, hash) in &replacement_hashes {
         baseline.insert(id.clone(), hash.clone());
-        published.insert(id.clone(), hash);
+        published.insert(id.clone(), hash.clone());
     }
     for id in &changes.removed_hash_ids {
         baseline.remove(id);
         published.remove(id);
     }
-    changes.source_row_hashes = baseline;
     // Even an empty source or exact row retry cannot prove that legacy
     // DB-only rows are intentional local additions rather than peer purges.
     // A guarded import must record that population's omission evidence. Keep
     // this pending across further incremental writes until that import occurs.
     changes.source_has_unimported_changes =
-        !trusted_version || source_was_unimported || published != changes.source_row_hashes;
+        !trusted_version || source_was_unimported || published != baseline;
+    changes.replace_row_receipts = !indexed_receipts;
+    changes.row_receipts = if changes.replace_row_receipts {
+        baseline
+    } else {
+        replacement_hashes
+    };
     Ok(())
 }
 
@@ -13932,14 +14094,14 @@ fn collect_incremental_retention_changes(
         })
         .collect::<Vec<_>>();
     if !missing.is_empty()
-        && (storage
-            .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?
+        && (!jsonl_row_receipt_version_is_trusted(
+            storage
+                .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?
+                .as_deref(),
+        ) || storage
+            .get_metadata(METADATA_JSONL_UNIMPORTED_SOURCE)?
             .as_deref()
-            != Some(CURRENT_JSONL_ROW_RECEIPT_VERSION)
-            || storage
-                .get_metadata(METADATA_JSONL_UNIMPORTED_SOURCE)?
-                .as_deref()
-                == Some("true"))
+            == Some("true"))
     {
         return Err(BeadsError::SyncConflict {
             message: "JSONL population has not been imported; refusing automatic restoration of missing tombstones. Run `br sync --merge` to reconcile branch-local issues and peer purges".to_string(),
@@ -19811,7 +19973,10 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn sync_merge_finalization_requires_exact_metadata_cardinality_and_mtime() {
         let storage = SqliteStorage::open_memory().unwrap();
-        let database_before = capture_sync_database_witness(&storage).unwrap();
+        let mut database_before = capture_sync_database_witness(&storage).unwrap();
+        // Model a legacy intent whose serialized witness predates indexed
+        // receipts, as well as the legacy finalization layout below.
+        database_before.row_receipts = None;
         let database_after = database_before.clone().into();
         let export_as_of = Utc::now();
         let reviewed_raw_sha256 = "66".repeat(32);
@@ -19864,6 +20029,7 @@ mod tests {
                 rows: 6,
                 payload_sha256: "99".repeat(32),
             },
+            row_receipts: None,
         };
 
         let error = committed
@@ -19926,6 +20092,7 @@ mod tests {
                 rows: 5,
                 payload_sha256: "99".repeat(32),
             },
+            row_receipts: None,
         };
         let error = committed
             .advance_to_export_finalized(
@@ -19955,6 +20122,38 @@ mod tests {
                 wrong_hashes,
             )
             .unwrap();
+        let legacy_json = serde_json::to_string(&finalized).unwrap();
+        assert!(
+            !legacy_json.contains("\"row_receipts\""),
+            "old pending receipts must retain their canonical serialized state"
+        );
+        let restored: SyncMergePendingReceipt = serde_json::from_str(&legacy_json).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored, finalized);
+
+        let mut indexed_finalization = finalized.export_finalization.clone().unwrap();
+        indexed_finalization.export_metadata.rows = 7;
+        indexed_finalization.row_receipts = Some(AdditiveTableWitness {
+            rows: 0,
+            payload_sha256: "aa".repeat(32),
+        });
+        let indexed = committed
+            .advance_to_export_finalized(
+                finalized.jsonl_after.clone().unwrap(),
+                indexed_finalization.clone(),
+            )
+            .unwrap();
+        indexed.validate().unwrap();
+        indexed_finalization.row_receipts.as_mut().unwrap().rows = 1;
+        assert!(
+            committed
+                .advance_to_export_finalized(
+                    finalized.jsonl_after.clone().unwrap(),
+                    indexed_finalization,
+                )
+                .is_err(),
+            "matching metadata cardinality cannot certify an extra receipt outside the published population"
+        );
         let mut tampered_mtime = finalized.clone();
         let Some(JsonlSourceStateWitness::Present { mtime, .. }) =
             tampered_mtime.jsonl_after.as_mut()
@@ -19979,6 +20178,237 @@ mod tests {
             tampered_export_time.validate().is_err(),
             "receipt validation must reject invalid finalized export time even with a recomputed state digest"
         );
+    }
+
+    #[test]
+    fn indexed_row_receipts_remain_bound_to_merge_recovery_witnesses() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+        let issue = make_test_issue("bd-receipt-witness", "Receipt recovery witness");
+        storage.create_issue(&issue, "test").unwrap();
+        let result = export_to_jsonl(&storage, &jsonl_path, &ExportConfig::default()).unwrap();
+        finalize_export(
+            &mut storage,
+            &result,
+            Some(&result.issue_hashes),
+            &jsonl_path,
+        )
+        .unwrap();
+
+        let database_before = capture_sync_database_witness(&storage).unwrap();
+        let core_before = capture_sync_merge_core_witness(&storage).unwrap();
+        let finalized_before = capture_sync_merge_export_finalization_witness(&storage).unwrap();
+        assert_eq!(finalized_before.row_receipts.as_ref().unwrap().rows, 1);
+        assert!(finalized_before.has_complete_metadata_layout(1));
+
+        storage
+            .execute_raw_with_params(
+                "UPDATE jsonl_row_receipts SET row_hash = ? WHERE issue_id = ?",
+                &[
+                    SqliteValue::from("aa".repeat(32)),
+                    SqliteValue::from(issue.id.as_str()),
+                ],
+            )
+            .unwrap();
+        assert_ne!(
+            capture_sync_database_witness(&storage).unwrap(),
+            database_before
+        );
+        assert_eq!(
+            capture_sync_merge_core_witness(&storage).unwrap(),
+            core_before
+        );
+        let finalized_after = capture_sync_merge_export_finalization_witness(&storage).unwrap();
+        assert_ne!(finalized_after.row_receipts, finalized_before.row_receipts);
+        assert_eq!(
+            finalized_after.export_metadata,
+            finalized_before.export_metadata
+        );
+        assert_ne!(
+            finalized_after, finalized_before,
+            "pending receipt clearance must detect row-receipt drift even when counts are unchanged"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn legacy_pending_merge_recovers_before_receipt_table_upgrade() {
+        for already_finalized in [false, true] {
+            let temp_dir = TempDir::new().unwrap();
+            let beads_dir = temp_dir.path().join(".beads");
+            fs::create_dir_all(&beads_dir).unwrap();
+            let database_path = beads_dir.join("beads.db");
+            let jsonl_path = beads_dir.join("issues.jsonl");
+            let mut storage = SqliteStorage::open(&database_path).unwrap();
+            // Model the released schema and its old witness before the new
+            // table existed. The pending receipt binds this exact catalog.
+            storage
+                .execute_raw("DROP TABLE jsonl_row_receipts")
+                .unwrap();
+            storage
+                .set_metadata("runtime_schema_witness_v1", "pre-indexed-row-receipts")
+                .unwrap();
+            storage
+                .create_issue(
+                    &make_test_issue("bd-legacy-pending", "Committed before upgrade"),
+                    "test",
+                )
+                .unwrap();
+            let export_as_of = Utc::now();
+            let export = export_to_jsonl(
+                &storage,
+                &jsonl_path,
+                &ExportConfig {
+                    export_as_of: Some(export_as_of),
+                    ..ExportConfig::default()
+                },
+            )
+            .unwrap();
+            let database_before = capture_sync_database_witness(&storage).unwrap();
+            assert!(database_before.row_receipts.is_none());
+            let intent = SyncMergeIntent {
+                schema_version: 2,
+                database_authority_sha256: "11".repeat(32),
+                jsonl_authority_sha256: "22".repeat(32),
+                jsonl_path_sha256: "33".repeat(32),
+                jsonl_before: JsonlSourceStateWitness::Missing,
+                jsonl_before_content_sha256: None,
+                base_authority_sha256: "44".repeat(32),
+                base_before: JsonlSourceStateWitness::Missing,
+                base_before_content_sha256: None,
+                resolution: "manual".to_string(),
+                actor: "test".to_string(),
+                event_attribution: EventAttribution::default(),
+                capacity_policy: crate::close_policy::CapacityPolicy::default(),
+                retention_days: None,
+                export_as_of,
+                changed_kept_issue_ids: Vec::new(),
+                kept_issue_witnesses: Vec::new(),
+                deleted_issue_ids: Vec::new(),
+                note_witnesses: Vec::new(),
+                database_before: database_before.clone(),
+            };
+            let mut receipt = SyncMergePendingReceipt::new(
+                intent,
+                export_as_of.to_rfc3339(),
+                database_before.into(),
+                export.content_hash.clone(),
+                export.exported_count,
+                &export.issue_hashes,
+                Vec::new(),
+            )
+            .unwrap();
+            storage
+                .set_metadata(
+                    METADATA_SYNC_MERGE_PENDING,
+                    &serde_json::to_string(&receipt).unwrap(),
+                )
+                .unwrap();
+            if already_finalized {
+                finalize_export(
+                    &mut storage,
+                    &export,
+                    Some(&export.issue_hashes),
+                    &jsonl_path,
+                )
+                .unwrap();
+                let finalized = receipt
+                    .advance_to_export_finalized(
+                        capture_jsonl_source_snapshot(&jsonl_path)
+                            .unwrap()
+                            .state_witness(),
+                        capture_sync_merge_export_finalization_witness(&storage).unwrap(),
+                    )
+                    .unwrap();
+                storage
+                    .compare_and_set_pending_sync_merge_receipt(&receipt, &finalized)
+                    .unwrap();
+                receipt = finalized;
+            }
+            let canonical_receipt = serde_json::to_string(&receipt).unwrap();
+            assert!(!canonical_receipt.contains("\"row_receipts\""));
+            let database_at_interruption = capture_sync_database_witness(&storage).unwrap();
+            drop(storage);
+
+            let mut storage = SqliteStorage::open(&database_path).unwrap();
+            assert!(!storage.jsonl_row_receipts_table_exists().unwrap());
+            assert_eq!(
+                capture_sync_database_witness(&storage).unwrap(),
+                database_at_interruption
+            );
+            assert_eq!(
+                storage
+                    .get_metadata(METADATA_SYNC_MERGE_PENDING)
+                    .unwrap()
+                    .as_deref(),
+                Some(canonical_receipt.as_str())
+            );
+            assert_eq!(
+                storage.pending_sync_merge_receipt().unwrap(),
+                Some(receipt.clone())
+            );
+            if !already_finalized {
+                finalize_export(
+                    &mut storage,
+                    &export,
+                    Some(&export.issue_hashes),
+                    &jsonl_path,
+                )
+                .unwrap();
+                let finalized = receipt
+                    .advance_to_export_finalized(
+                        capture_jsonl_source_snapshot(&jsonl_path)
+                            .unwrap()
+                            .state_witness(),
+                        capture_sync_merge_export_finalization_witness(&storage).unwrap(),
+                    )
+                    .unwrap();
+                storage
+                    .compare_and_set_pending_sync_merge_receipt(&receipt, &finalized)
+                    .unwrap();
+                receipt = finalized;
+            }
+            let finalization = receipt.export_finalization.as_ref().unwrap();
+            assert_eq!(finalization.export_metadata.rows, 8);
+            assert!(finalization.row_receipts.is_none());
+            assert_eq!(
+                storage
+                    .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)
+                    .unwrap()
+                    .as_deref(),
+                Some("2")
+            );
+            storage
+                .compare_and_clear_pending_sync_merge_receipt(&receipt)
+                .unwrap();
+            assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+            drop(storage);
+
+            let mut storage = SqliteStorage::open(&database_path).unwrap();
+            assert!(storage.jsonl_row_receipts_table_exists().unwrap());
+            import_from_jsonl(
+                &mut storage,
+                &jsonl_path,
+                &ImportConfig::default(),
+                Some("bd"),
+            )
+            .unwrap();
+            assert_eq!(storage.get_jsonl_row_receipts().unwrap().len(), 1);
+            assert!(
+                storage
+                    .get_metadata(METADATA_JSONL_ROW_HASHES)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                storage
+                    .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)
+                    .unwrap()
+                    .as_deref(),
+                Some(CURRENT_JSONL_ROW_RECEIPT_VERSION)
+            );
+        }
     }
 
     #[test]
@@ -21499,6 +21929,51 @@ mod tests {
         assert!(!idempotent_plan.receipt().metadata_update_planned);
         assert_eq!(idempotent_plan.receipt().export_hash_updates_planned, 0);
         assert_eq!(idempotent_plan.receipt().dirty_markers_clear_planned, 0);
+    }
+
+    #[test]
+    fn additive_reconcile_rejects_indexed_receipt_drift_before_apply() {
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let incoming = make_issue_at("bd-receipt-drift", "Reviewed receipt", fixed_time(100));
+        write_additive_issues(&jsonl_path, std::slice::from_ref(&incoming));
+        let initial_plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &initial_plan).unwrap();
+
+        let plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        assert_eq!(plan.receipt().status, AdditiveReconcileStatus::NoChanges);
+        let source_before = fs::read(&jsonl_path).unwrap();
+        let events_before = storage.get_all_events(0).unwrap();
+        storage
+            .execute_raw_with_params(
+                "UPDATE jsonl_row_receipts SET row_hash = ? WHERE issue_id = ?",
+                &[
+                    SqliteValue::from("ab".repeat(32)),
+                    SqliteValue::from(incoming.id.as_str()),
+                ],
+            )
+            .unwrap();
+        let drifted = capture_sync_database_witness(&storage).unwrap();
+        apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &plan)
+            .expect_err("indexed receipt drift must invalidate even a no-op reviewed plan");
+        assert_eq!(capture_sync_database_witness(&storage).unwrap(), drifted);
+        assert_eq!(storage.get_all_events(0).unwrap(), events_before);
+        assert_eq!(fs::read(&jsonl_path).unwrap(), source_before);
+
+        let repair_plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        assert_ne!(
+            repair_plan.receipt().status,
+            AdditiveReconcileStatus::NoChanges
+        );
+        assert!(!repair_plan.receipt().metadata_update_planned);
+        apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &repair_plan).unwrap();
+        assert_eq!(
+            capture_sync_database_witness(&storage)
+                .unwrap()
+                .row_receipts,
+            plan.receipt().target_before.row_receipts
+        );
     }
 
     #[test]
@@ -24836,6 +25311,293 @@ mod tests {
             .unwrap();
     }
 
+    /// #559: receipt work for a one-row mutation must not scale with the
+    /// untouched population. The JSONL publication itself still streams all
+    /// bytes, but it must not rebuild the raw-row receipt map.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn incremental_row_receipts_hash_only_changed_rows() {
+        for population in [1, 128] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+            let issues = (0..population)
+                .map(|index| {
+                    make_test_issue(
+                        &format!("bd-receipt-{index:04}"),
+                        &format!("Receipt issue {index}"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            write_jsonl_issues(&jsonl_path, &issues.iter().collect::<Vec<_>>());
+            import_from_jsonl(
+                &mut storage,
+                &jsonl_path,
+                &ImportConfig::default(),
+                Some("bd"),
+            )
+            .unwrap();
+
+            for iteration in 0..2 {
+                retitle(
+                    &mut storage,
+                    &issues[0].id,
+                    &format!("Changed receipt {iteration}"),
+                );
+                io_stats::reset();
+                assert!(
+                    flush_omission_fixture(&mut storage, &beads_dir, &jsonl_path, None).flushed
+                );
+                assert_eq!(io_stats::receipt_row_hashes(), 1, "population={population}");
+                assert!(
+                    storage
+                        .get_metadata(METADATA_JSONL_ROW_HASHES)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    storage.get_jsonl_row_receipts().unwrap(),
+                    jsonl_row_hashes(&capture_jsonl_source_snapshot(&jsonl_path).unwrap()).unwrap()
+                );
+            }
+
+            let created = make_test_issue("bd-receipt-new", "A new receipt");
+            storage.create_issue(&created, "tester").unwrap();
+            io_stats::reset();
+            assert!(flush_omission_fixture(&mut storage, &beads_dir, &jsonl_path, None).flushed);
+            assert_eq!(
+                io_stats::receipt_row_hashes(),
+                1,
+                "creating in {population} rows"
+            );
+            assert_eq!(
+                storage.get_jsonl_row_receipts().unwrap().len(),
+                population + 1
+            );
+
+            // A non-exportable local edit removes just this receipt. There
+            // are no replacement rows to hash and no stale receipt survives.
+            storage
+                .execute_raw_with_params(
+                    "UPDATE issues SET ephemeral = 1 WHERE id = ?",
+                    &[SqliteValue::from(created.id.as_str())],
+                )
+                .unwrap();
+            storage
+                .replace_dirty_issue_marker(&created.id, "ephemeral-edit")
+                .unwrap();
+            io_stats::reset();
+            assert!(flush_omission_fixture(&mut storage, &beads_dir, &jsonl_path, None).flushed);
+            assert_eq!(io_stats::receipt_row_hashes(), 0);
+            assert_eq!(
+                storage.get_jsonl_row_receipts().unwrap(),
+                jsonl_row_hashes(&capture_jsonl_source_snapshot(&jsonl_path).unwrap()).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn incremental_row_receipts_do_not_certify_preserved_peer_comments() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+        for id in ["bd-receipt-local", "bd-receipt-peer"] {
+            storage
+                .create_issue(&make_test_issue(id, id), "tester")
+                .unwrap();
+        }
+        flush_omission_fixture(&mut storage, &beads_dir, &jsonl_path, None);
+        let receipts_before = storage.get_jsonl_row_receipts().unwrap();
+        let mut source = read_issues_from_jsonl(&jsonl_path).unwrap();
+        let peer = source
+            .iter_mut()
+            .find(|issue| issue.id == "bd-receipt-peer")
+            .unwrap();
+        let narrow_hash = peer.compute_content_hash();
+        peer.comments.push(Comment {
+            id: 1,
+            issue_id: peer.id.clone(),
+            author: "peer".to_string(),
+            body: "Peer discussion must survive".to_string(),
+            created_at: peer.updated_at,
+        });
+        assert_eq!(peer.compute_content_hash(), narrow_hash);
+        write_jsonl_issues(&jsonl_path, &source.iter().collect::<Vec<_>>());
+
+        retitle(&mut storage, "bd-receipt-local", "Independent local edit");
+        io_stats::reset();
+        assert!(flush_omission_fixture(&mut storage, &beads_dir, &jsonl_path, None).flushed);
+        assert!(
+            io_stats::receipt_row_hashes() > 1,
+            "changed source must be inspected"
+        );
+        assert_eq!(
+            storage.get_jsonl_row_receipts().unwrap()["bd-receipt-peer"],
+            receipts_before["bd-receipt-peer"],
+            "preserving peer bytes must not authorize replacing them"
+        );
+        assert_eq!(
+            storage
+                .get_metadata(METADATA_JSONL_UNIMPORTED_SOURCE)
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            storage
+                .get_metadata(METADATA_JSONL_CONTENT_HASH)
+                .unwrap()
+                .as_deref(),
+            Some(
+                capture_jsonl_source_snapshot(&jsonl_path)
+                    .unwrap()
+                    .content_sha256()
+            ),
+            "the file witness advances even though the peer row is still unimported"
+        );
+
+        // The matching whole-file digest above cannot bypass the pending flag.
+        retitle(
+            &mut storage,
+            "bd-receipt-peer",
+            "Local edit conflicts with peer comment",
+        );
+        let bytes_before = fs::read(&jsonl_path).unwrap();
+        let receipts_before_refusal = storage.get_jsonl_row_receipts().unwrap();
+        let error = auto_flush(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            false,
+            None,
+            HistoryConfig::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, BeadsError::SyncConflict { .. }));
+        assert_eq!(fs::read(&jsonl_path).unwrap(), bytes_before);
+        assert_eq!(
+            storage.get_jsonl_row_receipts().unwrap(),
+            receipts_before_refusal
+        );
+        assert_eq!(
+            storage.get_dirty_issue_ids().unwrap(),
+            vec!["bd-receipt-peer"]
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn incremental_row_receipts_migrate_v2_atomically_and_retry_published_bytes() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+        for id in ["bd-migrate-local", "bd-migrate-untouched"] {
+            storage
+                .create_issue(&make_test_issue(id, id), "tester")
+                .unwrap();
+        }
+        flush_omission_fixture(&mut storage, &beads_dir, &jsonl_path, None);
+        let legacy = serde_json::to_string(&storage.get_jsonl_row_receipts().unwrap()).unwrap();
+        storage
+            .with_write_transaction(|storage| {
+                storage.replace_jsonl_row_receipts_in_tx(&BTreeMap::new())?;
+                storage.set_metadata_in_tx(METADATA_JSONL_ROW_HASHES, &legacy)?;
+                storage.set_metadata_in_tx(METADATA_JSONL_ROW_RECEIPT_VERSION, "2")
+            })
+            .unwrap();
+        let old_content_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH).unwrap();
+        retitle(
+            &mut storage,
+            "bd-migrate-local",
+            "Published before bookkeeping failed",
+        );
+        let dirty = storage.get_dirty_issue_metadata().unwrap();
+        let source = capture_jsonl_source_snapshot(&jsonl_path).unwrap();
+        let mut changes =
+            collect_incremental_auto_flush_changes(&storage, dirty.clone(), None, Utc::now())
+                .unwrap();
+        certify_incremental_source_changes(&storage, &source, &mut changes).unwrap();
+        assert!(changes.replace_row_receipts);
+        assert_eq!(changes.row_receipts.len(), 2);
+        assert!(!changes.source_has_unimported_changes);
+
+        // Publish the intended generation, then fail late in the bookkeeping
+        // transaction, after its receipt writes, by corrupting omission evidence.
+        let published = export_to_jsonl(&storage, &jsonl_path, &ExportConfig::default()).unwrap();
+        storage
+            .set_metadata(METADATA_IMPORT_OMITTED_IDS, "not-json")
+            .unwrap();
+        assert!(
+            finalize_incremental_auto_flush(
+                &mut storage,
+                &changes,
+                Some(&published.content_hash),
+                Some(&jsonl_path),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            storage.get_metadata(METADATA_JSONL_ROW_HASHES).unwrap(),
+            Some(legacy)
+        );
+        assert_eq!(
+            storage
+                .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)
+                .unwrap()
+                .as_deref(),
+            Some("2")
+        );
+        assert!(storage.get_jsonl_row_receipts().unwrap().is_empty());
+        assert_eq!(storage.get_dirty_issue_metadata().unwrap(), dirty);
+        assert_eq!(
+            storage.get_metadata(METADATA_JSONL_CONTENT_HASH).unwrap(),
+            old_content_hash
+        );
+
+        storage
+            .delete_metadata(METADATA_IMPORT_OMITTED_IDS)
+            .unwrap();
+        let published_bytes = fs::read(&jsonl_path).unwrap();
+        let retried = flush_omission_fixture(&mut storage, &beads_dir, &jsonl_path, None);
+        assert!(
+            !retried.flushed,
+            "the exact published rows need no rewrite on retry"
+        );
+        assert_eq!(fs::read(&jsonl_path).unwrap(), published_bytes);
+        assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
+        assert!(
+            storage
+                .get_metadata(METADATA_JSONL_ROW_HASHES)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            storage
+                .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)
+                .unwrap()
+                .as_deref(),
+            Some(CURRENT_JSONL_ROW_RECEIPT_VERSION)
+        );
+        assert_eq!(
+            storage.get_jsonl_row_receipts().unwrap(),
+            jsonl_row_hashes(&capture_jsonl_source_snapshot(&jsonl_path).unwrap()).unwrap()
+        );
+        retitle(
+            &mut storage,
+            "bd-migrate-local",
+            "Subsequent indexed update",
+        );
+        // An unchanged retry leaves the previous file witness. The next
+        // publication refreshes it without trusting any uncaptured bytes.
+        flush_omission_fixture(&mut storage, &beads_dir, &jsonl_path, None);
+        retitle(
+            &mut storage,
+            "bd-migrate-local",
+            "Indexed update after publication",
+        );
+        io_stats::reset();
+        flush_omission_fixture(&mut storage, &beads_dir, &jsonl_path, None);
+        assert_eq!(io_stats::receipt_row_hashes(), 1);
+    }
+
     /// GitHub #485: a one-line mutation used to read `issues.jsonl` eleven
     /// times and write two fsync'd copies of it. The incremental exporter now
     /// reads the live file exactly once and writes each artifact once.
@@ -26713,7 +27475,7 @@ mod tests {
                         .unwrap()
                         .export_metadata
                         .rows,
-                    8
+                    7
                 );
             } else {
                 // Accepted omission evidence also applies to live rows. A
@@ -31005,7 +31767,11 @@ transitions:
 
         let finalization = capture_sync_merge_export_finalization_witness(&storage).unwrap();
         assert_eq!(finalization.dirty_issues.rows, 0);
-        assert_eq!(finalization.export_metadata.rows, 8);
+        assert_eq!(finalization.export_metadata.rows, 7);
+        assert_eq!(
+            finalization.row_receipts.as_ref().unwrap().rows,
+            result.exported_count
+        );
         assert_eq!(
             finalization.export_hashes,
             sync_merge_export_hash_mapping_witness(&result.issue_hashes).unwrap()
@@ -31052,8 +31818,8 @@ transitions:
                         .unwrap()
                         .export_metadata
                         .rows,
-                    8,
-                    "omissions must not change the established receipt layout"
+                    7,
+                    "omissions must not change the indexed receipt layout"
                 );
 
                 // Only the terminal clear owns removal after a pending row
@@ -31121,6 +31887,108 @@ transitions:
                 || after_failure.needs_flush.as_deref() != Some("false"),
             "failed finalization must not satisfy the complete clean-export predicate"
         );
+    }
+
+    #[test]
+    fn version_two_receipts_preserve_guarded_full_export_during_upgrade() {
+        for peer_changed in [false, true] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+            for id in ["bd-v2-local", "bd-v2-peer"] {
+                storage
+                    .create_issue(&make_test_issue(id, id), "test")
+                    .unwrap();
+            }
+            flush_omission_fixture(&mut storage, &beads_dir, &jsonl_path, None);
+            let legacy = serde_json::to_string(&storage.get_jsonl_row_receipts().unwrap()).unwrap();
+            storage
+                .with_write_transaction(|storage| {
+                    storage.replace_jsonl_row_receipts_in_tx(&BTreeMap::new())?;
+                    storage.set_metadata_in_tx(METADATA_JSONL_ROW_HASHES, &legacy)?;
+                    storage.set_metadata_in_tx(METADATA_JSONL_ROW_RECEIPT_VERSION, "2")
+                })
+                .unwrap();
+            retitle(&mut storage, "bd-v2-local", "Pending local publication");
+            storage.set_metadata("needs_flush", "true").unwrap();
+            if peer_changed {
+                let mut issues = read_issues_from_jsonl(&jsonl_path).unwrap();
+                let peer = issues
+                    .iter_mut()
+                    .find(|issue| issue.id == "bd-v2-peer")
+                    .unwrap();
+                peer.comments.push(Comment {
+                    id: 1,
+                    issue_id: peer.id.clone(),
+                    author: "peer".to_string(),
+                    body: "Unimported peer discussion".to_string(),
+                    created_at: peer.updated_at,
+                });
+                write_jsonl_issues(&jsonl_path, &issues.iter().collect::<Vec<_>>());
+            }
+            let before = fs::read(&jsonl_path).unwrap();
+            let source = capture_jsonl_source_snapshot(&jsonl_path).unwrap();
+            let explicit_guard =
+                verify_full_export_source_loaded(&storage, &source, None, Utc::now());
+            let automatic = auto_flush(
+                &mut storage,
+                &beads_dir,
+                &jsonl_path,
+                false,
+                None,
+                HistoryConfig::default(),
+            );
+            if peer_changed {
+                assert!(matches!(
+                    explicit_guard,
+                    Err(BeadsError::SyncConflict { .. })
+                ));
+                assert!(matches!(automatic, Err(BeadsError::SyncConflict { .. })));
+                assert_eq!(fs::read(&jsonl_path).unwrap(), before);
+                assert_eq!(storage.get_dirty_issue_ids().unwrap(), vec!["bd-v2-local"]);
+                assert_eq!(
+                    storage.get_metadata(METADATA_JSONL_ROW_HASHES).unwrap(),
+                    Some(legacy)
+                );
+                assert_eq!(
+                    storage
+                        .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)
+                        .unwrap()
+                        .as_deref(),
+                    Some("2")
+                );
+                assert!(storage.get_jsonl_row_receipts().unwrap().is_empty());
+            } else {
+                explicit_guard.unwrap();
+                assert!(automatic.unwrap().flushed);
+                assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
+                assert_eq!(
+                    read_issues_from_jsonl(&jsonl_path)
+                        .unwrap()
+                        .iter()
+                        .find(|issue| issue.id == "bd-v2-local")
+                        .unwrap()
+                        .title,
+                    "Pending local publication"
+                );
+                assert_eq!(
+                    storage.get_jsonl_row_receipts().unwrap(),
+                    jsonl_row_hashes(&capture_jsonl_source_snapshot(&jsonl_path).unwrap()).unwrap()
+                );
+                assert!(
+                    storage
+                        .get_metadata(METADATA_JSONL_ROW_HASHES)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    storage
+                        .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)
+                        .unwrap()
+                        .as_deref(),
+                    Some(CURRENT_JSONL_ROW_RECEIPT_VERSION)
+                );
+            }
+        }
     }
 
     #[test]

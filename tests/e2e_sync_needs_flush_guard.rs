@@ -136,6 +136,28 @@ fn sync_metadata(workspace: &BrWorkspace) -> BTreeMap<String, String> {
         .collect()
 }
 
+fn row_receipts(workspace: &BrWorkspace) -> BTreeMap<String, String> {
+    let rows = database(workspace)
+        .query("SELECT issue_id, row_hash FROM jsonl_row_receipts ORDER BY issue_id")
+        .expect("read indexed raw row receipts");
+    let mut receipts = BTreeMap::new();
+    for row in rows {
+        let id = row
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .expect("receipt issue ID");
+        let hash = row
+            .get(1)
+            .and_then(SqliteValue::as_text)
+            .expect("receipt hash");
+        assert!(
+            receipts.insert(id.to_string(), hash.to_string()).is_none(),
+            "duplicate raw row receipt for {id}"
+        );
+    }
+    receipts
+}
+
 fn dirty_ids(workspace: &BrWorkspace) -> Vec<String> {
     database(workspace)
         .query("SELECT issue_id FROM dirty_issues ORDER BY issue_id")
@@ -156,6 +178,7 @@ struct SyncWitness {
     anchor: Vec<u8>,
     metadata: BTreeMap<String, String>,
     certificates: Vec<(String, String, String)>,
+    row_receipts: BTreeMap<String, String>,
 }
 
 fn sync_witness(workspace: &BrWorkspace) -> SyncWitness {
@@ -178,6 +201,7 @@ fn sync_witness(workspace: &BrWorkspace) -> SyncWitness {
         anchor: fs::read(workspace.root.join(".beads/beads.base.jsonl")).expect("merge anchor"),
         metadata: sync_metadata(workspace),
         certificates,
+        row_receipts: row_receipts(workspace),
     }
 }
 
@@ -448,7 +472,7 @@ fn implicit_import_refuses_git_revert_until_explicit_resolution() {
             expected_status
         );
         assert!(dirty_ids(&workspace).is_empty());
-        assert_eq!(sync_metadata(&workspace)["jsonl_row_receipt_version"], "2");
+        assert_eq!(sync_metadata(&workspace)["jsonl_row_receipt_version"], "3");
     }
 }
 
@@ -711,7 +735,7 @@ fn implicit_import_combines_comments_with_non_advancing_issue_timestamps() {
         let metadata = sync_metadata(&workspace);
         assert_eq!(metadata["needs_flush"], "false");
         assert_eq!(metadata["jsonl_unimported_source"], "false");
-        assert_eq!(metadata["jsonl_row_receipt_version"], "2");
+        assert_eq!(metadata["jsonl_row_receipt_version"], "3");
     }
 }
 
@@ -772,7 +796,7 @@ fn legacy_armed_import_receipts_cannot_authorize_full_publication() {
         "Legitimate pending work after upgrade"
     );
     assert!(dirty_ids(&workspace).is_empty());
-    assert_eq!(sync_metadata(&workspace)["jsonl_row_receipt_version"], "2");
+    assert_eq!(sync_metadata(&workspace)["jsonl_row_receipt_version"], "3");
     let after_recovery = checked_br(
         &workspace,
         &["create", "After legacy recovery", "--json"],
@@ -824,10 +848,9 @@ fn legacy_clean_receipts_publish_disjoint_work_before_guarded_import() {
             );
         }
         let metadata = sync_metadata(&workspace);
-        assert_eq!(metadata["jsonl_row_receipt_version"], "2");
+        assert_eq!(metadata["jsonl_row_receipt_version"], "3");
         assert_eq!(metadata["jsonl_unimported_source"], "true");
-        let receipts: BTreeMap<String, String> =
-            serde_json::from_str(&metadata["jsonl_row_hashes"]).expect("new row receipt map");
+        let receipts = row_receipts(&workspace);
         assert_eq!(receipts.keys().collect::<Vec<_>>(), vec![&new_id]);
         assert!(!receipts[&new_id].is_empty());
         assert!(dirty_ids(&workspace).is_empty());
@@ -848,9 +871,7 @@ fn legacy_clean_receipts_publish_disjoint_work_before_guarded_import() {
             assert_eq!(fs::read(&path).unwrap(), source_before);
             let metadata = sync_metadata(&workspace);
             assert_eq!(metadata["jsonl_unimported_source"], "false");
-            let receipts: BTreeMap<String, String> =
-                serde_json::from_str(&metadata["jsonl_row_hashes"])
-                    .expect("fully imported row receipt map");
+            let receipts = row_receipts(&workspace);
             assert_eq!(receipts.len(), published_rows.len());
             for id in published_rows.keys() {
                 assert!(receipts.get(id).is_some_and(|hash| !hash.is_empty()));
@@ -908,7 +929,7 @@ fn legacy_empty_source_records_omissions_before_later_full_flush() {
     let keeper_id = parse_created_json_id(&creation.stdout);
     assert_eq!(jsonl_records(&path).len(), 1);
     let metadata = sync_metadata(&workspace);
-    assert_eq!(metadata["jsonl_row_receipt_version"], "2");
+    assert_eq!(metadata["jsonl_row_receipt_version"], "3");
     assert_eq!(metadata["jsonl_unimported_source"], "true");
     let second = checked_br(
         &workspace,
@@ -1039,7 +1060,7 @@ fn legacy_retained_tombstone_requires_import_before_disjoint_export() {
                 "partial_current_receipt_before_peer_purge",
             );
             assert!(!first.stderr.contains("AUTO_FLUSH_FAILED"));
-            assert_eq!(sync_metadata(&workspace)["jsonl_row_receipt_version"], "2");
+            assert_eq!(sync_metadata(&workspace)["jsonl_row_receipt_version"], "3");
             assert_eq!(sync_metadata(&workspace)["jsonl_unimported_source"], "true");
             assert_eq!(jsonl_record(&path, "bd-shared")["status"], "tombstone");
         }
@@ -1079,7 +1100,7 @@ fn legacy_retained_tombstone_requires_import_before_disjoint_export() {
             "explicitly_accept_peer_tombstone_omission",
         );
         let metadata = sync_metadata(&workspace);
-        assert_eq!(metadata["jsonl_row_receipt_version"], "2");
+        assert_eq!(metadata["jsonl_row_receipt_version"], "3");
         assert_eq!(metadata["jsonl_unimported_source"], "false");
         let omissions: BTreeSet<String> = serde_json::from_str(&metadata["import_omitted_ids"])
             .expect("accepted tombstone omission");
@@ -1159,8 +1180,7 @@ fn incremental_export_preserves_unread_peer_comments_until_import() {
         "dirty",
     );
     let path = workspace.root.join(".beads/issues.jsonl");
-    let receipts_before: Value =
-        serde_json::from_str(&sync_metadata(&workspace)["jsonl_row_hashes"]).unwrap();
+    let receipts_before = row_receipts(&workspace);
     let peer_row = add_peer_comment(&path, &peer);
     let append = checked_br(
         &workspace,
@@ -1178,14 +1198,12 @@ fn incremental_export_preserves_unread_peer_comments_until_import() {
     assert!(dirty_ids(&workspace).is_empty());
     let metadata_after = sync_metadata(&workspace);
     assert_eq!(metadata_after["jsonl_unimported_source"], "true");
-    let receipts_after: Value = serde_json::from_str(&metadata_after["jsonl_row_hashes"]).unwrap();
+    let receipts_after = row_receipts(&workspace);
     let peer_receipt_before = receipts_before
         .get(&peer)
-        .and_then(Value::as_str)
         .expect("peer row has a synchronized receipt before the external comment");
     let peer_receipt_after = receipts_after
         .get(&peer)
-        .and_then(Value::as_str)
         .expect("unrelated publication retains the peer's previous receipt");
     assert_eq!(peer_receipt_after, peer_receipt_before);
     let unread: Issue =
