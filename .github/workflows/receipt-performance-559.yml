@@ -1,0 +1,163 @@
+name: Receipt correctness and 10k performance 559
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/receipt-performance-559.yml
+      - scripts/bench_receipts_559.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: receipt-performance-559
+  cancel-in-progress: false
+
+jobs:
+  build-and-test:
+    if: github.repository == 'Dicklesworthstone/beads_rust' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      BASELINE_SHA: a7fd80872a0f562bc6f951efa4e62ed15f1375fc
+    steps:
+      - name: Check out exact candidate and baseline commits
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -c credential.helper='!gh auth git-credential' fetch --no-tags --depth=1 origin "$GITHUB_SHA" "$BASELINE_SHA"
+          git checkout --detach "$GITHUB_SHA"
+          git worktree add --detach "$RUNNER_TEMP/receipt559-baseline" "$BASELINE_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C "$RUNNER_TEMP/receipt559-baseline" rev-parse HEAD)" = "$BASELINE_SHA"
+          test -z "$(git status --porcelain)"
+          test -z "$(git -C "$RUNNER_TEMP/receipt559-baseline" status --porcelain)"
+          cmp rust-toolchain.toml "$RUNNER_TEMP/receipt559-baseline/rust-toolchain.toml"
+          cmp tests/bench_synthetic_scale.rs "$RUNNER_TEMP/receipt559-baseline/tests/bench_synthetic_scale.rs"
+          printf 'CARGO_TARGET_DIR=%s\n' "$RUNNER_TEMP/receipt559-target" >> "$GITHUB_ENV"
+          printf 'BUNDLE=%s\n' "$RUNNER_TEMP/receipt559-artifacts" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/receipt559-artifacts"
+
+      - name: Install the pinned compiler and record build provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          {
+            rustc --version --verbose
+            cargo --version
+            printf 'Baseline: %s\nCandidate: %s\n' "$BASELINE_SHA" "$GITHUB_SHA"
+            printf 'Build: cargo build --locked --release --bin br; repository release profile (opt-level=z); no dependency or release-profile overrides\n'
+            sha256sum Cargo.toml Cargo.lock rust-toolchain.toml tests/bench_synthetic_scale.rs
+          } > "$BUNDLE/build-provenance.txt"
+          printf '%s\n' "$BASELINE_SHA" > "$BUNDLE/baseline.source"
+          printf '%s\n' "$GITHUB_SHA" > "$BUNDLE/candidate.source"
+          cp Cargo.lock "$BUNDLE/candidate.Cargo.lock"
+          cp "$RUNNER_TEMP/receipt559-baseline/Cargo.lock" "$BUNDLE/baseline.Cargo.lock"
+          cp scripts/bench_receipts_559.py "$BUNDLE/bench_receipts_559.py"
+          python3 scripts/bench_receipts_559.py --self-test
+
+      - name: Build and preserve the unmodified baseline release binary
+        working-directory: ${{ runner.temp }}/receipt559-baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --bin br 2>&1 | tee "$BUNDLE/baseline-build.log"
+          cp "$CARGO_TARGET_DIR/release/br" "$BUNDLE/br-before"
+
+      - name: Build the exact candidate with the same release profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --bin br 2>&1 | tee "$BUNDLE/candidate-build.log"
+          cp "$CARGO_TARGET_DIR/release/br" "$BUNDLE/br-after"
+
+      - name: Run receipt, recovery, and workflow policy regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib receipt -- --test-threads=1 2>&1 | tee "$BUNDLE/receipt-tests.log"
+          cargo test --locked --lib sync_safety_ -- --test-threads=1 2>&1 | tee "$BUNDLE/sync-safety-tests.log"
+          cargo test --locked --lib sync_merge_finalization_requires_exact_metadata_cardinality_and_mtime -- --test-threads=1 2>&1 | tee "$BUNDLE/cardinality-tests.log"
+          cargo test --locked --test e2e_sync_git_safety --test e2e_sync_reconcile --test e2e_sync_needs_flush_guard --test workflow_action_pins -- --test-threads=1 2>&1 | tee "$BUNDLE/recovery-tests.log"
+          cargo test --locked --test snapshots schema_document_golden_ -- --test-threads=1 2>&1 | tee "$BUNDLE/schema-snapshot-tests.log"
+          cargo check --locked --all-targets 2>&1 | tee "$BUNDLE/check.log"
+          cargo clippy --locked --all-targets -- -D warnings 2>&1 | tee "$BUNDLE/clippy.log"
+          cargo fmt --all --check
+
+      - name: Package the unchanged measurement driver and artifact digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --test bench_synthetic_scale --no-run --message-format=json > "$BUNDLE/build-artifacts.jsonl"
+          python3 - <<'PY'
+          import json, os, pathlib, shutil
+          bundle = pathlib.Path(os.environ["BUNDLE"])
+          records = [json.loads(line) for line in (bundle / "build-artifacts.jsonl").read_text().splitlines()]
+          executables = [r["executable"] for r in records if r.get("reason") == "compiler-artifact" and r.get("target", {}).get("name") == "bench_synthetic_scale" and r.get("executable")]
+          assert len(executables) == 1, executables
+          shutil.copy2(executables[0], bundle / "measurement-driver")
+          PY
+          test -z "$(git status --porcelain)"
+          cd "$BUNDLE"
+          sha256sum br-before br-after measurement-driver bench_receipts_559.py baseline.source candidate.source baseline.Cargo.lock candidate.Cargo.lock build-provenance.txt > SHA256SUMS
+
+      - name: Retain build artifacts and validation logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: receipt559-build
+          path: ${{ runner.temp }}/receipt559-artifacts
+          if-no-files-found: error
+          retention-days: 30
+
+  measure:
+    needs: build-and-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      # A fresh runner performs no compilation during measurement.
+      - name: Download the exact validated build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: receipt559-build
+          path: ${{ runner.temp }}/receipt559-artifacts
+
+      - name: Verify artifact identity and collect 10k A/A then A/B evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/receipt559-artifacts"
+          sha256sum --check --strict SHA256SUMS
+          test "$(cat candidate.source)" = "$GITHUB_SHA"
+          test "$(cat baseline.source)" = a7fd80872a0f562bc6f951efa4e62ed15f1375fc
+          chmod +x br-before br-after measurement-driver
+          python3 bench_receipts_559.py --artifacts "$PWD" --output "$RUNNER_TEMP/receipt559-evidence"
+
+      - name: Publish the descriptive benchmark report
+        if: always()
+        shell: bash
+        run: |
+          if test -f "$RUNNER_TEMP/receipt559-evidence/report.md"; then
+            cat "$RUNNER_TEMP/receipt559-evidence/report.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Retain all raw observations, identities, and reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: receipt559-evidence
+          path: ${{ runner.temp }}/receipt559-evidence
+          if-no-files-found: error
+          retention-days: 30
