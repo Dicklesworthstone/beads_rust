@@ -650,23 +650,11 @@ fn repair_refuses_when_run_dir_creation_fails() {
 // ---------------------------------------------------------------------------
 // Test 2 — Dry-run writes no files
 //
-// IGNORED: WP3 is not yet complete. The current `--repair --dry-run` path
-// still creates repair-session scaffolding before it knows the run will
-// remain a pure dry-run:
-//
-//   - `create_run_dir` itself writes `.doctor/runs/<id>/...` and may
-//     append `.doctor/` to the root `.gitignore` *before* any chokepoint
-//     mutation runs. That mutation is unconditional.
-//
-// The dry-run contract is part of the WP3+WP4 mutate() chokepoint plan;
-// landing it requires deferring repair-session/run-dir creation and the
-// `ensure_doctor_in_gitignore` write until after the dry-run preflight
-// confirms an actual repair is needed. Until that lands, this test fails
-// before it reaches any database repair path.
+// A dry-run repair session only plans its run dir: no `.doctor/` tree and
+// no `.doctor/` line appended to the root `.gitignore` (#583).
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "WP3 incomplete: --dry-run still creates repair run-dir/gitignore scaffolding before pure dry-run preflight"]
 fn chokepoint_dry_run_writes_no_files() {
     let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
@@ -684,22 +672,48 @@ fn chokepoint_dry_run_writes_no_files() {
         out.status
     );
 
-    // No run-dir should have been laid down.
-    let runs = root.join(".doctor").join("runs");
-    if runs.exists() {
-        let count = fs::read_dir(&runs)
-            .map(std::iter::Iterator::count)
-            .unwrap_or(0);
-        assert_eq!(
-            count,
-            0,
-            "dry-run created run-dirs under {}",
-            runs.display()
-        );
-    }
+    // No run-dir should have been laid down (`hash_workspace` skips it).
+    assert!(
+        !root.join(".doctor").exists(),
+        "dry-run created {}",
+        root.join(".doctor").display()
+    );
 
     let post = hash_workspace(&root);
     assert_eq!(pre, post, "dry-run mutated the workspace");
+}
+
+/// #583: on a healthy workspace with no root `.gitignore`, the dry run used
+/// to create one (`.doctor/`) plus an empty run dir.
+#[test]
+fn chokepoint_dry_run_on_healthy_workspace_creates_no_gitignore() {
+    let tmp = isolated_tempdir();
+    let root = tmp.path().to_path_buf();
+    br_init(&root);
+    assert!(
+        !root.join(".gitignore").exists(),
+        "fixture starts without one"
+    );
+
+    let pre = hash_workspace(&root);
+    let out = br_cmd(&root)
+        .args(["doctor", "--repair", "--dry-run"])
+        .output()
+        .expect("br doctor --repair --dry-run spawned");
+    assert!(
+        out.status.success(),
+        "dry-run should exit 0; got {:?}\nstdout={}\nstderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        !root.join(".gitignore").exists(),
+        "dry-run created .gitignore"
+    );
+    assert!(!root.join(".doctor").exists(), "dry-run created .doctor/");
+    assert_eq!(pre, hash_workspace(&root), "dry-run mutated the workspace");
 }
 
 // ---------------------------------------------------------------------------

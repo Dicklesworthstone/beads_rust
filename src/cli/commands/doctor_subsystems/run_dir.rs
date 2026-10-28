@@ -147,15 +147,61 @@ pub fn create_repair_run_dir(repo_root: &Path) -> Result<(RunDir, std::fs::File)
     create_run_dir_with_actions_file(repo_root)
 }
 
+/// Describe the run directory a `--repair --dry-run` would use, without
+/// creating it.
+///
+/// A dry run writes nothing (#583): no `.doctor/` tree, no `latest` link
+/// and no `.doctor/` line in `<repo>/.gitignore`. The planned paths stay
+/// available for `[dry-run]` messages, and the actions handle is the null
+/// device, which a dry run never appends to.
+///
+/// # Errors
+///
+/// Returns [`BeadsError`] when `repo_root` does not exist or the null
+/// device cannot be opened.
+pub fn plan_repair_run_dir(repo_root: &Path) -> Result<(RunDir, std::fs::File), BeadsError> {
+    ensure_repo_root_exists(repo_root)?;
+    let run = run_dir_layout(
+        repo_root,
+        &runs_root_for(repo_root),
+        generate_run_id(repo_root),
+    );
+    let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let actions_handle = OpenOptions::new()
+        .append(true)
+        .open(null_device)
+        .map_err(BeadsError::Io)?;
+    Ok((run, actions_handle))
+}
+
+fn ensure_repo_root_exists(repo_root: &Path) -> Result<(), BeadsError> {
+    if repo_root.exists() {
+        return Ok(());
+    }
+    Err(BeadsError::internal(format!(
+        "doctor: repo_root {} does not exist",
+        repo_root.display()
+    )))
+}
+
+fn run_dir_layout(repo_root: &Path, runs_root: &Path, run_id: String) -> RunDir {
+    let root = runs_root.join(&run_id);
+    RunDir {
+        run_id,
+        repo_root: repo_root.to_path_buf(),
+        backups: root.join("backups"),
+        actions_file: root.join("actions.jsonl"),
+        report_file: root.join("report.json"),
+        undo_script: root.join("undo.sh"),
+        latest_link: runs_root.parent().unwrap_or(runs_root).join("latest"),
+        root,
+    }
+}
+
 fn create_run_dir_with_actions_file(
     repo_root: &Path,
 ) -> Result<(RunDir, std::fs::File), BeadsError> {
-    if !repo_root.exists() {
-        return Err(BeadsError::internal(format!(
-            "doctor: repo_root {} does not exist",
-            repo_root.display()
-        )));
-    }
+    ensure_repo_root_exists(repo_root)?;
 
     // Round-5 fresh-eyes follow-through (`beads_rust-dfjs`): when
     // `BR_DOCTOR_RUNS_DIR` is set the run artifacts live OUTSIDE
@@ -174,48 +220,29 @@ fn create_run_dir_with_actions_file(
     let runs_root = runs_root_for(repo_root);
     fs::create_dir_all(&runs_root).map_err(BeadsError::Io)?;
 
-    let run_id = generate_run_id(repo_root);
-    let root = runs_root.join(&run_id);
-    let backups = root.join("backups");
-    fs::create_dir_all(&backups).map_err(BeadsError::Io)?;
+    let run = run_dir_layout(repo_root, &runs_root, generate_run_id(repo_root));
+    fs::create_dir_all(&run.backups).map_err(BeadsError::Io)?;
 
-    let actions_file = root.join("actions.jsonl");
     let actions_handle = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&actions_file)
+        .open(&run.actions_file)
         .map_err(BeadsError::Io)?;
 
-    let report_file = root.join("report.json");
-    if !report_file.exists() {
+    if !run.report_file.exists() {
         // Touch an empty placeholder so the file path is stable.
         OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&report_file)
+            .open(&run.report_file)
             .map_err(BeadsError::Io)?;
     }
 
-    let undo_script = root.join("undo.sh");
-
     // .doctor/latest symlink (points relative inside the runs root so
     // it survives moves of the repo root).
-    let latest_link = runs_root.parent().unwrap_or(&runs_root).join("latest");
-    update_latest_symlink(&latest_link, &root)?;
+    update_latest_symlink(&run.latest_link, &run.root)?;
 
-    Ok((
-        RunDir {
-            run_id,
-            repo_root: repo_root.to_path_buf(),
-            root,
-            backups,
-            actions_file,
-            report_file,
-            undo_script,
-            latest_link,
-        },
-        actions_handle,
-    ))
+    Ok((run, actions_handle))
 }
 
 /// Resolve where `runs/` should live for a given repo, honoring the

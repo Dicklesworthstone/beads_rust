@@ -283,9 +283,8 @@ struct LocalRepairResult {
 /// migration is tracked under WP4+.
 ///
 /// On `dry_run`, every routed call prints `[dry-run] would mutate …` to
-/// stderr without touching disk. The run-dir is still created (so the
-/// caller has somewhere to inspect the planned actions) but no
-/// `actions.jsonl` lines are appended.
+/// stderr without touching disk. The run-dir is only planned, not
+/// created, and `.gitignore` is left alone (#583).
 struct DoctorRepairSession {
     run: RunDir,
     ctx: MutateContext,
@@ -294,7 +293,8 @@ struct DoctorRepairSession {
 impl DoctorRepairSession {
     /// Build a fresh session rooted at `repo_root`. Creates
     /// `<repo_root>/.doctor/runs/<run-id>/` (or the
-    /// `BR_DOCTOR_RUNS_DIR` override) and seats a `MutateContext` with the
+    /// `BR_DOCTOR_RUNS_DIR` override), unless `dry_run` only plans it,
+    /// and seats a `MutateContext` with the
     /// default `.beads/` + `.doctor/` capabilities, plus the explicit root
     /// `.gitignore` path so the gitignore fixer can use the chokepoint
     /// without widening write_scopes to the entire repo root.
@@ -302,7 +302,11 @@ impl DoctorRepairSession {
     /// `fixer_id` may be a placeholder; callers update it via
     /// [`Self::with_fixer`] before each `mutate()` call.
     fn new(repo_root: &Path, dry_run: bool) -> Result<Self> {
-        let (run, actions_file) = run_dir::create_repair_run_dir(repo_root)?;
+        let (run, actions_file) = if dry_run {
+            run_dir::plan_repair_run_dir(repo_root)?
+        } else {
+            run_dir::create_repair_run_dir(repo_root)?
+        };
         let mut capabilities = Capabilities::for_repo(repo_root);
         // Allow the root .gitignore explicitly. It lives at <repo_root>/
         // which is outside .beads/ and .doctor/.
@@ -26465,14 +26469,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (beads_dir, gitignore, report) = make_doctor_fixture(tmp.path());
 
-        // Build the session first — `create_run_dir` may append a
-        // `.doctor/` line to `.gitignore` (this is an idempotent,
-        // documented setup write that happens once per repair run, not
-        // a fixer mutation). Snapshot AFTER session construction so we
-        // measure only what the dry-run fixer attempts.
+        // Snapshot BEFORE session construction: a dry-run session must not
+        // add `.doctor/` to `.gitignore` or lay down a run dir (#583).
+        let baseline = fs::read(&gitignore).unwrap();
         let mut session =
             DoctorRepairSession::new(tmp.path(), /* dry_run = */ true).expect("session must build");
-        let post_session_baseline = fs::read(&gitignore).unwrap();
+        assert_eq!(
+            fs::read(&gitignore).unwrap(),
+            baseline,
+            "a dry-run session must not touch .gitignore"
+        );
+        assert!(
+            !tmp.path().join(".doctor").exists() && !session.run.root.exists(),
+            "a dry-run session must not create a run dir"
+        );
         let actions_path = session.run.actions_file.clone();
 
         let result =
@@ -26482,7 +26492,7 @@ mod tests {
         // The fixer must not touch the file in dry-run.
         assert_eq!(
             fs::read(&gitignore).unwrap(),
-            post_session_baseline,
+            baseline,
             "dry-run must not mutate the target file"
         );
 
