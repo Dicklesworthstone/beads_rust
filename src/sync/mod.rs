@@ -5658,8 +5658,18 @@ struct AdditiveSourceWitness {
 struct AdditiveSourceSnapshot {
     witness: AdditiveSourceWitness,
     issues: BTreeMap<String, Issue>,
+    closure_attribution: BTreeMap<String, [Option<String>; 4]>,
     row_hashes: BTreeMap<String, String>,
     record_count: usize,
+}
+
+fn closure_attribution_values(issue: &Issue) -> [Option<String>; 4] {
+    [
+        issue.closed_by.clone(),
+        issue.closed_by_agent_name.clone(),
+        issue.closed_by_harness.clone(),
+        issue.closed_by_model.clone(),
+    ]
 }
 
 fn additive_sha256(value: &impl Serialize, context: &str) -> Result<String> {
@@ -5680,6 +5690,12 @@ fn canonicalize_additive_issue(issue: &mut Issue) {
     issue.bypassed_policy = None;
     issue.bypass_reason = None;
     issue.policy_gates_fired = None;
+    // Additive reconciliation preserves the local close_metadata table;
+    // ordinary import/merge transfers closure attribution with its issue.
+    issue.closed_by = None;
+    issue.closed_by_agent_name = None;
+    issue.closed_by_harness = None;
+    issue.closed_by_model = None;
     issue.labels.sort_unstable();
     issue.dependencies.sort_by(|left, right| {
         left.issue_id
@@ -6244,6 +6260,10 @@ fn parse_strict_additive_issue(trimmed: &str, line_num: usize) -> Result<Issue> 
         "closed_at",
         "close_reason",
         "closed_by_session",
+        "closed_by",
+        "closed_by_agent_name",
+        "closed_by_harness",
+        "closed_by_model",
         // Exported audit evidence is parsed with its model types and remains
         // bound by the source witness; canonicalization keeps it out of writes.
         "bypassed_policy",
@@ -6337,6 +6357,13 @@ fn parse_strict_additive_issue(trimmed: &str, line_num: usize) -> Result<Issue> 
         ("created_by", issue.created_by.as_deref()),
         ("close_reason", issue.close_reason.as_deref()),
         ("closed_by_session", issue.closed_by_session.as_deref()),
+        ("closed_by", issue.closed_by.as_deref()),
+        (
+            "closed_by_agent_name",
+            issue.closed_by_agent_name.as_deref(),
+        ),
+        ("closed_by_harness", issue.closed_by_harness.as_deref()),
+        ("closed_by_model", issue.closed_by_model.as_deref()),
         ("source_system", issue.source_system.as_deref()),
         ("source_repo", issue.source_repo.as_deref()),
         ("deleted_by", issue.deleted_by.as_deref()),
@@ -6510,6 +6537,7 @@ fn additive_source_snapshot(
     let mut canonical_hasher = Sha256::new();
     let mut line = String::new();
     let mut issues = BTreeMap::new();
+    let mut closure_attribution = BTreeMap::new();
     let mut row_hashes = BTreeMap::new();
     let mut record_count = 0usize;
     let mut line_num = 0usize;
@@ -6530,6 +6558,10 @@ fn additive_source_snapshot(
                 ))
             })?;
             let mut issue = parse_strict_additive_issue(trimmed, line_num)?;
+            let attribution = closure_attribution_values(&issue);
+            if attribution.iter().any(Option::is_some) {
+                closure_attribution.insert(issue.id.clone(), attribution);
+            }
             record_count = record_count.checked_add(1).ok_or_else(|| {
                 BeadsError::Config(
                     "JSONL record count overflow during additive reconciliation".to_string(),
@@ -6589,6 +6621,7 @@ fn additive_source_snapshot(
             mtime: path_after.mtime_witness,
         },
         issues,
+        closure_attribution,
         record_count,
     })
 }
@@ -6775,14 +6808,23 @@ fn additive_database_witness(
     )?;
     let config_rows =
         additive_raw_rows(storage, "SELECT key, value FROM config ORDER BY key, value")?;
-    let close_metadata_rows = additive_raw_rows(
-        storage,
+    // An interrupted merge must finish against the exact schema and witness
+    // it reviewed. The nullable actor column is installed on the next open;
+    // do not change the legacy row width or digest during recovery.
+    let close_metadata_sql = if storage.close_metadata_has_closed_by()? {
+        "SELECT issue_id, closed_by, closed_by_agent_name, closed_by_harness, closed_by_model, \
+         bypassed_policy, bypass_reason, policy_gates_fired, recorded_at \
+         FROM close_metadata \
+         ORDER BY issue_id, closed_by, closed_by_agent_name, closed_by_harness, closed_by_model, \
+                  bypassed_policy, bypass_reason, policy_gates_fired, recorded_at"
+    } else {
         "SELECT issue_id, closed_by_agent_name, closed_by_harness, closed_by_model, \
          bypassed_policy, bypass_reason, policy_gates_fired, recorded_at \
          FROM close_metadata \
          ORDER BY issue_id, closed_by_agent_name, closed_by_harness, closed_by_model, \
-                  bypassed_policy, bypass_reason, policy_gates_fired, recorded_at",
-    )?;
+                  bypassed_policy, bypass_reason, policy_gates_fired, recorded_at"
+    };
+    let close_metadata_rows = additive_raw_rows(storage, close_metadata_sql)?;
     let gate_result_rows = additive_raw_rows(
         storage,
         "SELECT issue_id, gate, provider, passed, note, recorded_by, recorded_at \
@@ -7857,6 +7899,7 @@ fn plan_additive_reconcile_in_snapshot(
         )));
     }
     let database = hydrate_additive_database_issues(storage)?;
+    let close_audit = storage.load_close_bypass_audit_for_export()?;
     let target_before = additive_database_witness(storage, &database)?;
     let database_issue_content_hashes = additive_issue_content_hashes(storage)?;
     let relations_before = target_before.relations;
@@ -7938,6 +7981,40 @@ fn plan_additive_reconcile_in_snapshot(
                 &mut conflict_ids,
                 &issue.id,
                 "ephemeral_source_issue",
+            )?;
+            continue;
+        }
+
+        // Additive repair cannot mutate close_metadata. Do not certify a
+        // source whose attribution the database cannot reproduce, or make an
+        // earlier closure's latent metadata visible through a status repair.
+        let mut local_audit = Issue {
+            id: issue.id.clone(),
+            status: crate::model::Status::Closed,
+            ..Issue::default()
+        };
+        close_audit.attach(std::slice::from_mut(&mut local_audit));
+        let local_attribution = closure_attribution_values(&local_audit);
+        let source_attribution = source
+            .closure_attribution
+            .get(&issue.id)
+            .cloned()
+            .unwrap_or_default();
+        let has_attribution = local_attribution.iter().any(Option::is_some)
+            || source_attribution.iter().any(Option::is_some);
+        let same_closure = database.get(&issue.id).is_some_and(|existing| {
+            existing.status == crate::model::Status::Closed
+                && issue.status == crate::model::Status::Closed
+                && existing.created_at == issue.created_at
+                && existing.closed_at.is_some()
+                && existing.closed_at == issue.closed_at
+        });
+        if has_attribution && (local_attribution != source_attribution || !same_closure) {
+            record_additive_conflict(
+                &mut conflict_reasons,
+                &mut conflict_ids,
+                &issue.id,
+                "closure_attribution_requires_import",
             )?;
             continue;
         }
@@ -9343,7 +9420,7 @@ pub(crate) fn apply_additive_reconcile(
                     }
                 }
                 AdditiveMutation::UpdateScalars(_) => {
-                    if !storage.upsert_issue_for_import_in_tx(issue)? {
+                    if !storage.update_issue_scalars_for_additive_reconcile_in_tx(issue)? {
                         return Err(BeadsError::Config(format!(
                             "Additive reconciliation failed to update planned issue {}",
                             issue.id
@@ -15101,6 +15178,7 @@ fn normalize_issue(issue: &mut Issue) -> usize {
     if !issue.status.is_terminal() {
         issue.closed_at = None;
     }
+    canonicalize_closure_attribution(issue);
 
     // Normalize external_ref: empty string should be None to prevent UNIQUE constraint violations
     if let Some(ext_ref) = &issue.external_ref {
@@ -15744,6 +15822,76 @@ fn skipped_import_matches_stored_issue(
     stored.sync_equals(&expected)
 }
 
+/// Accept new evidence for the same closure without replacing any known
+/// attribution. Legacy JSONL and databases may predate the exported fields;
+/// neither the import actor nor a different closure can supply this evidence.
+fn enrich_skipped_closure_attribution(
+    stored: &Issue,
+    target_id: &str,
+    incoming: &Issue,
+) -> Option<Issue> {
+    if stored.status != crate::model::Status::Closed
+        || incoming.status != crate::model::Status::Closed
+        || stored.created_at != incoming.created_at
+        || stored.closed_at.is_none()
+    {
+        return None;
+    }
+    let fields = [
+        (&stored.closed_by, &incoming.closed_by),
+        (&stored.closed_by_agent_name, &incoming.closed_by_agent_name),
+        (&stored.closed_by_harness, &incoming.closed_by_harness),
+        (&stored.closed_by_model, &incoming.closed_by_model),
+    ];
+    if fields
+        .iter()
+        .any(|(known, supplied)| known.is_some() && known != supplied)
+        || !fields
+            .iter()
+            .any(|(known, supplied)| known.is_none() && supplied.is_some())
+    {
+        return None;
+    }
+    let mut enriched = stored.clone();
+    enriched.closed_by.clone_from(&incoming.closed_by);
+    enriched
+        .closed_by_agent_name
+        .clone_from(&incoming.closed_by_agent_name);
+    enriched
+        .closed_by_harness
+        .clone_from(&incoming.closed_by_harness);
+    enriched
+        .closed_by_model
+        .clone_from(&incoming.closed_by_model);
+    skipped_import_matches_stored_issue(Some(&enriched), target_id, incoming).then_some(enriched)
+}
+
+/// Keep the last applied source record's verification witness in step with a
+/// later skipped alias that supplies compatible evidence for the same close.
+/// Recheck against the expected payload, independently of the stored row, so
+/// enrichment cannot hide a field shift or overwrite a known closing actor.
+fn record_expected_closure_enrichment(
+    applied_issues: &mut [Issue],
+    target_id: &str,
+    incoming: &Issue,
+) {
+    let Some(expected) = applied_issues
+        .iter_mut()
+        .rev()
+        .find(|issue| issue.id == target_id)
+    else {
+        return;
+    };
+    let mut normalized = expected.clone();
+    canonicalize_persisted_issue_defaults(&mut normalized);
+    if let Some(enriched) = enrich_skipped_closure_attribution(&normalized, target_id, incoming) {
+        expected.closed_by = enriched.closed_by;
+        expected.closed_by_agent_name = enriched.closed_by_agent_name;
+        expected.closed_by_harness = enriched.closed_by_harness;
+        expected.closed_by_model = enriched.closed_by_model;
+    }
+}
+
 /// Log the fields on which a skipped JSONL record differs from the local row
 /// that import keeps. Both sides are compared hydrated and normalized as skip
 /// certification compares them, so an ordinary unchanged row never reaches
@@ -15795,11 +15943,13 @@ fn export_hash_entry_for_import_action(
 /// Certify skips against the complete synced payload, including relations.
 /// A content hash alone cannot prove that a restored export matches newer
 /// local comments or fields excluded from that hash (GitHub #535).
+#[allow(clippy::too_many_arguments)]
 fn certify_skipped_imports(
     storage: &SqliteStorage,
     lookup: Option<&ImportIssueLookup>,
     mode: ImportMode,
     close_audit: &mut ImportCloseBypassAudit,
+    applied_issues: &mut [Issue],
     skipped: &mut Vec<(String, Issue, String)>,
     hashes: &mut Vec<(String, String)>,
     ids: &mut HashSet<String>,
@@ -15811,15 +15961,26 @@ fn certify_skipped_imports(
         .iter()
         .map(|(id, _, _)| id.clone())
         .collect::<Vec<_>>();
-    let stored = match lookup {
+    let mut stored = match lookup {
         Some(lookup) => storage.get_issues_for_import_comparison(&target_ids, lookup)?,
         None => storage.get_issues_for_import_comparison_live(&target_ids)?,
-    }
-    .into_iter()
-    .map(|issue| (issue.id.clone(), issue))
-    .collect::<HashMap<_, _>>();
+    };
+    close_audit.attach(&mut stored);
+    let mut stored = stored
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect::<HashMap<_, _>>();
     let mut uncertified = 0;
     for (id, mut incoming, hash) in skipped.drain(..) {
+        if let Some(actual) = stored.get_mut(&id)
+            && let Some(enriched) = enrich_skipped_closure_attribution(actual, &id, &incoming)
+        {
+            incoming.id.clone_from(&id);
+            storage.persist_imported_close_bypass_audit_in_tx(&incoming)?;
+            close_audit.record_imported(&id, &incoming);
+            record_expected_closure_enrichment(applied_issues, &id, &incoming);
+            *actual = enriched;
+        }
         if !skipped_import_matches_stored_issue(stored.get(&id), &id, &incoming) {
             if mode == ImportMode::Automatic {
                 let preserves_source = stored.get(&id).is_some_and(|stored| {
@@ -16108,6 +16269,7 @@ fn stream_import_actions_in_tx(
                             skip_lookup.as_ref(),
                             mode,
                             &mut close_audit,
+                            &mut tx_result.applied_issues,
                             &mut skipped,
                             &mut export_hash_batch,
                             &mut export_hash_ids,
@@ -16136,6 +16298,7 @@ fn stream_import_actions_in_tx(
                     skip_lookup.as_ref(),
                     mode,
                     &mut close_audit,
+                    &mut tx_result.applied_issues,
                     &mut skipped,
                     &mut export_hash_batch,
                     &mut export_hash_ids,
@@ -16156,9 +16319,9 @@ fn stream_import_actions_in_tx(
                 &issue,
                 &computed_hash,
             ) {
-                // Insert/update persisted source audit only when no local row
-                // existed. A preserved local audit can differ even after the
-                // issue payload was updated, so it needs export certification.
+                // Attribution follows the selected issue revision; a preserved
+                // local policy-bypass audit can still differ from the source,
+                // so both need export certification.
                 close_audit.record_imported(&export_id, &issue);
                 let source_matches =
                     source_before_comment_union
@@ -16185,6 +16348,7 @@ fn stream_import_actions_in_tx(
                     skip_lookup.as_ref(),
                     mode,
                     &mut close_audit,
+                    &mut tx_result.applied_issues,
                     &mut skipped,
                     &mut export_hash_batch,
                     &mut export_hash_ids,
@@ -16208,6 +16372,7 @@ fn stream_import_actions_in_tx(
         skip_lookup.as_ref(),
         mode,
         &mut close_audit,
+        &mut tx_result.applied_issues,
         &mut skipped,
         &mut export_hash_batch,
         &mut export_hash_ids,
@@ -16307,6 +16472,7 @@ fn stream_import_actions_in_tx(
 /// Materialize legacy schema defaults that are written even when older JSONL
 /// records omit the corresponding optional fields.
 pub(crate) fn canonicalize_persisted_issue_defaults(issue: &mut Issue) {
+    canonicalize_closure_attribution(issue);
     // Every optional text column comes back through `get_non_empty_str`, so a
     // JSONL record that spells "no value" as `""` (older bd exports, hand-
     // written fixtures, scripts) is persisted and re-read as `None`. Strict
@@ -16350,6 +16516,27 @@ pub(crate) fn canonicalize_persisted_issue_defaults(issue: &mut Issue) {
             .get_or_insert_with(|| "import".to_string());
         dependency.metadata.get_or_insert_with(|| "{}".to_string());
         dependency.thread_id.get_or_insert_with(String::new);
+    }
+}
+
+/// Closure evidence belongs only to the current closed state. Treat blank
+/// optional metadata as absent, matching the storage projection, and never
+/// retain a previous closer on an imported reopen or tombstone.
+fn canonicalize_closure_attribution(issue: &mut Issue) {
+    let closed = issue.status == crate::model::Status::Closed;
+    for field in [
+        &mut issue.closed_by,
+        &mut issue.closed_by_agent_name,
+        &mut issue.closed_by_harness,
+        &mut issue.closed_by_model,
+    ] {
+        if !closed
+            || field
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+        {
+            *field = None;
+        }
     }
 }
 
@@ -16461,8 +16648,9 @@ fn verify_applied_import_issue_semantics(
         .keys()
         .map(|id| (*id).to_string())
         .collect::<Vec<_>>();
-    let actual_by_id = storage
-        .get_issues_for_import_comparison_live(&ids)?
+    let mut actual = storage.get_issues_for_import_comparison_live(&ids)?;
+    storage.attach_close_bypass_audit_for_export(&mut actual)?;
+    let actual_by_id = actual
         .into_iter()
         .map(|issue| (issue.id.clone(), issue))
         .collect::<HashMap<_, _>>();
@@ -17475,6 +17663,7 @@ fn run_reconcile_apply_tx(
                     skip_lookup.as_ref(),
                     ImportMode::Explicit,
                     &mut close_audit,
+                    &mut import_result.applied_issues,
                     &mut skipped,
                     &mut export_hash_batch,
                     &mut export_hash_ids,
@@ -17516,6 +17705,7 @@ fn run_reconcile_apply_tx(
                     skip_lookup.as_ref(),
                     ImportMode::Explicit,
                     &mut close_audit,
+                    &mut import_result.applied_issues,
                     &mut skipped,
                     &mut export_hash_batch,
                     &mut export_hash_ids,
@@ -17536,6 +17726,7 @@ fn run_reconcile_apply_tx(
         skip_lookup.as_ref(),
         ImportMode::Explicit,
         &mut close_audit,
+        &mut import_result.applied_issues,
         &mut skipped,
         &mut export_hash_batch,
         &mut export_hash_ids,
@@ -19060,7 +19251,7 @@ fn snapshot_preserved_issue(
     kind: &str,
     warnings: &mut Vec<String>,
 ) -> Option<PreservedIssue> {
-    let issue = match storage.get_issue_for_preservation(issue_id) {
+    let mut issue = match storage.get_issue_for_preservation(issue_id) {
         Ok(Some(issue)) => issue,
         Ok(None) => {
             if kind == "tombstone" {
@@ -19085,6 +19276,9 @@ fn snapshot_preserved_issue(
     };
 
     let mut unreadable_relations = Vec::new();
+    if let Err(error) = storage.attach_close_attribution_for_preservation(&mut issue) {
+        unreadable_relations.push(format!("closure attribution ({error})"));
+    }
     let labels = match storage.get_labels(issue_id) {
         Ok(labels) => Some(labels),
         Err(error) => {
@@ -19730,6 +19924,10 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,
@@ -20242,10 +20440,18 @@ mod tests {
             let jsonl_path = beads_dir.join("issues.jsonl");
             let mut storage = SqliteStorage::open(&database_path).unwrap();
             // Model the released schema and its old witness before the new
-            // table existed. The pending receipt binds this exact catalog.
+            // receipt table and closure actor column existed. The pending
+            // receipt binds this exact catalog and raw audit row width.
             storage
                 .execute_raw("DROP TABLE jsonl_row_receipts")
                 .unwrap();
+            storage.execute_raw("DROP TABLE close_metadata").unwrap();
+            storage
+                .execute_raw(
+                    &crate::storage::schema::SCHEMA_SQL.replace("        closed_by TEXT,\n", ""),
+                )
+                .unwrap();
+            assert!(!storage.close_metadata_has_closed_by().unwrap());
             storage
                 .set_metadata("runtime_schema_witness_v1", "pre-indexed-row-receipts")
                 .unwrap();
@@ -20253,6 +20459,15 @@ mod tests {
                 .create_issue(
                     &make_test_issue("bd-legacy-pending", "Committed before upgrade"),
                     "test",
+                )
+                .unwrap();
+            storage
+                .record_close_metadata(
+                    "bd-legacy-pending",
+                    &crate::close_policy::AttributionValues::default(),
+                    false,
+                    None,
+                    &[],
                 )
                 .unwrap();
             let export_as_of = Utc::now();
@@ -20333,6 +20548,7 @@ mod tests {
 
             let mut storage = SqliteStorage::open(&database_path).unwrap();
             assert!(!storage.jsonl_row_receipts_table_exists().unwrap());
+            assert!(!storage.close_metadata_has_closed_by().unwrap());
             assert_eq!(
                 capture_sync_database_witness(&storage).unwrap(),
                 database_at_interruption
@@ -20387,6 +20603,15 @@ mod tests {
 
             let mut storage = SqliteStorage::open(&database_path).unwrap();
             assert!(storage.jsonl_row_receipts_table_exists().unwrap());
+            assert!(storage.close_metadata_has_closed_by().unwrap());
+            assert_eq!(
+                storage
+                    .get_close_metadata("bd-legacy-pending")
+                    .unwrap()
+                    .unwrap()
+                    .closed_by,
+                None
+            );
             import_from_jsonl(
                 &mut storage,
                 &jsonl_path,
@@ -20865,6 +21090,10 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,
@@ -21001,11 +21230,19 @@ mod tests {
         let mut issue = make_issue_at("bd-audit", "Audited closure", fixed_time(100));
         issue.status = Status::Closed;
         issue.closed_at = Some(issue.updated_at);
+        issue.closed_by = Some("operator-a".to_string());
+        issue.closed_by_agent_name = Some("agent-a".to_string());
+        issue.closed_by_harness = Some("claude-code".to_string());
+        issue.closed_by_model = Some("opus".to_string());
         issue.bypassed_policy = Some(true);
         issue.bypass_reason = Some("Reviewed source evidence".to_string());
         issue.policy_gates_fired = Some(vec!["source_gate".to_string()]);
         let canonical = serde_json::to_string(&issue).unwrap();
         let parsed = parse_strict_additive_issue(&canonical, 1).unwrap();
+        assert_eq!(parsed.closed_by, issue.closed_by);
+        assert_eq!(parsed.closed_by_agent_name, issue.closed_by_agent_name);
+        assert_eq!(parsed.closed_by_harness, issue.closed_by_harness);
+        assert_eq!(parsed.closed_by_model, issue.closed_by_model);
         assert_eq!(parsed.bypassed_policy, Some(true));
         assert_eq!(
             parsed.bypass_reason.as_deref(),
@@ -21017,6 +21254,10 @@ mod tests {
         );
 
         for (field, invalid) in [
+            ("closed_by", serde_json::json!(true)),
+            ("closed_by_agent_name", serde_json::json!(["agent-a"])),
+            ("closed_by_harness", serde_json::json!(42)),
+            ("closed_by_model", serde_json::json!({})),
             ("bypassed_policy", serde_json::json!("true")),
             ("bypass_reason", serde_json::json!(false)),
             ("policy_gates_fired", serde_json::json!("source_gate")),
@@ -26775,6 +27016,156 @@ mod tests {
     }
 
     #[test]
+    fn test_import_closure_attribution_enriches_only_the_same_unknown_closure() {
+        for conflicting_closure in [false, true] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let path = temp_dir.path().join("issues.jsonl");
+            let mut legacy = make_issue_at("bd-closer", "Shared closure", fixed_time(100));
+            legacy.status = Status::Closed;
+            legacy.closed_at = Some(legacy.updated_at);
+            write_additive_issues(&path, std::slice::from_ref(&legacy));
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+
+            let mut incoming = legacy.clone();
+            incoming.closed_by = Some("operator-a".to_string());
+            incoming.closed_by_agent_name = Some("agent-a".to_string());
+            incoming.closed_by_harness = Some("claude-code".to_string());
+            incoming.closed_by_model = Some("opus".to_string());
+            if conflicting_closure {
+                incoming.closed_at = Some(fixed_time(90));
+            }
+            write_additive_issues(&path, std::slice::from_ref(&incoming));
+            let result =
+                import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd"))
+                    .unwrap();
+            assert_eq!(result.skipped_count, 1);
+            assert_eq!(
+                result.export_hashes_recorded,
+                usize::from(!conflicting_closure)
+            );
+            let exported = issue_with_exported_close_audit(&storage, &incoming.id);
+            if conflicting_closure {
+                assert_eq!(exported.closed_by, None);
+                assert_eq!(exported.closed_by_agent_name, None);
+                assert!(storage.get_close_metadata(&incoming.id).unwrap().is_none());
+            } else {
+                assert_eq!(exported.closed_by, incoming.closed_by);
+                assert_eq!(exported.closed_by_agent_name, incoming.closed_by_agent_name);
+                assert_eq!(exported.closed_by_harness, incoming.closed_by_harness);
+                assert_eq!(exported.closed_by_model, incoming.closed_by_model);
+                assert_repeated_audit_import_is_noop(&mut storage, &path, &exported);
+            }
+            assert!(storage.get_events(&incoming.id, 100).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_import_closure_attribution_never_replaces_known_closer_on_skip() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+        let mut local = make_issue_at("bd-closer", "Known closure", fixed_time(100));
+        local.status = Status::Closed;
+        local.closed_at = Some(local.updated_at);
+        local.closed_by = Some("operator-a".to_string());
+        write_additive_issues(&path, std::slice::from_ref(&local));
+        import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+
+        for actor in [None, Some("operator-b".to_string())] {
+            let mut incoming = local.clone();
+            incoming.closed_by = actor;
+            write_additive_issues(&path, &[incoming]);
+            let result =
+                import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd"))
+                    .unwrap();
+            assert_eq!(result.skipped_count, 1);
+            assert_eq!(result.export_hashes_recorded, 0);
+            assert_eq!(
+                storage.get_issue(&local.id).unwrap().unwrap().closed_by,
+                local.closed_by
+            );
+        }
+    }
+
+    #[test]
+    fn test_import_closure_enrichment_tracks_same_target_applied_witness() {
+        for skip_first in [false, true] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let path = temp_dir.path().join("issues.jsonl");
+            let mut original = make_issue_at("bd-main", "Shared closure", fixed_time(100));
+            original.status = Status::Closed;
+            original.closed_at = Some(original.updated_at);
+            write_additive_issues(&path, std::slice::from_ref(&original));
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+
+            let mut update = original.clone();
+            update.updated_at = fixed_time(200);
+            let mut alias = original;
+            alias.id = "bd-alias".to_string();
+            alias.closed_by = Some("operator-a".to_string());
+            alias.closed_by_agent_name = Some("agent-a".to_string());
+            alias.closed_by_harness = Some("claude-code".to_string());
+            alias.closed_by_model = Some("opus".to_string());
+            let rows = if skip_first {
+                vec![alias.clone(), update.clone()]
+            } else {
+                vec![update.clone(), alias.clone()]
+            };
+            write_additive_issues(&path, &rows);
+
+            let result =
+                import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd"))
+                    .expect("safe enrichment must remain consistent with semantic verification");
+            assert_eq!(result.updated_count, 1);
+            assert_eq!(result.skipped_count, 1);
+            assert_eq!(result.applied_issues.len(), 1);
+            if !skip_first {
+                update.closed_by = alias.closed_by;
+                update.closed_by_agent_name = alias.closed_by_agent_name;
+                update.closed_by_harness = alias.closed_by_harness;
+                update.closed_by_model = alias.closed_by_model;
+            }
+            assert!(result.applied_issues[0].sync_equals(&update));
+            assert_eq!(result.applied_issues[0].updated_at, fixed_time(200));
+            canonicalize_persisted_issue_defaults(&mut update);
+            let actual = issue_with_exported_close_audit(&storage, &update.id);
+            assert!(actual.sync_equals(&update));
+            assert_eq!(actual.updated_at, fixed_time(200));
+            assert!(storage.get_issue("bd-alias").unwrap().is_none());
+            assert!(storage.get_events(&update.id, 100).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_expected_closure_enrichment_preserves_verification_boundaries() {
+        for mismatch in ["title", "closed_at", "known_actor"] {
+            let mut expected = make_issue_at("bd-main", "Expected closure", fixed_time(100));
+            expected.status = Status::Closed;
+            expected.closed_at = Some(expected.updated_at);
+            let mut incoming = expected.clone();
+            incoming.id = "bd-alias".to_string();
+            incoming.closed_by = Some("operator-a".to_string());
+            match mismatch {
+                "title" => incoming.title = "Different payload".to_string(),
+                "closed_at" => incoming.closed_at = Some(fixed_time(90)),
+                _ => expected.closed_by = Some("known-operator".to_string()),
+            }
+            let before = expected.clone();
+            record_expected_closure_enrichment(
+                std::slice::from_mut(&mut expected),
+                "bd-main",
+                &incoming,
+            );
+            assert_eq!(
+                expected, before,
+                "{mismatch} must remain a verification failure"
+            );
+        }
+    }
+
+    #[test]
     fn test_import_skipped_close_audit_does_not_attach_to_newer_local_payload() {
         for reopened in [false, true] {
             let mut storage = SqliteStorage::open_memory().unwrap();
@@ -26914,6 +27305,181 @@ mod tests {
             assert_ne!(
                 storage.get_metadata("needs_flush").unwrap().as_deref(),
                 Some("true")
+            );
+        }
+    }
+
+    #[test]
+    fn test_additive_closure_attribution_requires_complete_import() {
+        for scenario in ["source_only", "source_missing", "different_close", "latent"] {
+            let temp_dir = TempDir::new().unwrap();
+            let (_, path, config) = additive_test_paths(&temp_dir);
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let mut incoming = make_issue_at("bd-closer", "Shared close", fixed_time(100));
+            incoming.status = Status::Closed;
+            incoming.closed_at = Some(incoming.updated_at);
+            incoming.closed_by = Some("operator-a".to_string());
+            set_content_hash(&mut incoming);
+            if scenario != "source_only" {
+                let mut local = incoming.clone();
+                if scenario == "latent" {
+                    local.status = Status::Open;
+                    local.closed_at = None;
+                    local.closed_by = None;
+                    set_content_hash(&mut local);
+                }
+                storage.upsert_issue_for_import(&local).unwrap();
+            }
+            match scenario {
+                "source_missing" => incoming.closed_by = None,
+                "different_close" => {
+                    incoming.closed_at = Some(fixed_time(200));
+                    incoming.updated_at = fixed_time(200);
+                }
+                "latent" => {
+                    incoming.closed_by = None;
+                    incoming.closed_by_agent_name = Some("previous-agent".to_string());
+                    storage
+                        .record_close_metadata(
+                            &incoming.id,
+                            &crate::close_policy::AttributionValues {
+                                agent_name: incoming.closed_by_agent_name.clone(),
+                                ..crate::close_policy::AttributionValues::default()
+                            },
+                            false,
+                            None,
+                            &[],
+                        )
+                        .unwrap();
+                }
+                _ => {}
+            }
+            write_additive_issues(&path, &[incoming]);
+            let source_before = fs::read(&path).unwrap();
+            let database_before = capture_sync_database_witness(&storage).unwrap();
+            let plan = plan_additive_reconcile(&storage, &path, &config).unwrap();
+            assert_eq!(
+                plan.receipt
+                    .conflict_reasons
+                    .get("closure_attribution_requires_import"),
+                Some(&1),
+                "{scenario}"
+            );
+            assert_eq!(plan.receipt.synchronized, 0);
+            assert_eq!(plan.mutation_count(), 0);
+            assert!(apply_reviewed_additive_plan(&mut storage, &path, &config, &plan).is_err());
+            assert_eq!(
+                capture_sync_database_witness(&storage).unwrap(),
+                database_before
+            );
+            assert_eq!(fs::read(&path).unwrap(), source_before);
+        }
+    }
+
+    #[test]
+    fn test_additive_closure_attribution_accepts_matching_local_evidence() {
+        let temp_dir = TempDir::new().unwrap();
+        let (_, path, config) = additive_test_paths(&temp_dir);
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut incoming = make_issue_at("bd-closer", "Shared close", fixed_time(100));
+        incoming.status = Status::Closed;
+        incoming.closed_at = Some(incoming.updated_at);
+        incoming.closed_by = Some("operator-a".to_string());
+        incoming.closed_by_agent_name = Some("agent-a".to_string());
+        set_content_hash(&mut incoming);
+        storage.upsert_issue_for_import(&incoming).unwrap();
+        write_additive_issues(&path, std::slice::from_ref(&incoming));
+        let plan = plan_additive_reconcile(&storage, &path, &config).unwrap();
+        assert!(!plan.has_conflicts());
+        assert_eq!(plan.receipt.synchronized, 1);
+        apply_reviewed_additive_plan(&mut storage, &path, &config, &plan).unwrap();
+        let exported = issue_with_exported_close_audit(&storage, &incoming.id);
+        assert_eq!(exported.closed_by, incoming.closed_by);
+        assert_eq!(exported.closed_by_agent_name, incoming.closed_by_agent_name);
+    }
+
+    #[test]
+    fn test_additive_attributed_scalar_update_preserves_close_metadata() {
+        for attributed in [false, true] {
+            let temp_dir = TempDir::new().unwrap();
+            let (_, path, mut config) = additive_test_paths(&temp_dir);
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let mut local = make_issue_at("bd-closer", "Shared close", fixed_time(100));
+            local.status = Status::Closed;
+            local.closed_at = Some(local.updated_at);
+            if attributed {
+                local.closed_by = Some("operator-a".to_string());
+                local.closed_by_agent_name = Some("agent-a".to_string());
+                local.closed_by_harness = Some("claude-code".to_string());
+                local.closed_by_model = Some("opus".to_string());
+            }
+            set_content_hash(&mut local);
+            storage.create_issue(&local, "creator").unwrap();
+            storage.upsert_issue_for_import(&local).unwrap();
+
+            let mut incoming = local.clone();
+            incoming.notes = Some("Notes edited on another machine".to_string());
+            incoming.updated_at = fixed_time(200);
+            set_content_hash(&mut incoming);
+            config.source_authoritative_ids.insert(incoming.id.clone());
+            write_additive_issues(&path, std::slice::from_ref(&incoming));
+            let source_before = fs::read(&path).unwrap();
+            let database_before = capture_sync_database_witness(&storage).unwrap();
+            let close_metadata_before = storage
+                .execute_raw_query("SELECT * FROM close_metadata ORDER BY issue_id")
+                .unwrap();
+            let events_before = storage
+                .execute_raw_query("SELECT * FROM events ORDER BY id")
+                .unwrap();
+            assert!(!events_before.is_empty());
+            let plan = plan_additive_reconcile(&storage, &path, &config).unwrap();
+
+            assert!(!plan.has_conflicts());
+            assert_eq!(plan.mutation_count(), 1);
+            assert_eq!(plan.receipt.scalar_updates.len(), 1);
+            assert_eq!(
+                capture_sync_database_witness(&storage).unwrap(),
+                database_before,
+                "planning must not alter attribution or issue state"
+            );
+            let receipt =
+                apply_reviewed_additive_plan(&mut storage, &path, &config, &plan).unwrap();
+            assert_eq!(receipt.status, AdditiveReconcileStatus::Applied);
+            assert_eq!(
+                storage
+                    .execute_raw_query("SELECT * FROM close_metadata ORDER BY issue_id")
+                    .unwrap(),
+                close_metadata_before,
+                "scalar repair must preserve the raw closure metadata row"
+            );
+            assert_eq!(
+                storage
+                    .execute_raw_query("SELECT * FROM events ORDER BY id")
+                    .unwrap(),
+                events_before,
+                "scalar repair must preserve the raw event stream"
+            );
+            assert_eq!(fs::read(&path).unwrap(), source_before);
+            let exported = issue_with_exported_close_audit(&storage, &local.id);
+            assert_eq!(exported.notes, incoming.notes);
+            assert_eq!(exported.updated_at, incoming.updated_at);
+            assert_eq!(
+                closure_attribution_values(&exported),
+                closure_attribution_values(&local)
+            );
+
+            config.source_authoritative_ids.clear();
+            let database_after = capture_sync_database_witness(&storage).unwrap();
+            let second = plan_additive_reconcile(&storage, &path, &config).unwrap();
+            assert_eq!(second.receipt.status, AdditiveReconcileStatus::NoChanges);
+            assert_eq!(second.mutation_count(), 0);
+            let second_receipt =
+                apply_reviewed_additive_plan(&mut storage, &path, &config, &second).unwrap();
+            assert_eq!(second_receipt.status, AdditiveReconcileStatus::NoChanges);
+            assert_eq!(
+                capture_sync_database_witness(&storage).unwrap(),
+                database_after,
+                "repeating the reconciliation must not write anything"
             );
         }
     }
@@ -28426,6 +28992,82 @@ mod tests {
     }
 
     #[test]
+    fn test_unflushed_snapshot_retains_closed_issue_when_attribution_is_unreadable() {
+        for damaged in [
+            "close_metadata",
+            "closed_by",
+            "closed_by_agent_name",
+            "closed_by_harness",
+            "closed_by_model",
+        ] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            storage
+                .create_issue(
+                    &make_test_issue("bd-local-close", "Readable unflushed issue"),
+                    "creator",
+                )
+                .unwrap();
+            let closed = storage
+                .update_issue(
+                    "bd-local-close",
+                    &crate::storage::IssueUpdate {
+                        status: Some(Status::Closed),
+                        close_reason: Some(Some("completed locally".to_string())),
+                        ..crate::storage::IssueUpdate::default()
+                    },
+                    "closer",
+                )
+                .unwrap();
+            if damaged == "close_metadata" {
+                storage
+                    .execute_raw("ALTER TABLE close_metadata RENAME TO retained_close_metadata")
+                    .unwrap();
+            } else {
+                storage.execute_raw(&format!(
+                    "UPDATE close_metadata SET {damaged} = X'ff' WHERE issue_id = 'bd-local-close'"
+                )).unwrap();
+            }
+
+            let snapshot = snapshot_unflushed_state(&storage);
+            assert_eq!(
+                snapshot.dirty.len(),
+                1,
+                "{damaged}: readable issue must survive"
+            );
+            assert_eq!(
+                snapshot.warnings.len(),
+                1,
+                "{damaged}: unreadable attribution must prevent silent automatic recovery"
+            );
+            assert!(snapshot.warnings[0].contains("closure attribution"));
+            assert!(snapshot.warnings[0].contains("bd-local-close"));
+            if damaged != "close_metadata" {
+                assert!(snapshot.warnings[0].contains(damaged));
+                assert!(snapshot.warnings[0].contains("non-text"));
+            }
+            let preserved = &snapshot.dirty[0].issue;
+            assert_eq!(preserved.title, closed.title);
+            assert_eq!(preserved.status, Status::Closed);
+            assert_eq!(preserved.closed_at, closed.closed_at);
+            assert_eq!(preserved.close_reason, closed.close_reason);
+            assert!(
+                preserved.closed_by.is_none(),
+                "an unreadable actor must not be invented"
+            );
+
+            // Explicit best-effort repair may accept the warning and restore
+            // the readable closed issue even when its attribution is unknown.
+            let mut rebuilt = SqliteStorage::open_memory().unwrap();
+            restore_dirty_issues_after_rebuild(&mut rebuilt, &snapshot.dirty).unwrap();
+            let restored = rebuilt.get_issue("bd-local-close").unwrap().unwrap();
+            assert_eq!(restored.title, closed.title);
+            assert_eq!(restored.closed_at, closed.closed_at);
+            assert_eq!(restored.close_reason, closed.close_reason);
+            assert!(restored.closed_by.is_none());
+        }
+    }
+
+    #[test]
     fn test_unflushed_snapshot_reports_unrepresentable_relationship_values() {
         for (table, column, diagnostic) in [
             ("labels", "label", "non-text label"),
@@ -29045,6 +29687,7 @@ mod tests {
                                     lookup,
                                     ImportMode::Explicit,
                                     &mut close_audit,
+                                    &mut [],
                                     &mut skipped,
                                     &mut hashes,
                                     &mut ids,
@@ -29282,6 +29925,33 @@ mod tests {
 
         // closed_at should be cleared for open issues
         assert!(issue.closed_at.is_none());
+    }
+
+    #[test]
+    fn test_normalize_issue_closure_attribution_does_not_survive_reopen_or_delete() {
+        for status in [Status::Open, Status::Tombstone, Status::Closed] {
+            let mut issue = make_test_issue("bd-closer", "Closure attribution");
+            issue.status = status.clone();
+            issue.closed_by = Some("operator-a".to_string());
+            issue.closed_by_agent_name = Some(" \t ".to_string());
+            issue.closed_by_harness = Some("claude-code".to_string());
+            issue.closed_by_model = Some(String::new());
+            issue.deleted_by = Some("deleter".to_string());
+
+            normalize_issue(&mut issue);
+
+            assert_eq!(
+                issue.closed_by.as_deref(),
+                (status == Status::Closed).then_some("operator-a")
+            );
+            assert_eq!(issue.closed_by_agent_name, None);
+            assert_eq!(
+                issue.closed_by_harness.as_deref(),
+                (status == Status::Closed).then_some("claude-code")
+            );
+            assert_eq!(issue.closed_by_model, None);
+            assert_eq!(issue.deleted_by.as_deref(), Some("deleter"));
+        }
     }
 
     #[test]
@@ -33297,6 +33967,10 @@ transitions:
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,
@@ -33396,6 +34070,65 @@ transitions:
         let base = make_issue_with_hash("bd-3", "Old", fixed_time_merge(100), Some("hash3"));
         let result = merge_issue(Some(&base), None, None, ConflictResolution::PreferNewer);
         assert!(matches!(result, MergeResult::Delete));
+    }
+
+    #[test]
+    fn test_merge_closure_attribution_is_part_of_the_selected_revision() {
+        let mut base = make_issue_with_hash("bd-closer", "Closure", fixed_time_merge(100), None);
+        base.status = Status::Closed;
+        base.closed_at = Some(base.updated_at);
+        base.closed_by = Some("operator-a".to_string());
+        base.closed_by_agent_name = Some("agent-a".to_string());
+        base.closed_by_harness = Some("claude-code".to_string());
+        base.closed_by_model = Some("opus".to_string());
+
+        // These fields intentionally do not change content-addressed identity,
+        // but equal hashes and timestamps must not hide a provenance change.
+        for field in ["actor", "agent", "harness", "model"] {
+            let mut external = base.clone();
+            match field {
+                "actor" => external.closed_by = Some("operator-b".to_string()),
+                "agent" => external.closed_by_agent_name = Some("agent-b".to_string()),
+                "harness" => external.closed_by_harness = Some("codex".to_string()),
+                _ => external.closed_by_model = Some("new-model".to_string()),
+            }
+            assert_eq!(base.compute_content_hash(), external.compute_content_hash());
+            let merged = merge_issue(
+                Some(&base),
+                Some(&base),
+                Some(&external),
+                ConflictResolution::Manual,
+            );
+            assert!(matches!(merged, MergeResult::Keep(issue) if issue == external));
+
+            let mut local = base.clone();
+            local.closed_by = Some("operator-c".to_string());
+            assert!(matches!(
+                merge_issue(
+                    Some(&base),
+                    Some(&local),
+                    Some(&external),
+                    ConflictResolution::Manual,
+                ),
+                MergeResult::Conflict(ConflictType::BothModified)
+            ));
+        }
+
+        let mut reopened = base.clone();
+        reopened.status = Status::Open;
+        reopened.closed_at = None;
+        reopened.closed_by = None;
+        reopened.closed_by_agent_name = None;
+        reopened.closed_by_harness = None;
+        reopened.closed_by_model = None;
+        reopened.updated_at = fixed_time_merge(200);
+        let merged = merge_issue(
+            Some(&base),
+            Some(&base),
+            Some(&reopened),
+            ConflictResolution::Manual,
+        );
+        assert!(matches!(merged, MergeResult::Keep(issue) if issue == reopened));
     }
 
     #[test]

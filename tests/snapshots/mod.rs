@@ -684,7 +684,7 @@ pub fn normalize_json(json: &Value) -> Value {
                         }
                     }
                     // Normalize actor/user fields that vary by system
-                    "created_by" | "assignee" | "owner" | "author" | "deleted_by"
+                    "created_by" | "assignee" | "owner" | "author" | "deleted_by" | "closed_by"
                     | "closed_by_session" | "actor" => {
                         // Only normalize if the value is a non-empty string
                         if let Value::String(s) = value {

@@ -200,6 +200,9 @@ const SPECS: &[Spec] = &[
     },
     Spec {
         name: "close_metadata",
+        // Keep the v1 companion schema stable. Durable `closed_by` belongs to
+        // the primary issue JSONL; replay preserves it and any known primary
+        // agent attribution even when an older companion omits that evidence.
         columns: &[
             ("issue_id", Kind::Text),
             ("closed_by_agent_name", Kind::OptionalText),
@@ -817,6 +820,35 @@ fn insert(storage: &SqliteStorage, spec: &Spec, row: &[Value], omit_id: bool) ->
         .join(", ");
     let placeholders = vec!["?"; columns.len()].join(", ");
     let params = row.iter().map(to_sql).collect::<Result<Vec<_>>>()?;
+    if spec.name == "close_metadata" && !omit_id {
+        // The primary issue import has already installed any durable closure
+        // attribution. REPLACE would clear `closed_by`, which old companion
+        // records do not contain, and could erase captured agent fields with
+        // historical NULLs. Retain known primary values; a companion can fill
+        // absent agent fields from its recorded metadata but never invent an
+        // actor from an event. All other audit columns retain replay semantics.
+        storage.execute_raw_with_params(
+            &format!("INSERT OR IGNORE INTO close_metadata ({names}) VALUES ({placeholders})"),
+            &params,
+        )?;
+        let assignments = columns[1..]
+            .iter()
+            .map(|(name, _)| match *name {
+                "closed_by_agent_name" | "closed_by_harness" | "closed_by_model" => format!(
+                    "{name} = CASE WHEN {name} IS NULL OR TRIM({name}) = '' THEN ? ELSE {name} END"
+                ),
+                _ => format!("{name} = ?"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut update_params = params[1..].to_vec();
+        update_params.push(params[0].clone());
+        storage.execute_raw_with_params(
+            &format!("UPDATE close_metadata SET {assignments} WHERE issue_id = ?"),
+            &update_params,
+        )?;
+        return Ok(());
+    }
     let verb = if omit_id {
         "INSERT"
     } else {
@@ -830,4 +862,136 @@ fn insert(storage: &SqliteStorage, spec: &Spec, row: &[Value], omit_id: bool) ->
         &params,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Issue, Status};
+    use crate::storage::{EventAttribution, IssueUpdate};
+
+    fn closure_source() -> SqliteStorage {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = Issue {
+            id: "bd-portable-closure".to_string(),
+            title: "Portable closure attribution".to_string(),
+            ..Issue::default()
+        };
+        storage.create_issue(&issue, "creator").unwrap();
+        storage.set_pending_event_attribution(EventAttribution::new(
+            Some("primary-seat"),
+            Some("primary-harness"),
+            Some("primary-model"),
+            None,
+        ));
+        storage
+            .update_issue(
+                &issue.id,
+                &IssueUpdate {
+                    status: Some(Status::Closed),
+                    close_reason: Some(Some("verified".to_string())),
+                    ..IssueUpdate::default()
+                },
+                "primary-closer",
+            )
+            .unwrap();
+        storage
+    }
+
+    #[test]
+    fn portable_history_preserves_primary_closure_attribution() {
+        let source = closure_source();
+        let issue = source.get_issue("bd-portable-closure").unwrap().unwrap();
+        for companion_value in [Value::Null, Value::String("older-companion".to_string())] {
+            let mut history = source.all_portable_history().unwrap();
+            let close_table = history
+                .tables
+                .iter_mut()
+                .find(|table| table.table == "close_metadata")
+                .unwrap();
+            assert!(
+                !close_table
+                    .columns
+                    .iter()
+                    .any(|column| column == "closed_by")
+            );
+            for value in &mut close_table.rows[0][1..=3] {
+                *value = companion_value.clone();
+            }
+            validate(&history).unwrap();
+
+            let mut target = SqliteStorage::open_memory().unwrap();
+            target.upsert_issue_for_import(&issue).unwrap();
+            for _ in 0..2 {
+                let replay = target.restore_portable_history(&history).unwrap();
+                assert_eq!(replay.replayed, vec![issue.id.clone()]);
+                let restored = target.get_issue(&issue.id).unwrap().unwrap();
+                assert_eq!(restored.closed_by.as_deref(), Some("primary-closer"));
+                assert_eq!(
+                    restored.closed_by_agent_name.as_deref(),
+                    Some("primary-seat")
+                );
+                assert_eq!(
+                    restored.closed_by_harness.as_deref(),
+                    Some("primary-harness")
+                );
+                assert_eq!(restored.closed_by_model.as_deref(), Some("primary-model"));
+            }
+        }
+    }
+
+    #[test]
+    fn portable_history_does_not_infer_legacy_closer_from_events() {
+        let source = closure_source();
+        let mut legacy_issue = source.get_issue("bd-portable-closure").unwrap().unwrap();
+        legacy_issue.closed_by = None;
+        legacy_issue.closed_by_agent_name = None;
+        legacy_issue.closed_by_harness = None;
+        legacy_issue.closed_by_model = None;
+
+        for captured_agent in [false, true] {
+            let mut history = source.all_portable_history().unwrap();
+            if !captured_agent {
+                let close_table = history
+                    .tables
+                    .iter_mut()
+                    .find(|table| table.table == "close_metadata")
+                    .unwrap();
+                close_table.rows[0][1..=3].fill(Value::Null);
+            }
+            let mut target = SqliteStorage::open_memory().unwrap();
+            target.upsert_issue_for_import(&legacy_issue).unwrap();
+            assert!(
+                target
+                    .get_close_metadata(&legacy_issue.id)
+                    .unwrap()
+                    .is_none()
+            );
+            target.restore_portable_history(&history).unwrap();
+            let restored = target.get_issue(&legacy_issue.id).unwrap().unwrap();
+            assert!(
+                restored.closed_by.is_none(),
+                "event actors are not inferred closers"
+            );
+            assert_eq!(
+                restored.closed_by_agent_name.as_deref(),
+                captured_agent.then_some("primary-seat")
+            );
+            assert_eq!(
+                restored.closed_by_harness.as_deref(),
+                captured_agent.then_some("primary-harness")
+            );
+            assert_eq!(
+                restored.closed_by_model.as_deref(),
+                captured_agent.then_some("primary-model")
+            );
+            assert!(
+                target
+                    .get_events(&legacy_issue.id, 0)
+                    .unwrap()
+                    .iter()
+                    .any(|event| event.actor == "primary-closer")
+            );
+        }
+    }
 }

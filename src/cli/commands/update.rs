@@ -4067,6 +4067,9 @@ because downstream tooling links to them.\n\n- [ ] schema migration applied\n\
                 .add_dependency(dependent, blocker, kind, "tester")
                 .unwrap();
         }
+        // Materialize a fresh cache before planting the persisted timestamp.
+        // Read-only blocked queries can compute from a stale cache in memory.
+        storage_ctx.storage.ensure_blocked_cache_fresh().unwrap();
         assert_eq!(storage_ctx.storage.get_blocked_ids().unwrap().len(), 4);
         storage_ctx
             .storage

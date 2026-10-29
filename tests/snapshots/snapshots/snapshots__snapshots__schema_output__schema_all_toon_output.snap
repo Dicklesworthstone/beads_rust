@@ -1404,6 +1404,18 @@ schemas:
       closed_by_session:
         description: Session ID that closed this issue.
         type[2]: string,"null"
+      closed_by:
+        description: "Actor that performed the current close (GitHub #584). Missing means\nunknown, including historical closes predating durable attribution.\nBacked by `close_metadata` and shared in JSONL, never inferred from the\ncreator, assignee, importing actor, or unrelated local event history."
+        type[2]: string,"null"
+      closed_by_agent_name:
+        description: Self-reported agent name captured when the issue was closed.
+        type[2]: string,"null"
+      closed_by_harness:
+        description: Self-reported harness captured when the issue was closed.
+        type[2]: string,"null"
+      closed_by_model:
+        description: Self-reported model captured when the issue was closed.
+        type[2]: string,"null"
       bypassed_policy:
         description: "Close-policy bypass audit trail (GitHub #474). Serialized into the\nJSONL export only when the close bypassed policy so a bypassed close\nis reviewable off-machine; absent means \"not bypassed\" (pre-change\nexports stay valid). Backed by the DB-only `close_metadata` table;\nexcluded from `content_hash` and from `sync_equals`."
         type[2]: boolean,"null"
@@ -1604,6 +1616,18 @@ schemas:
         type[2]: string,"null"
       closed_by_session:
         description: Session ID that closed this issue.
+        type[2]: string,"null"
+      closed_by:
+        description: "Actor that performed the current close (GitHub #584). Missing means\nunknown, including historical closes predating durable attribution.\nBacked by `close_metadata` and shared in JSONL, never inferred from the\ncreator, assignee, importing actor, or unrelated local event history."
+        type[2]: string,"null"
+      closed_by_agent_name:
+        description: Self-reported agent name captured when the issue was closed.
+        type[2]: string,"null"
+      closed_by_harness:
+        description: Self-reported harness captured when the issue was closed.
+        type[2]: string,"null"
+      closed_by_model:
+        description: Self-reported model captured when the issue was closed.
         type[2]: string,"null"
       bypassed_policy:
         description: "Close-policy bypass audit trail (GitHub #474). Serialized into the\nJSONL export only when the close bypassed policy so a bypassed close\nis reviewable off-machine; absent means \"not bypassed\" (pre-change\nexports stay valid). Backed by the DB-only `close_metadata` table;\nexcluded from `content_hash` and from `sync_equals`."
@@ -1919,6 +1943,18 @@ schemas:
         type[2]: string,"null"
       closed_by_session:
         description: Session ID that closed this issue.
+        type[2]: string,"null"
+      closed_by:
+        description: "Actor that performed the current close (GitHub #584). Missing means\nunknown, including historical closes predating durable attribution.\nBacked by `close_metadata` and shared in JSONL, never inferred from the\ncreator, assignee, importing actor, or unrelated local event history."
+        type[2]: string,"null"
+      closed_by_agent_name:
+        description: Self-reported agent name captured when the issue was closed.
+        type[2]: string,"null"
+      closed_by_harness:
+        description: Self-reported harness captured when the issue was closed.
+        type[2]: string,"null"
+      closed_by_model:
+        description: Self-reported model captured when the issue was closed.
         type[2]: string,"null"
       bypassed_policy:
         description: "Close-policy bypass audit trail (GitHub #474). Serialized into the\nJSONL export only when the close bypassed policy so a bypassed close\nis reviewable off-machine; absent means \"not bypassed\" (pre-change\nexports stay valid). Backed by the DB-only `close_metadata` table;\nexcluded from `content_hash` and from `sync_equals`."

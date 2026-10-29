@@ -21,7 +21,7 @@ const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
 // schema rebuild, overwhelming the compile-time savings of the runtime fast
 // path itself.
 const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str =
-    "v19-typed-dependencies-jsonl-row-receipts-exact-ddl-cookie-fenced";
+    "v19-durable-close-attribution-jsonl-row-receipts-exact-ddl-cookie-fenced";
 // Keep this additive receipt table outside SCHEMA_SQL. A pending merge binds
 // the exact schema catalog and must finish against its original layout before
 // an older database can install the indexed receipts (#559).
@@ -481,7 +481,7 @@ pub const SCHEMA_SQL: &str = r"
 
     -- Close metadata (issue #274 — closure-time policy gates Phase 1).
     --
-    -- One row per terminal close. Tier 1 attribution + bypass-policy auditing
+    -- One row per terminal close. Actor, Tier 1 attribution + bypass-policy auditing
     -- live here so the issues table stays untouched (avoids breaking JSONL
     -- round-trip and the wide SELECT statements throughout sqlite.rs).
     --
@@ -496,6 +496,7 @@ pub const SCHEMA_SQL: &str = r"
         bypass_reason TEXT,
         policy_gates_fired TEXT,
         recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        closed_by TEXT,
         FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_close_metadata_recorded_at ON close_metadata(recorded_at);
@@ -1067,6 +1068,7 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
     tracing::info!("Migrating database to schema version 19 (typed dependency identity)");
     let dependency_type_key_added = apply_dependency_type_key_migration_in_transaction(conn, from)?;
     apply_jsonl_row_receipts_schema(conn)?;
+    ensure_auxiliary_runtime_columns(conn, "close_metadata", CLOSE_METADATA_COLUMNS)?;
 
     conn.execute(&format!("PRAGMA user_version = {target_version}"))
         .map_err(BeadsError::Database)?;
@@ -1595,6 +1597,8 @@ const CLOSE_METADATA_COLUMNS: &[AuxiliaryRuntimeColumn] = &[
         0,
         None,
     ),
+    // Additive and nullable: historical closures retain unknown actors.
+    auxiliary_runtime_column("closed_by", "TEXT", false, None, 0, Some("TEXT")),
 ];
 const CLOSE_METADATA_INDEXES: &[ExpectedRuntimeIndex] = &[
     ExpectedRuntimeIndex {
@@ -3064,7 +3068,7 @@ fn attest_reviewed_legacy_v15_source(conn: &Connection) -> Result<()> {
     for (table, columns, indexes) in [
         (
             "close_metadata",
-            CLOSE_METADATA_COLUMNS,
+            &CLOSE_METADATA_COLUMNS[..CLOSE_METADATA_COLUMNS.len() - 1],
             CLOSE_METADATA_INDEXES,
         ),
         ("gate_results", GATE_RESULTS_COLUMNS, GATE_RESULTS_INDEXES),
@@ -4127,7 +4131,13 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
         "close_metadata",
         CLOSE_METADATA_COLUMNS,
         CLOSE_METADATA_INDEXES,
-    );
+    ) || (has_pending_sync_merge_metadata(conn).unwrap_or(false)
+        && auxiliary_runtime_table_canonical(
+            conn,
+            "close_metadata",
+            &CLOSE_METADATA_COLUMNS[..CLOSE_METADATA_COLUMNS.len() - 1],
+            CLOSE_METADATA_INDEXES,
+        ));
     let gate_results_ok = auxiliary_runtime_table_canonical(
         conn,
         "gate_results",
@@ -4468,6 +4478,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
                 bypass_reason TEXT,
                 policy_gates_fired TEXT,
                 recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                closed_by TEXT,
                 FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_close_metadata_recorded_at ON close_metadata(recorded_at);
@@ -4761,6 +4772,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
     }
 
     apply_jsonl_row_receipts_schema(conn)?;
+    ensure_auxiliary_runtime_columns(conn, "close_metadata", CLOSE_METADATA_COLUMNS)?;
     Ok(())
 }
 
@@ -5564,6 +5576,53 @@ mod tests {
         let row = conn.query_row("PRAGMA foreign_keys").unwrap();
         let foreign_keys = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
         assert_eq!(foreign_keys, 1);
+    }
+
+    #[test]
+    fn closure_attribution_schema_upgrade_keeps_historical_actor_unknown() {
+        let temp = TempDir::new().unwrap();
+        let conn = Connection::open(
+            temp.path()
+                .join("legacy-close.db")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .unwrap();
+        let legacy_schema = SCHEMA_SQL.replace("        closed_by TEXT,\n", "");
+        assert_ne!(legacy_schema, SCHEMA_SQL);
+        execute_batch(&conn, &legacy_schema).unwrap();
+        apply_jsonl_row_receipts_schema(&conn).unwrap();
+        conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+            .unwrap();
+        execute_batch(
+            &conn,
+            "INSERT INTO issues (id, title, status, closed_at) VALUES \
+             ('bd-legacy-close', 'Legacy', 'closed', '2026-01-01T00:00:00Z');
+             INSERT INTO close_metadata (issue_id, closed_by_agent_name, bypassed_policy, bypass_reason, recorded_at) \
+             VALUES ('bd-legacy-close', 'historical-agent', 1, 'reviewed', '2026-01-01T00:00:00Z');
+             INSERT INTO events (issue_id, event_type, actor) VALUES \
+             ('bd-legacy-close', 'updated', 'unrelated-editor');",
+        ).unwrap();
+        assert!(!runtime_schema_compatible(&conn));
+        apply_schema(&conn).unwrap();
+        assert!(runtime_schema_compatible(&conn));
+        let row = conn.query_row(
+            "SELECT closed_by, closed_by_agent_name, bypassed_policy, bypass_reason, recorded_at \
+             FROM close_metadata WHERE issue_id = 'bd-legacy-close'",
+        ).unwrap();
+        assert_eq!(row.get(0), Some(&SqliteValue::Null));
+        assert_eq!(
+            row.get(1).and_then(SqliteValue::as_text),
+            Some("historical-agent")
+        );
+        assert_eq!(row.get(2).and_then(SqliteValue::as_integer), Some(1));
+        assert_eq!(row.get(3).and_then(SqliteValue::as_text), Some("reviewed"));
+        assert_eq!(
+            row.get(4).and_then(SqliteValue::as_text),
+            Some("2026-01-01T00:00:00Z")
+        );
+        apply_schema(&conn).unwrap();
+        assert!(runtime_schema_compatible(&conn));
     }
 
     #[test]
@@ -6591,7 +6650,9 @@ mod tests {
             Connection::open(temp.path().join("legacy.db").to_string_lossy().into_owned()).unwrap();
         execute_batch(
             &conn,
-            &SCHEMA_SQL.replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", ""),
+            &SCHEMA_SQL
+                .replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "")
+                .replace("        closed_by TEXT,\n", ""),
         )
         .unwrap();
         execute_batch(&conn, LEGACY_V15_TEST_CORE_SQL).unwrap();
@@ -6632,6 +6693,7 @@ mod tests {
                     .unwrap();
             let schema = SCHEMA_SQL
                 .replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "")
+                .replace("        closed_by TEXT,\n", "")
                 .replace(
                     "PRIMARY KEY (issue_id, depends_on_id, type)",
                     "PRIMARY KEY (issue_id, depends_on_id)",

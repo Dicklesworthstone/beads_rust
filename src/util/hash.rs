@@ -66,7 +66,7 @@ impl ContentHashable for Issue {
 /// - timestamps (`created_at`, `updated_at`, `closed_at`, etc.)
 /// - tombstone metadata (`deleted_at`, `deleted_by`, `delete_reason`)
 /// - `estimated_minutes`, `due_at`, `defer_until`
-/// - `close_reason`, `closed_by_session`
+/// - `close_reason`, `closed_by_session`, `closed_by`, agent attribution
 ///
 /// `status` is included, so a live issue and a `Status::Tombstone` issue do
 /// not hash alike solely because deletion metadata is excluded. Tombstone
@@ -229,6 +229,10 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,

@@ -955,6 +955,7 @@ mod tests {
             "gate_result_history".to_string(),
             "gate_results".to_string(),
             "issues".to_string(),
+            "jsonl_row_receipts".to_string(),
             "labels".to_string(),
             "metadata".to_string(),
         ];

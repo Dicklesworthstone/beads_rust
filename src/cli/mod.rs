@@ -2921,21 +2921,17 @@ pub struct CloseArgs {
     #[arg(long)]
     pub robot: bool,
 
-    // Closure-time policy gates (issue #274 — Phase 1).
-    //
-    // All fields below are inert when the project has no `.beads/policy.yaml`
-    // file. Solo-dev workflows see no behavior change; only opt-in repos
-    // observe gating or attribution capture.
-    //
-    /// Tier 1 attribution: agent name (env: BR_AGENT_NAME).
+    // Attribution is captured when supplied, including without policy.yaml.
+    // Closure-time policy gates remain opt-in (issue #274).
+    /// Closing agent name (env: BR_AGENT_NAME). Recorded only.
     #[arg(long, value_name = "NAME", env = "BR_AGENT_NAME")]
     pub agent_name: Option<String>,
 
-    /// Tier 1 attribution: harness identifier (env: BR_HARNESS).
+    /// Closing harness identifier (env: BR_HARNESS). Recorded only.
     #[arg(long, value_name = "HARNESS", env = "BR_HARNESS")]
     pub harness: Option<String>,
 
-    /// Tier 1 attribution: model identifier (env: BR_MODEL).
+    /// Closing model identifier (env: BR_MODEL). Recorded only.
     #[arg(long, value_name = "MODEL", env = "BR_MODEL")]
     pub model: Option<String>,
 

@@ -39,6 +39,7 @@ jsonl:
   "closed_at": "2026-04-23T08:30:00Z",
   "close_reason": "completed golden flow",
   "closed_by_session": "golden-session",
+  "closed_by": "golden-close",
   "external_ref": "GOLDEN-1",
   "source_repo": ".",
   "compaction_level": 0,

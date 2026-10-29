@@ -90,29 +90,91 @@ impl ImportIssueLookup {
 /// The exporter-visible close audit, reusable across bounded issue batches.
 #[derive(Debug, Default)]
 pub(crate) struct ExportCloseBypassAudit {
-    by_issue: HashMap<String, (Option<String>, Option<Vec<String>>)>,
+    by_issue: HashMap<String, CloseAuditProjection>,
+}
+
+#[derive(Debug, Default)]
+struct CloseAuditProjection {
+    closed_by: Option<String>,
+    closed_by_agent_name: Option<String>,
+    closed_by_harness: Option<String>,
+    closed_by_model: Option<String>,
+    bypassed: bool,
+    reason: Option<String>,
+    gates: Option<Vec<String>>,
+}
+
+impl CloseAuditProjection {
+    fn from_row(row: &Row) -> Result<Self> {
+        let text = |index, field| match row.get(index) {
+            Some(SqliteValue::Null) => Ok(None),
+            Some(SqliteValue::Text(value)) => {
+                Ok((!value.trim().is_empty()).then(|| value.to_string()))
+            }
+            _ => Err(BeadsError::Config(format!(
+                "closure attribution has a non-text {field} value"
+            ))),
+        };
+        Ok(Self {
+            closed_by: text(4, "closed_by")?,
+            closed_by_agent_name: text(5, "closed_by_agent_name")?,
+            closed_by_harness: text(6, "closed_by_harness")?,
+            closed_by_model: text(7, "closed_by_model")?,
+            bypassed: row.get(1).and_then(SqliteValue::as_integer) == Some(1),
+            reason: row
+                .get(2)
+                .and_then(SqliteValue::as_text)
+                .map(str::to_string),
+            gates: row
+                .get(3)
+                .and_then(SqliteValue::as_text)
+                .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok()),
+        })
+    }
+
+    fn attach_attribution(&self, issue: &mut Issue) {
+        if issue.status == Status::Closed {
+            issue.closed_by.clone_from(&self.closed_by);
+            issue
+                .closed_by_agent_name
+                .clone_from(&self.closed_by_agent_name);
+            issue.closed_by_harness.clone_from(&self.closed_by_harness);
+            issue.closed_by_model.clone_from(&self.closed_by_model);
+        }
+    }
+
+    fn attach(&self, issue: &mut Issue) {
+        self.attach_attribution(issue);
+        if self.bypassed {
+            issue.bypassed_policy = Some(true);
+            issue.bypass_reason.clone_from(&self.reason);
+            issue.policy_gates_fired.clone_from(&self.gates);
+        }
+    }
+
+    fn matches_export(&self, issue: &Issue) -> bool {
+        self.closed_by == issue.closed_by
+            && self.closed_by_agent_name == issue.closed_by_agent_name
+            && self.closed_by_harness == issue.closed_by_harness
+            && self.closed_by_model == issue.closed_by_model
+            && if self.bypassed {
+                issue.bypassed_policy == Some(true)
+                    && self.reason == issue.bypass_reason
+                    && self.gates == issue.policy_gates_fired
+            } else {
+                issue.bypassed_policy != Some(true)
+            }
+    }
 }
 
 impl ExportCloseBypassAudit {
-    fn insert_decoded(&mut self, issue_id: &str, reason: Option<&str>, gates: Option<&str>) {
-        self.by_issue.insert(
-            issue_id.to_string(),
-            (
-                reason.map(str::to_string),
-                gates.and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok()),
-            ),
-        );
-    }
-
     pub(crate) fn attach(&self, issues: &mut [Issue]) {
         if self.by_issue.is_empty() {
             return;
         }
         for issue in issues {
-            if let Some((reason, gates)) = self.by_issue.get(&issue.id) {
-                issue.bypassed_policy = Some(true);
-                issue.bypass_reason.clone_from(reason);
-                issue.policy_gates_fired.clone_from(gates);
+            if let Some(audit) = self.by_issue.get(&issue.id) {
+                audit.attach(issue);
             }
         }
     }
@@ -131,29 +193,46 @@ impl ImportCloseBypassAudit {
         self.recorded_ids.contains(issue_id)
     }
 
-    /// Mirror a successful insert-only audit write without reloading the table.
+    /// Attach the transaction's closure metadata before comparing full issues.
+    pub(crate) fn attach(&self, issues: &mut [Issue]) {
+        self.exported.attach(issues);
+    }
+
+    /// Mirror imported attribution replacement and insert-only bypass auditing.
     pub(crate) fn record_imported(&mut self, issue_id: &str, issue: &Issue) {
-        if issue.bypassed_policy == Some(true) && self.recorded_ids.insert(issue_id.to_string()) {
-            self.exported.by_issue.insert(
-                issue_id.to_string(),
-                (
-                    issue.bypass_reason.clone(),
-                    issue.policy_gates_fired.clone(),
-                ),
-            );
+        let has_attribution = issue.closed_by.is_some()
+            || issue.closed_by_agent_name.is_some()
+            || issue.closed_by_harness.is_some()
+            || issue.closed_by_model.is_some();
+        if !self.recorded_ids.contains(issue_id)
+            && !has_attribution
+            && issue.bypassed_policy != Some(true)
+        {
+            return;
+        }
+        let new_record = self.recorded_ids.insert(issue_id.to_string());
+        let audit = self
+            .exported
+            .by_issue
+            .entry(issue_id.to_string())
+            .or_default();
+        audit.closed_by.clone_from(&issue.closed_by);
+        audit
+            .closed_by_agent_name
+            .clone_from(&issue.closed_by_agent_name);
+        audit.closed_by_harness.clone_from(&issue.closed_by_harness);
+        audit.closed_by_model.clone_from(&issue.closed_by_model);
+        if new_record && issue.bypassed_policy == Some(true) {
+            audit.bypassed = true;
+            audit.reason.clone_from(&issue.bypass_reason);
+            audit.gates.clone_from(&issue.policy_gates_fired);
         }
     }
 
     pub(crate) fn matches_export(&self, issue_id: &str, issue: &Issue) -> bool {
         match self.exported.by_issue.get(issue_id) {
-            Some((reason, gates)) => {
-                issue.bypassed_policy == Some(true)
-                    && reason == &issue.bypass_reason
-                    && gates == &issue.policy_gates_fired
-            }
-            // Only bypassed closes project audit fields into JSONL. Explicit
-            // false and an absent flag both represent a non-bypassed close.
-            None => issue.bypassed_policy != Some(true),
+            Some(audit) => audit.matches_export(issue),
+            None => CloseAuditProjection::default().matches_export(issue),
         }
     }
 }
@@ -1595,12 +1674,17 @@ pub(crate) struct PreservedTableRows {
     pub(crate) rows: Vec<Vec<SqliteValue>>,
 }
 
+type CloseAttributionAnchors = HashMap<String, (DateTime<Utc>, DateTime<Utc>)>;
+
 /// Snapshot of every auxiliary/history table plus per-table capture failures
 /// (a corrupt source page must not abort preservation of the other tables).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AuxiliaryHistorySnapshot {
     pub(crate) tables: Vec<PreservedTableRows>,
     pub(crate) failures: Vec<String>,
+    /// Bind closure attribution to the issue and closure it described, so a
+    /// rebuild cannot attach an old local closer to a newer JSONL closure.
+    close_attribution_anchors: CloseAttributionAnchors,
 }
 
 impl AuxiliaryHistorySnapshot {
@@ -3379,6 +3463,12 @@ impl SqliteStorage {
     /// partially preserved history beats none.
     pub(crate) fn snapshot_auxiliary_history_tables(&self) -> AuxiliaryHistorySnapshot {
         let mut snapshot = AuxiliaryHistorySnapshot::default();
+        match Self::close_attribution_anchors(&self.conn) {
+            Ok(anchors) => snapshot.close_attribution_anchors = anchors,
+            Err(error) => snapshot.failures.push(format!(
+                "close_metadata: could not bind closure attribution to its issue ({error})"
+            )),
+        }
         for &table in AUXILIARY_HISTORY_TABLES {
             if !crate::storage::schema::table_exists(&self.conn, table) {
                 continue;
@@ -3429,6 +3519,27 @@ impl SqliteStorage {
         snapshot
     }
 
+    fn close_attribution_anchors(conn: &Connection) -> Result<CloseAttributionAnchors> {
+        let mut anchors = HashMap::new();
+        for row in
+            conn.query("SELECT id, created_at, closed_at FROM issues WHERE status = 'closed'")?
+        {
+            let Some(id) = row.get(0).and_then(SqliteValue::as_text) else {
+                return Err(BeadsError::Config(
+                    "closure anchor has a non-text issue ID".to_string(),
+                ));
+            };
+            anchors.insert(
+                id.to_string(),
+                (
+                    parse_datetime_value(row.get(1))?,
+                    parse_datetime_value(row.get(2))?,
+                ),
+            );
+        }
+        Ok(anchors)
+    }
+
     /// Restore auxiliary/history rows captured by
     /// [`Self::snapshot_auxiliary_history_tables`] into a freshly rebuilt
     /// database (GitHub #471). Returns per-table `(restored, skipped)` counts.
@@ -3446,6 +3557,7 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if a restore write fails.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn restore_auxiliary_history_tables(
         &self,
         snapshot: &AuxiliaryHistorySnapshot,
@@ -3461,6 +3573,7 @@ impl SqliteStorage {
             .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
             .collect();
         self.with_connection_write_transaction(|conn| {
+            let live_close_anchors = Self::close_attribution_anchors(conn)?;
             for preserved in &snapshot.tables {
                 let table = preserved.table.as_str();
                 if !crate::storage::schema::table_exists(conn, table) {
@@ -3510,8 +3623,36 @@ impl SqliteStorage {
                             continue;
                         }
                     }
-                    let params: Vec<SqliteValue> =
-                        keep.iter().filter_map(|&i| row.get(i).cloned()).collect();
+                    let restore_attribution = issue_id_index
+                        .and_then(|index| row.get(index))
+                        .and_then(SqliteValue::as_text)
+                        .is_some_and(|id| {
+                            snapshot
+                                .close_attribution_anchors
+                                .get(id)
+                                .is_some_and(|source| live_close_anchors.get(id) == Some(source))
+                        });
+                    let params: Vec<SqliteValue> = keep
+                        .iter()
+                        .filter_map(|&i| {
+                            row.get(i).map(|value| {
+                                if table == "close_metadata"
+                                    && !restore_attribution
+                                    && matches!(
+                                        preserved.columns[i].as_str(),
+                                        "closed_by"
+                                            | "closed_by_agent_name"
+                                            | "closed_by_harness"
+                                            | "closed_by_model"
+                                    )
+                                {
+                                    SqliteValue::Null
+                                } else {
+                                    value.clone()
+                                }
+                            })
+                        })
+                        .collect();
                     if params.len() != keep.len() {
                         skipped += 1;
                         continue;
@@ -4413,7 +4554,7 @@ impl SqliteStorage {
 
     /// Persist closure-time policy metadata (issue #274 Phase 1) for `issue_id`.
     ///
-    /// Inserts (or replaces) one row in the `close_metadata` table with the
+    /// Inserts (or updates) one row in the `close_metadata` table with the
     /// supplied attribution + bypass auditing values. All fields are optional:
     /// passing every-`None` still records a row that pins `bypassed_policy = 0`
     /// for the close, which keeps the table strictly additive — every close
@@ -4437,25 +4578,32 @@ impl SqliteStorage {
         policy_gates_fired: &[String],
     ) -> Result<()> {
         let gates_json = serde_json::to_string(policy_gates_fired).map_err(BeadsError::from)?;
+        let attribution = EventAttribution::new(
+            attribution.agent_name.as_deref(),
+            attribution.harness.as_deref(),
+            attribution.model.as_deref(),
+            None,
+        );
 
-        // INSERT OR REPLACE: a re-close (e.g. close → reopen → close) overwrites
-        // the prior row. If the project ever needs full history, querying the
-        // events table gives an audit trail; `close_metadata` is the
-        // currently-effective metadata for the most recent close.
+        // The status mutation already persisted the actor atomically. Policy
+        // enrichment must preserve it, including for a policy with no Tier 1
+        // attribution. Reopening clears the row before any subsequent close.
         self.with_connection_write_transaction(|conn| {
             conn.execute_with_params(
-                "INSERT OR REPLACE INTO close_metadata (
-                    issue_id,
-                    closed_by_agent_name,
-                    closed_by_harness,
-                    closed_by_model,
-                    bypassed_policy,
-                    bypass_reason,
-                    policy_gates_fired,
-                    recorded_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                "INSERT OR IGNORE INTO close_metadata (issue_id) VALUES (?)",
+                &[SqliteValue::from(issue_id)],
+            )?;
+            conn.execute_with_params(
+                "UPDATE close_metadata SET
+                    closed_by_agent_name = ?,
+                    closed_by_harness = ?,
+                    closed_by_model = ?,
+                    bypassed_policy = ?,
+                    bypass_reason = ?,
+                    policy_gates_fired = ?,
+                    recorded_at = CURRENT_TIMESTAMP
+                 WHERE issue_id = ?",
                 &[
-                    SqliteValue::from(issue_id),
                     attribution
                         .agent_name
                         .as_deref()
@@ -4471,15 +4619,15 @@ impl SqliteStorage {
                     SqliteValue::from(i64::from(bypassed)),
                     bypass_reason.map_or(SqliteValue::Null, SqliteValue::from),
                     SqliteValue::from(gates_json.as_str()),
+                    SqliteValue::from(issue_id),
                 ],
             )?;
             Ok(())
         })
     }
 
-    /// Read a previously-stored close-metadata row, or `None` when no policy
-    /// metadata was recorded for this close. Used by tests + future
-    /// observability commands.
+    /// Read the actor, optional attribution and policy metadata for the
+    /// current close, or `None` for historical closes with no recorded row.
     ///
     /// # Errors
     ///
@@ -4488,10 +4636,17 @@ impl SqliteStorage {
         if !crate::storage::schema::table_exists(&self.conn, "close_metadata") {
             return Ok(None);
         }
+        let closed_by = if self.close_metadata_has_closed_by()? {
+            "closed_by"
+        } else {
+            "NULL"
+        };
         let rows = self.conn.query_with_params(
-            "SELECT closed_by_agent_name, closed_by_harness, closed_by_model, \
-                    bypassed_policy, bypass_reason, policy_gates_fired, recorded_at \
-             FROM close_metadata WHERE issue_id = ?",
+            &format!(
+                "SELECT closed_by_agent_name, closed_by_harness, closed_by_model, \
+                        bypassed_policy, bypass_reason, policy_gates_fired, recorded_at, {closed_by} \
+                 FROM close_metadata WHERE issue_id = ?"
+            ),
             &[SqliteValue::from(issue_id)],
         )?;
         let Some(row) = rows.first() else {
@@ -4511,6 +4666,7 @@ impl SqliteStorage {
             _ => Vec::new(),
         };
         Ok(Some(CloseMetadataRow {
+            closed_by: row.get(7).and_then(SqliteValue::as_text).map(String::from),
             closed_by_agent_name: row.get(0).and_then(SqliteValue::as_text).map(String::from),
             closed_by_harness: row.get(1).and_then(SqliteValue::as_text).map(String::from),
             closed_by_model: row.get(2).and_then(SqliteValue::as_text).map(String::from),
@@ -8034,6 +8190,34 @@ impl SqliteStorage {
                 if !was_terminal {
                     let reason = updates.close_reason.as_ref().and_then(Clone::clone);
                     ctx.record_event(EventType::Closed, id, reason);
+                    // Capture the same resolved actor and self-reported
+                    // attribution as the close event, in the same transaction.
+                    // Imports and same-status updates never take this path, so
+                    // historical closures remain unknown rather than acquiring
+                    // the identity of the next machine to read or edit them.
+                    conn.execute_with_params(
+                        "INSERT OR REPLACE INTO close_metadata \
+                         (issue_id, closed_by, closed_by_agent_name, closed_by_harness, closed_by_model) \
+                         VALUES (?, ?, ?, ?, ?)",
+                        &[
+                            SqliteValue::from(id),
+                            (!actor.trim().is_empty())
+                                .then_some(actor)
+                                .map_or(SqliteValue::Null, SqliteValue::from),
+                            ctx.attribution
+                                .agent_name
+                                .as_deref()
+                                .map_or(SqliteValue::Null, SqliteValue::from),
+                            ctx.attribution
+                                .harness
+                                .as_deref()
+                                .map_or(SqliteValue::Null, SqliteValue::from),
+                            ctx.attribution
+                                .model
+                                .as_deref()
+                                .map_or(SqliteValue::Null, SqliteValue::from),
+                        ],
+                    )?;
                 }
 
                 // Auto-set closed_at if not provided
@@ -8603,6 +8787,8 @@ impl SqliteStorage {
     /// cannot use that index (`NOT INDEXED`; `id IN (...)` seeks the index too
     /// since FrankenSQLite 0.4.12), with the same strict decoder, before the
     /// row is reported missing or preservation fails.
+    /// Closure attribution is hydrated separately so its corruption cannot
+    /// discard an otherwise readable issue during explicit best-effort repair.
     pub(crate) fn get_issue_for_preservation(&self, id: &str) -> Result<Option<Issue>> {
         let issue = match Self::get_issue_row_from_conn(&self.conn, id) {
             Ok(Some(row)) => Self::issue_from_row_for_preservation(&row)?,
@@ -8635,6 +8821,16 @@ impl SqliteStorage {
             )));
         }
         Ok(Some(issue))
+    }
+
+    /// Read the closure projection separately from the strict base issue.
+    /// The snapshot caller records a warning if this read fails and can retain
+    /// the readable issue for an explicitly requested partial repair.
+    pub(crate) fn attach_close_attribution_for_preservation(
+        &self,
+        issue: &mut Issue,
+    ) -> Result<()> {
+        Self::attach_close_attribution_from_conn(&self.conn, issue)
     }
 
     /// Every `issues` row with this ID, read by a full table scan.
@@ -8797,14 +8993,51 @@ impl SqliteStorage {
         let Some(row) = Self::get_issue_row_from_conn(conn, id)? else {
             return Ok(None);
         };
-        let issue = Self::issue_from_row(&row)?;
+        let mut issue = Self::issue_from_row(&row)?;
         if issue.id != id {
             return Err(BeadsError::internal(format!(
                 "storage consistency: get_issue_from_conn requested {id:?} but row returned id {:?}",
                 issue.id
             )));
         }
+        if issue.status == Status::Closed && table_exists(conn, "close_metadata") {
+            Self::attach_close_attribution_from_conn(conn, &mut issue)?;
+        }
         Ok(Some(issue))
+    }
+
+    fn attach_close_attribution_from_conn(conn: &Connection, issue: &mut Issue) -> Result<()> {
+        if issue.status == Status::Closed {
+            let attribution = Self::close_attribution_select_clause(conn)?;
+            let rows = conn.query_with_params(
+                &format!(
+                    "SELECT issue_id, 0, NULL, NULL, {attribution} \
+                     FROM close_metadata WHERE issue_id = ?"
+                ),
+                &[SqliteValue::from(issue.id.as_str())],
+            )?;
+            if let Some(row) = rows.first() {
+                CloseAuditProjection::from_row(row)?.attach_attribution(issue);
+            }
+        }
+        Ok(())
+    }
+
+    fn attach_close_audit_from_conn(conn: &Connection, issue: &mut Issue) -> Result<()> {
+        if issue.status == Status::Closed && table_exists(conn, "close_metadata") {
+            let attribution = Self::close_attribution_select_clause(conn)?;
+            let audit = conn.query_with_params(
+                &format!(
+                    "SELECT issue_id, bypassed_policy = 1, bypass_reason, policy_gates_fired, \
+                            {attribution} FROM close_metadata WHERE issue_id = ?"
+                ),
+                &[SqliteValue::from(issue.id.as_str())],
+            )?;
+            if let Some(row) = audit.first() {
+                CloseAuditProjection::from_row(row)?.attach(issue);
+            }
+        }
+        Ok(())
     }
 
     fn get_issue_row_from_conn(conn: &Connection, id: &str) -> Result<Option<Row>> {
@@ -15894,10 +16127,9 @@ impl SqliteStorage {
         Ok(issues)
     }
 
-    /// Project the close-policy bypass audit trail from `close_metadata`
-    /// onto issues being exported (GitHub #474). Without this a
-    /// `--bypass-policy` close is recorded only in the gitignored local
-    /// database and is invisible in the shared JSONL record.
+    /// Project close attribution and the policy bypass audit trail from
+    /// `close_metadata` onto issues being exported (GitHub #474, #584).
+    /// These facts must survive the gitignored local database in JSONL.
     ///
     /// # Errors
     ///
@@ -15910,25 +16142,47 @@ impl SqliteStorage {
         Ok(())
     }
 
+    /// A pending merge may still bind the pre-attribution schema. Its raw
+    /// witness must retain the original column count until terminal cleanup.
+    pub(crate) fn close_metadata_has_closed_by(&self) -> Result<bool> {
+        Self::close_metadata_has_closed_by_from_conn(&self.conn)
+    }
+
+    fn close_metadata_has_closed_by_from_conn(conn: &Connection) -> Result<bool> {
+        Ok(conn
+            .query("PRAGMA table_info(close_metadata)")?
+            .iter()
+            .any(|row| row.get(1).and_then(SqliteValue::as_text) == Some("closed_by")))
+    }
+
+    fn close_attribution_select_clause(conn: &Connection) -> Result<&'static str> {
+        if Self::close_metadata_has_closed_by_from_conn(conn)? {
+            Ok("closed_by, closed_by_agent_name, closed_by_harness, closed_by_model")
+        } else {
+            // Old pending receipts describe the pre-#584 export projection.
+            // Do not change that generation by newly projecting agent fields.
+            Ok("NULL, NULL, NULL, NULL")
+        }
+    }
+
     /// Read the same audit projection once for a coherent batched export proof.
     pub(crate) fn load_close_bypass_audit_for_export(&self) -> Result<ExportCloseBypassAudit> {
         if !crate::storage::schema::table_exists(&self.conn, "close_metadata") {
             return Ok(ExportCloseBypassAudit::default());
         }
-        let rows = self.conn.query(
-            "SELECT issue_id, bypass_reason, policy_gates_fired
-             FROM close_metadata WHERE bypassed_policy = 1",
-        )?;
+        let attribution = Self::close_attribution_select_clause(&self.conn)?;
+        let rows = self.conn.query(&format!(
+            "SELECT issue_id, bypassed_policy = 1, bypass_reason, policy_gates_fired,
+                    {attribution} FROM close_metadata"
+        ))?;
         let mut audit = ExportCloseBypassAudit::default();
         for row in &rows {
             let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
                 continue;
             };
-            audit.insert_decoded(
-                issue_id,
-                row.get(1).and_then(SqliteValue::as_text),
-                row.get(2).and_then(SqliteValue::as_text),
-            );
+            audit
+                .by_issue
+                .insert(issue_id.to_string(), CloseAuditProjection::from_row(row)?);
         }
         Ok(audit)
     }
@@ -15941,21 +16195,19 @@ impl SqliteStorage {
             ));
         }
         let mut audit = ImportCloseBypassAudit::default();
-        for row in self.conn.query(
-            "SELECT issue_id, bypassed_policy = 1, bypass_reason, policy_gates_fired \
-             FROM close_metadata",
-        )? {
+        let attribution = Self::close_attribution_select_clause(&self.conn)?;
+        for row in self.conn.query(&format!(
+            "SELECT issue_id, bypassed_policy = 1, bypass_reason, policy_gates_fired, \
+                    {attribution} FROM close_metadata"
+        ))? {
             let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
                 continue;
             };
             audit.recorded_ids.insert(issue_id.to_string());
-            if row.get(1).and_then(SqliteValue::as_integer) == Some(1) {
-                audit.exported.insert_decoded(
-                    issue_id,
-                    row.get(2).and_then(SqliteValue::as_text),
-                    row.get(3).and_then(SqliteValue::as_text),
-                );
-            }
+            audit
+                .exported
+                .by_issue
+                .insert(issue_id.to_string(), CloseAuditProjection::from_row(&row)?);
         }
         Ok(audit)
     }
@@ -17145,6 +17397,10 @@ impl SqliteStorage {
             closed_at: get_opt_datetime(16)?,
             close_reason: get_non_empty_str(17),
             closed_by_session: get_non_empty_str(18),
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,
@@ -17214,6 +17470,10 @@ impl SqliteStorage {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,
@@ -17283,6 +17543,10 @@ impl SqliteStorage {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,
@@ -17352,6 +17616,10 @@ impl SqliteStorage {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,
@@ -17415,6 +17683,10 @@ impl SqliteStorage {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,
@@ -17484,6 +17756,10 @@ impl SqliteStorage {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,
@@ -17547,6 +17823,10 @@ impl SqliteStorage {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,
@@ -19508,12 +19788,14 @@ pub struct ListFilters {
     pub updated_after: Option<DateTime<Utc>>,
 }
 
-/// Closure-time policy metadata row (issue #274 Phase 1).
+/// Closure attribution and policy metadata row (issues #274 and #584).
 ///
-/// One row per terminal close that carried any opt-in policy data — Tier 1
+/// One row per new terminal close, optionally enriched with Tier 1
 /// attribution, a `--bypass-policy` waiver, or the list of gates that fired.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloseMetadataRow {
+    /// Resolved close actor; absent for historical or unattributed closes.
+    pub closed_by: Option<String>,
     pub closed_by_agent_name: Option<String>,
     pub closed_by_harness: Option<String>,
     pub closed_by_model: Option<String>,
@@ -20555,6 +20837,7 @@ impl SqliteStorage {
         let Some(mut issue) = self.get_issue(id)? else {
             return Ok(None);
         };
+        Self::attach_close_audit_from_conn(&self.conn, &mut issue)?;
 
         // Populate relations
         issue.labels = self.get_labels(id)?;
@@ -21366,6 +21649,24 @@ impl SqliteStorage {
         Ok(inserted)
     }
 
+    /// Apply a reviewed additive scalar update without writing audit metadata.
+    /// The planner binds the existing closure evidence and the complete raw
+    /// poststate; only the already-present issue row may change here.
+    pub(crate) fn update_issue_scalars_for_additive_reconcile_in_tx(
+        &self,
+        issue: &Issue,
+    ) -> Result<bool> {
+        if !self.conn.as_async().in_transaction() {
+            return Err(BeadsError::internal(
+                "additive scalar update requires an active transaction",
+            ));
+        }
+        let timestamps = ImportIssueTimestampStrings::from_issue(issue);
+        let updated =
+            self.update_issue_row_for_import(issue, &timestamps, ImportSourceRepoPath::KeepLocal)?;
+        Ok(updated == 1)
+    }
+
     /// Upsert an issue (create or update) for import operations.
     ///
     /// For an existing row, runs an in-place UPDATE; for a new row, runs
@@ -21445,43 +21746,72 @@ impl SqliteStorage {
         Ok(inserted)
     }
 
-    /// Persist an imported close-policy bypass audit trail into
-    /// `close_metadata` (GitHub #474). A locally recorded row wins — the
-    /// machine that performed the bypass holds the richer record (closer
-    /// attribution columns) — so this is insert-only.
+    /// Persist the winning imported closure record (GitHub #474, #584).
+    /// Attribution is replaced exactly, including absent values: an imported
+    /// historical closure must not inherit the actor of an earlier local
+    /// close. The existing insert-only precedence for bypass auditing remains
+    /// unchanged. No import actor or local events are consulted.
     pub(crate) fn persist_imported_close_bypass_audit_in_tx(&self, issue: &Issue) -> Result<()> {
-        if issue.bypassed_policy != Some(true) {
-            return Ok(());
-        }
         if !self.conn.as_async().in_transaction() {
             return Err(BeadsError::internal(
                 "import audit persistence requires an active transaction",
             ));
         }
-        let gates_json = issue
-            .policy_gates_fired
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|err| {
-                BeadsError::Config(format!(
-                    "could not serialize imported policy_gates_fired for {}: {err}",
-                    issue.id
-                ))
-            })?;
-        self.conn.execute_with_params(
-            "INSERT OR IGNORE INTO close_metadata \
-             (issue_id, bypassed_policy, bypass_reason, policy_gates_fired) \
-             VALUES (?, 1, ?, ?)",
-            &[
-                SqliteValue::from(issue.id.as_str()),
-                issue
-                    .bypass_reason
-                    .as_deref()
-                    .map_or(SqliteValue::Null, SqliteValue::from),
-                gates_json.map_or(SqliteValue::Null, SqliteValue::from),
-            ],
-        )?;
+        let attribution = [
+            &issue.closed_by,
+            &issue.closed_by_agent_name,
+            &issue.closed_by_harness,
+            &issue.closed_by_model,
+        ]
+        .map(|value| {
+            value
+                .as_deref()
+                .filter(|value| issue.status == Status::Closed && !value.trim().is_empty())
+                .map_or(SqliteValue::Null, SqliteValue::from)
+        });
+        let has_attribution = attribution.iter().any(|value| *value != SqliteValue::Null);
+        let supports_attribution = self.close_metadata_has_closed_by()?;
+        if has_attribution && !supports_attribution {
+            return Err(BeadsError::SyncConflict {
+                message: "Cannot import new closure attribution while a pending merge binds the legacy schema; finish the pending merge first".to_string(),
+            });
+        }
+        if has_attribution || issue.bypassed_policy == Some(true) {
+            let gates_json = issue
+                .policy_gates_fired
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|err| {
+                    BeadsError::Config(format!(
+                        "could not serialize imported policy_gates_fired for {}: {err}",
+                        issue.id
+                    ))
+                })?;
+            self.conn.execute_with_params(
+                "INSERT OR IGNORE INTO close_metadata \
+                 (issue_id, bypassed_policy, bypass_reason, policy_gates_fired) \
+                 VALUES (?, ?, ?, ?)",
+                &[
+                    SqliteValue::from(issue.id.as_str()),
+                    SqliteValue::from(i64::from(issue.bypassed_policy == Some(true))),
+                    issue
+                        .bypass_reason
+                        .as_deref()
+                        .map_or(SqliteValue::Null, SqliteValue::from),
+                    gates_json.map_or(SqliteValue::Null, SqliteValue::from),
+                ],
+            )?;
+        }
+        if supports_attribution {
+            let mut params = Vec::from(attribution);
+            params.push(SqliteValue::from(issue.id.as_str()));
+            self.conn.execute_with_params(
+                "UPDATE close_metadata SET closed_by = ?, closed_by_agent_name = ?, \
+                        closed_by_harness = ?, closed_by_model = ? WHERE issue_id = ?",
+                &params,
+            )?;
+        }
         Ok(())
     }
 
@@ -23069,6 +23399,10 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,
@@ -27938,6 +28272,10 @@ required_fields:
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,
@@ -29756,6 +30094,326 @@ required_fields:
             row.get(2).and_then(SqliteValue::as_text),
             Some("[\"typed_references_required\"]")
         );
+    }
+
+    #[test]
+    fn closure_attribution_is_atomic_and_survives_jsonl_and_preservation() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-closer",
+            "Shared close",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&issue, "creator").unwrap();
+        storage.set_pending_event_attribution(EventAttribution::new(
+            Some(" agent-a "),
+            Some(" claude-code "),
+            Some(" opus "),
+            None,
+        ));
+        let close = IssueUpdate {
+            status: Some(Status::Closed),
+            close_reason: Some(Some("finished".to_string())),
+            ..IssueUpdate::default()
+        };
+        let closed = storage
+            .update_issue(&issue.id, &close, "operator-a")
+            .unwrap();
+        assert_eq!(closed.closed_by.as_deref(), Some("operator-a"));
+        assert_eq!(closed.closed_by_agent_name.as_deref(), Some("agent-a"));
+        assert_eq!(closed.closed_by_harness.as_deref(), Some("claude-code"));
+        assert_eq!(closed.closed_by_model.as_deref(), Some("opus"));
+        let event = storage
+            .get_events(&issue.id, 10)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == EventType::Closed)
+            .unwrap();
+        assert_eq!(Some(event.actor), closed.closed_by);
+        assert_eq!(event.agent_name, closed.closed_by_agent_name);
+
+        let mut preserved = storage
+            .get_issue_for_preservation(&issue.id)
+            .unwrap()
+            .unwrap();
+        storage
+            .attach_close_attribution_for_preservation(&mut preserved)
+            .unwrap();
+        assert!(closed.sync_equals(&preserved));
+        let mut scan = storage
+            .get_issue_for_preservation_by_scan(&issue.id, None)
+            .unwrap()
+            .unwrap();
+        storage
+            .attach_close_attribution_for_preservation(&mut scan)
+            .unwrap();
+        assert!(closed.sync_equals(&scan));
+        let exports = [
+            storage.get_issue_for_export(&issue.id).unwrap().unwrap(),
+            storage
+                .get_issues_for_export(std::slice::from_ref(&issue.id))
+                .unwrap()
+                .remove(0),
+            storage.get_all_issues_for_export().unwrap().remove(0),
+        ];
+        for exported in exports {
+            assert!(closed.sync_equals(&exported));
+            let jsonl = serde_json::to_string(&exported).unwrap();
+            let imported: Issue = serde_json::from_str(&jsonl).unwrap();
+            let receiver = SqliteStorage::open_memory().unwrap();
+            receiver.upsert_issue_for_import(&imported).unwrap();
+            let received = receiver.get_issue(&issue.id).unwrap().unwrap();
+            assert!(closed.sync_equals(&received));
+            assert!(receiver.get_events(&issue.id, 10).unwrap().is_empty());
+            let reexported = receiver.get_all_issues_for_export().unwrap().remove(0);
+            assert_eq!(serde_json::to_string(&reexported).unwrap(), jsonl);
+        }
+    }
+
+    #[test]
+    fn closure_attribution_respects_noop_reopen_policy_and_delete() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-close-life",
+            "Close lifecycle",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&issue, "creator").unwrap();
+        let close = IssueUpdate {
+            status: Some(Status::Closed),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue(&issue.id, &close, "first-closer")
+            .unwrap();
+        storage
+            .record_close_metadata(
+                &issue.id,
+                &crate::close_policy::AttributionValues {
+                    agent_name: Some(" policy-agent ".to_string()),
+                    harness: Some(" harness ".to_string()),
+                    model: Some(" model ".to_string()),
+                },
+                true,
+                Some("reviewed override"),
+                &["gate".to_string()],
+            )
+            .unwrap();
+        let policy_close = storage.get_issue(&issue.id).unwrap().unwrap();
+        assert_eq!(policy_close.closed_by.as_deref(), Some("first-closer"));
+        assert_eq!(
+            policy_close.closed_by_agent_name.as_deref(),
+            Some("policy-agent")
+        );
+        assert!(
+            policy_close.bypassed_policy.is_none(),
+            "ordinary issue output retains its prior bypass-audit shape"
+        );
+        assert_eq!(
+            storage
+                .get_issue_for_export(&issue.id)
+                .unwrap()
+                .unwrap()
+                .bypassed_policy,
+            Some(true)
+        );
+        let repeated = storage
+            .update_issue(&issue.id, &close, "not-the-closer")
+            .unwrap();
+        assert_eq!(repeated.closed_by, policy_close.closed_by);
+        assert_eq!(
+            repeated.closed_by_agent_name,
+            policy_close.closed_by_agent_name
+        );
+
+        let reopen = IssueUpdate {
+            status: Some(Status::Open),
+            ..IssueUpdate::default()
+        };
+        let reopened = storage
+            .update_issue(&issue.id, &reopen, "reopener")
+            .unwrap();
+        assert!(reopened.closed_by.is_none());
+        assert!(reopened.closed_by_agent_name.is_none());
+        assert!(storage.get_close_metadata(&issue.id).unwrap().is_none());
+        let reclosed = storage
+            .update_issue(&issue.id, &close, "second-closer")
+            .unwrap();
+        assert_eq!(reclosed.closed_by.as_deref(), Some("second-closer"));
+        assert!(reclosed.closed_by_agent_name.is_none());
+        assert!(reclosed.bypassed_policy.is_none());
+
+        let deleted = storage
+            .delete_issue(&issue.id, "deleter", "cleanup", None)
+            .unwrap();
+        assert_eq!(deleted.deleted_by.as_deref(), Some("deleter"));
+        assert!(deleted.closed_by.is_none());
+        assert!(storage.get_close_metadata(&issue.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn closure_attribution_never_backfills_historical_or_replaced_closes() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut historical = make_issue(
+            "bd-history",
+            "Historical close",
+            Status::Closed,
+            2,
+            None,
+            now,
+            None,
+        );
+        historical.closed_at = Some(now);
+        historical.created_by = Some("creator-is-not-closer".to_string());
+        storage.upsert_issue_for_import(&historical).unwrap();
+        let close = IssueUpdate {
+            status: Some(Status::Closed),
+            ..IssueUpdate::default()
+        };
+        let unchanged = storage
+            .update_issue(&historical.id, &close, "not-the-closer")
+            .unwrap();
+        assert!(unchanged.closed_by.is_none());
+        assert!(
+            storage
+                .get_close_metadata(&historical.id)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut attributed = historical.clone();
+        attributed.closed_by = Some("peer-closer".to_string());
+        attributed.closed_by_agent_name = Some("peer-agent".to_string());
+        storage.upsert_issue_for_import(&attributed).unwrap();
+        assert_eq!(
+            storage
+                .get_issue(&historical.id)
+                .unwrap()
+                .unwrap()
+                .closed_by,
+            attributed.closed_by
+        );
+        historical.closed_at = Some(now + chrono::Duration::days(1));
+        historical.updated_at = historical.closed_at.unwrap();
+        storage.upsert_issue_for_import(&historical).unwrap();
+        let replaced = storage.get_issue(&historical.id).unwrap().unwrap();
+        assert!(replaced.closed_by.is_none());
+        assert!(replaced.closed_by_agent_name.is_none());
+        assert_eq!(replaced.closed_at, historical.closed_at);
+    }
+
+    #[test]
+    fn closure_attribution_history_restore_requires_the_same_closure() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-history-close",
+            "History anchor",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&issue, "creator").unwrap();
+        storage.set_pending_event_attribution(EventAttribution::new(
+            Some("original-agent"),
+            None,
+            None,
+            None,
+        ));
+        let closed = storage
+            .update_issue(
+                &issue.id,
+                &IssueUpdate {
+                    status: Some(Status::Closed),
+                    ..IssueUpdate::default()
+                },
+                "original-closer",
+            )
+            .unwrap();
+        let snapshot = storage.snapshot_auxiliary_history_tables();
+        assert!(snapshot.failures.is_empty());
+        for same_closure in [true, false] {
+            let rebuilt = SqliteStorage::open_memory().unwrap();
+            let mut shared = closed.clone();
+            shared.closed_by = None;
+            shared.closed_by_agent_name = None;
+            if !same_closure {
+                shared.closed_at = shared
+                    .closed_at
+                    .map(|time| time + chrono::Duration::days(1));
+                shared.updated_at = shared.closed_at.unwrap();
+            }
+            rebuilt.upsert_issue_for_import(&shared).unwrap();
+            rebuilt.restore_auxiliary_history_tables(&snapshot).unwrap();
+            let restored = rebuilt.get_issue(&shared.id).unwrap().unwrap();
+            if same_closure {
+                assert_eq!(restored.closed_by, closed.closed_by);
+                assert_eq!(restored.closed_by_agent_name, closed.closed_by_agent_name);
+            } else {
+                assert!(
+                    restored.closed_by.is_none(),
+                    "old closer must not attach to a later closure"
+                );
+                assert!(restored.closed_by_agent_name.is_none());
+            }
+            assert!(
+                !rebuilt.get_events(&shared.id, 10).unwrap().is_empty(),
+                "audit history remains available"
+            );
+        }
+    }
+
+    #[test]
+    fn closure_attribution_rolls_back_with_a_failed_batch() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        for id in ["bd-batch-a", "bd-batch-b"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 2, None, now, None),
+                    "creator",
+                )
+                .unwrap();
+        }
+        let updates = [
+            (
+                "bd-batch-a".to_string(),
+                IssueUpdate {
+                    status: Some(Status::Closed),
+                    ..IssueUpdate::default()
+                },
+            ),
+            (
+                "bd-batch-b".to_string(),
+                IssueUpdate {
+                    title: Some("x".repeat(501)),
+                    status: Some(Status::Closed),
+                    ..IssueUpdate::default()
+                },
+            ),
+        ];
+        assert!(
+            storage
+                .update_issues_atomically(&updates, "closer")
+                .is_err()
+        );
+        for id in ["bd-batch-a", "bd-batch-b"] {
+            assert_eq!(storage.get_issue(id).unwrap().unwrap().status, Status::Open);
+            assert!(storage.get_close_metadata(id).unwrap().is_none());
+        }
     }
 
     #[test]
@@ -32465,6 +33123,10 @@ required_fields:
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,
@@ -32550,6 +33212,10 @@ required_fields:
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,
@@ -32629,6 +33295,10 @@ required_fields:
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,
@@ -32765,6 +33435,10 @@ required_fields:
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,
@@ -33387,6 +34061,10 @@ required_fields:
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,
@@ -41639,6 +42317,86 @@ required_fields:
         });
         assert!(error.is_err());
         assert_eq!(storage.get_jsonl_row_receipts().unwrap(), initial);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn closure_attribution_schema_upgrade_waits_for_pending_merge_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("pending-close-schema.db");
+        {
+            let conn = Connection::open(path.to_string_lossy().into_owned()).unwrap();
+            let legacy_schema =
+                crate::storage::schema::SCHEMA_SQL.replace("        closed_by TEXT,\n", "");
+            execute_batch(&conn, &legacy_schema).unwrap();
+            conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+                .unwrap();
+            execute_batch(
+                &conn,
+                "INSERT INTO issues (id, title, status, closed_at) VALUES \
+                 ('bd-pending-close', 'Legacy close', 'closed', '2026-01-01T00:00:00Z');
+                 INSERT INTO close_metadata (issue_id, closed_by_agent_name, bypassed_policy) \
+                 VALUES ('bd-pending-close', 'legacy-agent', 1);",
+            )
+            .unwrap();
+            conn.execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(METADATA_SYNC_MERGE_PENDING),
+                    SqliteValue::from(""),
+                ],
+            )
+            .unwrap();
+        }
+        let (metadata_before, catalog_before) = {
+            let conn = Connection::open(path.to_string_lossy().into_owned()).unwrap();
+            (
+                conn.query("SELECT rowid, key, value FROM metadata ORDER BY rowid").unwrap().iter().map(|row| row.values().to_vec()).collect::<Vec<_>>(),
+                conn.query("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name").unwrap().iter().map(|row| row.values().to_vec()).collect::<Vec<_>>(),
+            )
+        };
+        {
+            let mut storage = SqliteStorage::open(&path).unwrap();
+            assert!(!storage.close_metadata_has_closed_by().unwrap());
+            assert_eq!(
+                storage
+                    .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
+                    .unwrap(),
+                metadata_before
+            );
+            assert_eq!(storage.execute_raw_query("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name").unwrap(), catalog_before);
+            let exported = storage
+                .get_issue_for_export("bd-pending-close")
+                .unwrap()
+                .unwrap();
+            assert!(exported.closed_by.is_none());
+            assert!(
+                exported.closed_by_agent_name.is_none(),
+                "pending generation must keep its old projection"
+            );
+            assert_eq!(exported.bypassed_policy, Some(true));
+            let raw = storage
+                .get_close_metadata("bd-pending-close")
+                .unwrap()
+                .unwrap();
+            assert!(raw.closed_by.is_none());
+            assert_eq!(raw.closed_by_agent_name.as_deref(), Some("legacy-agent"));
+            storage
+                .delete_metadata(METADATA_SYNC_MERGE_PENDING)
+                .unwrap();
+        }
+        let storage = SqliteStorage::open(&path).unwrap();
+        assert!(storage.close_metadata_has_closed_by().unwrap());
+        let exported = storage
+            .get_issue_for_export("bd-pending-close")
+            .unwrap()
+            .unwrap();
+        assert!(exported.closed_by.is_none());
+        assert_eq!(
+            exported.closed_by_agent_name.as_deref(),
+            Some("legacy-agent")
+        );
+        assert!(runtime_schema_witness_matches(&storage.conn));
     }
 
     #[test]

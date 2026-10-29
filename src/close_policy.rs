@@ -2,8 +2,9 @@
 //!
 //! Loads `.beads/policy.yaml` (when present) and evaluates configured gates
 //! against a candidate close. Every gate is opt-in. With no policy file,
-//! [`ClosePolicy::is_active`] returns `false` and `br close` behaves exactly
-//! as it did before this module existed.
+//! [`ClosePolicy::is_active`] returns `false` and no close-policy gates run.
+//! Closure actor and supplied agent attribution are captured independently
+//! of policy activation.
 //!
 //! # Phase 1 scope
 //!
@@ -95,7 +96,8 @@ pub struct ClosePolicy {
     /// is the natural touch-point that forces the closer to confront every
     /// deferred dependent before the prereq disappears from the graph.
     pub forbid_close_with_deferred_dependents: ToggleGate,
-    /// Tier 1 attribution capture (default: off).
+    /// Opt-in attribution policy metadata (default: off). Supplied agent
+    /// attribution is captured on ordinary closes regardless of this setting.
     pub attribution: Attribution,
     /// Typed structured references gate (capability #3 of #274). When
     /// `enabled`, the close `--reason` must contain at least one
@@ -2362,7 +2364,8 @@ impl Default for RequireCloseReason {
     }
 }
 
-/// Agent-attribution capture configuration.
+/// Agent-attribution policy configuration. This does not disable the
+/// capture-only attribution supplied to an ordinary close.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Attribution {
@@ -2375,7 +2378,8 @@ pub struct Attribution {
     pub fields: Vec<String>,
 }
 
-/// Attribution tier. Phase 1 ships `Off` and `Capture` only.
+/// Attribution policy tier. `Off` disables this policy component, while
+/// supplied agent attribution is still recorded with the closure actor.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttributionTier {

@@ -1325,6 +1325,10 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,
@@ -1751,7 +1755,10 @@ mod tests {
                         ],
                     )?;
                 }
-                tx.execute("UPDATE issues SET status = 'closed' WHERE id = 'bd-c'")?;
+                tx.execute_with_params(
+                    "UPDATE issues SET status = 'closed', closed_at = ? WHERE id = 'bd-c'",
+                    &[fsqlite_types::SqliteValue::from(stamp.as_str())],
+                )?;
                 tx.execute("UPDATE issues SET status = 'tombstone' WHERE id = 'bd-b'")?;
                 Ok(())
             })

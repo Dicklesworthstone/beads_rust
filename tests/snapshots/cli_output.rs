@@ -153,11 +153,16 @@ fn snapshot_stats_output() {
 #[test]
 fn snapshot_doctor_output() {
     let workspace = BrWorkspace::new();
-    let init = run_br(&workspace, ["init"], "init");
+    // Keep config.yaml's size independent of the generated workspace name.
+    let init = run_br(&workspace, ["init", "--prefix", "snapshots"], "init");
     assert!(init.status.success());
 
     let output = run_br(&workspace, ["doctor"], "doctor");
-    assert_snapshot!("doctor_output", normalize_output(&output.stdout));
+    // Mask this fixture's exact root before generic issue-ID normalization.
+    let stdout = output
+        .stdout
+        .replace(workspace.root.to_string_lossy().as_ref(), "/TMP");
+    assert_snapshot!("doctor_output", normalize_output(&stdout));
 }
 
 #[test]

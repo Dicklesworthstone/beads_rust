@@ -343,6 +343,25 @@ fn write_toon_issue_time_fields<W: Write>(
         "closed_by_session",
         issue.closed_by_session.as_deref(),
     )?;
+    write_optional_toon_string_field(writer, line, "closed_by", issue.closed_by.as_deref())?;
+    write_optional_toon_string_field(
+        writer,
+        line,
+        "closed_by_agent_name",
+        issue.closed_by_agent_name.as_deref(),
+    )?;
+    write_optional_toon_string_field(
+        writer,
+        line,
+        "closed_by_harness",
+        issue.closed_by_harness.as_deref(),
+    )?;
+    write_optional_toon_string_field(
+        writer,
+        line,
+        "closed_by_model",
+        issue.closed_by_model.as_deref(),
+    )?;
     write_optional_toon_datetime_field(writer, line, "due_at", issue.due_at.as_ref())?;
     write_optional_toon_datetime_field(writer, line, "defer_until", issue.defer_until.as_ref())
 }
@@ -1664,6 +1683,10 @@ mod tests {
         first.estimated_minutes = Some(42);
         first.closed_at = Some(closed_at);
         first.close_reason = Some("fixed".to_string());
+        first.closed_by = Some("closing-actor".to_string());
+        first.closed_by_agent_name = Some("agent,quoted".to_string());
+        first.closed_by_harness = Some("claude-code".to_string());
+        first.closed_by_model = Some("opus".to_string());
         first.due_at = Some(closed_at);
         first.external_ref = Some("JIRA-42".to_string());
         first.compacted_at_commit = Some("abc123".to_string());

@@ -9,7 +9,7 @@ use beads_rust::sync::{blocking_jsonl_family_write_lock_with_timeout, blocking_w
 use chrono::Utc;
 use common::cli::{
     BrRun, BrWorkspace, extract_json_payload, parse_json_value, parse_list_issues, run_br,
-    run_br_smoke_at_root_with_env,
+    run_br_smoke_at_root_with_env, run_br_with_env,
 };
 use common::isolated_workspace_failure_fixture;
 #[cfg(target_os = "linux")]
@@ -60,6 +60,10 @@ fn make_issue(id: &str, title: &str, now: chrono::DateTime<Utc>) -> Issue {
         closed_at: None,
         close_reason: None,
         closed_by_session: None,
+        closed_by: None,
+        closed_by_agent_name: None,
+        closed_by_harness: None,
+        closed_by_model: None,
         bypassed_policy: None,
         bypass_reason: None,
         policy_gates_fired: None,
@@ -144,6 +148,607 @@ fn read_jsonl_values(path: &Path) -> Vec<Value> {
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("parse exported issue"))
         .collect()
+}
+
+const EMPTY_CLOSE_AGENT_ENV: [(&str, &str); 3] =
+    [("BR_AGENT_NAME", ""), ("BR_HARNESS", ""), ("BR_MODEL", "")];
+
+fn closure_workspace() -> BrWorkspace {
+    let workspace = BrWorkspace::new();
+    assert_br_success(
+        &run_br(&workspace, ["init", "--prefix", "attr"], "closure_init"),
+        "initialize closure workspace",
+    );
+    workspace
+}
+
+fn create_closure_issue(workspace: &BrWorkspace, title: &str) -> String {
+    let created = run_br(
+        workspace,
+        ["create", title, "--actor", "creator", "--json"],
+        "closure_create",
+    );
+    assert_br_success(&created, "create closure issue");
+    parse_json_value(&created.stdout)["id"]
+        .as_str()
+        .expect("created closure issue ID")
+        .to_string()
+}
+
+fn closure_records(workspace: &BrWorkspace, id: &str) -> [Value; 2] {
+    let shown = run_br(workspace, ["show", id, "--json"], "closure_show");
+    assert_br_success(&shown, "show closure issue");
+    let shown = parse_json_value(&shown.stdout)[0].clone();
+    let exported = read_jsonl_values(&workspace.root.join(".beads/issues.jsonl"))
+        .into_iter()
+        .find(|issue| issue["id"] == id)
+        .expect("exported closure issue");
+    [shown, exported]
+}
+
+fn assert_closure_attribution(record: &Value, actor: Option<&str>, agent: [Option<&str>; 3]) {
+    for (field, expected) in [
+        ("closed_by", actor),
+        ("closed_by_agent_name", agent[0]),
+        ("closed_by_harness", agent[1]),
+        ("closed_by_model", agent[2]),
+    ] {
+        if let Some(expected) = expected {
+            assert_eq!(record[field], expected, "{field}: {record}");
+        } else {
+            assert!(record.get(field).is_none(), "unexpected {field}: {record}");
+        }
+    }
+}
+
+/// #584: ordinary closes must share the resolved actor, independently of the
+/// optional agent name and without requiring a close-policy file.
+#[test]
+fn e2e_close_attribution_uses_existing_actor_resolution() {
+    for (cli_actor, env_actor, user, expected) in [
+        (
+            Some("  explicit-closer  "),
+            "env-actor",
+            "local-user",
+            "explicit-closer",
+        ),
+        (None, "  env-closer  ", "local-user", "env-closer"),
+        (None, "", "  local-user  ", "local-user"),
+        (None, "", " ", "unknown"),
+    ] {
+        let workspace = closure_workspace();
+        let id = create_closure_issue(&workspace, "Resolved closer");
+        let mut args = vec!["close", id.as_str(), "--reason", "verified", "--json"];
+        if let Some(cli_actor) = cli_actor {
+            args.extend(["--actor", cli_actor]);
+        }
+        let close = run_br_with_env(
+            &workspace,
+            args,
+            [
+                ("BD_ACTOR", env_actor),
+                ("USER", user),
+                ("BR_AGENT_NAME", "seat-a"),
+                ("BR_HARNESS", "claude-code"),
+                ("BR_MODEL", "opus"),
+            ],
+            "closure_actor",
+        );
+        assert_br_success(&close, "close with resolved actor");
+        assert!(!workspace.root.join(".beads/policy.yaml").exists());
+        for record in closure_records(&workspace, &id) {
+            assert_eq!(record["status"], "closed");
+            assert_eq!(record["created_by"], "creator");
+            assert_eq!(record["close_reason"], "verified");
+            assert_closure_attribution(
+                &record,
+                Some(expected),
+                [Some("seat-a"), Some("claude-code"), Some("opus")],
+            );
+            assert!(record.get("deleted_by").is_none(), "{record}");
+            assert!(record.get("bypassed_policy").is_none(), "{record}");
+        }
+    }
+}
+
+#[test]
+fn e2e_close_attribution_flags_override_env_and_noop_preserves_closer() {
+    let workspace = closure_workspace();
+    let id = create_closure_issue(&workspace, "Attribution precedence");
+    let close = run_br_with_env(
+        &workspace,
+        [
+            "close",
+            &id,
+            "--actor",
+            "original-closer",
+            "--agent-name",
+            "cli-seat",
+            "--harness",
+            "cli-harness",
+            "--model",
+            "cli-model",
+            "--json",
+        ],
+        [
+            ("BR_AGENT_NAME", "env-seat"),
+            ("BR_HARNESS", "env-harness"),
+            ("BR_MODEL", "env-model"),
+        ],
+        "closure_cli_precedence",
+    );
+    assert_br_success(&close, "close with explicit agent metadata");
+    let before = fs::read(workspace.root.join(".beads/issues.jsonl")).expect("closure export");
+    let repeated = run_br_with_env(
+        &workspace,
+        ["close", &id, "--actor", "late-observer", "--json"],
+        [
+            ("BR_AGENT_NAME", "late-seat"),
+            ("BR_HARNESS", "late-harness"),
+            ("BR_MODEL", "late-model"),
+        ],
+        "closure_noop",
+    );
+    assert!(
+        !repeated.status.success(),
+        "an already-closed issue is skipped"
+    );
+    assert_eq!(
+        fs::read(workspace.root.join(".beads/issues.jsonl")).expect("unchanged closure export"),
+        before,
+        "a skipped close must not rewrite the shared closure record",
+    );
+    for record in closure_records(&workspace, &id) {
+        assert_closure_attribution(
+            &record,
+            Some("original-closer"),
+            [Some("cli-seat"), Some("cli-harness"), Some("cli-model")],
+        );
+    }
+}
+
+#[test]
+fn e2e_close_attribution_reopen_reclose_and_delete_keep_distinct_actors() {
+    let workspace = closure_workspace();
+    let id = create_closure_issue(&workspace, "Reopened closure");
+    let first = run_br_with_env(
+        &workspace,
+        [
+            "close",
+            &id,
+            "--actor",
+            "first-closer",
+            "--session",
+            "first-session",
+            "--json",
+        ],
+        [
+            ("BR_AGENT_NAME", "first-seat"),
+            ("BR_HARNESS", "first-harness"),
+            ("BR_MODEL", "first-model"),
+        ],
+        "closure_first",
+    );
+    assert_br_success(&first, "first close");
+    assert_br_success(
+        &run_br(
+            &workspace,
+            ["reopen", &id, "--actor", "reviewer", "--json"],
+            "closure_reopen",
+        ),
+        "reopen issue",
+    );
+    for record in closure_records(&workspace, &id) {
+        assert_eq!(record["status"], "open");
+        assert_closure_attribution(&record, None, [None; 3]);
+        assert!(record.get("closed_at").is_none(), "{record}");
+        assert!(record.get("closed_by_session").is_none(), "{record}");
+    }
+    let second = run_br_with_env(
+        &workspace,
+        ["close", &id, "--actor", "second-closer", "--json"],
+        EMPTY_CLOSE_AGENT_ENV,
+        "closure_second",
+    );
+    assert_br_success(&second, "second close without agent metadata");
+    for record in closure_records(&workspace, &id) {
+        assert_closure_attribution(&record, Some("second-closer"), [None; 3]);
+        assert!(record.get("closed_by_session").is_none(), "{record}");
+        assert!(record.get("deleted_by").is_none(), "{record}");
+    }
+    assert_br_success(
+        &run_br(
+            &workspace,
+            ["delete", &id, "--force", "--actor", "deleter", "--json"],
+            "closure_delete",
+        ),
+        "delete closed issue",
+    );
+    let deleted = read_jsonl_values(&workspace.root.join(".beads/issues.jsonl"));
+    assert_eq!(deleted[0]["status"], "tombstone");
+    assert_eq!(deleted[0]["deleted_by"], "deleter");
+}
+
+#[test]
+fn e2e_close_attribution_legacy_jsonl_never_infers_a_closer() {
+    let workspace = closure_workspace();
+    let id = "attr-legacy";
+    let legacy = serde_json::json!({
+        "id": id,
+        "title": "Legacy closure without attribution",
+        "status": "closed",
+        "priority": 1,
+        "issue_type": "task",
+        "created_by": "historical-author",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T00:00:00Z",
+        "closed_at": "2026-01-02T00:00:00Z",
+        "close_reason": "historical completion"
+    });
+    fs::write(
+        workspace.root.join(".beads/issues.jsonl"),
+        format!("{legacy}\n"),
+    )
+    .expect("write legacy JSONL");
+    for force in [false, true] {
+        let mut args = vec!["sync", "--import-only", "--actor", "importer", "--json"];
+        if force {
+            args.push("--force");
+        }
+        let imported = run_br_with_env(
+            &workspace,
+            args,
+            [
+                ("BR_AGENT_NAME", "import-seat"),
+                ("BR_HARNESS", "import-harness"),
+                ("BR_MODEL", "import-model"),
+            ],
+            "closure_legacy_import",
+        );
+        assert_br_success(&imported, "import legacy closure");
+        for record in closure_records(&workspace, id) {
+            assert_closure_attribution(&record, None, [None; 3]);
+            assert_eq!(record["created_by"], "historical-author");
+            assert_eq!(record["close_reason"], "historical completion");
+        }
+    }
+    let repeated = run_br_with_env(
+        &workspace,
+        ["close", id, "--actor", "observer", "--json"],
+        [("BR_AGENT_NAME", "observer-seat")],
+        "closure_legacy_noop",
+    );
+    assert!(!repeated.status.success());
+    assert_br_success(
+        &run_br(
+            &workspace,
+            [
+                "update",
+                id,
+                "--notes",
+                "Reviewed on another machine",
+                "--actor",
+                "reviewer",
+                "--json",
+            ],
+            "closure_legacy_edit",
+        ),
+        "edit legacy issue without changing its closure",
+    );
+    assert_br_success(
+        &run_br(
+            &workspace,
+            ["sync", "--flush-only"],
+            "closure_legacy_export",
+        ),
+        "re-export legacy closure",
+    );
+    for record in closure_records(&workspace, id) {
+        assert_closure_attribution(&record, None, [None; 3]);
+    }
+}
+
+#[test]
+fn e2e_close_attribution_new_unattributed_closure_cannot_reuse_previous_closer() {
+    let workspace = closure_workspace();
+    let id = create_closure_issue(&workspace, "Different historical closure");
+    assert_br_success(
+        &run_br_with_env(
+            &workspace,
+            ["close", &id, "--actor", "previous-closer", "--json"],
+            [
+                ("BR_AGENT_NAME", "previous-seat"),
+                ("BR_HARNESS", "previous-harness"),
+                ("BR_MODEL", "previous-model"),
+            ],
+            "closure_previous",
+        ),
+        "close before historical import",
+    );
+    let mut incoming = closure_records(&workspace, &id)[1].clone();
+    incoming["closed_at"] = Value::String("2035-01-01T00:00:00Z".to_string());
+    incoming["updated_at"] = incoming["closed_at"].clone();
+    incoming["close_reason"] = Value::String("Closed again on an older client".to_string());
+    for field in [
+        "closed_by",
+        "closed_by_agent_name",
+        "closed_by_harness",
+        "closed_by_model",
+    ] {
+        incoming
+            .as_object_mut()
+            .expect("issue object")
+            .remove(field);
+    }
+    fs::write(
+        workspace.root.join(".beads/issues.jsonl"),
+        format!("{incoming}\n"),
+    )
+    .expect("publish a different unattributed closure");
+    assert_br_success(
+        &run_br_with_env(
+            &workspace,
+            ["sync", "--import-only", "--actor", "importer", "--json"],
+            [("BR_AGENT_NAME", "import-seat")],
+            "closure_new_legacy_import",
+        ),
+        "import a newer closure without provenance",
+    );
+    assert_br_success(
+        &run_br(
+            &workspace,
+            ["sync", "--flush-only"],
+            "closure_new_legacy_export",
+        ),
+        "export a newer closure without provenance",
+    );
+    for record in closure_records(&workspace, &id) {
+        assert_eq!(record["close_reason"], "Closed again on an older client");
+        assert_closure_attribution(&record, None, [None; 3]);
+    }
+}
+
+#[test]
+fn e2e_close_attribution_no_db_close_survives_show_and_sqlite_import() {
+    let workspace = closure_workspace();
+    let id = create_closure_issue(&workspace, "JSONL-only closure");
+    assert_br_success(
+        &run_br_with_env(
+            &workspace,
+            ["--no-db", "close", &id, "--actor", "jsonl-closer", "--json"],
+            [
+                ("BR_AGENT_NAME", "jsonl-seat"),
+                ("BR_HARNESS", "jsonl-harness"),
+                ("BR_MODEL", "jsonl-model"),
+            ],
+            "closure_no_db_close",
+        ),
+        "close in JSONL-only mode",
+    );
+    let shown = run_br_with_env(
+        &workspace,
+        ["--no-db", "show", &id, "--actor", "jsonl-reader", "--json"],
+        [("BR_AGENT_NAME", "reader-seat")],
+        "closure_no_db_show",
+    );
+    assert_br_success(&shown, "read closure with a fresh JSONL-only session");
+    assert_closure_attribution(
+        &parse_json_value(&shown.stdout)[0],
+        Some("jsonl-closer"),
+        [
+            Some("jsonl-seat"),
+            Some("jsonl-harness"),
+            Some("jsonl-model"),
+        ],
+    );
+    assert_br_success(
+        &run_br_with_env(
+            &workspace,
+            [
+                "sync",
+                "--import-only",
+                "--actor",
+                "sqlite-importer",
+                "--json",
+            ],
+            [("BR_AGENT_NAME", "import-seat")],
+            "closure_no_db_import",
+        ),
+        "import JSONL-only close into the persistent database",
+    );
+    assert_br_success(
+        &run_br(
+            &workspace,
+            ["sync", "--flush-only"],
+            "closure_no_db_reexport",
+        ),
+        "re-export JSONL-only closure from SQLite",
+    );
+    for record in closure_records(&workspace, &id) {
+        assert_closure_attribution(
+            &record,
+            Some("jsonl-closer"),
+            [
+                Some("jsonl-seat"),
+                Some("jsonl-harness"),
+                Some("jsonl-model"),
+            ],
+        );
+    }
+}
+
+/// Both machines exchange only issues.jsonl. Importer and merger identities
+/// must never replace the actor that actually closed the issue.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_close_attribution_survives_jsonl_only_machine_sync_and_reclose() {
+    let machine_a = closure_workspace();
+    let machine_b = closure_workspace();
+    let id = create_closure_issue(&machine_a, "Shared closure");
+    let jsonl_a = machine_a.root.join(".beads/issues.jsonl");
+    let jsonl_b = machine_b.root.join(".beads/issues.jsonl");
+    assert_br_success(
+        &run_br_with_env(
+            &machine_a,
+            ["close", &id, "--actor", "closer-a", "--json"],
+            [
+                ("BR_AGENT_NAME", "seat-a"),
+                ("BR_HARNESS", "harness-a"),
+                ("BR_MODEL", "model-a"),
+            ],
+            "closure_machine_a",
+        ),
+        "close on machine A",
+    );
+    assert_br_success(
+        &run_br(&machine_a, ["sync", "--flush-only"], "closure_a_export"),
+        "export closure from machine A",
+    );
+    fs::copy(&jsonl_a, &jsonl_b).expect("transfer only shared JSONL to B");
+    assert_br_success(
+        &run_br_with_env(
+            &machine_b,
+            ["sync", "--import-only", "--actor", "importer-b", "--json"],
+            [
+                ("BR_AGENT_NAME", "import-seat-b"),
+                ("BR_HARNESS", "import-harness-b"),
+                ("BR_MODEL", "import-model-b"),
+            ],
+            "closure_b_import",
+        ),
+        "import closure on machine B",
+    );
+    for record in closure_records(&machine_b, &id) {
+        assert_closure_attribution(
+            &record,
+            Some("closer-a"),
+            [Some("seat-a"), Some("harness-a"), Some("model-a")],
+        );
+    }
+    // Only JSONL crossed machines; establish B's local merge base before
+    // the two workspaces diverge.
+    assert_br_success(
+        &run_br(
+            &machine_b,
+            ["sync", "--flush-only"],
+            "closure_b_export_base",
+        ),
+        "establish machine B's local merge base",
+    );
+    assert_br_success(
+        &run_br(
+            &machine_a,
+            [
+                "update",
+                &id,
+                "--description",
+                "Local description",
+                "--no-auto-flush",
+                "--json",
+            ],
+            "closure_a_local_edit",
+        ),
+        "edit local description before merge",
+    );
+    assert_br_success(
+        &run_br(
+            &machine_b,
+            [
+                "update",
+                &id,
+                "--notes",
+                "Remote review notes",
+                "--actor",
+                "reviewer-b",
+                "--json",
+            ],
+            "closure_b_remote_edit",
+        ),
+        "edit remote notes before merge",
+    );
+    fs::copy(&jsonl_b, &jsonl_a).expect("transfer peer's JSONL for merge");
+    assert_br_success(
+        &run_br_with_env(
+            &machine_a,
+            [
+                "sync",
+                "--merge",
+                "--force-jsonl",
+                "--actor",
+                "merger-a",
+                "--json",
+            ],
+            [("BR_AGENT_NAME", "merge-seat-a")],
+            "closure_a_merge",
+        ),
+        "merge peer changes without replacing the closer",
+    );
+    for record in closure_records(&machine_a, &id) {
+        // Merge chooses a complete issue revision; the explicit source winner
+        // retains its closer rather than acquiring the merging actor.
+        assert!(record.get("description").is_none(), "{record}");
+        assert_eq!(record["notes"], "Remote review notes");
+        assert_closure_attribution(
+            &record,
+            Some("closer-a"),
+            [Some("seat-a"), Some("harness-a"), Some("model-a")],
+        );
+    }
+    fs::copy(&jsonl_a, &jsonl_b).expect("transfer merged JSONL back to B");
+    assert_br_success(
+        &run_br(
+            &machine_b,
+            ["sync", "--merge", "--actor", "merger-b", "--json"],
+            "closure_b_merge",
+        ),
+        "converge machine B",
+    );
+    for record in closure_records(&machine_b, &id) {
+        assert_closure_attribution(
+            &record,
+            Some("closer-a"),
+            [Some("seat-a"), Some("harness-a"), Some("model-a")],
+        );
+    }
+    assert_br_success(
+        &run_br(
+            &machine_b,
+            ["reopen", &id, "--actor", "reviewer-b", "--json"],
+            "closure_b_reopen",
+        ),
+        "reopen on machine B",
+    );
+    for record in closure_records(&machine_b, &id) {
+        assert_closure_attribution(&record, None, [None; 3]);
+    }
+    assert_br_success(
+        &run_br_with_env(
+            &machine_b,
+            ["close", &id, "--actor", "closer-b", "--json"],
+            EMPTY_CLOSE_AGENT_ENV,
+            "closure_machine_b",
+        ),
+        "close on machine B without optional metadata",
+    );
+    fs::copy(&jsonl_b, &jsonl_a).expect("transfer the replacement closure to A");
+    assert_br_success(
+        &run_br_with_env(
+            &machine_a,
+            ["sync", "--import-only", "--actor", "importer-a", "--json"],
+            [("BR_AGENT_NAME", "import-seat-a")],
+            "closure_a_import_reclose",
+        ),
+        "import the new closer on machine A",
+    );
+    assert_br_success(
+        &run_br(&machine_a, ["sync", "--flush-only"], "closure_a_reexport"),
+        "re-export peer closure",
+    );
+    for workspace in [&machine_a, &machine_b] {
+        for record in closure_records(workspace, &id) {
+            assert_closure_attribution(&record, Some("closer-b"), [None; 3]);
+        }
+    }
 }
 
 #[test]

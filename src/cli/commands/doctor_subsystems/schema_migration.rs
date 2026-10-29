@@ -98,6 +98,10 @@ struct LegacyTableProjection {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct LegacyV15Projection {
     profile: String,
+    // Older receipts retain their original eight-column projection and DDL
+    // witness. New plans bind the nullable addition in the existing token.
+    #[serde(default, skip_serializing_if = "is_false")]
+    closed_by_column_added: bool,
     tables: Vec<LegacyTableProjection>,
     preserved_schema_sha256: String,
     retired_indexes: Vec<String>,
@@ -2777,7 +2781,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     require_source_tables(&conn, from)?;
     let legacy_v15 = attest_reviewed_migration_source_core_tables(&conn)?;
     let legacy_v15_conversion = legacy_v15
-        .then(|| legacy_v15_projection(&conn, true))
+        .then(|| legacy_v15_projection(&conn, true, true))
         .transpose()?;
     let issue_count = query_count(&conn, "SELECT COUNT(*) FROM issues")?;
     let gate_result_history_created = !named_table_exists(&conn, "gate_result_history")?;
@@ -5541,12 +5545,14 @@ fn legacy_table_projection(
     conn: &Connection,
     table: &str,
     project_source: bool,
+    closed_by_column_added: bool,
 ) -> Result<LegacyTableProjection> {
     let rowid = legacy_projection_rowid(conn, table)?;
     let prefix = rowid.map_or_else(String::new, |alias| format!("{alias}, "));
     let columns = match (project_source, table) {
         (_, "sqlite_sequence") => "name, seq",
         (true, "issues") => "*, ''",
+        (true, "close_metadata") if closed_by_column_added => "*, NULL",
         (true, "dirty_issues") => "issue_id, marked_at",
         (true, "child_counters") => "parent_id, last_child",
         _ => "*",
@@ -5609,7 +5615,53 @@ fn legacy_rows_projection(
     })
 }
 
-fn legacy_preserved_schema_witness(conn: &Connection) -> Result<String> {
+/// Remove only the reviewed nullable-column addition from the candidate's
+/// declaration. Every existing column, constraint, and table option remains
+/// in the DDL witness, and row projection separately requires a NULL closer.
+fn legacy_close_metadata_schema_fingerprint(sql: &str) -> Result<String> {
+    let mut tokens = ddl_tokens(sql, true);
+    let mut depth = 0_usize;
+    let mut addition = None;
+    for (index, token) in tokens.iter().enumerate() {
+        let previous = index.checked_sub(1).and_then(|index| tokens.get(index));
+        if depth == 1
+            && token == "closed_by"
+            && previous.is_some_and(|token| matches!(token.as_str(), "(" | ","))
+        {
+            let delimiter = tokens.get(index + 2).map(String::as_str);
+            if addition.is_some()
+                || tokens.get(index + 1).map(String::as_str) != Some("text")
+                || !matches!(delimiter, Some("," | ")"))
+                || (previous.is_some_and(|token| token == "(") && delimiter == Some(")"))
+            {
+                return Err(BeadsError::internal(
+                    "legacy close metadata projection requires exactly one nullable closed_by TEXT addition without defaults or constraints",
+                ));
+            }
+            addition = Some(if previous.is_some_and(|token| token == ",") {
+                index - 1..index + 2
+            } else {
+                index..index + 3
+            });
+        }
+        match token.as_str() {
+            "(" => depth += 1,
+            ")" => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    let addition = addition.ok_or_else(|| {
+        BeadsError::internal("legacy close metadata projection is missing closed_by TEXT")
+    })?;
+    drop(tokens.drain(addition));
+    Ok(tokens.join(" "))
+}
+
+fn legacy_preserved_schema_witness(
+    conn: &Connection,
+    project_source: bool,
+    closed_by_column_added: bool,
+) -> Result<String> {
     let mut hasher = Sha256::new();
     for row in conn.query(
         "SELECT type, name, tbl_name, COALESCE(sql, '') FROM main.sqlite_schema \
@@ -5643,12 +5695,25 @@ fn legacy_preserved_schema_witness(conn: &Connection) -> Result<String> {
         // Retain grouping for this newly admitted conversion. A rewrite that
         // changes operator CHECK/partial-index parentheses must be refused,
         // even when its present rows happen to satisfy both expressions.
-        hash_len_prefixed(&mut hasher, ddl_token_fingerprint(sql, true).as_bytes());
+        let fingerprint = if closed_by_column_added
+            && !project_source
+            && object_type == "table"
+            && table == "close_metadata"
+        {
+            legacy_close_metadata_schema_fingerprint(sql)?
+        } else {
+            ddl_token_fingerprint(sql, true)
+        };
+        hash_len_prefixed(&mut hasher, fingerprint.as_bytes());
     }
     Ok(hex_digest(hasher.finalize().as_slice()))
 }
 
-fn legacy_v15_projection(conn: &Connection, project_source: bool) -> Result<LegacyV15Projection> {
+fn legacy_v15_projection(
+    conn: &Connection,
+    project_source: bool,
+    closed_by_column_added: bool,
+) -> Result<LegacyV15Projection> {
     if !project_source {
         for row in conn.query("SELECT name FROM main.sqlite_schema WHERE type='index'")? {
             if let Some(name) = row.get(0).and_then(SqliteValue::as_text)
@@ -5666,7 +5731,12 @@ fn legacy_v15_projection(conn: &Connection, project_source: bool) -> Result<Lega
             .get(0)
             .and_then(SqliteValue::as_text)
             .ok_or_else(|| BeadsError::internal("projection table name is not text"))?;
-        tables.push(legacy_table_projection(conn, name, project_source)?);
+        tables.push(legacy_table_projection(
+            conn,
+            name,
+            project_source,
+            closed_by_column_added,
+        )?);
     }
     if project_source {
         for name in LEGACY_V15_NEW_TABLES {
@@ -5676,8 +5746,13 @@ fn legacy_v15_projection(conn: &Connection, project_source: bool) -> Result<Lega
     tables.sort_by(|left, right| left.table.name.cmp(&right.table.name));
     Ok(LegacyV15Projection {
         profile: LEGACY_V15_PROFILE.to_owned(),
+        closed_by_column_added,
         tables,
-        preserved_schema_sha256: legacy_preserved_schema_witness(conn)?,
+        preserved_schema_sha256: legacy_preserved_schema_witness(
+            conn,
+            project_source,
+            closed_by_column_added,
+        )?,
         retired_indexes: REVIEWED_LEGACY_V15_RETIRED_INDEXES
             .iter()
             .map(|name| (*name).to_owned())
@@ -5694,7 +5769,7 @@ fn verify_legacy_v15_projection(
         return Ok(());
     };
     let conn = open_read_only(db_path)?;
-    let observed = legacy_v15_projection(&conn, project_source);
+    let observed = legacy_v15_projection(&conn, project_source, expected.closed_by_column_added);
     let closed = close_connection(conn);
     let observed = observed?;
     closed?;
@@ -6014,6 +6089,10 @@ fn quote_identifier(identifier: &str) -> String {
 /// accepting only that stronger equality avoids hiding expression grouping
 /// or identifier changes behind the old layout-maintenance normalization.
 fn ddl_token_fingerprint(sql: &str, preserve_grouping: bool) -> String {
+    ddl_tokens(sql, preserve_grouping).join(" ")
+}
+
+fn ddl_tokens(sql: &str, preserve_grouping: bool) -> Vec<String> {
     fn flush(word: &mut String, tokens: &mut Vec<String>) {
         if !word.is_empty() {
             tokens.push(word.to_ascii_lowercase());
@@ -6104,7 +6183,7 @@ fn ddl_token_fingerprint(sql: &str, preserve_grouping: bool) -> String {
         }
     }
     flush(&mut word, &mut tokens);
-    tokens.join(" ")
+    tokens
 }
 
 fn hash_sqlite_value(hasher: &mut Sha256, value: &SqliteValue) {
@@ -7969,6 +8048,55 @@ mod tests {
     }
 
     #[test]
+    fn legacy_close_metadata_projection_allows_only_the_nullable_actor_column() {
+        let source = "CREATE TABLE close_metadata (issue_id TEXT PRIMARY KEY, \
+                      recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+                      FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE)";
+        let expected = ddl_token_fingerprint(source, true);
+        for candidate in [
+            "CREATE TABLE close_metadata (issue_id TEXT PRIMARY KEY, \
+             recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, closed_by TEXT, \
+             FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE)",
+            "CREATE TABLE close_metadata (issue_id TEXT PRIMARY KEY, \
+             recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+             FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE, \
+             \"closed_by\" TEXT /* historical actor stays unknown */)",
+        ] {
+            assert_eq!(
+                legacy_close_metadata_schema_fingerprint(candidate).unwrap(),
+                expected
+            );
+        }
+        for declaration in [
+            "closed_by TEXT NOT NULL",
+            "closed_by TEXT DEFAULT NULL",
+            "closed_by TEXT DEFAULT 'importer'",
+            "closed_by INTEGER",
+            "closed_by TEXT CHECK (closed_by <> '')",
+        ] {
+            let candidate = format!("CREATE TABLE close_metadata (issue_id TEXT, {declaration})");
+            assert!(legacy_close_metadata_schema_fingerprint(&candidate).is_err());
+        }
+        assert!(legacy_close_metadata_schema_fingerprint(source).is_err());
+        for changed in [
+            source.replace("issue_id TEXT PRIMARY KEY", "issue_id TEXT"),
+            source.replace("ON DELETE CASCADE", "ON DELETE RESTRICT"),
+            source.replace("DEFAULT CURRENT_TIMESTAMP", "DEFAULT 'different'"),
+        ] {
+            let candidate = changed.replacen(
+                "recorded_at DATETIME",
+                "closed_by TEXT, recorded_at DATETIME",
+                1,
+            );
+            assert_ne!(
+                legacy_close_metadata_schema_fingerprint(&candidate).unwrap(),
+                expected,
+                "the reviewed actor addition must not hide another DDL change"
+            );
+        }
+    }
+
+    #[test]
     fn legacy_schema_fingerprint_keeps_operator_grouping_and_compound_identifiers() {
         for (before, changed) in [
             (
@@ -8837,7 +8965,8 @@ mod tests {
         crate::storage::schema::execute_batch(
             &conn,
             &crate::storage::schema::SCHEMA_SQL
-                .replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", ""),
+                .replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "")
+                .replace("        closed_by TEXT,\n", ""),
         )
         .unwrap();
         crate::storage::schema::execute_batch(
@@ -8848,6 +8977,13 @@ mod tests {
         crate::storage::schema::execute_batch(
             &conn,
             r#"
+            UPDATE issues SET status = 'closed', closed_at = '2026-01-30T04:07:21Z'
+                WHERE id = 'bd-legacy';
+            INSERT INTO close_metadata
+                (rowid, issue_id, closed_by_agent_name, closed_by_harness, closed_by_model,
+                 bypassed_policy, bypass_reason, policy_gates_fired, recorded_at)
+                VALUES (91, 'bd-legacy', 'historical-agent', 'historical-harness', 'historical-model',
+                        1, 'reviewed exception', '["reviewed_gate"]', '2026-01-30T04:07:21Z');
             CREATE TABLE "operator'opaque" (key TEXT PRIMARY KEY, payload BLOB);
             INSERT INTO "operator'opaque" (rowid, key, payload) VALUES (991, 'retain', X'00FF');
             CREATE TABLE operator_without_rowid (key TEXT PRIMARY KEY, payload TEXT) WITHOUT ROWID;
@@ -8890,6 +9026,7 @@ mod tests {
         assert_eq!(forecast.content_hash_rows_rebuilt, 0);
         let projection = forecast.legacy_v15_conversion.as_ref().unwrap();
         assert_eq!(projection.profile, LEGACY_V15_PROFILE);
+        assert!(projection.closed_by_column_added);
         assert_eq!(projection.retired_indexes.len(), 7);
         assert!(projection.tables.iter().any(|table| {
             table.table.name == "operator_without_rowid" && !table.rowid_included
@@ -8926,6 +9063,9 @@ mod tests {
             "SELECT rowid, * FROM dependencies ORDER BY rowid",
             "SELECT rowid, * FROM comments ORDER BY rowid",
             "SELECT rowid, * FROM events ORDER BY rowid",
+            "SELECT rowid, issue_id, closed_by_agent_name, closed_by_harness, closed_by_model, \
+             bypassed_policy, bypass_reason, policy_gates_fired, recorded_at \
+             FROM close_metadata ORDER BY rowid",
             "SELECT rowid, issue_id, marked_at FROM dirty_issues ORDER BY rowid",
             "SELECT rowid, * FROM export_hashes ORDER BY rowid",
             "SELECT rowid, parent_id, last_child FROM child_counters ORDER BY rowid",
@@ -8942,12 +9082,50 @@ mod tests {
     }
 
     #[test]
+    fn legacy_close_attribution_projection_is_receipt_bound_and_backward_compatible() {
+        let (_temp, migration) = legacy_v15_migration_context();
+        let conn = open_read_only(&migration.db_path).unwrap();
+        let historical = legacy_v15_projection(&conn, true, false).unwrap();
+        close_connection(conn).unwrap();
+        let historical_json = serde_json::to_value(&historical).unwrap();
+        assert!(historical_json.get("closed_by_column_added").is_none());
+        let restored: LegacyV15Projection = serde_json::from_value(historical_json).unwrap();
+        assert!(!restored.closed_by_column_added);
+        assert_eq!(restored, historical);
+        verify_legacy_v15_projection(&migration.db_path, Some(&restored), true).unwrap();
+
+        let plan = build_plan(&migration.db_path).unwrap();
+        let mut changed_forecast = plan.forecast.clone().unwrap();
+        let projection = changed_forecast.legacy_v15_conversion.as_mut().unwrap();
+        assert!(projection.closed_by_column_added);
+        projection.closed_by_column_added = false;
+        assert_ne!(
+            compute_plan_token(
+                &plan.database_path,
+                &plan.logical_witness,
+                &changed_forecast,
+            )
+            .unwrap(),
+            plan.plan_token.unwrap(),
+            "changing the reviewed actor-column addition must invalidate the plan identity"
+        );
+    }
+
+    #[test]
     fn reviewed_legacy_v15_plan_apply_and_undo_preserve_projected_data_and_source_bytes() {
         let (_temp, migration) = legacy_v15_migration_context();
         let payloads = raw_legacy_payloads(&migration.db_path);
         let applied = apply_legacy_v15_upgrade(&migration);
         assert_eq!(raw_legacy_payloads(&migration.db_path), payloads);
         let conn = open_read_only(&migration.db_path).unwrap();
+        let closure = conn
+            .query_row("SELECT closed_by, closed_by_agent_name FROM close_metadata WHERE issue_id = 'bd-legacy'")
+            .unwrap();
+        assert_eq!(closure.get(0), Some(&SqliteValue::Null));
+        assert_eq!(
+            closure.get(1).and_then(SqliteValue::as_text),
+            Some("historical-agent")
+        );
         assert_eq!(
             conn.query("SELECT name, seq FROM sqlite_sequence WHERE name IN ('comments', 'events') ORDER BY name")
                 .unwrap()
@@ -8983,10 +9161,41 @@ mod tests {
     }
 
     #[test]
+    fn legacy_close_attribution_projection_rejects_a_fabricated_historical_closer() {
+        let (_temp, migration) = legacy_v15_migration_context();
+        let applied = apply_legacy_v15_upgrade(&migration);
+        let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute(
+            "UPDATE close_metadata SET closed_by = 'invented-closer' WHERE issue_id = 'bd-legacy'",
+        )
+        .unwrap();
+        close_connection(conn).unwrap();
+        let bytes_before = fs::read(&migration.db_path).unwrap();
+        verify_legacy_v15_projection(
+            &migration.db_path,
+            applied.forecast.legacy_v15_conversion.as_ref(),
+            false,
+        )
+        .expect_err("the migrated historical actor must remain NULL");
+        let error = execute_undo(
+            &DoctorMigrateSchemaUndoArgs {
+                run_id: applied.run_id,
+                dry_run: false,
+                json: false,
+            },
+            &migration,
+        )
+        .expect_err("undo must preserve changed attribution as newer work");
+        assert!(error.to_string().contains("live database has changed"));
+        assert_eq!(fs::read(&migration.db_path).unwrap(), bytes_before);
+    }
+
+    #[test]
     fn legacy_upgrade_plan_and_undo_bind_hidden_rowids_even_when_values_are_equal() {
         for mutation in [
             "UPDATE dependencies SET rowid = 2001 WHERE rowid = 11",
             "UPDATE \"operator'opaque\" SET rowid = 2002 WHERE rowid = 991",
+            "UPDATE close_metadata SET rowid = 2004 WHERE rowid = 91",
         ] {
             let (_temp, migration) = legacy_v15_migration_context();
             let applied = apply_legacy_v15_upgrade(&migration);

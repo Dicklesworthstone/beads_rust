@@ -7,10 +7,7 @@ use crate::cli::commands::{
     report_auto_flush_failure, resolve_issue_ids, same_workspace,
     update_issues_atomically_with_recovery,
 };
-use crate::close_policy::{
-    self, AttributionTier, AttributionValues, CloseEvidence, ClosePolicy, PolicyDocument,
-    PolicyViolation,
-};
+use crate::close_policy::{self, AttributionValues, CloseEvidence, ClosePolicy, PolicyViolation};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
@@ -117,16 +114,10 @@ fn close_precondition(args: &CloseArgs) -> Result<Option<DateTime<Utc>>> {
     )
 }
 
-/// Resolve attribution values for the close. CLI flags take precedence over
-/// env vars; both are ignored when the policy.yaml `attribution.tier` is
-/// `off`. Tier 2/3 ("require"/"allowlist") are out of scope for Phase 1.
-pub(crate) fn resolve_attribution_for_close(
-    args: &CloseArgs,
-    policy_doc: &PolicyDocument,
-) -> AttributionValues {
-    if policy_doc.close_policy.attribution.tier == AttributionTier::Off {
-        return AttributionValues::default();
-    }
+/// Resolve capture-only attribution for every close. CLI flags take
+/// precedence over env vars, independently of closure-policy enforcement.
+/// Missing values stay absent and never prevent an otherwise valid close.
+pub(crate) fn resolve_attribution_for_close(args: &CloseArgs) -> AttributionValues {
     AttributionValues::resolve_from_env(
         args.agent_name.as_deref(),
         args.harness.as_deref(),
@@ -949,7 +940,7 @@ fn execute_route_with_storage(
         || policy_doc.workflow.gates_enforced()
         || !policy_doc.workflow.required_fields.is_empty()
         || (args.bypass_policy && policy_doc.workflow.transitions_enforced());
-    let attribution = resolve_attribution_for_close(args, &policy_doc);
+    let attribution = resolve_attribution_for_close(args);
     if args.bypass_policy && !policy_doc.allow_bypass {
         return Err(BeadsError::validation(
             "bypass-policy",
@@ -1270,11 +1261,9 @@ fn execute_route_with_storage(
         tracing::info!(id = %id, reason = ?args.reason, "Issue closed");
 
         if policy_active {
-            // Best-effort persistence of attribution + bypass auditing. Failure
-            // to record metadata never undoes a successful close: the close
-            // already committed, and burning down a successful close because of
-            // an optional auxiliary table would be a regression for users whose
-            // schema could not migrate. We log and move on.
+            // Attribution is already durable in the close transaction. Enrich
+            // that row with the existing best-effort policy audit details;
+            // a failure here does not undo the committed close or its actor.
             let bypass_reason = if args.bypass_policy {
                 args.bypass_reason.as_deref()
             } else {
@@ -1487,6 +1476,20 @@ mod tests {
     // =========================================================================
     // CloseArgs tests
     // =========================================================================
+
+    #[test]
+    fn close_attribution_uses_explicit_values_without_policy() {
+        let args = CloseArgs {
+            agent_name: Some("  agent-a  ".to_string()),
+            harness: Some("  claude-code  ".to_string()),
+            model: Some("  opus  ".to_string()),
+            ..CloseArgs::default()
+        };
+        let attribution = resolve_attribution_for_close(&args);
+        assert_eq!(attribution.agent_name.as_deref(), Some("agent-a"));
+        assert_eq!(attribution.harness.as_deref(), Some("claude-code"));
+        assert_eq!(attribution.model.as_deref(), Some("opus"));
+    }
 
     // === Startup connection reuse (beads_rust-naul5) ===
 
@@ -2750,7 +2753,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_with_args_leaves_no_policy_close_metadata_invisible() {
+    fn execute_with_args_records_actor_without_active_policy() {
         let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2772,16 +2775,26 @@ mod tests {
             reason: Some("done".to_string()),
             ..CloseArgs::default()
         };
-        execute_with_args(&args, false, &CliOverrides::default(), &ctx).expect("close issue");
+        let cli = CliOverrides {
+            actor: Some("plain-closer".to_string()),
+            ..CliOverrides::default()
+        };
+        execute_with_args(&args, false, &cli, &ctx).expect("close issue");
 
         let storage = SqliteStorage::open(&db_path).expect("reopen storage");
-        assert!(
-            storage
-                .get_close_metadata("bd-no-policy")
-                .expect("read close metadata")
-                .is_none(),
-            "repos without an active policy should retain the no-observable-change invariant"
-        );
+        let metadata = storage
+            .get_close_metadata("bd-no-policy")
+            .expect("read close metadata")
+            .expect("ordinary close should retain its actor");
+        assert_eq!(metadata.closed_by.as_deref(), Some("plain-closer"));
+        assert!(!metadata.bypassed_policy);
+        assert!(metadata.bypass_reason.is_none());
+        assert!(metadata.policy_gates_fired.is_empty());
+        let issue = storage
+            .get_issue("bd-no-policy")
+            .expect("read issue")
+            .expect("closed issue exists");
+        assert_eq!(issue.closed_by.as_deref(), Some("plain-closer"));
     }
 
     /// GitHub #399: `br close` must honor `workflow.transitions`. A policy

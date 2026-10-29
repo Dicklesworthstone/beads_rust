@@ -537,6 +537,25 @@ pub struct Issue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed_by_session: Option<String>,
 
+    /// Actor that performed the current close (GitHub #584). Missing means
+    /// unknown, including historical closes predating durable attribution.
+    /// Backed by `close_metadata` and shared in JSONL, never inferred from the
+    /// creator, assignee, importing actor, or unrelated local event history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_by: Option<String>,
+
+    /// Self-reported agent name captured when the issue was closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_by_agent_name: Option<String>,
+
+    /// Self-reported harness captured when the issue was closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_by_harness: Option<String>,
+
+    /// Self-reported model captured when the issue was closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_by_model: Option<String>,
+
     /// Close-policy bypass audit trail (GitHub #474). Serialized into the
     /// JSONL export only when the close bypassed policy so a bypassed close
     /// is reviewable off-machine; absent means "not bypassed" (pre-change
@@ -681,6 +700,10 @@ impl Default for Issue {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,
@@ -748,6 +771,10 @@ impl Issue {
             || self.closed_at != other.closed_at
             || self.close_reason != other.close_reason
             || self.closed_by_session != other.closed_by_session
+            || self.closed_by != other.closed_by
+            || self.closed_by_agent_name != other.closed_by_agent_name
+            || self.closed_by_harness != other.closed_by_harness
+            || self.closed_by_model != other.closed_by_model
             || self.due_at != other.due_at
             || self.defer_until != other.defer_until
             || self.external_ref != other.external_ref
@@ -1048,6 +1075,41 @@ mod tests {
     }
 
     #[test]
+    fn closure_attribution_is_optional_and_part_of_sync_identity() {
+        let legacy: Issue = serde_json::from_str(
+            r#"{"id":"bd-old","title":"Historical close","status":"closed",
+                "created_at":"2026-01-01T00:00:00Z",
+                "updated_at":"2026-01-02T00:00:00Z",
+                "closed_at":"2026-01-02T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let legacy_json = serde_json::to_value(&legacy).unwrap();
+        for field in [
+            "closed_by",
+            "closed_by_agent_name",
+            "closed_by_harness",
+            "closed_by_model",
+        ] {
+            assert!(
+                legacy_json.get(field).is_none(),
+                "{field} must stay unknown"
+            );
+            let mut attributed_json = legacy_json.clone();
+            attributed_json[field] = serde_json::json!("agent-value");
+            let attributed: Issue = serde_json::from_value(attributed_json).unwrap();
+            assert!(!legacy.sync_equals(&attributed), "{field} is shared state");
+            assert_eq!(
+                legacy.compute_content_hash(),
+                attributed.compute_content_hash(),
+                "attribution must not alter content-based deduplication"
+            );
+            let round_trip: Issue =
+                serde_json::from_str(&serde_json::to_string(&attributed).unwrap()).unwrap();
+            assert!(round_trip.sync_equals(&attributed));
+        }
+    }
+
+    #[test]
     fn dependency_type_affects_ready_work() {
         assert!(DependencyType::Blocks.affects_ready_work());
         assert!(DependencyType::ParentChild.affects_ready_work());
@@ -1077,6 +1139,10 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,
@@ -1550,6 +1616,10 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            closed_by: None,
+            closed_by_agent_name: None,
+            closed_by_harness: None,
+            closed_by_model: None,
             bypassed_policy: None,
             bypass_reason: None,
             policy_gates_fired: None,

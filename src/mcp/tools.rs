@@ -2631,7 +2631,7 @@ fn close_issue_json(
     }
 
     validate_mcp_close(storage, state, id, args, policy)?;
-    let attribution = crate::cli::commands::close::resolve_attribution_for_close(args, policy);
+    let attribution = crate::cli::commands::close::resolve_attribution_for_close(args);
     storage.set_pending_event_attribution(crate::storage::EventAttribution::new(
         attribution.agent_name.as_deref(),
         attribution.harness.as_deref(),

@@ -565,7 +565,40 @@ br close [OPTIONS] [IDS]...
 | `--suggest-next` | Return newly unblocked issues |
 | `--if-unchanged <UPDATED_AT>` | Close only if the issue still carries this `updated_at` (same precondition as `update --if-unchanged`, see [lost updates](#if-unchanged-lost-updates)); one issue at a time |
 | `--session <ID>` | Session ID for tracking |
+| `--actor <NAME>` | Actor recorded durably as `closed_by` (global option) |
+| `--agent-name <NAME>` | Closing agent name; overrides `BR_AGENT_NAME` |
+| `--harness <NAME>` | Agent harness; overrides `BR_HARNESS` |
+| `--model <NAME>` | Agent model; overrides `BR_MODEL` |
 | `--robot` | Machine-readable output |
+
+**Durable closure attribution:** A successful close records the resolved actor
+as `closed_by` in both `br show <ID> --json` and `.beads/issues.jsonl`. The normal
+actor resolution applies: explicit `--actor`, configured actor (including
+`BD_ACTOR`), then `USER`, then `unknown`. When supplied, agent attribution is
+also exported as `closed_by_agent_name`, `closed_by_harness`, and
+`closed_by_model`. These fields are captured even without `policy.yaml` or
+when its attribution requirement is off; policy still controls whether a
+missing value blocks closure.
+
+For example, closing with `--actor operator-a` and `BR_AGENT_NAME=agent-a`
+preserves those distinct identities. JSONL import and merge carry the selected
+closure's attribution to other machines without substituting the importing
+actor. Reopening clears current closure attribution, and a subsequent close
+records its own actor and optional metadata. Closing an already closed issue
+does not replace its closer. Older JSONL records without attribution remain
+valid and unattributed; import does not infer a closer from the creator,
+assignee, local environment, or historical events. Deletion continues to use
+the separate `deleted_by` field.
+
+Additive reconciliation preserves local audit tables. If closure attribution
+differs between the database and JSONL or belongs to a different closure, its
+plan reports
+`closure_attribution_requires_import`; use ordinary `sync --import-only` or
+`sync --merge` to transfer the complete closure record. Matching attribution
+for the same closure permits certification and the existing reviewed scalar
+updates, such as changed notes, while leaving the closure metadata unchanged.
+Additive reconciliation does not certify or discard attribution that it cannot
+persist.
 
 **Examples:**
 ```bash
