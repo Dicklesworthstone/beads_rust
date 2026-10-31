@@ -460,6 +460,18 @@ fn e2e_beads_jsonl_external_rename_prefix_honors_allow_flag_during_config_load()
     );
 }
 
+fn write_external_recovery_jsonl(workspace: &BrWorkspace) -> std::path::PathBuf {
+    let external_dir = workspace.temp_dir.path().join("external-recovery");
+    fs::create_dir_all(&external_dir).expect("create external dir");
+    let external_jsonl = external_dir.join("recovery-source.jsonl");
+    fs::write(
+        &external_jsonl,
+        "{\"id\":\"ext-1\",\"title\":\"External missing DB recovery\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":\"2026-01-01T00:00:00Z\",\"updated_at\":\"2026-01-01T00:00:00Z\"}\n",
+    )
+    .expect("write external jsonl");
+    external_jsonl
+}
+
 #[test]
 fn e2e_external_missing_database_requires_explicit_import_and_honors_allow_flag() {
     let _log = common::test_log(
@@ -474,14 +486,7 @@ fn e2e_external_missing_database_requires_explicit_import_and_honors_allow_flag(
     );
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    let external_dir = workspace.temp_dir.path().join("external-recovery");
-    fs::create_dir_all(&external_dir).expect("create external dir");
-    let external_jsonl = external_dir.join("recovery-source.jsonl");
-    fs::write(
-        &external_jsonl,
-        "{\"id\":\"ext-1\",\"title\":\"External missing DB recovery\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":\"2026-01-01T00:00:00Z\",\"updated_at\":\"2026-01-01T00:00:00Z\"}\n",
-    )
-    .expect("write external jsonl");
+    let external_jsonl = write_external_recovery_jsonl(&workspace);
     let source_bytes = fs::read(&external_jsonl).unwrap();
     let original_db = workspace.root.join(".beads/beads.db");
     let original_bytes = fs::read(&original_db).unwrap();
