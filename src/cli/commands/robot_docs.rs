@@ -59,9 +59,12 @@ Safety:
   Avoid bare bv in automated sessions; use bv --robot-* flags.
   Use RUST_LOG=error for routine br runs to suppress dependency logs.
   br sync does not commit, push, pull, or install hooks.
-  A database on an older schema is upgraded automatically (backup kept) only
-  when it holds nothing the JSONL lacks. Otherwise mutations refuse; run
-  br doctor migrate-schema heal --dry-run, then br doctor migrate-schema heal.
+  Read commands never upgrade or rebuild an older-schema database. Mutations
+  require a reviewed lossless migration and retain the original recovery bundle.
+  Missing or refused migrations preserve the original database and return an
+  error; JSONL alone cannot preserve event history, configuration, or all other
+  database-only records. Inspect br doctor migrate-schema plan --json and
+  br doctor migrate-schema heal --dry-run before explicitly upgrading.
 "#;
 
 #[derive(Debug, Serialize)]

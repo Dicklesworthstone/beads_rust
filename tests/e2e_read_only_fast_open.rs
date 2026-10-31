@@ -6,7 +6,7 @@
 
 mod common;
 
-use beads_rust::franken_sync::Connection;
+use beads_rust::franken_sync::{Connection, SqliteValue};
 use common::cli::{BrRun, BrWorkspace, parse_created_id, run_br, run_br_with_env};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -15,7 +15,7 @@ use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
@@ -536,9 +536,10 @@ fn cli_read_only_fast_open_fails_when_the_authoritative_jsonl_probe_fails() {
 }
 
 #[test]
-fn cli_fast_open_healing_reuses_its_authority_for_a_newer_jsonl_import() {
-    let _log =
-        common::test_log("cli_fast_open_healing_reuses_its_authority_for_a_newer_jsonl_import");
+fn cli_read_only_open_refuses_incomplete_schema_before_importing_newer_jsonl() {
+    let _log = common::test_log(
+        "cli_read_only_open_refuses_incomplete_schema_before_importing_newer_jsonl",
+    );
     let workspace = BrWorkspace::new();
     run_success(&workspace, &["init"], "init");
     let issue_id = create_issue(
@@ -571,23 +572,219 @@ fn cli_fast_open_healing_reuses_its_authority_for_a_newer_jsonl_import() {
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(&jsonl_path, format!("{rewritten}\n")).expect("write newer JSONL");
+    let before = regular_file_evidence(&workspace.root.join(".beads"));
 
     let run = run_br(
         &workspace,
         ["--lock-timeout", "50", "list", "--json"],
-        "heal_then_import",
+        "refuse_incomplete_schema",
     );
     assert!(
-        run.status.success(),
-        "fast-open healing must reuse its retained authority for auto-import\nstdout:\n{}\nstderr:\n{}",
+        !run.status.success(),
+        "ordinary reads must refuse an incomplete runtime schema before recovery or import\nstdout:\n{}\nstderr:\n{}",
         run.stdout,
         run.stderr
     );
     assert!(
-        run.stdout.contains("JSONL-side title"),
-        "the newer JSONL generation must be imported: {}",
-        run.stdout
+        format!("{} {}", run.stdout, run.stderr)
+            .to_ascii_lowercase()
+            .contains("schema"),
+        "{} {}",
+        run.stdout,
+        run.stderr
     );
+    assert_eq!(
+        regular_file_evidence(&workspace.root.join(".beads")),
+        before
+    );
+    assert!(!workspace.root.join(".beads/.br_recovery").exists());
+}
+
+fn query_private_copy(db: &Path, sql: &str) -> Vec<Vec<SqliteValue>> {
+    let scratch = tempfile::tempdir().unwrap();
+    let copy = scratch.path().join("copy.db");
+    fs::copy(db, &copy).unwrap();
+    let wal = PathBuf::from(format!("{}-wal", db.display()));
+    if wal.exists() {
+        fs::copy(wal, scratch.path().join("copy.db-wal")).unwrap();
+    }
+    let connection = Connection::open(copy.to_string_lossy().into_owned()).unwrap();
+    let rows = connection
+        .query(sql)
+        .unwrap()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect();
+    connection.close().unwrap();
+    rows
+}
+
+#[test]
+fn gh585_current_schema_auto_import_cannot_enter_generic_anomaly_recovery() {
+    let workspace = BrWorkspace::new();
+    run_success(
+        &workspace,
+        &["init", "--prefix", "guard"],
+        "init_authority_guard",
+    );
+    let issue_id = create_issue(
+        &workspace,
+        &["create", "Original local history"],
+        "seed_guard",
+    );
+    let db = workspace.root.join(".beads/beads.db");
+    let connection = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+    for sql in [
+        // Duplicate keys trigger the generic writable-open anomaly recovery.
+        // Auto-import from a read must use a current-schema-only reopen that
+        // cannot rebuild the database and discard any of these records.
+        "INSERT INTO config (key, value) VALUES ('issue_prefix', 'guard')",
+        "INSERT INTO config (key, value) VALUES ('compact_model', 'operator-model')",
+        "INSERT INTO metadata (key, value) VALUES ('operator_checkpoint', 'first authority')",
+        "INSERT INTO metadata (key, value) VALUES ('operator_checkpoint', 'second authority')",
+        "CREATE TABLE operator_state (payload BLOB NOT NULL)",
+        "INSERT INTO operator_state VALUES (X'0001FF7F')",
+    ] {
+        connection.execute(sql).unwrap();
+    }
+    connection.close().unwrap();
+    let events = query_private_copy(&db, "SELECT * FROM events ORDER BY id");
+    assert!(!events.is_empty(), "the test must have history to lose");
+    let config = query_private_copy(&db, "SELECT key, value FROM config ORDER BY rowid");
+    assert_eq!(
+        config
+            .iter()
+            .filter(|row| row[0].as_text() == Some("issue_prefix"))
+            .count(),
+        2
+    );
+    let operator = query_private_copy(&db, "SELECT * FROM operator_state ORDER BY rowid");
+    let metadata_sql =
+        "SELECT key, value FROM metadata WHERE key = 'operator_checkpoint' ORDER BY rowid";
+    let metadata = query_private_copy(&db, metadata_sql);
+    assert_eq!(metadata.len(), 2);
+
+    let jsonl = workspace.root.join(".beads/issues.jsonl");
+    let rewritten: Vec<String> = fs::read_to_string(&jsonl)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut issue: Value = serde_json::from_str(line).unwrap();
+            if issue["id"].as_str() == Some(issue_id.as_str()) {
+                issue["title"] = json!("Incoming JSONL revision without database history");
+                issue["updated_at"] = json!("2099-01-01T00:00:00Z");
+                issue["content_hash"] = Value::Null;
+            }
+            issue.to_string()
+        })
+        .collect();
+    fs::write(&jsonl, format!("{}\n", rewritten.join("\n"))).unwrap();
+    let export_before = fs::read(&jsonl).unwrap();
+    let result = run_br(
+        &workspace,
+        ["list", "--json", "--lock-timeout", "1000"],
+        "guard_auto_import",
+    );
+    if result.status.success() {
+        assert!(
+            result
+                .stdout
+                .contains("Incoming JSONL revision without database history"),
+            "{}",
+            result.stdout
+        );
+    } else {
+        let error: Value =
+            serde_json::from_str(&result.stdout).expect("actionable structured refusal");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty())
+        );
+    }
+    let after_events = query_private_copy(&db, "SELECT * FROM events ORDER BY id");
+    assert!(
+        events.iter().all(|row| after_events.contains(row)),
+        "auto-import dropped original audit history"
+    );
+    assert_eq!(
+        query_private_copy(&db, "SELECT key, value FROM config ORDER BY rowid"),
+        config
+    );
+    assert_eq!(
+        query_private_copy(&db, "SELECT * FROM operator_state ORDER BY rowid"),
+        operator
+    );
+    assert_eq!(query_private_copy(&db, metadata_sql), metadata);
+    assert_eq!(fs::read(jsonl).unwrap(), export_before);
+    assert!(!workspace.root.join(".beads/.br_recovery").exists());
+}
+
+#[test]
+fn gh585_explicit_previews_do_not_auto_import_or_flush() {
+    let workspace = BrWorkspace::new();
+    run_success(&workspace, &["init", "--prefix", "preview"], "init_preview");
+    let id = create_issue(
+        &workspace,
+        &["create", "Original database title"],
+        "seed_preview",
+    );
+    let jsonl_path = workspace.root.join(".beads/issues.jsonl");
+    let rewritten = fs::read_to_string(&jsonl_path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut issue: Value = serde_json::from_str(line).unwrap();
+            if issue["id"].as_str() == Some(id.as_str()) {
+                issue["title"] = json!("Newer JSONL must remain unimported by previews");
+                issue["updated_at"] = json!("2099-01-01T00:00:00Z");
+                issue["content_hash"] = Value::Null;
+            }
+            issue.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&jsonl_path, format!("{rewritten}\n")).unwrap();
+    let beads_dir = workspace.root.join(".beads");
+    let before = regular_file_evidence(&beads_dir);
+    for (index, command) in [
+        vec!["create", "Proposed issue", "--dry-run", "--json"],
+        vec!["delete", &id, "--dry-run", "--json"],
+        vec!["delete", "--hard", "--dry-run", "--json"],
+        vec!["epic", "close-eligible", "--dry-run", "--json"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let preview = run_br(
+            &workspace,
+            command,
+            &format!("gh585_current_preview_{index}"),
+        );
+        let output: Value =
+            serde_json::from_str(&preview.stdout).expect("structured preview or refusal");
+        if !preview.status.success() {
+            let message = output["error"]["message"]
+                .as_str()
+                .expect("actionable freshness refusal");
+            assert!(
+                message.contains("Read-only")
+                    && message.contains("import")
+                    && message.contains("--no-auto-import"),
+                "{message}"
+            );
+        }
+        assert_eq!(
+            regular_file_evidence(&beads_dir),
+            before,
+            "preview {index} changed durable state"
+        );
+    }
+    assert_eq!(
+        query_private_copy(&beads_dir.join("beads.db"), "SELECT title FROM issues"),
+        vec![vec![SqliteValue::from("Original database title")]],
+    );
+    assert!(!beads_dir.join(".br_recovery").exists());
 }
 
 fn run_matrix_round(workspace: &BrWorkspace, commands: &[MatrixCommand], disable_fast_open: bool) {

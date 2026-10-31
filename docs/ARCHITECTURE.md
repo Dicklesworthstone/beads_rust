@@ -618,6 +618,23 @@ may preopen storage and auto-import changed JSONL before dispatch. Mutating
 paths retain write authority and dispatch to command-specific `execute`
 functions; their signatures differ.
 
+Read commands carry a strict observational storage intent independently of the
+fast-open optimization. A failed read-only open cannot select writable recovery,
+seed metadata, repair the schema, or rebuild from JSONL. Older-schema issue reads
+may use an explicitly warned private JSONL view; database-only records remain in
+the original database and are not represented by that view. Diagnostic commands
+such as `info`, `where`, and configuration reads inspect the original database
+through observational paths. Statistics do not persist cache updates on a read.
+
+Current-schema auto-import remains available when enabled and a nonmutating
+freshness probe establishes that it is needed. Startup then acquires write
+authority, reprobes the same database, and opens only the compatible current
+schema for import. That reopen cannot repair or reconstruct the database.
+`--no-auto-import` suppresses this transition; combined with `--no-auto-flush`,
+it keeps explicitly observational commands free of sync writes. Routed read
+helpers that need an import refuse with `br sync --import-only` guidance instead
+of promoting a read-only handle to writable recovery.
+
 The dispatcher routes errors through `handle_error(err, json_mode, color_mode)`.
 Successful mutations with auto-flush enabled then publish pending JSONL through
 the retained storage/authority context. Commands can also finalize their own
@@ -740,7 +757,7 @@ The vocabulary below is `WorkspaceHealth` in `src/health.rs` (`healthy`,
 |-------|---------|-------------------------|
 | `healthy` | SQLite, JSONL, metadata, and derived state agree closely enough for normal operation | Proceed normally; no repair messaging |
 | `degraded` | Operable, but something disagrees: freshness or path metadata differ, derived state is stale, or a non-fatal anomaly was observed | Report the anomaly explicitly; prefer import/export reconciliation over repair |
-| `recoverable` | Primary storage is damaged or incomplete, but authoritative evidence exists to rebuild safely | Preserve evidence, rebuild only through the allowed repair path, then re-verify |
+| `recoverable` | Primary storage is damaged or incomplete, but authoritative evidence supports a verified repair | Preserve evidence, use only the allowed repair path, then re-verify every preservation claim |
 | `unsafe` | State is unsafe to mutate automatically because the authority source is ambiguous or itself damaged | Refuse risky mutation, preserve artifacts, require operator intervention |
 
 ### Authority Model
@@ -748,37 +765,49 @@ The vocabulary below is `WorkspaceHealth` in `src/health.rs` (`healthy`,
 | State family | Examples | Authority level | Why |
 |-------------|----------|-----------------|-----|
 | Primary data | `issues`, `dependencies`, `labels`, `comments` tables; semantically equivalent JSONL issue records | Authoritative | These describe the actual issue graph and cannot be silently discarded |
-| Interchange data | `.beads/issues.jsonl` plus its content hash / mtime witnesses | Authoritative interchange copy | This is the git-facing source used for rebuild/import/export decisions |
+| Database-only data | `events`, non-default `config`, closure and workflow history, capacity records, local provenance, allocation reservations, operator tables and schema objects | Authoritative | JSONL does not completely represent these records; retaining them only in a backup does not preserve normal access to them |
+| Interchange data | `.beads/issues.jsonl` plus its content hash / mtime witnesses | Authoritative interchange copy for the fields it represents | This is the git-facing sync source, not a complete replacement for the database |
 | Workspace metadata | `.beads/metadata.json`, config layers, sync timestamps/hashes in DB metadata | Control-plane evidence | Needed to resolve paths, detect drift, and explain why a workspace is classified a certain way |
-| Derived state | `dirty_issues`, `export_hashes`, `blocked_issues_cache`, `child_counters`, stale markers | Rebuildable | These speed up operations or summarize state, but should never outrank authoritative issue data |
+| Derived state | `dirty_issues`, `export_hashes`, `blocked_issues_cache`, stale markers | Rebuildable through a reviewed transition | These speed up operations or summarize state, but should never outrank authoritative issue data |
 
 ### Invariant Matrix
 
 | Surface | Object | Required invariant | Allowed automatic action | Forbidden silent behavior |
 |---------|--------|--------------------|--------------------------|---------------------------|
-| Primary data | `issues` + relational tables | Issue rows, dependencies, labels, and comments must remain representable either in SQLite or in valid JSONL records | Rebuild SQLite from valid JSONL when the DB family is recoverably damaged | Dropping primary issue data because a derived table is inconsistent |
+| Primary data | `issues` + relational tables | Preserve original field values, relation payloads, multiplicity, and identities through a schema migration | Use a reviewed migration whose candidate proves preservation before installation | Replacing database contents with a newer JSONL projection that omits local records |
+| Database-only data | Events, configuration, local history, allocation state, and operator extensions | Preserve all authoritative records in the active migrated database | Refuse an unsupported or unprovable migration while leaving the original active | Treating an original database in `.br_recovery` as sufficient proof of preservation |
 | Primary data | SQLite database family (database plus engine sidecars; see the [engine inventory](reliability/ENGINE_OPERATING_MODEL.md)) | The DB family must be treated as one unit when diagnosing corruption or recovery | Preserve the family before an authorized rebuild; a namespace diagnostic alone does not authorize quarantine | Deleting or overwriting only one sidecar and pretending the rest are canonical |
 | Interchange data | `.beads/issues.jsonl` | JSONL must be parseable, conflict-free, and valid for the requested import mode; mixed prefixes are supported by default | Reject invalid import and preserve the file for manual repair | Best-effort partial import of malformed or conflicted JSONL |
 | Interchange data | DB vs JSONL freshness | Empty/stale export must never overwrite non-empty authoritative JSONL by accident | Refuse export unless the operator explicitly forces the destructive direction | Treating a missing import as permission to publish an empty snapshot |
-| Metadata | `.beads/metadata.json` path mapping | Resolved DB + JSONL targets must point at the intended workspace and be explainable | Rehydrate missing defaults from the canonical workspace layout and config rules | Silently operating on a different workspace than the one diagnostics describe |
+| Metadata | `.beads/metadata.json` path mapping | Resolved DB + JSONL targets must point at the intended workspace and be explainable | Initialize defaults only on an authorized write path | Seeding defaults during an ordinary read or silently operating on a different workspace than the one diagnostics describe |
 | Metadata | Sync witness keys (`last_import_time`, `last_export_time`, `jsonl_content_hash`, JSONL mtime witness) | Metadata must explain whether DB or JSONL is newer and whether divergence is expected | Recompute witness metadata after successful import/export | Claiming a workspace is healthy when witness data proves drift or missing export/import |
 | Metadata | Prefix/config resolution | Effective prefix and safety-relevant config must be source-traceable | Surface the winning config layer in diagnostics | Forcing absent CLI bools or env overrides into false certainty |
 | Derived state | `dirty_issues` | Dirty flags may lag but must never redefine issue truth | Recompute/clear after verified export | Using stale dirty flags as proof that data itself is corrupt |
 | Derived state | `export_hashes` | Export hashes may be rebuilt from authoritative issue content | Regenerate during import/export finalization | Treating missing hashes as a reason to discard issue rows |
 | Derived state | `blocked_issues_cache` | Cache may be stale; blocked truth comes from the dependency graph | Rebuild cache locally or after repair/import | Reporting cache staleness as unrecoverable workspace corruption |
-| Derived state | `child_counters` and similar summaries | Summary tables must match authoritative parent/child relationships eventually | Recompute from primary graph state | Trusting counters over real dependency or parent-child edges |
+| Allocation state | `child_counters` and `sqlite_sequence` | Preserve existing reservations, including those above surviving issue or event IDs | Advance reservations through authorized allocation or an explicitly reviewed migration | Inferring that an unused high-water value may be discarded because its historical row was deleted |
 
 ### Primary-Data Repair Rules
 
 These rules exist so tests and diagnostics can assert what is never allowed.
 
-1. Primary issue data may only be replaced by a rebuild when there is a valid,
-   authoritative interchange source to rebuild from.
-2. Any rebuild of SQLite from JSONL must preserve the original DB family in
-   `.beads/.br_recovery/` before replacement.
-3. Row-level or index-level corruption that affects writes is classified as
-   `recoverable`, not as permission to mutate around the bad row.
-4. Malformed JSONL or unresolved conflict markers prevent automatic
+1. Ordinary reads never upgrade, quarantine, repair, or reconstruct an existing
+   database. An incompatible read returns an actionable refusal or a warned
+   private JSONL view without replacing the original.
+2. Schema upgrades require a reviewed migration with a candidate prepared from
+   the original database family. Typed source values, row multiplicity, hidden
+   rowids, sequence reservations, and operator schema must remain intact except
+   for explicitly reviewed changes. Missing migration paths or failed proofs
+   leave the original active; JSONL reconstruction is not a schema migration.
+3. A verified backup is necessary for replacement but is not proof of a
+   lossless result. Candidate and installed-state checks must establish that
+   authoritative data remains available in the active database. Interrupted
+   migration completion and fresh undo recheck the preservation proof using
+   private copies of retained evidence.
+4. Row-level or index-level corruption that affects writes requires an
+   authorized repair with sufficient preservation evidence. It does not permit
+   mutation around the bad row or dropping database-only state during replay.
+5. Malformed JSONL or unresolved conflict markers prevent automatic
    import/rebuild. Reject a prefix mismatch when that import explicitly requires
    a matching prefix; a valid mixed-prefix workspace is not unsafe merely
    because its IDs use different prefixes.
@@ -791,8 +820,8 @@ truth, but only within the boundaries below.
 1. `blocked_issues_cache` may be rebuilt from the current dependency graph.
 2. `dirty_issues` and `export_hashes` may be cleared or regenerated only after
    a verified export/import transition.
-3. Summary structures such as `child_counters` may be recomputed from the
-   primary graph whenever authoritative issue rows are known-good.
+3. Allocation reservations such as `child_counters` and `sqlite_sequence` are
+   not disposable caches. Preserve their historical high-water values.
 4. Rebuilding derived state must not hide disagreement between SQLite, JSONL,
    and metadata. If primary/interchange drift remains, the workspace is still
    `degraded` or `unsafe`.
@@ -801,7 +830,8 @@ truth, but only within the boundaries below.
 
 | Surface | Must report | Must not do silently |
 |---------|-------------|----------------------|
-| Startup / open | Whether the workspace is healthy, degraded, recoverable, or unsafe; whether an automatic DB rebuild was attempted; where evidence was preserved | Auto-rebuild from ambiguous or invalid JSONL, or collapse corruption into a generic `NOT_INITIALIZED` story |
+| Startup / open | Whether the workspace is healthy, degraded, recoverable, or unsafe; whether a read uses a partial JSONL view; why migration or recovery was refused | Promote a failed ordinary read to writable recovery, or collapse corruption into a generic `NOT_INITIALIZED` story |
+| Schema migration | The reviewed path, source/candidate preservation results, retained evidence, and resumable recovery state | Fall back to JSONL reconstruction after a missing or refused migration |
 | `br doctor` | Structural anomalies, JSONL integrity, metadata drift, sync witness disagreement, and whether repair is local-derived-state-only vs full DB rebuild | Emit a clean bill of health when another surface would reject the same workspace |
 | Write recovery | Distinguish lock contention from corruption; identify when a mutation can retry once after rebuild | Retry blindly against uncertain state or persist partial side effects without surfacing them |
 | `br sync --status` / export/import preflight | Which side is newer, whether divergence is safe, and whether the requested direction is destructive | Treat stale/empty export conditions as healthy just because files exist |

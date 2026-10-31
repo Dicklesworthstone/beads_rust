@@ -236,6 +236,10 @@ fn db_path_is_symlink(db_path: &Path) -> bool {
 }
 
 fn load_info_snapshot_direct_read_only(args: &InfoArgs, db_path: &Path) -> Result<InfoSnapshot> {
+    // Info reads historical schemas directly. Participate in the opener
+    // protocol so a concurrent migration cannot replace/checkpoint the family
+    // while this connection is observing it (GH #585).
+    let _opener_lease = crate::sync::DatabaseOpenerLease::register(db_path)?;
     let conn = open_with_flags(
         db_path.to_string_lossy().as_ref(),
         OpenFlags::SQLITE_OPEN_READ_ONLY,

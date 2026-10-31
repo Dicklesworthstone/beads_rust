@@ -252,7 +252,13 @@ fn failed_reviewed_migration_cannot_bypass_the_strict_fallback_audit() {
     for args in commands {
         let run = run_br(&workspace, args, "551_failed_migration");
         assert!(!run.status.success(), "{} {}", run.stdout, run.stderr);
-        assert!(format!("{}{}", run.stdout, run.stderr).contains("labels.label"));
+        let output = format!("{}{}", run.stdout, run.stderr);
+        // Neither mode may turn a refused reviewed migration into a JSONL
+        // replacement that projects away the original malformed values.
+        assert!(
+            output.contains("migration") && output.contains("dirty_issues"),
+            "{output}"
+        );
         assert_eq!(protected_bytes(&db), before);
         assert_eq!(
             fs::read(workspace.root.join(".beads/issues.jsonl")).unwrap(),
@@ -273,7 +279,11 @@ fn failed_reviewed_migration_cannot_automatically_drop_well_formed_orphans() {
         "551_orphans",
     );
     assert!(!run.status.success(), "{} {}", run.stdout, run.stderr);
-    assert!(format!("{}{}", run.stdout, run.stderr).contains("without an owning issue"));
+    let output = format!("{}{}", run.stdout, run.stderr);
+    assert!(
+        output.contains("migration") && output.contains("dirty_issues"),
+        "{output}"
+    );
     assert_eq!(protected_bytes(&db), before);
     assert_eq!(labels(&db).len(), 1);
 }

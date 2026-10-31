@@ -1,7 +1,8 @@
 //! GH #550: authorizing backup-only retention must not discard recoverable work.
 //!
-//! Exercise the actual heal and flush commands using the released schema-4
-//! fixture, not just the audit or its human-readable plan.
+//! The old discard flag cannot authorize an unreviewed rebuild that moves
+//! audit/configuration records out of the active database. These released
+//! schema-4 fixtures keep their original events and metadata throughout.
 
 mod common;
 
@@ -73,8 +74,9 @@ fn flagged_heal(workspace: &BrWorkspace, dry_run: bool) -> Value {
         args.push("--dry-run");
     }
     let result = run_br(workspace, args, if dry_run { "preview" } else { "heal" });
-    assert!(
+    assert_eq!(
         result.status.success(),
+        dry_run,
         "stdout={} stderr={}",
         result.stdout,
         result.stderr
@@ -82,53 +84,63 @@ fn flagged_heal(workspace: &BrWorkspace, dry_run: bool) -> Value {
     json(&result.stdout)
 }
 
-fn show_without_sync(workspace: &BrWorkspace, id: &str) -> Value {
-    let result = run_br(
-        workspace,
-        ["show", id, "--json", "--no-auto-import", "--no-auto-flush"],
-        &format!("show_{id}"),
-    );
-    assert!(
-        result.status.success(),
-        "{} {}",
-        result.stdout,
-        result.stderr
-    );
-    json(&result.stdout)[0].clone()
-}
-
-fn assert_recoverable_issue_and_flush(workspace: &BrWorkspace, db_path: &Path) -> Vec<Value> {
-    let issue = show_without_sync(workspace, "leg-u4i");
-    assert_eq!(issue["title"], "Unflushed legacy issue");
-    assert_eq!(issue["labels"], serde_json::json!(["unflushed-label"]));
-    assert_eq!(issue["comments"][0]["text"], "unflushed comment");
-    assert_eq!(issue["dependencies"][0]["id"], "leg-n57");
-
-    let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open healed DB");
+fn assert_recoverable_records_still_active(db_path: &Path) {
+    let scratch = tempfile::tempdir().unwrap();
+    let copy = scratch.path().join("copy.db");
+    fs::copy(db_path, &copy).unwrap();
+    let wal = PathBuf::from(format!("{}-wal", db_path.display()));
+    if wal.exists() {
+        fs::copy(wal, scratch.path().join("copy.db-wal")).unwrap();
+    }
+    let conn = Connection::open(copy.to_string_lossy().into_owned()).expect("open inspection copy");
+    for (sql, expected) in [
+        (
+            "SELECT title FROM issues WHERE id = 'leg-u4i'",
+            "Unflushed legacy issue",
+        ),
+        (
+            "SELECT label FROM labels WHERE issue_id = 'leg-u4i'",
+            "unflushed-label",
+        ),
+        (
+            "SELECT text FROM comments WHERE issue_id = 'leg-u4i'",
+            "unflushed comment",
+        ),
+        (
+            "SELECT depends_on_id FROM dependencies WHERE issue_id = 'leg-u4i'",
+            "leg-n57",
+        ),
+    ] {
+        let rows = conn.query(sql).unwrap();
+        assert_eq!(rows.len(), 1, "{sql}");
+        assert_eq!(
+            rows[0]
+                .get(0)
+                .and_then(beads_rust::franken_sync::SqliteValue::as_text),
+            Some(expected)
+        );
+    }
     let dirty = conn
         .query("SELECT issue_id FROM dirty_issues WHERE issue_id = 'leg-u4i'")
         .expect("read dirty markers");
-    assert_eq!(dirty.len(), 1, "the restored issue must remain exportable");
-    conn.close().expect("close healed DB");
-
-    let flush = run_br(workspace, ["sync", "--flush-only", "--json"], "flush");
-    assert!(flush.status.success(), "{} {}", flush.stdout, flush.stderr);
-    let exported = fs::read_to_string(workspace.root.join(".beads/issues.jsonl")).expect("export");
-    let rows: Vec<Value> = exported.lines().map(json).collect();
-    let restored = rows
-        .iter()
-        .find(|row| row["id"] == "leg-u4i")
-        .expect("restored export");
-    assert_eq!(restored["title"], "Unflushed legacy issue");
-    assert_eq!(restored["labels"], serde_json::json!(["unflushed-label"]));
-    assert_eq!(restored["comments"][0]["text"], "unflushed comment");
-    assert_eq!(restored["dependencies"][0]["depends_on_id"], "leg-n57");
-    rows
+    assert_eq!(
+        dirty.len(),
+        1,
+        "the original issue must remain exportable by its owning release"
+    );
+    let events = conn.query("SELECT count(*) FROM events").unwrap();
+    assert_eq!(
+        events[0]
+            .get(0)
+            .and_then(beads_rust::franken_sync::SqliteValue::as_integer),
+        Some(7)
+    );
+    conn.close().expect("close inspection copy");
 }
 
 #[test]
-fn discard_for_orphans_restores_unflushed_edits_and_their_relations() {
-    // The flag must preserve recoverable work even when it was unnecessary.
+fn discard_for_orphans_cannot_remove_unflushed_edits_or_audit_records() {
+    // The flag never establishes a lossless migration, with or without orphans.
     for orphan in [false, true] {
         let workspace = BrWorkspace::new();
         let db_path = install_fixture(&workspace);
@@ -144,12 +156,10 @@ fn discard_for_orphans_restores_unflushed_edits_and_their_relations() {
             );
             assert!(!refused.status.success());
             let error = json(&refused.stdout).to_string();
-            assert!(error.contains("without an owning issue"), "{error}");
             assert!(
-                error.contains("2 recoverable database-only issue(s)"),
+                error.contains("migration") && error.contains("preserv"),
                 "{error}"
             );
-            assert!(error.contains("leg-n57, leg-u4i"), "{error}");
             assert_eq!(fs::read(&db_path).unwrap(), before_db);
             assert_eq!(fs::read(&jsonl_path).unwrap(), before_jsonl);
         }
@@ -159,10 +169,17 @@ fn discard_for_orphans_restores_unflushed_edits_and_their_relations() {
             preview["planned_action"]
                 .as_str()
                 .unwrap()
-                .contains("re-add 2 database-only issue(s)"),
+                .contains("refus"),
             "{preview}"
         );
         assert_eq!(preview["automatic_rebuild_allowed"], false);
+        assert_eq!(preview["audit"]["db_only"].as_array().unwrap().len(), 2);
+        if orphan {
+            assert_eq!(
+                preview["audit"]["orphan_relations"],
+                serde_json::json!([{"table": "labels", "rows": 1}])
+            );
+        }
         assert_eq!(
             fs::read(&db_path).unwrap(),
             before_db,
@@ -171,37 +188,16 @@ fn discard_for_orphans_restores_unflushed_edits_and_their_relations() {
         assert_eq!(fs::read(&jsonl_path).unwrap(), before_jsonl);
 
         let outcome = flagged_heal(&workspace, false);
-        assert_eq!(outcome["action"], "rebuilt");
-        let mut restored: Vec<&str> = outcome["restored_db_only"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|id| id.as_str().unwrap())
-            .collect();
-        restored.sort_unstable();
-        assert_eq!(restored, ["leg-n57", "leg-u4i"]);
-        assert_eq!(outcome["backup_only_db_only"], serde_json::json!([]));
-        if orphan {
-            assert_eq!(
-                outcome["backup_only_orphan_relations"],
-                serde_json::json!([{"table": "labels", "rows": 1}])
-            );
-        }
-        assert!(Path::new(outcome["backup"].as_str().unwrap()).is_dir());
-        assert_eq!(
-            show_without_sync(&workspace, "leg-n57")["title"],
-            "Renamed locally, never flushed"
-        );
-        let rows = assert_recoverable_issue_and_flush(&workspace, &db_path);
-        assert_eq!(
-            rows.iter().find(|row| row["id"] == "leg-n57").unwrap()["title"],
-            "Renamed locally, never flushed"
-        );
+        assert!(outcome["error"].is_object());
+        assert_eq!(fs::read(&db_path).unwrap(), before_db);
+        assert_eq!(fs::read(&jsonl_path).unwrap(), before_jsonl);
+        assert!(!workspace.root.join(".beads/.br_recovery").exists());
+        assert_recoverable_records_still_active(&db_path);
     }
 }
 
 #[test]
-fn discard_unreadable_payload_does_not_omit_a_different_recoverable_issue() {
+fn discard_unreadable_payload_cannot_omit_a_different_recoverable_issue() {
     let workspace = BrWorkspace::new();
     let db_path = install_fixture(&workspace);
     seed_relations(&db_path, true, true);
@@ -213,33 +209,29 @@ fn discard_unreadable_payload_does_not_omit_a_different_recoverable_issue() {
     );
     assert!(!refused.status.success());
     let error = json(&refused.stdout).to_string();
-    assert!(error.contains("unreadable"), "{error}");
     assert!(
-        error.contains("1 recoverable database-only issue(s) (leg-u4i)"),
+        error.contains("migration") && error.contains("preserv"),
         "{error}"
     );
     assert_eq!(fs::read(&db_path).unwrap(), before);
 
     let preview = flagged_heal(&workspace, true);
     let action = preview["planned_action"].as_str().unwrap();
+    assert!(action.contains("refus"), "{action}");
     assert!(
-        action.contains("re-add 1 database-only issue(s)"),
-        "{action}"
-    );
-    assert!(
-        action.contains("1 unreadable or superseded database-only issue(s)"),
-        "{action}"
+        preview["audit"]["db_only"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["id"] == "leg-n57" && issue["reason"] == "unreadable")
     );
     assert_eq!(fs::read(&db_path).unwrap(), before);
 
     let outcome = flagged_heal(&workspace, false);
-    assert_eq!(outcome["restored_db_only"], serde_json::json!(["leg-u4i"]));
-    assert_eq!(
-        outcome["backup_only_db_only"],
-        serde_json::json!(["leg-n57"])
-    );
-    assert!(Path::new(outcome["backup"].as_str().unwrap()).is_dir());
-    let _ = assert_recoverable_issue_and_flush(&workspace, &db_path);
+    assert!(outcome["error"].is_object());
+    assert_eq!(fs::read(&db_path).unwrap(), before);
+    assert!(!workspace.root.join(".beads/.br_recovery").exists());
+    assert_recoverable_records_still_active(&db_path);
 }
 
 #[test]
@@ -261,20 +253,13 @@ fn discard_preservation_does_not_overwrite_a_superseding_jsonl_edit() {
         })
         .collect();
     fs::write(&jsonl_path, format!("{}\n", rewritten.join("\n"))).expect("newer export");
+    let before_db = fs::read(&db_path).unwrap();
+    let before_jsonl = fs::read(&jsonl_path).unwrap();
 
     let outcome = flagged_heal(&workspace, false);
-    assert_eq!(outcome["restored_db_only"], serde_json::json!(["leg-u4i"]));
-    assert_eq!(
-        outcome["backup_only_db_only"],
-        serde_json::json!(["leg-n57"])
-    );
-    assert_eq!(
-        show_without_sync(&workspace, "leg-n57")["title"],
-        "Newer upstream edit"
-    );
-    let rows = assert_recoverable_issue_and_flush(&workspace, &db_path);
-    assert_eq!(
-        rows.iter().find(|row| row["id"] == "leg-n57").unwrap()["title"],
-        "Newer upstream edit"
-    );
+    assert!(outcome["error"].is_object());
+    assert_eq!(fs::read(&db_path).unwrap(), before_db);
+    assert_eq!(fs::read(&jsonl_path).unwrap(), before_jsonl);
+    assert!(!workspace.root.join(".beads/.br_recovery").exists());
+    assert_recoverable_records_still_active(&db_path);
 }

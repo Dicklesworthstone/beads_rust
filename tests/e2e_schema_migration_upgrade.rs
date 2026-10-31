@@ -55,6 +55,10 @@ fn assert_framed_wal_refusal(
         output.contains(FRAMED_WAL_REFUSAL),
         "unexpected refusal: {output}"
     );
+    assert_source_family_preserved(workspace, main_before, wal_before);
+}
+
+fn assert_source_family_preserved(workspace: &BrWorkspace, main_before: &[u8], wal_before: &[u8]) {
     assert!(!workspace.root.join(".beads/beads.db-shm").exists());
     assert!(
         !workspace
@@ -127,22 +131,22 @@ fn current_workspace_without_wal_index(pending_merge: bool) -> BrWorkspace {
 }
 
 #[test]
-fn missing_wal_index_startup_refuses_framed_wal_and_preserves_family() {
+fn missing_wal_index_reads_private_snapshot_but_mutations_refuse_framed_wal() {
     // The committed rows stay in the WAL; recovering them is the owning
     // engine's checkpoint, not an index-only recovery (#562).
     let workspace = current_workspace_without_wal_index(false);
     let main_before = fs::read(workspace.root.join(".beads/beads.db")).unwrap();
     let wal_before = fs::read(workspace.root.join(".beads/beads.db-wal")).unwrap();
-    for (args, label) in [
-        (["list", "--all", "--json"], "framed_list"),
-        (
-            ["create", "must never be created", "--json"],
-            "framed_create",
-        ),
-    ] {
-        let run = run_br(&workspace, args, label);
-        assert_framed_wal_refusal(&workspace, &run, &main_before, &wal_before);
-    }
+    let list = run_br(&workspace, ["list", "--all", "--json"], "framed_list");
+    assert!(list.status.success(), "{} {}", list.stdout, list.stderr);
+    assert!(list.stdout.contains(WAL_ONLY_TITLE));
+    assert_source_family_preserved(&workspace, &main_before, &wal_before);
+    let create = run_br(
+        &workspace,
+        ["create", "must never be created", "--json"],
+        "framed_create",
+    );
+    assert_framed_wal_refusal(&workspace, &create, &main_before, &wal_before);
 }
 
 #[test]
@@ -236,24 +240,24 @@ fn missing_wal_index_doctor_reads_pending_receipt_without_live_repair() {
 }
 
 #[test]
-fn missing_wal_index_live_peer_prevents_recovery() {
-    // Recovery only runs without frames, so the framed WAL is refused before
-    // the sole-opener check is reached; the lib test
-    // `engine_recovery_refuses_peer_before_creating_backup` covers that check
-    // over a truncated WAL.
+fn missing_wal_index_read_with_a_live_peer_remains_observational() {
+    // Shared readers may observe a verified private snapshot while a peer
+    // holds its lease. A read must never request exclusive recovery authority.
     let workspace = current_workspace_without_wal_index(false);
     let db_path = workspace.root.join(".beads/beads.db");
     let main_before = fs::read(&db_path).unwrap();
     let wal_before = fs::read(workspace.root.join(".beads/beads.db-wal")).unwrap();
     let _peer = beads_rust::sync::DatabaseOpenerLease::register(&db_path).unwrap();
-    let list = run_br(&workspace, ["list", "--json"], "peer_refusal");
-    assert_framed_wal_refusal(&workspace, &list, &main_before, &wal_before);
+    let list = run_br(&workspace, ["list", "--json"], "peer_observation");
+    assert!(list.status.success(), "{} {}", list.stdout, list.stderr);
+    assert!(list.stdout.contains(WAL_ONLY_TITLE));
+    assert_source_family_preserved(&workspace, &main_before, &wal_before);
 }
 
 #[test]
 fn missing_wal_index_corrupt_wal_refuses_without_live_mutation() {
-    // A corrupt frame checksum still leaves a frame-bearing WAL, which is
-    // refused before any checksum scan; the family keeps the corrupt bytes.
+    // Private read-only snapshots validate committed WAL frames; they must
+    // refuse a checksum failure without repairing or discarding the source.
     let workspace = current_workspace_without_wal_index(false);
     let wal_path = workspace.root.join(".beads/beads.db-wal");
     let main_before = fs::read(workspace.root.join(".beads/beads.db")).unwrap();
@@ -261,7 +265,10 @@ fn missing_wal_index_corrupt_wal_refuses_without_live_mutation() {
     wal_before[48] ^= 1; // First frame's checksum; a tolerant scan would ignore it.
     fs::write(&wal_path, &wal_before).unwrap();
     let list = run_br(&workspace, ["list", "--json"], "corrupt_refusal");
-    assert_framed_wal_refusal(&workspace, &list, &main_before, &wal_before);
+    assert!(!list.status.success(), "{} {}", list.stdout, list.stderr);
+    let message = format!("{} {}", list.stdout, list.stderr).to_ascii_lowercase();
+    assert!(message.contains("wal"), "{message}");
+    assert_source_family_preserved(&workspace, &main_before, &wal_before);
 }
 
 fn install_fixture_workspace(workspace: &BrWorkspace, db_gz: &str, issues: &str, config: &str) {
@@ -378,6 +385,75 @@ fn engine_rows(db_path: &Path, columns: Option<&TableRows>) -> TableRows {
     result
 }
 
+/// Model termination after installation but before the applied receipt was
+/// published. Keep the completed receipt as test evidence, leave the real
+/// commit-ready intent in place, and require an explicit resume to finish it.
+fn interrupted_apply_keeps_authority_until_explicit_resume(
+    workspace: &BrWorkspace,
+    db_path: &Path,
+    run_id: &str,
+    plan_token: &str,
+    rows_before: &TableRows,
+) {
+    let run_dir = workspace
+        .root
+        .join(".beads/.br_recovery/schema-migrations")
+        .join(run_id);
+    let applied_path = run_dir.join("applied.json");
+    fs::rename(
+        &applied_path,
+        run_dir.join("applied.interruption-test.json"),
+    )
+    .expect("retain receipt while simulating interrupted finalization");
+    let original_backup = fs::read(run_dir.join("before/beads.db")).expect("original backup");
+    let intent = fs::read(run_dir.join("commit-ready.json")).expect("commit-ready intent");
+    let database = fs::read(db_path).expect("installed database");
+    let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+    let wal = fs::read(&wal_path).ok();
+    for (index, command) in ["info", "list", "stats"].into_iter().enumerate() {
+        let read = run_br(
+            workspace,
+            [command, "--json", "--no-auto-import", "--no-auto-flush"],
+            &format!("read_during_interrupted_migration_{index}"),
+        );
+        assert!(read.status.success(), "{} {}", read.stdout, read.stderr);
+        assert!(!applied_path.exists(), "a read must not finalize recovery");
+        assert_eq!(fs::read(db_path).unwrap(), database);
+        assert_eq!(fs::read(&wal_path).ok(), wal);
+        assert_eq!(fs::read(run_dir.join("commit-ready.json")).unwrap(), intent);
+        assert_eq!(
+            fs::read(run_dir.join("before/beads.db")).unwrap(),
+            original_backup
+        );
+    }
+    let resume = run_br(
+        workspace,
+        [
+            "doctor",
+            "migrate-schema",
+            "apply",
+            "--plan-token",
+            plan_token,
+            "--json",
+        ],
+        "resume_interrupted_migration",
+    );
+    assert!(
+        resume.status.success(),
+        "{} {}",
+        resume.stdout,
+        resume.stderr
+    );
+    let receipt: Value = serde_json::from_str(&extract_json_payload(&resume.stdout)).unwrap();
+    assert_eq!(receipt["run_id"], run_id);
+    assert!(applied_path.is_file());
+    assert_eq!(engine_rows(db_path, Some(rows_before)), *rows_before);
+    assert_eq!(
+        fs::read(run_dir.join("before/beads.db")).unwrap(),
+        original_backup
+    );
+}
+
 #[allow(clippy::too_many_lines)]
 fn upgrade_fixture_end_to_end(
     label: &str,
@@ -391,6 +467,36 @@ fn upgrade_fixture_end_to_end(
     let workspace = BrWorkspace::new();
     install_fixture_workspace(&workspace, db_gz, issues, config);
     let db_path = workspace.root.join(".beads").join("beads.db");
+    // #585: preserving issue counts is insufficient. These records have no
+    // representation in issues.jsonl and must remain in the active database,
+    // byte-valued cells included, after migration and after undo/re-apply.
+    let source = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    for sql in [
+        "INSERT INTO config (key, value) VALUES ('compact_batch_size', '37')",
+        "INSERT INTO config (key, value) VALUES ('compact_model', 'preserved-model')",
+        "INSERT INTO config (key, value) VALUES ('compaction_enabled', 'false')",
+        "INSERT INTO metadata (key, value) VALUES ('operator_checkpoint', 'not a derived cache')",
+        "CREATE TABLE extension_authority (key TEXT PRIMARY KEY, payload BLOB NOT NULL)",
+        "INSERT INTO extension_authority VALUES ('private', X'0001FF007F')",
+        "UPDATE dependencies SET metadata = '{\"reason\":\"database-only payload\"}', \
+         thread_id = 'database-only-thread', created_by = 'database-only-agent'",
+    ] {
+        source.execute(sql).expect("seed database-only authority");
+    }
+    let owner = source
+        .query("SELECT id FROM issues ORDER BY id LIMIT 1")
+        .unwrap()[0]
+        .get(0)
+        .expect("fixture issue")
+        .clone();
+    source
+        .execute_with_params(
+            "INSERT INTO comments (issue_id, author, text, created_at) \
+             VALUES (?1, 'local-agent', 'database-only comment', '2026-10-31T00:00:00Z')",
+            &[owner],
+        )
+        .unwrap();
+    source.close().expect("close seeded source");
     assert_eq!(
         u64::from(header_user_version(&db_path)),
         expected_from,
@@ -411,8 +517,8 @@ fn upgrade_fixture_end_to_end(
         stats.stderr
     );
     assert!(
-        stats.stderr.contains("migrate-schema heal"),
-        "{label}: the fallback warning must name `br doctor migrate-schema heal`; got: {}",
+        stats.stderr.contains("migrate-schema plan --json"),
+        "{label}: the fallback warning must name `br doctor migrate-schema plan --json`; got: {}",
         stats.stderr
     );
     serde_json::from_str::<Value>(&extract_json_payload(&stats.stdout))
@@ -573,6 +679,16 @@ fn upgrade_fixture_end_to_end(
         );
     }
 
+    if expected_from == 16 {
+        interrupted_apply_keeps_authority_until_explicit_resume(
+            &workspace,
+            &db_path,
+            &run_id,
+            &plan_token,
+            &rows_before,
+        );
+    }
+
     // 5. The consumed receipt is stale: re-plan reports nothing to do, and
     //    re-applying the old token must be rejected without mutating.
     let replan = run_br(
@@ -697,6 +813,11 @@ fn upgrade_fixture_end_to_end(
         apply2.stderr
     );
     assert_eq!(header_user_version(&db_path), target);
+    assert_eq!(
+        engine_rows(&db_path, Some(&rows_before)),
+        rows_before,
+        "{label}: undo and re-apply must retain every original database value"
+    );
 }
 
 /// Schema 15 (gate-history era, pre-#384) upgrades to the current schema.

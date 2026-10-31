@@ -818,6 +818,7 @@ struct SqliteRecoveryOpenResult {
 struct SqliteStartupOpenOptions<'a> {
     defer_jsonl_recovery: bool,
     read_only_fast_open: bool,
+    read_only_storage: bool,
     write_authority: Option<&'a Arc<crate::sync::DatabaseFamilyWriteLock>>,
     allow_external_jsonl: bool,
 }
@@ -4323,6 +4324,68 @@ impl OpenStorageResult {
         self.write_authority.as_ref().map(Arc::clone)
     }
 
+    /// Reopen the existing current-schema database solely for an authorized
+    /// automatic import, without startup repair, migration, or reconstruction.
+    ///
+    /// The caller must first repeat its freshness and pending-merge probes
+    /// under this authority. The original observational handle and immutable
+    /// routing context remain intact if a safe writable open is unavailable.
+    ///
+    /// # Errors
+    ///
+    /// Refuses mismatched authority, a missing or incompatible database, or
+    /// any engine-open failure. No recovery fallback is attempted.
+    #[doc(hidden)]
+    pub fn reopen_current_for_auto_import(
+        &mut self,
+        authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
+    ) -> Result<()> {
+        if self.no_db
+            || self.database_transition_failed_closed
+            || self.pending_recovery_backup.is_some()
+        {
+            return Err(BeadsError::SyncConflict {
+                message: "Automatic import requires an intact persistent database context"
+                    .to_string(),
+            });
+        }
+        if crate::sync::database_write_authority_sha256(&self.paths.db_path)?
+            != authority.authority_path_sha256()
+            || crate::sync::canonical_database_authority_path(&self.paths.db_path)?
+                != authority.canonical_database_path()
+        {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Automatic import database routing does not match the held write authority"
+                        .to_string(),
+            });
+        }
+        authority.verify_database_authority()?;
+        let refusal_context = || {
+            format!(
+                "Automatic import refused for {}: the existing current-schema database could not \
+             be opened without repair. Run `br doctor --json` to inspect it before retrying; \
+             automatic import never rebuilds the database from JSONL",
+                self.paths.db_path.display(),
+            )
+        };
+        let mut storage = SqliteStorage::open_current_for_reconcile(
+            &self.paths.db_path,
+            self.resolved_lock_timeout,
+        )
+        .map_err(|error| BeadsError::WithContext {
+            context: refusal_context(),
+            source: Box::new(error),
+        })?
+        .ok_or_else(|| BeadsError::Config(refusal_context()))?;
+        authority.verify_database_authority()?;
+        storage.set_workflow_policy(self.storage.workflow_policy());
+        storage.attach_write_authority(Arc::clone(authority));
+        self.storage = storage;
+        self.write_authority = Some(Arc::clone(authority));
+        Ok(())
+    }
+
     /// Reconstruct the immutable startup snapshot that opened this context.
     ///
     /// Protected fast-open reopens use this snapshot so a concurrent metadata
@@ -5261,7 +5324,7 @@ fn open_storage_with_owned_write_authority(
         });
     }
 
-    if cli.read_only_fast_open {
+    if cli.read_only_storage || cli.read_only_fast_open {
         return open_storage_with_startup_config_impl(
             startup,
             cli,
@@ -5320,6 +5383,41 @@ pub fn open_storage_with_startup_config_under_write_lock(
     Ok(result)
 }
 
+pub(crate) fn open_sqlite_storage_read_only(db_path: &Path) -> Result<SqliteStorage> {
+    // GH #585: observation is an execution contract, not a fast-path
+    // preference. A read-only miss must never authorize migration,
+    // namespace repair, default seeding, or reconstruction from JSONL,
+    // even when the caller already holds the writer authority.
+    let refusal_context = || {
+        format!(
+            "Read-only storage open refused for {}: writable recovery and schema changes \
+             are disabled. Run `br doctor --json` to inspect the original tracker and \
+             select an explicit, lossless recovery or migration",
+            db_path.display(),
+        )
+    };
+    let storage = SqliteStorage::open_current_read_only(db_path).map_err(|error| {
+        BeadsError::WithContext {
+            context: refusal_context(),
+            source: Box::new(error),
+        }
+    })?;
+    let Some(storage) = storage else {
+        return Err(BeadsError::Config(refusal_context()));
+    };
+    if !storage.fast_open_runtime_schema_is_compatible() {
+        return Err(BeadsError::Config(format!(
+            "{}; the database's runtime schema is incomplete or incompatible",
+            refusal_context(),
+        )));
+    }
+    Ok(storage)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "startup routing keeps observational refusal ahead of every writable fallback"
+)]
 fn open_sqlite_storage_for_startup(
     beads_dir: &Path,
     paths: &ConfigPaths,
@@ -5330,6 +5428,17 @@ fn open_sqlite_storage_for_startup(
     SqliteRecoveryOpenResult,
     Option<Arc<crate::sync::DatabaseFamilyWriteLock>>,
 )> {
+    if options.read_only_storage {
+        return Ok((
+            SqliteRecoveryOpenResult {
+                storage: open_sqlite_storage_read_only(&paths.db_path)?,
+                auto_rebuilt: false,
+                pending_recovery_backup: None,
+                recovered_jsonl: None,
+            },
+            None,
+        ));
+    }
     if options.defer_jsonl_recovery {
         let database_was_missing = options
             .write_authority
@@ -5457,6 +5566,12 @@ fn open_storage_with_startup_config_impl(
         .or(Some(30000));
 
     if no_db {
+        if cli.read_only_storage && cli.no_db_write_intent {
+            return Err(BeadsError::Config(
+                "Read-only storage cannot request JSONL write authority in --no-db mode"
+                    .to_string(),
+            ));
+        }
         let mut storage = SqliteStorage::open_memory()?;
         validate_sync_path_with_external(&paths.jsonl_path, &beads_dir, allow_external_jsonl)?;
         let jsonl_write_authority = if cli.no_db_write_intent {
@@ -5557,6 +5672,7 @@ fn open_storage_with_startup_config_impl(
             SqliteStartupOpenOptions {
                 defer_jsonl_recovery,
                 read_only_fast_open: cli.read_only_fast_open,
+                read_only_storage: cli.read_only_storage,
                 write_authority,
                 allow_external_jsonl,
             },
@@ -6166,6 +6282,11 @@ pub struct CliOverrides {
     /// and therefore must retain JSONL-family authority for its whole life.
     pub(crate) no_db_write_intent: bool,
     pub read_only_fast_open: bool,
+    /// Observational execution contract for persistent storage. Unlike the
+    /// fast-open optimization, this forbids writable fallback, recovery,
+    /// schema changes, and default metadata writes. It is process-local,
+    /// survives routed command clones, and is never a persisted config key.
+    pub read_only_storage: bool,
 }
 
 impl CliOverrides {
@@ -7591,7 +7712,7 @@ mod tests {
     use crate::franken_sync::Connection;
     use crate::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
-    use crate::storage::sqlite::database_family_snapshot;
+    use crate::storage::sqlite::{database_family_read_only_diffs, database_family_snapshot};
     use chrono::Utc;
     use tempfile::TempDir;
 
@@ -8765,6 +8886,7 @@ labels:
             held_write_authority: None,
             no_db_write_intent: false,
             read_only_fast_open: false,
+            read_only_storage: false,
         };
 
         let layer = cli.as_layer();
@@ -12105,6 +12227,432 @@ routing:
             None,
             "recording the repaired schema witness must not create duplicate metadata keys"
         );
+    }
+
+    #[test]
+    fn strict_read_only_storage_refuses_missing_or_malformed_database_without_recovery() {
+        for malformed in [false, true] {
+            let temp = TempDir::new().expect("tempdir");
+            let beads_dir = temp.path().join(".beads");
+            let db_path = beads_dir.join("beads.db");
+            let jsonl_path = beads_dir.join("issues.jsonl");
+            fs::create_dir_all(&beads_dir).expect("create beads dir");
+            write_single_issue_jsonl(&jsonl_path, "bd-only-jsonl", "Interchange snapshot");
+            if malformed {
+                fs::write(&db_path, b"unreadable authoritative database bytes")
+                    .expect("write malformed database");
+            }
+            let before = database_family_snapshot(&db_path).expect("snapshot source");
+            let jsonl_before = fs::read(&jsonl_path).expect("read JSONL");
+            let _writer = crate::sync::blocking_write_lock(&beads_dir).expect("competing writer");
+
+            for fast_open in [false, true] {
+                for deferred in [false, true] {
+                    let cli = CliOverrides {
+                        read_only_storage: true,
+                        read_only_fast_open: fast_open,
+                        lock_timeout: Some(1),
+                        ..CliOverrides::default()
+                    };
+                    let error = open_storage_with_cli_impl(&beads_dir, &cli, deferred)
+                        .expect_err("observational miss must refuse without promotion");
+                    assert!(
+                        error.to_string().contains("Read-only storage open refused"),
+                        "strict reads must not wait for writable recovery: {error}"
+                    );
+                    assert!(error.to_string().contains("br doctor --json"));
+                    assert_eq!(
+                        database_family_snapshot(&db_path).expect("reread source"),
+                        before,
+                        "neither fast-open nor deferred recovery may override observation"
+                    );
+                    assert_eq!(fs::read(&jsonl_path).unwrap(), jsonl_before);
+                    assert!(!beads_dir.join(".br_recovery").exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn strict_read_only_storage_refuses_older_schemas_and_keeps_database_only_records() {
+        for version in [0, 4, 7, 16, 17] {
+            let temp = TempDir::new().expect("tempdir");
+            let beads_dir = temp.path().join(".beads");
+            let db_path = beads_dir.join("beads.db");
+            fs::create_dir_all(&beads_dir).expect("create beads dir");
+            let mut original = SqliteStorage::open(&db_path).expect("initialize fixture");
+            let issue = Issue {
+                id: "bd-local".to_owned(),
+                title: "Authoritative local issue and event history".to_owned(),
+                ..Issue::default()
+            };
+            original.create_issue(&issue, "local-author").unwrap();
+            original
+                .set_config("compact_model", "operator-choice")
+                .unwrap();
+            drop(original);
+            let fixture = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            fixture
+                .execute(&format!("PRAGMA user_version = {version}"))
+                .unwrap();
+            fixture.close().unwrap();
+            let before = database_family_snapshot(&db_path).unwrap();
+
+            for fast_open in [false, true] {
+                let cli = CliOverrides {
+                    read_only_storage: true,
+                    read_only_fast_open: fast_open,
+                    ..CliOverrides::default()
+                };
+                let error = open_storage_with_cli(&beads_dir, &cli)
+                    .expect_err("legacy data requires an explicit lossless migration");
+                assert!(error.to_string().contains("Read-only storage open refused"));
+                let after = database_family_snapshot(&db_path).unwrap();
+                let diffs = database_family_read_only_diffs(&before, &after);
+                assert!(diffs.is_empty(), "schema {version}: {diffs:?}");
+                assert!(!beads_dir.join(".br_recovery").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn strict_read_only_storage_refuses_incomplete_schema_even_with_writer_authority() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        fs::create_dir_all(&beads_dir).unwrap();
+        drop(SqliteStorage::open(&db_path).unwrap());
+        let fixture = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        fixture.execute("DROP TABLE labels").unwrap();
+        fixture.close().unwrap();
+        let before = database_family_snapshot(&db_path).unwrap();
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &db_path,
+                Some(100),
+            )
+            .unwrap(),
+        );
+
+        for fast_open in [false, true] {
+            for deferred in [false, true] {
+                let mut cli = CliOverrides {
+                    read_only_storage: true,
+                    read_only_fast_open: fast_open,
+                    lock_timeout: Some(1),
+                    ..CliOverrides::default()
+                };
+                cli.mark_database_family_lock_held(&beads_dir, &authority);
+                let error = open_storage_with_cli_impl(&beads_dir, &cli, deferred)
+                    .expect_err("holding authority must not authorize schema repair");
+                assert!(error.to_string().contains("runtime schema is incomplete"));
+                let diffs = database_family_read_only_diffs(
+                    &before,
+                    &database_family_snapshot(&db_path).unwrap(),
+                );
+                assert!(diffs.is_empty(), "incomplete schema changed: {diffs:?}");
+                assert!(!beads_dir.join(".br_recovery").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn strict_read_only_storage_skips_writer_lock_and_metadata_defaults() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let mut original = SqliteStorage::open(&db_path).unwrap();
+        original.set_config("compact_batch_size", "91").unwrap();
+        original.delete_metadata("jsonl_content_hash").unwrap();
+        drop(original);
+        let before = database_family_snapshot(&db_path).unwrap();
+        let _writer = crate::sync::blocking_write_lock(&beads_dir).expect("competing writer");
+
+        let opened = open_storage_with_cli(
+            &beads_dir,
+            &CliOverrides {
+                read_only_storage: true,
+                read_only_fast_open: false,
+                lock_timeout: Some(1),
+                ..CliOverrides::default()
+            },
+        )
+        .expect("observational reads do not join the writer queue");
+        assert_eq!(
+            opened.storage.get_metadata("jsonl_content_hash").unwrap(),
+            None
+        );
+        assert_eq!(
+            opened
+                .storage
+                .get_config("compact_batch_size")
+                .unwrap()
+                .as_deref(),
+            Some("91")
+        );
+        assert!(opened.retained_database_write_authority().is_none());
+        assert!(!opened.auto_rebuilt);
+        drop(opened);
+        let diffs =
+            database_family_read_only_diffs(&before, &database_family_snapshot(&db_path).unwrap());
+        assert!(diffs.is_empty(), "current schema changed: {diffs:?}");
+        assert!(!beads_dir.join(".br_recovery").exists());
+    }
+
+    #[test]
+    fn strict_read_only_storage_allows_private_jsonl_view_without_creating_database() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).unwrap();
+        write_single_issue_jsonl(&jsonl_path, "bd-portable", "Private read view");
+        let before = fs::read(&jsonl_path).unwrap();
+        let opened = open_storage_with_cli(
+            &beads_dir,
+            &CliOverrides {
+                read_only_storage: true,
+                no_db: Some(true),
+                ..CliOverrides::default()
+            },
+        )
+        .expect("a private JSONL view may initialize its own in-memory schema");
+        assert_eq!(
+            opened
+                .storage
+                .get_issue("bd-portable")
+                .unwrap()
+                .unwrap()
+                .title,
+            "Private read view"
+        );
+        assert!(opened.no_db);
+        drop(opened);
+        assert!(!db_path.exists());
+        assert_eq!(fs::read(&jsonl_path).unwrap(), before);
+        assert!(!beads_dir.join(".br_recovery").exists());
+    }
+
+    #[test]
+    fn strict_read_only_storage_refuses_conflicting_jsonl_write_intent() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).unwrap();
+        write_single_issue_jsonl(&jsonl_path, "bd-source", "Preserved JSONL");
+        let before = fs::read(&jsonl_path).unwrap();
+        let mut cli = CliOverrides {
+            read_only_storage: true,
+            no_db: Some(true),
+            ..CliOverrides::default()
+        };
+        cli.mark_no_db_write_intent(true);
+
+        let error = open_storage_with_cli(&beads_dir, &cli)
+            .expect_err("strict observation cannot acquire JSONL write authority");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Read-only storage cannot request JSONL write authority")
+        );
+        assert_eq!(fs::read(&jsonl_path).unwrap(), before);
+        assert!(!beads_dir.join("beads.db").exists());
+        assert!(!beads_dir.join(".br_recovery").exists());
+    }
+
+    #[test]
+    fn current_auto_import_reopen_preserves_duplicate_config_events_and_operator_rows() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage.set_config("issue_prefix", "bd").unwrap();
+        storage
+            .set_config("compact_model", "operator-model")
+            .unwrap();
+        storage
+            .create_issue(
+                &Issue {
+                    id: "bd-local".to_string(),
+                    title: "Database-only history".to_string(),
+                    ..Issue::default()
+                },
+                "local-actor",
+            )
+            .unwrap();
+        storage
+            .execute_test_sql("CREATE TABLE operator_state (payload TEXT NOT NULL)")
+            .unwrap();
+        storage
+            .execute_test_sql("INSERT INTO operator_state VALUES ('authoritative operator record')")
+            .unwrap();
+        drop(storage);
+        insert_duplicate_issue_prefix_config_row(&db_path, "bd");
+        write_single_issue_jsonl(&jsonl_path, "bd-remote", "Incoming interchange issue");
+        let jsonl_before = fs::read(&jsonl_path).unwrap();
+
+        let mut context = open_storage_with_cli(
+            &beads_dir,
+            &CliOverrides {
+                read_only_storage: true,
+                ..CliOverrides::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            context
+                .storage
+                .detect_recoverable_open_anomaly()
+                .unwrap()
+                .is_some_and(|anomaly| anomaly.contains("config contains duplicate"))
+        );
+        assert!(!context.storage.get_all_events(0).unwrap().is_empty());
+        let source_rows = |storage: &SqliteStorage| {
+            ["issues", "events", "config", "metadata", "operator_state"].map(|table| {
+                storage
+                    .execute_raw_query(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                    .unwrap()
+            })
+        };
+        let rows_before = source_rows(&context.storage);
+        let paths_before = context.paths.clone();
+        let policy = crate::close_policy::Workflow {
+            strict: true,
+            statuses: vec!["open".to_string()],
+            ..crate::close_policy::Workflow::default()
+        };
+        context.storage.set_workflow_policy(policy.clone());
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &db_path,
+                Some(100),
+            )
+            .unwrap(),
+        );
+
+        context
+            .reopen_current_for_auto_import(&authority)
+            .expect("automatic import may open the existing database without repairing it");
+
+        assert_eq!(source_rows(&context.storage), rows_before);
+        assert_eq!(context.paths, paths_before);
+        assert_eq!(context.storage.workflow_policy(), policy);
+        assert!(context.storage.attached_write_authority().is_some());
+        assert!(context.retained_database_write_authority().is_some());
+        assert!(!context.auto_rebuilt);
+        assert_eq!(fs::read(&jsonl_path).unwrap(), jsonl_before);
+        assert!(!beads_dir.join(".br_recovery").exists());
+    }
+
+    #[test]
+    fn current_auto_import_reopen_refuses_missing_stale_and_incomplete_sources() {
+        for condition in ["missing", "malformed", "legacy", "incomplete"] {
+            let temp = TempDir::new().unwrap();
+            let beads_dir = temp.path().join(".beads");
+            let db_path = beads_dir.join("beads.db");
+            let jsonl_path = beads_dir.join("issues.jsonl");
+            fs::create_dir_all(&beads_dir).unwrap();
+            drop(SqliteStorage::open(&db_path).unwrap());
+            write_single_issue_jsonl(&jsonl_path, "bd-source", "JSONL must not trigger recovery");
+            let mut context = open_storage_with_cli(
+                &beads_dir,
+                &CliOverrides {
+                    read_only_storage: true,
+                    ..CliOverrides::default()
+                },
+            )
+            .unwrap();
+            if matches!(condition, "missing" | "malformed") {
+                context.paths.db_path = beads_dir.join("unavailable.db");
+                if condition == "malformed" {
+                    fs::write(&context.paths.db_path, b"unreadable authoritative database")
+                        .unwrap();
+                }
+            } else {
+                let fixture = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+                fixture
+                    .execute(if condition == "legacy" {
+                        "PRAGMA user_version = 1"
+                    } else {
+                        "DROP TABLE labels"
+                    })
+                    .unwrap();
+                fixture.close().unwrap();
+            }
+            let before = database_family_snapshot(&context.paths.db_path).unwrap();
+            let jsonl_before = fs::read(&jsonl_path).unwrap();
+            let authority = Arc::new(
+                crate::sync::blocking_database_family_write_lock_with_timeout(
+                    &beads_dir,
+                    &context.paths.db_path,
+                    Some(100),
+                )
+                .unwrap(),
+            );
+
+            let error = context
+                .reopen_current_for_auto_import(&authority)
+                .expect_err("automatic import is never permission to recover the database");
+
+            assert!(
+                error.to_string().contains("Automatic import refused"),
+                "{condition}: {error}"
+            );
+            assert!(error.to_string().contains("br doctor --json"));
+            let diffs = database_family_read_only_diffs(
+                &before,
+                &database_family_snapshot(&context.paths.db_path).unwrap(),
+            );
+            assert!(diffs.is_empty(), "{condition} source changed: {diffs:?}");
+            assert_eq!(fs::read(&jsonl_path).unwrap(), jsonl_before);
+            assert!(!beads_dir.join(".br_recovery").exists());
+        }
+    }
+
+    #[test]
+    fn current_auto_import_reopen_refuses_authority_for_another_database() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        fs::create_dir_all(&beads_dir).unwrap();
+        drop(SqliteStorage::open(&db_path).unwrap());
+        let mut context = open_storage_with_cli(
+            &beads_dir,
+            &CliOverrides {
+                read_only_storage: true,
+                ..CliOverrides::default()
+            },
+        )
+        .unwrap();
+        let before = database_family_snapshot(&db_path).unwrap();
+        let wrong_authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &beads_dir.join("different.db"),
+                Some(100),
+            )
+            .unwrap(),
+        );
+
+        let error = context
+            .reopen_current_for_auto_import(&wrong_authority)
+            .expect_err("authority cannot authorize another database's automatic import");
+
+        assert!(error.to_string().contains("routing does not match"));
+        let diffs =
+            database_family_read_only_diffs(&before, &database_family_snapshot(&db_path).unwrap());
+        assert!(
+            diffs.is_empty(),
+            "mismatched authority changed source: {diffs:?}"
+        );
+        assert!(context.retained_database_write_authority().is_none());
+        assert!(!beads_dir.join(".br_recovery").exists());
     }
 
     #[test]

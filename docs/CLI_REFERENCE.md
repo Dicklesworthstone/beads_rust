@@ -2438,33 +2438,42 @@ reports the stage and retained pre-state location. All rehearsal and failure
 artifacts remain available. Run `plan` again after successful recovery; `plan`
 itself remains read-only.
 
-**Stale-schema self-heal.** When a command meets a database on an older schema
-(including the unversioned schema 0 of early `br` and Go `bd`), it first audits
-the database against `issues.jsonl`. An issue row counts as represented when the
-JSONL carries it as a tombstone, carries equivalent content, or carries a copy
-at least as new while the row was never marked dirty. If every row is
-represented, the command upgrades the database and continues, printing one
-`br: tracker database was on schema N ...` line on stderr: schemas 13-18 go
-through the reviewed migration below (recovery bundle and undo command
-retained), older schemas are rebuilt from the JSONL with the old family kept in
-`.beads/.br_recovery`. Explicitly read-only invocations
-(`--no-auto-import --no-auto-flush`) never upgrade.
+**Older schemas and data preservation.** Ordinary read commands never migrate
+or rebuild an existing database, including schema 0 from early `br` and Go
+`bd`. `info`, `where`, and configuration inspection read the original database
+through their legacy-schema diagnostic readers. Supported issue queries can
+read `issues.jsonl` in a private in-memory database instead, with a warning
+that database-only records are retained in SQLite and may be absent from that
+view. Commands without a safe reader refuse with migration guidance.
+`--no-auto-import --no-auto-flush` also prevents automatic synchronization;
+disabling the fast-open optimization does not disable read-only protection.
 
-If any row exists only in the database (absent from the JSONL, an unflushed
-edit, or newer than its JSONL copy), mutations refuse and name those issues,
-and read-only commands read the JSONL directly (as with `--no-db`). Resolve it
-with:
+A mutating command may upgrade schemas 13-18 through the reviewed migration
+below, which witnesses the complete database and retains a recovery bundle
+and undo receipt. A refused migration or a schema with no reviewed migration
+path stops the command. It never falls through to automatic JSONL
+reconstruction. The error preserves the migration refusal reason.
+
+Inspect the available migration or explicit reconstruction plan with:
 
 ```bash
-br doctor migrate-schema heal --dry-run   # show the audit, change nothing
-br doctor migrate-schema heal             # upgrade, keeping database-only issues
+br doctor migrate-schema plan --json       # reviewed lossless migration
+br doctor migrate-schema heal --dry-run    # inspect explicit heal safety
 ```
 
-`heal` migrates schemas 13-18 in place (every row kept). For older schemas it
-rebuilds from the JSONL and re-adds the database-only issues as unflushed
-changes, so the next `br sync --flush-only` exports them; unflushed edits that a
-newer JSONL edit already superseded stay only in the backup.
-`--discard-db-only` skips the re-add.
+`heal` attempts the same reviewed migration and refuses if that migration is
+unavailable or fails. Its dry-run audit identifies state that JSONL cannot
+represent: event history, configuration and metadata, unknown tables or
+columns, and database-only issues and relations. Even an issue-only source
+cannot authorize live reconstruction: the former rebuild-and-replay path
+could leave partially restored active state after an interruption. Until a
+reviewed migration with a crash-safe installer exists for that source schema,
+the original active database stays in place. `--discard-db-only` cannot bypass
+this refusal or authorize discarding history or configuration. Keep the
+complete database family and use a compatible release to inspect it. A
+retained backup is recovery evidence, not permission to remove authoritative
+records from active storage. Explicit corruption recovery and migration
+recover/undo retain their separate safety checks and backup protocols.
 
 The explicit receipt-bound lifecycle remains available for supported older
 versions:

@@ -155,10 +155,13 @@ pub fn execute_with_storage(
     // JSONL-recovery retry.
     let description = resolve_create_description(args)?;
 
-    let issue =
-        retry_mutation_with_jsonl_recovery(&mut storage_ctx, true, "create", None, |storage| {
-            create_issue_impl(storage, args, &config, description.clone())
-        })?;
+    let issue = retry_mutation_with_jsonl_recovery(
+        &mut storage_ctx,
+        !args.dry_run,
+        "create",
+        None,
+        |storage| create_issue_impl(storage, args, &config, description.clone()),
+    )?;
     let capacity_warnings = storage_ctx.storage.take_capacity_warnings();
     let created_id = issue.id.clone();
     let last_touched_dir = storage_ctx.paths.beads_dir.clone();

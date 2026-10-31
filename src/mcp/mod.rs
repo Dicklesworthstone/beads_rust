@@ -205,23 +205,6 @@ fn pending_sync_merge_unknown_mcp_error(err: impl std::fmt::Display) -> McpError
     )
 }
 
-fn pending_sync_merge_read_fallback_error(inspection: &PendingSyncMergeInspection) -> BeadsError {
-    BeadsError::SyncConflict {
-        message: format!(
-            "MCP writable read fallback refused because {}. Run `br sync --merge` before retrying",
-            inspection.diagnostic()
-        ),
-    }
-}
-
-fn pending_sync_merge_read_fallback_unknown(err: impl std::fmt::Display) -> BeadsError {
-    BeadsError::SyncConflict {
-        message: format!(
-            "MCP writable read fallback refused because pending sync-merge state could not be proven absent: {err}. Restore current-schema read-only database access, run `br doctor`, and reconcile with `br sync --merge` before retrying"
-        ),
-    }
-}
-
 fn dirty_auto_flush_incomplete_error(remaining_dirty: usize, needs_flush: bool) -> BeadsError {
     BeadsError::Config(format!(
         "Automatic JSONL export remains pending: {remaining_dirty} dirty issue(s), forced flush: {needs_flush}"
@@ -461,63 +444,19 @@ impl BeadsState {
         Ok(storage)
     }
 
-    fn open_storage_with_fresh_write_authority(&self) -> crate::Result<SqliteStorage> {
-        let write_authority = Arc::new(
-            crate::sync::blocking_database_family_write_lock_with_timeout(
-                &self.beads_dir,
-                &self.db_path,
-                self.write_lock_timeout_ms,
-            )?,
-        );
-        let _sync_lock = crate::sync::try_sync_lock(&self.beads_dir)?
-            .ok_or_else(|| sync_lock_busy_error(&self.beads_dir))?;
-
-        match SqliteStorage::inspect_pending_sync_merge_under_authority(
-            &self.db_path,
-            &write_authority,
-        ) {
-            Ok(PendingSyncMergeInspection::Absent) => {}
-            Ok(inspection) => {
-                return Err(pending_sync_merge_read_fallback_error(&inspection));
-            }
-            Err(err) => {
-                return Err(pending_sync_merge_read_fallback_unknown(err));
-            }
-        }
-
-        let storage = self.open_storage_under_write_authority(&write_authority)?;
-        match storage.inspect_pending_sync_merge() {
-            Ok(PendingSyncMergeInspection::Absent) => Ok(storage),
-            Ok(inspection) => Err(pending_sync_merge_read_fallback_error(&inspection)),
-            Err(err) => Err(pending_sync_merge_read_fallback_unknown(err)),
-        }
-    }
-
     /// Open a fresh read-oriented storage connection.
     ///
     /// Current-schema databases open read-only to avoid schema, recovery, or
-    /// metadata writes for MCP resources, prompts, and read-only tools. If the
-    /// read-only fast path is unavailable, fall back to normal storage open
-    /// while holding the workspace write lock because that path may repair or
-    /// initialize database state.
+    /// metadata writes for MCP resources, prompts, and read-only tools. If a
+    /// safe read is unavailable, refuse with remediation; failure to observe
+    /// is never authority to repair or initialize the database.
     ///
     /// # Errors
     ///
     /// Returns an error if storage cannot be opened.
     pub fn open_read_storage(&self) -> crate::Result<SqliteStorage> {
         let policy = crate::close_policy::load_for_beads_dir(&self.beads_dir)?;
-        let mut storage = match SqliteStorage::open_current_read_only(&self.db_path) {
-            Ok(Some(storage)) => Ok(storage),
-            Ok(None) => self.open_storage_with_fresh_write_authority(),
-            Err(err) => {
-                tracing::debug!(
-                    error = %err,
-                    db_path = %self.db_path.display(),
-                    "MCP read-only storage open failed; falling back to locked writable open"
-                );
-                self.open_storage_with_fresh_write_authority()
-            }
-        }?;
+        let mut storage = config::open_sqlite_storage_read_only(&self.db_path)?;
         storage.set_workflow_policy(policy.workflow);
         Ok(storage)
     }
@@ -752,6 +691,7 @@ mod tests {
 
     use super::*;
     use crate::model::Issue;
+    use crate::storage::sqlite::{database_family_read_only_diffs, database_family_snapshot};
 
     fn test_issue(id: &str, title: &str) -> Issue {
         let now = Utc::now();
@@ -965,7 +905,65 @@ mod tests {
     }
 
     #[test]
-    fn writable_read_fallback_refuses_stale_schema_without_repairing_it() {
+    fn open_read_storage_refuses_missing_or_malformed_database_without_recovery() {
+        for malformed in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let mut state = test_state(&temp, temp.path().join(".beads/issues.jsonl"));
+            state.db_path = state.beads_dir.join("authoritative.db");
+            state.write_lock_timeout_ms = Some(1);
+            if malformed {
+                fs::write(&state.db_path, b"unreadable authoritative database").unwrap();
+            }
+            let issue = test_issue("br-source", "JSONL cannot replace database-only state");
+            fs::write(&state.jsonl_path, serde_json::to_vec(&issue).unwrap()).unwrap();
+            let before = database_family_snapshot(&state.db_path).unwrap();
+            let jsonl_before = fs::read(&state.jsonl_path).unwrap();
+            let _writer = crate::sync::blocking_write_lock(&state.beads_dir).unwrap();
+
+            let error = state
+                .open_read_storage()
+                .expect_err("an MCP observation miss must not acquire writable recovery");
+
+            assert!(error.to_string().contains("Read-only storage open refused"));
+            assert!(error.to_string().contains("br doctor"));
+            assert_eq!(database_family_snapshot(&state.db_path).unwrap(), before);
+            assert_eq!(fs::read(&state.jsonl_path).unwrap(), jsonl_before);
+            assert!(!state.beads_dir.join(".br_recovery").exists());
+        }
+    }
+
+    #[test]
+    fn open_read_storage_refuses_incomplete_current_schema_without_repair() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp, temp.path().join(".beads/issues.jsonl"));
+        let mut storage = SqliteStorage::open(&state.db_path).unwrap();
+        storage
+            .create_issue(&test_issue("br-local", "Database-only issue"), "operator")
+            .unwrap();
+        storage
+            .set_config("compact_model", "operator-model")
+            .unwrap();
+        storage.execute_test_sql("DROP TABLE labels").unwrap();
+        drop(storage);
+        let before = database_family_snapshot(&state.db_path).unwrap();
+        let _writer = crate::sync::blocking_write_lock(&state.beads_dir).unwrap();
+
+        let error = state
+            .open_read_storage()
+            .expect_err("current version without runtime tables requires explicit repair");
+
+        assert!(error.to_string().contains("runtime schema is incomplete"));
+        let diffs = database_family_read_only_diffs(
+            &before,
+            &database_family_snapshot(&state.db_path).unwrap(),
+        );
+        assert!(diffs.is_empty(), "MCP refusal changed source: {diffs:?}");
+        assert!(!state.jsonl_path.exists());
+        assert!(!state.beads_dir.join(".br_recovery").exists());
+    }
+
+    #[test]
+    fn read_storage_refuses_stale_schema_without_repairing_it() {
         let temp = TempDir::new().unwrap();
         let jsonl_path = temp.path().join(".beads").join("issues.jsonl");
         let state = test_state(&temp, jsonl_path.clone());
@@ -977,24 +975,24 @@ mod tests {
         let err = state.open_read_storage().unwrap_err();
 
         assert!(
-            err.to_string().contains("could not be proven absent")
+            err.to_string().contains("Read-only storage open refused")
                 && err.to_string().contains("br doctor"),
-            "stale-schema fallback must fail closed with remediation: {err}"
+            "stale-schema observation must fail closed with remediation: {err}"
         );
         assert_eq!(
             fs::read(&state.db_path).unwrap(),
             database_before,
-            "writable read fallback must not migrate or repair a stale database"
+            "read-only observation must not migrate or repair a stale database"
         );
         assert!(
             SqliteStorage::open_current_read_only(&state.db_path)
                 .unwrap()
                 .is_none(),
-            "failed fallback must leave the stale schema version unchanged"
+            "refused observation must leave the stale schema version unchanged"
         );
         assert!(
             !jsonl_path.exists(),
-            "failed read fallback must not create or rewrite JSONL"
+            "refused observation must not create or rewrite JSONL"
         );
 
         let called = Rc::new(Cell::new(false));
@@ -1321,6 +1319,23 @@ mod tests {
         let receipt = install_valid_pending_merge_receipt(&state);
         let database_before = fs::read(&state.db_path).unwrap();
         let jsonl_before = fs::read(&jsonl_path).unwrap();
+        let family_before = database_family_snapshot(&state.db_path).unwrap();
+        let read_storage = state
+            .open_read_storage()
+            .expect("pending merge remains observable");
+        assert_eq!(
+            read_storage.pending_sync_merge_receipt().unwrap(),
+            Some(receipt.clone())
+        );
+        drop(read_storage);
+        let diffs = database_family_read_only_diffs(
+            &family_before,
+            &database_family_snapshot(&state.db_path).unwrap(),
+        );
+        assert!(
+            diffs.is_empty(),
+            "pending-merge observation changed source: {diffs:?}"
+        );
         let called = Rc::new(Cell::new(false));
         let called_for_closure = Rc::clone(&called);
 
@@ -1417,9 +1432,18 @@ mod tests {
                     .map_err(to_mcp)
             })
             .unwrap();
+        let conflict = "<<<<<<< ours\n{}\n=======\n{}\n>>>>>>> theirs\n";
+        fs::write(&state.jsonl_path, conflict).unwrap();
+        let purge_error = state
+            .with_mutation(|storage, _| {
+                storage
+                    .purge_issue("br-purge", &state.actor)
+                    .map_err(to_mcp)
+            })
+            .unwrap_err();
+        assert_eq!(purge_error.data.unwrap()["error_type"], "AUTO_FLUSH_FAILED");
         {
-            let mut storage = state.open_storage_with_fresh_write_authority().unwrap();
-            storage.purge_issue("br-purge", &state.actor).unwrap();
+            let storage = state.open_read_storage().unwrap();
             assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
             assert_eq!(storage.count_issues().unwrap(), 0);
             assert_eq!(
@@ -1427,8 +1451,6 @@ mod tests {
                 Some("true")
             );
         }
-        let conflict = "<<<<<<< ours\n{}\n=======\n{}\n>>>>>>> theirs\n";
-        fs::write(&state.jsonl_path, conflict).unwrap();
         let expected = json!({"count": 0, "ok_count": 0, "error_count": 0});
         let error = state
             .with_mutation(|_, _| Ok(expected.clone()))

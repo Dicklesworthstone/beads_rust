@@ -4,7 +4,7 @@ use crate::format::sanitize_terminal_text;
 use crate::model::Issue;
 use crate::output::OutputContext;
 use crate::storage::{IssueUpdate, SqliteStorage};
-use crate::sync::auto_import_if_stale;
+use crate::sync::{auto_import_if_stale, auto_import_probe};
 use crate::util::id::IdResolver;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -401,6 +401,31 @@ pub(super) fn auto_import_storage_ctx_if_stale(
     );
     let expected_prefix = crate::config::id_config_from_layer(&config_layer).prefix;
 
+    if cli.read_only_storage {
+        // A command-local or routed read does not own main's checked
+        // reopen protocol. It may inspect freshness, but must never convert
+        // its observation handle into a writable import or witness refresh.
+        if !cli.allow_stale.unwrap_or(false)
+            && !no_auto_import
+            && auto_import_probe(
+                &storage_ctx.storage,
+                &storage_ctx.paths.beads_dir,
+                &storage_ctx.paths.jsonl_path,
+                allow_external_jsonl,
+            )?
+        {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Read-only command found JSONL changes requiring import in {}. \
+                     Run `br sync --import-only` in that workspace, or pass \
+                     `--no-auto-import` to inspect the existing database",
+                    storage_ctx.paths.beads_dir.display(),
+                ),
+            });
+        }
+        return Ok(());
+    }
+
     auto_import_if_stale(
         &mut storage_ctx.storage,
         &storage_ctx.paths.beads_dir,
@@ -431,7 +456,8 @@ pub(super) fn auto_import_external_projects_if_stale(
     local_beads_dir: &Path,
     cli: &crate::config::CliOverrides,
 ) {
-    if cli.allow_stale.unwrap_or(false)
+    if cli.read_only_storage
+        || cli.allow_stale.unwrap_or(false)
         || cli.no_auto_import.unwrap_or(false)
         || cli.no_db.unwrap_or(false)
         || crate::config::no_db_from_layer(config_layer).unwrap_or(false)
@@ -757,15 +783,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_routed_workspace_write_lock, finalize_batched_blocked_cache_refresh,
-        preserve_blocked_cache_on_error, rebuild_blocked_cache_after_partial_mutation,
-        retry_mutation_with_jsonl_recovery, should_attempt_mutation_jsonl_recovery,
+        acquire_routed_workspace_write_lock, auto_import_external_projects_if_stale,
+        auto_import_storage_ctx_if_stale, cli_for_routed_workspace,
+        finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
+        rebuild_blocked_cache_after_partial_mutation, retry_mutation_with_jsonl_recovery,
+        should_attempt_mutation_jsonl_recovery,
     };
-    use crate::config::{CliOverrides, OpenStorageResult, open_storage_with_cli};
+    use crate::config::{CliOverrides, ConfigLayer, OpenStorageResult, open_storage_with_cli};
     use crate::error::BeadsError;
     use crate::franken_sync::Connection;
     use crate::model::Issue;
     use crate::storage::SqliteStorage;
+    use crate::storage::sqlite::{database_family_read_only_diffs, database_family_snapshot};
     use crate::sync::{ExportConfig, export_to_jsonl_with_policy};
     use chrono::Utc;
     use fsqlite_error::FrankenError;
@@ -884,6 +913,147 @@ mod tests {
 
         assert_eq!(issue.title, "Recovered under routed write lock");
         assert!(db_path.is_file(), "database should be rebuilt from JSONL");
+    }
+
+    #[test]
+    fn strict_read_only_storage_survives_external_routing_without_rebuilding() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join("remote/.beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).unwrap();
+        write_single_issue_jsonl(&jsonl_path, "bd-remote", "Remote interchange source");
+        let before = fs::read(&jsonl_path).unwrap();
+        let cli = CliOverrides {
+            db: Some(temp.path().join("local.db")),
+            read_only_fast_open: true,
+            read_only_storage: true,
+            ..CliOverrides::default()
+        };
+
+        let routed = cli_for_routed_workspace(&cli, true);
+        assert!(routed.read_only_storage);
+        assert!(!routed.read_only_fast_open);
+        assert!(routed.db.is_none());
+        let error = open_storage_with_cli(&beads_dir, &routed)
+            .expect_err("external discovery cannot turn observation into recovery");
+
+        assert!(error.to_string().contains("Read-only storage open refused"));
+        assert!(!db_path.exists());
+        assert!(!beads_dir.join(".br_recovery").exists());
+        assert_eq!(fs::read(&jsonl_path).unwrap(), before);
+    }
+
+    #[test]
+    fn strict_read_only_local_freshness_probe_refuses_import_without_writes() {
+        let (_temp, original) = storage_ctx_with_exported_issue();
+        let paths = original.paths.clone();
+        drop(original);
+        write_single_issue_jsonl(&paths.jsonl_path, "bd-1", "Unimported remote edit");
+        let before = database_family_snapshot(&paths.db_path).unwrap();
+        let jsonl_before = fs::read(&paths.jsonl_path).unwrap();
+        let cli = CliOverrides {
+            read_only_storage: true,
+            ..CliOverrides::default()
+        };
+        let mut storage_ctx = open_storage_with_cli(&paths.beads_dir, &cli).unwrap();
+
+        let error = auto_import_storage_ctx_if_stale(&mut storage_ctx, &cli)
+            .expect_err("command-local reads must defer import to explicit synchronization");
+        assert!(error.to_string().contains("br sync --import-only"));
+        assert!(error.to_string().contains("--no-auto-import"));
+        assert_eq!(
+            storage_ctx
+                .storage
+                .get_issue("bd-1")
+                .unwrap()
+                .unwrap()
+                .title,
+            "test"
+        );
+        drop(storage_ctx);
+
+        let diffs = database_family_read_only_diffs(
+            &before,
+            &database_family_snapshot(&paths.db_path).unwrap(),
+        );
+        assert!(
+            diffs.is_empty(),
+            "freshness refusal changed source: {diffs:?}"
+        );
+        assert_eq!(fs::read(&paths.jsonl_path).unwrap(), jsonl_before);
+        assert!(!paths.beads_dir.join(".br_recovery").exists());
+    }
+
+    #[test]
+    fn strict_read_only_local_freshness_respects_no_import_and_allow_stale() {
+        let (_temp, original) = storage_ctx_with_exported_issue();
+        let paths = original.paths.clone();
+        drop(original);
+        write_single_issue_jsonl(&paths.jsonl_path, "bd-1", "Unimported remote edit");
+        let before = database_family_snapshot(&paths.db_path).unwrap();
+        let jsonl_before = fs::read(&paths.jsonl_path).unwrap();
+
+        for allow_stale in [false, true] {
+            let cli = CliOverrides {
+                read_only_storage: true,
+                allow_stale: Some(allow_stale),
+                no_auto_import: Some(!allow_stale),
+                ..CliOverrides::default()
+            };
+            let mut storage_ctx = open_storage_with_cli(&paths.beads_dir, &cli).unwrap();
+            auto_import_storage_ctx_if_stale(&mut storage_ctx, &cli)
+                .expect("explicit bypass must permit observation of the existing database");
+            assert_eq!(
+                storage_ctx
+                    .storage
+                    .get_issue("bd-1")
+                    .unwrap()
+                    .unwrap()
+                    .title,
+                "test"
+            );
+            drop(storage_ctx);
+            let diffs = database_family_read_only_diffs(
+                &before,
+                &database_family_snapshot(&paths.db_path).unwrap(),
+            );
+            assert!(
+                diffs.is_empty(),
+                "explicit bypass changed source: {diffs:?}"
+            );
+            assert_eq!(fs::read(&paths.jsonl_path).unwrap(), jsonl_before);
+        }
+    }
+
+    #[test]
+    fn strict_read_only_external_freshness_does_not_create_or_import_database() {
+        let temp = TempDir::new().expect("tempdir");
+        let local_beads_dir = temp.path().join("local/.beads");
+        let remote_beads_dir = temp.path().join("remote/.beads");
+        let remote_jsonl = remote_beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&local_beads_dir).unwrap();
+        fs::create_dir_all(&remote_beads_dir).unwrap();
+        write_single_issue_jsonl(&remote_jsonl, "bd-remote", "External issue");
+        let before = fs::read(&remote_jsonl).unwrap();
+        let mut layer = ConfigLayer::default();
+        layer.runtime.insert(
+            "external_projects.remote".to_string(),
+            remote_beads_dir.to_string_lossy().into_owned(),
+        );
+
+        auto_import_external_projects_if_stale(
+            &layer,
+            &local_beads_dir,
+            &CliOverrides {
+                read_only_storage: true,
+                ..CliOverrides::default()
+            },
+        );
+
+        assert!(!remote_beads_dir.join("beads.db").exists());
+        assert!(!remote_beads_dir.join(".br_recovery").exists());
+        assert_eq!(fs::read(&remote_jsonl).unwrap(), before);
     }
 
     #[test]

@@ -1,12 +1,11 @@
 //! Self-healing for tracker databases left behind on an older schema.
 //!
-//! Ordinary commands refuse a database whose schema predates this binary.
-//! That refusal exists to protect data that lives only in the database: an
-//! edit or creation that was never flushed to `issues.jsonl`. For the common
-//! case — a stale cache whose every issue is already represented in the
-//! git-tracked JSONL — the refusal protects nothing and blocks every command,
-//! including the reviewed migration's own prerequisite (`plan` refuses the
-//! unversioned schema-0 databases written by pre-versioning `br` and Go `bd`).
+//! An older database remains authoritative even when every issue is present
+//! in `issues.jsonl`. Event history, configuration, relation attribution,
+//! workflow records, hidden rowids, and operator schema can exist only in the
+//! database. An issue-level JSONL comparison cannot prove their preservation.
+//! Reads therefore observe the original database or a labelled JSONL view;
+//! mutations require a reviewed migration with complete preservation checks.
 //!
 //! This module separates the two cases:
 //!
@@ -20,26 +19,25 @@
 //!    Anything else — absent from the JSONL, an unflushed (dirty) edit that
 //!    differs, missing comments, a row newer than its JSONL copy, or a row
 //!    that cannot be read — is database-only data.
-//! 2. [`heal_stale_schema`] first attempts the reviewed in-place migration for
-//!    supported source schemas (lossless, recovery bundle, undo). This preserves
-//!    raw SQL values without requiring that they can be encoded in JSONL. Only
-//!    a JSONL-rebuild fallback needs the strict audit: with no database-only data
-//!    it rebuilds from the audited snapshot with the old family retained in
-//!    `.br_recovery`. With database-only data, automatic rebuilding refuses and
-//!    names the explicit `br doctor migrate-schema heal`, which does the same
-//!    upgrade but re-adds the database-only issues as unflushed changes so the
-//!    next flush exports them. A malformed issue or relation is never silently
-//!    omitted from that audit. A rebuild that cannot restore an unreadable
-//!    payload requires explicit `--discard-db-only` authorization; a retained
-//!    backup alone is not permission to remove data from the live tracker.
-//!    That authorization applies only to unrestorable payloads and orphan
-//!    relations: recoverable database-only issues are always re-added.
+//! 2. [`heal_stale_schema`] attempts the reviewed in-place migration for
+//!    supported source schemas (lossless, recovery bundle, undo). Automatic
+//!    startup never falls back to JSONL reconstruction: matching issue rows
+//!    cannot establish preservation of audit history, configuration, workflow
+//!    state, or operator-owned schema. An absent or refused migration leaves
+//!    the original database authoritative and reports the reason.
+//! 3. An explicit `br doctor migrate-schema heal` follows the same rule. Its
+//!    audit diagnoses database-only issues, relations, history, configuration,
+//!    workflow state, and operator-owned schema, but cannot turn a JSONL
+//!    reconstruction into a reviewed migration. Without a complete crash-safe
+//!    installer, even replayable issue rows do not authorize replacing the live
+//!    database. `--discard-db-only` does not bypass that boundary. A retained
+//!    backup alone is not permission to remove authoritative live data.
 
 mod rebuild_preflight;
 
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -54,6 +52,7 @@ use crate::franken_sync::compat::{OpenFlags, open_with_flags};
 use crate::model::{Comment, Dependency, Issue, Status};
 use crate::storage::schema::{CURRENT_SCHEMA_VERSION, REVIEWED_MIGRATION_SOURCE_VERSIONS};
 use crate::sync::{DatabaseFamilyWriteLock, JsonlSourceSnapshot, PreservedIssue};
+use rebuild_preflight::{audit_local_replay_coverage, audit_unrepresented_state};
 
 /// Most database-only issue ids named in a refusal before eliding the rest.
 const DB_ONLY_IDS_SHOWN: usize = 10;
@@ -94,10 +93,9 @@ impl DbOnlyReason {
 pub struct DbOnlyIssue {
     pub id: String,
     pub reason: DbOnlyReason,
-    /// Whether the explicit heal re-adds this row after the rebuild. Unflushed
-    /// scalar edits that a newer JSONL edit superseded stay in the backup,
-    /// matching GitHub #394. A comments-only restore keeps the JSONL's newer
-    /// issue payload instead of reviving those superseded scalar edits.
+    /// Whether this row can be decoded for a preservation plan. This is not
+    /// permission to reconstruct the live database. A comments-only plan
+    /// keeps JSONL's newer issue payload while identifying the local history.
     pub restorable: bool,
 }
 
@@ -119,9 +117,12 @@ pub struct StaleSchemaAudit {
     pub jsonl_issue_count: usize,
     pub db_only: Vec<DbOnlyIssue>,
     /// Well-formed relation rows without an owning issue row. A reviewed
-    /// in-place migration keeps them; a JSONL rebuild cannot carry them, so it
-    /// requires explicit `--discard-db-only`.
+    /// in-place migration keeps them; an issue-only JSONL replay cannot.
     pub orphan_relations: Vec<OrphanRelationRows>,
+    /// Authoritative tables, columns, or schema objects that the JSONL replay
+    /// cannot reproduce. Unlike unreadable issue payloads and orphan relations,
+    /// these are never covered by `--discard-db-only` authorization.
+    pub rebuild_blockers: Vec<String>,
     /// A reason the whole database cannot be audited (not a beads tracker,
     /// no JSONL, unparseable JSONL). Always blocks a JSONL rebuild, but cannot
     /// prevent a reviewed lossless migration that never imports JSONL.
@@ -131,10 +132,13 @@ pub struct StaleSchemaAudit {
 }
 
 impl StaleSchemaAudit {
-    /// True when every database issue is provably represented in the JSONL.
+    /// True when the database has no unrepresented issue or auxiliary state.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.unprovable.is_none() && self.db_only.is_empty()
+        self.unprovable.is_none()
+            && self.db_only.is_empty()
+            && self.orphan_relations.is_empty()
+            && self.rebuild_blockers.is_empty()
     }
 
     /// True when the database holds relation rows without an owning issue.
@@ -149,13 +153,6 @@ impl StaleSchemaAudit {
     #[must_use]
     pub fn automatic_heal_allowed(&self) -> bool {
         REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&self.from_version)
-            || self.automatic_rebuild_allowed()
-    }
-
-    /// A rebuild, unlike a reviewed migration, must not drop database-only
-    /// issues or orphan relations without an explicit operator decision.
-    fn automatic_rebuild_allowed(&self) -> bool {
-        self.is_clean() && !self.has_orphan_relations()
     }
 
     fn orphan_summary(&self) -> String {
@@ -182,11 +179,11 @@ impl StaleSchemaAudit {
         shown.join(", ")
     }
 
-    /// Explain which live issues a rebuild will restore, independently of
-    /// permission to leave unreadable payloads and orphans in the backup.
+    /// Explain which database-only issues can be decoded without implying
+    /// that a complete crash-safe reconstruction has been established.
     fn restoration_notice(&self) -> String {
         if self.restorable.is_empty() {
-            return "No recoverable database-only issues were found to re-add".to_owned();
+            return "No recoverable database-only issues could be decoded".to_owned();
         }
         let mut ids: Vec<&str> = self
             .restorable
@@ -206,8 +203,8 @@ impl StaleSchemaAudit {
             String::new()
         };
         format!(
-            "{} recoverable database-only issue(s) ({shown}{remaining}) will still be \
-             re-added as unflushed changes, including with --discard-db-only",
+            "{} recoverable database-only issue(s) ({shown}{remaining}) can be decoded; \
+             they remain in the original database because no reconstruction is authorized",
             ids.len()
         )
     }
@@ -216,12 +213,12 @@ impl StaleSchemaAudit {
 /// How [`heal_stale_schema`] was invoked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealMode {
-    /// Ordinary command startup: prefer a reviewed lossless migration;
-    /// rebuild only when the audit is clean and no orphan relations are lost.
+    /// Mutating command startup: require a reviewed lossless migration.
+    /// Neither missing migration paths nor refusals authorize reconstruction.
     Automatic,
-    /// `br doctor migrate-schema heal`: always re-add restorable database-only
-    /// issues. `discard_db_only` authorizes backup-only retention of unreadable
-    /// payloads and orphan relations, not omission of recoverable issues.
+    /// `br doctor migrate-schema heal`: attempt a reviewed migration or return
+    /// a preservation audit. The legacy discard option never authorizes an
+    /// unreviewed live-database reconstruction.
     Explicit { discard_db_only: bool },
 }
 
@@ -230,59 +227,20 @@ pub enum HealMode {
 pub struct HealOutcome {
     pub from_version: u32,
     pub to_version: u32,
-    /// `migrated` (reviewed in-place migration) or `rebuilt` (from JSONL).
+    /// `migrated`: only a reviewed lossless migration can succeed.
     pub action: &'static str,
     /// Where the pre-heal database family was preserved.
     pub backup: String,
-    /// Database-only issues re-added as unflushed changes.
-    pub restored_db_only: Vec<String>,
-    /// Database-only issues left only in the backup.
-    pub backup_only_db_only: Vec<String>,
-    /// Relation rows without an owning issue that a rebuild kept only in the
-    /// backup (`--discard-db-only`).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub backup_only_orphan_relations: Vec<OrphanRelationRows>,
-    /// Why a reviewed migration was not used, when the rebuild ran instead.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub migration_fallback_reason: Option<String>,
 }
 
 impl HealOutcome {
     /// One-line human notice for stderr.
     #[must_use]
     pub fn notice(&self) -> String {
-        let how = if self.action == "migrated" {
-            "migrated it in place"
-        } else {
-            "rebuilt it from the JSONL"
-        };
-        let mut line = format!(
-            "br: tracker database was on schema {} (this br uses {}); {how} — backup at {}",
+        format!(
+            "br: tracker database was on schema {} (this br uses {}); migrated it in place — backup at {}",
             self.from_version, self.to_version, self.backup
-        );
-        if !self.restored_db_only.is_empty() {
-            line.push_str(&format!(
-                "; re-added {} database-only issue(s) as unflushed changes",
-                self.restored_db_only.len()
-            ));
-        }
-        if !self.backup_only_db_only.is_empty() {
-            line.push_str(&format!(
-                "; {} database-only issue(s) not restored; kept only in the backup",
-                self.backup_only_db_only.len()
-            ));
-        }
-        if !self.backup_only_orphan_relations.is_empty() {
-            let rows: usize = self
-                .backup_only_orphan_relations
-                .iter()
-                .map(|orphans| orphans.rows)
-                .sum();
-            line.push_str(&format!(
-                "; {rows} relation row(s) without an owning issue kept only in the backup"
-            ));
-        }
-        line
+        )
     }
 }
 
@@ -333,40 +291,28 @@ pub fn refusal_error(audit: &StaleSchemaAudit) -> BeadsError {
                 audit.orphan_summary()
             ));
         }
+        if !audit.rebuild_blockers.is_empty() {
+            why.push(format!(
+                "JSONL cannot preserve the complete database: {}",
+                audit.rebuild_blockers.join("; ")
+            ));
+        }
+        if why.is_empty() {
+            why.push(format!(
+                "there is no reviewed lossless migration for schema {}",
+                audit.from_version
+            ));
+        }
         why.join("; ")
     });
-    let what = if REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&audit.from_version) {
-        "migrates the database in place without dropping any row, keeping a recovery bundle \
-         and printing an undo command"
-            .to_string()
-    } else if audit
-        .db_only
-        .iter()
-        .any(|issue| issue.reason == DbOnlyReason::Unreadable)
-    {
-        format!(
-            "refuses a JSONL rebuild that cannot restore unreadable issues; repair those \
-             original payloads first, or use `{HEAL_COMMAND} --discard-db-only` to keep \
-             unreadable payloads and orphan relations only in the retained backup. {}",
-            audit.restoration_notice()
-        )
-    } else if audit.has_orphan_relations() {
-        format!(
-            "refuses a JSONL rebuild that would drop those relation rows; `{HEAL_COMMAND} \
-             --discard-db-only` is the explicit choice to rebuild and keep them only in the \
-             retained .beads/.br_recovery backup. {}",
-            audit.restoration_notice()
-        )
-    } else {
-        "rebuilds the database from issues.jsonl, re-adds the database-only issues as \
-         unflushed changes (exported by the next flush), and keeps the old database in \
-         .beads/.br_recovery"
-            .to_string()
-    };
     BeadsError::WithContext {
         context: format!(
-            "automatic schema upgrade refused because {why}. Run `{HEAL_COMMAND}`: it {what}. \
-             `{HEAL_COMMAND} --dry-run` shows the audit without changing anything"
+            "schema upgrade refused because {why}. The rebuild was not started; the original \
+             database remains authoritative. Reconstructing an existing tracker from JSONL \
+             has no reviewed crash-safe installer, including with --discard-db-only. Keep the \
+             original database and use a release that supports its schema, or a reviewed \
+             lossless migration. `{HEAL_COMMAND} --dry-run` shows the preservation audit; \
+             `br doctor migrate-schema plan --json` diagnoses reviewed migration support"
         ),
         source: Box::new(BeadsError::SchemaMismatch {
             expected: CURRENT_SCHEMA_VERSION,
@@ -392,16 +338,30 @@ pub(crate) fn audit_stale_database(
     db_path: &Path,
     jsonl: Option<&JsonlSourceSnapshot>,
 ) -> Result<StaleSchemaAudit> {
+    // A schema-agnostic audit is still a live WAL reader. Keep checkpoints
+    // and recovery from treating this connection as an absent opener.
+    let _opener_lease = crate::sync::DatabaseOpenerLease::register(db_path)?;
     let conn = open_with_flags(
         db_path.to_string_lossy().as_ref(),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .map_err(BeadsError::Database)?;
+    // Do not combine tables from different committed generations when a
+    // non-br SQLite client writes concurrently with this observational audit.
+    conn.execute("BEGIN DEFERRED TRANSACTION")?;
     let result = audit_connection(&conn, jsonl.map(JsonlSourceSnapshot::reader));
-    let _ = conn.close();
-    result
+    let rolled_back = conn.execute("ROLLBACK");
+    let closed = conn.close();
+    let audit = result?;
+    rolled_back?;
+    closed?;
+    Ok(audit)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the observational audit keeps issue and relation classification in one stable snapshot"
+)]
 fn audit_connection(
     conn: &Connection,
     jsonl_reader: Option<impl BufRead>,
@@ -414,6 +374,7 @@ fn audit_connection(
         jsonl_issue_count: 0,
         db_only: Vec::new(),
         orphan_relations: Vec::new(),
+        rebuild_blockers: Vec::new(),
         unprovable: None,
         restorable: Vec::new(),
     };
@@ -439,6 +400,7 @@ fn audit_connection(
     let (db_issues, orphan_relations) = read_legacy_issues(conn, &tables, &issue_columns)?;
     audit.db_issue_count = db_issues.len();
     audit.orphan_relations = orphan_relations;
+    audit.rebuild_blockers = audit_unrepresented_state(conn, &tables, &issue_columns)?;
     let dirty: Option<HashSet<String>> = if tables.contains("dirty_issues") {
         Some(
             conn.query("SELECT issue_id FROM dirty_issues")?
@@ -483,6 +445,12 @@ fn audit_connection(
         };
         let is_dirty = dirty.as_ref().is_none_or(|dirty| dirty.contains(&id));
         let verdict = classify(&preserved.issue, jsonl_issues.get(&id), is_dirty);
+        audit_local_replay_coverage(
+            &preserved.issue,
+            jsonl_issues.get(&id),
+            verdict,
+            &mut audit.rebuild_blockers,
+        );
         if let Some((reason, restorable)) = verdict {
             audit.db_only.push(DbOnlyIssue {
                 id,
@@ -549,8 +517,8 @@ fn comment_only_restore(mut local: PreservedIssue, jsonl: &Issue) -> Result<Pres
     Ok(local)
 }
 
-/// `None` when represented; otherwise the reason and whether the explicit
-/// heal re-adds the row.
+/// `None` when represented; otherwise the reason and whether the row can be
+/// decoded into a preservation plan. This never authorizes installation.
 fn classify(db: &Issue, jsonl: Option<&Issue>, is_dirty: bool) -> Option<(DbOnlyReason, bool)> {
     let Some(jsonl) = jsonl else {
         return Some((DbOnlyReason::AbsentFromJsonl, true));
@@ -831,8 +799,7 @@ fn read_legacy_issues(
     // Well-formed relation rows whose issue row is gone (deletes that older
     // releases ran without foreign-key enforcement) have no issue to compare
     // or restore. Report them rather than refusing the whole audit: the
-    // reviewed in-place migration keeps them, and a JSONL rebuild requires
-    // explicit `--discard-db-only` (see `require_lossless_rebuild`).
+    // reviewed in-place migration keeps them, whereas JSONL cannot carry them.
     let orphan_relations = [
         ("labels", labels.values().map(Vec::len).sum::<usize>()),
         (
@@ -1085,19 +1052,17 @@ fn query_user_version(conn: &Connection) -> Result<u32> {
 }
 
 fn table_names(conn: &Connection) -> Result<HashSet<String>> {
-    Ok(conn
-        .query("SELECT name FROM sqlite_master WHERE type='table'")?
+    conn.query("SELECT name FROM sqlite_master WHERE type='table'")?
         .iter()
-        .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_owned))
-        .collect())
+        .map(|row| required_legacy_text(row.get(0), "sqlite_master", "name"))
+        .collect()
 }
 
 fn column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
-    Ok(conn
-        .query(&format!("PRAGMA table_info({})", quote_identifier(table)))?
+    conn.query(&format!("PRAGMA table_info({})", quote_identifier(table)))?
         .iter()
-        .filter_map(|row| row.get(1).and_then(SqliteValue::as_text).map(str::to_owned))
-        .collect())
+        .map(|row| required_legacy_text(row.get(1), table, "column name"))
+        .collect()
 }
 
 fn quote_identifier(name: &str) -> String {
@@ -1125,19 +1090,18 @@ pub enum HealResult {
     Refused(Box<StaleSchemaAudit>),
 }
 
-/// Upgrade a stale database, auditing only the JSONL-rebuild fallback.
+/// Upgrade a stale database through a reviewed lossless migration only.
 ///
 /// The caller must hold the database-family write authority for the whole
 /// call. A reviewed migration preserves raw rows without consulting JSONL.
-/// Before any rebuild, JSONL family authority pins exactly the snapshot that
-/// the strict audit compares and the rebuild imports.
+/// An explicit invocation receives a detailed preservation audit when no
+/// reviewed migration completes. No schema-heal path reconstructs a live
+/// database from JSONL, including after a refused or interrupted migration.
 ///
 /// # Errors
 ///
-/// Returns an error when the audit or upgrade fails. Deterministic local
-/// replay failures are rehearsed before live replacement. Reviewed migration
-/// and JSONL installation retain their existing backup/rollback protocols;
-/// late replay I/O failures still require the retained recovery backup.
+/// Returns an error when the audit or reviewed upgrade fails. The reviewed
+/// migration retains its existing private-candidate, backup and undo protocol.
 #[allow(clippy::too_many_lines)]
 pub fn heal_stale_schema(ctx: &HealContext<'_>, mode: HealMode) -> Result<HealResult> {
     let startup = config::load_startup_config_with_paths(ctx.beads_dir, ctx.cli.db.as_ref())?;
@@ -1151,7 +1115,7 @@ pub fn heal_stale_schema(ctx: &HealContext<'_>, mode: HealMode) -> Result<HealRe
     // migration safety. Empty labels, NULL relation owners, BLOBs and legacy
     // scalar encodings can be kept by the reviewed raw-row migration even
     // when they cannot be represented by the current Issue/JSONL model.
-    let mut migration_fallback_reason = None;
+    let mut migration_refusal_reason = None;
     if REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from_version) {
         let migration = super::schema_migration::MigrationContext {
             beads_dir: ctx.beads_dir.to_path_buf(),
@@ -1165,123 +1129,77 @@ pub fn heal_stale_schema(ctx: &HealContext<'_>, mode: HealMode) -> Result<HealRe
                     to_version: current_version(),
                     action: "migrated",
                     backup: backup.display().to_string(),
-                    restored_db_only: Vec::new(),
-                    backup_only_db_only: Vec::new(),
-                    backup_only_orphan_relations: Vec::new(),
-                    migration_fallback_reason: None,
                 }));
             }
-            // Consider fallback only when the original schema is still in
-            // place. A failed migration is never permission to bypass the
-            // independent audit below, or to rebuild a partially upgraded DB.
+            // GH #585: a migration refusal must remain a refusal during
+            // ordinary startup. JSONL cannot represent the complete database,
+            // and a backup is not permission to remove authoritative rows
+            // from the active tracker. Preserve the precise migration error.
+            Err(error) if mode == HealMode::Automatic => {
+                return Err(automatic_migration_refusal(from_version, Some(error)));
+            }
+            // An explicit heal can add an observational preservation audit
+            // while the original schema remains; it never retries via JSONL.
             Err(error) if stale_schema_version(&paths.db_path)? == Some(from_version) => {
-                migration_fallback_reason = Some(error.to_string());
+                migration_refusal_reason = Some(error.to_string());
             }
             Err(error) => return Err(error),
         }
     }
 
-    let (jsonl_authority, source) = capture_jsonl(&paths.jsonl_path, ctx.cli.lock_timeout)?;
-    let mut audit = audit_stale_database(&paths.db_path, source.as_ref())?;
-    audit.from_version = from_version;
-    let discard_db_only = match mode {
-        HealMode::Automatic if !audit.automatic_rebuild_allowed() => {
-            // Do not reuse automatic_heal_allowed here: reviewed-range
-            // eligibility was exhausted above and cannot authorize data loss.
-            return Ok(HealResult::Refused(Box::new(audit)));
-        }
-        HealMode::Automatic => false,
-        HealMode::Explicit { discard_db_only } => discard_db_only,
-    };
-
-    let (Some(jsonl_authority), Some(source)) = (jsonl_authority, source) else {
-        let migration = migration_fallback_reason.as_ref().map_or_else(
-            || format!("no reviewed migration exists for schema {from_version}"),
-            |reason| format!("the reviewed migration did not complete ({reason})"),
-        );
-        return Err(BeadsError::Config(format!(
-            "cannot heal the schema-{from_version} database: there is no issues.jsonl to rebuild \
-             from and {migration}. Export it with the \
-             br release that wrote it (`br sync --flush-only`), then rerun `{HEAL_COMMAND}`"
-        )));
-    };
-    // A successful reviewed migration above preserves raw rows. A JSONL
-    // rebuild cannot do that for unreadable payloads, even in explicit mode.
-    // Enforce this before calling the routine that replaces the live family.
-    require_lossless_rebuild(&audit, discard_db_only)?;
-    let mut merged = startup.merged_config.clone();
-    merged.merge_from(&ctx.cli.as_layer());
-    let allow_external_jsonl =
-        config::implicit_external_jsonl_allowed(ctx.beads_dir, &paths.db_path, &paths.jsonl_path);
-    let lock_timeout = ctx
-        .cli
-        .lock_timeout
-        .or_else(|| config::lock_timeout_from_layer(&merged))
-        .or(Some(30000));
-    // Complete append-only comment histories without changing the audited
-    // scalar precedence. Rehearse and install the same combined restore plan;
-    // neither the pinned source nor the original audited payloads are mutated.
-    let restore_plan =
-        rebuild_preflight::complete_comment_restore_plan(&source, &audit.restorable)?;
-    // A readable legacy payload can still conflict with imported rows or
-    // current constraints. Prove the complete replay on private state before
-    // replacing the live family, then verify the real result against it.
-    let rebuild_witness =
-        rebuild_preflight::rehearse(&source, &restore_plan, &merged, lock_timeout)?;
-    let (mut storage, _import, backups) =
-        config::repair_database_from_jsonl_snapshot_under_write_authority(
-            ctx.beads_dir,
-            &paths.db_path,
-            lock_timeout,
-            &merged,
-            false,
-            allow_external_jsonl,
-            &source,
-            &jsonl_authority,
-            ctx.write_authority,
-        )?;
-    let backup = backups
-        .iter()
-        .find(|verified| Path::new(&verified.original) == paths.db_path)
-        .or_else(|| backups.first())
-        .map(|verified| {
-            Path::new(&verified.backup)
-                .parent()
-                .map_or_else(|| PathBuf::from(&verified.backup), Path::to_path_buf)
-        })
-        .unwrap_or_else(|| config::recovery_dir_for_db_path(&paths.db_path, ctx.beads_dir));
-
-    // GH #550: authorizing backup-only retention for an unreadable payload
-    // or orphan relation must not also omit unrelated, recoverable work.
-    // Superseded edits are already excluded by the audit's restore plan.
-    let restore = restore_plan.as_slice();
-    crate::sync::restore_dirty_issues_after_rebuild(&mut storage, restore)?;
-    if let Some(witness) = rebuild_witness {
-        witness.verify(&storage)?;
+    if mode == HealMode::Automatic {
+        return Err(automatic_migration_refusal(from_version, None));
     }
-    drop(storage);
+    let audited = (|| {
+        let (_jsonl_authority, source) = capture_jsonl(&paths.jsonl_path, ctx.cli.lock_timeout)?;
+        audit_stale_database(&paths.db_path, source.as_ref())
+    })();
+    let mut audit = match audited {
+        Ok(audit) => audit,
+        Err(error) => {
+            let reason = migration_refusal_reason.map_or_else(
+                || format!("no reviewed lossless migration exists for schema {from_version}"),
+                |reason| format!("the reviewed migration did not complete ({reason})"),
+            );
+            return Err(BeadsError::WithContext {
+                context: format!(
+                    "schema upgrade refused: {reason}; the supplementary audit could not complete. \
+                     The database was not rebuilt and the original database remains authoritative"
+                ),
+                source: Box::new(error),
+            });
+        }
+    };
+    audit.from_version = from_version;
+    if let Some(reason) = migration_refusal_reason {
+        return Err(BeadsError::WithContext {
+            context: format!("the reviewed migration did not complete ({reason})"),
+            source: Box::new(refusal_error(&audit)),
+        });
+    }
+    Ok(HealResult::Refused(Box::new(audit)))
+}
 
-    let restored: HashSet<&str> = restore
-        .iter()
-        .map(|entry| entry.issue.id.as_str())
-        .collect();
-    let (restored_db_only, backup_only_db_only): (Vec<String>, Vec<String>) = audit
-        .db_only
-        .iter()
-        .map(|issue| issue.id.clone())
-        .partition(|id| restored.contains(id.as_str()));
-    Ok(HealResult::Healed(HealOutcome {
-        from_version,
-        to_version: audit.to_version,
-        action: "rebuilt",
-        backup: backup.display().to_string(),
-        restored_db_only,
-        backup_only_db_only,
-        // Reachable with orphans only under `--discard-db-only`
-        // (`require_lossless_rebuild`): a rebuild never carries them.
-        backup_only_orphan_relations: audit.orphan_relations.clone(),
-        migration_fallback_reason,
-    }))
+fn automatic_migration_refusal(from_version: u32, source: Option<BeadsError>) -> BeadsError {
+    let why = if source.is_some() {
+        "the reviewed lossless migration did not complete".to_owned()
+    } else {
+        format!("no reviewed lossless migration exists for schema {from_version}")
+    };
+    BeadsError::WithContext {
+        context: format!(
+            "automatic schema upgrade refused: {why}. The database will not be rebuilt from \
+             issues.jsonl because that export cannot establish preservation of event history, \
+             configuration, and other database-only state. Keep the original database; run \
+             `br doctor migrate-schema plan --json` for the migration diagnosis or \
+             `{HEAL_COMMAND} --dry-run --json` for a non-destructive rebuild audit. \
+             Use a release supporting this database until a lossless migration is available"
+        ),
+        source: Box::new(source.unwrap_or(BeadsError::SchemaMismatch {
+            expected: CURRENT_SCHEMA_VERSION,
+            found: i32::try_from(from_version).unwrap_or(i32::MAX),
+        })),
+    }
 }
 
 fn capture_jsonl(
@@ -1303,10 +1221,23 @@ fn capture_jsonl(
     Ok((Some(authority), Some(source)))
 }
 
-fn require_lossless_rebuild(audit: &StaleSchemaAudit, discard_db_only: bool) -> Result<()> {
+/// Necessary payload coverage for a diagnostic plan, never sufficient
+/// authorization to replace a database. Even an entirely decodable plan is
+/// refused by `heal_stale_schema` without a reviewed migration installer.
+fn require_replay_payload_coverage(audit: &StaleSchemaAudit, discard_db_only: bool) -> Result<()> {
     if let Some(reason) = &audit.unprovable {
         return Err(BeadsError::Config(format!(
             "cannot certify a schema-heal rebuild: {reason}; the rebuild was not started"
+        )));
+    }
+    if !audit.rebuild_blockers.is_empty() {
+        return Err(BeadsError::Config(format!(
+            "schema-heal rebuild refused: the complete database cannot be preserved from \
+             issues.jsonl ({}). The rebuild was not started; the original database remains \
+             authoritative. --discard-db-only does not authorize discarding event history, \
+             configuration, workflow records, or operator-owned schema. Use a release that \
+             supports this database or a reviewed lossless migration",
+            audit.rebuild_blockers.join("; ")
         )));
     }
     if !discard_db_only
@@ -1317,10 +1248,8 @@ fn require_lossless_rebuild(audit: &StaleSchemaAudit, discard_db_only: bool) -> 
     {
         return Err(BeadsError::Config(format!(
             "schema-heal rebuild refused: unreadable database-only payloads cannot be \
-             restored ({}). The rebuild was not started. Repair the original payloads first; \
-             `{HEAL_COMMAND} --discard-db-only` is an explicit choice to keep unreadable \
-             payloads and orphan relations only in the retained backup, not in the rebuilt \
-             tracker. {}",
+             restored ({}). The rebuild was not started. Repair the original payloads first. \
+             --discard-db-only does not authorize an unreviewed reconstruction. {}",
             audit.db_only_summary(),
             audit.restoration_notice()
         )));
@@ -1329,8 +1258,7 @@ fn require_lossless_rebuild(audit: &StaleSchemaAudit, discard_db_only: bool) -> 
         return Err(BeadsError::Config(format!(
             "schema-heal rebuild refused: the database holds relation rows without an owning \
              issue ({}), which a rebuild from issues.jsonl cannot carry. The rebuild was not \
-             started. `{HEAL_COMMAND} --discard-db-only` is an explicit choice to keep them \
-             only in the retained backup, not in the rebuilt tracker. {}",
+             started. --discard-db-only does not authorize an unreviewed reconstruction. {}",
             audit.orphan_summary(),
             audit.restoration_notice()
         )));
@@ -1343,43 +1271,10 @@ fn planned_action(audit: &StaleSchemaAudit, discard_db_only: bool) -> String {
     if REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&audit.from_version) {
         return reviewed_migration_action(audit.from_version, audit.to_version);
     }
-    if let Err(error) = require_lossless_rebuild(audit, discard_db_only) {
+    if let Err(error) = require_replay_payload_coverage(audit, discard_db_only) {
         return format!("refuse rebuild: {error}");
     }
-    let restorable = audit
-        .db_only
-        .iter()
-        .filter(|issue| issue.restorable)
-        .count();
-    let tail = if audit.db_only.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "; re-add {restorable} database-only issue(s) as unflushed changes{}",
-            if restorable < audit.db_only.len() {
-                format!(
-                    "; {} unreadable or superseded database-only issue(s) kept only in the backup",
-                    audit.db_only.len() - restorable
-                )
-            } else {
-                String::new()
-            }
-        )
-    };
-    // `require_lossless_rebuild` passed, so orphans here mean `--discard-db-only`.
-    let orphans = if audit.has_orphan_relations() {
-        format!(
-            "; {} without an owning issue kept only in the backup",
-            audit.orphan_summary()
-        )
-    } else {
-        String::new()
-    };
-    format!(
-        "rebuild schema {} -> {} from issues.jsonl, old database family moved to \
-         .beads/.br_recovery{tail}{orphans}",
-        audit.from_version, audit.to_version
-    )
+    format!("refuse rebuild: {}", refusal_error(audit))
 }
 
 fn reviewed_migration_action(from_version: u32, to_version: u32) -> String {
@@ -1400,8 +1295,8 @@ fn emit_migration_dry_run_without_audit(
 ) -> Result<()> {
     let action = reviewed_migration_action(from_version, current_version());
     let note = "No migration was run. The JSONL rebuild audit failed; a reviewed migration \
-                can still be attempted without it. Rebuilding remains refused until a fresh \
-                audit proves it safe. Use `br doctor migrate-schema plan` to inspect the \
+                can still be attempted without it. JSONL reconstruction remains refused. \
+                Use `br doctor migrate-schema plan` to inspect the \
                 migration's own checks.";
     if json {
         println!(
@@ -1434,6 +1329,11 @@ fn print_dry_run_audit(audit: &StaleSchemaAudit, action: &str) {
     );
     if let Some(reason) = &audit.unprovable {
         println!("Audit incomplete: {reason}.");
+    } else if !audit.rebuild_blockers.is_empty() {
+        println!("Reconstruction cannot preserve the complete database:");
+        for reason in &audit.rebuild_blockers {
+            println!("  {reason}");
+        }
     } else if audit.db_only.is_empty() {
         if audit.has_orphan_relations() {
             println!(
@@ -1443,13 +1343,13 @@ fn print_dry_run_audit(audit: &StaleSchemaAudit, action: &str) {
         }
         if audit.automatic_heal_allowed() {
             println!(
-                "Nothing exists only in the database; ordinary commands heal it \
-                 automatically."
+                "A mutating command may attempt a reviewed lossless migration. \
+                 Read commands never upgrade the database."
             );
         } else {
             println!(
-                "No issue exists only in the database, but a rebuild would drop those \
-                 relation rows, so ordinary commands refuse."
+                "No reviewed lossless migration exists for this schema. \
+                 Ordinary commands never reconstruct it from JSONL."
             );
         }
     } else {
@@ -1471,8 +1371,8 @@ fn print_dry_run_audit(audit: &StaleSchemaAudit, action: &str) {
     if REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&audit.from_version) {
         println!(
             "The reviewed migration is attempted before this JSONL audit. If it fails, \
-             automatic rebuilding is allowed only when that audit is clean and no orphan \
-             relations would be lost."
+             schema healing refuses and preserves the original database. An explicit heal \
+             can diagnose missing state but never bypasses that refusal via JSONL."
         );
     }
 }
@@ -1511,7 +1411,7 @@ pub fn execute_heal(
                 "dry_run": true,
                 "audit": audit,
                 "automatic_heal_allowed": audit.automatic_heal_allowed(),
-                "automatic_rebuild_allowed": audit.automatic_rebuild_allowed(),
+                "automatic_rebuild_allowed": false,
                 "planned_action": action,
             });
             println!(
@@ -1545,18 +1445,6 @@ pub fn execute_heal(
                 );
             } else {
                 println!("{}", outcome.notice().trim_start_matches("br: "));
-                if let Some(reason) = &outcome.migration_fallback_reason {
-                    println!("(reviewed migration was not possible: {reason})");
-                }
-                for id in &outcome.restored_db_only {
-                    println!("  re-added {id}");
-                }
-                for id in &outcome.backup_only_db_only {
-                    println!("  kept only in backup: {id}");
-                }
-                if !outcome.restored_db_only.is_empty() {
-                    println!("Run `br sync --flush-only` to export the re-added issues.");
-                }
             }
             Ok(())
         }
@@ -1593,11 +1481,16 @@ mod tests {
             jsonl_issue_count: 1,
             db_only: Vec::new(),
             orphan_relations: Vec::new(),
+            rebuild_blockers: Vec::new(),
             unprovable: None,
             restorable: Vec::new(),
         };
         assert!(audit.automatic_heal_allowed());
-        assert!(audit.automatic_rebuild_allowed());
+        assert!(
+            automatic_migration_refusal(audit.from_version, None)
+                .to_string()
+                .contains("will not be rebuilt from issues.jsonl")
+        );
 
         audit.db_only.push(DbOnlyIssue {
             id: "legacy-551".to_owned(),
@@ -1605,8 +1498,7 @@ mod tests {
             restorable: false,
         });
         assert!(audit.automatic_heal_allowed());
-        assert!(!audit.automatic_rebuild_allowed());
-        assert!(require_lossless_rebuild(&audit, false).is_err());
+        assert!(require_replay_payload_coverage(&audit, false).is_err());
 
         audit.db_only.clear();
         audit.orphan_relations.push(OrphanRelationRows {
@@ -1614,15 +1506,13 @@ mod tests {
             rows: 1,
         });
         assert!(audit.automatic_heal_allowed());
-        assert!(!audit.automatic_rebuild_allowed());
-        assert!(require_lossless_rebuild(&audit, false).is_err());
+        assert!(require_replay_payload_coverage(&audit, false).is_err());
 
         audit.orphan_relations.clear();
         audit.unprovable = Some("JSONL snapshot cannot be decoded".to_owned());
         assert!(audit.automatic_heal_allowed());
-        assert!(!audit.automatic_rebuild_allowed());
         // Even --discard-db-only cannot invent a trustworthy rebuild source.
-        assert!(require_lossless_rebuild(&audit, true).is_err());
+        assert!(require_replay_payload_coverage(&audit, true).is_err());
         audit.from_version = 4;
         assert!(!audit.automatic_heal_allowed());
     }
@@ -1747,6 +1637,140 @@ mod tests {
     }
 
     #[test]
+    fn issue_equivalence_never_certifies_database_only_tables_for_rebuild() {
+        for table in [
+            "events",
+            "config",
+            "metadata",
+            "child_counters",
+            "close_metadata",
+            "gate_results",
+            "gate_result_history",
+            "capacity_exemptions",
+            "capacity_exemption_history",
+            "capacity_occupancy",
+            "operator_notes",
+        ] {
+            let (conn, jsonl) = legacy_audit_fixture();
+            conn.execute(&format!("CREATE TABLE {table} (payload BLOB)"))
+                .unwrap();
+            conn.execute(&format!("INSERT INTO {table} VALUES (X'FEED')"))
+                .unwrap();
+            let before = conn.query(&format!("SELECT * FROM {table}")).unwrap();
+            let audit = audit_connection(&conn, Some(std::io::Cursor::new(jsonl))).unwrap();
+            assert!(audit.db_only.is_empty(), "issue matches JSONL: {table}");
+            assert!(
+                !audit.is_clean(),
+                "auxiliary data is authoritative: {table}"
+            );
+            for discard in [false, true] {
+                let refusal = require_replay_payload_coverage(&audit, discard).unwrap_err();
+                let message = refusal.to_string();
+                assert!(message.contains(&format!("table {table}")), "{message}");
+                assert!(message.contains("rebuild was not started"), "{message}");
+                assert!(message.contains("--discard-db-only does not authorize"));
+            }
+            assert_eq!(
+                conn.query(&format!("SELECT * FROM {table}")).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_schema_and_sequence_reservations_are_not_disposable() {
+        for (setup, name) in [
+            (
+                "CREATE TABLE operator_notes (payload TEXT)",
+                "operator_notes",
+            ),
+            (
+                "ALTER TABLE issues ADD COLUMN operator_payload TEXT",
+                "issues.operator_payload",
+            ),
+            (
+                "CREATE UNIQUE INDEX operator_unique_title ON issues(title)",
+                "operator_unique_title",
+            ),
+            (
+                "CREATE VIEW operator_tasks AS SELECT id FROM issues",
+                "operator_tasks",
+            ),
+        ] {
+            let (conn, jsonl) = legacy_audit_fixture();
+            conn.execute(setup).unwrap();
+            let audit = audit_connection(&conn, Some(std::io::Cursor::new(jsonl))).unwrap();
+            let error = require_replay_payload_coverage(&audit, true).unwrap_err();
+            assert!(error.to_string().contains(name), "{name}: {error}");
+        }
+
+        let (conn, jsonl) = legacy_audit_fixture();
+        for sql in [
+            "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT)",
+            "INSERT INTO events (id, payload) VALUES (5000, 'reserved identity')",
+            "DELETE FROM events",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let audit = audit_connection(&conn, Some(std::io::Cursor::new(jsonl))).unwrap();
+        assert!(
+            require_replay_payload_coverage(&audit, true)
+                .unwrap_err()
+                .to_string()
+                .contains("sqlite_sequence")
+        );
+    }
+
+    #[test]
+    fn newer_jsonl_cannot_hide_unreplayed_local_relations_or_provenance() {
+        let (conn, _) = legacy_audit_fixture();
+        for sql in [
+            "CREATE TABLE labels (issue_id TEXT, label TEXT)",
+            "INSERT INTO labels VALUES ('a-1', 'local-only')",
+            "CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT, created_at TEXT)",
+            "INSERT INTO dependencies VALUES ('a-1', 'a-2', 'blocks', '2026-01-01T00:00:00Z')",
+            "CREATE TABLE dirty_issues (issue_id TEXT)",
+            "ALTER TABLE issues ADD COLUMN source_repo_path TEXT",
+            "UPDATE issues SET source_repo_path = '/local/project'",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let mut newer = issue("a-1", "2026-01-01T00:00:00Z");
+        newer.updated_at += chrono::Duration::hours(1);
+        let jsonl = serde_json::to_vec(&newer).unwrap();
+        let audit = audit_connection(&conn, Some(std::io::Cursor::new(jsonl))).unwrap();
+        assert!(
+            audit.db_only.is_empty(),
+            "legacy scalar precedence alone permits this"
+        );
+        let error = require_replay_payload_coverage(&audit, true)
+            .unwrap_err()
+            .to_string();
+        for required in ["local labels", "local dependencies", "source_repo_path"] {
+            assert!(error.contains(required), "{required}: {error}");
+        }
+    }
+
+    #[test]
+    fn automatic_refusal_retains_the_reviewed_migration_diagnosis() {
+        let error = automatic_migration_refusal(
+            16,
+            Some(BeadsError::Config(
+                "schema migrate v19 refused: dependencies has unreviewed indexes".to_owned(),
+            )),
+        );
+        let message = error.to_string();
+        assert!(message.contains("dependencies has unreviewed indexes"));
+        assert!(message.contains("will not be rebuilt from issues.jsonl"));
+        assert!(message.contains("migrate-schema plan --json"));
+        assert!(
+            automatic_migration_refusal(0, None)
+                .to_string()
+                .contains("no reviewed lossless migration exists for schema 0")
+        );
+    }
+
+    #[test]
     fn malformed_relations_cannot_make_a_schema_audit_appear_clean() {
         for setup in [
             [
@@ -1772,10 +1796,10 @@ mod tests {
             assert_eq!(audit.db_only[0].reason, DbOnlyReason::Unreadable);
             assert!(!audit.db_only[0].restorable);
             assert!(audit.restorable.is_empty());
-            assert!(require_lossless_rebuild(&audit, false).is_err());
-            assert!(require_lossless_rebuild(&audit, true).is_ok());
+            assert!(require_replay_payload_coverage(&audit, false).is_err());
+            assert!(require_replay_payload_coverage(&audit, true).is_ok());
             assert!(planned_action(&audit, false).starts_with("refuse rebuild:"));
-            assert!(planned_action(&audit, true).starts_with("rebuild schema"));
+            assert!(planned_action(&audit, true).starts_with("refuse rebuild:"));
         }
     }
 
@@ -1851,7 +1875,10 @@ mod tests {
             conn.execute(sql).unwrap();
         }
         let mut audit = audit_connection(&conn, Some(std::io::Cursor::new(jsonl))).unwrap();
-        assert!(audit.is_clean(), "orphans are not issues: {audit:?}");
+        assert!(
+            !audit.is_clean(),
+            "orphan relations are still authoritative: {audit:?}"
+        );
         let orphans: Vec<(&str, usize)> = audit
             .orphan_relations
             .iter()
@@ -1869,15 +1896,15 @@ mod tests {
                 .contains("--discard-db-only")
         );
 
-        let refused = require_lossless_rebuild(&audit, false).unwrap_err();
+        let refused = require_replay_payload_coverage(&audit, false).unwrap_err();
         assert!(
             refused.to_string().contains("without an owning issue"),
             "{refused}"
         );
         assert!(planned_action(&audit, false).starts_with("refuse rebuild"));
-        require_lossless_rebuild(&audit, true).expect("explicit discard authorizes it");
+        require_replay_payload_coverage(&audit, true).expect("orphan discard covers only payloads");
         assert!(
-            planned_action(&audit, true).contains("kept only in the backup"),
+            planned_action(&audit, true).starts_with("refuse rebuild:"),
             "{}",
             planned_action(&audit, true)
         );
@@ -1960,7 +1987,7 @@ mod tests {
         assert_eq!(restored.dependencies[0].depends_on_id, "external-target");
         assert_eq!(restored.dependencies[0].created_at, restored.created_at);
         assert!(restored.due_at.is_none());
-        assert!(require_lossless_rebuild(&audit, false).is_ok());
+        assert!(require_replay_payload_coverage(&audit, false).is_ok());
     }
 
     #[test]
@@ -1979,7 +2006,7 @@ mod tests {
                 .contains("duplicate issue id")
         );
         for discard in [false, true] {
-            assert!(require_lossless_rebuild(&audit, discard).is_err());
+            assert!(require_replay_payload_coverage(&audit, discard).is_err());
             assert!(planned_action(&audit, discard).starts_with("refuse rebuild:"));
         }
     }
@@ -2000,8 +2027,8 @@ mod tests {
         assert_eq!(audit.db_only.len(), 2);
         assert_eq!(audit.restorable.len(), 1);
         assert_eq!(audit.restorable[0].issue.id, "a-1");
-        assert!(!audit.automatic_rebuild_allowed());
-        let refusal = require_lossless_rebuild(&audit, false).unwrap_err();
+        assert!(!audit.is_clean());
+        let refusal = require_replay_payload_coverage(&audit, false).unwrap_err();
         assert!(refusal.to_string().contains("unreadable"));
         assert!(
             refusal
@@ -2013,52 +2040,38 @@ mod tests {
                 .to_string()
                 .contains("--discard-db-only")
         );
-        require_lossless_rebuild(&audit, true)
-            .expect("explicit authorization for unrestorable data");
+        require_replay_payload_coverage(&audit, true)
+            .expect("payload classification is independent of installer safety");
         let action = planned_action(&audit, true);
-        assert!(
-            action.contains("re-add 1 database-only issue(s)"),
-            "{action}"
-        );
-        assert!(
-            action.contains(
-                "1 unreadable or superseded database-only issue(s) kept only in the backup"
-            ),
-            "{action}"
-        );
-        assert!(
-            action.contains("1 labels row(s) without an owning issue"),
-            "{action}"
-        );
+        assert!(action.starts_with("refuse rebuild:"), "{action}");
+        assert!(action.contains("unreadable row"), "{action}");
+        assert!(action.contains("1 labels row(s)"), "{action}");
     }
 
     #[test]
-    fn discard_plan_still_restores_issues_when_no_data_is_unreadable() {
+    fn decodable_issue_plan_still_requires_a_reviewed_migration() {
         let (conn, _) = legacy_audit_fixture();
         let audit = audit_connection(&conn, Some(std::io::Cursor::new(Vec::<u8>::new())))
             .expect("recoverable database-only issue");
-        require_lossless_rebuild(&audit, false).unwrap();
-        require_lossless_rebuild(&audit, true).unwrap();
+        require_replay_payload_coverage(&audit, false).unwrap();
+        require_replay_payload_coverage(&audit, true).unwrap();
         assert_eq!(planned_action(&audit, false), planned_action(&audit, true));
-        assert!(planned_action(&audit, true).contains("re-add 1 database-only issue(s)"));
+        assert!(planned_action(&audit, true).starts_with("refuse rebuild:"));
+        assert!(planned_action(&audit, true).contains("no reviewed crash-safe installer"));
     }
 
     #[test]
-    fn backup_only_notice_does_not_call_unreadable_payloads_superseded() {
+    fn completed_heal_reports_a_reviewed_migration() {
         let outcome = HealOutcome {
-            from_version: 4,
+            from_version: 16,
             to_version: current_version(),
-            action: "rebuilt",
+            action: "migrated",
             backup: "retained-backup".to_owned(),
-            restored_db_only: vec!["a-1".to_owned()],
-            backup_only_db_only: vec!["a-2".to_owned()],
-            backup_only_orphan_relations: Vec::new(),
-            migration_fallback_reason: None,
         };
         let notice = outcome.notice();
-        assert!(notice.contains("re-added 1 database-only issue(s)"));
-        assert!(notice.contains("1 database-only issue(s) not restored"));
-        assert!(!notice.contains("superseded"));
+        assert!(notice.contains("migrated it in place"));
+        assert!(notice.contains("retained-backup"));
+        assert!(!notice.contains("rebuilt"));
     }
 
     #[test]
@@ -2101,7 +2114,7 @@ mod tests {
         }
         let audit = audit_connection(&conn, Some(std::io::Cursor::new(jsonl))).unwrap();
         assert!(!audit.is_clean());
-        assert!(!audit.automatic_rebuild_allowed());
+        assert!(!audit.automatic_heal_allowed());
         assert_eq!(audit.db_only[0].reason, DbOnlyReason::UnflushedEdit);
     }
 
@@ -2120,7 +2133,7 @@ mod tests {
                 "{column}"
             );
             assert!(audit.restorable.is_empty());
-            assert!(require_lossless_rebuild(&audit, false).is_err());
+            assert!(require_replay_payload_coverage(&audit, false).is_err());
         }
     }
 
@@ -2324,7 +2337,7 @@ mod tests {
                 let bytes = serde_json::to_vec(&peer).unwrap();
                 let audit = audit_connection(&conn, Some(std::io::Cursor::new(bytes))).unwrap();
                 assert!(!audit.is_clean());
-                assert!(!audit.automatic_rebuild_allowed());
+                assert!(!audit.automatic_heal_allowed());
                 assert_eq!(audit.db_only.len(), 1);
                 assert_eq!(
                     audit.db_only[0].reason,
@@ -2337,8 +2350,8 @@ mod tests {
                         .contains("comments absent from JSONL")
                 );
                 for discard in [false, true] {
-                    require_lossless_rebuild(&audit, discard).unwrap();
-                    assert!(planned_action(&audit, discard).contains("re-add 1 database-only"));
+                    require_replay_payload_coverage(&audit, discard).unwrap();
+                    assert!(planned_action(&audit, discard).starts_with("refuse rebuild:"));
                 }
                 let restore = &audit.restorable[0];
                 assert_eq!(restore.issue.title, peer.title);
@@ -2414,33 +2427,7 @@ mod tests {
     }
 
     #[test]
-    fn audited_older_comments_survive_rehearsal_and_replay() {
-        const NAME: &str = "cli::commands::doctor_subsystems::schema_heal::tests::audited_older_comments_survive_rehearsal_and_replay";
-        const CHILD_ENV: &str = "BR_TEST_ISOLATED_HEAL_OLDER_COMMENTS";
-        if std::env::var(CHILD_ENV).as_deref() != Ok(NAME) {
-            // #506: isolate before any nested rebuild can acquire an opener lease.
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    NAME,
-                    "--test-threads=1",
-                    "--format=pretty",
-                    "--color=never",
-                ])
-                .env(CHILD_ENV, NAME)
-                .env_remove("RUST_TEST_NOCAPTURE")
-                .output()
-                .unwrap();
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let passed = format!("test {NAME} ... ok");
-            assert!(
-                output.status.success() && stdout.lines().any(|line| line == passed),
-                "isolated older-comment regression failed or did not run: {}\n{stdout}\n{}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return;
-        }
+    fn audited_older_comments_are_retained_when_reconstruction_is_refused() {
         let (conn, peer) = older_comment_fixture(1, false);
         let scratch = tempfile::tempdir().unwrap();
         let path = scratch.path().join("issues.jsonl");
@@ -2453,44 +2440,13 @@ mod tests {
             1,
             "an older clean row still owns its comments"
         );
-        let plan =
-            rebuild_preflight::complete_comment_restore_plan(&source, &audit.restorable).unwrap();
-        assert_eq!(plan[0].issue.title, peer.title);
-        assert_eq!(plan[0].issue.status, Status::Closed);
-        let bodies: HashSet<_> = plan[0]
-            .issue
-            .comments
-            .iter()
-            .map(|comment| comment.body.as_str())
-            .collect();
-        assert_eq!(bodies, HashSet::from(["local-only", "peer-only"]));
-        let witness = rebuild_preflight::rehearse(
-            &source,
-            &plan,
-            &config::ConfigLayer::default(),
-            Some(5_000),
-        )
-        .unwrap()
-        .unwrap();
-        let mut storage = crate::storage::SqliteStorage::open_memory().unwrap();
-        storage.create_issue(&peer, "test").unwrap();
-        storage
-            .sync_comments_for_import(&peer.id, &peer.comments)
-            .unwrap();
-        for _ in 0..2 {
-            crate::sync::restore_dirty_issues_after_rebuild(&mut storage, &plan).unwrap();
-            witness.verify(&storage).unwrap();
-            let restored = storage.get_issue(&peer.id).unwrap().unwrap();
-            assert_eq!(restored.status, Status::Closed);
-            assert_eq!(restored.title, peer.title);
-            assert_eq!(restored.updated_at, peer.updated_at);
-        }
-        storage
-            .sync_comments_for_import(&peer.id, &peer.comments)
-            .unwrap();
+        assert_eq!(
+            audit.db_only[0].reason,
+            DbOnlyReason::CommentsAbsentFromJsonl
+        );
         assert!(
-            witness.verify(&storage).is_err(),
-            "losing the older local comment must fail verification"
+            planned_action(&audit, false).starts_with("refuse rebuild:"),
+            "decoding a comment restore plan does not establish crash-safe installation"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
         let original = conn.query_row("SELECT text FROM comments").unwrap();

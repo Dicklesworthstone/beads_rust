@@ -19743,6 +19743,9 @@ pub(crate) fn effective_database_user_version(path: &Path) -> Result<Option<u32>
     if checked_database_header_user_version(path)?.is_none() {
         return Ok(None);
     }
+    // Schema detection is a real WAL-aware read. Retain the same opener
+    // protection as other persistent readers until the connection is closed.
+    let _opener_lease = crate::sync::DatabaseOpenerLease::register(path)?;
     let conn = open_engine_connection_explained(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let version = connection_user_version(&conn).or(checked_database_header_user_version(path)?);
     conn.close().map_err(BeadsError::Database)?;
@@ -20317,6 +20320,7 @@ fn query_external_project_capabilities(
         return Ok(HashSet::new());
     }
 
+    let _opener_lease = DatabaseOpenerLease::register(db_path)?;
     let conn = open_existing_read_only_connection(db_path)?;
     let labels: Vec<String> = capabilities
         .iter()

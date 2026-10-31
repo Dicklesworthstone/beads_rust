@@ -91,6 +91,22 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ## Unreleased
 
+### Data preservation
+
+- Ordinary reads no longer trigger schema healing or writable recovery after a
+  failed read-only open, including `info --json --no-auto-import --no-auto-flush`
+  and MCP read tools ([#585](https://github.com/Dicklesworthstone/beads_rust/issues/585)).
+  Older-schema issue reads may use a warned private JSONL view while preserving
+  the original database. Statistics reads no longer persist their activity cache.
+- Schema healing requires a reviewed lossless migration and refuses missing or
+  unprovable paths instead of reconstructing the database from issue JSONL.
+  Migration proofs cover original typed values, row multiplicity, hidden rowids,
+  sequence reservations, and operator schema, including database-only history
+  and configuration. Installation, interrupted completion, and undo verify
+  preservation while retaining recovery evidence. Historical release notes
+  below describe the behavior of those releases, including the old automatic
+  reconstruction policy.
+
 ### Tests
 
 - Tests read an issue id's hash as its last `-` segment, so a hyphenated

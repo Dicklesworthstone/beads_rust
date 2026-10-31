@@ -144,7 +144,12 @@ fn execute_inner(
     }
 
     let recent_activity = if should_collect_activity(args, early_ctx.mode()) {
-        compute_recent_activity(Some(storage), &jsonl_path, args.activity_hours)
+        compute_recent_activity(
+            Some(storage),
+            &jsonl_path,
+            args.activity_hours,
+            !cli.read_only_storage,
+        )
     } else {
         None
     };
@@ -645,6 +650,7 @@ fn compute_recent_activity(
     storage: Option<&SqliteStorage>,
     jsonl_path: &Path,
     hours: u32,
+    persist_cache: bool,
 ) -> Option<RecentActivity> {
     if !jsonl_path.exists() {
         debug!("No issues.jsonl found for activity tracking");
@@ -688,7 +694,10 @@ fn compute_recent_activity(
         total_changes: counts.total_changes(),
     };
 
-    if let Some(storage) = storage
+    // Startup may have imported JSONL through this writable handle. Read
+    // intent still forbids unrelated metadata writes during stats dispatch.
+    if persist_cache
+        && let Some(storage) = storage
         && let RecentActivityCachePolicy::Cache { valid_until_epoch } =
             recent_activity_cache_policy(commit_count, earliest_commit_ts, hours)
     {
@@ -2212,7 +2221,7 @@ mod tests {
             &["commit", "-q", "-m", "Track bd-abc in custom issues file"],
         );
 
-        let activity = compute_recent_activity(None, &jsonl_path, 24)
+        let activity = compute_recent_activity(None, &jsonl_path, 24, false)
             .expect("activity for committed custom jsonl");
         assert_eq!(activity.commit_count, 1);
         assert_eq!(activity.hours_tracked, 24);
@@ -2261,13 +2270,81 @@ mod tests {
         git(temp.path(), &["add", ".beads/issues.jsonl"]);
         git(temp.path(), &["commit", "-q", "-m", "Reopen bd-activity"]);
 
-        let activity = compute_recent_activity(None, &jsonl_path, 24).expect("recent activity");
+        let activity =
+            compute_recent_activity(None, &jsonl_path, 24, false).expect("recent activity");
         assert_eq!(activity.commit_count, 4);
         assert_eq!(activity.issues_created, 1);
         assert_eq!(activity.issues_updated, 1);
         assert_eq!(activity.issues_closed, 1);
         assert_eq!(activity.issues_reopened, 1);
         assert_eq!(activity.total_changes, 4);
+    }
+
+    #[test]
+    fn strict_read_only_stats_skip_cache_writes_even_with_writable_preloaded_storage() {
+        let temp = TempDir::new().unwrap();
+        git(temp.path(), &["init", "-q"]);
+        git(temp.path(), &["config", "user.email", "tester@example.com"]);
+        git(temp.path(), &["config", "user.name", "Tester"]);
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        write_issue_jsonl(
+            &jsonl_path,
+            &make_issue("bd-history", Status::Open, IssueType::Task),
+        );
+        git(temp.path(), &["add", ".beads/issues.jsonl"]);
+        git(temp.path(), &["commit", "-q", "-m", "Record tracked issue"]);
+        let storage = SqliteStorage::open(&beads_dir.join("beads.db")).unwrap();
+        let metadata_before = storage
+            .execute_raw_query("SELECT * FROM metadata ORDER BY rowid")
+            .unwrap();
+        let args = StatsArgs {
+            activity_hours: 24,
+            ..StatsArgs::default()
+        };
+        let output = OutputContext::from_output_format(OutputFormat::Json, false, true);
+
+        execute_with_storage(
+            &args,
+            &config::CliOverrides {
+                read_only_storage: true,
+                ..config::CliOverrides::default()
+            },
+            &output,
+            &beads_dir,
+            &storage,
+        )
+        .unwrap();
+
+        assert_eq!(
+            storage
+                .execute_raw_query("SELECT * FROM metadata ORDER BY rowid")
+                .unwrap(),
+            metadata_before
+        );
+        let cache_key = recent_activity_cache_key(".beads/issues.jsonl", 24);
+        assert_eq!(storage.get_metadata(&cache_key).unwrap(), None);
+
+        // Prove that the same fixture actually exercises cache persistence
+        // when a caller permits it, rather than passing because git was absent.
+        execute_with_storage(
+            &args,
+            &config::CliOverrides::default(),
+            &output,
+            &beads_dir,
+            &storage,
+        )
+        .unwrap();
+        let cached: RecentActivityCacheEntry = serde_json::from_str(
+            &storage
+                .get_metadata(&cache_key)
+                .unwrap()
+                .expect("permitted cache write"),
+        )
+        .unwrap();
+        assert_eq!(cached.activity.commit_count, 1);
+        assert_eq!(cached.activity.issues_created, 1);
     }
 
     #[test]

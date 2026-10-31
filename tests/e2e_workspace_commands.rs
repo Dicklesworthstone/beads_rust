@@ -1020,19 +1020,13 @@ fn e2e_doctor_repair_json_rebuilds_and_returns_single_payload() {
 }
 
 #[test]
-fn e2e_startup_auto_recovery_preserves_unflushed_tombstones() {
-    // Regression: when the DB opens successfully but
-    // `detect_recoverable_open_anomaly` flags duplicate config/metadata/
-    // schema rows, the startup recovery path inside
-    // `open_sqlite_storage_with_recovery_strategy` used to
-    // `drop(storage)` + `rebuild_database_from_jsonl(...)` unconditionally.
-    // Any local tombstone the user had deleted but not yet flushed to
-    // JSONL was silently wiped by the rebuild, because the JSONL still
-    // showed the issue as open and the rebuild only imports what's in the
-    // JSONL. The fix snapshots tombstones from the anomalous-but-queryable
-    // storage before dropping it and restores them after the rebuild, the
-    // same way the explicit `br sync --import-only --rebuild` delegation path does.
-    let _log = common::test_log("e2e_startup_auto_recovery_preserves_unflushed_tombstones");
+fn e2e_observational_read_preserves_unflushed_tombstones_without_anomaly_recovery() {
+    // GH #585: duplicate config must not turn a read into reconstruction.
+    // The current-schema storage remains queryable, and its local tombstone
+    // must remain authoritative despite the older open issue in the JSONL.
+    let _log = common::test_log(
+        "e2e_observational_read_preserves_unflushed_tombstones_without_anomaly_recovery",
+    );
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -1077,10 +1071,8 @@ fn e2e_startup_auto_recovery_preserves_unflushed_tombstones() {
         delete_cmd.stderr
     );
 
-    // Inject duplicate config rows directly into the DB so the next open
-    // trips `detect_recoverable_open_anomaly`, firing the startup rebuild
-    // path. Scope the connection in its own block so it is closed before
-    // the next `br` invocation tries to reopen the DB.
+    // These rows used to trigger writable startup anomaly recovery. Keep
+    // them in the original source and verify the entire database family.
     let db_path = workspace.root.join(".beads").join("beads.db");
     {
         let conn = Connection::open(db_path.to_string_lossy().into_owned())
@@ -1089,19 +1081,19 @@ fn e2e_startup_auto_recovery_preserves_unflushed_tombstones() {
             .expect("insert duplicate config row a");
         conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')")
             .expect("insert duplicate config row b");
+        conn.close().expect("checkpoint anomaly fixture");
     }
+    let before = namespace_family_bytes(&workspace);
+    let jsonl = fs::read(workspace.root.join(".beads/issues.jsonl")).unwrap();
 
-    // Any read command that opens storage will now trip startup
-    // auto-recovery. Use `br show` on the tombstoned ID so the assertion
-    // below tests the exact question we care about.
     let show = run_br(
         &workspace,
         ["show", &delete_id, "--json"],
-        "show_after_rebuild",
+        "show_without_rebuild",
     );
     assert!(
         show.status.success(),
-        "show after startup auto-rebuild failed: stderr={}",
+        "show of the original queryable database failed: stderr={}",
         show.stderr
     );
     let payload = extract_json_payload(&show.stdout);
@@ -1115,10 +1107,16 @@ fn e2e_startup_auto_recovery_preserves_unflushed_tombstones() {
     assert_eq!(
         record["status"].as_str(),
         Some("tombstone"),
-        "the local unflushed tombstone must survive startup auto-recovery from a recoverable anomaly, \
+        "the local unflushed tombstone must remain visible through observational startup, \
          but was found as `{:?}`",
         record["status"]
     );
+    assert_namespace_family_preserved(&workspace, &before, true);
+    assert_eq!(
+        fs::read(workspace.root.join(".beads/issues.jsonl")).unwrap(),
+        jsonl
+    );
+    assert!(!workspace.root.join(".beads/.br_recovery").exists());
 }
 
 #[test]

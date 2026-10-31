@@ -1921,22 +1921,49 @@ fn repair_rebuild_preserves_dirty_unflushed_issue() {
 }
 
 #[test]
-fn startup_auto_recovery_preserves_dirty_unflushed_issue() {
-    // Same corruption, but recovered by the startup probe's automatic
-    // rebuild (config-layer `rebuild_with_tombstone_preservation`) when a
-    // plain read command opens the workspace — no doctor involved.
+fn read_refuses_corruption_until_explicit_repair_preserves_dirty_unflushed_issue() {
+    // GH #585: an ordinary read must never rebuild a corrupt database.
+    // The explicitly requested repair still preserves the #394 dirty issue.
     let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     let dirty_id = seed_dirty_issue_and_corrupt_db(&root);
+    let before = hash_workspace(&root);
 
-    let list = br_cmd(&root)
+    let refused = br_cmd(&root)
         .args(["list", "--json"])
         .output()
         .expect("br list spawned");
     assert!(
+        !refused.status.success(),
+        "a read must refuse corrupt storage without rebuilding: {refused:?}"
+    );
+    let error = parse_trailing_json(&String::from_utf8_lossy(&refused.stdout));
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty())
+    );
+    assert_eq!(hash_workspace(&root), before);
+    assert!(!root.join(".beads/.br_recovery").exists());
+
+    let repair = br_cmd(&root)
+        .args(["doctor", "--repair", "--json"])
+        .output()
+        .expect("explicit repair spawned");
+    assert!(
+        repair.status.success(),
+        "explicit repair failed: {repair:?}"
+    );
+    let repaired = parse_trailing_json(&String::from_utf8_lossy(&repair.stdout));
+    assert_eq!(repaired["preservation_verified"], true, "{repaired}");
+
+    let list = br_cmd(&root)
+        .args(["list", "--json"])
+        .output()
+        .expect("br list after repair spawned");
+    assert!(
         list.status.success(),
-        "br list must auto-recover: stderr={}",
-        String::from_utf8_lossy(&list.stderr)
+        "br list after explicit repair failed: {list:?}"
     );
     let listed = parse_trailing_json(&String::from_utf8_lossy(&list.stdout));
     let titles: Vec<&str> = listed["issues"]
@@ -1947,7 +1974,7 @@ fn startup_auto_recovery_preserves_dirty_unflushed_issue() {
         .collect();
     assert!(
         titles.contains(&"db-only issue"),
-        "dirty issue {dirty_id} lost across startup auto-recovery; titles: {titles:?}"
+        "dirty issue {dirty_id} lost across explicit repair; titles: {titles:?}"
     );
     assert!(titles.contains(&"flushed fine"), "titles: {titles:?}");
 
@@ -1962,9 +1989,10 @@ fn startup_auto_recovery_preserves_dirty_unflushed_issue() {
     );
 }
 
-// GitHub #539 / beads_rust-utbzw: an ordinary command may rebuild only after
-// establishing that all unflushed issue state can be carried across. Keep
-// both the original fixtures and each command's logs, including on success.
+// GitHub #539 / beads_rust-utbzw: a mutating command may recover only after
+// establishing that all unflushed issue state can be carried across. GH #585
+// additionally prohibits recovery during observational reads. Keep the
+// original fixtures and each command's logs, including on success.
 struct StartupRecoveryFixture {
     root: PathBuf,
     issue_id: String,
@@ -2427,16 +2455,44 @@ fn assert_startup_refuses_with_diagnostics(
     check_fast_fallback: bool,
 ) {
     let before = StartupRecoveryBefore::capture(fixture);
-    // stats selects ordinary startup in both output modes. A compatible
-    // read-only fast open need not run the anomaly probe at all. Header
-    // damage additionally exercises list's definite fast-open fallback.
-    let mut probes = vec![
-        (vec!["stats", "--json"], "refused_stats_json", true),
-        (vec!["stats"], "refused_stats", false),
-    ];
+    // Observational reads may safely query unaffected tables or refuse the
+    // damaged storage. Neither result may reconstruct the database or audit
+    // it by opening a writable connection. Mutation startup below still
+    // exercises the original #539 preservation guard and detailed diagnosis.
+    let mut reads = vec![(vec!["stats", "--json"], "observational_stats")];
     if check_fast_fallback {
-        probes.push((vec!["list", "--json"], "refused_list", true));
+        reads.push((vec!["list", "--json"], "observational_list"));
     }
+    for (args, label) in reads {
+        let out = startup_fixture_run(&fixture.root, &args, label);
+        let payload: Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|err| panic!("read must return one JSON document: {err}; {out:?}"));
+        if !out.status.success() {
+            assert!(
+                payload["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| !message.is_empty())
+            );
+        }
+        before.assert_refusal_retained_sources(fixture);
+    }
+    let probes = [
+        (
+            vec![
+                "create",
+                "Refused recovery mutation",
+                "--no-auto-flush",
+                "--json",
+            ],
+            "refused_mutation_json",
+            true,
+        ),
+        (
+            vec!["create", "Refused recovery mutation", "--no-auto-flush"],
+            "refused_mutation",
+            false,
+        ),
+    ];
     for (args, label, json) in probes {
         let out = startup_fixture_run(&fixture.root, &args, label);
         assert_eq!(
@@ -3301,11 +3357,18 @@ fn assert_complete_recovered_unflushed_state(
 }
 
 #[test]
-fn startup_auto_recovery_preserves_complete_unflushed_state() {
+fn read_keeps_complete_unflushed_state_until_explicit_repair() {
     let fixture = StartupRecoveryFixture::new("complete");
     fixture.add_recoverable_anomaly();
     let before = StartupRecoveryBefore::capture(&fixture);
-    startup_fixture_succeeds(&fixture.root, &["stats", "--json"], "successful_recovery");
+    startup_fixture_succeeds(&fixture.root, &["stats", "--json"], "observational_stats");
+    before.assert_refusal_retained_sources(&fixture);
+    let repair = startup_fixture_succeeds(
+        &fixture.root,
+        &["doctor", "--repair", "--json"],
+        "explicit_recovery_after_read",
+    );
+    assert_eq!(repair["preservation_verified"], true, "{repair}");
     assert_complete_recovered_unflushed_state(&fixture, &before);
 }
 
@@ -3588,45 +3651,36 @@ fn e2e_reviewed_schema_migration_plan_apply_barrier_and_non_deleting_undo() {
     }
     let source_bytes = fs::read(&db_path).expect("read v14 source bytes");
 
-    // The seeded issue exists only in the database, so the automatic upgrade
-    // must refuse: mutations fail, and a read-only command reads the JSONL
-    // instead, naming the heal command, without touching the database.
-    let refused = br_cmd(&root)
-        .args([
-            "--no-auto-import",
-            "--allow-stale",
-            "create",
-            "blocked",
-            "--json",
-        ])
-        .output()
-        .expect("ordinary mutation spawned");
-    assert!(
-        !refused.status.success(),
-        "a mutation must refuse an implicit upgrade that could drop database-only data"
-    );
-    assert_eq!(db_user_version(&db_path), 14);
-    let refusal_text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&refused.stdout),
-        String::from_utf8_lossy(&refused.stderr)
-    );
-    assert!(
-        refusal_text.contains("br doctor migrate-schema heal")
-            && refusal_text.contains("bd-e2e-schema"),
-        "refusal must name the heal command and the database-only issue: {refusal_text}"
-    );
-    let read_only = br_cmd(&root)
-        .args(["--no-auto-import", "--allow-stale", "list", "--json"])
-        .output()
-        .expect("read-only command spawned");
-    assert!(
-        read_only.status.success(),
-        "a read-only command must fall back to the JSONL: {}",
-        String::from_utf8_lossy(&read_only.stderr)
-    );
-    assert!(String::from_utf8_lossy(&read_only.stderr).contains("migrate-schema heal"));
-    assert_eq!(db_user_version(&db_path), 14);
+    // This shape has a reviewed lossless migration, including its DB-only
+    // issue. Ordinary reads still must leave that upgrade for a write or an
+    // explicit migration. Their warned JSONL view cannot show the local issue.
+    for args in [
+        vec!["list", "--json"],
+        vec!["--no-auto-import", "--no-auto-flush", "list", "--json"],
+    ] {
+        let read_only = br_cmd(&root)
+            .args(args)
+            .output()
+            .expect("read-only command spawned");
+        assert!(
+            read_only.status.success(),
+            "a read-only command must fall back to the JSONL: {read_only:?}"
+        );
+        let warning = String::from_utf8_lossy(&read_only.stderr);
+        assert!(
+            warning.contains("schema") && warning.contains("JSONL"),
+            "{warning}"
+        );
+        let listed = parse_trailing_json(&String::from_utf8_lossy(&read_only.stdout));
+        assert!(
+            listed["issues"].as_array().is_some_and(|issues| {
+                issues.iter().all(|issue| issue["id"] != "bd-e2e-schema")
+            })
+        );
+        assert_eq!(db_user_version(&db_path), 14);
+        assert_eq!(fs::read(&db_path).unwrap(), source_bytes);
+        assert!(!beads_dir.join(".br_recovery").exists());
+    }
 
     let plan = br_cmd(&root)
         .args(["doctor", "migrate-schema", "plan", "--json"])
@@ -3705,6 +3759,13 @@ fn e2e_reviewed_schema_migration_plan_apply_barrier_and_non_deleting_undo() {
         "current canonical schema should open normally: stdout={} stderr={}",
         String::from_utf8_lossy(&list_after.stdout),
         String::from_utf8_lossy(&list_after.stderr)
+    );
+    let listed_after = parse_trailing_json(&String::from_utf8_lossy(&list_after.stdout));
+    assert!(
+        listed_after["issues"]
+            .as_array()
+            .is_some_and(|issues| { issues.iter().any(|issue| issue["id"] == "bd-e2e-schema") }),
+        "the reviewed migration must retain the original database-only issue: {listed_after}"
     );
 
     let undo_plan = br_cmd(&root)

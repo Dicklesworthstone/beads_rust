@@ -1240,8 +1240,8 @@ points at `br sync --merge`.
 **Cause:** the WAL index (`.beads/beads.db-shm`) has to be rebuilt before the
 engine will read the database. Stock SQLite programs that open the tracker
 (bv, the `sqlite3` shell, Python) and br 0.6.0 leave indexes like that; for
-those, read-only commands (`--no-auto-import --no-auto-flush`, which is what bv
-runs) read a private snapshot and any ordinary command rebuilds the index, so
+those, read commands (including `--no-auto-import --no-auto-flush`, which is
+what bv runs) read a private snapshot and mutating commands can rebuild the index, so
 you should not see this error. You see it when the index is damaged in some
 other way (a torn header, a truncated or overwritten file), which every command
 refuses, or while another br process is recovering the database.

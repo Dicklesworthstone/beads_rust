@@ -1,6 +1,7 @@
-//! Regressions for failures after a valid JSONL import but during local replay.
-//! Neither an explicit heal nor --discard-db-only may first replace the live
-//! database and only then discover that readable local work cannot be restored.
+//! Regressions for local-replay risks in a schema-heal reconstruction.
+//! Valid JSONL and a replayable issue subset do not prove preservation of the
+//! complete database, nor a crash-safe installation. Until a reviewed path
+//! exists, neither heal nor --discard-db-only may replace the old database.
 
 mod common;
 
@@ -120,9 +121,12 @@ fn assert_refused_before_replacement(workspace: &BrWorkspace, db: &Path, discard
         .as_str()
         .expect("structured error")
         .to_owned();
-    assert!(message.contains("restore rehearsal failed"), "{message}");
     assert!(
-        message.contains("live database rebuild was not started"),
+        message.contains("migration") && message.contains("refused"),
+        "{message}"
+    );
+    assert!(
+        message.contains("original database") && message.contains("preserv"),
         "{message}"
     );
     assert_eq!(
@@ -144,23 +148,15 @@ fn conflicting_local_replay_leaves_the_old_family_intact_on_every_retry() {
     }
 }
 
-fn show(workspace: &BrWorkspace, id: &str) -> Value {
-    let result = run_br(
-        workspace,
-        ["show", id, "--json", "--no-auto-import", "--no-auto-flush"],
-        &format!("show_{id}"),
-    );
-    assert!(
-        result.status.success(),
-        "{} {}",
-        result.stdout,
-        result.stderr
-    );
-    json(&result.stdout)[0].clone()
-}
-
 fn assert_stored_governance(db: &Path) {
-    let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let copy = scratch.path().join("copy.db");
+    fs::copy(db, &copy).unwrap();
+    let wal = PathBuf::from(format!("{}-wal", db.display()));
+    if wal.exists() {
+        fs::copy(wal, scratch.path().join("copy.db-wal")).unwrap();
+    }
+    let conn = Connection::open(copy.to_string_lossy().into_owned()).unwrap();
     let rows = conn
         .query(
             "SELECT agent_context, source_repo_path, prerequisites \
@@ -184,69 +180,29 @@ fn assert_stored_governance(db: &Path) {
 }
 
 #[test]
-fn resolving_the_conflict_allows_a_lossless_retry_and_export() {
+fn resolving_one_replay_conflict_does_not_prove_complete_database_preservation() {
     let workspace = BrWorkspace::new();
     let db = fixture(&workspace);
     assert_refused_before_replacement(&workspace, &db, false);
     set_upstream_reference(&workspace, "different-upstream-reference");
 
-    let result = run_br(
-        &workspace,
-        ["doctor", "migrate-schema", "heal", "--json"],
-        "heal_after_resolving_conflict",
-    );
-    assert!(
-        result.status.success(),
-        "{} {}",
-        result.stdout,
-        result.stderr
-    );
-    let receipt = json(&result.stdout);
-    assert_eq!(receipt["action"], "rebuilt");
-    assert_eq!(receipt["restored_db_only"], serde_json::json!(["leg-u4i"]));
-    assert_eq!(
-        receipt["backup_only_db_only"],
-        serde_json::json!(["leg-n57"])
-    );
-    assert!(Path::new(receipt["backup"].as_str().unwrap()).is_dir());
-    assert_eq!(
-        header_version(&db),
-        u32::try_from(beads_rust::storage::schema::CURRENT_SCHEMA_VERSION).unwrap()
-    );
+    // The old code only rehearsed issue replay. Even after this collision is
+    // resolved, the events/configuration still have no lossless migration and
+    // replay-after-install cannot survive interruption safely.
+    assert_refused_before_replacement(&workspace, &db, false);
+    assert_refused_before_replacement(&workspace, &db, true);
     assert_stored_governance(&db);
-    let local = show(&workspace, "leg-u4i");
-    assert_eq!(local["title"], "Unflushed legacy issue");
-    assert_eq!(local["external_ref"], "replay-conflict");
-    assert_eq!(local["labels"], serde_json::json!(["preserve-local"]));
-    assert_eq!(local["comments"][0]["text"], "preserve this comment");
-    assert_eq!(local["dependencies"][0]["id"], "leg-n57");
-    let upstream = show(&workspace, "leg-n57");
-    assert_eq!(upstream["title"], "Superseding upstream title");
-    assert_eq!(upstream["external_ref"], "different-upstream-reference");
-
-    let flush = run_br(
-        &workspace,
-        ["sync", "--flush-only", "--json"],
-        "flush_retry",
-    );
-    assert!(flush.status.success(), "{} {}", flush.stdout, flush.stderr);
     let rows: Vec<Value> = fs::read_to_string(workspace.root.join(".beads/issues.jsonl"))
         .unwrap()
         .lines()
         .map(json)
         .collect();
-    let local = rows.iter().find(|row| row["id"] == "leg-u4i").unwrap();
-    assert_eq!(local["external_ref"], "replay-conflict");
-    assert_eq!(local["labels"], serde_json::json!(["preserve-local"]));
-    assert_eq!(local["comments"][0]["text"], "preserve this comment");
-    assert_eq!(local["dependencies"][0]["depends_on_id"], "leg-n57");
-    assert_eq!(local["agent_context"], LOCAL_CONTEXT);
-    assert_eq!(local["prerequisites"], LOCAL_PREREQUISITES);
     assert!(
-        local.get("source_repo_path").is_none(),
-        "machine-local paths stay local"
+        rows.iter().all(|row| row["id"] != "leg-u4i"),
+        "unreviewed reconstruction must not publish local work into JSONL"
     );
-    assert_stored_governance(&db);
     let upstream = rows.iter().find(|row| row["id"] == "leg-n57").unwrap();
     assert_eq!(upstream["title"], "Superseding upstream title");
+    assert_eq!(upstream["external_ref"], "different-upstream-reference");
+    assert!(!workspace.root.join(".beads/.br_recovery").exists());
 }

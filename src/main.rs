@@ -118,11 +118,10 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     // kept its index in memory leaves behind (br 0.6.0, GH #521).
     // Recover any such derived-cache state under write + sole-opener authority,
     // with a verified private rehearsal and unchanged durable payloads, before
-    // classifying the real pending receipt. Explicit read-only opens never take
-    // this repair path.
-    let observational_startup = (ctx.overrides.read_only_fast_open
-        && cli.no_auto_import
-        && cli.no_auto_flush)
+    // classifying the real pending receipt. Read commands never take this
+    // repair path. This is an intent boundary, independent of the fast-open
+    // optimization and of automatic-sync flags (GH #585).
+    let observational_startup = ctx.overrides.read_only_storage
         || matches!(cli.command, Commands::Doctor(_))
         || matches!(&cli.command, Commands::Sync(args) if args.status || (args.reconcile && args.dry_run));
     let mut startup_recovery_lock = if storage_enabled
@@ -162,13 +161,15 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     } else {
         None
     };
-    // A database left on an older schema refuses every ordinary command.
-    // When the audit proves nothing lives only in the database, upgrade it
-    // here (reviewed migration or JSONL rebuild, backup retained) and carry
-    // on; otherwise mutations refuse with the one command that resolves it,
-    // and read-only commands fall back to reading the JSONL directly.
+    // Only a mutating command may request a reviewed, lossless migration.
+    // A refused or missing migration is never permission to reconstruct an
+    // existing database from JSONL: events, configuration, and other records
+    // may exist only in SQLite. Ordinary reads preserve the original family
+    // and use a clearly labelled JSONL view when that command supports it.
+    // Diagnostics with generic legacy-schema readers inspect the original.
     if storage_enabled
         && !matches!(cli.command, Commands::Doctor(_) | Commands::Init { .. })
+        && !inspects_legacy_database_without_recovery(&cli.command)
         && (command_needs_write_lock
             || should_preopen_storage
             || command_supports_auto_import
@@ -178,7 +179,7 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
             commands::doctor_subsystems::schema_heal::stale_schema_version(&paths.db_path)
     {
         let refusal = if observational_startup {
-            // Explicitly read-only invocations never rewrite the database.
+            // Read intent, not fast-open eligibility, protects this boundary.
             Some(stale_schema_observational_refusal(found))
         } else {
             let authority = match startup_recovery_lock.as_ref() {
@@ -219,12 +220,13 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
             }
         };
         if let Some(refusal) = refusal {
-            if !supports_read_only_fast_open(&cli.command) {
+            if !supports_stale_jsonl_fallback(&cli.command) {
                 return Err(refusal);
             }
             eprintln!(
                 "warning: {refusal}. This read-only command reads issues.jsonl directly instead \
-                 (as with --no-db)."
+                 (as with --no-db). Database-only records remain in the original database \
+                 and may be absent from this view."
             );
             overrides.no_db = Some(true);
             ctx.overrides.no_db = Some(true);
@@ -245,6 +247,7 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
         && (command_needs_write_lock || should_preopen_storage)
         && pending_merge_disposition == PendingMergeStartupDisposition::ReadOnlyNoAutoSync
         && !matches!(cli.command, Commands::Doctor(_))
+        && !inspects_legacy_database_without_recovery(&cli.command)
         && let Some(paths) = ctx.paths.as_ref()
     {
         match inspect_pending_sync_merge_for_startup(&paths.db_path) {
@@ -287,7 +290,9 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     let ordinary_database_authority_required = should_acquire_startup_write_lock(
         command_needs_write_lock,
         should_preopen_storage,
-        ctx.overrides.read_only_fast_open,
+        ctx.overrides.read_only_fast_open
+            || (ctx.overrides.read_only_storage
+                && !inspects_legacy_database_without_recovery(&cli.command)),
     );
     let pending_merge_mutation_gate_required =
         pending_merge_disposition == PendingMergeStartupDisposition::Refuse;
@@ -434,11 +439,13 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
             || pending_merge_mutation_gate_required)
         && pending_merge_disposition != PendingMergeStartupDisposition::Resume
         && !matches!(cli.command, Commands::Doctor(_))
+        && !inspects_legacy_database_without_recovery(&cli.command)
         // Read-only fast-open runs without the family authority; the
         // advisory path-only inspection above already classified pending
         // state for it, and a fast-open miss reacquires the authority (and
         // with it this definitive gate) before any writable fallback.
-        && !(write_lock.is_none() && ctx.overrides.read_only_fast_open)
+        && !(write_lock.is_none()
+            && (ctx.overrides.read_only_fast_open || ctx.overrides.read_only_storage))
         && let Some(paths) = ctx.paths.as_ref()
     {
         let authority = write_lock.as_ref().ok_or_else(|| BeadsError::SyncConflict {
@@ -536,7 +543,7 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
         let mut auto_import_write_lock = storage_result
             .as_ref()
             .and_then(config::OpenStorageResult::retained_database_write_authority);
-        if !ctx.overrides.read_only_fast_open
+        if !(ctx.overrides.read_only_fast_open || ctx.overrides.read_only_storage)
             && write_lock.is_none()
             && auto_import_write_lock.is_none()
         {
@@ -556,13 +563,17 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
         }
         let mut should_attempt_auto_import = {
             match storage_result.as_mut() {
-                Some(res) if ctx.overrides.read_only_fast_open => auto_import_probe(
-                    &res.storage,
-                    &paths.beads_dir,
-                    &paths.jsonl_path,
-                    allow_external_jsonl,
-                )
-                .unwrap_or(true),
+                Some(res)
+                    if ctx.overrides.read_only_fast_open || ctx.overrides.read_only_storage =>
+                {
+                    auto_import_probe(
+                        &res.storage,
+                        &paths.beads_dir,
+                        &paths.jsonl_path,
+                        allow_external_jsonl,
+                    )
+                    .unwrap_or(true)
+                }
                 Some(res) => auto_import_probe_refreshing_witnesses(
                     &mut res.storage,
                     &paths.beads_dir,
@@ -575,7 +586,7 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
         };
 
         if should_attempt_auto_import {
-            if ctx.overrides.read_only_fast_open
+            if (ctx.overrides.read_only_fast_open || ctx.overrides.read_only_storage)
                 && write_lock.is_none()
                 && auto_import_write_lock.is_none()
             {
@@ -602,8 +613,8 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
             // classified pending receipt keeps the command read-only; probe
             // uncertainty is an error because serving the database anyway
             // could return stale state.
-            if ctx.overrides.read_only_fast_open
-                && let Some(authority) = auto_import_write_lock.as_ref()
+            if (ctx.overrides.read_only_fast_open || ctx.overrides.read_only_storage)
+                && let Some(authority) = auto_import_write_lock.as_ref().or(write_lock.as_ref())
             {
                 let reprobe = reopen_and_reprobe_fast_open_auto_import_under_authority(
                     &mut storage_result,
@@ -623,9 +634,7 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
         }
 
         if should_attempt_auto_import {
-            if ctx.overrides.read_only_fast_open {
-                let mut writable_overrides = ctx.overrides.clone();
-                writable_overrides.read_only_fast_open = false;
+            if ctx.overrides.read_only_fast_open || ctx.overrides.read_only_storage {
                 let authority = auto_import_write_lock
                     .as_ref()
                     .or(write_lock.as_ref())
@@ -633,20 +642,17 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
                         message: "Writable fast-open reopen has no database-family authority"
                             .to_string(),
                     })?;
-                writable_overrides.mark_database_family_lock_held(&paths.beads_dir, authority);
-                let frozen_startup = storage_result
-                    .as_ref()
-                    .map(config::OpenStorageResult::retained_startup_config)
+                // The positive probe grants import authority only. A generic
+                // writable open could still repair/reconstruct the database
+                // on an anomaly, silently discarding non-JSONL state (#585).
+                // Reopen the witnessed current schema without recovery,
+                // migrations, creation, or default seeding.
+                storage_result
+                    .as_mut()
                     .ok_or_else(|| BeadsError::SyncConflict {
                         message: "Writable fast-open reopen lost its startup snapshot".to_string(),
-                    })?;
-                drop(storage_result.take());
-                storage_result = Some(config::open_storage_with_startup_config_under_write_lock(
-                    frozen_startup,
-                    &writable_overrides,
-                    false,
-                    authority,
-                )?);
+                    })?
+                    .reopen_current_for_auto_import(authority)?;
             }
 
             let _ = auto_import_write_lock.as_ref();
@@ -1326,9 +1332,9 @@ const fn startup_database_authority_required(
 /// Determine if a command potentially mutates data and triggers auto-flush.
 const fn is_mutating_command(cmd: &Commands) -> bool {
     match cmd {
-        Commands::Create(_)
-        | Commands::Update(_)
-        | Commands::Delete(_)
+        Commands::Create(args) => !args.dry_run,
+        Commands::Delete(args) => !args.dry_run,
+        Commands::Update(_)
         | Commands::Close(_)
         | Commands::Reopen(_)
         | Commands::Q(_)
@@ -1357,6 +1363,55 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
         Commands::Orphans(args) => args.fix,
         _ => false,
     }
+}
+
+/// Read intent must not depend on whether a command has a fast-open
+/// optimization. In particular, info, activity-bearing stats, and routed
+/// issue reads must never authorize startup repair or a writable fallback.
+const fn requires_read_only_storage(cmd: &Commands) -> bool {
+    if supports_read_only_fast_open(cmd) {
+        return true;
+    }
+    match cmd {
+        Commands::Create(args) => args.dry_run,
+        Commands::Delete(args) => args.dry_run,
+        Commands::Info(_) | Commands::Where => true,
+        Commands::Config { command } => matches!(
+            command,
+            beads_rust::cli::ConfigCommands::List { .. }
+                | beads_rust::cli::ConfigCommands::Get { .. }
+                | beads_rust::cli::ConfigCommands::Path
+                | beads_rust::cli::ConfigCommands::Schema { .. }
+        ),
+        Commands::Gate { command } => matches!(command, beads_rust::cli::GateCommands::List(_)),
+        Commands::Capacity { command } => !is_mutating_capacity_command(command),
+        Commands::Label { command } => matches!(command, beads_rust::cli::LabelCommands::List(_)),
+        Commands::Audit { command } => matches!(
+            command,
+            beads_rust::cli::AuditCommands::Log(_) | beads_rust::cli::AuditCommands::Summary(_)
+        ),
+        Commands::Epic { command } => matches!(
+            command,
+            beads_rust::cli::EpicCommands::CloseEligible(args) if args.dry_run
+        ),
+        _ => false,
+    }
+}
+
+/// These diagnostics already read generic tables through observational
+/// connections/snapshots and do not require the current application schema.
+/// Keep their writer serialization for coherent snapshots, but never heal or
+/// substitute JSONL for the original database's configuration and row counts.
+const fn inspects_legacy_database_without_recovery(cmd: &Commands) -> bool {
+    matches!(
+        cmd,
+        Commands::Info(_)
+            | Commands::Where
+            | Commands::Config {
+                command: beads_rust::cli::ConfigCommands::List { .. }
+                    | beads_rust::cli::ConfigCommands::Get { .. }
+            }
+    )
 }
 
 const fn command_is_sync_merge(cmd: &Commands) -> bool {
@@ -1470,6 +1525,7 @@ fn force_pending_merge_read_only_overrides(overrides: &mut config::CliOverrides)
     overrides.no_auto_import = Some(true);
     overrides.no_auto_flush = Some(true);
     overrides.read_only_fast_open = true;
+    overrides.read_only_storage = true;
 }
 
 fn pending_sync_merge_refusal_error(state: &commands::doctor::PendingSyncMergeState) -> BeadsError {
@@ -1488,15 +1544,14 @@ fn reviewed_schema_migration_required(source: BeadsError) -> BeadsError {
     source.reviewed_schema_migration_required()
 }
 
-/// Refusal for an explicitly read-only invocation that found a stale schema:
-/// such invocations never rewrite the database, so name the heal instead.
+/// Refusal for a read command that found a stale schema. A subsequent
+/// migration must establish full preservation; JSONL is not a database backup.
 fn stale_schema_observational_refusal(found: u32) -> BeadsError {
     BeadsError::WithContext {
         context: format!(
-            "the tracker database is on schema {found} and explicitly read-only invocations \
-             never upgrade it; any ordinary br command upgrades it automatically when nothing \
-             exists only in the database, or run `{}`",
-            commands::doctor_subsystems::schema_heal::HEAL_COMMAND
+            "the tracker database is on schema {found}; read-only commands never upgrade or \
+             rebuild it. Run `br doctor migrate-schema plan --json` to inspect the \
+             reviewed lossless migration path before upgrading"
         ),
         source: Box::new(BeadsError::SchemaMismatch {
             expected: beads_rust::storage::schema::CURRENT_SCHEMA_VERSION,
@@ -1562,6 +1617,7 @@ fn reopen_and_reprobe_fast_open_auto_import_under_authority(
 ) -> Result<FastOpenAutoImportReprobe> {
     let mut canonical_overrides = overrides.clone();
     canonical_overrides.read_only_fast_open = true;
+    canonical_overrides.read_only_storage = true;
     canonical_overrides.mark_database_family_lock_held(&paths.beads_dir, authority);
 
     // The pre-lock read-only connection may refer to an inode that a writer
@@ -1825,6 +1881,11 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
 
 const fn should_auto_import(cmd: &Commands) -> bool {
     match cmd {
+        Commands::Create(args) => !args.dry_run,
+        Commands::Delete(args) => !args.dry_run,
+        Commands::Epic {
+            command: beads_rust::cli::EpicCommands::CloseEligible(args),
+        } => !args.dry_run,
         Commands::List(_)
         | Commands::Show(_)
         | Commands::Search(_)
@@ -1839,9 +1900,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Status(_)
         | Commands::Changelog(_)
         | Commands::Graph(_)
-        | Commands::Create(_)
         | Commands::Update(_)
-        | Commands::Delete(_)
         | Commands::Close(_)
         | Commands::Reopen(_)
         | Commands::Q(_)
@@ -1912,6 +1971,13 @@ const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
         Commands::Query { command } => is_read_only_query_command(command),
         _ => false,
     }
+}
+
+/// A private JSONL view can answer issue projections, but it cannot stand in
+/// for database-only saved queries, dirty markers, or reconciliation state.
+/// Those commands must inspect the original current schema or refuse.
+const fn supports_stale_jsonl_fallback(cmd: &Commands) -> bool {
+    supports_read_only_fast_open(cmd) && !matches!(cmd, Commands::Query { .. } | Commands::Sync(_))
 }
 
 /// Commands whose default freshness contract can use a nonmutating JSONL
@@ -2451,6 +2517,7 @@ fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
     overrides.lock_timeout = cli.lock_timeout;
     overrides.mark_no_db_write_intent(no_db_jsonl_write_intent(&cli.command));
     overrides.read_only_fast_open = read_only_fast_open;
+    overrides.read_only_storage = requires_read_only_storage(&cli.command);
     overrides
 }
 
@@ -2887,6 +2954,106 @@ mod tests {
 
         let ready = Cli::parse_from(["br", "--no-auto-import", "--no-auto-flush", "ready"]);
         assert!(build_cli_overrides(&ready).read_only_fast_open);
+    }
+
+    #[test]
+    fn read_only_intent_covers_commands_without_fast_open_optimization() {
+        let reads: &[&[&str]] = &[
+            &["br", "info", "--json"],
+            &[
+                "br",
+                "info",
+                "--json",
+                "--no-auto-import",
+                "--no-auto-flush",
+            ],
+            &["br", "where"],
+            &["br", "stats"],
+            &["br", "status"],
+            &["br", "lint", "demo-1"],
+            &["br", "label", "list", "demo-1"],
+            &["br", "config", "get", "compact_model"],
+            &["br", "config", "list"],
+            &["br", "gate", "list", "demo-1"],
+            &["br", "capacity", "exemptions"],
+            &["br", "audit", "summary"],
+            &["br", "epic", "close-eligible", "--dry-run"],
+            &["br", "create", "preview", "--dry-run"],
+            &["br", "delete", "demo-1", "--dry-run"],
+        ];
+        for args in reads {
+            let cli = Cli::parse_from(*args);
+            assert!(
+                build_cli_overrides(&cli).read_only_storage,
+                "{args:?} must not authorize schema repair or writable fallback"
+            );
+        }
+        let writes: &[&[&str]] = &[
+            &["br", "create", "new issue"],
+            &["br", "config", "set", "compact_model=example"],
+            &["br", "query", "delete", "saved"],
+            &["br", "sync", "--import-only"],
+            &["br", "sync", "--flush-only"],
+            &["br", "doctor", "migrate-schema", "heal"],
+        ];
+        for args in writes {
+            let cli = Cli::parse_from(*args);
+            assert!(
+                !build_cli_overrides(&cli).read_only_storage,
+                "{args:?} has explicit mutation intent"
+            );
+        }
+    }
+
+    #[test]
+    fn previews_do_not_authorize_startup_sync_or_mutation() {
+        for args in [
+            vec!["br", "create", "preview", "--dry-run"],
+            vec!["br", "delete", "demo-1", "--dry-run"],
+            vec!["br", "epic", "close-eligible", "--dry-run"],
+        ] {
+            let cli = Cli::parse_from(args);
+            assert!(requires_read_only_storage(&cli.command));
+            assert!(!is_mutating_command(&cli.command));
+            assert!(!no_db_jsonl_write_intent(&cli.command));
+            assert!(!should_auto_import(&cli.command));
+        }
+    }
+
+    #[test]
+    fn database_authority_reads_cannot_substitute_a_jsonl_projection() {
+        for args in [
+            vec!["br", "query", "list"],
+            vec!["br", "query", "run", "saved"],
+            vec!["br", "sync", "--status"],
+            vec!["br", "sync", "--reconcile", "--dry-run"],
+            vec!["br", "audit", "summary"],
+        ] {
+            let cli = Cli::parse_from(args);
+            assert!(requires_read_only_storage(&cli.command));
+            assert!(!supports_stale_jsonl_fallback(&cli.command));
+        }
+        for args in [vec!["br", "list"], vec!["br", "show", "demo-1"]] {
+            let cli = Cli::parse_from(args);
+            assert!(supports_stale_jsonl_fallback(&cli.command));
+        }
+    }
+
+    #[test]
+    fn legacy_diagnostics_inspect_original_database_without_schema_heal() {
+        for args in [
+            vec!["br", "info", "--schema", "--json"],
+            vec!["br", "where"],
+            vec!["br", "config", "get", "compact_model"],
+            vec!["br", "config", "list"],
+        ] {
+            let cli = Cli::parse_from(args);
+            assert!(inspects_legacy_database_without_recovery(&cli.command));
+            assert!(requires_read_only_storage(&cli.command));
+            assert!(!should_auto_import(&cli.command));
+        }
+        let list = Cli::parse_from(["br", "list"]);
+        assert!(!inspects_legacy_database_without_recovery(&list.command));
     }
 
     #[test]

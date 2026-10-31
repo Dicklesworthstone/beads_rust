@@ -3645,11 +3645,11 @@ pub enum DoctorMigrateSchemaCommand {
     /// Upgrade a database left on an older schema (any version, including the
     /// unversioned schema 0 of early br and Go bd), keeping a backup.
     ///
-    /// Schemas 13-18 use the reviewed in-place migration. Older schemas are
-    /// rebuilt from issues.jsonl; issues that exist only in the database are
-    /// re-added as unflushed changes so the next flush exports them. Ordinary
-    /// commands do this automatically when the database holds nothing the
-    /// JSONL lacks; this command is for the case they refuse.
+    /// Schemas 13-18 use the reviewed lossless migration. Refused or unavailable
+    /// migrations leave the original database in place: JSONL reconstruction
+    /// cannot guarantee complete preservation through concurrent access or an
+    /// interrupted replay. Ordinary read commands never upgrade or rebuild
+    /// databases. Use --dry-run to inspect the preservation audit.
     Heal(DoctorMigrateSchemaHealArgs),
 }
 
@@ -3661,8 +3661,9 @@ pub struct DoctorMigrateSchemaHealArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Do not re-add database-only issues after a rebuild; they remain only
-    /// in the retained backup.
+    /// Include the legacy discard request in the reconstruction audit. This
+    /// cannot bypass the requirement for a reviewed lossless migration or
+    /// authorize discarding history, configuration, or database-only records.
     #[arg(long)]
     pub discard_db_only: bool,
 

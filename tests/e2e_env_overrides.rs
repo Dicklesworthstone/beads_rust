@@ -461,11 +461,17 @@ fn e2e_beads_jsonl_external_rename_prefix_honors_allow_flag_during_config_load()
 }
 
 #[test]
-fn e2e_beads_jsonl_external_missing_db_recovery_honors_allow_flag() {
-    let _log = common::test_log("e2e_beads_jsonl_external_missing_db_recovery_honors_allow_flag");
+fn e2e_external_missing_database_requires_explicit_import_and_honors_allow_flag() {
+    let _log = common::test_log(
+        "e2e_external_missing_database_requires_explicit_import_and_honors_allow_flag",
+    );
     let workspace = BrWorkspace::new();
 
-    let init = run_br(&workspace, ["init"], "init_external_missing_db_recovery");
+    let init = run_br(
+        &workspace,
+        ["init", "--prefix", "ext"],
+        "init_external_missing_db_recovery",
+    );
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
     let external_dir = workspace.temp_dir.path().join("external-recovery");
@@ -476,33 +482,73 @@ fn e2e_beads_jsonl_external_missing_db_recovery_honors_allow_flag() {
         "{\"id\":\"ext-1\",\"title\":\"External missing DB recovery\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":\"2026-01-01T00:00:00Z\",\"updated_at\":\"2026-01-01T00:00:00Z\"}\n",
     )
     .expect("write external jsonl");
+    let source_bytes = fs::read(&external_jsonl).unwrap();
+    let original_db = workspace.root.join(".beads/beads.db");
+    let original_bytes = fs::read(&original_db).unwrap();
 
     let alt_db = workspace
         .root
         .join(".beads")
         .join("external-missing-db-recovery.db");
-    let env_vars = vec![("BEADS_JSONL", external_jsonl.to_str().unwrap())];
-    let status = run_br_with_env(
-        &workspace,
-        [
-            "--db",
-            alt_db.to_str().expect("alt db path"),
-            "sync",
-            "--status",
-            "--allow-external-jsonl",
-            "--json",
-            "--no-auto-import",
-            "--no-auto-flush",
-        ],
-        env_vars,
+    let run_external = |args: &[&str], label: &str| {
+        run_br_with_env(
+            &workspace,
+            [
+                "--db",
+                alt_db.to_str().unwrap(),
+                "--json",
+                "--no-auto-import",
+                "--no-auto-flush",
+            ]
+            .into_iter()
+            .chain(args.iter().copied()),
+            [("BEADS_JSONL", external_jsonl.to_str().unwrap())],
+            label,
+        )
+    };
+    let status = run_external(
+        &["sync", "--status", "--allow-external-jsonl"],
         "sync_external_missing_db_recovery_status",
     );
     assert!(
-        status.status.success(),
-        "external JSONL missing-db recovery should honor --allow-external-jsonl during startup rebuild: stdout={} stderr={}",
+        !status.status.success(),
+        "read-only status must not create a missing database: stdout={} stderr={}",
         status.stdout,
         status.stderr
     );
+    assert!(!alt_db.exists());
+    assert_eq!(fs::read(&original_db).unwrap(), original_bytes);
+    assert_eq!(fs::read(&external_jsonl).unwrap(), source_bytes);
+    assert!(!workspace.root.join(".beads/.br_recovery").exists());
+
+    // An explicit in-memory view can report the external JSONL without
+    // installing any database. Creating the selected DB is a separate write.
+    let no_db = run_external(
+        &["--no-db", "sync", "--status", "--allow-external-jsonl"],
+        "external_missing_db_in_memory_status",
+    );
+    assert!(
+        no_db.status.success(),
+        "in-memory status failed: {}",
+        no_db.stderr
+    );
+    assert!(!alt_db.exists());
+    assert_eq!(fs::read(&original_db).unwrap(), original_bytes);
+    assert_eq!(fs::read(&external_jsonl).unwrap(), source_bytes);
+
+    let import = run_external(
+        &["sync", "--import-only", "--allow-external-jsonl"],
+        "external_missing_db_explicit_import",
+    );
+    assert!(
+        import.status.success(),
+        "explicit import failed: {} {}",
+        import.stdout,
+        import.stderr
+    );
+    assert!(alt_db.exists());
+    assert_eq!(fs::read(&original_db).unwrap(), original_bytes);
+    assert_eq!(fs::read(&external_jsonl).unwrap(), source_bytes);
 
     let list = run_br(
         &workspace,
@@ -523,7 +569,7 @@ fn e2e_beads_jsonl_external_missing_db_recovery_honors_allow_flag() {
             issue.get("title").and_then(Value::as_str),
             Some("External missing DB recovery")
         )),
-        "issue imported during missing-db recovery should be listed"
+        "issue imported by the explicit command should be listed"
     );
 }
 

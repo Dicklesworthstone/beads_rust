@@ -1,10 +1,8 @@
 //! E2E tests for the stale-schema self-heal.
 //!
-//! A tracker database left on an older schema used to refuse every command.
-//! Ordinary commands now upgrade it automatically when an audit proves every
-//! database row is represented in the JSONL, keep a backup, and print one
-//! stderr notice; otherwise mutations refuse with the one command that
-//! resolves it and read-only commands read the JSONL directly.
+//! Read commands must never migrate or replace an older database. Mutations
+//! may run a reviewed lossless migration, but a missing or refused migration
+//! is not permission to replace database authority with a JSONL projection.
 //!
 //! Fixture provenance: `schema4_v0127_*.db.gz` were written by the released
 //! `br 0.1.27` binary (which stamps `user_version = 4`) with real `init` /
@@ -17,10 +15,11 @@
 mod common;
 
 use beads_rust::franken_sync::{Connection, SqliteValue};
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
 use flate2::read::GzDecoder;
 use serde_json::Value;
-use std::fs;
+use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -61,14 +60,160 @@ fn json_stdout(stdout: &str) -> Value {
     serde_json::from_str(&extract_json_payload(stdout)).expect("stdout must be clean JSON")
 }
 
+/// Source payloads and retained recovery evidence. A read may acquire an
+/// opener lease or update SHM reader marks, but none of these bytes may change.
+fn protected_files(workspace: &BrWorkspace) -> BTreeMap<PathBuf, Vec<u8>> {
+    protected_files_at(&workspace.root.join(".beads"))
+}
+
+fn protected_files_at(beads_dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    for name in [
+        "beads.db",
+        "beads.db-wal",
+        "beads.db-journal",
+        "issues.jsonl",
+        "issues.history.jsonl",
+        "metadata.json",
+        "config.yaml",
+    ] {
+        let path = beads_dir.join(name);
+        match fs::read(&path) {
+            Ok(bytes) => {
+                files.insert(PathBuf::from(name), bytes);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("cannot inspect {}: {error}", path.display()),
+        }
+    }
+    for path in walk(&beads_dir.join(".br_recovery")) {
+        files.insert(
+            path.strip_prefix(beads_dir).unwrap().to_path_buf(),
+            fs::read(path).expect("read retained recovery evidence"),
+        );
+    }
+    files
+}
+
 fn show(workspace: &BrWorkspace, id: &str) -> Value {
     let run = run_br(workspace, ["show", id, "--json"], &format!("show_{id}"));
     assert!(run.status.success(), "show {id}: {}", run.stderr);
     json_stdout(&run.stdout)[0].clone()
 }
 
+/// Synthetic variants of the released schema-16 tracker. A schema-17 source
+/// receives the actual v17 occupancy addition; other version variants
+/// deliberately exercise dispatch decisions. The frozen released fixtures in
+/// e2e_schema_migration_upgrade independently qualify historical migrations.
+fn synthetic_tracker(version: u32, events: usize, refused_index: bool) -> (BrWorkspace, PathBuf) {
+    let workspace = BrWorkspace::new();
+    let db = install(
+        &workspace,
+        "schema16_v0219_release.db.gz",
+        "schema16_issues.jsonl",
+        "v15ws",
+    );
+    fs::write(
+        workspace.root.join(".beads/metadata.json"),
+        "{\"database\":\"beads.db\",\"jsonl_export\":\"issues.jsonl\"}\n",
+    )
+    .unwrap();
+    let connection = Connection::open(db.to_string_lossy().into_owned()).expect("open fixture");
+    connection.execute("BEGIN IMMEDIATE").unwrap();
+    // Replace only synthetic test records so the investigation's count is
+    // exact, rather than counting the seed fixture's incidental audit rows.
+    connection.execute("DELETE FROM events").unwrap();
+    for index in 0..events {
+        connection
+            .execute_with_params(
+                "INSERT INTO events \
+                 (issue_id, event_type, actor, old_value, new_value, comment, created_at, \
+                  agent_name, harness, model) \
+                 VALUES ('v15ws-9nx', 'updated', 'gh-585', ?1, ?2, ?3, \
+                         '2026-10-31T00:00:00Z', 'preserved-agent', 'preserved-harness', 'model')",
+                &[
+                    SqliteValue::from(format!("before-{index}")),
+                    SqliteValue::from(format!("after-{index}")),
+                    SqliteValue::from(format!("database-only audit event {index}")),
+                ],
+            )
+            .unwrap();
+    }
+    for sql in [
+        "INSERT INTO config (key, value) VALUES ('compact_batch_size', '37')",
+        "INSERT INTO config (key, value) VALUES ('compact_model', 'local-model')",
+        "INSERT INTO config (key, value) VALUES ('compaction_enabled', 'false')",
+    ] {
+        connection.execute(sql).unwrap();
+    }
+    if version == 17 && !refused_index {
+        // Derive the genuine v17 shape from the released v16 fixture without
+        // adding v18/v19 columns. This is a reviewed-upgrade control, not a
+        // version stamp over an incompatible older table inventory.
+        for sql in [
+            "CREATE TABLE capacity_occupancy (issue_id TEXT PRIMARY KEY, actor TEXT, \
+             agent_name TEXT, harness TEXT, session TEXT, \
+             recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+             FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE)",
+            "CREATE INDEX idx_capacity_occupancy_actor ON capacity_occupancy(actor) WHERE actor IS NOT NULL",
+            "CREATE INDEX idx_capacity_occupancy_harness ON capacity_occupancy(harness) WHERE harness IS NOT NULL",
+            "CREATE INDEX idx_capacity_occupancy_session ON capacity_occupancy(session) WHERE session IS NOT NULL",
+        ] {
+            connection.execute(sql).unwrap();
+        }
+    }
+    if refused_index {
+        // These accelerators appeared in the #585 report and are outside the
+        // reviewed schema-16 dependency index set. The source is not corrupt.
+        for sql in [
+            "CREATE INDEX idx_dependencies_depends_on_type_issue \
+             ON dependencies (depends_on_id, type, issue_id)",
+            "CREATE INDEX idx_dependencies_issue_type ON dependencies (issue_id, type)",
+        ] {
+            connection.execute(sql).unwrap();
+        }
+    }
+    connection
+        .execute(&format!("PRAGMA user_version = {version}"))
+        .unwrap();
+    connection.execute("COMMIT").unwrap();
+    connection.close().expect("close synthetic fixture");
+    (workspace, db)
+}
+
+/// Inspect a private copy: the assertion machinery must not itself checkpoint
+/// or migrate the database whose preservation it is measuring.
+fn query_copy(db: &Path, sql: &str) -> Vec<Vec<SqliteValue>> {
+    let scratch = tempfile::tempdir().expect("scratch copy");
+    let copy = scratch.path().join("copy.db");
+    fs::copy(db, &copy).unwrap();
+    for suffix in ["-wal", "-journal"] {
+        let source = PathBuf::from(format!("{}{suffix}", db.display()));
+        if source.is_file() {
+            fs::copy(source, scratch.path().join(format!("copy.db{suffix}"))).unwrap();
+        }
+    }
+    let connection = Connection::open(copy.to_string_lossy().into_owned()).expect("open copy");
+    let rows = connection
+        .query(sql)
+        .expect("read preserved records")
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect();
+    connection.close().expect("close inspection copy");
+    rows
+}
+
+fn event_count(db: &Path) -> usize {
+    let rows = query_copy(db, "SELECT count(*) FROM events");
+    match rows[0][0] {
+        SqliteValue::Integer(count) => usize::try_from(count).expect("nonnegative event count"),
+        ref other => panic!("invalid event count: {other:?}"),
+    }
+}
+
 #[test]
-fn clean_legacy_database_heals_automatically_and_keeps_a_backup() {
+fn legacy_database_without_a_reviewed_migration_refuses_automatic_rebuild() {
     let workspace = BrWorkspace::new();
     let db_path = install(
         &workspace,
@@ -77,6 +222,7 @@ fn clean_legacy_database_heals_automatically_and_keeps_a_backup() {
         "leg",
     );
     assert_eq!(header_user_version(&db_path), 4);
+    let before = protected_files(&workspace);
 
     let create = run_br(
         &workspace,
@@ -84,28 +230,30 @@ fn clean_legacy_database_heals_automatically_and_keeps_a_backup() {
         "create_after_heal",
     );
     assert!(
-        create.status.success(),
-        "create must heal and proceed: {}",
-        create.stderr
+        !create.status.success(),
+        "an unreviewed schema must not be rebuilt automatically: {} {}",
+        create.stdout,
+        create.stderr,
     );
-    let created = json_stdout(&create.stdout);
-    assert_eq!(created["title"], "Created after heal");
-    let notices: Vec<&str> = create
-        .stderr
-        .lines()
-        .filter(|line| line.starts_with("br: tracker database was on schema 4"))
-        .collect();
-    assert_eq!(notices.len(), 1, "one notice line: {}", create.stderr);
+    let message = json_stdout(&create.stdout)["error"]["message"]
+        .as_str()
+        .expect("actionable refusal")
+        .to_owned();
     assert!(
-        notices[0].contains("rebuilt it from the JSONL") && notices[0].contains(".br_recovery")
+        message.contains("migration") && message.contains("doctor"),
+        "{message}"
     );
+    assert_eq!(protected_files(&workspace), before);
+    assert_eq!(header_user_version(&db_path), 4);
 
-    // Current schema now, with every flushed row, label, comment and dependency.
-    let listed = run_br(&workspace, ["list", "--json"], "list_after_heal");
+    // The JSONL issue projection is still readable, without claiming that its
+    // missing audit history is the complete database or replacing the source.
+    let listed = run_br(&workspace, ["list", "--json"], "list_without_heal");
     assert!(listed.status.success(), "{}", listed.stderr);
     assert!(
-        !listed.stderr.contains("tracker database was on schema"),
-        "heals once"
+        listed.stderr.contains("reads issues.jsonl directly"),
+        "{}",
+        listed.stderr
     );
     let issue = show(&workspace, "leg-n57");
     assert_eq!(issue["labels"], serde_json::json!(["legacy-label"]));
@@ -113,26 +261,8 @@ fn clean_legacy_database_heals_automatically_and_keeps_a_backup() {
     let second = show(&workspace, "leg-znr");
     assert_eq!(second["dependencies"][0]["id"], "leg-n57", "{second}");
 
-    // The old database is retained byte-for-byte in the recovery directory.
-    let recovery = workspace.root.join(".beads/.br_recovery");
-    let retained = walk(&recovery)
-        .into_iter()
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("beads.db") && !name.contains("-wal"))
-        })
-        .find(|path| {
-            fs::read(path).is_ok_and(|bytes| bytes.len() > 100 && header_bytes(&bytes) == 4)
-        });
-    assert!(
-        retained.is_some(),
-        "schema-4 backup must be retained under {recovery:?}"
-    );
-}
-
-fn header_bytes(bytes: &[u8]) -> u32 {
-    u32::from_be_bytes(bytes[60..64].try_into().expect("header"))
+    assert_eq!(protected_files(&workspace), before);
+    assert!(!workspace.root.join(".beads/.br_recovery").exists());
 }
 
 fn walk(dir: &Path) -> Vec<PathBuf> {
@@ -151,7 +281,7 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
-fn database_only_data_refuses_mutation_reads_jsonl_and_heals_explicitly() {
+fn database_only_data_refuses_unreviewed_migration_and_keeps_read_only_jsonl_available() {
     let workspace = BrWorkspace::new();
     let db_path = install(
         &workspace,
@@ -160,8 +290,11 @@ fn database_only_data_refuses_mutation_reads_jsonl_and_heals_explicitly() {
         "leg",
     );
     let source = fs::read(&db_path).expect("source bytes");
+    let protected = protected_files(&workspace);
 
-    // Mutations refuse, naming the command and the database-only issues.
+    // Without a reviewed migration the source must remain authoritative.
+    // Automatic startup cannot treat issue equivalence as permission to
+    // discard events, configuration, or a partially restorable database.
     let create = run_br(
         &workspace,
         ["create", "blocked", "--json"],
@@ -171,9 +304,7 @@ fn database_only_data_refuses_mutation_reads_jsonl_and_heals_explicitly() {
     let error = json_stdout(&create.stdout);
     let message = error["error"]["message"].as_str().expect("message");
     assert!(
-        message.contains("br doctor migrate-schema heal")
-            && message.contains("leg-u4i (absent from JSONL)")
-            && message.contains("leg-n57 (unflushed edit)"),
+        message.contains("br doctor migrate-schema heal") && message.contains("migration"),
         "{message}"
     );
     assert_eq!(fs::read(&db_path).expect("after refusal"), source);
@@ -215,37 +346,31 @@ fn database_only_data_refuses_mutation_reads_jsonl_and_heals_explicitly() {
     );
     assert_eq!(fs::read(&db_path).expect("after dry run"), source);
 
-    // The explicit heal rebuilds and re-adds both database-only issues.
-    let heal = run_br(
-        &workspace,
-        ["doctor", "migrate-schema", "heal", "--json"],
-        "heal_explicit",
-    );
-    assert!(heal.status.success(), "{} {}", heal.stdout, heal.stderr);
-    let outcome = json_stdout(&heal.stdout);
-    assert_eq!(outcome["action"], "rebuilt");
-    let mut restored: Vec<&str> = outcome["restored_db_only"]
-        .as_array()
-        .expect("restored")
-        .iter()
-        .filter_map(Value::as_str)
-        .collect();
-    restored.sort_unstable();
-    assert_eq!(restored, vec!["leg-n57", "leg-u4i"]);
-    assert_eq!(header_user_version(&db_path), current_version());
-
-    assert_eq!(
-        show(&workspace, "leg-n57")["title"],
-        "Renamed locally, never flushed"
-    );
-    assert_eq!(
-        show(&workspace, "leg-u4i")["title"],
-        "Unflushed legacy issue"
-    );
-    let flush = run_br(&workspace, ["sync", "--flush-only", "--json"], "flush");
-    assert!(flush.status.success(), "{}", flush.stderr);
-    let jsonl = fs::read_to_string(workspace.root.join(".beads/issues.jsonl")).expect("jsonl");
-    assert!(jsonl.contains("\"leg-u4i\"") && jsonl.contains("Renamed locally, never flushed"));
+    // Neither an explicit heal nor its discard flag establishes a crash-safe
+    // migration. All local records must stay active, not merely in a backup.
+    for discard in [false, true] {
+        let mut args = vec!["doctor", "migrate-schema", "heal", "--json"];
+        if discard {
+            args.push("--discard-db-only");
+        }
+        let heal = run_br(&workspace, args, "heal_refused");
+        assert!(!heal.status.success(), "{} {}", heal.stdout, heal.stderr);
+        let message = json_stdout(&heal.stdout)["error"]["message"]
+            .as_str()
+            .expect("refusal")
+            .to_owned();
+        assert!(
+            message.contains("migration") && message.contains("preserv"),
+            "{message}"
+        );
+        assert_eq!(protected_files(&workspace), protected);
+        assert_eq!(header_user_version(&db_path), 4);
+        assert_eq!(event_count(&db_path), 7);
+        let rows = query_copy(&db_path, "SELECT id, title FROM issues ORDER BY id");
+        assert!(rows.iter().any(|row| row[0].as_text() == Some("leg-u4i")
+            && row[1].as_text() == Some("Unflushed legacy issue")));
+    }
+    assert!(!workspace.root.join(".beads/.br_recovery").exists());
 }
 
 #[test]
@@ -272,7 +397,7 @@ fn explicitly_read_only_invocation_never_heals() {
         2
     );
     assert!(
-        list.stderr.contains("migrate-schema heal"),
+        list.stderr.contains("migrate-schema plan --json"),
         "{}",
         list.stderr
     );
@@ -346,7 +471,7 @@ fn reviewed_range_database_heals_through_the_reviewed_migration() {
 /// with "does not match its normalized JSONL payload (differing fields:
 /// dependencies)"; five real trackers carried such edges.
 #[test]
-fn dangling_dependency_edge_does_not_block_import_or_heal() {
+fn dangling_dependency_edge_import_does_not_authorize_rebuilding_an_old_database() {
     let workspace = BrWorkspace::new();
     let db_path = install(
         &workspace,
@@ -377,24 +502,40 @@ fn dangling_dependency_edge_does_not_block_import_or_heal() {
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(&jsonl_path, format!("{rewritten}\n")).expect("rewrite jsonl");
+    let before = protected_files(&workspace);
 
-    // The automatic heal rebuilds from this JSONL.
-    let list = run_br(
-        &workspace,
-        ["list", "--json"],
-        "list_heals_with_dangling_edge",
-    );
+    // Reads may use JSONL; neither usable JSONL nor a dangling edge licenses
+    // replacing this old tracker and dropping its database-only audit trail.
+    let list = run_br(&workspace, ["list", "--json"], "list_with_dangling_edge");
     assert!(list.status.success(), "{}", list.stderr);
     assert!(
-        list.stderr.contains("rebuilt it from the JSONL"),
+        list.stderr.contains("reads issues.jsonl directly"),
         "{}",
         list.stderr
     );
-    assert_eq!(header_user_version(&db_path), current_version());
-
-    // A plain re-import of the same JSONL succeeds too.
-    let import = run_br(
+    assert_eq!(header_user_version(&db_path), 4);
+    let heal = run_br(
         &workspace,
+        ["doctor", "migrate-schema", "heal", "--json"],
+        "heal_refuses_despite_readable_jsonl",
+    );
+    assert!(!heal.status.success(), "{} {}", heal.stdout, heal.stderr);
+    assert_eq!(header_user_version(&db_path), 4);
+    assert_eq!(protected_files(&workspace), before);
+    assert_eq!(event_count(&db_path), 5);
+
+    // Preserve the original orphan-import regression on a current tracker,
+    // where the user is explicitly importing this interchange projection.
+    let current = BrWorkspace::new();
+    let init = run_br(
+        &current,
+        ["init", "--prefix", "leg", "--json"],
+        "init_import_target",
+    );
+    assert!(init.status.success(), "{} {}", init.stdout, init.stderr);
+    fs::copy(&jsonl_path, current.root.join(".beads/issues.jsonl")).unwrap();
+    let import = run_br(
+        &current,
         ["sync", "--import-only", "--rebuild", "--json"],
         "reimport_with_dangling_edge",
     );
@@ -405,7 +546,7 @@ fn dangling_dependency_edge_does_not_block_import_or_heal() {
         import.stderr
     );
     assert!(
-        show(&workspace, "leg-n57")["dependencies"]
+        show(&current, "leg-n57")["dependencies"]
             .as_array()
             .is_none_or(Vec::is_empty),
         "the dangling edge is dropped locally"
@@ -526,12 +667,10 @@ fn orphan_relation_rows_heal_through_the_reviewed_migration_and_are_kept() {
     );
 }
 
-/// Without a reviewed migration (schema 4 heals by rebuilding from the JSONL),
-/// orphan relation rows cannot be carried into the rebuilt tracker. Ordinary
-/// commands and the plain heal refuse and change nothing; the explicit
-/// `--discard-db-only` rebuilds and keeps the rows only in the retained backup.
+/// Orphans do not justify replacing the rest of an undamaged tracker.
+/// Neither mode nor the old discard flag supplies a reviewed migration.
 #[test]
-fn orphan_relation_rows_refuse_a_rebuild_until_discard_is_explicit() {
+fn orphan_relation_rows_never_authorize_an_unreviewed_rebuild() {
     let workspace = BrWorkspace::new();
     let db_path = install(
         &workspace,
@@ -541,6 +680,7 @@ fn orphan_relation_rows_refuse_a_rebuild_until_discard_is_explicit() {
     );
     add_orphan_relations(&db_path, "leg-deleted");
     assert_eq!(header_user_version(&db_path), 4);
+    let before = protected_files(&workspace);
 
     let create = run_br(
         &workspace,
@@ -551,7 +691,7 @@ fn orphan_relation_rows_refuse_a_rebuild_until_discard_is_explicit() {
     // With --json the refusal is a JSON error on stdout.
     let refusal = format!("{}{}", create.stdout, create.stderr);
     assert!(
-        refusal.contains("without an owning issue") && refusal.contains("--discard-db-only"),
+        refusal.contains("migration") && refusal.contains("doctor"),
         "{refusal}"
     );
     assert_eq!(header_user_version(&db_path), 4, "nothing changed");
@@ -564,7 +704,7 @@ fn orphan_relation_rows_refuse_a_rebuild_until_discard_is_explicit() {
     assert!(!heal.status.success(), "plain heal must refuse");
     let refusal = format!("{}{}", heal.stdout, heal.stderr);
     assert!(
-        refusal.contains("rebuild refused") && refusal.contains("without an owning issue"),
+        refusal.contains("refused") && refusal.contains("migration"),
         "{refusal}"
     );
     assert_eq!(header_user_version(&db_path), 4, "nothing changed");
@@ -581,34 +721,552 @@ fn orphan_relation_rows_refuse_a_rebuild_until_discard_is_explicit() {
         ],
         "orphans4_heal_discard",
     );
-    assert!(heal.status.success(), "{} {}", heal.stdout, heal.stderr);
-    let outcome = json_stdout(&heal.stdout);
-    assert_eq!(outcome["action"], "rebuilt", "{outcome}");
-    assert_eq!(
-        outcome["backup_only_orphan_relations"],
-        serde_json::json!([
-            {"table": "labels", "rows": 1},
-            {"table": "comments", "rows": 1}
-        ]),
-        "{outcome}"
-    );
-    assert_eq!(header_user_version(&db_path), current_version());
-    assert_eq!(relation_rows(&db_path, "leg-deleted"), (0, 0));
+    assert!(!heal.status.success(), "{} {}", heal.stdout, heal.stderr);
+    assert_eq!(header_user_version(&db_path), 4);
+    assert_eq!(relation_rows(&db_path, "leg-deleted"), (1, 1));
+    assert_eq!(event_count(&db_path), 5);
+    assert_eq!(protected_files(&workspace), before);
     let issue = show(&workspace, "leg-n57");
     assert_eq!(issue["labels"], serde_json::json!(["legacy-label"]));
+    assert_eq!(protected_files(&workspace), before);
+    assert!(!workspace.root.join(".beads/.br_recovery").exists());
+}
 
-    // The rows survive byte-for-byte in the retained schema-4 backup.
-    let recovery = workspace.root.join(".beads/.br_recovery");
-    let retained = walk(&recovery)
+/// #585's five ordinary reads, expanded to the flagged info regression and
+/// relation commands. Each runs below the tracker, not with a BEADS_DIR hint.
+#[test]
+fn gh585_nested_read_matrix_never_upgrades_or_rebuilds_old_databases() {
+    let commands = [
+        vec!["info", "--json"],
+        vec!["list", "--json"],
+        vec!["ready", "--json"],
+        vec!["stats", "--json"],
+        vec!["show", "v15ws-9nx", "--json"],
+        vec!["blocked", "--json"],
+        vec!["dep", "list", "v15ws-z1u", "--json"],
+        vec!["dep", "tree", "v15ws-z1u", "--direction=down", "--json"],
+    ];
+    for (version, refused_index) in [(0, false), (4, false), (7, false), (16, true), (17, false)] {
+        let (mut workspace, db) = synthetic_tracker(version, 5, refused_index);
+        let beads_dir = workspace.root.join(".beads");
+        let before = protected_files(&workspace);
+        let config = query_copy(&db, "SELECT key, value FROM config ORDER BY key");
+        assert_eq!(config.len(), 4);
+        assert_eq!(event_count(&db), 5);
+        let nested = workspace.root.join("project/nested");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(!nested.join(".beads").exists());
+        workspace.root = nested;
+
+        // The optimization switch must not decide whether explicitly
+        // observational commands have permission to rewrite user data.
+        for mode in 0..3 {
+            for (index, command) in commands.iter().enumerate() {
+                let mut args = command.clone();
+                if mode != 0 {
+                    args.extend(["--no-auto-import", "--no-auto-flush"]);
+                }
+                let label = format!("gh585_read_v{version}_mode{mode}_{index}");
+                let run = if mode == 2 {
+                    run_br_with_env(
+                        &workspace,
+                        args,
+                        [("BR_DISABLE_READ_ONLY_FAST_OPEN", "1")],
+                        &label,
+                    )
+                } else {
+                    run_br(&workspace, args, &label)
+                };
+                assert!(
+                    run.status.success(),
+                    "{label}: the supported JSONL read fallback must stay usable: {} {}",
+                    run.stdout,
+                    run.stderr
+                );
+                let _ = json_stdout(&run.stdout);
+                if command[0] != "info" {
+                    assert!(
+                        run.stderr.contains("schema") && !run.stderr.contains("rebuilt it"),
+                        "{label}: explain the stale source without claiming migration: {}",
+                        run.stderr
+                    );
+                }
+                assert_eq!(
+                    protected_files_at(&beads_dir),
+                    before,
+                    "{label}: a read changed source or recovery bytes"
+                );
+                assert_eq!(header_user_version(&db), version);
+                assert!(!beads_dir.join(".br_recovery").exists());
+            }
+        }
+        assert_eq!(event_count(&db), 5);
+        assert_eq!(
+            query_copy(&db, "SELECT key, value FROM config ORDER BY key"),
+            config
+        );
+    }
+}
+
+#[test]
+fn gh585_database_authority_reads_never_invent_empty_history_or_default_config() {
+    let (workspace, db) = synthetic_tracker(16, 5, true);
+    let connection = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+    for sql in [
+        "INSERT INTO config (key, value) VALUES ('saved_query:local', \
+         '{\"name\":\"local\",\"created_at\":\"2026-10-31T00:00:00Z\",\"filters\":{\"status\":[\"open\"]}}')",
+        "INSERT OR REPLACE INTO dirty_issues (issue_id, marked_at) VALUES ('v15ws-9nx', '2026-10-31T00:00:00Z')",
+        "UPDATE metadata SET value = '1' WHERE key = 'needs_flush'",
+    ] {
+        connection.execute(sql).unwrap();
+    }
+    connection.close().unwrap();
+    let before = protected_files(&workspace);
+    for (index, mut args) in [
+        vec!["audit", "log", "v15ws-9nx", "--json"],
+        vec!["audit", "summary", "--json"],
+        vec!["query", "list", "--json"],
+        vec!["query", "run", "local", "--json"],
+        vec!["sync", "--status", "--json"],
+        vec!["sync", "--reconcile", "--dry-run", "--json"],
+        vec!["config", "get", "compact_model", "--json"],
+        vec!["config", "list", "--json"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        args.extend(["--no-auto-import", "--no-auto-flush"]);
+        let run = run_br(&workspace, args, &format!("gh585_db_authority_{index}"));
+        if index < 6 {
+            assert!(
+                !run.status.success(),
+                "must refuse an incomplete view of database authority: {}",
+                run.stdout
+            );
+            let error = json_stdout(&run.stdout)["error"]["message"]
+                .as_str()
+                .expect("structured refusal")
+                .to_owned();
+            assert!(
+                error.contains("schema") && error.contains("doctor"),
+                "{error}"
+            );
+        } else {
+            assert!(run.status.success(), "{} {}", run.stdout, run.stderr);
+            let config = json_stdout(&run.stdout);
+            if index == 6 {
+                assert_eq!(config["value"], "local-model");
+            } else {
+                assert_eq!(config["compact_model"], "local-model");
+                assert_eq!(config["compact_batch_size"], "37");
+                assert_eq!(config["compaction_enabled"], "false");
+                assert!(
+                    config["saved_query:local"]
+                        .as_str()
+                        .is_some_and(|query| query.contains("local"))
+                );
+            }
+        }
+        assert_eq!(protected_files(&workspace), before);
+        assert_eq!(event_count(&db), 5);
+    }
+}
+
+#[test]
+fn gh585_explicit_previews_never_upgrade_older_databases() {
+    // Schema 16 has a reviewed migration, while schema 4 has no such path.
+    // The preview contract forbids either kind of upgrade before dispatch.
+    for version in [4, 16] {
+        let (workspace, db) = synthetic_tracker(version, 5, false);
+        let before = protected_files(&workspace);
+        for (index, command) in [
+            vec!["create", "Proposed issue", "--dry-run", "--json"],
+            vec!["delete", "v15ws-9nx", "--dry-run", "--json"],
+            vec!["delete", "--hard", "--dry-run", "--json"],
+            vec!["epic", "close-eligible", "--dry-run", "--json"],
+        ]
         .into_iter()
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("beads.db") && !name.contains('-'))
-        })
-        .find(|path| {
-            fs::read(path).is_ok_and(|bytes| bytes.len() > 100 && header_bytes(&bytes) == 4)
-        })
-        .unwrap_or_else(|| panic!("schema-4 backup must be retained under {recovery:?}"));
-    assert_eq!(relation_rows(&retained, "leg-deleted"), (1, 1));
+        .enumerate()
+        {
+            for explicit_flags in [false, true] {
+                let mut args = command.clone();
+                if explicit_flags {
+                    args.extend(["--no-auto-import", "--no-auto-flush"]);
+                }
+                let run = run_br(
+                    &workspace,
+                    args,
+                    &format!("gh585_preview_v{version}_{index}_{explicit_flags}"),
+                );
+                let output = json_stdout(&run.stdout);
+                if !run.status.success() {
+                    let message = output["error"]["message"]
+                        .as_str()
+                        .expect("actionable preview refusal");
+                    assert!(
+                        message.contains("schema") && message.contains("doctor"),
+                        "{message}"
+                    );
+                }
+                assert_eq!(
+                    protected_files(&workspace),
+                    before,
+                    "preview changed schema {version}: {run:?}"
+                );
+                assert_eq!(header_user_version(&db), version);
+                assert!(!workspace.root.join(".beads/.br_recovery").exists());
+            }
+        }
+        assert_eq!(event_count(&db), 5);
+    }
+}
+
+#[test]
+fn gh585_failed_or_missing_migration_preserves_every_database_only_record() {
+    for (version, refused_index) in [(0, false), (4, false), (7, false), (16, true)] {
+        let (workspace, db) = synthetic_tracker(version, 5, refused_index);
+        let connection = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        for sql in [
+            "INSERT INTO comments (issue_id, author, text, created_at) \
+             VALUES ('v15ws-z1u', 'local-agent', 'comment absent from JSONL', '2026-10-31T00:00:00Z')",
+            "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id) \
+             VALUES ('v15ws-9nx', 'v15ws-4kf', 'related', '2026-10-31T00:00:00Z', \
+                     'local-agent', '{\"why\":\"database-only edge\"}', 'unexported-thread')",
+            "INSERT INTO labels (issue_id, label) VALUES ('v15ws-z1u', 'unexported-label')",
+            "INSERT INTO metadata (key, value) VALUES ('operator_state', 'never exported')",
+            "CREATE TABLE extension_authority (key TEXT PRIMARY KEY, payload BLOB NOT NULL)",
+            "INSERT INTO extension_authority VALUES ('private', X'0001FF00')",
+        ] {
+            connection.execute(sql).unwrap();
+        }
+        connection.close().unwrap();
+        let before = protected_files(&workspace);
+        let tables = [
+            "events",
+            "config",
+            "comments",
+            "dependencies",
+            "labels",
+            "metadata",
+            "extension_authority",
+        ];
+        let expected: Vec<_> = tables
+            .iter()
+            .map(|table| query_copy(&db, &format!("SELECT * FROM {table} ORDER BY rowid")))
+            .collect();
+
+        for (index, args) in [
+            vec!["create", "must not run", "--json"],
+            vec!["doctor", "migrate-schema", "heal", "--json"],
+            vec![
+                "doctor",
+                "migrate-schema",
+                "heal",
+                "--discard-db-only",
+                "--json",
+            ],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let run = run_br(
+                &workspace,
+                args,
+                &format!("gh585_refused_v{version}_{index}"),
+            );
+            assert!(!run.status.success(), "{} {}", run.stdout, run.stderr);
+            let message = json_stdout(&run.stdout)["error"]["message"]
+                .as_str()
+                .expect("actionable refusal")
+                .to_owned();
+            assert!(
+                message.contains("preserv") || message.contains("migration"),
+                "{message}"
+            );
+            assert_eq!(header_user_version(&db), version);
+            // A reviewed attempt may retain its private diagnostics, but
+            // never changes any existing source or recovery artifact.
+            let after = protected_files(&workspace);
+            for (path, bytes) in &before {
+                assert_eq!(after.get(path), Some(bytes), "changed {path:?}: {message}");
+            }
+            for (table, rows) in tables.iter().zip(&expected) {
+                assert_eq!(
+                    query_copy(&db, &format!("SELECT * FROM {table} ORDER BY rowid")),
+                    *rows,
+                    "lost {table} on schema {version}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn gh585_old_schema_readers_do_not_take_writer_or_replacement_authority() {
+    let (workspace, db) = synthetic_tracker(16, 5, true);
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(workspace.root.join(".beads/.write.lock"))
+        .unwrap();
+    lock.lock().expect("hold writer lock");
+    let _peer = beads_rust::sync::DatabaseOpenerLease::register(&db).unwrap();
+    let before = protected_files(&workspace);
+    std::thread::scope(|scope| {
+        for (index, command) in ["list", "ready", "stats"].into_iter().enumerate() {
+            let workspace = &workspace;
+            scope.spawn(move || {
+                let run = run_br(
+                    workspace,
+                    [command, "--json", "--lock-timeout", "50"],
+                    &format!("gh585_concurrent_read_{index}"),
+                );
+                assert!(
+                    run.status.success(),
+                    "{command}: {} {}",
+                    run.stdout,
+                    run.stderr
+                );
+                let _ = json_stdout(&run.stdout);
+            });
+        }
+    });
+    // Info's generic historical-schema snapshot remains serialized with the
+    // writer so it never reads a half-copied database family.
+    let info = run_br(
+        &workspace,
+        ["info", "--json", "--lock-timeout", "50"],
+        "gh585_info_under_writer",
+    );
+    assert!(!info.status.success(), "{}", info.stdout);
+    assert!(
+        format!("{} {}", info.stdout, info.stderr)
+            .to_lowercase()
+            .contains("lock"),
+        "{} {}",
+        info.stdout,
+        info.stderr
+    );
+    assert_eq!(protected_files(&workspace), before);
+    assert!(!workspace.root.join(".beads/.br_recovery").exists());
+    drop(lock);
+    let info = run_br(&workspace, ["info", "--json"], "gh585_info_after_writer");
+    assert!(info.status.success(), "{} {}", info.stdout, info.stderr);
+    assert_eq!(
+        json_stdout(&info.stdout)["config"]["compact_model"],
+        "local-model"
+    );
+    assert_eq!(protected_files(&workspace), before);
+    assert_eq!(event_count(&db), 5);
+}
+
+#[test]
+fn gh585_reviewed_migration_waits_for_live_opener_without_reconstructing() {
+    let (workspace, db) = synthetic_tracker(16, 5, false);
+    let before = protected_files(&workspace);
+    let original_events = query_copy(&db, "SELECT * FROM events ORDER BY id");
+    let original_config = query_copy(&db, "SELECT key, value FROM config ORDER BY key");
+    let peer = beads_rust::sync::DatabaseOpenerLease::register(&db).unwrap();
+    let refused = run_br(
+        &workspace,
+        [
+            "create",
+            "Wait for the existing reader",
+            "--json",
+            "--lock-timeout",
+            "50",
+        ],
+        "gh585_migration_live_opener",
+    );
+    assert!(
+        !refused.status.success(),
+        "{} {}",
+        refused.stdout,
+        refused.stderr
+    );
+    let refusal = json_stdout(&refused.stdout)["error"]["message"]
+        .as_str()
+        .expect("migration contention diagnosis")
+        .to_owned();
+    assert!(
+        refusal.contains("opener") || refusal.contains("lease"),
+        "{refusal}"
+    );
+    assert_eq!(header_user_version(&db), 16);
+    let after = protected_files(&workspace);
+    for (path, bytes) in &before {
+        assert_eq!(after.get(path), Some(bytes), "changed {path:?}");
+    }
+    assert_eq!(
+        query_copy(&db, "SELECT * FROM events ORDER BY id"),
+        original_events
+    );
+    assert_eq!(
+        query_copy(&db, "SELECT key, value FROM config ORDER BY key"),
+        original_config
+    );
+
+    drop(peer);
+    let created = run_br(
+        &workspace,
+        [
+            "create",
+            "Created after the reader released its lease",
+            "--json",
+        ],
+        "gh585_migration_after_opener",
+    );
+    assert!(
+        created.status.success(),
+        "{} {}",
+        created.stdout,
+        created.stderr
+    );
+    assert_eq!(header_user_version(&db), current_version());
+    let migrated_events = query_copy(&db, "SELECT * FROM events ORDER BY id");
+    assert!(
+        original_events
+            .iter()
+            .all(|event| migrated_events.contains(event))
+    );
+    assert_eq!(
+        query_copy(&db, "SELECT key, value FROM config ORDER BY key"),
+        original_config
+    );
+    assert!(
+        workspace
+            .root
+            .join(".beads/.br_recovery/schema-migrations")
+            .is_dir()
+    );
+}
+
+#[test]
+fn gh585_unreadable_schema_probe_cannot_fall_through_to_startup_reconstruction() {
+    let (workspace, db) = synthetic_tracker(16, 5, false);
+    let beads_dir = workspace.root.join(".beads");
+    let mut damaged = fs::read(&db).unwrap();
+    // Keep the valid SQLite header and stale user_version but make the first
+    // b-tree page invalid. Schema detection now fails during the engine probe
+    // instead of returning a usable version, exercising the other startup
+    // branch. Recovery evidence still contains the complete source.
+    let evidence = beads_dir.join(".br_recovery/gh585-original");
+    fs::create_dir_all(&evidence).unwrap();
+    fs::write(evidence.join("beads.db"), &damaged).unwrap();
+    let wal = beads_dir.join("beads.db-wal");
+    if wal.is_file() {
+        fs::rename(wal, evidence.join("beads.db-wal")).unwrap();
+    }
+    damaged[100] = 0xff;
+    fs::write(&db, damaged).unwrap();
+    let before = protected_files(&workspace);
+
+    for (index, args) in [
+        vec!["list", "--json"],
+        vec!["list", "--json", "--no-auto-import", "--no-auto-flush"],
+        vec!["info", "--json", "--no-auto-import", "--no-auto-flush"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let run = run_br(
+            &workspace,
+            args,
+            &format!("gh585_unreadable_source_{index}"),
+        );
+        if index < 2 {
+            assert!(
+                !run.status.success(),
+                "unreadable authority must refuse: {}",
+                run.stdout
+            );
+            assert!(json_stdout(&run.stdout)["error"].is_object());
+        }
+        assert_eq!(protected_files(&workspace), before);
+        assert_eq!(header_user_version(&db), 16);
+    }
+    assert_eq!(event_count(&evidence.join("beads.db")), 5);
+}
+
+/// Reproduce the investigation's scale and documented version distribution
+/// using generated data, without claiming access to the reporter's trackers.
+#[test]
+fn gh585_fifty_tracker_cohort_keeps_all_5251_events_in_active_databases() {
+    let versions: Vec<u32> = std::iter::repeat_n(0, 19)
+        .chain([7, 7, 4])
+        .chain(std::iter::repeat_n(17, 10))
+        .chain([16])
+        // The report did not classify these seventeen sources. Represent
+        // them as refusal controls with unmistakable DB-only issue state.
+        .chain([1, 2, 3, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 0])
+        .collect();
+    assert_eq!(versions.len(), 50);
+    let mut events_before = 0;
+    let mut events_after = 0;
+    for (index, version) in versions.into_iter().enumerate() {
+        let events = match index {
+            0..=4 => 875,
+            5 => 876,
+            _ => 0,
+        };
+        let (mut workspace, db) = synthetic_tracker(version, events, index >= 33);
+        if index >= 33 {
+            let connection = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+            connection
+                .execute(
+                    "UPDATE issues SET title = 'Unflushed negative-control edit', \
+                 updated_at = '2999-01-01T00:00:00Z' WHERE id = 'v15ws-9nx'",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO dirty_issues (issue_id, marked_at) \
+                 VALUES ('v15ws-9nx', '2999-01-01T00:00:00Z')",
+                )
+                .unwrap();
+            connection.close().unwrap();
+        }
+        let beads_dir = workspace.root.join(".beads");
+        let before = protected_files(&workspace);
+        events_before += event_count(&db);
+        let config = query_copy(&db, "SELECT key, value FROM config ORDER BY key");
+        assert_eq!(config.len(), 4);
+        let nested = workspace.root.join("nested/project");
+        fs::create_dir_all(&nested).unwrap();
+        workspace.root = nested;
+        let run = run_br(
+            &workspace,
+            ["info", "--json", "--no-auto-import", "--no-auto-flush"],
+            &format!("gh585_cohort_{index}"),
+        );
+        assert!(
+            run.status.success(),
+            "tracker {index}: {} {}",
+            run.stdout,
+            run.stderr
+        );
+        let info = json_stdout(&run.stdout);
+        assert_eq!(info["issue_count"], 3, "tracker {index}: {info}");
+        assert_eq!(info["config"]["compact_model"], "local-model");
+        assert_eq!(info["config"]["compact_batch_size"], "37");
+        assert_eq!(info["config"]["compaction_enabled"], "false");
+        assert_eq!(protected_files_at(&beads_dir), before, "tracker {index}");
+        assert_eq!(header_user_version(&db), version);
+        assert!(!beads_dir.join(".br_recovery").exists());
+        events_after += event_count(&db);
+        assert_eq!(
+            query_copy(&db, "SELECT key, value FROM config ORDER BY key"),
+            config
+        );
+    }
+    assert_eq!(
+        events_before, 5251,
+        "six populated sources in the 22 formerly rebuilt trackers"
+    );
+    assert_eq!(
+        events_after, events_before,
+        "all events must remain in the active databases"
+    );
 }
