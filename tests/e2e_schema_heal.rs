@@ -130,6 +130,15 @@ fn edit_fixture(db: &Path, statements: &[&str]) {
     connection.close().expect("close fixture");
 }
 
+fn add_unreviewed_dependency_index(db: &Path) {
+    // The released schema4 now has a lossless upgrade. Keep refusal controls
+    // outside that exact reviewed profile without removing any original data.
+    edit_fixture(
+        db,
+        &["CREATE INDEX operator_dependency_index ON dependencies(created_by)"],
+    );
+}
+
 fn move_to_nested_directory(workspace: &mut BrWorkspace) {
     workspace.root = workspace.root.join("project/nested");
     fs::create_dir_all(&workspace.root).unwrap();
@@ -308,7 +317,7 @@ fn assert_migration_kept_records(
 }
 
 #[test]
-fn legacy_database_without_a_reviewed_migration_refuses_automatic_rebuild() {
+fn legacy_database_with_an_unreviewed_index_refuses_automatic_rebuild() {
     let workspace = BrWorkspace::new();
     let db_path = install(
         &workspace,
@@ -316,6 +325,7 @@ fn legacy_database_without_a_reviewed_migration_refuses_automatic_rebuild() {
         "schema4_v0127.issues.jsonl",
         "leg",
     );
+    add_unreviewed_dependency_index(&db_path);
     assert_eq!(header_user_version(&db_path), 4);
     let before = protected_files(&workspace);
 
@@ -376,7 +386,7 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
-fn database_only_data_refuses_unreviewed_migration_and_keeps_read_only_jsonl_available() {
+fn database_only_data_refuses_an_unreviewed_shape_and_keeps_read_only_jsonl_available() {
     let workspace = BrWorkspace::new();
     let db_path = install(
         &workspace,
@@ -384,6 +394,7 @@ fn database_only_data_refuses_unreviewed_migration_and_keeps_read_only_jsonl_ava
         "schema4_v0127.issues.jsonl",
         "leg",
     );
+    add_unreviewed_dependency_index(&db_path);
     let source = fs::read(&db_path).expect("source bytes");
     let protected = protected_files(&workspace);
 
@@ -574,6 +585,7 @@ fn dangling_dependency_edge_import_does_not_authorize_rebuilding_an_old_database
         "schema4_v0127.issues.jsonl",
         "leg",
     );
+    add_unreviewed_dependency_index(&db_path);
     let jsonl_path = workspace.root.join(".beads/issues.jsonl");
     let original = fs::read_to_string(&jsonl_path).expect("jsonl");
     let mut rows: Vec<Value> = original
@@ -992,6 +1004,7 @@ fn orphan_relation_rows_never_authorize_an_unreviewed_rebuild() {
         "leg",
     );
     add_orphan_relations(&db_path, "leg-deleted");
+    add_unreviewed_dependency_index(&db_path);
     assert_eq!(header_user_version(&db_path), 4);
     let before = protected_files(&workspace);
 
@@ -1183,7 +1196,8 @@ fn gh585_database_authority_reads_never_invent_empty_history_or_default_config()
 
 #[test]
 fn gh585_explicit_previews_never_upgrade_older_databases() {
-    // Schema 16 has a reviewed migration, while schema 4 has no such path.
+    // The released schema16 has a reviewed migration; stamping its newer
+    // layout as schema4 does not match the separately reviewed release4 shape.
     // The preview contract forbids either kind of upgrade before dispatch.
     for version in [4, 16] {
         let (workspace, db) = synthetic_tracker(version, 5, false);
@@ -1694,6 +1708,7 @@ fn refused_schema_migration_previews_keep_the_complete_legacy_tracker() {
         "schema4_v0127.issues.jsonl",
         "leg",
     );
+    add_unreviewed_dependency_index(&db);
     let beads_dir = workspace.root.join(".beads");
     let before = tracker_files(&beads_dir);
     move_to_nested_directory(&mut workspace);

@@ -49,6 +49,9 @@ use crate::storage::schema::{
 };
 use crate::sync::{DatabaseFamilyWriteLock, DatabaseTargetAuthorityState};
 
+mod legacy_v4;
+use legacy_v4::LegacyV4Projection;
+
 const PLAN_SCHEMA: &str = "br.doctor.schema_migration.plan.v1";
 const PREPARED_SCHEMA: &str = "br.doctor.schema_migration.prepared.v1";
 const COMMIT_READY_SCHEMA: &str = "br.doctor.schema_migration.commit_ready.v1";
@@ -148,6 +151,8 @@ struct MigrationForecast {
     dependency_type_key_added: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     legacy_v15_conversion: Option<LegacyV15Projection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_v4_conversion: Option<LegacyV4Projection>,
     #[serde(default, skip_serializing_if = "is_false")]
     post_migration_maintenance: bool,
 }
@@ -2809,6 +2814,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
                 prerequisites_column_added: false,
                 dependency_type_key_added: false,
                 legacy_v15_conversion: None,
+                legacy_v4_conversion: None,
                 post_migration_maintenance: true,
             };
             let plan_token = compute_plan_token(&database_path, &logical_witness, &forecast)?;
@@ -2848,7 +2854,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     }
     if !REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         return Err(BeadsError::internal(format!(
-            "reviewed schema migration is available only from source schemas 13, 14, 15, 16, 17, and 18 \
+            "reviewed schema migration is available only from source schemas 4, 13, 14, 15, 16, 17, and 18 \
              to {target}; observed unsupported source version {from}. The original database \
              remains authoritative: JSONL reconstruction cannot establish lossless preservation. \
              Use `br doctor migrate-schema heal --dry-run` to audit this tracker, then use a \
@@ -2869,6 +2875,9 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     let legacy_v15_conversion = legacy_v15
         .then(|| legacy_v15_projection(&conn, true, true))
         .transpose()?;
+    let legacy_v4_conversion = (from == 4)
+        .then(|| legacy_v4::projection(&conn, true))
+        .transpose()?;
     let issue_count = query_count(&conn, "SELECT COUNT(*) FROM issues")?;
     let gate_result_history_created = !named_table_exists(&conn, "gate_result_history")?;
     close_connection(conn)?;
@@ -2876,7 +2885,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     let forecast = MigrationForecast {
         from_version: from,
         to_version: target,
-        content_hash_rows_rebuilt: if from == 13 {
+        content_hash_rows_rebuilt: if matches!(from, 4 | 13) {
             usize::try_from(issue_count).map_err(|_| {
                 BeadsError::internal(format!(
                     "issue count {issue_count} cannot be represented on this platform"
@@ -2889,6 +2898,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
         prerequisites_column_added: from < 18,
         dependency_type_key_added: !legacy_v15,
         legacy_v15_conversion,
+        legacy_v4_conversion,
         post_migration_maintenance: true,
     };
     let plan_token = compute_plan_token(&database_path, &logical_witness, &forecast)?;
@@ -2906,7 +2916,14 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
             "br doctor migrate-schema apply --plan-token {plan_token}"
         )),
         plan_token: Some(plan_token),
-        note: if integrity_clean {
+        note: if from == 4 {
+            "the released schema4 profile preserves every existing record and hidden rowid, \
+             appends the named defaulted columns, and creates empty auxiliary tables. Only \
+             derived issue content hashes change; dirty markers and export receipts remain \
+             exact. The token binds the complete projected destination before candidate \
+             construction, installation, recovery, and undo"
+                .to_string()
+        } else if integrity_clean {
             "review the forecast and retain this receipt; apply will recompute the complete \
              logical witness and refuse semantic drift, then back up the current raw SQLite \
              family before migration and mandatory post-migration page maintenance"
@@ -3843,7 +3860,7 @@ fn run_post_migration_maintenance(
     let to = forecast.to_version;
     mark_stage(failed_stage, "source-witness");
     write_authority.verify_database_authority()?;
-    verify_legacy_v15_projection(db_path, forecast.legacy_v15_conversion.as_ref(), true)?;
+    verify_reviewed_profile(db_path, forecast, true)?;
     let source_logical = logical_witness(db_path)?;
     let source_preservation = capture_reviewed_state_preservation(db_path, forecast)?;
     let source_permissions_witness = raw_family_witness(db_path)?;
@@ -3962,11 +3979,7 @@ fn run_post_migration_maintenance(
     }
 
     mark_stage(failed_stage, "candidate-attestation");
-    verify_legacy_v15_projection(
-        &candidate_path,
-        forecast.legacy_v15_conversion.as_ref(),
-        false,
-    )?;
+    verify_reviewed_profile(&candidate_path, forecast, false)?;
     let candidate_logical = logical_witness(&candidate_path)?;
     verify_reviewed_state_preservation(&candidate_path, source_preservation.as_ref(), true)?;
     let candidate_matches_reviewed_operation = if from == to {
@@ -3990,7 +4003,7 @@ fn run_post_migration_maintenance(
     }
 
     let source_logical_after = logical_witness(db_path)?;
-    verify_legacy_v15_projection(db_path, forecast.legacy_v15_conversion.as_ref(), true)?;
+    verify_reviewed_profile(db_path, forecast, true)?;
     verify_reviewed_state_preservation(db_path, source_preservation.as_ref(), false)?;
     if source_logical_after != source_logical {
         return Err(BeadsError::internal(format!(
@@ -4071,7 +4084,7 @@ fn run_post_migration_maintenance(
     let post_install_result = (|| {
         verify_backup_family(db_path, &displaced_dir, &source_raw)?;
         let installed_logical = logical_witness(db_path)?;
-        verify_legacy_v15_projection(db_path, forecast.legacy_v15_conversion.as_ref(), false)?;
+        verify_reviewed_profile(db_path, forecast, false)?;
         verify_reviewed_state_preservation(db_path, source_preservation.as_ref(), true)?;
         if installed_logical != candidate_logical {
             return Err(BeadsError::internal(format!(
@@ -5717,9 +5730,9 @@ fn capture_reviewed_state_preservation(
     db_path: &Path,
     forecast: &MigrationForecast,
 ) -> Result<Option<ReviewedStatePreservation>> {
-    if forecast.legacy_v15_conversion.is_some() {
-        // This profile already proves all raw values, rowids, sequence
-        // reservations, and preserved schema through LegacyV15Projection.
+    if forecast.legacy_v15_conversion.is_some() || forecast.legacy_v4_conversion.is_some() {
+        // These profiles already bind their exact projected destination,
+        // including raw values, rowids, sequence reservations, and schema.
         return Ok(None);
     }
     with_preservation_snapshot(db_path, |conn| {
@@ -5951,12 +5964,11 @@ fn verify_retained_migration_preservation_at(
     forecast: &MigrationForecast,
     scratch_parent: Option<&Path>,
 ) -> Result<()> {
-    if forecast.legacy_v15_conversion.is_some() {
-        return verify_legacy_v15_projection(
-            db_path,
-            forecast.legacy_v15_conversion.as_ref(),
-            false,
-        );
+    if forecast.from_version == 4
+        || forecast.legacy_v15_conversion.is_some()
+        || forecast.legacy_v4_conversion.is_some()
+    {
+        return verify_reviewed_profile(db_path, forecast, false);
     }
     let before_dir = run_dir.join("before");
     verify_backup_family(db_path, &before_dir, raw_before)?;
@@ -6268,6 +6280,29 @@ fn verify_legacy_v15_projection(
         )));
     }
     Ok(())
+}
+
+fn verify_reviewed_profile(
+    db_path: &Path,
+    forecast: &MigrationForecast,
+    project_source: bool,
+) -> Result<()> {
+    if (forecast.from_version == 4) != forecast.legacy_v4_conversion.is_some()
+        || (forecast.legacy_v4_conversion.is_some() && forecast.legacy_v15_conversion.is_some())
+    {
+        return Err(BeadsError::Config(
+            "reviewed schema4 migration requires its complete, exclusive destination projection"
+                .to_owned(),
+        ));
+    }
+    if let Some(expected) = &forecast.legacy_v4_conversion {
+        legacy_v4::verify(db_path, expected, project_source)?;
+    }
+    verify_legacy_v15_projection(
+        db_path,
+        forecast.legacy_v15_conversion.as_ref(),
+        project_source,
+    )
 }
 
 fn logical_witness(db_path: &Path) -> Result<LogicalDatabaseWitness> {
@@ -8966,6 +9001,7 @@ mod tests {
             prerequisites_column_added: false,
             dependency_type_key_added: false,
             legacy_v15_conversion: None,
+            legacy_v4_conversion: None,
             post_migration_maintenance: true,
         };
         let first = compute_plan_token("db", &logical, &forecast).unwrap();
@@ -9302,6 +9338,7 @@ mod tests {
             prerequisites_column_added: true,
             dependency_type_key_added: true,
             legacy_v15_conversion: None,
+            legacy_v4_conversion: None,
             post_migration_maintenance: false,
         };
         (temp, db_path, forecast)

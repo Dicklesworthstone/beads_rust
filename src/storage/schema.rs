@@ -8,6 +8,8 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
+pub(crate) mod legacy_v4;
+
 #[cfg(test)]
 pub(crate) use tests::LEGACY_V15_TEST_CORE_SQL;
 
@@ -938,13 +940,14 @@ fn connection_user_version(conn: &Connection) -> Result<u32> {
 }
 
 /// Source schema versions accepted by the reviewed, receipt-bound
-/// `br doctor migrate-schema` lifecycle. Every released schema since v13 must
+/// `br doctor migrate-schema` lifecycle. The released v0.1.27 schema4 has a
+/// separately attested additive profile. Every released schema since v13 must
 /// stay upgradeable here: 13/14 (pre-gate-history releases), 15 (the #388
 /// gate-history schema shipped in the v0.2.19-era line) and 16 (the #384
 /// capacity-exemptions schema created by the released v0.2.19 binary), and
 /// 17 (capacity occupancy) and 18 (prerequisite checklists, before typed
 /// dependency identity). See GitHub #398.
-pub const REVIEWED_MIGRATION_SOURCE_VERSIONS: [u32; 6] = [13, 14, 15, 16, 17, 18];
+pub const REVIEWED_MIGRATION_SOURCE_VERSIONS: [u32; 7] = [4, 13, 14, 15, 16, 17, 18];
 
 fn current_schema_version_u32() -> Result<u32> {
     u32::try_from(CURRENT_SCHEMA_VERSION).map_err(|_| {
@@ -1000,7 +1003,7 @@ fn validate_reviewed_schema_migration(
     if !REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         return Err(BeadsError::internal(format!(
             "schema migrate refused — reviewed migrations are supported only from source \
-             schemas 13, 14, 15, 16, 17, and 18 to {supported_target} (got {from}->{target_version})"
+             schemas 4, 13, 14, 15, 16, 17, and 18 to {supported_target} (got {from}->{target_version})"
         )));
     }
     if marked_at.is_empty() {
@@ -1025,7 +1028,7 @@ fn validate_reviewed_schema_migration(
 /// `BEGIN IMMEDIATE` transaction before calling it. All validation occurs
 /// before the first migration write.
 ///
-/// Sources in [`REVIEWED_MIGRATION_SOURCE_VERSIONS`] (13 through 18) are
+/// Sources in [`REVIEWED_MIGRATION_SOURCE_VERSIONS`] (4 and 13 through 18) are
 /// accepted, each running exactly the version-gated step chain up to
 /// `CURRENT_SCHEMA_VERSION` (#398). `marked_at` is written verbatim to every
 /// `dirty_issues` row rewritten by the v13 content-hash step, making the
@@ -1044,7 +1047,9 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
 ) -> Result<ReviewedSchemaMigrationEffects> {
     validate_reviewed_schema_migration(conn, from, target_version, marked_at)?;
 
-    let content_hash_rows_rebuilt = if from == 13 {
+    let content_hash_rows_rebuilt = if from == 4 {
+        legacy_v4::apply_in_transaction(conn)?
+    } else if from == 13 {
         tracing::info!("Migrating database to schema version 14 (length-prefixed content hashes)");
         rebuild_content_hashes_for_current_format_in_transaction(conn, marked_at)?
     } else {
@@ -2829,6 +2834,10 @@ fn core_runtime_table_declaration_canonical(
 /// only known index definitions are rebuilt by candidate maintenance. Returns
 /// true only for the separately attested legacy-v15 conversion profile.
 pub(crate) fn attest_reviewed_migration_source_core_tables(conn: &Connection) -> Result<bool> {
+    if connection_user_version(conn)? == 4 {
+        legacy_v4::attest_source(conn)?;
+        return Ok(false);
+    }
     match attest_reviewed_source_core_tables(conn, false) {
         Ok(()) => Ok(false),
         Err(canonical_error) => {
@@ -2865,10 +2874,17 @@ fn attest_reviewed_source_core_tables(conn: &Connection, legacy_v15: bool) -> Re
     // Attest the version's actual shape, including the old pair dependency key.
     // Merely changing a version stamp must never authorize a different shape.
     let from = connection_user_version(conn)?;
-    let source_issue_columns = if from < 18 {
+    let source_issue_columns = if from == 4 {
+        &ISSUES_RUNTIME_COLUMNS[..ISSUES_RUNTIME_COLUMNS.len() - 3]
+    } else if from < 18 {
         &ISSUES_RUNTIME_COLUMNS[..ISSUES_RUNTIME_COLUMNS.len() - 1]
     } else {
         ISSUES_RUNTIME_COLUMNS
+    };
+    let source_event_columns = if from == 4 {
+        &EVENTS_RUNTIME_COLUMNS[..EVENTS_RUNTIME_COLUMNS.len() - 3]
+    } else {
+        EVENTS_RUNTIME_COLUMNS
     };
     let mut source_dependency_columns = DEPENDENCIES_RUNTIME_COLUMNS.to_vec();
     source_dependency_columns[2].primary_key_position = 0;
@@ -2885,7 +2901,7 @@ fn attest_reviewed_source_core_tables(conn: &Connection, legacy_v15: bool) -> Re
             COMMENTS_RUNTIME_COLUMNS,
             COMMENTS_RUNTIME_INDEXES,
         ),
-        ("events", EVENTS_RUNTIME_COLUMNS, EVENTS_RUNTIME_INDEXES),
+        ("events", source_event_columns, EVENTS_RUNTIME_INDEXES),
         ("config", CONFIG_RUNTIME_COLUMNS, CONFIG_RUNTIME_INDEXES),
         (
             "metadata",
@@ -2918,13 +2934,15 @@ fn attest_reviewed_source_core_tables(conn: &Connection, legacy_v15: bool) -> Re
             table,
             columns,
             references,
-            table == "issues",
+            table == "issues" || from == 4,
             (!legacy_v15 && matches!(table, "comments" | "events")).then_some("id"),
             matches!(table, "config" | "metadata"),
         ) && (table != "issues" || issues_required_checks_canonical(conn))
             && (!legacy_v15 || legacy_v15_table_declaration_exact(conn, table, columns));
         let indexes_ok = if legacy_v15 {
             legacy_v15_indexes_canonical(conn, table, indexes)
+        } else if from == 4 && table == "issues" {
+            legacy_v4::issue_indexes_canonical(conn)
         } else if table == "dependencies" {
             reviewed_dependency_source_indexes_canonical(conn)
         } else {

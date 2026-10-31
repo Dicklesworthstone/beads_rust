@@ -2462,13 +2462,16 @@ source-path migration planning use the same protection without requiring the
 flag pair. If a safe snapshot cannot be read, the command refuses instead of
 opening the original database for recovery.
 
-A mutating command may upgrade schemas 13-18 through the reviewed migration
-below, which witnesses the complete database and retains a recovery bundle
-and undo receipt. A refused migration or a schema with no reviewed migration
-path stops the command. It never falls through to automatic JSONL
-reconstruction. The error preserves the migration refusal reason.
+A mutating command may upgrade the attested schema-4 layout from released
+`br 0.1.27`, or reviewed source schemas 13-18, through the migration below.
+The migrator witnesses the complete database and retains a recovery bundle
+and undo receipt. A version stamp alone does not establish eligibility:
+unreviewed core columns, constraints, indexes, or reserved destination tables
+stop the command. Unsupported versions, including 0 and 7, remain refused. A
+refused migration never falls through to automatic JSONL reconstruction, and
+the error preserves its specific refusal reason.
 
-Inspect the available migration or explicit reconstruction plan with:
+Inspect the available migration and stale-schema audit with:
 
 ```bash
 br doctor migrate-schema plan --json       # reviewed lossless migration
@@ -2518,12 +2521,22 @@ br doctor migrate-schema undo \
   --json
 ```
 
-`plan` accepts the explicitly reviewed transitions from source schemas 13, 14,
-15 (the #388 gate-history schema), 16 (the #384 capacity-exemptions schema
-created by the released v0.2.19 binary), 17 (capacity occupancy), and 18
-(prerequisites) to the current schema 19. Each source runs
-exactly the version-gated step chain it is missing — content-hash rebuild
-(13→14), transition-scoped gate history (→15), capacity exemptions (→16), and
+`plan` accepts the explicitly reviewed transitions from source schema 4 (the
+released `br 0.1.27` layout), 13, 14, 15 (the #388 gate-history schema), 16 (the
+#384 capacity-exemptions schema created by the released v0.2.19 binary), 17
+(capacity occupancy), and 18 (prerequisites) to the current schema 19. The
+schema-4 profile appends the
+local provenance, agent context, prerequisite, and event attribution columns,
+creates the missing empty workflow tables, and refreshes only the derived
+issue content hashes. It preserves original issue, relation, event, and
+configuration row IDs, duplicate metadata keys, dirty markers, export receipts,
+extension tables, and sequence high-water marks. Database-only records remain
+active after the upgrade. The plan reports this proof in
+`legacy_v4_conversion`; apply and undo verify the complete projected state
+before replacing the active database.
+
+Each source runs exactly the version-gated step chain it is missing —
+content-hash rebuild (13→14), transition-scoped gate history (→15), capacity exemptions (→16), and
 capacity occupancy (→17), the prerequisite field (→18), and typed dependency
 identity (→19). `prerequisites_column_added` reports the new field and preserves
 existing issue values with an unset prerequisite field. The

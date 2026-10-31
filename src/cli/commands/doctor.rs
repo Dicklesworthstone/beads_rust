@@ -1230,9 +1230,9 @@ pub fn inspect_pending_sync_merge_under_authority(
 /// checkpointed, so a single engine-free header read separates the cases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StalledMigrationHint {
-    /// Header version sits in the migrator's reviewed source range.
+    /// Header version is one of the migrator's reviewed sources.
     Migratable(u32),
-    /// Header version predates the reviewed range; the migrator refuses it.
+    /// Header version has no reviewed migration, including gaps in the set.
     TooOld(u32),
     /// Header version is newer than this binary supports.
     NewerThanBinary(u32),
@@ -1284,9 +1284,11 @@ impl StalledMigrationHint {
                  JSONL and cannot finish a migration."
             )),
             Self::TooOld(found) => Some(format!(
-                "The database header is at schema {found}, which predates the reviewed migration \
-                 range ({}), so `br doctor migrate-schema` will refuse it. Recreate the workspace \
-                 from its JSONL export instead: `br init` in a fresh directory, then `br import`.",
+                "The database header is at schema {found}, which is not a reviewed migration \
+                 source ({}), so `br doctor migrate-schema` will refuse it. Preserve the original \
+                 database and its sidecars until a supported lossless migration is available. \
+                 JSONL does not contain every durable database record and cannot replace this \
+                 authority safely.",
                 reviewed_migration_source_versions_display()
             )),
             Self::NewerThanBinary(found) => Some(format!(
@@ -20049,14 +20051,26 @@ mod tests {
     fn stalled_migration_hint_classifies_versions_outside_the_reviewed_range() {
         let temp = TempDir::new().unwrap();
 
-        // Older than the migrator accepts: pointing at migrate-schema would
-        // send the operator to a command that refuses them.
+        // An unsupported gap between reviewed sources must not be presented
+        // as a supported migration or permission to reconstruct from JSONL.
         let ancient = temp.path().join("ancient.db");
-        write_db_header_with_user_version(&ancient, 4);
+        write_db_header_with_user_version(&ancient, 7);
         let hint = StalledMigrationHint::probe(&ancient);
-        assert_eq!(hint, StalledMigrationHint::TooOld(4));
+        assert_eq!(hint, StalledMigrationHint::TooOld(7));
         let remediation = hint.remediation().expect("too-old remediates");
-        assert!(remediation.contains("br import"), "{remediation}");
+        assert!(
+            remediation.contains("not a reviewed migration"),
+            "{remediation}"
+        );
+        assert!(
+            remediation.contains("Preserve the original"),
+            "{remediation}"
+        );
+        assert!(
+            remediation.contains("JSONL does not contain every"),
+            "{remediation}"
+        );
+        assert!(!remediation.contains("br import"), "{remediation}");
         assert!(
             !remediation.contains("migrate-schema plan"),
             "must not send an unsupported schema to the migrator: {remediation}"
@@ -20122,8 +20136,8 @@ mod tests {
         assert!(StalledMigrationHint::Indeterminate.remediation().is_none());
     }
 
-    /// The reviewed range is a closed interval, so both ends and the versions
-    /// either side of them decide which advice an operator gets.
+    /// Reviewed source versions form an explicit set. Both its boundaries and
+    /// every unsupported gap must keep directing operators to safe advice.
     #[test]
     fn stalled_migration_hint_classifies_the_range_boundaries() {
         let temp = TempDir::new().unwrap();
@@ -20138,6 +20152,13 @@ mod tests {
 
         assert_eq!(probe_at(lowest), StalledMigrationHint::Migratable(lowest));
         assert_eq!(probe_at(highest), StalledMigrationHint::Migratable(highest));
+        for version in lowest..=highest {
+            if REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&version) {
+                assert_eq!(probe_at(version), StalledMigrationHint::Migratable(version));
+            } else {
+                assert_eq!(probe_at(version), StalledMigrationHint::TooOld(version));
+            }
+        }
         assert_eq!(
             probe_at(lowest - 1),
             StalledMigrationHint::TooOld(lowest - 1),

@@ -34,9 +34,10 @@ fn fixture(workspace: &BrWorkspace) -> PathBuf {
     .unwrap();
     fs::write(beads.join("config.yaml"), "issue_prefix: leg\n").unwrap();
     let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
-    // Extend the released fixture with later legacy payload columns while
-    // retaining the pre-reviewed schema marker. The schema-agnostic rebuild
-    // must preserve these values rather than silently projecting them away.
+    // Extend the released fixture with later payload columns without the
+    // corresponding historical schema transition. This mixed layout is
+    // deliberately outside the reviewed released-schema4 profile; a matching
+    // version stamp must not authorize projecting these values away.
     let columns = conn.query("PRAGMA table_info(issues)").unwrap();
     for column in ["agent_context", "source_repo_path", "prerequisites"] {
         if !columns
@@ -186,9 +187,9 @@ fn resolving_one_replay_conflict_does_not_prove_complete_database_preservation()
     assert_refused_before_replacement(&workspace, &db, false);
     set_upstream_reference(&workspace, "different-upstream-reference");
 
-    // The old code only rehearsed issue replay. Even after this collision is
-    // resolved, the events/configuration still have no lossless migration and
-    // replay-after-install cannot survive interruption safely.
+    // The old code only rehearsed issue replay. Resolving that collision does
+    // not make this mixed core layout match the reviewed released profile.
+    // Its records still must not be replaced through replay-after-install.
     assert_refused_before_replacement(&workspace, &db, false);
     assert_refused_before_replacement(&workspace, &db, true);
     assert_stored_governance(&db);

@@ -11886,6 +11886,95 @@ impl SqliteStorage {
         // Clear existing counters
         conn.execute("DELETE FROM child_counters")?;
 
+        let max_children = Self::observed_child_counter_maxima(conn)?;
+        let mut count = 0;
+        for (parent_id, last_child) in max_children {
+            // Explicit DELETE + INSERT instead of INSERT OR REPLACE because
+            // fsqlite does not reliably support UNIQUE constraint upserts.
+            conn.execute_with_params(
+                "DELETE FROM child_counters WHERE parent_id = ?",
+                &[SqliteValue::from(parent_id.as_str())],
+            )?;
+            conn.execute_with_params(
+                "INSERT INTO child_counters (parent_id, last_child) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(parent_id.as_str()),
+                    SqliteValue::from(i64::from(last_child)),
+                ],
+            )?;
+            count += 1;
+        }
+
+        Ok(count)
+    }
+
+    /// Automatic import may discover higher child numbers, but cannot revoke
+    /// a database-only allocation reservation for children no longer present.
+    /// The caller owns the import transaction, including rollback on malformed
+    /// counters. Existing rows are updated in place only when advancing them.
+    pub(crate) fn advance_child_counters_in_tx(&self) -> Result<usize> {
+        let mut existing = HashMap::new();
+        for row in self
+            .conn
+            .query("SELECT parent_id, last_child FROM child_counters")?
+        {
+            let parent = row.get(0).and_then(SqliteValue::as_text).ok_or_else(|| {
+                BeadsError::SyncConflict {
+                    message: "Automatic import refused: child_counters contains a reservation \
+                              without a text parent_id; no import was applied"
+                        .to_owned(),
+                }
+            })?;
+            let counter = row
+                .get(1)
+                .and_then(SqliteValue::as_integer)
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| BeadsError::SyncConflict {
+                    message: format!(
+                        "Automatic import refused: child_counters has an invalid allocation \
+                         reservation for {parent}; last_child must be an integer from 0 through \
+                         {}. No import was applied; preserve and inspect the original counter \
+                         before deciding how to repair it",
+                        u32::MAX,
+                    ),
+                })?;
+            if existing.insert(parent.to_owned(), counter).is_some() {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Automatic import refused: child_counters contains duplicate allocation \
+                         reservations for {parent}; no import was applied",
+                    ),
+                });
+            }
+        }
+
+        let mut count = existing.len();
+        for (parent_id, observed) in Self::observed_child_counter_maxima(&self.conn)? {
+            let params = [
+                SqliteValue::from(i64::from(observed)),
+                SqliteValue::from(parent_id.as_str()),
+            ];
+            match existing.get(&parent_id) {
+                Some(previous) if *previous >= observed => {}
+                Some(_) => {
+                    self.conn.execute_with_params(
+                        "UPDATE child_counters SET last_child = ? WHERE parent_id = ?",
+                        &params,
+                    )?;
+                }
+                None => {
+                    self.conn.execute_with_params(
+                        "INSERT INTO child_counters (last_child, parent_id) VALUES (?, ?)",
+                        &params,
+                    )?;
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    fn observed_child_counter_maxima(conn: &Connection) -> Result<HashMap<String, u32>> {
         // Build counters only for parents that still exist. Recovered imports can
         // contain hierarchical IDs whose root parent was deleted long ago.
         let rows = conn.query("SELECT id FROM issues")?;
@@ -11931,25 +12020,7 @@ impl SqliteStorage {
             );
         }
 
-        let mut count = 0;
-        for (parent_id, last_child) in max_children {
-            // Explicit DELETE + INSERT instead of INSERT OR REPLACE because
-            // fsqlite does not reliably support UNIQUE constraint upserts.
-            conn.execute_with_params(
-                "DELETE FROM child_counters WHERE parent_id = ?",
-                &[SqliteValue::from(parent_id.as_str())],
-            )?;
-            conn.execute_with_params(
-                "INSERT INTO child_counters (parent_id, last_child) VALUES (?, ?)",
-                &[
-                    SqliteValue::from(parent_id.as_str()),
-                    SqliteValue::from(i64::from(last_child)),
-                ],
-            )?;
-            count += 1;
-        }
-
-        Ok(count)
+        Ok(max_children)
     }
 
     fn compute_blocked_issues_map_impl(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {

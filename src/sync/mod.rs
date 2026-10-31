@@ -16504,10 +16504,13 @@ fn stream_import_actions_in_tx(
         elapsed_ms = stream_started.elapsed().as_millis(),
         "Import phase: blocked cache rebuilt"
     );
-    tx_result.child_counter_entries = storage.rebuild_child_counters_in_tx()?;
+    tx_result.child_counter_entries = match mode {
+        ImportMode::Automatic => storage.advance_child_counters_in_tx()?,
+        ImportMode::Explicit => storage.rebuild_child_counters_in_tx()?,
+    };
     tracing::debug!(
         elapsed_ms = stream_started.elapsed().as_millis(),
-        "Import phase: child counters rebuilt"
+        "Import phase: child counters reconciled"
     );
     verify_applied_import_issue_semantics(storage, &tx_result.applied_issues)?;
     tracing::debug!(
@@ -31501,6 +31504,153 @@ mod tests {
                 .unwrap(),
             dependencies_before,
         );
+    }
+
+    #[test]
+    fn automatic_import_preserves_and_advances_child_counter_reservations() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+        let parents = [
+            make_issue_at("bd-retained", "No surviving children", fixed_time(100)),
+            make_issue_at("bd-higher", "High reservation", fixed_time(100)),
+            make_issue_at("bd-lower", "Reservation to advance", fixed_time(100)),
+            make_issue_at("bd-new", "No reservation yet", fixed_time(100)),
+        ];
+        write_jsonl_issues(&jsonl_path, &parents.iter().collect::<Vec<_>>());
+        import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd"),
+        )
+        .unwrap();
+        storage
+            .execute_test_sql(
+                "INSERT INTO child_counters (rowid, parent_id, last_child) \
+             VALUES (101, 'bd-retained', 47), (103, 'bd-higher', 47), (107, 'bd-lower', 2);",
+            )
+            .unwrap();
+        let children = [
+            make_issue_at("bd-higher.3", "Low child number", fixed_time(200)),
+            make_issue_at("bd-lower.8", "Higher child number", fixed_time(200)),
+            make_issue_at("bd-new.6", "First imported child", fixed_time(200)),
+            make_issue_at("bd-absent.9", "Parent no longer exists", fixed_time(200)),
+        ];
+        write_jsonl_issues(
+            &jsonl_path,
+            &parents.iter().chain(children.iter()).collect::<Vec<_>>(),
+        );
+        let source = fs::read(&jsonl_path).unwrap();
+        let imported = auto_import_if_stale(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            Some("bd"),
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(imported.attempted);
+        assert_eq!(imported.imported_count, 4);
+        for (parent, rowid, counter, next) in [
+            ("bd-retained", 101_i64, 47_i64, 48),
+            ("bd-higher", 103, 47, 48),
+            ("bd-lower", 107, 8, 9),
+        ] {
+            assert_eq!(
+                storage
+                    .execute_raw_query(&format!(
+                        "SELECT rowid, last_child FROM child_counters WHERE parent_id = '{parent}'"
+                    ))
+                    .unwrap(),
+                vec![vec![
+                    SqliteValue::Integer(rowid),
+                    SqliteValue::Integer(counter)
+                ]],
+                "reservation and row identity for {parent}",
+            );
+            assert_eq!(storage.next_child_number(parent).unwrap(), next);
+        }
+        assert_eq!(storage.next_child_number("bd-new").unwrap(), 7);
+        assert_eq!(
+            storage
+                .execute_raw_query("SELECT COUNT(*) FROM child_counters")
+                .unwrap(),
+            vec![vec![SqliteValue::Integer(4)]],
+        );
+        assert!(
+            storage
+                .execute_raw_query("SELECT * FROM child_counters WHERE parent_id = 'bd-absent'")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read(&jsonl_path).unwrap(), source);
+    }
+
+    #[test]
+    fn automatic_import_rolls_back_every_change_for_malformed_child_reservations() {
+        for malformed in ["-1", "1.5", "'opaque'", "X'FF00'", "4294967296"] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+            let mut parent = make_issue_at("bd-parent", "Original parent", fixed_time(100));
+            write_jsonl_issues(&jsonl_path, &[&parent]);
+            import_from_jsonl(
+                &mut storage,
+                &jsonl_path,
+                &ImportConfig::default(),
+                Some("bd"),
+            )
+            .unwrap();
+            storage
+                .execute_test_sql(&format!(
+                    "INSERT INTO child_counters (rowid, parent_id, last_child) \
+                 VALUES (301, 'bd-parent', {malformed});"
+                ))
+                .unwrap();
+            parent.title = "Must be rolled back".to_string();
+            parent.updated_at = fixed_time(200);
+            let child = make_issue_at("bd-parent.8", "Must not be inserted", fixed_time(200));
+            write_jsonl_issues(&jsonl_path, &[&parent, &child]);
+            let source = fs::read(&jsonl_path).unwrap();
+            let before = raw_import_refusal_state(&storage);
+
+            let error = auto_import_if_stale(
+                &mut storage,
+                &beads_dir,
+                &jsonl_path,
+                Some("bd"),
+                None,
+                false,
+                false,
+                false,
+            )
+            .unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("Automatic import refused:"), "{message}");
+            assert!(message.contains("child_counters"), "{message}");
+            assert!(
+                message.contains("invalid allocation reservation"),
+                "{message}"
+            );
+            assert_eq!(raw_import_refusal_state(&storage), before, "{malformed}");
+            assert_eq!(fs::read(&jsonl_path).unwrap(), source);
+
+            // An explicitly requested import still deliberately reconstructs
+            // counters from visible children rather than preserving the bad
+            // value. This is not an automatic fallback from the refusal.
+            let imported = import_from_jsonl(
+                &mut storage,
+                &jsonl_path,
+                &ImportConfig::default(),
+                Some("bd"),
+            )
+            .unwrap();
+            assert_eq!(imported.created_count, 1);
+            assert_eq!(imported.updated_count, 1);
+            assert_eq!(storage.next_child_number("bd-parent").unwrap(), 9);
+        }
     }
 
     #[test]

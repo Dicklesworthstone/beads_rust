@@ -168,6 +168,14 @@ inspect it with `br doctor --json` before deciding how to reconcile the missing
 issues. Explicit import and cleanup retain their existing behavior and can
 permanently delete orphaned records; `issues.jsonl` cannot restore event history.
 
+Child-number counters are durable allocation reservations, including numbers
+whose former child issues no longer exist. Automatic import retains those
+reservations and their row identities, advances a counter in place only when
+an imported child has a higher number, and creates counters for newly observed
+parents. It refuses malformed counters transactionally rather than resetting
+them and allowing old child IDs to be reused. Explicit import keeps its
+deliberate counter-rebuild behavior.
+
 A newer row is held to the project workflow policy when `.beads/policy.yaml`
 enforces `workflow.transitions` (GitHub #540). Import sees only the status
 another clone ended at, so it asks whether any sequence of permitted moves
