@@ -15763,36 +15763,85 @@ fn cleanup_import_orphans_in_tx(storage: &SqliteStorage) -> Result<usize> {
     cleanup_import_orphans_counting_dependencies_in_tx(storage).map(|(total, _)| total)
 }
 
+const IMPORT_ORPHAN_REFERENCES: &[(&str, &str)] = &[
+    ("dependencies", "issue_id"),
+    ("dependencies", "depends_on_id"),
+    ("labels", "issue_id"),
+    ("comments", "issue_id"),
+    ("events", "issue_id"),
+    ("dirty_issues", "issue_id"),
+    ("blocked_issues_cache", "issue_id"),
+    ("child_counters", "parent_id"),
+];
+
+fn import_orphan_predicate(table: &str, column: &str) -> String {
+    let external_dependency_filter = if table == "dependencies" {
+        format!(" AND {column} NOT LIKE 'external:%'")
+    } else {
+        String::new()
+    };
+    format!("{column} NOT IN (SELECT id FROM issues){external_dependency_filter}")
+}
+
+/// A missing issue does not make its durable history disposable. Reviewed
+/// schema migrations preserve these rows, and automatic import must not erase
+/// them later through relation replacement or the global orphan-cleanup pass.
+/// Run inside the import transaction before its first mutation so concurrent
+/// changes cannot introduce an unreviewed cleanup between this check and apply.
+fn refuse_automatic_import_with_existing_orphans(storage: &SqliteStorage) -> Result<()> {
+    let mut retained = Vec::new();
+    for &(table, column) in IMPORT_ORPHAN_REFERENCES {
+        let predicate = import_orphan_predicate(table, column);
+        let rows = storage
+            .execute_raw_query(&format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"))?;
+        let count = match rows.as_slice() {
+            [row] => match row.as_slice() {
+                [SqliteValue::Integer(count)] if *count >= 0 => *count,
+                _ => {
+                    return Err(BeadsError::internal(format!(
+                        "Could not establish existing orphan count for {table}.{column}"
+                    )));
+                }
+            },
+            _ => {
+                return Err(BeadsError::internal(format!(
+                    "Could not establish existing orphan count for {table}.{column}"
+                )));
+            }
+        };
+        if count > 0 {
+            retained.push(format!("{table}.{column}: {count}"));
+        }
+    }
+    if retained.is_empty() {
+        return Ok(());
+    }
+    Err(BeadsError::SyncConflict {
+        message: format!(
+            "Automatic import refused: existing database records reference missing issues ({}); \
+             no import was applied and these records were retained. Preserve the database and \
+             inspect it with `br doctor --json` before deciding how to reconcile the missing \
+             issues. Explicit cleanup can permanently delete these records, including event \
+             history that issues.jsonl cannot restore",
+            retained.join(", "),
+        ),
+    })
+}
+
 /// Orphan cleanup that also reports how many `dependencies` rows it dropped,
 /// so the import's dependency count describes the rows it actually persisted.
 fn cleanup_import_orphans_counting_dependencies_in_tx(
     storage: &SqliteStorage,
 ) -> Result<(usize, usize)> {
-    let orphan_tables = &[
-        ("dependencies", "issue_id"),
-        ("dependencies", "depends_on_id"),
-        ("labels", "issue_id"),
-        ("comments", "issue_id"),
-        ("events", "issue_id"),
-        ("dirty_issues", "issue_id"),
-        ("blocked_issues_cache", "issue_id"),
-        ("child_counters", "parent_id"),
-    ];
     let mut orphans_cleaned = 0usize;
     let mut dependency_rows_removed = 0usize;
 
-    for (table, col) in orphan_tables {
-        let external_dependency_filter = match (*table, *col) {
-            ("dependencies", "issue_id") => " AND issue_id NOT LIKE 'external:%'",
-            ("dependencies", "depends_on_id") => " AND depends_on_id NOT LIKE 'external:%'",
-            _ => "",
-        };
-        let sql = format!(
-            "DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues){external_dependency_filter}"
-        );
+    for &(table, column) in IMPORT_ORPHAN_REFERENCES {
+        let predicate = import_orphan_predicate(table, column);
+        let sql = format!("DELETE FROM {table} WHERE {predicate}");
         let removed = storage.execute_raw_count(&sql)?;
         orphans_cleaned += removed;
-        if *table == "dependencies" {
+        if table == "dependencies" {
             dependency_rows_removed += removed;
         }
     }
@@ -16869,6 +16918,9 @@ fn import_from_jsonl_snapshot_impl(
     );
 
     let apply_result = storage.with_write_transaction(|storage| -> Result<ImportResult> {
+        if mode == ImportMode::Automatic {
+            refuse_automatic_import_with_existing_orphans(storage)?;
+        }
         // One query proves that no owned relation rows (labels, dependencies,
         // comments) exist anywhere yet. When it holds, every inserted issue
         // can take the insert-only relation path instead of probing its own
@@ -31263,6 +31315,191 @@ mod tests {
             external_rows.len(),
             1,
             "external dependency endpoints must survive import cleanup"
+        );
+    }
+
+    fn raw_import_refusal_state(storage: &SqliteStorage) -> BTreeMap<String, Vec<Vec<String>>> {
+        let tables = storage
+            .execute_raw_query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap();
+        let mut state = BTreeMap::new();
+        for row in tables {
+            let name = row[0].as_text().unwrap();
+            let quoted = name.replace('"', "\"\"");
+            state.insert(
+                name.to_string(),
+                additive_raw_rows(
+                    storage,
+                    &format!("SELECT rowid, * FROM \"{quoted}\" ORDER BY rowid"),
+                )
+                .unwrap(),
+            );
+        }
+        state.insert(
+            "schema".to_string(),
+            additive_raw_rows(storage, "SELECT * FROM sqlite_master ORDER BY type, name").unwrap(),
+        );
+        state
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn automatic_import_refuses_every_preexisting_orphan_before_replacing_rows() {
+        let cases = [
+            (
+                "dependencies.issue_id: 1",
+                "INSERT INTO dependencies (issue_id, depends_on_id, type) \
+                 VALUES ('bd-new', 'bd-existing', 'related');",
+            ),
+            (
+                "dependencies.depends_on_id: 1",
+                "INSERT INTO dependencies (issue_id, depends_on_id, type) \
+                 VALUES ('bd-existing', 'bd-missing', 'related');",
+            ),
+            (
+                "labels.issue_id: 1",
+                "INSERT INTO labels (issue_id, label) VALUES ('bd-new', 'retained-label');",
+            ),
+            (
+                "comments.issue_id: 1",
+                "INSERT INTO comments (issue_id, author, text) \
+                 VALUES ('bd-new', 'operator', 'retained-comment');",
+            ),
+            (
+                "events.issue_id: 2",
+                "INSERT INTO events (issue_id, event_type, actor, new_value) \
+                 VALUES ('bd-missing', 'updated', 'operator', X'00FF'), \
+                        ('bd-missing', 'created', 'operator', 'retained-history');",
+            ),
+            (
+                "dirty_issues.issue_id: 1",
+                "INSERT INTO dirty_issues (issue_id) VALUES ('bd-missing');",
+            ),
+            (
+                "blocked_issues_cache.issue_id: 1",
+                "INSERT INTO blocked_issues_cache (issue_id, blocked_by) \
+                 VALUES ('bd-missing', '[\"bd-existing\"]');",
+            ),
+            (
+                "child_counters.parent_id: 1",
+                "INSERT INTO child_counters (parent_id, last_child) VALUES ('bd-missing', 99);",
+            ),
+        ];
+        for (diagnostic, orphan_sql) in cases {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let (_temp_dir, _beads_dir, jsonl_path) = counted_workspace();
+            let mut existing = make_issue_at("bd-existing", "Original", fixed_time(100));
+            write_jsonl_issues(&jsonl_path, &[&existing]);
+            import_from_jsonl(
+                &mut storage,
+                &jsonl_path,
+                &ImportConfig::default(),
+                Some("bd"),
+            )
+            .unwrap();
+            storage
+                .execute_test_sql(&format!(
+                    "PRAGMA foreign_keys = OFF; \
+                     INSERT INTO config (key, value) VALUES ('custom.retained', 'non-default'); \
+                     CREATE TABLE operator_evidence (id INTEGER PRIMARY KEY, payload BLOB); \
+                     INSERT INTO operator_evidence VALUES (17, X'00FF'); \
+                     {orphan_sql} \
+                     PRAGMA foreign_keys = ON;"
+                ))
+                .unwrap();
+            existing.title = "Incoming update".to_string();
+            existing.updated_at = fixed_time(200);
+            let incoming = make_issue_at("bd-new", "Incoming new issue", fixed_time(200));
+            write_jsonl_issues(&jsonl_path, &[&existing, &incoming]);
+            let source = capture_jsonl_source_snapshot(&jsonl_path).unwrap();
+            let jsonl_before = fs::read(&jsonl_path).unwrap();
+            let before = raw_import_refusal_state(&storage);
+
+            let error = import_from_jsonl_snapshot_impl(
+                &mut storage,
+                &source,
+                &ImportConfig::default(),
+                Some("bd"),
+                ImportMode::Automatic,
+                None,
+            )
+            .unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("Automatic import refused:"), "{message}");
+            assert!(message.contains(diagnostic), "{message}");
+            assert!(
+                message.contains("Explicit cleanup can permanently delete"),
+                "{message}"
+            );
+            assert_eq!(raw_import_refusal_state(&storage), before, "{diagnostic}");
+            assert_eq!(fs::read(&jsonl_path).unwrap(), jsonl_before);
+            assert_eq!(
+                storage.execute_raw_query("PRAGMA foreign_keys").unwrap(),
+                vec![vec![SqliteValue::Integer(1)]],
+            );
+
+            // Deliberate import keeps its existing cleanup semantics. In
+            // particular, an incoming owner may replace orphaned relations;
+            // automatic import cannot assume that is the intended recovery.
+            let explicit = import_from_jsonl_snapshot(
+                &mut storage,
+                &source,
+                &ImportConfig::default(),
+                Some("bd"),
+            )
+            .unwrap();
+            assert_eq!(explicit.created_count, 1, "{diagnostic}");
+            assert_eq!(explicit.updated_count, 1, "{diagnostic}");
+        }
+    }
+
+    #[test]
+    fn automatic_import_accepts_external_dependency_endpoints() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let (_temp_dir, _beads_dir, jsonl_path) = counted_workspace();
+        let mut issue = make_issue_at("bd-epic", "Epic", fixed_time(100));
+        issue.dependencies.push(Dependency {
+            issue_id: issue.id.clone(),
+            depends_on_id: "external:peer:capability".to_string(),
+            dep_type: DependencyType::Related,
+            created_at: fixed_time(50),
+            created_by: Some("operator".to_string()),
+            metadata: Some("{}".to_string()),
+            thread_id: Some(String::new()),
+        });
+        write_jsonl_issues(&jsonl_path, &[&issue]);
+        import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd"),
+        )
+        .unwrap();
+        storage
+            .execute_test_sql(
+                "PRAGMA foreign_keys = OFF; \
+                 INSERT INTO dependencies (issue_id, depends_on_id, type) \
+                 VALUES ('external:child:capability', 'bd-epic', 'parent-child'); \
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+        let dependencies_before =
+            additive_raw_rows(&storage, "SELECT rowid, * FROM dependencies ORDER BY rowid")
+                .unwrap();
+        let source = capture_jsonl_source_snapshot(&jsonl_path).unwrap();
+        import_from_jsonl_snapshot_impl(
+            &mut storage,
+            &source,
+            &ImportConfig::default(),
+            Some("bd"),
+            ImportMode::Automatic,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            additive_raw_rows(&storage, "SELECT rowid, * FROM dependencies ORDER BY rowid")
+                .unwrap(),
+            dependencies_before,
         );
     }
 

@@ -159,6 +159,15 @@ those intentions. The refusal occurs before the requested command and rolls
 back the whole import, including earlier rows and synchronization receipts.
 JSONL and the merge anchor remain intact for explicit reconciliation.
 
+Automatic import also refuses if existing database records reference missing
+issues and import would discard them through relation replacement or orphan
+cleanup. The refusal names the affected tables, columns, and row counts before
+any import rows or receipts are changed. This includes database-only event
+history retained by a lossless schema migration. Preserve the database and
+inspect it with `br doctor --json` before deciding how to reconcile the missing
+issues. Explicit import and cleanup retain their existing behavior and can
+permanently delete orphaned records; `issues.jsonl` cannot restore event history.
+
 A newer row is held to the project workflow policy when `.beads/policy.yaml`
 enforces `workflow.transitions` (GitHub #540). Import sees only the status
 another clone ended at, so it asks whether any sequence of permitted moves

@@ -692,6 +692,218 @@ fn relation_rows(db_path: &Path, issue_id: &str) -> (i64, i64) {
     rows
 }
 
+/// Include every table, value, duplicate and hidden rowid. Comparing the raw
+/// records also catches import-side changes to receipts and sequence counters
+/// that issue-model equality would miss.
+fn raw_database_records(db: &Path) -> BTreeMap<String, Vec<Vec<SqliteValue>>> {
+    let mut records = BTreeMap::new();
+    records.insert(
+        "schema".to_owned(),
+        query_copy(
+            db,
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name",
+        ),
+    );
+    for row in query_copy(db, "SELECT name FROM sqlite_master WHERE type = 'table'") {
+        let table = row[0].as_text().expect("table name");
+        let quoted = table.replace('"', "\"\"");
+        records.insert(
+            table.to_owned(),
+            query_copy(
+                db,
+                &format!("SELECT rowid, * FROM \"{quoted}\" ORDER BY rowid"),
+            ),
+        );
+    }
+    records
+}
+
+fn seed_durable_import_orphans(db: &Path, ghost: &str) {
+    add_orphan_relations(db, ghost);
+    edit_fixture(
+        db,
+        &[
+            "PRAGMA foreign_keys = OFF",
+            &format!(
+                "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at) \
+                 VALUES ('{ghost}', 'updated', 'original-operator', 'before', 'after', \
+                         'durable audit evidence', '2026-01-01T00:00:00Z')"
+            ),
+            &format!("INSERT INTO child_counters (parent_id, last_child) VALUES ('{ghost}', 83)"),
+        ],
+    );
+}
+
+fn seed_orphan_dependency_endpoints(db: &Path, live_id: &str, ghost: &str) {
+    edit_fixture(
+        db,
+        &[
+            "PRAGMA foreign_keys = OFF",
+            &format!(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by) \
+                 VALUES ('{ghost}', '{live_id}', 'blocks', '2026-01-01T00:00:00Z', 'original-operator')"
+            ),
+            &format!(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by) \
+                 VALUES ('{live_id}', '{ghost}', 'discovered-from', '2026-01-01T00:00:00Z', 'original-operator')"
+            ),
+        ],
+    );
+}
+
+fn advance_jsonl_issue(jsonl: &Path, id: &str) {
+    let original = fs::read_to_string(jsonl).expect("read JSONL");
+    let mut rows: Vec<Value> = original
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid JSONL row"))
+        .collect();
+    let issue = rows
+        .iter_mut()
+        .find(|row| row["id"] == id)
+        .expect("issue in JSONL");
+    issue["title"] = Value::from("External edit that must not erase local audit history");
+    issue["updated_at"] = Value::from("2099-01-01T00:00:00Z");
+    let rewritten = rows
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(jsonl, format!("{rewritten}\n")).expect("publish external JSONL edit");
+}
+
+fn assert_automatic_import_keeps_orphans(workspace: &mut BrWorkspace, db: &Path, live_id: &str) {
+    let beads_dir = workspace.root.join(".beads");
+    let jsonl = beads_dir.join("issues.jsonl");
+    advance_jsonl_issue(&jsonl, live_id);
+    let source = fs::read(&jsonl).unwrap();
+    let before = raw_database_records(db);
+    assert!(
+        before["dirty_issues"].is_empty(),
+        "must exercise automatic import"
+    );
+    move_to_nested_directory(workspace);
+
+    // The explicitly observational escape hatch must continue to work even
+    // while this tracker requires an operator to reconcile its orphan rows.
+    let files = tracker_files(&beads_dir);
+    let read = run_br_with_env(
+        workspace,
+        ["list", "--json", "--no-auto-import", "--no-auto-flush"],
+        [("BR_DISABLE_READ_ONLY_FAST_OPEN", "1")],
+        "orphan_noauto_read",
+    );
+    assert!(read.status.success(), "{} {}", read.stdout, read.stderr);
+    assert_tracker_unchanged(&beads_dir, &files);
+
+    let automatic = run_br(workspace, ["list", "--json"], "orphan_automatic_import");
+    assert!(
+        !automatic.status.success(),
+        "automatic import must refuse before cleanup: {} {}",
+        automatic.stdout,
+        automatic.stderr
+    );
+    let output = json_stdout(&automatic.stdout);
+    let message = output["error"]["message"]
+        .as_str()
+        .expect("actionable refusal");
+    for expected in [
+        "Automatic import refused",
+        "events",
+        "comments",
+        "labels",
+        "dependencies",
+        "child_counters",
+    ] {
+        assert!(message.contains(expected), "missing {expected}: {message}");
+    }
+    assert!(message.contains("permanently delete"), "{message}");
+    assert_eq!(
+        raw_database_records(db),
+        before,
+        "refused import changed raw database state"
+    );
+    assert_eq!(
+        fs::read(jsonl).unwrap(),
+        source,
+        "refused import rewrote JSONL"
+    );
+}
+
+#[test]
+fn current_database_automatic_import_refuses_preexisting_durable_orphans() {
+    let mut workspace = BrWorkspace::new();
+    let init = run_br(
+        &workspace,
+        ["init", "--prefix", "orph", "--json"],
+        "orphan_current_init",
+    );
+    assert!(init.status.success(), "{} {}", init.stdout, init.stderr);
+    let created = run_br(
+        &workspace,
+        ["create", "Original issue", "--json"],
+        "orphan_current_create",
+    );
+    assert!(
+        created.status.success(),
+        "{} {}",
+        created.stdout,
+        created.stderr
+    );
+    let created = json_stdout(&created.stdout);
+    let live_id = created["id"].as_str().expect("created issue id");
+    let db = workspace.root.join(".beads/beads.db");
+    seed_durable_import_orphans(&db, "orph-deleted");
+    seed_orphan_dependency_endpoints(&db, live_id, "orph-deleted");
+    assert_automatic_import_keeps_orphans(&mut workspace, &db, live_id);
+}
+
+#[test]
+fn reviewed_migration_then_ordinary_import_keeps_preexisting_durable_orphans() {
+    let (mut workspace, db) = synthetic_tracker(17, 5, false);
+    seed_durable_import_orphans(&db, "v15ws-deleted");
+    let source = raw_database_records(&db);
+    let source_bytes = fs::read(&db).unwrap();
+    let healed = run_br(
+        &workspace,
+        [
+            "doctor",
+            "migrate-schema",
+            "heal",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "orphan_reviewed_heal",
+    );
+    assert!(
+        healed.status.success(),
+        "{} {}",
+        healed.stdout,
+        healed.stderr
+    );
+    assert_eq!(header_user_version(&db), current_version());
+    let migrated = raw_database_records(&db);
+    for table in [
+        "events",
+        "comments",
+        "labels",
+        "dependencies",
+        "child_counters",
+    ] {
+        assert_eq!(migrated[table], source[table], "migration changed {table}");
+    }
+    let backup = walk(&workspace.root.join(".beads/.br_recovery/schema-migrations"))
+        .into_iter()
+        .find(|path| fs::read(path).is_ok_and(|bytes| bytes == source_bytes))
+        .expect("migration retains exact original database backup");
+    assert_eq!(raw_database_records(&backup), source);
+    // The reviewed typed-key conversion correctly enforces the owner's FK.
+    // Add damaged dependency endpoints only after proving that migration kept
+    // all supported legacy orphan records and every original dependency row.
+    seed_orphan_dependency_endpoints(&db, "v15ws-9nx", "v15ws-deleted");
+    assert_automatic_import_keeps_orphans(&mut workspace, &db, "v15ws-9nx");
+}
+
 /// A pre-0.6.0 database holding the label and comment of a deleted issue used
 /// to fail the stale-schema audit outright ("contains rows without an owning
 /// issue"), so every mutating command refused and even
@@ -741,7 +953,13 @@ fn orphan_relation_rows_heal_through_the_reviewed_migration_and_are_kept() {
 
     let create = run_br(
         &workspace,
-        ["create", "Created after orphan heal", "--json"],
+        [
+            "create",
+            "Created after orphan heal",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
         "orphans16_create",
     );
     assert!(
